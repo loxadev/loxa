@@ -1,0 +1,7 @@
+docs/
+target/
+.loxa/
+*.gguf
+.env
+.DS_Store
+.claude/
