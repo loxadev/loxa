@@ -2,6 +2,7 @@
 
 pub mod detect;
 pub mod hardware;
+pub mod registry;
 
 #[cfg(test)]
 mod tests {
