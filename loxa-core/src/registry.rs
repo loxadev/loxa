@@ -84,3 +84,158 @@ pub fn find(id: &str) -> Option<&'static ModelEntry> {
     REGISTRY.iter().find(|entry| entry.id == id)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{find, REGISTRY};
+    use std::collections::HashSet;
+
+    const EXPECTED_IDS: &[&str] = &[
+        "qwen3-coder-30b-a3b-q4",
+        "qwen3-coder-30b-a3b-q8",
+        "qwen25-coder-7b-q4",
+        "qwen25-coder-7b-q8",
+        "gemma-3-4b-it-q4",
+        "qwen3-14b-q4",
+    ];
+
+    #[test]
+    fn registry_contains_expected_six_entries() {
+        assert_eq!(EXPECTED_IDS.len(), 6);
+        assert_eq!(REGISTRY.len(), 6);
+    }
+
+    #[test]
+    fn registry_ids_are_unique() {
+        let ids = REGISTRY
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<HashSet<_>>();
+
+        assert_eq!(ids.len(), REGISTRY.len());
+    }
+
+    #[test]
+    fn registry_contains_exact_expected_ids() {
+        let actual_ids = REGISTRY
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<HashSet<_>>();
+        let expected_ids = EXPECTED_IDS.iter().copied().collect::<HashSet<_>>();
+
+        assert_eq!(actual_ids, expected_ids);
+    }
+
+    #[test]
+    fn find_returns_each_registry_entry_and_none_for_unknown() {
+        for entry in REGISTRY {
+            let found =
+                find(entry.id).unwrap_or_else(|| panic!("missing registry id {}", entry.id));
+
+            assert_eq!(found.id, entry.id);
+            assert_eq!(found.repo, entry.repo);
+            assert_eq!(found.filename, entry.filename);
+            assert_eq!(found.sha256, entry.sha256);
+        }
+
+        assert!(find("unknown-model").is_none());
+    }
+
+    #[test]
+    fn sha256_values_are_verified_hashes_or_todo_markers() {
+        for entry in REGISTRY {
+            let valid_hash = entry.sha256.len() == 64
+                && entry
+                    .sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+
+            assert!(
+                valid_hash || entry.sha256 == "TODO_VERIFY",
+                "invalid sha256 for {}",
+                entry.id
+            );
+        }
+    }
+
+    #[test]
+    fn registry_contains_no_todo_verify_hashes() {
+        for entry in REGISTRY {
+            assert_ne!(
+                entry.sha256, "TODO_VERIFY",
+                "unverified hash for {}",
+                entry.id
+            );
+        }
+    }
+
+    #[test]
+    fn repos_are_owner_and_name_pairs() {
+        for entry in REGISTRY {
+            assert_eq!(
+                entry.repo.matches('/').count(),
+                1,
+                "repo must contain exactly one slash: {}",
+                entry.repo
+            );
+        }
+    }
+
+    #[test]
+    fn filenames_are_flat_gguf_names() {
+        for entry in REGISTRY {
+            assert!(
+                is_flat_filename(entry.filename),
+                "filename is not downloader-compatible: {}",
+                entry.filename
+            );
+            assert!(
+                entry.filename.ends_with(".gguf"),
+                "filename must end with .gguf: {}",
+                entry.filename
+            );
+        }
+    }
+
+    #[test]
+    fn sizes_are_larger_than_one_gib() {
+        for entry in REGISTRY {
+            assert!(
+                entry.size_bytes > 1_073_741_824,
+                "size must be larger than 1 GiB: {}",
+                entry.id
+            );
+        }
+    }
+
+    #[test]
+    fn min_free_memory_is_size_plus_fifteen_percent_rounded_to_one_decimal() {
+        for entry in REGISTRY {
+            let expected =
+                ((entry.size_bytes as f64 / 1_073_741_824.0) * 1.15 * 10.0).round() / 10.0;
+
+            assert!(
+                entry.min_free_mem_gb > 0.0,
+                "min_free_mem_gb must be positive: {}",
+                entry.id
+            );
+            assert!(
+                (entry.min_free_mem_gb as f64 - expected).abs() <= 0.1,
+                "min_free_mem_gb mismatch for {}: got {}, expected {}",
+                entry.id,
+                entry.min_free_mem_gb,
+                expected
+            );
+        }
+    }
+
+    fn is_flat_filename(filename: &str) -> bool {
+        !filename.is_empty()
+            && filename == filename.trim()
+            && filename != "."
+            && filename != ".."
+            && !filename.ends_with('.')
+            && !filename.contains('/')
+            && !filename.contains('\\')
+            && !filename.contains('\0')
+    }
+}
