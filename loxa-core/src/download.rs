@@ -272,8 +272,7 @@ fn download_with_transport_and_available_space(
     let bytes_needed = entry.size_bytes.saturating_sub(resume_from);
     ensure_disk_space_for_download(dest_dir, bytes_needed, available_space_override)?;
 
-    let progress = progress_bar(entry.size_bytes, &filename);
-    progress.set_position(resume_from);
+    let progress = progress_bar(entry.size_bytes, &filename, resume_from);
 
     let result = download_body(
         transport,
@@ -610,7 +609,9 @@ fn download_body(
         }
         hasher = Sha256::new();
         offset = 0;
+        context.progress.set_length(context.entry.size_bytes);
         context.progress.set_position(0);
+        context.progress.reset_eta();
     }
 
     let mut file = if offset > 0 {
@@ -726,7 +727,7 @@ fn copy_response_to_part(
         file.write_all(&buffer[..read])?;
         hasher.update(&buffer[..read]);
         total += read as u64;
-        progress.set_position(total);
+        progress.set_position(total.saturating_sub(start));
     }
 
     file.flush()?;
@@ -799,8 +800,8 @@ fn hash_unverified_warning(path: &Path) -> String {
     format!("warning: hash unverified for {}", path.display())
 }
 
-fn progress_bar(total: u64, filename: &str) -> ProgressBar {
-    let progress = ProgressBar::new(total);
+fn progress_bar(total: u64, filename: &str, resume_from: u64) -> ProgressBar {
+    let progress = ProgressBar::new(total.saturating_sub(resume_from));
     progress.set_message(filename.to_string());
     let style = ProgressStyle::with_template(
         "{msg} {wide_bar} {bytes}/{total_bytes} ({percent}%) {bytes_per_sec} ETA {eta}",
@@ -1059,6 +1060,32 @@ mod tests {
                 "header should be rejected: {header:?}"
             );
         }
+    }
+
+    #[test]
+    fn resumed_progress_bar_tracks_only_remaining_transfer() {
+        let progress = progress_bar(100, "model.gguf", 40);
+
+        assert_eq!(progress.length(), Some(60));
+        assert_eq!(progress.position(), 0);
+    }
+
+    #[test]
+    fn resumed_copy_reports_current_session_bytes_to_progress() {
+        let dir = tempdir().unwrap();
+        let part_path = dir.path().join("model.gguf.part");
+        fs::write(&part_path, b"seed").unwrap();
+        let mut file = OpenOptions::new().append(true).open(&part_path).unwrap();
+        let mut response = Cursor::new(b"more".to_vec());
+        let mut hasher = Sha256::new();
+        let progress = progress_bar(10, "model.gguf", 4);
+
+        let total =
+            copy_response_to_part(&mut response, &mut file, &mut hasher, &progress, 4).unwrap();
+
+        assert_eq!(total, 8);
+        assert_eq!(progress.length(), Some(6));
+        assert_eq!(progress.position(), 4);
     }
 
     #[test]
