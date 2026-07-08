@@ -1,0 +1,50 @@
+name: Audit
+
+on:
+  pull_request:
+    paths:
+      - Cargo.lock
+      - deny.toml
+      - .github/workflows/audit.yml
+  push:
+    branches: [main]
+    paths:
+      - Cargo.lock
+      - deny.toml
+      - .github/workflows/audit.yml
+  schedule:
+    - cron: "0 9 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cargo-deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        with:
+          toolchain: 1.96.1
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2.82.7
+        with:
+          tool: cargo-deny
+
+      - name: Check advisories and licenses
+        run: cargo deny check --warn unmaintained advisories licenses

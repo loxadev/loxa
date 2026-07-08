@@ -1,5 +1,7 @@
 # loxa
 
+[![CI](https://github.com/loxadev/loxa/actions/workflows/ci.yml/badge.svg)](https://github.com/loxadev/loxa/actions/workflows/ci.yml)
+
 Running AI models on your own hardware is still a guessing game. You pick a
 model, wait through a 20GB download, and only then find out it crawls, blows
 past your memory, or breaks the agent you wired it into. Fit labels in other
