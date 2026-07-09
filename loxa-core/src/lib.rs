@@ -4,6 +4,7 @@ pub mod detect;
 pub mod download;
 pub mod hardware;
 pub mod registry;
+pub mod supervisor;
 
 #[cfg(test)]
 mod tests {
