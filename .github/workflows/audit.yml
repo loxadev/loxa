@@ -45,6 +45,7 @@ jobs:
         uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2.82.7
         with:
           tool: cargo-deny
+          fallback: none
 
       - name: Check advisories and licenses
         run: cargo deny check --warn unmaintained advisories licenses
