@@ -77,15 +77,6 @@ enum RunOutcome {
 }
 
 #[derive(Debug)]
-enum SpawnBoundary<T> {
-    Spawned {
-        run: supervisor::ManagedRun,
-        value: T,
-    },
-    RequestedStop,
-}
-
-#[derive(Debug)]
 enum ManagedAttachmentBoundary {
     Attached(supervisor::ManagedRun),
     Terminal(ExitCode),
@@ -352,87 +343,94 @@ fn run_model<W: Write, E: Write>(
     loop {
         let owned_replacement = replacement_run.take();
         let started_at_unix_s = unix_timestamp_now();
-        let (entry, model_path, llama_server_path, starting_run, initial_generation) =
-            if let Some(run) = owned_replacement {
-                let preparation = prepare_owned_replacement_run(
-                    &paths.state_path,
-                    run,
-                    &signal_guard,
-                    || supervisor::resolve_model_path(id, &paths.models_dir),
-                    supervisor::detect_llama_server,
-                );
-                let preparation = match preparation {
-                    Ok(preparation) => preparation,
-                    Err(SupervisorError::ModelNotDownloaded(_)) => {
-                        writeln!(
-                            stderr,
-                            "model not downloaded for {id}; run `loxa pull {id}`"
-                        )?;
-                        return Ok(ExitCode::from(1));
-                    }
-                    Err(error) => return Err(supervisor_error_to_io(error)),
-                };
-                match preparation {
-                    OwnedReplacementPreparation::Prepared {
-                        run,
-                        resolved: (entry, model_path),
-                        detected: llama_server_path,
-                    } => (entry, model_path, llama_server_path, run, false),
-                    OwnedReplacementPreparation::RequestedStop => return Ok(ExitCode::SUCCESS),
-                    OwnedReplacementPreparation::Interrupted => {
-                        return Ok(ExitCode::from(130));
-                    }
+        let (
+            entry,
+            model_path,
+            llama_server_path,
+            starting_run,
+            initial_generation,
+            initial_reservation,
+        ) = if let Some(run) = owned_replacement {
+            let preparation = prepare_owned_replacement_run(
+                &paths.state_path,
+                run,
+                &signal_guard,
+                || supervisor::resolve_model_path(id, &paths.models_dir),
+                supervisor::detect_llama_server,
+            );
+            let preparation = match preparation {
+                Ok(preparation) => preparation,
+                Err(SupervisorError::ModelNotDownloaded(_)) => {
+                    writeln!(
+                        stderr,
+                        "model not downloaded for {id}; run `loxa pull {id}`"
+                    )?;
+                    return Ok(ExitCode::from(1));
                 }
-            } else {
-                if signal_guard.interrupted() {
-                    return Ok(ExitCode::from(130));
-                }
-                let (entry, model_path) =
-                    match supervisor::resolve_model_path(id, &paths.models_dir) {
-                        Ok(resolved) => resolved,
-                        Err(SupervisorError::ModelNotDownloaded(_)) => {
-                            writeln!(
-                                stderr,
-                                "model not downloaded for {id}; run `loxa pull {id}`"
-                            )?;
-                            return Ok(ExitCode::from(1));
-                        }
-                        Err(error) => return Err(supervisor_error_to_io(error)),
-                    };
-                if signal_guard.interrupted() {
-                    return Ok(ExitCode::from(130));
-                }
-                let llama_server_path =
-                    supervisor::detect_llama_server().map_err(supervisor_error_to_io)?;
-                if signal_guard.interrupted() {
-                    return Ok(ExitCode::from(130));
-                }
-                let selected_port =
-                    supervisor::choose_localhost_port(port).map_err(supervisor_error_to_io)?;
-                let log_path = paths.log_path(id, selected_port, started_at_unix_s);
-                (
-                    entry,
-                    model_path,
-                    llama_server_path,
-                    supervisor::ManagedRun {
-                        schema_version: supervisor::RUNTIME_STATE_SCHEMA_VERSION,
-                        run_id: run_id.clone(),
-                        model_id: id.to_string(),
-                        owner_pid,
-                        owner_process_start_time_unix_s,
-                        stop_requested: false,
-                        lifecycle: supervisor::RunLifecycle::Starting,
-                        generation: 0,
-                        generation_alias: format!("loxa-{run_id}-g0"),
-                        port: selected_port,
-                        log_path,
-                        child_pid: None,
-                        child_process_start_time_unix_s: None,
-                        child_pgid: None,
-                    },
-                    true,
-                )
+                Err(error) => return Err(supervisor_error_to_io(error)),
             };
+            match preparation {
+                OwnedReplacementPreparation::Prepared {
+                    run,
+                    resolved: (entry, model_path),
+                    detected: llama_server_path,
+                } => (entry, model_path, llama_server_path, run, false, None),
+                OwnedReplacementPreparation::RequestedStop => return Ok(ExitCode::SUCCESS),
+                OwnedReplacementPreparation::Interrupted => {
+                    return Ok(ExitCode::from(130));
+                }
+            }
+        } else {
+            if signal_guard.interrupted() {
+                return Ok(ExitCode::from(130));
+            }
+            let (entry, model_path) = match supervisor::resolve_model_path(id, &paths.models_dir) {
+                Ok(resolved) => resolved,
+                Err(SupervisorError::ModelNotDownloaded(_)) => {
+                    writeln!(
+                        stderr,
+                        "model not downloaded for {id}; run `loxa pull {id}`"
+                    )?;
+                    return Ok(ExitCode::from(1));
+                }
+                Err(error) => return Err(supervisor_error_to_io(error)),
+            };
+            if signal_guard.interrupted() {
+                return Ok(ExitCode::from(130));
+            }
+            let llama_server_path =
+                supervisor::detect_llama_server().map_err(supervisor_error_to_io)?;
+            if signal_guard.interrupted() {
+                return Ok(ExitCode::from(130));
+            }
+            let reservation =
+                supervisor::reserve_localhost_port(port).map_err(supervisor_error_to_io)?;
+            let selected_port = reservation.port();
+            let log_path = paths.log_path(id, selected_port, started_at_unix_s);
+            (
+                entry,
+                model_path,
+                llama_server_path,
+                supervisor::ManagedRun {
+                    schema_version: supervisor::RUNTIME_STATE_SCHEMA_VERSION,
+                    run_id: run_id.clone(),
+                    model_id: id.to_string(),
+                    owner_pid,
+                    owner_process_start_time_unix_s,
+                    stop_requested: false,
+                    lifecycle: supervisor::RunLifecycle::Starting,
+                    generation: 0,
+                    generation_alias: format!("loxa-{run_id}-g0"),
+                    port: selected_port,
+                    log_path,
+                    child_pid: None,
+                    child_process_start_time_unix_s: None,
+                    child_pgid: None,
+                },
+                true,
+                Some(reservation),
+            )
+        };
         let log_path = starting_run.log_path.clone();
         let spec = supervisor::ServerSpec {
             entry,
@@ -440,34 +438,45 @@ fn run_model<W: Write, E: Write>(
             llama_server_path,
             port: starting_run.port,
             ctx_tokens: ctx.unwrap_or(supervisor::DEFAULT_CTX_TOKENS),
+            generation_alias: starting_run.generation_alias.clone(),
         };
-        let prepare = || supervisor::llama_server_version(&spec.llama_server_path);
-        let spawn = |llama_server_version| {
-            let child = supervisor::spawn_llama_server(&spec, &log_path)?;
-            Ok((llama_server_version, child))
-        };
-        let boundary = if initial_generation {
-            prepare_and_spawn_after_starting_run_persisted(
-                &paths.state_path,
-                starting_run,
-                prepare,
-                spawn,
-            )
+        let starting_run = if initial_generation {
+            supervisor::create_starting_run(&paths.state_path, starting_run)
+                .map_err(supervisor_error_to_io)?
         } else {
-            prepare_and_spawn_after_persisted_starting_run(
-                &paths.state_path,
-                starting_run,
-                prepare,
-                spawn,
-            )
-        }
-        .map_err(supervisor_error_to_io)?;
-        let SpawnBoundary::Spawned {
-            run: starting_run,
-            value: (llama_server_version, mut child),
-        } = boundary
-        else {
-            return Ok(ExitCode::SUCCESS);
+            starting_run
+        };
+        let version_path = spec.llama_server_path.clone();
+        let replacement_port = spec.port;
+        let preparation = (|| {
+            let reservation = match initial_reservation {
+                Some(reservation) => reservation,
+                None => supervisor::reserve_localhost_port(Some(replacement_port))?,
+            };
+            let version = supervisor::llama_server_version(&version_path)?;
+            Ok((version, reservation))
+        })();
+        let (llama_server_version, reservation) = match preparation {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return finish_childless_owner_error(&paths.state_path, &starting_run, error)
+                    .map_err(supervisor_error_to_io)
+            }
+        };
+        let spawn = supervisor::spawn_starting_llama_server(
+            &paths.state_path,
+            &starting_run.identity(),
+            &spec,
+            &log_path,
+            reservation,
+        );
+        let (starting_run, mut child) = match spawn {
+            Ok(supervisor::SpawnStartingRunOutcome::Spawned { run, value }) => (run, value),
+            Ok(supervisor::SpawnStartingRunOutcome::RequestedStop) => return Ok(ExitCode::SUCCESS),
+            Err(error) => {
+                return finish_childless_owner_error(&paths.state_path, &starting_run, error)
+                    .map_err(supervisor_error_to_io)
+            }
         };
         let initialization_error = child.take_initialization_error();
         if let Some(outcome) = finish_spawn_initialization(
@@ -1980,9 +1989,8 @@ mod tests {
     use loxa_core::supervisor::LogDrainingChild;
     use std::cell::{Cell, RefCell};
     use std::fs;
+    use std::net::TcpListener;
     use std::path::PathBuf;
-    use std::sync::{Arc, Barrier};
-    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn persist_run_for_server(state_path: &Path, server: &ManagedServer) -> supervisor::ManagedRun {
@@ -2222,7 +2230,7 @@ mod tests {
         assert_eq!(exit, std::process::ExitCode::SUCCESS);
         assert!(stderr.is_empty());
         let stdout = String::from_utf8(stdout).expect("stdout is utf8");
-        assert!(stdout.contains("stale"));
+        assert!(stdout.contains("recovery-required"));
         assert!(stdout.contains("gemma-3-4b-it-q4"));
     }
 
@@ -2279,92 +2287,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_spawn_boundary_rejects_a_second_run_before_spawn_is_reached() {
-        let temp = TempDir::new("loxa-pre-spawn-second-run");
-        let state_path = temp.path().join("managed.json");
-        let first = starting_run_for_test(&state_path, "run-1");
-        supervisor::create_starting_run(&state_path, first).expect("create first run");
-        let second = starting_run_for_test(&state_path, "run-2");
-        let spawn_reached = Cell::new(false);
-
-        let error = spawn_after_starting_run_persisted(&state_path, second, || {
-            spawn_reached.set(true);
-            Ok(())
-        })
-        .expect_err("second run must be rejected before spawn");
-
-        assert!(matches!(error, SupervisorError::ActiveRun(run_id) if run_id == "run-1"));
-        assert!(!spawn_reached.get());
-    }
-
-    #[test]
-    fn pre_spawn_boundary_rejects_a_legacy_array_before_spawn_is_reached() {
-        let temp = TempDir::new("loxa-pre-spawn-legacy-array");
-        let state_path = temp.path().join("managed.json");
-        fs::create_dir_all(temp.path()).expect("create temp root");
-        fs::write(&state_path, "[]").expect("write legacy array");
-        let run = starting_run_for_test(&state_path, "run-1");
-        let spawn_reached = Cell::new(false);
-
-        let error = spawn_after_starting_run_persisted(&state_path, run, || {
-            spawn_reached.set(true);
-            Ok(())
-        })
-        .expect_err("legacy array must be rejected before spawn");
-
-        assert!(matches!(error, SupervisorError::LegacyRuntimeState(path) if path == state_path));
-        assert!(!spawn_reached.get());
-    }
-
-    #[test]
-    fn pre_spawn_boundary_rejects_a_legacy_sentinel_before_spawn_is_reached() {
-        let temp = TempDir::new("loxa-pre-spawn-legacy-sentinel");
-        let state_path = temp.path().join("managed.json");
-        let sentinel_path = state_path.with_file_name("managed.json.lock");
-        fs::create_dir_all(temp.path()).expect("create temp root");
-        fs::write(&sentinel_path, "legacy owner\n").expect("write legacy sentinel");
-        let run = starting_run_for_test(&state_path, "run-1");
-        let spawn_reached = Cell::new(false);
-
-        let error = spawn_after_starting_run_persisted(&state_path, run, || {
-            spawn_reached.set(true);
-            Ok(())
-        })
-        .expect_err("legacy sentinel must be rejected before spawn");
-
-        assert!(
-            matches!(error, SupervisorError::LegacyRuntimeState(path) if path == sentinel_path)
-        );
-        assert!(!spawn_reached.get());
-        assert!(!state_path.exists());
-    }
-
-    #[test]
-    fn pre_spawn_boundary_closure_error_exact_finishes_the_starting_record() {
-        let temp = TempDir::new("loxa-pre-spawn-closure-error");
-        let state_path = temp.path().join("managed.json");
-        let run = starting_run_for_test(&state_path, "run-1");
-        let closure_reached = Cell::new(false);
-
-        let error = spawn_after_starting_run_persisted(&state_path, run, || {
-            closure_reached.set(true);
-            Err::<(), _>(SupervisorError::NoFreePort)
-        })
-        .expect_err("closure failure must be returned after exact cleanup");
-
-        assert!(closure_reached.get());
-        assert!(matches!(error, SupervisorError::NoFreePort));
-        assert_eq!(
-            supervisor::read_runtime_state(&state_path).expect("read cleaned state"),
-            RuntimeStateRead::Loaded(Vec::new())
-        );
-        let envelope = fs::read_to_string(&state_path).expect("read empty v2 envelope");
-        assert!(envelope.contains("\"schema_version\": 2"));
-        assert!(envelope.contains("\"runs\": []"));
-    }
-
-    #[test]
-    fn pre_spawn_boundary_cleanup_conflict_overrides_the_closure_error() {
+    fn childless_spawn_error_cleanup_conflict_preserves_a_newer_generation() {
         let temp = TempDir::new("loxa-pre-spawn-cleanup-conflict");
         let state_path = temp.path().join("managed.json");
         let run = starting_run_for_test(&state_path, "run-1");
@@ -2372,183 +2295,21 @@ mod tests {
         let mut newer_generation = run.clone();
         newer_generation.generation = 1;
         newer_generation.generation_alias = "loxa-run-1-g1".to_string();
-        let closure_reached = Cell::new(false);
+        supervisor::create_starting_run(&state_path, run.clone()).expect("publish starting run");
+        assert!(supervisor::update_runtime_state_run(
+            &state_path,
+            &starting_identity,
+            newer_generation.clone(),
+        )
+        .expect("advance generation before stale cleanup"));
 
-        let error = spawn_after_starting_run_persisted(&state_path, run, || {
-            closure_reached.set(true);
-            assert!(supervisor::update_runtime_state_run(
-                &state_path,
-                &starting_identity,
-                newer_generation.clone(),
-            )
-            .expect("advance generation inside boundary"));
-            Err::<(), _>(SupervisorError::NoFreePort)
-        })
-        .expect_err("cleanup conflict must replace the closure error");
+        let error = finish_childless_owner_error(&state_path, &run, SupervisorError::NoFreePort)
+            .expect_err("cleanup conflict must replace the spawn error");
 
-        assert!(closure_reached.get());
         assert!(matches!(error, SupervisorError::RunStateConflict(_)));
         assert_eq!(
             supervisor::read_runtime_state(&state_path).expect("read preserved newer state"),
             RuntimeStateRead::Loaded(vec![newer_generation])
-        );
-    }
-
-    #[test]
-    fn pre_spawn_boundary_stop_on_childless_initial_record_skips_spawn_and_finishes() {
-        let temp = TempDir::new("loxa-pre-spawn-stop-initial");
-        let state_path = temp.path().join("managed.json");
-        let run = starting_run_for_test(&state_path, "run-1");
-        let identity = run.identity();
-        let events = RefCell::new(Vec::new());
-        let spawn_count = Cell::new(0_u8);
-
-        let outcome = spawn_after_starting_run_persisted_with_hook(
-            &state_path,
-            run,
-            || {
-                events.borrow_mut().push("initial_persisted");
-                request_stop_for_test(&state_path, &identity);
-            },
-            || {
-                spawn_count.set(spawn_count.get() + 1);
-                Ok(())
-            },
-        )
-        .expect("requested stop outcome");
-
-        assert!(matches!(outcome, SpawnBoundary::RequestedStop));
-        assert_eq!(spawn_count.get(), 0);
-        assert_eq!(events.into_inner(), vec!["initial_persisted"]);
-        assert_eq!(
-            supervisor::read_runtime_state(&state_path).expect("read finished state"),
-            RuntimeStateRead::Loaded(Vec::new())
-        );
-    }
-
-    #[test]
-    fn restart_boundary_stop_immediately_before_replacement_spawn_skips_spawn() {
-        let temp = TempDir::new("loxa-pre-spawn-stop-replacement");
-        let state_path = temp.path().join("managed.json");
-        let mut replacement = starting_run_for_test(&state_path, "run-1");
-        replacement.generation = 1;
-        replacement.generation_alias = "loxa-run-1-g1".to_string();
-        supervisor::create_starting_run(&state_path, replacement.clone())
-            .expect("publish generation one");
-        let identity = replacement.identity();
-        let events = RefCell::new(vec!["generation_one_published"]);
-        let spawn_count = Cell::new(0_u8);
-
-        let outcome = spawn_after_persisted_starting_run_with_hook(
-            &state_path,
-            replacement,
-            || {
-                events.borrow_mut().push("before_replacement_spawn");
-                request_stop_for_test(&state_path, &identity);
-            },
-            || {
-                spawn_count.set(spawn_count.get() + 1);
-                Ok(())
-            },
-        )
-        .expect("requested stop outcome");
-
-        assert!(matches!(outcome, SpawnBoundary::RequestedStop));
-        assert_eq!(spawn_count.get(), 0);
-        assert_eq!(
-            events.into_inner(),
-            vec!["generation_one_published", "before_replacement_spawn"]
-        );
-        assert_eq!(
-            supervisor::read_runtime_state(&state_path).expect("read finished state"),
-            RuntimeStateRead::Loaded(Vec::new())
-        );
-    }
-
-    #[test]
-    fn initial_stop_committed_during_version_probe_blocks_os_spawn() {
-        let temp = TempDir::new("loxa-version-stop-initial");
-        let state_path = temp.path().join("managed.json");
-        let run = starting_run_for_test(&state_path, "run-1");
-        let identity = run.identity();
-        let probe_entered = Arc::new(Barrier::new(2));
-        let stop_committed = Arc::new(Barrier::new(2));
-        let stopper_path = state_path.clone();
-        let entered_for_stopper = Arc::clone(&probe_entered);
-        let committed_for_stopper = Arc::clone(&stop_committed);
-        let stopper = thread::spawn(move || {
-            entered_for_stopper.wait();
-            request_stop_for_test(&stopper_path, &identity);
-            committed_for_stopper.wait();
-        });
-        let spawn_count = Cell::new(0_u8);
-
-        let outcome = prepare_and_spawn_after_starting_run_persisted(
-            &state_path,
-            run,
-            || {
-                probe_entered.wait();
-                stop_committed.wait();
-                Ok("test-version".to_string())
-            },
-            |_| {
-                spawn_count.set(spawn_count.get() + 1);
-                Ok(())
-            },
-        )
-        .expect("requested stop boundary");
-        stopper.join().expect("stopper joins");
-
-        assert!(matches!(outcome, SpawnBoundary::RequestedStop));
-        assert_eq!(spawn_count.get(), 0);
-        assert_eq!(
-            supervisor::read_runtime_state(&state_path).expect("read terminal state"),
-            RuntimeStateRead::Loaded(Vec::new())
-        );
-    }
-
-    #[test]
-    fn replacement_stop_committed_during_version_probe_blocks_os_spawn() {
-        let temp = TempDir::new("loxa-version-stop-replacement");
-        let state_path = temp.path().join("managed.json");
-        let mut run = starting_run_for_test(&state_path, "run-1");
-        run.generation = 1;
-        run.generation_alias = "loxa-run-1-g1".to_string();
-        supervisor::create_starting_run(&state_path, run.clone()).expect("publish generation one");
-        let identity = run.identity();
-        let probe_entered = Arc::new(Barrier::new(2));
-        let stop_committed = Arc::new(Barrier::new(2));
-        let stopper_path = state_path.clone();
-        let entered_for_stopper = Arc::clone(&probe_entered);
-        let committed_for_stopper = Arc::clone(&stop_committed);
-        let stopper = thread::spawn(move || {
-            entered_for_stopper.wait();
-            request_stop_for_test(&stopper_path, &identity);
-            committed_for_stopper.wait();
-        });
-        let spawn_count = Cell::new(0_u8);
-
-        let outcome = prepare_and_spawn_after_persisted_starting_run(
-            &state_path,
-            run,
-            || {
-                probe_entered.wait();
-                stop_committed.wait();
-                Ok("test-version".to_string())
-            },
-            |_| {
-                spawn_count.set(spawn_count.get() + 1);
-                Ok(())
-            },
-        )
-        .expect("requested stop boundary");
-        stopper.join().expect("stopper joins");
-
-        assert!(matches!(outcome, SpawnBoundary::RequestedStop));
-        assert_eq!(spawn_count.get(), 0);
-        assert_eq!(
-            supervisor::read_runtime_state(&state_path).expect("read terminal state"),
-            RuntimeStateRead::Loaded(Vec::new())
         );
     }
 
@@ -2692,6 +2453,69 @@ mod tests {
         assert_eq!(spawn_count.get(), 0);
         assert_eq!(
             supervisor::read_runtime_state(&state_path).expect("read terminal state"),
+            RuntimeStateRead::Loaded(Vec::new())
+        );
+    }
+
+    #[test]
+    fn replacement_reservation_failure_exact_finishes_childless_state_and_stop_still_wins() {
+        let ordinary_temp = TempDir::new("loxa-replacement-reservation-failure");
+        let ordinary_state_path = ordinary_temp.path().join("managed.json");
+        let ordinary_blocker =
+            TcpListener::bind(("127.0.0.1", 0)).expect("block ordinary replacement port");
+        let ordinary_port = ordinary_blocker
+            .local_addr()
+            .expect("ordinary blocker address")
+            .port();
+        let mut ordinary_run = starting_run_for_test(&ordinary_state_path, "run-ordinary");
+        ordinary_run.generation = 1;
+        ordinary_run.generation_alias = "loxa-run-ordinary-g1".to_string();
+        ordinary_run.port = ordinary_port;
+        supervisor::create_starting_run(&ordinary_state_path, ordinary_run.clone())
+            .expect("publish ordinary replacement");
+        let reservation_error = match supervisor::reserve_localhost_port(Some(ordinary_port)) {
+            Err(error) => error,
+            Ok(_) => panic!("blocked port must reject a replacement reservation"),
+        };
+        let ordinary_error =
+            finish_childless_owner_error(&ordinary_state_path, &ordinary_run, reservation_error)
+                .expect_err("blocked replacement reservation must fail");
+
+        assert!(matches!(ordinary_error, SupervisorError::NoFreePort));
+        assert_eq!(
+            supervisor::read_runtime_state(&ordinary_state_path)
+                .expect("read ordinary terminal state"),
+            RuntimeStateRead::Loaded(Vec::new())
+        );
+
+        let stopped_temp = TempDir::new("loxa-stopped-replacement-reservation-failure");
+        let stopped_state_path = stopped_temp.path().join("managed.json");
+        let stopped_blocker =
+            TcpListener::bind(("127.0.0.1", 0)).expect("block stopped replacement port");
+        let stopped_port = stopped_blocker
+            .local_addr()
+            .expect("stopped blocker address")
+            .port();
+        let mut stopped_run = starting_run_for_test(&stopped_state_path, "run-stopped");
+        stopped_run.generation = 1;
+        stopped_run.generation_alias = "loxa-run-stopped-g1".to_string();
+        stopped_run.port = stopped_port;
+        supervisor::create_starting_run(&stopped_state_path, stopped_run.clone())
+            .expect("publish stopped replacement");
+        let stopped_identity = stopped_run.identity();
+        request_stop_for_test(&stopped_state_path, &stopped_identity);
+        let reservation_error = match supervisor::reserve_localhost_port(Some(stopped_port)) {
+            Err(error) => error,
+            Ok(_) => panic!("blocked port must reject a stopped replacement reservation"),
+        };
+        let stopped_exit =
+            finish_childless_owner_error(&stopped_state_path, &stopped_run, reservation_error)
+                .expect("durable stop must win over replacement reservation failure");
+
+        assert_eq!(stopped_exit, ExitCode::SUCCESS);
+        assert_eq!(
+            supervisor::read_runtime_state(&stopped_state_path)
+                .expect("read stopped terminal state"),
             RuntimeStateRead::Loaded(Vec::new())
         );
     }
@@ -3387,21 +3211,11 @@ mod tests {
         let RunOutcome::Restart { run: replacement } = outcome else {
             panic!("expected owned replacement handoff, got {outcome:?}");
         };
-        let spawn_count = Cell::new(0_u8);
+        let exit =
+            finish_childless_owner_error(&state_path, &replacement, SupervisorError::NoFreePort)
+                .expect("committed stop must win after the non-fatal announcement");
 
-        let boundary = prepare_and_spawn_after_persisted_starting_run(
-            &state_path,
-            replacement,
-            || Ok(()),
-            |_| {
-                spawn_count.set(spawn_count.get() + 1);
-                Ok(())
-            },
-        )
-        .expect("committed stop must win after the non-fatal announcement");
-
-        assert!(matches!(boundary, SpawnBoundary::RequestedStop));
-        assert_eq!(spawn_count.get(), 0);
+        assert_eq!(exit, ExitCode::SUCCESS);
         assert_eq!(stdout.write_attempts, 1);
         assert_eq!(
             supervisor::read_runtime_state(&state_path).expect("read terminal state"),
@@ -3613,20 +3427,11 @@ mod tests {
             "llama-server exited before becoming healthy; restarting once...",
             replacement,
         );
-        let spawn_count = Cell::new(0_u8);
-        let error = prepare_and_spawn_after_persisted_starting_run(
-            &state_path,
-            replacement,
-            || Ok(()),
-            |_| {
-                spawn_count.set(spawn_count.get() + 1);
-                Ok(())
-            },
-        )
-        .expect_err("newer exact state must beat the stale generation-one handoff");
+        let error =
+            finish_childless_owner_error(&state_path, &replacement, SupervisorError::NoFreePort)
+                .expect_err("newer exact state must beat the stale generation-one handoff");
 
         assert!(matches!(error, SupervisorError::RunStateConflict(_)));
-        assert_eq!(spawn_count.get(), 0);
         assert_eq!(stdout.write_attempts, 1);
         assert_eq!(
             supervisor::read_runtime_state(&state_path).expect("read newer state"),
