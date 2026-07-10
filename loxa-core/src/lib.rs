@@ -5,6 +5,7 @@ pub mod download;
 pub mod hardware;
 pub mod plan;
 pub mod provider;
+pub mod qualification;
 pub mod registry;
 pub mod supervisor;
 
