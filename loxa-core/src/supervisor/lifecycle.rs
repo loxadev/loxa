@@ -32,9 +32,9 @@ pub enum PostSpawnCleanupOutcome {
     RecoveryRequired,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PreSpawnDecision {
-    Spawn(ManagedRun),
+#[derive(Debug)]
+pub enum SpawnStartingRunOutcome<T> {
+    Spawned { run: ManagedRun, value: T },
     RequestedStop,
 }
 
@@ -48,11 +48,15 @@ pub trait InterruptStatus {
     fn interrupted(&self) -> bool;
 }
 
-pub fn prepare_starting_run_for_spawn(
+pub(super) fn spawn_starting_run_with<T, F>(
     path: &Path,
     expected: &ManagedRunIdentity,
-) -> Result<PreSpawnDecision, SupervisorError> {
-    let _lock = state::acquire_runtime_state_lock_for_mutation(
+    spawn: F,
+) -> Result<SpawnStartingRunOutcome<T>, SupervisorError>
+where
+    F: FnOnce() -> Result<T, SupervisorError>,
+{
+    let lock = state::acquire_runtime_state_lock_for_mutation(
         path,
         state::RUNTIME_STATE_LOCK_TIMEOUT,
         state::RUNTIME_STATE_LOCK_POLL_INTERVAL,
@@ -82,10 +86,13 @@ pub fn prepare_starting_run_for_spawn(
 
     if current.stop_requested {
         state::write_runtime_state(path, &[])?;
-        Ok(PreSpawnDecision::RequestedStop)
-    } else {
-        Ok(PreSpawnDecision::Spawn(current.clone()))
+        return Ok(SpawnStartingRunOutcome::RequestedStop);
     }
+
+    let run = current.clone();
+    let spawned = spawn();
+    drop(lock);
+    spawned.map(|value| SpawnStartingRunOutcome::Spawned { run, value })
 }
 
 pub fn finish_childless_runtime_state_run(
@@ -335,6 +342,7 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::io;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::Duration;
@@ -375,6 +383,82 @@ mod tests {
             child_pid: None,
             child_process_start_time_unix_s: None,
             child_pgid: None,
+        }
+    }
+
+    #[test]
+    fn late_stop_serializes_after_true_spawn_boundary_for_initial_and_replacement() {
+        for generation in [0, 1] {
+            let temp = tempdir().expect("tempdir");
+            let state_path = temp.path().join("managed.json");
+            let mut run =
+                childless_starting_run(temp.path(), &format!("run-spawn-boundary-g{generation}"));
+            run.generation = generation;
+            run.generation_alias = format!("loxa-{}-g{generation}", run.run_id);
+            create_starting_run(&state_path, run.clone()).expect("publish childless generation");
+
+            let spawn_boundary_entered = Arc::new(Barrier::new(2));
+            let stop_probe_completed = Arc::new(Barrier::new(2));
+            let spawned = Arc::new(AtomicBool::new(false));
+            let stop_path = state_path.clone();
+            let stop_boundary = Arc::clone(&spawn_boundary_entered);
+            let stop_probe = Arc::clone(&stop_probe_completed);
+            let spawned_for_stop = Arc::clone(&spawned);
+            let stopper = thread::spawn(move || {
+                stop_boundary.wait();
+                let probe = record_stop_request_with_lock_options_and_hook(
+                    &stop_path,
+                    "all",
+                    Duration::ZERO,
+                    Duration::ZERO,
+                    |_| Ok(()),
+                );
+                assert!(
+                    matches!(
+                        probe,
+                        Err(SupervisorError::Io(ref error))
+                            if error.kind() == io::ErrorKind::WouldBlock
+                    ),
+                    "the stop transaction must not commit between the final decision and OS spawn: {probe:?}"
+                );
+                stop_probe.wait();
+                record_stop_request_with_lock_options_and_hook(
+                    &stop_path,
+                    "all",
+                    Duration::from_secs(2),
+                    Duration::from_millis(1),
+                    |_| {
+                        assert!(
+                            spawned_for_stop.load(Ordering::SeqCst),
+                            "a committed late stop must serialize after OS spawn"
+                        );
+                        Ok(())
+                    },
+                )
+            });
+
+            let outcome = spawn_starting_run_with(&state_path, &run.identity(), || {
+                spawn_boundary_entered.wait();
+                stop_probe_completed.wait();
+                spawned.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .expect("spawn boundary succeeds");
+
+            assert!(matches!(
+                outcome,
+                SpawnStartingRunOutcome::Spawned { value: (), .. }
+            ));
+            assert!(matches!(
+                stopper
+                    .join()
+                    .expect("stopper joins")
+                    .expect("late stop commits after spawn"),
+                StopRequestMatch::Requested(_)
+            ));
+            let current = state::current_runtime_state_run(&state_path, &run.identity())
+                .expect("read stopped childless generation");
+            assert!(current.stop_requested);
         }
     }
 
