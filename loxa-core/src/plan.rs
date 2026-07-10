@@ -33,23 +33,36 @@ impl CandidateIdentity {
     pub fn identity_errors(&self) -> Vec<String> {
         let mut errors = Vec::new();
 
-        if self.provider_version.is_empty() {
+        if self.candidate_id.trim().is_empty() {
+            errors.push("candidate_id".to_string());
+        }
+        if self.provider_version.trim().is_empty() {
             errors.push("provider_version".to_string());
         }
-        if self.engine_revision.is_none() {
+        if self
+            .engine_revision
+            .as_deref()
+            .is_none_or(|revision| revision.trim().is_empty())
+        {
             errors.push("engine_revision".to_string());
         }
-        if self.model_id.is_empty() {
+        if self.model_id.trim().is_empty() {
             errors.push("model_id".to_string());
         }
-        if self.artifact_digest.is_empty() {
+        if self.artifact_digest.trim().is_empty() {
             errors.push("artifact_digest".to_string());
         }
-        if self.tokenizer_digest.is_empty() {
+        if self.tokenizer_digest.trim().is_empty() {
             errors.push("tokenizer_digest".to_string());
         }
-        if self.chat_template_digest.is_empty() {
+        if self.chat_template_digest.trim().is_empty() {
             errors.push("chat_template_digest".to_string());
+        }
+        if self.context_tokens == 0 {
+            errors.push("context_tokens".to_string());
+        }
+        if self.required_free_memory_bytes == 0 {
+            errors.push("required_free_memory_bytes".to_string());
         }
 
         errors
@@ -97,19 +110,45 @@ mod tests {
 
     #[test]
     fn incomplete_identity_reports_stable_field_names() {
-        let identity = CandidateIdentity {
+        let empty_identity = CandidateIdentity {
+            candidate_id: String::new(),
             provider_version: String::new(),
             engine_revision: None,
             model_id: String::new(),
             artifact_digest: String::new(),
             tokenizer_digest: String::new(),
             chat_template_digest: String::new(),
+            context_tokens: 0,
+            required_free_memory_bytes: 0,
             ..complete_identity()
         };
+        let whitespace_identity = CandidateIdentity {
+            candidate_id: " \t".into(),
+            provider_version: " \n".into(),
+            engine_revision: Some(" \t".into()),
+            model_id: " ".into(),
+            artifact_digest: " \r".into(),
+            tokenizer_digest: "\n".into(),
+            chat_template_digest: "\t".into(),
+            ..complete_identity()
+        };
+        let all_field_errors = vec![
+            "candidate_id".to_string(),
+            "provider_version".to_string(),
+            "engine_revision".to_string(),
+            "model_id".to_string(),
+            "artifact_digest".to_string(),
+            "tokenizer_digest".to_string(),
+            "chat_template_digest".to_string(),
+            "context_tokens".to_string(),
+            "required_free_memory_bytes".to_string(),
+        ];
 
+        assert_eq!(empty_identity.identity_errors(), all_field_errors);
         assert_eq!(
-            identity.identity_errors(),
+            whitespace_identity.identity_errors(),
             vec![
+                "candidate_id".to_string(),
                 "provider_version".to_string(),
                 "engine_revision".to_string(),
                 "model_id".to_string(),
