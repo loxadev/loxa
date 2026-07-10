@@ -120,11 +120,18 @@ where
     }
 
     let result = calibrate_prepared(managed, attached, &mut evidence);
+    if let Err((ownership, error)) = &result {
+        let candidate = match ownership {
+            CandidateOwnership::Managed => &mut evidence.managed,
+            CandidateOwnership::Attached => &mut evidence.attached,
+        };
+        candidate.failure = Some(error.to_string());
+    }
     let cleanup = managed.finish();
 
     match (result, cleanup) {
         (Ok(()), Ok(())) => CalibrationOutcome::Completed { evidence },
-        (Err(error), Ok(())) => CalibrationOutcome::Failed {
+        (Err((_, error)), Ok(())) => CalibrationOutcome::Failed {
             evidence,
             reason: error.to_string(),
         },
@@ -132,7 +139,7 @@ where
             evidence,
             reason: format!("managed cleanup failed: {error}"),
         },
-        (Err(error), Err(cleanup)) => CalibrationOutcome::Failed {
+        (Err((_, error)), Err(cleanup)) => CalibrationOutcome::Failed {
             evidence,
             reason: format!("{error}; managed cleanup failed: {cleanup}"),
         },
@@ -171,16 +178,23 @@ fn calibrate_prepared(
     managed: &mut dyn CalibrationCandidate,
     attached: &mut dyn CalibrationCandidate,
     evidence: &mut CalibrationEvidence,
-) -> Result<(), ProviderError> {
-    evidence.managed.warmup = Some(measure(managed)?);
-    evidence.attached.warmup = Some(measure(attached)?);
+) -> Result<(), (CandidateOwnership, ProviderError)> {
+    evidence.managed.warmup =
+        Some(measure(managed).map_err(|error| (CandidateOwnership::Managed, error))?);
+    evidence.attached.warmup =
+        Some(measure(attached).map_err(|error| (CandidateOwnership::Attached, error))?);
 
     for pair_index in 0..5 {
         let (managed_observation, attached_observation) = if pair_index % 2 == 0 {
-            (measure(managed)?, measure(attached)?)
+            (
+                measure(managed).map_err(|error| (CandidateOwnership::Managed, error))?,
+                measure(attached).map_err(|error| (CandidateOwnership::Attached, error))?,
+            )
         } else {
-            let attached_observation = measure(attached)?;
-            let managed_observation = measure(managed)?;
+            let attached_observation =
+                measure(attached).map_err(|error| (CandidateOwnership::Attached, error))?;
+            let managed_observation =
+                measure(managed).map_err(|error| (CandidateOwnership::Managed, error))?;
             (managed_observation, attached_observation)
         };
         evidence.pairs.push(PairedObservation {
@@ -460,10 +474,12 @@ mod tests {
         let events = Rc::new(RefCell::new(vec![]));
         let (mut managed, mut attached) = candidates(events.clone());
         managed.fail_at = Some(1);
-        assert!(matches!(
-            run_calibration(&mut managed, &mut attached, || 1_000),
-            CalibrationOutcome::Failed { .. }
-        ));
+        let outcome = run_calibration(&mut managed, &mut attached, || 1_000);
+        let CalibrationOutcome::Failed { evidence, .. } = outcome else {
+            panic!("expected failed calibration");
+        };
+        assert!(evidence.managed.failure.is_some());
+        assert!(evidence.attached.failure.is_none());
         assert!(events
             .borrow()
             .iter()

@@ -56,8 +56,8 @@ fn compare_qualified(evidence: &CalibrationEvidence) -> SelectorVerdict {
         .iter()
         .filter(|pair| pair.attached.wall_time_ns < pair.managed.wall_time_ns)
         .count();
-    let materially_faster =
-        attached_median.saturating_mul(100) <= managed_median.saturating_mul(90);
+    let ninety_percent = (managed_median / 10) * 9 + ((managed_median % 10) * 9) / 10;
+    let materially_faster = attached_median <= ninety_percent;
     if materially_faster && attached_wins >= 4 {
         selected(&evidence.attached)
     } else {
@@ -201,6 +201,22 @@ mod tests {
     #[test]
     fn selector_returns_no_material_winner_when_attached_wins_only_three_pairs() {
         let times = vec![(100, 80), (100, 80), (100, 80), (100, 120), (100, 120)];
+        let input = evidence(
+            candidate("managed", CandidateOwnership::Managed, true),
+            candidate("attached", CandidateOwnership::Attached, true),
+            &times,
+        );
+        assert_eq!(
+            select_plan(&input),
+            SelectorVerdict::NoMaterialWinner {
+                baseline_id: "managed".into()
+            }
+        );
+    }
+
+    #[test]
+    fn selector_threshold_comparison_does_not_overflow() {
+        let times = vec![(u128::MAX, u128::MAX - 1); 5];
         let input = evidence(
             candidate("managed", CandidateOwnership::Managed, true),
             candidate("attached", CandidateOwnership::Attached, true),
