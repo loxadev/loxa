@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::{Pid, ProcessesToUpdate, Signal, System};
 
 mod lifecycle;
@@ -90,6 +90,243 @@ pub struct ManagedServerIdentity {
     pub pid: u32,
     pub port: u16,
     pub process_start_time_unix_s: Option<u64>,
+}
+
+/// An opaque, single-generation managed server owned by a calibration run.
+///
+/// Process control deliberately remains inside the supervisor: callers can
+/// observe identity and liveness, then consume the session to finish it.
+pub struct ManagedCalibrationSession {
+    child: SpawnedServer,
+    state_path: PathBuf,
+    run: ManagedRun,
+    server: ManagedServer,
+}
+
+fn resolve_calibration_initialization_failure(
+    run_id: &str,
+    initialization_error: SupervisorError,
+    cleanup: Result<PostSpawnCleanupOutcome, SupervisorError>,
+) -> SupervisorError {
+    match cleanup {
+        Ok(PostSpawnCleanupOutcome::Cleaned) => initialization_error,
+        Ok(PostSpawnCleanupOutcome::RequestedStop) => SupervisorError::RunStateConflict(format!(
+            "managed calibration run {run_id} was stopped during initialization"
+        )),
+        Ok(PostSpawnCleanupOutcome::RecoveryRequired) => {
+            SupervisorError::RecoveryRequired(run_id.to_owned())
+        }
+        Err(cleanup_error) => cleanup_error,
+    }
+}
+
+fn resolve_calibration_childless_spawn_failure(
+    run_id: &str,
+    spawn_error: SupervisorError,
+    finish: Result<ChildlessFinishOutcome, SupervisorError>,
+) -> SupervisorError {
+    match finish {
+        Ok(ChildlessFinishOutcome::Finished) => spawn_error,
+        Ok(ChildlessFinishOutcome::RequestedStop) => SupervisorError::RunStateConflict(format!(
+            "managed calibration run {run_id} was stopped while spawn failed"
+        )),
+        Err(finish_error) => finish_error,
+    }
+}
+
+fn validate_calibration_attached_state(
+    expected: &ManagedRun,
+    current: &ManagedRun,
+    server: &ManagedServer,
+    child_pid: u32,
+    pid_live: bool,
+    process_start_time: Option<u64>,
+) -> Result<(), SupervisorError> {
+    let exact = current == expected
+        && current.lifecycle == RunLifecycle::Running
+        && !current.stop_requested
+        && current.model_id == server.id
+        && current.port == server.port
+        && current.child_pid == Some(server.pid)
+        && current.child_process_start_time_unix_s == server.process_start_time_unix_s
+        && server.pid == child_pid
+        && pid_live
+        && server.process_start_time_unix_s.is_some()
+        && process_start_time == server.process_start_time_unix_s;
+    if exact {
+        Ok(())
+    } else {
+        Err(SupervisorError::RunStateConflict(format!(
+            "managed calibration run {} no longer matches its attached identity",
+            expected.run_id
+        )))
+    }
+}
+
+impl ManagedCalibrationSession {
+    pub fn start(
+        state_path: &Path,
+        models_dir: &Path,
+        model_id: &str,
+        ctx_tokens: u32,
+    ) -> Result<Self, SupervisorError> {
+        let (entry, model_path) = resolve_model_path(model_id, models_dir)?;
+        let llama_server_path = detect_llama_server()?;
+        let llama_server_version = llama_server_version(&llama_server_path)?;
+        let reservation = reserve_localhost_port(None)?;
+        let port = reservation.port();
+        let owner_pid = std::process::id();
+        let owner_start = process_start_time_with_retry(owner_pid)
+            .ok_or(SupervisorError::ProcessIdentityUnavailable(owner_pid))?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| SupervisorError::Io(io::Error::other(error)))?
+            .as_secs();
+        let run_id = format!("calibration-{owner_pid}-{owner_start}-{now}-{port}");
+        let log_path = runtime_logs_dir().join(format!("{run_id}.log"));
+        let starting = create_starting_run(
+            state_path,
+            ManagedRun {
+                schema_version: RUNTIME_STATE_SCHEMA_VERSION,
+                run_id: run_id.clone(),
+                model_id: model_id.to_owned(),
+                owner_pid,
+                owner_process_start_time_unix_s: owner_start,
+                stop_requested: false,
+                lifecycle: RunLifecycle::Starting,
+                generation: 0,
+                generation_alias: format!("loxa-{run_id}-g0"),
+                port,
+                log_path: log_path.clone(),
+                child_pid: None,
+                child_process_start_time_unix_s: None,
+                child_pgid: None,
+            },
+        )?;
+        let spec = ServerSpec {
+            entry,
+            model_path: model_path.clone(),
+            llama_server_path,
+            port,
+            ctx_tokens,
+            generation_alias: starting.generation_alias.clone(),
+        };
+        let spawned = spawn_starting_llama_server(
+            state_path,
+            &starting.identity(),
+            &spec,
+            &log_path,
+            reservation,
+        );
+        let (starting, mut child) = match spawned {
+            Ok(SpawnStartingRunOutcome::Spawned { run, value }) => (run, value),
+            Ok(SpawnStartingRunOutcome::RequestedStop) => {
+                return Err(SupervisorError::RunStateConflict(format!(
+                    "managed calibration run {run_id} was stopped before spawn"
+                )))
+            }
+            Err(error) => {
+                return Err(resolve_calibration_childless_spawn_failure(
+                    &run_id,
+                    error,
+                    finish_childless_runtime_state_run(state_path, &starting.identity()),
+                ));
+            }
+        };
+        if let Some(error) = child.take_initialization_error() {
+            let cleanup = cleanup_post_spawn_failure(&mut child, state_path, &starting.identity());
+            return Err(resolve_calibration_initialization_failure(
+                &run_id, error, cleanup,
+            ));
+        }
+        let server = ManagedServer {
+            id: model_id.to_owned(),
+            pid: child.pid(),
+            port,
+            model_path,
+            started_at_unix_s: now,
+            llama_server_version,
+            process_start_time_unix_s: process_start_time_with_retry(child.pid()),
+        };
+        let run = match persist_managed_server_or_cleanup(
+            &mut child,
+            state_path,
+            starting,
+            server.clone(),
+            CTRL_C_GRACE_PERIOD,
+        )? {
+            PersistManagedServerOutcome::Attached(run) => run,
+            PersistManagedServerOutcome::RequestedStop => {
+                return Err(SupervisorError::RunStateConflict(format!(
+                    "managed calibration run {run_id} was stopped during attachment"
+                )))
+            }
+            PersistManagedServerOutcome::RecoveryRequired => {
+                return Err(SupervisorError::RecoveryRequired(run_id))
+            }
+        };
+        if let Err(error) = wait_for_generation_ready_or_exit(
+            &mut child,
+            port,
+            &run.generation_alias,
+            HEALTH_TIMEOUT,
+            HEALTH_POLL_INTERVAL,
+        ) {
+            let outcome = teardown_owned_run(
+                &mut child,
+                state_path,
+                &run.identity(),
+                OwnerTeardownDecision::UnexpectedExit,
+            )?;
+            if outcome == OwnerTerminalOutcome::RecoveryRequired {
+                return Err(SupervisorError::RecoveryRequired(run.run_id));
+            }
+            return Err(error);
+        }
+        Ok(Self {
+            child,
+            state_path: state_path.to_owned(),
+            run,
+            server,
+        })
+    }
+
+    pub fn run(&self) -> &ManagedRun {
+        &self.run
+    }
+    pub fn server(&self) -> &ManagedServer {
+        &self.server
+    }
+    pub fn endpoint(&self) -> String {
+        format!("http://127.0.0.1:{}", self.server.port)
+    }
+    pub fn generation_alias(&self) -> &str {
+        &self.run.generation_alias
+    }
+
+    pub fn ensure_running(&mut self) -> Result<(), SupervisorError> {
+        let current = current_runtime_state_run(&self.state_path, &self.run.identity())?;
+        match self.child.try_wait()? {
+            None => validate_calibration_attached_state(
+                &self.run,
+                &current,
+                &self.server,
+                self.child.pid(),
+                pid_is_alive(self.server.pid),
+                process_start_time_with_retry(self.server.pid),
+            ),
+            Some(_) => Err(child_exited_early(&self.run.log_path)?),
+        }
+    }
+
+    pub fn finish(mut self) -> Result<OwnerTerminalOutcome, SupervisorError> {
+        teardown_owned_run(
+            &mut self.child,
+            &self.state_path,
+            &self.run.identity(),
+            OwnerTeardownDecision::RequestedStop,
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2279,4 +2516,89 @@ mod tests {
             Self::next_start_time(&self.process_start_times)
         }
     }
+}
+#[test]
+fn managed_calibration_session_exposes_only_recorded_identity() {
+    fn assert_send<T: Send>() {}
+    assert_send::<crate::supervisor::ManagedCalibrationSession>();
+}
+
+#[test]
+fn calibration_session_rejects_attached_state_drift() {
+    let server = ManagedServer {
+        id: "model".into(),
+        pid: 10,
+        port: 8080,
+        model_path: PathBuf::from("model.gguf"),
+        started_at_unix_s: 1,
+        llama_server_version: "v".into(),
+        process_start_time_unix_s: Some(2),
+    };
+    let mut expected = ManagedRun {
+        schema_version: RUNTIME_STATE_SCHEMA_VERSION,
+        run_id: "run".into(),
+        model_id: "model".into(),
+        owner_pid: 1,
+        owner_process_start_time_unix_s: 1,
+        stop_requested: false,
+        lifecycle: RunLifecycle::Running,
+        generation: 0,
+        generation_alias: "alias".into(),
+        port: 8080,
+        log_path: PathBuf::from("run.log"),
+        child_pid: Some(10),
+        child_process_start_time_unix_s: Some(2),
+        child_pgid: Some(10),
+    };
+    let mut current = expected.clone();
+    current.generation_alias.push_str("-drift");
+    assert!(
+        validate_calibration_attached_state(&expected, &current, &server, 10, true, Some(2))
+            .is_err()
+    );
+    expected.stop_requested = true;
+    assert!(
+        validate_calibration_attached_state(&expected, &expected, &server, 10, true, Some(2))
+            .is_err()
+    );
+}
+
+#[test]
+fn calibration_initialization_cleanup_preserves_terminal_truth() {
+    assert!(matches!(
+        resolve_calibration_initialization_failure(
+            "run",
+            SupervisorError::HealthTimeout,
+            Ok(PostSpawnCleanupOutcome::RecoveryRequired)
+        ),
+        SupervisorError::RecoveryRequired(_)
+    ));
+    assert!(matches!(
+        resolve_calibration_initialization_failure(
+            "run",
+            SupervisorError::HealthTimeout,
+            Err(SupervisorError::RunStateConflict("cleanup".into()))
+        ),
+        SupervisorError::RunStateConflict(_)
+    ));
+}
+
+#[test]
+fn calibration_childless_finish_preserves_cleanup_truth() {
+    assert!(matches!(
+        resolve_calibration_childless_spawn_failure(
+            "run",
+            SupervisorError::HealthTimeout,
+            Err(SupervisorError::RunStateConflict("finish".into()))
+        ),
+        SupervisorError::RunStateConflict(_)
+    ));
+    assert!(matches!(
+        resolve_calibration_childless_spawn_failure(
+            "run",
+            SupervisorError::HealthTimeout,
+            Ok(ChildlessFinishOutcome::RequestedStop)
+        ),
+        SupervisorError::RunStateConflict(_)
+    ));
 }
