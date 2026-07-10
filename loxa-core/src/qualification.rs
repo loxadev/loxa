@@ -7,6 +7,13 @@ use serde_json::{json, Value};
 use std::time::Instant;
 
 const PASS_REASON: &str = "structural requirements satisfied";
+const EXPECTED_CASE_IDS: [&str; 5] = [
+    "weather_required_city",
+    "no_tool_needed",
+    "weather_optional_units",
+    "weather_argument_types",
+    "multi_turn_ticket_context",
+];
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct QualificationCase {
@@ -39,14 +46,22 @@ pub struct QualificationReport {
 
 impl QualificationReport {
     pub fn passed(&self) -> bool {
-        self.results.iter().all(|result| result.passed)
+        self.results.len() == EXPECTED_CASE_IDS.len()
+            && self.results.iter().all(|result| result.passed)
+            && EXPECTED_CASE_IDS.iter().all(|expected_id| {
+                self.results
+                    .iter()
+                    .filter(|result| result.case_id == *expected_id)
+                    .count()
+                    == 1
+            })
     }
 }
 
 pub fn qualification_cases() -> Vec<QualificationCase> {
     vec![
         QualificationCase {
-            id: "weather_required_city".into(),
+            id: EXPECTED_CASE_IDS[0].into(),
             description: "Calls weather with its required city argument.".into(),
             request: InvocationRequest {
                 messages: vec![ChatMessage::user("What is the weather in Paris?")],
@@ -56,7 +71,7 @@ pub fn qualification_cases() -> Vec<QualificationCase> {
             expectation: CaseExpectation::Tool("weather"),
         },
         QualificationCase {
-            id: "no_tool_needed".into(),
+            id: EXPECTED_CASE_IDS[1].into(),
             description: "Answers directly when no tool is needed.".into(),
             request: InvocationRequest {
                 messages: vec![ChatMessage::user("Reply with the word ready.")],
@@ -66,7 +81,7 @@ pub fn qualification_cases() -> Vec<QualificationCase> {
             expectation: CaseExpectation::NoTool,
         },
         QualificationCase {
-            id: "weather_optional_units".into(),
+            id: EXPECTED_CASE_IDS[2].into(),
             description: "Accepts the optional weather units argument.".into(),
             request: InvocationRequest {
                 messages: vec![ChatMessage::user(
@@ -78,7 +93,7 @@ pub fn qualification_cases() -> Vec<QualificationCase> {
             expectation: CaseExpectation::Tool("weather"),
         },
         QualificationCase {
-            id: "weather_argument_types".into(),
+            id: EXPECTED_CASE_IDS[3].into(),
             description: "Uses the required weather argument type.".into(),
             request: InvocationRequest {
                 messages: vec![ChatMessage::user("What is the weather in Madrid?")],
@@ -88,10 +103,10 @@ pub fn qualification_cases() -> Vec<QualificationCase> {
             expectation: CaseExpectation::Tool("weather"),
         },
         QualificationCase {
-            id: "multi_turn_ticket_context".into(),
+            id: EXPECTED_CASE_IDS[4].into(),
             description: "Consumes a simulated ticket result in a follow-up turn.".into(),
             request: InvocationRequest {
-                messages: vec![ChatMessage::user("Look up ticket LOXA-42.")],
+                messages: vec![ChatMessage::user("Look up ticket TICKET-42.")],
                 tools: vec![lookup_ticket_definition()],
                 max_tokens: 128,
             },
@@ -152,27 +167,28 @@ fn evaluate_multi_turn_ticket(
         return result(case, false, reason, started, vec![first]);
     }
 
-    let tool_call = &first.tool_calls[0];
+    let tool_call = first.tool_calls[0].clone();
+    let Some(tool_call_id) = tool_call.id.clone().filter(|id| !id.is_empty()) else {
+        return result(
+            case,
+            false,
+            "lookup_ticket tool call is missing an id".into(),
+            started,
+            vec![first],
+        );
+    };
     let tool_result = json!({
-        "ticket_id": "LOXA-42",
+        "ticket_id": "TICKET-42",
         "status": "resolved",
         "summary": "Selector qualification complete"
     });
     let mut messages = case.request.messages.clone();
-    messages.push(ChatMessage {
-        role: "assistant".into(),
-        content: json!({
-            "tool_calls": [{
-                "name": tool_call.name,
-                "arguments": tool_call.arguments
-            }]
-        })
-        .to_string(),
-    });
-    messages.push(ChatMessage {
-        role: "tool".into(),
-        content: tool_result.to_string(),
-    });
+    messages.push(ChatMessage::assistant_tool_calls(vec![tool_call.clone()]));
+    messages.push(ChatMessage::tool_result(
+        tool_call_id,
+        tool_call.name,
+        tool_result.to_string(),
+    ));
     messages.push(ChatMessage::user(
         "Give a concise summary of the ticket result.",
     ));
@@ -196,10 +212,19 @@ fn evaluate_multi_turn_ticket(
     };
     let observations = vec![first, second];
 
-    match validate_no_tool_response(&observations[1]) {
+    match validate_ticket_response(&observations[1]) {
         Ok(()) => result(case, true, PASS_REASON.into(), started, observations),
         Err(reason) => result(case, false, reason, started, observations),
     }
+}
+
+fn validate_ticket_response(observation: &InvocationObservation) -> Result<(), String> {
+    validate_no_tool_response(observation)?;
+    let content = observation.content.as_deref().unwrap_or_default();
+    if !content.contains("TICKET-42") || !content.contains("resolved") {
+        return Err("final response must include `TICKET-42` and `resolved`".into());
+    }
+    Ok(())
 }
 
 fn validate_single_tool_call(
@@ -349,7 +374,10 @@ fn lookup_ticket_definition() -> ToolDefinition {
 
 #[cfg(test)]
 mod tests {
-    use super::{evaluate_case, qualification_cases, qualify_provider};
+    use super::{
+        evaluate_case, qualification_cases, qualify_provider, QualificationReport,
+        QualificationResult,
+    };
     use crate::plan::{CandidateIdentity, ProviderKind, SamplingPolicy};
     use crate::provider::{
         InvocationObservation, InvocationRequest, ProviderAdapter, ProviderError, ToolCall,
@@ -434,6 +462,7 @@ mod tests {
         let mut provider = ScriptedAdapter::new(vec![Ok(observation(
             None,
             vec![ToolCall {
+                id: None,
                 name: "weather".into(),
                 arguments: serde_json::json!({"city": "Paris"}),
             }],
@@ -441,6 +470,7 @@ mod tests {
         let mut missing_city_provider = ScriptedAdapter::new(vec![Ok(observation(
             None,
             vec![ToolCall {
+                id: None,
                 name: "weather".into(),
                 arguments: serde_json::json!({}),
             }],
@@ -473,10 +503,12 @@ mod tests {
     #[test]
     fn qualification_accepts_optional_units_but_rejects_unknown_arguments() {
         let valid = ToolCall {
+            id: None,
             name: "weather".into(),
             arguments: serde_json::json!({"city": "Tokyo", "units": "celsius"}),
         };
         let invalid = ToolCall {
+            id: None,
             name: "weather".into(),
             arguments: serde_json::json!({
                 "city": "Tokyo",
@@ -504,6 +536,7 @@ mod tests {
         let mut provider = ScriptedAdapter::new(vec![Ok(observation(
             None,
             vec![ToolCall {
+                id: None,
                 name: "weather".into(),
                 arguments: serde_json::json!({"city": 42}),
             }],
@@ -521,16 +554,17 @@ mod tests {
             Ok(observation(
                 None,
                 vec![ToolCall {
+                    id: Some("call-ticket-42".into()),
                     name: "lookup_ticket".into(),
-                    arguments: serde_json::json!({"ticket_id": "LOXA-42"}),
+                    arguments: serde_json::json!({"ticket_id": "TICKET-42"}),
                 }],
             )),
-            Ok(observation(Some("LOXA-42 is resolved."), vec![])),
+            Ok(observation(Some("TICKET-42 is resolved."), vec![])),
         ]);
 
         let result = evaluate_case(&mut provider, &case("multi_turn_ticket_context"));
         let expected_tool_result = serde_json::json!({
-            "ticket_id": "LOXA-42",
+            "ticket_id": "TICKET-42",
             "status": "resolved",
             "summary": "Selector qualification complete"
         })
@@ -539,9 +573,27 @@ mod tests {
         assert!(result.passed, "{}", result.reason);
         assert_eq!(result.observations.len(), 2);
         assert_eq!(provider.requests.len(), 2);
-        assert!(provider.requests[1].messages.iter().any(|message| {
-            message.role == "tool" && message.content.as_str() == expected_tool_result.as_str()
-        }));
+        assert_eq!(
+            provider.requests[1].messages[1].tool_calls,
+            vec![ToolCall {
+                id: Some("call-ticket-42".into()),
+                name: "lookup_ticket".into(),
+                arguments: serde_json::json!({"ticket_id": "TICKET-42"}),
+            }]
+        );
+        assert_eq!(provider.requests[1].messages[2].role, "tool");
+        assert_eq!(
+            provider.requests[1].messages[2].tool_call_id.as_deref(),
+            Some("call-ticket-42")
+        );
+        assert_eq!(
+            provider.requests[1].messages[2].tool_name.as_deref(),
+            Some("lookup_ticket")
+        );
+        assert_eq!(
+            provider.requests[1].messages[2].content,
+            expected_tool_result
+        );
     }
 
     #[test]
@@ -559,5 +611,83 @@ mod tests {
             report.results[0].reason,
             "provider error: provider invocation timed out"
         );
+    }
+
+    #[test]
+    fn qualification_rejects_unlinked_multi_turn_tool_call() {
+        let mut provider = ScriptedAdapter::new(vec![
+            Ok(observation(
+                None,
+                vec![ToolCall {
+                    id: None,
+                    name: "lookup_ticket".into(),
+                    arguments: serde_json::json!({"ticket_id": "TICKET-42"}),
+                }],
+            )),
+            Ok(observation(Some("TICKET-42 is resolved."), vec![])),
+        ]);
+
+        let result = evaluate_case(&mut provider, &case("multi_turn_ticket_context"));
+
+        assert!(!result.passed);
+        assert_eq!(result.reason, "lookup_ticket tool call is missing an id");
+        assert_eq!(provider.requests.len(), 1);
+    }
+
+    #[test]
+    fn qualification_rejects_unrelated_multi_turn_answer() {
+        let mut provider = ScriptedAdapter::new(vec![
+            Ok(observation(
+                None,
+                vec![ToolCall {
+                    id: Some("call-ticket-42".into()),
+                    name: "lookup_ticket".into(),
+                    arguments: serde_json::json!({"ticket_id": "TICKET-42"}),
+                }],
+            )),
+            Ok(observation(Some("The lookup completed."), vec![])),
+        ]);
+
+        let result = evaluate_case(&mut provider, &case("multi_turn_ticket_context"));
+
+        assert!(!result.passed);
+        assert_eq!(
+            result.reason,
+            "final response must include `TICKET-42` and `resolved`"
+        );
+    }
+
+    #[test]
+    fn qualification_report_requires_exact_five_case_results() {
+        let passed_result = |case_id: &str| QualificationResult {
+            case_id: case_id.into(),
+            passed: true,
+            reason: "structural requirements satisfied".into(),
+            elapsed_ns: 1,
+            observations: vec![],
+        };
+        let expected_ids = qualification_cases()
+            .into_iter()
+            .map(|case| case.id)
+            .collect::<Vec<_>>();
+        let complete = QualificationReport {
+            results: expected_ids.iter().map(|id| passed_result(id)).collect(),
+        };
+        let incomplete = QualificationReport {
+            results: vec![passed_result(&expected_ids[0])],
+        };
+        let duplicate = QualificationReport {
+            results: expected_ids
+                .iter()
+                .take(4)
+                .map(|id| passed_result(id))
+                .chain(std::iter::once(passed_result(&expected_ids[0])))
+                .collect(),
+        };
+
+        assert!(complete.passed());
+        assert!(!QualificationReport { results: vec![] }.passed());
+        assert!(!incomplete.passed());
+        assert!(!duplicate.passed());
     }
 }

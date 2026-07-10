@@ -12,6 +12,12 @@ mod transport;
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    #[serde(default)]
+    pub tool_calls: Vec<ToolCall>,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+    #[serde(default)]
+    pub tool_name: Option<String>,
 }
 
 impl ChatMessage {
@@ -19,6 +25,33 @@ impl ChatMessage {
         Self {
             role: "user".to_string(),
             content: content.into(),
+            tool_calls: vec![],
+            tool_call_id: None,
+            tool_name: None,
+        }
+    }
+
+    pub fn assistant_tool_calls(tool_calls: Vec<ToolCall>) -> Self {
+        Self {
+            role: "assistant".to_string(),
+            content: String::new(),
+            tool_calls,
+            tool_call_id: None,
+            tool_name: None,
+        }
+    }
+
+    pub fn tool_result(
+        tool_call_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
+        Self {
+            role: "tool".to_string(),
+            content: content.into(),
+            tool_calls: vec![],
+            tool_call_id: Some(tool_call_id.into()),
+            tool_name: Some(tool_name.into()),
         }
     }
 }
@@ -48,6 +81,8 @@ impl ToolDefinition {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCall {
+    #[serde(default)]
+    pub id: Option<String>,
     pub name: String,
     pub arguments: Value,
 }
@@ -143,6 +178,7 @@ mod tests {
         let observation = InvocationObservation {
             content: None,
             tool_calls: vec![ToolCall {
+                id: Some("call-weather".into()),
                 name: "weather".into(),
                 arguments: serde_json::json!({"city":"Paris"}),
             }],
@@ -163,6 +199,31 @@ mod tests {
         assert_eq!(observation.tool_calls[0].name, "weather");
         assert_eq!(observation.ttft_ns, Some(250_000));
         assert_eq!(observation.raw_events.len(), 1);
+    }
+
+    #[test]
+    fn normalized_messages_represent_linked_tool_turns() {
+        let call = ToolCall {
+            id: Some("call-ticket-42".into()),
+            name: "lookup_ticket".into(),
+            arguments: serde_json::json!({"ticket_id": "TICKET-42"}),
+        };
+        let assistant = ChatMessage::assistant_tool_calls(vec![call.clone()]);
+        let tool = ChatMessage::tool_result(
+            "call-ticket-42",
+            "lookup_ticket",
+            serde_json::json!({"ticket_id": "TICKET-42", "status": "resolved"}).to_string(),
+        );
+
+        assert_eq!(assistant.role, "assistant");
+        assert!(assistant.content.is_empty());
+        assert_eq!(assistant.tool_calls, vec![call]);
+        assert_eq!(assistant.tool_call_id, None);
+        assert_eq!(assistant.tool_name, None);
+        assert_eq!(tool.role, "tool");
+        assert!(tool.tool_calls.is_empty());
+        assert_eq!(tool.tool_call_id.as_deref(), Some("call-ticket-42"));
+        assert_eq!(tool.tool_name.as_deref(), Some("lookup_ticket"));
     }
 
     #[test]

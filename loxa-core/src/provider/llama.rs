@@ -1,5 +1,7 @@
 use super::transport::{JsonTransport, ReqwestJsonTransport, StreamFraming, TimedJsonEvent};
-use super::{InvocationObservation, InvocationRequest, ProviderAdapter, ProviderError, ToolCall};
+use super::{
+    ChatMessage, InvocationObservation, InvocationRequest, ProviderAdapter, ProviderError, ToolCall,
+};
 use crate::plan::CandidateIdentity;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -85,8 +87,8 @@ impl ProviderAdapter for LlamaAdapter {
         let messages = request
             .messages
             .iter()
-            .map(|message| json!({"role": message.role, "content": message.content}))
-            .collect::<Vec<_>>();
+            .map(encode_message)
+            .collect::<Result<Vec<_>, _>>()?;
         let tools = request
             .tools
             .iter()
@@ -122,8 +124,57 @@ impl ProviderAdapter for LlamaAdapter {
     }
 }
 
+fn encode_message(message: &ChatMessage) -> Result<Value, ProviderError> {
+    if !message.tool_calls.is_empty() {
+        let tool_calls = message
+            .tool_calls
+            .iter()
+            .map(|call| {
+                let id = call
+                    .id
+                    .as_deref()
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| {
+                        ProviderError::Protocol("llama assistant tool call is missing id".into())
+                    })?;
+                Ok(json!({
+                    "id": id,
+                    "type": "function",
+                    "function": {
+                        "name": call.name,
+                        "arguments": call.arguments.to_string()
+                    }
+                }))
+            })
+            .collect::<Result<Vec<_>, ProviderError>>()?;
+        return Ok(json!({
+            "role": message.role,
+            "content": message.content,
+            "tool_calls": tool_calls
+        }));
+    }
+
+    if message.role == "tool" {
+        let tool_call_id = message
+            .tool_call_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                ProviderError::Protocol("llama tool result is missing tool_call_id".into())
+            })?;
+        return Ok(json!({
+            "role": message.role,
+            "content": message.content,
+            "tool_call_id": tool_call_id
+        }));
+    }
+
+    Ok(json!({"role": message.role, "content": message.content}))
+}
+
 #[derive(Default)]
 struct ToolCallFragments {
+    id: String,
     name: String,
     arguments: String,
 }
@@ -159,6 +210,7 @@ fn normalize_events(events: Vec<TimedJsonEvent>) -> Result<InvocationObservation
                     let index = call.get("index").and_then(Value::as_u64).ok_or_else(|| {
                         ProviderError::Protocol("llama tool-call delta is missing index".into())
                     })?;
+                    let id = call.get("id").and_then(Value::as_str).unwrap_or("");
                     let function = call.get("function").ok_or_else(|| {
                         ProviderError::Protocol("llama tool-call delta is missing function".into())
                     })?;
@@ -171,6 +223,7 @@ fn normalize_events(events: Vec<TimedJsonEvent>) -> Result<InvocationObservation
                         ttft_ns.get_or_insert(event.elapsed_ns);
                     }
                     let fragments = tool_fragments.entry(index).or_default();
+                    fragments.id.push_str(id);
                     fragments.name.push_str(name);
                     fragments.arguments.push_str(arguments);
                 }
@@ -215,6 +268,7 @@ fn normalize_events(events: Vec<TimedJsonEvent>) -> Result<InvocationObservation
                 ))
             })?;
             Ok(ToolCall {
+                id: (!fragments.id.is_empty()).then_some(fragments.id),
                 name: fragments.name,
                 arguments,
             })
@@ -467,15 +521,15 @@ mod tests {
             TimedJsonEvent::new(
                 20,
                 json!({"choices": [{"delta": {"tool_calls": [
-                    {"index": 1, "function": {"name": "wea", "arguments": "{\"city\":\"Par"}},
-                    {"index": 0, "function": {"name": "wea", "arguments": "{\"city\":\"Ro"}}
+                    {"index": 1, "id": "call_par", "function": {"name": "wea", "arguments": "{\"city\":\"Par"}},
+                    {"index": 0, "id": "call_ro", "function": {"name": "wea", "arguments": "{\"city\":\"Ro"}}
                 ]}}]}),
             ),
             TimedJsonEvent::new(
                 30,
                 json!({"choices": [{"delta": {"tool_calls": [
-                    {"index": 0, "function": {"name": "ther", "arguments": "me\"}"}},
-                    {"index": 1, "function": {"name": "ther", "arguments": "is\"}"}}
+                    {"index": 0, "id": "me", "function": {"name": "ther", "arguments": "me\"}"}},
+                    {"index": 1, "id": "is", "function": {"name": "ther", "arguments": "is\"}"}}
                 ]}}]}),
             ),
             TimedJsonEvent::new(
@@ -511,10 +565,12 @@ mod tests {
             observation.tool_calls,
             vec![
                 ToolCall {
+                    id: Some("call_rome".into()),
                     name: "weather".into(),
                     arguments: json!({"city": "Rome"}),
                 },
                 ToolCall {
+                    id: Some("call_paris".into()),
                     name: "weather".into(),
                     arguments: json!({"city": "Paris"}),
                 }
@@ -527,6 +583,74 @@ mod tests {
         assert_eq!(observation.prompt_rate, Some(500.0));
         assert_eq!(observation.decode_rate, Some(100.0));
         assert_eq!(observation.raw_events, raw_events);
+        assert_fixtures_consumed(&fixtures);
+    }
+
+    #[test]
+    fn llama_chat_translation_preserves_structured_tool_context() {
+        let call = ToolCall {
+            id: Some("call-ticket-42".into()),
+            name: "lookup_ticket".into(),
+            arguments: json!({"ticket_id": "TICKET-42"}),
+        };
+        let tool_result = json!({"ticket_id": "TICKET-42", "status": "resolved"}).to_string();
+        let request = InvocationRequest {
+            messages: vec![
+                ChatMessage::user("Look up ticket TICKET-42."),
+                ChatMessage::assistant_tool_calls(vec![call]),
+                ChatMessage::tool_result("call-ticket-42", "lookup_ticket", tool_result.clone()),
+                ChatMessage::user("Summarize the result."),
+            ],
+            tools: vec![],
+            max_tokens: 64,
+        };
+        let body = json!({
+            "model": "loxa-run-123-g1",
+            "messages": [
+                {"role": "user", "content": "Look up ticket TICKET-42."},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call-ticket-42",
+                        "type": "function",
+                        "function": {
+                            "name": "lookup_ticket",
+                            "arguments": "{\"ticket_id\":\"TICKET-42\"}"
+                        }
+                    }]
+                },
+                {"role": "tool", "content": tool_result, "tool_call_id": "call-ticket-42"},
+                {"role": "user", "content": "Summarize the result."}
+            ],
+            "tools": [],
+            "max_tokens": 64,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "seed": 1,
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        });
+        let events = vec![TimedJsonEvent::new(
+            10,
+            json!({"choices": [{"delta": {"content": "TICKET-42 resolved"}}]}),
+        )];
+        let (transport, fixtures) = fake_transport(vec![ExpectedRequest::Stream {
+            url: "http://127.0.0.1:8080/v1/chat/completions".into(),
+            body,
+            framing: StreamFraming::SseData,
+            response: Ok(events),
+        }]);
+        let mut adapter = LlamaAdapter::with_transport(
+            identity(),
+            "http://127.0.0.1:8080",
+            "loxa-run-123-g1",
+            transport,
+        );
+
+        let observation = adapter.invoke(&request).expect("llama invoke");
+
+        assert_eq!(observation.content.as_deref(), Some("TICKET-42 resolved"));
         assert_fixtures_consumed(&fixtures);
     }
 

@@ -1,5 +1,7 @@
 use super::transport::{JsonTransport, ReqwestJsonTransport, StreamFraming, TimedJsonEvent};
-use super::{InvocationObservation, InvocationRequest, ProviderAdapter, ProviderError, ToolCall};
+use super::{
+    ChatMessage, InvocationObservation, InvocationRequest, ProviderAdapter, ProviderError, ToolCall,
+};
 use crate::plan::{CandidateIdentity, ProviderKind};
 use serde_json::{json, Value};
 
@@ -169,8 +171,8 @@ impl ProviderAdapter for OllamaAdapter {
         let messages = request
             .messages
             .iter()
-            .map(|message| json!({"role": message.role, "content": message.content}))
-            .collect::<Vec<_>>();
+            .map(encode_message)
+            .collect::<Result<Vec<_>, _>>()?;
         let tools = request
             .tools
             .iter()
@@ -205,6 +207,49 @@ impl ProviderAdapter for OllamaAdapter {
 
         normalize_events(events)
     }
+}
+
+fn encode_message(message: &ChatMessage) -> Result<Value, ProviderError> {
+    if !message.tool_calls.is_empty() {
+        let tool_calls = message
+            .tool_calls
+            .iter()
+            .map(|call| {
+                let mut encoded = json!({
+                    "function": {
+                        "name": call.name,
+                        "arguments": call.arguments
+                    }
+                });
+                if let Some(id) = call.id.as_deref().filter(|id| !id.is_empty()) {
+                    encoded["id"] = Value::String(id.to_string());
+                }
+                encoded
+            })
+            .collect::<Vec<_>>();
+        return Ok(json!({
+            "role": message.role,
+            "content": message.content,
+            "tool_calls": tool_calls
+        }));
+    }
+
+    if message.role == "tool" {
+        let tool_name = message
+            .tool_name
+            .as_deref()
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                ProviderError::Protocol("ollama tool result is missing tool_name".into())
+            })?;
+        return Ok(json!({
+            "role": message.role,
+            "content": message.content,
+            "tool_name": tool_name
+        }));
+    }
+
+    Ok(json!({"role": message.role, "content": message.content}))
 }
 
 fn validate_sha256_digest(digest: &str) -> Result<&str, ProviderError> {
@@ -269,6 +314,11 @@ fn normalize_events(events: Vec<TimedJsonEvent>) -> Result<InvocationObservation
                     })?;
                 let arguments = normalize_arguments(function.get("arguments"))?;
                 tool_calls.push(ToolCall {
+                    id: call
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                        .map(str::to_string),
                     name: name.to_string(),
                     arguments,
                 });
@@ -643,7 +693,7 @@ mod tests {
             TimedJsonEvent::new(
                 21,
                 json!({"message": {"role": "assistant", "content": "", "tool_calls": [
-                    {"function": {"name": "weather", "arguments": {"city": "Paris"}}}
+                    {"id": "call-weather", "function": {"name": "weather", "arguments": {"city": "Paris"}}}
                 ]}, "done": false}),
             ),
             TimedJsonEvent::new(
@@ -683,6 +733,7 @@ mod tests {
         assert_eq!(
             observation.tool_calls,
             vec![ToolCall {
+                id: Some("call-weather".into()),
                 name: "weather".into(),
                 arguments: json!({"city": "Paris"}),
             }]
@@ -694,6 +745,78 @@ mod tests {
         assert_eq!(observation.prompt_rate, Some(500.0));
         assert_eq!(observation.decode_rate, Some(100.0));
         assert_eq!(observation.raw_events, raw_events);
+        assert_fixtures_consumed(&expected);
+    }
+
+    #[test]
+    fn ollama_chat_translation_preserves_structured_tool_context() {
+        let call = ToolCall {
+            id: Some("call-ticket-42".into()),
+            name: "lookup_ticket".into(),
+            arguments: json!({"ticket_id": "TICKET-42"}),
+        };
+        let tool_result = json!({"ticket_id": "TICKET-42", "status": "resolved"}).to_string();
+        let request = InvocationRequest {
+            messages: vec![
+                ChatMessage::user("Look up ticket TICKET-42."),
+                ChatMessage::assistant_tool_calls(vec![call]),
+                ChatMessage::tool_result("call-ticket-42", "lookup_ticket", tool_result.clone()),
+                ChatMessage::user("Summarize the result."),
+            ],
+            tools: vec![],
+            max_tokens: 64,
+        };
+        let body = json!({
+            "model": "gemma3:4b",
+            "messages": [
+                {"role": "user", "content": "Look up ticket TICKET-42."},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call-ticket-42",
+                        "function": {
+                            "name": "lookup_ticket",
+                            "arguments": {"ticket_id": "TICKET-42"}
+                        }
+                    }]
+                },
+                {"role": "tool", "content": tool_result, "tool_name": "lookup_ticket"},
+                {"role": "user", "content": "Summarize the result."}
+            ],
+            "tools": [],
+            "stream": true,
+            "options": {
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "seed": 1,
+                "num_predict": 64
+            }
+        });
+        let events = vec![TimedJsonEvent::new(
+            10,
+            json!({
+                "message": {"role": "assistant", "content": "TICKET-42 resolved"},
+                "done": true
+            }),
+        )];
+        let (transport, expected) = fake_transport(vec![ExpectedRequest::Stream {
+            url: "http://127.0.0.1:11434/api/chat".into(),
+            body,
+            framing: StreamFraming::JsonLines,
+            response: Ok(events),
+        }]);
+        let candidate = identity();
+        let mut adapter = OllamaAdapter::with_transport(
+            candidate.clone(),
+            "http://127.0.0.1:11434",
+            candidate.model_id.clone(),
+            transport,
+        );
+
+        let observation = adapter.invoke(&request).expect("ollama invoke");
+
+        assert_eq!(observation.content.as_deref(), Some("TICKET-42 resolved"));
         assert_fixtures_consumed(&expected);
     }
 
