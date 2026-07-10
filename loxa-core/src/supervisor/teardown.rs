@@ -854,20 +854,20 @@ mod tests {
     use crate::supervisor::{BoundedLogWriter, ManagedChild, TeardownConfirmation, MAX_LOG_BYTES};
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     use std::fs;
     use std::fs::File;
     use std::io::Cursor;
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     use std::path::{Path, PathBuf};
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     use std::process::{Child, ExitStatus};
     use std::process::{Command, Stdio};
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     use std::rc::Rc;
     use std::sync::{mpsc, Arc, Mutex};
     use std::time::Instant;
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::tempdir;
 
@@ -1920,7 +1920,7 @@ mod tests {
         assert_eq!(error.raw_os_error(), Some(3));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn real_unix_teardown_kills_term_ignoring_descendant_before_completion() {
         match std::env::var("LOXA_TEARDOWN_HELPER_ROLE").as_deref() {
@@ -1932,11 +1932,11 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     const REAL_HELPER_TEST: &str =
         "supervisor::teardown::tests::real_unix_teardown_kills_term_ignoring_descendant_before_completion";
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     unsafe extern "C" fn real_helper_leader_term(_signal: c_int) {
         unsafe extern "C" {
             fn _exit(status: c_int) -> !;
@@ -1944,10 +1944,10 @@ mod tests {
         unsafe { _exit(42) }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     unsafe extern "C" fn real_helper_descendant_term(_signal: c_int) {}
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn run_real_helper_test_process() {
         let temp = tempdir().expect("real helper tempdir");
         let root = temp.path();
@@ -1977,7 +1977,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn run_real_helper_controller() {
         #[cfg(target_os = "linux")]
         install_linux_subreaper();
@@ -2046,7 +2046,7 @@ mod tests {
             &mut groups,
             TeardownTiming {
                 phase_one: Duration::from_millis(200),
-                phase_two: Duration::from_secs(2),
+                phase_two: Duration::from_secs(5),
                 drains: Duration::from_secs(1),
                 interval: Duration::from_millis(10),
             },
@@ -2064,7 +2064,7 @@ mod tests {
         assert_real_helper_trace(&trace);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn run_real_helper_leader() {
         install_test_signal_handler(15, real_helper_leader_term);
         let root = helper_root();
@@ -2111,7 +2111,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn run_real_helper_descendant() {
         install_test_signal_handler(15, real_helper_descendant_term);
         let root = helper_root();
@@ -2133,7 +2133,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn helper_command(role: &str, root: &Path, nonce: &str) -> Command {
         let mut command = Command::new(std::env::current_exe().expect("current test binary"));
         command
@@ -2147,26 +2147,26 @@ mod tests {
         command
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn helper_root() -> PathBuf {
         PathBuf::from(
             std::env::var_os("LOXA_TEARDOWN_HELPER_ROOT").expect("helper root environment"),
         )
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn helper_nonce() -> String {
         std::env::var("LOXA_TEARDOWN_HELPER_NONCE").expect("helper nonce environment")
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn publish_artifact(path: &Path, contents: &str) {
         let temp = path.with_extension(format!("{}.tmp", std::process::id()));
         fs::write(&temp, contents).expect("write helper artifact temp file");
         fs::rename(&temp, path).expect("publish helper artifact atomically");
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn wait_for_artifact(path: &Path, timeout: Duration, mut child: Option<&mut Child>) -> String {
         let deadline = Instant::now() + timeout;
         loop {
@@ -2189,7 +2189,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn parse_helper_fields(contents: &str, count: usize) -> Vec<String> {
         let fields = contents
             .split_whitespace()
@@ -2203,19 +2203,19 @@ mod tests {
         fields
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn parse_c_int(value: &str) -> c_int {
         value.parse::<c_int>().expect("numeric helper field")
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn checked_test_pid(pid: u32) -> c_int {
         let pid = c_int::try_from(pid).expect("helper PID fits c_int");
         assert!(pid > 1, "helper PID must be strictly above one");
         pid
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn raw_getpgid(pid: c_int) -> io::Result<c_int> {
         unsafe extern "C" {
             fn getpgid(pid: c_int) -> c_int;
@@ -2228,7 +2228,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn raw_getpgrp() -> c_int {
         unsafe extern "C" {
             fn getpgrp() -> c_int;
@@ -2236,7 +2236,7 @@ mod tests {
         unsafe { getpgrp() }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn raw_kill_group(group: OwnedProcessGroup, signal: c_int) -> io::Result<()> {
         unsafe extern "C" {
             fn kill(pid: c_int, signal: c_int) -> c_int;
@@ -2248,7 +2248,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn install_test_signal_handler(signal_number: c_int, handler: unsafe extern "C" fn(c_int)) {
         unsafe extern "C" {
             fn signal(signal: c_int, handler: usize) -> usize;
@@ -2257,7 +2257,7 @@ mod tests {
         assert_ne!(previous, usize::MAX, "install helper signal handler");
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn wait_for_helper_exit(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
         let deadline = Instant::now() + timeout;
         loop {
@@ -2271,7 +2271,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn publish_controller_info(
         root: &Path,
         leader_pid: c_int,
@@ -2284,7 +2284,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn cleanup_reported_helper_group(root: &Path) {
         let Ok(contents) = fs::read_to_string(root.join("controller.info")) else {
             return;
@@ -2323,7 +2323,7 @@ mod tests {
         assert_eq!(result, 0, "install Linux child subreaper");
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[derive(Default)]
     struct RealHelperState {
         absent: bool,
@@ -2334,7 +2334,7 @@ mod tests {
         descendant_reaped: bool,
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     struct RealHelperChild {
         child: Child,
         group: Option<OwnedProcessGroup>,
@@ -2343,7 +2343,7 @@ mod tests {
         events: Rc<RefCell<Vec<String>>>,
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     impl ManagedChild for RealHelperChild {
         fn pid(&self) -> u32 {
             self.child.id()
@@ -2380,7 +2380,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     impl LogDrainingChild for RealHelperChild {
         fn log_drains_finished(&self) -> bool {
             self.events.borrow_mut().push("drains_finished".to_string());
@@ -2393,7 +2393,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     struct RecordingRealGroupControl {
         inner: UnixProcessGroupControl,
         shared: Rc<RefCell<RealHelperState>>,
@@ -2402,7 +2402,7 @@ mod tests {
         descendant_pid: c_int,
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     impl ProcessGroupControl for RecordingRealGroupControl {
         fn signal_group(
             &mut self,
@@ -2476,7 +2476,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     struct RealHelperGuard {
         child: Option<RealHelperChild>,
         group: Option<OwnedProcessGroup>,
@@ -2486,7 +2486,7 @@ mod tests {
         armed: bool,
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     impl RealHelperGuard {
         fn new(
             child: Child,
@@ -2542,7 +2542,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     impl Drop for RealHelperGuard {
         fn drop(&mut self) {
             if !self.armed {
@@ -2602,12 +2602,12 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     struct DirectChildGuard {
         child: Option<Child>,
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     impl DirectChildGuard {
         fn new(child: Child) -> Self {
             Self { child: Some(child) }
@@ -2622,7 +2622,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     impl Drop for DirectChildGuard {
         fn drop(&mut self) {
             if let Some(child) = self.child.as_mut() {
@@ -2632,7 +2632,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn assert_real_helper_trace(trace: &[String]) {
         let term = trace
             .iter()
