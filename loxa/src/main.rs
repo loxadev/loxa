@@ -333,8 +333,8 @@ fn run_model<W: Write, E: Write>(
 
     let signal_guard = SignalGuard::install()?;
     let owner_pid = std::process::id();
-    let owner_process_start_time_unix_s =
-        supervisor::process_start_time(owner_pid).ok_or_else(|| {
+    let owner_process_start_time_unix_s = supervisor::process_start_time_with_retry(owner_pid)
+        .ok_or_else(|| {
             supervisor_error_to_io(SupervisorError::ProcessIdentityUnavailable(owner_pid))
         })?;
     let run_id = format!("run-{owner_pid}-{owner_process_start_time_unix_s}");
@@ -502,7 +502,7 @@ fn run_model<W: Write, E: Write>(
             model_path: spec.model_path.clone(),
             started_at_unix_s,
             llama_server_version,
-            process_start_time_unix_s: supervisor::process_start_time(child.pid()),
+            process_start_time_unix_s: supervisor::process_start_time_with_retry(child.pid()),
         };
 
         if signal_guard.interrupted() {
@@ -544,10 +544,10 @@ fn run_model<W: Write, E: Write>(
             &state_identity,
             &paths.state_path,
             &signal_guard,
-            |child, timeout, interval| match supervisor::wait_for_health_or_exit(
+            |child, timeout, interval| match supervisor::wait_for_generation_ready_or_exit(
                 child,
                 server.port,
-                &log_path,
+                &run.generation_alias,
                 timeout,
                 interval,
             ) {
@@ -780,101 +780,21 @@ fn finish_owned_replacement_error<R, D>(
     }
 }
 
-fn prepare_and_spawn_after_starting_run_persisted<P, T, PF, SF>(
-    state_path: &Path,
-    run: supervisor::ManagedRun,
-    prepare: PF,
-    spawn: SF,
-) -> Result<SpawnBoundary<T>, SupervisorError>
-where
-    PF: FnOnce() -> Result<P, SupervisorError>,
-    SF: FnOnce(P) -> Result<T, SupervisorError>,
-{
-    let run = supervisor::create_starting_run(state_path, run)?;
-    prepare_and_spawn_after_persisted_starting_run(state_path, run, prepare, spawn)
-}
-
-fn prepare_and_spawn_after_persisted_starting_run<P, T, PF, SF>(
-    state_path: &Path,
-    run: supervisor::ManagedRun,
-    prepare: PF,
-    spawn: SF,
-) -> Result<SpawnBoundary<T>, SupervisorError>
-where
-    PF: FnOnce() -> Result<P, SupervisorError>,
-    SF: FnOnce(P) -> Result<T, SupervisorError>,
-{
-    let prepared = match prepare() {
-        Ok(prepared) => prepared,
-        Err(error) => return finish_childless_spawn_error(state_path, &run, error),
-    };
-    let run = match supervisor::prepare_starting_run_for_spawn(state_path, &run.identity())? {
-        supervisor::PreSpawnDecision::Spawn(run) => run,
-        supervisor::PreSpawnDecision::RequestedStop => return Ok(SpawnBoundary::RequestedStop),
-    };
-    match spawn(prepared) {
-        Ok(value) => Ok(SpawnBoundary::Spawned { run, value }),
-        Err(error) => finish_childless_spawn_error(state_path, &run, error),
-    }
-}
-
-fn finish_childless_spawn_error<T>(
+fn finish_childless_owner_error(
     state_path: &Path,
     run: &supervisor::ManagedRun,
     error: SupervisorError,
-) -> Result<SpawnBoundary<T>, SupervisorError> {
+) -> Result<ExitCode, SupervisorError> {
     match supervisor::finish_childless_runtime_state_run(state_path, &run.identity())? {
-        supervisor::ChildlessFinishOutcome::RequestedStop => Ok(SpawnBoundary::RequestedStop),
+        supervisor::ChildlessFinishOutcome::RequestedStop => Ok(ExitCode::SUCCESS),
         supervisor::ChildlessFinishOutcome::Finished => Err(error),
     }
-}
-
-#[cfg(test)]
-fn spawn_after_starting_run_persisted<T, F>(
-    state_path: &Path,
-    run: supervisor::ManagedRun,
-    spawn: F,
-) -> Result<SpawnBoundary<T>, SupervisorError>
-where
-    F: FnOnce() -> Result<T, SupervisorError>,
-{
-    spawn_after_starting_run_persisted_with_hook(state_path, run, || {}, spawn)
-}
-
-#[cfg(test)]
-fn spawn_after_starting_run_persisted_with_hook<T, H, F>(
-    state_path: &Path,
-    run: supervisor::ManagedRun,
-    before_spawn: H,
-    spawn: F,
-) -> Result<SpawnBoundary<T>, SupervisorError>
-where
-    H: FnOnce(),
-    F: FnOnce() -> Result<T, SupervisorError>,
-{
-    let run = supervisor::create_starting_run(state_path, run)?;
-    spawn_after_persisted_starting_run_with_hook(state_path, run, before_spawn, spawn)
-}
-
-#[cfg(test)]
-fn spawn_after_persisted_starting_run_with_hook<T, H, F>(
-    state_path: &Path,
-    run: supervisor::ManagedRun,
-    before_spawn: H,
-    spawn: F,
-) -> Result<SpawnBoundary<T>, SupervisorError>
-where
-    H: FnOnce(),
-    F: FnOnce() -> Result<T, SupervisorError>,
-{
-    before_spawn();
-    prepare_and_spawn_after_persisted_starting_run(state_path, run, || Ok(()), |_| spawn())
 }
 
 fn print_managed_servers<W: Write>(paths: &CliPaths, stdout: &mut W) -> io::Result<ExitCode> {
     let state =
         supervisor::read_runtime_state(&paths.state_path).map_err(supervisor_error_to_io)?;
-    let servers = match state {
+    let runs = match state {
         RuntimeStateRead::Missing => {
             writeln!(stdout, "no managed sidecars")?;
             return Ok(ExitCode::SUCCESS);
@@ -883,39 +803,44 @@ fn print_managed_servers<W: Write>(paths: &CliPaths, stdout: &mut W) -> io::Resu
             writeln!(stdout, "managed sidecar state is corrupt: {message}")?;
             return Ok(ExitCode::SUCCESS);
         }
-        RuntimeStateRead::Legacy => {
+        RuntimeStateRead::Legacy(legacy_path) => {
             writeln!(
                 stdout,
-                "legacy managed sidecar state requires manual recovery: {}",
-                paths.state_path.display()
+                "legacy managed sidecar state requires manual recovery at {}; confirm no old Loxa process remains, then archive it manually",
+                legacy_path.display()
             )?;
             return Ok(ExitCode::SUCCESS);
         }
-        RuntimeStateRead::Loaded(runs) => runs
-            .into_iter()
-            .filter_map(|run| managed_server_from_run(&run))
-            .collect::<Vec<_>>(),
+        RuntimeStateRead::Loaded(runs) => runs,
     };
 
-    if servers.is_empty() {
+    if runs.is_empty() {
         writeln!(stdout, "no managed sidecars")?;
         return Ok(ExitCode::SUCCESS);
     }
 
-    let inspections = supervisor::inspect_managed_servers(&servers);
     writeln!(
         stdout,
         "id                  pid    port   status               model"
     )?;
-    for inspection in inspections {
+    for run in runs {
+        let inspection = supervisor::inspect_managed_run(&run);
+        let pid = run
+            .child_pid
+            .map(|pid| pid.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let model_path = registry::find(&run.model_id)
+            .map(|entry| paths.models_dir.join(entry.filename))
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "-".to_string());
         writeln!(
             stdout,
             "{:<19} {:>6}  {:>5}  {:<19} {}",
-            inspection.server.id,
-            inspection.server.pid,
-            inspection.server.port,
-            inspection_status(&inspection),
-            inspection.server.model_path.display(),
+            run.model_id,
+            pid,
+            run.port,
+            managed_run_status(&inspection),
+            model_path,
         )?;
     }
 
@@ -1618,40 +1543,20 @@ fn ensure_runtime_state_is_mutable(state_path: &Path) -> io::Result<()> {
         RuntimeStateRead::Corrupt(message) => Err(io::Error::other(format!(
             "managed sidecar state is corrupt: {message}"
         ))),
-        RuntimeStateRead::Legacy => Err(io::Error::other(format!(
+        RuntimeStateRead::Legacy(legacy_path) => Err(io::Error::other(format!(
             "legacy managed sidecar state requires manual recovery: {}",
-            state_path.display()
+            legacy_path.display()
         ))),
         RuntimeStateRead::Missing | RuntimeStateRead::Loaded(_) => Ok(()),
     }
 }
 
-fn managed_server_from_run(run: &supervisor::ManagedRun) -> Option<ManagedServer> {
-    Some(ManagedServer {
-        id: run.model_id.clone(),
-        pid: run.child_pid?,
-        port: run.port,
-        model_path: PathBuf::new(),
-        started_at_unix_s: run.owner_process_start_time_unix_s,
-        llama_server_version: String::new(),
-        process_start_time_unix_s: run.child_process_start_time_unix_s,
-    })
-}
-
-fn inspection_status(inspection: &supervisor::ManagedServerInspection) -> String {
-    if !inspection.stale {
-        return "running".to_string();
-    }
-
-    if inspection.pid_alive && inspection.port_alive && !inspection.process_identity_matches {
-        return "stale (identity)".to_string();
-    }
-
-    match (inspection.pid_alive, inspection.port_alive) {
-        (false, false) => "stale (pid dead, port dead)".to_string(),
-        (false, true) => "stale (pid dead)".to_string(),
-        (true, false) => "stale (port dead)".to_string(),
-        (true, true) => "running".to_string(),
+fn managed_run_status(inspection: &supervisor::ManagedRunInspection) -> &'static str {
+    match inspection.status {
+        supervisor::ManagedRunStatus::Starting => "starting",
+        supervisor::ManagedRunStatus::Running => "running",
+        supervisor::ManagedRunStatus::Stopping => "stopping",
+        supervisor::ManagedRunStatus::RecoveryRequired => "recovery-required",
     }
 }
 
@@ -2049,6 +1954,116 @@ mod tests {
             .expect("exact test stop")
     }
 
+    fn set_test_owner_to_current_process(run: &mut supervisor::ManagedRun) {
+        run.owner_pid = std::process::id();
+        run.owner_process_start_time_unix_s =
+            supervisor::process_start_time_with_retry(run.owner_pid)
+                .expect("current test process start time");
+    }
+
+    fn set_test_child_to_current_process(run: &mut supervisor::ManagedRun, listener: &TcpListener) {
+        run.lifecycle = supervisor::RunLifecycle::Running;
+        run.port = listener.local_addr().expect("listener address").port();
+        run.child_pid = Some(std::process::id());
+        run.child_process_start_time_unix_s = Some(
+            supervisor::process_start_time_with_retry(std::process::id())
+                .expect("current test child process start time"),
+        );
+    }
+
+    fn persist_test_run(state_path: &Path, run: supervisor::ManagedRun) {
+        let mut starting = run.clone();
+        starting.stop_requested = false;
+        starting.lifecycle = supervisor::RunLifecycle::Starting;
+        starting.child_pid = None;
+        starting.child_process_start_time_unix_s = None;
+        starting.child_pgid = None;
+        supervisor::create_starting_run(state_path, starting.clone())
+            .expect("create test starting run");
+        if run != starting {
+            assert!(
+                supervisor::update_runtime_state_run(state_path, &starting.identity(), run)
+                    .expect("persist final test run")
+            );
+        }
+    }
+
+    fn render_ps_for_test(temp: &TempDir) -> String {
+        let state_path = temp.path().join("managed.json");
+        let before = fs::read(&state_path).expect("read state before ps");
+        let paths = CliPaths {
+            models_dir: temp.path().join("models"),
+            state_path: state_path.clone(),
+            logs_dir: temp.path().join("logs"),
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let exit = run_with_paths(
+            Cli {
+                command: Command::Ps,
+            },
+            &paths,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(exit, std::process::ExitCode::SUCCESS);
+        assert!(stderr.is_empty());
+        assert_eq!(
+            fs::read(&state_path).expect("read state after ps"),
+            before,
+            "ps must not mutate managed state"
+        );
+        String::from_utf8(stdout).expect("stdout is utf8")
+    }
+
+    fn only_ps_row_fields(stdout: &str) -> Vec<&str> {
+        let lines = stdout.lines().collect::<Vec<_>>();
+        assert_eq!(
+            lines.len(),
+            2,
+            "expected one header and one row: {stdout:?}"
+        );
+        lines[1].split_whitespace().collect()
+    }
+
+    #[test]
+    fn process_identity_wiring_uses_retry_for_owner_and_post_spawn_child_capture() {
+        let source = include_str!("main.rs");
+        let run_model = source
+            .split_once("fn run_model")
+            .expect("run_model source")
+            .1
+            .split_once("fn render_post_cleanup_startup_failure")
+            .expect("run_model boundary")
+            .0;
+        let retry_call = ["process_start_time_with", "_retry("].concat();
+        let one_shot_call = ["process_start", "_time("].concat();
+        let retry_positions = run_model
+            .match_indices(&retry_call)
+            .map(|(position, _)| position)
+            .collect::<Vec<_>>();
+
+        assert_eq!(retry_positions.len(), 2, "owner and child must both retry");
+        assert_eq!(run_model.matches(&one_shot_call).count(), 0);
+
+        let loop_position = run_model.find("loop {").expect("run loop");
+        assert!(
+            retry_positions[0] < loop_position,
+            "persistent owner miss must happen before state creation or spawn"
+        );
+
+        let spawned_position = run_model
+            .find("let (starting_run, mut child) = match spawn")
+            .expect("managed child spawn boundary");
+        let attachment_position = run_model
+            .find("persist_managed_server_or_cleanup")
+            .expect("managed child attachment boundary");
+        assert!(spawned_position < retry_positions[1]);
+        assert!(retry_positions[1] < attachment_position);
+    }
+
     #[test]
     fn clap_parses_all_subcommands() {
         assert!(Cli::try_parse_from(["loxa", "doctor"]).is_ok());
@@ -2202,7 +2217,134 @@ mod tests {
     }
 
     #[test]
-    fn ps_marks_stale_entries() {
+    fn ps_legacy_sentinel_without_managed_json_fails_closed_with_exact_recovery_guidance() {
+        let temp = TempDir::new("loxa-ps-legacy-sentinel");
+        let state_path = temp.path().join("managed.json");
+        let sentinel_path = state_path.with_file_name("managed.json.lock");
+        fs::create_dir_all(temp.path()).expect("create temp root");
+        fs::write(&sentinel_path, b"legacy owner metadata\n").expect("write legacy sentinel");
+        let paths = CliPaths {
+            models_dir: temp.path().join("models"),
+            state_path: state_path.clone(),
+            logs_dir: temp.path().join("logs"),
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let exit = run_with_paths(
+            Cli {
+                command: Command::Ps,
+            },
+            &paths,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(exit, std::process::ExitCode::SUCCESS);
+        assert!(stderr.is_empty());
+        assert_eq!(
+            String::from_utf8(stdout).expect("stdout is utf8"),
+            format!(
+                "legacy managed sidecar state requires manual recovery at {}; confirm no old Loxa process remains, then archive it manually\n",
+                sentinel_path.display()
+            )
+        );
+        assert!(sentinel_path.exists());
+        assert!(!state_path.exists());
+        assert!(!state_path.with_file_name("managed.json.v2.lock").exists());
+    }
+
+    #[test]
+    fn ps_renders_childless_live_owner_as_starting() {
+        let temp = TempDir::new("loxa-ps-starting");
+        let state_path = temp.path().join("managed.json");
+        let mut run = starting_run_for_test(&state_path, "run-starting");
+        set_test_owner_to_current_process(&mut run);
+        persist_test_run(&state_path, run);
+
+        let stdout = render_ps_for_test(&temp);
+        let fields = only_ps_row_fields(&stdout);
+
+        assert_eq!(fields[1], "-");
+        assert_eq!(fields[3], "starting");
+    }
+
+    #[test]
+    fn ps_renders_live_owner_with_stop_intent_as_stopping() {
+        let temp = TempDir::new("loxa-ps-stopping");
+        let state_path = temp.path().join("managed.json");
+        let mut run = starting_run_for_test(&state_path, "run-stopping");
+        set_test_owner_to_current_process(&mut run);
+        run.stop_requested = true;
+        run.lifecycle = supervisor::RunLifecycle::Running;
+        run.child_pid = Some(u32::MAX);
+        run.child_process_start_time_unix_s = Some(1);
+        persist_test_run(&state_path, run);
+
+        let stdout = render_ps_for_test(&temp);
+        let fields = only_ps_row_fields(&stdout);
+
+        assert_eq!(fields[3], "stopping");
+    }
+
+    #[test]
+    fn ps_renders_dead_owner_with_live_child_as_recovery_required() {
+        let temp = TempDir::new("loxa-ps-dead-owner");
+        let state_path = temp.path().join("managed.json");
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind live child port");
+        let mut run = starting_run_for_test(&state_path, "run-dead-owner");
+        run.owner_pid = u32::MAX;
+        run.owner_process_start_time_unix_s = 1;
+        set_test_child_to_current_process(&mut run, &listener);
+        persist_test_run(&state_path, run);
+
+        let stdout = render_ps_for_test(&temp);
+        let fields = only_ps_row_fields(&stdout);
+
+        assert_eq!(fields[1], std::process::id().to_string());
+        assert_eq!(fields[3], "recovery-required");
+        assert!(!stdout.contains("  running"));
+    }
+
+    #[test]
+    fn ps_renders_running_only_for_live_owner_and_exact_live_child() {
+        let temp = TempDir::new("loxa-ps-running");
+        let state_path = temp.path().join("managed.json");
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind live child port");
+        let mut run = starting_run_for_test(&state_path, "run-running");
+        set_test_owner_to_current_process(&mut run);
+        set_test_child_to_current_process(&mut run, &listener);
+        persist_test_run(&state_path, run);
+
+        let stdout = render_ps_for_test(&temp);
+        let fields = only_ps_row_fields(&stdout);
+
+        assert_eq!(fields[1], std::process::id().to_string());
+        assert_eq!(fields[3], "running");
+    }
+
+    #[test]
+    fn ps_model_column_renders_the_canonical_model_path_without_shifting_child_pid() {
+        let temp = TempDir::new("loxa-ps-model-column");
+        let state_path = temp.path().join("managed.json");
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind live child port");
+        let mut run = starting_run_for_test(&state_path, "run-model-column");
+        set_test_owner_to_current_process(&mut run);
+        set_test_child_to_current_process(&mut run, &listener);
+        persist_test_run(&state_path, run);
+
+        let stdout = render_ps_for_test(&temp);
+        let fields = only_ps_row_fields(&stdout);
+        let entry = registry::find("gemma-3-4b-it-q4").expect("registry entry");
+        let expected_model_path = temp.path().join("models").join(entry.filename);
+
+        assert_eq!(fields[1], std::process::id().to_string());
+        assert_eq!(fields[3], "running");
+        assert_eq!(fields[4], expected_model_path.display().to_string());
+    }
+
+    #[test]
+    fn ps_marks_inconsistent_entries_as_recovery_required() {
         let temp = TempDir::new("loxa-ps-stale");
         let cli = Cli {
             command: Command::Ps,
@@ -3302,10 +3444,10 @@ mod tests {
             &run.identity(),
             &state_path,
             &signal,
-            |child, _, _| match supervisor::wait_for_health_or_exit(
+            |child, _, _| match supervisor::wait_for_generation_ready_or_exit(
                 child,
                 server.port,
-                &run.log_path,
+                &run.generation_alias,
                 Duration::ZERO,
                 Duration::ZERO,
             ) {
