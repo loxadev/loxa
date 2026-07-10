@@ -4,6 +4,9 @@ use serde_json::Value;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
+pub mod llama;
+mod transport;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,

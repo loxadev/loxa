@@ -987,6 +987,7 @@ fn llama_server_args(spec: &ServerSpec<'_>) -> Vec<String> {
         "auto".to_string(),
         "--flash-attn".to_string(),
         "auto".to_string(),
+        "--jinja".to_string(),
         "--metrics".to_string(),
         "--log-disable".to_string(),
     ]

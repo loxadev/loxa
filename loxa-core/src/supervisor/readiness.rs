@@ -513,13 +513,32 @@ mod tests {
             generation_alias: alias.to_string(),
         });
 
-        let alias_index = args
-            .iter()
-            .position(|arg| arg == "--alias")
-            .expect("direct generation alias flag");
-        assert_eq!(args.get(alias_index + 1).map(String::as_str), Some(alias));
-        assert!(args.iter().any(|arg| arg == "--model"));
-        assert!(args.iter().any(|arg| arg == "/tmp/model.gguf"));
+        assert_eq!(
+            args,
+            vec![
+                "--model",
+                "/tmp/model.gguf",
+                "--alias",
+                alias,
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "8080",
+                "--ctx-size",
+                "8192",
+                "--gpu-layers",
+                "auto",
+                "--flash-attn",
+                "auto",
+                "--jinja",
+                "--metrics",
+                "--log-disable",
+            ]
+        );
+        assert_eq!(
+            args.iter().filter(|arg| arg.as_str() == "--jinja").count(),
+            1
+        );
         assert!(!args.iter().any(|arg| arg == "--models-preset"));
         assert!(!args.iter().any(|arg| arg.starts_with("--router")));
     }
