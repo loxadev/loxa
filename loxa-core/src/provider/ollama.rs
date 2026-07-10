@@ -12,7 +12,71 @@ pub struct OllamaAdapter {
     transport: Box<dyn JsonTransport>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OllamaPreflight {
+    pub provider_version: String,
+    pub artifact_digest: String,
+}
+
 impl OllamaAdapter {
+    pub fn preflight(
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Result<OllamaPreflight, ProviderError> {
+        let base_url = base_url.into();
+        let model = model.into();
+        Self::preflight_with_transport(&base_url, &model, Box::new(ReqwestJsonTransport::new()))
+    }
+
+    fn preflight_with_transport(
+        base_url: &str,
+        model: &str,
+        mut transport: Box<dyn JsonTransport>,
+    ) -> Result<OllamaPreflight, ProviderError> {
+        let base_url = base_url.trim_end_matches('/');
+        let version = transport.get_json(&format!("{base_url}/api/version"))?;
+        let tags = transport.get_json(&format!("{base_url}/api/tags"))?;
+        let loaded = transport.get_json(&format!("{base_url}/api/ps"))?;
+
+        let provider_version = version
+            .get("version")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                ProviderError::Protocol("ollama version response is missing version".into())
+            })?;
+        let models = tags
+            .get("models")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                ProviderError::Protocol("ollama model inventory is missing models array".into())
+            })?;
+        let mut exact = models
+            .iter()
+            .filter(|entry| entry.get("name").and_then(Value::as_str) == Some(model));
+        let selected = exact.next().ok_or_else(|| {
+            ProviderError::Protocol(format!("ollama model inventory has no exact model {model}"))
+        })?;
+        if exact.next().is_some() {
+            return Err(ProviderError::Protocol(format!(
+                "ollama model inventory has duplicate exact model {model}"
+            )));
+        }
+        let artifact_digest = selected
+            .get("digest")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ProviderError::Protocol("ollama model inventory is missing digest".into())
+            })?;
+        validate_sha256_digest(artifact_digest)?;
+        validate_loaded_models(&loaded, model)?;
+
+        Ok(OllamaPreflight {
+            provider_version: provider_version.to_string(),
+            artifact_digest: artifact_digest.to_string(),
+        })
+    }
+
     pub fn new(
         identity: CandidateIdentity,
         base_url: impl Into<String>,
@@ -86,50 +150,48 @@ impl OllamaAdapter {
     pub fn isolation_check(&mut self) -> Result<(), ProviderError> {
         self.validate_identity()?;
         let inventory = self.transport.get_json(&self.endpoint("/api/ps"))?;
-        let models = inventory
-            .get("models")
-            .and_then(Value::as_array)
-            .ok_or_else(|| {
-                ProviderError::Protocol(
-                    "ollama loaded-model inventory is missing models array".into(),
-                )
-            })?;
-
-        if models.is_empty() {
-            return Ok(());
-        }
-        if models.len() != 1 {
-            return Err(ProviderError::Protocol(
-                "ollama isolation is uncontrolled: multiple models are loaded".into(),
-            ));
-        }
-
-        let loaded = models[0].as_object().ok_or_else(|| {
-            ProviderError::Protocol("ollama loaded-model entry must be an object".into())
-        })?;
-        let name = loaded
-            .get("name")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                ProviderError::Protocol("ollama loaded-model entry is missing name".into())
-            })?;
-        let model = loaded
-            .get("model")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                ProviderError::Protocol("ollama loaded-model entry is missing model".into())
-            })?;
-        if name != self.model || model != self.model {
-            return Err(ProviderError::Protocol(format!(
-                "ollama isolation is uncontrolled: loaded model {name}/{model} is not {}",
-                self.model
-            )));
-        }
-
-        Ok(())
+        validate_loaded_models(&inventory, &self.model)
     }
+}
+
+fn validate_loaded_models(inventory: &Value, selected_model: &str) -> Result<(), ProviderError> {
+    let models = inventory
+        .get("models")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            ProviderError::Protocol("ollama loaded-model inventory is missing models array".into())
+        })?;
+    if models.is_empty() {
+        return Ok(());
+    }
+    if models.len() != 1 {
+        return Err(ProviderError::Protocol(
+            "ollama isolation is uncontrolled: multiple models are loaded".into(),
+        ));
+    }
+    let loaded = models[0].as_object().ok_or_else(|| {
+        ProviderError::Protocol("ollama loaded-model entry must be an object".into())
+    })?;
+    let name = loaded
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ProviderError::Protocol("ollama loaded-model entry is missing name".into())
+        })?;
+    let model = loaded
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ProviderError::Protocol("ollama loaded-model entry is missing model".into())
+        })?;
+    if name != selected_model || model != selected_model {
+        return Err(ProviderError::Protocol(format!(
+            "ollama isolation is uncontrolled: loaded model {name}/{model} is not {selected_model}"
+        )));
+    }
+    Ok(())
 }
 
 impl ProviderAdapter for OllamaAdapter {
@@ -644,6 +706,100 @@ mod tests {
             url: "http://127.0.0.1:11434/api/ps".into(),
             response: Ok(response),
         }]
+    }
+
+    fn preflight_fixtures(version: Value, tags: Value, loaded: Value) -> Vec<ExpectedRequest> {
+        vec![
+            ExpectedRequest::Get {
+                url: "http://127.0.0.1:11434/api/version".into(),
+                response: Ok(version),
+            },
+            ExpectedRequest::Get {
+                url: "http://127.0.0.1:11434/api/tags".into(),
+                response: Ok(tags),
+            },
+            ExpectedRequest::Get {
+                url: "http://127.0.0.1:11434/api/ps".into(),
+                response: Ok(loaded),
+            },
+        ]
+    }
+
+    #[test]
+    fn preflight_returns_exact_version_and_digest_for_controlled_inventory() {
+        let candidate = identity();
+        for loaded in [
+            json!({"models": []}),
+            json!({"models": [{"name": candidate.model_id, "model": candidate.model_id}]}),
+        ] {
+            let fixtures = preflight_fixtures(
+                json!({"version": candidate.provider_version}),
+                valid_tags(&candidate),
+                loaded,
+            );
+            let (transport, expected) = fake_transport(fixtures);
+
+            let result = OllamaAdapter::preflight_with_transport(
+                "http://127.0.0.1:11434/",
+                &candidate.model_id,
+                transport,
+            );
+
+            assert_eq!(
+                result,
+                Ok(super::OllamaPreflight {
+                    provider_version: candidate.provider_version.clone(),
+                    artifact_digest: candidate.artifact_digest.clone(),
+                })
+            );
+            assert_fixtures_consumed(&expected);
+        }
+    }
+
+    #[test]
+    fn preflight_rejects_invalid_identity_or_uncontrolled_loaded_models() {
+        let candidate = identity();
+        let invalid_cases = [
+            (
+                json!({"version": ""}),
+                valid_tags(&candidate),
+                json!({"models": []}),
+            ),
+            (
+                json!({"version": "0.9.1"}),
+                json!({"models": []}),
+                json!({"models": []}),
+            ),
+            (
+                json!({"version": "0.9.1"}),
+                json!({"models": [
+                    {"name": candidate.model_id, "digest": candidate.artifact_digest},
+                    {"name": candidate.model_id, "digest": candidate.artifact_digest}
+                ]}),
+                json!({"models": []}),
+            ),
+            (
+                json!({"version": "0.9.1"}),
+                json!({"models": [{"name": candidate.model_id, "digest": "not-a-digest"}]}),
+                json!({"models": []}),
+            ),
+            (
+                json!({"version": "0.9.1"}),
+                valid_tags(&candidate),
+                json!({"models": [{"name": "other:latest", "model": "other:latest"}]}),
+            ),
+        ];
+
+        for (version, tags, loaded) in invalid_cases {
+            let (transport, expected) = fake_transport(preflight_fixtures(version, tags, loaded));
+            assert!(OllamaAdapter::preflight_with_transport(
+                "http://127.0.0.1:11434",
+                &candidate.model_id,
+                transport,
+            )
+            .is_err());
+            assert_fixtures_consumed(&expected);
+        }
     }
 
     #[test]
