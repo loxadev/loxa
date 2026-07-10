@@ -547,6 +547,16 @@ pub struct SpawnedServer {
     initialization_error: Option<SupervisorError>,
 }
 
+pub(super) struct PreparedManagedCommand {
+    command: Command,
+    writer: Arc<Mutex<BoundedLogWriter>>,
+}
+
+pub(super) struct RawSpawnedServer {
+    child: Option<Child>,
+    writer: Option<Arc<Mutex<BoundedLogWriter>>>,
+}
+
 impl SpawnedServer {
     fn from_spawned_child(child: Child) -> Self {
         #[cfg(unix)]
@@ -714,34 +724,102 @@ impl LogDrainingChild for SpawnedServer {
     }
 }
 
-pub(super) fn spawn_managed_command(
+#[cfg(test)]
+pub(super) fn spawn_managed_command<B>(
     command: Command,
     writer: Arc<Mutex<BoundedLogWriter>>,
-) -> Result<SpawnedServer, SupervisorError> {
-    spawn_managed_command_with(command, writer, |reader, writer| {
+    before_spawn: B,
+) -> Result<SpawnedServer, SupervisorError>
+where
+    B: FnOnce() -> Result<(), SupervisorError>,
+{
+    spawn_managed_command_with(command, writer, before_spawn, |reader, writer| {
         spawn_log_drain(reader, writer)
     })
 }
 
-fn spawn_managed_command_with<F>(
+pub(super) fn prepare_managed_command(
     mut command: Command,
     writer: Arc<Mutex<BoundedLogWriter>>,
+) -> PreparedManagedCommand {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(unix)]
+    command.process_group(0);
+
+    PreparedManagedCommand { command, writer }
+}
+
+impl PreparedManagedCommand {
+    pub(super) fn spawn_raw<B>(
+        mut self,
+        before_spawn: B,
+    ) -> Result<RawSpawnedServer, SupervisorError>
+    where
+        B: FnOnce() -> Result<(), SupervisorError>,
+    {
+        before_spawn()?;
+        let child = self.command.spawn()?;
+        Ok(RawSpawnedServer {
+            child: Some(child),
+            writer: Some(self.writer),
+        })
+    }
+}
+
+impl RawSpawnedServer {
+    pub(super) fn finish(self) -> SpawnedServer {
+        self.finish_with(spawn_log_drain)
+    }
+
+    fn finish_with<F>(mut self, spawn: F) -> SpawnedServer
+    where
+        F: FnMut(
+            Box<dyn Read + Send>,
+            Arc<Mutex<BoundedLogWriter>>,
+        ) -> io::Result<JoinHandle<io::Result<()>>>,
+    {
+        let writer = self.writer.take().expect("raw spawn writer is retained");
+        let child = self.child.take().expect("raw spawn child is retained");
+        let mut spawned = SpawnedServer::from_spawned_child(child);
+        let initialization = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            spawned.initialize_log_drains_with(writer, spawn);
+        }));
+        if let Err(payload) = initialization {
+            let _ = teardown_managed_child_result(&mut spawned);
+            std::panic::resume_unwind(payload);
+        }
+        spawned
+    }
+}
+
+impl Drop for RawSpawnedServer {
+    fn drop(&mut self) {
+        let Some(child) = self.child.take() else {
+            return;
+        };
+
+        let mut spawned = SpawnedServer::from_spawned_child(child);
+        let _ = teardown_managed_child_result(&mut spawned);
+    }
+}
+
+#[cfg(test)]
+fn spawn_managed_command_with<B, F>(
+    command: Command,
+    writer: Arc<Mutex<BoundedLogWriter>>,
+    before_spawn: B,
     spawn: F,
 ) -> Result<SpawnedServer, SupervisorError>
 where
+    B: FnOnce() -> Result<(), SupervisorError>,
     F: FnMut(
         Box<dyn Read + Send>,
         Arc<Mutex<BoundedLogWriter>>,
     ) -> io::Result<JoinHandle<io::Result<()>>>,
 {
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    #[cfg(unix)]
-    command.process_group(0);
-
-    let child = command.spawn()?;
-    let mut spawned = SpawnedServer::from_spawned_child(child);
-    spawned.initialize_log_drains_with(writer, spawn);
-    Ok(spawned)
+    let prepared = prepare_managed_command(command, writer);
+    let raw = prepared.spawn_raw(before_spawn)?;
+    Ok(raw.finish_with(spawn))
 }
 
 pub(super) fn spawn_log_drain<R>(
@@ -832,6 +910,34 @@ mod tests {
         assert_eq!(FakeChild.owned_pgid(), None);
     }
 
+    #[test]
+    fn fallible_pre_spawn_callback_is_the_last_gate_before_os_spawn() {
+        let temp = tempdir().expect("tempdir");
+        let marker = temp.path().join("os-spawn-reached");
+        let writer = Arc::new(Mutex::new(BoundedLogWriter {
+            file: File::create(temp.path().join("spawn-gate.log")).expect("create log"),
+            remaining: MAX_LOG_BYTES,
+            truncated: false,
+        }));
+        let mut command = Command::new("/usr/bin/touch");
+        command.arg(&marker);
+        let gate_calls = Cell::new(0_u8);
+
+        let error = match spawn_managed_command(command, writer, || {
+            gate_calls.set(gate_calls.get() + 1);
+            Err(SupervisorError::RunStateConflict(
+                "injected pre-spawn rejection".to_string(),
+            ))
+        }) {
+            Ok(_) => panic!("pre-spawn rejection must prevent OS spawn"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, SupervisorError::RunStateConflict(_)));
+        assert_eq!(gate_calls.get(), 1);
+        assert!(!marker.exists(), "OS spawn must not run after gate failure");
+    }
+
     #[cfg(unix)]
     #[test]
     fn managed_spawn_creates_and_retains_the_child_owned_process_group() {
@@ -849,7 +955,8 @@ mod tests {
         let mut command = Command::new("/bin/sleep");
         command.arg("30");
 
-        let mut spawned = spawn_managed_command(command, writer).expect("spawn managed child");
+        let mut spawned =
+            spawn_managed_command(command, writer, || Ok(())).expect("spawn managed child");
         let pid = spawned.pid();
         let pgid = spawned.owned_pgid().expect("owned process group");
         let pid = std::ffi::c_int::try_from(pid).expect("test pid fits c_int");
@@ -875,12 +982,17 @@ mod tests {
         let mut command = Command::new("/bin/sleep");
         command.arg("30");
         let drain_spawn_calls = Cell::new(0_u8);
-        let mut spawned = spawn_managed_command_with(command, writer, |_, _| {
-            drain_spawn_calls.set(drain_spawn_calls.get() + 1);
-            Err(io::Error::other(
-                "injected log-drain thread creation failure",
-            ))
-        })
+        let mut spawned = spawn_managed_command_with(
+            command,
+            writer,
+            || Ok(()),
+            |_, _| {
+                drain_spawn_calls.set(drain_spawn_calls.get() + 1);
+                Err(io::Error::other(
+                    "injected log-drain thread creation failure",
+                ))
+            },
+        )
         .expect("OS spawn still returns the owned child");
         let pid = spawned.pid();
 
@@ -931,6 +1043,141 @@ mod tests {
 
         assert_eq!(calls.get(), 1);
         assert_eq!(result.confirmation, TeardownConfirmation::Confirmed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn panic_during_post_spawn_wrapping_kills_the_owned_group_and_reaps_the_child() {
+        unsafe extern "C" {
+            fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
+        }
+
+        let temp = tempdir().expect("tempdir");
+        let writer = Arc::new(Mutex::new(BoundedLogWriter {
+            file: File::create(temp.path().join("wrapping-panic.log")).expect("create log"),
+            remaining: MAX_LOG_BYTES,
+            truncated: false,
+        }));
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        let raw = prepare_managed_command(command, writer)
+            .spawn_raw(|| Ok(()))
+            .expect("raw OS spawn");
+        let pid =
+            c_int::try_from(raw.child.as_ref().expect("raw child").id()).expect("pid fits c_int");
+        let group = OwnedProcessGroup::try_from_raw(i64::from(pid)).expect("owned process group");
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = raw.finish_with(|_, _| -> io::Result<JoinHandle<io::Result<()>>> {
+                panic!("injected post-spawn wrapping panic")
+            });
+        }));
+        let mut adapter = UnixProcessGroupControl;
+        let absent_after_unwind = matches!(
+            adapter.signal_group(group, GroupSignal::Probe),
+            Err(ref error) if error.raw_os_error() == Some(3)
+        );
+        if !absent_after_unwind {
+            let _ = adapter.signal_group(group, GroupSignal::Kill);
+            let mut status = 0;
+            assert_eq!(unsafe { waitpid(pid, &mut status, 0) }, pid);
+        }
+
+        assert!(panic.is_err(), "injected wrapping panic must propagate");
+        assert!(
+            absent_after_unwind,
+            "post-spawn wrapping panic must not leak the owned process group"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_raw_spawn_ownership_kills_the_owned_group_and_reaps_the_child() {
+        unsafe extern "C" {
+            fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
+        }
+
+        let temp = tempdir().expect("tempdir");
+        let writer = Arc::new(Mutex::new(BoundedLogWriter {
+            file: File::create(temp.path().join("raw-drop.log")).expect("create log"),
+            remaining: MAX_LOG_BYTES,
+            truncated: false,
+        }));
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        let raw = prepare_managed_command(command, writer)
+            .spawn_raw(|| Ok(()))
+            .expect("raw OS spawn");
+        let pid =
+            c_int::try_from(raw.child.as_ref().expect("raw child").id()).expect("pid fits c_int");
+        let group = OwnedProcessGroup::try_from_raw(i64::from(pid)).expect("owned process group");
+
+        drop(raw);
+
+        let mut adapter = UnixProcessGroupControl;
+        let absent_after_drop = matches!(
+            adapter.signal_group(group, GroupSignal::Probe),
+            Err(ref error) if error.raw_os_error() == Some(3)
+        );
+        let mut status = 0;
+        let wait_after_drop = unsafe { waitpid(pid, &mut status, 1) };
+        let reaped_after_drop =
+            wait_after_drop == -1 && io::Error::last_os_error().raw_os_error() == Some(10);
+        if !absent_after_drop {
+            let _ = adapter.signal_group(group, GroupSignal::Kill);
+        }
+        if !reaped_after_drop {
+            assert_eq!(unsafe { waitpid(pid, &mut status, 0) }, pid);
+        }
+
+        assert!(
+            absent_after_drop,
+            "dropping raw spawn ownership must not leak the process group"
+        );
+        assert!(
+            reaped_after_drop,
+            "dropping raw spawn ownership must reap the direct child"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_drop_uses_the_bounded_owned_group_teardown_graceful_phase() {
+        let temp = tempdir().expect("tempdir");
+        let ready_path = temp.path().join("raw-drop-ready");
+        let term_path = temp.path().join("raw-drop-term");
+        let writer = Arc::new(Mutex::new(BoundedLogWriter {
+            file: File::create(temp.path().join("raw-drop-bounded.log")).expect("create log"),
+            remaining: MAX_LOG_BYTES,
+            truncated: false,
+        }));
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(
+                "trap 'printf term > \"$LOXA_TERM_MARKER\"; exit 0' TERM; \
+                 printf ready > \"$LOXA_READY_MARKER\"; while :; do sleep 1; done",
+            )
+            .env("LOXA_READY_MARKER", &ready_path)
+            .env("LOXA_TERM_MARKER", &term_path);
+        let raw = prepare_managed_command(command, writer)
+            .spawn_raw(|| Ok(()))
+            .expect("raw OS spawn");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !ready_path.is_file() {
+            assert!(
+                Instant::now() < deadline,
+                "helper did not publish readiness"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        drop(raw);
+
+        assert!(
+            term_path.is_file(),
+            "raw Drop must enter the existing bounded TERM-first teardown path"
+        );
     }
 
     #[cfg(unix)]
@@ -1651,7 +1898,8 @@ mod tests {
         }));
         let mut command = Command::new("/bin/sleep");
         command.arg("30");
-        let mut spawned = spawn_managed_command(command, writer).expect("spawn managed child");
+        let mut spawned =
+            spawn_managed_command(command, writer, || Ok(())).expect("spawn managed child");
         let group = OwnedProcessGroup::try_from_raw(i64::from(
             spawned.owned_pgid().expect("owned process group"),
         ))
