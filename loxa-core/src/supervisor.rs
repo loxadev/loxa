@@ -6,7 +6,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -23,8 +23,8 @@ pub use readiness::{reserve_localhost_port, LocalhostPortReservation};
 
 pub use lifecycle::{
     decide_observed_child_exit, finish_childless_runtime_state_run, finish_owner_teardown_with,
-    prepare_starting_run_for_spawn, ChildlessFinishOutcome, InterruptStatus, ObservedChildExit,
-    OwnerTeardownDecision, OwnerTerminalOutcome, PostSpawnCleanupOutcome, PreSpawnDecision,
+    ChildlessFinishOutcome, InterruptStatus, ObservedChildExit, OwnerTeardownDecision,
+    OwnerTerminalOutcome, PostSpawnCleanupOutcome, SpawnStartingRunOutcome,
 };
 pub use state::{
     create_starting_run, current_runtime_state_run, finish_runtime_state_run, read_runtime_state,
@@ -34,12 +34,22 @@ pub use state::{
     RUNTIME_STATE_SCHEMA_VERSION,
 };
 use state::{record_stop_request, stable_run_is_present, StopRequestMatch};
+use teardown::prepare_managed_command;
 #[cfg(test)]
-use teardown::spawn_log_drain;
 use teardown::spawn_managed_command;
 pub use teardown::{
     teardown_managed_child, LogDrainingChild, ManagedChild, SpawnedServer, TeardownConfirmation,
 };
+
+struct PreparedLlamaServerSpawn {
+    prepared: teardown::PreparedManagedCommand,
+    reservation: LocalhostPortReservation,
+    expected_port: u16,
+}
+
+struct RawLlamaServerSpawn {
+    raw: teardown::RawSpawnedServer,
+}
 
 pub const DEFAULT_CTX_TOKENS: u32 = 8_192;
 pub const CTRL_C_GRACE_PERIOD: Duration = Duration::from_secs(5);
@@ -301,25 +311,6 @@ pub fn resolve_model_path(
     }
 }
 
-pub fn build_server_spec(
-    id: &str,
-    models_dir: &Path,
-    requested_port: Option<u16>,
-    requested_ctx: Option<u32>,
-) -> Result<ServerSpec<'static>, SupervisorError> {
-    let (entry, model_path) = resolve_model_path(id, models_dir)?;
-    let llama_server_path = detect_llama_server()?;
-    let port = choose_localhost_port(requested_port)?;
-
-    Ok(ServerSpec {
-        entry,
-        model_path,
-        llama_server_path,
-        port,
-        ctx_tokens: requested_ctx.unwrap_or(DEFAULT_CTX_TOKENS),
-    })
-}
-
 pub fn detect_llama_server() -> Result<PathBuf, SupervisorError> {
     if let Some(path) = env::var_os("LOXA_LLAMA_SERVER").filter(|value| !value.is_empty()) {
         let path = PathBuf::from(path);
@@ -362,17 +353,6 @@ pub fn llama_server_version(path: &Path) -> Result<String, SupervisorError> {
     let _ = child.kill();
     let _ = child.wait();
     Err(SupervisorError::LlamaServerVersionTimeout)
-}
-
-pub fn choose_localhost_port(requested: Option<u16>) -> Result<u16, SupervisorError> {
-    let address = SocketAddr::from(([127, 0, 0, 1], requested.unwrap_or(0)));
-    let listener = TcpListener::bind(address).map_err(|_| SupervisorError::NoFreePort)?;
-    let port = listener
-        .local_addr()
-        .map_err(|_| SupervisorError::NoFreePort)?
-        .port();
-    drop(listener);
-    Ok(port)
 }
 
 pub fn log_file_path(id: &str, port: u16, started_at_unix_s: u64) -> PathBuf {
@@ -614,14 +594,80 @@ where
     )
 }
 
-pub fn spawn_llama_server(
+/// Spawns one validated childless managed generation through the complete boundary.
+///
+/// The lower-level arbitrary-closure transaction is intentionally crate-private:
+///
+/// ```compile_fail
+/// use loxa_core::supervisor::spawn_starting_run_with;
+/// ```
+pub fn spawn_starting_llama_server(
+    state_path: &Path,
+    expected: &ManagedRunIdentity,
     spec: &ServerSpec<'_>,
     log_path: &Path,
-) -> Result<SpawnedServer, SupervisorError> {
+    reservation: LocalhostPortReservation,
+) -> Result<SpawnStartingRunOutcome<SpawnedServer>, SupervisorError> {
+    spawn_starting_llama_server_with_hooks(
+        state_path,
+        expected,
+        spec,
+        log_path,
+        reservation,
+        || {},
+        || {},
+        || {},
+        || {},
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_starting_llama_server_with_hooks<L, B, A, D>(
+    state_path: &Path,
+    expected: &ManagedRunIdentity,
+    spec: &ServerSpec<'_>,
+    log_path: &Path,
+    reservation: LocalhostPortReservation,
+    before_log_open: L,
+    before_reservation_release: B,
+    after_os_spawn: A,
+    after_log_drain_setup: D,
+) -> Result<SpawnStartingRunOutcome<SpawnedServer>, SupervisorError>
+where
+    L: FnOnce(),
+    B: FnOnce(),
+    A: FnOnce(),
+    D: FnOnce(),
+{
+    let prepared =
+        prepare_llama_server_spawn_with_hook(spec, log_path, reservation, before_log_open)?;
+    match lifecycle::spawn_starting_run_with(state_path, expected, || {
+        prepared.spawn_raw_with_hooks(before_reservation_release, after_os_spawn)
+    })? {
+        SpawnStartingRunOutcome::Spawned { run, value: raw } => {
+            Ok(SpawnStartingRunOutcome::Spawned {
+                run,
+                value: raw.finish_with_hook(after_log_drain_setup),
+            })
+        }
+        SpawnStartingRunOutcome::RequestedStop => Ok(SpawnStartingRunOutcome::RequestedStop),
+    }
+}
+
+fn prepare_llama_server_spawn_with_hook<F>(
+    spec: &ServerSpec<'_>,
+    log_path: &Path,
+    reservation: LocalhostPortReservation,
+    before_log_open: F,
+) -> Result<PreparedLlamaServerSpawn, SupervisorError>
+where
+    F: FnOnce(),
+{
     if let Some(parent) = log_path.parent() {
         fs::create_dir_all(parent)?;
     }
 
+    before_log_open();
     let log_file = OpenOptions::new()
         .create(true)
         .write(true)
@@ -639,59 +685,51 @@ pub fn spawn_llama_server(
         truncated: false,
     }));
 
-    spawn_managed_command(command, writer)
+    Ok(PreparedLlamaServerSpawn {
+        prepared: prepare_managed_command(command, writer),
+        reservation,
+        expected_port: spec.port,
+    })
 }
 
-pub fn wait_for_health(
-    port: u16,
-    timeout: Duration,
-    interval: Duration,
-) -> Result<(), SupervisorError> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(health_request_timeout(timeout, interval))
-        .build()?;
-    let started = Instant::now();
-
-    while started.elapsed() < timeout {
-        if server_ready(&client, port) {
-            return Ok(());
-        }
-
-        thread::sleep(interval);
+impl PreparedLlamaServerSpawn {
+    fn spawn_raw_with_hooks<B, A>(
+        self,
+        before_reservation_release: B,
+        after_os_spawn: A,
+    ) -> Result<RawLlamaServerSpawn, SupervisorError>
+    where
+        B: FnOnce(),
+        A: FnOnce(),
+    {
+        let Self {
+            prepared,
+            reservation,
+            expected_port,
+        } = self;
+        let raw = prepared.spawn_raw(move || {
+            before_reservation_release();
+            reservation.release_for(expected_port)
+        })?;
+        after_os_spawn();
+        Ok(RawLlamaServerSpawn { raw })
     }
-
-    Err(SupervisorError::HealthTimeout)
 }
 
-pub fn wait_for_health_or_exit<C: ManagedChild>(
-    child: &mut C,
-    port: u16,
-    _log_path: &Path,
-    timeout: Duration,
-    interval: Duration,
-) -> Result<(), SupervisorError> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(health_request_timeout(timeout, interval))
-        .build()?;
-    let started = Instant::now();
-
-    while started.elapsed() < timeout {
-        if server_ready(&client, port) {
-            return Ok(());
-        }
-
-        if child.try_wait()?.is_some() {
-            return Err(SupervisorError::ChildExitedEarly(String::new()));
-        }
-
-        thread::sleep(interval);
+impl RawLlamaServerSpawn {
+    fn finish(self) -> SpawnedServer {
+        self.raw.finish()
     }
 
-    if child.try_wait()?.is_some() {
-        return Err(SupervisorError::ChildExitedEarly(String::new()));
+    fn finish_with_hook(self, after_log_drain_setup: impl FnOnce()) -> SpawnedServer {
+        let mut spawned = self.finish();
+        let hook = std::panic::catch_unwind(std::panic::AssertUnwindSafe(after_log_drain_setup));
+        if let Err(payload) = hook {
+            let _ = teardown::teardown_managed_child_result(&mut spawned);
+            std::panic::resume_unwind(payload);
+        }
+        spawned
     }
-
-    Err(SupervisorError::HealthTimeout)
 }
 
 pub fn read_log_tail(path: &Path, max_bytes: usize) -> Result<String, SupervisorError> {
@@ -725,50 +763,6 @@ pub fn cleanup_after_ctrl_c<C: ManagedChild + LogDrainingChild>(
         forced: result.forced,
         removed_state,
     })
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HealthEndpointProbe {
-    Healthy,
-    Unsupported,
-    NotReady,
-}
-
-fn server_ready(client: &reqwest::blocking::Client, port: u16) -> bool {
-    match probe_health_endpoint(client, port) {
-        HealthEndpointProbe::Healthy => true,
-        HealthEndpointProbe::Unsupported => endpoint_healthy(client, port, "/v1/models"),
-        HealthEndpointProbe::NotReady => false,
-    }
-}
-
-fn probe_health_endpoint(client: &reqwest::blocking::Client, port: u16) -> HealthEndpointProbe {
-    let url = format!("http://127.0.0.1:{port}/health");
-    match client.get(url).send() {
-        Ok(response) if response.status().is_success() => HealthEndpointProbe::Healthy,
-        Ok(response) if health_endpoint_unsupported(response.status()) => {
-            HealthEndpointProbe::Unsupported
-        }
-        Ok(_) | Err(_) => HealthEndpointProbe::NotReady,
-    }
-}
-
-fn health_endpoint_unsupported(status: reqwest::StatusCode) -> bool {
-    matches!(status.as_u16(), 404 | 405 | 501)
-}
-
-fn endpoint_healthy(client: &reqwest::blocking::Client, port: u16, path: &str) -> bool {
-    let url = format!("http://127.0.0.1:{port}{path}");
-    client
-        .get(url)
-        .send()
-        .map(|response| response.status().is_success())
-        .unwrap_or(false)
-}
-
-fn health_request_timeout(timeout: Duration, interval: Duration) -> Duration {
-    let timeout = timeout.min(interval).min(Duration::from_secs(1));
-    timeout.max(Duration::from_millis(1))
 }
 
 fn read_child_output(child: &mut Child) -> io::Result<String> {
@@ -1000,9 +994,8 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::fs;
-    use std::io::{Read, Write};
-    use std::net::{TcpListener, TcpStream};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::io::Write;
+    use std::net::TcpListener;
     use tempfile::tempdir;
 
     fn managed_run_for(server: &ManagedServer) -> ManagedRun {
@@ -1359,7 +1352,7 @@ mod tests {
     }
 
     #[test]
-    fn attachment_identity_failure_after_committed_stop_returns_requested_stop_after_one_cleanup() {
+    fn process_identity_persistent_child_miss_after_committed_stop_uses_one_unified_teardown() {
         let temp = tempdir().expect("tempdir");
         let state_path = temp.path().join("managed.json");
         let starting = childless_starting_run(temp.path(), "run-1");
@@ -1424,7 +1417,8 @@ mod tests {
         }));
         let mut command = Command::new(std::env::current_exe().expect("current test binary"));
         command.arg("--exact").arg("__loxa_gate3_no_test_matches__");
-        let mut child = spawn_managed_command(command, writer).expect("spawn owned group child");
+        let mut child =
+            spawn_managed_command(command, writer, || Ok(())).expect("spawn owned group child");
         let server = ManagedServer {
             id: starting.model_id.clone(),
             pid: child.pid(),
@@ -1637,241 +1631,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn wait_for_health_or_exit_reports_reaped_child_without_preteardown_drain_or_tail_read() {
-        let temp = tempdir().expect("tempdir");
-        let log_path = temp.path().join("captured.log");
-        let log_file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&log_path)
-            .expect("create log");
-        let writer = Arc::new(Mutex::new(BoundedLogWriter {
-            file: log_file,
-            remaining: MAX_LOG_BYTES,
-            truncated: false,
-        }));
-        let handle = spawn_log_drain(
-            DelayedReader::new(b"startup panic\n".to_vec(), Duration::from_millis(5)),
-            writer,
-        )
-        .expect("spawn startup log drain");
-        let mut child = FakeSpawnedServer::new(vec![handle]);
-
-        let error = wait_for_health_or_exit(
-            &mut child,
-            65_530,
-            &log_path,
-            Duration::from_millis(10),
-            Duration::from_millis(1),
-        )
-        .expect_err("expected child exit");
-
-        match error {
-            SupervisorError::ChildExitedEarly(message) => {
-                assert!(message.is_empty());
-                assert_eq!(child.log_drains.len(), 1);
-            }
-            other => panic!("unexpected error: {other}"),
-        }
-    }
-
-    #[test]
-    fn wait_for_health_keeps_polling_when_health_is_unhealthy() {
-        let server = TestHttpServer::spawn(vec![
-            ("/health", TestHttpAction::Status(503)),
-            ("/v1/models", TestHttpAction::Status(200)),
-        ]);
-
-        let result = wait_for_health(
-            server.port(),
-            Duration::from_millis(80),
-            Duration::from_millis(10),
-        );
-
-        assert!(
-            matches!(result, Err(SupervisorError::HealthTimeout)),
-            "unexpected result: {result:?}; requests: {:?}",
-            server.requests()
-        );
-        assert!(!server.requests().iter().any(|path| path == "/v1/models"));
-    }
-
-    #[test]
-    fn wait_for_health_keeps_polling_when_health_connection_fails() {
-        let server = TestHttpServer::spawn(vec![
-            ("/health", TestHttpAction::Close),
-            ("/v1/models", TestHttpAction::Status(200)),
-        ]);
-
-        let error = wait_for_health(
-            server.port(),
-            Duration::from_millis(80),
-            Duration::from_millis(10),
-        )
-        .expect_err("expected failed /health connection to keep polling");
-
-        assert!(matches!(error, SupervisorError::HealthTimeout));
-        assert!(!server.requests().iter().any(|path| path == "/v1/models"));
-    }
-
-    #[test]
-    fn wait_for_health_falls_back_to_models_when_health_is_unsupported() {
-        let server = TestHttpServer::spawn(vec![
-            ("/health", TestHttpAction::Status(404)),
-            ("/v1/models", TestHttpAction::Status(200)),
-        ]);
-
-        wait_for_health(
-            server.port(),
-            Duration::from_millis(80),
-            Duration::from_millis(10),
-        )
-        .expect("expected unsupported /health to fall back to models");
-
-        let requests = server.requests();
-        assert!(requests.iter().any(|path| path == "/health"));
-        assert!(requests.iter().any(|path| path == "/v1/models"));
-    }
-
-    #[test]
-    fn wait_for_health_or_exit_keeps_polling_when_health_is_unhealthy() {
-        let temp = tempdir().expect("tempdir");
-        let log_path = temp.path().join("captured.log");
-        let mut child = FakeChild::with_wait_results(vec![None]);
-        let server = TestHttpServer::spawn(vec![
-            ("/health", TestHttpAction::Status(503)),
-            ("/v1/models", TestHttpAction::Status(200)),
-        ]);
-
-        let error = wait_for_health_or_exit(
-            &mut child,
-            server.port(),
-            &log_path,
-            Duration::from_millis(80),
-            Duration::from_millis(10),
-        )
-        .expect_err("expected unhealthy /health to keep polling");
-
-        assert!(matches!(error, SupervisorError::HealthTimeout));
-        assert!(!server.requests().iter().any(|path| path == "/v1/models"));
-        assert!(child.events.contains(&"try_wait"));
-    }
-
-    #[derive(Clone, Copy)]
-    enum TestHttpAction {
-        Status(u16),
-        Close,
-    }
-
-    struct TestHttpServer {
-        port: u16,
-        requests: Arc<Mutex<Vec<String>>>,
-        stop: Arc<AtomicBool>,
-        handle: Option<thread::JoinHandle<()>>,
-    }
-
-    impl TestHttpServer {
-        fn spawn(routes: Vec<(&'static str, TestHttpAction)>) -> Self {
-            let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind test server");
-            let port = listener.local_addr().expect("local addr").port();
-            listener
-                .set_nonblocking(true)
-                .expect("set test server nonblocking");
-            let requests = Arc::new(Mutex::new(Vec::new()));
-            let stop = Arc::new(AtomicBool::new(false));
-            let server_requests = Arc::clone(&requests);
-            let server_stop = Arc::clone(&stop);
-
-            let handle = thread::spawn(move || {
-                while !server_stop.load(Ordering::SeqCst) {
-                    match listener.accept() {
-                        Ok((mut stream, _addr)) => {
-                            let path = read_request_path(&mut stream);
-                            server_requests
-                                .lock()
-                                .expect("lock requests")
-                                .push(path.clone());
-                            let action = routes
-                                .iter()
-                                .find(|(route, _action)| *route == path)
-                                .map(|(_route, action)| *action)
-                                .unwrap_or(TestHttpAction::Close);
-                            respond_to_test_request(&mut stream, action);
-                        }
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                            thread::sleep(Duration::from_millis(1));
-                        }
-                        Err(_) => break,
-                    }
-                }
-            });
-
-            Self {
-                port,
-                requests,
-                stop,
-                handle: Some(handle),
-            }
-        }
-
-        fn port(&self) -> u16 {
-            self.port
-        }
-
-        fn requests(&self) -> Vec<String> {
-            self.requests.lock().expect("lock requests").clone()
-        }
-    }
-
-    impl Drop for TestHttpServer {
-        fn drop(&mut self) {
-            self.stop.store(true, Ordering::SeqCst);
-            let _ = TcpStream::connect(("127.0.0.1", self.port));
-            if let Some(handle) = self.handle.take() {
-                let _ = handle.join();
-            }
-        }
-    }
-
-    fn read_request_path(stream: &mut TcpStream) -> String {
-        let mut buffer = [0_u8; 1024];
-        let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
-        let read = stream.read(&mut buffer).unwrap_or(0);
-        let request = String::from_utf8_lossy(&buffer[..read]);
-
-        request
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .unwrap_or_default()
-            .to_string()
-    }
-
-    fn respond_to_test_request(stream: &mut TcpStream, action: TestHttpAction) {
-        let TestHttpAction::Status(status) = action else {
-            return;
-        };
-        let reason = match status {
-            200 => "OK",
-            404 => "Not Found",
-            405 => "Method Not Allowed",
-            501 => "Not Implemented",
-            503 => "Service Unavailable",
-            _ => "Test Status",
-        };
-        let body = if status == 200 { "{}" } else { "" };
-        let response = format!(
-            "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-
-        stream
-            .write_all(response.as_bytes())
-            .expect("write test response");
-    }
-
     struct FakeChild {
         events: Vec<&'static str>,
         wait_results: Vec<Option<i32>>,
@@ -2051,42 +1810,6 @@ mod tests {
 
         fn process_start_time(&self, _pid: u32) -> Option<u64> {
             Self::next_start_time(&self.process_start_times)
-        }
-    }
-
-    struct DelayedReader {
-        bytes: Vec<u8>,
-        delay: Duration,
-        offset: usize,
-        slept: bool,
-    }
-
-    impl DelayedReader {
-        fn new(bytes: Vec<u8>, delay: Duration) -> Self {
-            Self {
-                bytes,
-                delay,
-                offset: 0,
-                slept: false,
-            }
-        }
-    }
-
-    impl Read for DelayedReader {
-        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-            if !self.slept {
-                thread::sleep(self.delay);
-                self.slept = true;
-            }
-            if self.offset >= self.bytes.len() {
-                return Ok(0);
-            }
-
-            let remaining = &self.bytes[self.offset..];
-            let read = remaining.len().min(buffer.len());
-            buffer[..read].copy_from_slice(&remaining[..read]);
-            self.offset += read;
-            Ok(read)
         }
     }
 }
