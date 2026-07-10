@@ -72,6 +72,16 @@ impl ProviderAdapter for LlamaAdapter {
         &mut self,
         request: &InvocationRequest,
     ) -> Result<InvocationObservation, ProviderError> {
+        if self.identity.sampling.temperature_milli != 0
+            || self.identity.sampling.top_p_milli != 1000
+            || self.identity.sampling.seed != 1
+        {
+            return Err(ProviderError::Identity(
+                "llama invocation requires deterministic sampling: temperature=0, top_p=1, seed=1"
+                    .into(),
+            ));
+        }
+
         let messages = request
             .messages
             .iter()
@@ -96,9 +106,9 @@ impl ProviderAdapter for LlamaAdapter {
             "messages": messages,
             "tools": tools,
             "max_tokens": request.max_tokens,
-            "temperature": f64::from(self.identity.sampling.temperature_milli) / 1000.0,
-            "top_p": f64::from(self.identity.sampling.top_p_milli) / 1000.0,
-            "seed": self.identity.sampling.seed,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "seed": 1,
             "stream": true,
             "stream_options": {"include_usage": true}
         });
@@ -168,18 +178,26 @@ fn normalize_events(events: Vec<TimedJsonEvent>) -> Result<InvocationObservation
         }
 
         if let Some(usage) = event.value.get("usage") {
-            prompt_tokens = usage.get("prompt_tokens").and_then(Value::as_u64);
-            completion_tokens = usage.get("completion_tokens").and_then(Value::as_u64);
+            if let Some(value) = usage.get("prompt_tokens").and_then(Value::as_u64) {
+                prompt_tokens = Some(value);
+            }
+            if let Some(value) = usage.get("completion_tokens").and_then(Value::as_u64) {
+                completion_tokens = Some(value);
+            }
         }
         if let Some(timings) = event.value.get("timings") {
-            prompt_rate = rate_per_second(
+            if let Some(value) = rate_per_second(
                 timings.get("prompt_n").and_then(Value::as_f64),
                 timings.get("prompt_ms").and_then(Value::as_f64),
-            );
-            decode_rate = rate_per_second(
+            ) {
+                prompt_rate = Some(value);
+            }
+            if let Some(value) = rate_per_second(
                 timings.get("predicted_n").and_then(Value::as_f64),
                 timings.get("predicted_ms").and_then(Value::as_f64),
-            );
+            ) {
+                decode_rate = Some(value);
+            }
         }
     }
 
@@ -510,6 +528,63 @@ mod tests {
         assert_eq!(observation.decode_rate, Some(100.0));
         assert_eq!(observation.raw_events, raw_events);
         assert_fixtures_consumed(&fixtures);
+    }
+
+    #[test]
+    fn llama_invoke_rejects_nondeterministic_sampling_before_transport() {
+        let mut identities = Vec::new();
+        let mut nonzero_temperature = identity();
+        nonzero_temperature.sampling.temperature_milli = 1;
+        identities.push(nonzero_temperature);
+        let mut reduced_top_p = identity();
+        reduced_top_p.sampling.top_p_milli = 999;
+        identities.push(reduced_top_p);
+        let mut different_seed = identity();
+        different_seed.sampling.seed = 2;
+        identities.push(different_seed);
+
+        for identity in identities {
+            let (transport, fixtures) = fake_transport(vec![]);
+            let mut adapter = LlamaAdapter::with_transport(
+                identity,
+                "http://127.0.0.1:8080",
+                "loxa-run-123-g1",
+                transport,
+            );
+
+            assert!(matches!(
+                adapter.invoke(&weather_request()),
+                Err(ProviderError::Identity(message)) if message.contains("deterministic sampling")
+            ));
+            assert_fixtures_consumed(&fixtures);
+        }
+    }
+
+    #[test]
+    fn llama_chat_translation_preserves_split_usage_and_timing_fields() {
+        let events = vec![
+            TimedJsonEvent::new(
+                10,
+                json!({
+                    "usage": {"prompt_tokens": 20},
+                    "timings": {"prompt_n": 20, "prompt_ms": 40.0}
+                }),
+            ),
+            TimedJsonEvent::new(
+                20,
+                json!({
+                    "usage": {"completion_tokens": 8},
+                    "timings": {"predicted_n": 8, "predicted_ms": 80.0}
+                }),
+            ),
+        ];
+
+        let observation = super::normalize_events(events).expect("normalize split timings");
+
+        assert_eq!(observation.prompt_tokens, Some(20));
+        assert_eq!(observation.completion_tokens, Some(8));
+        assert_eq!(observation.prompt_rate, Some(500.0));
+        assert_eq!(observation.decode_rate, Some(100.0));
     }
 
     #[test]
