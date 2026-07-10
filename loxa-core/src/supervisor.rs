@@ -237,24 +237,96 @@ pub struct CleanupResult {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct StopResult {
-    pub was_running: bool,
-    pub forced: bool,
-    pub removed_state: bool,
-    pub pid_alive: bool,
-    pub port_alive: bool,
+pub enum OwnerIdentityStatus {
+    Live,
+    Dead,
+    Unavailable,
+    Mismatched,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RestartPolicy {
-    remaining_restarts: u8,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StopRequestOutcome {
+    NoMatch,
+    Completed {
+        run_id: String,
+        model_id: String,
+    },
+    RecoveryRequired {
+        run_id: String,
+        model_id: String,
+        owner_status: OwnerIdentityStatus,
+    },
+    TimedOut {
+        run_id: String,
+        model_id: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum StopRequestMatch {
+    NoMatch,
+    Requested(ManagedRun),
+}
+
+#[derive(Clone, Copy)]
+struct StopWaitTiming {
+    timeout: Duration,
+    interval: Duration,
+}
+
+impl StopWaitTiming {
+    fn production() -> Self {
+        Self {
+            timeout: STOP_OWNER_WAIT_TIMEOUT,
+            interval: STOP_POLL_INTERVAL,
+        }
+    }
+
+    #[cfg(test)]
+    fn test(timeout: Duration, interval: Duration) -> Self {
+        Self { timeout, interval }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ObservedChildExit {
+    RequestedStop,
     Interrupted,
-    Restart,
-    Crash { log_tail: String },
+    Restart { run: ManagedRun },
+    Exhausted { log_tail: String },
+    RecoveryRequired,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnerTeardownDecision {
+    RequestedStop,
+    Interrupted,
+    UnexpectedExit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TeardownConfirmation {
+    Confirmed,
+    Unconfirmed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnerTerminalOutcome {
+    RequestedStop,
+    Interrupted,
+    RecoveryRequired,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PreSpawnDecision {
+    Spawn(ManagedRun),
+    RequestedStop,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChildlessFinishOutcome {
+    Finished,
+    RequestedStop,
 }
 
 pub trait ManagedChild {
@@ -272,8 +344,10 @@ trait ProcessController {
     fn pid_is_alive(&self, pid: u32) -> bool;
     fn port_is_alive(&self, port: u16) -> bool;
     fn process_start_time(&self, pid: u32) -> Option<u64>;
-    fn terminate(&self, pid: u32) -> io::Result<()>;
-    fn kill(&self, pid: u32) -> io::Result<()>;
+}
+
+trait OwnerIdentityProbe {
+    fn probe(&self, pid: u32, expected_start_time_unix_s: u64) -> OwnerIdentityStatus;
 }
 
 pub trait InterruptStatus {
@@ -281,6 +355,22 @@ pub trait InterruptStatus {
 }
 
 struct SystemProcessController;
+
+struct SystemOwnerIdentityProbe;
+
+impl OwnerIdentityProbe for SystemOwnerIdentityProbe {
+    fn probe(&self, pid: u32, expected_start_time_unix_s: u64) -> OwnerIdentityStatus {
+        if !pid_is_alive(pid) {
+            return OwnerIdentityStatus::Dead;
+        }
+
+        match process_start_time(pid) {
+            Some(actual) if actual == expected_start_time_unix_s => OwnerIdentityStatus::Live,
+            Some(_) => OwnerIdentityStatus::Mismatched,
+            None => OwnerIdentityStatus::Unavailable,
+        }
+    }
+}
 
 impl ProcessController for SystemProcessController {
     fn pid_is_alive(&self, pid: u32) -> bool {
@@ -603,62 +693,546 @@ fn create_starting_run_with_lock_options(
         }
     };
 
-    servers.retain(|existing| existing.identity() != server.identity());
-    servers.push(server);
-    write_runtime_state(path, &servers)
-}
-
-pub fn persist_managed_server_or_cleanup<C>(
-    child: &mut C,
-    state_path: &Path,
-    server: ManagedServer,
-    grace_period: Duration,
-) -> Result<(), SupervisorError>
-where
-    C: ManagedChild + LogDrainingChild,
-{
-    let identity = server.identity();
-    match upsert_runtime_state_entry(state_path, server) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = cleanup_after_ctrl_c(child, state_path, identity, grace_period);
-            let _ = child.join_log_drains();
-            Err(error)
-        }
+    if let Some(existing) = runs.first() {
+        return Err(SupervisorError::ActiveRun(existing.run_id.clone()));
     }
+
+    write_runtime_state(path, std::slice::from_ref(&run))?;
+    Ok(run)
 }
 
-pub fn remove_runtime_state_entry(
+pub fn update_runtime_state_run(
     path: &Path,
-    identity: ManagedServerIdentity,
+    expected: &ManagedRunIdentity,
+    updated: ManagedRun,
 ) -> Result<bool, SupervisorError> {
-    remove_runtime_state_entry_with_lock_options(
+    update_runtime_state_run_with_lock_options(
         path,
-        identity,
+        expected,
+        updated,
         RUNTIME_STATE_LOCK_TIMEOUT,
         RUNTIME_STATE_LOCK_POLL_INTERVAL,
     )
 }
 
-fn remove_runtime_state_entry_with_lock_options(
+pub fn update_runtime_state_run_committed(
     path: &Path,
-    identity: ManagedServerIdentity,
+    expected: &ManagedRunIdentity,
+    updated: ManagedRun,
+) -> Result<Option<ManagedRun>, SupervisorError> {
+    update_runtime_state_run_committed_with_lock_options_and_hook(
+        path,
+        expected,
+        updated,
+        RUNTIME_STATE_LOCK_TIMEOUT,
+        RUNTIME_STATE_LOCK_POLL_INTERVAL,
+        |_| Ok(()),
+    )
+}
+
+fn update_runtime_state_run_with_lock_options(
+    path: &Path,
+    expected: &ManagedRunIdentity,
+    updated: ManagedRun,
     timeout: Duration,
     interval: Duration,
 ) -> Result<bool, SupervisorError> {
-    let _lock = RuntimeStateLock::acquire(path, timeout, interval)?;
-    let RuntimeStateRead::Loaded(mut servers) = read_runtime_state(path)? else {
-        return Ok(false);
-    };
+    update_runtime_state_run_with_lock_options_and_hook(
+        path,
+        expected,
+        updated,
+        timeout,
+        interval,
+        |_| Ok(()),
+    )
+}
 
-    let original_len = servers.len();
-    servers.retain(|server| server.identity() != identity);
-    if servers.len() == original_len {
+fn update_runtime_state_run_with_lock_options_and_hook<F>(
+    path: &Path,
+    expected: &ManagedRunIdentity,
+    updated: ManagedRun,
+    timeout: Duration,
+    interval: Duration,
+    before_rename: F,
+) -> Result<bool, SupervisorError>
+where
+    F: FnOnce(&Path) -> io::Result<()>,
+{
+    Ok(
+        update_runtime_state_run_committed_with_lock_options_and_hook(
+            path,
+            expected,
+            updated,
+            timeout,
+            interval,
+            before_rename,
+        )?
+        .is_some(),
+    )
+}
+
+fn update_runtime_state_run_committed_with_lock_options_and_hook<F>(
+    path: &Path,
+    expected: &ManagedRunIdentity,
+    mut updated: ManagedRun,
+    timeout: Duration,
+    interval: Duration,
+    before_rename: F,
+) -> Result<Option<ManagedRun>, SupervisorError>
+where
+    F: FnOnce(&Path) -> io::Result<()>,
+{
+    validate_runtime_run(&updated).map_err(SupervisorError::RunStateConflict)?;
+    let _lock = acquire_runtime_state_lock_for_mutation(path, timeout, interval)?;
+    let mut runs = runtime_state_runs_for_mutation(path)?;
+    let Some(current) = runs.first() else {
+        return Ok(None);
+    };
+    if current.identity() != *expected {
+        return Ok(None);
+    }
+    if updated.run_id != current.run_id {
+        return Err(SupervisorError::RunStateConflict(format!(
+            "run ID changed from {} to {}",
+            current.run_id, updated.run_id
+        )));
+    }
+
+    updated.stop_requested |= current.stop_requested;
+    runs[0] = updated.clone();
+    write_runtime_state_with_hook(path, &runs, before_rename)?;
+    Ok(Some(updated))
+}
+
+pub fn finish_runtime_state_run(
+    path: &Path,
+    expected: &ManagedRunIdentity,
+) -> Result<bool, SupervisorError> {
+    finish_runtime_state_run_with_lock_options(
+        path,
+        expected,
+        RUNTIME_STATE_LOCK_TIMEOUT,
+        RUNTIME_STATE_LOCK_POLL_INTERVAL,
+    )
+}
+
+fn finish_runtime_state_run_with_lock_options(
+    path: &Path,
+    expected: &ManagedRunIdentity,
+    timeout: Duration,
+    interval: Duration,
+) -> Result<bool, SupervisorError> {
+    let _lock = acquire_runtime_state_lock_for_mutation(path, timeout, interval)?;
+    let runs = runtime_state_runs_for_mutation(path)?;
+    if runs.first().map(ManagedRun::identity).as_ref() != Some(expected) {
         return Ok(false);
     }
 
-    write_runtime_state(path, &servers)?;
+    write_runtime_state(path, &[])?;
     Ok(true)
+}
+
+pub fn request_managed_stop(
+    path: &Path,
+    target: &str,
+) -> Result<StopRequestOutcome, SupervisorError> {
+    let started = Instant::now();
+    request_managed_stop_with(
+        path,
+        target,
+        &SystemOwnerIdentityProbe,
+        StopWaitTiming::production(),
+        || started.elapsed(),
+        thread::sleep,
+    )
+}
+
+fn request_managed_stop_with<P, N, S>(
+    path: &Path,
+    target: &str,
+    owner_probe: &P,
+    timing: StopWaitTiming,
+    now: N,
+    sleep: S,
+) -> Result<StopRequestOutcome, SupervisorError>
+where
+    P: OwnerIdentityProbe,
+    N: FnMut() -> Duration,
+    S: FnMut(Duration),
+{
+    request_managed_stop_with_hooks(path, target, owner_probe, timing, || {}, now, sleep)
+}
+
+fn request_managed_stop_with_hooks<P, H, N, S>(
+    path: &Path,
+    target: &str,
+    owner_probe: &P,
+    timing: StopWaitTiming,
+    after_record: H,
+    mut now: N,
+    mut sleep: S,
+) -> Result<StopRequestOutcome, SupervisorError>
+where
+    P: OwnerIdentityProbe,
+    H: FnOnce(),
+    N: FnMut() -> Duration,
+    S: FnMut(Duration),
+{
+    let run = match record_stop_request(path, target)? {
+        StopRequestMatch::NoMatch => return Ok(StopRequestOutcome::NoMatch),
+        StopRequestMatch::Requested(run) => run,
+    };
+    after_record();
+    let completed = || StopRequestOutcome::Completed {
+        run_id: run.run_id.clone(),
+        model_id: run.model_id.clone(),
+    };
+    let recovery = |owner_status| StopRequestOutcome::RecoveryRequired {
+        run_id: run.run_id.clone(),
+        model_id: run.model_id.clone(),
+        owner_status,
+    };
+    let mut owner_status = owner_probe.probe(run.owner_pid, run.owner_process_start_time_unix_s);
+    if !stable_run_is_present(path, &run.run_id)? {
+        return Ok(completed());
+    }
+    if owner_status != OwnerIdentityStatus::Live {
+        return Ok(recovery(owner_status));
+    }
+
+    let started = now();
+    loop {
+        if !stable_run_is_present(path, &run.run_id)? {
+            return Ok(StopRequestOutcome::Completed {
+                run_id: run.run_id,
+                model_id: run.model_id,
+            });
+        }
+
+        owner_status = owner_probe.probe(run.owner_pid, run.owner_process_start_time_unix_s);
+        if !stable_run_is_present(path, &run.run_id)? {
+            return Ok(completed());
+        }
+        if owner_status != OwnerIdentityStatus::Live {
+            return Ok(recovery(owner_status));
+        }
+
+        let elapsed = now().saturating_sub(started);
+        if elapsed >= timing.timeout {
+            return Ok(StopRequestOutcome::TimedOut {
+                run_id: run.run_id,
+                model_id: run.model_id,
+            });
+        }
+        sleep(timing.interval.min(timing.timeout - elapsed));
+    }
+}
+
+fn record_stop_request(path: &Path, target: &str) -> Result<StopRequestMatch, SupervisorError> {
+    record_stop_request_with_lock_options_and_hook(
+        path,
+        target,
+        RUNTIME_STATE_LOCK_TIMEOUT,
+        RUNTIME_STATE_LOCK_POLL_INTERVAL,
+        |_| Ok(()),
+    )
+}
+
+fn record_stop_request_with_lock_options_and_hook<F>(
+    path: &Path,
+    target: &str,
+    timeout: Duration,
+    interval: Duration,
+    before_rename: F,
+) -> Result<StopRequestMatch, SupervisorError>
+where
+    F: FnOnce(&Path) -> io::Result<()>,
+{
+    let _lock = acquire_runtime_state_lock_for_mutation(path, timeout, interval)?;
+    let mut runs = runtime_state_runs_for_mutation(path)?;
+    let Some(run) = runs.first_mut() else {
+        return Ok(StopRequestMatch::NoMatch);
+    };
+    if target != "all" && run.model_id != target {
+        return Ok(StopRequestMatch::NoMatch);
+    }
+
+    if !run.stop_requested {
+        run.stop_requested = true;
+        write_runtime_state_with_hook(path, &runs, before_rename)?;
+    }
+    Ok(StopRequestMatch::Requested(runs[0].clone()))
+}
+
+fn stable_run_is_present(path: &Path, run_id: &str) -> Result<bool, SupervisorError> {
+    match read_runtime_state(path)? {
+        RuntimeStateRead::Missing => Ok(false),
+        RuntimeStateRead::Loaded(runs) => Ok(runs.iter().any(|run| run.run_id == run_id)),
+        RuntimeStateRead::Legacy => Err(SupervisorError::LegacyRuntimeState(path.to_path_buf())),
+        RuntimeStateRead::Corrupt(message) => Err(SupervisorError::Io(io::Error::other(format!(
+            "managed sidecar state is corrupt: {message}"
+        )))),
+    }
+}
+
+pub fn current_runtime_state_run(
+    path: &Path,
+    expected: &ManagedRunIdentity,
+) -> Result<ManagedRun, SupervisorError> {
+    let _lock = acquire_runtime_state_lock_for_mutation(
+        path,
+        RUNTIME_STATE_LOCK_TIMEOUT,
+        RUNTIME_STATE_LOCK_POLL_INTERVAL,
+    )?;
+    let runs = runtime_state_runs_for_mutation(path)?;
+    let Some(current) = runs.first() else {
+        return Err(SupervisorError::RunStateConflict(format!(
+            "managed run {} generation {} is no longer present",
+            expected.run_id, expected.generation
+        )));
+    };
+    if current.identity() != *expected {
+        return Err(SupervisorError::RunStateConflict(format!(
+            "managed run {} generation {} no longer matches",
+            expected.run_id, expected.generation
+        )));
+    }
+    Ok(current.clone())
+}
+
+pub fn prepare_starting_run_for_spawn(
+    path: &Path,
+    expected: &ManagedRunIdentity,
+) -> Result<PreSpawnDecision, SupervisorError> {
+    let _lock = acquire_runtime_state_lock_for_mutation(
+        path,
+        RUNTIME_STATE_LOCK_TIMEOUT,
+        RUNTIME_STATE_LOCK_POLL_INTERVAL,
+    )?;
+    let runs = runtime_state_runs_for_mutation(path)?;
+    let Some(current) = runs.first() else {
+        return Err(SupervisorError::RunStateConflict(format!(
+            "managed run {} generation {} is no longer present before spawn",
+            expected.run_id, expected.generation
+        )));
+    };
+    if current.identity() != *expected {
+        return Err(SupervisorError::RunStateConflict(format!(
+            "managed run {} generation {} no longer matches before spawn",
+            expected.run_id, expected.generation
+        )));
+    }
+    if current.child_pid.is_some()
+        || current.child_process_start_time_unix_s.is_some()
+        || current.child_pgid.is_some()
+    {
+        return Err(SupervisorError::RunStateConflict(format!(
+            "managed run {} generation {} is not childless before spawn",
+            expected.run_id, expected.generation
+        )));
+    }
+
+    if current.stop_requested {
+        write_runtime_state(path, &[])?;
+        Ok(PreSpawnDecision::RequestedStop)
+    } else {
+        Ok(PreSpawnDecision::Spawn(current.clone()))
+    }
+}
+
+pub fn finish_childless_runtime_state_run(
+    path: &Path,
+    expected: &ManagedRunIdentity,
+) -> Result<ChildlessFinishOutcome, SupervisorError> {
+    let _lock = acquire_runtime_state_lock_for_mutation(
+        path,
+        RUNTIME_STATE_LOCK_TIMEOUT,
+        RUNTIME_STATE_LOCK_POLL_INTERVAL,
+    )?;
+    let runs = runtime_state_runs_for_mutation(path)?;
+    let Some(current) = runs.first() else {
+        return Err(SupervisorError::RunStateConflict(format!(
+            "childless managed run {} generation {} is no longer present",
+            expected.run_id, expected.generation
+        )));
+    };
+    if current.identity() != *expected {
+        return Err(SupervisorError::RunStateConflict(format!(
+            "childless managed run {} generation {} no longer matches",
+            expected.run_id, expected.generation
+        )));
+    }
+    if current.child_pid.is_some()
+        || current.child_process_start_time_unix_s.is_some()
+        || current.child_pgid.is_some()
+    {
+        return Err(SupervisorError::RunStateConflict(format!(
+            "managed run {} generation {} is not childless at terminal transition",
+            expected.run_id, expected.generation
+        )));
+    }
+    let outcome = if current.stop_requested {
+        ChildlessFinishOutcome::RequestedStop
+    } else {
+        ChildlessFinishOutcome::Finished
+    };
+    write_runtime_state(path, &[])?;
+    Ok(outcome)
+}
+
+pub fn finish_owner_teardown_with<T>(
+    path: &Path,
+    expected: &ManagedRunIdentity,
+    decision: OwnerTeardownDecision,
+    teardown: T,
+) -> Result<OwnerTerminalOutcome, SupervisorError>
+where
+    T: FnOnce(OwnerTeardownDecision) -> TeardownConfirmation,
+{
+    if teardown(decision) == TeardownConfirmation::Unconfirmed {
+        return Ok(OwnerTerminalOutcome::RecoveryRequired);
+    }
+
+    finish_confirmed_owner_teardown(path, expected, decision)
+}
+
+fn finish_confirmed_owner_teardown(
+    path: &Path,
+    expected: &ManagedRunIdentity,
+    decision: OwnerTeardownDecision,
+) -> Result<OwnerTerminalOutcome, SupervisorError> {
+    let _lock = acquire_runtime_state_lock_for_mutation(
+        path,
+        RUNTIME_STATE_LOCK_TIMEOUT,
+        RUNTIME_STATE_LOCK_POLL_INTERVAL,
+    )?;
+    let runs = runtime_state_runs_for_mutation(path)?;
+    let Some(current) = runs.first() else {
+        return Ok(OwnerTerminalOutcome::RecoveryRequired);
+    };
+    if current.identity() != *expected {
+        return Ok(OwnerTerminalOutcome::RecoveryRequired);
+    }
+    let stop_requested = current.stop_requested;
+    write_runtime_state(path, &[])?;
+
+    Ok(
+        if stop_requested || decision == OwnerTeardownDecision::RequestedStop {
+            OwnerTerminalOutcome::RequestedStop
+        } else if decision == OwnerTeardownDecision::Interrupted {
+            OwnerTerminalOutcome::Interrupted
+        } else {
+            OwnerTerminalOutcome::RecoveryRequired
+        },
+    )
+}
+
+fn runtime_state_runs_for_mutation(path: &Path) -> Result<Vec<ManagedRun>, SupervisorError> {
+    match read_runtime_state(path)? {
+        RuntimeStateRead::Missing => Ok(Vec::new()),
+        RuntimeStateRead::Loaded(runs) => Ok(runs),
+        RuntimeStateRead::Legacy => Err(SupervisorError::LegacyRuntimeState(path.to_path_buf())),
+        RuntimeStateRead::Corrupt(message) => Err(SupervisorError::Io(io::Error::other(format!(
+            "managed sidecar state is corrupt: {message}"
+        )))),
+    }
+}
+
+fn validate_runtime_run(run: &ManagedRun) -> Result<(), String> {
+    if run.schema_version != RUNTIME_STATE_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported managed run schema version {}",
+            run.schema_version
+        ));
+    }
+    if run.run_id.is_empty() {
+        return Err("managed run ID must not be empty".to_string());
+    }
+    if run.model_id.is_empty() {
+        return Err("managed run model ID must not be empty".to_string());
+    }
+    if run.generation_alias.is_empty() {
+        return Err("managed run generation alias must not be empty".to_string());
+    }
+    if run.port == 0 {
+        return Err("managed run port must not be zero".to_string());
+    }
+    if run.log_path.as_os_str().is_empty() {
+        return Err("managed run log path must not be empty".to_string());
+    }
+    if run.child_pid.is_none()
+        && (run.child_process_start_time_unix_s.is_some() || run.child_pgid.is_some())
+    {
+        return Err("managed run child metadata requires a child PID".to_string());
+    }
+    Ok(())
+}
+
+pub fn inspect_managed_servers(servers: &[ManagedServer]) -> Vec<ManagedServerInspection> {
+    inspect_managed_servers_with(servers, &SystemProcessController)
+}
+
+fn inspect_managed_servers_with<P: ProcessController>(
+    servers: &[ManagedServer],
+    controller: &P,
+) -> Vec<ManagedServerInspection> {
+    servers
+        .iter()
+        .cloned()
+        .map(|server| {
+            let pid_alive = controller.pid_is_alive(server.pid);
+            let port_alive = controller.port_is_alive(server.port);
+            let process_identity_matches = process_identity_matches(&server, controller);
+            ManagedServerInspection {
+                stale: !(pid_alive && port_alive && process_identity_matches),
+                server,
+                pid_alive,
+                port_alive,
+                process_identity_matches,
+            }
+        })
+        .collect()
+}
+
+pub fn persist_managed_server_or_cleanup<C>(
+    child: &mut C,
+    state_path: &Path,
+    mut run: ManagedRun,
+    server: ManagedServer,
+    grace_period: Duration,
+) -> Result<ManagedRun, SupervisorError>
+where
+    C: ManagedChild + LogDrainingChild,
+{
+    let expected = run.identity();
+    let error = if server.process_start_time_unix_s.is_none() {
+        SupervisorError::ProcessIdentityUnavailable(server.pid)
+    } else {
+        run.model_id = server.id;
+        run.lifecycle = RunLifecycle::Running;
+        run.port = server.port;
+        run.child_pid = Some(server.pid);
+        run.child_process_start_time_unix_s = server.process_start_time_unix_s;
+        match update_runtime_state_run_committed(state_path, &expected, run) {
+            Ok(Some(committed)) => return Ok(committed),
+            Ok(None) => SupervisorError::RunStateConflict(format!(
+                "starting run {} generation {} no longer matches",
+                expected.run_id, expected.generation
+            )),
+            Err(error) => error,
+        }
+    };
+
+    let _ = cleanup_after_ctrl_c(child, state_path, &expected, grace_period);
+    let _ = child.join_log_drains();
+    Err(error)
+}
+
+pub fn remove_runtime_state_entry(
+    path: &Path,
+    identity: &ManagedRunIdentity,
+) -> Result<bool, SupervisorError> {
+    finish_runtime_state_run(path, identity)
 }
 
 pub fn spawn_llama_server(
@@ -740,14 +1314,14 @@ pub fn wait_for_health_or_exit<C: ManagedChild + LogDrainingChild>(
         }
 
         if child.try_wait()?.is_some() {
-            return Err(child_exited_early_with_drains(child, log_path)?);
+            return Err(reaped_child_exit_with_drains(child, log_path));
         }
 
         thread::sleep(interval);
     }
 
     if child.try_wait()?.is_some() {
-        return Err(child_exited_early_with_drains(child, log_path)?);
+        return Err(reaped_child_exit_with_drains(child, log_path));
     }
 
     Err(SupervisorError::HealthTimeout)
@@ -776,37 +1350,43 @@ pub fn child_exited_early_with_drains<C: LogDrainingChild>(
     child_exited_early(log_path)
 }
 
-pub fn stop_managed_server(
-    server: &ManagedServer,
-    state_path: &Path,
-    grace_period: Duration,
-) -> Result<StopResult, SupervisorError> {
-    stop_managed_server_with(
-        server,
-        state_path,
-        grace_period,
-        FORCE_KILL_CONFIRMATION_PERIOD,
-        STOP_POLL_INTERVAL,
-        &SystemProcessController,
-        thread::sleep,
-    )
+pub fn reaped_child_exit_with_drains<C: LogDrainingChild>(
+    child: &mut C,
+    log_path: &Path,
+) -> SupervisorError {
+    child_exited_early_with_drains(child, log_path)
+        .unwrap_or_else(|error| SupervisorError::ChildReapedDiagnosticsFailed(error.to_string()))
 }
 
 pub fn cleanup_after_ctrl_c<C: ManagedChild>(
     child: &mut C,
     state_path: &Path,
-    identity: ManagedServerIdentity,
+    state_identity: &ManagedRunIdentity,
     grace_period: Duration,
 ) -> Result<CleanupResult, SupervisorError> {
     cleanup_after_ctrl_c_with(
         child,
         state_path,
-        identity,
+        state_identity,
         grace_period,
         FORCE_KILL_CONFIRMATION_PERIOD,
         STOP_POLL_INTERVAL,
         thread::sleep,
     )
+}
+
+pub fn teardown_managed_child<C: ManagedChild>(
+    child: &mut C,
+    grace_period: Duration,
+) -> Result<TeardownConfirmation, SupervisorError> {
+    Ok(teardown_managed_child_with(
+        child,
+        grace_period,
+        FORCE_KILL_CONFIRMATION_PERIOD,
+        STOP_POLL_INTERVAL,
+        thread::sleep,
+    )?
+    .confirmation)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -984,89 +1564,10 @@ fn legacy_runtime_state_lock_path(state_path: &Path) -> PathBuf {
     state_path.with_file_name(format!("{file_name}.lock"))
 }
 
-fn stop_managed_server_with<P, S>(
-    server: &ManagedServer,
-    state_path: &Path,
-    grace_period: Duration,
-    force_kill_confirmation: Duration,
-    interval: Duration,
-    controller: &P,
-    mut sleep: S,
-) -> Result<StopResult, SupervisorError>
-where
-    P: ProcessController,
-    S: FnMut(Duration),
-{
-    let initial_status = inspect_stop_status(server, controller);
-    let was_running = initial_status.pid_alive && initial_status.identity_matches;
-
-    if !was_running {
-        let removed_state = remove_runtime_state_entry(state_path, server.identity())?;
-
-        return Ok(StopResult {
-            was_running: false,
-            forced: false,
-            removed_state,
-            pid_alive: initial_status.pid_alive,
-            port_alive: initial_status.port_alive,
-        });
-    }
-
-    controller.terminate(server.pid)?;
-
-    let stopped = wait_for_stop_confirmation(grace_period, interval, &mut sleep, || {
-        Ok(inspect_stop_status(server, controller))
-    })?;
-    if let Some(status) = stopped {
-        let removed_state = remove_runtime_state_entry(state_path, server.identity())?;
-        return Ok(StopResult {
-            was_running,
-            forced: false,
-            removed_state,
-            pid_alive: status.pid_alive,
-            port_alive: status.port_alive,
-        });
-    }
-
-    let pre_kill_status = inspect_stop_status(server, controller);
-    if !pre_kill_status.pid_alive || !pre_kill_status.identity_matches {
-        let removed_state = remove_runtime_state_entry(state_path, server.identity())?;
-        return Ok(StopResult {
-            was_running,
-            forced: false,
-            removed_state,
-            pid_alive: pre_kill_status.pid_alive,
-            port_alive: pre_kill_status.port_alive,
-        });
-    }
-
-    controller.kill(server.pid)?;
-    let status =
-        match wait_for_stop_confirmation(force_kill_confirmation, interval, &mut sleep, || {
-            Ok(inspect_stop_status(server, controller))
-        })? {
-            Some(status) => status,
-            None => inspect_stop_status(server, controller),
-        };
-    let removed_state = if !status.pid_alive || !status.identity_matches {
-        remove_runtime_state_entry(state_path, server.identity())?
-    } else {
-        false
-    };
-
-    Ok(StopResult {
-        was_running,
-        forced: true,
-        removed_state,
-        pid_alive: status.pid_alive,
-        port_alive: status.port_alive,
-    })
-}
-
 fn cleanup_after_ctrl_c_with<C, S>(
     child: &mut C,
     state_path: &Path,
-    identity: ManagedServerIdentity,
+    state_identity: &ManagedRunIdentity,
     grace_period: Duration,
     force_kill_confirmation: Duration,
     interval: Duration,
@@ -1076,28 +1577,61 @@ where
     C: ManagedChild,
     S: FnMut(Duration),
 {
+    let result = teardown_managed_child_with(
+        child,
+        grace_period,
+        force_kill_confirmation,
+        interval,
+        &mut sleep,
+    )?;
+    let removed_state = if result.confirmation == TeardownConfirmation::Confirmed {
+        remove_runtime_state_entry(state_path, state_identity)?
+    } else {
+        false
+    };
+
+    Ok(CleanupResult {
+        forced: result.forced,
+        removed_state,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ChildTeardownResult {
+    confirmation: TeardownConfirmation,
+    forced: bool,
+}
+
+fn teardown_managed_child_with<C, S>(
+    child: &mut C,
+    grace_period: Duration,
+    force_kill_confirmation: Duration,
+    interval: Duration,
+    mut sleep: S,
+) -> Result<ChildTeardownResult, SupervisorError>
+where
+    C: ManagedChild,
+    S: FnMut(Duration),
+{
     child.terminate()?;
 
     if wait_for_child_exit(child, grace_period, interval, &mut sleep)? {
-        let removed_state = remove_runtime_state_entry(state_path, identity)?;
-        return Ok(CleanupResult {
+        return Ok(ChildTeardownResult {
+            confirmation: TeardownConfirmation::Confirmed,
             forced: false,
-            removed_state,
         });
     }
 
     child.kill()?;
     let confirmed_stopped =
         wait_for_child_exit(child, force_kill_confirmation, interval, &mut sleep)?;
-    let removed_state = if confirmed_stopped {
-        remove_runtime_state_entry(state_path, identity)?
-    } else {
-        false
-    };
-
-    Ok(CleanupResult {
+    Ok(ChildTeardownResult {
+        confirmation: if confirmed_stopped {
+            TeardownConfirmation::Confirmed
+        } else {
+            TeardownConfirmation::Unconfirmed
+        },
         forced: true,
-        removed_state,
     })
 }
 
@@ -1140,23 +1674,99 @@ pub fn process_start_time(pid: u32) -> Option<u64> {
     system.process(pid).map(|process| process.start_time())
 }
 
-pub fn decide_observed_child_exit<I: InterruptStatus>(
+pub fn decide_observed_child_exit<I, T>(
     log_tail: String,
     state_path: &Path,
-    identity: ManagedServerIdentity,
+    state_identity: &ManagedRunIdentity,
     interrupt: &I,
-    restart_policy: &mut RestartPolicy,
+    teardown: T,
+) -> Result<ObservedChildExit, SupervisorError>
+where
+    I: InterruptStatus,
+    T: FnOnce(OwnerTeardownDecision) -> TeardownConfirmation,
+{
+    decide_observed_child_exit_with(
+        log_tail,
+        state_path,
+        state_identity,
+        interrupt,
+        || {},
+        teardown,
+    )
+}
+
+fn decide_observed_child_exit_with<I, H, T>(
+    log_tail: String,
+    state_path: &Path,
+    state_identity: &ManagedRunIdentity,
+    interrupt: &I,
+    after_observation: H,
+    teardown: T,
+) -> Result<ObservedChildExit, SupervisorError>
+where
+    I: InterruptStatus,
+    H: FnOnce(),
+    T: FnOnce(OwnerTeardownDecision) -> TeardownConfirmation,
+{
+    after_observation();
+    let current = current_runtime_state_run(state_path, state_identity)?;
+    let interrupted = interrupt.interrupted();
+    if teardown(OwnerTeardownDecision::UnexpectedExit) == TeardownConfirmation::Unconfirmed {
+        return Ok(ObservedChildExit::RecoveryRequired);
+    }
+    transition_after_confirmed_unexpected_exit(
+        state_path,
+        &current.identity(),
+        log_tail,
+        interrupted,
+    )
+}
+
+fn transition_after_confirmed_unexpected_exit(
+    state_path: &Path,
+    expected: &ManagedRunIdentity,
+    log_tail: String,
+    interrupted: bool,
 ) -> Result<ObservedChildExit, SupervisorError> {
-    if interrupt.interrupted() {
-        remove_runtime_state_entry(state_path, identity)?;
+    let _lock = acquire_runtime_state_lock_for_mutation(
+        state_path,
+        RUNTIME_STATE_LOCK_TIMEOUT,
+        RUNTIME_STATE_LOCK_POLL_INTERVAL,
+    )?;
+    let mut runs = runtime_state_runs_for_mutation(state_path)?;
+    let Some(current) = runs.first() else {
+        return Ok(ObservedChildExit::RecoveryRequired);
+    };
+    if current.identity() != *expected {
+        return Ok(ObservedChildExit::RecoveryRequired);
+    }
+    if current.stop_requested {
+        write_runtime_state(state_path, &[])?;
+        return Ok(ObservedChildExit::RequestedStop);
+    }
+    if interrupted {
+        write_runtime_state(state_path, &[])?;
         return Ok(ObservedChildExit::Interrupted);
     }
 
-    remove_runtime_state_entry(state_path, identity)?;
-    if restart_policy.should_restart() {
-        Ok(ObservedChildExit::Restart)
-    } else {
-        Ok(ObservedChildExit::Crash { log_tail })
+    match current.generation {
+        0 => {
+            let mut replacement = current.clone();
+            replacement.lifecycle = RunLifecycle::Starting;
+            replacement.generation = 1;
+            replacement.generation_alias = format!("loxa-{}-g1", current.run_id);
+            replacement.child_pid = None;
+            replacement.child_process_start_time_unix_s = None;
+            replacement.child_pgid = None;
+            runs[0] = replacement.clone();
+            write_runtime_state(state_path, &runs)?;
+            Ok(ObservedChildExit::Restart { run: replacement })
+        }
+        1 => {
+            write_runtime_state(state_path, &[])?;
+            Ok(ObservedChildExit::Exhausted { log_tail })
+        }
+        _ => Ok(ObservedChildExit::RecoveryRequired),
     }
 }
 
@@ -1441,19 +2051,840 @@ mod tests {
             llama_server_version: "test".to_string(),
             process_start_time_unix_s: Some(456),
         };
-        write_runtime_state(&state_path, std::slice::from_ref(&expected))
+        let expected_run = managed_run_for(&expected);
+        write_runtime_state(&state_path, std::slice::from_ref(&expected_run))
             .expect("write runtime state");
 
         assert_eq!(
             read_runtime_state(&state_path).expect("read runtime state"),
-            RuntimeStateRead::Loaded(vec![expected])
+            RuntimeStateRead::Loaded(vec![expected_run])
         );
 
         fs::write(&state_path, "{not-json").expect("write corrupt state");
         match read_runtime_state(&state_path).expect("corrupt state read") {
-            RuntimeStateRead::Corrupt(message) => assert!(message.contains("expected")),
+            RuntimeStateRead::Corrupt(message) => assert!(!message.is_empty()),
             other => panic!("unexpected runtime state: {other:?}"),
         }
+    }
+
+    #[test]
+    fn childless_starting_runtime_state_round_trips_all_generation_metadata() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let run = childless_starting_run(temp.path(), "run-1");
+
+        write_runtime_state(&state_path, std::slice::from_ref(&run))
+            .expect("write v2 runtime state");
+
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).expect("read raw v2 runtime state"))
+                .expect("parse v2 runtime state");
+        assert_eq!(value["schema_version"], RUNTIME_STATE_SCHEMA_VERSION);
+        assert_eq!(value["runs"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            value["runs"][0]["schema_version"],
+            RUNTIME_STATE_SCHEMA_VERSION
+        );
+        assert_eq!(value["runs"][0]["generation_alias"], "loxa-run-1-g0");
+        assert_eq!(value["runs"][0]["port"], 8080);
+        assert_eq!(
+            value["runs"][0]["log_path"],
+            run.log_path.display().to_string()
+        );
+        assert!(value["runs"][0]["child_pid"].is_null());
+        assert_eq!(
+            read_runtime_state(&state_path).expect("read v2 runtime state"),
+            RuntimeStateRead::Loaded(vec![run])
+        );
+
+        fs::write(&state_path, "[]").expect("write legacy array");
+        assert_eq!(
+            read_runtime_state(&state_path).expect("read legacy state"),
+            RuntimeStateRead::Legacy
+        );
+    }
+
+    #[test]
+    fn create_starting_run_persists_the_childless_record() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let run = childless_starting_run(temp.path(), "run-1");
+
+        let stored = create_starting_run(&state_path, run.clone()).expect("create starting run");
+
+        assert_eq!(stored, run);
+        assert_eq!(
+            read_runtime_state(&state_path).expect("read created state"),
+            RuntimeStateRead::Loaded(vec![run])
+        );
+        assert!(runtime_state_lock_path(&state_path).is_file());
+    }
+
+    #[test]
+    fn create_starting_run_rejects_a_second_run_without_changing_the_first() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let first = childless_starting_run(temp.path(), "run-1");
+        let second = childless_starting_run(temp.path(), "run-2");
+        create_starting_run(&state_path, first.clone()).expect("create first run");
+        let committed = fs::read(&state_path).expect("read first committed bytes");
+
+        let error = create_starting_run(&state_path, second).expect_err("reject second run");
+
+        assert!(matches!(error, SupervisorError::ActiveRun(run_id) if run_id == "run-1"));
+        assert_eq!(
+            fs::read(&state_path).expect("read unchanged state"),
+            committed
+        );
+        assert_eq!(
+            read_runtime_state(&state_path).expect("read first run"),
+            RuntimeStateRead::Loaded(vec![first])
+        );
+    }
+
+    #[test]
+    fn stale_generation_cannot_update_or_finish_the_current_run_with_identical_child() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let first = childless_starting_run(temp.path(), "run-1");
+        create_starting_run(&state_path, first.clone()).expect("create first generation");
+        let mut stale_generation = first.clone();
+        stale_generation.lifecycle = RunLifecycle::Running;
+        stale_generation.child_pid = Some(777);
+        stale_generation.child_process_start_time_unix_s = Some(111);
+        assert!(
+            update_runtime_state_run(&state_path, &first.identity(), stale_generation.clone())
+                .expect("attach first-generation child")
+        );
+        let stale_identity = stale_generation.identity();
+        let mut current = stale_generation.clone();
+        current.generation = 1;
+        current.generation_alias = "loxa-run-1-g1".to_string();
+        assert!(
+            update_runtime_state_run(&state_path, &stale_identity, current.clone())
+                .expect("advance current generation")
+        );
+        assert_eq!(stale_identity.child_pid, current.identity().child_pid);
+        assert_eq!(
+            stale_identity.child_process_start_time_unix_s,
+            current.identity().child_process_start_time_unix_s
+        );
+        let committed = fs::read(&state_path).expect("read current bytes");
+
+        let mut stale_update = stale_generation;
+        stale_update.lifecycle = RunLifecycle::RecoveryRequired;
+        assert!(
+            !update_runtime_state_run(&state_path, &stale_identity, stale_update)
+                .expect("reject stale update")
+        );
+        assert!(
+            !finish_runtime_state_run(&state_path, &stale_identity).expect("reject stale finish")
+        );
+
+        assert_eq!(
+            fs::read(&state_path).expect("read unchanged bytes"),
+            committed
+        );
+
+        assert!(finish_runtime_state_run(&state_path, &current.identity())
+            .expect("finish current generation"));
+        assert_eq!(
+            read_runtime_state(&state_path).expect("read terminal state"),
+            RuntimeStateRead::Loaded(Vec::new())
+        );
+        let terminal: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).expect("read terminal envelope"))
+                .expect("parse terminal envelope");
+        assert_eq!(terminal["schema_version"], RUNTIME_STATE_SCHEMA_VERSION);
+        assert_eq!(terminal["runs"].as_array().map(Vec::len), Some(0));
+    }
+
+    #[test]
+    fn wrong_child_cannot_update_or_finish_the_current_run() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let first = childless_starting_run(temp.path(), "run-1");
+        create_starting_run(&state_path, first.clone()).expect("create run");
+        let mut current = first.clone();
+        current.lifecycle = RunLifecycle::Running;
+        current.child_pid = Some(777);
+        current.child_process_start_time_unix_s = Some(111);
+        assert!(
+            update_runtime_state_run(&state_path, &first.identity(), current.clone())
+                .expect("attach child")
+        );
+        let committed = fs::read(&state_path).expect("read current bytes");
+        let mut wrong_child = current.identity();
+        wrong_child.child_pid = Some(778);
+
+        assert!(
+            !update_runtime_state_run(&state_path, &wrong_child, current.clone())
+                .expect("reject wrong child update")
+        );
+        assert!(!finish_runtime_state_run(&state_path, &wrong_child)
+            .expect("reject wrong child finish"));
+        assert_eq!(
+            fs::read(&state_path).expect("read unchanged bytes"),
+            committed
+        );
+    }
+
+    #[test]
+    fn ordinary_runtime_state_update_cannot_clear_a_true_stop_request() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let first = childless_starting_run(temp.path(), "run-1");
+        create_starting_run(&state_path, first.clone()).expect("create run");
+        let mut stopped = first.clone();
+        stopped.stop_requested = true;
+        assert!(
+            update_runtime_state_run(&state_path, &first.identity(), stopped.clone())
+                .expect("set stop request")
+        );
+
+        let mut stale_ordinary_update = stopped.clone();
+        stale_ordinary_update.stop_requested = false;
+        stale_ordinary_update.lifecycle = RunLifecycle::Running;
+        assert!(
+            update_runtime_state_run(&state_path, &stopped.identity(), stale_ordinary_update)
+                .expect("apply ordinary update")
+        );
+
+        let RuntimeStateRead::Loaded(runs) =
+            read_runtime_state(&state_path).expect("read updated run")
+        else {
+            panic!("expected loaded run");
+        };
+        assert!(runs[0].stop_requested);
+        assert_eq!(runs[0].lifecycle, RunLifecycle::Running);
+    }
+
+    #[test]
+    fn stop_request_transaction_matches_model_and_all_idempotently_without_changing_metadata() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let mut run = childless_starting_run(temp.path(), "run-1");
+        run.lifecycle = RunLifecycle::Running;
+        run.child_pid = Some(777);
+        run.child_process_start_time_unix_s = Some(111);
+        run.child_pgid = Some(777);
+        write_runtime_state(&state_path, std::slice::from_ref(&run)).expect("seed run");
+
+        assert_eq!(
+            record_stop_request(&state_path, "missing-model").expect("no-match transaction"),
+            StopRequestMatch::NoMatch
+        );
+        let requested =
+            record_stop_request(&state_path, &run.model_id).expect("model stop transaction");
+        let StopRequestMatch::Requested(first) = requested else {
+            panic!("expected requested run");
+        };
+        let mut expected = run.clone();
+        expected.stop_requested = true;
+        assert_eq!(first, expected);
+        let committed = fs::read(&state_path).expect("read committed request");
+
+        assert_eq!(
+            record_stop_request(&state_path, "all").expect("idempotent all transaction"),
+            StopRequestMatch::Requested(expected.clone())
+        );
+        assert_eq!(
+            fs::read(&state_path).expect("read unchanged idempotent bytes"),
+            committed
+        );
+        assert_eq!(
+            read_runtime_state(&state_path).expect("read stopped run"),
+            RuntimeStateRead::Loaded(vec![expected])
+        );
+    }
+
+    #[test]
+    fn external_stop_request_records_intent_without_child_or_pgid_signals() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let mut run = childless_starting_run(temp.path(), "run-1");
+        run.lifecycle = RunLifecycle::Running;
+        run.child_pid = Some(777);
+        run.child_process_start_time_unix_s = Some(111);
+        run.child_pgid = Some(700);
+        write_runtime_state(&state_path, std::slice::from_ref(&run)).expect("seed run");
+        let probe = FakeOwnerIdentityProbe::new(vec![OwnerIdentityStatus::Dead]);
+        let now = Cell::new(Duration::ZERO);
+
+        let outcome = request_managed_stop_with(
+            &state_path,
+            "all",
+            &probe,
+            StopWaitTiming::test(Duration::from_secs(15), Duration::from_secs(1)),
+            || now.get(),
+            |duration| now.set(now.get() + duration),
+        )
+        .expect("external stop outcome");
+
+        assert_eq!(
+            outcome,
+            StopRequestOutcome::RecoveryRequired {
+                run_id: run.run_id.clone(),
+                model_id: run.model_id.clone(),
+                owner_status: OwnerIdentityStatus::Dead,
+            }
+        );
+        assert_eq!(
+            probe.events(),
+            vec![(run.owner_pid, run.owner_process_start_time_unix_s)]
+        );
+        let RuntimeStateRead::Loaded(runs) =
+            read_runtime_state(&state_path).expect("read preserved run")
+        else {
+            panic!("expected loaded run");
+        };
+        assert!(runs[0].stop_requested);
+        assert_eq!(runs[0].child_pid, Some(777));
+        assert_eq!(runs[0].child_pgid, Some(700));
+    }
+
+    #[test]
+    fn external_stop_wait_releases_lock_before_owner_exact_finish() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let run = childless_starting_run(temp.path(), "run-1");
+        create_starting_run(&state_path, run.clone()).expect("seed run");
+        let entered_wait = Arc::new(Barrier::new(2));
+        let release_wait = Arc::new(Barrier::new(2));
+        let clock_ms = Arc::new(AtomicU64::new(0));
+        let waiter_path = state_path.clone();
+        let entered_for_waiter = Arc::clone(&entered_wait);
+        let release_for_waiter = Arc::clone(&release_wait);
+        let clock_for_now = Arc::clone(&clock_ms);
+        let clock_for_sleep = Arc::clone(&clock_ms);
+        let waiter = thread::spawn(move || {
+            request_managed_stop_with(
+                &waiter_path,
+                "all",
+                &FakeOwnerIdentityProbe::new(vec![OwnerIdentityStatus::Live]),
+                StopWaitTiming::test(Duration::from_secs(15), Duration::from_millis(1)),
+                || Duration::from_millis(clock_for_now.load(Ordering::SeqCst)),
+                |duration| {
+                    entered_for_waiter.wait();
+                    release_for_waiter.wait();
+                    clock_for_sleep.fetch_add(duration.as_millis() as u64, Ordering::SeqCst);
+                },
+            )
+        });
+
+        entered_wait.wait();
+        assert!(finish_runtime_state_run(&state_path, &run.identity())
+            .expect("owner exact-finishes while waiter is blocked"));
+        release_wait.wait();
+
+        assert_eq!(
+            waiter.join().expect("waiter joins").expect("wait outcome"),
+            StopRequestOutcome::Completed {
+                run_id: run.run_id,
+                model_id: run.model_id,
+            }
+        );
+    }
+
+    #[test]
+    fn external_stop_timeout_preserves_stopped_record() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let run = childless_starting_run(temp.path(), "run-1");
+        create_starting_run(&state_path, run.clone()).expect("seed run");
+        let probe = FakeOwnerIdentityProbe::new(vec![OwnerIdentityStatus::Live]);
+        let now = Cell::new(Duration::ZERO);
+
+        let outcome = request_managed_stop_with(
+            &state_path,
+            &run.model_id,
+            &probe,
+            StopWaitTiming::test(Duration::from_secs(15), Duration::from_secs(5)),
+            || now.get(),
+            |duration| now.set(now.get() + duration),
+        )
+        .expect("timeout outcome");
+
+        assert_eq!(
+            outcome,
+            StopRequestOutcome::TimedOut {
+                run_id: run.run_id.clone(),
+                model_id: run.model_id.clone(),
+            }
+        );
+        let RuntimeStateRead::Loaded(runs) =
+            read_runtime_state(&state_path).expect("read timed-out run")
+        else {
+            panic!("expected loaded run");
+        };
+        assert!(runs[0].stop_requested);
+        assert_eq!(runs[0].run_id, run.run_id);
+    }
+
+    #[test]
+    fn external_stop_dead_unavailable_and_mismatched_owner_preserve_state() {
+        for status in [
+            OwnerIdentityStatus::Dead,
+            OwnerIdentityStatus::Unavailable,
+            OwnerIdentityStatus::Mismatched,
+        ] {
+            let temp = tempdir().expect("tempdir");
+            let state_path = temp.path().join("managed.json");
+            let run = childless_starting_run(temp.path(), "run-1");
+            create_starting_run(&state_path, run.clone()).expect("seed run");
+            let probe = FakeOwnerIdentityProbe::new(vec![status]);
+            let now = Cell::new(Duration::ZERO);
+
+            let outcome = request_managed_stop_with(
+                &state_path,
+                "all",
+                &probe,
+                StopWaitTiming::test(Duration::from_secs(15), Duration::from_secs(1)),
+                || now.get(),
+                |duration| now.set(now.get() + duration),
+            )
+            .expect("recovery-required outcome");
+
+            assert_eq!(
+                outcome,
+                StopRequestOutcome::RecoveryRequired {
+                    run_id: run.run_id.clone(),
+                    model_id: run.model_id.clone(),
+                    owner_status: status,
+                }
+            );
+            let RuntimeStateRead::Loaded(runs) =
+                read_runtime_state(&state_path).expect("read preserved stopped run")
+            else {
+                panic!("expected loaded run");
+            };
+            assert_eq!(runs.len(), 1);
+            assert!(runs[0].stop_requested);
+        }
+    }
+
+    #[test]
+    fn external_stop_completion_wins_when_run_finishes_before_dead_owner_probe() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let run = childless_starting_run(temp.path(), "run-1");
+        create_starting_run(&state_path, run.clone()).expect("seed run");
+        let request_recorded = Arc::new(Barrier::new(2));
+        let release_probe = Arc::new(Barrier::new(2));
+        let recorded_for_waiter = Arc::clone(&request_recorded);
+        let release_for_waiter = Arc::clone(&release_probe);
+        let waiter_path = state_path.clone();
+        let waiter = thread::spawn(move || {
+            request_managed_stop_with_hooks(
+                &waiter_path,
+                "all",
+                &FakeOwnerIdentityProbe::new(vec![OwnerIdentityStatus::Dead]),
+                StopWaitTiming::test(Duration::from_secs(15), Duration::from_secs(1)),
+                || {
+                    recorded_for_waiter.wait();
+                    release_for_waiter.wait();
+                },
+                || Duration::ZERO,
+                |_| {},
+            )
+        });
+
+        request_recorded.wait();
+        assert!(finish_runtime_state_run(&state_path, &run.identity())
+            .expect("finish before owner probe"));
+        release_probe.wait();
+
+        assert_eq!(
+            waiter.join().expect("waiter joins").expect("stop outcome"),
+            StopRequestOutcome::Completed {
+                run_id: run.run_id,
+                model_id: run.model_id,
+            }
+        );
+    }
+
+    #[test]
+    fn external_stop_completion_wins_when_run_finishes_during_mismatched_owner_probe() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let run = childless_starting_run(temp.path(), "run-1");
+        create_starting_run(&state_path, run.clone()).expect("seed run");
+        let probe_entered = Arc::new(Barrier::new(2));
+        let release_probe = Arc::new(Barrier::new(2));
+        let waiter_path = state_path.clone();
+        let probe = BlockingOwnerIdentityProbe {
+            entered: Arc::clone(&probe_entered),
+            release: Arc::clone(&release_probe),
+            status: OwnerIdentityStatus::Mismatched,
+        };
+        let waiter = thread::spawn(move || {
+            request_managed_stop_with_hooks(
+                &waiter_path,
+                "all",
+                &probe,
+                StopWaitTiming::test(Duration::from_secs(15), Duration::from_secs(1)),
+                || {},
+                || Duration::ZERO,
+                |_| {},
+            )
+        });
+
+        probe_entered.wait();
+        assert!(finish_runtime_state_run(&state_path, &run.identity())
+            .expect("finish during owner probe"));
+        release_probe.wait();
+
+        assert_eq!(
+            waiter.join().expect("waiter joins").expect("stop outcome"),
+            StopRequestOutcome::Completed {
+                run_id: run.run_id,
+                model_id: run.model_id,
+            }
+        );
+    }
+
+    #[test]
+    fn external_stop_wait_ignores_generation_change_with_same_run_id() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let run = childless_starting_run(temp.path(), "run-1");
+        create_starting_run(&state_path, run.clone()).expect("seed run");
+        let probe = FakeOwnerIdentityProbe::new(vec![OwnerIdentityStatus::Live]);
+        let now = Cell::new(Duration::ZERO);
+        let sleeps = Cell::new(0_u8);
+
+        let outcome = request_managed_stop_with(
+            &state_path,
+            "all",
+            &probe,
+            StopWaitTiming::test(Duration::from_secs(15), Duration::from_secs(1)),
+            || now.get(),
+            |duration| {
+                let sleep = sleeps.get();
+                if sleep == 0 {
+                    let RuntimeStateRead::Loaded(runs) =
+                        read_runtime_state(&state_path).expect("read stopped generation zero")
+                    else {
+                        panic!("expected generation zero");
+                    };
+                    let mut generation_one = runs[0].clone();
+                    generation_one.generation = 1;
+                    generation_one.generation_alias = "loxa-run-1-g1".to_string();
+                    assert!(update_runtime_state_run(
+                        &state_path,
+                        &runs[0].identity(),
+                        generation_one,
+                    )
+                    .expect("advance generation"));
+                } else {
+                    let RuntimeStateRead::Loaded(runs) =
+                        read_runtime_state(&state_path).expect("read generation one")
+                    else {
+                        panic!("expected generation one");
+                    };
+                    assert!(finish_runtime_state_run(&state_path, &runs[0].identity())
+                        .expect("finish stable run"));
+                }
+                sleeps.set(sleep + 1);
+                now.set(now.get() + duration);
+            },
+        )
+        .expect("wait outcome");
+
+        assert_eq!(
+            outcome,
+            StopRequestOutcome::Completed {
+                run_id: run.run_id,
+                model_id: run.model_id,
+            }
+        );
+        assert_eq!(sleeps.get(), 2, "generation change is not completion");
+    }
+
+    #[test]
+    fn ordinary_update_and_stop_request_keep_stop_monotonic_in_both_orderings() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let run = childless_starting_run(temp.path(), "run-1");
+        create_starting_run(&state_path, run.clone()).expect("seed run");
+        let update_entered = Arc::new(Barrier::new(2));
+        let release_update = Arc::new(Barrier::new(2));
+        let update_path = state_path.clone();
+        let update_run = run.clone();
+        let entered = Arc::clone(&update_entered);
+        let release = Arc::clone(&release_update);
+        let updater = thread::spawn(move || {
+            let mut ordinary = update_run.clone();
+            ordinary.lifecycle = RunLifecycle::Running;
+            update_runtime_state_run_with_lock_options_and_hook(
+                &update_path,
+                &update_run.identity(),
+                ordinary,
+                Duration::from_secs(2),
+                Duration::from_millis(1),
+                |_| {
+                    entered.wait();
+                    release.wait();
+                    Ok(())
+                },
+            )
+        });
+        update_entered.wait();
+        let stop_path = state_path.clone();
+        let stopper = thread::spawn(move || record_stop_request(&stop_path, "all"));
+        release_update.wait();
+        assert!(updater
+            .join()
+            .expect("updater joins")
+            .expect("ordinary update"));
+        assert!(matches!(
+            stopper
+                .join()
+                .expect("stopper joins")
+                .expect("stop request"),
+            StopRequestMatch::Requested(_)
+        ));
+        let RuntimeStateRead::Loaded(runs) =
+            read_runtime_state(&state_path).expect("read update-first result")
+        else {
+            panic!("expected loaded run");
+        };
+        assert!(runs[0].stop_requested);
+
+        let second_path = temp.path().join("second-managed.json");
+        let second = childless_starting_run(temp.path(), "run-2");
+        create_starting_run(&second_path, second.clone()).expect("seed second run");
+        assert!(matches!(
+            record_stop_request(&second_path, "all").expect("stop first"),
+            StopRequestMatch::Requested(_)
+        ));
+        let mut stale = second.clone();
+        stale.lifecycle = RunLifecycle::Running;
+        assert!(
+            update_runtime_state_run(&second_path, &second.identity(), stale)
+                .expect("stale ordinary update")
+        );
+        let RuntimeStateRead::Loaded(runs) =
+            read_runtime_state(&second_path).expect("read stop-first result")
+        else {
+            panic!("expected loaded run");
+        };
+        assert!(runs[0].stop_requested);
+    }
+
+    #[test]
+    fn stop_request_legacy_state_and_sentinel_fail_before_mutation() {
+        for legacy_sentinel in [false, true] {
+            let temp = tempdir().expect("tempdir");
+            let state_path = temp.path().join("managed.json");
+            let protected_path = if legacy_sentinel {
+                let sentinel = legacy_runtime_state_lock_path(&state_path);
+                fs::write(&sentinel, b"legacy owner\n").expect("write sentinel");
+                sentinel
+            } else {
+                fs::write(&state_path, b"[]").expect("write legacy array");
+                state_path.clone()
+            };
+            let committed = fs::read(&protected_path).expect("read protected bytes");
+            let probe = FakeOwnerIdentityProbe::new(vec![OwnerIdentityStatus::Live]);
+            let now = Cell::new(Duration::ZERO);
+
+            let error = request_managed_stop_with(
+                &state_path,
+                "all",
+                &probe,
+                StopWaitTiming::test(Duration::from_secs(15), Duration::from_secs(1)),
+                || now.get(),
+                |duration| now.set(now.get() + duration),
+            )
+            .expect_err("legacy state must fail closed");
+
+            assert!(matches!(error, SupervisorError::LegacyRuntimeState(_)));
+            assert_eq!(
+                fs::read(&protected_path).expect("read unchanged protected bytes"),
+                committed
+            );
+            assert!(probe.events().is_empty());
+        }
+    }
+
+    #[test]
+    fn legacy_runtime_state_arrays_fail_closed_with_path_and_guidance() {
+        for (case, legacy) in [
+            ("empty", b"[]".as_slice()),
+            ("populated", b"[{}]".as_slice()),
+        ] {
+            let temp = tempdir().expect("tempdir");
+            let state_path = temp.path().join(format!("{case}-managed.json"));
+            fs::write(&state_path, legacy).expect("write legacy state");
+            let original = fs::read(&state_path).expect("read legacy bytes");
+            let run = childless_starting_run(temp.path(), "run-1");
+
+            let error = create_starting_run(&state_path, run).expect_err("reject legacy array");
+            let message = error.to_string();
+
+            assert!(
+                matches!(error, SupervisorError::LegacyRuntimeState(ref path) if path == &state_path)
+            );
+            assert!(message.contains(&state_path.display().to_string()));
+            assert!(message.contains("archive it manually"));
+            assert_eq!(
+                fs::read(&state_path).expect("read unchanged legacy"),
+                original
+            );
+            assert!(!runtime_state_lock_path(&state_path).exists());
+            assert_eq!(
+                read_runtime_state(&state_path).expect("read-only legacy read"),
+                RuntimeStateRead::Legacy
+            );
+            assert!(!runtime_state_lock_path(&state_path).exists());
+        }
+    }
+
+    #[test]
+    fn legacy_runtime_state_lock_sentinel_fails_closed_with_path_and_guidance() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let sentinel_path = state_path.with_file_name("managed.json.lock");
+        fs::write(&sentinel_path, b"legacy owner metadata\n").expect("write legacy sentinel");
+        let sentinel = fs::read(&sentinel_path).expect("read sentinel bytes");
+        let run = childless_starting_run(temp.path(), "run-1");
+
+        let error = create_starting_run(&state_path, run).expect_err("reject legacy sentinel");
+        let message = error.to_string();
+
+        assert!(
+            matches!(error, SupervisorError::LegacyRuntimeState(ref path) if path == &sentinel_path)
+        );
+        assert!(message.contains(&sentinel_path.display().to_string()));
+        assert!(message.contains("archive it manually"));
+        assert_eq!(
+            fs::read(&sentinel_path).expect("read unchanged sentinel"),
+            sentinel
+        );
+        assert!(!state_path.exists());
+        assert!(!runtime_state_lock_path(&state_path).exists());
+    }
+
+    #[test]
+    fn injected_pre_rename_failure_preserves_runtime_state_bytes_and_cleans_temp_file() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let first = childless_starting_run(temp.path(), "run-1");
+        create_starting_run(&state_path, first.clone()).expect("create run");
+        let committed = fs::read(&state_path).expect("read committed bytes");
+        let mut update = first.clone();
+        update.lifecycle = RunLifecycle::Running;
+
+        let error = update_runtime_state_run_with_lock_options_and_hook(
+            &state_path,
+            &first.identity(),
+            update,
+            Duration::from_millis(100),
+            Duration::from_millis(1),
+            |_| {
+                Err(io::Error::other(
+                    "injected failure immediately before rename",
+                ))
+            },
+        )
+        .expect_err("inject pre-rename failure");
+
+        assert!(
+            matches!(error, SupervisorError::Io(ref error) if error.kind() == io::ErrorKind::Other)
+        );
+        assert_eq!(
+            fs::read(&state_path).expect("read preserved state"),
+            committed
+        );
+        assert_eq!(
+            read_runtime_state(&state_path).expect("read preserved envelope"),
+            RuntimeStateRead::Loaded(vec![first])
+        );
+        let temp_prefix = format!(
+            "{}.",
+            state_path
+                .file_name()
+                .expect("state file name")
+                .to_string_lossy()
+        );
+        let temp_files = fs::read_dir(temp.path())
+            .expect("read runtime directory")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with(&temp_prefix) && name.ends_with(".tmp")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            temp_files.is_empty(),
+            "temporary state file must be cleaned"
+        );
+    }
+
+    #[test]
+    fn runtime_state_reader_rejects_unsupported_envelope_and_run_versions_and_multiple_runs() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let run = childless_starting_run(temp.path(), "run-1");
+        let mut value = serde_json::json!({
+            "schema_version": RUNTIME_STATE_SCHEMA_VERSION,
+            "runs": [run.clone()]
+        });
+        value["runs"][0]["schema_version"] = serde_json::json!(99);
+        fs::write(
+            &state_path,
+            serde_json::to_vec_pretty(&value).expect("serialize unsupported run state"),
+        )
+        .expect("write unsupported run state");
+        assert!(matches!(
+            read_runtime_state(&state_path).expect("read unsupported run state"),
+            RuntimeStateRead::Corrupt(message)
+                if message.contains("unsupported managed run schema version 99")
+        ));
+
+        value["runs"][0]["schema_version"] = serde_json::json!(RUNTIME_STATE_SCHEMA_VERSION);
+        value["schema_version"] = serde_json::json!(99);
+        fs::write(
+            &state_path,
+            serde_json::to_vec_pretty(&value).expect("serialize unsupported envelope"),
+        )
+        .expect("write unsupported envelope");
+        assert!(matches!(
+            read_runtime_state(&state_path).expect("read unsupported envelope"),
+            RuntimeStateRead::Corrupt(message)
+                if message.contains("unsupported managed state schema version 99")
+        ));
+
+        value["schema_version"] = serde_json::json!(RUNTIME_STATE_SCHEMA_VERSION);
+        value["runs"] = serde_json::json!([run.clone(), run]);
+        fs::write(
+            &state_path,
+            serde_json::to_vec_pretty(&value).expect("serialize multiple runs"),
+        )
+        .expect("write multiple runs");
+        assert!(matches!(
+            read_runtime_state(&state_path).expect("read multiple runs"),
+            RuntimeStateRead::Corrupt(message)
+                if message.contains("more than one active run")
+        ));
+    }
+
+    #[test]
+    fn create_starting_run_rejects_nonstarting_or_child_attached_records() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let mut invalid = childless_starting_run(temp.path(), "run-1");
+        invalid.lifecycle = RunLifecycle::Running;
+        invalid.child_pid = Some(777);
+        invalid.child_process_start_time_unix_s = Some(111);
+
+        let error = create_starting_run(&state_path, invalid)
+            .expect_err("create operation accepts only childless starting records");
+
+        assert!(matches!(error, SupervisorError::RunStateConflict(_)));
+        assert!(!state_path.exists());
     }
 
     #[test]
@@ -1528,21 +2959,20 @@ mod tests {
             llama_server_version: "test".to_string(),
             process_start_time_unix_s: Some(2),
         };
-        write_runtime_state(&state_path, &[first.clone(), second.clone()])
-            .expect("seed runtime state");
+        write_runtime_state(&state_path, &[managed_run_for(&second)]).expect("seed runtime state");
 
-        let removed = remove_runtime_state_entry(&state_path, first.identity())
+        let removed = remove_runtime_state_entry(&state_path, &managed_run_for(&first).identity())
             .expect("remove matching runtime state");
 
-        assert!(removed);
+        assert!(!removed);
         assert_eq!(
             read_runtime_state(&state_path).expect("runtime state after removal"),
-            RuntimeStateRead::Loaded(vec![second])
+            RuntimeStateRead::Loaded(vec![managed_run_for(&second)])
         );
     }
 
     #[test]
-    fn cleanup_after_ctrl_c_removes_only_matching_instance() {
+    fn cleanup_after_ctrl_c_removes_the_matching_single_run() {
         let temp = tempdir().expect("tempdir");
         let state_path = temp.path().join("managed.json");
         let server = ManagedServer {
@@ -1554,23 +2984,13 @@ mod tests {
             llama_server_version: "test".to_string(),
             process_start_time_unix_s: Some(1),
         };
-        let duplicate_id = ManagedServer {
-            id: "gemma-3-4b-it-q4".to_string(),
-            pid: 888,
-            port: 8082,
-            model_path: temp.path().join("other-model.gguf"),
-            started_at_unix_s: 790,
-            llama_server_version: "test".to_string(),
-            process_start_time_unix_s: Some(2),
-        };
-        write_runtime_state(&state_path, &[server.clone(), duplicate_id.clone()])
-            .expect("seed runtime state");
+        write_runtime_state(&state_path, &[managed_run_for(&server)]).expect("seed runtime state");
 
         let mut child = FakeChild::default();
         let result = cleanup_after_ctrl_c(
             &mut child,
             &state_path,
-            server.identity(),
+            &managed_run_for(&server).identity(),
             Duration::from_millis(10),
         )
         .expect("cleanup result");
@@ -1585,7 +3005,42 @@ mod tests {
         assert_eq!(child.events, vec!["terminate", "try_wait", "try_wait"]);
         assert_eq!(
             read_runtime_state(&state_path).expect("runtime state after cleanup"),
-            RuntimeStateRead::Loaded(vec![duplicate_id])
+            RuntimeStateRead::Loaded(Vec::new())
+        );
+    }
+
+    #[test]
+    fn cleanup_after_ctrl_c_cannot_remove_a_newer_generation_with_the_same_child() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let server = ManagedServer {
+            id: "gemma-3-4b-it-q4".to_string(),
+            pid: 777,
+            port: 8081,
+            model_path: temp.path().join("model.gguf"),
+            started_at_unix_s: 789,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: Some(1),
+        };
+        let stale_generation = managed_run_for(&server);
+        let mut current = stale_generation.clone();
+        current.generation = 1;
+        current.generation_alias = format!("loxa-{}-g1", current.run_id);
+        write_runtime_state(&state_path, &[current.clone()]).expect("seed newer generation");
+        let mut child = FakeChild::default();
+
+        let result = cleanup_after_ctrl_c(
+            &mut child,
+            &state_path,
+            &stale_generation.identity(),
+            Duration::from_millis(10),
+        )
+        .expect("cleanup result");
+
+        assert!(!result.removed_state);
+        assert_eq!(
+            read_runtime_state(&state_path).expect("read newer generation"),
+            RuntimeStateRead::Loaded(vec![current])
         );
     }
 
@@ -1602,23 +3057,13 @@ mod tests {
             llama_server_version: "test".to_string(),
             process_start_time_unix_s: Some(1),
         };
-        let other = ManagedServer {
-            id: "gemma-3-4b-it-q4".to_string(),
-            pid: 888,
-            port: 8082,
-            model_path: temp.path().join("other-model.gguf"),
-            started_at_unix_s: 790,
-            llama_server_version: "test".to_string(),
-            process_start_time_unix_s: Some(2),
-        };
-        write_runtime_state(&state_path, &[server.clone(), other.clone()])
-            .expect("seed runtime state");
+        write_runtime_state(&state_path, &[managed_run_for(&server)]).expect("seed runtime state");
 
         let mut child = FakeChild::with_wait_results(vec![None]);
         let result = cleanup_after_ctrl_c_with(
             &mut child,
             &state_path,
-            server.identity(),
+            &managed_run_for(&server).identity(),
             Duration::ZERO,
             Duration::ZERO,
             Duration::ZERO,
@@ -1639,7 +3084,7 @@ mod tests {
         );
         assert_eq!(
             read_runtime_state(&state_path).expect("runtime state after cleanup"),
-            RuntimeStateRead::Loaded(vec![server, other])
+            RuntimeStateRead::Loaded(vec![managed_run_for(&server)])
         );
     }
 
@@ -1656,14 +3101,13 @@ mod tests {
             llama_server_version: "test".to_string(),
             process_start_time_unix_s: Some(1),
         };
-        write_runtime_state(&state_path, std::slice::from_ref(&server))
-            .expect("seed runtime state");
+        write_runtime_state(&state_path, &[managed_run_for(&server)]).expect("seed runtime state");
 
         let mut child = FakeChild::with_wait_results(vec![None, Some(0)]);
         let result = cleanup_after_ctrl_c_with(
             &mut child,
             &state_path,
-            server.identity(),
+            &managed_run_for(&server).identity(),
             Duration::ZERO,
             Duration::from_millis(10),
             Duration::ZERO,
@@ -1685,266 +3129,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_managed_server_uses_grace_then_force_and_removes_matching_instance() {
-        let temp = tempdir().expect("tempdir");
-        let state_path = temp.path().join("managed.json");
-        let server = ManagedServer {
-            id: "gemma-3-4b-it-q4".to_string(),
-            pid: 777,
-            port: 8081,
-            model_path: temp.path().join("model.gguf"),
-            started_at_unix_s: 789,
-            llama_server_version: "test".to_string(),
-            process_start_time_unix_s: Some(1),
-        };
-        let other = ManagedServer {
-            id: "gemma-3-4b-it-q4".to_string(),
-            pid: 778,
-            port: 8082,
-            model_path: temp.path().join("other.gguf"),
-            started_at_unix_s: 790,
-            llama_server_version: "test".to_string(),
-            process_start_time_unix_s: Some(2),
-        };
-        write_runtime_state(&state_path, &[server.clone(), other.clone()])
-            .expect("seed runtime state");
-
-        let controller = FakeProcessController::new(
-            vec![true, true, true, false],
-            vec![true, true, true, false],
-        );
-
-        let result = stop_managed_server_with(
-            &server,
-            &state_path,
-            Duration::ZERO,
-            Duration::ZERO,
-            Duration::ZERO,
-            &controller,
-            |_| {},
-        )
-        .expect("stop result");
-
-        assert_eq!(
-            result,
-            StopResult {
-                was_running: true,
-                forced: true,
-                removed_state: true,
-                pid_alive: false,
-                port_alive: false,
-            }
-        );
-        assert_eq!(controller.events(), vec!["terminate:777", "kill:777"]);
-        assert_eq!(
-            read_runtime_state(&state_path).expect("runtime state after stop"),
-            RuntimeStateRead::Loaded(vec![other])
-        );
-    }
-
-    #[test]
-    fn stop_managed_server_waits_briefly_after_force_kill_before_removing_state() {
-        let temp = tempdir().expect("tempdir");
-        let state_path = temp.path().join("managed.json");
-        let server = ManagedServer {
-            id: "gemma-3-4b-it-q4".to_string(),
-            pid: 777,
-            port: 8081,
-            model_path: temp.path().join("model.gguf"),
-            started_at_unix_s: 789,
-            llama_server_version: "test".to_string(),
-            process_start_time_unix_s: Some(1),
-        };
-        write_runtime_state(&state_path, std::slice::from_ref(&server))
-            .expect("seed runtime state");
-
-        let controller = FakeProcessController::new(
-            vec![true, true, true, false],
-            vec![true, true, true, false],
-        );
-
-        let result = stop_managed_server_with(
-            &server,
-            &state_path,
-            Duration::ZERO,
-            Duration::from_millis(10),
-            Duration::ZERO,
-            &controller,
-            |_| {},
-        )
-        .expect("stop result");
-
-        assert_eq!(
-            result,
-            StopResult {
-                was_running: true,
-                forced: true,
-                removed_state: true,
-                pid_alive: false,
-                port_alive: false,
-            }
-        );
-        assert_eq!(
-            read_runtime_state(&state_path).expect("runtime state after stop"),
-            RuntimeStateRead::Loaded(Vec::new())
-        );
-    }
-
-    #[test]
-    fn stop_managed_server_removes_state_when_force_kill_leaves_only_port_alive() {
-        let temp = tempdir().expect("tempdir");
-        let state_path = temp.path().join("managed.json");
-        let server = ManagedServer {
-            id: "gemma-3-4b-it-q4".to_string(),
-            pid: 777,
-            port: 8081,
-            model_path: temp.path().join("model.gguf"),
-            started_at_unix_s: 789,
-            llama_server_version: "test".to_string(),
-            process_start_time_unix_s: Some(1),
-        };
-        let other = ManagedServer {
-            id: "gemma-3-4b-it-q4".to_string(),
-            pid: 778,
-            port: 8082,
-            model_path: temp.path().join("other.gguf"),
-            started_at_unix_s: 790,
-            llama_server_version: "test".to_string(),
-            process_start_time_unix_s: Some(2),
-        };
-        write_runtime_state(&state_path, &[server.clone(), other.clone()])
-            .expect("seed runtime state");
-
-        let controller =
-            FakeProcessController::new(vec![true, true, true, false], vec![true, true, true, true]);
-
-        let result = stop_managed_server_with(
-            &server,
-            &state_path,
-            Duration::ZERO,
-            Duration::ZERO,
-            Duration::ZERO,
-            &controller,
-            |_| {},
-        )
-        .expect("stop result");
-
-        assert_eq!(
-            result,
-            StopResult {
-                was_running: true,
-                forced: true,
-                removed_state: true,
-                pid_alive: false,
-                port_alive: true,
-            }
-        );
-        assert_eq!(controller.events(), vec!["terminate:777", "kill:777"]);
-        assert_eq!(
-            read_runtime_state(&state_path).expect("runtime state after stop"),
-            RuntimeStateRead::Loaded(vec![other])
-        );
-    }
-
-    #[test]
-    fn stop_managed_server_stops_matching_identity_even_when_port_is_dead() {
-        let temp = tempdir().expect("tempdir");
-        let state_path = temp.path().join("managed.json");
-        let server = ManagedServer {
-            id: "gemma-3-4b-it-q4".to_string(),
-            pid: 777,
-            port: 8081,
-            model_path: temp.path().join("model.gguf"),
-            started_at_unix_s: 789,
-            llama_server_version: "test".to_string(),
-            process_start_time_unix_s: Some(1),
-        };
-        write_runtime_state(&state_path, std::slice::from_ref(&server))
-            .expect("seed runtime state");
-
-        let controller = FakeProcessController::new_with_start_times(
-            vec![true, false],
-            vec![false, false],
-            vec![Some(1)],
-        );
-
-        let result = stop_managed_server_with(
-            &server,
-            &state_path,
-            Duration::ZERO,
-            Duration::ZERO,
-            Duration::ZERO,
-            &controller,
-            |_| {},
-        )
-        .expect("stop result");
-
-        assert_eq!(
-            result,
-            StopResult {
-                was_running: true,
-                forced: false,
-                removed_state: true,
-                pid_alive: false,
-                port_alive: false,
-            }
-        );
-        assert_eq!(controller.events(), vec!["terminate:777"]);
-        assert_eq!(
-            read_runtime_state(&state_path).expect("runtime state after stop"),
-            RuntimeStateRead::Loaded(Vec::new())
-        );
-    }
-
-    #[test]
-    fn stop_managed_server_removes_stale_pid_dead_port_alive_without_signaling() {
-        let temp = tempdir().expect("tempdir");
-        let state_path = temp.path().join("managed.json");
-        let server = ManagedServer {
-            id: "gemma-3-4b-it-q4".to_string(),
-            pid: 777,
-            port: 8081,
-            model_path: temp.path().join("model.gguf"),
-            started_at_unix_s: 789,
-            llama_server_version: "test".to_string(),
-            process_start_time_unix_s: Some(1),
-        };
-        write_runtime_state(&state_path, std::slice::from_ref(&server))
-            .expect("seed runtime state");
-
-        let controller =
-            FakeProcessController::new_with_start_times(vec![false], vec![true], vec![Some(1)]);
-
-        let result = stop_managed_server_with(
-            &server,
-            &state_path,
-            Duration::ZERO,
-            Duration::ZERO,
-            Duration::ZERO,
-            &controller,
-            |_| {},
-        )
-        .expect("stop result");
-
-        assert_eq!(
-            result,
-            StopResult {
-                was_running: false,
-                forced: false,
-                removed_state: true,
-                pid_alive: false,
-                port_alive: true,
-            }
-        );
-        assert!(controller.events().is_empty());
-        assert_eq!(
-            read_runtime_state(&state_path).expect("runtime state after stop"),
-            RuntimeStateRead::Loaded(Vec::new())
-        );
-    }
-
-    #[test]
-    fn stop_managed_server_removes_identity_mismatch_with_pid_and_port_alive_without_signaling() {
+    fn child_teardown_confirmation_boundary_does_not_mutate_runtime_state() {
         let temp = tempdir().expect("tempdir");
         let state_path = temp.path().join("managed.json");
         let server = ManagedServer {
@@ -1956,155 +3141,25 @@ mod tests {
             llama_server_version: "test".to_string(),
             process_start_time_unix_s: Some(111),
         };
-        write_runtime_state(&state_path, std::slice::from_ref(&server))
-            .expect("seed runtime state");
+        let run = managed_run_for(&server);
+        write_runtime_state(&state_path, std::slice::from_ref(&run)).expect("seed run");
+        let mut child = FakeChild::with_wait_results(vec![Some(0)]);
 
-        let controller =
-            FakeProcessController::new_with_start_times(vec![true], vec![true], vec![Some(222)]);
-
-        let result = stop_managed_server_with(
-            &server,
-            &state_path,
+        let confirmation = teardown_managed_child_with(
+            &mut child,
             Duration::ZERO,
             Duration::ZERO,
             Duration::ZERO,
-            &controller,
             |_| {},
         )
-        .expect("stop result");
+        .expect("child teardown result")
+        .confirmation;
 
+        assert_eq!(confirmation, TeardownConfirmation::Confirmed);
+        assert_eq!(child.events, vec!["terminate", "try_wait"]);
         assert_eq!(
-            result,
-            StopResult {
-                was_running: false,
-                forced: false,
-                removed_state: true,
-                pid_alive: true,
-                port_alive: true,
-            }
-        );
-        assert!(controller.events().is_empty());
-        assert_eq!(
-            read_runtime_state(&state_path).expect("runtime state after stop"),
-            RuntimeStateRead::Loaded(Vec::new())
-        );
-    }
-
-    #[test]
-    fn stop_managed_server_removes_missing_identity_without_signaling() {
-        let temp = tempdir().expect("tempdir");
-        let state_path = temp.path().join("managed.json");
-        let server = ManagedServer {
-            id: "gemma-3-4b-it-q4".to_string(),
-            pid: 777,
-            port: 8081,
-            model_path: temp.path().join("model.gguf"),
-            started_at_unix_s: 789,
-            llama_server_version: "test".to_string(),
-            process_start_time_unix_s: None,
-        };
-        write_runtime_state(&state_path, std::slice::from_ref(&server))
-            .expect("seed runtime state");
-
-        let controller =
-            FakeProcessController::new_with_start_times(vec![true], vec![true], vec![Some(111)]);
-
-        let result = stop_managed_server_with(
-            &server,
-            &state_path,
-            Duration::ZERO,
-            Duration::ZERO,
-            Duration::ZERO,
-            &controller,
-            |_| {},
-        )
-        .expect("stop result");
-
-        assert!(!result.was_running);
-        assert!(result.removed_state);
-        assert!(result.pid_alive);
-        assert!(result.port_alive);
-        assert!(controller.events().is_empty());
-        assert_eq!(
-            read_runtime_state(&state_path).expect("runtime state after stop"),
-            RuntimeStateRead::Loaded(Vec::new())
-        );
-    }
-
-    #[test]
-    fn stop_managed_server_rechecks_identity_before_force_kill() {
-        let temp = tempdir().expect("tempdir");
-        let state_path = temp.path().join("managed.json");
-        let server = ManagedServer {
-            id: "gemma-3-4b-it-q4".to_string(),
-            pid: 777,
-            port: 8081,
-            model_path: temp.path().join("model.gguf"),
-            started_at_unix_s: 789,
-            llama_server_version: "test".to_string(),
-            process_start_time_unix_s: Some(111),
-        };
-        write_runtime_state(&state_path, std::slice::from_ref(&server))
-            .expect("seed runtime state");
-
-        let controller = FakeProcessController::new_with_start_times(
-            vec![true, true],
-            vec![true, true],
-            vec![Some(111), Some(222)],
-        );
-
-        let result = stop_managed_server_with(
-            &server,
-            &state_path,
-            Duration::ZERO,
-            Duration::ZERO,
-            Duration::ZERO,
-            &controller,
-            |_| {},
-        )
-        .expect("stop result");
-
-        assert_eq!(
-            result,
-            StopResult {
-                was_running: true,
-                forced: false,
-                removed_state: true,
-                pid_alive: true,
-                port_alive: true,
-            }
-        );
-        assert_eq!(controller.events(), vec!["terminate:777"]);
-        assert_eq!(
-            read_runtime_state(&state_path).expect("runtime state after stop"),
-            RuntimeStateRead::Loaded(Vec::new())
-        );
-    }
-
-    #[test]
-    fn upsert_runtime_state_entry_rejects_missing_process_identity() {
-        let temp = tempdir().expect("tempdir");
-        let state_path = temp.path().join("managed.json");
-        let server = ManagedServer {
-            id: "gemma-3-4b-it-q4".to_string(),
-            pid: 777,
-            port: 8081,
-            model_path: temp.path().join("model.gguf"),
-            started_at_unix_s: 789,
-            llama_server_version: "test".to_string(),
-            process_start_time_unix_s: None,
-        };
-
-        let error = upsert_runtime_state_entry(&state_path, server)
-            .expect_err("missing process identity should not persist");
-
-        match error {
-            SupervisorError::ProcessIdentityUnavailable(777) => {}
-            other => panic!("unexpected error: {other}"),
-        }
-        assert_eq!(
-            read_runtime_state(&state_path).expect("runtime state after rejected upsert"),
-            RuntimeStateRead::Missing
+            read_runtime_state(&state_path).expect("state remains owner-controlled"),
+            RuntimeStateRead::Loaded(vec![run])
         );
     }
 
@@ -2112,6 +3167,8 @@ mod tests {
     fn persist_managed_server_or_cleanup_cleans_child_when_identity_is_missing() {
         let temp = tempdir().expect("tempdir");
         let state_path = temp.path().join("managed.json");
+        let starting = childless_starting_run(temp.path(), "run-1");
+        create_starting_run(&state_path, starting.clone()).expect("create starting run");
         let server = ManagedServer {
             id: "gemma-3-4b-it-q4".to_string(),
             pid: 777,
@@ -2126,6 +3183,7 @@ mod tests {
         let error = persist_managed_server_or_cleanup(
             &mut child,
             &state_path,
+            starting,
             server,
             Duration::from_millis(10),
         )
@@ -2141,51 +3199,133 @@ mod tests {
         );
         assert_eq!(
             read_runtime_state(&state_path).expect("runtime state after cleanup"),
-            RuntimeStateRead::Missing
-        );
-    }
-
-    #[test]
-    fn child_exit_decision_removes_state_when_restart_budget_is_exhausted() {
-        let temp = tempdir().expect("tempdir");
-        let state_path = temp.path().join("managed.json");
-        let server = ManagedServer {
-            id: "gemma-3-4b-it-q4".to_string(),
-            pid: 777,
-            port: 8081,
-            model_path: temp.path().join("model.gguf"),
-            started_at_unix_s: 789,
-            llama_server_version: "test".to_string(),
-            process_start_time_unix_s: Some(111),
-        };
-        write_runtime_state(&state_path, std::slice::from_ref(&server))
-            .expect("seed runtime state");
-        let mut restarts = RestartPolicy::default();
-        assert!(restarts.should_restart());
-
-        let decision = decide_observed_child_exit(
-            "crash tail".to_string(),
-            &state_path,
-            server.identity(),
-            &NeverInterrupted,
-            &mut restarts,
-        )
-        .expect("child exit decision");
-
-        assert_eq!(
-            decision,
-            ObservedChildExit::Crash {
-                log_tail: "crash tail".to_string(),
-            }
-        );
-        assert_eq!(
-            read_runtime_state(&state_path).expect("runtime state after crash"),
             RuntimeStateRead::Loaded(Vec::new())
         );
     }
 
     #[test]
-    fn child_exit_decision_treats_interrupt_race_as_ctrl_c_cleanup() {
+    fn persist_managed_server_attaches_child_through_exact_starting_identity() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let starting = childless_starting_run(temp.path(), "run-1");
+        create_starting_run(&state_path, starting.clone()).expect("create starting run");
+        let server = ManagedServer {
+            id: starting.model_id.clone(),
+            pid: 777,
+            port: starting.port,
+            model_path: temp.path().join("model.gguf"),
+            started_at_unix_s: 789,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: Some(111),
+        };
+        let mut child = FakeChild::default();
+
+        let attached = persist_managed_server_or_cleanup(
+            &mut child,
+            &state_path,
+            starting,
+            server,
+            Duration::from_millis(10),
+        )
+        .expect("attach managed child");
+
+        assert_eq!(attached.lifecycle, RunLifecycle::Running);
+        assert_eq!(attached.child_pid, Some(777));
+        assert_eq!(attached.child_process_start_time_unix_s, Some(111));
+        assert_eq!(
+            read_runtime_state(&state_path).expect("read attached run"),
+            RuntimeStateRead::Loaded(vec![attached])
+        );
+        assert!(child.events.is_empty());
+    }
+
+    #[test]
+    fn attachment_returns_committed_stop_and_requested_stop_finishes_once_when_confirmed() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let starting = childless_starting_run(temp.path(), "run-1");
+        create_starting_run(&state_path, starting.clone()).expect("create starting run");
+        let stop_has_lock = Arc::new(Barrier::new(2));
+        let release_stop = Arc::new(Barrier::new(2));
+        let stop_path = state_path.clone();
+        let stop_has_lock_thread = Arc::clone(&stop_has_lock);
+        let release_stop_thread = Arc::clone(&release_stop);
+        let stopper = thread::spawn(move || {
+            record_stop_request_with_lock_options_and_hook(
+                &stop_path,
+                "all",
+                Duration::from_secs(2),
+                Duration::from_millis(1),
+                |_| {
+                    stop_has_lock_thread.wait();
+                    release_stop_thread.wait();
+                    Ok(())
+                },
+            )
+        });
+        stop_has_lock.wait();
+        let attach_path = state_path.clone();
+        let attach_starting = starting.clone();
+        let model_path = temp.path().join("model.gguf");
+        let attacher = thread::spawn(move || {
+            let server = ManagedServer {
+                id: attach_starting.model_id.clone(),
+                pid: 777,
+                port: attach_starting.port,
+                model_path,
+                started_at_unix_s: 789,
+                llama_server_version: "test".to_string(),
+                process_start_time_unix_s: Some(111),
+            };
+            let mut child = FakeChild::default();
+            persist_managed_server_or_cleanup(
+                &mut child,
+                &attach_path,
+                attach_starting,
+                server,
+                Duration::from_millis(10),
+            )
+        });
+        release_stop.wait();
+        assert!(matches!(
+            stopper
+                .join()
+                .expect("stopper joins")
+                .expect("stop transaction"),
+            StopRequestMatch::Requested(_)
+        ));
+        let attached = attacher
+            .join()
+            .expect("attacher joins")
+            .expect("attachment succeeds");
+        assert!(
+            attached.stop_requested,
+            "attachment returns committed state"
+        );
+        let decisions = Cell::new(0_u8);
+
+        let outcome = finish_owner_teardown_with(
+            &state_path,
+            &attached.identity(),
+            OwnerTeardownDecision::RequestedStop,
+            |decision| {
+                assert_eq!(decision, OwnerTeardownDecision::RequestedStop);
+                decisions.set(decisions.get() + 1);
+                TeardownConfirmation::Confirmed
+            },
+        )
+        .expect("finish requested stop");
+
+        assert_eq!(outcome, OwnerTerminalOutcome::RequestedStop);
+        assert_eq!(decisions.get(), 1);
+        assert_eq!(
+            read_runtime_state(&state_path).expect("read finished state"),
+            RuntimeStateRead::Loaded(Vec::new())
+        );
+    }
+
+    #[test]
+    fn requested_stop_unconfirmed_teardown_preserves_full_state_for_recovery() {
         let temp = tempdir().expect("tempdir");
         let state_path = temp.path().join("managed.json");
         let server = ManagedServer {
@@ -2197,16 +3337,226 @@ mod tests {
             llama_server_version: "test".to_string(),
             process_start_time_unix_s: Some(111),
         };
-        write_runtime_state(&state_path, std::slice::from_ref(&server))
-            .expect("seed runtime state");
-        let mut restarts = RestartPolicy::default();
+        let mut run = managed_run_for(&server);
+        run.stop_requested = true;
+        write_runtime_state(&state_path, std::slice::from_ref(&run)).expect("seed stopped run");
+
+        let outcome = finish_owner_teardown_with(
+            &state_path,
+            &run.identity(),
+            OwnerTeardownDecision::RequestedStop,
+            |_| TeardownConfirmation::Unconfirmed,
+        )
+        .expect("recovery outcome");
+
+        assert_eq!(outcome, OwnerTerminalOutcome::RecoveryRequired);
+        assert_eq!(
+            read_runtime_state(&state_path).expect("read preserved state"),
+            RuntimeStateRead::Loaded(vec![run])
+        );
+    }
+
+    #[test]
+    fn one_unexpected_exit_advances_same_run_to_childless_generation_one_then_attaches() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let server = ManagedServer {
+            id: "gemma-3-4b-it-q4".to_string(),
+            pid: 777,
+            port: 8081,
+            model_path: temp.path().join("model.gguf"),
+            started_at_unix_s: 789,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: Some(111),
+        };
+        let generation_zero = managed_run_for(&server);
+        write_runtime_state(&state_path, std::slice::from_ref(&generation_zero))
+            .expect("seed generation zero");
+        let decisions = RefCell::new(Vec::new());
+
+        let decision = decide_observed_child_exit_with(
+            "first crash".to_string(),
+            &state_path,
+            &generation_zero.identity(),
+            &NeverInterrupted,
+            || {},
+            |decision| {
+                decisions.borrow_mut().push(decision);
+                TeardownConfirmation::Confirmed
+            },
+        )
+        .expect("restart decision");
+        let ObservedChildExit::Restart {
+            run: generation_one,
+        } = decision
+        else {
+            panic!("expected generation-one restart");
+        };
+        assert_eq!(
+            decisions.into_inner(),
+            vec![OwnerTeardownDecision::UnexpectedExit]
+        );
+        assert_eq!(generation_one.run_id, generation_zero.run_id);
+        assert_eq!(generation_one.generation, 1);
+        assert_eq!(generation_one.generation_alias, "loxa-test-run-777-g1");
+        assert_eq!(generation_one.lifecycle, RunLifecycle::Starting);
+        assert_eq!(generation_one.child_pid, None);
+        assert_eq!(generation_one.child_process_start_time_unix_s, None);
+        assert_eq!(generation_one.child_pgid, None);
+        assert_eq!(
+            read_runtime_state(&state_path).expect("read generation one"),
+            RuntimeStateRead::Loaded(vec![generation_one.clone()])
+        );
+
+        let replacement = ManagedServer {
+            pid: 778,
+            process_start_time_unix_s: Some(222),
+            ..server
+        };
+        let mut child = FakeChild::default();
+        let attached = persist_managed_server_or_cleanup(
+            &mut child,
+            &state_path,
+            generation_one,
+            replacement,
+            Duration::from_millis(10),
+        )
+        .expect("attach generation-one child");
+        assert_eq!(attached.run_id, generation_zero.run_id);
+        assert_eq!(attached.generation, 1);
+        assert_eq!(attached.child_pid, Some(778));
+        assert_eq!(attached.child_process_start_time_unix_s, Some(222));
+    }
+
+    #[test]
+    fn reaped_exit_with_concurrent_stop_confirms_unexpected_exit_once() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let server = ManagedServer {
+            id: "gemma-3-4b-it-q4".to_string(),
+            pid: 777,
+            port: 8081,
+            model_path: temp.path().join("model.gguf"),
+            started_at_unix_s: 789,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: Some(111),
+        };
+        let run = managed_run_for(&server);
+        write_runtime_state(&state_path, std::slice::from_ref(&run)).expect("seed run");
+        let events = RefCell::new(Vec::new());
+
+        let outcome = decide_observed_child_exit_with(
+            "crash".to_string(),
+            &state_path,
+            &run.identity(),
+            &NeverInterrupted,
+            || {
+                events.borrow_mut().push("exit_observed");
+                assert!(matches!(
+                    record_stop_request(&state_path, "all").expect("request stop at barrier"),
+                    StopRequestMatch::Requested(_)
+                ));
+            },
+            |decision| {
+                assert_eq!(decision, OwnerTeardownDecision::UnexpectedExit);
+                events.borrow_mut().push("reaped_exit_confirmation");
+                TeardownConfirmation::Confirmed
+            },
+        )
+        .expect("requested stop wins");
+
+        assert_eq!(outcome, ObservedChildExit::RequestedStop);
+        assert_eq!(
+            events.into_inner(),
+            vec!["exit_observed", "reaped_exit_confirmation"]
+        );
+        assert_eq!(
+            read_runtime_state(&state_path).expect("read finished state"),
+            RuntimeStateRead::Loaded(Vec::new())
+        );
+    }
+
+    #[test]
+    fn second_unexpected_exit_exhausts_without_generation_two_and_gates_on_teardown_confirmation() {
+        for confirmation in [
+            TeardownConfirmation::Confirmed,
+            TeardownConfirmation::Unconfirmed,
+        ] {
+            let temp = tempdir().expect("tempdir");
+            let state_path = temp.path().join("managed.json");
+            let server = ManagedServer {
+                id: "gemma-3-4b-it-q4".to_string(),
+                pid: 778,
+                port: 8081,
+                model_path: temp.path().join("model.gguf"),
+                started_at_unix_s: 789,
+                llama_server_version: "test".to_string(),
+                process_start_time_unix_s: Some(222),
+            };
+            let mut generation_one = managed_run_for(&server);
+            generation_one.generation = 1;
+            generation_one.generation_alias = "loxa-test-run-778-g1".to_string();
+            write_runtime_state(&state_path, std::slice::from_ref(&generation_one))
+                .expect("seed generation one");
+
+            let outcome = decide_observed_child_exit_with(
+                "second crash".to_string(),
+                &state_path,
+                &generation_one.identity(),
+                &NeverInterrupted,
+                || {},
+                |_| confirmation,
+            )
+            .expect("exhaustion outcome");
+
+            match confirmation {
+                TeardownConfirmation::Confirmed => {
+                    assert_eq!(
+                        outcome,
+                        ObservedChildExit::Exhausted {
+                            log_tail: "second crash".to_string(),
+                        }
+                    );
+                    assert_eq!(
+                        read_runtime_state(&state_path).expect("read exhausted state"),
+                        RuntimeStateRead::Loaded(Vec::new())
+                    );
+                }
+                TeardownConfirmation::Unconfirmed => {
+                    assert_eq!(outcome, ObservedChildExit::RecoveryRequired);
+                    assert_eq!(
+                        read_runtime_state(&state_path).expect("read preserved generation one"),
+                        RuntimeStateRead::Loaded(vec![generation_one])
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reaped_exit_with_concurrent_interrupt_confirms_unexpected_exit_once() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let server = ManagedServer {
+            id: "gemma-3-4b-it-q4".to_string(),
+            pid: 777,
+            port: 8081,
+            model_path: temp.path().join("model.gguf"),
+            started_at_unix_s: 789,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: Some(111),
+        };
+        write_runtime_state(&state_path, &[managed_run_for(&server)]).expect("seed runtime state");
 
         let decision = decide_observed_child_exit(
             "crash tail".to_string(),
             &state_path,
-            server.identity(),
+            &managed_run_for(&server).identity(),
             &AlwaysInterrupted,
-            &mut restarts,
+            |decision| {
+                assert_eq!(decision, OwnerTeardownDecision::UnexpectedExit);
+                TeardownConfirmation::Confirmed
+            },
         )
         .expect("child exit decision");
 
@@ -2746,33 +4096,73 @@ mod tests {
         }
     }
 
+    struct FakeOwnerIdentityProbe {
+        statuses: Mutex<Vec<OwnerIdentityStatus>>,
+        events: Mutex<Vec<(u32, u64)>>,
+    }
+
+    impl FakeOwnerIdentityProbe {
+        fn new(statuses: Vec<OwnerIdentityStatus>) -> Self {
+            Self {
+                statuses: Mutex::new(statuses),
+                events: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn events(&self) -> Vec<(u32, u64)> {
+            self.events.lock().expect("owner events lock").clone()
+        }
+    }
+
+    impl OwnerIdentityProbe for FakeOwnerIdentityProbe {
+        fn probe(&self, pid: u32, expected_start_time_unix_s: u64) -> OwnerIdentityStatus {
+            self.events
+                .lock()
+                .expect("owner events lock")
+                .push((pid, expected_start_time_unix_s));
+            let mut statuses = self.statuses.lock().expect("owner statuses lock");
+            if statuses.len() > 1 {
+                statuses.remove(0)
+            } else {
+                statuses
+                    .first()
+                    .copied()
+                    .unwrap_or(OwnerIdentityStatus::Unavailable)
+            }
+        }
+    }
+
+    struct BlockingOwnerIdentityProbe {
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+        status: OwnerIdentityStatus,
+    }
+
+    impl OwnerIdentityProbe for BlockingOwnerIdentityProbe {
+        fn probe(&self, _pid: u32, _expected_start_time_unix_s: u64) -> OwnerIdentityStatus {
+            self.entered.wait();
+            self.release.wait();
+            self.status
+        }
+    }
+
     struct FakeProcessController {
-        events: Mutex<Vec<String>>,
         pid_alive: Mutex<Vec<bool>>,
         port_alive: Mutex<Vec<bool>>,
         process_start_times: Mutex<Vec<Option<u64>>>,
     }
 
     impl FakeProcessController {
-        fn new(pid_alive: Vec<bool>, port_alive: Vec<bool>) -> Self {
-            Self::new_with_start_times(pid_alive, port_alive, vec![Some(1)])
-        }
-
         fn new_with_start_times(
             pid_alive: Vec<bool>,
             port_alive: Vec<bool>,
             process_start_times: Vec<Option<u64>>,
         ) -> Self {
             Self {
-                events: Mutex::new(Vec::new()),
                 pid_alive: Mutex::new(pid_alive),
                 port_alive: Mutex::new(port_alive),
                 process_start_times: Mutex::new(process_start_times),
             }
-        }
-
-        fn events(&self) -> Vec<String> {
-            self.events.lock().expect("events lock").clone()
         }
 
         fn next_state(states: &Mutex<Vec<bool>>) -> bool {
