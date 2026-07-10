@@ -78,6 +78,58 @@ impl OllamaAdapter {
         }
         Ok(())
     }
+
+    /// Verifies that Ollama has no unrelated model resident in memory.
+    ///
+    /// This check is deliberately read-only: attached Ollama instances are
+    /// user-owned and must never be loaded, unloaded, or stopped by Loxa.
+    pub fn isolation_check(&mut self) -> Result<(), ProviderError> {
+        self.validate_identity()?;
+        let inventory = self.transport.get_json(&self.endpoint("/api/ps"))?;
+        let models = inventory
+            .get("models")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                ProviderError::Protocol(
+                    "ollama loaded-model inventory is missing models array".into(),
+                )
+            })?;
+
+        if models.is_empty() {
+            return Ok(());
+        }
+        if models.len() != 1 {
+            return Err(ProviderError::Protocol(
+                "ollama isolation is uncontrolled: multiple models are loaded".into(),
+            ));
+        }
+
+        let loaded = models[0].as_object().ok_or_else(|| {
+            ProviderError::Protocol("ollama loaded-model entry must be an object".into())
+        })?;
+        let name = loaded
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                ProviderError::Protocol("ollama loaded-model entry is missing name".into())
+            })?;
+        let model = loaded
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                ProviderError::Protocol("ollama loaded-model entry is missing model".into())
+            })?;
+        if name != self.model || model != self.model {
+            return Err(ProviderError::Protocol(format!(
+                "ollama isolation is uncontrolled: loaded model {name}/{model} is not {}",
+                self.model
+            )));
+        }
+
+        Ok(())
+    }
 }
 
 impl ProviderAdapter for OllamaAdapter {
@@ -585,6 +637,63 @@ mod tests {
             "template": "{{ .System }} {{ .Prompt }}",
             "details": {"family": "gemma3", "parameter_size": "4.3B"}
         })
+    }
+
+    fn isolation_fixture(response: Value) -> Vec<ExpectedRequest> {
+        vec![ExpectedRequest::Get {
+            url: "http://127.0.0.1:11434/api/ps".into(),
+            response: Ok(response),
+        }]
+    }
+
+    #[test]
+    fn isolation_check_accepts_empty_or_exact_configured_model_without_mutation() {
+        let candidate = identity();
+        for response in [
+            json!({"models": []}),
+            json!({"models": [{"name": candidate.model_id, "model": candidate.model_id}]}),
+        ] {
+            let (transport, expected) = fake_transport(isolation_fixture(response));
+            let mut adapter = OllamaAdapter::with_transport(
+                candidate.clone(),
+                "http://127.0.0.1:11434",
+                candidate.model_id.clone(),
+                transport,
+            );
+
+            assert_eq!(adapter.isolation_check(), Ok(()));
+            assert_fixtures_consumed(&expected);
+        }
+    }
+
+    #[test]
+    fn isolation_check_rejects_other_loaded_models_and_malformed_inventory() {
+        let candidate = identity();
+        for response in [
+            json!({"models": [{"name": "other:latest", "model": "other:latest"}]}),
+            json!({"models": [
+                {"name": candidate.model_id, "model": candidate.model_id},
+                {"name": "other:latest", "model": "other:latest"}
+            ]}),
+            json!({}),
+            json!({"models": {}}),
+            json!({"models": [{}]}),
+            json!({"models": [{"name": candidate.model_id, "model": "other:latest"}]}),
+        ] {
+            let (transport, expected) = fake_transport(isolation_fixture(response));
+            let mut adapter = OllamaAdapter::with_transport(
+                candidate.clone(),
+                "http://127.0.0.1:11434",
+                candidate.model_id.clone(),
+                transport,
+            );
+
+            assert!(matches!(
+                adapter.isolation_check(),
+                Err(ProviderError::Protocol(_))
+            ));
+            assert_fixtures_consumed(&expected);
+        }
     }
 
     fn weather_request() -> InvocationRequest {
