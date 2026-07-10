@@ -19,12 +19,14 @@ mod readiness;
 mod state;
 mod teardown;
 
-pub use readiness::{reserve_localhost_port, LocalhostPortReservation};
-
 pub use lifecycle::{
     decide_observed_child_exit, finish_childless_runtime_state_run, finish_owner_teardown_with,
     ChildlessFinishOutcome, InterruptStatus, ObservedChildExit, OwnerTeardownDecision,
     OwnerTerminalOutcome, PostSpawnCleanupOutcome, SpawnStartingRunOutcome,
+};
+pub use readiness::{
+    process_start_time_with_retry, reserve_localhost_port, wait_for_generation_ready_or_exit,
+    LocalhostPortReservation, PROCESS_IDENTITY_POLL_INTERVAL, PROCESS_IDENTITY_TIMEOUT,
 };
 pub use state::{
     create_starting_run, current_runtime_state_run, finish_runtime_state_run, read_runtime_state,
@@ -68,6 +70,7 @@ pub struct ServerSpec<'a> {
     pub llama_server_path: PathBuf,
     pub port: u16,
     pub ctx_tokens: u32,
+    pub generation_alias: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -205,6 +208,20 @@ pub struct ManagedServerInspection {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManagedRunStatus {
+    Starting,
+    Running,
+    Stopping,
+    RecoveryRequired,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ManagedRunInspection {
+    pub status: ManagedRunStatus,
+    pub owner_status: OwnerIdentityStatus,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CleanupResult {
     pub forced: bool,
     pub removed_state: bool,
@@ -270,17 +287,37 @@ struct SystemProcessController;
 
 struct SystemOwnerIdentityProbe;
 
+fn probe_owner_identity_with<L, S>(
+    pid: u32,
+    expected_start_time_unix_s: u64,
+    mut pid_is_alive: L,
+    mut process_start_time: S,
+) -> OwnerIdentityStatus
+where
+    L: FnMut(u32) -> bool,
+    S: FnMut(u32) -> Option<u64>,
+{
+    if !pid_is_alive(pid) {
+        return OwnerIdentityStatus::Dead;
+    }
+
+    match process_start_time(pid) {
+        Some(actual) if actual != expected_start_time_unix_s => OwnerIdentityStatus::Mismatched,
+        Some(_) if pid_is_alive(pid) => OwnerIdentityStatus::Live,
+        Some(_) => OwnerIdentityStatus::Dead,
+        None if !pid_is_alive(pid) => OwnerIdentityStatus::Dead,
+        None => OwnerIdentityStatus::Unavailable,
+    }
+}
+
 impl OwnerIdentityProbe for SystemOwnerIdentityProbe {
     fn probe(&self, pid: u32, expected_start_time_unix_s: u64) -> OwnerIdentityStatus {
-        if !pid_is_alive(pid) {
-            return OwnerIdentityStatus::Dead;
-        }
-
-        match process_start_time(pid) {
-            Some(actual) if actual == expected_start_time_unix_s => OwnerIdentityStatus::Live,
-            Some(_) => OwnerIdentityStatus::Mismatched,
-            None => OwnerIdentityStatus::Unavailable,
-        }
+        probe_owner_identity_with(
+            pid,
+            expected_start_time_unix_s,
+            pid_is_alive,
+            process_start_time_with_retry,
+        )
     }
 }
 
@@ -294,7 +331,7 @@ impl ProcessController for SystemProcessController {
     }
 
     fn process_start_time(&self, pid: u32) -> Option<u64> {
-        process_start_time(pid)
+        process_start_time_with_retry(pid)
     }
 }
 
@@ -457,6 +494,53 @@ where
 
 pub fn inspect_managed_servers(servers: &[ManagedServer]) -> Vec<ManagedServerInspection> {
     inspect_managed_servers_with(servers, &SystemProcessController)
+}
+
+pub fn inspect_managed_run(run: &ManagedRun) -> ManagedRunInspection {
+    inspect_managed_run_with(run, &SystemOwnerIdentityProbe, &SystemProcessController)
+}
+
+fn inspect_managed_run_with<O, P>(
+    run: &ManagedRun,
+    owner_probe: &O,
+    controller: &P,
+) -> ManagedRunInspection
+where
+    O: OwnerIdentityProbe,
+    P: ProcessController,
+{
+    let owner_status = owner_probe.probe(run.owner_pid, run.owner_process_start_time_unix_s);
+    let status = if owner_status != OwnerIdentityStatus::Live {
+        ManagedRunStatus::RecoveryRequired
+    } else if run.stop_requested || run.lifecycle == RunLifecycle::Stopping {
+        ManagedRunStatus::Stopping
+    } else if run.lifecycle == RunLifecycle::RecoveryRequired {
+        ManagedRunStatus::RecoveryRequired
+    } else if matches!(
+        run.lifecycle,
+        RunLifecycle::Starting | RunLifecycle::Restarting
+    ) && run.child_pid.is_none()
+    {
+        ManagedRunStatus::Starting
+    } else if run.lifecycle == RunLifecycle::Running {
+        match (run.child_pid, run.child_process_start_time_unix_s) {
+            (Some(pid), Some(expected_start_time))
+                if controller.pid_is_alive(pid)
+                    && controller.process_start_time(pid) == Some(expected_start_time)
+                    && controller.port_is_alive(run.port) =>
+            {
+                ManagedRunStatus::Running
+            }
+            _ => ManagedRunStatus::RecoveryRequired,
+        }
+    } else {
+        ManagedRunStatus::RecoveryRequired
+    };
+
+    ManagedRunInspection {
+        status,
+        owner_status,
+    }
 }
 
 fn inspect_managed_servers_with<P: ProcessController>(
@@ -887,17 +971,12 @@ fn process_identity_matches<P: ProcessController>(server: &ManagedServer, contro
     controller.process_start_time(server.pid) == Some(expected)
 }
 
-pub fn process_start_time(pid: u32) -> Option<u64> {
-    let mut system = System::new();
-    let pid = Pid::from_u32(pid);
-    system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
-    system.process(pid).map(|process| process.start_time())
-}
-
 fn llama_server_args(spec: &ServerSpec<'_>) -> Vec<String> {
     vec![
         "--model".to_string(),
         spec.model_path.display().to_string(),
+        "--alias".to_string(),
+        spec.generation_alias.clone(),
         "--host".to_string(),
         "127.0.0.1".to_string(),
         "--port".to_string(),
@@ -1037,14 +1116,151 @@ mod tests {
     }
 
     #[test]
-    fn choose_localhost_port_returns_bindable_localhost_port() {
-        let port = choose_localhost_port(None).expect("choose localhost port");
-        let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind chosen port");
+    fn production_spawn_pipeline_holds_stop_lock_only_across_reservation_release_and_os_spawn() {
+        fn assert_stop_lock_available(state_path: &Path) {
+            let outcome = state::record_stop_request_with_lock_options_and_hook(
+                state_path,
+                "not-the-managed-model",
+                Duration::ZERO,
+                Duration::ZERO,
+                |_| Ok(()),
+            )
+            .expect("stop mutation lock is available");
+            assert_eq!(outcome, state::StopRequestMatch::NoMatch);
+        }
 
-        assert_eq!(
-            listener.local_addr().expect("local addr").ip().to_string(),
-            "127.0.0.1"
-        );
+        fn assert_stop_lock_unavailable(state_path: &Path) {
+            let outcome = state::record_stop_request_with_lock_options_and_hook(
+                state_path,
+                "not-the-managed-model",
+                Duration::ZERO,
+                Duration::ZERO,
+                |_| Ok(()),
+            );
+            assert!(
+                matches!(
+                    outcome,
+                    Err(SupervisorError::Io(ref error))
+                        if error.kind() == io::ErrorKind::WouldBlock
+                ),
+                "stop mutation lock must cover the true OS spawn boundary: {outcome:?}"
+            );
+        }
+
+        for generation in [0, 1] {
+            let temp = tempdir().expect("tempdir");
+            let state_path = temp.path().join("managed.json");
+            let mut run =
+                childless_starting_run(temp.path(), &format!("run-production-spawn-g{generation}"));
+            run.generation = generation;
+            run.generation_alias = format!("loxa-{}-g{generation}", run.run_id);
+            let reservation = reserve_localhost_port(None).expect("reserve localhost port");
+            run.port = reservation.port();
+            create_starting_run(&state_path, run.clone()).expect("publish childless generation");
+            let entry = registry::find(&run.model_id).expect("registry entry");
+            let spec = ServerSpec {
+                entry,
+                model_path: temp.path().join(entry.filename),
+                llama_server_path: std::env::current_exe().expect("current test executable"),
+                port: run.port,
+                ctx_tokens: DEFAULT_CTX_TOKENS,
+                generation_alias: run.generation_alias.clone(),
+            };
+            let log_path = run.log_path.clone();
+            let outcome = spawn_starting_llama_server_with_hooks(
+                &state_path,
+                &run.identity(),
+                &spec,
+                &log_path,
+                reservation,
+                || assert_stop_lock_available(&state_path),
+                || assert_stop_lock_unavailable(&state_path),
+                || assert_stop_lock_unavailable(&state_path),
+                || assert_stop_lock_available(&state_path),
+            )
+            .expect("production spawn pipeline");
+            let SpawnStartingRunOutcome::Spawned {
+                value: mut child, ..
+            } = outcome
+            else {
+                panic!("unexpected requested stop");
+            };
+
+            assert_eq!(
+                teardown_managed_child(&mut child, Duration::ZERO).expect("teardown test child"),
+                TeardownConfirmation::Confirmed
+            );
+            assert_eq!(
+                finish_childless_runtime_state_run(&state_path, &run.identity())
+                    .expect("finish childless test state"),
+                ChildlessFinishOutcome::Finished
+            );
+        }
+    }
+
+    #[test]
+    fn production_facade_committed_childless_stop_suppresses_initial_and_replacement_spawn() {
+        for generation in [0, 1] {
+            let temp = tempdir().expect("tempdir");
+            let state_path = temp.path().join("managed.json");
+            let mut run = childless_starting_run(
+                temp.path(),
+                &format!("run-production-stopped-g{generation}"),
+            );
+            run.generation = generation;
+            run.generation_alias = format!("loxa-{}-g{generation}", run.run_id);
+            let reservation = reserve_localhost_port(None).expect("reserve localhost port");
+            let reserved_port = reservation.port();
+            run.port = reserved_port;
+            create_starting_run(&state_path, run.clone()).expect("publish childless generation");
+            let stopped = state::record_stop_request(&state_path, "all")
+                .expect("commit stop during version/reservation interval");
+            assert!(matches!(
+                stopped,
+                state::StopRequestMatch::Requested(ref current) if current.stop_requested
+            ));
+            let entry = registry::find(&run.model_id).expect("registry entry");
+            let spec = ServerSpec {
+                entry,
+                model_path: temp.path().join(entry.filename),
+                llama_server_path: std::env::current_exe().expect("current test executable"),
+                port: run.port,
+                ctx_tokens: DEFAULT_CTX_TOKENS,
+                generation_alias: run.generation_alias.clone(),
+            };
+            let log_path = run.log_path.clone();
+            let reservation_release_reached = Cell::new(false);
+            let os_spawn_reached = Cell::new(false);
+            let drain_setup_reached = Cell::new(false);
+
+            let outcome = spawn_starting_llama_server_with_hooks(
+                &state_path,
+                &run.identity(),
+                &spec,
+                &log_path,
+                reservation,
+                || {},
+                || reservation_release_reached.set(true),
+                || os_spawn_reached.set(true),
+                || drain_setup_reached.set(true),
+            )
+            .expect("committed childless stop outcome");
+
+            assert!(matches!(outcome, SpawnStartingRunOutcome::RequestedStop));
+            assert!(!reservation_release_reached.get());
+            assert!(!os_spawn_reached.get());
+            assert!(!drain_setup_reached.get());
+            assert_eq!(
+                read_runtime_state(&state_path).expect("read exact-finished stopped state"),
+                RuntimeStateRead::Loaded(Vec::new())
+            );
+            let rebound = TcpListener::bind(("127.0.0.1", reserved_port))
+                .expect("reservation is released without OS spawn");
+            assert_eq!(
+                rebound.local_addr().expect("rebound address").port(),
+                reserved_port
+            );
+        }
     }
 
     #[test]
@@ -1111,6 +1327,213 @@ mod tests {
         assert!(inspections[0].port_alive);
         assert!(!inspections[0].process_identity_matches);
         assert!(inspections[0].stale);
+    }
+
+    #[test]
+    fn inspect_managed_run_requires_live_owner_identity() {
+        let server = ManagedServer {
+            id: "gemma-3-4b-it-q4".to_string(),
+            pid: 777,
+            port: 8081,
+            model_path: PathBuf::from("/tmp/model.gguf"),
+            started_at_unix_s: 456,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: Some(111),
+        };
+        let run = managed_run_for(&server);
+
+        for owner_status in [
+            OwnerIdentityStatus::Dead,
+            OwnerIdentityStatus::Unavailable,
+            OwnerIdentityStatus::Mismatched,
+        ] {
+            let inspection = inspect_managed_run_with(
+                &run,
+                &FixedOwnerIdentityProbe(owner_status),
+                &FakeProcessController::new_with_start_times(
+                    vec![true],
+                    vec![true],
+                    vec![Some(111)],
+                ),
+            );
+
+            assert_eq!(
+                inspection,
+                ManagedRunInspection {
+                    status: ManagedRunStatus::RecoveryRequired,
+                    owner_status,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn inspect_managed_run_applies_live_owner_lifecycle_precedence() {
+        let mut run = childless_starting_run(Path::new("/tmp"), "run-precedence");
+        run.stop_requested = true;
+        run.lifecycle = RunLifecycle::RecoveryRequired;
+        let owner = FixedOwnerIdentityProbe(OwnerIdentityStatus::Live);
+        let controller = FakeProcessController::new_with_start_times(vec![], vec![], vec![]);
+
+        assert_eq!(
+            inspect_managed_run_with(&run, &owner, &controller).status,
+            ManagedRunStatus::Stopping
+        );
+
+        run.stop_requested = false;
+        run.lifecycle = RunLifecycle::Stopping;
+        assert_eq!(
+            inspect_managed_run_with(&run, &owner, &controller).status,
+            ManagedRunStatus::Stopping
+        );
+
+        run.lifecycle = RunLifecycle::RecoveryRequired;
+        assert_eq!(
+            inspect_managed_run_with(&run, &owner, &controller).status,
+            ManagedRunStatus::RecoveryRequired
+        );
+
+        run.lifecycle = RunLifecycle::Restarting;
+        assert_eq!(
+            inspect_managed_run_with(&run, &owner, &controller).status,
+            ManagedRunStatus::Starting
+        );
+
+        run.child_pid = Some(777);
+        run.child_process_start_time_unix_s = Some(111);
+        assert_eq!(
+            inspect_managed_run_with(&run, &owner, &controller).status,
+            ManagedRunStatus::RecoveryRequired
+        );
+    }
+
+    #[test]
+    fn inspect_managed_run_rejects_ambiguous_running_child_identity() {
+        let server = ManagedServer {
+            id: "gemma-3-4b-it-q4".to_string(),
+            pid: 777,
+            port: 8081,
+            model_path: PathBuf::from("/tmp/model.gguf"),
+            started_at_unix_s: 456,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: Some(111),
+        };
+        let owner = FixedOwnerIdentityProbe(OwnerIdentityStatus::Live);
+
+        let mut missing_identity = managed_run_for(&server);
+        missing_identity.child_process_start_time_unix_s = None;
+        assert_eq!(
+            inspect_managed_run_with(
+                &missing_identity,
+                &owner,
+                &FakeProcessController::new_with_start_times(vec![true], vec![], vec![]),
+            )
+            .status,
+            ManagedRunStatus::RecoveryRequired
+        );
+
+        assert_eq!(
+            inspect_managed_run_with(
+                &managed_run_for(&server),
+                &owner,
+                &FakeProcessController::new_with_start_times(vec![false], vec![], vec![]),
+            )
+            .status,
+            ManagedRunStatus::RecoveryRequired
+        );
+
+        assert_eq!(
+            inspect_managed_run_with(
+                &managed_run_for(&server),
+                &owner,
+                &FakeProcessController::new_with_start_times(vec![true], vec![], vec![Some(222)],),
+            )
+            .status,
+            ManagedRunStatus::RecoveryRequired
+        );
+
+        assert_eq!(
+            inspect_managed_run_with(
+                &managed_run_for(&server),
+                &owner,
+                &FakeProcessController::new_with_start_times(
+                    vec![true],
+                    vec![false],
+                    vec![Some(111)],
+                ),
+            )
+            .status,
+            ManagedRunStatus::RecoveryRequired
+        );
+    }
+
+    #[test]
+    fn process_identity_transient_owner_and_child_misses_keep_run_inspection_running() {
+        let server = ManagedServer {
+            id: "gemma-3-4b-it-q4".to_string(),
+            pid: 777,
+            port: 8081,
+            model_path: PathBuf::from("/tmp/model.gguf"),
+            started_at_unix_s: 456,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: Some(111),
+        };
+        let owner = RetryingOwnerIdentityProbe::new(vec![true, true], vec![None, Some(456)]);
+        let child = RetryingProcessController::new(true, true, vec![None, Some(111)]);
+
+        let inspection = inspect_managed_run_with(&managed_run_for(&server), &owner, &child);
+
+        assert_eq!(
+            inspection,
+            ManagedRunInspection {
+                status: ManagedRunStatus::Running,
+                owner_status: OwnerIdentityStatus::Live,
+            }
+        );
+        assert_eq!(owner.lookups.get(), 2);
+        assert_eq!(child.lookups.get(), 2);
+    }
+
+    #[test]
+    fn process_identity_transient_owner_miss_preserves_external_stop_inspection() {
+        let mut run = childless_starting_run(Path::new("/tmp"), "run-stopping");
+        run.stop_requested = true;
+        let owner = RetryingOwnerIdentityProbe::new(
+            vec![true, true],
+            vec![None, Some(run.owner_process_start_time_unix_s)],
+        );
+        let child = FakeProcessController::new_with_start_times(vec![], vec![], vec![]);
+
+        let inspection = inspect_managed_run_with(&run, &owner, &child);
+
+        assert_eq!(inspection.status, ManagedRunStatus::Stopping);
+        assert_eq!(inspection.owner_status, OwnerIdentityStatus::Live);
+        assert_eq!(owner.lookups.get(), 2);
+    }
+
+    #[test]
+    fn process_identity_owner_that_dies_during_retry_is_dead() {
+        let owner = RetryingOwnerIdentityProbe::new(vec![true, false], vec![None, Some(456)]);
+
+        let status = owner.probe(42, 456);
+
+        assert_eq!(status, OwnerIdentityStatus::Dead);
+    }
+
+    #[test]
+    fn process_identity_mismatch_is_definitive_during_run_inspection() {
+        let run = childless_starting_run(Path::new("/tmp"), "run-mismatch");
+        let owner = RetryingOwnerIdentityProbe::new(
+            vec![true, true],
+            vec![Some(999), Some(run.owner_process_start_time_unix_s)],
+        );
+        let child = FakeProcessController::new_with_start_times(vec![], vec![], vec![]);
+
+        let inspection = inspect_managed_run_with(&run, &owner, &child);
+
+        assert_eq!(inspection.status, ManagedRunStatus::RecoveryRequired);
+        assert_eq!(inspection.owner_status, OwnerIdentityStatus::Mismatched);
+        assert_eq!(owner.lookups.get(), 1);
     }
 
     #[test]
@@ -1618,6 +2041,7 @@ mod tests {
             llama_server_path: PathBuf::from("/tmp/llama-server"),
             port: 8080,
             ctx_tokens: DEFAULT_CTX_TOKENS,
+            generation_alias: "loxa-test-run-g0".to_string(),
         });
 
         assert!(args.iter().any(|arg| arg == "--log-disable"));
@@ -1713,58 +2137,101 @@ mod tests {
         }
     }
 
-    struct FakeSpawnedServer {
-        wait_results: Vec<Option<i32>>,
-        log_drains: Vec<thread::JoinHandle<io::Result<()>>>,
-    }
-
-    impl FakeSpawnedServer {
-        fn new(log_drains: Vec<thread::JoinHandle<io::Result<()>>>) -> Self {
-            Self {
-                wait_results: vec![Some(1)],
-                log_drains,
-            }
-        }
-    }
-
-    impl ManagedChild for FakeSpawnedServer {
-        fn pid(&self) -> u32 {
-            777
-        }
-
-        fn terminate(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-
-        fn kill(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-
-        fn try_wait(&mut self) -> io::Result<Option<i32>> {
-            if self.wait_results.len() > 1 {
-                Ok(self.wait_results.remove(0))
-            } else {
-                Ok(self.wait_results.first().copied().unwrap_or(Some(1)))
-            }
-        }
-    }
-
-    impl LogDrainingChild for FakeSpawnedServer {
-        fn join_log_drains(&mut self) -> Result<(), SupervisorError> {
-            for drain in self.log_drains.drain(..) {
-                drain
-                    .join()
-                    .map_err(|_| SupervisorError::Io(io::Error::other("drain panic")))?
-                    .map_err(SupervisorError::Io)?;
-            }
-            Ok(())
-        }
-    }
-
     struct FakeProcessController {
         pid_alive: Mutex<Vec<bool>>,
         port_alive: Mutex<Vec<bool>>,
         process_start_times: Mutex<Vec<Option<u64>>>,
+    }
+
+    struct FixedOwnerIdentityProbe(OwnerIdentityStatus);
+
+    struct RetryingOwnerIdentityProbe {
+        alive: Mutex<Vec<bool>>,
+        start_times: Mutex<Vec<Option<u64>>>,
+        lookups: Cell<u8>,
+    }
+
+    struct RetryingProcessController {
+        pid_alive: bool,
+        port_alive: bool,
+        start_times: Mutex<Vec<Option<u64>>>,
+        lookups: Cell<u8>,
+    }
+
+    impl OwnerIdentityProbe for FixedOwnerIdentityProbe {
+        fn probe(&self, _pid: u32, _expected_start_time_unix_s: u64) -> OwnerIdentityStatus {
+            self.0
+        }
+    }
+
+    impl RetryingOwnerIdentityProbe {
+        fn new(alive: Vec<bool>, start_times: Vec<Option<u64>>) -> Self {
+            Self {
+                alive: Mutex::new(alive),
+                start_times: Mutex::new(start_times),
+                lookups: Cell::new(0),
+            }
+        }
+    }
+
+    impl OwnerIdentityProbe for RetryingOwnerIdentityProbe {
+        fn probe(&self, pid: u32, expected_start_time_unix_s: u64) -> OwnerIdentityStatus {
+            let elapsed = Cell::new(Duration::ZERO);
+            probe_owner_identity_with(
+                pid,
+                expected_start_time_unix_s,
+                |_| FakeProcessController::next_state(&self.alive),
+                |pid| {
+                    readiness::process_start_time_with_retry_with(
+                        pid,
+                        Duration::from_millis(100),
+                        Duration::from_millis(25),
+                        |_| {
+                            self.lookups.set(self.lookups.get() + 1);
+                            FakeProcessController::next_start_time(&self.start_times)
+                        },
+                        || elapsed.get(),
+                        |duration| elapsed.set(elapsed.get() + duration),
+                    )
+                },
+            )
+        }
+    }
+
+    impl RetryingProcessController {
+        fn new(pid_alive: bool, port_alive: bool, start_times: Vec<Option<u64>>) -> Self {
+            Self {
+                pid_alive,
+                port_alive,
+                start_times: Mutex::new(start_times),
+                lookups: Cell::new(0),
+            }
+        }
+    }
+
+    impl ProcessController for RetryingProcessController {
+        fn pid_is_alive(&self, _pid: u32) -> bool {
+            self.pid_alive
+        }
+
+        fn port_is_alive(&self, _port: u16) -> bool {
+            self.port_alive
+        }
+
+        fn process_start_time(&self, pid: u32) -> Option<u64> {
+            let elapsed = Cell::new(Duration::ZERO);
+            readiness::process_start_time_with_retry_with(
+                pid,
+                Duration::from_millis(100),
+                Duration::from_millis(25),
+                |_| {
+                    self.lookups.set(self.lookups.get() + 1);
+                    FakeProcessController::next_start_time(&self.start_times)
+                },
+                || elapsed.get(),
+                |duration| elapsed.set(elapsed.get() + duration),
+            )
+        }
     }
 
     impl FakeProcessController {
