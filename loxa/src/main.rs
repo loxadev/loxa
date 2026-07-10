@@ -24,6 +24,7 @@ struct Cli {
 
 #[derive(clap::Subcommand)]
 enum Command {
+    Calibrate,
     Doctor,
     Pull {
         id: String,
@@ -173,6 +174,7 @@ fn run_with_paths<W: Write, E: Write>(
     mut stderr: E,
 ) -> ExitCode {
     let result = match cli.command {
+        Command::Calibrate => run_calibration(&mut stdout),
         Command::Doctor => print_doctor(&mut stdout),
         Command::Pull { id } => pull_model(&id, &mut stdout, &mut stderr),
         Command::List => print_list(&mut stdout),
@@ -184,12 +186,149 @@ fn run_with_paths<W: Write, E: Write>(
         Command::Stop { target } => stop_managed_servers(&target, paths, &mut stdout, &mut stderr),
     };
 
+    finish_cli_result(result, &mut stderr)
+}
+
+fn finish_cli_result<E: Write>(result: io::Result<ExitCode>, stderr: &mut E) -> ExitCode {
     match result {
         Ok(exit_code) => exit_code,
         Err(error) => {
             let _ = writeln!(stderr, "error: {error}");
             ExitCode::from(1)
         }
+    }
+}
+
+fn run_calibration<W: Write>(stdout: &mut W) -> io::Result<ExitCode> {
+    run_calibration_with(loxa_core::calibration::run_pinned_calibration, stdout)
+}
+
+fn run_calibration_with<W: Write>(
+    execute: impl FnOnce() -> Result<
+        loxa_core::calibration::CalibrationOutcome,
+        loxa_core::calibration::CalibrationError,
+    >,
+    stdout: &mut W,
+) -> io::Result<ExitCode> {
+    match execute() {
+        Ok(outcome) => {
+            render_calibration_outcome(&outcome, stdout)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(error) => Err(io::Error::other(calibration_error_message(&error))),
+    }
+}
+
+fn render_calibration_outcome<W: Write>(
+    outcome: &loxa_core::calibration::CalibrationOutcome,
+    output: &mut W,
+) -> io::Result<()> {
+    use loxa_core::evidence::EvidenceVerdict;
+    let evidence = &outcome.evidence;
+    let evidence_path = outcome
+        .evidence_path
+        .as_deref()
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| {
+            io::Error::other("calibration succeeded without an absolute evidence path")
+        })?;
+    writeln!(output, "workload: {}", evidence.workload_version)?;
+    for (index, candidate) in evidence.candidates.iter().enumerate() {
+        let label = if index == 0 { 'A' } else { 'B' };
+        writeln!(
+            output,
+            "candidate {label}: {} fingerprint={} digest={} provider={:?}",
+            candidate.identity.candidate_id,
+            candidate.fingerprint,
+            candidate.identity.artifact.digest_sha256,
+            candidate.identity.provider_kind
+        )?;
+    }
+    writeln!(output, "\nqualification:")?;
+    for (index, candidate) in evidence.candidates.iter().enumerate() {
+        let label = if index == 0 { 'A' } else { 'B' };
+        let qualification = evidence
+            .qualifications
+            .iter()
+            .find(|q| q.candidate_fingerprint == candidate.fingerprint);
+        let passed = qualification.is_some_and(|q| q.passed_current_contract());
+        let failure = qualification.and_then(|q| {
+            q.case_results
+                .iter()
+                .find(|case| !case.passed)
+                .and_then(|case| case.reason.as_deref())
+                .or_else(|| q.failure_codes.first().map(String::as_str))
+        });
+        match failure {
+            Some(reason) => writeln!(output, "  candidate {label}: failed — {reason}")?,
+            None if passed => writeln!(output, "  candidate {label}: passed")?,
+            None => writeln!(output, "  candidate {label}: failed — qualification_failed")?,
+        }
+    }
+    match &evidence.verdict {
+        EvidenceVerdict::Selected {
+            candidate_id,
+            reason_code,
+            ..
+        } => {
+            let label = candidate_label(evidence, candidate_id)?;
+            writeln!(output, "\nverdict: selected candidate {label}")?;
+            writeln!(output, "reason: {reason_code}")?;
+        }
+        EvidenceVerdict::NoVerifiedPlan { reason_codes, .. } => {
+            writeln!(output, "\nverdict: no verified plan")?;
+            writeln!(output, "reason: {}", reason_codes.join(", "))?;
+        }
+        EvidenceVerdict::NoMaterialWinner {
+            baseline_candidate_id,
+            reason_code,
+            ..
+        } => {
+            let label = candidate_label(evidence, baseline_candidate_id)?;
+            writeln!(output, "\nverdict: no material winner")?;
+            writeln!(output, "reason: {reason_code}")?;
+            writeln!(output, "baseline retained: candidate {label}")?;
+        }
+    }
+    writeln!(output, "evidence: {}", evidence_path.display())?;
+    Ok(())
+}
+
+fn candidate_label(
+    evidence: &loxa_core::evidence::CalibrationEvidence,
+    id: &str,
+) -> io::Result<char> {
+    match evidence
+        .candidates
+        .iter()
+        .position(|candidate| candidate.identity.candidate_id == id)
+    {
+        Some(0) => Ok('A'),
+        Some(1) => Ok('B'),
+        _ => Err(io::Error::other(format!(
+            "verdict references unknown candidate id: {id:?}"
+        ))),
+    }
+}
+
+fn calibration_error_message(error: &loxa_core::calibration::CalibrationError) -> String {
+    use loxa_core::calibration::CalibrationError;
+    match error {
+        CalibrationError::Isolation(reasons) => {
+            format!("isolation prerequisite failed: {}", reasons.join(", "))
+        }
+        CalibrationError::Provider(error) => format!("provider prerequisite failed: {error}"),
+        CalibrationError::IdentityChanged => {
+            "evidence error: candidate identity changed during calibration".into()
+        }
+        CalibrationError::Evidence(error) => format!("evidence persistence failed: {error}"),
+        CalibrationError::OperationAndTeardown {
+            operation,
+            teardown,
+        } => format!(
+            "{}; managed teardown also failed: {teardown}",
+            calibration_error_message(operation)
+        ),
     }
 }
 
@@ -2066,6 +2205,12 @@ mod tests {
 
     #[test]
     fn clap_parses_all_subcommands() {
+        assert!(matches!(
+            Cli::try_parse_from(["loxa", "calibrate"]),
+            Ok(Cli {
+                command: Command::Calibrate
+            })
+        ));
         assert!(Cli::try_parse_from(["loxa", "doctor"]).is_ok());
         assert!(Cli::try_parse_from(["loxa", "list"]).is_ok());
         assert!(Cli::try_parse_from(["loxa", "pull", "gemma-3-4b-it-q4"]).is_ok());
@@ -2092,6 +2237,318 @@ mod tests {
                 command: Command::Stop { target },
             }) if target == "all"
         ));
+    }
+
+    #[test]
+    fn calibration_renderer_reports_no_material_winner_and_retained_baseline() {
+        let outcome = calibration_outcome_for_test(
+            loxa_core::evidence::EvidenceVerdict::NoMaterialWinner {
+                schema_version: 1,
+                baseline_candidate_id: "gemma-3-4b-it-q4".into(),
+                reason_code: "no_material_winner".into(),
+            },
+            loxa_core::selector::SelectorVerdict::NoMaterialWinner {
+                schema_version: 1,
+                baseline_candidate_id: "gemma-3-4b-it-q4".into(),
+                reason: "both qualified; attached candidate did not clear both thresholds".into(),
+            },
+        );
+        let mut output = Vec::new();
+        render_calibration_outcome(&outcome, &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("workload: tool-use-v1"));
+        assert!(output.contains("verdict: no material winner"));
+        assert!(output.contains("baseline retained: candidate A"));
+        assert!(output.contains("evidence: /tmp/calibration.json"));
+        assert!(!output.contains("best"));
+    }
+
+    #[test]
+    fn calibration_renderer_reports_selected_and_no_verified_outcomes() {
+        use loxa_core::evidence::EvidenceVerdict;
+        use loxa_core::selector::SelectorVerdict;
+        let cases = [
+            (
+                EvidenceVerdict::Selected {
+                    schema_version: 1,
+                    candidate_id: "gemma-3-4b-it-q4".into(),
+                    reason_code: "only_managed_qualified".into(),
+                },
+                SelectorVerdict::Selected {
+                    schema_version: 1,
+                    candidate_id: "gemma-3-4b-it-q4".into(),
+                    reason: "only managed qualified".into(),
+                },
+                "verdict: selected candidate A",
+            ),
+            (
+                EvidenceVerdict::Selected {
+                    schema_version: 1,
+                    candidate_id: "candidate-b".into(),
+                    reason_code: "only_attached_qualified".into(),
+                },
+                SelectorVerdict::Selected {
+                    schema_version: 1,
+                    candidate_id: "candidate-b".into(),
+                    reason: "only attached qualified".into(),
+                },
+                "verdict: selected candidate B",
+            ),
+            (
+                EvidenceVerdict::NoVerifiedPlan {
+                    schema_version: 1,
+                    reason_codes: vec!["qualification_failed".into()],
+                },
+                SelectorVerdict::NoVerifiedPlan {
+                    schema_version: 1,
+                    reasons: vec!["qualification failed".into()],
+                },
+                "verdict: no verified plan",
+            ),
+        ];
+        for (evidence_verdict, verdict, expected) in cases {
+            let outcome = calibration_outcome_for_test(evidence_verdict, verdict);
+            let mut output = Vec::new();
+            render_calibration_outcome(&outcome, &mut output).unwrap();
+            let output = String::from_utf8(output).unwrap();
+            assert!(output.contains(expected));
+            assert!(output.contains("candidate A: gemma-3-4b-it-q4 fingerprint="));
+            assert!(output.contains("digest="));
+            assert!(output.contains("provider=Ollama"));
+            assert!(output.contains("candidate A: passed"));
+            assert!(output.contains("candidate B: passed"));
+            assert!(output.contains("reason:"));
+            assert!(output.contains("evidence: /tmp/calibration.json"));
+        }
+    }
+
+    #[test]
+    fn calibration_errors_are_nonzero_and_name_the_prerequisite_class() {
+        use loxa_core::calibration::CalibrationError;
+        use loxa_core::evidence::read_evidence_json;
+        use loxa_core::provider::ProviderError;
+        let evidence_error = read_evidence_json(b"not-json").unwrap_err();
+        let cases = [
+            (
+                CalibrationError::Isolation(vec!["other model loaded".into()]),
+                "isolation prerequisite failed",
+            ),
+            (
+                CalibrationError::Provider(ProviderError::Unreachable),
+                "provider prerequisite failed",
+            ),
+            (CalibrationError::IdentityChanged, "evidence error"),
+            (
+                CalibrationError::Evidence(evidence_error),
+                "evidence persistence failed",
+            ),
+            (
+                CalibrationError::OperationAndTeardown {
+                    operation: Box::new(CalibrationError::Provider(ProviderError::Unreachable)),
+                    teardown: ProviderError::Lifecycle("cleanup".into()),
+                },
+                "managed teardown also failed",
+            ),
+        ];
+        for (error, expected) in cases {
+            let mut output = Vec::new();
+            let result = run_calibration_with(|| Err(error), &mut output);
+            assert!(result.is_err());
+            assert!(result.unwrap_err().to_string().contains(expected));
+            assert!(output.is_empty());
+        }
+    }
+
+    #[test]
+    fn calibration_error_reaches_top_level_stderr_and_nonzero_exit() {
+        let mut stdout = Vec::new();
+        let result = run_calibration_with(
+            || {
+                Err(loxa_core::calibration::CalibrationError::Provider(
+                    loxa_core::provider::ProviderError::Unreachable,
+                ))
+            },
+            &mut stdout,
+        );
+        let mut stderr = Vec::new();
+        let exit = finish_cli_result(result, &mut stderr);
+        assert_eq!(exit, ExitCode::from(1));
+        assert!(stdout.is_empty());
+        assert!(String::from_utf8(stderr)
+            .unwrap()
+            .contains("error: provider prerequisite failed: provider is unreachable"));
+    }
+
+    #[test]
+    fn calibration_success_requires_absolute_evidence_for_every_verdict() {
+        use loxa_core::evidence::EvidenceVerdict;
+        use loxa_core::selector::SelectorVerdict;
+        let verdicts = vec![
+            (
+                EvidenceVerdict::Selected {
+                    schema_version: 1,
+                    candidate_id: "gemma-3-4b-it-q4".into(),
+                    reason_code: "only_managed_qualified".into(),
+                },
+                SelectorVerdict::Selected {
+                    schema_version: 1,
+                    candidate_id: "gemma-3-4b-it-q4".into(),
+                    reason: "x".into(),
+                },
+            ),
+            (
+                EvidenceVerdict::NoVerifiedPlan {
+                    schema_version: 1,
+                    reason_codes: vec!["qualification_failed".into()],
+                },
+                SelectorVerdict::NoVerifiedPlan {
+                    schema_version: 1,
+                    reasons: vec!["x".into()],
+                },
+            ),
+            (
+                EvidenceVerdict::NoMaterialWinner {
+                    schema_version: 1,
+                    baseline_candidate_id: "gemma-3-4b-it-q4".into(),
+                    reason_code: "no_material_winner".into(),
+                },
+                SelectorVerdict::NoMaterialWinner {
+                    schema_version: 1,
+                    baseline_candidate_id: "gemma-3-4b-it-q4".into(),
+                    reason: "x".into(),
+                },
+            ),
+        ];
+        for (evidence_verdict, verdict) in verdicts {
+            for path in [None, Some(PathBuf::from("relative.json"))] {
+                let mut outcome =
+                    calibration_outcome_for_test(evidence_verdict.clone(), verdict.clone());
+                outcome.evidence_path = path;
+                assert!(render_calibration_outcome(&outcome, &mut Vec::new()).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn calibration_qualification_requires_all_five_clean_passes() {
+        use loxa_core::workload::QualificationCaseResult;
+        let mut outcome = calibration_outcome_for_test(
+            loxa_core::evidence::EvidenceVerdict::NoVerifiedPlan {
+                schema_version: 1,
+                reason_codes: vec!["qualification_failed".into()],
+            },
+            loxa_core::selector::SelectorVerdict::NoVerifiedPlan {
+                schema_version: 1,
+                reasons: vec!["x".into()],
+            },
+        );
+        outcome.evidence.qualifications[0].case_results = (0..4)
+            .map(|i| QualificationCaseResult {
+                schema_version: 1,
+                case_id: format!("case-{i}"),
+                passed: true,
+                reason: None,
+            })
+            .collect();
+        let mut output = Vec::new();
+        render_calibration_outcome(&outcome, &mut output).unwrap();
+        assert!(String::from_utf8(output)
+            .unwrap()
+            .contains("candidate A: failed — qualification_failed"));
+    }
+
+    #[test]
+    fn calibration_unknown_or_empty_selected_candidate_is_an_error() {
+        for id in ["", "unknown"] {
+            let mut outcome = calibration_outcome_for_test(
+                loxa_core::evidence::EvidenceVerdict::Selected {
+                    schema_version: 1,
+                    candidate_id: id.into(),
+                    reason_code: "only_managed_qualified".into(),
+                },
+                loxa_core::selector::SelectorVerdict::Selected {
+                    schema_version: 1,
+                    candidate_id: id.into(),
+                    reason: "x".into(),
+                },
+            );
+            outcome.evidence.verdict = loxa_core::evidence::EvidenceVerdict::Selected {
+                schema_version: 1,
+                candidate_id: id.into(),
+                reason_code: "only_managed_qualified".into(),
+            };
+            assert!(render_calibration_outcome(&outcome, &mut Vec::new()).is_err());
+        }
+    }
+
+    fn calibration_outcome_for_test(
+        evidence_verdict: loxa_core::evidence::EvidenceVerdict,
+        verdict: loxa_core::selector::SelectorVerdict,
+    ) -> loxa_core::calibration::CalibrationOutcome {
+        use loxa_core::evidence::*;
+        let mut a = loxa_core::provider::ollama::provisional_candidate_spec();
+        a.candidate_id = "gemma-3-4b-it-q4".into();
+        let mut b = a.clone();
+        b.candidate_id = "candidate-b".into();
+        b.artifact.artifact_id = "candidate-b-artifact".into();
+        let candidates = [
+            CandidateEvidence {
+                schema_version: 1,
+                fingerprint: a.fingerprint(),
+                identity: a,
+            },
+            CandidateEvidence {
+                schema_version: 1,
+                fingerprint: b.fingerprint(),
+                identity: b,
+            },
+        ];
+        loxa_core::calibration::CalibrationOutcome {
+            evidence: CalibrationEvidence {
+                schema_version: 1,
+                protocol_version: "calibration-v1".into(),
+                workload_version: "tool-use-v1".into(),
+                policy_version: "selector-v1".into(),
+                started_at_unix_ms: 1,
+                ended_at_unix_ms: 2,
+                host: HostFingerprint {
+                    schema_version: 1,
+                    os_name: "test".into(),
+                    os_version: "1".into(),
+                    hardware_model: "test".into(),
+                    physical_cores: 1,
+                    logical_cores: 1,
+                    memory_total_bytes: 1,
+                    memory_available_bytes: 1,
+                    root_disk_total_bytes: Some(1),
+                    root_disk_available_bytes: Some(1),
+                },
+                qualifications: candidates
+                    .iter()
+                    .map(|candidate| QualificationEvidence {
+                        schema_version: 1,
+                        candidate_fingerprint: candidate.fingerprint.clone(),
+                        case_results: (0..5)
+                            .map(|i| loxa_core::workload::QualificationCaseResult {
+                                schema_version: 1,
+                                case_id: format!("case-{i}"),
+                                passed: true,
+                                reason: None,
+                            })
+                            .collect(),
+                        failure_codes: vec![],
+                    })
+                    .collect(),
+                candidates,
+                disclosed_differences: vec![],
+                measurements: vec![],
+                isolation_observations: vec![],
+                verdict: evidence_verdict,
+                explanation_codes: vec![],
+            },
+            evidence_path: Some(PathBuf::from("/tmp/calibration.json")),
+            verdict,
+        }
     }
 
     #[test]
