@@ -69,7 +69,7 @@ struct RuntimeStateEnvelope {
 pub enum RuntimeStateRead {
     Missing,
     Loaded(Vec<ManagedRun>),
-    Legacy,
+    Legacy(PathBuf),
     Corrupt(String),
 }
 
@@ -92,6 +92,11 @@ pub fn runtime_logs_dir() -> PathBuf {
 }
 
 pub fn read_runtime_state(path: &Path) -> Result<RuntimeStateRead, SupervisorError> {
+    let sentinel_path = legacy_runtime_state_lock_path(path);
+    if sentinel_path.try_exists()? {
+        return Ok(RuntimeStateRead::Legacy(sentinel_path));
+    }
+
     match fs::read(path) {
         Ok(bytes) => {
             if bytes.iter().all(u8::is_ascii_whitespace) {
@@ -99,7 +104,7 @@ pub fn read_runtime_state(path: &Path) -> Result<RuntimeStateRead, SupervisorErr
             }
 
             if serde_json::from_slice::<Vec<serde_json::Value>>(&bytes).is_ok() {
-                return Ok(RuntimeStateRead::Legacy);
+                return Ok(RuntimeStateRead::Legacy(path.to_path_buf()));
             }
 
             match serde_json::from_slice::<RuntimeStateEnvelope>(&bytes) {
@@ -219,8 +224,8 @@ fn create_starting_run_with_lock_options(
     let runs = match read_runtime_state(path)? {
         RuntimeStateRead::Missing => Vec::new(),
         RuntimeStateRead::Loaded(runs) => runs,
-        RuntimeStateRead::Legacy => {
-            return Err(SupervisorError::LegacyRuntimeState(path.to_path_buf()))
+        RuntimeStateRead::Legacy(legacy_path) => {
+            return Err(SupervisorError::LegacyRuntimeState(legacy_path))
         }
         RuntimeStateRead::Corrupt(message) => {
             return Err(SupervisorError::Io(io::Error::other(format!(
@@ -411,7 +416,9 @@ pub(super) fn stable_run_is_present(path: &Path, run_id: &str) -> Result<bool, S
     match read_runtime_state(path)? {
         RuntimeStateRead::Missing => Ok(false),
         RuntimeStateRead::Loaded(runs) => Ok(runs.iter().any(|run| run.run_id == run_id)),
-        RuntimeStateRead::Legacy => Err(SupervisorError::LegacyRuntimeState(path.to_path_buf())),
+        RuntimeStateRead::Legacy(legacy_path) => {
+            Err(SupervisorError::LegacyRuntimeState(legacy_path))
+        }
         RuntimeStateRead::Corrupt(message) => Err(SupervisorError::Io(io::Error::other(format!(
             "managed sidecar state is corrupt: {message}"
         )))),
@@ -456,7 +463,9 @@ pub(super) fn runtime_state_runs_for_mutation(
     match read_runtime_state(path)? {
         RuntimeStateRead::Missing => Ok(Vec::new()),
         RuntimeStateRead::Loaded(runs) => Ok(runs),
-        RuntimeStateRead::Legacy => Err(SupervisorError::LegacyRuntimeState(path.to_path_buf())),
+        RuntimeStateRead::Legacy(legacy_path) => {
+            Err(SupervisorError::LegacyRuntimeState(legacy_path))
+        }
         RuntimeStateRead::Corrupt(message) => Err(SupervisorError::Io(io::Error::other(format!(
             "managed sidecar state is corrupt: {message}"
         )))),
@@ -513,10 +522,8 @@ fn reject_legacy_runtime_artifacts(state_path: &Path) -> Result<(), SupervisorEr
     if sentinel_path.try_exists()? {
         return Err(SupervisorError::LegacyRuntimeState(sentinel_path));
     }
-    if matches!(read_runtime_state(state_path)?, RuntimeStateRead::Legacy) {
-        return Err(SupervisorError::LegacyRuntimeState(
-            state_path.to_path_buf(),
-        ));
+    if let RuntimeStateRead::Legacy(legacy_path) = read_runtime_state(state_path)? {
+        return Err(SupervisorError::LegacyRuntimeState(legacy_path));
     }
     Ok(())
 }
@@ -798,7 +805,7 @@ mod tests {
         fs::write(&state_path, "[]").expect("write legacy array");
         assert_eq!(
             read_runtime_state(&state_path).expect("read legacy state"),
-            RuntimeStateRead::Legacy
+            RuntimeStateRead::Legacy(state_path.clone())
         );
     }
 
@@ -1433,7 +1440,7 @@ mod tests {
             assert!(!runtime_state_lock_path(&state_path).exists());
             assert_eq!(
                 read_runtime_state(&state_path).expect("read-only legacy read"),
-                RuntimeStateRead::Legacy
+                RuntimeStateRead::Legacy(state_path.clone())
             );
             assert!(!runtime_state_lock_path(&state_path).exists());
         }
@@ -1460,6 +1467,22 @@ mod tests {
             fs::read(&sentinel_path).expect("read unchanged sentinel"),
             sentinel
         );
+        assert!(!state_path.exists());
+        assert!(!runtime_state_lock_path(&state_path).exists());
+    }
+
+    #[test]
+    fn read_only_state_detects_legacy_sentinel_when_managed_json_is_absent() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let sentinel_path = state_path.with_file_name("managed.json.lock");
+        fs::write(&sentinel_path, b"legacy owner metadata\n").expect("write legacy sentinel");
+
+        assert_eq!(
+            read_runtime_state(&state_path).expect("read sentinel-only state"),
+            RuntimeStateRead::Legacy(sentinel_path.clone())
+        );
+        assert!(sentinel_path.exists());
         assert!(!state_path.exists());
         assert!(!runtime_state_lock_path(&state_path).exists());
     }
