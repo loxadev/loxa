@@ -24,8 +24,10 @@ pub const STOP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub const FORCE_KILL_CONFIRMATION_PERIOD: Duration = Duration::from_millis(250);
 pub const RUNTIME_STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 pub const RUNTIME_STATE_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(25);
+pub const STOP_OWNER_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 pub const LOG_TAIL_BYTES: usize = 8 * 1024;
 pub const MAX_LOG_BYTES: usize = 1024 * 1024;
+pub const RUNTIME_STATE_SCHEMA_VERSION: u32 = 2;
 
 pub struct ServerSpec<'a> {
     pub entry: &'a ModelEntry,
@@ -69,6 +71,59 @@ impl ManagedServer {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunLifecycle {
+    Starting,
+    Running,
+    Restarting,
+    Stopping,
+    RecoveryRequired,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedRun {
+    pub schema_version: u32,
+    pub run_id: String,
+    pub model_id: String,
+    pub owner_pid: u32,
+    pub owner_process_start_time_unix_s: u64,
+    pub stop_requested: bool,
+    pub lifecycle: RunLifecycle,
+    pub generation: u32,
+    pub generation_alias: String,
+    pub port: u16,
+    pub log_path: PathBuf,
+    pub child_pid: Option<u32>,
+    pub child_process_start_time_unix_s: Option<u64>,
+    pub child_pgid: Option<i32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManagedRunIdentity {
+    pub run_id: String,
+    pub generation: u32,
+    pub child_pid: Option<u32>,
+    pub child_process_start_time_unix_s: Option<u64>,
+}
+
+impl ManagedRun {
+    pub fn identity(&self) -> ManagedRunIdentity {
+        ManagedRunIdentity {
+            run_id: self.run_id.clone(),
+            generation: self.generation,
+            child_pid: self.child_pid,
+            child_process_start_time_unix_s: self.child_process_start_time_unix_s,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct RuntimeStateEnvelope {
+    schema_version: u32,
+    runs: Vec<ManagedRun>,
+}
+
 #[derive(Debug)]
 pub enum SupervisorError {
     UnknownModel(String),
@@ -77,8 +132,14 @@ pub enum SupervisorError {
     LlamaServerVersionTimeout,
     NoFreePort,
     ProcessIdentityUnavailable(u32),
+    LegacyRuntimeState(PathBuf),
+    ActiveRun(String),
+    RecoveryRequired(String),
+    RunStateConflict(String),
+    CleanupNotConfirmed(String),
     HealthTimeout,
     ChildExitedEarly(String),
+    ChildReapedDiagnosticsFailed(String),
     Io(io::Error),
     Http(reqwest::Error),
 }
@@ -98,10 +159,32 @@ impl fmt::Display for SupervisorError {
             SupervisorError::ProcessIdentityUnavailable(pid) => {
                 write!(f, "could not capture process identity for pid {pid}")
             }
+            SupervisorError::LegacyRuntimeState(path) => write!(
+                f,
+                "legacy runtime state blocks safe mutation at {}; confirm no old Loxa process remains, then archive it manually",
+                path.display()
+            ),
+            SupervisorError::ActiveRun(run_id) => {
+                write!(f, "managed run {run_id} is already active")
+            }
+            SupervisorError::RecoveryRequired(run_id) => {
+                write!(f, "recovery required for managed run {run_id}")
+            }
+            SupervisorError::RunStateConflict(message) => {
+                write!(f, "managed run state conflict: {message}")
+            }
+            SupervisorError::CleanupNotConfirmed(run_id) => write!(
+                f,
+                "cleanup could not be confirmed for managed run {run_id}; recovery required"
+            ),
             SupervisorError::HealthTimeout => write!(f, "llama-server did not become healthy"),
             SupervisorError::ChildExitedEarly(message) => {
                 write!(f, "llama-server exited before becoming healthy: {message}")
             }
+            SupervisorError::ChildReapedDiagnosticsFailed(message) => write!(
+                f,
+                "llama-server exited, but crash diagnostics failed after it was reaped: {message}"
+            ),
             SupervisorError::Io(error) => write!(f, "io error: {error}"),
             SupervisorError::Http(error) => write!(f, "http error: {error}"),
         }
@@ -133,7 +216,8 @@ impl From<reqwest::Error> for SupervisorError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeStateRead {
     Missing,
-    Loaded(Vec<ManagedServer>),
+    Loaded(Vec<ManagedRun>),
+    Legacy,
     Corrupt(String),
 }
 
@@ -209,33 +293,6 @@ impl ProcessController for SystemProcessController {
 
     fn process_start_time(&self, pid: u32) -> Option<u64> {
         process_start_time(pid)
-    }
-
-    fn terminate(&self, pid: u32) -> io::Result<()> {
-        signal_pid(pid, Signal::Term)
-    }
-
-    fn kill(&self, pid: u32) -> io::Result<()> {
-        signal_pid(pid, Signal::Kill)
-    }
-}
-
-impl Default for RestartPolicy {
-    fn default() -> Self {
-        Self {
-            remaining_restarts: 1,
-        }
-    }
-}
-
-impl RestartPolicy {
-    pub fn should_restart(&mut self) -> bool {
-        if self.remaining_restarts == 0 {
-            false
-        } else {
-            self.remaining_restarts -= 1;
-            true
-        }
     }
 }
 
@@ -415,8 +472,31 @@ pub fn read_runtime_state(path: &Path) -> Result<RuntimeStateRead, SupervisorErr
                 return Ok(RuntimeStateRead::Missing);
             }
 
-            match serde_json::from_slice::<Vec<ManagedServer>>(&bytes) {
-                Ok(servers) => Ok(RuntimeStateRead::Loaded(servers)),
+            if serde_json::from_slice::<Vec<serde_json::Value>>(&bytes).is_ok() {
+                return Ok(RuntimeStateRead::Legacy);
+            }
+
+            match serde_json::from_slice::<RuntimeStateEnvelope>(&bytes) {
+                Ok(envelope) if envelope.schema_version != RUNTIME_STATE_SCHEMA_VERSION => {
+                    Ok(RuntimeStateRead::Corrupt(format!(
+                        "unsupported managed state schema version {}",
+                        envelope.schema_version
+                    )))
+                }
+                Ok(envelope) if envelope.runs.len() > 1 => Ok(RuntimeStateRead::Corrupt(
+                    "managed state contains more than one active run".to_string(),
+                )),
+                Ok(envelope) => {
+                    if let Some(message) = envelope
+                        .runs
+                        .iter()
+                        .find_map(|run| validate_runtime_run(run).err())
+                    {
+                        Ok(RuntimeStateRead::Corrupt(message))
+                    } else {
+                        Ok(RuntimeStateRead::Loaded(envelope.runs))
+                    }
+                }
                 Err(error) => Ok(RuntimeStateRead::Corrupt(error.to_string())),
             }
         }
@@ -425,74 +505,97 @@ pub fn read_runtime_state(path: &Path) -> Result<RuntimeStateRead, SupervisorErr
     }
 }
 
-pub fn write_runtime_state(path: &Path, servers: &[ManagedServer]) -> Result<(), SupervisorError> {
+fn write_runtime_state(path: &Path, runs: &[ManagedRun]) -> Result<(), SupervisorError> {
+    write_runtime_state_with_hook(path, runs, |_| Ok(()))
+}
+
+fn write_runtime_state_with_hook<F>(
+    path: &Path,
+    runs: &[ManagedRun],
+    before_rename: F,
+) -> Result<(), SupervisorError>
+where
+    F: FnOnce(&Path) -> io::Result<()>,
+{
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    let bytes = serde_json::to_vec_pretty(servers)
+    if runs.len() > 1 {
+        return Err(SupervisorError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "only one managed run is supported",
+        )));
+    }
+    if let Some(message) = runs.iter().find_map(|run| validate_runtime_run(run).err()) {
+        return Err(SupervisorError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            message,
+        )));
+    }
+
+    let envelope = RuntimeStateEnvelope {
+        schema_version: RUNTIME_STATE_SCHEMA_VERSION,
+        runs: runs.to_vec(),
+    };
+    let bytes = serde_json::to_vec_pretty(&envelope)
         .map_err(|error| SupervisorError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))?;
     let temp_path = temp_path_for(path);
-    let mut file = File::create(&temp_path)?;
-    file.write_all(&bytes)?;
-    file.flush()?;
-    file.sync_all()?;
-    fs::rename(&temp_path, path)?;
-    Ok(())
+    let result = (|| -> Result<(), SupervisorError> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)?;
+        file.write_all(&bytes)?;
+        file.flush()?;
+        file.sync_all()?;
+        before_rename(&temp_path)?;
+        drop(file);
+        fs::rename(&temp_path, path)?;
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
 }
 
-pub fn inspect_managed_servers(servers: &[ManagedServer]) -> Vec<ManagedServerInspection> {
-    inspect_managed_servers_with(servers, &SystemProcessController)
-}
-
-fn inspect_managed_servers_with<P: ProcessController>(
-    servers: &[ManagedServer],
-    controller: &P,
-) -> Vec<ManagedServerInspection> {
-    servers
-        .iter()
-        .cloned()
-        .map(|server| {
-            let pid_alive = controller.pid_is_alive(server.pid);
-            let port_alive = controller.port_is_alive(server.port);
-            let process_identity_matches = process_identity_matches(&server, controller);
-            ManagedServerInspection {
-                stale: !(pid_alive && port_alive && process_identity_matches),
-                server,
-                pid_alive,
-                port_alive,
-                process_identity_matches,
-            }
-        })
-        .collect()
-}
-
-pub fn upsert_runtime_state_entry(
-    path: &Path,
-    server: ManagedServer,
-) -> Result<(), SupervisorError> {
-    upsert_runtime_state_entry_with_lock_options(
+pub fn create_starting_run(path: &Path, run: ManagedRun) -> Result<ManagedRun, SupervisorError> {
+    create_starting_run_with_lock_options(
         path,
-        server,
+        run,
         RUNTIME_STATE_LOCK_TIMEOUT,
         RUNTIME_STATE_LOCK_POLL_INTERVAL,
     )
 }
 
-fn upsert_runtime_state_entry_with_lock_options(
+fn create_starting_run_with_lock_options(
     path: &Path,
-    server: ManagedServer,
+    run: ManagedRun,
     timeout: Duration,
     interval: Duration,
-) -> Result<(), SupervisorError> {
-    if server.process_start_time_unix_s.is_none() {
-        return Err(SupervisorError::ProcessIdentityUnavailable(server.pid));
+) -> Result<ManagedRun, SupervisorError> {
+    validate_runtime_run(&run).map_err(SupervisorError::RunStateConflict)?;
+    if run.lifecycle != RunLifecycle::Starting
+        || run.child_pid.is_some()
+        || run.child_process_start_time_unix_s.is_some()
+        || run.child_pgid.is_some()
+    {
+        return Err(SupervisorError::RunStateConflict(
+            "new run must be childless and in the starting lifecycle".to_string(),
+        ));
     }
-
-    let _lock = RuntimeStateLock::acquire(path, timeout, interval)?;
-    let mut servers = match read_runtime_state(path)? {
-        RuntimeStateRead::Loaded(servers) => servers,
+    let _lock = acquire_runtime_state_lock_for_mutation(path, timeout, interval)?;
+    let runs = match read_runtime_state(path)? {
         RuntimeStateRead::Missing => Vec::new(),
+        RuntimeStateRead::Loaded(runs) => runs,
+        RuntimeStateRead::Legacy => {
+            return Err(SupervisorError::LegacyRuntimeState(path.to_path_buf()))
+        }
         RuntimeStateRead::Corrupt(message) => {
             return Err(SupervisorError::Io(io::Error::other(format!(
                 "managed sidecar state is corrupt: {message}"
@@ -790,7 +893,31 @@ fn read_child_output(child: &mut Child) -> io::Result<String> {
 }
 
 struct RuntimeStateLock {
-    path: PathBuf,
+    _file: File,
+}
+
+fn acquire_runtime_state_lock_for_mutation(
+    state_path: &Path,
+    timeout: Duration,
+    interval: Duration,
+) -> Result<RuntimeStateLock, SupervisorError> {
+    reject_legacy_runtime_artifacts(state_path)?;
+    let lock = RuntimeStateLock::acquire(state_path, timeout, interval)?;
+    reject_legacy_runtime_artifacts(state_path)?;
+    Ok(lock)
+}
+
+fn reject_legacy_runtime_artifacts(state_path: &Path) -> Result<(), SupervisorError> {
+    let sentinel_path = legacy_runtime_state_lock_path(state_path);
+    if sentinel_path.try_exists()? {
+        return Err(SupervisorError::LegacyRuntimeState(sentinel_path));
+    }
+    if matches!(read_runtime_state(state_path)?, RuntimeStateRead::Legacy) {
+        return Err(SupervisorError::LegacyRuntimeState(
+            state_path.to_path_buf(),
+        ));
+    }
+    Ok(())
 }
 
 impl RuntimeStateLock {
@@ -804,18 +931,24 @@ impl RuntimeStateLock {
             fs::create_dir_all(parent)?;
         }
 
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
         let started = Instant::now();
         loop {
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&lock_path)
-            {
-                Ok(mut file) => {
+            match file.try_lock() {
+                Ok(()) => {
+                    file.set_len(0)?;
+                    file.seek(SeekFrom::Start(0))?;
                     writeln!(file, "{}", std::process::id())?;
-                    return Ok(Self { path: lock_path });
+                    file.flush()?;
+                    file.sync_all()?;
+                    return Ok(Self { _file: file });
                 }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                Err(fs::TryLockError::WouldBlock) => {
                     if started.elapsed() >= timeout {
                         return Err(SupervisorError::Io(io::Error::new(
                             io::ErrorKind::WouldBlock,
@@ -827,19 +960,23 @@ impl RuntimeStateLock {
                     }
                     thread::sleep(interval);
                 }
-                Err(error) => return Err(SupervisorError::Io(error)),
+                Err(fs::TryLockError::Error(error)) => {
+                    return Err(SupervisorError::Io(error));
+                }
             }
         }
     }
 }
 
-impl Drop for RuntimeStateLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
+fn runtime_state_lock_path(state_path: &Path) -> PathBuf {
+    let file_name = state_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("managed.json");
+    state_path.with_file_name(format!("{file_name}.v2.lock"))
 }
 
-fn runtime_state_lock_path(state_path: &Path) -> PathBuf {
+fn legacy_runtime_state_lock_path(state_path: &Path) -> PathBuf {
     let file_name = state_path
         .file_name()
         .and_then(|name| name.to_str())
@@ -985,50 +1122,6 @@ where
         }
 
         sleep(interval);
-    }
-}
-
-fn wait_for_stop_confirmation<S, F>(
-    timeout: Duration,
-    interval: Duration,
-    sleep: &mut S,
-    mut inspect: F,
-) -> Result<Option<StopStatus>, SupervisorError>
-where
-    S: FnMut(Duration),
-    F: FnMut() -> Result<StopStatus, SupervisorError>,
-{
-    let deadline = Instant::now() + timeout;
-    loop {
-        let status = inspect()?;
-        if !status.pid_alive || !status.identity_matches {
-            return Ok(Some(status));
-        }
-
-        if Instant::now() >= deadline {
-            return Ok(None);
-        }
-
-        sleep(interval);
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct StopStatus {
-    pid_alive: bool,
-    port_alive: bool,
-    identity_matches: bool,
-}
-
-fn inspect_stop_status<P: ProcessController>(server: &ManagedServer, controller: &P) -> StopStatus {
-    let pid_alive = controller.pid_is_alive(server.pid);
-    let port_alive = controller.port_is_alive(server.port);
-    let identity_matches = pid_alive && process_identity_matches(server, controller);
-
-    StopStatus {
-        pid_alive,
-        port_alive,
-        identity_matches,
     }
 }
 
@@ -1200,11 +1293,107 @@ impl BoundedLogWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::{Cell, RefCell};
     use std::fs;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Barrier;
     use tempfile::tempdir;
+
+    fn managed_run_for(server: &ManagedServer) -> ManagedRun {
+        ManagedRun {
+            schema_version: RUNTIME_STATE_SCHEMA_VERSION,
+            run_id: format!("test-run-{}", server.pid),
+            model_id: server.id.clone(),
+            owner_pid: 42,
+            owner_process_start_time_unix_s: 456,
+            stop_requested: false,
+            lifecycle: RunLifecycle::Running,
+            generation: 0,
+            generation_alias: format!("loxa-test-run-{}-g0", server.pid),
+            port: server.port,
+            log_path: PathBuf::from(format!("/tmp/test-run-{}.log", server.pid)),
+            child_pid: Some(server.pid),
+            child_process_start_time_unix_s: server.process_start_time_unix_s,
+            child_pgid: None,
+        }
+    }
+
+    fn childless_starting_run(root: &Path, run_id: &str) -> ManagedRun {
+        ManagedRun {
+            schema_version: RUNTIME_STATE_SCHEMA_VERSION,
+            run_id: run_id.to_string(),
+            model_id: "gemma-3-4b-it-q4".to_string(),
+            owner_pid: 42,
+            owner_process_start_time_unix_s: 456,
+            stop_requested: false,
+            lifecycle: RunLifecycle::Starting,
+            generation: 0,
+            generation_alias: format!("loxa-{run_id}-g0"),
+            port: 8080,
+            log_path: root.join(format!("{run_id}.log")),
+            child_pid: None,
+            child_process_start_time_unix_s: None,
+            child_pgid: None,
+        }
+    }
+
+    fn run_runtime_state_lock_helper_if_requested() -> bool {
+        let Some(state_path) = std::env::var_os("LOXA_TEST_V2_LOCK_HELPER_STATE") else {
+            return false;
+        };
+        let ready_path =
+            std::env::var_os("LOXA_TEST_V2_LOCK_HELPER_READY").expect("lock helper readiness path");
+        let _lock = RuntimeStateLock::acquire(
+            Path::new(&state_path),
+            Duration::from_secs(2),
+            Duration::from_millis(1),
+        )
+        .expect("helper acquires advisory lock");
+        fs::write(&ready_path, b"locked\n").expect("publish lock readiness barrier");
+        let mut release = [0_u8; 1];
+        std::io::stdin()
+            .read_exact(&mut release)
+            .expect("helper blocks behind parent-owned release pipe");
+        true
+    }
+
+    fn spawn_runtime_state_lock_helper(
+        state_path: &Path,
+        ready_path: &Path,
+    ) -> (Child, std::process::ChildStdin) {
+        let mut helper = Command::new(std::env::current_exe().expect("current test binary"))
+            .arg("--exact")
+            .arg("supervisor::tests::runtime_state_advisory_lock_recovers_after_helper_is_killed")
+            .arg("--nocapture")
+            .env("LOXA_TEST_V2_LOCK_HELPER_STATE", state_path)
+            .env("LOXA_TEST_V2_LOCK_HELPER_READY", ready_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn lock helper test process");
+        let helper_stdin = helper.stdin.take().expect("helper release pipe");
+        (helper, helper_stdin)
+    }
+
+    fn wait_for_lock_helper_ready(helper: &mut Child, ready_path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if ready_path.is_file() {
+                return;
+            }
+            if let Some(status) = helper.try_wait().expect("poll lock helper") {
+                panic!("lock helper exited before readiness barrier: {status}");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "lock helper did not reach readiness barrier"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
 
     #[test]
     fn choose_localhost_port_returns_bindable_localhost_port() {
@@ -1318,7 +1507,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_runtime_state_entry_only_removes_matching_instance() {
+    fn remove_runtime_state_entry_does_not_remove_a_different_instance() {
         let temp = tempdir().expect("tempdir");
         let state_path = temp.path().join("managed.json");
         let first = ManagedServer {
@@ -2029,43 +2218,88 @@ mod tests {
     }
 
     #[test]
-    fn runtime_state_lock_reports_contention_without_mutating_state() {
+    fn runtime_state_lock_release_leaves_the_persistent_lock_file() {
         let temp = tempdir().expect("tempdir");
         let state_path = temp.path().join("managed.json");
-        fs::create_dir_all(temp.path()).expect("create temp root");
-        let _held_lock = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(runtime_state_lock_path(&state_path))
-            .expect("hold lock");
-        let server = ManagedServer {
-            id: "gemma-3-4b-it-q4".to_string(),
-            pid: 777,
-            port: 8081,
-            model_path: temp.path().join("model.gguf"),
-            started_at_unix_s: 789,
-            llama_server_version: "test".to_string(),
-            process_start_time_unix_s: Some(111),
-        };
+        let lock_path = state_path.with_file_name("managed.json.v2.lock");
+        fs::write(&lock_path, "stale owner metadata\n").expect("write stale metadata");
 
-        let error = upsert_runtime_state_entry_with_lock_options(
+        let lock = RuntimeStateLock::acquire(
             &state_path,
-            server,
+            Duration::from_millis(100),
+            Duration::from_millis(1),
+        )
+        .expect("stale metadata must not block the kernel lock");
+        assert_eq!(runtime_state_lock_path(&state_path), lock_path);
+        drop(lock);
+
+        assert!(lock_path.is_file(), "v2 lock inode must remain persistent");
+        RuntimeStateLock::acquire(
+            &state_path,
+            Duration::from_millis(100),
+            Duration::from_millis(1),
+        )
+        .expect("released kernel lock must be immediately reusable");
+    }
+
+    #[test]
+    fn runtime_state_advisory_lock_recovers_after_helper_is_killed() {
+        if run_runtime_state_lock_helper_if_requested() {
+            return;
+        }
+
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let ready_path = temp.path().join("lock-helper.ready");
+        let first = childless_starting_run(temp.path(), "run-1");
+        create_starting_run(&state_path, first.clone()).expect("seed run");
+        let committed = fs::read(&state_path).expect("read committed state");
+        let (mut helper, _helper_stdin) = spawn_runtime_state_lock_helper(&state_path, &ready_path);
+        wait_for_lock_helper_ready(&mut helper, &ready_path);
+
+        let mut update = first.clone();
+        update.lifecycle = RunLifecycle::Running;
+        let error = update_runtime_state_run_with_lock_options(
+            &state_path,
+            &first.identity(),
+            update.clone(),
+            Duration::from_millis(25),
+            Duration::from_millis(1),
+        )
+        .expect_err("contender must time out while helper owns advisory lock");
+        assert!(
+            matches!(error, SupervisorError::Io(ref error) if error.kind() == io::ErrorKind::WouldBlock)
+        );
+        assert_eq!(
+            fs::read(&state_path).expect("read state after contention"),
+            committed
+        );
+
+        let helper_pid = helper.id();
+        helper.kill().expect("kill lock helper");
+        helper.wait().expect("reap lock helper");
+        let lock_path = runtime_state_lock_path(&state_path);
+        assert!(lock_path.is_file());
+        assert_eq!(
+            fs::read_to_string(&lock_path)
+                .expect("read stale lock metadata")
+                .trim(),
+            helper_pid.to_string()
+        );
+
+        assert!(update_runtime_state_run_with_lock_options(
+            &state_path,
+            &first.identity(),
+            update.clone(),
             Duration::ZERO,
             Duration::ZERO,
         )
-        .expect_err("expected lock contention");
-
-        match error {
-            SupervisorError::Io(error) => {
-                assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
-            }
-            other => panic!("unexpected error: {other}"),
-        }
+        .expect("acquire immediately after helper crash"));
         assert_eq!(
-            read_runtime_state(&state_path).expect("state should stay missing"),
-            RuntimeStateRead::Missing
+            read_runtime_state(&state_path).expect("read updated state"),
+            RuntimeStateRead::Loaded(vec![update])
         );
+        assert!(lock_path.is_file());
     }
 
     #[test]
@@ -2571,22 +2805,6 @@ mod tests {
 
         fn process_start_time(&self, _pid: u32) -> Option<u64> {
             Self::next_start_time(&self.process_start_times)
-        }
-
-        fn terminate(&self, pid: u32) -> io::Result<()> {
-            self.events
-                .lock()
-                .expect("events lock")
-                .push(format!("terminate:{pid}"));
-            Ok(())
-        }
-
-        fn kill(&self, pid: u32) -> io::Result<()> {
-            self.events
-                .lock()
-                .expect("events lock")
-                .push(format!("kill:{pid}"));
-            Ok(())
         }
     }
 
