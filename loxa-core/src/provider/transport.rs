@@ -123,7 +123,7 @@ impl JsonTransport for ReqwestJsonTransport {
 
         match framing {
             StreamFraming::SseData => parse_sse_stream_started(reader, started),
-            StreamFraming::JsonLines => parse_json_lines_stream(reader, started),
+            StreamFraming::JsonLines => parse_json_lines_stream_started(reader, started),
         }
     }
 }
@@ -193,7 +193,14 @@ fn parse_sse_stream_started<R: BufRead>(
     }
 }
 
-fn parse_json_lines_stream<R: BufRead>(
+#[cfg(test)]
+pub(crate) fn parse_json_lines_stream<R: BufRead>(
+    reader: R,
+) -> Result<Vec<TimedJsonEvent>, ProviderError> {
+    parse_json_lines_stream_started(reader, Instant::now())
+}
+
+fn parse_json_lines_stream_started<R: BufRead>(
     mut reader: R,
     started: Instant,
 ) -> Result<Vec<TimedJsonEvent>, ProviderError> {

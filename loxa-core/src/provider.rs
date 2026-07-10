@@ -5,6 +5,7 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
 pub mod llama;
+pub mod ollama;
 mod transport;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
