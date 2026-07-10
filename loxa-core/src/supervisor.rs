@@ -15,8 +15,11 @@ use std::time::{Duration, Instant};
 use sysinfo::{Pid, ProcessesToUpdate, Signal, System};
 
 mod lifecycle;
+mod readiness;
 mod state;
 mod teardown;
+
+pub use readiness::{reserve_localhost_port, LocalhostPortReservation};
 
 pub use lifecycle::{
     decide_observed_child_exit, finish_childless_runtime_state_run, finish_owner_teardown_with,
