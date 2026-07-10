@@ -6,22 +6,22 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::mem;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::{Duration, Instant};
 use sysinfo::{Pid, ProcessesToUpdate, Signal, System};
 
 mod lifecycle;
 mod state;
+mod teardown;
 
 pub use lifecycle::{
     decide_observed_child_exit, finish_childless_runtime_state_run, finish_owner_teardown_with,
     prepare_starting_run_for_spawn, ChildlessFinishOutcome, InterruptStatus, ObservedChildExit,
-    OwnerTeardownDecision, OwnerTerminalOutcome, PreSpawnDecision, TeardownConfirmation,
+    OwnerTeardownDecision, OwnerTerminalOutcome, PostSpawnCleanupOutcome, PreSpawnDecision,
 };
 pub use state::{
     create_starting_run, current_runtime_state_run, finish_runtime_state_run, read_runtime_state,
@@ -31,6 +31,12 @@ pub use state::{
     RUNTIME_STATE_SCHEMA_VERSION,
 };
 use state::{record_stop_request, stable_run_is_present, StopRequestMatch};
+#[cfg(test)]
+use teardown::spawn_log_drain;
+use teardown::spawn_managed_command;
+pub use teardown::{
+    teardown_managed_child, LogDrainingChild, ManagedChild, SpawnedServer, TeardownConfirmation,
+};
 
 pub const DEFAULT_CTX_TOKENS: u32 = 8_192;
 pub const CTRL_C_GRACE_PERIOD: Duration = Duration::from_secs(5);
@@ -38,7 +44,7 @@ pub const HEALTH_TIMEOUT: Duration = Duration::from_secs(60);
 pub const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(250);
 pub const LLAMA_SERVER_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 pub const STOP_POLL_INTERVAL: Duration = Duration::from_millis(50);
-pub const FORCE_KILL_CONFIRMATION_PERIOD: Duration = Duration::from_millis(250);
+pub const FORCE_KILL_CONFIRMATION_PERIOD: Duration = Duration::from_secs(5);
 pub const STOP_OWNER_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 pub const LOG_TAIL_BYTES: usize = 8 * 1024;
 pub const MAX_LOG_BYTES: usize = 1024 * 1024;
@@ -70,9 +76,11 @@ pub struct ManagedServerIdentity {
     pub process_start_time_unix_s: Option<u64>,
 }
 
-pub struct SpawnedServer {
-    child: Child,
-    log_drains: Vec<JoinHandle<()>>,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PersistManagedServerOutcome {
+    Attached(ManagedRun),
+    RequestedStop,
+    RecoveryRequired,
 }
 
 impl ManagedServer {
@@ -235,17 +243,6 @@ impl StopWaitTiming {
     }
 }
 
-pub trait ManagedChild {
-    fn pid(&self) -> u32;
-    fn terminate(&mut self) -> io::Result<()>;
-    fn kill(&mut self) -> io::Result<()>;
-    fn try_wait(&mut self) -> io::Result<Option<i32>>;
-}
-
-pub trait LogDrainingChild {
-    fn join_log_drains(&mut self) -> Result<(), SupervisorError>;
-}
-
 trait ProcessController {
     fn pid_is_alive(&self, pid: u32) -> bool;
     fn port_is_alive(&self, port: u16) -> bool;
@@ -285,72 +282,6 @@ impl ProcessController for SystemProcessController {
 
     fn process_start_time(&self, pid: u32) -> Option<u64> {
         process_start_time(pid)
-    }
-}
-
-impl ManagedChild for Child {
-    fn pid(&self) -> u32 {
-        self.id()
-    }
-
-    fn terminate(&mut self) -> io::Result<()> {
-        signal_pid(self.id(), Signal::Term)
-    }
-
-    fn kill(&mut self) -> io::Result<()> {
-        if signal_pid(self.id(), Signal::Kill).is_err() {
-            return Child::kill(self);
-        }
-
-        Ok(())
-    }
-
-    fn try_wait(&mut self) -> io::Result<Option<i32>> {
-        Ok(self
-            .try_wait()?
-            .map(|status| status.code().unwrap_or_default()))
-    }
-}
-
-impl SpawnedServer {
-    pub fn join_log_drains(&mut self) -> Result<(), SupervisorError> {
-        for drain in mem::take(&mut self.log_drains) {
-            drain
-                .join()
-                .map_err(|_| SupervisorError::Io(io::Error::other("log drain thread panicked")))?;
-        }
-        Ok(())
-    }
-}
-
-impl ManagedChild for SpawnedServer {
-    fn pid(&self) -> u32 {
-        self.child.id()
-    }
-
-    fn terminate(&mut self) -> io::Result<()> {
-        signal_pid(self.child.id(), Signal::Term)
-    }
-
-    fn kill(&mut self) -> io::Result<()> {
-        if signal_pid(self.child.id(), Signal::Kill).is_err() {
-            return Child::kill(&mut self.child);
-        }
-
-        Ok(())
-    }
-
-    fn try_wait(&mut self) -> io::Result<Option<i32>> {
-        Ok(self
-            .child
-            .try_wait()?
-            .map(|status| status.code().unwrap_or_default()))
-    }
-}
-
-impl LogDrainingChild for SpawnedServer {
-    fn join_log_drains(&mut self) -> Result<(), SupervisorError> {
-        SpawnedServer::join_log_drains(self)
     }
 }
 
@@ -570,12 +501,37 @@ fn inspect_managed_servers_with<P: ProcessController>(
 pub fn persist_managed_server_or_cleanup<C>(
     child: &mut C,
     state_path: &Path,
-    mut run: ManagedRun,
+    run: ManagedRun,
     server: ManagedServer,
     grace_period: Duration,
-) -> Result<ManagedRun, SupervisorError>
+) -> Result<PersistManagedServerOutcome, SupervisorError>
 where
     C: ManagedChild + LogDrainingChild,
+{
+    let _ = grace_period;
+    persist_managed_server_or_cleanup_with(
+        child,
+        state_path,
+        run,
+        server,
+        |child, path, expected| cleanup_post_spawn_failure(child, path, expected),
+    )
+}
+
+fn persist_managed_server_or_cleanup_with<C, T>(
+    child: &mut C,
+    state_path: &Path,
+    mut run: ManagedRun,
+    server: ManagedServer,
+    cleanup: T,
+) -> Result<PersistManagedServerOutcome, SupervisorError>
+where
+    C: ManagedChild + LogDrainingChild,
+    T: FnOnce(
+        &mut C,
+        &Path,
+        &ManagedRunIdentity,
+    ) -> Result<PostSpawnCleanupOutcome, SupervisorError>,
 {
     let expected = run.identity();
     let error = if server.process_start_time_unix_s.is_none() {
@@ -586,8 +542,11 @@ where
         run.port = server.port;
         run.child_pid = Some(server.pid);
         run.child_process_start_time_unix_s = server.process_start_time_unix_s;
+        run.child_pgid = child.owned_pgid();
         match update_runtime_state_run_committed(state_path, &expected, run) {
-            Ok(Some(committed)) => return Ok(committed),
+            Ok(Some(committed)) => {
+                return Ok(PersistManagedServerOutcome::Attached(committed));
+            }
             Ok(None) => SupervisorError::RunStateConflict(format!(
                 "starting run {} generation {} no longer matches",
                 expected.run_id, expected.generation
@@ -596,9 +555,60 @@ where
         }
     };
 
-    let _ = cleanup_after_ctrl_c(child, state_path, &expected, grace_period);
-    let _ = child.join_log_drains();
-    Err(error)
+    match cleanup(child, state_path, &expected)? {
+        PostSpawnCleanupOutcome::Cleaned => Err(error),
+        PostSpawnCleanupOutcome::RequestedStop => Ok(PersistManagedServerOutcome::RequestedStop),
+        PostSpawnCleanupOutcome::RecoveryRequired => {
+            Ok(PersistManagedServerOutcome::RecoveryRequired)
+        }
+    }
+}
+
+pub fn cleanup_post_spawn_failure<C>(
+    child: &mut C,
+    state_path: &Path,
+    state_identity: &ManagedRunIdentity,
+) -> Result<PostSpawnCleanupOutcome, SupervisorError>
+where
+    C: ManagedChild + LogDrainingChild,
+{
+    lifecycle::finish_post_spawn_failure_with(state_path, state_identity, || {
+        teardown::teardown_managed_child_result(child).confirmation
+    })
+}
+
+pub fn teardown_owned_run<C>(
+    child: &mut C,
+    state_path: &Path,
+    state_identity: &ManagedRunIdentity,
+    decision: OwnerTeardownDecision,
+) -> Result<OwnerTerminalOutcome, SupervisorError>
+where
+    C: ManagedChild + LogDrainingChild,
+{
+    lifecycle::finish_owner_teardown_with(state_path, state_identity, decision, |_| {
+        teardown::teardown_managed_child_result(child).confirmation
+    })
+}
+
+pub fn handle_observed_child_exit<C, I>(
+    child: &mut C,
+    log_path: &Path,
+    state_path: &Path,
+    state_identity: &ManagedRunIdentity,
+    interrupt: &I,
+) -> Result<ObservedChildExit, SupervisorError>
+where
+    C: ManagedChild + LogDrainingChild,
+    I: InterruptStatus,
+{
+    lifecycle::decide_observed_child_exit_with_diagnostics(
+        state_path,
+        state_identity,
+        interrupt,
+        || teardown::teardown_managed_child_result(child).confirmation,
+        || read_log_tail(log_path, LOG_TAIL_BYTES),
+    )
 }
 
 pub fn spawn_llama_server(
@@ -619,10 +629,6 @@ pub fn spawn_llama_server(
     for arg in llama_server_args(spec) {
         command.arg(arg);
     }
-    let mut child = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
 
     let writer = Arc::new(Mutex::new(BoundedLogWriter {
         file: log_file,
@@ -630,15 +636,7 @@ pub fn spawn_llama_server(
         truncated: false,
     }));
 
-    let mut log_drains = Vec::new();
-    if let Some(stdout) = child.stdout.take() {
-        log_drains.push(spawn_log_drain(stdout, Arc::clone(&writer)));
-    }
-    if let Some(stderr) = child.stderr.take() {
-        log_drains.push(spawn_log_drain(stderr, writer));
-    }
-
-    Ok(SpawnedServer { child, log_drains })
+    spawn_managed_command(command, writer)
 }
 
 pub fn wait_for_health(
@@ -662,10 +660,10 @@ pub fn wait_for_health(
     Err(SupervisorError::HealthTimeout)
 }
 
-pub fn wait_for_health_or_exit<C: ManagedChild + LogDrainingChild>(
+pub fn wait_for_health_or_exit<C: ManagedChild>(
     child: &mut C,
     port: u16,
-    log_path: &Path,
+    _log_path: &Path,
     timeout: Duration,
     interval: Duration,
 ) -> Result<(), SupervisorError> {
@@ -680,14 +678,14 @@ pub fn wait_for_health_or_exit<C: ManagedChild + LogDrainingChild>(
         }
 
         if child.try_wait()?.is_some() {
-            return Err(reaped_child_exit_with_drains(child, log_path));
+            return Err(SupervisorError::ChildExitedEarly(String::new()));
         }
 
         thread::sleep(interval);
     }
 
     if child.try_wait()?.is_some() {
-        return Err(reaped_child_exit_with_drains(child, log_path));
+        return Err(SupervisorError::ChildExitedEarly(String::new()));
     }
 
     Err(SupervisorError::HealthTimeout)
@@ -708,51 +706,22 @@ pub fn child_exited_early(log_path: &Path) -> Result<SupervisorError, Supervisor
     Ok(SupervisorError::ChildExitedEarly(log_tail))
 }
 
-pub fn child_exited_early_with_drains<C: LogDrainingChild>(
-    child: &mut C,
-    log_path: &Path,
-) -> Result<SupervisorError, SupervisorError> {
-    child.join_log_drains()?;
-    child_exited_early(log_path)
-}
-
-pub fn reaped_child_exit_with_drains<C: LogDrainingChild>(
-    child: &mut C,
-    log_path: &Path,
-) -> SupervisorError {
-    child_exited_early_with_drains(child, log_path)
-        .unwrap_or_else(|error| SupervisorError::ChildReapedDiagnosticsFailed(error.to_string()))
-}
-
-pub fn cleanup_after_ctrl_c<C: ManagedChild>(
+pub fn cleanup_after_ctrl_c<C: ManagedChild + LogDrainingChild>(
     child: &mut C,
     state_path: &Path,
     state_identity: &ManagedRunIdentity,
-    grace_period: Duration,
+    _grace_period: Duration,
 ) -> Result<CleanupResult, SupervisorError> {
-    cleanup_after_ctrl_c_with(
-        child,
-        state_path,
-        state_identity,
-        grace_period,
-        FORCE_KILL_CONFIRMATION_PERIOD,
-        STOP_POLL_INTERVAL,
-        thread::sleep,
-    )
-}
-
-pub fn teardown_managed_child<C: ManagedChild>(
-    child: &mut C,
-    grace_period: Duration,
-) -> Result<TeardownConfirmation, SupervisorError> {
-    Ok(teardown_managed_child_with(
-        child,
-        grace_period,
-        FORCE_KILL_CONFIRMATION_PERIOD,
-        STOP_POLL_INTERVAL,
-        thread::sleep,
-    )?
-    .confirmation)
+    let result = teardown::teardown_managed_child_result(child);
+    let removed_state = if result.confirmation == TeardownConfirmation::Confirmed {
+        remove_runtime_state_entry(state_path, state_identity)?
+    } else {
+        false
+    };
+    Ok(CleanupResult {
+        forced: result.forced,
+        removed_state,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -799,30 +768,6 @@ fn health_request_timeout(timeout: Duration, interval: Duration) -> Duration {
     timeout.max(Duration::from_millis(1))
 }
 
-fn spawn_log_drain<R>(mut reader: R, writer: Arc<Mutex<BoundedLogWriter>>) -> JoinHandle<()>
-where
-    R: Read + Send + 'static,
-{
-    thread::spawn(move || {
-        let mut buffer = [0_u8; 8 * 1024];
-        loop {
-            let read = match reader.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(read) => read,
-                Err(_) => break,
-            };
-
-            let mut writer = match writer.lock() {
-                Ok(writer) => writer,
-                Err(_) => break,
-            };
-            if writer.write_chunk(&buffer[..read]).is_err() {
-                break;
-            }
-        }
-    })
-}
-
 fn read_child_output(child: &mut Child) -> io::Result<String> {
     let mut stdout = String::new();
     let mut stderr = String::new();
@@ -838,6 +783,7 @@ fn read_child_output(child: &mut Child) -> io::Result<String> {
     Ok(output)
 }
 
+#[cfg(test)]
 fn cleanup_after_ctrl_c_with<C, S>(
     child: &mut C,
     state_path: &Path,
@@ -871,11 +817,13 @@ where
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(test)]
 struct ChildTeardownResult {
     confirmation: TeardownConfirmation,
     forced: bool,
 }
 
+#[cfg(test)]
 fn teardown_managed_child_with<C, S>(
     child: &mut C,
     grace_period: Duration,
@@ -909,6 +857,7 @@ where
     })
 }
 
+#[cfg(test)]
 fn wait_for_child_exit<C, S>(
     child: &mut C,
     timeout: Duration,
@@ -1046,6 +995,7 @@ impl BoundedLogWriter {
 mod tests {
     use super::state::write_runtime_state;
     use super::*;
+    use std::cell::Cell;
     use std::fs;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -1168,7 +1118,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_after_ctrl_c_removes_the_matching_single_run() {
+    fn cleanup_after_ctrl_c_requires_owned_unix_group_before_removing_state() {
         let temp = tempdir().expect("tempdir");
         let state_path = temp.path().join("managed.json");
         let server = ManagedServer {
@@ -1191,18 +1141,29 @@ mod tests {
         )
         .expect("cleanup result");
 
-        assert_eq!(
-            result,
-            CleanupResult {
-                forced: false,
-                removed_state: true,
-            }
-        );
-        assert_eq!(child.events, vec!["terminate", "try_wait", "try_wait"]);
-        assert_eq!(
-            read_runtime_state(&state_path).expect("runtime state after cleanup"),
-            RuntimeStateRead::Loaded(Vec::new())
-        );
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                result,
+                CleanupResult {
+                    forced: false,
+                    removed_state: false,
+                }
+            );
+            assert_eq!(child.events, vec!["terminate", "try_wait", "try_wait"]);
+            assert_eq!(
+                read_runtime_state(&state_path).expect("runtime state after cleanup"),
+                RuntimeStateRead::Loaded(vec![managed_run_for(&server)])
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            assert!(result.removed_state);
+            assert_eq!(
+                read_runtime_state(&state_path).expect("runtime state after cleanup"),
+                RuntimeStateRead::Loaded(Vec::new())
+            );
+        }
     }
 
     #[test]
@@ -1359,8 +1320,9 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
-    fn persist_managed_server_or_cleanup_cleans_child_when_identity_is_missing() {
+    fn persist_failure_with_missing_unix_owned_group_preserves_state_for_recovery() {
         let temp = tempdir().expect("tempdir");
         let state_path = temp.path().join("managed.json");
         let starting = childless_starting_run(temp.path(), "run-1");
@@ -1376,26 +1338,163 @@ mod tests {
         };
         let mut child = FakeChild::with_wait_results(vec![Some(0)]);
 
-        let error = persist_managed_server_or_cleanup(
+        let outcome = persist_managed_server_or_cleanup(
+            &mut child,
+            &state_path,
+            starting.clone(),
+            server,
+            Duration::from_millis(10),
+        )
+        .expect("missing owned group reports recovery");
+
+        assert_eq!(outcome, PersistManagedServerOutcome::RecoveryRequired);
+        assert_eq!(child.events, vec!["terminate", "try_wait"]);
+        assert_eq!(
+            read_runtime_state(&state_path).expect("runtime state after cleanup"),
+            RuntimeStateRead::Loaded(vec![starting])
+        );
+    }
+
+    #[test]
+    fn attachment_identity_failure_after_committed_stop_returns_requested_stop_after_one_cleanup() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let starting = childless_starting_run(temp.path(), "run-1");
+        create_starting_run(&state_path, starting.clone()).expect("create starting run");
+        let mut stopped = starting.clone();
+        stopped.stop_requested = true;
+        assert!(
+            update_runtime_state_run(&state_path, &starting.identity(), stopped)
+                .expect("commit stop before identity failure")
+        );
+        let server = ManagedServer {
+            id: starting.model_id.clone(),
+            pid: 777,
+            port: starting.port,
+            model_path: temp.path().join("model.gguf"),
+            started_at_unix_s: 789,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: None,
+        };
+        let mut child = FakeChild::with_wait_results(vec![Some(0)]);
+        let cleanup_calls = Cell::new(0_u8);
+
+        let outcome = persist_managed_server_or_cleanup_with(
+            &mut child,
+            &state_path,
+            starting,
+            server,
+            |_, path, expected| {
+                cleanup_calls.set(cleanup_calls.get() + 1);
+                lifecycle::finish_post_spawn_failure_with(path, expected, || {
+                    TeardownConfirmation::Confirmed
+                })
+            },
+        )
+        .expect("committed stop wins attachment identity failure");
+
+        assert_eq!(outcome, PersistManagedServerOutcome::RequestedStop);
+        assert_eq!(cleanup_calls.get(), 1);
+        assert_eq!(
+            read_runtime_state(&state_path).expect("read exact-finished stopped run"),
+            RuntimeStateRead::Loaded(Vec::new())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn production_attachment_identity_failure_honors_committed_stop_after_group_teardown() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let starting = childless_starting_run(temp.path(), "run-1");
+        create_starting_run(&state_path, starting.clone()).expect("create starting run");
+        let mut stopped = starting.clone();
+        stopped.stop_requested = true;
+        assert!(
+            update_runtime_state_run(&state_path, &starting.identity(), stopped)
+                .expect("commit stop before identity failure")
+        );
+        let writer = Arc::new(Mutex::new(BoundedLogWriter {
+            file: File::create(temp.path().join("owned-group.log")).expect("create log"),
+            remaining: MAX_LOG_BYTES,
+            truncated: false,
+        }));
+        let mut command = Command::new(std::env::current_exe().expect("current test binary"));
+        command.arg("--exact").arg("__loxa_gate3_no_test_matches__");
+        let mut child = spawn_managed_command(command, writer).expect("spawn owned group child");
+        let server = ManagedServer {
+            id: starting.model_id.clone(),
+            pid: child.pid(),
+            port: starting.port,
+            model_path: temp.path().join("model.gguf"),
+            started_at_unix_s: 789,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: None,
+        };
+
+        let outcome = persist_managed_server_or_cleanup(
             &mut child,
             &state_path,
             starting,
             server,
             Duration::from_millis(10),
         )
-        .expect_err("missing process identity should fail");
+        .expect("committed stop wins after production group teardown");
 
-        match error {
-            SupervisorError::ProcessIdentityUnavailable(777) => {}
-            other => panic!("unexpected error: {other}"),
-        }
+        assert_eq!(outcome, PersistManagedServerOutcome::RequestedStop);
+        assert!(child.try_wait().expect("idempotent leader reap").is_some());
         assert_eq!(
-            child.events,
-            vec!["terminate", "try_wait", "join_log_drains"]
+            read_runtime_state(&state_path).expect("read exact-finished state"),
+            RuntimeStateRead::Loaded(Vec::new())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attachment_cas_failure_invokes_unified_teardown_once_and_preserves_newer_state() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let starting = childless_starting_run(temp.path(), "run-1");
+        create_starting_run(&state_path, starting.clone()).expect("create starting run");
+        let mut newer = starting.clone();
+        newer.generation = 1;
+        newer.generation_alias = "loxa-run-1-g1".to_string();
+        assert!(
+            update_runtime_state_run(&state_path, &starting.identity(), newer.clone(),)
+                .expect("publish newer state")
+        );
+        let server = ManagedServer {
+            id: starting.model_id.clone(),
+            pid: 777,
+            port: starting.port,
+            model_path: temp.path().join("model.gguf"),
+            started_at_unix_s: 789,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: Some(111),
+        };
+        let mut child = FakeChild::with_wait_results(vec![Some(0)]);
+
+        let outcome = persist_managed_server_or_cleanup(
+            &mut child,
+            &state_path,
+            starting,
+            server,
+            Duration::from_millis(10),
+        )
+        .expect("stale attachment reports recovery");
+
+        assert_eq!(outcome, PersistManagedServerOutcome::RecoveryRequired);
+        assert_eq!(
+            child
+                .events
+                .iter()
+                .filter(|event| **event == "terminate")
+                .count(),
+            1
         );
         assert_eq!(
-            read_runtime_state(&state_path).expect("runtime state after cleanup"),
-            RuntimeStateRead::Loaded(Vec::new())
+            read_runtime_state(&state_path).expect("read preserved newer state"),
+            RuntimeStateRead::Loaded(vec![newer])
         );
     }
 
@@ -1424,6 +1523,9 @@ mod tests {
             Duration::from_millis(10),
         )
         .expect("attach managed child");
+        let PersistManagedServerOutcome::Attached(attached) = attached else {
+            panic!("managed child must attach");
+        };
 
         assert_eq!(attached.lifecycle, RunLifecycle::Running);
         assert_eq!(attached.child_pid, Some(777));
@@ -1433,6 +1535,42 @@ mod tests {
             RuntimeStateRead::Loaded(vec![attached])
         );
         assert!(child.events.is_empty());
+    }
+
+    #[test]
+    fn persist_managed_server_attaches_the_live_owned_pgid_for_diagnostics() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let starting = childless_starting_run(temp.path(), "run-1");
+        create_starting_run(&state_path, starting.clone()).expect("create starting run");
+        let server = ManagedServer {
+            id: starting.model_id.clone(),
+            pid: 777,
+            port: starting.port,
+            model_path: temp.path().join("model.gguf"),
+            started_at_unix_s: 789,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: Some(111),
+        };
+        let mut child = OwnedPgidFakeChild;
+
+        let attached = persist_managed_server_or_cleanup(
+            &mut child,
+            &state_path,
+            starting,
+            server,
+            Duration::from_millis(10),
+        )
+        .expect("attach managed child");
+        let PersistManagedServerOutcome::Attached(attached) = attached else {
+            panic!("managed child must attach");
+        };
+
+        assert_eq!(attached.child_pgid, Some(777));
+        assert_eq!(
+            read_runtime_state(&state_path).expect("read attached run"),
+            RuntimeStateRead::Loaded(vec![attached])
+        );
     }
 
     #[test]
@@ -1497,42 +1635,7 @@ mod tests {
     }
 
     #[test]
-    fn child_exited_early_waits_for_log_drains_before_reading_tail() {
-        let temp = tempdir().expect("tempdir");
-        let log_path = temp.path().join("captured.log");
-        let log_file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&log_path)
-            .expect("create log");
-        let writer = Arc::new(Mutex::new(BoundedLogWriter {
-            file: log_file,
-            remaining: MAX_LOG_BYTES,
-            truncated: false,
-        }));
-        let handle = spawn_log_drain(
-            DelayedReader::new(
-                b"delayed stderr panic\n".to_vec(),
-                Duration::from_millis(20),
-            ),
-            writer,
-        );
-        let mut child = FakeSpawnedServer::new(vec![handle]);
-
-        let error =
-            child_exited_early_with_drains(&mut child, &log_path).expect("child exited early");
-
-        match error {
-            SupervisorError::ChildExitedEarly(message) => {
-                assert!(message.contains("delayed stderr panic"));
-            }
-            other => panic!("unexpected error: {other}"),
-        }
-    }
-
-    #[test]
-    fn wait_for_health_or_exit_reports_child_exit_with_drained_log_tail() {
+    fn wait_for_health_or_exit_reports_reaped_child_without_preteardown_drain_or_tail_read() {
         let temp = tempdir().expect("tempdir");
         let log_path = temp.path().join("captured.log");
         let log_file = OpenOptions::new()
@@ -1549,7 +1652,8 @@ mod tests {
         let handle = spawn_log_drain(
             DelayedReader::new(b"startup panic\n".to_vec(), Duration::from_millis(5)),
             writer,
-        );
+        )
+        .expect("spawn startup log drain");
         let mut child = FakeSpawnedServer::new(vec![handle]);
 
         let error = wait_for_health_or_exit(
@@ -1563,7 +1667,8 @@ mod tests {
 
         match error {
             SupervisorError::ChildExitedEarly(message) => {
-                assert!(message.contains("startup panic"));
+                assert!(message.is_empty());
+                assert_eq!(child.log_drains.len(), 1);
             }
             other => panic!("unexpected error: {other}"),
         }
@@ -1816,13 +1921,43 @@ mod tests {
         }
     }
 
+    struct OwnedPgidFakeChild;
+
+    impl ManagedChild for OwnedPgidFakeChild {
+        fn pid(&self) -> u32 {
+            777
+        }
+
+        fn owned_pgid(&self) -> Option<i32> {
+            Some(777)
+        }
+
+        fn terminate(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn kill(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn try_wait(&mut self) -> io::Result<Option<i32>> {
+            Ok(Some(0))
+        }
+    }
+
+    impl LogDrainingChild for OwnedPgidFakeChild {
+        fn join_log_drains(&mut self) -> Result<(), SupervisorError> {
+            Ok(())
+        }
+    }
+
     struct FakeSpawnedServer {
         wait_results: Vec<Option<i32>>,
-        log_drains: Vec<thread::JoinHandle<()>>,
+        log_drains: Vec<thread::JoinHandle<io::Result<()>>>,
     }
 
     impl FakeSpawnedServer {
-        fn new(log_drains: Vec<thread::JoinHandle<()>>) -> Self {
+        fn new(log_drains: Vec<thread::JoinHandle<io::Result<()>>>) -> Self {
             Self {
                 wait_results: vec![Some(1)],
                 log_drains,
@@ -1857,7 +1992,8 @@ mod tests {
             for drain in self.log_drains.drain(..) {
                 drain
                     .join()
-                    .map_err(|_| SupervisorError::Io(io::Error::other("drain panic")))?;
+                    .map_err(|_| SupervisorError::Io(io::Error::other("drain panic")))?
+                    .map_err(SupervisorError::Io)?;
             }
             Ok(())
         }

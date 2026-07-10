@@ -1,5 +1,5 @@
 use super::state::{self, ManagedRun, ManagedRunIdentity, RunLifecycle};
-use super::SupervisorError;
+use super::{SupervisorError, TeardownConfirmation};
 use std::path::Path;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -19,15 +19,16 @@ pub enum OwnerTeardownDecision {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TeardownConfirmation {
-    Confirmed,
-    Unconfirmed,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OwnerTerminalOutcome {
     RequestedStop,
     Interrupted,
+    RecoveryRequired,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PostSpawnCleanupOutcome {
+    Cleaned,
+    RequestedStop,
     RecoveryRequired,
 }
 
@@ -143,6 +144,39 @@ where
     finish_confirmed_owner_teardown(path, expected, decision)
 }
 
+pub fn finish_post_spawn_failure_with<T>(
+    path: &Path,
+    expected: &ManagedRunIdentity,
+    teardown: T,
+) -> Result<PostSpawnCleanupOutcome, SupervisorError>
+where
+    T: FnOnce() -> TeardownConfirmation,
+{
+    if teardown() == TeardownConfirmation::Unconfirmed {
+        return Ok(PostSpawnCleanupOutcome::RecoveryRequired);
+    }
+
+    let _lock = state::acquire_runtime_state_lock_for_mutation(
+        path,
+        state::RUNTIME_STATE_LOCK_TIMEOUT,
+        state::RUNTIME_STATE_LOCK_POLL_INTERVAL,
+    )?;
+    let runs = state::runtime_state_runs_for_mutation(path)?;
+    let Some(current) = runs.first() else {
+        return Ok(PostSpawnCleanupOutcome::RecoveryRequired);
+    };
+    if current.identity() != *expected {
+        return Ok(PostSpawnCleanupOutcome::RecoveryRequired);
+    }
+    let requested_stop = current.stop_requested;
+    state::write_runtime_state(path, &[])?;
+    Ok(if requested_stop {
+        PostSpawnCleanupOutcome::RequestedStop
+    } else {
+        PostSpawnCleanupOutcome::Cleaned
+    })
+}
+
 fn finish_confirmed_owner_teardown(
     path: &Path,
     expected: &ManagedRunIdentity,
@@ -209,24 +243,40 @@ where
     T: FnOnce(OwnerTeardownDecision) -> TeardownConfirmation,
 {
     after_observation();
-    let current = state::current_runtime_state_run(state_path, state_identity)?;
-    let interrupted = interrupt.interrupted();
-    if teardown(OwnerTeardownDecision::UnexpectedExit) == TeardownConfirmation::Unconfirmed {
-        return Ok(ObservedChildExit::RecoveryRequired);
-    }
-    transition_after_confirmed_unexpected_exit(
+    decide_observed_child_exit_with_diagnostics(
         state_path,
-        &current.identity(),
-        log_tail,
-        interrupted,
+        state_identity,
+        interrupt,
+        || teardown(OwnerTeardownDecision::UnexpectedExit),
+        || Ok(log_tail),
     )
 }
 
-fn transition_after_confirmed_unexpected_exit(
+pub(super) fn decide_observed_child_exit_with_diagnostics<I, T, D>(
+    state_path: &Path,
+    state_identity: &ManagedRunIdentity,
+    interrupt: &I,
+    teardown: T,
+    diagnostics: D,
+) -> Result<ObservedChildExit, SupervisorError>
+where
+    I: InterruptStatus,
+    T: FnOnce() -> TeardownConfirmation,
+    D: FnOnce() -> Result<String, SupervisorError>,
+{
+    if teardown() == TeardownConfirmation::Unconfirmed {
+        return Ok(ObservedChildExit::RecoveryRequired);
+    }
+    let log_tail = diagnostics()
+        .unwrap_or_else(|error| format!("crash diagnostics unavailable after teardown: {error}"));
+    transition_after_confirmed_unexpected_exit(state_path, state_identity, log_tail, interrupt)
+}
+
+fn transition_after_confirmed_unexpected_exit<I: InterruptStatus>(
     state_path: &Path,
     expected: &ManagedRunIdentity,
     log_tail: String,
-    interrupted: bool,
+    interrupt: &I,
 ) -> Result<ObservedChildExit, SupervisorError> {
     let _lock = state::acquire_runtime_state_lock_for_mutation(
         state_path,
@@ -244,7 +294,7 @@ fn transition_after_confirmed_unexpected_exit(
         state::write_runtime_state(state_path, &[])?;
         return Ok(ObservedChildExit::RequestedStop);
     }
-    if interrupted {
+    if interrupt.interrupted() {
         state::write_runtime_state(state_path, &[])?;
         return Ok(ObservedChildExit::Interrupted);
     }
@@ -280,6 +330,7 @@ mod tests {
     };
     use crate::supervisor::{
         persist_managed_server_or_cleanup, LogDrainingChild, ManagedChild, ManagedServer,
+        PersistManagedServerOutcome,
     };
     use std::cell::{Cell, RefCell};
     use std::io;
@@ -386,6 +437,9 @@ mod tests {
             .join()
             .expect("attacher joins")
             .expect("attachment succeeds");
+        let PersistManagedServerOutcome::Attached(attached) = attached else {
+            panic!("concurrent stop is merged into the attached run");
+        };
         assert!(
             attached.stop_requested,
             "attachment returns committed state"
@@ -510,6 +564,9 @@ mod tests {
             Duration::from_millis(10),
         )
         .expect("attach generation-one child");
+        let PersistManagedServerOutcome::Attached(attached) = attached else {
+            panic!("generation-one child must attach");
+        };
         assert_eq!(attached.run_id, generation_zero.run_id);
         assert_eq!(attached.generation, 1);
         assert_eq!(attached.child_pid, Some(778));
@@ -655,6 +712,120 @@ mod tests {
         );
     }
 
+    #[test]
+    fn interrupt_arriving_during_physical_teardown_is_sampled_at_finalization() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let server = ManagedServer {
+            id: "gemma-3-4b-it-q4".to_string(),
+            pid: 777,
+            port: 8081,
+            model_path: temp.path().join("model.gguf"),
+            started_at_unix_s: 789,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: Some(111),
+        };
+        let run = managed_run_for(&server);
+        write_runtime_state(&state_path, std::slice::from_ref(&run)).expect("seed run");
+        let interrupt = MutableInterrupt(Cell::new(false));
+
+        let outcome = decide_observed_child_exit(
+            "crash tail".to_string(),
+            &state_path,
+            &run.identity(),
+            &interrupt,
+            |_| {
+                interrupt.0.set(true);
+                TeardownConfirmation::Confirmed
+            },
+        )
+        .expect("finalized interrupt outcome");
+
+        assert_eq!(outcome, ObservedChildExit::Interrupted);
+        assert_eq!(
+            read_runtime_state(&state_path).expect("read terminal state"),
+            RuntimeStateRead::Loaded(Vec::new())
+        );
+    }
+
+    #[test]
+    fn unexpected_exit_orders_physical_teardown_then_diagnostics_then_finalization_sample() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let server = ManagedServer {
+            id: "gemma-3-4b-it-q4".to_string(),
+            pid: 777,
+            port: 8081,
+            model_path: temp.path().join("model.gguf"),
+            started_at_unix_s: 789,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: Some(111),
+        };
+        let run = managed_run_for(&server);
+        write_runtime_state(&state_path, std::slice::from_ref(&run)).expect("seed run");
+        let events = RefCell::new(Vec::new());
+        let interrupt = RecordingInterrupt(&events);
+
+        let outcome = decide_observed_child_exit_with_diagnostics(
+            &state_path,
+            &run.identity(),
+            &interrupt,
+            || {
+                events.borrow_mut().push("physical_teardown");
+                TeardownConfirmation::Confirmed
+            },
+            || {
+                events.borrow_mut().push("diagnostics");
+                Ok("crash tail".to_string())
+            },
+        )
+        .expect("restart outcome");
+
+        assert!(matches!(outcome, ObservedChildExit::Restart { .. }));
+        assert_eq!(
+            events.into_inner(),
+            vec![
+                "physical_teardown",
+                "diagnostics",
+                "finalization_interrupt_sample"
+            ]
+        );
+    }
+
+    #[test]
+    fn post_spawn_failure_finalizes_exact_state_only_after_confirmed_physical_cleanup() {
+        for confirmation in [
+            TeardownConfirmation::Confirmed,
+            TeardownConfirmation::Unconfirmed,
+        ] {
+            let temp = tempdir().expect("tempdir");
+            let state_path = temp.path().join("managed.json");
+            let run = childless_starting_run(temp.path(), "run-1");
+            create_starting_run(&state_path, run.clone()).expect("create starting run");
+            let calls = Cell::new(0_u8);
+
+            let outcome = finish_post_spawn_failure_with(&state_path, &run.identity(), || {
+                calls.set(calls.get() + 1);
+                confirmation
+            })
+            .expect("post-spawn cleanup outcome");
+
+            assert_eq!(calls.get(), 1);
+            let RuntimeStateRead::Loaded(runs) =
+                read_runtime_state(&state_path).expect("read post-spawn state")
+            else {
+                panic!("expected loaded state");
+            };
+            if confirmation == TeardownConfirmation::Confirmed {
+                assert_eq!(outcome, PostSpawnCleanupOutcome::Cleaned);
+                assert!(runs.is_empty());
+            } else {
+                assert_eq!(outcome, PostSpawnCleanupOutcome::RecoveryRequired);
+                assert_eq!(runs, vec![run]);
+            }
+        }
+    }
+
     struct FakeChild {
         events: Vec<&'static str>,
         wait_results: Vec<Option<i32>>,
@@ -720,6 +891,23 @@ mod tests {
     impl InterruptStatus for AlwaysInterrupted {
         fn interrupted(&self) -> bool {
             true
+        }
+    }
+
+    struct MutableInterrupt(Cell<bool>);
+
+    impl InterruptStatus for MutableInterrupt {
+        fn interrupted(&self) -> bool {
+            self.0.get()
+        }
+    }
+
+    struct RecordingInterrupt<'a>(&'a RefCell<Vec<&'static str>>);
+
+    impl InterruptStatus for RecordingInterrupt<'_> {
+        fn interrupted(&self) -> bool {
+            self.0.borrow_mut().push("finalization_interrupt_sample");
+            false
         }
     }
 }
