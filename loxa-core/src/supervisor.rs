@@ -20,9 +20,10 @@ mod state;
 mod teardown;
 
 pub use lifecycle::{
-    decide_observed_child_exit, finish_childless_runtime_state_run, finish_owner_teardown_with,
-    ChildlessFinishOutcome, InterruptStatus, ObservedChildExit, OwnerTeardownDecision,
-    OwnerTerminalOutcome, PostSpawnCleanupOutcome, SpawnStartingRunOutcome,
+    decide_observed_child_exit, decide_observed_child_exit_with_policy,
+    finish_childless_runtime_state_run, finish_owner_teardown_with, ChildlessFinishOutcome,
+    InterruptStatus, ObservedChildExit, OwnerTeardownDecision, OwnerTerminalOutcome,
+    PostSpawnCleanupOutcome, SpawnStartingRunOutcome, UnexpectedExitPolicy,
 };
 pub use readiness::{
     process_start_time_with_retry, reserve_localhost_port, wait_for_generation_ready_or_exit,
@@ -669,10 +670,33 @@ where
     C: ManagedChild + LogDrainingChild,
     I: InterruptStatus,
 {
-    lifecycle::decide_observed_child_exit_with_diagnostics(
+    handle_observed_child_exit_with_policy(
+        child,
+        log_path,
         state_path,
         state_identity,
         interrupt,
+        UnexpectedExitPolicy::RestartOnce,
+    )
+}
+
+pub fn handle_observed_child_exit_with_policy<C, I>(
+    child: &mut C,
+    log_path: &Path,
+    state_path: &Path,
+    state_identity: &ManagedRunIdentity,
+    interrupt: &I,
+    policy: UnexpectedExitPolicy,
+) -> Result<ObservedChildExit, SupervisorError>
+where
+    C: ManagedChild + LogDrainingChild,
+    I: InterruptStatus,
+{
+    lifecycle::decide_observed_child_exit_with_diagnostics_and_policy(
+        state_path,
+        state_identity,
+        interrupt,
+        policy,
         || teardown::teardown_managed_child_result(child).confirmation,
         || read_log_tail(log_path, LOG_TAIL_BYTES),
     )

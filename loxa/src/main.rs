@@ -38,6 +38,18 @@ enum Command {
         ctx: Option<u32>,
         #[arg(long)]
         port: Option<u16>,
+        #[arg(long, hide = true)]
+        no_restart: bool,
+    },
+    Bench {
+        #[arg(long, default_value = "gemma-3-4b-it-q4")]
+        managed_id: String,
+        #[arg(long)]
+        ollama_model: String,
+        #[arg(long, default_value_t = 8192)]
+        ctx: u32,
+        #[arg(long)]
+        confirm_exclusive: bool,
     },
     Ps,
     Stop {
@@ -130,6 +142,7 @@ struct RunSession<'a> {
     state_identity: &'a supervisor::ManagedRunIdentity,
     log_path: &'a Path,
     state_path: &'a Path,
+    no_restart: bool,
 }
 
 trait InterruptSource {
@@ -177,9 +190,24 @@ fn run_with_paths<W: Write, E: Write>(
         Command::Pull { id } => pull_model(&id, &mut stdout, &mut stderr),
         Command::List => print_list(&mut stdout),
         Command::Rm { id } => remove_model(&id, &mut stdout, &mut stderr),
-        Command::Run { id, ctx, port } => {
-            run_model(&id, ctx, port, paths, &mut stdout, &mut stderr)
-        }
+        Command::Run {
+            id,
+            ctx,
+            port,
+            no_restart,
+        } => run_model(&id, ctx, port, no_restart, paths, &mut stdout, &mut stderr),
+        Command::Bench {
+            managed_id,
+            ollama_model,
+            ctx,
+            confirm_exclusive,
+        } => bench_preflight(
+            &managed_id,
+            &ollama_model,
+            ctx,
+            confirm_exclusive,
+            &mut stderr,
+        ),
         Command::Ps => print_managed_servers(paths, &mut stdout),
         Command::Stop { target } => stop_managed_servers(&target, paths, &mut stdout, &mut stderr),
     };
@@ -214,6 +242,28 @@ fn pull_model<W: Write, E: Write>(
             Ok(ExitCode::from(1))
         }
     }
+}
+
+fn bench_preflight<E: Write>(
+    managed_id: &str,
+    _ollama_model: &str,
+    _ctx: u32,
+    confirm_exclusive: bool,
+    stderr: &mut E,
+) -> io::Result<ExitCode> {
+    if !confirm_exclusive {
+        writeln!(stderr, "bench requires --confirm-exclusive")?;
+        return Ok(ExitCode::from(1));
+    }
+    if registry::find(managed_id).is_none() {
+        write_unknown_id(managed_id, stderr)?;
+        return Ok(ExitCode::from(1));
+    }
+    writeln!(
+        stderr,
+        "bench orchestration is unavailable until the next implementation step"
+    )?;
+    Ok(ExitCode::from(1))
 }
 
 fn print_list<W: Write>(stdout: &mut W) -> io::Result<ExitCode> {
@@ -320,6 +370,7 @@ fn run_model<W: Write, E: Write>(
     id: &str,
     ctx: Option<u32>,
     port: Option<u16>,
+    no_restart: bool,
     paths: &CliPaths,
     stdout: &mut W,
     stderr: &mut E,
@@ -576,6 +627,7 @@ fn run_model<W: Write, E: Write>(
                         state_identity: &state_identity,
                         log_path: &log_path,
                         state_path: &paths.state_path,
+                        no_restart,
                     },
                     &mut child,
                     &signal_guard,
@@ -604,15 +656,16 @@ fn run_model<W: Write, E: Write>(
                 diagnostics_error,
             }) => {
                 let _ = (log_tail, diagnostics_error);
-                match supervisor::handle_observed_child_exit(
+                let observed = supervisor::handle_observed_child_exit_with_policy(
                     &mut child,
                     &log_path,
                     &paths.state_path,
                     &state_identity,
                     &signal_guard,
+                    unexpected_exit_policy(no_restart),
                 )
-                .map_err(supervisor_error_to_io)?
-                {
+                .map_err(supervisor_error_to_io)?;
+                match observed {
                     ObservedChildExit::RequestedStop => return Ok(ExitCode::SUCCESS),
                     ObservedChildExit::Interrupted => return Ok(ExitCode::from(130)),
                     ObservedChildExit::Restart { run } => {
@@ -712,6 +765,14 @@ fn retain_restart_after_best_effort_announcement<W: Write>(
 ) -> supervisor::ManagedRun {
     let _ = writeln!(stdout, "{message}");
     run
+}
+
+fn unexpected_exit_policy(no_restart: bool) -> supervisor::UnexpectedExitPolicy {
+    if no_restart {
+        supervisor::UnexpectedExitPolicy::FailFast
+    } else {
+        supervisor::UnexpectedExitPolicy::RestartOnce
+    }
 }
 
 fn prepare_owned_replacement_run<R, D, I, RF, DF>(
@@ -1348,15 +1409,16 @@ where
                 };
             }
             Ok(Some(_)) => {
-                match supervisor::handle_observed_child_exit(
+                let observed = supervisor::handle_observed_child_exit_with_policy(
                     child,
                     session.log_path,
                     session.state_path,
                     session.state_identity,
                     interrupt,
+                    unexpected_exit_policy(session.no_restart),
                 )
-                .map_err(supervisor_error_to_io)?
-                {
+                .map_err(supervisor_error_to_io)?;
+                match observed {
                     ObservedChildExit::RequestedStop => return Ok(RunOutcome::RequestedStop),
                     ObservedChildExit::Interrupted => return Ok(RunOutcome::Interrupted),
                     ObservedChildExit::Restart { run } => {
@@ -1464,15 +1526,16 @@ where
         if child.try_wait()?.is_some() {
             let log_tail = supervisor::read_log_tail(session.log_path, supervisor::LOG_TAIL_BYTES)
                 .unwrap_or_else(|error| format!("crash diagnostics unavailable: {error}"));
-            match supervisor::decide_observed_child_exit(
+            let observed = supervisor::decide_observed_child_exit_with_policy(
                 log_tail,
                 session.state_path,
                 session.state_identity,
                 interrupt,
+                unexpected_exit_policy(session.no_restart),
                 |decision| teardown(child, decision),
             )
-            .map_err(supervisor_error_to_io)?
-            {
+            .map_err(supervisor_error_to_io)?;
+            match observed {
                 ObservedChildExit::RequestedStop => return Ok(RunOutcome::RequestedStop),
                 ObservedChildExit::Interrupted => return Ok(RunOutcome::Interrupted),
                 ObservedChildExit::Restart { run } => {
@@ -1890,6 +1953,7 @@ fn optional_bytes_to_gb(bytes: Option<u64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
     use loxa_core::registry::REGISTRY;
     use loxa_core::supervisor::LogDrainingChild;
     use std::cell::{Cell, RefCell};
@@ -2077,6 +2141,7 @@ mod tests {
                     id,
                     ctx: Some(4096),
                     port: Some(9000),
+                    no_restart: false,
                 },
             }) if id == "gemma-3-4b-it-q4"
         ));
@@ -2092,6 +2157,114 @@ mod tests {
                 command: Command::Stop { target },
             }) if target == "all"
         ));
+    }
+
+    #[test]
+    fn bench_requires_ollama_model() {
+        assert!(Cli::try_parse_from(["loxa", "bench"]).is_err());
+    }
+
+    #[test]
+    fn bench_uses_exact_managed_default() {
+        assert!(matches!(
+            Cli::try_parse_from([
+                "loxa",
+                "bench",
+                "--ollama-model",
+                "gemma3:4b",
+                "--confirm-exclusive",
+            ]),
+            Ok(Cli {
+                command: Command::Bench {
+                    managed_id,
+                    ollama_model,
+                    ctx: 8192,
+                    confirm_exclusive: true,
+                },
+            }) if managed_id == "gemma-3-4b-it-q4" && ollama_model == "gemma3:4b"
+        ));
+    }
+
+    #[test]
+    fn bench_is_listed_in_help() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("bench"));
+    }
+
+    #[test]
+    fn bench_preflight_requires_confirmation_before_registry_lookup() {
+        let mut stderr = Vec::new();
+        let exit = bench_preflight("missing-model", "unused", 8192, false, &mut stderr)
+            .expect("bench preflight");
+
+        assert_eq!(exit, ExitCode::from(1));
+        assert_eq!(
+            String::from_utf8(stderr).expect("utf8 stderr"),
+            "bench requires --confirm-exclusive\n"
+        );
+    }
+
+    #[test]
+    fn bench_preflight_rejects_unknown_managed_id_before_orchestration() {
+        let mut stderr = Vec::new();
+        let exit = bench_preflight("missing-model", "unused", 8192, true, &mut stderr)
+            .expect("bench preflight");
+
+        assert_eq!(exit, ExitCode::from(1));
+        let stderr = String::from_utf8(stderr).expect("utf8 stderr");
+        assert!(stderr.contains("unknown model id: missing-model"));
+        assert!(!stderr.contains("orchestration is unavailable"));
+    }
+
+    #[test]
+    fn run_no_restart_is_hidden_but_accepted() {
+        let run_help = Cli::command()
+            .find_subcommand_mut("run")
+            .expect("run command")
+            .render_long_help()
+            .to_string();
+        assert!(!run_help.contains("no-restart"));
+        assert!(matches!(
+            Cli::try_parse_from(["loxa", "run", "gemma-3-4b-it-q4", "--no-restart",]),
+            Ok(Cli {
+                command: Command::Run {
+                    no_restart: true,
+                    ..
+                },
+            })
+        ));
+    }
+
+    #[test]
+    fn calibration_run_fails_after_first_crash_instead_of_restarting() {
+        let temp = TempDir::new("loxa-calibration-no-restart");
+        let state_path = temp.path().join("managed.json");
+        let server = ManagedServer {
+            id: "gemma-3-4b-it-q4".to_string(),
+            pid: 779,
+            port: 8081,
+            model_path: temp.path().join("model.gguf"),
+            started_at_unix_s: 789,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: Some(333),
+        };
+        let run = persist_run_for_server(&state_path, &server);
+        let signal = FakeInterruptSource::new(vec![false]);
+        let outcome = supervisor::decide_observed_child_exit_with_policy(
+            "first crash".to_string(),
+            &state_path,
+            &run.identity(),
+            &signal,
+            supervisor::UnexpectedExitPolicy::FailFast,
+            |_| supervisor::TeardownConfirmation::Confirmed,
+        )
+        .expect("calibration fail-fast decision");
+
+        assert!(matches!(outcome, ObservedChildExit::Exhausted { .. }));
+        assert_eq!(
+            supervisor::read_runtime_state(&state_path).expect("read cleaned state"),
+            RuntimeStateRead::Loaded(Vec::new())
+        );
     }
 
     #[test]
@@ -2145,6 +2318,7 @@ mod tests {
                 id: "missing-model".to_string(),
                 ctx: None,
                 port: None,
+                no_restart: false,
             },
         };
         let mut stdout = Vec::new();
@@ -2175,6 +2349,7 @@ mod tests {
                 id: "gemma-3-4b-it-q4".to_string(),
                 ctx: None,
                 port: None,
+                no_restart: false,
             },
         };
         let mut stdout = Vec::new();
@@ -2410,6 +2585,7 @@ mod tests {
                 id: "gemma-3-4b-it-q4".to_string(),
                 ctx: None,
                 port: None,
+                no_restart: false,
             },
         };
         let mut stdout = Vec::new();
@@ -2974,6 +3150,7 @@ mod tests {
                 state_identity: &run.identity(),
                 log_path: run.log_path.as_path(),
                 state_path: &state_path,
+                no_restart: false,
             },
             &mut child,
             &signal,
@@ -3019,6 +3196,7 @@ mod tests {
                 state_identity: &run.identity(),
                 log_path: run.log_path.as_path(),
                 state_path: &state_path,
+                no_restart: false,
             },
             &mut child,
             &signal,
@@ -3172,6 +3350,7 @@ mod tests {
                     state_identity: &stopped.identity(),
                     log_path: stopped.log_path.as_path(),
                     state_path: &state_path,
+                    no_restart: false,
                 },
                 &mut child,
                 &signal,
@@ -3235,6 +3414,7 @@ mod tests {
                 state_identity: &identity,
                 log_path: run.log_path.as_path(),
                 state_path: &state_path,
+                no_restart: false,
             },
             &mut child,
             &signal,
@@ -3286,6 +3466,7 @@ mod tests {
                 state_identity: &run.identity(),
                 log_path: run.log_path.as_path(),
                 state_path: &state_path,
+                no_restart: false,
             },
             &mut child,
             &signal,
@@ -3341,6 +3522,7 @@ mod tests {
                 state_identity: &run.identity(),
                 log_path: run.log_path.as_path(),
                 state_path: &state_path,
+                no_restart: false,
             },
             &mut child,
             &signal,

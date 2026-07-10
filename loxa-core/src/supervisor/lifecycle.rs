@@ -12,6 +12,12 @@ pub enum ObservedChildExit {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnexpectedExitPolicy {
+    RestartOnce,
+    FailFast,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OwnerTeardownDecision {
     RequestedStop,
     Interrupted,
@@ -226,11 +232,34 @@ where
     I: InterruptStatus,
     T: FnOnce(OwnerTeardownDecision) -> TeardownConfirmation,
 {
+    decide_observed_child_exit_with_policy(
+        log_tail,
+        state_path,
+        state_identity,
+        interrupt,
+        UnexpectedExitPolicy::RestartOnce,
+        teardown,
+    )
+}
+
+pub fn decide_observed_child_exit_with_policy<I, T>(
+    log_tail: String,
+    state_path: &Path,
+    state_identity: &ManagedRunIdentity,
+    interrupt: &I,
+    policy: UnexpectedExitPolicy,
+    teardown: T,
+) -> Result<ObservedChildExit, SupervisorError>
+where
+    I: InterruptStatus,
+    T: FnOnce(OwnerTeardownDecision) -> TeardownConfirmation,
+{
     decide_observed_child_exit_with(
         log_tail,
         state_path,
         state_identity,
         interrupt,
+        policy,
         || {},
         teardown,
     )
@@ -241,6 +270,7 @@ fn decide_observed_child_exit_with<I, H, T>(
     state_path: &Path,
     state_identity: &ManagedRunIdentity,
     interrupt: &I,
+    policy: UnexpectedExitPolicy,
     after_observation: H,
     teardown: T,
 ) -> Result<ObservedChildExit, SupervisorError>
@@ -250,19 +280,44 @@ where
     T: FnOnce(OwnerTeardownDecision) -> TeardownConfirmation,
 {
     after_observation();
-    decide_observed_child_exit_with_diagnostics(
+    decide_observed_child_exit_with_diagnostics_and_policy(
         state_path,
         state_identity,
         interrupt,
+        policy,
         || teardown(OwnerTeardownDecision::UnexpectedExit),
         || Ok(log_tail),
     )
 }
 
-pub(super) fn decide_observed_child_exit_with_diagnostics<I, T, D>(
+#[cfg(test)]
+fn decide_observed_child_exit_with_diagnostics<I, T, D>(
     state_path: &Path,
     state_identity: &ManagedRunIdentity,
     interrupt: &I,
+    teardown: T,
+    diagnostics: D,
+) -> Result<ObservedChildExit, SupervisorError>
+where
+    I: InterruptStatus,
+    T: FnOnce() -> TeardownConfirmation,
+    D: FnOnce() -> Result<String, SupervisorError>,
+{
+    decide_observed_child_exit_with_diagnostics_and_policy(
+        state_path,
+        state_identity,
+        interrupt,
+        UnexpectedExitPolicy::RestartOnce,
+        teardown,
+        diagnostics,
+    )
+}
+
+pub(super) fn decide_observed_child_exit_with_diagnostics_and_policy<I, T, D>(
+    state_path: &Path,
+    state_identity: &ManagedRunIdentity,
+    interrupt: &I,
+    policy: UnexpectedExitPolicy,
     teardown: T,
     diagnostics: D,
 ) -> Result<ObservedChildExit, SupervisorError>
@@ -276,7 +331,13 @@ where
     }
     let log_tail = diagnostics()
         .unwrap_or_else(|error| format!("crash diagnostics unavailable after teardown: {error}"));
-    transition_after_confirmed_unexpected_exit(state_path, state_identity, log_tail, interrupt)
+    transition_after_confirmed_unexpected_exit(
+        state_path,
+        state_identity,
+        log_tail,
+        interrupt,
+        policy,
+    )
 }
 
 fn transition_after_confirmed_unexpected_exit<I: InterruptStatus>(
@@ -284,6 +345,7 @@ fn transition_after_confirmed_unexpected_exit<I: InterruptStatus>(
     expected: &ManagedRunIdentity,
     log_tail: String,
     interrupt: &I,
+    policy: UnexpectedExitPolicy,
 ) -> Result<ObservedChildExit, SupervisorError> {
     let _lock = state::acquire_runtime_state_lock_for_mutation(
         state_path,
@@ -307,6 +369,10 @@ fn transition_after_confirmed_unexpected_exit<I: InterruptStatus>(
     }
 
     match current.generation {
+        0 if policy == UnexpectedExitPolicy::FailFast => {
+            state::write_runtime_state(state_path, &[])?;
+            Ok(ObservedChildExit::Exhausted { log_tail })
+        }
         0 => {
             let mut replacement = current.clone();
             replacement.lifecycle = RunLifecycle::Starting;
@@ -605,6 +671,7 @@ mod tests {
             &state_path,
             &generation_zero.identity(),
             &NeverInterrupted,
+            UnexpectedExitPolicy::RestartOnce,
             || {},
             |decision| {
                 decisions.borrow_mut().push(decision);
@@ -679,6 +746,7 @@ mod tests {
             &state_path,
             &run.identity(),
             &NeverInterrupted,
+            UnexpectedExitPolicy::RestartOnce,
             || {
                 events.borrow_mut().push("exit_observed");
                 assert!(matches!(
@@ -733,6 +801,7 @@ mod tests {
                 &state_path,
                 &generation_one.identity(),
                 &NeverInterrupted,
+                UnexpectedExitPolicy::RestartOnce,
                 || {},
                 |_| confirmation,
             )
