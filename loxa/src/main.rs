@@ -5,7 +5,7 @@ use loxa_core::hardware::HardwareReport;
 use loxa_core::registry::{self, ModelEntry, REGISTRY};
 use loxa_core::supervisor::{
     self, InterruptStatus, LogDrainingChild, ManagedChild, ManagedServer, ObservedChildExit,
-    RuntimeStateRead, SpawnedServer, SupervisorError,
+    RuntimeStateRead, SupervisorError,
 };
 use std::fmt;
 use std::fs;
@@ -86,6 +86,12 @@ enum SpawnBoundary<T> {
 }
 
 #[derive(Debug)]
+enum ManagedAttachmentBoundary {
+    Attached(supervisor::ManagedRun),
+    Terminal(ExitCode),
+}
+
+#[derive(Debug)]
 enum OwnedReplacementPreparation<R, D> {
     Prepared {
         run: supervisor::ManagedRun,
@@ -110,8 +116,16 @@ enum StartupWaitOutcome {
     RecoveryRequired,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadyOutputOutcome {
+    Ready,
+    RequestedStop,
+    RecoveryRequired,
+}
+
 #[derive(Debug)]
 enum StartupWaitFailure {
+    #[cfg(test)]
     BeforeTeardown(SupervisorError),
     AfterTeardown(SupervisorError),
     AfterChildReaped {
@@ -455,6 +469,23 @@ fn run_model<W: Write, E: Write>(
         else {
             return Ok(ExitCode::SUCCESS);
         };
+        let initialization_error = child.take_initialization_error();
+        if let Some(outcome) = finish_spawn_initialization(
+            &mut child,
+            &paths.state_path,
+            &starting_run.identity(),
+            initialization_error,
+        )
+        .map_err(supervisor_error_to_io)?
+        {
+            return match outcome {
+                supervisor::PostSpawnCleanupOutcome::RequestedStop => Ok(ExitCode::SUCCESS),
+                supervisor::PostSpawnCleanupOutcome::RecoveryRequired => {
+                    recovery_required_exit(stderr, &starting_run.run_id)
+                }
+                supervisor::PostSpawnCleanupOutcome::Cleaned => Ok(ExitCode::from(1)),
+            };
+        }
         let server = ManagedServer {
             id: id.to_string(),
             pid: child.pid(),
@@ -466,21 +497,17 @@ fn run_model<W: Write, E: Write>(
         };
 
         if signal_guard.interrupted() {
-            let outcome = supervisor::finish_owner_teardown_with(
-                &paths.state_path,
-                &starting_run.identity(),
-                supervisor::OwnerTeardownDecision::Interrupted,
-                |decision| owner_teardown_child(&mut child, decision),
-            )
-            .map_err(supervisor_error_to_io)?;
-            return Ok(match outcome {
-                supervisor::OwnerTerminalOutcome::RequestedStop => ExitCode::SUCCESS,
-                supervisor::OwnerTerminalOutcome::Interrupted => ExitCode::from(130),
-                supervisor::OwnerTerminalOutcome::RecoveryRequired => ExitCode::from(1),
-            });
+            let outcome =
+                finish_spawned_interrupt(&mut child, &paths.state_path, &starting_run.identity())
+                    .map_err(supervisor_error_to_io)?;
+            if outcome == supervisor::OwnerTerminalOutcome::RecoveryRequired {
+                return recovery_required_exit(stderr, &starting_run.run_id);
+            }
+            return Ok(owner_terminal_exit_code(outcome));
         }
 
-        let run = supervisor::persist_managed_server_or_cleanup(
+        let starting_run_id = starting_run.run_id.clone();
+        let persist_outcome = supervisor::persist_managed_server_or_cleanup(
             &mut child,
             &paths.state_path,
             starting_run,
@@ -488,25 +515,22 @@ fn run_model<W: Write, E: Write>(
             supervisor::CTRL_C_GRACE_PERIOD,
         )
         .map_err(supervisor_error_to_io)?;
+        let run = match resolve_managed_attachment(persist_outcome, stderr, &starting_run_id)? {
+            ManagedAttachmentBoundary::Attached(run) => run,
+            ManagedAttachmentBoundary::Terminal(exit) => return Ok(exit),
+        };
         let state_identity = run.identity();
 
-        if let Some(outcome) = observe_attached_stop_with(
-            &mut child,
-            &paths.state_path,
-            &state_identity,
-            || {},
-            owner_teardown_child,
-        )
-        .map_err(supervisor_error_to_io)?
+        if let Some(outcome) = observe_attached_stop(&mut child, &paths.state_path, &state_identity)
+            .map_err(supervisor_error_to_io)?
         {
-            return Ok(match outcome {
-                supervisor::OwnerTerminalOutcome::RequestedStop => ExitCode::SUCCESS,
-                supervisor::OwnerTerminalOutcome::Interrupted => ExitCode::from(130),
-                supervisor::OwnerTerminalOutcome::RecoveryRequired => ExitCode::from(1),
-            });
+            if outcome == supervisor::OwnerTerminalOutcome::RecoveryRequired {
+                return recovery_required_exit(stderr, &run.run_id);
+            }
+            return Ok(owner_terminal_exit_code(outcome));
         }
 
-        match wait_for_startup(
+        match wait_for_startup_owned(
             &mut child,
             &state_identity,
             &paths.state_path,
@@ -522,10 +546,21 @@ fn run_model<W: Write, E: Write>(
                 Err(SupervisorError::HealthTimeout) => Ok(StartupPoll::Pending),
                 Err(error) => Err(error),
             },
-            owner_teardown_child,
         ) {
             Ok(StartupWaitOutcome::Ready) => {
-                print_run_ready(stdout, &server)?;
+                match print_run_ready_owned(
+                    stdout,
+                    &server,
+                    &mut child,
+                    &paths.state_path,
+                    &state_identity,
+                )? {
+                    ReadyOutputOutcome::Ready => {}
+                    ReadyOutputOutcome::RequestedStop => return Ok(ExitCode::SUCCESS),
+                    ReadyOutputOutcome::RecoveryRequired => {
+                        return recovery_required_exit(stderr, &run.run_id)
+                    }
+                }
                 match supervise_running_server(
                     RunSession {
                         id,
@@ -544,27 +579,28 @@ fn run_model<W: Write, E: Write>(
                         replacement_run = Some(run);
                         continue;
                     }
-                    RunOutcome::Exhausted { .. } | RunOutcome::RecoveryRequired => {
-                        return Ok(ExitCode::from(1))
+                    RunOutcome::Exhausted { .. } => return Ok(ExitCode::from(1)),
+                    RunOutcome::RecoveryRequired => {
+                        return recovery_required_exit(stderr, &run.run_id)
                     }
                 }
             }
             Ok(StartupWaitOutcome::RequestedStop) => return Ok(ExitCode::SUCCESS),
             Ok(StartupWaitOutcome::Interrupted) => return Ok(ExitCode::from(130)),
-            Ok(StartupWaitOutcome::RecoveryRequired) => return Ok(ExitCode::from(1)),
+            Ok(StartupWaitOutcome::RecoveryRequired) => {
+                return recovery_required_exit(stderr, &run.run_id)
+            }
             Err(StartupWaitFailure::AfterChildReaped {
                 log_tail,
                 diagnostics_error,
             }) => {
-                let log_tail = diagnostics_error
-                    .map(|error| format!("crash diagnostics unavailable: {error}"))
-                    .unwrap_or(log_tail);
-                match supervisor::decide_observed_child_exit(
-                    log_tail,
+                let _ = (log_tail, diagnostics_error);
+                match supervisor::handle_observed_child_exit(
+                    &mut child,
+                    &log_path,
                     &paths.state_path,
                     &state_identity,
                     &signal_guard,
-                    |decision| owner_teardown_child(&mut child, decision),
                 )
                 .map_err(supervisor_error_to_io)?
                 {
@@ -587,35 +623,77 @@ fn run_model<W: Write, E: Write>(
                         write_log_tail(stderr, &log_tail)?;
                         return Ok(ExitCode::from(1));
                     }
-                    ObservedChildExit::RecoveryRequired => return Ok(ExitCode::from(1)),
+                    ObservedChildExit::RecoveryRequired => {
+                        return recovery_required_exit(stderr, &run.run_id)
+                    }
                 }
             }
             Err(StartupWaitFailure::AfterTeardown(error)) => {
-                return Err(supervisor_error_to_io(error));
+                return render_post_cleanup_startup_failure(stderr, &log_path, error);
             }
+            #[cfg(test)]
             Err(StartupWaitFailure::BeforeTeardown(error)) => {
-                let _ = supervisor::cleanup_after_ctrl_c(
+                let cleanup = supervisor::cleanup_post_spawn_failure(
                     &mut child,
                     &paths.state_path,
                     &state_identity,
-                    supervisor::CTRL_C_GRACE_PERIOD,
-                );
-                let _ = child.join_log_drains();
-                return match error {
-                    SupervisorError::HealthTimeout => {
-                        writeln!(
-                            stderr,
-                            "llama-server did not become healthy within {} seconds",
-                            supervisor::HEALTH_TIMEOUT.as_secs()
-                        )?;
-                        writeln!(stderr, "log file: {}", log_path.display())?;
-                        Ok(ExitCode::from(1))
-                    }
-                    other => Err(supervisor_error_to_io(other)),
-                };
+                )
+                .map_err(supervisor_error_to_io)?;
+                if cleanup == supervisor::PostSpawnCleanupOutcome::RequestedStop {
+                    return Ok(ExitCode::SUCCESS);
+                }
+                if cleanup == supervisor::PostSpawnCleanupOutcome::RecoveryRequired {
+                    return recovery_required_exit(stderr, &run.run_id);
+                }
+                return render_post_cleanup_startup_failure(stderr, &log_path, error);
             }
         }
     }
+}
+
+fn render_post_cleanup_startup_failure<E: Write>(
+    stderr: &mut E,
+    log_path: &Path,
+    error: SupervisorError,
+) -> io::Result<ExitCode> {
+    match error {
+        SupervisorError::HealthTimeout => {
+            writeln!(
+                stderr,
+                "llama-server did not become healthy within {} seconds",
+                supervisor::HEALTH_TIMEOUT.as_secs()
+            )?;
+            writeln!(stderr, "log file: {}", log_path.display())?;
+            Ok(ExitCode::from(1))
+        }
+        other => Err(supervisor_error_to_io(other)),
+    }
+}
+
+fn resolve_managed_attachment<E: Write>(
+    outcome: supervisor::PersistManagedServerOutcome,
+    stderr: &mut E,
+    run_id: &str,
+) -> io::Result<ManagedAttachmentBoundary> {
+    match outcome {
+        supervisor::PersistManagedServerOutcome::Attached(run) => {
+            Ok(ManagedAttachmentBoundary::Attached(run))
+        }
+        supervisor::PersistManagedServerOutcome::RequestedStop => {
+            Ok(ManagedAttachmentBoundary::Terminal(ExitCode::SUCCESS))
+        }
+        supervisor::PersistManagedServerOutcome::RecoveryRequired => Ok(
+            ManagedAttachmentBoundary::Terminal(recovery_required_exit(stderr, run_id)?),
+        ),
+    }
+}
+
+fn recovery_required_exit<E: Write>(stderr: &mut E, run_id: &str) -> io::Result<ExitCode> {
+    writeln!(
+        stderr,
+        "cleanup could not be confirmed for managed run {run_id}; recovery required"
+    )?;
+    Ok(ExitCode::from(1))
 }
 
 fn retain_restart_after_best_effort_announcement<W: Write>(
@@ -879,6 +957,7 @@ fn stop_managed_servers<W: Write, E: Write>(
     }
 }
 
+#[cfg(test)]
 fn observe_attached_stop_with<C, H, T>(
     child: &mut C,
     state_path: &Path,
@@ -904,6 +983,77 @@ where
     )?))
 }
 
+fn observe_attached_stop<C>(
+    child: &mut C,
+    state_path: &Path,
+    state_identity: &supervisor::ManagedRunIdentity,
+) -> Result<Option<supervisor::OwnerTerminalOutcome>, SupervisorError>
+where
+    C: ManagedChild + LogDrainingChild,
+{
+    let current = match supervisor::current_runtime_state_run(state_path, state_identity) {
+        Ok(current) => current,
+        Err(error) => {
+            return match supervisor::cleanup_post_spawn_failure(child, state_path, state_identity)?
+            {
+                supervisor::PostSpawnCleanupOutcome::Cleaned => Err(error),
+                supervisor::PostSpawnCleanupOutcome::RequestedStop => {
+                    Ok(Some(supervisor::OwnerTerminalOutcome::RequestedStop))
+                }
+                supervisor::PostSpawnCleanupOutcome::RecoveryRequired => {
+                    Ok(Some(supervisor::OwnerTerminalOutcome::RecoveryRequired))
+                }
+            };
+        }
+    };
+    if !current.stop_requested {
+        return Ok(None);
+    }
+    supervisor::teardown_owned_run(
+        child,
+        state_path,
+        &current.identity(),
+        supervisor::OwnerTeardownDecision::RequestedStop,
+    )
+    .map(Some)
+}
+
+fn finish_spawn_initialization<C>(
+    child: &mut C,
+    state_path: &Path,
+    state_identity: &supervisor::ManagedRunIdentity,
+    error: Option<SupervisorError>,
+) -> Result<Option<supervisor::PostSpawnCleanupOutcome>, SupervisorError>
+where
+    C: ManagedChild + LogDrainingChild,
+{
+    let Some(error) = error else {
+        return Ok(None);
+    };
+    match supervisor::cleanup_post_spawn_failure(child, state_path, state_identity)? {
+        supervisor::PostSpawnCleanupOutcome::Cleaned => Err(error),
+        outcome @ (supervisor::PostSpawnCleanupOutcome::RequestedStop
+        | supervisor::PostSpawnCleanupOutcome::RecoveryRequired) => Ok(Some(outcome)),
+    }
+}
+
+fn finish_spawned_interrupt<C>(
+    child: &mut C,
+    state_path: &Path,
+    state_identity: &supervisor::ManagedRunIdentity,
+) -> Result<supervisor::OwnerTerminalOutcome, SupervisorError>
+where
+    C: ManagedChild + LogDrainingChild,
+{
+    supervisor::teardown_owned_run(
+        child,
+        state_path,
+        state_identity,
+        supervisor::OwnerTeardownDecision::Interrupted,
+    )
+}
+
+#[cfg(test)]
 fn owner_teardown_child<C>(
     child: &mut C,
     decision: supervisor::OwnerTeardownDecision,
@@ -912,20 +1062,165 @@ where
     C: ManagedChild + LogDrainingChild,
 {
     if decision == supervisor::OwnerTeardownDecision::UnexpectedExit {
-        return supervisor::TeardownConfirmation::Confirmed;
-    }
-
-    match supervisor::teardown_managed_child(child, supervisor::CTRL_C_GRACE_PERIOD) {
-        Ok(supervisor::TeardownConfirmation::Confirmed) => match child.join_log_drains() {
-            Ok(()) => supervisor::TeardownConfirmation::Confirmed,
-            Err(_) => supervisor::TeardownConfirmation::Unconfirmed,
-        },
-        Ok(supervisor::TeardownConfirmation::Unconfirmed) | Err(_) => {
+        return if child.join_log_drains().is_ok() {
+            supervisor::TeardownConfirmation::Confirmed
+        } else {
             supervisor::TeardownConfirmation::Unconfirmed
+        };
+    }
+    if child.terminate().is_err() {
+        return supervisor::TeardownConfirmation::Unconfirmed;
+    }
+    match child.try_wait() {
+        Ok(Some(_)) if child.join_log_drains().is_ok() => {
+            supervisor::TeardownConfirmation::Confirmed
+        }
+        Ok(None) => {
+            let _ = child.kill();
+            match child.try_wait() {
+                Ok(Some(_)) if child.join_log_drains().is_ok() => {
+                    supervisor::TeardownConfirmation::Confirmed
+                }
+                _ => supervisor::TeardownConfirmation::Unconfirmed,
+            }
+        }
+        _ => supervisor::TeardownConfirmation::Unconfirmed,
+    }
+}
+
+fn wait_for_startup_owned<C, I, W>(
+    child: &mut C,
+    state_identity: &supervisor::ManagedRunIdentity,
+    state_path: &Path,
+    interrupt: &I,
+    mut wait_step: W,
+) -> Result<StartupWaitOutcome, StartupWaitFailure>
+where
+    C: ManagedChild + LogDrainingChild,
+    I: InterruptSource,
+    W: FnMut(&mut C, Duration, Duration) -> Result<StartupPoll, SupervisorError>,
+{
+    let started = std::time::Instant::now();
+    loop {
+        let current = match supervisor::current_runtime_state_run(state_path, state_identity) {
+            Ok(current) => current,
+            Err(error) => {
+                return finish_owned_startup_failure(child, state_path, state_identity, error)
+            }
+        };
+        if current.stop_requested {
+            return map_owned_startup_transition(
+                supervisor::teardown_owned_run(
+                    child,
+                    state_path,
+                    &current.identity(),
+                    supervisor::OwnerTeardownDecision::RequestedStop,
+                )
+                .map_err(StartupWaitFailure::AfterTeardown)?,
+            );
+        }
+        if InterruptSource::interrupted(interrupt) {
+            return map_owned_startup_transition(
+                supervisor::teardown_owned_run(
+                    child,
+                    state_path,
+                    state_identity,
+                    supervisor::OwnerTeardownDecision::Interrupted,
+                )
+                .map_err(StartupWaitFailure::AfterTeardown)?,
+            );
+        }
+
+        let remaining = supervisor::HEALTH_TIMEOUT.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return finish_owned_startup_failure(
+                child,
+                state_path,
+                state_identity,
+                SupervisorError::HealthTimeout,
+            );
+        }
+        let step_timeout = remaining.min(supervisor::HEALTH_POLL_INTERVAL);
+        match wait_step(child, step_timeout, step_timeout) {
+            Ok(StartupPoll::Pending) => {}
+            Ok(StartupPoll::Ready) => {
+                let current =
+                    match supervisor::current_runtime_state_run(state_path, state_identity) {
+                        Ok(current) => current,
+                        Err(error) => {
+                            return finish_owned_startup_failure(
+                                child,
+                                state_path,
+                                state_identity,
+                                error,
+                            )
+                        }
+                    };
+                if current.stop_requested {
+                    return map_owned_startup_transition(
+                        supervisor::teardown_owned_run(
+                            child,
+                            state_path,
+                            &current.identity(),
+                            supervisor::OwnerTeardownDecision::RequestedStop,
+                        )
+                        .map_err(StartupWaitFailure::AfterTeardown)?,
+                    );
+                }
+                return Ok(StartupWaitOutcome::Ready);
+            }
+            Err(SupervisorError::ChildExitedEarly(log_tail)) => {
+                return Err(StartupWaitFailure::AfterChildReaped {
+                    log_tail,
+                    diagnostics_error: None,
+                })
+            }
+            Err(SupervisorError::ChildReapedDiagnosticsFailed(error)) => {
+                return Err(StartupWaitFailure::AfterChildReaped {
+                    log_tail: String::new(),
+                    diagnostics_error: Some(error),
+                })
+            }
+            Err(error) => {
+                return finish_owned_startup_failure(child, state_path, state_identity, error)
+            }
         }
     }
 }
 
+fn finish_owned_startup_failure<C>(
+    child: &mut C,
+    state_path: &Path,
+    state_identity: &supervisor::ManagedRunIdentity,
+    error: SupervisorError,
+) -> Result<StartupWaitOutcome, StartupWaitFailure>
+where
+    C: ManagedChild + LogDrainingChild,
+{
+    match supervisor::cleanup_post_spawn_failure(child, state_path, state_identity)
+        .map_err(StartupWaitFailure::AfterTeardown)?
+    {
+        supervisor::PostSpawnCleanupOutcome::Cleaned => {
+            Err(StartupWaitFailure::AfterTeardown(error))
+        }
+        supervisor::PostSpawnCleanupOutcome::RequestedStop => Ok(StartupWaitOutcome::RequestedStop),
+        supervisor::PostSpawnCleanupOutcome::RecoveryRequired => {
+            Ok(StartupWaitOutcome::RecoveryRequired)
+        }
+    }
+}
+
+fn map_owned_startup_transition(
+    outcome: supervisor::OwnerTerminalOutcome,
+) -> Result<StartupWaitOutcome, StartupWaitFailure> {
+    Ok(match outcome {
+        supervisor::OwnerTerminalOutcome::RequestedStop => StartupWaitOutcome::RequestedStop,
+        supervisor::OwnerTerminalOutcome::Interrupted => StartupWaitOutcome::Interrupted,
+        supervisor::OwnerTerminalOutcome::RecoveryRequired => StartupWaitOutcome::RecoveryRequired,
+    })
+}
+
+#[cfg(test)]
 fn wait_for_startup<C, I, W, T>(
     child: &mut C,
     state_identity: &supervisor::ManagedRunIdentity,
@@ -953,6 +1248,7 @@ where
     )
 }
 
+#[cfg(test)]
 fn wait_for_startup_with_finalizer<C, I, W, T, F>(
     child: &mut C,
     state_identity: &supervisor::ManagedRunIdentity,
@@ -1043,6 +1339,7 @@ where
     }
 }
 
+#[cfg(test)]
 fn finish_startup_owner_transition<C, T, F>(
     child: &mut C,
     state_path: &Path,
@@ -1070,24 +1367,117 @@ where
     })
 }
 
-fn supervise_running_server<W: Write, E: Write, I: InterruptSource + InterruptStatus>(
+fn supervise_running_server<C, W: Write, E: Write, I: InterruptSource + InterruptStatus>(
     session: RunSession<'_>,
-    child: &mut SpawnedServer,
+    child: &mut C,
     interrupt: &I,
     stdout: &mut W,
     stderr: &mut E,
-) -> io::Result<RunOutcome> {
-    supervise_running_server_with(
-        session,
-        child,
-        interrupt,
-        stdout,
-        stderr,
-        owner_teardown_child,
-        std::thread::sleep,
-    )
+) -> io::Result<RunOutcome>
+where
+    C: ManagedChild + LogDrainingChild,
+{
+    loop {
+        if let Some(outcome) =
+            observe_attached_stop(child, session.state_path, session.state_identity)
+                .map_err(supervisor_error_to_io)?
+        {
+            return Ok(owner_terminal_to_run_outcome(outcome));
+        }
+        if InterruptSource::interrupted(interrupt) {
+            let outcome = supervisor::teardown_owned_run(
+                child,
+                session.state_path,
+                session.state_identity,
+                supervisor::OwnerTeardownDecision::Interrupted,
+            )
+            .map_err(supervisor_error_to_io)?;
+            return Ok(owner_terminal_to_run_outcome(outcome));
+        }
+        match child.try_wait() {
+            Ok(None) => std::thread::sleep(Duration::from_millis(250)),
+            Err(error) => {
+                return match supervisor::cleanup_post_spawn_failure(
+                    child,
+                    session.state_path,
+                    session.state_identity,
+                )
+                .map_err(supervisor_error_to_io)?
+                {
+                    supervisor::PostSpawnCleanupOutcome::Cleaned => Err(error),
+                    supervisor::PostSpawnCleanupOutcome::RequestedStop => {
+                        Ok(RunOutcome::RequestedStop)
+                    }
+                    supervisor::PostSpawnCleanupOutcome::RecoveryRequired => {
+                        Ok(RunOutcome::RecoveryRequired)
+                    }
+                };
+            }
+            Ok(Some(_)) => {
+                match supervisor::handle_observed_child_exit(
+                    child,
+                    session.log_path,
+                    session.state_path,
+                    session.state_identity,
+                    interrupt,
+                )
+                .map_err(supervisor_error_to_io)?
+                {
+                    ObservedChildExit::RequestedStop => return Ok(RunOutcome::RequestedStop),
+                    ObservedChildExit::Interrupted => return Ok(RunOutcome::Interrupted),
+                    ObservedChildExit::Restart { run } => {
+                        let run = retain_restart_after_best_effort_announcement(
+                            stdout,
+                            "llama-server exited unexpectedly; restarting once...",
+                            run,
+                        );
+                        return Ok(RunOutcome::Restart { run });
+                    }
+                    ObservedChildExit::Exhausted { log_tail } => {
+                        writeln!(
+                            stderr,
+                            "llama-server exited unexpectedly for {}",
+                            session.id
+                        )?;
+                        write_log_tail(stderr, &log_tail)?;
+                        return Ok(RunOutcome::Exhausted { log_tail });
+                    }
+                    ObservedChildExit::RecoveryRequired => return Ok(RunOutcome::RecoveryRequired),
+                }
+            }
+        }
+    }
 }
 
+fn owner_terminal_to_run_outcome(outcome: supervisor::OwnerTerminalOutcome) -> RunOutcome {
+    match outcome {
+        supervisor::OwnerTerminalOutcome::RequestedStop => RunOutcome::RequestedStop,
+        supervisor::OwnerTerminalOutcome::Interrupted => RunOutcome::Interrupted,
+        supervisor::OwnerTerminalOutcome::RecoveryRequired => RunOutcome::RecoveryRequired,
+    }
+}
+
+fn owner_terminal_exit_code(outcome: supervisor::OwnerTerminalOutcome) -> ExitCode {
+    match outcome {
+        supervisor::OwnerTerminalOutcome::RequestedStop => ExitCode::SUCCESS,
+        supervisor::OwnerTerminalOutcome::Interrupted => ExitCode::from(130),
+        supervisor::OwnerTerminalOutcome::RecoveryRequired => ExitCode::from(1),
+    }
+}
+
+#[cfg(test)]
+fn observed_terminal_exit_code(outcome: &ObservedChildExit) -> Option<ExitCode> {
+    match outcome {
+        ObservedChildExit::RequestedStop => Some(ExitCode::SUCCESS),
+        ObservedChildExit::Interrupted => Some(ExitCode::from(130)),
+        ObservedChildExit::Restart { .. } => None,
+        ObservedChildExit::Exhausted { .. } | ObservedChildExit::RecoveryRequired => {
+            Some(ExitCode::from(1))
+        }
+    }
+}
+
+#[cfg(test)]
 fn supervise_running_server_with<C, W, E, I, T, S>(
     session: RunSession<'_>,
     child: &mut C,
@@ -1138,8 +1528,8 @@ where
         }
 
         if child.try_wait()?.is_some() {
-            let crash = supervisor::reaped_child_exit_with_drains(child, session.log_path);
-            let log_tail = crash_tail(&crash).to_string();
+            let log_tail = supervisor::read_log_tail(session.log_path, supervisor::LOG_TAIL_BYTES)
+                .unwrap_or_else(|error| format!("crash diagnostics unavailable: {error}"));
             match supervisor::decide_observed_child_exit(
                 log_tail,
                 session.state_path,
@@ -1189,6 +1579,31 @@ fn print_run_ready<W: Write>(stdout: &mut W, server: &ManagedServer) -> io::Resu
     stdout.flush()
 }
 
+fn print_run_ready_owned<C, W>(
+    stdout: &mut W,
+    server: &ManagedServer,
+    child: &mut C,
+    state_path: &Path,
+    state_identity: &supervisor::ManagedRunIdentity,
+) -> io::Result<ReadyOutputOutcome>
+where
+    C: ManagedChild + LogDrainingChild,
+    W: Write,
+{
+    let Err(output_error) = print_run_ready(stdout, server) else {
+        return Ok(ReadyOutputOutcome::Ready);
+    };
+    match supervisor::cleanup_post_spawn_failure(child, state_path, state_identity)
+        .map_err(supervisor_error_to_io)?
+    {
+        supervisor::PostSpawnCleanupOutcome::Cleaned => Err(output_error),
+        supervisor::PostSpawnCleanupOutcome::RequestedStop => Ok(ReadyOutputOutcome::RequestedStop),
+        supervisor::PostSpawnCleanupOutcome::RecoveryRequired => {
+            Ok(ReadyOutputOutcome::RecoveryRequired)
+        }
+    }
+}
+
 fn ensure_runtime_state_is_mutable(state_path: &Path) -> io::Result<()> {
     match supervisor::read_runtime_state(state_path).map_err(supervisor_error_to_io)? {
         RuntimeStateRead::Corrupt(message) => Err(io::Error::other(format!(
@@ -1233,14 +1648,6 @@ fn inspection_status(inspection: &supervisor::ManagedServerInspection) -> String
 
 fn supervisor_error_to_io(error: SupervisorError) -> io::Error {
     io::Error::other(error.to_string())
-}
-
-fn crash_tail(error: &SupervisorError) -> &str {
-    match error {
-        SupervisorError::ChildExitedEarly(message)
-        | SupervisorError::ChildReapedDiagnosticsFailed(message) => message.as_str(),
-        _ => "",
-    }
 }
 
 fn write_log_tail<W: Write>(writer: &mut W, log_tail: &str) -> io::Result<()> {
@@ -2321,6 +2728,9 @@ mod tests {
                 Duration::from_millis(10),
             )
             .expect("attach replacement");
+            let supervisor::PersistManagedServerOutcome::Attached(attached) = attached else {
+                panic!("replacement attachment must remain owned");
+            };
             let events = RefCell::new(Vec::new());
             let identity = attached.identity();
 
@@ -2355,6 +2765,312 @@ mod tests {
                 RuntimeStateRead::Loaded(Vec::new())
             );
         }
+    }
+
+    #[test]
+    fn post_spawn_interrupt_before_attachment_invokes_unified_teardown_once() {
+        let temp = TempDir::new("loxa-post-spawn-pre-attach-interrupt");
+        let state_path = temp.path().join("managed.json");
+        let run = starting_run_for_test(&state_path, "run-1");
+        supervisor::create_starting_run(&state_path, run.clone()).expect("create starting run");
+        let mut child = FakeStartupChild::with_wait_results(vec![Some(0)]);
+
+        let outcome = finish_spawned_interrupt(&mut child, &state_path, &run.identity())
+            .expect("interrupt cleanup outcome");
+
+        assert_eq!(outcome, supervisor::OwnerTerminalOutcome::RecoveryRequired);
+        assert_eq!(
+            child
+                .events
+                .borrow()
+                .iter()
+                .filter(|event| **event == "terminate")
+                .count(),
+            1
+        );
+        assert_eq!(
+            supervisor::read_runtime_state(&state_path).expect("read preserved starting run"),
+            RuntimeStateRead::Loaded(vec![run])
+        );
+    }
+
+    #[test]
+    fn post_spawn_initialization_failure_invokes_unified_teardown_once() {
+        let temp = TempDir::new("loxa-post-spawn-initialization-failure");
+        let state_path = temp.path().join("managed.json");
+        let run = starting_run_for_test(&state_path, "run-1");
+        supervisor::create_starting_run(&state_path, run.clone()).expect("create starting run");
+        let mut child = FakeStartupChild::with_wait_results(vec![Some(0)]);
+
+        let outcome = finish_spawn_initialization(
+            &mut child,
+            &state_path,
+            &run.identity(),
+            Some(SupervisorError::Io(io::Error::other(
+                "injected drain initialization failure",
+            ))),
+        )
+        .expect("initialization cleanup outcome");
+
+        assert_eq!(
+            outcome,
+            Some(supervisor::PostSpawnCleanupOutcome::RecoveryRequired)
+        );
+        assert_eq!(
+            child
+                .events
+                .borrow()
+                .iter()
+                .filter(|event| **event == "terminate")
+                .count(),
+            1
+        );
+        assert_eq!(
+            supervisor::read_runtime_state(&state_path).expect("read preserved starting run"),
+            RuntimeStateRead::Loaded(vec![run])
+        );
+    }
+
+    #[test]
+    fn post_spawn_immediate_attachment_reread_error_invokes_unified_teardown_once() {
+        let temp = TempDir::new("loxa-post-spawn-attachment-reread");
+        let state_path = temp.path().join("managed.json");
+        let server = ManagedServer {
+            id: "gemma-3-4b-it-q4".to_string(),
+            pid: 777,
+            port: 8081,
+            model_path: temp.path().join("model.gguf"),
+            started_at_unix_s: 789,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: Some(111),
+        };
+        let run = persist_run_for_server(&state_path, &server);
+        fs::write(&state_path, b"{corrupt").expect("corrupt state after attachment");
+        let mut child = FakeStartupChild::with_wait_results(vec![Some(0)]);
+
+        let outcome = observe_attached_stop(&mut child, &state_path, &run.identity())
+            .expect("reread recovery outcome");
+
+        assert_eq!(
+            outcome,
+            Some(supervisor::OwnerTerminalOutcome::RecoveryRequired)
+        );
+        assert_eq!(
+            child
+                .events
+                .borrow()
+                .iter()
+                .filter(|event| **event == "terminate")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn post_spawn_startup_state_read_error_invokes_unified_teardown_once() {
+        let temp = TempDir::new("loxa-post-spawn-startup-state-read");
+        let state_path = temp.path().join("managed.json");
+        let server = ManagedServer {
+            id: "gemma-3-4b-it-q4".to_string(),
+            pid: 777,
+            port: 8081,
+            model_path: temp.path().join("model.gguf"),
+            started_at_unix_s: 789,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: Some(111),
+        };
+        let run = persist_run_for_server(&state_path, &server);
+        fs::write(&state_path, b"{corrupt").expect("corrupt startup state");
+        let signal = FakeInterruptSource::new(vec![false]);
+        let mut child = FakeStartupChild::with_wait_results(vec![Some(0)]);
+
+        let outcome = wait_for_startup_owned(
+            &mut child,
+            &run.identity(),
+            &state_path,
+            &signal,
+            |_, _, _| panic!("state read error must precede readiness polling"),
+        )
+        .expect("startup recovery outcome");
+
+        assert_eq!(outcome, StartupWaitOutcome::RecoveryRequired);
+        assert_eq!(
+            child
+                .events
+                .borrow()
+                .iter()
+                .filter(|event| **event == "terminate")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn post_spawn_startup_readiness_error_invokes_unified_teardown_once() {
+        let temp = TempDir::new("loxa-post-spawn-startup-readiness");
+        let state_path = temp.path().join("managed.json");
+        let server = ManagedServer {
+            id: "gemma-3-4b-it-q4".to_string(),
+            pid: 777,
+            port: 8081,
+            model_path: temp.path().join("model.gguf"),
+            started_at_unix_s: 789,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: Some(111),
+        };
+        let run = persist_run_for_server(&state_path, &server);
+        let signal = FakeInterruptSource::new(vec![false]);
+        let mut child = FakeStartupChild::with_wait_results(vec![Some(0)]);
+
+        let outcome = wait_for_startup_owned(
+            &mut child,
+            &run.identity(),
+            &state_path,
+            &signal,
+            |_, _, _| Err(SupervisorError::NoFreePort),
+        )
+        .expect("startup recovery outcome");
+
+        assert_eq!(outcome, StartupWaitOutcome::RecoveryRequired);
+        assert_eq!(
+            child
+                .events
+                .borrow()
+                .iter()
+                .filter(|event| **event == "terminate")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn post_spawn_ready_writer_failure_invokes_unified_teardown_once() {
+        let temp = TempDir::new("loxa-post-spawn-ready-writer");
+        let state_path = temp.path().join("managed.json");
+        let server = ManagedServer {
+            id: "gemma-3-4b-it-q4".to_string(),
+            pid: 777,
+            port: 8081,
+            model_path: temp.path().join("model.gguf"),
+            started_at_unix_s: 789,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: Some(111),
+        };
+        let run = persist_run_for_server(&state_path, &server);
+        let mut child = FakeStartupChild::with_wait_results(vec![Some(0)]);
+        let mut stdout = BrokenPipeWriter::new(|| {});
+
+        let outcome = print_run_ready_owned(
+            &mut stdout,
+            &server,
+            &mut child,
+            &state_path,
+            &run.identity(),
+        )
+        .expect("ready output recovery outcome");
+
+        assert_eq!(outcome, ReadyOutputOutcome::RecoveryRequired);
+        assert_eq!(stdout.write_attempts, 1);
+        assert_eq!(
+            child
+                .events
+                .borrow()
+                .iter()
+                .filter(|event| **event == "terminate")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn post_spawn_running_state_read_error_invokes_unified_teardown_once() {
+        let temp = TempDir::new("loxa-post-spawn-running-state-read");
+        let state_path = temp.path().join("managed.json");
+        let server = ManagedServer {
+            id: "gemma-3-4b-it-q4".to_string(),
+            pid: 777,
+            port: 8081,
+            model_path: temp.path().join("model.gguf"),
+            started_at_unix_s: 789,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: Some(111),
+        };
+        let run = persist_run_for_server(&state_path, &server);
+        fs::write(&state_path, b"{corrupt").expect("corrupt running state");
+        let signal = FakeInterruptSource::new(vec![false]);
+        let mut child = FakeStartupChild::with_wait_results(vec![Some(0)]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let outcome = supervise_running_server(
+            RunSession {
+                id: &server.id,
+                state_identity: &run.identity(),
+                log_path: run.log_path.as_path(),
+                state_path: &state_path,
+            },
+            &mut child,
+            &signal,
+            &mut stdout,
+            &mut stderr,
+        )
+        .expect("running recovery outcome");
+
+        assert_eq!(outcome, RunOutcome::RecoveryRequired);
+        assert_eq!(
+            child
+                .events
+                .borrow()
+                .iter()
+                .filter(|event| **event == "terminate")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn post_spawn_running_try_wait_error_invokes_unified_teardown_once() {
+        let temp = TempDir::new("loxa-post-spawn-running-try-wait");
+        let state_path = temp.path().join("managed.json");
+        let server = ManagedServer {
+            id: "gemma-3-4b-it-q4".to_string(),
+            pid: 777,
+            port: 8081,
+            model_path: temp.path().join("model.gguf"),
+            started_at_unix_s: 789,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: Some(111),
+        };
+        let run = persist_run_for_server(&state_path, &server);
+        let signal = FakeInterruptSource::new(vec![false]);
+        let mut child = FakeStartupChild::with_wait_error_then(vec![Some(0)]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let outcome = supervise_running_server(
+            RunSession {
+                id: &server.id,
+                state_identity: &run.identity(),
+                log_path: run.log_path.as_path(),
+                state_path: &state_path,
+            },
+            &mut child,
+            &signal,
+            &mut stdout,
+            &mut stderr,
+        )
+        .expect("running recovery outcome");
+
+        assert_eq!(outcome, RunOutcome::RecoveryRequired);
+        assert_eq!(
+            child
+                .events
+                .borrow()
+                .iter()
+                .filter(|event| **event == "terminate")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -2827,10 +3543,18 @@ mod tests {
             0,
             "an already-reaped PID must never be killed again: {events:?}"
         );
-        assert!(matches!(
-            observed_exit,
-            Some(ObservedChildExit::Restart { .. })
-        ));
+        if drain_fails {
+            assert_eq!(observed_exit, Some(ObservedChildExit::RecoveryRequired));
+            assert!(matches!(
+                supervisor::read_runtime_state(&state_path).expect("read preserved state"),
+                RuntimeStateRead::Loaded(runs) if runs.len() == 1
+            ));
+        } else {
+            assert!(matches!(
+                observed_exit,
+                Some(ObservedChildExit::Restart { .. })
+            ));
+        }
     }
 
     #[test]
@@ -3056,6 +3780,197 @@ mod tests {
         assert!(!ctrl_c_received());
     }
 
+    #[test]
+    fn truthful_owner_terminal_exit_codes_never_map_unconfirmed_cleanup_to_130() {
+        assert_eq!(
+            owner_terminal_exit_code(supervisor::OwnerTerminalOutcome::RequestedStop),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            owner_terminal_exit_code(supervisor::OwnerTerminalOutcome::Interrupted),
+            ExitCode::from(130)
+        );
+        assert_eq!(
+            owner_terminal_exit_code(supervisor::OwnerTerminalOutcome::RecoveryRequired),
+            ExitCode::from(1)
+        );
+    }
+
+    #[test]
+    fn attachment_requested_stop_outcome_maps_to_exit_0() {
+        let mut stderr = Vec::new();
+
+        let boundary = resolve_managed_attachment(
+            supervisor::PersistManagedServerOutcome::RequestedStop,
+            &mut stderr,
+            "run-1",
+        )
+        .expect("map requested-stop attachment outcome");
+
+        assert!(matches!(
+            boundary,
+            ManagedAttachmentBoundary::Terminal(exit) if exit == ExitCode::SUCCESS
+        ));
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn unconfirmed_requested_stop_exits_1_and_preserves_state() {
+        let temp = TempDir::new("loxa-unconfirmed-requested-stop-exit");
+        let state_path = temp.path().join("managed.json");
+        let server = ManagedServer {
+            id: "gemma-3-4b-it-q4".to_string(),
+            pid: 777,
+            port: 8081,
+            model_path: temp.path().join("model.gguf"),
+            started_at_unix_s: 789,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: Some(111),
+        };
+        let run = persist_run_for_server(&state_path, &server);
+        let stopped = request_stop_for_test(&state_path, &run.identity());
+        let teardown_calls = Cell::new(0_u8);
+
+        let outcome = supervisor::finish_owner_teardown_with(
+            &state_path,
+            &stopped.identity(),
+            supervisor::OwnerTeardownDecision::RequestedStop,
+            |_| {
+                teardown_calls.set(teardown_calls.get() + 1);
+                supervisor::TeardownConfirmation::Unconfirmed
+            },
+        )
+        .expect("unconfirmed stop outcome");
+
+        assert_eq!(outcome, supervisor::OwnerTerminalOutcome::RecoveryRequired);
+        assert_eq!(owner_terminal_exit_code(outcome), ExitCode::from(1));
+        assert_eq!(teardown_calls.get(), 1);
+        assert_eq!(
+            supervisor::read_runtime_state(&state_path).expect("read preserved stopped state"),
+            RuntimeStateRead::Loaded(vec![stopped])
+        );
+    }
+
+    #[test]
+    fn unconfirmed_generation_zero_unexpected_exit_exits_1_without_restart_and_preserves_exact_state(
+    ) {
+        let temp = TempDir::new("loxa-unconfirmed-generation-zero-exit");
+        let state_path = temp.path().join("managed.json");
+        let server = ManagedServer {
+            id: "gemma-3-4b-it-q4".to_string(),
+            pid: 777,
+            port: 8081,
+            model_path: temp.path().join("model.gguf"),
+            started_at_unix_s: 789,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: Some(111),
+        };
+        let run = persist_run_for_server(&state_path, &server);
+        let signal = FakeInterruptSource::new(vec![false]);
+        let teardown_calls = Cell::new(0_u8);
+
+        let outcome = supervisor::decide_observed_child_exit(
+            "first crash".to_string(),
+            &state_path,
+            &run.identity(),
+            &signal,
+            |_| {
+                teardown_calls.set(teardown_calls.get() + 1);
+                supervisor::TeardownConfirmation::Unconfirmed
+            },
+        )
+        .expect("unconfirmed generation-zero outcome");
+
+        assert_eq!(outcome, ObservedChildExit::RecoveryRequired);
+        assert_eq!(
+            observed_terminal_exit_code(&outcome),
+            Some(ExitCode::from(1))
+        );
+        assert_eq!(teardown_calls.get(), 1);
+        assert_eq!(
+            supervisor::read_runtime_state(&state_path).expect("read preserved generation zero"),
+            RuntimeStateRead::Loaded(vec![run])
+        );
+    }
+
+    #[test]
+    fn confirmed_second_crash_removes_exact_state_then_exits_1() {
+        let temp = TempDir::new("loxa-confirmed-second-crash-exit");
+        let state_path = temp.path().join("managed.json");
+        let server = ManagedServer {
+            id: "gemma-3-4b-it-q4".to_string(),
+            pid: 778,
+            port: 8081,
+            model_path: temp.path().join("model.gguf"),
+            started_at_unix_s: 789,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: Some(222),
+        };
+        let mut run = persist_run_for_server(&state_path, &server);
+        let old_identity = run.identity();
+        run.generation = 1;
+        run.generation_alias = "loxa-test-run-778-g1".to_string();
+        assert!(
+            supervisor::update_runtime_state_run(&state_path, &old_identity, run.clone(),)
+                .expect("publish generation one")
+        );
+        let signal = FakeInterruptSource::new(vec![false]);
+
+        let outcome = supervisor::decide_observed_child_exit(
+            "second crash".to_string(),
+            &state_path,
+            &run.identity(),
+            &signal,
+            |_| supervisor::TeardownConfirmation::Confirmed,
+        )
+        .expect("confirmed second-crash outcome");
+
+        assert!(matches!(outcome, ObservedChildExit::Exhausted { .. }));
+        assert_eq!(
+            observed_terminal_exit_code(&outcome),
+            Some(ExitCode::from(1))
+        );
+        assert_eq!(
+            supervisor::read_runtime_state(&state_path).expect("read removed generation one"),
+            RuntimeStateRead::Loaded(Vec::new())
+        );
+    }
+
+    #[test]
+    fn post_spawn_startup_timeout_preserves_existing_output_after_unified_teardown() {
+        let log_path = PathBuf::from("/tmp/loxa-startup-timeout.log");
+        let mut stderr = Vec::new();
+
+        let exit = render_post_cleanup_startup_failure(
+            &mut stderr,
+            &log_path,
+            SupervisorError::HealthTimeout,
+        )
+        .expect("render confirmed startup timeout");
+
+        assert_eq!(exit, ExitCode::from(1));
+        assert_eq!(
+            String::from_utf8(stderr).expect("utf8 timeout output"),
+            format!(
+                "llama-server did not become healthy within {} seconds\nlog file: {}\n",
+                supervisor::HEALTH_TIMEOUT.as_secs(),
+                log_path.display()
+            )
+        );
+    }
+
+    #[test]
+    fn recovery_required_exit_writes_guidance_and_status_1() {
+        let mut stderr = Vec::new();
+
+        let exit = recovery_required_exit(&mut stderr, "run-1").expect("recovery exit");
+
+        assert_eq!(exit, ExitCode::from(1));
+        let stderr = String::from_utf8(stderr).expect("utf8 guidance");
+        assert!(stderr.contains("recovery required"));
+        assert!(stderr.contains("run-1"));
+    }
+
     struct TempDir {
         path: PathBuf,
     }
@@ -3123,6 +4038,7 @@ mod tests {
         events: RefCell<Vec<&'static str>>,
         wait_results: RefCell<Vec<Option<i32>>>,
         drain_error: bool,
+        wait_error_once: Cell<bool>,
     }
 
     impl FakeStartupChild {
@@ -3138,7 +4054,14 @@ mod tests {
                 events: RefCell::new(Vec::new()),
                 wait_results: RefCell::new(wait_results),
                 drain_error,
+                wait_error_once: Cell::new(false),
             }
+        }
+
+        fn with_wait_error_then(wait_results: Vec<Option<i32>>) -> Self {
+            let child = Self::with_wait_results(wait_results);
+            child.wait_error_once.set(true);
+            child
         }
     }
 
@@ -3159,6 +4082,9 @@ mod tests {
 
         fn try_wait(&mut self) -> io::Result<Option<i32>> {
             self.events.borrow_mut().push("try_wait");
+            if self.wait_error_once.replace(false) {
+                return Err(io::Error::other("injected try_wait failure"));
+            }
             let mut wait_results = self.wait_results.borrow_mut();
             if wait_results.len() > 1 {
                 Ok(wait_results.remove(0))
