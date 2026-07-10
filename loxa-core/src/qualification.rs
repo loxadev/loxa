@@ -1,3 +1,4 @@
+use crate::plan::ProviderKind;
 use crate::provider::{
     ChatMessage, InvocationObservation, InvocationRequest, ProviderAdapter, ToolCall,
     ToolDefinition,
@@ -168,15 +169,6 @@ fn evaluate_multi_turn_ticket(
     }
 
     let tool_call = first.tool_calls[0].clone();
-    let Some(tool_call_id) = tool_call.id.clone().filter(|id| !id.is_empty()) else {
-        return result(
-            case,
-            false,
-            "lookup_ticket tool call is missing an id".into(),
-            started,
-            vec![first],
-        );
-    };
     let tool_result = json!({
         "ticket_id": "TICKET-42",
         "status": "resolved",
@@ -184,11 +176,28 @@ fn evaluate_multi_turn_ticket(
     });
     let mut messages = case.request.messages.clone();
     messages.push(ChatMessage::assistant_tool_calls(vec![tool_call.clone()]));
-    messages.push(ChatMessage::tool_result(
-        tool_call_id,
-        tool_call.name,
-        tool_result.to_string(),
-    ));
+    let tool_result_message = match provider.identity().provider {
+        ProviderKind::ManagedLlama => {
+            let Some(tool_call_id) = tool_call.id.clone().filter(|id| !id.is_empty()) else {
+                return result(
+                    case,
+                    false,
+                    "lookup_ticket tool call is missing an id".into(),
+                    started,
+                    vec![first],
+                );
+            };
+            ChatMessage::tool_result(tool_call_id, tool_call.name, tool_result.to_string())
+        }
+        ProviderKind::Ollama => ChatMessage {
+            role: "tool".into(),
+            content: tool_result.to_string(),
+            tool_calls: vec![],
+            tool_call_id: None,
+            tool_name: Some(tool_call.name),
+        },
+    };
+    messages.push(tool_result_message);
     messages.push(ChatMessage::user(
         "Give a concise summary of the ticket result.",
     ));
@@ -632,6 +641,31 @@ mod tests {
         assert!(!result.passed);
         assert_eq!(result.reason, "lookup_ticket tool call is missing an id");
         assert_eq!(provider.requests.len(), 1);
+    }
+
+    #[test]
+    fn qualification_accepts_ollama_tool_name_linkage_without_id() {
+        let mut provider = ScriptedAdapter::new(vec![
+            Ok(observation(
+                None,
+                vec![ToolCall {
+                    id: None,
+                    name: "lookup_ticket".into(),
+                    arguments: serde_json::json!({"ticket_id": "TICKET-42"}),
+                }],
+            )),
+            Ok(observation(Some("TICKET-42 is resolved."), vec![])),
+        ]);
+        provider.identity.provider = ProviderKind::Ollama;
+
+        let result = evaluate_case(&mut provider, &case("multi_turn_ticket_context"));
+
+        assert!(result.passed, "{}", result.reason);
+        assert_eq!(provider.requests.len(), 2);
+        let tool_result = &provider.requests[1].messages[2];
+        assert_eq!(tool_result.role, "tool");
+        assert_eq!(tool_result.tool_call_id, None);
+        assert_eq!(tool_result.tool_name.as_deref(), Some("lookup_ticket"));
     }
 
     #[test]

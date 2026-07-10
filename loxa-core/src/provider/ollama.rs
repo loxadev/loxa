@@ -693,7 +693,7 @@ mod tests {
             TimedJsonEvent::new(
                 21,
                 json!({"message": {"role": "assistant", "content": "", "tool_calls": [
-                    {"id": "call-weather", "function": {"name": "weather", "arguments": {"city": "Paris"}}}
+                    {"function": {"name": "weather", "arguments": {"city": "Paris"}}}
                 ]}, "done": false}),
             ),
             TimedJsonEvent::new(
@@ -733,7 +733,7 @@ mod tests {
         assert_eq!(
             observation.tool_calls,
             vec![ToolCall {
-                id: Some("call-weather".into()),
+                id: None,
                 name: "weather".into(),
                 arguments: json!({"city": "Paris"}),
             }]
