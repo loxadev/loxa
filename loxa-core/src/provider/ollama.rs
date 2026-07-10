@@ -55,10 +55,11 @@ impl OllamaAdapter {
                 "ollama adapter requires provider kind ollama".into(),
             ));
         }
-        if self.model.trim().is_empty() {
-            return Err(ProviderError::Identity(
-                "ollama requested model is empty".into(),
-            ));
+        if self.model != self.identity.model_id {
+            return Err(ProviderError::Identity(format!(
+                "ollama configured model {} must exactly match candidate model_id {}",
+                self.model, self.identity.model_id
+            )));
         }
         validate_sha256_digest(&self.identity.artifact_digest).map(|_| ())
     }
@@ -132,9 +133,9 @@ impl ProviderAdapter for OllamaAdapter {
             .ok_or_else(|| {
                 ProviderError::Identity("ollama model inventory is missing digest".into())
             })?;
-        let expected_hex = validate_sha256_digest(&self.identity.artifact_digest)?;
-        let observed_hex = validate_sha256_digest(observed_digest)?;
-        if !expected_hex.eq_ignore_ascii_case(observed_hex) {
+        validate_sha256_digest(&self.identity.artifact_digest)?;
+        validate_sha256_digest(observed_digest)?;
+        if self.identity.artifact_digest != observed_digest {
             return Err(ProviderError::Identity(format!(
                 "ollama model digest mismatch for {}",
                 self.model
@@ -212,7 +213,11 @@ fn validate_sha256_digest(digest: &str) -> Result<&str, ProviderError> {
             "ollama model digest must use explicit sha256:<hex> representation".into(),
         ));
     };
-    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
         return Err(ProviderError::Identity(
             "ollama model digest must use explicit sha256:<hex> representation".into(),
         ));
@@ -769,5 +774,71 @@ mod tests {
             Err(ProviderError::Identity(message)) if message.contains("engine_revision")
         ));
         assert_fixtures_consumed(&expected);
+    }
+
+    #[test]
+    fn ollama_identity_rejects_configured_model_mismatch_before_transport() {
+        let candidate = identity();
+        let (transport, expected) = fake_transport(vec![]);
+        let mut adapter = OllamaAdapter::with_transport(
+            candidate,
+            "http://127.0.0.1:11434",
+            "gemma3:4b-other",
+            transport,
+        );
+
+        assert!(matches!(
+            adapter.inspect(),
+            Err(ProviderError::Identity(message)) if message.contains("model_id")
+        ));
+        assert_fixtures_consumed(&expected);
+    }
+
+    #[test]
+    fn ollama_identity_requires_canonical_lowercase_sha256_digest() {
+        for digest in [
+            "sha256:04A43A22E8D2003DEDA5ACC262F68EC1005FA76C735A9962A8C77042A74A7D19",
+            "sha256:04a43a22e8d2003deda5acc262f68ec1005fa76c735a9962a8c77042a74a7D19",
+            "sha256:04a43a22e8d2003deda5acc262f68ec1005fa76c735a9962a8c77042a74a7d1",
+            "sha256:04a43a22e8d2003deda5acc262f68ec1005fa76c735a9962a8c77042a74a7d190",
+        ] {
+            let mut candidate = identity();
+            candidate.artifact_digest = digest.into();
+            let (transport, expected) = fake_transport(vec![]);
+            let mut adapter = OllamaAdapter::with_transport(
+                candidate.clone(),
+                "http://127.0.0.1:11434",
+                candidate.model_id,
+                transport,
+            );
+
+            assert!(matches!(adapter.inspect(), Err(ProviderError::Identity(_))));
+            assert_fixtures_consumed(&expected);
+        }
+
+        let candidate = identity();
+        for digest in [
+            "sha256:04A43A22E8D2003DEDA5ACC262F68EC1005FA76C735A9962A8C77042A74A7D19",
+            "sha256:04a43a22e8d2003deda5acc262f68ec1005fa76c735a9962a8c77042a74a7D19",
+            "sha256:04a43a22e8d2003deda5acc262f68ec1005fa76c735a9962a8c77042a74a7d1",
+            "sha256:04a43a22e8d2003deda5acc262f68ec1005fa76c735a9962a8c77042a74a7d190",
+        ] {
+            let tags = json!({"models": [{
+                "name": candidate.model_id,
+                "digest": digest
+            }]});
+            let fixtures =
+                inspection_fixtures(&candidate, json!({"version": "0.9.1"}), tags, valid_show());
+            let (transport, expected) = fake_transport(fixtures);
+            let mut adapter = OllamaAdapter::with_transport(
+                candidate.clone(),
+                "http://127.0.0.1:11434",
+                candidate.model_id.clone(),
+                transport,
+            );
+
+            assert!(matches!(adapter.inspect(), Err(ProviderError::Identity(_))));
+            assert_fixtures_consumed(&expected);
+        }
     }
 }
