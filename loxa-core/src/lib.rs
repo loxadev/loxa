@@ -1,5 +1,6 @@
 //! Loxa core library.
 
+pub mod calibration;
 pub mod detect;
 pub mod download;
 pub mod hardware;
@@ -7,6 +8,7 @@ pub mod plan;
 pub mod provider;
 pub mod qualification;
 pub mod registry;
+pub mod selector;
 pub mod supervisor;
 
 #[cfg(test)]
