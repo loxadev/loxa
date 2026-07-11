@@ -1,4 +1,4 @@
-use crate::registry::ModelEntry;
+use crate::registry::VerifiedModel;
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::blocking::{Client, RequestBuilder};
 use reqwest::header::{CONTENT_RANGE, RANGE};
@@ -125,7 +125,7 @@ struct ReqwestTransport {
 }
 
 struct DownloadBodyContext<'a> {
-    entry: &'a ModelEntry,
+    entry: &'a dyn VerifiedModel,
     part_path: &'a Path,
     final_path: &'a Path,
     progress: &'a ProgressBar,
@@ -211,12 +211,12 @@ fn non_empty_env_os(name: &str) -> Option<std::ffi::OsString> {
     env::var_os(name).filter(|value| !value.is_empty())
 }
 
-pub fn download(entry: &ModelEntry, dest_dir: &Path) -> Result<PathBuf, DownloadError> {
+pub fn download(entry: &dyn VerifiedModel, dest_dir: &Path) -> Result<PathBuf, DownloadError> {
     download_from_base_url(entry, dest_dir, HF_BASE_URL)
 }
 
 fn download_from_base_url(
-    entry: &ModelEntry,
+    entry: &dyn VerifiedModel,
     dest_dir: &Path,
     base_url: &str,
 ) -> Result<PathBuf, DownloadError> {
@@ -229,7 +229,7 @@ fn download_from_base_url(
 }
 
 fn download_with_transport(
-    entry: &ModelEntry,
+    entry: &dyn VerifiedModel,
     dest_dir: &Path,
     base_url: &str,
     transport: &impl DownloadTransport,
@@ -238,13 +238,13 @@ fn download_with_transport(
 }
 
 fn download_with_transport_and_available_space(
-    entry: &ModelEntry,
+    entry: &dyn VerifiedModel,
     dest_dir: &Path,
     base_url: &str,
     transport: &impl DownloadTransport,
     available_space_override: Option<u64>,
 ) -> Result<PathBuf, DownloadError> {
-    let filename = sanitize_filename(entry.filename)?;
+    let filename = sanitize_filename(entry.filename())?;
     fs::create_dir_all(dest_dir)?;
 
     let mut warnings = StderrWarnings;
@@ -254,11 +254,11 @@ fn download_with_transport_and_available_space(
         return Ok(path);
     }
 
-    let url = build_download_url(base_url, entry.repo, &filename)?;
+    let url = build_download_url(base_url, entry.repo(), entry.revision(), &filename)?;
     let remote_size = transport.probe_size(&url)?;
-    if remote_size != entry.size_bytes {
+    if remote_size != entry.size_bytes() {
         return Err(DownloadError::SizeMismatch {
-            expected: entry.size_bytes,
+            expected: entry.size_bytes(),
             actual: remote_size,
         });
     }
@@ -269,10 +269,10 @@ fn download_with_transport_and_available_space(
         ExistingDownload::Ready(path) => return Ok(path),
         ExistingDownload::Download { resume_from } => resume_from,
     };
-    let bytes_needed = entry.size_bytes.saturating_sub(resume_from);
+    let bytes_needed = entry.size_bytes().saturating_sub(resume_from);
     ensure_disk_space_for_download(dest_dir, bytes_needed, available_space_override)?;
 
-    let progress = progress_bar(entry.size_bytes, &filename, resume_from);
+    let progress = progress_bar(entry.size_bytes(), &filename, resume_from);
 
     let result = download_body(
         transport,
@@ -481,7 +481,7 @@ fn hash_existing_prefix_into(hasher: &mut Sha256, path: &Path) -> Result<u64, Do
 }
 
 fn inspect_existing_download(
-    entry: &ModelEntry,
+    entry: &dyn VerifiedModel,
     dest_dir: &Path,
 ) -> Result<ExistingDownload, DownloadError> {
     let mut warnings = StderrWarnings;
@@ -489,12 +489,12 @@ fn inspect_existing_download(
 }
 
 fn inspect_existing_download_with_warnings(
-    entry: &ModelEntry,
+    entry: &dyn VerifiedModel,
     dest_dir: &Path,
     warnings: &mut impl WarningSink,
     announce_resume: bool,
 ) -> Result<ExistingDownload, DownloadError> {
-    let filename = sanitize_filename(entry.filename)?;
+    let filename = sanitize_filename(entry.filename())?;
     fs::create_dir_all(dest_dir)?;
 
     let final_path = dest_dir.join(&filename);
@@ -502,14 +502,14 @@ fn inspect_existing_download_with_warnings(
 
     if final_path.exists() {
         let final_size = fs::metadata(&final_path)?.len();
-        if final_size == entry.size_bytes {
-            if entry.sha256 == TODO_VERIFY {
+        if final_size == entry.size_bytes() {
+            if entry.sha256() == TODO_VERIFY {
                 warnings.warn(&hash_unverified_warning(&final_path));
                 return Ok(ExistingDownload::Ready(final_path));
             }
 
             let actual = hash_file(&final_path)?;
-            if actual == entry.sha256 {
+            if actual == entry.sha256() {
                 eprintln!("already present, verified: {}", final_path.display());
                 return Ok(ExistingDownload::Ready(final_path));
             }
@@ -522,12 +522,12 @@ fn inspect_existing_download_with_warnings(
 
     if part_path.exists() {
         let part_size = fs::metadata(&part_path)?.len();
-        if part_size > entry.size_bytes {
+        if part_size > entry.size_bytes() {
             fs::remove_file(&part_path)?;
             return Ok(ExistingDownload::Download { resume_from: 0 });
         }
 
-        if part_size == entry.size_bytes {
+        if part_size == entry.size_bytes() {
             verify_part_and_rename(entry, &part_path, &final_path, warnings)?;
             return Ok(ExistingDownload::Ready(final_path));
         }
@@ -545,7 +545,12 @@ fn inspect_existing_download_with_warnings(
     Ok(ExistingDownload::Download { resume_from: 0 })
 }
 
-fn build_download_url(base_url: &str, repo: &str, filename: &str) -> Result<Url, DownloadError> {
+fn build_download_url(
+    base_url: &str,
+    repo: &str,
+    revision: &str,
+    filename: &str,
+) -> Result<Url, DownloadError> {
     let mut url = Url::parse(base_url).map_err(|error| DownloadError::Http(error.to_string()))?;
     {
         let mut segments = url
@@ -555,7 +560,7 @@ fn build_download_url(base_url: &str, repo: &str, filename: &str) -> Result<Url,
             segments.push(segment);
         }
         segments.push("resolve");
-        segments.push("main");
+        segments.push(revision);
         segments.push(filename);
     }
     url.query_pairs_mut().append_pair("download", "true");
@@ -601,7 +606,7 @@ fn download_body(
         ensure_disk_space_after_reclaiming_part(
             context.final_path.parent().unwrap_or(Path::new(".")),
             context.part_path,
-            context.entry.size_bytes,
+            context.entry.size_bytes(),
             context.available_space_override,
         )?;
         if context.part_path.exists() {
@@ -609,7 +614,7 @@ fn download_body(
         }
         hasher = Sha256::new();
         offset = 0;
-        context.progress.set_length(context.entry.size_bytes);
+        context.progress.set_length(context.entry.size_bytes());
         context.progress.set_position(0);
         context.progress.reset_eta();
     }
@@ -618,7 +623,7 @@ fn download_body(
         validate_resume_content_range(
             response.content_range.as_deref(),
             offset,
-            context.entry.size_bytes,
+            context.entry.size_bytes(),
         )?;
         OpenOptions::new().append(true).open(context.part_path)?
     } else {
@@ -632,9 +637,9 @@ fn download_body(
         context.progress,
         offset,
     )?;
-    if total != context.entry.size_bytes {
+    if total != context.entry.size_bytes() {
         return Err(DownloadError::SizeMismatch {
-            expected: context.entry.size_bytes,
+            expected: context.entry.size_bytes(),
             actual: total,
         });
     }
@@ -735,30 +740,30 @@ fn copy_response_to_part(
 }
 
 fn verify_part_and_rename(
-    entry: &ModelEntry,
+    entry: &dyn VerifiedModel,
     part_path: &Path,
     final_path: &Path,
     warnings: &mut impl WarningSink,
 ) -> Result<(), DownloadError> {
     let actual_size = fs::metadata(part_path)?.len();
-    if actual_size != entry.size_bytes {
+    if actual_size != entry.size_bytes() {
         return Err(DownloadError::SizeMismatch {
-            expected: entry.size_bytes,
+            expected: entry.size_bytes(),
             actual: actual_size,
         });
     }
 
-    if entry.sha256 == TODO_VERIFY {
+    if entry.sha256() == TODO_VERIFY {
         warnings.warn(&hash_unverified_warning(part_path));
         fs::rename(part_path, final_path)?;
         return Ok(());
     }
 
     let actual = hash_file(part_path)?;
-    if actual != entry.sha256 {
+    if actual != entry.sha256() {
         fs::remove_file(part_path)?;
         return Err(DownloadError::ChecksumMismatch {
-            expected: entry.sha256.to_string(),
+            expected: entry.sha256().to_string(),
             actual,
         });
     }
@@ -768,11 +773,11 @@ fn verify_part_and_rename(
 }
 
 fn verify_hash_policy(
-    entry: &ModelEntry,
+    entry: &dyn VerifiedModel,
     part_path: &Path,
     hasher: Sha256,
 ) -> Result<(), DownloadError> {
-    if entry.sha256 == TODO_VERIFY {
+    if entry.sha256() == TODO_VERIFY {
         eprintln!(
             "warning: hash unverified for downloaded file {}",
             part_path.display()
@@ -781,10 +786,10 @@ fn verify_hash_policy(
     }
 
     let actual = hex_bytes(hasher.finalize().as_ref());
-    if actual != entry.sha256 {
+    if actual != entry.sha256() {
         fs::remove_file(part_path)?;
         return Err(DownloadError::ChecksumMismatch {
-            expected: entry.sha256.to_string(),
+            expected: entry.sha256().to_string(),
             actual,
         });
     }
@@ -867,6 +872,7 @@ mod tests {
         ModelEntry {
             id: "test-model",
             repo: "owner/repo",
+            revision: "main",
             filename,
             sha256,
             size_bytes,
@@ -894,6 +900,7 @@ mod tests {
         ModelEntry {
             id: "live-hf-small-config",
             repo: "julien-c/dummy-unknown",
+            revision: "main",
             filename: "config.json",
             sha256: "b908f2b7227d4d31a2105dfa31095e28d304f9bc938bfaaa57ee2cacf1f62d32",
             size_bytes: 496,
@@ -970,6 +977,21 @@ mod tests {
                 reader: Box::new(Cursor::new(body.body)),
             })
         }
+    }
+
+    #[test]
+    fn download_url_uses_the_verified_revision() {
+        let url = build_download_url(
+            "https://huggingface.co",
+            "owner/repo",
+            "0123456789abcdef0123456789abcdef01234567",
+            "model.gguf",
+        )
+        .unwrap();
+        assert_eq!(
+            url.path(),
+            "/owner/repo/resolve/0123456789abcdef0123456789abcdef01234567/model.gguf"
+        );
     }
 
     #[test]

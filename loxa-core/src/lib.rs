@@ -8,6 +8,7 @@ pub mod gateway;
 pub mod hardware;
 pub mod provider;
 pub mod registry;
+pub mod resolve;
 pub mod selector;
 pub mod supervisor;
 pub mod workload;
