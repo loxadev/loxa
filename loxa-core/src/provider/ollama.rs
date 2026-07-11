@@ -165,9 +165,9 @@ fn engine_evidence(provider_version: &str, revision: &EngineRevision) -> Vec<Str
         }
     };
     vec![
-        format!("/api/version:version={provider_version}"),
-        "/api/tags:details.family=gemma3".into(),
-        "/api/show:model_info.general.architecture=gemma3".into(),
+        format!("ollama_api_version:version={provider_version}"),
+        "ollama_api_tags:details.family=gemma3".into(),
+        "ollama_api_show:model_info.general.architecture=gemma3".into(),
         revision_evidence,
     ]
 }
@@ -256,7 +256,7 @@ impl<T: OllamaTransport> OllamaAdapter<T> {
                 format: model.details.format,
                 quantization: model.details.quantization_level,
                 tokenizer_evidence: vec![format!(
-                    "/api/show:model_info.tokenizer.ggml.model={tokenizer_model}"
+                    "ollama_api_show:model_info.tokenizer.ggml.model={tokenizer_model}"
                 )],
                 template_evidence: vec![template_evidence],
             },
@@ -460,7 +460,7 @@ fn template_evidence(template: &str) -> Result<String, ProviderError> {
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     Ok(format!(
-        "/api/show:template_sha256={digest};bytes={}",
+        "ollama_api_show:template_sha256={digest};bytes={}",
         template.len()
     ))
 }
@@ -748,12 +748,12 @@ mod tests {
         assert_eq!(inspection.candidate.endpoint, "http://127.0.0.1:11434");
         assert_eq!(
             inspection.candidate.artifact.tokenizer_evidence,
-            ["/api/show:model_info.tokenizer.ggml.model=llama"]
+            ["ollama_api_show:model_info.tokenizer.ggml.model=llama"]
         );
         assert_eq!(
             inspection.candidate.artifact.template_evidence,
             [concat!(
-                "/api/show:template_sha256=",
+                "ollama_api_show:template_sha256=",
                 "c18169ef197353927df82b637b4f7d829f0e1030141b0302f3833501ea53539e",
                 ";bytes=60"
             )]
@@ -773,7 +773,17 @@ mod tests {
             .candidate
             .engine
             .evidence
-            .contains(&"/api/version:version=0.11.0".into()));
+            .contains(&"ollama_api_version:version=0.11.0".into()));
+        assert!(inspection
+            .candidate
+            .engine
+            .evidence
+            .contains(&"ollama_api_tags:details.family=gemma3".into()));
+        assert!(inspection
+            .candidate
+            .engine
+            .evidence
+            .contains(&"ollama_api_show:model_info.general.architecture=gemma3".into()));
         assert_eq!(
             inspection.candidate.engine.invalidation_keys,
             [

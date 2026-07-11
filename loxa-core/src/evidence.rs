@@ -1067,6 +1067,44 @@ mod tests {
     }
 
     #[test]
+    fn realistic_ollama_identity_evidence_persists_without_weakening_path_rejection() {
+        let directory = tempdir().expect("temp directory");
+        let mut evidence = sample_evidence();
+        let attached = &mut evidence.candidates[1];
+        attached.identity.artifact.tokenizer_evidence =
+            vec!["ollama_api_show:model_info.tokenizer.ggml.model=llama".into()];
+        attached.identity.artifact.template_evidence = vec![concat!(
+            "ollama_api_show:template_sha256=",
+            "c18169ef197353927df82b637b4f7d829f0e1030141b0302f3833501ea53539e",
+            ";bytes=60"
+        )
+        .into()];
+        attached.identity.engine.evidence = vec![
+            "ollama_api_version:version=0.21.0".into(),
+            "ollama_api_tags:details.family=gemma3".into(),
+            "ollama_api_show:model_info.general.architecture=gemma3".into(),
+            "ollama_api_show:engine_revision=unknown;hidden=true".into(),
+        ];
+        attached.identity.engine.provider_version = "0.21.0".into();
+        attached.identity.engine.invalidation_keys = vec!["provider_version=0.21.0".into()];
+        attached.fingerprint = attached.identity.fingerprint();
+
+        let path = write_evidence_new(directory.path(), &evidence)
+            .expect("realistic inspected Ollama evidence remains persistable");
+        let persisted = fs::read(path).expect("persisted evidence");
+        read_evidence_json(&persisted).expect("persisted evidence validates");
+
+        evidence.candidates[1].identity.engine.evidence =
+            vec!["/Users/alice/private/ollama-state".into()];
+        evidence.candidates[1].fingerprint = evidence.candidates[1].identity.fingerprint();
+        assert!(matches!(
+            validate_candidate_material(&evidence.candidates[1].identity),
+            Err(EvidenceError::InvalidRecord(message))
+                if message.contains("candidate identity contains forbidden material")
+        ));
+    }
+
+    #[test]
     fn unsupported_evidence_and_selection_schemas_are_rejected() {
         let mut evidence = serde_json::to_value(sample_evidence()).expect("evidence value");
         evidence["schema_version"] = Value::from(99);
