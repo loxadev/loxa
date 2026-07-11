@@ -104,10 +104,10 @@ fn macos_thermal_code() -> Option<String> {
     if std::env::consts::OS != "macos" {
         return Some("thermal_probe_unavailable".into());
     }
-    let mut child = match Command::new("pmset")
-        .args(["-g", "therm"])
+    let mut child = match Command::new("/usr/bin/pmset")
+        .args(["-g", "sysload"])
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
     {
         Ok(child) => child,
@@ -123,8 +123,9 @@ fn macos_thermal_code() -> Option<String> {
             if !output.status.success() {
                 return Some("thermal_probe_unavailable".into());
             }
-            let text = String::from_utf8_lossy(&output.stdout);
-            return Some(parse_macos_thermal_output(&text).into());
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Some(parse_macos_thermal_streams(&stdout, &stderr).into());
         }
         thread::sleep(Duration::from_millis(10));
     }
@@ -133,9 +134,51 @@ fn macos_thermal_code() -> Option<String> {
     Some("thermal_probe_timeout".into())
 }
 
+fn parse_macos_thermal_streams(stdout: &str, stderr: &str) -> &'static str {
+    if !stderr.trim().is_empty() {
+        return "thermal_probe_unavailable";
+    }
+    parse_macos_thermal_output(stdout)
+}
+
 fn parse_macos_thermal_output(text: &str) -> &'static str {
-    let cpu = thermal_limit(text, "CPU_Speed_Limit");
-    let scheduler = thermal_limit(text, "Scheduler_Limit");
+    if text.lines().any(|line| {
+        let line = line.trim();
+        line.starts_with("Error:") || line.starts_with("- Internal error:")
+    }) {
+        return "thermal_probe_parse_changed";
+    }
+
+    let cpu = match thermal_limit(text, "CPU_Speed_Limit") {
+        Ok(value) => value,
+        Err(()) => return "thermal_probe_parse_changed",
+    };
+    let scheduler = match thermal_limit(text, "Scheduler_Limit") {
+        Ok(value) => value,
+        Err(()) => return "thermal_probe_parse_changed",
+    };
+    let mut sysload_level = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("- thermal level") {
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once('=') else {
+            return "thermal_probe_parse_changed";
+        };
+        if key.trim() != "- thermal level" || sysload_level.replace(value.trim()).is_some() {
+            return "thermal_probe_parse_changed";
+        }
+    }
+    match sysload_level {
+        Some(_) if cpu.is_some() || scheduler.is_some() => return "thermal_probe_parse_changed",
+        Some("Great") => return "thermal_nominal",
+        Some("OK") => return "thermal_level_ok",
+        Some("Bad") => return "thermal_level_bad",
+        Some(_) => return "thermal_probe_parse_changed",
+        None => {}
+    }
+
     match (cpu, scheduler) {
         (Some(100), Some(100)) => "thermal_nominal",
         (Some(value), _) | (_, Some(value)) if value < 100 => "thermal_throttled",
@@ -143,13 +186,20 @@ fn parse_macos_thermal_output(text: &str) -> &'static str {
     }
 }
 
-fn thermal_limit(text: &str, name: &str) -> Option<u32> {
-    text.lines().find_map(|line| {
-        let (key, value) = line.split_once('=')?;
-        (key.trim() == name)
-            .then(|| value.trim().parse().ok())
-            .flatten()
-    })
+fn thermal_limit(text: &str, name: &str) -> Result<Option<u32>, ()> {
+    let mut observed = None;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with(name) {
+            continue;
+        }
+        let (key, value) = trimmed.split_once('=').ok_or(())?;
+        if key.trim() != name || observed.is_some() {
+            return Err(());
+        }
+        observed = Some(value.trim().parse().map_err(|_| ())?);
+    }
+    Ok(observed)
 }
 
 #[derive(Debug)]
@@ -1276,6 +1326,22 @@ mod tests {
             TestHost { controlled: true }.fingerprint()
         }
     }
+
+    struct SysloadOkHost;
+    impl HostProbe for SysloadOkHost {
+        fn preflight(&mut self) -> Vec<PreflightObservation> {
+            vec![PreflightObservation {
+                code: parse_macos_thermal_output("- thermal level = OK\n").into(),
+                controlled: false,
+            }]
+        }
+        fn available_memory_bytes(&mut self) -> u64 {
+            8 << 30
+        }
+        fn fingerprint(&mut self) -> HostFingerprint {
+            TestHost { controlled: true }.fingerprint()
+        }
+    }
     impl HostProbe for IsolationLossHost {
         fn preflight(&mut self) -> Vec<PreflightObservation> {
             vec![PreflightObservation {
@@ -1673,6 +1739,62 @@ mod tests {
 
     #[test]
     fn thermal_output_has_bounded_nominal_throttled_and_parse_changed_codes() {
+        let live_sysload = "2026-07-11 10:10:30 +0500 \n\
+  combined level = OK\n\
+  - user level = OK\n\
+  - battery level = Great\n\
+  - thermal level = Great\n";
+        assert_eq!(parse_macos_thermal_output(live_sysload), "thermal_nominal");
+        assert_eq!(
+            parse_macos_thermal_streams(live_sysload, "pmset warning\n"),
+            "thermal_probe_unavailable"
+        );
+        assert_eq!(
+            parse_macos_thermal_output("- thermal level = OK\n"),
+            "thermal_level_ok"
+        );
+        assert_eq!(
+            parse_macos_thermal_output("- thermal level = Bad\n"),
+            "thermal_level_bad"
+        );
+        assert_eq!(
+            parse_macos_thermal_output("- thermal level = Great\n- thermal level = Great\n"),
+            "thermal_probe_parse_changed"
+        );
+        assert_eq!(
+            parse_macos_thermal_output(
+                "- thermal level = Great\n- Internal error: Invalid dictionary 0x0 returned from IOCopySystemLoadAdvisoryDetailed.\n"
+            ),
+            "thermal_probe_parse_changed"
+        );
+        assert_eq!(
+            parse_macos_thermal_output("- thermal level = Great\n- thermal level Great\n"),
+            "thermal_probe_parse_changed"
+        );
+        assert_eq!(
+            parse_macos_thermal_output(
+                "- thermal level = Great\nCPU_Speed_Limit = 80\nScheduler_Limit = 100\n"
+            ),
+            "thermal_probe_parse_changed"
+        );
+        assert_eq!(
+            parse_macos_thermal_output("- thermal level = Unknown\n"),
+            "thermal_probe_parse_changed"
+        );
+        assert_eq!(
+            parse_macos_thermal_output(
+                "- Internal error: Invalid dictionary 0x0 returned from IOCopySystemLoadAdvisoryDetailed.\n"
+            ),
+            "thermal_probe_parse_changed"
+        );
+        assert_eq!(
+            parse_macos_thermal_output(
+                "Error:Failed to get thermal warning level with error code 0xe00002bc\n\
+Error: Failed to get performance warning level with error code 0xe00002bc\n\
+Error: No CPU power status with error code 0xe00002bc\n"
+            ),
+            "thermal_probe_parse_changed"
+        );
         assert_eq!(
             parse_macos_thermal_output("CPU_Speed_Limit = 100\nScheduler_Limit = 100\n"),
             "thermal_nominal"
@@ -1688,6 +1810,18 @@ mod tests {
         assert_eq!(
             parse_macos_thermal_output("CPU_Speed_Limit = 80\n"),
             "thermal_throttled"
+        );
+        assert_eq!(
+            parse_macos_thermal_output(
+                "CPU_Speed_Limit = 100\nCPU_Speed_Limit = 50\nScheduler_Limit = 100\n"
+            ),
+            "thermal_probe_parse_changed"
+        );
+        assert_eq!(
+            parse_macos_thermal_output(
+                "CPU_Speed_Limit = 100\nCPU_Speed_Limit = 100\nScheduler_Limit = 100\n"
+            ),
+            "thermal_probe_parse_changed"
         );
         assert_eq!(
             parse_macos_thermal_output("pmset output changed"),
@@ -1723,6 +1857,41 @@ mod tests {
             evidence.explanation_codes,
             vec![
                 "thermal_probe_parse_changed".to_owned(),
+                "isolation_preflight_failed".to_owned()
+            ]
+        );
+        assert_eq!((a.turns, b.turns), (0, 0));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sysload_ok_refuses_before_inference_with_bounded_reason() {
+        let root = std::env::temp_dir().join(format!("loxa-sysload-ok-abort-{}", now_ms()));
+        let mut host = SysloadOkHost;
+        let mut a = provider(managed_candidate_spec("test", "rev").unwrap(), 100);
+        let mut b = provider(ollama_spec(), 80);
+        let error = CalibrationRunner::run_and_persist(
+            &mut host,
+            &mut a,
+            &mut b,
+            &root.join("evidence"),
+            &root.join("selection.json"),
+        )
+        .unwrap_err();
+        let CalibrationError::Aborted {
+            kind,
+            evidence_path,
+        } = error
+        else {
+            panic!("expected typed abort")
+        };
+        assert_eq!(kind, "thermal_level_ok");
+        let evidence =
+            crate::evidence::read_evidence_json(&fs::read(evidence_path).unwrap()).unwrap();
+        assert_eq!(
+            evidence.explanation_codes,
+            vec![
+                "thermal_level_ok".to_owned(),
                 "isolation_preflight_failed".to_owned()
             ]
         );
