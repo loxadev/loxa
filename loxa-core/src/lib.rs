@@ -3,6 +3,7 @@
 pub mod calibration;
 pub mod detect;
 pub mod download;
+pub mod engine;
 pub mod evidence;
 pub mod gateway;
 pub mod hardware;
