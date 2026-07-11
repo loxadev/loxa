@@ -7,6 +7,14 @@ const appRoot = resolve(import.meta.dirname, "..");
 const repositoryRoot = resolve(appRoot, "..");
 
 describe("Cargo workspace isolation", () => {
+  it("starts with no frontend capability permissions", () => {
+    const capability = JSON.parse(
+      readFileSync(resolve(appRoot, "src-tauri/capabilities/default.json"), "utf8"),
+    ) as { permissions: string[] };
+
+    expect(capability.permissions).toEqual([]);
+  });
+
   it("declares the desktop crate as its own workspace", () => {
     const manifest = readFileSync(resolve(appRoot, "src-tauri/Cargo.toml"), "utf8");
     expect(manifest).toMatch(/^\[workspace\]$/m);

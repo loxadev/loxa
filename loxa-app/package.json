@@ -4,9 +4,13 @@
   "version": "0.1.0",
   "type": "module",
   "packageManager": "pnpm@11.7.0",
+  "engines": {
+    "node": "24.18.0",
+    "pnpm": "11.7.0"
+  },
   "scripts": {
     "dev": "vite",
-    "build": "pnpm typecheck && vite build",
+    "build": "tsc --noEmit && tsc --noEmit -p tsconfig.node.json && vite build",
     "lint": "eslint .",
     "preview": "vite preview",
     "test": "vitest run",
