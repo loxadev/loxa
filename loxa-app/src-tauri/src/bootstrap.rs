@@ -36,6 +36,10 @@ struct OwnedNode {
     child: Child,
     #[cfg(test)]
     fail_termination_once: bool,
+    #[cfg(test)]
+    fail_inspection_once: bool,
+    #[cfg(test)]
+    exit_before_signal_once: bool,
 }
 
 pub struct BootstrapState {
@@ -43,6 +47,8 @@ pub struct BootstrapState {
     ownership: Ownership,
     owned: Option<OwnedNode>,
     error: Option<String>,
+    #[cfg(test)]
+    fail_startup_inspection_once: bool,
 }
 
 impl Default for BootstrapState {
@@ -52,6 +58,8 @@ impl Default for BootstrapState {
             ownership: Ownership::None,
             owned: None,
             error: None,
+            #[cfg(test)]
+            fail_startup_inspection_once: false,
         }
     }
 }
@@ -143,24 +151,39 @@ impl BootstrapState {
             child,
             #[cfg(test)]
             fail_termination_once: false,
+            #[cfg(test)]
+            fail_inspection_once: std::mem::take(&mut self.fail_startup_inspection_once),
+            #[cfg(test)]
+            exit_before_signal_once: false,
         });
         self.ownership = Ownership::Owned;
 
         let deadline = Instant::now() + config.startup_timeout;
         loop {
-            if let Some(status) = self
-                .owned
-                .as_mut()
-                .expect("owned child retained while starting")
-                .child
-                .try_wait()
-                .map_err(|error| format!("failed to inspect owned child: {error}"))?
-            {
-                self.owned = None;
-                self.ownership = Ownership::None;
-                let message = format!("loxa exited before readiness with status {status}");
-                self.error = Some(message.clone());
-                return Err(message);
+            let inspection = inspect_owned_node(
+                self.owned
+                    .as_mut()
+                    .expect("owned child retained while starting"),
+            );
+            match inspection {
+                Ok(Some(status)) => {
+                    self.owned = None;
+                    self.ownership = Ownership::None;
+                    let message = format!("loxa exited before readiness with status {status}");
+                    self.error = Some(message.clone());
+                    return Err(message);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let owned = self
+                        .owned
+                        .take()
+                        .expect("failed inspection retains exact child");
+                    return self.preserve_after_termination_failure(
+                        owned,
+                        format!("failed to inspect exact owned child during startup: {error}"),
+                    );
+                }
             }
             if probe_ready(address, config.poll_interval) {
                 return Ok(self.current_snapshot());
@@ -339,7 +362,27 @@ fn terminate_owned_node(owned: &mut OwnedNode) -> Result<(), String> {
     if std::mem::take(&mut owned.fail_termination_once) {
         return Err("injected termination failure".into());
     }
+    #[cfg(all(test, unix))]
+    if std::mem::take(&mut owned.exit_before_signal_once) {
+        let pid = i32::try_from(owned.child.id())
+            .map_err(|_| "owned child PID exceeded i32".to_string())?;
+        if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 {
+            return Err(format!(
+                "failed to inject child exit race: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
     terminate_exact_child(&mut owned.child)
+}
+
+fn inspect_owned_node(owned: &mut OwnedNode) -> std::io::Result<Option<std::process::ExitStatus>> {
+    #[cfg(test)]
+    if std::mem::take(&mut owned.fail_inspection_once) {
+        return Err(std::io::Error::other("injected child inspection failure"));
+    }
+    owned.child.try_wait()
 }
 
 fn terminate_exact_child(child: &mut Child) -> Result<(), String> {
@@ -347,8 +390,11 @@ fn terminate_exact_child(child: &mut Child) -> Result<(), String> {
     {
         let pid =
             i32::try_from(child.id()).map_err(|_| "owned child PID exceeded i32".to_string())?;
-        // The retained, still-running Child is the identity proof. SIGINT lets `loxa serve`
-        // run its supervisor cleanup instead of abandoning its managed backend state.
+        // Safety invariant: this module keeps the only Child handle and every wait/try_wait runs
+        // synchronously while BootstrapState is mutex-guarded; no background or concurrent waiter
+        // can reap it. If it exits after the caller's last Ok(None), Unix retains it as a zombie
+        // and reserves its PID until our try_wait reaps it, so this signal cannot hit a replacement.
+        // SIGINT lets `loxa serve` run supervisor cleanup instead of abandoning managed state.
         if unsafe { libc::kill(pid, libc::SIGINT) } != 0 {
             return Err(format!(
                 "failed to signal exact owned child: {}",
@@ -492,6 +538,20 @@ pub fn window_closed(state: &SharedBootstrapState) {
     }
 }
 
+pub fn handle_exit_event<W: Write>(state: &SharedBootstrapState, stderr: &mut W) -> bool {
+    let result = match state.lock() {
+        Ok(mut state) => state.exit_app(),
+        Err(_) => Err("recovery required; bootstrap state lock is poisoned".into()),
+    };
+    match result {
+        Ok(()) => true,
+        Err(error) => {
+            let _ = writeln!(stderr, "loxa desktop exit cleanup failed: {error}");
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,8 +564,11 @@ mod tests {
             owned: Some(OwnedNode {
                 child,
                 fail_termination_once: true,
+                fail_inspection_once: false,
+                exit_before_signal_once: false,
             }),
             error: None,
+            fail_startup_inspection_once: false,
         }
     }
 
@@ -547,5 +610,64 @@ mod tests {
         assert!(snapshot.child_running);
         assert_eq!(snapshot.error.as_deref(), Some(error.as_str()));
         state.stop_owned().unwrap();
+    }
+
+    #[test]
+    fn startup_inspection_failure_preserves_exact_child_and_recovery_error() {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake loxa executable");
+        let mut state = BootstrapState {
+            fail_startup_inspection_once: true,
+            ..BootstrapState::default()
+        };
+        let error = state
+            .start_with_config(
+                StartNodeRequest {
+                    endpoint: "http://127.0.0.1:49191".into(),
+                    model: "timeout".into(),
+                    engine: "llama-cpp".into(),
+                },
+                &BootstrapConfig {
+                    executable: Some(fixture),
+                    startup_timeout: Duration::from_millis(200),
+                    poll_interval: Duration::from_millis(10),
+                },
+            )
+            .unwrap_err();
+        assert!(error.contains("recovery required"), "{error}");
+        assert!(error.contains("inspect"), "{error}");
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.ownership, Ownership::Owned);
+        assert!(snapshot.child_running);
+        assert_eq!(snapshot.error.as_deref(), Some(error.as_str()));
+        state.stop_owned().unwrap();
+    }
+
+    #[test]
+    fn exit_event_reports_cleanup_failure_deterministically() {
+        let state = Arc::new(Mutex::new(state_with_sleeping_child()));
+        let mut stderr = Vec::new();
+        assert!(!handle_exit_event(&state, &mut stderr));
+        let evidence = String::from_utf8(stderr).unwrap();
+        assert!(
+            evidence.contains("desktop exit cleanup failed"),
+            "{evidence}"
+        );
+        assert!(evidence.contains("recovery required"), "{evidence}");
+        let mut state = state.lock().unwrap();
+        assert!(state.snapshot().child_running);
+        state.stop_owned().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn child_exit_between_observation_and_signal_is_reaped_without_retargeting() {
+        let mut state = state_with_sleeping_child();
+        let owned = state.owned.as_mut().unwrap();
+        owned.fail_termination_once = false;
+        owned.exit_before_signal_once = true;
+        let stopped = state.stop_owned().unwrap();
+        assert_eq!(stopped.ownership, Ownership::None);
+        assert!(!stopped.child_running);
     }
 }
