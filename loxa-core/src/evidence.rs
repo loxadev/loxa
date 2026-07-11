@@ -868,8 +868,8 @@ mod tests {
     use super::*;
     use crate::provider::managed_llama::managed_candidate_spec;
     use crate::provider::{
-        ArtifactIdentity, EngineIdentity, EngineRevision, GenerationSettings, ProviderKind,
-        ProviderOwnership,
+        ArtifactIdentity, CheckpointAttestation, EngineIdentity, EngineRevision,
+        GenerationSettings, ProviderKind, ProviderOwnership, ARTIFACT_IDENTITY_SCHEMA_VERSION,
     };
     use crate::workload::QualificationCaseResult;
     use serde_json::Value;
@@ -886,11 +886,15 @@ mod tests {
             ownership: ProviderOwnership::Attached,
             endpoint: "http://127.0.0.1:11434".into(),
             artifact: ArtifactIdentity {
-                schema_version: 1,
+                schema_version: ARTIFACT_IDENTITY_SCHEMA_VERSION,
                 artifact_id: "gemma3:4b-it-q4_K_M".into(),
                 digest_sha256: "a2af6cc3eb7fa8be8504abaf9b04e88f17a119ec3f04a3addf55f92841195f5a"
                     .into(),
                 base_checkpoint: "google/gemma-3-4b-it".into(),
+                checkpoint_attestation: CheckpointAttestation::MetadataComposite {
+                    architecture: "gemma3".into(),
+                    parameter_count: 4_299_915_632,
+                },
                 format: "gguf".into(),
                 quantization: "Q4_K_M".into(),
                 tokenizer_evidence: vec!["ollama_show_tokenizer=verified".into()],
@@ -945,12 +949,27 @@ mod tests {
                     fingerprint: attached_fingerprint,
                 },
             ],
-            disclosed_differences: vec![DisclosedDifference {
-                schema_version: EVIDENCE_SCHEMA_VERSION,
-                difference_code: "provider_engine".into(),
-                candidate_a_fact: "llama_cpp".into(),
-                candidate_b_fact: "ollama".into(),
-            }],
+            disclosed_differences: vec![
+                DisclosedDifference {
+                    schema_version: EVIDENCE_SCHEMA_VERSION,
+                    difference_code: "provider_engine".into(),
+                    candidate_a_fact: "llama_cpp".into(),
+                    candidate_b_fact: "ollama".into(),
+                },
+                DisclosedDifference {
+                    schema_version: EVIDENCE_SCHEMA_VERSION,
+                    difference_code: "checkpoint_attestation".into(),
+                    candidate_a_fact: "registry".into(),
+                    candidate_b_fact: "metadata_composite".into(),
+                },
+                DisclosedDifference {
+                    schema_version: EVIDENCE_SCHEMA_VERSION,
+                    difference_code: "checkpoint_provenance_limit".into(),
+                    candidate_a_fact: "registry_declared_checkpoint".into(),
+                    candidate_b_fact: "family_and_parameter_shape_not_exact_upstream_revision"
+                        .into(),
+                },
+            ],
             qualifications: vec![QualificationEvidence {
                 schema_version: EVIDENCE_SCHEMA_VERSION,
                 candidate_fingerprint: managed_fingerprint.clone(),
@@ -1027,6 +1046,24 @@ mod tests {
             .engine
             .invalidation_keys
             .contains(&"provider_version=0.9.0".into()));
+        assert_eq!(
+            parsed.candidates[1]
+                .identity
+                .artifact
+                .checkpoint_attestation,
+            CheckpointAttestation::MetadataComposite {
+                architecture: "gemma3".into(),
+                parameter_count: 4_299_915_632,
+            }
+        );
+        assert!(parsed.disclosed_differences.iter().any(|fact| {
+            fact.difference_code == "checkpoint_attestation"
+                && fact.candidate_b_fact == "metadata_composite"
+        }));
+        assert!(parsed.disclosed_differences.iter().any(|fact| {
+            fact.difference_code == "checkpoint_provenance_limit"
+                && fact.candidate_b_fact == "family_and_parameter_shape_not_exact_upstream_revision"
+        }));
     }
 
     #[test]

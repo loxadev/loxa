@@ -783,6 +783,29 @@ fn candidate_evidence(identity: crate::provider::CandidateSpec) -> CandidateEvid
         identity,
     }
 }
+
+fn checkpoint_attestation_fact(
+    attestation: &crate::provider::CheckpointAttestation,
+) -> &'static str {
+    match attestation {
+        crate::provider::CheckpointAttestation::Registry { .. } => "registry",
+        crate::provider::CheckpointAttestation::Basename { .. } => "basename",
+        crate::provider::CheckpointAttestation::MetadataComposite { .. } => "metadata_composite",
+    }
+}
+
+fn checkpoint_provenance_scope_fact(
+    attestation: &crate::provider::CheckpointAttestation,
+) -> &'static str {
+    match attestation {
+        crate::provider::CheckpointAttestation::Registry { .. } => "registry_declared_checkpoint",
+        crate::provider::CheckpointAttestation::Basename { .. } => "provider_explicit_basename",
+        crate::provider::CheckpointAttestation::MetadataComposite { .. } => {
+            "family_and_parameter_shape_not_exact_upstream_revision"
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn base_evidence(
     started_at_unix_ms: u64,
@@ -795,6 +818,12 @@ fn base_evidence(
     verdict: EvidenceVerdict,
     explanation_codes: Vec<String>,
 ) -> CalibrationEvidence {
+    let managed_checkpoint_fact = checkpoint_attestation_fact(&a.artifact.checkpoint_attestation);
+    let attached_checkpoint_fact = checkpoint_attestation_fact(&b.artifact.checkpoint_attestation);
+    let managed_checkpoint_scope =
+        checkpoint_provenance_scope_fact(&a.artifact.checkpoint_attestation);
+    let attached_checkpoint_scope =
+        checkpoint_provenance_scope_fact(&b.artifact.checkpoint_attestation);
     let attached_revision_fact = match &b.engine.engine_revision {
         crate::provider::EngineRevision::Known(_) => "revision_observed",
         crate::provider::EngineRevision::Unknown { hidden: true } => "revision_hidden_unknown",
@@ -816,6 +845,16 @@ fn base_evidence(
                 "artifact_digest",
                 "managed_registry_digest",
                 "ollama_manifest_digest",
+            ),
+            difference(
+                "checkpoint_attestation",
+                managed_checkpoint_fact,
+                attached_checkpoint_fact,
+            ),
+            difference(
+                "checkpoint_provenance_limit",
+                managed_checkpoint_scope,
+                attached_checkpoint_scope,
             ),
             difference("engine_kind", "llama_cpp", "ollama_managed_gguf_engine"),
             difference(
@@ -1053,9 +1092,10 @@ fn check_provider_activity(
 mod tests {
     use super::*;
     use crate::provider::{
-        managed_llama::managed_candidate_spec, ArtifactIdentity, CandidateSpec, EngineIdentity,
-        EngineRevision, GenerationSettings, NormalizedTurn, ProviderActivityObservation,
-        ProviderHealth, ProviderKind, ProviderOwnership, ProviderTiming,
+        managed_llama::managed_candidate_spec, ArtifactIdentity, CandidateSpec,
+        CheckpointAttestation, EngineIdentity, EngineRevision, GenerationSettings, NormalizedTurn,
+        ProviderActivityObservation, ProviderHealth, ProviderKind, ProviderOwnership,
+        ProviderTiming, ARTIFACT_IDENTITY_SCHEMA_VERSION,
     };
     use std::collections::VecDeque;
     use std::fs;
@@ -1271,11 +1311,14 @@ mod tests {
             ownership: ProviderOwnership::Attached,
             endpoint: "http://127.0.0.1:11434".into(),
             artifact: ArtifactIdentity {
-                schema_version: 1,
+                schema_version: ARTIFACT_IDENTITY_SCHEMA_VERSION,
                 artifact_id: "gemma3:4b-it-q4_K_M".into(),
                 digest_sha256: "a2af6cc3eb7fa8be8504abaf9b04e88f17a119ec3f04a3addf55f92841195f5a"
                     .into(),
                 base_checkpoint: "google/gemma-3-4b-it".into(),
+                checkpoint_attestation: CheckpointAttestation::Basename {
+                    value: "gemma-3-4b-it".into(),
+                },
                 format: "gguf".into(),
                 quantization: "Q4_K_M".into(),
                 tokenizer_evidence: vec!["fixture".into()],
@@ -1305,6 +1348,15 @@ mod tests {
             "ollama_api_show:engine_revision=unknown;hidden=true".into(),
         ];
         spec.engine.invalidation_keys = vec![format!("provider_version={provider_version}")];
+        spec
+    }
+
+    fn ollama_spec_with_composite_checkpoint() -> CandidateSpec {
+        let mut spec = ollama_spec();
+        spec.artifact.checkpoint_attestation = CheckpointAttestation::MetadataComposite {
+            architecture: "gemma3".into(),
+            parameter_count: 4_299_915_632,
+        };
         spec
     }
     fn turn(content: &str, duration: Option<u64>) -> NormalizedTurn {
@@ -1457,6 +1509,60 @@ mod tests {
             fact.difference_code == "engine_revision"
                 && fact.candidate_b_fact == "revision_observed"
         }));
+    }
+
+    #[test]
+    fn calibration_admits_and_discloses_composite_checkpoint_attestation() {
+        let mut host = TestHost { controlled: true };
+        let mut a = provider(managed_candidate_spec("test", "rev").unwrap(), 100);
+        let mut b = provider(ollama_spec_with_composite_checkpoint(), 80);
+
+        let outcome = CalibrationRunner::run(&mut host, &mut a, &mut b).unwrap();
+
+        assert_eq!(
+            outcome.evidence.candidates[1]
+                .identity
+                .artifact
+                .checkpoint_attestation,
+            CheckpointAttestation::MetadataComposite {
+                architecture: "gemma3".into(),
+                parameter_count: 4_299_915_632,
+            }
+        );
+        assert!(outcome.evidence.disclosed_differences.iter().any(|fact| {
+            fact.difference_code == "checkpoint_attestation"
+                && fact.candidate_a_fact == "registry"
+                && fact.candidate_b_fact == "metadata_composite"
+        }));
+        assert!(outcome.evidence.disclosed_differences.iter().any(|fact| {
+            fact.difference_code == "checkpoint_provenance_limit"
+                && fact.candidate_a_fact == "registry_declared_checkpoint"
+                && fact.candidate_b_fact == "family_and_parameter_shape_not_exact_upstream_revision"
+        }));
+        assert_eq!(outcome.evidence.qualifications.len(), 2);
+        assert_eq!(outcome.evidence.measurements.len(), 12);
+    }
+
+    #[test]
+    fn calibration_discloses_explicit_basename_checkpoint_attestation() {
+        let mut host = TestHost { controlled: true };
+        let mut a = provider(managed_candidate_spec("test", "rev").unwrap(), 100);
+        let mut b = provider(ollama_spec(), 80);
+
+        let outcome = CalibrationRunner::run(&mut host, &mut a, &mut b).unwrap();
+
+        assert!(outcome.evidence.disclosed_differences.iter().any(|fact| {
+            fact.difference_code == "checkpoint_attestation"
+                && fact.candidate_a_fact == "registry"
+                && fact.candidate_b_fact == "basename"
+        }));
+        assert!(outcome.evidence.disclosed_differences.iter().any(|fact| {
+            fact.difference_code == "checkpoint_provenance_limit"
+                && fact.candidate_a_fact == "registry_declared_checkpoint"
+                && fact.candidate_b_fact == "provider_explicit_basename"
+        }));
+        assert_eq!(outcome.evidence.qualifications.len(), 2);
+        assert_eq!(outcome.evidence.measurements.len(), 12);
     }
 
     #[test]
