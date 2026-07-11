@@ -1280,9 +1280,12 @@ mod tests {
                 schema_version: 1,
                 engine_kind: "ollama-managed-gguf-engine".into(),
                 provider_version: "test".into(),
-                engine_revision: EngineRevision::Unknown,
-                evidence: vec!["fixture".into()],
-                invalidation_keys: vec!["provider_version=test".into()],
+                engine_revision: EngineRevision::Known("fixture-observed-revision".into()),
+                evidence: vec!["ollama_api_show:engine_revision=fixture-observed-revision".into()],
+                invalidation_keys: vec![
+                    "provider_version=test".into(),
+                    "engine_revision=fixture-observed-revision".into(),
+                ],
             },
             settings: GenerationSettings::pinned_v1(),
         }
@@ -1331,10 +1334,16 @@ mod tests {
     }
 
     #[test]
-    fn scripted_end_to_end_records_exact_suite_and_pair_schedule() {
+    fn calibration_runs_one_warmup_then_five_counterbalanced_pairs_at_concurrency_one() {
         let mut host = TestHost { controlled: true };
         let mut a = provider(managed_candidate_spec("test", "rev").unwrap(), 100);
         let mut b = provider(ollama_spec(), 80);
+        let a_fingerprint = a.spec.fingerprint();
+        let b_fingerprint = b.spec.fingerprint();
+        assert_eq!(
+            (a.spec.settings.concurrency, b.spec.settings.concurrency),
+            (1, 1)
+        );
         let outcome = CalibrationRunner::run(&mut host, &mut a, &mut b).unwrap();
         assert_eq!(outcome.evidence.qualifications.len(), 2);
         assert!(outcome
@@ -1346,28 +1355,51 @@ mod tests {
         assert_eq!((a.prepares, b.prepares), (2, 2));
         assert_eq!((a.finishes, b.finishes), (2, 2));
         assert_eq!(outcome.evidence.measurements.len(), 12);
-        let schedule = outcome
+
+        let warmups = outcome
             .evidence
             .measurements
             .iter()
-            .filter(|m| m.repetition > 0)
-            .map(|m| (m.repetition, m.order_position))
+            .filter(|measurement| measurement.repetition == 0)
+            .map(|measurement| {
+                (
+                    measurement.candidate_fingerprint.as_str(),
+                    measurement.order_position,
+                )
+            })
             .collect::<Vec<_>>();
         assert_eq!(
-            schedule,
-            vec![
-                (1, 1),
-                (1, 2),
-                (2, 1),
-                (2, 2),
-                (3, 1),
-                (3, 2),
-                (4, 1),
-                (4, 2),
-                (5, 1),
-                (5, 2)
-            ]
+            warmups,
+            vec![(a_fingerprint.as_str(), 0), (b_fingerprint.as_str(), 0)]
         );
+
+        let measured = outcome
+            .evidence
+            .measurements
+            .iter()
+            .filter(|measurement| measurement.repetition > 0)
+            .collect::<Vec<_>>();
+        assert!(measured.len() >= 10);
+        assert_eq!(measured.len(), usize::from(MEASURED_PAIRS) * 2);
+        assert!(measured.chunks_exact(2).all(|pair| {
+            pair[0].repetition == pair[1].repetition
+                && pair[0].order_position == 1
+                && pair[1].order_position == 2
+        }));
+        let candidate_order = measured
+            .iter()
+            .map(|measurement| measurement.candidate_fingerprint.as_str())
+            .collect::<Vec<_>>();
+        let expected_order = (1..=MEASURED_PAIRS)
+            .flat_map(|repetition| {
+                if repetition % 2 == 1 {
+                    [a_fingerprint.as_str(), b_fingerprint.as_str()]
+                } else {
+                    [b_fingerprint.as_str(), a_fingerprint.as_str()]
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(candidate_order, expected_order);
     }
 
     #[test]
