@@ -1,0 +1,35 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Loxa",
+  "version": "0.1.0",
+  "identifier": "dev.loxa.desktop",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Loxa",
+        "width": 800,
+        "height": 600
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:*; font-src 'self'; img-src 'self'; script-src 'self'; style-src 'self'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app", "dmg"],
+    "icon": [
+      "icons/AppIcon.appiconset/icon_32x32.png",
+      "icons/AppIcon.appiconset/icon_128x128.png",
+      "icons/AppIcon.appiconset/icon_128x128@2x.png",
+      "icons/AppIcon.appiconset/icon_512x512@2x.png"
+    ]
+  }
+}
