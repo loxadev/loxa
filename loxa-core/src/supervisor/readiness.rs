@@ -1121,7 +1121,8 @@ mod tests {
     #[test]
     fn child_exit_during_chat_completion_request_wins_after_the_blocking_phase() {
         let server = chat_completion_server(ResponseAction::chat_completion_message("ready"));
-        let mut child = FakeChild::with_wait_results([None, None, None, None, Some(1)]);
+        let mut child =
+            FakeChild::exit_after_trace(server.trace_handle(), "request /v1/chat/completions");
 
         let error = wait_for_chat_completion_under_test(
             &mut child,
@@ -1136,7 +1137,7 @@ mod tests {
         assert!(server
             .trace()
             .iter()
-            .any(|event| event == "response /v1/chat/completions 200"));
+            .any(|event| event == "request /v1/chat/completions"));
     }
 
     #[test]
@@ -1508,6 +1509,10 @@ mod tests {
             self.trace.lock().expect("lock request trace").clone()
         }
 
+        fn trace_handle(&self) -> Arc<Mutex<Vec<String>>> {
+            Arc::clone(&self.trace)
+        }
+
         fn requests(&self) -> Vec<ScriptedRequest> {
             self.requests
                 .lock()
@@ -1643,6 +1648,7 @@ mod tests {
         wait_results: VecDeque<Option<i32>>,
         repeat: Option<i32>,
         response_exit: Option<(usize, ResponseGate)>,
+        trace_exit: Option<(Arc<Mutex<Vec<String>>>, &'static str)>,
         wait_calls: usize,
     }
 
@@ -1653,6 +1659,7 @@ mod tests {
                 wait_results: VecDeque::from([None]),
                 repeat: None,
                 response_exit: None,
+                trace_exit: None,
                 wait_calls: 0,
             }
         }
@@ -1665,6 +1672,7 @@ mod tests {
                 wait_results,
                 repeat,
                 response_exit: None,
+                trace_exit: None,
                 wait_calls: 0,
             }
         }
@@ -1675,6 +1683,18 @@ mod tests {
                 wait_results: VecDeque::from([None, Some(1)]),
                 repeat: Some(1),
                 response_exit: Some((wait_call, gate)),
+                trace_exit: None,
+                wait_calls: 0,
+            }
+        }
+
+        fn exit_after_trace(trace: Arc<Mutex<Vec<String>>>, event: &'static str) -> Self {
+            Self {
+                events: Vec::new(),
+                wait_results: VecDeque::new(),
+                repeat: None,
+                response_exit: None,
+                trace_exit: Some((trace, event)),
                 wait_calls: 0,
             }
         }
@@ -1701,6 +1721,16 @@ mod tests {
             if let Some((wait_call, gate)) = &self.response_exit {
                 if *wait_call <= self.wait_calls {
                     gate.wait_until_delivered_then_release();
+                    return Ok(Some(1));
+                }
+            }
+            if let Some((trace, event)) = &self.trace_exit {
+                if trace
+                    .lock()
+                    .expect("lock request trace for child exit")
+                    .iter()
+                    .any(|observed| observed == event)
+                {
                     return Ok(Some(1));
                 }
             }
