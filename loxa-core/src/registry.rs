@@ -68,6 +68,17 @@ pub const REGISTRY: &[ModelEntry] = &[
         min_free_mem_gb: 2.7,
     },
     ModelEntry {
+        id: "qwen3-4b-instruct-2507-q4",
+        repo: "unsloth/Qwen3-4B-Instruct-2507-GGUF",
+        filename: "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+        sha256: "3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597",
+        size_bytes: 2_497_281_120,
+        license: "apache-2.0",
+        params: "4B",
+        quant: "Q4_K_M",
+        min_free_mem_gb: 2.7,
+    },
+    ModelEntry {
         id: "qwen3-14b-q4",
         repo: "unsloth/Qwen3-14B-GGUF",
         filename: "Qwen3-14B-Q4_K_M.gguf",
@@ -95,13 +106,14 @@ mod tests {
         "qwen25-coder-7b-q4",
         "qwen25-coder-7b-q8",
         "gemma-3-4b-it-q4",
+        "qwen3-4b-instruct-2507-q4",
         "qwen3-14b-q4",
     ];
 
     #[test]
-    fn registry_contains_expected_six_entries() {
-        assert_eq!(EXPECTED_IDS.len(), 6);
-        assert_eq!(REGISTRY.len(), 6);
+    fn registry_contains_expected_entries() {
+        assert_eq!(EXPECTED_IDS.len(), 7);
+        assert_eq!(REGISTRY.len(), 7);
     }
 
     #[test]

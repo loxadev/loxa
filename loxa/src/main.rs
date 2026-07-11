@@ -44,7 +44,7 @@ enum Command {
         no_restart: bool,
     },
     Bench {
-        #[arg(long, default_value = "gemma-3-4b-it-q4")]
+        #[arg(long, default_value = "qwen3-4b-instruct-2507-q4")]
         managed_id: String,
         #[arg(long)]
         ollama_model: String,
@@ -2153,7 +2153,7 @@ mod tests {
                 "loxa",
                 "bench",
                 "--ollama-model",
-                "gemma3:4b",
+                "qwen3:4b-instruct",
                 "--confirm-exclusive",
             ]),
             Ok(Cli {
@@ -2163,7 +2163,7 @@ mod tests {
                     ctx: 8192,
                     confirm_exclusive: true,
                 },
-            }) if managed_id == "gemma-3-4b-it-q4" && ollama_model == "gemma3:4b"
+            }) if managed_id == "qwen3-4b-instruct-2507-q4" && ollama_model == "qwen3:4b-instruct"
         ));
     }
 
