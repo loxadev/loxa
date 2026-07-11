@@ -20,7 +20,8 @@ pub enum PyMlxLmError {
     ModelDirectory(PathBuf),
     ServerNotFound,
     VersionCommandNotFound,
-    VersionTimeout,
+    VersionTimeout { pid: u32 },
+    VersionCommandFailed { status: Option<i32>, stderr: String },
     VersionMismatch { expected: String, detected: String },
     Io(io::Error),
 }
@@ -43,7 +44,16 @@ impl fmt::Display for PyMlxLmError {
             Self::VersionCommandNotFound => formatter.write_str(
                 "mlx_lm version command not found; run `uv tool install mlx-lm==0.31.3`",
             ),
-            Self::VersionTimeout => formatter.write_str("mlx_lm --version timed out"),
+            Self::VersionTimeout { pid } => {
+                write!(formatter, "mlx_lm --version timed out (pid {pid} was reaped)")
+            }
+            Self::VersionCommandFailed { status, stderr } => write!(
+                formatter,
+                "mlx_lm --version failed with status {}: {stderr}",
+                status
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "signal".to_string())
+            ),
             Self::VersionMismatch { expected, detected } => write!(
                 formatter,
                 "mlx-lm version mismatch: expected {expected}, detected {detected}; run `uv tool install mlx-lm=={expected}`"
@@ -149,6 +159,12 @@ pub fn run_version_command(
             let output = child.wait_with_output()?;
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
+            if !output.status.success() {
+                return Err(PyMlxLmError::VersionCommandFailed {
+                    status: output.status.code(),
+                    stderr: stderr.trim().to_string(),
+                });
+            }
             let rendered = if stdout.trim().is_empty() {
                 stderr.trim()
             } else {
@@ -157,23 +173,22 @@ pub fn run_version_command(
             return Ok(rendered.to_string());
         }
         if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(PyMlxLmError::VersionTimeout);
+            let pid = child.id();
+            let kill = child.kill();
+            let wait = child.wait();
+            if let Err(error) = kill {
+                wait?;
+                return Err(PyMlxLmError::Io(error));
+            }
+            wait?;
+            return Err(PyMlxLmError::VersionTimeout { pid });
         }
         thread::sleep(Duration::from_millis(25));
     }
 }
 
 pub fn validate_version_output(output: &str) -> Result<String, PyMlxLmError> {
-    let detected = output
-        .split_whitespace()
-        .find(|part| {
-            part.chars()
-                .next()
-                .is_some_and(|first| first.is_ascii_digit())
-        })
-        .unwrap_or(output.trim());
+    let detected = output.trim();
     if detected == REQUIRED_VERSION {
         Ok(detected.to_string())
     } else {
@@ -295,28 +310,88 @@ mod tests {
     #[test]
     fn exact_version_validation_accepts_only_required_version() {
         assert_eq!(
-            validate_version_output("mlx_lm 0.31.3\n").expect("required version"),
+            validate_version_output("0.31.3\n").expect("required version"),
             REQUIRED_VERSION
         );
-        assert!(validate_version_output("mlx_lm 0.31.2\n").is_err());
+        assert!(validate_version_output("0.31.2\n").is_err());
+        assert!(validate_version_output("mlx_lm 0.31.3\n").is_err());
+        assert!(validate_version_output("0.31.3 3.12.0\n").is_err());
         assert!(validate_version_output("unknown\n").is_err());
     }
 
     #[cfg(unix)]
     #[test]
-    fn version_execution_is_direct_and_bounded() {
+    fn version_execution_is_direct() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = TempDir::new().expect("temp dir");
         let version = temp.path().join("mlx_lm");
-        fs::write(&version, "#!/bin/sh\nprintf 'mlx_lm 0.31.3\\n'\n").expect("write executable");
+        fs::write(&version, "#!/bin/sh\nprintf '0.31.3\\n'\n").expect("write executable");
         let mut permissions = fs::metadata(&version).expect("metadata").permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&version, permissions).expect("set executable");
 
         assert_eq!(
-            run_version_command(&version, Duration::from_secs(1)).expect("version output"),
-            "mlx_lm 0.31.3"
+            run_version_command(&version, Duration::from_secs(5)).expect("version output"),
+            "0.31.3"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonzero_version_exit_preserves_status_and_stderr_without_validating_stdout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("temp dir");
+        let version = temp.path().join("mlx_lm");
+        fs::write(
+            &version,
+            "#!/bin/sh\nprintf '0.31.3\\n'\nprintf 'broken environment\\n' >&2\nexit 7\n",
+        )
+        .expect("write executable");
+        let mut permissions = fs::metadata(&version).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&version, permissions).expect("set executable");
+
+        let error = run_version_command(&version, Duration::from_secs(5))
+            .expect_err("nonzero exit must fail");
+        assert!(matches!(
+            error,
+            PyMlxLmError::VersionCommandFailed {
+                status: Some(7),
+                ref stderr,
+            } if stderr == "broken environment"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn slow_version_process_times_out_promptly_and_is_gone_after_reap() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("temp dir");
+        let version = temp.path().join("mlx_lm");
+        fs::write(&version, "#!/bin/sh\nwhile :; do :; done\n").expect("write executable");
+        let mut permissions = fs::metadata(&version).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&version, permissions).expect("set executable");
+
+        let started = Instant::now();
+        let error = run_version_command(&version, Duration::from_millis(75))
+            .expect_err("slow process must time out");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let PyMlxLmError::VersionTimeout { pid } = error else {
+            panic!("expected timeout with reaped pid, got {error}");
+        };
+        let status = Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("probe timed-out pid");
+        assert!(
+            !status.success(),
+            "timed-out version process {pid} survived"
         );
     }
 
