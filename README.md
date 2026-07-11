@@ -52,10 +52,6 @@ The model path must already be a local directory, and `--ctx` is intentionally
 rejected for this backend. Run `loxa doctor` to inspect the external executable,
 exact version, platform compatibility, and default-endpoint reachability.
 
-See [Python MLX backend](docs/backends/py-mlx-lm.md) for installation,
-operations, limitations, and architecture. The planned native replacement is
-defined in [Swift MLX handoff](docs/backends/mlx-swift-handoff.md).
-
 ## What is being built now
 
 Workload qualification: run the same tool-use workload against two
