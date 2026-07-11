@@ -2446,7 +2446,14 @@ fn print_doctor<W: Write>(stdout: &mut W) -> io::Result<ExitCode> {
 fn write_doctor<W: Write>(stdout: &mut W) -> io::Result<()> {
     let hardware = HardwareReport::detect();
     let tools = LocalToolsReport::detect();
+    write_doctor_report(stdout, &hardware, &tools)
+}
 
+fn write_doctor_report<W: Write>(
+    stdout: &mut W,
+    hardware: &HardwareReport,
+    tools: &LocalToolsReport,
+) -> io::Result<()> {
     writeln!(stdout, "Machine")?;
     writeln!(stdout, "  {:<16} {}", "Chip:", hardware.chip)?;
     writeln!(
@@ -2580,6 +2587,7 @@ fn optional_bytes_to_gb(bytes: Option<u64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use loxa_core::detect::{InstallState, RunState, ToolDetection};
     use loxa_core::registry::REGISTRY;
     use loxa_core::supervisor::LogDrainingChild;
     use std::cell::{Cell, RefCell};
@@ -2623,6 +2631,52 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn doctor_report_renders_injected_python_mlx_evidence() {
+        let hardware = HardwareReport {
+            chip: "Apple M4".to_string(),
+            physical_cores: 4,
+            logical_cores: 8,
+            ram_total_bytes: 16 * 1024 * 1024 * 1024,
+            ram_available_bytes: 8 * 1024 * 1024 * 1024,
+            ram_used_bytes: 8 * 1024 * 1024 * 1024,
+            swap_total_bytes: 0,
+            swap_used_bytes: 0,
+            root_disk_total_bytes: Some(512 * 1024 * 1024 * 1024),
+            root_disk_available_bytes: Some(256 * 1024 * 1024 * 1024),
+            os_name: "macOS".to_string(),
+            os_version: "15.0".to_string(),
+        };
+        let tools = LocalToolsReport {
+            tools: vec![DetectedTool {
+                name: "Python MLX (external)".to_string(),
+                detection: ToolDetection {
+                    install_state: InstallState::Installed,
+                    run_state: RunState::NotRunning,
+                    evidence: vec![
+                        "platform compatible: macos/aarch64".to_string(),
+                        "server path: /opt/tools/mlx_lm.server".to_string(),
+                        "required version: 0.31.3".to_string(),
+                        "detected version: 0.31.3".to_string(),
+                        "external default endpoint not running at 127.0.0.1:8080 (port not reachable)"
+                            .to_string(),
+                    ],
+                },
+            }],
+        };
+        let mut output = Vec::new();
+
+        write_doctor_report(&mut output, &hardware, &tools).expect("render doctor report");
+
+        let output = String::from_utf8(output).expect("doctor output is utf8");
+        assert!(output.contains("Python MLX"));
+        assert!(output.contains("platform compatible: macos/aarch64"));
+        assert!(output.contains("server path: /opt/tools/mlx_lm.server"));
+        assert!(output.contains("required version: 0.31.3"));
+        assert!(output.contains("detected version: 0.31.3"));
+        assert!(output.contains("external default endpoint not running at 127.0.0.1:8080"));
     }
 
     fn read_test_http_request(stream: &mut std::net::TcpStream) -> String {
