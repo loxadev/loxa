@@ -37,7 +37,7 @@ pub struct ArtifactIdentity {
 #[serde(rename_all = "snake_case")]
 pub enum EngineRevision {
     Known(String),
-    Unknown,
+    Unknown { hidden: bool },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,7 +121,10 @@ impl CandidateSpec {
                 append_str(&mut bytes, "known");
                 append_str(&mut bytes, revision);
             }
-            EngineRevision::Unknown => append_str(&mut bytes, "unknown"),
+            EngineRevision::Unknown { hidden } => {
+                append_str(&mut bytes, "unknown");
+                append_str(&mut bytes, if *hidden { "hidden" } else { "unverified" });
+            }
         }
         append_strings(&mut bytes, &self.engine.evidence);
         append_strings(&mut bytes, &self.engine.invalidation_keys);
@@ -217,25 +220,34 @@ impl CandidateSpec {
             ));
         }
         if self.provider_kind == ProviderKind::Ollama {
-            let revision = match &self.engine.engine_revision {
-                EngineRevision::Known(revision) if !revision.trim().is_empty() => revision,
-                EngineRevision::Known(_) | EngineRevision::Unknown => {
+            match &self.engine.engine_revision {
+                EngineRevision::Known(revision) if !revision.trim().is_empty() => {
+                    let evidence = format!("ollama_api_show:engine_revision={revision}");
+                    if !self.engine.evidence.contains(&evidence) {
+                        return Err(ProviderError::IdentityMismatch(
+                            "observed engine revision evidence".into(),
+                        ));
+                    }
+                    let revision_key = format!("engine_revision={revision}");
+                    if !self.engine.invalidation_keys.contains(&revision_key) {
+                        return Err(ProviderError::IdentityMismatch(
+                            "engine revision invalidation key".into(),
+                        ));
+                    }
+                }
+                EngineRevision::Unknown { hidden: true } => {
+                    let evidence = "ollama_api_show:engine_revision=unknown;hidden=true".into();
+                    if !self.engine.evidence.contains(&evidence) {
+                        return Err(ProviderError::IdentityMismatch(
+                            "hidden engine revision disclosure".into(),
+                        ));
+                    }
+                }
+                EngineRevision::Known(_) | EngineRevision::Unknown { hidden: false } => {
                     return Err(ProviderError::IdentityMismatch(
                         "engine revision is not verified".into(),
                     ));
                 }
-            };
-            let evidence = format!("ollama_api_show:engine_revision={revision}");
-            if !self.engine.evidence.contains(&evidence) {
-                return Err(ProviderError::IdentityMismatch(
-                    "observed engine revision evidence".into(),
-                ));
-            }
-            let revision_key = format!("engine_revision={revision}");
-            if !self.engine.invalidation_keys.contains(&revision_key) {
-                return Err(ProviderError::IdentityMismatch(
-                    "engine revision invalidation key".into(),
-                ));
             }
         }
         if self.settings != GenerationSettings::pinned_v1() {
@@ -408,9 +420,9 @@ mod tests {
                 format!("ollama_api_show:engine_revision={value}"),
                 format!("engine_revision={value}"),
             ),
-            EngineRevision::Unknown => (
-                "ollama_api_show:engine_revision=missing".into(),
-                "engine_revision=unknown".into(),
+            EngineRevision::Unknown { hidden } => (
+                format!("ollama_api_show:engine_revision=unknown;hidden={hidden}"),
+                format!("engine_revision=unknown;hidden={hidden}"),
             ),
         };
         CandidateSpec {
@@ -508,7 +520,7 @@ mod tests {
 
     #[test]
     fn every_added_identity_field_invalidates_fingerprint() {
-        let base = ollama_spec("0.11.0", EngineRevision::Unknown);
+        let base = ollama_spec("0.11.0", EngineRevision::Unknown { hidden: true });
         let fingerprint = base.fingerprint();
 
         let mut changed = base.clone();
@@ -570,11 +582,25 @@ mod tests {
     }
 
     #[test]
-    fn ollama_unknown_engine_revision_is_explicit_and_rejected() {
+    fn ollama_hidden_engine_revision_is_explicit_admitted_and_provider_version_bound() {
         let known = ollama_spec("0.11.0", EngineRevision::Known("rev-abc".into()));
-        let unknown = ollama_spec("0.11.0", EngineRevision::Unknown);
+        let unknown = ollama_spec("0.11.0", EngineRevision::Unknown { hidden: true });
         assert_ne!(known.fingerprint(), unknown.fingerprint());
-        assert!(serde_json::to_string(&unknown).unwrap().contains("unknown"));
+        let serialized = serde_json::to_string(&unknown).unwrap();
+        assert!(serialized.contains("unknown"));
+        assert!(serialized.contains("hidden"));
+        unknown.validate_pinned().unwrap();
+        assert!(unknown
+            .engine
+            .invalidation_keys
+            .contains(&"provider_version=0.11.0".into()));
+        let changed_version = ollama_spec("0.12.0", EngineRevision::Unknown { hidden: true });
+        assert_ne!(unknown.fingerprint(), changed_version.fingerprint());
+    }
+
+    #[test]
+    fn ollama_unverified_nonhidden_engine_revision_is_rejected() {
+        let unknown = ollama_spec("0.11.0", EngineRevision::Unknown { hidden: false });
         assert!(unknown
             .validate_pinned()
             .unwrap_err()

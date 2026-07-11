@@ -152,6 +152,31 @@ pub struct OllamaAdapter<T: OllamaTransport> {
     transport: T,
 }
 
+fn engine_evidence(provider_version: &str, revision: &EngineRevision) -> Vec<String> {
+    let revision_evidence = match revision {
+        EngineRevision::Known(revision) => {
+            format!("ollama_api_show:engine_revision={revision}")
+        }
+        EngineRevision::Unknown { hidden } => {
+            format!("ollama_api_show:engine_revision=unknown;hidden={hidden}")
+        }
+    };
+    vec![
+        format!("/api/version:version={provider_version}"),
+        "/api/tags:details.family=gemma3".into(),
+        "/api/show:model_info.general.architecture=gemma3".into(),
+        revision_evidence,
+    ]
+}
+
+fn engine_invalidation_keys(provider_version: &str, revision: &EngineRevision) -> Vec<String> {
+    let mut keys = vec![format!("provider_version={provider_version}")];
+    if let EngineRevision::Known(revision) = revision {
+        keys.push(format!("engine_revision={revision}"));
+    }
+    keys
+}
+
 impl<T: OllamaTransport> OllamaAdapter<T> {
     pub fn new(endpoint: &str, transport: T) -> Result<Self, ProviderError> {
         validated_endpoint(endpoint)?;
@@ -177,8 +202,12 @@ impl<T: OllamaTransport> OllamaAdapter<T> {
         require_identity(&model.details.family, "gemma3", "model family")?;
 
         let show: ShowResponse = self.request_json(OllamaRequest::Show)?;
-        let engine_revision =
-            require_present_evidence(show.engine_revision.as_deref(), "engine revision")?;
+        let engine_revision = match show.engine_revision.as_deref() {
+            Some(revision) => EngineRevision::Known(
+                require_present_evidence(Some(revision), "engine revision")?.into(),
+            ),
+            None => EngineRevision::Unknown { hidden: true },
+        };
         require_identity(&show.details.format, "gguf", "show format")?;
         require_identity(
             &show.details.quantization_level,
@@ -240,17 +269,9 @@ impl<T: OllamaTransport> OllamaAdapter<T> {
                 schema_version: 1,
                 engine_kind: "ollama-managed-gguf-engine".into(),
                 provider_version: version.version.clone(),
-                engine_revision: EngineRevision::Known(engine_revision.into()),
-                evidence: vec![
-                    format!("/api/version:version={}", version.version),
-                    "/api/tags:details.family=gemma3".into(),
-                    "/api/show:model_info.general.architecture=gemma3".into(),
-                    format!("ollama_api_show:engine_revision={engine_revision}"),
-                ],
-                invalidation_keys: vec![
-                    format!("provider_version={}", version.version),
-                    format!("engine_revision={engine_revision}"),
-                ],
+                evidence: engine_evidence(&version.version, &engine_revision),
+                invalidation_keys: engine_invalidation_keys(&version.version, &engine_revision),
+                engine_revision,
             },
             settings: GenerationSettings::pinned_v1(),
         };
@@ -759,11 +780,27 @@ mod tests {
             "",
         );
 
-        let error = inspect_with(TAGS, &show, PS_EMPTY).unwrap_err();
+        let inspection = inspect_with(TAGS, &show, PS_EMPTY).unwrap();
 
-        assert!(
-            matches!(error, ProviderError::IdentityMismatch(message) if message.contains("engine revision") && message.contains("missing"))
+        assert_eq!(
+            inspection.candidate.engine.engine_revision,
+            EngineRevision::Unknown { hidden: true }
         );
+        assert!(inspection
+            .candidate
+            .engine
+            .evidence
+            .contains(&"ollama_api_show:engine_revision=unknown;hidden=true".into()));
+        assert_eq!(
+            inspection.candidate.engine.invalidation_keys,
+            ["provider_version=0.11.0"]
+        );
+        assert!(!inspection
+            .candidate
+            .engine
+            .evidence
+            .iter()
+            .any(|item| item.contains(OLLAMA_MODEL_TAG)));
     }
 
     #[test]
@@ -778,6 +815,28 @@ mod tests {
         assert!(
             matches!(error, ProviderError::IdentityMismatch(message) if message.contains("engine revision") && message.contains("missing"))
         );
+    }
+
+    #[test]
+    fn rejects_missing_provider_version() {
+        let version = r#"{}"#;
+        let adapter = OllamaAdapter::new(
+            "http://127.0.0.1:11434",
+            ScriptedTransport::from_bodies(&[version, TAGS, SHOW, TAGS, PS_EMPTY]),
+        )
+        .unwrap();
+
+        assert!(adapter.inspect().is_err());
+    }
+
+    #[test]
+    fn rejects_missing_artifact_digest() {
+        let tags = TAGS.replace(
+            "            \"digest\": \"a2af6cc3eb7fa8be8504abaf9b04e88f17a119ec3f04a3addf55f92841195f5a\",\n",
+            "",
+        );
+
+        assert!(inspect_with(&tags, SHOW, PS_EMPTY).is_err());
     }
 
     #[test]

@@ -171,7 +171,7 @@ pub fn managed_candidate_spec(
             engine_kind: "llama.cpp".into(),
             provider_version: provider_version.into(),
             engine_revision: if engine_revision.trim().is_empty() {
-                EngineRevision::Unknown
+                EngineRevision::Unknown { hidden: false }
             } else {
                 EngineRevision::Known(engine_revision.into())
             },
