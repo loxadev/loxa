@@ -40,6 +40,12 @@ enum Command {
         #[arg(long)]
         port: Option<u16>,
     },
+    Serve {
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        port: Option<u16>,
+    },
     Ps,
     Stop {
         target: String,
@@ -180,7 +186,10 @@ fn run_with_paths<W: Write, E: Write>(
         Command::List => print_list(&mut stdout),
         Command::Rm { id } => remove_model(&id, &mut stdout, &mut stderr),
         Command::Run { id, ctx, port } => {
-            run_model(&id, ctx, port, paths, &mut stdout, &mut stderr)
+            run_model(&id, ctx, port, paths, &mut stdout, &mut stderr, None)
+        }
+        Command::Serve { model, port } => {
+            serve_node(model.as_deref(), port, paths, &mut stdout, &mut stderr)
         }
         Command::Ps => print_managed_servers(paths, &mut stdout),
         Command::Stop { target } => stop_managed_servers(&target, paths, &mut stdout, &mut stderr),
@@ -469,6 +478,7 @@ fn run_model<W: Write, E: Write>(
     paths: &CliPaths,
     stdout: &mut W,
     stderr: &mut E,
+    gateway: Option<&loxa_core::gateway::GatewayState>,
 ) -> io::Result<ExitCode> {
     let Some(_) = registry::find(id) else {
         write_unknown_id(id, stderr)?;
@@ -716,6 +726,16 @@ fn run_model<W: Write, E: Write>(
                         return recovery_required_exit(stderr, &run.run_id)
                     }
                 }
+                if let Some(gateway) = gateway {
+                    gateway.publish(loxa_core::gateway::EngineTarget {
+                        base_url: format!("http://127.0.0.1:{}", server.port),
+                        backend_alias: run.generation_alias.clone(),
+                        engine: "llama.cpp".to_string(),
+                        engine_version: server.llama_server_version.clone(),
+                        model_id: id.to_string(),
+                        profile: format!("llama.cpp:{id}"),
+                    });
+                }
                 match supervise_running_server(
                     RunSession {
                         id,
@@ -725,18 +745,40 @@ fn run_model<W: Write, E: Write>(
                     },
                     &mut child,
                     &signal_guard,
+                    gateway,
                     stdout,
                     stderr,
                 )? {
-                    RunOutcome::RequestedStop => return Ok(ExitCode::SUCCESS),
-                    RunOutcome::Interrupted => return Ok(ExitCode::from(130)),
+                    RunOutcome::RequestedStop => {
+                        if let Some(gateway) = gateway {
+                            gateway.withdraw();
+                        }
+                        return Ok(ExitCode::SUCCESS);
+                    }
+                    RunOutcome::Interrupted => {
+                        if let Some(gateway) = gateway {
+                            gateway.withdraw();
+                        }
+                        return Ok(ExitCode::from(130));
+                    }
                     RunOutcome::Restart { run } => {
+                        if let Some(gateway) = gateway {
+                            gateway.withdraw();
+                        }
                         replacement_run = Some(run);
                         continue;
                     }
-                    RunOutcome::Exhausted { .. } => return Ok(ExitCode::from(1)),
+                    RunOutcome::Exhausted { .. } => {
+                        if let Some(gateway) = gateway {
+                            gateway.withdraw();
+                        }
+                        return Ok(ExitCode::from(1));
+                    }
                     RunOutcome::RecoveryRequired => {
-                        return recovery_required_exit(stderr, &run.run_id)
+                        if let Some(gateway) = gateway {
+                            gateway.withdraw();
+                        }
+                        return recovery_required_exit(stderr, &run.run_id);
                     }
                 }
             }
@@ -803,6 +845,75 @@ fn run_model<W: Write, E: Write>(
                 return render_post_cleanup_startup_failure(stderr, &log_path, error);
             }
         }
+    }
+}
+
+const DEFAULT_GATEWAY_PORT: u16 = 11_435;
+
+fn select_serve_model(
+    models_dir: &Path,
+    requested: Option<&str>,
+) -> io::Result<&'static ModelEntry> {
+    if let Some(id) = requested {
+        let entry = registry::find(id).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, format!("unknown model: {id}"))
+        })?;
+        if !models_dir.join(entry.filename).is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("model not downloaded for {id}; run `loxa pull {id}`"),
+            ));
+        }
+        return Ok(entry);
+    }
+    REGISTRY
+        .iter()
+        .find(|entry| models_dir.join(entry.filename).is_file())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "no registry model is downloaded; run `loxa pull {}`",
+                    REGISTRY[0].id
+                ),
+            )
+        })
+}
+
+fn serve_node<W: Write, E: Write>(
+    requested_model: Option<&str>,
+    port: Option<u16>,
+    paths: &CliPaths,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> io::Result<ExitCode> {
+    let entry = select_serve_model(&paths.models_dir, requested_model)?;
+    let node_id = format!("loxa-node-{}", std::process::id());
+    let gateway_state = loxa_core::gateway::GatewayState::new(node_id);
+    let gateway = loxa_core::gateway::GatewayServer::start(
+        port.unwrap_or(DEFAULT_GATEWAY_PORT),
+        gateway_state.clone(),
+    )?;
+    writeln!(
+        stdout,
+        "loxa node listening on http://127.0.0.1:{} with model alias loxa",
+        gateway.port()
+    )?;
+    let outcome = run_model(
+        entry.id,
+        None,
+        None,
+        paths,
+        stdout,
+        stderr,
+        Some(&gateway_state),
+    );
+    gateway_state.withdraw();
+    let shutdown = gateway.shutdown();
+    match (outcome, shutdown) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(exit), Ok(())) => Ok(exit),
     }
 }
 
@@ -1451,6 +1562,7 @@ fn supervise_running_server<C, W: Write, E: Write, I: InterruptSource + Interrup
     session: RunSession<'_>,
     child: &mut C,
     interrupt: &I,
+    gateway: Option<&loxa_core::gateway::GatewayState>,
     stdout: &mut W,
     stderr: &mut E,
 ) -> io::Result<RunOutcome>
@@ -1462,9 +1574,15 @@ where
             observe_attached_stop(child, session.state_path, session.state_identity)
                 .map_err(supervisor_error_to_io)?
         {
+            if let Some(gateway) = gateway {
+                gateway.withdraw();
+            }
             return Ok(owner_terminal_to_run_outcome(outcome));
         }
         if InterruptSource::interrupted(interrupt) {
+            if let Some(gateway) = gateway {
+                gateway.withdraw();
+            }
             let outcome = supervisor::teardown_owned_run(
                 child,
                 session.state_path,
@@ -1477,6 +1595,9 @@ where
         match child.try_wait() {
             Ok(None) => std::thread::sleep(Duration::from_millis(250)),
             Err(error) => {
+                if let Some(gateway) = gateway {
+                    gateway.withdraw();
+                }
                 return match supervisor::cleanup_post_spawn_failure(
                     child,
                     session.state_path,
@@ -1494,6 +1615,9 @@ where
                 };
             }
             Ok(Some(_)) => {
+                if let Some(gateway) = gateway {
+                    gateway.withdraw();
+                }
                 match supervisor::handle_observed_child_exit(
                     child,
                     session.log_path,
@@ -2208,6 +2332,39 @@ mod tests {
             .expect("managed child attachment boundary");
         assert!(spawned_position < retry_positions[1]);
         assert!(retry_positions[1] < attachment_position);
+    }
+
+    #[test]
+    fn serve_selects_first_downloaded_registry_model_in_order() {
+        let temp = TempDir::new("serve-selection");
+        let later = &REGISTRY[2];
+        let first = &REGISTRY[1];
+        fs::write(temp.path().join(later.filename), b"later").unwrap();
+        fs::write(temp.path().join(first.filename), b"first").unwrap();
+
+        let selected = select_serve_model(temp.path(), None).unwrap();
+
+        assert_eq!(selected.id, first.id);
+    }
+
+    #[test]
+    fn clap_parses_serve_options() {
+        let cli = Cli::try_parse_from([
+            "loxa",
+            "serve",
+            "--model",
+            "gemma-3-4b-it-q4",
+            "--port",
+            "11435",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Serve { model, port } => {
+                assert_eq!(model.as_deref(), Some("gemma-3-4b-it-q4"));
+                assert_eq!(port, Some(11435));
+            }
+            _ => panic!("expected serve command"),
+        }
     }
 
     #[test]
@@ -3456,6 +3613,7 @@ mod tests {
             },
             &mut child,
             &signal,
+            None,
             &mut stdout,
             &mut stderr,
         )
@@ -3501,6 +3659,7 @@ mod tests {
             },
             &mut child,
             &signal,
+            None,
             &mut stdout,
             &mut stderr,
         )
