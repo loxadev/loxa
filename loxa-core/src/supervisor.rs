@@ -1,3 +1,4 @@
+use crate::engine::{EngineLaunchSpec, ReadinessStrategy};
 use crate::registry::{self, ModelEntry};
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -43,13 +44,13 @@ pub use teardown::{
     teardown_managed_child, LogDrainingChild, ManagedChild, SpawnedServer, TeardownConfirmation,
 };
 
-struct PreparedLlamaServerSpawn {
+struct PreparedEngineSpawn {
     prepared: teardown::PreparedManagedCommand,
     reservation: LocalhostPortReservation,
     expected_port: u16,
 }
 
-struct RawLlamaServerSpawn {
+struct RawEngineSpawn {
     raw: teardown::RawSpawnedServer,
 }
 
@@ -915,21 +916,21 @@ where
     )
 }
 
-/// Spawns one validated childless managed generation through the complete boundary.
+/// Spawns one validated childless managed engine generation through the complete boundary.
 ///
 /// The lower-level arbitrary-closure transaction is intentionally crate-private:
 ///
 /// ```compile_fail
 /// use loxa_core::supervisor::spawn_starting_run_with;
 /// ```
-pub fn spawn_starting_llama_server(
+pub fn spawn_starting_engine(
     state_path: &Path,
     expected: &ManagedRunIdentity,
-    spec: &ServerSpec<'_>,
+    spec: &EngineLaunchSpec,
     log_path: &Path,
     reservation: LocalhostPortReservation,
 ) -> Result<SpawnStartingRunOutcome<SpawnedServer>, SupervisorError> {
-    spawn_starting_llama_server_with_hooks(
+    spawn_starting_engine_with_hooks(
         state_path,
         expected,
         spec,
@@ -942,7 +943,51 @@ pub fn spawn_starting_llama_server(
     )
 }
 
+pub fn spawn_starting_llama_server(
+    state_path: &Path,
+    expected: &ManagedRunIdentity,
+    spec: &ServerSpec<'_>,
+    log_path: &Path,
+    reservation: LocalhostPortReservation,
+) -> Result<SpawnStartingRunOutcome<SpawnedServer>, SupervisorError> {
+    let launch = llama_engine_launch_spec(spec);
+    spawn_starting_engine(state_path, expected, &launch, log_path, reservation)
+}
+
 #[allow(clippy::too_many_arguments)]
+fn spawn_starting_engine_with_hooks<L, B, A, D>(
+    state_path: &Path,
+    expected: &ManagedRunIdentity,
+    spec: &EngineLaunchSpec,
+    log_path: &Path,
+    reservation: LocalhostPortReservation,
+    before_log_open: L,
+    before_reservation_release: B,
+    after_os_spawn: A,
+    after_log_drain_setup: D,
+) -> Result<SpawnStartingRunOutcome<SpawnedServer>, SupervisorError>
+where
+    L: FnOnce(),
+    B: FnOnce(),
+    A: FnOnce(),
+    D: FnOnce(),
+{
+    let prepared = prepare_engine_spawn_with_hook(spec, log_path, reservation, before_log_open)?;
+    match lifecycle::spawn_starting_run_with(state_path, expected, || {
+        prepared.spawn_raw_with_hooks(before_reservation_release, after_os_spawn)
+    })? {
+        SpawnStartingRunOutcome::Spawned { run, value: raw } => {
+            Ok(SpawnStartingRunOutcome::Spawned {
+                run,
+                value: raw.finish_with_hook(after_log_drain_setup),
+            })
+        }
+        SpawnStartingRunOutcome::RequestedStop => Ok(SpawnStartingRunOutcome::RequestedStop),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn spawn_starting_llama_server_with_hooks<L, B, A, D>(
     state_path: &Path,
     expected: &ManagedRunIdentity,
@@ -960,27 +1005,44 @@ where
     A: FnOnce(),
     D: FnOnce(),
 {
-    let prepared =
-        prepare_llama_server_spawn_with_hook(spec, log_path, reservation, before_log_open)?;
-    match lifecycle::spawn_starting_run_with(state_path, expected, || {
-        prepared.spawn_raw_with_hooks(before_reservation_release, after_os_spawn)
-    })? {
-        SpawnStartingRunOutcome::Spawned { run, value: raw } => {
-            Ok(SpawnStartingRunOutcome::Spawned {
-                run,
-                value: raw.finish_with_hook(after_log_drain_setup),
-            })
-        }
-        SpawnStartingRunOutcome::RequestedStop => Ok(SpawnStartingRunOutcome::RequestedStop),
+    let launch = llama_engine_launch_spec(spec);
+    spawn_starting_engine_with_hooks(
+        state_path,
+        expected,
+        &launch,
+        log_path,
+        reservation,
+        before_log_open,
+        before_reservation_release,
+        after_os_spawn,
+        after_log_drain_setup,
+    )
+}
+
+fn llama_engine_launch_spec(spec: &ServerSpec<'_>) -> EngineLaunchSpec {
+    EngineLaunchSpec {
+        program: spec.llama_server_path.clone(),
+        args: llama_server_args(spec)
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+        port: spec.port,
+        engine_name: "llama-server".to_string(),
+        engine_version: "unknown".to_string(),
+        runtime_model: spec.model_path.display().to_string(),
+        upstream_model: spec.generation_alias.clone(),
+        readiness: ReadinessStrategy::LlamaModelAlias {
+            expected_alias: spec.generation_alias.clone(),
+        },
     }
 }
 
-fn prepare_llama_server_spawn_with_hook<F>(
-    spec: &ServerSpec<'_>,
+fn prepare_engine_spawn_with_hook<F>(
+    spec: &EngineLaunchSpec,
     log_path: &Path,
     reservation: LocalhostPortReservation,
     before_log_open: F,
-) -> Result<PreparedLlamaServerSpawn, SupervisorError>
+) -> Result<PreparedEngineSpawn, SupervisorError>
 where
     F: FnOnce(),
 {
@@ -995,10 +1057,8 @@ where
         .truncate(true)
         .open(log_path)?;
 
-    let mut command = Command::new(&spec.llama_server_path);
-    for arg in llama_server_args(spec) {
-        command.arg(arg);
-    }
+    let mut command = Command::new(&spec.program);
+    command.args(&spec.args);
 
     let writer = Arc::new(Mutex::new(BoundedLogWriter {
         file: log_file,
@@ -1006,19 +1066,19 @@ where
         truncated: false,
     }));
 
-    Ok(PreparedLlamaServerSpawn {
+    Ok(PreparedEngineSpawn {
         prepared: prepare_managed_command(command, writer),
         reservation,
         expected_port: spec.port,
     })
 }
 
-impl PreparedLlamaServerSpawn {
+impl PreparedEngineSpawn {
     fn spawn_raw_with_hooks<B, A>(
         self,
         before_reservation_release: B,
         after_os_spawn: A,
-    ) -> Result<RawLlamaServerSpawn, SupervisorError>
+    ) -> Result<RawEngineSpawn, SupervisorError>
     where
         B: FnOnce(),
         A: FnOnce(),
@@ -1033,11 +1093,11 @@ impl PreparedLlamaServerSpawn {
             reservation.release_for(expected_port)
         })?;
         after_os_spawn();
-        Ok(RawLlamaServerSpawn { raw })
+        Ok(RawEngineSpawn { raw })
     }
 }
 
-impl RawLlamaServerSpawn {
+impl RawEngineSpawn {
     fn finish(self) -> SpawnedServer {
         self.raw.finish()
     }
@@ -1309,9 +1369,15 @@ mod tests {
     use super::state::write_runtime_state;
     use super::*;
     use std::cell::Cell;
+    #[cfg(unix)]
+    use std::ffi::OsString;
     use std::fs;
     use std::io::Write;
     use std::net::TcpListener;
+    #[cfg(unix)]
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 
     fn managed_run_for(server: &ManagedServer) -> ManagedRun {
@@ -1350,6 +1416,247 @@ mod tests {
             child_process_start_time_unix_s: None,
             child_pgid: None,
         }
+    }
+
+    #[cfg(unix)]
+    fn executable_script(path: &Path, source: &str) {
+        fs::write(path, source).expect("write executable script");
+        let mut permissions = fs::metadata(path).expect("script metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("make script executable");
+    }
+
+    #[cfg(unix)]
+    fn test_engine_launch_spec(
+        program: PathBuf,
+        args: Vec<OsString>,
+        port: u16,
+    ) -> crate::engine::EngineLaunchSpec {
+        crate::engine::EngineLaunchSpec {
+            program,
+            args,
+            port,
+            engine_name: "test-engine".to_string(),
+            engine_version: "1.0.0".to_string(),
+            runtime_model: "test-runtime-model".to_string(),
+            upstream_model: "test-upstream-model".to_string(),
+            readiness: crate::engine::ReadinessStrategy::ChatCompletionProbe {
+                request_model: "test-upstream-model".to_string(),
+            },
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generic_spawn_preserves_exact_program_and_argument_bytes() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let program = temp.path().join("engine with spaces");
+        executable_script(&program, "#!/bin/sh\nprintf '%s\\n' \"$0\" \"$@\"\n");
+        let args = vec![
+            OsString::from("plain"),
+            OsString::from("with spaces"),
+            OsString::from_vec(b"native-\x80-byte".to_vec()),
+        ];
+        let reservation = reserve_localhost_port(None).expect("reserve localhost port");
+        let port = reservation.port();
+        let mut run = childless_starting_run(temp.path(), "generic-exact-command");
+        run.port = port;
+        create_starting_run(&state_path, run.clone()).expect("publish starting run");
+        let spec = test_engine_launch_spec(program.clone(), args.clone(), port);
+
+        let outcome = spawn_starting_engine(
+            &state_path,
+            &run.identity(),
+            &spec,
+            &run.log_path,
+            reservation,
+        )
+        .expect("spawn exact command");
+        let SpawnStartingRunOutcome::Spawned {
+            value: mut child, ..
+        } = outcome
+        else {
+            panic!("unexpected requested stop");
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while child.try_wait().expect("observe exact command").is_none()
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            child.try_wait().expect("reap exact command").is_some(),
+            "exact command must exit"
+        );
+        assert_eq!(
+            teardown_managed_child(&mut child, Duration::ZERO).expect("reap exact command"),
+            TeardownConfirmation::Confirmed
+        );
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(program.as_os_str().as_bytes());
+        expected.push(b'\n');
+        for arg in &args {
+            expected.extend_from_slice(arg.as_os_str().as_bytes());
+            expected.push(b'\n');
+        }
+        assert_eq!(
+            fs::read(&run.log_path).expect("read captured argv"),
+            expected
+        );
+        assert_eq!(
+            finish_childless_runtime_state_run(&state_path, &run.identity())
+                .expect("finish exact-command state"),
+            ChildlessFinishOutcome::Finished
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generic_spawn_holds_reservation_to_spawn_and_attaches_pid_and_pgid_transactionally() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let program = temp.path().join("long-running engine");
+        executable_script(
+            &program,
+            "#!/bin/sh\ntrap 'exit 0' TERM\nwhile :; do sleep 1; done\n",
+        );
+        let reservation = reserve_localhost_port(None).expect("reserve localhost port");
+        let port = reservation.port();
+        let address = ("127.0.0.1", port);
+        let mut run = childless_starting_run(temp.path(), "generic-attached-command");
+        run.port = port;
+        create_starting_run(&state_path, run.clone()).expect("publish starting run");
+        let spec = test_engine_launch_spec(program, Vec::new(), port);
+        let reservation_was_held = Cell::new(false);
+        let reservation_was_released = Cell::new(false);
+
+        let outcome = spawn_starting_engine_with_hooks(
+            &state_path,
+            &run.identity(),
+            &spec,
+            &run.log_path,
+            reservation,
+            || {},
+            || {
+                let error = TcpListener::bind(address)
+                    .expect_err("reservation must still be held immediately before spawn");
+                assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+                reservation_was_held.set(true);
+            },
+            || {
+                drop(TcpListener::bind(address).expect("reservation released for OS spawn"));
+                reservation_was_released.set(true);
+            },
+            || {},
+        )
+        .expect("spawn generic engine");
+        let SpawnStartingRunOutcome::Spawned {
+            run: starting,
+            value: mut child,
+        } = outcome
+        else {
+            panic!("unexpected requested stop");
+        };
+        assert!(reservation_was_held.get());
+        assert!(reservation_was_released.get());
+        let child_pid = child.pid();
+        let child_pgid = child.owned_pgid();
+        let server = ManagedServer {
+            id: starting.model_id.clone(),
+            pid: child_pid,
+            port,
+            model_path: temp.path().join("test-model"),
+            started_at_unix_s: 1,
+            llama_server_version: spec.engine_version.clone(),
+            process_start_time_unix_s: process_start_time_with_retry(child_pid),
+        };
+
+        let attached = persist_managed_server_or_cleanup(
+            &mut child,
+            &state_path,
+            starting,
+            server,
+            Duration::ZERO,
+        )
+        .expect("attach generic engine");
+        let PersistManagedServerOutcome::Attached(attached) = attached else {
+            panic!("generic engine must attach");
+        };
+        assert_eq!(attached.child_pid, Some(child_pid));
+        assert_eq!(attached.child_pgid, child_pgid);
+        assert_eq!(child_pgid, i32::try_from(child_pid).ok());
+        assert_eq!(
+            read_runtime_state(&state_path).expect("read attached generic engine"),
+            RuntimeStateRead::Loaded(vec![attached.clone()])
+        );
+        assert_eq!(
+            teardown_owned_run(
+                &mut child,
+                &state_path,
+                &attached.identity(),
+                OwnerTeardownDecision::RequestedStop,
+            )
+            .expect("teardown attached generic engine"),
+            OwnerTerminalOutcome::RequestedStop
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generic_spawn_cleans_up_when_post_spawn_initialization_panics() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let pid_path = temp.path().join("engine.pid");
+        let program = temp.path().join("post-spawn failure engine");
+        executable_script(
+            &program,
+            "#!/bin/sh\nprintf '%s' \"$$\" > \"$1\"\ntrap 'exit 0' TERM\nwhile :; do sleep 1; done\n",
+        );
+        let reservation = reserve_localhost_port(None).expect("reserve localhost port");
+        let port = reservation.port();
+        let mut run = childless_starting_run(temp.path(), "generic-post-spawn-failure");
+        run.port = port;
+        create_starting_run(&state_path, run.clone()).expect("publish starting run");
+        let spec = test_engine_launch_spec(program, vec![pid_path.as_os_str().to_owned()], port);
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = spawn_starting_engine_with_hooks(
+                &state_path,
+                &run.identity(),
+                &spec,
+                &run.log_path,
+                reservation,
+                || {},
+                || {},
+                || {},
+                || {
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    while !pid_path.is_file() && Instant::now() < deadline {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    assert!(pid_path.is_file(), "spawned engine must publish its pid");
+                    panic!("injected post-spawn initialization failure");
+                },
+            );
+        }));
+
+        assert!(panic.is_err());
+        let pid = fs::read_to_string(&pid_path)
+            .expect("read spawned pid")
+            .parse::<u32>()
+            .expect("parse spawned pid");
+        assert!(!pid_is_alive(pid), "post-spawn failure must reap child");
+        assert_eq!(
+            read_runtime_state(&state_path).expect("read childless state after failed spawn"),
+            RuntimeStateRead::Loaded(vec![run.clone()])
+        );
+        assert_eq!(
+            finish_childless_runtime_state_run(&state_path, &run.identity())
+                .expect("finish failed-spawn state"),
+            ChildlessFinishOutcome::Finished
+        );
     }
 
     #[test]
