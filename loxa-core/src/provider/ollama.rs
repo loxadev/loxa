@@ -31,7 +31,7 @@ pub fn provisional_candidate_spec() -> CandidateSpec {
             base_checkpoint: "google/gemma-3-4b-it".into(),
             format: "gguf".into(),
             quantization: "Q4_K_M".into(),
-            tokenizer_evidence: vec!["provisional_expected_tokenizer=gemma".into()],
+            tokenizer_evidence: vec!["provisional_tokenizer_evidence=unverified".into()],
             template_evidence: vec!["provisional_expected_template=ollama_gemma3".into()],
         },
         engine: EngineIdentity {
@@ -223,11 +223,8 @@ impl<T: OllamaTransport> OllamaAdapter<T> {
             "gemma3",
             "model architecture",
         )?;
-        require_present_identity(
-            show.model_info.tokenizer_model.as_deref(),
-            "gemma",
-            "tokenizer",
-        )?;
+        let tokenizer_model =
+            require_present_evidence(show.model_info.tokenizer_model.as_deref(), "tokenizer")?;
 
         let tags_after_show: TagsResponse = self.request_json(OllamaRequest::Tags)?;
         let model_after_show = unique_exact_tag(tags_after_show)?;
@@ -259,7 +256,9 @@ impl<T: OllamaTransport> OllamaAdapter<T> {
                 base_checkpoint: "google/gemma-3-4b-it".into(),
                 format: model.details.format,
                 quantization: model.details.quantization_level,
-                tokenizer_evidence: vec!["/api/show:model_info.tokenizer.ggml.model=gemma".into()],
+                tokenizer_evidence: vec![format!(
+                    "/api/show:model_info.tokenizer.ggml.model={tokenizer_model}"
+                )],
                 template_evidence: vec![template_evidence],
             },
             engine: EngineIdentity {
@@ -440,6 +439,19 @@ fn require_present_identity(
     require_identity(actual, expected, field)
 }
 
+fn require_present_evidence<'a>(
+    actual: Option<&'a str>,
+    field: &str,
+) -> Result<&'a str, ProviderError> {
+    actual
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            ProviderError::IdentityMismatch(format!(
+                "{field}: required official /api/show evidence is missing"
+            ))
+        })
+}
+
 fn template_evidence(template: &str) -> Result<String, ProviderError> {
     if template.is_empty() {
         return Err(ProviderError::IdentityMismatch(
@@ -474,9 +486,7 @@ fn unique_exact_tag(tags: TagsResponse) -> Result<TagModel, ProviderError> {
 }
 
 fn is_exact_loaded_target(model: &LoadedModel) -> bool {
-    model.name == OLLAMA_MODEL_TAG
-        && model.model == OLLAMA_MODEL_TAG
-        && model.digest == OLLAMA_MODEL_DIGEST
+    model.digest == OLLAMA_MODEL_DIGEST
 }
 
 #[derive(Deserialize)]
@@ -532,7 +542,6 @@ struct PsResponse {
 #[derive(Deserialize)]
 struct LoadedModel {
     name: String,
-    model: String,
     digest: String,
 }
 
@@ -598,7 +607,7 @@ mod tests {
         "model_info": {
             "general.name": "gemma-3-4b-it",
             "general.architecture": "gemma3",
-            "tokenizer.ggml.model": "gemma"
+            "tokenizer.ggml.model": "llama"
         },
         "capabilities": ["completion", "tools"]
     }"#;
@@ -674,7 +683,7 @@ mod tests {
         assert_eq!(inspection.candidate.endpoint, "http://127.0.0.1:11434");
         assert_eq!(
             inspection.candidate.artifact.tokenizer_evidence,
-            ["/api/show:model_info.tokenizer.ggml.model=gemma"]
+            ["/api/show:model_info.tokenizer.ggml.model=llama"]
         );
         assert_eq!(
             inspection.candidate.artifact.template_evidence,
@@ -750,6 +759,39 @@ mod tests {
     }
 
     #[test]
+    fn rejects_missing_tokenizer_evidence() {
+        let show = SHOW.replace(",\n            \"tokenizer.ggml.model\": \"llama\"", "");
+        let error = inspect_with(TAGS, &show, PS_EMPTY).unwrap_err();
+        assert!(
+            matches!(error, ProviderError::IdentityMismatch(message) if message.contains("tokenizer") && message.contains("missing"))
+        );
+    }
+
+    #[test]
+    fn rejects_empty_tokenizer_evidence() {
+        let show = SHOW.replace(
+            "\"tokenizer.ggml.model\": \"llama\"",
+            "\"tokenizer.ggml.model\": \"\"",
+        );
+        let error = inspect_with(TAGS, &show, PS_EMPTY).unwrap_err();
+        assert!(
+            matches!(error, ProviderError::IdentityMismatch(message) if message.contains("tokenizer") && message.contains("missing"))
+        );
+    }
+
+    #[test]
+    fn rejects_whitespace_only_tokenizer_evidence() {
+        let show = SHOW.replace(
+            "\"tokenizer.ggml.model\": \"llama\"",
+            "\"tokenizer.ggml.model\": \"  \\t\"",
+        );
+        let error = inspect_with(TAGS, &show, PS_EMPTY).unwrap_err();
+        assert!(
+            matches!(error, ProviderError::IdentityMismatch(message) if message.contains("tokenizer") && message.contains("missing"))
+        );
+    }
+
+    #[test]
     fn health_is_typed_and_reverifies_exact_identity() {
         let transport = ScriptedTransport::from_bodies(&[VERSION, TAGS, SHOW, TAGS, PS_EMPTY]);
         let mut adapter = OllamaAdapter::new("http://127.0.0.1:11434", transport).unwrap();
@@ -760,7 +802,7 @@ mod tests {
 
     #[test]
     fn activity_observation_is_an_exact_ps_snapshot_only() {
-        let ps = r#"{"models":[{"name":"gemma3:4b-it-q4_K_M","model":"gemma3:4b-it-q4_K_M","digest":"a2af6cc3eb7fa8be8504abaf9b04e88f17a119ec3f04a3addf55f92841195f5a"}]}"#;
+        let ps = r#"{"models":[{"name":"gemma3:4b","model":"gemma3:4b","digest":"a2af6cc3eb7fa8be8504abaf9b04e88f17a119ec3f04a3addf55f92841195f5a"}]}"#;
         let transport = ScriptedTransport::from_bodies(&[ps]);
         let adapter = OllamaAdapter::new("http://127.0.0.1:11434", transport).unwrap();
         let activity = adapter.observe_activity().unwrap();
@@ -895,18 +937,18 @@ mod tests {
     }
 
     #[test]
-    fn ps_requires_exact_name_model_and_digest_for_target_activity() {
+    fn ps_correlates_target_activity_by_exact_digest_despite_canonical_name() {
         let wrong_digest = r#"{"models":[{"name":"gemma3:4b-it-q4_K_M","model":"gemma3:4b-it-q4_K_M","digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]}"#;
         let inspection = inspect_with(TAGS, SHOW, wrong_digest).unwrap();
         assert!(!inspection.activity.target_loaded);
         assert_eq!(inspection.activity.unrelated_models, [OLLAMA_MODEL_TAG]);
 
-        let wrong_model = format!(
-            r#"{{"models":[{{"name":"{OLLAMA_MODEL_TAG}","model":"other:latest","digest":"{OLLAMA_MODEL_DIGEST}"}}]}}"#
+        let canonical_name = format!(
+            r#"{{"models":[{{"name":"gemma3:4b","model":"gemma3:4b","digest":"{OLLAMA_MODEL_DIGEST}"}}]}}"#
         );
-        let inspection = inspect_with(TAGS, SHOW, &wrong_model).unwrap();
-        assert!(!inspection.activity.target_loaded);
-        assert_eq!(inspection.activity.unrelated_models, [OLLAMA_MODEL_TAG]);
+        let inspection = inspect_with(TAGS, SHOW, &canonical_name).unwrap();
+        assert!(inspection.activity.target_loaded);
+        assert!(inspection.activity.unrelated_models.is_empty());
 
         let exact = format!(
             r#"{{"models":[{{"name":"{OLLAMA_MODEL_TAG}","model":"{OLLAMA_MODEL_TAG}","digest":"{OLLAMA_MODEL_DIGEST}"}}]}}"#
