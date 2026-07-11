@@ -273,7 +273,7 @@ fn quant_from_filename(filename: &str) -> String {
         .strip_suffix(".gguf")
         .or_else(|| filename.strip_suffix(".GGUF"))
         .unwrap_or(filename);
-    stem.rsplit('-')
+    stem.rsplit(['-', '.'])
         .next()
         .unwrap_or("unknown")
         .to_ascii_uppercase()
@@ -365,6 +365,7 @@ mod tests {
     #[test]
     fn extracts_unlisted_quantization_names_and_next_page_links() {
         assert_eq!(quant_from_filename("demo-UD-Q4_K_XL.gguf"), "Q4_K_XL");
+        assert_eq!(quant_from_filename("demo.Q2_K.gguf"), "Q2_K");
         assert_eq!(
             next_link("<https://huggingface.co/api/tree?cursor=2>; rel=\"next\""),
             Some("https://huggingface.co/api/tree?cursor=2".into())
