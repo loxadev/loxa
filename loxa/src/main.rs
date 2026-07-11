@@ -329,6 +329,13 @@ fn calibration_error_message(error: &loxa_core::calibration::CalibrationError) -
             "{}; managed teardown also failed: {teardown}",
             calibration_error_message(operation)
         ),
+        CalibrationError::Aborted {
+            kind,
+            evidence_path,
+        } => format!(
+            "calibration aborted: {kind}; evidence: {}",
+            evidence_path.display()
+        ),
     }
 }
 
@@ -2348,6 +2355,13 @@ mod tests {
                     teardown: ProviderError::Lifecycle("cleanup".into()),
                 },
                 "managed teardown also failed",
+            ),
+            (
+                CalibrationError::Aborted {
+                    kind: "isolation_lost".into(),
+                    evidence_path: PathBuf::from("/tmp/aborted-evidence.json"),
+                },
+                "calibration aborted: isolation_lost; evidence: /tmp/aborted-evidence.json",
             ),
         ];
         for (error, expected) in cases {

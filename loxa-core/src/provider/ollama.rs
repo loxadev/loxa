@@ -9,6 +9,7 @@ use reqwest::redirect::Policy;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 
 pub const OLLAMA_MODEL_TAG: &str = "gemma3:4b-it-q4_K_M";
@@ -211,25 +212,19 @@ impl<T: OllamaTransport> OllamaAdapter<T> {
             "show quantization",
         )?;
         require_identity(&show.details.family, "gemma3", "show family")?;
-        require_identity(&show.template, "{{ .Messages }}", "chat template")?;
-        require_identity(
-            show.model_info.general_name.as_deref().unwrap_or_default(),
+        let template_evidence = template_evidence(&show.template)?;
+        require_present_identity(
+            show.model_info.general_name.as_deref(),
             "gemma-3-4b-it",
             "base checkpoint",
         )?;
-        require_identity(
-            show.model_info
-                .general_architecture
-                .as_deref()
-                .unwrap_or_default(),
+        require_present_identity(
+            show.model_info.general_architecture.as_deref(),
             "gemma3",
             "model architecture",
         )?;
-        require_identity(
-            show.model_info
-                .tokenizer_model
-                .as_deref()
-                .unwrap_or_default(),
+        require_present_identity(
+            show.model_info.tokenizer_model.as_deref(),
             "gemma",
             "tokenizer",
         )?;
@@ -265,7 +260,7 @@ impl<T: OllamaTransport> OllamaAdapter<T> {
                 format: model.details.format,
                 quantization: model.details.quantization_level,
                 tokenizer_evidence: vec!["/api/show:model_info.tokenizer.ggml.model=gemma".into()],
-                template_evidence: vec!["/api/show:template={{ .Messages }}".into()],
+                template_evidence: vec![template_evidence],
             },
             engine: EngineIdentity {
                 schema_version: 1,
@@ -432,6 +427,36 @@ fn require_identity(actual: &str, expected: &str, field: &str) -> Result<(), Pro
     }
 }
 
+fn require_present_identity(
+    actual: Option<&str>,
+    expected: &str,
+    field: &str,
+) -> Result<(), ProviderError> {
+    let actual = actual.filter(|value| !value.is_empty()).ok_or_else(|| {
+        ProviderError::IdentityMismatch(format!(
+            "{field}: required official /api/show evidence is missing"
+        ))
+    })?;
+    require_identity(actual, expected, field)
+}
+
+fn template_evidence(template: &str) -> Result<String, ProviderError> {
+    if template.is_empty() {
+        return Err(ProviderError::IdentityMismatch(
+            "chat template evidence is empty".into(),
+        ));
+    }
+    let digest = Sha256::digest(template.as_bytes());
+    let digest = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(format!(
+        "/api/show:template_sha256={digest};bytes={}",
+        template.len()
+    ))
+}
+
 fn unique_exact_tag(tags: TagsResponse) -> Result<TagModel, ProviderError> {
     let mut matches = tags
         .models
@@ -561,7 +586,7 @@ mod tests {
         "license": "Gemma Terms of Use",
         "modelfile": "FROM /models/gemma-3-4b-it-Q4_K_M.gguf",
         "parameters": "temperature 0",
-        "template": "{{ .Messages }}",
+        "template": "{{- range .Messages }}{{ .Role }}: {{ .Content }}\n{{- end }}",
         "details": {
             "parent_model": "",
             "format": "gguf",
@@ -653,8 +678,13 @@ mod tests {
         );
         assert_eq!(
             inspection.candidate.artifact.template_evidence,
-            ["/api/show:template={{ .Messages }}"]
+            [concat!(
+                "/api/show:template_sha256=",
+                "c18169ef197353927df82b637b4f7d829f0e1030141b0302f3833501ea53539e",
+                ";bytes=60"
+            )]
         );
+        assert!(!inspection.candidate.artifact.template_evidence[0].contains("range"));
         assert_eq!(
             inspection.candidate.engine.engine_kind,
             "ollama-managed-gguf-engine"
@@ -695,6 +725,27 @@ mod tests {
                 ("GET", "/api/tags"),
                 ("GET", "/api/ps"),
             ]
+        );
+    }
+
+    #[test]
+    fn rejects_empty_template_evidence() {
+        let show = SHOW.replace(
+            "{{- range .Messages }}{{ .Role }}: {{ .Content }}\\n{{- end }}",
+            "",
+        );
+        let error = inspect_with(TAGS, &show, PS_EMPTY).unwrap_err();
+        assert!(
+            matches!(error, ProviderError::IdentityMismatch(message) if message.contains("chat template evidence is empty"))
+        );
+    }
+
+    #[test]
+    fn rejects_real_shape_when_exact_base_checkpoint_evidence_is_absent() {
+        let show = SHOW.replace("\n            \"general.name\": \"gemma-3-4b-it\",", "");
+        let error = inspect_with(TAGS, &show, PS_EMPTY).unwrap_err();
+        assert!(
+            matches!(error, ProviderError::IdentityMismatch(message) if message.contains("base checkpoint") && message.contains("missing"))
         );
     }
 

@@ -39,7 +39,9 @@ impl HostProbe for SystemHostProbe {
         let load = sysinfo::System::load_average().one;
         let load_controlled =
             h.logical_cores > 0 && load.is_finite() && load <= h.logical_cores as f64 * 0.5;
-        let thermal_nominal = macos_thermal_code().as_deref() == Some("thermal_nominal");
+        let thermal_code =
+            macos_thermal_code().unwrap_or_else(|| "thermal_probe_unavailable".into());
+        let thermal_nominal = thermal_code == "thermal_nominal";
         vec![
             PreflightObservation {
                 code: "memory_headroom".into(),
@@ -50,7 +52,7 @@ impl HostProbe for SystemHostProbe {
                 controlled: load_controlled,
             },
             PreflightObservation {
-                code: "thermal_nominal".into(),
+                code: thermal_code,
                 controlled: thermal_nominal,
             },
             PreflightObservation {
@@ -100,34 +102,54 @@ impl HostProbe for SystemHostProbe {
 
 fn macos_thermal_code() -> Option<String> {
     if std::env::consts::OS != "macos" {
-        return None;
+        return Some("thermal_probe_unavailable".into());
     }
-    let mut child = Command::new("pmset")
+    let mut child = match Command::new("pmset")
         .args(["-g", "therm"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .ok()?;
+    {
+        Ok(child) => child,
+        Err(_) => return Some("thermal_probe_unavailable".into()),
+    };
     let started = Instant::now();
     while started.elapsed() < Duration::from_millis(500) {
         if child.try_wait().ok().flatten().is_some() {
-            let output = child.wait_with_output().ok()?;
+            let output = match child.wait_with_output() {
+                Ok(output) => output,
+                Err(_) => return Some("thermal_probe_unavailable".into()),
+            };
+            if !output.status.success() {
+                return Some("thermal_probe_unavailable".into());
+            }
             let text = String::from_utf8_lossy(&output.stdout);
-            return Some(
-                if text.contains("CPU_Speed_Limit = 100") && text.contains("Scheduler_Limit = 100")
-                {
-                    "thermal_nominal"
-                } else {
-                    "thermal_unknown_or_throttled"
-                }
-                .into(),
-            );
+            return Some(parse_macos_thermal_output(&text).into());
         }
         thread::sleep(Duration::from_millis(10));
     }
     let _ = child.kill();
     let _ = child.wait();
-    None
+    Some("thermal_probe_timeout".into())
+}
+
+fn parse_macos_thermal_output(text: &str) -> &'static str {
+    let cpu = thermal_limit(text, "CPU_Speed_Limit");
+    let scheduler = thermal_limit(text, "Scheduler_Limit");
+    match (cpu, scheduler) {
+        (Some(100), Some(100)) => "thermal_nominal",
+        (Some(value), _) | (_, Some(value)) if value < 100 => "thermal_throttled",
+        _ => "thermal_probe_parse_changed",
+    }
+}
+
+fn thermal_limit(text: &str, name: &str) -> Option<u32> {
+    text.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        (key.trim() == name)
+            .then(|| value.trim().parse().ok())
+            .flatten()
+    })
 }
 
 #[derive(Debug)]
@@ -166,10 +188,14 @@ impl CalibrationRunner {
         b: &mut dyn ProviderAdapter,
     ) -> Result<CalibrationOutcome, CalibrationError> {
         let started = now_ms();
-        let provisional_a =
-            crate::provider::managed_llama::managed_candidate_spec("unverified", "unverified")
-                .map_err(CalibrationError::Provider)?;
-        let provisional_b = crate::provider::ollama::provisional_candidate_spec();
+        // Inspect both candidates before host/isolation refusal. Candidate evidence must never
+        // contain a provisional identity presented as though it had been verified.
+        let inspected_a = a.inspect_candidate();
+        let inspected_b = b.inspect_candidate();
+        let ai = inspected_a.map_err(CalibrationError::Provider)?;
+        let bi = inspected_b.map_err(CalibrationError::Provider)?;
+        ai.validate_pinned().map_err(CalibrationError::Provider)?;
+        bi.validate_pinned().map_err(CalibrationError::Provider)?;
         let preflight = host.preflight();
         let mut isolation = preflight
             .iter()
@@ -183,21 +209,21 @@ impl CalibrationRunner {
         if !rejected.is_empty() {
             let verdict = SelectorVerdict::NoVerifiedPlan {
                 schema_version: 1,
-                reasons: vec![format!(
-                    "{}: isolation_preflight_failed",
-                    provisional_a.candidate_id
-                )],
+                reasons: vec![format!("{}: isolation_preflight_failed", ai.candidate_id)],
             };
             let evidence = base_evidence(
                 started,
                 host.fingerprint(),
-                provisional_a,
-                provisional_b,
+                ai,
+                bi,
                 vec![],
                 vec![],
                 isolation,
                 EvidenceVerdict::from_selector(&verdict)?,
-                vec!["isolation_preflight_failed".into()],
+                rejected
+                    .into_iter()
+                    .chain(std::iter::once("isolation_preflight_failed".into()))
+                    .collect(),
             );
             return Ok(CalibrationOutcome {
                 evidence,
@@ -205,51 +231,6 @@ impl CalibrationRunner {
                 verdict,
             });
         }
-        let ai = match a.inspect_candidate() {
-            Ok(identity) => identity,
-            Err(error) => {
-                let code = provider_code(&error);
-                isolation.push(isolation_observation(
-                    "candidate_a_identity_unverified",
-                    false,
-                ));
-                isolation.push(isolation_observation(code, false));
-                return aborted_outcome(
-                    started,
-                    host.fingerprint(),
-                    provisional_a,
-                    provisional_b,
-                    isolation,
-                    vec![],
-                    vec![],
-                    code,
-                );
-            }
-        };
-        let (bi, initial_b_error) = match b.inspect_candidate() {
-            Ok(identity) => (identity, None),
-            Err(error) => (provisional_b, Some(error)),
-        };
-        if let Some(error) = initial_b_error {
-            let code = provider_code(&error);
-            isolation.push(isolation_observation(
-                "candidate_b_identity_unverified",
-                false,
-            ));
-            isolation.push(isolation_observation(code, false));
-            return aborted_outcome(
-                started,
-                host.fingerprint(),
-                ai,
-                bi,
-                isolation,
-                vec![],
-                vec![],
-                code,
-            );
-        }
-        ai.validate_pinned().map_err(CalibrationError::Provider)?;
-        bi.validate_pinned().map_err(CalibrationError::Provider)?;
         if let Err(error) = check_provider_activity("candidate_a", a, &mut isolation)
             .and_then(|_| check_provider_preflight("candidate_b", b, &mut isolation))
         {
@@ -1234,6 +1215,22 @@ mod tests {
     struct IsolationLossHost {
         background_calls: usize,
     }
+
+    struct ThermalRefusalHost;
+    impl HostProbe for ThermalRefusalHost {
+        fn preflight(&mut self) -> Vec<PreflightObservation> {
+            vec![PreflightObservation {
+                code: "thermal_probe_parse_changed".into(),
+                controlled: false,
+            }]
+        }
+        fn available_memory_bytes(&mut self) -> u64 {
+            8 << 30
+        }
+        fn fingerprint(&mut self) -> HostFingerprint {
+            TestHost { controlled: true }.fingerprint()
+        }
+    }
     impl HostProbe for IsolationLossHost {
         fn preflight(&mut self) -> Vec<PreflightObservation> {
             vec![PreflightObservation {
@@ -1439,8 +1436,77 @@ mod tests {
         assert!(evidence
             .explanation_codes
             .contains(&"isolation_preflight_failed".into()));
+        assert_eq!(evidence.candidates[0].identity, a.spec);
+        assert_eq!(evidence.candidates[1].identity, b.spec);
+        assert_eq!(
+            evidence.candidates[0].fingerprint,
+            evidence.candidates[0].identity.fingerprint()
+        );
+        assert_eq!(
+            evidence.candidates[1].fingerprint,
+            evidence.candidates[1].identity.fingerprint()
+        );
         assert!(evidence_path.is_file());
         assert!(!selection.exists());
+        assert_eq!((a.turns, b.turns), (0, 0));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn thermal_output_has_bounded_nominal_throttled_and_parse_changed_codes() {
+        assert_eq!(
+            parse_macos_thermal_output("CPU_Speed_Limit = 100\nScheduler_Limit = 100\n"),
+            "thermal_nominal"
+        );
+        assert_eq!(
+            parse_macos_thermal_output("CPU_Speed_Limit = 80\nScheduler_Limit = 100\n"),
+            "thermal_throttled"
+        );
+        assert_eq!(
+            parse_macos_thermal_output("CPU_Speed_Limit = 100\nScheduler_Limit = 70\n"),
+            "thermal_throttled"
+        );
+        assert_eq!(
+            parse_macos_thermal_output("CPU_Speed_Limit = 80\n"),
+            "thermal_throttled"
+        );
+        assert_eq!(
+            parse_macos_thermal_output("pmset output changed"),
+            "thermal_probe_parse_changed"
+        );
+    }
+
+    #[test]
+    fn thermal_refusal_persists_and_surfaces_the_exact_bounded_reason() {
+        let root = std::env::temp_dir().join(format!("loxa-thermal-abort-{}", now_ms()));
+        let mut host = ThermalRefusalHost;
+        let mut a = provider(managed_candidate_spec("test", "rev").unwrap(), 100);
+        let mut b = provider(ollama_spec(), 80);
+        let error = CalibrationRunner::run_and_persist(
+            &mut host,
+            &mut a,
+            &mut b,
+            &root.join("evidence"),
+            &root.join("selection.json"),
+        )
+        .unwrap_err();
+        let CalibrationError::Aborted {
+            kind,
+            evidence_path,
+        } = error
+        else {
+            panic!("expected typed abort")
+        };
+        assert_eq!(kind, "thermal_probe_parse_changed");
+        let evidence =
+            crate::evidence::read_evidence_json(&fs::read(evidence_path).unwrap()).unwrap();
+        assert_eq!(
+            evidence.explanation_codes,
+            vec![
+                "thermal_probe_parse_changed".to_owned(),
+                "isolation_preflight_failed".to_owned()
+            ]
+        );
         assert_eq!((a.turns, b.turns), (0, 0));
         fs::remove_dir_all(root).unwrap();
     }
