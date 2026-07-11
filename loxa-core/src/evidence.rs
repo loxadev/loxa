@@ -900,15 +900,12 @@ mod tests {
                 schema_version: 1,
                 engine_kind: "ollama-managed-gguf-engine".into(),
                 provider_version: "0.9.0".into(),
-                engine_revision: EngineRevision::Known("fixture-observed-revision".into()),
+                engine_revision: EngineRevision::Unknown { hidden: true },
                 evidence: vec![
                     "ollama_version=0.9.0".into(),
-                    "ollama_api_show:engine_revision=fixture-observed-revision".into(),
+                    "ollama_api_show:engine_revision=unknown;hidden=true".into(),
                 ],
-                invalidation_keys: vec![
-                    "provider_version=0.9.0".into(),
-                    "engine_revision=fixture-observed-revision".into(),
-                ],
+                invalidation_keys: vec!["provider_version=0.9.0".into()],
             },
             settings: GenerationSettings::pinned_v1(),
         };
@@ -1021,6 +1018,15 @@ mod tests {
 
         assert_eq!(parsed, evidence);
         assert_eq!(parsed.schema_version, EVIDENCE_SCHEMA_VERSION);
+        assert_eq!(
+            parsed.candidates[1].identity.engine.engine_revision,
+            EngineRevision::Unknown { hidden: true }
+        );
+        assert!(parsed.candidates[1]
+            .identity
+            .engine
+            .invalidation_keys
+            .contains(&"provider_version=0.9.0".into()));
     }
 
     #[test]

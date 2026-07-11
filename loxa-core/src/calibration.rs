@@ -795,6 +795,11 @@ fn base_evidence(
     verdict: EvidenceVerdict,
     explanation_codes: Vec<String>,
 ) -> CalibrationEvidence {
+    let attached_revision_fact = match &b.engine.engine_revision {
+        crate::provider::EngineRevision::Known(_) => "revision_observed",
+        crate::provider::EngineRevision::Unknown { hidden: true } => "revision_hidden_unknown",
+        crate::provider::EngineRevision::Unknown { hidden: false } => "revision_unverified",
+    };
     CalibrationEvidence {
         schema_version: EVIDENCE_SCHEMA_VERSION,
         protocol_version: "calibration-v1".into(),
@@ -821,7 +826,7 @@ fn base_evidence(
             difference(
                 "engine_revision",
                 "managed_binary_digest",
-                "revision_unknown",
+                attached_revision_fact,
             ),
             difference("ownership_lifecycle", "loxa_managed", "owner_attached"),
             difference("cache_residency_regime", "controlled_warm", "attached_warm"),
@@ -1290,6 +1295,18 @@ mod tests {
             settings: GenerationSettings::pinned_v1(),
         }
     }
+
+    fn ollama_spec_with_hidden_revision(provider_version: &str) -> CandidateSpec {
+        let mut spec = ollama_spec();
+        spec.engine.provider_version = provider_version.into();
+        spec.engine.engine_revision = EngineRevision::Unknown { hidden: true };
+        spec.engine.evidence = vec![
+            format!("ollama_version={provider_version}"),
+            "ollama_api_show:engine_revision=unknown;hidden=true".into(),
+        ];
+        spec.engine.invalidation_keys = vec![format!("provider_version={provider_version}")];
+        spec
+    }
     fn turn(content: &str, duration: Option<u64>) -> NormalizedTurn {
         NormalizedTurn {
             schema_version: 1,
@@ -1400,6 +1417,70 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(candidate_order, expected_order);
+    }
+
+    #[test]
+    fn calibration_admits_and_discloses_hidden_unknown_ollama_revision() {
+        let mut host = TestHost { controlled: true };
+        let mut a = provider(managed_candidate_spec("test", "rev").unwrap(), 100);
+        let mut b = provider(ollama_spec_with_hidden_revision("0.21.0"), 80);
+
+        let outcome = CalibrationRunner::run(&mut host, &mut a, &mut b).unwrap();
+
+        assert_eq!(
+            outcome.evidence.candidates[1]
+                .identity
+                .engine
+                .engine_revision,
+            EngineRevision::Unknown { hidden: true }
+        );
+        assert!(outcome.evidence.disclosed_differences.iter().any(|fact| {
+            fact.difference_code == "engine_revision"
+                && fact.candidate_b_fact == "revision_hidden_unknown"
+        }));
+        assert!(outcome.evidence.candidates[1]
+            .identity
+            .engine
+            .invalidation_keys
+            .contains(&"provider_version=0.21.0".into()));
+    }
+
+    #[test]
+    fn calibration_discloses_an_observed_ollama_revision_without_calling_it_unknown() {
+        let mut host = TestHost { controlled: true };
+        let mut a = provider(managed_candidate_spec("test", "rev").unwrap(), 100);
+        let mut b = provider(ollama_spec(), 80);
+
+        let outcome = CalibrationRunner::run(&mut host, &mut a, &mut b).unwrap();
+
+        assert!(outcome.evidence.disclosed_differences.iter().any(|fact| {
+            fact.difference_code == "engine_revision"
+                && fact.candidate_b_fact == "revision_observed"
+        }));
+    }
+
+    #[test]
+    fn hidden_unknown_provider_version_change_aborts_requalification() {
+        let mut host = TestHost { controlled: true };
+        let mut a = provider(managed_candidate_spec("test", "rev").unwrap(), 100);
+        let mut b = provider(ollama_spec_with_hidden_revision("0.21.0"), 80);
+        let original_fingerprint = b.spec.fingerprint();
+        b.drift_after_turns = Some(1);
+
+        let outcome = CalibrationRunner::run(&mut host, &mut a, &mut b).unwrap();
+
+        assert!(matches!(
+            outcome.verdict,
+            SelectorVerdict::NoVerifiedPlan { .. }
+        ));
+        assert!(outcome
+            .evidence
+            .explanation_codes
+            .contains(&"identity_changed".into()));
+        assert_ne!(
+            original_fingerprint,
+            b.inspect_candidate().unwrap().fingerprint()
+        );
     }
 
     #[test]
