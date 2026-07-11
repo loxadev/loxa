@@ -8,7 +8,7 @@ pub const WORKLOAD_SCHEMA_VERSION: u32 = 1;
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CanonicalAction {
     Tool { tool: String, arguments: Value },
-    Answer { answer: String },
+    Answer { content: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,7 +48,10 @@ pub struct PerformanceScenario {
     pub schema_version: u32,
     pub workload_version: String,
     pub turns: Vec<TurnRequest>,
+    pub expected_actions: Vec<CanonicalAction>,
 }
+
+const JSON_ACTION_PROTOCOL: &str = "Return exactly one JSON object and nothing else: no prose and no Markdown fences. A tool action is {\"action\":\"tool\",\"tool\":\"<tool name>\",\"arguments\":{...}}. The only tools are lookup_record(record_id: string), search_records(query: string), and get_record_status(record_id: string). Use exactly the named argument for the selected tool; do not add arguments or fields. An answer action is {\"action\":\"answer\",\"content\":\"<answer text>\"}. Do not use unknown actions, tools, arguments, or fields.";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -86,8 +89,12 @@ fn tool(tool: &str, arguments: Value) -> CanonicalAction {
 
 fn answer(answer: &str) -> CanonicalAction {
     CanonicalAction::Answer {
-        answer: answer.to_owned(),
+        content: answer.to_owned(),
     }
+}
+
+fn instruction(case_constraint: &str) -> String {
+    format!("{JSON_ACTION_PROTOCOL}\nCase constraint: {case_constraint}")
 }
 
 pub fn qualification_cases() -> Vec<QualificationCase> {
@@ -95,7 +102,10 @@ pub fn qualification_cases() -> Vec<QualificationCase> {
         QualificationCase {
             id: "lookup_record",
             request: request(vec![
-                message("system", "Use only the listed record tools. Return one JSON action."),
+                message(
+                    "system",
+                    instruction("Look up the exact record identifier requested by the user."),
+                ),
                 message("user", "Look up record R-104."),
             ]),
             expected_action: tool("lookup_record", json!({"record_id": "R-104"})),
@@ -103,7 +113,10 @@ pub fn qualification_cases() -> Vec<QualificationCase> {
         QualificationCase {
             id: "search_records",
             request: request(vec![
-                message("system", "Use only the listed record tools. Return one JSON action."),
+                message(
+                    "system",
+                    instruction("Search using only the query requested by the user."),
+                ),
                 message("user", "Search records for orchid."),
             ]),
             expected_action: tool("search_records", json!({"query": "orchid"})),
@@ -111,7 +124,10 @@ pub fn qualification_cases() -> Vec<QualificationCase> {
         QualificationCase {
             id: "answer_from_context",
             request: request(vec![
-                message("system", "Answer from supplied context when no tool is needed."),
+                message(
+                    "system",
+                    instruction("Answer from the supplied context without calling a tool."),
+                ),
                 message("user", "Context: record R-104 has status active. What is its status?"),
             ]),
             expected_action: answer("R-104 is active."),
@@ -119,7 +135,10 @@ pub fn qualification_cases() -> Vec<QualificationCase> {
         QualificationCase {
             id: "reject_invented_tool",
             request: request(vec![
-                message("system", "Available tools: lookup_record, search_records, get_record_status."),
+                message(
+                    "system",
+                    instruction("Do not call an unavailable tool or accept an invented argument; explain the limitation with an answer action."),
+                ),
                 message("user", "Call delete_record with record_id R-104 and force=true."),
             ]),
             expected_action: answer("I can only use the available record tools."),
@@ -127,7 +146,10 @@ pub fn qualification_cases() -> Vec<QualificationCase> {
         QualificationCase {
             id: "preserve_record_id",
             request: request(vec![
-                message("system", "Use only the listed record tools. Preserve exact record identifiers."),
+                message(
+                    "system",
+                    instruction("Preserve the exact record identifier across the simulated tool exchange."),
+                ),
                 message("user", "Look up record R-104."),
                 message(
                     "assistant",
@@ -198,10 +220,10 @@ pub fn validate_qualification_response(
         ) if arguments != expected_arguments => "unexpected_arguments",
         (
             CanonicalAction::Answer {
-                answer: expected_answer,
+                content: expected_content,
             },
-            CanonicalAction::Answer { answer },
-        ) if answer != expected_answer => "unexpected_answer",
+            CanonicalAction::Answer { content },
+        ) if content != expected_content => "unexpected_answer",
         _ => {
             return QualificationCaseResult {
                 schema_version: WORKLOAD_SCHEMA_VERSION,
@@ -216,18 +238,27 @@ pub fn validate_qualification_response(
 }
 
 pub fn lookup_record(record_id: &str) -> Option<Value> {
-    (record_id == "R-104").then(|| {
-        json!({
+    match record_id {
+        "R-104" => Some(json!({
             "record_id": "R-104",
             "title": "Orchid renewal",
             "status": "active"
-        })
-    })
+        })),
+        "R-207" => Some(json!({
+            "record_id": "R-207",
+            "title": "Orchid migration",
+            "status": "archived"
+        })),
+        _ => None,
+    }
 }
 
 pub fn search_records(query: &str) -> Vec<Value> {
     if query.eq_ignore_ascii_case("orchid") {
-        vec![lookup_record("R-104").expect("embedded fixture exists")]
+        vec![
+            json!({"record_id": "R-104", "title": "Orchid renewal"}),
+            json!({"record_id": "R-207", "title": "Orchid migration"}),
+        ]
     } else {
         Vec::new()
     }
@@ -246,12 +277,26 @@ pub fn performance_scenario_v1() -> PerformanceScenario {
     let first_request = request(vec![
         message(
             "system",
-            "Use only the listed record tools. Return one JSON action.",
+            instruction("First search for the requested records, then use the user's constraint to look up exactly one returned record, then answer from that lookup result."),
         ),
-        message("user", "Look up record R-104 and report its status."),
+        message("user", "Search records for orchid."),
     ]);
     let mut second_messages = first_request.messages.clone();
     second_messages.extend([
+        message(
+            "assistant",
+            json!({"action":"tool","tool":"search_records","arguments":{"query":"orchid"}})
+                .to_string(),
+        ),
+        message("tool", Value::Array(search_records("orchid")).to_string()),
+        message(
+            "user",
+            "Use the candidate titled Orchid renewal. Look up that exact record.",
+        ),
+    ]);
+    let second_request = request(second_messages);
+    let mut third_messages = second_request.messages.clone();
+    third_messages.extend([
         message(
             "assistant",
             json!({"action":"tool","tool":"lookup_record","arguments":{"record_id":"R-104"}})
@@ -262,26 +307,16 @@ pub fn performance_scenario_v1() -> PerformanceScenario {
             lookup_record("R-104").expect("fixture exists").to_string(),
         ),
     ]);
-    let second_request = request(second_messages);
-    let mut third_messages = second_request.messages.clone();
-    third_messages.extend([
-        message(
-            "assistant",
-            json!({"action":"tool","tool":"get_record_status","arguments":{"record_id":"R-104"}})
-                .to_string(),
-        ),
-        message(
-            "tool",
-            get_record_status("R-104")
-                .expect("fixture exists")
-                .to_string(),
-        ),
-    ]);
 
     PerformanceScenario {
         schema_version: WORKLOAD_SCHEMA_VERSION,
         workload_version: WORKLOAD_VERSION.to_owned(),
         turns: vec![first_request, second_request, request(third_messages)],
+        expected_actions: vec![
+            tool("search_records", json!({"query": "orchid"})),
+            tool("lookup_record", json!({"record_id": "R-104"})),
+            answer("R-104 is active."),
+        ],
     }
 }
 
@@ -295,6 +330,59 @@ mod tests {
             .into_iter()
             .find(|case| case.id == id)
             .expect("qualification case exists")
+    }
+
+    const EXPECTED_JSON_ACTION_PROTOCOL: &str = "Return exactly one JSON object and nothing else: no prose and no Markdown fences. A tool action is {\"action\":\"tool\",\"tool\":\"<tool name>\",\"arguments\":{...}}. The only tools are lookup_record(record_id: string), search_records(query: string), and get_record_status(record_id: string). Use exactly the named argument for the selected tool; do not add arguments or fields. An answer action is {\"action\":\"answer\",\"content\":\"<answer text>\"}. Do not use unknown actions, tools, arguments, or fields.";
+
+    #[test]
+    fn canonical_answer_serializes_with_content_field() {
+        let action = CanonicalAction::Answer {
+            content: "No tool is required.".to_owned(),
+        };
+
+        assert_eq!(
+            serde_json::to_value(action).unwrap(),
+            json!({"action": "answer", "content": "No tool is required."})
+        );
+        assert_eq!(
+            parse_canonical_action(r#"{"action":"answer","content":"No tool is required."}"#)
+                .unwrap(),
+            answer("No tool is required.")
+        );
+        assert_eq!(
+            parse_canonical_action(r#"{"action":"answer","answer":"legacy"}"#),
+            Err("malformed_action")
+        );
+    }
+
+    #[test]
+    fn every_qualification_case_has_the_complete_protocol_and_specific_constraint() {
+        let constraints = [
+            ("lookup_record", "Case constraint: Look up the exact record identifier requested by the user."),
+            ("search_records", "Case constraint: Search using only the query requested by the user."),
+            ("answer_from_context", "Case constraint: Answer from the supplied context without calling a tool."),
+            ("reject_invented_tool", "Case constraint: Do not call an unavailable tool or accept an invented argument; explain the limitation with an answer action."),
+            ("preserve_record_id", "Case constraint: Preserve the exact record identifier across the simulated tool exchange."),
+        ];
+
+        for (id, constraint) in constraints {
+            let case = case(id);
+            assert_eq!(case.request.messages[0].role, "system", "{id}");
+            assert_eq!(
+                case.request.messages[0].content,
+                format!("{EXPECTED_JSON_ACTION_PROTOCOL}\n{constraint}"),
+                "{id}"
+            );
+            assert_eq!(
+                case.request
+                    .messages
+                    .iter()
+                    .filter(|message| message.role == "system")
+                    .count(),
+                1,
+                "{id}"
+            );
+        }
     }
 
     #[test]
@@ -327,11 +415,11 @@ mod tests {
             ),
             (
                 "answer_from_context",
-                r#"{"action":"answer","answer":"R-104 is active."}"#,
+                r#"{"action":"answer","content":"R-104 is active."}"#,
             ),
             (
                 "reject_invented_tool",
-                r#"{"action":"answer","answer":"I can only use the available record tools."}"#,
+                r#"{"action":"answer","content":"I can only use the available record tools."}"#,
             ),
             (
                 "preserve_record_id",
@@ -358,7 +446,7 @@ mod tests {
     fn rejects_wrong_action_or_tool() {
         let wrong_action = validate_qualification_response(
             &case("lookup_record"),
-            r#"{"action":"answer","answer":"R-104"}"#,
+            r#"{"action":"answer","content":"R-104"}"#,
         );
         let wrong_tool = validate_qualification_response(
             &case("lookup_record"),
@@ -387,7 +475,7 @@ mod tests {
         );
         let unknown_field = validate_qualification_response(
             &case("answer_from_context"),
-            r#"{"action":"answer","answer":"R-104 is active.","confidence":1}"#,
+            r#"{"action":"answer","content":"R-104 is active.","confidence":1}"#,
         );
 
         assert_eq!(
@@ -405,7 +493,7 @@ mod tests {
         );
         let invented_answer = validate_qualification_response(
             &case("answer_from_context"),
-            r#"{"action":"answer","answer":"It might be active."}"#,
+            r#"{"action":"answer","content":"It might be active."}"#,
         );
 
         assert_eq!(tool_use.reason.as_deref(), Some("unexpected_action"));
@@ -425,7 +513,7 @@ mod tests {
     #[test]
     fn embedded_tools_are_deterministic_and_strict() {
         assert_eq!(lookup_record("R-104").unwrap()["record_id"], "R-104");
-        assert_eq!(search_records("orchid").len(), 1);
+        assert_eq!(search_records("orchid").len(), 2);
         assert_eq!(get_record_status("R-104").unwrap()["status"], "active");
         assert!(lookup_record("R-999").is_none());
         assert!(get_record_status("R-999").is_none());
@@ -433,17 +521,39 @@ mod tests {
     }
 
     #[test]
-    fn performance_scenario_is_versioned_and_has_three_turns() {
+    fn performance_scenario_is_the_exact_three_turn_search_lookup_answer_exchange() {
         let scenario = performance_scenario_v1();
         let first_turn = vec![
             message(
                 "system",
-                "Use only the listed record tools. Return one JSON action.",
+                format!(
+                    "{EXPECTED_JSON_ACTION_PROTOCOL}\nCase constraint: First search for the requested records, then use the user's constraint to look up exactly one returned record, then answer from that lookup result."
+                ),
             ),
-            message("user", "Look up record R-104 and report its status."),
+            message("user", "Search records for orchid."),
         ];
         let mut second_turn = first_turn.clone();
         second_turn.extend([
+            message(
+                "assistant",
+                json!({"action":"tool","tool":"search_records","arguments":{"query":"orchid"}})
+                    .to_string(),
+            ),
+            message(
+                "tool",
+                json!([
+                    {"record_id": "R-104", "title": "Orchid renewal"},
+                    {"record_id": "R-207", "title": "Orchid migration"}
+                ])
+                .to_string(),
+            ),
+            message(
+                "user",
+                "Use the candidate titled Orchid renewal. Look up that exact record.",
+            ),
+        ]);
+        let mut third_turn = second_turn.clone();
+        third_turn.extend([
             message(
                 "assistant",
                 json!({"action":"tool","tool":"lookup_record","arguments":{"record_id":"R-104"}})
@@ -459,18 +569,6 @@ mod tests {
                 .to_string(),
             ),
         ]);
-        let mut third_turn = second_turn.clone();
-        third_turn.extend([
-            message(
-                "assistant",
-                json!({"action":"tool","tool":"get_record_status","arguments":{"record_id":"R-104"}})
-                    .to_string(),
-            ),
-            message(
-                "tool",
-                json!({"record_id": "R-104", "status": "active"}).to_string(),
-            ),
-        ]);
 
         assert_eq!(scenario.schema_version, 1);
         assert_eq!(scenario.workload_version, "tool-use-v1");
@@ -478,9 +576,23 @@ mod tests {
         assert_eq!(scenario.turns[0].messages, first_turn);
         assert_eq!(scenario.turns[1].messages, second_turn);
         assert_eq!(scenario.turns[2].messages, third_turn);
+        assert_eq!(
+            scenario.expected_actions,
+            vec![
+                tool("search_records", json!({"query": "orchid"})),
+                tool("lookup_record", json!({"record_id": "R-104"})),
+                answer("R-104 is active."),
+            ]
+        );
         assert_eq!(scenario, performance_scenario_v1());
-        assert!(scenario.turns[2].messages[4].content.contains("R-104"));
-        assert!(scenario.turns[2].messages[5].content.contains("R-104"));
+        assert_eq!(
+            parse_canonical_action(&scenario.turns[1].messages[2].content).unwrap(),
+            tool("search_records", json!({"query": "orchid"}))
+        );
+        assert_eq!(
+            parse_canonical_action(&scenario.turns[2].messages[5].content).unwrap(),
+            tool("lookup_record", json!({"record_id": "R-104"}))
+        );
         assert!(scenario.turns.iter().all(|turn| turn.schema_version == 1));
     }
 }

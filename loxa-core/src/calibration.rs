@@ -321,7 +321,16 @@ impl CalibrationRunner {
         isolation.extend(measurements.3.clone());
         let a_fingerprint = ai.fingerprint();
         let b_fingerprint = bi.fingerprint();
-        if !measurements.3.is_empty() {
+        if let Some(failed_isolation) = measurements
+            .3
+            .iter()
+            .find(|observation| observation.outcome_code == "uncontrolled")
+        {
+            let code = match failed_isolation.check_code.as_str() {
+                "candidate_a_teardown_failed" | "candidate_b_teardown_failed" => "teardown_failed",
+                "runtime_provider_activity_unknown" => "runtime_provider_activity_unknown",
+                _ => "runtime_provider_activity_uncontrolled",
+            };
             return aborted_outcome(
                 started,
                 host.fingerprint(),
@@ -333,7 +342,7 @@ impl CalibrationRunner {
                     qualification_evidence(&b_fingerprint, &bq, &measurements.1),
                 ],
                 measurements.2,
-                "teardown_failed",
+                code,
             );
         }
         if measurements
@@ -467,6 +476,108 @@ type Execution = (
         Vec<IsolationObservation>,
     ),
 );
+
+#[derive(Clone, Copy)]
+enum CandidateSlot {
+    A,
+    B,
+}
+
+#[derive(Default)]
+struct RuntimeProviderIsolation {
+    a_invoked: bool,
+    b_invoked: bool,
+    a_controlled_target_prepared: bool,
+    b_controlled_target_prepared: bool,
+    failure_code: Option<&'static str>,
+}
+
+impl RuntimeProviderIsolation {
+    fn mark_prepared(&mut self, slot: CandidateSlot, controlled_ownership: bool) {
+        if !controlled_ownership {
+            return;
+        }
+        match slot {
+            CandidateSlot::A => self.a_controlled_target_prepared = true,
+            CandidateSlot::B => self.b_controlled_target_prepared = true,
+        }
+    }
+
+    fn mark_invoked(&mut self, slot: CandidateSlot) {
+        match slot {
+            CandidateSlot::A => self.a_invoked = true,
+            CandidateSlot::B => self.b_invoked = true,
+        }
+    }
+
+    fn mark_finished(&mut self, slot: CandidateSlot) {
+        match slot {
+            CandidateSlot::A => self.a_controlled_target_prepared = false,
+            CandidateSlot::B => self.b_controlled_target_prepared = false,
+        }
+    }
+
+    fn check_pair(
+        &mut self,
+        active: &dyn ProviderAdapter,
+        other: &dyn ProviderAdapter,
+        active_slot: CandidateSlot,
+    ) -> Result<(), &'static str> {
+        if let Some(code) = self.failure_code {
+            return Err(code);
+        }
+        let (a, b) = match active_slot {
+            CandidateSlot::A => (active, other),
+            CandidateSlot::B => (other, active),
+        };
+        let a_activity = a
+            .observe_activity()
+            .map_err(|_| self.record_failure("runtime_provider_activity_unknown"))?;
+        let b_activity = b
+            .observe_activity()
+            .map_err(|_| self.record_failure("runtime_provider_activity_unknown"))?;
+        if !activity_is_controlled(
+            &a_activity,
+            self.a_invoked,
+            self.a_controlled_target_prepared,
+        ) || !activity_is_controlled(
+            &b_activity,
+            self.b_invoked,
+            self.b_controlled_target_prepared,
+        ) {
+            return Err(self.record_failure("runtime_provider_activity_uncontrolled"));
+        }
+        Ok(())
+    }
+
+    fn record_failure(&mut self, code: &'static str) -> &'static str {
+        self.failure_code.get_or_insert(code);
+        self.failure_code.expect("failure was just recorded")
+    }
+
+    fn observations(&self) -> Vec<IsolationObservation> {
+        vec![isolation_observation(
+            self.failure_code
+                .unwrap_or("runtime_provider_activity_controlled"),
+            self.failure_code.is_none(),
+        )]
+    }
+}
+
+fn activity_is_controlled(
+    activity: &crate::provider::ProviderActivityObservation,
+    invoked_by_calibration: bool,
+    controlled_target_prepared: bool,
+) -> bool {
+    let target_allowed =
+        !activity.target_active || invoked_by_calibration || controlled_target_prepared;
+    let no_unrelated_activity = activity.unrelated_activity.is_empty()
+        || (activity.target_active
+            && controlled_target_prepared
+            && activity.unrelated_activity == ["active_managed_runs=1"]);
+    target_allowed && no_unrelated_activity
+}
+
 fn execute(
     host: &mut dyn HostProbe,
     a: &mut dyn ProviderAdapter,
@@ -476,20 +587,58 @@ fn execute(
     let b_identity = b.inspect_candidate().map_err(CalibrationError::Provider)?;
     let a_fingerprint = a_identity.fingerprint();
     let b_fingerprint = b_identity.fingerprint();
-    let (a_cases, a_qualification_teardown_failed) = qualify_isolated(a);
-    let (b_cases, b_qualification_teardown_failed) = qualify_isolated(b);
+    let mut runtime_isolation = RuntimeProviderIsolation::default();
+    let (a_cases, a_qualification_teardown_failed) = qualify_isolated(
+        a,
+        b,
+        CandidateSlot::A,
+        a_identity.ownership == crate::provider::ProviderOwnership::Controlled,
+        &mut runtime_isolation,
+    );
+    let (b_cases, b_qualification_teardown_failed) =
+        if let Some(code) = runtime_isolation.failure_code {
+            (failed_qualification_cases(code), false)
+        } else {
+            qualify_isolated(
+                b,
+                a,
+                CandidateSlot::B,
+                b_identity.ownership == crate::provider::ProviderOwnership::Controlled,
+                &mut runtime_isolation,
+            )
+        };
     let mut aq = qualification(&a_identity.candidate_id, &a_cases);
     let mut bq = qualification(&b_identity.candidate_id, &b_cases);
     let mut raw = Vec::new();
     let mut a_cold = None;
     let mut b_cold = None;
-    let a_run = if aq.passed && !a_qualification_teardown_failed {
-        a.prepare_controlled_run().ok()
+    let a_run = if runtime_isolation.failure_code.is_none()
+        && aq.passed
+        && !a_qualification_teardown_failed
+    {
+        let run = a.prepare_controlled_run().ok();
+        if run.is_some() {
+            runtime_isolation.mark_prepared(
+                CandidateSlot::A,
+                a_identity.ownership == crate::provider::ProviderOwnership::Controlled,
+            );
+        }
+        run
     } else {
         None
     };
-    let b_run = if bq.passed && !b_qualification_teardown_failed {
-        b.prepare_controlled_run().ok()
+    let b_run = if runtime_isolation.failure_code.is_none()
+        && bq.passed
+        && !b_qualification_teardown_failed
+    {
+        let run = b.prepare_controlled_run().ok();
+        if run.is_some() {
+            runtime_isolation.mark_prepared(
+                CandidateSlot::B,
+                b_identity.ownership == crate::provider::ProviderOwnership::Controlled,
+            );
+        }
+        run
     } else {
         None
     };
@@ -501,15 +650,20 @@ fn execute(
         bq.passed = false;
         bq.reasons.push("performance_prepare_failed".into());
     }
-    if aq.passed {
+    if aq.passed && runtime_isolation.failure_code.is_none() {
         let warmup = measure(
             host,
             a,
+            b,
+            CandidateSlot::A,
+            &mut runtime_isolation,
             a_run.as_ref().expect("prepared performance run"),
-            &a_fingerprint,
-            0,
-            0,
-            false,
+            MeasurementSpec {
+                candidate_fingerprint: &a_fingerprint,
+                repetition: 0,
+                order_position: 0,
+                retain: false,
+            },
         );
         a_cold = warmup.cold_readiness_duration_ns;
         if warmup.failure_code.is_some() {
@@ -518,15 +672,20 @@ fn execute(
         }
         raw.push(warmup);
     }
-    if bq.passed {
+    if bq.passed && runtime_isolation.failure_code.is_none() {
         let warmup = measure(
             host,
             b,
+            a,
+            CandidateSlot::B,
+            &mut runtime_isolation,
             b_run.as_ref().expect("prepared performance run"),
-            &b_fingerprint,
-            0,
-            0,
-            false,
+            MeasurementSpec {
+                candidate_fingerprint: &b_fingerprint,
+                repetition: 0,
+                order_position: 0,
+                retain: false,
+            },
         );
         b_cold = warmup.cold_readiness_duration_ns;
         if warmup.failure_code.is_some() {
@@ -539,15 +698,23 @@ fn execute(
         let positions = if rep % 2 == 1 { (1, 2) } else { (2, 1) };
         let a_first = rep % 2 == 1;
         for choose_a in [a_first, !a_first] {
+            if runtime_isolation.failure_code.is_some() {
+                break;
+            }
             if choose_a && aq.passed {
                 let mut am = measure(
                     host,
                     a,
+                    b,
+                    CandidateSlot::A,
+                    &mut runtime_isolation,
                     a_run.as_ref().expect("prepared performance run"),
-                    &a_fingerprint,
-                    rep,
-                    positions.0,
-                    true,
+                    MeasurementSpec {
+                        candidate_fingerprint: &a_fingerprint,
+                        repetition: rep,
+                        order_position: positions.0,
+                        retain: true,
+                    },
                 );
                 if rep == 1 {
                     am.cold_readiness_duration_ns = a_cold;
@@ -558,11 +725,16 @@ fn execute(
                 let mut bm = measure(
                     host,
                     b,
+                    a,
+                    CandidateSlot::B,
+                    &mut runtime_isolation,
                     b_run.as_ref().expect("prepared performance run"),
-                    &b_fingerprint,
-                    rep,
-                    positions.1,
-                    true,
+                    MeasurementSpec {
+                        candidate_fingerprint: &b_fingerprint,
+                        repetition: rep,
+                        order_position: positions.1,
+                        retain: true,
+                    },
                 );
                 if rep == 1 {
                     bm.cold_readiness_duration_ns = b_cold;
@@ -573,10 +745,26 @@ fn execute(
         }
     }
     let mut lifecycle = Vec::new();
-    let a_teardown_failed = a_qualification_teardown_failed
-        || a_run.is_some_and(|run| a.finish_controlled_run(run).is_err());
-    let b_teardown_failed = b_qualification_teardown_failed
-        || b_run.is_some_and(|run| b.finish_controlled_run(run).is_err());
+    let a_performance_teardown_failed = if let Some(run) = a_run {
+        let failed = a.finish_controlled_run(run).is_err();
+        runtime_isolation.mark_finished(CandidateSlot::A);
+        failed
+    } else {
+        false
+    };
+    let b_performance_teardown_failed = if let Some(run) = b_run {
+        let failed = b.finish_controlled_run(run).is_err();
+        runtime_isolation.mark_finished(CandidateSlot::B);
+        failed
+    } else {
+        false
+    };
+    if runtime_isolation.failure_code.is_none() {
+        let _ = runtime_isolation.check_pair(a, b, CandidateSlot::A);
+    }
+    lifecycle.extend(runtime_isolation.observations());
+    let a_teardown_failed = a_qualification_teardown_failed || a_performance_teardown_failed;
+    let b_teardown_failed = b_qualification_teardown_failed || b_performance_teardown_failed;
     if a_teardown_failed {
         lifecycle.push(isolation_observation("candidate_a_teardown_failed", false));
     }
@@ -613,35 +801,63 @@ fn with_run<T>(
 
 fn qualify(
     provider: &mut dyn ProviderAdapter,
+    other: &dyn ProviderAdapter,
+    slot: CandidateSlot,
+    runtime_isolation: &mut RuntimeProviderIsolation,
     run: &ControlledRun,
 ) -> Vec<QualificationCaseResult> {
-    workload::qualification_cases()
-        .into_iter()
-        .map(
-            |case| match provider.run_turn(run, &messages(&case.request.messages)) {
-                Ok(turn) => workload::validate_qualification_response(&case, &turn.content),
-                Err(e) => QualificationCaseResult {
-                    schema_version: 1,
-                    case_id: case.id.into(),
-                    passed: false,
-                    reason: Some(provider_code(&e).into()),
-                },
+    let cases = workload::qualification_cases();
+    let mut results = Vec::with_capacity(cases.len());
+    for (index, case) in cases.iter().enumerate() {
+        if let Err(code) = runtime_isolation.check_pair(provider, other, slot) {
+            results.extend(failed_cases_from(&cases[index..], code));
+            break;
+        }
+        let turn = provider.run_turn(run, &messages(&case.request.messages));
+        runtime_isolation.mark_invoked(slot);
+        if let Err(code) = runtime_isolation.check_pair(provider, other, slot) {
+            results.extend(failed_cases_from(&cases[index..], code));
+            break;
+        }
+        results.push(match turn {
+            Ok(turn) => workload::validate_qualification_response(case, &turn.content),
+            Err(e) => QualificationCaseResult {
+                schema_version: 1,
+                case_id: case.id.into(),
+                passed: false,
+                reason: Some(provider_code(&e).into()),
             },
-        )
-        .collect()
+        });
+    }
+    results
 }
-fn qualify_isolated(provider: &mut dyn ProviderAdapter) -> (Vec<QualificationCaseResult>, bool) {
+
+fn qualify_isolated(
+    provider: &mut dyn ProviderAdapter,
+    other: &dyn ProviderAdapter,
+    slot: CandidateSlot,
+    controlled_ownership: bool,
+    runtime_isolation: &mut RuntimeProviderIsolation,
+) -> (Vec<QualificationCaseResult>, bool) {
     let run = match provider.prepare_controlled_run() {
-        Ok(run) => run,
+        Ok(run) => {
+            runtime_isolation.mark_prepared(slot, controlled_ownership);
+            run
+        }
         Err(error) => return (failed_qualification_cases(provider_code(&error)), false),
     };
-    let cases = qualify(provider, &run);
+    let cases = qualify(provider, other, slot, runtime_isolation, &run);
     let teardown_failed = provider.finish_controlled_run(run).is_err();
+    runtime_isolation.mark_finished(slot);
     (cases, teardown_failed)
 }
-fn failed_qualification_cases(code: &str) -> Vec<QualificationCaseResult> {
-    workload::qualification_cases()
-        .into_iter()
+
+fn failed_cases_from(
+    cases: &[workload::QualificationCase],
+    code: &str,
+) -> Vec<QualificationCaseResult> {
+    cases
+        .iter()
         .map(|case| QualificationCaseResult {
             schema_version: 1,
             case_id: case.id.into(),
@@ -651,14 +867,25 @@ fn failed_qualification_cases(code: &str) -> Vec<QualificationCaseResult> {
         .collect()
 }
 
-fn measure(
-    host: &mut dyn HostProbe,
-    provider: &mut dyn ProviderAdapter,
-    run: &ControlledRun,
-    candidate_fingerprint: &str,
+fn failed_qualification_cases(code: &str) -> Vec<QualificationCaseResult> {
+    failed_cases_from(&workload::qualification_cases(), code)
+}
+
+struct MeasurementSpec<'a> {
+    candidate_fingerprint: &'a str,
     repetition: u8,
     order_position: u8,
     retain: bool,
+}
+
+fn measure(
+    host: &mut dyn HostProbe,
+    provider: &mut dyn ProviderAdapter,
+    other: &dyn ProviderAdapter,
+    slot: CandidateSlot,
+    runtime_isolation: &mut RuntimeProviderIsolation,
+    run: &ControlledRun,
+    spec: MeasurementSpec<'_>,
 ) -> MeasurementEvidence {
     let managed_readiness = provider.cold_readiness_duration_ns(run);
     let before = host.available_memory_bytes();
@@ -668,9 +895,18 @@ fn measure(
     let mut timing = None;
     let mut failure = None;
     let scenario = workload::performance_scenario_v1();
-    let mut transcript = scenario.turns[0].messages.clone();
-    for step in 0..3 {
-        match provider.run_turn(run, &messages(&transcript)) {
+    for (request, expected_action) in scenario.turns.iter().zip(&scenario.expected_actions) {
+        if let Err(code) = runtime_isolation.check_pair(provider, other, slot) {
+            failure = Some(code.into());
+            break;
+        }
+        let turn = provider.run_turn(run, &messages(&request.messages));
+        runtime_isolation.mark_invoked(slot);
+        if let Err(code) = runtime_isolation.check_pair(provider, other, slot) {
+            failure = Some(code.into());
+            break;
+        }
+        match turn {
             Ok(t) => {
                 timing = Some(merge_timing(timing.take(), t.timing));
                 let action = match workload::parse_canonical_action(&t.content) {
@@ -680,39 +916,9 @@ fn measure(
                         break;
                     }
                 };
-                transcript.push(workload::CanonicalMessage {
-                    role: "assistant".into(),
-                    content: t.content,
-                });
-                match (step, action) {
-                    (0, workload::CanonicalAction::Tool { tool, arguments })
-                        if tool == "lookup_record"
-                            && arguments == serde_json::json!({"record_id":"R-104"}) =>
-                    {
-                        transcript.push(workload::CanonicalMessage {
-                            role: "tool".into(),
-                            content: workload::lookup_record("R-104")
-                                .expect("embedded fixture")
-                                .to_string(),
-                        });
-                    }
-                    (1, workload::CanonicalAction::Tool { tool, arguments })
-                        if tool == "get_record_status"
-                            && arguments == serde_json::json!({"record_id":"R-104"}) =>
-                    {
-                        transcript.push(workload::CanonicalMessage {
-                            role: "tool".into(),
-                            content: workload::get_record_status("R-104")
-                                .expect("embedded fixture")
-                                .to_string(),
-                        });
-                    }
-                    (2, workload::CanonicalAction::Answer { answer })
-                        if answer == "R-104 is active." => {}
-                    _ => {
-                        failure = Some("performance_action_mismatch".into());
-                        break;
-                    }
+                if action != *expected_action {
+                    failure = Some("performance_action_mismatch".into());
+                    break;
                 }
             }
             Err(e) => {
@@ -728,16 +934,17 @@ fn measure(
     let isolation_controlled = background_before == "background_load_controlled"
         && thermal_before.as_deref() == Some("thermal_nominal")
         && background_code == "background_load_controlled"
-        && thermal_code.as_deref() == Some("thermal_nominal");
-    if !isolation_controlled {
+        && thermal_code.as_deref() == Some("thermal_nominal")
+        && runtime_isolation.failure_code.is_none();
+    if !isolation_controlled && failure.is_none() {
         failure = Some("isolation_lost".into());
     }
     MeasurementEvidence {
         schema_version: 1,
-        candidate_fingerprint: candidate_fingerprint.into(),
-        repetition,
-        order_position,
-        cold_readiness_duration_ns: (!retain)
+        candidate_fingerprint: spec.candidate_fingerprint.into(),
+        repetition: spec.repetition,
+        order_position: spec.order_position,
+        cold_readiness_duration_ns: (!spec.retain)
             .then(|| {
                 timing
                     .as_ref()
@@ -745,7 +952,9 @@ fn measure(
                     .or(managed_readiness)
             })
             .flatten(),
-        end_to_end_duration_ns: (failure.is_none() && retain).then_some(duration).flatten(),
+        end_to_end_duration_ns: (failure.is_none() && spec.retain)
+            .then_some(duration)
+            .flatten(),
         outcome_code: if failure.is_none() {
             "success"
         } else {
@@ -905,6 +1114,16 @@ fn base_evidence(
                 "checkpoint_provenance_limit",
                 managed_checkpoint_scope,
                 attached_checkpoint_scope,
+            ),
+            difference(
+                "tokenizer_identity_evidence",
+                "registry_declared_tokenizer_reference",
+                "provider_observed_tokenizer_metadata",
+            ),
+            difference(
+                "template_identity_evidence",
+                "registry_template_metadata_unavailable",
+                "provider_observed_template_digest",
             ),
             difference("engine_kind", "llama_cpp", "ollama_managed_gguf_engine"),
             difference(
@@ -1147,6 +1366,7 @@ mod tests {
         ProviderActivityObservation, ProviderHealth, ProviderKind, ProviderOwnership,
         ProviderTiming, ARTIFACT_IDENTITY_SCHEMA_VERSION,
     };
+    use std::cell::Cell;
     use std::collections::VecDeque;
     use std::fs;
 
@@ -1218,6 +1438,10 @@ mod tests {
         turns: usize,
         drift_after_turns: Option<usize>,
         fail_first_finish: bool,
+        activity_calls: Cell<usize>,
+        unrelated_on_activity_call: Option<usize>,
+        activity_error_on_call: Option<usize>,
+        target_active_on_activity_call: Option<usize>,
     }
 
     impl ProviderAdapter for ScriptedProvider {
@@ -1239,10 +1463,21 @@ mod tests {
             })
         }
         fn observe_activity(&self) -> Result<ProviderActivityObservation, ProviderError> {
+            let call = self.activity_calls.get() + 1;
+            self.activity_calls.set(call);
+            if self.activity_error_on_call == Some(call) {
+                return Err(ProviderError::MalformedResponse {
+                    endpoint: "/api/ps",
+                    detail: "fixture activity cannot be understood".into(),
+                });
+            }
             Ok(ProviderActivityObservation {
                 schema_version: 1,
-                target_active: false,
-                unrelated_activity: vec![],
+                target_active: self.turns > 0 || self.target_active_on_activity_call == Some(call),
+                unrelated_activity: (self.unrelated_on_activity_call == Some(call))
+                    .then(|| "unrelated-model".into())
+                    .into_iter()
+                    .collect(),
                 evidence: vec!["fixture".into()],
             })
         }
@@ -1447,12 +1682,17 @@ mod tests {
             })
             .collect::<VecDeque<_>>();
         for _ in 0..6 {
-            out.push_back(Ok(turn("{\"action\":\"tool\",\"tool\":\"lookup_record\",\"arguments\":{\"record_id\":\"R-104\"}}", Some(duration))));
-            out.push_back(Ok(turn("{\"action\":\"tool\",\"tool\":\"get_record_status\",\"arguments\":{\"record_id\":\"R-104\"}}", Some(duration))));
-            out.push_back(Ok(turn(
-                "{\"action\":\"answer\",\"answer\":\"R-104 is active.\"}",
-                Some(duration),
-            )));
+            out.extend(
+                workload::performance_scenario_v1()
+                    .expected_actions
+                    .into_iter()
+                    .map(|action| {
+                        Ok(turn(
+                            &serde_json::to_string(&action).unwrap(),
+                            Some(duration),
+                        ))
+                    }),
+            );
         }
         out
     }
@@ -1465,7 +1705,128 @@ mod tests {
             turns: 0,
             drift_after_turns: None,
             fail_first_finish: false,
+            activity_calls: Cell::new(0),
+            unrelated_on_activity_call: None,
+            activity_error_on_call: None,
+            target_active_on_activity_call: None,
         }
+    }
+
+    #[test]
+    fn unrelated_ollama_activity_during_managed_qualification_aborts_before_more_inference() {
+        let mut host = TestHost { controlled: true };
+        let mut a = provider(managed_candidate_spec("test", "rev").unwrap(), 100);
+        let mut b = provider(ollama_spec(), 80);
+        // Call 1 is preflight. Calls 2 and 3 bracket candidate A's first turn.
+        b.unrelated_on_activity_call = Some(3);
+
+        let outcome = CalibrationRunner::run(&mut host, &mut a, &mut b).unwrap();
+
+        assert!(matches!(
+            outcome.verdict,
+            SelectorVerdict::NoVerifiedPlan { .. }
+        ));
+        assert_eq!((a.turns, b.turns), (1, 0));
+        assert_eq!((a.prepares, a.finishes), (1, 1));
+        assert_eq!((b.prepares, b.finishes), (0, 0));
+        assert!(outcome
+            .evidence
+            .explanation_codes
+            .contains(&"runtime_provider_activity_uncontrolled".into()));
+        assert!(outcome.evidence.qualifications[0]
+            .case_results
+            .iter()
+            .any(|case| case.reason.as_deref() == Some("runtime_provider_activity_uncontrolled")));
+        assert!(outcome.evidence.measurements.is_empty());
+    }
+
+    #[test]
+    fn activity_that_cannot_be_understood_during_execution_aborts_and_finishes_the_run() {
+        let mut host = TestHost { controlled: true };
+        let mut a = provider(managed_candidate_spec("test", "rev").unwrap(), 100);
+        let mut b = provider(ollama_spec(), 80);
+        // Call 1 is preflight. Call 2 is the boundary before candidate A's first turn.
+        b.activity_error_on_call = Some(2);
+
+        let outcome = CalibrationRunner::run(&mut host, &mut a, &mut b).unwrap();
+
+        assert_eq!((a.turns, b.turns), (0, 0));
+        assert_eq!((a.prepares, a.finishes), (1, 1));
+        assert!(outcome
+            .evidence
+            .explanation_codes
+            .contains(&"runtime_provider_activity_unknown".into()));
+        assert!(outcome.evidence.qualifications[0]
+            .case_results
+            .iter()
+            .all(|case| case.reason.as_deref() == Some("runtime_provider_activity_unknown")));
+    }
+
+    #[test]
+    fn provider_activity_loss_during_measurement_is_raw_uncontrolled_evidence() {
+        let mut host = TestHost { controlled: true };
+        let mut a = provider(managed_candidate_spec("test", "rev").unwrap(), 100);
+        let mut b = provider(ollama_spec(), 80);
+        // Preflight is call 1; five paired qualification boundaries consume calls 2..21.
+        // Call 23 is the boundary after candidate A's first warm-up inference.
+        b.unrelated_on_activity_call = Some(23);
+
+        let outcome = CalibrationRunner::run(&mut host, &mut a, &mut b).unwrap();
+
+        let failed = outcome
+            .evidence
+            .measurements
+            .iter()
+            .find(|measurement| {
+                measurement.failure_code.as_deref()
+                    == Some("runtime_provider_activity_uncontrolled")
+            })
+            .expect("runtime isolation failure is retained as a raw measurement");
+        assert!(!failed.isolation_controlled);
+        assert_eq!(failed.end_to_end_duration_ns, None);
+        assert_eq!((a.prepares, a.finishes), (2, 2));
+        assert_eq!((b.prepares, b.finishes), (2, 2));
+        assert!(outcome
+            .evidence
+            .explanation_codes
+            .contains(&"runtime_provider_activity_uncontrolled".into()));
+    }
+
+    #[test]
+    fn exact_target_activity_is_allowed_only_after_this_calibration_invokes_it() {
+        let mut host = TestHost { controlled: true };
+        let mut a = provider(managed_candidate_spec("test", "rev").unwrap(), 100);
+        let mut b = provider(ollama_spec(), 80);
+
+        let outcome = CalibrationRunner::run(&mut host, &mut a, &mut b).unwrap();
+
+        assert!(!outcome.evidence.explanation_codes.iter().any(|code| {
+            code == "runtime_provider_activity_uncontrolled"
+                || code == "runtime_provider_activity_unknown"
+        }));
+        // One preflight, before/after all qualification and performance turns,
+        // and one final boundary before selection.
+        assert_eq!((a.activity_calls.get(), b.activity_calls.get()), (94, 94));
+        assert_eq!((a.prepares, a.finishes), (2, 2));
+        assert_eq!((b.prepares, b.finishes), (2, 2));
+    }
+
+    #[test]
+    fn target_that_appears_after_preflight_but_before_invocation_aborts() {
+        let mut host = TestHost { controlled: true };
+        let mut a = provider(managed_candidate_spec("test", "rev").unwrap(), 100);
+        let mut b = provider(ollama_spec(), 80);
+        // Call 1 is preflight; call 2 is the boundary before candidate A's first turn.
+        b.target_active_on_activity_call = Some(2);
+
+        let outcome = CalibrationRunner::run(&mut host, &mut a, &mut b).unwrap();
+
+        assert_eq!((a.turns, b.turns), (0, 0));
+        assert_eq!((a.prepares, a.finishes), (1, 1));
+        assert!(outcome
+            .evidence
+            .explanation_codes
+            .contains(&"runtime_provider_activity_uncontrolled".into()));
     }
 
     #[test]
@@ -1574,6 +1935,26 @@ mod tests {
         assert!(outcome.evidence.disclosed_differences.iter().any(|fact| {
             fact.difference_code == "engine_revision"
                 && fact.candidate_b_fact == "revision_observed"
+        }));
+    }
+
+    #[test]
+    fn calibration_discloses_tokenizer_and_template_evidence_asymmetry() {
+        let mut host = TestHost { controlled: true };
+        let mut a = provider(managed_candidate_spec("test", "rev").unwrap(), 100);
+        let mut b = provider(ollama_spec(), 80);
+
+        let outcome = CalibrationRunner::run(&mut host, &mut a, &mut b).unwrap();
+
+        assert!(outcome.evidence.disclosed_differences.iter().any(|fact| {
+            fact.difference_code == "tokenizer_identity_evidence"
+                && fact.candidate_a_fact == "registry_declared_tokenizer_reference"
+                && fact.candidate_b_fact == "provider_observed_tokenizer_metadata"
+        }));
+        assert!(outcome.evidence.disclosed_differences.iter().any(|fact| {
+            fact.difference_code == "template_identity_evidence"
+                && fact.candidate_a_fact == "registry_template_metadata_unavailable"
+                && fact.candidate_b_fact == "provider_observed_template_digest"
         }));
     }
 
