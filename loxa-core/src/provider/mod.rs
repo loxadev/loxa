@@ -6,6 +6,7 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 
 pub const CANDIDATE_IDENTITY_SCHEMA_VERSION: u32 = 1;
+pub const ARTIFACT_IDENTITY_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -22,11 +23,27 @@ pub enum ProviderOwnership {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "checkpoint_attested_by", rename_all = "snake_case")]
+pub enum CheckpointAttestation {
+    Registry {
+        reference: String,
+    },
+    Basename {
+        value: String,
+    },
+    MetadataComposite {
+        architecture: String,
+        parameter_count: u64,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactIdentity {
     pub schema_version: u32,
     pub artifact_id: String,
     pub digest_sha256: String,
     pub base_checkpoint: String,
+    pub checkpoint_attestation: CheckpointAttestation,
     pub format: String,
     pub quantization: String,
     pub tokenizer_evidence: Vec<String>,
@@ -109,6 +126,24 @@ impl CandidateSpec {
         append_str(&mut bytes, &self.artifact.artifact_id);
         append_str(&mut bytes, &self.artifact.digest_sha256);
         append_str(&mut bytes, &self.artifact.base_checkpoint);
+        match &self.artifact.checkpoint_attestation {
+            CheckpointAttestation::Registry { reference } => {
+                append_str(&mut bytes, "registry");
+                append_str(&mut bytes, reference);
+            }
+            CheckpointAttestation::Basename { value } => {
+                append_str(&mut bytes, "basename");
+                append_str(&mut bytes, value);
+            }
+            CheckpointAttestation::MetadataComposite {
+                architecture,
+                parameter_count,
+            } => {
+                append_str(&mut bytes, "metadata_composite");
+                append_str(&mut bytes, architecture);
+                append_u64(&mut bytes, *parameter_count);
+            }
+        }
         append_str(&mut bytes, &self.artifact.format);
         append_str(&mut bytes, &self.artifact.quantization);
         append_strings(&mut bytes, &self.artifact.tokenizer_evidence);
@@ -171,7 +206,7 @@ impl CandidateSpec {
             ),
         };
         if self.schema_version != 1
-            || self.artifact.schema_version != 1
+            || self.artifact.schema_version != ARTIFACT_IDENTITY_SCHEMA_VERSION
             || self.engine.schema_version != 1
             || self.settings.schema_version != 1
         {
@@ -194,6 +229,24 @@ impl CandidateSpec {
         }
         if self.artifact.base_checkpoint != expected_base {
             return Err(ProviderError::IdentityMismatch("base checkpoint".into()));
+        }
+        match (&self.provider_kind, &self.artifact.checkpoint_attestation) {
+            (ProviderKind::ManagedLlamaCpp, CheckpointAttestation::Registry { reference })
+                if reference == "loxa-registry:gemma-3-4b-it-q4" => {}
+            (ProviderKind::Ollama, CheckpointAttestation::Basename { value })
+                if value == "gemma-3-4b-it" => {}
+            (
+                ProviderKind::Ollama,
+                CheckpointAttestation::MetadataComposite {
+                    architecture,
+                    parameter_count,
+                },
+            ) if architecture == "gemma3" && *parameter_count == 4_299_915_632 => {}
+            _ => {
+                return Err(ProviderError::IdentityMismatch(
+                    "checkpoint attestation".into(),
+                ));
+            }
         }
         if self.artifact.format != "gguf" {
             return Err(ProviderError::IdentityMismatch("artifact format".into()));
@@ -260,6 +313,10 @@ impl CandidateSpec {
 }
 
 fn append_u32(output: &mut Vec<u8>, value: u32) {
+    output.extend_from_slice(&value.to_be_bytes());
+}
+
+fn append_u64(output: &mut Vec<u8>, value: u64) {
     output.extend_from_slice(&value.to_be_bytes());
 }
 
@@ -409,8 +466,8 @@ pub trait ProviderAdapter {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtifactIdentity, CandidateSpec, EngineIdentity, EngineRevision, GenerationSettings,
-        ProviderKind, ProviderOwnership,
+        ArtifactIdentity, CandidateSpec, CheckpointAttestation, EngineIdentity, EngineRevision,
+        GenerationSettings, ProviderKind, ProviderOwnership, ARTIFACT_IDENTITY_SCHEMA_VERSION,
     };
     use crate::provider::managed_llama::managed_candidate_spec;
 
@@ -432,11 +489,14 @@ mod tests {
             ownership: ProviderOwnership::Attached,
             endpoint: "http://127.0.0.1:11434".into(),
             artifact: ArtifactIdentity {
-                schema_version: 1,
+                schema_version: ARTIFACT_IDENTITY_SCHEMA_VERSION,
                 artifact_id: "gemma3:4b-it-q4_K_M".into(),
                 digest_sha256: "a2af6cc3eb7fa8be8504abaf9b04e88f17a119ec3f04a3addf55f92841195f5a"
                     .into(),
                 base_checkpoint: "google/gemma-3-4b-it".into(),
+                checkpoint_attestation: CheckpointAttestation::Basename {
+                    value: "gemma-3-4b-it".into(),
+                },
                 format: "gguf".into(),
                 quantization: "Q4_K_M".into(),
                 tokenizer_evidence: vec!["/api/show:model_info.tokenizer.ggml.model=gemma".into()],
@@ -514,8 +574,66 @@ mod tests {
     }
 
     #[test]
+    fn metadata_composite_identity_fingerprints_exact_observed_shape_and_artifact() {
+        let mut spec = ollama_spec("0.11.0", EngineRevision::Unknown { hidden: true });
+        spec.artifact.checkpoint_attestation = CheckpointAttestation::MetadataComposite {
+            architecture: "gemma3".into(),
+            parameter_count: 4_299_915_632,
+        };
+        let fingerprint = spec.fingerprint();
+        let serialized = serde_json::to_string(&spec).unwrap();
+        assert!(serialized.contains("\"checkpoint_attested_by\":\"metadata_composite\""));
+        for expected in [
+            "metadata_composite",
+            "gemma3",
+            "4299915632",
+            "Q4_K_M",
+            "a2af6cc3eb7fa8be8504abaf9b04e88f17a119ec3f04a3addf55f92841195f5a",
+        ] {
+            assert!(
+                serialized.contains(expected),
+                "missing identity: {expected}"
+            );
+        }
+
+        let mut changed = spec.clone();
+        changed.artifact.digest_sha256 = "00".repeat(32);
+        assert_ne!(fingerprint, changed.fingerprint());
+
+        let mut changed = spec.clone();
+        changed.artifact.quantization = "Q8_0".into();
+        assert_ne!(fingerprint, changed.fingerprint());
+
+        let mut changed = spec.clone();
+        changed.artifact.checkpoint_attestation = CheckpointAttestation::MetadataComposite {
+            architecture: "other".into(),
+            parameter_count: 4_299_915_632,
+        };
+        assert_ne!(fingerprint, changed.fingerprint());
+
+        let mut changed = spec;
+        changed.artifact.checkpoint_attestation = CheckpointAttestation::MetadataComposite {
+            architecture: "gemma3".into(),
+            parameter_count: 4_299_915_631,
+        };
+        assert_ne!(fingerprint, changed.fingerprint());
+    }
+
+    #[test]
     fn pinned_settings_include_common_output_budget() {
         assert_eq!(GenerationSettings::pinned_v1().max_output_tokens, 256);
+    }
+
+    #[test]
+    fn previous_artifact_identity_schema_is_rejected() {
+        let mut spec = ollama_spec("0.11.0", EngineRevision::Unknown { hidden: true });
+        spec.artifact.schema_version = 1;
+
+        assert!(spec
+            .validate_pinned()
+            .unwrap_err()
+            .to_string()
+            .contains("schema version"));
     }
 
     #[test]
@@ -525,6 +643,13 @@ mod tests {
 
         let mut changed = base.clone();
         changed.endpoint.push_str("/changed");
+        assert_ne!(fingerprint, changed.fingerprint());
+
+        let mut changed = base.clone();
+        changed.artifact.checkpoint_attestation = CheckpointAttestation::MetadataComposite {
+            architecture: "gemma3".into(),
+            parameter_count: 4_299_915_632,
+        };
         assert_ne!(fingerprint, changed.fingerprint());
 
         let mut changed = base.clone();

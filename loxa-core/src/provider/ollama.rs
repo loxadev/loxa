@@ -1,8 +1,8 @@
 use super::{
-    ArtifactIdentity, CandidateSpec, ControlledRun, EngineIdentity, EngineRevision,
-    GenerationSettings, NormalizedTurn, ProviderActivityObservation, ProviderAdapter,
-    ProviderError, ProviderHealth, ProviderMessage, ProviderOwnership, ProviderTiming,
-    CANDIDATE_IDENTITY_SCHEMA_VERSION,
+    ArtifactIdentity, CandidateSpec, CheckpointAttestation, ControlledRun, EngineIdentity,
+    EngineRevision, GenerationSettings, NormalizedTurn, ProviderActivityObservation,
+    ProviderAdapter, ProviderError, ProviderHealth, ProviderMessage, ProviderOwnership,
+    ProviderTiming, ARTIFACT_IDENTITY_SCHEMA_VERSION, CANDIDATE_IDENTITY_SCHEMA_VERSION,
 };
 use reqwest::blocking::Client;
 use reqwest::redirect::Policy;
@@ -16,6 +16,9 @@ pub const OLLAMA_MODEL_TAG: &str = "gemma3:4b-it-q4_K_M";
 pub const OLLAMA_MODEL_DIGEST: &str =
     "a2af6cc3eb7fa8be8504abaf9b04e88f17a119ec3f04a3addf55f92841195f5a";
 const OLLAMA_ENDPOINT: &str = "http://127.0.0.1:11434";
+const EXPECTED_BASE_CHECKPOINT: &str = "gemma-3-4b-it";
+const EXPECTED_ARCHITECTURE: &str = "gemma3";
+const EXPECTED_PARAMETER_COUNT: u64 = 4_299_915_632;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OllamaRequest {
@@ -216,16 +219,7 @@ impl<T: OllamaTransport> OllamaAdapter<T> {
         )?;
         require_identity(&show.details.family, "gemma3", "show family")?;
         let template_evidence = template_evidence(&show.template)?;
-        require_present_identity(
-            show.model_info.general_name.as_deref(),
-            "gemma-3-4b-it",
-            "base checkpoint",
-        )?;
-        require_present_identity(
-            show.model_info.general_architecture.as_deref(),
-            "gemma3",
-            "model architecture",
-        )?;
+        let checkpoint_attestation = checkpoint_attestation(&show.model_info)?;
         let tokenizer_model =
             require_present_evidence(show.model_info.tokenizer_model.as_deref(), "tokenizer")?;
 
@@ -254,10 +248,11 @@ impl<T: OllamaTransport> OllamaAdapter<T> {
             ownership: ProviderOwnership::Attached,
             endpoint: OLLAMA_ENDPOINT.into(),
             artifact: ArtifactIdentity {
-                schema_version: 1,
+                schema_version: ARTIFACT_IDENTITY_SCHEMA_VERSION,
                 artifact_id: OLLAMA_MODEL_TAG.into(),
                 digest_sha256: model.digest,
                 base_checkpoint: "google/gemma-3-4b-it".into(),
+                checkpoint_attestation,
                 format: model.details.format,
                 quantization: model.details.quantization_level,
                 tokenizer_evidence: vec![format!(
@@ -440,19 +435,6 @@ fn canonicalize_sha256(digest: &str, field: &str) -> Result<String, ProviderErro
     Ok(bare.into())
 }
 
-fn require_present_identity(
-    actual: Option<&str>,
-    expected: &str,
-    field: &str,
-) -> Result<(), ProviderError> {
-    let actual = actual.filter(|value| !value.is_empty()).ok_or_else(|| {
-        ProviderError::IdentityMismatch(format!(
-            "{field}: required official /api/show evidence is missing"
-        ))
-    })?;
-    require_identity(actual, expected, field)
-}
-
 fn require_present_evidence<'a>(
     actual: Option<&'a str>,
     field: &str,
@@ -541,12 +523,70 @@ struct ShowResponse {
 
 #[derive(Default, Deserialize)]
 struct ModelInfo {
+    #[serde(rename = "general.basename")]
+    general_basename: Option<String>,
     #[serde(rename = "general.name")]
     general_name: Option<String>,
     #[serde(rename = "general.architecture")]
     general_architecture: Option<String>,
+    #[serde(rename = "general.parameter_count")]
+    general_parameter_count: Option<u64>,
     #[serde(rename = "tokenizer.ggml.model")]
     tokenizer_model: Option<String>,
+}
+
+fn checkpoint_attestation(model_info: &ModelInfo) -> Result<CheckpointAttestation, ProviderError> {
+    let architecture = require_present_evidence(
+        model_info.general_architecture.as_deref(),
+        "model architecture",
+    )?;
+    require_identity(architecture, EXPECTED_ARCHITECTURE, "model architecture")?;
+
+    let basename = present_checkpoint_field(
+        model_info.general_basename.as_deref(),
+        "base checkpoint basename",
+    )?;
+    let name =
+        present_checkpoint_field(model_info.general_name.as_deref(), "base checkpoint name")?;
+    if let (Some(basename), Some(name)) = (basename, name) {
+        if basename != name {
+            return Err(ProviderError::AmbiguousIdentity(
+                "conflicting base checkpoint basename and name".into(),
+            ));
+        }
+    }
+    if let Some(value) = basename.or(name) {
+        require_identity(value, EXPECTED_BASE_CHECKPOINT, "base checkpoint")?;
+        return Ok(CheckpointAttestation::Basename {
+            value: value.into(),
+        });
+    }
+
+    let parameter_count = model_info.general_parameter_count.ok_or_else(|| {
+        ProviderError::IdentityMismatch("parameter count: required evidence is missing".into())
+    })?;
+    if parameter_count != EXPECTED_PARAMETER_COUNT {
+        return Err(ProviderError::IdentityMismatch(format!(
+            "parameter count: expected {EXPECTED_PARAMETER_COUNT}, observed {parameter_count}"
+        )));
+    }
+    Ok(CheckpointAttestation::MetadataComposite {
+        architecture: architecture.into(),
+        parameter_count,
+    })
+}
+
+fn present_checkpoint_field<'a>(
+    value: Option<&'a str>,
+    field: &str,
+) -> Result<Option<&'a str>, ProviderError> {
+    match value {
+        Some(value) if value.trim().is_empty() => Err(ProviderError::IdentityMismatch(format!(
+            "{field}: observed value is blank"
+        ))),
+        Some(value) => Ok(Some(value)),
+        None => Ok(None),
+    }
 }
 
 #[derive(Deserialize)]
@@ -584,7 +624,9 @@ mod tests {
         OllamaAdapter, OllamaRequest, OllamaResponse, OllamaTransport, OllamaTransportError,
         OLLAMA_MODEL_DIGEST, OLLAMA_MODEL_TAG,
     };
-    use crate::provider::{EngineRevision, ProviderAdapter, ProviderError, ProviderMessage};
+    use crate::provider::{
+        CheckpointAttestation, EngineRevision, ProviderAdapter, ProviderError, ProviderMessage,
+    };
     use std::cell::RefCell;
     use std::collections::VecDeque;
 
@@ -623,6 +665,7 @@ mod tests {
         "model_info": {
             "general.name": "gemma-3-4b-it",
             "general.architecture": "gemma3",
+            "general.parameter_count": 4299915632,
             "tokenizer.ggml.model": "llama"
         },
         "capabilities": ["completion", "tools"]
@@ -693,6 +736,12 @@ mod tests {
         assert_eq!(
             inspection.candidate.artifact.base_checkpoint,
             "google/gemma-3-4b-it"
+        );
+        assert_eq!(
+            inspection.candidate.artifact.checkpoint_attestation,
+            CheckpointAttestation::Basename {
+                value: "gemma-3-4b-it".into()
+            }
         );
         assert_eq!(inspection.candidate.artifact.format, "gguf");
         assert_eq!(inspection.candidate.artifact.quantization, "Q4_K_M");
@@ -840,11 +889,132 @@ mod tests {
     }
 
     #[test]
-    fn rejects_real_shape_when_exact_base_checkpoint_evidence_is_absent() {
+    fn admits_exact_metadata_composite_when_basename_is_absent() {
         let show = SHOW.replace("\n            \"general.name\": \"gemma-3-4b-it\",", "");
+        let inspection = inspect_with(TAGS, &show, PS_EMPTY).unwrap();
+
+        assert_eq!(
+            inspection.candidate.artifact.checkpoint_attestation,
+            CheckpointAttestation::MetadataComposite {
+                architecture: "gemma3".into(),
+                parameter_count: 4_299_915_632,
+            }
+        );
+    }
+
+    #[test]
+    fn accepts_explicit_general_basename_attestation() {
+        let show = SHOW
+            .replace("\n            \"general.name\": \"gemma-3-4b-it\",", "")
+            .replace(
+                "            \"general.architecture\": \"gemma3\",",
+                "            \"general.basename\": \"gemma-3-4b-it\",\n            \"general.architecture\": \"gemma3\",",
+            );
+
+        let inspection = inspect_with(TAGS, &show, PS_EMPTY).unwrap();
+
+        assert_eq!(
+            inspection.candidate.artifact.checkpoint_attestation,
+            CheckpointAttestation::Basename {
+                value: "gemma-3-4b-it".into()
+            }
+        );
+    }
+
+    #[test]
+    fn conflicting_present_basename_refuses_without_composite_fallback() {
+        let show = SHOW.replace(
+            "\"general.name\": \"gemma-3-4b-it\"",
+            "\"general.name\": \"other-checkpoint\"",
+        );
+
         let error = inspect_with(TAGS, &show, PS_EMPTY).unwrap_err();
+
         assert!(
-            matches!(error, ProviderError::IdentityMismatch(message) if message.contains("base checkpoint") && message.contains("missing"))
+            matches!(error, ProviderError::IdentityMismatch(message) if message.contains("base checkpoint"))
+        );
+    }
+
+    #[test]
+    fn present_blank_basename_refuses_without_composite_fallback() {
+        let show = SHOW.replace(
+            "\"general.name\": \"gemma-3-4b-it\"",
+            "\"general.name\": \"   \"",
+        );
+
+        let error = inspect_with(TAGS, &show, PS_EMPTY).unwrap_err();
+
+        assert!(
+            matches!(error, ProviderError::IdentityMismatch(message) if message.contains("base checkpoint") && message.contains("blank"))
+        );
+    }
+
+    #[test]
+    fn conflicting_general_basename_and_name_refuses_as_ambiguous() {
+        let show = SHOW.replace(
+            "\"general.name\": \"gemma-3-4b-it\"",
+            "\"general.basename\": \"other-checkpoint\",\n            \"general.name\": \"gemma-3-4b-it\"",
+        );
+
+        let error = inspect_with(TAGS, &show, PS_EMPTY).unwrap_err();
+
+        assert!(
+            matches!(error, ProviderError::AmbiguousIdentity(message) if message.contains("basename") && message.contains("name"))
+        );
+    }
+
+    #[test]
+    fn conflicting_composite_architecture_refuses() {
+        let show = SHOW
+            .replace("\n            \"general.name\": \"gemma-3-4b-it\",", "")
+            .replace(
+                "\"general.architecture\": \"gemma3\"",
+                "\"general.architecture\": \"other\"",
+            );
+
+        let error = inspect_with(TAGS, &show, PS_EMPTY).unwrap_err();
+
+        assert!(
+            matches!(error, ProviderError::IdentityMismatch(message) if message.contains("model architecture"))
+        );
+    }
+
+    #[test]
+    fn missing_composite_architecture_refuses() {
+        let show = SHOW
+            .replace("\n            \"general.name\": \"gemma-3-4b-it\",", "")
+            .replace("\n            \"general.architecture\": \"gemma3\",", "");
+
+        let error = inspect_with(TAGS, &show, PS_EMPTY).unwrap_err();
+
+        assert!(
+            matches!(error, ProviderError::IdentityMismatch(message) if message.contains("model architecture") && message.contains("missing"))
+        );
+    }
+
+    #[test]
+    fn missing_composite_parameter_count_refuses() {
+        let show = SHOW
+            .replace("\n            \"general.name\": \"gemma-3-4b-it\",", "")
+            .replace("\n            \"general.parameter_count\": 4299915632,", "");
+
+        let error = inspect_with(TAGS, &show, PS_EMPTY).unwrap_err();
+
+        assert!(
+            matches!(error, ProviderError::IdentityMismatch(message) if message.contains("parameter count") && message.contains("missing"))
+        );
+    }
+
+    #[test]
+    fn conflicting_composite_parameter_count_refuses() {
+        let show = SHOW
+            .replace("\n            \"general.name\": \"gemma-3-4b-it\",", "")
+            .replace("4299915632", "4299915631");
+
+        let error = inspect_with(TAGS, &show, PS_EMPTY).unwrap_err();
+
+        assert!(
+            matches!(error, ProviderError::IdentityMismatch(message) if message.contains("parameter count"))
         );
     }
 

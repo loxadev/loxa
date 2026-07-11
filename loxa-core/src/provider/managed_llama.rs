@@ -1,8 +1,9 @@
 use super::{
-    ArtifactIdentity, CandidateSpec, ControlledRun, EngineIdentity, EngineRevision,
-    GenerationSettings, NormalizedTurn, ProviderActivityObservation, ProviderAdapter,
-    ProviderError, ProviderHealth, ProviderKind, ProviderMessage, ProviderOwnership,
-    ProviderTiming, CANDIDATE_IDENTITY_SCHEMA_VERSION,
+    ArtifactIdentity, CandidateSpec, CheckpointAttestation, ControlledRun, EngineIdentity,
+    EngineRevision, GenerationSettings, NormalizedTurn, ProviderActivityObservation,
+    ProviderAdapter, ProviderError, ProviderHealth, ProviderKind, ProviderMessage,
+    ProviderOwnership, ProviderTiming, ARTIFACT_IDENTITY_SCHEMA_VERSION,
+    CANDIDATE_IDENTITY_SCHEMA_VERSION,
 };
 use crate::{download, registry, supervisor};
 use reqwest::blocking::Client;
@@ -151,10 +152,13 @@ pub fn managed_candidate_spec(
         ownership: ProviderOwnership::Controlled,
         endpoint: "managed://loxa-supervisor/llama-server".into(),
         artifact: ArtifactIdentity {
-            schema_version: 1,
+            schema_version: ARTIFACT_IDENTITY_SCHEMA_VERSION,
             artifact_id: entry.id.into(),
             digest_sha256: entry.sha256.into(),
             base_checkpoint: "google/gemma-3-4b-it".into(),
+            checkpoint_attestation: CheckpointAttestation::Registry {
+                reference: "loxa-registry:gemma-3-4b-it-q4".into(),
+            },
             format: "gguf".into(),
             quantization: entry.quant.into(),
             tokenizer_evidence: vec![
