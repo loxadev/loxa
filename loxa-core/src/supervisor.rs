@@ -1635,10 +1635,21 @@ mod tests {
                 || {},
                 || {
                     let deadline = Instant::now() + Duration::from_secs(2);
-                    while !pid_path.is_file() && Instant::now() < deadline {
+                    while fs::read_to_string(&pid_path)
+                        .ok()
+                        .and_then(|contents| contents.parse::<u32>().ok())
+                        .is_none()
+                        && Instant::now() < deadline
+                    {
                         thread::sleep(Duration::from_millis(10));
                     }
-                    assert!(pid_path.is_file(), "spawned engine must publish its pid");
+                    assert!(
+                        fs::read_to_string(&pid_path)
+                            .ok()
+                            .and_then(|contents| contents.parse::<u32>().ok())
+                            .is_some(),
+                        "spawned engine must publish its complete pid"
+                    );
                     panic!("injected post-spawn initialization failure");
                 },
             );
