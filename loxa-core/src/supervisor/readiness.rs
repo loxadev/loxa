@@ -1,7 +1,9 @@
 use super::{ManagedChild, SupervisorError};
 use crate::engine::ReadinessStrategy;
 use serde::Deserialize;
+use std::io;
 use std::net::{SocketAddr, TcpListener};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 use sysinfo::{Pid, ProcessesToUpdate, System};
@@ -77,6 +79,236 @@ impl LocalhostPortReservation {
         drop(self.listener);
         Ok(())
     }
+}
+
+#[derive(Debug)]
+pub enum ReadinessWorkerPoll {
+    Pending,
+    Ready,
+    Failed(SupervisorError),
+}
+
+pub struct ChatCompletionReadinessWorker {
+    cancel: Option<tokio::sync::oneshot::Sender<()>>,
+    result: mpsc::Receiver<Result<(), SupervisorError>>,
+    thread: Option<thread::JoinHandle<()>>,
+    terminal_polled: bool,
+}
+
+pub fn spawn_chat_completion_readiness_worker(
+    port: u16,
+    request_model: String,
+    timeout: Duration,
+    interval: Duration,
+) -> Result<ChatCompletionReadinessWorker, SupervisorError> {
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    let worker = thread::Builder::new()
+        .name("loxa-readiness".to_string())
+        .spawn(move || {
+            let result = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime.block_on(run_cancellable_chat_completion_readiness(
+                    cancel_rx,
+                    port,
+                    request_model,
+                    timeout,
+                    interval,
+                )),
+                Err(error) => Some(Err(SupervisorError::Io(error))),
+            };
+            if let Some(result) = result {
+                let _ = result_tx.send(result);
+            }
+        })?;
+
+    Ok(ChatCompletionReadinessWorker {
+        cancel: Some(cancel_tx),
+        result: result_rx,
+        thread: Some(worker),
+        terminal_polled: false,
+    })
+}
+
+impl ChatCompletionReadinessWorker {
+    pub fn poll(&mut self) -> ReadinessWorkerPoll {
+        assert!(
+            !self.terminal_polled,
+            "readiness worker polled after terminal result"
+        );
+        match self.result.try_recv() {
+            Ok(result) => {
+                self.terminal_polled = true;
+                if let Err(error) = self.join_thread() {
+                    return ReadinessWorkerPoll::Failed(error);
+                }
+                match result {
+                    Ok(()) => ReadinessWorkerPoll::Ready,
+                    Err(error) => ReadinessWorkerPoll::Failed(error),
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => ReadinessWorkerPoll::Pending,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.terminal_polled = true;
+                let error = self.join_thread().err().unwrap_or_else(|| {
+                    SupervisorError::Io(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "readiness worker exited without a result",
+                    ))
+                });
+                ReadinessWorkerPoll::Failed(error)
+            }
+        }
+    }
+
+    pub fn cancel_and_join(&mut self) -> Result<(), SupervisorError> {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
+        self.join_thread()
+    }
+
+    fn join_thread(&mut self) -> Result<(), SupervisorError> {
+        let Some(worker) = self.thread.take() else {
+            return Ok(());
+        };
+        worker
+            .join()
+            .map_err(|_| SupervisorError::Io(io::Error::other("readiness worker thread panicked")))
+    }
+}
+
+impl Drop for ChatCompletionReadinessWorker {
+    fn drop(&mut self) {
+        let _ = self.cancel_and_join();
+    }
+}
+
+async fn run_cancellable_chat_completion_readiness(
+    mut cancel: tokio::sync::oneshot::Receiver<()>,
+    port: u16,
+    request_model: String,
+    timeout: Duration,
+    interval: Duration,
+) -> Option<Result<(), SupervisorError>> {
+    tokio::select! {
+        _ = &mut cancel => None,
+        result = wait_for_chat_completion_ready_async(
+            port,
+            &request_model,
+            timeout,
+            interval,
+        ) => Some(result),
+    }
+}
+
+async fn wait_for_chat_completion_ready_async(
+    port: u16,
+    request_model: &str,
+    timeout: Duration,
+    interval: Duration,
+) -> Result<(), SupervisorError> {
+    let started = Instant::now();
+
+    loop {
+        if remaining_before_deadline(started, timeout).is_none() {
+            return Err(SupervisorError::HealthTimeout);
+        }
+
+        if probe_chat_completion_readiness_async(port, request_model, started, timeout).await
+            == ReadinessProbe::Ready
+        {
+            return if remaining_before_deadline(started, timeout).is_some() {
+                Ok(())
+            } else {
+                Err(SupervisorError::HealthTimeout)
+            };
+        }
+
+        let Some(remaining) = remaining_before_deadline(started, timeout) else {
+            return Err(SupervisorError::HealthTimeout);
+        };
+        tokio::time::sleep(sleep_duration(remaining, interval)).await;
+    }
+}
+
+async fn probe_chat_completion_readiness_async(
+    port: u16,
+    request_model: &str,
+    started: Instant,
+    timeout: Duration,
+) -> ReadinessProbe {
+    let Some(remaining) = remaining_before_deadline(started, timeout) else {
+        return ReadinessProbe::NotReady;
+    };
+    let Some(client) = localhost_async_client(remaining) else {
+        return ReadinessProbe::NotReady;
+    };
+    let Ok(health) = client
+        .get(format!("http://127.0.0.1:{port}/health"))
+        .send()
+        .await
+    else {
+        return ReadinessProbe::NotReady;
+    };
+    if !health.status().is_success() {
+        return ReadinessProbe::NotReady;
+    }
+
+    let Some(remaining) = remaining_before_deadline(started, timeout) else {
+        return ReadinessProbe::NotReady;
+    };
+    let Some(client) = localhost_async_client(remaining) else {
+        return ReadinessProbe::NotReady;
+    };
+    let request = serde_json::json!({
+        "model": request_model,
+        "messages": [{"role": "user", "content": "ready"}],
+        "max_tokens": 1,
+        "stream": false,
+    });
+    let Ok(completion) = client
+        .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+        .json(&request)
+        .send()
+        .await
+    else {
+        return ReadinessProbe::NotReady;
+    };
+    if !completion.status().is_success() {
+        return ReadinessProbe::NotReady;
+    }
+    let Ok(body) = completion.text().await else {
+        return ReadinessProbe::NotReady;
+    };
+    let Ok(completion) = serde_json::from_str::<ChatCompletionResponse>(&body) else {
+        return ReadinessProbe::NotReady;
+    };
+    let Some(first) = completion.choices.first() else {
+        return ReadinessProbe::NotReady;
+    };
+    let has_message_content = first
+        .message
+        .as_ref()
+        .and_then(|message| message.content.as_deref())
+        .is_some_and(|content| !content.is_empty());
+    let has_text = first.text.as_deref().is_some_and(|text| !text.is_empty());
+
+    if has_message_content || has_text {
+        ReadinessProbe::Ready
+    } else {
+        ReadinessProbe::NotReady
+    }
+}
+
+fn localhost_async_client(timeout: Duration) -> Option<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(timeout)
+        .build()
+        .ok()
 }
 
 pub fn wait_for_engine_ready_or_exit<C: ManagedChild>(
@@ -1159,6 +1391,102 @@ mod tests {
     }
 
     #[test]
+    fn background_chat_probe_stays_pending_past_caller_poll_and_sends_once() {
+        let server = chat_completion_server(ResponseAction::delayed(
+            Duration::from_millis(400),
+            ResponseAction::chat_completion_message("ready"),
+        ));
+        let mut worker = super::spawn_chat_completion_readiness_worker(
+            server.port(),
+            "default_model".to_string(),
+            Duration::from_secs(2),
+            Duration::from_millis(20),
+        )
+        .expect("spawn background readiness worker");
+
+        thread::sleep(Duration::from_millis(275));
+        assert!(matches!(worker.poll(), super::ReadinessWorkerPoll::Pending));
+        assert!(matches!(
+            wait_for_worker_terminal(&mut worker, Duration::from_secs(2)),
+            super::ReadinessWorkerPoll::Ready
+        ));
+        assert_eq!(
+            server
+                .trace()
+                .iter()
+                .filter(|event| *event == "request /v1/chat/completions")
+                .count(),
+            1,
+            "caller polling must not restart the generation request"
+        );
+        worker
+            .cancel_and_join()
+            .expect("join completed readiness worker");
+    }
+
+    #[test]
+    fn cancelling_background_chat_probe_joins_promptly_and_disconnects_request() {
+        let disconnected = Arc::new(AtomicBool::new(false));
+        let server = chat_completion_server(ResponseAction::observe_disconnect(Arc::clone(
+            &disconnected,
+        )));
+        let mut worker = super::spawn_chat_completion_readiness_worker(
+            server.port(),
+            "default_model".to_string(),
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+        )
+        .expect("spawn cancellable readiness worker");
+        wait_for_trace(
+            &server,
+            "request /v1/chat/completions",
+            Duration::from_secs(1),
+        );
+
+        let started = Instant::now();
+        worker
+            .cancel_and_join()
+            .expect("cancel and join readiness worker");
+
+        assert!(started.elapsed() < Duration::from_millis(250));
+        wait_for_atomic_true(&disconnected, Duration::from_secs(1));
+        assert_eq!(
+            server
+                .trace()
+                .iter()
+                .filter(|event| *event == "request /v1/chat/completions")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn dropping_background_chat_probe_cancels_joins_and_disconnects_request() {
+        let disconnected = Arc::new(AtomicBool::new(false));
+        let server = chat_completion_server(ResponseAction::observe_disconnect(Arc::clone(
+            &disconnected,
+        )));
+        let worker = super::spawn_chat_completion_readiness_worker(
+            server.port(),
+            "default_model".to_string(),
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+        )
+        .expect("spawn drop-safe readiness worker");
+        wait_for_trace(
+            &server,
+            "request /v1/chat/completions",
+            Duration::from_secs(1),
+        );
+
+        let started = Instant::now();
+        drop(worker);
+
+        assert!(started.elapsed() < Duration::from_millis(250));
+        wait_for_atomic_true(&disconnected, Duration::from_secs(1));
+    }
+
+    #[test]
     fn pending_probe_checks_child_again_before_another_poll() {
         let server = ScriptedHttpServer::spawn(vec![("/health", ResponseAction::status(503))]);
         let mut child = FakeChild::with_wait_results([None, Some(1)]);
@@ -1301,6 +1629,46 @@ mod tests {
         );
     }
 
+    fn wait_for_worker_terminal(
+        worker: &mut super::ChatCompletionReadinessWorker,
+        timeout: Duration,
+    ) -> super::ReadinessWorkerPoll {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match worker.poll() {
+                super::ReadinessWorkerPoll::Pending if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                result => return result,
+            }
+        }
+    }
+
+    fn wait_for_trace(server: &ScriptedHttpServer, expected: &str, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if server.trace().iter().any(|event| event == expected) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!(
+            "scripted server did not observe {expected:?}; trace: {:?}",
+            server.trace()
+        );
+    }
+
+    fn wait_for_atomic_true(value: &AtomicBool, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if value.load(Ordering::SeqCst) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("condition did not become true before deadline");
+    }
+
     #[derive(Clone)]
     enum ResponseAction {
         Response {
@@ -1311,6 +1679,11 @@ mod tests {
         },
         Close,
         Stall(Duration),
+        Delayed {
+            duration: Duration,
+            action: Box<ResponseAction>,
+        },
+        ObserveDisconnect(Arc<AtomicBool>),
     }
 
     impl ResponseAction {
@@ -1345,6 +1718,17 @@ mod tests {
                 200,
                 format!(r#"{{"choices":[{{"message":{{"content":{content:?}}}}}]}}"#),
             )
+        }
+
+        fn delayed(duration: Duration, action: Self) -> Self {
+            Self::Delayed {
+                duration,
+                action: Box::new(action),
+            }
+        }
+
+        fn observe_disconnect(observed: Arc<AtomicBool>) -> Self {
+            Self::ObserveDisconnect(observed)
         }
 
         fn with_gate(self, response_gate: ResponseGate) -> Self {
@@ -1387,7 +1771,8 @@ mod tests {
         fn gate(&self) -> Option<ResponseGate> {
             match self {
                 Self::Response { gate, .. } => gate.clone(),
-                Self::Close | Self::Stall(_) => None,
+                Self::Delayed { action, .. } => action.gate(),
+                Self::Close | Self::Stall(_) | Self::ObserveDisconnect(_) => None,
             }
         }
     }
@@ -1599,6 +1984,33 @@ mod tests {
         action: ResponseAction,
         trace: &Arc<Mutex<Vec<String>>>,
     ) {
+        if let ResponseAction::Delayed { duration, action } = action {
+            thread::sleep(duration);
+            return respond(stream, path, *action, trace);
+        }
+        if let ResponseAction::ObserveDisconnect(observed) = action {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut byte = [0_u8; 1];
+            while Instant::now() < deadline {
+                match stream.read(&mut byte) {
+                    Ok(0) => {
+                        observed.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(_) => {
+                        observed.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                }
+            }
+            return;
+        }
         if let ResponseAction::Stall(duration) = action {
             thread::sleep(duration);
             return;
