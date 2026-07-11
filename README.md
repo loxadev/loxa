@@ -2,33 +2,46 @@
 
 [![CI](https://github.com/loxadev/loxa/actions/workflows/ci.yml/badge.svg)](https://github.com/loxadev/loxa/actions/workflows/ci.yml)
 
-Running AI models on your own hardware is still a guessing game. You pick a
-model, wait through a 20GB download, and only then find out it crawls, blows
-past your memory, or breaks the agent you wired it into. Fit labels in other
-tools are estimates. Nobody actually measures.
+Running a local AI model is easy now. Knowing which setup will actually
+handle your agent's workload on your machine is not. A model can load
+fine and still return broken tool calls, run out of memory at the
+context you need, or quietly underperform the other runtime you already
+have installed. Today you find that out during real work.
 
-Loxa measures. It benchmarks speed, memory, and tool-calling reliability on
-your machine, picks the best configuration from those results, and serves it
-through OpenAI and Anthropic compatible APIs. When your cloud provider goes
-down, it fails over to the local setup it already verified.
+Loxa is being built to answer that question before it costs you an
+evening: qualify local AI configurations against a real tool-using
+workload on your own hardware, reject the ones that fail, and keep the
+verified choice running behind one stable endpoint.
 
-## What it does
+## What works today
 
 ```
-loxa doctor    # what this machine has, and what it can actually run
-loxa pull      # download models, checksum verified, resumable
-loxa run       # serve a model locally with a supervised llama-server
-loxa bench     # real numbers: time to first token, tokens/sec, peak memory
+loxa doctor    # hardware report and detected local AI tools
+loxa pull      # download pinned models, SHA-256 verified, resumable
+loxa list      # registry and download status
+loxa run       # serve a model with a supervised llama-server
+loxa ps        # show the managed server
+loxa stop      # stop it cleanly, no orphan processes
 ```
 
-Every download is SHA-256 verified against a pinned registry. Every server
-is supervised: clean shutdown, no orphan processes. Every recommendation
-comes from a benchmark that ran on your hardware, not a lookup table.
+Downloads are verified against pinned checksums. The managed server has
+a race-tested lifecycle: clean shutdown, crash recovery, one bounded
+restart, no orphans.
+
+## What is being built now
+
+Workload qualification: run the same tool-use workload against two
+candidate setups, a Loxa-managed llama-server and an existing Ollama
+install, on your machine. Reject candidates that fail correctness,
+context, stability, or memory gates. Select the winner with recorded
+evidence, or say honestly that no verified plan exists. Then serve that
+choice at one stable endpoint.
 
 ## Status
 
-Early development. The CLI works on macOS (Apple silicon) and builds on
-Linux. Expect sharp edges before 0.1.0.
+Early development. macOS (Apple silicon) first; builds on Linux. The
+qualification loop described above is in active development and not
+released yet. Expect sharp edges before 0.1.0.
 
 ## License
 
