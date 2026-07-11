@@ -315,6 +315,7 @@ impl ProviderAdapter for OllamaAdapter {
                 "temperature": 0.0,
                 "top_p": 1.0,
                 "seed": 1,
+                "num_ctx": self.identity.context_tokens,
                 "num_predict": request.max_tokens
             }
         });
@@ -1008,6 +1009,7 @@ mod tests {
                 "temperature": 0.0,
                 "top_p": 1.0,
                 "seed": 1,
+                "num_ctx": 8192,
                 "num_predict": 128
             }
         });
@@ -1120,6 +1122,7 @@ mod tests {
                 "temperature": 0.0,
                 "top_p": 1.0,
                 "seed": 1,
+                "num_ctx": 8192,
                 "num_predict": 64
             }
         });
