@@ -1,7 +1,8 @@
 use crate::evidence::{
     CalibrationEvidence, CandidateEvidence, DisclosedDifference, EvidenceError, EvidenceVerdict,
     HostFingerprint, IsolationObservation, MeasurementEvidence, QualificationEvidence,
-    SelectionDisposition, SelectionRecord, EVIDENCE_SCHEMA_VERSION, SELECTION_SCHEMA_VERSION,
+    SelectionDisposition, SelectionRecord, CALIBRATION_PROTOCOL_VERSION, EVIDENCE_SCHEMA_VERSION,
+    SELECTION_SCHEMA_VERSION,
 };
 use crate::provider::{ControlledRun, ProviderAdapter, ProviderError, ProviderMessage};
 use crate::selector::{self, CandidateQualification, MeasuredRepetition, SelectorVerdict};
@@ -1090,7 +1091,7 @@ fn base_evidence(
     };
     CalibrationEvidence {
         schema_version: EVIDENCE_SCHEMA_VERSION,
-        protocol_version: "calibration-v1".into(),
+        protocol_version: CALIBRATION_PROTOCOL_VERSION.into(),
         workload_version: workload::WORKLOAD_VERSION.into(),
         policy_version: "selector-v1".into(),
         started_at_unix_ms,
@@ -2297,6 +2298,12 @@ Error: No CPU power status with error code 0xe00002bc\n"
         )
         .unwrap();
         assert!(outcome.evidence_path.as_ref().is_some_and(|p| p.is_file()));
+        let persisted = crate::evidence::read_evidence_json(
+            &fs::read(outcome.evidence_path.as_ref().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted.protocol_version, "calibration-v2");
+        assert_eq!(persisted.workload_version, "tool-use-v1");
         assert!(selection.is_file());
         fs::remove_dir_all(root).unwrap();
     }

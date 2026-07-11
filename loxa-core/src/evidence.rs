@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const EVIDENCE_SCHEMA_VERSION: u32 = 1;
 pub const SELECTION_SCHEMA_VERSION: u32 = 1;
-pub const CALIBRATION_PROTOCOL_VERSION: &str = "calibration-v1";
+pub const CALIBRATION_PROTOCOL_VERSION: &str = "calibration-v2";
 pub const SELECTION_POLICY_VERSION: &str = "selector-v1";
 
 static UNIQUE_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -920,7 +920,7 @@ mod tests {
         let attached_fingerprint = attached.fingerprint();
         CalibrationEvidence {
             schema_version: EVIDENCE_SCHEMA_VERSION,
-            protocol_version: "calibration-v1".into(),
+            protocol_version: CALIBRATION_PROTOCOL_VERSION.into(),
             workload_version: "tool-use-v1".into(),
             policy_version: "selector-v1".into(),
             started_at_unix_ms: 1_700_000_000_000,

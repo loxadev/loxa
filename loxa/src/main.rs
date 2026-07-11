@@ -2528,7 +2528,7 @@ mod tests {
         loxa_core::calibration::CalibrationOutcome {
             evidence: CalibrationEvidence {
                 schema_version: 1,
-                protocol_version: "calibration-v1".into(),
+                protocol_version: CALIBRATION_PROTOCOL_VERSION.into(),
                 workload_version: "tool-use-v1".into(),
                 policy_version: "selector-v1".into(),
                 started_at_unix_ms: 1,
