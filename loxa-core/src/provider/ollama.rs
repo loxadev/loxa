@@ -64,18 +64,19 @@ impl OllamaAdapter {
                 "ollama model inventory has duplicate exact model {model}"
             )));
         }
-        let artifact_digest = selected
-            .get("digest")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                ProviderError::Protocol("ollama model inventory is missing digest".into())
-            })?;
-        validate_sha256_digest(artifact_digest)?;
+        let observed_artifact_digest =
+            selected
+                .get("digest")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ProviderError::Protocol("ollama model inventory is missing digest".into())
+                })?;
+        let artifact_digest = canonicalize_observed_sha256(observed_artifact_digest)?;
         validate_loaded_models(&loaded, model)?;
 
         Ok(OllamaPreflight {
             provider_version: provider_version.to_string(),
-            artifact_digest: artifact_digest.to_string(),
+            artifact_digest,
         })
     }
 
@@ -254,7 +255,7 @@ impl ProviderAdapter for OllamaAdapter {
                 ProviderError::Identity("ollama model inventory is missing digest".into())
             })?;
         validate_sha256_digest(&self.identity.artifact_digest)?;
-        validate_sha256_digest(observed_digest)?;
+        let observed_digest = canonicalize_observed_sha256(observed_digest)?;
         if self.identity.artifact_digest != observed_digest {
             return Err(ProviderError::Identity(format!(
                 "ollama model digest mismatch for {}",
@@ -386,6 +387,15 @@ fn validate_sha256_digest(digest: &str) -> Result<&str, ProviderError> {
         ));
     }
     Ok(hex)
+}
+
+fn canonicalize_observed_sha256(digest: &str) -> Result<String, ProviderError> {
+    if validate_sha256_digest(digest).is_ok() {
+        return Ok(digest.to_string());
+    }
+    let canonical = format!("sha256:{digest}");
+    validate_sha256_digest(&canonical)?;
+    Ok(canonical)
 }
 
 fn normalize_events(events: Vec<TimedJsonEvent>) -> Result<InvocationObservation, ProviderError> {
@@ -698,6 +708,17 @@ mod tests {
         })
     }
 
+    fn bare_digest_tags(identity: &CandidateIdentity) -> Value {
+        json!({
+            "models": [{
+                "name": identity.model_id,
+                "model": identity.model_id,
+                "digest": identity.artifact_digest.strip_prefix("sha256:").unwrap(),
+                "details": {"quantization_level": "Q4_K_M"}
+            }]
+        })
+    }
+
     fn valid_show() -> Value {
         json!({
             "template": "{{ .System }} {{ .Prompt }}",
@@ -752,6 +773,27 @@ mod tests {
                 artifact_digest: candidate.artifact_digest.clone(),
             })
         );
+        assert_fixtures_consumed(&expected);
+    }
+
+    #[test]
+    fn preflight_canonicalizes_real_ollama_bare_sha256_digest() {
+        let candidate = identity();
+        let fixtures = preflight_fixtures(
+            json!({"version": candidate.provider_version}),
+            bare_digest_tags(&candidate),
+            json!({"models": [{"name": candidate.model_id, "model": candidate.model_id}]}),
+        );
+        let (transport, expected) = fake_transport(fixtures);
+
+        let result = OllamaAdapter::preflight_with_transport(
+            "http://127.0.0.1:11434",
+            &candidate.model_id,
+            transport,
+        )
+        .unwrap();
+
+        assert_eq!(result.artifact_digest, candidate.artifact_digest);
         assert_fixtures_consumed(&expected);
     }
 
@@ -931,6 +973,27 @@ mod tests {
             transport,
         );
         assert!(matches!(adapter.inspect(), Err(ProviderError::Identity(_))));
+        assert_fixtures_consumed(&expected);
+    }
+
+    #[test]
+    fn ollama_inspection_matches_real_bare_digest_to_canonical_identity() {
+        let candidate = identity();
+        let fixtures = inspection_fixtures(
+            &candidate,
+            json!({"version": candidate.provider_version}),
+            bare_digest_tags(&candidate),
+            valid_show(),
+        );
+        let (transport, expected) = fake_transport(fixtures);
+        let mut adapter = OllamaAdapter::with_transport(
+            candidate.clone(),
+            "http://127.0.0.1:11434",
+            candidate.model_id.clone(),
+            transport,
+        );
+
+        assert_eq!(adapter.inspect(), Ok(()));
         assert_fixtures_consumed(&expected);
     }
 
@@ -1129,7 +1192,7 @@ mod tests {
             }]}),
             json!({"models": [{
                 "name": "gemma3:4b",
-                "digest": "04a43a22e8d2003deda5acc262f68ec1005fa76c735a9962a8c77042a74a7d19"
+                "digest": "04a43a22e8d2003deda5acc262f68ec1005fa76c735a9962a8c77042a74a7d18"
             }]}),
             json!({"models": [{
                 "name": "gemma3:4b-latest",
