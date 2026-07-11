@@ -1,4 +1,5 @@
 use super::{ManagedChild, SupervisorError};
+use crate::engine::ReadinessStrategy;
 use serde::Deserialize;
 use std::net::{SocketAddr, TcpListener};
 use std::thread;
@@ -23,6 +24,25 @@ struct ModelsResponse {
 #[derive(Deserialize)]
 struct ModelDescriptor {
     id: String,
+}
+
+#[derive(Deserialize)]
+struct ChatCompletionResponse {
+    choices: Vec<ChatCompletionChoice>,
+}
+
+#[derive(Deserialize)]
+struct ChatCompletionChoice {
+    #[serde(default)]
+    message: Option<ChatCompletionMessage>,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ChatCompletionMessage {
+    #[serde(default)]
+    content: Option<String>,
 }
 
 pub struct LocalhostPortReservation {
@@ -56,6 +76,23 @@ impl LocalhostPortReservation {
         }
         drop(self.listener);
         Ok(())
+    }
+}
+
+pub fn wait_for_engine_ready_or_exit<C: ManagedChild>(
+    child: &mut C,
+    port: u16,
+    strategy: &ReadinessStrategy,
+    timeout: Duration,
+    interval: Duration,
+) -> Result<(), SupervisorError> {
+    match strategy {
+        ReadinessStrategy::LlamaModelAlias { expected_alias } => {
+            wait_for_generation_ready_or_exit(child, port, expected_alias, timeout, interval)
+        }
+        ReadinessStrategy::ChatCompletionProbe { request_model } => {
+            wait_for_chat_completion_ready_or_exit(child, port, request_model, timeout, interval)
+        }
     }
 }
 
@@ -98,6 +135,123 @@ pub fn wait_for_generation_ready_or_exit<C: ManagedChild>(
             thread::sleep(sleep_for);
         }
     }
+}
+
+fn wait_for_chat_completion_ready_or_exit<C: ManagedChild>(
+    child: &mut C,
+    port: u16,
+    request_model: &str,
+    timeout: Duration,
+    interval: Duration,
+) -> Result<(), SupervisorError> {
+    let started = Instant::now();
+
+    loop {
+        return_if_child_exited(child)?;
+
+        if remaining_before_deadline(started, timeout).is_none() {
+            return_if_child_exited(child)?;
+            return Err(SupervisorError::HealthTimeout);
+        }
+
+        let probe = probe_chat_completion_readiness(child, port, request_model, started, timeout)?;
+
+        if probe == ReadinessProbe::Ready {
+            return_if_child_exited(child)?;
+            if remaining_before_deadline(started, timeout).is_some() {
+                return Ok(());
+            }
+            return_if_child_exited(child)?;
+            return Err(SupervisorError::HealthTimeout);
+        }
+
+        return_if_child_exited(child)?;
+        let Some(remaining) = remaining_before_deadline(started, timeout) else {
+            return_if_child_exited(child)?;
+            return Err(SupervisorError::HealthTimeout);
+        };
+        let sleep_for = sleep_duration(remaining, interval);
+        if !sleep_for.is_zero() {
+            thread::sleep(sleep_for);
+            return_if_child_exited(child)?;
+        }
+    }
+}
+
+fn probe_chat_completion_readiness<C: ManagedChild>(
+    child: &mut C,
+    port: u16,
+    request_model: &str,
+    started: Instant,
+    timeout: Duration,
+) -> Result<ReadinessProbe, SupervisorError> {
+    let Some(remaining) = remaining_before_deadline(started, timeout) else {
+        return Ok(ReadinessProbe::NotReady);
+    };
+    let Some(client) = localhost_client(remaining) else {
+        return Ok(ReadinessProbe::NotReady);
+    };
+
+    return_if_child_exited(child)?;
+    let health = client.get(format!("http://127.0.0.1:{port}/health")).send();
+    return_if_child_exited(child)?;
+    let Ok(health) = health else {
+        return Ok(ReadinessProbe::NotReady);
+    };
+    if !health.status().is_success() {
+        return Ok(ReadinessProbe::NotReady);
+    }
+
+    let Some(remaining) = remaining_before_deadline(started, timeout) else {
+        return Ok(ReadinessProbe::NotReady);
+    };
+    let Some(client) = localhost_client(remaining) else {
+        return Ok(ReadinessProbe::NotReady);
+    };
+    let request = serde_json::json!({
+        "model": request_model,
+        "messages": [{"role": "user", "content": "ready"}],
+        "max_tokens": 1,
+        "stream": false,
+    });
+
+    return_if_child_exited(child)?;
+    let completion = client
+        .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+        .json(&request)
+        .send();
+    return_if_child_exited(child)?;
+    let Ok(completion) = completion else {
+        return Ok(ReadinessProbe::NotReady);
+    };
+    if !completion.status().is_success() {
+        return Ok(ReadinessProbe::NotReady);
+    }
+
+    return_if_child_exited(child)?;
+    let body = completion.text();
+    return_if_child_exited(child)?;
+    let Ok(body) = body else {
+        return Ok(ReadinessProbe::NotReady);
+    };
+    let Ok(completion) = serde_json::from_str::<ChatCompletionResponse>(&body) else {
+        return Ok(ReadinessProbe::NotReady);
+    };
+    let Some(first) = completion.choices.first() else {
+        return Ok(ReadinessProbe::NotReady);
+    };
+    let has_message_content = first
+        .message
+        .as_ref()
+        .and_then(|message| message.content.as_deref())
+        .is_some_and(|content| !content.is_empty());
+    let has_text = first.text.as_deref().is_some_and(|text| !text.is_empty());
+
+    Ok(if has_message_content || has_text {
+        ReadinessProbe::Ready
+    } else {
+        ReadinessProbe::NotReady
+    })
 }
 
 fn return_if_child_exited<C: ManagedChild>(child: &mut C) -> Result<(), SupervisorError> {
@@ -784,6 +938,226 @@ mod tests {
     }
 
     #[test]
+    fn chat_completion_health_alone_remains_pending() {
+        let server = ScriptedHttpServer::spawn(vec![
+            ("/health", ResponseAction::status(200)),
+            ("/v1/chat/completions", ResponseAction::Close),
+        ]);
+        let mut child = FakeChild::running();
+
+        let error = wait_for_chat_completion_under_test(
+            &mut child,
+            server.port(),
+            "default_model",
+            Duration::from_millis(80),
+            Duration::from_millis(20),
+        )
+        .expect_err("health without generated output must remain pending");
+
+        assert!(matches!(error, SupervisorError::HealthTimeout));
+        let trace = server.trace();
+        assert!(trace.iter().any(|event| event == "request /health"));
+        assert!(trace
+            .iter()
+            .any(|event| event == "request /v1/chat/completions"));
+    }
+
+    #[test]
+    fn valid_first_chat_completion_choice_becomes_ready_with_exact_probe_request() {
+        let server = chat_completion_server(ResponseAction::chat_completion_message("ready"));
+        let mut child = FakeChild::running();
+
+        wait_for_chat_completion_under_test(
+            &mut child,
+            server.port(),
+            "default_model",
+            Duration::from_secs(1),
+            Duration::from_millis(20),
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "valid completion must become ready: {error}; trace: {:?}",
+                server.trace()
+            )
+        });
+
+        let requests = server.requests();
+        let completion = requests
+            .iter()
+            .find(|request| request.path == "/v1/chat/completions")
+            .expect("completion probe request");
+        assert_eq!(completion.method, "POST");
+        let body: serde_json::Value =
+            serde_json::from_str(&completion.body).expect("completion probe JSON");
+        assert_eq!(body["model"], "default_model");
+        assert_eq!(body["stream"], false);
+        assert_eq!(body["max_tokens"], 1);
+        assert_eq!(body["messages"].as_array().map(Vec::len), Some(1));
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert!(body["messages"][0]["content"].is_string());
+    }
+
+    #[test]
+    fn chat_completion_text_choice_becomes_ready() {
+        let server = chat_completion_server(ResponseAction::response(
+            200,
+            r#"{"choices":[{"text":"ready"}]}"#,
+        ));
+        let mut child = FakeChild::running();
+
+        wait_for_chat_completion_under_test(
+            &mut child,
+            server.port(),
+            "default_model",
+            Duration::from_secs(1),
+            Duration::from_millis(20),
+        )
+        .expect("valid text completion must become ready");
+    }
+
+    #[test]
+    fn chat_completion_redirect_is_not_ready_and_is_not_followed() {
+        let server = ScriptedHttpServer::spawn(vec![
+            ("/health", ResponseAction::status(200)),
+            (
+                "/v1/chat/completions",
+                ResponseAction::redirect(307, "/redirected-completion"),
+            ),
+            (
+                "/redirected-completion",
+                ResponseAction::chat_completion_message("ready"),
+            ),
+        ]);
+
+        assert_chat_completion_times_out(&server);
+        assert!(!server
+            .trace()
+            .iter()
+            .any(|event| event.contains("/redirected-completion")));
+    }
+
+    #[test]
+    fn chat_completion_timeout_is_bounded_by_the_single_startup_deadline() {
+        let server = ScriptedHttpServer::spawn(vec![
+            ("/health", ResponseAction::status(200)),
+            (
+                "/v1/chat/completions",
+                ResponseAction::Stall(Duration::from_millis(150)),
+            ),
+        ]);
+        let mut child = FakeChild::running();
+        let started = Instant::now();
+
+        let error = wait_for_chat_completion_under_test(
+            &mut child,
+            server.port(),
+            "default_model",
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+        )
+        .expect_err("stalled completion must time out");
+
+        assert!(matches!(error, SupervisorError::HealthTimeout));
+        assert!(started.elapsed() < Duration::from_millis(140));
+    }
+
+    #[test]
+    fn non_success_chat_completion_status_is_not_ready() {
+        let server = chat_completion_server(ResponseAction::response(503, "{}"));
+        assert_chat_completion_times_out(&server);
+    }
+
+    #[test]
+    fn malformed_chat_completion_json_is_not_ready() {
+        let server = chat_completion_server(ResponseAction::response(200, "{malformed"));
+        assert_chat_completion_times_out(&server);
+    }
+
+    #[test]
+    fn empty_chat_completion_choices_are_not_ready() {
+        let server = chat_completion_server(ResponseAction::response(200, r#"{"choices":[]}"#));
+        assert_chat_completion_times_out(&server);
+    }
+
+    #[test]
+    fn only_the_first_chat_completion_choice_can_establish_readiness() {
+        let server = chat_completion_server(ResponseAction::response(
+            200,
+            r#"{"choices":[{}, {"message":{"content":"ready"}}]}"#,
+        ));
+        assert_chat_completion_times_out(&server);
+    }
+
+    #[test]
+    fn chat_completion_choice_without_content_or_text_is_not_ready() {
+        for body in [
+            r#"{"choices":[{}]}"#,
+            r#"{"choices":[{"message":{}}]}"#,
+            r#"{"choices":[{"message":{"content":""},"text":""}]}"#,
+        ] {
+            let server = chat_completion_server(ResponseAction::response(200, body));
+            assert_chat_completion_times_out(&server);
+        }
+    }
+
+    #[test]
+    fn child_exit_before_chat_probe_wins_without_requests() {
+        let server = chat_completion_server(ResponseAction::chat_completion_message("ready"));
+        let mut child = FakeChild::with_wait_results([Some(1)]);
+
+        let error = wait_for_chat_completion_under_test(
+            &mut child,
+            server.port(),
+            "default_model",
+            Duration::from_millis(500),
+            Duration::from_millis(20),
+        )
+        .expect_err("exited child must win before the chat probe");
+
+        assert!(matches!(error, SupervisorError::ChildExitedEarly(message) if message.is_empty()));
+        assert!(server.trace().is_empty());
+    }
+
+    #[test]
+    fn child_exit_during_chat_completion_request_wins_after_the_blocking_phase() {
+        let server = chat_completion_server(ResponseAction::chat_completion_message("ready"));
+        let mut child = FakeChild::with_wait_results([None, None, None, None, Some(1)]);
+
+        let error = wait_for_chat_completion_under_test(
+            &mut child,
+            server.port(),
+            "default_model",
+            Duration::from_millis(500),
+            Duration::from_millis(20),
+        )
+        .expect_err("child exit during completion request must win");
+
+        assert!(matches!(error, SupervisorError::ChildExitedEarly(message) if message.is_empty()));
+        assert!(server
+            .trace()
+            .iter()
+            .any(|event| event == "response /v1/chat/completions 200"));
+    }
+
+    #[test]
+    fn child_exit_after_valid_chat_completion_wins_before_ready() {
+        let server = chat_completion_server(ResponseAction::chat_completion_message("ready"));
+        let mut child =
+            FakeChild::with_wait_results([None, None, None, None, None, None, None, Some(1)]);
+
+        let error = wait_for_chat_completion_under_test(
+            &mut child,
+            server.port(),
+            "default_model",
+            Duration::from_millis(500),
+            Duration::from_millis(20),
+        )
+        .expect_err("child exit after valid completion must win before ready");
+
+        assert!(matches!(error, SupervisorError::ChildExitedEarly(message) if message.is_empty()));
+    }
+
+    #[test]
     fn pending_probe_checks_child_again_before_another_poll() {
         let server = ScriptedHttpServer::spawn(vec![("/health", ResponseAction::status(503))]);
         let mut child = FakeChild::with_wait_results([None, Some(1)]);
@@ -857,6 +1231,24 @@ mod tests {
         super::wait_for_generation_ready_or_exit(child, port, expected_alias, timeout, interval)
     }
 
+    fn wait_for_chat_completion_under_test<C: super::super::ManagedChild>(
+        child: &mut C,
+        port: u16,
+        request_model: &str,
+        timeout: Duration,
+        interval: Duration,
+    ) -> Result<(), SupervisorError> {
+        super::wait_for_engine_ready_or_exit(
+            child,
+            port,
+            &crate::engine::ReadinessStrategy::ChatCompletionProbe {
+                request_model: request_model.to_string(),
+            },
+            timeout,
+            interval,
+        )
+    }
+
     fn assert_times_out(server: &ScriptedHttpServer, expected_alias: &str) {
         let mut child = FakeChild::running();
         let error = wait_under_test(
@@ -884,6 +1276,30 @@ mod tests {
         ])
     }
 
+    fn chat_completion_server(action: ResponseAction) -> ScriptedHttpServer {
+        ScriptedHttpServer::spawn(vec![
+            ("/health", ResponseAction::status(200)),
+            ("/v1/chat/completions", action),
+        ])
+    }
+
+    fn assert_chat_completion_times_out(server: &ScriptedHttpServer) {
+        let mut child = FakeChild::running();
+        let error = wait_for_chat_completion_under_test(
+            &mut child,
+            server.port(),
+            "default_model",
+            Duration::from_millis(80),
+            Duration::from_millis(20),
+        )
+        .expect_err("invalid completion readiness must remain pending");
+        assert!(
+            matches!(error, SupervisorError::HealthTimeout),
+            "unexpected readiness result: {error}; trace: {:?}",
+            server.trace()
+        );
+    }
+
     #[derive(Clone)]
     enum ResponseAction {
         Response {
@@ -893,6 +1309,7 @@ mod tests {
             gate: Option<ResponseGate>,
         },
         Close,
+        Stall(Duration),
     }
 
     impl ResponseAction {
@@ -920,6 +1337,13 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(",");
             Self::response(200, format!(r#"{{"object":"list","data":[{data}]}}"#))
+        }
+
+        fn chat_completion_message(content: &str) -> Self {
+            Self::response(
+                200,
+                format!(r#"{{"choices":[{{"message":{{"content":{content:?}}}}}]}}"#),
+            )
         }
 
         fn with_gate(self, response_gate: ResponseGate) -> Self {
@@ -962,7 +1386,7 @@ mod tests {
         fn gate(&self) -> Option<ResponseGate> {
             match self {
                 Self::Response { gate, .. } => gate.clone(),
-                Self::Close => None,
+                Self::Close | Self::Stall(_) => None,
             }
         }
     }
@@ -1016,6 +1440,7 @@ mod tests {
     struct ScriptedHttpServer {
         port: u16,
         trace: Arc<Mutex<Vec<String>>>,
+        requests: Arc<Mutex<Vec<ScriptedRequest>>>,
         stop: Arc<AtomicBool>,
         gates: Vec<ResponseGate>,
         handle: Option<thread::JoinHandle<()>>,
@@ -1031,6 +1456,8 @@ mod tests {
             let trace = Arc::new(Mutex::new(Vec::new()));
             let stop = Arc::new(AtomicBool::new(false));
             let server_trace = Arc::clone(&trace);
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let server_requests = Arc::clone(&requests);
             let server_stop = Arc::clone(&stop);
             let gates = routes
                 .iter()
@@ -1041,7 +1468,12 @@ mod tests {
                 while !server_stop.load(Ordering::SeqCst) {
                     match listener.accept() {
                         Ok((mut stream, _address)) => {
-                            let path = read_request_path(&mut stream);
+                            let request = read_request(&mut stream);
+                            let path = request.path.clone();
+                            server_requests
+                                .lock()
+                                .expect("lock scripted requests")
+                                .push(request);
                             record_trace(&server_trace, format!("request {path}"));
                             let action = routes
                                 .iter()
@@ -1061,6 +1493,7 @@ mod tests {
             Self {
                 port,
                 trace,
+                requests,
                 stop,
                 gates,
                 handle: Some(handle),
@@ -1073,6 +1506,13 @@ mod tests {
 
         fn trace(&self) -> Vec<String> {
             self.trace.lock().expect("lock request trace").clone()
+        }
+
+        fn requests(&self) -> Vec<ScriptedRequest> {
+            self.requests
+                .lock()
+                .expect("lock scripted requests")
+                .clone()
         }
     }
 
@@ -1095,23 +1535,57 @@ mod tests {
         }
     }
 
-    fn read_request_path(stream: &mut TcpStream) -> String {
-        let mut bytes = [0_u8; 1024];
+    #[derive(Clone, Debug)]
+    struct ScriptedRequest {
+        method: String,
+        path: String,
+        body: String,
+    }
+
+    fn read_request(stream: &mut TcpStream) -> ScriptedRequest {
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 1024];
         let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
-        let read = stream.read(&mut bytes).unwrap_or(0);
-        let request = String::from_utf8_lossy(&bytes[..read]);
-        request
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .map(str::to_string)
-            .unwrap_or_else(|| {
+        loop {
+            let read = stream.read(&mut chunk).unwrap_or(0);
+            bytes.extend_from_slice(&chunk[..read]);
+            let Some(headers_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
                 if read == 0 {
-                    "<eof>".to_string()
-                } else {
-                    format!("<invalid:{request:?}>")
+                    break;
                 }
-            })
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&bytes[..headers_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if bytes.len() >= headers_end + 4 + content_length || read == 0 {
+                break;
+            }
+        }
+        let request = String::from_utf8_lossy(&bytes);
+        let request_line = request.lines().next().unwrap_or_default();
+        let mut request_parts = request_line.split_whitespace();
+        let method = request_parts.next().unwrap_or_default().to_string();
+        let path = request_parts.next().map(str::to_string).unwrap_or_else(|| {
+            if bytes.is_empty() {
+                "<eof>".to_string()
+            } else {
+                format!("<invalid:{request:?}>")
+            }
+        });
+        let body = request
+            .split_once("\r\n\r\n")
+            .map(|(_headers, body)| body.to_string())
+            .unwrap_or_default();
+        ScriptedRequest { method, path, body }
     }
 
     fn respond(
@@ -1120,6 +1594,10 @@ mod tests {
         action: ResponseAction,
         trace: &Arc<Mutex<Vec<String>>>,
     ) {
+        if let ResponseAction::Stall(duration) = action {
+            thread::sleep(duration);
+            return;
+        }
         let ResponseAction::Response {
             status,
             body,

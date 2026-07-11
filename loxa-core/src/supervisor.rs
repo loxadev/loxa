@@ -26,8 +26,9 @@ pub use lifecycle::{
     OwnerTerminalOutcome, PostSpawnCleanupOutcome, SpawnStartingRunOutcome,
 };
 pub use readiness::{
-    process_start_time_with_retry, reserve_localhost_port, wait_for_generation_ready_or_exit,
-    LocalhostPortReservation, PROCESS_IDENTITY_POLL_INTERVAL, PROCESS_IDENTITY_TIMEOUT,
+    process_start_time_with_retry, reserve_localhost_port, wait_for_engine_ready_or_exit,
+    wait_for_generation_ready_or_exit, LocalhostPortReservation, PROCESS_IDENTITY_POLL_INTERVAL,
+    PROCESS_IDENTITY_TIMEOUT,
 };
 pub use state::{
     create_starting_run, current_runtime_state_run, finish_runtime_state_run, read_runtime_state,
