@@ -1,0 +1,160 @@
+/* Loxa canonical tokens v1.0.0 — source: loxa.tokens.json */
+
+:root {
+  --loxa-color-ink: #101410;
+  --loxa-color-snow: #F4F6F0;
+  --loxa-color-mineral: #69716C;
+  --loxa-color-glacier: #C5DDD4;
+  --loxa-color-signal: #B7ED62;
+
+  --loxa-font-sans: "Instrument Sans", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --loxa-font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+
+  --loxa-type-display-family: var(--loxa-font-sans);
+  --loxa-type-display-size: 64px;
+  --loxa-type-display-weight: 600;
+  --loxa-type-display-line-height: 1;
+  --loxa-type-display-letter-spacing: -0.055em;
+  --loxa-type-h1-family: var(--loxa-font-sans);
+  --loxa-type-h1-size: 48px;
+  --loxa-type-h1-weight: 600;
+  --loxa-type-h1-line-height: 1.05;
+  --loxa-type-h1-letter-spacing: -0.045em;
+  --loxa-type-h2-family: var(--loxa-font-sans);
+  --loxa-type-h2-size: 36px;
+  --loxa-type-h2-weight: 600;
+  --loxa-type-h2-line-height: 1.1;
+  --loxa-type-h2-letter-spacing: -0.04em;
+  --loxa-type-h3-family: var(--loxa-font-sans);
+  --loxa-type-h3-size: 28px;
+  --loxa-type-h3-weight: 600;
+  --loxa-type-h3-line-height: 1.2;
+  --loxa-type-h3-letter-spacing: -0.03em;
+  --loxa-type-title-family: var(--loxa-font-sans);
+  --loxa-type-title-size: 20px;
+  --loxa-type-title-weight: 600;
+  --loxa-type-title-line-height: 1.3;
+  --loxa-type-title-letter-spacing: -0.02em;
+  --loxa-type-body-large-family: var(--loxa-font-sans);
+  --loxa-type-body-large-size: 18px;
+  --loxa-type-body-large-weight: 400;
+  --loxa-type-body-large-line-height: 1.6;
+  --loxa-type-body-large-letter-spacing: -0.015em;
+  --loxa-type-body-family: var(--loxa-font-sans);
+  --loxa-type-body-size: 16px;
+  --loxa-type-body-weight: 400;
+  --loxa-type-body-line-height: 1.6;
+  --loxa-type-body-letter-spacing: -0.01em;
+  --loxa-type-body-small-family: var(--loxa-font-sans);
+  --loxa-type-body-small-size: 14px;
+  --loxa-type-body-small-weight: 400;
+  --loxa-type-body-small-line-height: 1.5;
+  --loxa-type-body-small-letter-spacing: 0em;
+  --loxa-type-label-family: var(--loxa-font-sans);
+  --loxa-type-label-size: 13px;
+  --loxa-type-label-weight: 500;
+  --loxa-type-label-line-height: 1.3;
+  --loxa-type-label-letter-spacing: 0em;
+  --loxa-type-label-caps-family: var(--loxa-font-mono);
+  --loxa-type-label-caps-size: 12px;
+  --loxa-type-label-caps-weight: 500;
+  --loxa-type-label-caps-line-height: 1.3;
+  --loxa-type-label-caps-letter-spacing: 0.08em;
+  --loxa-type-code-family: var(--loxa-font-mono);
+  --loxa-type-code-size: 14px;
+  --loxa-type-code-weight: 400;
+  --loxa-type-code-line-height: 1.6;
+  --loxa-type-code-letter-spacing: 0em;
+  --loxa-type-code-compact-family: var(--loxa-font-mono);
+  --loxa-type-code-compact-size: 12px;
+  --loxa-type-code-compact-weight: 400;
+  --loxa-type-code-compact-line-height: 1.5;
+  --loxa-type-code-compact-letter-spacing: 0em;
+
+  --loxa-space-1: 4px;
+  --loxa-space-2: 8px;
+  --loxa-space-3: 12px;
+  --loxa-space-4: 16px;
+  --loxa-space-6: 24px;
+  --loxa-space-8: 32px;
+  --loxa-space-12: 48px;
+  --loxa-space-16: 64px;
+  --loxa-space-24: 96px;
+  --loxa-space-32: 128px;
+
+  --loxa-radius-sm: 4px;
+  --loxa-radius-md: 6px;
+  --loxa-radius-lg: 8px;
+  --loxa-radius-xl: 12px;
+
+  --loxa-motion-fast: 150ms;
+  --loxa-motion-theme: 190ms;
+  --loxa-motion-slow: 250ms;
+  --loxa-motion-easing: ease;
+
+  --loxa-component-minimum-interactive-target: 44px;
+}
+
+:root,
+[data-loxa-theme='light'] {
+  color-scheme: light;
+  --loxa-light-background: #F4F6F0;
+  --loxa-light-foreground: #101410;
+  --loxa-light-muted-foreground: #555C58;
+  --loxa-light-secondary-surface: #E4EEE7;
+  --loxa-light-control-border: #69716C;
+  --loxa-light-selected-surface: #69716C;
+  --loxa-light-selected-foreground: #F4F6F0;
+  --loxa-light-focus: #101410;
+  --loxa-light-accent: #B7ED62;
+  --loxa-light-accent-foreground: #101410;
+
+  --loxa-background: var(--loxa-light-background);
+  --loxa-foreground: var(--loxa-light-foreground);
+  --loxa-muted-foreground: var(--loxa-light-muted-foreground);
+  --loxa-secondary-surface: var(--loxa-light-secondary-surface);
+  --loxa-control-border: var(--loxa-light-control-border);
+  --loxa-selected-surface: var(--loxa-light-selected-surface);
+  --loxa-selected-foreground: var(--loxa-light-selected-foreground);
+  --loxa-focus: var(--loxa-light-focus);
+  --loxa-accent: var(--loxa-light-accent);
+  --loxa-accent-foreground: var(--loxa-light-accent-foreground);
+}
+
+[data-loxa-theme='dark'] {
+  color-scheme: dark;
+  --loxa-dark-background: #101410;
+  --loxa-dark-foreground: #F4F6F0;
+  --loxa-dark-muted-foreground: #C5DDD4;
+  --loxa-dark-secondary-surface: #202420;
+  --loxa-dark-control-border: #C5DDD4;
+  --loxa-dark-selected-surface: #C5DDD4;
+  --loxa-dark-selected-foreground: #101410;
+  --loxa-dark-focus: #B7ED62;
+  --loxa-dark-accent: #B7ED62;
+  --loxa-dark-accent-foreground: #101410;
+
+  --loxa-background: var(--loxa-dark-background);
+  --loxa-foreground: var(--loxa-dark-foreground);
+  --loxa-muted-foreground: var(--loxa-dark-muted-foreground);
+  --loxa-secondary-surface: var(--loxa-dark-secondary-surface);
+  --loxa-control-border: var(--loxa-dark-control-border);
+  --loxa-selected-surface: var(--loxa-dark-selected-surface);
+  --loxa-selected-foreground: var(--loxa-dark-selected-foreground);
+  --loxa-focus: var(--loxa-dark-focus);
+  --loxa-accent: var(--loxa-dark-accent);
+  --loxa-accent-foreground: var(--loxa-dark-accent-foreground);
+}
+
+:focus-visible {
+  outline: 2px solid var(--loxa-focus);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --loxa-motion-fast: 0.01ms;
+    --loxa-motion-theme: 0.01ms;
+    --loxa-motion-slow: 0.01ms;
+  }
+}
