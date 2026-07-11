@@ -900,9 +900,15 @@ mod tests {
                 schema_version: 1,
                 engine_kind: "ollama-managed-gguf-engine".into(),
                 provider_version: "0.9.0".into(),
-                engine_revision: EngineRevision::Unknown,
-                evidence: vec!["ollama_version=0.9.0".into()],
-                invalidation_keys: vec!["provider_version=0.9.0".into()],
+                engine_revision: EngineRevision::Known("fixture-observed-revision".into()),
+                evidence: vec![
+                    "ollama_version=0.9.0".into(),
+                    "ollama_api_show:engine_revision=fixture-observed-revision".into(),
+                ],
+                invalidation_keys: vec![
+                    "provider_version=0.9.0".into(),
+                    "engine_revision=fixture-observed-revision".into(),
+                ],
             },
             settings: GenerationSettings::pinned_v1(),
         };

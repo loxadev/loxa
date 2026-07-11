@@ -2500,7 +2500,15 @@ mod tests {
         verdict: loxa_core::selector::SelectorVerdict,
     ) -> loxa_core::calibration::CalibrationOutcome {
         use loxa_core::evidence::*;
-        let mut a = loxa_core::provider::ollama::provisional_candidate_spec();
+        let mut a = loxa_core::provider::managed_llama::managed_candidate_spec(
+            "fixture-provider",
+            "fixture-revision",
+        )
+        .expect("valid fixture candidate");
+        a.provider_kind = loxa_core::provider::ProviderKind::Ollama;
+        a.ownership = loxa_core::provider::ProviderOwnership::Attached;
+        a.endpoint = "http://127.0.0.1:11434".into();
+        a.engine.engine_kind = "ollama-managed-gguf-engine".into();
         a.candidate_id = "gemma-3-4b-it-q4".into();
         let mut b = a.clone();
         b.candidate_id = "candidate-b".into();

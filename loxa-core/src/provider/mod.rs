@@ -216,6 +216,28 @@ impl CandidateSpec {
                 "provider version invalidation key".into(),
             ));
         }
+        if self.provider_kind == ProviderKind::Ollama {
+            let revision = match &self.engine.engine_revision {
+                EngineRevision::Known(revision) if !revision.trim().is_empty() => revision,
+                EngineRevision::Known(_) | EngineRevision::Unknown => {
+                    return Err(ProviderError::IdentityMismatch(
+                        "engine revision is not verified".into(),
+                    ));
+                }
+            };
+            let evidence = format!("ollama_api_show:engine_revision={revision}");
+            if !self.engine.evidence.contains(&evidence) {
+                return Err(ProviderError::IdentityMismatch(
+                    "observed engine revision evidence".into(),
+                ));
+            }
+            let revision_key = format!("engine_revision={revision}");
+            if !self.engine.invalidation_keys.contains(&revision_key) {
+                return Err(ProviderError::IdentityMismatch(
+                    "engine revision invalidation key".into(),
+                ));
+            }
+        }
         if self.settings != GenerationSettings::pinned_v1() {
             return Err(ProviderError::IdentityMismatch(
                 "generation settings".into(),
@@ -381,6 +403,16 @@ mod tests {
     use crate::provider::managed_llama::managed_candidate_spec;
 
     fn ollama_spec(provider_version: &str, revision: EngineRevision) -> CandidateSpec {
+        let (revision_evidence, revision_key) = match &revision {
+            EngineRevision::Known(value) => (
+                format!("ollama_api_show:engine_revision={value}"),
+                format!("engine_revision={value}"),
+            ),
+            EngineRevision::Unknown => (
+                "ollama_api_show:engine_revision=missing".into(),
+                "engine_revision=unknown".into(),
+            ),
+        };
         CandidateSpec {
             schema_version: 1,
             candidate_id: "ollama-gemma3-4b-it-q4-k-m".into(),
@@ -403,8 +435,14 @@ mod tests {
                 engine_kind: "ollama-managed-gguf-engine".into(),
                 provider_version: provider_version.into(),
                 engine_revision: revision,
-                evidence: vec!["/api/show:model_info.general.architecture=gemma3".into()],
-                invalidation_keys: vec![format!("provider_version={provider_version}")],
+                evidence: vec![
+                    "/api/show:model_info.general.architecture=gemma3".into(),
+                    revision_evidence,
+                ],
+                invalidation_keys: vec![
+                    format!("provider_version={provider_version}"),
+                    revision_key,
+                ],
             },
             settings: GenerationSettings::pinned_v1(),
         }
@@ -500,7 +538,7 @@ mod tests {
 
     #[test]
     fn pinned_validation_rejects_execution_plan_drift() {
-        let valid = ollama_spec("0.11.0", EngineRevision::Unknown);
+        let valid = ollama_spec("0.11.0", EngineRevision::Known("rev-abc".into()));
         valid.validate_pinned().unwrap();
         let mut invalid = Vec::new();
 
@@ -532,11 +570,16 @@ mod tests {
     }
 
     #[test]
-    fn unknown_engine_revision_is_explicit_and_fingerprint_relevant() {
+    fn ollama_unknown_engine_revision_is_explicit_and_rejected() {
         let known = ollama_spec("0.11.0", EngineRevision::Known("rev-abc".into()));
         let unknown = ollama_spec("0.11.0", EngineRevision::Unknown);
         assert_ne!(known.fingerprint(), unknown.fingerprint());
         assert!(serde_json::to_string(&unknown).unwrap().contains("unknown"));
+        assert!(unknown
+            .validate_pinned()
+            .unwrap_err()
+            .to_string()
+            .contains("engine revision"));
     }
 
     #[test]

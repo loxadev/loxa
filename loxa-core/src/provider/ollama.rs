@@ -17,35 +17,6 @@ pub const OLLAMA_MODEL_DIGEST: &str =
     "a2af6cc3eb7fa8be8504abaf9b04e88f17a119ec3f04a3addf55f92841195f5a";
 const OLLAMA_ENDPOINT: &str = "http://127.0.0.1:11434";
 
-pub fn provisional_candidate_spec() -> CandidateSpec {
-    CandidateSpec {
-        schema_version: 1,
-        candidate_id: "ollama-gemma3-4b-it-q4-k-m".into(),
-        provider_kind: super::ProviderKind::Ollama,
-        ownership: ProviderOwnership::Attached,
-        endpoint: OLLAMA_ENDPOINT.into(),
-        artifact: ArtifactIdentity {
-            schema_version: 1,
-            artifact_id: OLLAMA_MODEL_TAG.into(),
-            digest_sha256: OLLAMA_MODEL_DIGEST.into(),
-            base_checkpoint: "google/gemma-3-4b-it".into(),
-            format: "gguf".into(),
-            quantization: "Q4_K_M".into(),
-            tokenizer_evidence: vec!["provisional_tokenizer_evidence=unverified".into()],
-            template_evidence: vec!["provisional_expected_template=ollama_gemma3".into()],
-        },
-        engine: EngineIdentity {
-            schema_version: 1,
-            engine_kind: "ollama-managed-gguf-engine".into(),
-            provider_version: "unverified".into(),
-            engine_revision: EngineRevision::Unknown,
-            evidence: vec!["provisional_expected_engine=ollama_managed_gguf".into()],
-            invalidation_keys: vec!["provider_version=unverified".into()],
-        },
-        settings: GenerationSettings::pinned_v1(),
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OllamaRequest {
     Version,
@@ -194,7 +165,8 @@ impl<T: OllamaTransport> OllamaAdapter<T> {
     pub fn inspect(&self) -> Result<OllamaInspection, ProviderError> {
         let version: VersionResponse = self.request_json(OllamaRequest::Version)?;
         let tags: TagsResponse = self.request_json(OllamaRequest::Tags)?;
-        let model = unique_exact_tag(tags)?;
+        let mut model = unique_exact_tag(tags)?;
+        model.digest = canonicalize_sha256(&model.digest, "artifact digest")?;
         require_identity(&model.digest, OLLAMA_MODEL_DIGEST, "artifact digest")?;
         require_identity(&model.details.format, "gguf", "artifact format")?;
         require_identity(
@@ -205,6 +177,8 @@ impl<T: OllamaTransport> OllamaAdapter<T> {
         require_identity(&model.details.family, "gemma3", "model family")?;
 
         let show: ShowResponse = self.request_json(OllamaRequest::Show)?;
+        let engine_revision =
+            require_present_evidence(show.engine_revision.as_deref(), "engine revision")?;
         require_identity(&show.details.format, "gguf", "show format")?;
         require_identity(
             &show.details.quantization_level,
@@ -227,7 +201,8 @@ impl<T: OllamaTransport> OllamaAdapter<T> {
             require_present_evidence(show.model_info.tokenizer_model.as_deref(), "tokenizer")?;
 
         let tags_after_show: TagsResponse = self.request_json(OllamaRequest::Tags)?;
-        let model_after_show = unique_exact_tag(tags_after_show)?;
+        let mut model_after_show = unique_exact_tag(tags_after_show)?;
+        model_after_show.digest = canonicalize_sha256(&model_after_show.digest, "artifact digest")?;
         if model_after_show != model {
             return Err(ProviderError::IdentityMismatch(
                 "tag identity changed during inspection".into(),
@@ -265,13 +240,17 @@ impl<T: OllamaTransport> OllamaAdapter<T> {
                 schema_version: 1,
                 engine_kind: "ollama-managed-gguf-engine".into(),
                 provider_version: version.version.clone(),
-                engine_revision: EngineRevision::Unknown,
+                engine_revision: EngineRevision::Known(engine_revision.into()),
                 evidence: vec![
                     format!("/api/version:version={}", version.version),
                     "/api/tags:details.family=gemma3".into(),
                     "/api/show:model_info.general.architecture=gemma3".into(),
+                    format!("ollama_api_show:engine_revision={engine_revision}"),
                 ],
-                invalidation_keys: vec![format!("provider_version={}", version.version)],
+                invalidation_keys: vec![
+                    format!("provider_version={}", version.version),
+                    format!("engine_revision={engine_revision}"),
+                ],
             },
             settings: GenerationSettings::pinned_v1(),
         };
@@ -426,6 +405,20 @@ fn require_identity(actual: &str, expected: &str, field: &str) -> Result<(), Pro
     }
 }
 
+fn canonicalize_sha256(digest: &str, field: &str) -> Result<String, ProviderError> {
+    let bare = digest.strip_prefix("sha256:").unwrap_or(digest);
+    if bare.len() != 64
+        || !bare
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(ProviderError::IdentityMismatch(format!(
+            "{field}: expected a canonical sha256 digest"
+        )));
+    }
+    Ok(bare.into())
+}
+
 fn require_present_identity(
     actual: Option<&str>,
     expected: &str,
@@ -519,6 +512,7 @@ struct ModelDetails {
 
 #[derive(Deserialize)]
 struct ShowResponse {
+    engine_revision: Option<String>,
     template: String,
     details: ModelDetails,
     model_info: ModelInfo,
@@ -593,6 +587,7 @@ mod tests {
     }"#;
     const SHOW: &str = r#"{
         "license": "Gemma Terms of Use",
+        "engine_revision": "ollama-engine-build-7",
         "modelfile": "FROM /models/gemma-3-4b-it-Q4_K_M.gguf",
         "parameters": "temperature 0",
         "template": "{{- range .Messages }}{{ .Role }}: {{ .Content }}\n{{- end }}",
@@ -711,13 +706,21 @@ mod tests {
             .contains(&"/api/version:version=0.11.0".into()));
         assert_eq!(
             inspection.candidate.engine.invalidation_keys,
-            ["provider_version=0.11.0"]
+            [
+                "provider_version=0.11.0",
+                "engine_revision=ollama-engine-build-7"
+            ]
         );
         assert_eq!(inspection.candidate.engine.provider_version, "0.11.0");
         assert_eq!(
             inspection.candidate.engine.engine_revision,
-            EngineRevision::Unknown
+            EngineRevision::Known("ollama-engine-build-7".into())
         );
+        assert!(inspection
+            .candidate
+            .engine
+            .evidence
+            .contains(&"ollama_api_show:engine_revision=ollama-engine-build-7".into()));
         assert!(!inspection.activity.target_loaded);
         assert!(inspection.activity.unrelated_models.is_empty());
 
@@ -746,6 +749,34 @@ mod tests {
         let error = inspect_with(TAGS, &show, PS_EMPTY).unwrap_err();
         assert!(
             matches!(error, ProviderError::IdentityMismatch(message) if message.contains("chat template evidence is empty"))
+        );
+    }
+
+    #[test]
+    fn does_not_infer_engine_revision_from_model_tag() {
+        let show = SHOW.replace(
+            "        \"engine_revision\": \"ollama-engine-build-7\",\n",
+            "",
+        );
+
+        let error = inspect_with(TAGS, &show, PS_EMPTY).unwrap_err();
+
+        assert!(
+            matches!(error, ProviderError::IdentityMismatch(message) if message.contains("engine revision") && message.contains("missing"))
+        );
+    }
+
+    #[test]
+    fn rejects_blank_observed_engine_revision() {
+        let show = SHOW.replace(
+            "\"engine_revision\": \"ollama-engine-build-7\"",
+            "\"engine_revision\": \"   \"",
+        );
+
+        let error = inspect_with(TAGS, &show, PS_EMPTY).unwrap_err();
+
+        assert!(
+            matches!(error, ProviderError::IdentityMismatch(message) if message.contains("engine revision") && message.contains("missing"))
         );
     }
 
@@ -926,6 +957,21 @@ mod tests {
         let wrong = TAGS.replace(OLLAMA_MODEL_DIGEST, &"00".repeat(32));
         let error = inspect_with(&wrong, SHOW, PS_EMPTY).unwrap_err();
         assert!(error.to_string().contains("digest"));
+    }
+
+    #[test]
+    fn canonicalizes_explicit_sha256_tag_digest() {
+        let prefixed = TAGS.replace(
+            OLLAMA_MODEL_DIGEST,
+            &format!("sha256:{OLLAMA_MODEL_DIGEST}"),
+        );
+
+        let inspection = inspect_with(&prefixed, SHOW, PS_EMPTY).unwrap();
+
+        assert_eq!(
+            inspection.candidate.artifact.digest_sha256,
+            OLLAMA_MODEL_DIGEST
+        );
     }
 
     #[test]
