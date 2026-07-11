@@ -20,6 +20,7 @@ loxa doctor    # hardware report and detected local AI tools
 loxa pull      # download pinned models, SHA-256 verified, resumable
 loxa list      # registry and download status
 loxa run       # serve a model with a supervised llama-server
+loxa serve     # expose the managed model through the stable `loxa` API alias
 loxa ps        # show the managed server
 loxa stop      # stop it cleanly, no orphan processes
 ```
@@ -27,6 +28,33 @@ loxa stop      # stop it cleanly, no orphan processes
 Downloads are verified against pinned checksums. The managed server has
 a race-tested lifecycle: clean shutdown, crash recovery, one bounded
 restart, no orphans.
+
+## Experimental Python MLX backend
+
+On Apple Silicon macOS, Loxa can supervise an externally installed
+`mlx_lm.server` as an experimental backend. Python and `mlx-lm` remain
+user-managed: Loxa does not bundle Python, create an environment, or install
+packages.
+
+```bash
+uv tool install mlx-lm==0.31.3
+
+loxa run /absolute/path/to/mlx-model --engine py-mlx-lm
+
+loxa serve \
+  --engine py-mlx-lm \
+  --model /absolute/path/to/mlx-model \
+  --port 11435
+```
+
+Clients of `loxa serve` continue to use `model: "loxa"` at the Loxa endpoint.
+The model path must already be a local directory, and `--ctx` is intentionally
+rejected for this backend. Run `loxa doctor` to inspect the external executable,
+exact version, platform compatibility, and default-endpoint reachability.
+
+See [Python MLX backend](docs/backends/py-mlx-lm.md) for installation,
+operations, limitations, and architecture. The planned native replacement is
+defined in [Swift MLX handoff](docs/backends/mlx-swift-handoff.md).
 
 ## What is being built now
 
