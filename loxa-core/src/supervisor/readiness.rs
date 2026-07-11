@@ -265,7 +265,8 @@ async fn probe_chat_completion_readiness_async(
     };
     let request = serde_json::json!({
         "model": request_model,
-        "messages": [{"role": "user", "content": "ready"}],
+        "messages": [{"role": "user", "content": "Reply with one token."}],
+        "temperature": 0,
         "max_tokens": 1,
         "stream": false,
     });
@@ -442,7 +443,8 @@ fn probe_chat_completion_readiness<C: ManagedChild>(
     };
     let request = serde_json::json!({
         "model": request_model,
-        "messages": [{"role": "user", "content": "ready"}],
+        "messages": [{"role": "user", "content": "Reply with one token."}],
+        "temperature": 0,
         "max_tokens": 1,
         "stream": false,
     });
@@ -1222,11 +1224,12 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_str(&completion.body).expect("completion probe JSON");
         assert_eq!(body["model"], "default_model");
+        assert_eq!(body["temperature"], 0);
         assert_eq!(body["stream"], false);
         assert_eq!(body["max_tokens"], 1);
         assert_eq!(body["messages"].as_array().map(Vec::len), Some(1));
         assert_eq!(body["messages"][0]["role"], "user");
-        assert!(body["messages"][0]["content"].is_string());
+        assert_eq!(body["messages"][0]["content"], "Reply with one token.");
     }
 
     #[test]
@@ -1419,6 +1422,20 @@ mod tests {
             1,
             "caller polling must not restart the generation request"
         );
+        let requests = server.requests();
+        let completion = requests
+            .iter()
+            .find(|request| request.path == "/v1/chat/completions")
+            .expect("background completion probe request");
+        let body: serde_json::Value =
+            serde_json::from_str(&completion.body).expect("background completion probe JSON");
+        assert_eq!(body["model"], "default_model");
+        assert_eq!(body["temperature"], 0);
+        assert_eq!(body["stream"], false);
+        assert_eq!(body["max_tokens"], 1);
+        assert_eq!(body["messages"].as_array().map(Vec::len), Some(1));
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["messages"][0]["content"], "Reply with one token.");
         worker
             .cancel_and_join()
             .expect("join completed readiness worker");
