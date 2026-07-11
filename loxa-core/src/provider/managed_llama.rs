@@ -79,6 +79,7 @@ impl ManagedLlamaAdapter {
         provider_version: impl Into<String>,
         engine_revision: impl Into<String>,
     ) -> Result<Self, ProviderError> {
+        let provider_version = normalize_provider_version(&provider_version.into());
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(2))
             .timeout(Duration::from_secs(30))
@@ -86,7 +87,7 @@ impl ManagedLlamaAdapter {
             .build()
             .map_err(|error| ProviderError::Transport(error.to_string()))?;
         Ok(Self {
-            provider_version: provider_version.into(),
+            provider_version,
             engine_revision: engine_revision.into(),
             session: None,
             transport: Box::new(HttpManagedTransport { client }),
@@ -138,10 +139,15 @@ fn sha256_file(path: &std::path::Path) -> Result<String, ProviderError> {
         .collect::<String>())
 }
 
+fn normalize_provider_version(version: &str) -> String {
+    version.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 pub fn managed_candidate_spec(
     provider_version: &str,
     engine_revision: &str,
 ) -> Result<CandidateSpec, ProviderError> {
+    let provider_version = normalize_provider_version(provider_version);
     let entry = registry::find(MANAGED_REGISTRY_ID).ok_or_else(|| {
         ProviderError::IdentityMismatch("managed registry entry is missing".into())
     })?;
@@ -173,7 +179,7 @@ pub fn managed_candidate_spec(
         engine: EngineIdentity {
             schema_version: 1,
             engine_kind: "llama.cpp".into(),
-            provider_version: provider_version.into(),
+            provider_version: provider_version.clone(),
             engine_revision: if engine_revision.trim().is_empty() {
                 EngineRevision::Unknown { hidden: false }
             } else {
@@ -203,6 +209,7 @@ impl ProviderAdapter for ManagedLlamaAdapter {
                 ));
             }
             let version = supervisor::llama_server_version(path).map_err(map_supervisor)?;
+            let version = normalize_provider_version(&version);
             if version != self.provider_version {
                 return Err(ProviderError::IdentityMismatch(
                     "managed provider version changed".into(),
@@ -225,7 +232,9 @@ impl ProviderAdapter for ManagedLlamaAdapter {
         Ok(ProviderHealth {
             schema_version: 1,
             healthy: true,
-            provider_version: Some(session.server().llama_server_version.clone()),
+            provider_version: Some(normalize_provider_version(
+                &session.server().llama_server_version,
+            )),
             evidence: vec![format!("generation_alias={}", session.generation_alias())],
         })
     }
@@ -400,8 +409,8 @@ struct ManagedUsage {
 
 #[cfg(test)]
 mod tests {
-    use super::ManagedLlamaAdapter;
-    use crate::provider::{ProviderAdapter, ProviderKind, ProviderOwnership};
+    use super::{managed_candidate_spec, ManagedLlamaAdapter};
+    use crate::provider::{EngineRevision, ProviderAdapter, ProviderKind, ProviderOwnership};
 
     #[test]
     fn managed_adapter_is_usable_through_object_safe_boundary() {
@@ -417,5 +426,34 @@ mod tests {
         let mut adapter = ManagedLlamaAdapter::new("llama-server 1.2.3", "rev-abc").unwrap();
         assert!(!adapter.verify_health().unwrap().healthy);
         assert!(!adapter.observe_activity().unwrap().target_active);
+    }
+
+    #[test]
+    fn managed_version_normalization_stabilizes_fingerprint_and_preserves_drift() {
+        let engine_revision = "f".repeat(64);
+        let live_version = concat!(
+            "version: 9910 (f5525f7e7)\n",
+            "built with AppleClang 17.0.0.17000013 for arm64-apple-darwin24.6.0"
+        );
+        let normalized_version = concat!(
+            "version: 9910 (f5525f7e7) ",
+            "built with AppleClang 17.0.0.17000013 for arm64-apple-darwin24.6.0"
+        );
+        let drifted_version = live_version.replacen("9910", "9911", 1);
+
+        let adapter = ManagedLlamaAdapter::new(live_version, engine_revision.clone()).unwrap();
+        assert_eq!(adapter.provider_version, normalized_version);
+
+        let live = managed_candidate_spec(live_version, &engine_revision).unwrap();
+        let normalized = managed_candidate_spec(normalized_version, &engine_revision).unwrap();
+        let drifted = managed_candidate_spec(&drifted_version, &engine_revision).unwrap();
+
+        assert_eq!(live.engine.provider_version, normalized_version);
+        assert_eq!(
+            live.engine.engine_revision,
+            EngineRevision::Known(engine_revision)
+        );
+        assert_eq!(live.fingerprint(), normalized.fingerprint());
+        assert_ne!(live.fingerprint(), drifted.fingerprint());
     }
 }

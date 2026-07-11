@@ -1105,6 +1105,43 @@ mod tests {
     }
 
     #[test]
+    fn live_shaped_managed_version_persists_as_normalized_identity() {
+        let directory = tempdir().expect("temp directory");
+        let mut evidence = sample_evidence();
+        let live_version = concat!(
+            "version: 9910 (f5525f7e7)\n",
+            "built with AppleClang 17.0.0.17000013 for arm64-apple-darwin24.6.0"
+        );
+        let normalized_version = concat!(
+            "version: 9910 (f5525f7e7) ",
+            "built with AppleClang 17.0.0.17000013 for arm64-apple-darwin24.6.0"
+        );
+        let managed = managed_candidate_spec(live_version, &"f".repeat(64))
+            .expect("live-shaped managed identity");
+        evidence.candidates[0] = CandidateEvidence {
+            schema_version: EVIDENCE_SCHEMA_VERSION,
+            fingerprint: managed.fingerprint(),
+            identity: managed,
+        };
+        evidence.qualifications[0].candidate_fingerprint =
+            evidence.candidates[0].fingerprint.clone();
+        evidence.measurements[0].candidate_fingerprint = evidence.candidates[0].fingerprint.clone();
+
+        let path = write_evidence_new(directory.path(), &evidence)
+            .expect("normalized managed evidence remains persistable");
+        let persisted = fs::read(path).expect("persisted evidence");
+        let parsed = read_evidence_json(&persisted).expect("persisted evidence validates");
+
+        assert_eq!(
+            parsed.candidates[0].identity.engine.provider_version,
+            normalized_version
+        );
+        assert!(!String::from_utf8(persisted)
+            .expect("JSON text")
+            .contains("\\n"));
+    }
+
+    #[test]
     fn unsupported_evidence_and_selection_schemas_are_rejected() {
         let mut evidence = serde_json::to_value(sample_evidence()).expect("evidence value");
         evidence["schema_version"] = Value::from(99);
