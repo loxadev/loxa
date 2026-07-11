@@ -2654,14 +2654,13 @@ mod tests {
                 name: "Python MLX (external)".to_string(),
                 detection: ToolDetection {
                     install_state: InstallState::Installed,
-                    run_state: RunState::NotRunning,
+                    run_state: RunState::ReachableUnverified,
                     evidence: vec![
                         "platform compatible: macos/aarch64".to_string(),
                         "server path: /opt/tools/mlx_lm.server".to_string(),
                         "required version: 0.31.3".to_string(),
                         "detected version: 0.31.3".to_string(),
-                        "external default endpoint not running at 127.0.0.1:8080 (port not reachable)"
-                            .to_string(),
+                        "external default endpoint reachable: 127.0.0.1:8080".to_string(),
                     ],
                 },
             }],
@@ -2676,7 +2675,8 @@ mod tests {
         assert!(output.contains("server path: /opt/tools/mlx_lm.server"));
         assert!(output.contains("required version: 0.31.3"));
         assert!(output.contains("detected version: 0.31.3"));
-        assert!(output.contains("external default endpoint not running at 127.0.0.1:8080"));
+        assert!(output.contains("reachable (unverified)"));
+        assert!(output.contains("external default endpoint reachable: 127.0.0.1:8080"));
     }
 
     fn read_test_http_request(stream: &mut std::net::TcpStream) -> String {

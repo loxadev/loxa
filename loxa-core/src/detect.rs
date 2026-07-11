@@ -39,6 +39,7 @@ impl fmt::Display for InstallState {
 pub enum RunState {
     Running,
     NotRunning,
+    ReachableUnverified,
 }
 
 impl RunState {
@@ -56,6 +57,7 @@ impl fmt::Display for RunState {
         let status = match self {
             Self::Running => "running",
             Self::NotRunning => "not running",
+            Self::ReachableUnverified => "reachable (unverified)",
         };
         f.write_str(status)
     }
@@ -151,6 +153,10 @@ pub fn detect_py_mlx_lm_with(
 
     let mut installed = false;
     match py_mlx_lm::discover_server(environment_override, path) {
+        Ok(server) if !is_executable_file(&server) => {
+            evidence.push(format!("server is not executable: {}", server.display()));
+            evidence.push(mlx_remediation());
+        }
         Ok(server) => {
             installed = true;
             evidence.push(format!("server path: {}", server.display()));
@@ -207,7 +213,11 @@ pub fn detect_py_mlx_lm_with(
 
     ToolDetection {
         install_state: InstallState::from_detected(installed),
-        run_state: RunState::from_detected(running),
+        run_state: if running {
+            RunState::ReachableUnverified
+        } else {
+            RunState::NotRunning
+        },
         evidence,
     }
 }
@@ -217,6 +227,19 @@ fn mlx_remediation() -> String {
         "remediation: `uv tool install mlx-lm=={}`",
         py_mlx_lm::REQUIRED_VERSION
     )
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    path.metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
 }
 
 pub fn detect_ollama() -> ToolDetection {
@@ -327,6 +350,20 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    #[cfg(unix)]
+    fn make_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(path)
+            .expect("executable metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("make executable");
+    }
+
+    #[cfg(not(unix))]
+    fn make_executable(_path: &Path) {}
+
     fn evidence_contains(detection: &ToolDetection, expected: &str) {
         assert!(
             detection
@@ -382,6 +419,44 @@ mod tests {
         evidence_contains(&detection, "test endpoint not running at 127.0.0.1:8080");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn mlx_detection_rejects_non_executable_environment_and_path_servers() {
+        let temp = TempDir::new().expect("temp dir");
+        let environment_server = temp.path().join("env-mlx_lm.server");
+        let path_dir = temp.path().join("bin");
+        let path_server = path_dir.join("mlx_lm.server");
+        fs::create_dir(&path_dir).expect("create PATH directory");
+        fs::write(&environment_server, b"not executable").expect("write environment server");
+        fs::write(&path_server, b"not executable").expect("write PATH server");
+        let path = env::join_paths([path_dir]).expect("join PATH");
+
+        for (environment_override, path) in [
+            (Some(environment_server.as_os_str()), None),
+            (None, Some(path.as_os_str())),
+        ] {
+            let detection = detect_py_mlx_lm_with(
+                detection_context(
+                    "macos",
+                    "aarch64",
+                    environment_override,
+                    path,
+                    "test endpoint",
+                    "127.0.0.1:8080",
+                ),
+                |_| panic!("version runner must not run for a non-executable server"),
+                |_| false,
+            );
+
+            assert_eq!(detection.install_state, InstallState::NotInstalled);
+            evidence_contains(&detection, "server is not executable:");
+            evidence_contains(
+                &detection,
+                &format!("uv tool install mlx-lm=={REQUIRED_VERSION}"),
+            );
+        }
+    }
+
     #[test]
     fn mlx_detection_reports_present_server_path_and_exact_version() {
         let temp = TempDir::new().expect("temp dir");
@@ -389,6 +464,8 @@ mod tests {
         let version_command = temp.path().join("mlx_lm");
         fs::write(&server, b"server").expect("write server");
         fs::write(&version_command, b"command").expect("write version command");
+        make_executable(&server);
+        make_executable(&version_command);
 
         let detection = detect_py_mlx_lm_with(
             detection_context(
@@ -418,6 +495,8 @@ mod tests {
         let version_command = temp.path().join("mlx_lm");
         fs::write(&server, b"server").expect("write server");
         fs::write(&version_command, b"command").expect("write version command");
+        make_executable(&server);
+        make_executable(&version_command);
 
         let detection = detect_py_mlx_lm_with(
             detection_context(
@@ -447,6 +526,8 @@ mod tests {
         let version_command = temp.path().join("mlx_lm");
         fs::write(&server, b"server").expect("write server");
         fs::write(&version_command, b"command").expect("write version command");
+        make_executable(&server);
+        make_executable(&version_command);
 
         let detection = detect_py_mlx_lm_with(
             detection_context(
@@ -507,7 +588,9 @@ mod tests {
             |address| address == "127.0.0.1:49152",
         );
 
-        assert_eq!(detection.run_state, RunState::Running);
+        assert_eq!(detection.run_state, RunState::ReachableUnverified);
+        assert_eq!(detection.run_state.to_string(), "reachable (unverified)");
+        assert_eq!(RunState::from_detected(true), RunState::Running);
         evidence_contains(
             &detection,
             "injected candidate endpoint reachable: 127.0.0.1:49152",
