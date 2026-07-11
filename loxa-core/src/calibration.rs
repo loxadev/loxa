@@ -3,6 +3,7 @@ use crate::provider::{
     ChatMessage, InvocationObservation, InvocationRequest, ProviderAdapter, ProviderError,
     ToolCall, ToolDefinition,
 };
+use crate::qualification::{qualify_provider, QualificationReport};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::time::Instant;
@@ -39,6 +40,7 @@ pub struct CandidateEvidence {
     pub identity: CandidateIdentity,
     pub ownership: CandidateOwnership,
     pub qualified: bool,
+    pub qualification: Option<QualificationReport>,
     pub available_memory_before_bytes: u64,
     pub failure: Option<String>,
     pub warmup: Option<CalibrationMeasurement>,
@@ -57,6 +59,7 @@ pub struct CalibrationEvidence {
     pub managed: CandidateEvidence,
     pub attached: CandidateEvidence,
     pub pairs: Vec<PairedObservation>,
+    pub verdict: Option<crate::selector::SelectorVerdict>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -101,22 +104,57 @@ where
         };
     }
 
-    let managed_memory = available_memory();
     let attached_memory = available_memory();
+    let managed_memory = 0;
     let mut evidence = CalibrationEvidence {
         schema_version: CALIBRATION_EVIDENCE_SCHEMA_VERSION,
         managed: candidate_evidence(managed, managed_memory),
         attached: candidate_evidence(attached, attached_memory),
         pairs: vec![],
+        verdict: None,
     };
 
+    if let Err(error) = attached.prepare().and_then(|_| attached.inspect()) {
+        evidence.attached.failure = Some(error.to_string());
+        return CalibrationOutcome::Failed {
+            evidence,
+            reason: error.to_string(),
+        };
+    }
+    evidence.attached.identity = attached.identity().clone();
+    let attached_qualification = qualify_provider(attached);
+    evidence.attached.qualified = attached_qualification.passed();
+    evidence.attached.qualification = Some(attached_qualification);
+    if !evidence.attached.qualified {
+        evidence.attached.failure = Some("qualification failed".into());
+        return CalibrationOutcome::Failed {
+            evidence,
+            reason: "attached candidate qualification failed".into(),
+        };
+    }
+    if let Err(error) = attached.isolation_check() {
+        evidence.attached.failure = Some(error.to_string());
+        return CalibrationOutcome::Uncontrolled {
+            reason: error.to_string(),
+        };
+    }
+
+    evidence.managed.available_memory_before_bytes = available_memory();
     if let Err(error) = managed.prepare().and_then(|_| managed.inspect()) {
         evidence.managed.failure = Some(error.to_string());
         return failed_after_managed_cleanup(managed, evidence, error.to_string());
     }
-    if let Err(error) = attached.prepare().and_then(|_| attached.inspect()) {
-        evidence.attached.failure = Some(error.to_string());
-        return failed_after_managed_cleanup(managed, evidence, error.to_string());
+    evidence.managed.identity = managed.identity().clone();
+    let managed_qualification = qualify_provider(managed);
+    evidence.managed.qualified = managed_qualification.passed();
+    evidence.managed.qualification = Some(managed_qualification);
+    if !evidence.managed.qualified {
+        evidence.managed.failure = Some("qualification failed".into());
+        return failed_after_managed_cleanup(
+            managed,
+            evidence,
+            "managed candidate qualification failed".into(),
+        );
     }
 
     let result = calibrate_prepared(managed, attached, &mut evidence);
@@ -128,6 +166,9 @@ where
         candidate.failure = Some(error.to_string());
     }
     let cleanup = managed.finish();
+    if cleanup.is_err() {
+        evidence.managed.failure = Some("managed cleanup failed".into());
+    }
 
     match (result, cleanup) {
         (Ok(()), Ok(())) => CalibrationOutcome::Completed { evidence },
@@ -153,7 +194,8 @@ fn candidate_evidence(
     CandidateEvidence {
         identity: candidate.identity().clone(),
         ownership: candidate.ownership(),
-        qualified: true,
+        qualified: false,
+        qualification: None,
         available_memory_before_bytes,
         failure: None,
         warmup: None,
@@ -162,15 +204,18 @@ fn candidate_evidence(
 
 fn failed_after_managed_cleanup(
     managed: &mut dyn CalibrationCandidate,
-    evidence: CalibrationEvidence,
+    mut evidence: CalibrationEvidence,
     reason: String,
 ) -> CalibrationOutcome {
     match managed.finish() {
         Ok(()) => CalibrationOutcome::Failed { evidence, reason },
-        Err(error) => CalibrationOutcome::Failed {
-            evidence,
-            reason: format!("{reason}; managed cleanup failed: {error}"),
-        },
+        Err(error) => {
+            evidence.managed.failure = Some("managed cleanup failed".into());
+            CalibrationOutcome::Failed {
+                evidence,
+                reason: format!("{reason}; managed cleanup failed: {error}"),
+            }
+        }
     }
 }
 
@@ -179,12 +224,21 @@ fn calibrate_prepared(
     attached: &mut dyn CalibrationCandidate,
     evidence: &mut CalibrationEvidence,
 ) -> Result<(), (CandidateOwnership, ProviderError)> {
+    attached
+        .isolation_check()
+        .map_err(|error| (CandidateOwnership::Attached, error))?;
     evidence.managed.warmup =
         Some(measure(managed).map_err(|error| (CandidateOwnership::Managed, error))?);
+    attached
+        .isolation_check()
+        .map_err(|error| (CandidateOwnership::Attached, error))?;
     evidence.attached.warmup =
         Some(measure(attached).map_err(|error| (CandidateOwnership::Attached, error))?);
 
     for pair_index in 0..5 {
+        attached
+            .isolation_check()
+            .map_err(|error| (CandidateOwnership::Attached, error))?;
         let (managed_observation, attached_observation) = if pair_index % 2 == 0 {
             (
                 measure(managed).map_err(|error| (CandidateOwnership::Managed, error))?,
@@ -304,6 +358,9 @@ mod tests {
         calls: usize,
         fail_at: Option<usize>,
         isolation_error: bool,
+        isolation_checks: usize,
+        isolation_fail_at: Option<usize>,
+        finish_error: bool,
     }
 
     impl ProviderAdapter for FakeCandidate {
@@ -311,11 +368,14 @@ mod tests {
             &self.identity
         }
         fn inspect(&mut self) -> Result<(), ProviderError> {
+            self.events
+                .borrow_mut()
+                .push(format!("{}:inspect", self.identity.candidate_id));
             Ok(())
         }
         fn invoke(
             &mut self,
-            _request: &InvocationRequest,
+            request: &InvocationRequest,
         ) -> Result<InvocationObservation, ProviderError> {
             self.calls += 1;
             self.events
@@ -324,18 +384,49 @@ mod tests {
             if self.fail_at == Some(self.calls) {
                 return Err(ProviderError::Unavailable);
             }
-            let odd = self.calls % 2 == 1;
-            Ok(InvocationObservation {
-                content: (!odd).then(|| "TICKET-42 resolved".into()),
-                tool_calls: if odd {
+            let prompt = request
+                .messages
+                .last()
+                .map(|message| message.content.as_str())
+                .unwrap_or_default();
+            let tool_name = request.tools.first().map(|tool| tool.name.as_str());
+            let (content, tool_calls) = match tool_name {
+                Some("lookup_ticket") => (
+                    None,
                     vec![ToolCall {
                         id: Some("call-1".into()),
                         name: "lookup_ticket".into(),
                         arguments: json!({"ticket_id":"TICKET-42"}),
-                    }]
-                } else {
-                    vec![]
-                },
+                    }],
+                ),
+                Some("weather") if prompt.contains("word ready") => (Some("ready".into()), vec![]),
+                Some("weather") => {
+                    let city = if prompt.contains("Tokyo") {
+                        "Tokyo"
+                    } else if prompt.contains("Madrid") {
+                        "Madrid"
+                    } else {
+                        "Paris"
+                    };
+                    let arguments = if prompt.contains("celsius") {
+                        json!({"city":city,"units":"celsius"})
+                    } else {
+                        json!({"city":city})
+                    };
+                    (
+                        None,
+                        vec![ToolCall {
+                            id: Some("call-weather".into()),
+                            name: "weather".into(),
+                            arguments,
+                        }],
+                    )
+                }
+                _ => (Some("TICKET-42 resolved".into()), vec![]),
+            };
+            Ok(InvocationObservation {
+                content,
+                tool_calls,
                 prompt_tokens: Some(10),
                 completion_tokens: Some(5),
                 ttft_ns: Some(1),
@@ -361,13 +452,18 @@ mod tests {
             self.events
                 .borrow_mut()
                 .push(format!("{}:finish", self.identity.candidate_id));
-            Ok(())
+            if self.finish_error {
+                Err(ProviderError::Io("cleanup failed".into()))
+            } else {
+                Ok(())
+            }
         }
         fn isolation_check(&mut self) -> Result<(), ProviderError> {
+            self.isolation_checks += 1;
             self.events
                 .borrow_mut()
                 .push(format!("{}:isolation", self.identity.candidate_id));
-            if self.isolation_error {
+            if self.isolation_error || self.isolation_fail_at == Some(self.isolation_checks) {
                 Err(ProviderError::Protocol("uncontrolled state".into()))
             } else {
                 Ok(())
@@ -404,6 +500,9 @@ mod tests {
                 calls: 0,
                 fail_at: None,
                 isolation_error: false,
+                isolation_checks: 0,
+                isolation_fail_at: None,
+                finish_error: false,
             },
             FakeCandidate {
                 identity: identity("attached", ProviderKind::Ollama),
@@ -412,6 +511,9 @@ mod tests {
                 calls: 0,
                 fail_at: None,
                 isolation_error: false,
+                isolation_checks: 0,
+                isolation_fail_at: None,
+                finish_error: false,
             },
         )
     }
@@ -430,7 +532,8 @@ mod tests {
             .filter(|event| event.ends_with(":invoke"))
             .cloned()
             .collect::<Vec<_>>();
-        let sample_order = invocations
+        let measurement_invocations = &invocations[invocations.len() - 24..];
+        let sample_order = measurement_invocations
             .chunks_exact(2)
             .map(|chunk| chunk[0].split(':').next().unwrap())
             .collect::<Vec<_>>();
@@ -503,5 +606,109 @@ mod tests {
             .borrow()
             .iter()
             .any(|event| event.ends_with(":prepare")));
+    }
+
+    #[test]
+    fn attached_qualification_completes_before_managed_prepare() {
+        let events = Rc::new(RefCell::new(vec![]));
+        let (mut managed, mut attached) = candidates(events.clone());
+
+        let _ = run_calibration(&mut managed, &mut attached, || 1_000);
+
+        let events = events.borrow();
+        let managed_prepare = events
+            .iter()
+            .position(|event| event == "managed:prepare")
+            .unwrap();
+        let attached_invocations_before_managed = events[..managed_prepare]
+            .iter()
+            .filter(|event| *event == "attached:invoke")
+            .count();
+        assert_eq!(attached_invocations_before_managed, 6);
+        assert!(events[..managed_prepare]
+            .iter()
+            .any(|event| event == "attached:inspect"));
+    }
+
+    #[test]
+    fn attached_qualification_failure_never_prepares_managed() {
+        let events = Rc::new(RefCell::new(vec![]));
+        let (mut managed, mut attached) = candidates(events.clone());
+        attached.fail_at = Some(1);
+
+        let outcome = run_calibration(&mut managed, &mut attached, || 1_000);
+
+        let CalibrationOutcome::Failed { evidence, .. } = outcome else {
+            panic!("expected failed calibration");
+        };
+        assert!(!evidence.attached.qualified);
+        assert!(evidence
+            .attached
+            .qualification
+            .as_ref()
+            .is_some_and(|report| !report.passed()));
+        assert!(!events
+            .borrow()
+            .iter()
+            .any(|event| event == "managed:prepare"));
+        assert!(!events
+            .borrow()
+            .iter()
+            .any(|event| event.ends_with(":finish")));
+    }
+
+    #[test]
+    fn attached_isolation_loss_after_qualification_never_prepares_managed() {
+        let events = Rc::new(RefCell::new(vec![]));
+        let (mut managed, mut attached) = candidates(events.clone());
+        attached.isolation_fail_at = Some(2);
+
+        let outcome = run_calibration(&mut managed, &mut attached, || 1_000);
+
+        assert!(matches!(outcome, CalibrationOutcome::Uncontrolled { .. }));
+        assert!(!events
+            .borrow()
+            .iter()
+            .any(|event| event == "managed:prepare"));
+    }
+
+    #[test]
+    fn attached_isolation_is_rechecked_between_measured_pairs() {
+        let events = Rc::new(RefCell::new(vec![]));
+        let (mut managed, mut attached) = candidates(events.clone());
+        attached.isolation_fail_at = Some(5);
+
+        let outcome = run_calibration(&mut managed, &mut attached, || 1_000);
+
+        let CalibrationOutcome::Failed { evidence, .. } = outcome else {
+            panic!("expected failed calibration");
+        };
+        assert!(evidence.attached.failure.is_some());
+        assert!(events
+            .borrow()
+            .iter()
+            .any(|event| event == "managed:finish"));
+        assert!(evidence.pairs.is_empty());
+    }
+
+    #[test]
+    fn managed_cleanup_failure_is_a_failed_outcome_with_evidence() {
+        let events = Rc::new(RefCell::new(vec![]));
+        let (mut managed, mut attached) = candidates(events);
+        managed.finish_error = true;
+
+        let outcome = run_calibration(&mut managed, &mut attached, || 1_000);
+
+        let CalibrationOutcome::Failed { evidence, reason } = outcome else {
+            panic!("expected failed calibration");
+        };
+        assert!(reason.contains("managed cleanup failed"));
+        assert!(evidence.managed.qualified);
+        assert_eq!(
+            evidence.managed.failure.as_deref(),
+            Some("managed cleanup failed")
+        );
+        assert!(evidence.attached.qualified);
+        assert_eq!(evidence.pairs.len(), 5);
     }
 }

@@ -55,7 +55,9 @@ impl OllamaAdapter {
             .iter()
             .filter(|entry| entry.get("name").and_then(Value::as_str) == Some(model));
         let selected = exact.next().ok_or_else(|| {
-            ProviderError::Protocol(format!("ollama model inventory has no exact model {model}"))
+            ProviderError::Identity(format!(
+                "ollama has no exact model {model}; run `ollama list`, install it with `ollama pull {model}`, preload it yourself, then rerun `loxa bench`"
+            ))
         })?;
         if exact.next().is_some() {
             return Err(ProviderError::Protocol(format!(
@@ -143,7 +145,7 @@ impl OllamaAdapter {
         Ok(())
     }
 
-    /// Verifies that Ollama has no unrelated model resident in memory.
+    /// Verifies that exactly the configured Ollama model is resident in memory.
     ///
     /// This check is deliberately read-only: attached Ollama instances are
     /// user-owned and must never be loaded, unloaded, or stopped by Loxa.
@@ -162,7 +164,9 @@ fn validate_loaded_models(inventory: &Value, selected_model: &str) -> Result<(),
             ProviderError::Protocol("ollama loaded-model inventory is missing models array".into())
         })?;
     if models.is_empty() {
-        return Ok(());
+        return Err(ProviderError::Protocol(format!(
+            "ollama isolation is uncontrolled: no model is loaded; preload {selected_model} yourself and confirm it with `ollama ps` before rerunning `loxa bench`"
+        )));
     }
     if models.len() != 1 {
         return Err(ProviderError::Protocol(
@@ -728,32 +732,27 @@ mod tests {
     #[test]
     fn preflight_returns_exact_version_and_digest_for_controlled_inventory() {
         let candidate = identity();
-        for loaded in [
-            json!({"models": []}),
+        let fixtures = preflight_fixtures(
+            json!({"version": candidate.provider_version}),
+            valid_tags(&candidate),
             json!({"models": [{"name": candidate.model_id, "model": candidate.model_id}]}),
-        ] {
-            let fixtures = preflight_fixtures(
-                json!({"version": candidate.provider_version}),
-                valid_tags(&candidate),
-                loaded,
-            );
-            let (transport, expected) = fake_transport(fixtures);
+        );
+        let (transport, expected) = fake_transport(fixtures);
 
-            let result = OllamaAdapter::preflight_with_transport(
-                "http://127.0.0.1:11434/",
-                &candidate.model_id,
-                transport,
-            );
+        let result = OllamaAdapter::preflight_with_transport(
+            "http://127.0.0.1:11434/",
+            &candidate.model_id,
+            transport,
+        );
 
-            assert_eq!(
-                result,
-                Ok(super::OllamaPreflight {
-                    provider_version: candidate.provider_version.clone(),
-                    artifact_digest: candidate.artifact_digest.clone(),
-                })
-            );
-            assert_fixtures_consumed(&expected);
-        }
+        assert_eq!(
+            result,
+            Ok(super::OllamaPreflight {
+                provider_version: candidate.provider_version.clone(),
+                artifact_digest: candidate.artifact_digest.clone(),
+            })
+        );
+        assert_fixtures_consumed(&expected);
     }
 
     #[test]
@@ -786,6 +785,11 @@ mod tests {
             (
                 json!({"version": "0.9.1"}),
                 valid_tags(&candidate),
+                json!({"models": []}),
+            ),
+            (
+                json!({"version": "0.9.1"}),
+                valid_tags(&candidate),
                 json!({"models": [{"name": "other:latest", "model": "other:latest"}]}),
             ),
         ];
@@ -803,29 +807,27 @@ mod tests {
     }
 
     #[test]
-    fn isolation_check_accepts_empty_or_exact_configured_model_without_mutation() {
+    fn isolation_check_requires_exact_configured_model_without_mutation() {
         let candidate = identity();
-        for response in [
-            json!({"models": []}),
-            json!({"models": [{"name": candidate.model_id, "model": candidate.model_id}]}),
-        ] {
-            let (transport, expected) = fake_transport(isolation_fixture(response));
-            let mut adapter = OllamaAdapter::with_transport(
-                candidate.clone(),
-                "http://127.0.0.1:11434",
-                candidate.model_id.clone(),
-                transport,
-            );
+        let response =
+            json!({"models": [{"name": candidate.model_id, "model": candidate.model_id}]});
+        let (transport, expected) = fake_transport(isolation_fixture(response));
+        let mut adapter = OllamaAdapter::with_transport(
+            candidate.clone(),
+            "http://127.0.0.1:11434",
+            candidate.model_id.clone(),
+            transport,
+        );
 
-            assert_eq!(adapter.isolation_check(), Ok(()));
-            assert_fixtures_consumed(&expected);
-        }
+        assert_eq!(adapter.isolation_check(), Ok(()));
+        assert_fixtures_consumed(&expected);
     }
 
     #[test]
     fn isolation_check_rejects_other_loaded_models_and_malformed_inventory() {
         let candidate = identity();
         for response in [
+            json!({"models": []}),
             json!({"models": [{"name": "other:latest", "model": "other:latest"}]}),
             json!({"models": [
                 {"name": candidate.model_id, "model": candidate.model_id},

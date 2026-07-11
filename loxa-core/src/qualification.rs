@@ -116,7 +116,10 @@ pub fn qualification_cases() -> Vec<QualificationCase> {
     ]
 }
 
-pub fn qualify_provider(provider: &mut dyn ProviderAdapter) -> QualificationReport {
+pub fn qualify_provider<P>(provider: &mut P) -> QualificationReport
+where
+    P: ProviderAdapter + ?Sized,
+{
     QualificationReport {
         results: qualification_cases()
             .iter()
@@ -125,10 +128,10 @@ pub fn qualify_provider(provider: &mut dyn ProviderAdapter) -> QualificationRepo
     }
 }
 
-fn evaluate_case(
-    provider: &mut dyn ProviderAdapter,
-    case: &QualificationCase,
-) -> QualificationResult {
+fn evaluate_case<P>(provider: &mut P, case: &QualificationCase) -> QualificationResult
+where
+    P: ProviderAdapter + ?Sized,
+{
     let started = Instant::now();
     let first = match provider.invoke(&case.request) {
         Ok(observation) => observation,
@@ -158,12 +161,15 @@ fn evaluate_case(
     }
 }
 
-fn evaluate_multi_turn_ticket(
-    provider: &mut dyn ProviderAdapter,
+fn evaluate_multi_turn_ticket<P>(
+    provider: &mut P,
     case: &QualificationCase,
     first: InvocationObservation,
     started: Instant,
-) -> QualificationResult {
+) -> QualificationResult
+where
+    P: ProviderAdapter + ?Sized,
+{
     if let Err(reason) = validate_single_tool_call(&first, "lookup_ticket") {
         return result(case, false, reason, started, vec![first]);
     }

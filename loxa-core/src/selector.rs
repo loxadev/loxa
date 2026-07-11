@@ -28,6 +28,10 @@ fn selected(candidate: &CandidateEvidence) -> SelectorVerdict {
 
 fn hard_gates_pass(candidate: &CandidateEvidence) -> bool {
     candidate.qualified
+        && candidate
+            .qualification
+            .as_ref()
+            .is_some_and(crate::qualification::QualificationReport::passed)
         && candidate.failure.is_none()
         && candidate.identity.identity_errors().is_empty()
         && candidate.available_memory_before_bytes >= candidate.identity.required_free_memory_bytes
@@ -75,6 +79,28 @@ mod tests {
         CALIBRATION_EVIDENCE_SCHEMA_VERSION,
     };
     use crate::plan::{CandidateIdentity, ProviderKind, SamplingPolicy};
+    use crate::qualification::{QualificationReport, QualificationResult};
+
+    fn passing_qualification() -> QualificationReport {
+        QualificationReport {
+            results: [
+                "weather_required_city",
+                "no_tool_needed",
+                "weather_optional_units",
+                "weather_argument_types",
+                "multi_turn_ticket_context",
+            ]
+            .into_iter()
+            .map(|case_id| QualificationResult {
+                case_id: case_id.into(),
+                passed: true,
+                reason: "structural requirements satisfied".into(),
+                elapsed_ns: 1,
+                observations: vec![],
+            })
+            .collect(),
+        }
+    }
 
     fn candidate(id: &str, ownership: CandidateOwnership, qualified: bool) -> CandidateEvidence {
         CandidateEvidence {
@@ -101,6 +127,7 @@ mod tests {
             },
             ownership,
             qualified,
+            qualification: qualified.then(passing_qualification),
             available_memory_before_bytes: 1_000,
             failure: None,
             warmup: None,
@@ -136,6 +163,7 @@ mod tests {
                     attached: measurement("attached", *attached),
                 })
                 .collect(),
+            verdict: None,
         }
     }
     fn default_times() -> Vec<(u128, u128)> {
@@ -246,6 +274,18 @@ mod tests {
     fn selector_rejects_candidate_without_required_free_memory_headroom() {
         let mut attached = candidate("attached", CandidateOwnership::Attached, true);
         attached.available_memory_before_bytes = 99;
+        let input = evidence(
+            candidate("managed", CandidateOwnership::Managed, false),
+            attached,
+            &default_times(),
+        );
+        assert_eq!(select_plan(&input), SelectorVerdict::NoVerifiedPlan);
+    }
+
+    #[test]
+    fn selector_rejects_qualified_boolean_without_passing_report() {
+        let mut attached = candidate("attached", CandidateOwnership::Attached, true);
+        attached.qualification = None;
         let input = evidence(
             candidate("managed", CandidateOwnership::Managed, false),
             attached,

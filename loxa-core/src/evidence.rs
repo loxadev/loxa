@@ -161,7 +161,8 @@ mod tests {
                 },
             },
             ownership,
-            qualified: true,
+            qualified: false,
+            qualification: None,
             available_memory_before_bytes: 1_000,
             failure: None,
             warmup: None,
@@ -179,6 +180,7 @@ mod tests {
                 CandidateOwnership::Attached,
             ),
             pairs: vec![],
+            verdict: None,
         }
     }
 
