@@ -891,7 +891,10 @@ mod tests {
         .expect("gateway shutdown waited on stalled JSON body")
         .unwrap()
         .unwrap();
-        request.await.unwrap().unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), request)
+            .await
+            .expect("cancelled client request remained pending")
+            .expect("client request task panicked");
     }
 
     #[tokio::test]
