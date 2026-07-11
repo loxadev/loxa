@@ -1,12 +1,14 @@
 use clap::Parser;
 use loxa_core::detect::{DetectedTool, LocalToolsReport};
 use loxa_core::download;
+use loxa_core::engine::{py_mlx_lm, EngineLaunchSpec, ReadinessStrategy, RuntimeBackendKind};
 use loxa_core::hardware::HardwareReport;
 use loxa_core::registry::{self, ModelEntry, REGISTRY};
 use loxa_core::supervisor::{
     self, InterruptStatus, LogDrainingChild, ManagedChild, ManagedServer, ObservedChildExit,
     RuntimeStateRead, SupervisorError,
 };
+use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::io::{self, Write};
@@ -41,12 +43,16 @@ enum Command {
         ctx: Option<u32>,
         #[arg(long)]
         port: Option<u16>,
+        #[arg(long, default_value_t = RuntimeBackendKind::LlamaCpp)]
+        engine: RuntimeBackendKind,
     },
     Serve {
         #[arg(long)]
         model: Option<String>,
         #[arg(long)]
         port: Option<u16>,
+        #[arg(long, default_value_t = RuntimeBackendKind::LlamaCpp)]
+        engine: RuntimeBackendKind,
     },
     Ps,
     Stop {
@@ -181,23 +187,66 @@ fn run_with_paths<W: Write, E: Write>(
     mut stdout: W,
     mut stderr: E,
 ) -> ExitCode {
+    if let Err(error) = validate_cli_contract(&cli) {
+        return finish_cli_result(Err(error), &mut stderr);
+    }
     let result = match cli.command {
         Command::Calibrate => run_calibration(&mut stdout),
         Command::Doctor => print_doctor(&mut stdout),
         Command::Pull { id, quant } => pull_model(&id, quant.as_deref(), &mut stdout, &mut stderr),
         Command::List => print_list(&mut stdout),
         Command::Rm { id } => remove_model(&id, &mut stdout, &mut stderr),
-        Command::Run { id, ctx, port } => {
-            run_model(&id, ctx, port, paths, &mut stdout, &mut stderr, None)
-        }
-        Command::Serve { model, port } => {
-            serve_node(model.as_deref(), port, paths, &mut stdout, &mut stderr)
-        }
+        Command::Run {
+            id,
+            ctx,
+            port,
+            engine,
+        } => run_model(
+            RunRequest {
+                id: &id,
+                ctx,
+                port,
+                engine,
+            },
+            paths,
+            &mut stdout,
+            &mut stderr,
+            None,
+        ),
+        Command::Serve {
+            model,
+            port,
+            engine,
+        } => serve_node(
+            model.as_deref(),
+            port,
+            engine,
+            paths,
+            &mut stdout,
+            &mut stderr,
+        ),
         Command::Ps => print_managed_servers(paths, &mut stdout),
         Command::Stop { target } => stop_managed_servers(&target, paths, &mut stdout, &mut stderr),
     };
 
     finish_cli_result(result, &mut stderr)
+}
+
+fn validate_cli_contract(cli: &Cli) -> io::Result<()> {
+    if matches!(
+        &cli.command,
+        Command::Run {
+            ctx: Some(_),
+            engine: RuntimeBackendKind::PyMlxLm,
+            ..
+        }
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--ctx is not supported with --engine py-mlx-lm",
+        ));
+    }
+    Ok(())
 }
 
 fn finish_cli_result<E: Write>(result: io::Result<ExitCode>, stderr: &mut E) -> ExitCode {
@@ -584,18 +633,159 @@ fn remove_user_entry(
     Ok(Some(removed))
 }
 
-fn run_model<W: Write, E: Write>(
+#[derive(Clone, Debug)]
+struct ResolvedRuntimeBackend {
+    kind: RuntimeBackendKind,
+    model_id: String,
+    model_path: PathBuf,
+    program: PathBuf,
+    engine_version: String,
+}
+
+impl ResolvedRuntimeBackend {
+    fn launch_spec(&self, port: u16, ctx_tokens: u32, generation_alias: &str) -> EngineLaunchSpec {
+        match self.kind {
+            RuntimeBackendKind::LlamaCpp => EngineLaunchSpec {
+                program: self.program.clone(),
+                args: vec![
+                    OsString::from("--model"),
+                    self.model_path.as_os_str().to_owned(),
+                    OsString::from("--alias"),
+                    OsString::from(generation_alias),
+                    OsString::from("--host"),
+                    OsString::from("127.0.0.1"),
+                    OsString::from("--port"),
+                    OsString::from(port.to_string()),
+                    OsString::from("--ctx-size"),
+                    OsString::from(ctx_tokens.to_string()),
+                    OsString::from("--gpu-layers"),
+                    OsString::from("auto"),
+                    OsString::from("--flash-attn"),
+                    OsString::from("auto"),
+                    OsString::from("--metrics"),
+                    OsString::from("--log-disable"),
+                ],
+                port,
+                engine_name: "llama.cpp".to_string(),
+                engine_version: self.engine_version.clone(),
+                runtime_model: self.model_path.display().to_string(),
+                upstream_model: generation_alias.to_string(),
+                readiness: ReadinessStrategy::LlamaModelAlias {
+                    expected_alias: generation_alias.to_string(),
+                },
+            },
+            RuntimeBackendKind::PyMlxLm => {
+                py_mlx_lm::launch_spec(&self.program, &self.model_path, port, &self.engine_version)
+            }
+        }
+    }
+
+    fn process_label(&self) -> &'static str {
+        match self.kind {
+            RuntimeBackendKind::LlamaCpp => "llama-server",
+            RuntimeBackendKind::PyMlxLm => "mlx_lm.server",
+        }
+    }
+
+    fn log_key(&self) -> &str {
+        match self.kind {
+            RuntimeBackendKind::LlamaCpp => &self.model_id,
+            RuntimeBackendKind::PyMlxLm => "py-mlx-lm",
+        }
+    }
+}
+
+fn resolve_runtime_backend(
+    kind: RuntimeBackendKind,
     id: &str,
+    models_dir: &Path,
+) -> Result<ResolvedRuntimeBackend, SupervisorError> {
+    match kind {
+        RuntimeBackendKind::LlamaCpp => {
+            let (_, model_path) = supervisor::resolve_model_path(id, models_dir)?;
+            let program = supervisor::detect_llama_server()?;
+            let engine_version = supervisor::llama_server_version(&program)?;
+            Ok(ResolvedRuntimeBackend {
+                kind,
+                model_id: id.to_string(),
+                model_path,
+                program,
+                engine_version,
+            })
+        }
+        RuntimeBackendKind::PyMlxLm => {
+            py_mlx_lm::validate_current_platform().map_err(py_mlx_error_to_supervisor)?;
+            let model_path = py_mlx_lm::canonicalize_model_dir(Path::new(id))
+                .map_err(py_mlx_error_to_supervisor)?;
+            let program = py_mlx_lm::discover_server_from_environment()
+                .map_err(py_mlx_error_to_supervisor)?;
+            let version_command =
+                py_mlx_lm::discover_version_command(&program, std::env::var_os("PATH").as_deref())
+                    .map_err(py_mlx_error_to_supervisor)?;
+            let engine_version =
+                py_mlx_lm::detect_version(&version_command).map_err(py_mlx_error_to_supervisor)?;
+            Ok(ResolvedRuntimeBackend {
+                kind,
+                model_id: model_path.display().to_string(),
+                model_path,
+                program,
+                engine_version,
+            })
+        }
+    }
+}
+
+fn py_mlx_error_to_supervisor(error: py_mlx_lm::PyMlxLmError) -> SupervisorError {
+    SupervisorError::Io(io::Error::other(error))
+}
+
+fn gateway_target(
+    backend: &ResolvedRuntimeBackend,
+    spec: &EngineLaunchSpec,
+) -> loxa_core::gateway::EngineTarget {
+    loxa_core::gateway::EngineTarget {
+        base_url: format!("http://127.0.0.1:{}", spec.port),
+        backend_alias: spec.upstream_model.clone(),
+        engine: spec.engine_name.clone(),
+        engine_version: spec.engine_version.clone(),
+        model_id: backend.model_id.clone(),
+        profile: format!("{}:{}", spec.engine_name, backend.model_id),
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RunRequest<'a> {
+    id: &'a str,
     ctx: Option<u32>,
     port: Option<u16>,
+    engine: RuntimeBackendKind,
+}
+
+fn run_model<W: Write, E: Write>(
+    request: RunRequest<'_>,
     paths: &CliPaths,
     stdout: &mut W,
     stderr: &mut E,
     gateway: Option<&loxa_core::gateway::GatewayState>,
 ) -> io::Result<ExitCode> {
-    let Some(_) = registry::find(id) else {
-        write_unknown_id(id, stderr)?;
-        return Ok(ExitCode::from(1));
+    let RunRequest {
+        id,
+        ctx,
+        port,
+        engine,
+    } = request;
+    let mut initial_backend = match engine {
+        RuntimeBackendKind::LlamaCpp => {
+            let Some(_) = registry::find(id) else {
+                write_unknown_id(id, stderr)?;
+                return Ok(ExitCode::from(1));
+            };
+            None
+        }
+        RuntimeBackendKind::PyMlxLm => Some(
+            resolve_runtime_backend(engine, id, &paths.models_dir)
+                .map_err(supervisor_error_to_io)?,
+        ),
     };
 
     ensure_runtime_state_is_mutable(&paths.state_path)?;
@@ -612,127 +802,110 @@ fn run_model<W: Write, E: Write>(
     loop {
         let owned_replacement = replacement_run.take();
         let started_at_unix_s = unix_timestamp_now();
-        let (
-            entry,
-            model_path,
-            llama_server_path,
-            starting_run,
-            initial_generation,
-            initial_reservation,
-        ) = if let Some(run) = owned_replacement {
-            let preparation = prepare_owned_replacement_run(
-                &paths.state_path,
-                run,
-                &signal_guard,
-                || supervisor::resolve_model_path(id, &paths.models_dir),
-                supervisor::detect_llama_server,
-            );
-            let preparation = match preparation {
-                Ok(preparation) => preparation,
-                Err(SupervisorError::ModelNotDownloaded(_)) => {
-                    writeln!(
-                        stderr,
-                        "model not downloaded for {id}; run `loxa pull {id}`"
-                    )?;
-                    return Ok(ExitCode::from(1));
-                }
-                Err(error) => return Err(supervisor_error_to_io(error)),
-            };
-            match preparation {
-                OwnedReplacementPreparation::Prepared {
+        let (backend, starting_run, initial_generation, initial_reservation) =
+            if let Some(run) = owned_replacement {
+                let preparation = prepare_owned_replacement_run(
+                    &paths.state_path,
                     run,
-                    resolved: (entry, model_path),
-                    detected: llama_server_path,
-                } => (entry, model_path, llama_server_path, run, false, None),
-                OwnedReplacementPreparation::RequestedStop => return Ok(ExitCode::SUCCESS),
-                OwnedReplacementPreparation::Interrupted => {
+                    &signal_guard,
+                    || resolve_runtime_backend(engine, id, &paths.models_dir),
+                    || Ok(()),
+                );
+                let preparation = match preparation {
+                    Ok(preparation) => preparation,
+                    Err(SupervisorError::ModelNotDownloaded(_)) => {
+                        writeln!(
+                            stderr,
+                            "model not downloaded for {id}; run `loxa pull {id}`"
+                        )?;
+                        return Ok(ExitCode::from(1));
+                    }
+                    Err(error) => return Err(supervisor_error_to_io(error)),
+                };
+                match preparation {
+                    OwnedReplacementPreparation::Prepared {
+                        run,
+                        resolved: backend,
+                        detected: (),
+                    } => (backend, run, false, None),
+                    OwnedReplacementPreparation::RequestedStop => return Ok(ExitCode::SUCCESS),
+                    OwnedReplacementPreparation::Interrupted => {
+                        return Ok(ExitCode::from(130));
+                    }
+                }
+            } else {
+                if signal_guard.interrupted() {
                     return Ok(ExitCode::from(130));
                 }
-            }
-        } else {
-            if signal_guard.interrupted() {
-                return Ok(ExitCode::from(130));
-            }
-            let (entry, model_path) = match supervisor::resolve_model_path(id, &paths.models_dir) {
-                Ok(resolved) => resolved,
-                Err(SupervisorError::ModelNotDownloaded(_)) => {
-                    writeln!(
-                        stderr,
-                        "model not downloaded for {id}; run `loxa pull {id}`"
-                    )?;
-                    return Ok(ExitCode::from(1));
+                let backend = match initial_backend
+                    .take()
+                    .map(Ok)
+                    .unwrap_or_else(|| resolve_runtime_backend(engine, id, &paths.models_dir))
+                {
+                    Ok(resolved) => resolved,
+                    Err(SupervisorError::ModelNotDownloaded(_)) => {
+                        writeln!(
+                            stderr,
+                            "model not downloaded for {id}; run `loxa pull {id}`"
+                        )?;
+                        return Ok(ExitCode::from(1));
+                    }
+                    Err(error) => return Err(supervisor_error_to_io(error)),
+                };
+                if signal_guard.interrupted() {
+                    return Ok(ExitCode::from(130));
                 }
-                Err(error) => return Err(supervisor_error_to_io(error)),
+                let reservation =
+                    supervisor::reserve_localhost_port(port).map_err(supervisor_error_to_io)?;
+                let selected_port = reservation.port();
+                let log_path = paths.log_path(backend.log_key(), selected_port, started_at_unix_s);
+                (
+                    backend,
+                    supervisor::ManagedRun {
+                        schema_version: supervisor::RUNTIME_STATE_SCHEMA_VERSION,
+                        run_id: run_id.clone(),
+                        model_id: id.to_string(),
+                        owner_pid,
+                        owner_process_start_time_unix_s,
+                        stop_requested: false,
+                        lifecycle: supervisor::RunLifecycle::Starting,
+                        generation: 0,
+                        generation_alias: format!("loxa-{run_id}-g0"),
+                        port: selected_port,
+                        log_path,
+                        child_pid: None,
+                        child_process_start_time_unix_s: None,
+                        child_pgid: None,
+                    },
+                    true,
+                    Some(reservation),
+                )
             };
-            if signal_guard.interrupted() {
-                return Ok(ExitCode::from(130));
-            }
-            let llama_server_path =
-                supervisor::detect_llama_server().map_err(supervisor_error_to_io)?;
-            if signal_guard.interrupted() {
-                return Ok(ExitCode::from(130));
-            }
-            let reservation =
-                supervisor::reserve_localhost_port(port).map_err(supervisor_error_to_io)?;
-            let selected_port = reservation.port();
-            let log_path = paths.log_path(id, selected_port, started_at_unix_s);
-            (
-                entry,
-                model_path,
-                llama_server_path,
-                supervisor::ManagedRun {
-                    schema_version: supervisor::RUNTIME_STATE_SCHEMA_VERSION,
-                    run_id: run_id.clone(),
-                    model_id: id.to_string(),
-                    owner_pid,
-                    owner_process_start_time_unix_s,
-                    stop_requested: false,
-                    lifecycle: supervisor::RunLifecycle::Starting,
-                    generation: 0,
-                    generation_alias: format!("loxa-{run_id}-g0"),
-                    port: selected_port,
-                    log_path,
-                    child_pid: None,
-                    child_process_start_time_unix_s: None,
-                    child_pgid: None,
-                },
-                true,
-                Some(reservation),
-            )
-        };
         let log_path = starting_run.log_path.clone();
-        let spec = supervisor::ServerSpec {
-            entry,
-            model_path,
-            llama_server_path,
-            port: starting_run.port,
-            ctx_tokens: ctx.unwrap_or(supervisor::DEFAULT_CTX_TOKENS),
-            generation_alias: starting_run.generation_alias.clone(),
-        };
+        let spec = backend.launch_spec(
+            starting_run.port,
+            ctx.unwrap_or(supervisor::DEFAULT_CTX_TOKENS),
+            &starting_run.generation_alias,
+        );
         let starting_run = if initial_generation {
             supervisor::create_starting_run(&paths.state_path, starting_run)
                 .map_err(supervisor_error_to_io)?
         } else {
             starting_run
         };
-        let version_path = spec.llama_server_path.clone();
         let replacement_port = spec.port;
-        let preparation = (|| {
-            let reservation = match initial_reservation {
-                Some(reservation) => reservation,
-                None => supervisor::reserve_localhost_port(Some(replacement_port))?,
-            };
-            let version = supervisor::llama_server_version(&version_path)?;
-            Ok((version, reservation))
-        })();
-        let (llama_server_version, reservation) = match preparation {
-            Ok(prepared) => prepared,
+        let reservation = match initial_reservation {
+            Some(reservation) => Ok(reservation),
+            None => supervisor::reserve_localhost_port(Some(replacement_port)),
+        };
+        let reservation = match reservation {
+            Ok(reservation) => reservation,
             Err(error) => {
                 return finish_childless_owner_error(&paths.state_path, &starting_run, error)
                     .map_err(supervisor_error_to_io)
             }
         };
-        let spawn = supervisor::spawn_starting_llama_server(
+        let spawn = supervisor::spawn_starting_engine(
             &paths.state_path,
             &starting_run.identity(),
             &spec,
@@ -765,12 +938,12 @@ fn run_model<W: Write, E: Write>(
             };
         }
         let server = ManagedServer {
-            id: id.to_string(),
+            id: backend.model_id.clone(),
             pid: child.pid(),
             port: spec.port,
-            model_path: spec.model_path.clone(),
+            model_path: backend.model_path.clone(),
             started_at_unix_s,
-            llama_server_version,
+            llama_server_version: backend.engine_version.clone(),
             process_start_time_unix_s: supervisor::process_start_time_with_retry(child.pid()),
         };
 
@@ -808,23 +981,42 @@ fn run_model<W: Write, E: Write>(
             return Ok(owner_terminal_exit_code(outcome));
         }
 
-        match wait_for_startup_owned(
-            &mut child,
-            &state_identity,
-            &paths.state_path,
-            &signal_guard,
-            |child, timeout, interval| match supervisor::wait_for_generation_ready_or_exit(
-                child,
-                server.port,
-                &run.generation_alias,
-                timeout,
-                interval,
-            ) {
-                Ok(()) => Ok(StartupPoll::Ready),
-                Err(SupervisorError::HealthTimeout) => Ok(StartupPoll::Pending),
-                Err(error) => Err(error),
-            },
-        ) {
+        let readiness_worker = match &spec.readiness {
+            ReadinessStrategy::LlamaModelAlias { .. } => Ok(None),
+            ReadinessStrategy::ChatCompletionProbe { request_model } => {
+                supervisor::spawn_chat_completion_readiness_worker(
+                    server.port,
+                    request_model.clone(),
+                    supervisor::HEALTH_TIMEOUT,
+                    supervisor::HEALTH_POLL_INTERVAL,
+                )
+                .map(Some)
+            }
+        };
+        let startup = match readiness_worker {
+            Ok(mut readiness_worker) => wait_for_startup_owned(
+                &mut child,
+                &state_identity,
+                &paths.state_path,
+                &signal_guard,
+                readiness_worker.as_mut(),
+                |child, timeout, interval| match supervisor::wait_for_engine_ready_or_exit(
+                    child,
+                    server.port,
+                    &spec.readiness,
+                    timeout,
+                    interval,
+                ) {
+                    Ok(()) => Ok(StartupPoll::Ready),
+                    Err(SupervisorError::HealthTimeout) => Ok(StartupPoll::Pending),
+                    Err(error) => Err(error),
+                },
+            ),
+            Err(error) => {
+                finish_owned_startup_failure(&mut child, &paths.state_path, &state_identity, error)
+            }
+        };
+        match startup {
             Ok(StartupWaitOutcome::Ready) => {
                 match print_run_ready_owned(
                     stdout,
@@ -840,18 +1032,11 @@ fn run_model<W: Write, E: Write>(
                     }
                 }
                 if let Some(gateway) = gateway {
-                    gateway.publish(loxa_core::gateway::EngineTarget {
-                        base_url: format!("http://127.0.0.1:{}", server.port),
-                        backend_alias: run.generation_alias.clone(),
-                        engine: "llama.cpp".to_string(),
-                        engine_version: server.llama_server_version.clone(),
-                        model_id: id.to_string(),
-                        profile: format!("llama.cpp:{id}"),
-                    });
+                    gateway.publish(gateway_target(&backend, &spec));
                 }
                 match supervise_running_server(
                     RunSession {
-                        id,
+                        id: &backend.model_id,
                         state_identity: &state_identity,
                         log_path: &log_path,
                         state_path: &paths.state_path,
@@ -859,6 +1044,7 @@ fn run_model<W: Write, E: Write>(
                     &mut child,
                     &signal_guard,
                     gateway,
+                    backend.process_label(),
                     stdout,
                     stderr,
                 )? {
@@ -919,7 +1105,10 @@ fn run_model<W: Write, E: Write>(
                     ObservedChildExit::Restart { run } => {
                         let run = retain_restart_after_best_effort_announcement(
                             stdout,
-                            "llama-server exited before becoming healthy; restarting once...",
+                            &format!(
+                                "{} exited before becoming healthy; restarting once...",
+                                backend.process_label()
+                            ),
                             run,
                         );
                         replacement_run = Some(run);
@@ -928,7 +1117,9 @@ fn run_model<W: Write, E: Write>(
                     ObservedChildExit::Exhausted { log_tail } => {
                         writeln!(
                             stderr,
-                            "llama-server exited before becoming healthy for {id}"
+                            "{} exited before becoming healthy for {}",
+                            backend.process_label(),
+                            backend.model_id
                         )?;
                         write_log_tail(stderr, &log_tail)?;
                         return Ok(ExitCode::from(1));
@@ -939,7 +1130,12 @@ fn run_model<W: Write, E: Write>(
                 }
             }
             Err(StartupWaitFailure::AfterTeardown(error)) => {
-                return render_post_cleanup_startup_failure(stderr, &log_path, error);
+                return render_post_cleanup_startup_failure(
+                    stderr,
+                    &log_path,
+                    backend.process_label(),
+                    error,
+                );
             }
             #[cfg(test)]
             Err(StartupWaitFailure::BeforeTeardown(error)) => {
@@ -955,7 +1151,12 @@ fn run_model<W: Write, E: Write>(
                 if cleanup == supervisor::PostSpawnCleanupOutcome::RecoveryRequired {
                     return recovery_required_exit(stderr, &run.run_id);
                 }
-                return render_post_cleanup_startup_failure(stderr, &log_path, error);
+                return render_post_cleanup_startup_failure(
+                    stderr,
+                    &log_path,
+                    backend.process_label(),
+                    error,
+                );
             }
         }
     }
@@ -999,11 +1200,20 @@ fn select_serve_model(
 fn serve_node<W: Write, E: Write>(
     requested_model: Option<&str>,
     port: Option<u16>,
+    engine: RuntimeBackendKind,
     paths: &CliPaths,
     stdout: &mut W,
     stderr: &mut E,
 ) -> io::Result<ExitCode> {
-    let entry = select_serve_model(&paths.models_dir, requested_model)?;
+    let model_id = match engine {
+        RuntimeBackendKind::LlamaCpp => select_serve_model(&paths.models_dir, requested_model)?.id,
+        RuntimeBackendKind::PyMlxLm => requested_model.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--model <local-directory> is required with --engine py-mlx-lm",
+            )
+        })?,
+    };
     let node_id = format!("loxa-node-{}", std::process::id());
     let gateway_state = loxa_core::gateway::GatewayState::new(node_id);
     let gateway = loxa_core::gateway::GatewayServer::start(
@@ -1016,9 +1226,12 @@ fn serve_node<W: Write, E: Write>(
         gateway.port()
     )?;
     let outcome = run_model(
-        entry.id,
-        None,
-        None,
+        RunRequest {
+            id: model_id,
+            ctx: None,
+            port: None,
+            engine,
+        },
         paths,
         stdout,
         stderr,
@@ -1036,13 +1249,14 @@ fn serve_node<W: Write, E: Write>(
 fn render_post_cleanup_startup_failure<E: Write>(
     stderr: &mut E,
     log_path: &Path,
+    process_label: &str,
     error: SupervisorError,
 ) -> io::Result<ExitCode> {
     match error {
         SupervisorError::HealthTimeout => {
             writeln!(
                 stderr,
-                "llama-server did not become healthy within {} seconds",
+                "{process_label} did not become healthy within {} seconds",
                 supervisor::HEALTH_TIMEOUT.as_secs()
             )?;
             writeln!(stderr, "log file: {}", log_path.display())?;
@@ -1400,6 +1614,7 @@ fn wait_for_startup_owned<C, I, W>(
     state_identity: &supervisor::ManagedRunIdentity,
     state_path: &Path,
     interrupt: &I,
+    mut readiness_worker: Option<&mut supervisor::ChatCompletionReadinessWorker>,
     mut wait_step: W,
 ) -> Result<StartupWaitOutcome, StartupWaitFailure>
 where
@@ -1412,45 +1627,82 @@ where
         let current = match supervisor::current_runtime_state_run(state_path, state_identity) {
             Ok(current) => current,
             Err(error) => {
-                return finish_owned_startup_failure(child, state_path, state_identity, error)
-            }
-        };
-        if current.stop_requested {
-            return map_owned_startup_transition(
-                supervisor::teardown_owned_run(
-                    child,
-                    state_path,
-                    &current.identity(),
-                    supervisor::OwnerTeardownDecision::RequestedStop,
-                )
-                .map_err(StartupWaitFailure::AfterTeardown)?,
-            );
-        }
-        if InterruptSource::interrupted(interrupt) {
-            return map_owned_startup_transition(
-                supervisor::teardown_owned_run(
+                return finish_owned_startup_failure_after_readiness(
                     child,
                     state_path,
                     state_identity,
-                    supervisor::OwnerTeardownDecision::Interrupted,
+                    &mut readiness_worker,
+                    error,
                 )
-                .map_err(StartupWaitFailure::AfterTeardown)?,
+            }
+        };
+        if current.stop_requested {
+            return finish_owned_startup_transition_after_readiness(
+                child,
+                state_path,
+                &current.identity(),
+                supervisor::OwnerTeardownDecision::RequestedStop,
+                &mut readiness_worker,
             );
+        }
+        if InterruptSource::interrupted(interrupt) {
+            return finish_owned_startup_transition_after_readiness(
+                child,
+                state_path,
+                state_identity,
+                supervisor::OwnerTeardownDecision::Interrupted,
+                &mut readiness_worker,
+            );
+        }
+
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                let diagnostics_error = cancel_startup_readiness(&mut readiness_worker)
+                    .err()
+                    .map(|error| error.to_string());
+                return Err(StartupWaitFailure::AfterChildReaped {
+                    log_tail: String::new(),
+                    diagnostics_error,
+                });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return finish_owned_startup_failure_after_readiness(
+                    child,
+                    state_path,
+                    state_identity,
+                    &mut readiness_worker,
+                    SupervisorError::Io(error),
+                )
+            }
         }
 
         let remaining = supervisor::HEALTH_TIMEOUT.saturating_sub(started.elapsed());
         if remaining.is_zero() {
-            return finish_owned_startup_failure(
+            return finish_owned_startup_failure_after_readiness(
                 child,
                 state_path,
                 state_identity,
+                &mut readiness_worker,
                 SupervisorError::HealthTimeout,
             );
         }
         let step_timeout = remaining.min(supervisor::HEALTH_POLL_INTERVAL);
-        match wait_step(child, step_timeout, step_timeout) {
+        let poll = if let Some(worker) = readiness_worker.as_deref_mut() {
+            match worker.poll() {
+                supervisor::ReadinessWorkerPoll::Pending => Ok(StartupPoll::Pending),
+                supervisor::ReadinessWorkerPoll::Ready => Ok(StartupPoll::Ready),
+                supervisor::ReadinessWorkerPoll::Failed(error) => Err(error),
+            }
+        } else {
+            wait_step(child, step_timeout, step_timeout)
+        };
+        match poll {
             Ok(StartupPoll::Pending) => {}
             Ok(StartupPoll::Ready) => {
+                if let Err(error) = cancel_startup_readiness(&mut readiness_worker) {
+                    return finish_owned_startup_failure(child, state_path, state_identity, error);
+                }
                 let current =
                     match supervisor::current_runtime_state_run(state_path, state_identity) {
                         Ok(current) => current,
@@ -1464,14 +1716,12 @@ where
                         }
                     };
                 if current.stop_requested {
-                    return map_owned_startup_transition(
-                        supervisor::teardown_owned_run(
-                            child,
-                            state_path,
-                            &current.identity(),
-                            supervisor::OwnerTeardownDecision::RequestedStop,
-                        )
-                        .map_err(StartupWaitFailure::AfterTeardown)?,
+                    return finish_owned_startup_transition_after_readiness(
+                        child,
+                        state_path,
+                        &current.identity(),
+                        supervisor::OwnerTeardownDecision::RequestedStop,
+                        &mut readiness_worker,
                     );
                 }
                 return Ok(StartupWaitOutcome::Ready);
@@ -1489,10 +1739,63 @@ where
                 })
             }
             Err(error) => {
-                return finish_owned_startup_failure(child, state_path, state_identity, error)
+                return finish_owned_startup_failure_after_readiness(
+                    child,
+                    state_path,
+                    state_identity,
+                    &mut readiness_worker,
+                    error,
+                )
             }
         }
+        if readiness_worker.is_some() {
+            std::thread::sleep(step_timeout);
+        }
     }
+}
+
+fn cancel_startup_readiness(
+    worker: &mut Option<&mut supervisor::ChatCompletionReadinessWorker>,
+) -> Result<(), SupervisorError> {
+    let result = match worker.as_deref_mut() {
+        Some(worker) => worker.cancel_and_join(),
+        None => Ok(()),
+    };
+    *worker = None;
+    result
+}
+
+fn finish_owned_startup_failure_after_readiness<C>(
+    child: &mut C,
+    state_path: &Path,
+    state_identity: &supervisor::ManagedRunIdentity,
+    worker: &mut Option<&mut supervisor::ChatCompletionReadinessWorker>,
+    error: SupervisorError,
+) -> Result<StartupWaitOutcome, StartupWaitFailure>
+where
+    C: ManagedChild + LogDrainingChild,
+{
+    let error = cancel_startup_readiness(worker).err().unwrap_or(error);
+    finish_owned_startup_failure(child, state_path, state_identity, error)
+}
+
+fn finish_owned_startup_transition_after_readiness<C>(
+    child: &mut C,
+    state_path: &Path,
+    state_identity: &supervisor::ManagedRunIdentity,
+    decision: supervisor::OwnerTeardownDecision,
+    worker: &mut Option<&mut supervisor::ChatCompletionReadinessWorker>,
+) -> Result<StartupWaitOutcome, StartupWaitFailure>
+where
+    C: ManagedChild + LogDrainingChild,
+{
+    let cancellation = cancel_startup_readiness(worker);
+    let outcome = supervisor::teardown_owned_run(child, state_path, state_identity, decision)
+        .map_err(StartupWaitFailure::AfterTeardown)?;
+    if let Err(error) = cancellation {
+        return Err(StartupWaitFailure::AfterTeardown(error));
+    }
+    map_owned_startup_transition(outcome)
 }
 
 fn finish_owned_startup_failure<C>(
@@ -1679,6 +1982,7 @@ fn supervise_running_server<C, W: Write, E: Write, I: InterruptSource + Interrup
     child: &mut C,
     interrupt: &I,
     gateway: Option<&loxa_core::gateway::GatewayState>,
+    process_label: &str,
     stdout: &mut W,
     stderr: &mut E,
 ) -> io::Result<RunOutcome>
@@ -1748,7 +2052,7 @@ where
                     ObservedChildExit::Restart { run } => {
                         let run = retain_restart_after_best_effort_announcement(
                             stdout,
-                            "llama-server exited unexpectedly; restarting once...",
+                            &format!("{process_label} exited unexpectedly; restarting once..."),
                             run,
                         );
                         return Ok(RunOutcome::Restart { run });
@@ -1756,7 +2060,7 @@ where
                     ObservedChildExit::Exhausted { log_tail } => {
                         writeln!(
                             stderr,
-                            "llama-server exited unexpectedly for {}",
+                            "{process_label} exited unexpectedly for {}",
                             session.id
                         )?;
                         write_log_tail(stderr, &log_tail)?;
@@ -2280,9 +2584,90 @@ mod tests {
     use loxa_core::supervisor::LogDrainingChild;
     use std::cell::{Cell, RefCell};
     use std::fs;
+    use std::io::Read;
     use std::net::TcpListener;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool as TestAtomicBool, Ordering as TestOrdering};
+    use std::sync::Arc;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    static MLX_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    struct TestEnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    impl TestEnvRestore {
+        fn set(values: &[(&'static str, &std::ffi::OsStr)]) -> Self {
+            let previous = values
+                .iter()
+                .map(|(name, _)| (*name, std::env::var_os(name)))
+                .collect();
+            for (name, value) in values {
+                unsafe { std::env::set_var(name, value) };
+            }
+            Self(previous)
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    impl Drop for TestEnvRestore {
+        fn drop(&mut self) {
+            for (name, value) in self.0.drain(..) {
+                match value {
+                    Some(value) => unsafe { std::env::set_var(name, value) },
+                    None => unsafe { std::env::remove_var(name) },
+                }
+            }
+        }
+    }
+
+    fn read_test_http_request(stream: &mut std::net::TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set request timeout");
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let read = stream.read(&mut chunk).expect("read request");
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..read]);
+            let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") else {
+                continue;
+            };
+            let header_end = header_end + 4;
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if request.len() >= header_end + content_length {
+                break;
+            }
+        }
+        String::from_utf8(request).expect("request is utf8")
+    }
+
+    fn respond_test_http(stream: &mut std::net::TcpStream, body: &str) {
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .expect("write response");
+        stream.flush().expect("flush response");
+    }
 
     fn persist_run_for_server(state_path: &Path, server: &ManagedServer) -> supervisor::ManagedRun {
         let run_id = format!("test-run-{}", server.pid);
@@ -2487,12 +2872,107 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Command::Serve { model, port } => {
+            Command::Serve {
+                model,
+                port,
+                engine,
+            } => {
                 assert_eq!(model.as_deref(), Some("gemma-3-4b-it-q4"));
                 assert_eq!(port, Some(11435));
+                assert_eq!(engine, RuntimeBackendKind::LlamaCpp);
             }
             _ => panic!("expected serve command"),
         }
+    }
+
+    #[test]
+    fn clap_preserves_llama_default_and_accepts_explicit_runtime_engines() {
+        assert!(matches!(
+            Cli::try_parse_from(["loxa", "run", "gemma-3-4b-it-q4"]),
+            Ok(Cli {
+                command: Command::Run {
+                    engine: RuntimeBackendKind::LlamaCpp,
+                    ..
+                }
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "loxa",
+                "run",
+                "/tmp/mlx model",
+                "--engine",
+                "py-mlx-lm",
+            ]),
+            Ok(Cli {
+                command: Command::Run {
+                    id,
+                    engine: RuntimeBackendKind::PyMlxLm,
+                    ..
+                }
+            }) if id == "/tmp/mlx model"
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "loxa",
+                "serve",
+                "--model",
+                "/tmp/mlx model",
+                "--engine",
+                "py-mlx-lm",
+            ]),
+            Ok(Cli {
+                command: Command::Serve {
+                    model: Some(model),
+                    engine: RuntimeBackendKind::PyMlxLm,
+                    ..
+                }
+            }) if model == "/tmp/mlx model"
+        ));
+        assert!(Cli::try_parse_from(["loxa", "serve", "--engine", "llama-cpp",]).is_ok());
+    }
+
+    #[test]
+    fn clap_rejects_invalid_engine() {
+        assert!(Cli::try_parse_from([
+            "loxa",
+            "run",
+            "gemma-3-4b-it-q4",
+            "--engine",
+            "not-an-engine",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn python_ctx_is_rejected_before_execution() {
+        let cli = Cli::try_parse_from([
+            "loxa",
+            "run",
+            "/tmp/mlx-model",
+            "--engine",
+            "py-mlx-lm",
+            "--ctx",
+            "4096",
+        ])
+        .expect("parse Python engine request");
+        let temp = TempDir::new("loxa-python-ctx");
+        let paths = CliPaths {
+            models_dir: temp.path().join("models"),
+            state_path: temp.path().join("managed.json"),
+            logs_dir: temp.path().join("logs"),
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let exit = run_with_paths(cli, &paths, &mut stdout, &mut stderr);
+
+        assert_eq!(exit, ExitCode::from(1));
+        assert!(stdout.is_empty());
+        let error = String::from_utf8(stderr).expect("stderr is utf8");
+        assert!(error.contains("--ctx"));
+        assert!(error.contains("py-mlx-lm"));
+        assert!(!paths.state_path.exists());
     }
 
     #[test]
@@ -2514,6 +2994,7 @@ mod tests {
                     id,
                     ctx: Some(4096),
                     port: Some(9000),
+                    engine: RuntimeBackendKind::LlamaCpp,
                 },
             }) if id == "gemma-3-4b-it-q4"
         ));
@@ -2910,6 +3391,7 @@ mod tests {
                 id: "missing-model".to_string(),
                 ctx: None,
                 port: None,
+                engine: RuntimeBackendKind::LlamaCpp,
             },
         };
         let mut stdout = Vec::new();
@@ -2940,6 +3422,7 @@ mod tests {
                 id: "gemma-3-4b-it-q4".to_string(),
                 ctx: None,
                 port: None,
+                engine: RuntimeBackendKind::LlamaCpp,
             },
         };
         let mut stdout = Vec::new();
@@ -2957,6 +3440,92 @@ mod tests {
         let stderr = String::from_utf8(stderr).expect("stderr is utf8");
         assert!(stderr.contains("model not downloaded"));
         assert!(stderr.contains("loxa pull gemma-3-4b-it-q4"));
+    }
+
+    #[test]
+    fn invalid_python_model_fails_before_runtime_state_creation() {
+        let temp = TempDir::new("loxa-python-invalid-model");
+        let missing_model = temp.path().join("missing mlx model");
+        let state_path = temp.path().join("managed.json");
+        let cli = Cli {
+            command: Command::Run {
+                id: missing_model.display().to_string(),
+                ctx: None,
+                port: None,
+                engine: RuntimeBackendKind::PyMlxLm,
+            },
+        };
+        let paths = CliPaths {
+            models_dir: temp.path().join("models"),
+            state_path: state_path.clone(),
+            logs_dir: temp.path().join("logs"),
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let exit = run_with_paths(cli, &paths, &mut stdout, &mut stderr);
+
+        assert_eq!(exit, ExitCode::from(1));
+        assert!(stdout.is_empty());
+        let stderr = String::from_utf8(stderr).expect("stderr is utf8");
+        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            assert!(stderr.contains("py-mlx-lm model path"), "{stderr}");
+            assert!(stderr.contains("existing directory"), "{stderr}");
+        } else {
+            assert!(stderr.contains("requires Apple Silicon macOS"), "{stderr}");
+        }
+        assert!(!stderr.contains("unknown model id"), "{stderr}");
+        assert!(
+            !state_path.exists(),
+            "validation must precede state creation"
+        );
+    }
+
+    #[test]
+    fn python_gateway_metadata_uses_default_model_and_pinned_mlx_identity() {
+        let backend = ResolvedRuntimeBackend {
+            kind: RuntimeBackendKind::PyMlxLm,
+            model_id: "/tmp/mlx model".to_string(),
+            model_path: PathBuf::from("/tmp/mlx model"),
+            program: PathBuf::from("/tmp/bin/mlx_lm.server"),
+            engine_version: "0.31.3".to_string(),
+        };
+        let spec = backend.launch_spec(8123, supervisor::DEFAULT_CTX_TOKENS, "ignored-g0");
+
+        let target = gateway_target(&backend, &spec);
+
+        assert_eq!(target.backend_alias, "default_model");
+        assert_eq!(target.engine, "mlx-lm");
+        assert_eq!(target.engine_version, "0.31.3");
+        assert_eq!(target.model_id, "/tmp/mlx model");
+        assert_eq!(target.profile, "mlx-lm:/tmp/mlx model");
+    }
+
+    #[test]
+    fn python_serve_requires_an_explicit_local_model_before_gateway_start() {
+        let temp = TempDir::new("loxa-python-serve-no-model");
+        let paths = CliPaths {
+            models_dir: temp.path().join("models"),
+            state_path: temp.path().join("managed.json"),
+            logs_dir: temp.path().join("logs"),
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let error = serve_node(
+            None,
+            Some(0),
+            RuntimeBackendKind::PyMlxLm,
+            &paths,
+            &mut stdout,
+            &mut stderr,
+        )
+        .expect_err("Python serve needs --model");
+
+        assert!(error.to_string().contains("--model <local-directory>"));
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+        assert!(!paths.state_path.exists());
     }
 
     #[test]
@@ -3175,6 +3744,7 @@ mod tests {
                 id: "gemma-3-4b-it-q4".to_string(),
                 ctx: None,
                 port: None,
+                engine: RuntimeBackendKind::LlamaCpp,
             },
         };
         let mut stdout = Vec::new();
@@ -3620,6 +4190,7 @@ mod tests {
             &run.identity(),
             &state_path,
             &signal,
+            None,
             |_, _, _| panic!("state read error must precede readiness polling"),
         )
         .expect("startup recovery outcome");
@@ -3651,13 +4222,14 @@ mod tests {
         };
         let run = persist_run_for_server(&state_path, &server);
         let signal = FakeInterruptSource::new(vec![false]);
-        let mut child = FakeStartupChild::with_wait_results(vec![Some(0)]);
+        let mut child = FakeStartupChild::with_wait_results(vec![None, Some(0)]);
 
         let outcome = wait_for_startup_owned(
             &mut child,
             &run.identity(),
             &state_path,
             &signal,
+            None,
             |_, _, _| Err(SupervisorError::NoFreePort),
         )
         .expect("startup recovery outcome");
@@ -3671,6 +4243,397 @@ mod tests {
                 .filter(|event| **event == "terminate")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn python_startup_accepts_completion_slower_than_llama_poll_interval() {
+        let temp = TempDir::new("loxa-python-slow-readiness");
+        let state_path = temp.path().join("managed.json");
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind fake MLX server");
+        let port = listener.local_addr().expect("fake MLX address").port();
+        let exited = Arc::new(TestAtomicBool::new(false));
+        let server_exit = Arc::clone(&exited);
+        let server_thread = std::thread::spawn(move || {
+            let (mut health, _) = listener.accept().expect("accept health request");
+            read_test_http_request(&mut health);
+            respond_test_http(&mut health, r#"{"status":"ok"}"#);
+
+            let (mut completion, _) = listener.accept().expect("accept completion request");
+            read_test_http_request(&mut completion);
+            std::thread::sleep(Duration::from_millis(400));
+            respond_test_http(
+                &mut completion,
+                r#"{"choices":[{"message":{"content":"ok"}}]}"#,
+            );
+            std::thread::sleep(Duration::from_millis(500));
+            server_exit.store(true, TestOrdering::SeqCst);
+        });
+        let server = ManagedServer {
+            id: "/tmp/mlx-model".to_string(),
+            pid: 777,
+            port,
+            model_path: PathBuf::from("/tmp/mlx-model"),
+            started_at_unix_s: 789,
+            llama_server_version: "0.31.3".to_string(),
+            process_start_time_unix_s: Some(111),
+        };
+        let run = persist_run_for_server(&state_path, &server);
+        let signal = FakeInterruptSource::new(vec![false]);
+        let mut child = FakeStartupChild::with_shared_exit(exited);
+        let mut worker = supervisor::spawn_chat_completion_readiness_worker(
+            port,
+            "default_model".to_string(),
+            supervisor::HEALTH_TIMEOUT,
+            supervisor::HEALTH_POLL_INTERVAL,
+        )
+        .expect("spawn slow readiness worker");
+
+        let outcome = wait_for_startup_owned(
+            &mut child,
+            &run.identity(),
+            &state_path,
+            &signal,
+            Some(&mut worker),
+            |_, _, _| panic!("worker owns Python readiness"),
+        );
+        server_thread.join().expect("join fake MLX server");
+
+        assert_eq!(
+            outcome.expect("slow completion readiness"),
+            StartupWaitOutcome::Ready
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn py_mlx_restart_helper() {
+        if std::env::var_os("LOXA_MLX_RESTART_CHILD").as_deref() != Some(std::ffi::OsStr::new("1"))
+        {
+            return;
+        }
+        let Some(port) = std::env::var_os("LOXA_MLX_RESTART_HELPER_PORT") else {
+            return;
+        };
+        let port = port.to_string_lossy().parse::<u16>().expect("helper port");
+        let generation =
+            std::env::var("LOXA_MLX_RESTART_HELPER_GENERATION").expect("helper generation");
+        let requests_path = PathBuf::from(
+            std::env::var_os("LOXA_MLX_RESTART_REQUESTS").expect("helper requests path"),
+        );
+        let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind restart helper");
+
+        let (mut health, _) = listener.accept().expect("accept restart health");
+        let health_request = read_test_http_request(&mut health);
+        assert!(health_request.starts_with("GET /health "));
+        respond_test_http(&mut health, r#"{"status":"ok"}"#);
+
+        let (mut completion, _) = listener.accept().expect("accept restart completion");
+        let completion_request = read_test_http_request(&mut completion);
+        assert!(completion_request.starts_with("POST /v1/chat/completions "));
+        assert!(completion_request.contains(r#""model":"default_model""#));
+        let mut requests = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(requests_path)
+            .expect("open readiness evidence");
+        writeln!(requests, "generation={generation} health completion")
+            .expect("write readiness evidence");
+        if let Some(marker) = std::env::var_os("LOXA_MLX_RESTART_MARKER") {
+            fs::write(marker, generation.as_bytes()).expect("write completion marker");
+        }
+        let delay = std::env::var("LOXA_MLX_RESTART_DELAY_MS")
+            .expect("helper delay")
+            .parse::<u64>()
+            .expect("numeric helper delay");
+        if delay > 0 {
+            completion
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("set cancellation poll timeout");
+            let deadline = std::time::Instant::now() + Duration::from_millis(delay);
+            let mut byte = [0_u8; 1];
+            while std::time::Instant::now() < deadline {
+                match completion.read(&mut byte) {
+                    Ok(0) => return,
+                    Ok(_) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(_) => return,
+                }
+            }
+        }
+        respond_test_http(
+            &mut completion,
+            r#"{"choices":[{"message":{"content":"ok"}}]}"#,
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn actual_run_model_restarts_python_once_with_same_backend_plan() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = MLX_ENV_LOCK.lock().expect("MLX environment lock");
+        let temp = TempDir::new("loxa-python-actual-restart");
+        let bin_dir = temp.path().join("fake bin");
+        let model_dir = temp.path().join("mlx model with spaces");
+        let wrapper = bin_dir.join("mlx_lm.server");
+        let version = bin_dir.join("mlx_lm");
+        let count_path = temp.path().join("generation-count");
+        let args_path = temp.path().join("launch-args");
+        let requests_path = temp.path().join("readiness-requests");
+        let marker_path = temp.path().join("completion-marker");
+        fs::create_dir_all(&bin_dir).expect("create fake bin");
+        fs::create_dir_all(&model_dir).expect("create fake model");
+        fs::write(
+            &wrapper,
+            r#"#!/bin/sh
+count=0
+if [ -f "$LOXA_MLX_RESTART_COUNT" ]; then
+  count=$(<"$LOXA_MLX_RESTART_COUNT")
+fi
+count=$((count + 1))
+printf '%s\n' "$count" > "$LOXA_MLX_RESTART_COUNT"
+printf 'generation=%s\n' "$count" >> "$LOXA_MLX_RESTART_ARGS"
+for arg in "$@"; do
+  printf 'arg=%s\n' "$arg" >> "$LOXA_MLX_RESTART_ARGS"
+done
+port=''
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = '--port' ]; then
+    shift
+    port="$1"
+  fi
+  shift
+done
+LOXA_MLX_RESTART_HELPER_PORT="$port" \
+LOXA_MLX_RESTART_HELPER_GENERATION="$count" \
+LOXA_MLX_RESTART_CHILD="1" \
+"$LOXA_MLX_RESTART_TEST_EXE" --exact tests::py_mlx_restart_helper --nocapture
+"#,
+        )
+        .expect("write fake server");
+        fs::write(&version, "#!/bin/sh\nprintf '0.31.3\\n'\n").expect("write fake version command");
+        for path in [&wrapper, &version] {
+            let mut permissions = fs::metadata(path).expect("fake metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions).expect("make fake executable");
+        }
+        let test_exe = std::env::current_exe().expect("test executable");
+        let _environment = TestEnvRestore::set(&[
+            ("LOXA_MLX_LM_SERVER", wrapper.as_os_str()),
+            ("LOXA_MLX_RESTART_COUNT", count_path.as_os_str()),
+            ("LOXA_MLX_RESTART_ARGS", args_path.as_os_str()),
+            ("LOXA_MLX_RESTART_REQUESTS", requests_path.as_os_str()),
+            ("LOXA_MLX_RESTART_TEST_EXE", test_exe.as_os_str()),
+            ("LOXA_MLX_RESTART_MARKER", marker_path.as_os_str()),
+            ("LOXA_MLX_RESTART_DELAY_MS", std::ffi::OsStr::new("0")),
+        ]);
+        let paths = CliPaths {
+            models_dir: temp.path().join("models"),
+            state_path: temp.path().join("managed.json"),
+            logs_dir: temp.path().join("logs"),
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let exit = run_model(
+            RunRequest {
+                id: model_dir.to_str().expect("utf8 model path"),
+                ctx: None,
+                port: None,
+                engine: RuntimeBackendKind::PyMlxLm,
+            },
+            &paths,
+            &mut stdout,
+            &mut stderr,
+            None,
+        )
+        .expect("run fake Python engine");
+
+        assert_eq!(
+            exit,
+            ExitCode::from(1),
+            "generation one must exhaust restart"
+        );
+        let stdout = String::from_utf8(stdout).expect("stdout is utf8");
+        assert_eq!(
+            stdout
+                .matches("mlx_lm.server exited unexpectedly; restarting once...")
+                .count(),
+            1,
+            "{stdout}"
+        );
+        assert_eq!(stdout.matches("model id:").count(), 2, "{stdout}");
+        let stderr = String::from_utf8(stderr).expect("stderr is utf8");
+        assert!(
+            stderr.contains("mlx_lm.server exited unexpectedly"),
+            "{stderr}"
+        );
+
+        let canonical_model = fs::canonicalize(&model_dir).expect("canonical model");
+        let args = fs::read_to_string(&args_path).expect("read launch arguments");
+        let generations = args
+            .split("generation=")
+            .filter(|block| !block.is_empty())
+            .map(|block| {
+                let mut lines = block.lines();
+                let generation = lines.next().expect("generation number").to_string();
+                let argv = lines
+                    .map(|line| {
+                        line.strip_prefix("arg=")
+                            .expect("only argv evidence follows generation")
+                            .to_string()
+                    })
+                    .collect::<Vec<_>>();
+                (generation, argv)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(generations.len(), 2, "{args}");
+        assert_eq!(generations[0].0, "1");
+        assert_eq!(generations[1].0, "2");
+        for (_, argv) in &generations {
+            assert_eq!(argv.len(), 6, "unexpected extra argv: {argv:?}");
+            assert_eq!(argv[0], "--model");
+            assert_eq!(argv[1], canonical_model.display().to_string());
+            assert_eq!(argv[2], "--host");
+            assert_eq!(argv[3], "127.0.0.1");
+            assert_eq!(argv[4], "--port");
+            assert!(argv[5].parse::<u16>().is_ok(), "invalid port: {argv:?}");
+        }
+        assert_eq!(generations[0].1, generations[1].1);
+        let requests = fs::read_to_string(&requests_path).expect("read readiness evidence");
+        assert!(
+            requests.contains("generation=1 health completion"),
+            "{requests}"
+        );
+        assert!(
+            requests.contains("generation=2 health completion"),
+            "{requests}"
+        );
+        assert_eq!(
+            supervisor::read_runtime_state(&paths.state_path).expect("read final state"),
+            RuntimeStateRead::Loaded(Vec::new())
+        );
+
+        for path in [&count_path, &args_path, &requests_path, &marker_path] {
+            let _ = fs::remove_file(path);
+        }
+        unsafe { std::env::set_var("LOXA_MLX_RESTART_DELAY_MS", "5000") };
+        let stop_paths = CliPaths {
+            models_dir: temp.path().join("models-stop"),
+            state_path: temp.path().join("managed-stop.json"),
+            logs_dir: temp.path().join("logs-stop"),
+        };
+        let stop_state = stop_paths.state_path.clone();
+        let stop_marker = marker_path.clone();
+        let stop_thread = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !stop_marker.is_file() {
+                assert!(std::time::Instant::now() < deadline, "stop marker timeout");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            supervisor::request_managed_stop(&stop_state, "all").expect("request external stop")
+        });
+        let mut stop_stdout = Vec::new();
+        let mut stop_stderr = Vec::new();
+        let stop_started = std::time::Instant::now();
+        let stop_exit = run_model(
+            RunRequest {
+                id: model_dir.to_str().expect("utf8 model path"),
+                ctx: None,
+                port: None,
+                engine: RuntimeBackendKind::PyMlxLm,
+            },
+            &stop_paths,
+            &mut stop_stdout,
+            &mut stop_stderr,
+            None,
+        )
+        .expect("stop stalled Python readiness");
+        let stop_outcome = stop_thread.join().expect("join external stop request");
+        assert_eq!(stop_exit, ExitCode::SUCCESS);
+        assert!(
+            matches!(
+                stop_outcome,
+                supervisor::StopRequestOutcome::Completed { .. }
+            ),
+            "{stop_outcome:?}"
+        );
+        assert!(
+            stop_started.elapsed() < Duration::from_secs(2),
+            "external stop was blocked for {:?}",
+            stop_started.elapsed()
+        );
+        assert_eq!(
+            fs::read_to_string(&count_path)
+                .expect("stop generation count")
+                .trim(),
+            "1"
+        );
+        assert_eq!(
+            supervisor::read_runtime_state(&stop_paths.state_path).expect("read stopped state"),
+            RuntimeStateRead::Loaded(Vec::new())
+        );
+
+        for path in [&count_path, &args_path, &requests_path, &marker_path] {
+            let _ = fs::remove_file(path);
+        }
+        let interrupt_paths = CliPaths {
+            models_dir: temp.path().join("models-interrupt"),
+            state_path: temp.path().join("managed-interrupt.json"),
+            logs_dir: temp.path().join("logs-interrupt"),
+        };
+        let interrupt_marker = marker_path.clone();
+        let interrupt_thread = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !interrupt_marker.is_file() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "interrupt marker timeout"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            set_ctrl_c_received();
+        });
+        let mut interrupt_stdout = Vec::new();
+        let mut interrupt_stderr = Vec::new();
+        let interrupt_started = std::time::Instant::now();
+        let interrupt_exit = run_model(
+            RunRequest {
+                id: model_dir.to_str().expect("utf8 model path"),
+                ctx: None,
+                port: None,
+                engine: RuntimeBackendKind::PyMlxLm,
+            },
+            &interrupt_paths,
+            &mut interrupt_stdout,
+            &mut interrupt_stderr,
+            None,
+        )
+        .expect("interrupt stalled Python readiness");
+        interrupt_thread.join().expect("join interrupt request");
+        clear_ctrl_c_received();
+        assert_eq!(interrupt_exit, ExitCode::from(130));
+        assert!(
+            interrupt_started.elapsed() < Duration::from_secs(2),
+            "interrupt was blocked for {:?}",
+            interrupt_started.elapsed()
+        );
+        assert_eq!(
+            fs::read_to_string(&count_path)
+                .expect("interrupt generation count")
+                .trim(),
+            "1"
+        );
+        assert_eq!(
+            supervisor::read_runtime_state(&interrupt_paths.state_path)
+                .expect("read interrupted state"),
+            RuntimeStateRead::Loaded(Vec::new())
         );
     }
 
@@ -3743,6 +4706,7 @@ mod tests {
             &mut child,
             &signal,
             None,
+            "llama-server",
             &mut stdout,
             &mut stderr,
         )
@@ -3789,6 +4753,7 @@ mod tests {
             &mut child,
             &signal,
             None,
+            "llama-server",
             &mut stdout,
             &mut stderr,
         )
@@ -4519,6 +5484,8 @@ mod tests {
 
     #[test]
     fn ctrl_c_flag_helpers_round_trip() {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let _lock = MLX_ENV_LOCK.lock().expect("process-global test lock");
         clear_ctrl_c_received();
         assert!(!ctrl_c_received());
 
@@ -4693,6 +5660,7 @@ mod tests {
         let exit = render_post_cleanup_startup_failure(
             &mut stderr,
             &log_path,
+            "llama-server",
             SupervisorError::HealthTimeout,
         )
         .expect("render confirmed startup timeout");
@@ -4788,6 +5756,7 @@ mod tests {
         wait_results: RefCell<Vec<Option<i32>>>,
         drain_error: bool,
         wait_error_once: Cell<bool>,
+        shared_exit: Option<Arc<TestAtomicBool>>,
     }
 
     impl FakeStartupChild {
@@ -4804,7 +5773,14 @@ mod tests {
                 wait_results: RefCell::new(wait_results),
                 drain_error,
                 wait_error_once: Cell::new(false),
+                shared_exit: None,
             }
+        }
+
+        fn with_shared_exit(shared_exit: Arc<TestAtomicBool>) -> Self {
+            let mut child = Self::with_wait_results(vec![None]);
+            child.shared_exit = Some(shared_exit);
+            child
         }
 
         fn with_wait_error_then(wait_results: Vec<Option<i32>>) -> Self {
@@ -4831,6 +5807,13 @@ mod tests {
 
         fn try_wait(&mut self) -> io::Result<Option<i32>> {
             self.events.borrow_mut().push("try_wait");
+            if self
+                .shared_exit
+                .as_ref()
+                .is_some_and(|exited| exited.load(TestOrdering::SeqCst))
+            {
+                return Ok(Some(0));
+            }
             if self.wait_error_once.replace(false) {
                 return Err(io::Error::other("injected try_wait failure"));
             }
