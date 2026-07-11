@@ -28,6 +28,8 @@ enum Command {
     Doctor,
     Pull {
         id: String,
+        #[arg(long)]
+        quant: Option<String>,
     },
     List,
     Rm {
@@ -176,7 +178,7 @@ fn run_with_paths<W: Write, E: Write>(
     let result = match cli.command {
         Command::Calibrate => run_calibration(&mut stdout),
         Command::Doctor => print_doctor(&mut stdout),
-        Command::Pull { id } => pull_model(&id, &mut stdout, &mut stderr),
+        Command::Pull { id, quant } => pull_model(&id, quant.as_deref(), &mut stdout, &mut stderr),
         Command::List => print_list(&mut stdout),
         Command::Rm { id } => remove_model(&id, &mut stdout, &mut stderr),
         Command::Run { id, ctx, port } => {
@@ -341,9 +343,74 @@ fn calibration_error_message(error: &loxa_core::calibration::CalibrationError) -
 
 fn pull_model<W: Write, E: Write>(
     id: &str,
+    quant: Option<&str>,
     stdout: &mut W,
     stderr: &mut E,
 ) -> io::Result<ExitCode> {
+    if id.starts_with("hf://") || id.matches('/').count() == 1 {
+        let reference = loxa_core::resolve::ModelReference::parse(id).map_err(io::Error::other)?;
+        let available = HardwareReport::detect().ram_available_bytes;
+        let resolved = match loxa_core::resolve::resolve(&reference, quant, available) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                writeln!(stderr, "pull resolution failed: {error}")?;
+                return Ok(ExitCode::from(1));
+            }
+        };
+        let generated_id = format!(
+            "{}-{}",
+            reference
+                .repo
+                .split('/')
+                .next_back()
+                .unwrap_or("model")
+                .to_ascii_lowercase()
+                .replace(|c: char| !c.is_ascii_alphanumeric(), "-"),
+            resolved.quant.to_ascii_lowercase().replace('_', "-")
+        );
+        let entry = registry::UserModelEntry {
+            id: generated_id,
+            repo: resolved.repo,
+            revision: resolved.revision,
+            filename: resolved.filename,
+            sha256: resolved.sha256,
+            size_bytes: resolved.size_bytes,
+            license: resolved.license,
+            params: "unknown".into(),
+            quant: resolved.quant,
+            min_free_mem_gb: resolved.min_free_mem_gb,
+        };
+        if registry::find(&entry.id).is_some()
+            || registry::load_user_entries(&user_registry_dir())
+                .map_err(io::Error::other)?
+                .iter()
+                .any(|old| old.id == entry.id)
+        {
+            writeln!(
+                stderr,
+                "model id {} already exists; run `loxa rm {}` first",
+                entry.id, entry.id
+            )?;
+            return Ok(ExitCode::from(1));
+        }
+        writeln!(
+            stdout,
+            "selected {} ({}, {:.1} GB minimum free RAM)",
+            entry.filename, entry.quant, entry.min_free_mem_gb
+        )?;
+        return match download::download(&entry, &download::model_dir()) {
+            Ok(path) => {
+                registry::save_user_entry(&user_registry_dir(), &entry)
+                    .map_err(io::Error::other)?;
+                writeln!(stdout, "{}", path.display())?;
+                Ok(ExitCode::SUCCESS)
+            }
+            Err(error) => {
+                writeln!(stderr, "pull failed for {}: {error}", entry.id)?;
+                Ok(ExitCode::from(1))
+            }
+        };
+    }
     let Some(entry) = registry::find(id) else {
         write_unknown_id(id, stderr)?;
         return Ok(ExitCode::from(1));
@@ -360,6 +427,13 @@ fn pull_model<W: Write, E: Write>(
             Ok(ExitCode::from(1))
         }
     }
+}
+
+fn user_registry_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".loxa/registry.d")
 }
 
 fn print_list<W: Write>(stdout: &mut W) -> io::Result<ExitCode> {
@@ -436,6 +510,19 @@ fn print_list<W: Write>(stdout: &mut W) -> io::Result<ExitCode> {
         )?;
     }
 
+    for entry in registry::load_user_entries(&user_registry_dir()).map_err(io::Error::other)? {
+        writeln!(
+            stdout,
+            "{:<id_width$}  {:<params_width$}  {:<quant_width$}  {:>size_width$}  {:<license_width$}  {:<status_width$}",
+            entry.id,
+            entry.params,
+            entry.quant,
+            bytes_to_gb_string(entry.size_bytes),
+            entry.license,
+            if download::model_dir().join(&entry.filename).exists() { "downloaded" } else { "not downloaded" },
+        )?;
+    }
+
     Ok(ExitCode::SUCCESS)
 }
 
@@ -444,13 +531,16 @@ fn remove_model<W: Write, E: Write>(
     stdout: &mut W,
     stderr: &mut E,
 ) -> io::Result<ExitCode> {
-    let Some(entry) = registry::find(id) else {
-        write_unknown_id(id, stderr)?;
-        return Ok(ExitCode::from(1));
-    };
-
     let dir = download::model_dir();
-    let removed = remove_model_files(entry, &dir)?;
+    let removed = if let Some(entry) = REGISTRY.iter().find(|entry| entry.id == id) {
+        remove_model_files(entry, &dir)?
+    } else {
+        let Some(removed) = remove_user_entry(id, &user_registry_dir(), &dir)? else {
+            write_unknown_id(id, stderr)?;
+            return Ok(ExitCode::from(1));
+        };
+        removed
+    };
     if removed.is_empty() {
         writeln!(stdout, "nothing present for {id}")?;
     } else {
@@ -460,6 +550,29 @@ fn remove_model<W: Write, E: Write>(
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+fn remove_user_entry(
+    id: &str,
+    registry_dir: &Path,
+    models_dir: &Path,
+) -> io::Result<Option<Vec<PathBuf>>> {
+    let entries = registry::load_user_entries(registry_dir).map_err(io::Error::other)?;
+    let Some(entry) = entries.into_iter().find(|entry| entry.id == id) else {
+        return Ok(None);
+    };
+    let mut removed = Vec::new();
+    for path in [
+        models_dir.join(&entry.filename),
+        models_dir.join(format!("{}.part", entry.filename)),
+        registry_dir.join(format!("{}.json", entry.id)),
+    ] {
+        if path.try_exists()? {
+            fs::remove_file(&path)?;
+            removed.push(path);
+        }
+    }
+    Ok(Some(removed))
 }
 
 fn run_model<W: Write, E: Write>(
@@ -2578,6 +2691,7 @@ mod tests {
         let cli = Cli {
             command: Command::Pull {
                 id: "missing-model".to_string(),
+                quant: None,
             },
         };
         let mut stdout = Vec::new();
@@ -4185,6 +4299,41 @@ mod tests {
 
         let removed = remove_model_files(entry, temp.path()).expect("remove absent model files");
         assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn remove_user_entry_deletes_registry_final_and_partial_files() {
+        let temp = TempDir::new("loxa-user-rm");
+        let registry_dir = temp.path().join("registry.d");
+        let models_dir = temp.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        let entry = registry::UserModelEntry {
+            id: "demo-q4-k-m".into(),
+            repo: "owner/repo".into(),
+            revision: "0123456789abcdef0123456789abcdef01234567".into(),
+            filename: "demo-Q4_K_M.gguf".into(),
+            sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            size_bytes: 100 * 1024 * 1024,
+            license: "apache-2.0".into(),
+            params: "unknown".into(),
+            quant: "Q4_K_M".into(),
+            min_free_mem_gb: 0.1,
+        };
+        let registry_path = registry::save_user_entry(&registry_dir, &entry).unwrap();
+        let final_path = models_dir.join(&entry.filename);
+        let part_path = models_dir.join(format!("{}.part", entry.filename));
+        fs::write(&final_path, b"final").unwrap();
+        fs::write(&part_path, b"partial").unwrap();
+
+        let removed = remove_user_entry(&entry.id, &registry_dir, &models_dir)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            removed,
+            vec![final_path.clone(), part_path.clone(), registry_path.clone()]
+        );
+        assert!(!final_path.exists() && !part_path.exists() && !registry_path.exists());
     }
 
     #[test]
