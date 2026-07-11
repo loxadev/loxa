@@ -189,7 +189,7 @@ fn exact_child_cleanup_replacement_and_ten_cycles() {
     state
         .start_with_config(request(p, "ready"), &config(fixture()))
         .unwrap();
-    state.exit_app();
+    state.exit_app().unwrap();
     let snapshot = state.snapshot();
     assert_eq!(snapshot.ownership, Ownership::None);
     assert!(!snapshot.child_running);
@@ -231,6 +231,8 @@ fn rejects_untyped_or_unsafe_start_inputs() {
         "http://example.com:8080",
         "https://127.0.0.1:8080",
         "http://127.0.0.1/no-port",
+        "http://[::1]:8080",
+        "http://127.0.0.1:0",
     ] {
         let req = StartNodeRequest {
             endpoint: endpoint.into(),
@@ -239,4 +241,104 @@ fn rejects_untyped_or_unsafe_start_inputs() {
         };
         assert!(state.start_with_config(req, &config(fixture())).is_err());
     }
+}
+
+#[test]
+fn rejects_ipv6_loopback_and_port_zero_during_validation() {
+    let mut state = BootstrapState::default();
+    let initial = state.snapshot();
+    let began = Instant::now();
+    let ipv6_error = state
+        .start_with_config(
+            StartNodeRequest {
+                endpoint: "http://[::1]:8080".into(),
+                model: "ready".into(),
+                engine: "llama-cpp".into(),
+            },
+            &config(fixture()),
+        )
+        .unwrap_err();
+    assert!(ipv6_error.contains("IPv4"), "{ipv6_error}");
+    let zero_error = state
+        .start_with_config(
+            StartNodeRequest {
+                endpoint: "http://127.0.0.1:0".into(),
+                model: "ready".into(),
+                engine: "llama-cpp".into(),
+            },
+            &config(fixture()),
+        )
+        .unwrap_err();
+    assert!(zero_error.contains("between 1 and 65535"), "{zero_error}");
+    assert!(began.elapsed() < Duration::from_secs(1));
+    assert_eq!(state.snapshot().endpoint, initial.endpoint);
+}
+
+#[test]
+fn owned_child_cannot_be_retargeted_by_start_or_attach() {
+    let mut state = BootstrapState::default();
+    let original_port = port();
+    let original = state
+        .start_with_config(request(original_port, "ready"), &config(fixture()))
+        .unwrap();
+    let different_endpoint = endpoint(port());
+
+    let start_error = state
+        .start_with_config(
+            StartNodeRequest {
+                endpoint: different_endpoint.clone(),
+                model: "ready".into(),
+                engine: "llama-cpp".into(),
+            },
+            &config(fixture()),
+        )
+        .unwrap_err();
+    assert!(start_error.contains("owned"), "{start_error}");
+    let after_start = state.snapshot();
+    assert_eq!(after_start.endpoint, original.endpoint);
+    assert_eq!(after_start.ownership, Ownership::Owned);
+
+    let attach_error = state
+        .attach_with_config(different_endpoint, &config(fixture()))
+        .unwrap_err();
+    assert!(attach_error.contains("owned"), "{attach_error}");
+    let after_attach = state.snapshot();
+    assert_eq!(after_attach.endpoint, original.endpoint);
+    assert_eq!(after_attach.ownership, Ownership::Owned);
+    state.stop_owned().unwrap();
+}
+
+#[test]
+fn input_and_spawn_failures_are_visible_without_corrupting_state() {
+    let mut state = BootstrapState::default();
+    let initial = state.snapshot();
+
+    let invalid = StartNodeRequest {
+        endpoint: "http://127.0.0.1:0".into(),
+        model: "ready".into(),
+        engine: "llama-cpp".into(),
+    };
+    let input_error = state
+        .start_with_config(invalid, &config(fixture()))
+        .unwrap_err();
+    let after_input = state.snapshot();
+    assert_eq!(after_input.endpoint, initial.endpoint);
+    assert_eq!(after_input.ownership, Ownership::None);
+    assert_eq!(after_input.error.as_deref(), Some(input_error.as_str()));
+
+    let requested_endpoint = endpoint(port());
+    let spawn_error = state
+        .start_with_config(
+            StartNodeRequest {
+                endpoint: requested_endpoint.clone(),
+                model: "ready".into(),
+                engine: "llama-cpp".into(),
+            },
+            &config(PathBuf::from("/missing/loxa")),
+        )
+        .unwrap_err();
+    let after_spawn = state.snapshot();
+    assert_eq!(after_spawn.endpoint, requested_endpoint);
+    assert_eq!(after_spawn.ownership, Ownership::None);
+    assert_eq!(after_spawn.error.as_deref(), Some(spawn_error.as_str()));
 }

@@ -26,7 +26,7 @@ pub fn run() {
         if matches!(event, tauri::RunEvent::Exit) {
             let state = app_handle.state::<bootstrap::SharedBootstrapState>();
             if let Ok(mut state) = state.lock() {
-                state.exit_app();
+                let _ = state.exit_app();
             }
         }
     });
