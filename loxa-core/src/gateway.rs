@@ -621,6 +621,58 @@ mod tests {
         );
     }
 
+    async fn fake_default_model_chat(
+        State(seen): State<Arc<Mutex<Option<Value>>>>,
+        Json(request): Json<Value>,
+    ) -> Json<Value> {
+        *seen.lock().unwrap() = Some(request);
+        Json(json!({
+            "id": "chatcmpl-mlx-test",
+            "object": "chat.completion",
+            "model": "default_model",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hello from MLX"}}]
+        }))
+    }
+
+    #[tokio::test]
+    async fn non_stream_default_model_alias_round_trips_as_loxa() {
+        let seen = Arc::new(Mutex::new(None));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/v1/chat/completions", post(fake_default_model_chat))
+            .with_state(seen.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let state = GatewayState::new("node-test");
+        state.publish(EngineTarget {
+            base_url: format!("http://{address}"),
+            backend_alias: "default_model".into(),
+            engine: "mlx-lm".into(),
+            engine_version: "0.31.3".into(),
+            model_id: "/models/mlx-test".into(),
+            profile: "default".into(),
+        });
+        let base = spawn_gateway(state).await;
+
+        let response = Client::new()
+            .post(format!("{base}/v1/chat/completions"))
+            .json(&json!({"model": "loxa", "messages": [{"role": "user", "content": "hi"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let text = response.text().await.unwrap();
+        assert!(!text.contains("default_model"));
+        let body: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["model"], "loxa");
+        assert_eq!(body["choices"][0]["message"]["content"], "hello from MLX");
+        assert_eq!(
+            seen.lock().unwrap().as_ref().unwrap()["model"],
+            "default_model"
+        );
+    }
+
     #[tokio::test]
     async fn non_stream_errors_are_openai_shaped() {
         let state = GatewayState::new("node-test");
@@ -689,6 +741,63 @@ mod tests {
             .header("content-type", "text/event-stream")
             .body(Body::from_stream(stream::iter(chunks)))
             .unwrap()
+    }
+
+    async fn fake_default_model_stream_chat(
+        State(seen): State<Arc<Mutex<Option<Value>>>>,
+        Json(request): Json<Value>,
+    ) -> Response {
+        *seen.lock().unwrap() = Some(request);
+        let chunks = vec![
+            Ok::<_, std::convert::Infallible>(": mlx keepalive\n\n"),
+            Ok("data: {\"model\":\"default_"),
+            Ok("model\",\"choices\":[]}\n\n"),
+            Ok("data: [DONE]\n\n"),
+        ];
+        Response::builder()
+            .header("content-type", "text/event-stream")
+            .body(Body::from_stream(stream::iter(chunks)))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn streaming_default_model_alias_round_trips_as_loxa_with_one_done() {
+        let seen = Arc::new(Mutex::new(None));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/v1/chat/completions", post(fake_default_model_stream_chat))
+            .with_state(seen.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let state = GatewayState::new("node-test");
+        state.publish(EngineTarget {
+            base_url: format!("http://{address}"),
+            backend_alias: "default_model".into(),
+            engine: "mlx-lm".into(),
+            engine_version: "0.31.3".into(),
+            model_id: "/models/mlx-test".into(),
+            profile: "default".into(),
+        });
+        let base = spawn_gateway(state).await;
+
+        let response = Client::new()
+            .post(format!("{base}/v1/chat/completions"))
+            .json(&json!({"model": "loxa", "stream": true, "messages": []}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.headers()["content-type"], "text/event-stream");
+        let text = response.text().await.unwrap();
+        assert_eq!(
+            text,
+            ": mlx keepalive\n\ndata: {\"choices\":[],\"model\":\"loxa\"}\n\ndata: [DONE]\n\n"
+        );
+        assert_eq!(text.matches("data: [DONE]").count(), 1);
+        assert!(!text.contains("default_model"));
+        let upstream = seen.lock().unwrap();
+        assert_eq!(upstream.as_ref().unwrap()["model"], "default_model");
+        assert_eq!(upstream.as_ref().unwrap()["stream"], true);
     }
 
     #[tokio::test]
