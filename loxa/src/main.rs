@@ -856,7 +856,10 @@ fn select_serve_model(
 ) -> io::Result<&'static ModelEntry> {
     if let Some(id) = requested {
         let entry = registry::find(id).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, format!("unknown model: {id}"))
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unknown model: {id}; check `loxa list`, then run `loxa pull {id}`"),
+            )
         })?;
         if !models_dir.join(entry.filename).is_file() {
             return Err(io::Error::new(
@@ -2345,6 +2348,18 @@ mod tests {
         let selected = select_serve_model(temp.path(), None).unwrap();
 
         assert_eq!(selected.id, first.id);
+    }
+
+    #[test]
+    fn serve_unknown_explicit_model_includes_pull_guidance() {
+        let temp = TempDir::new("serve-selection");
+
+        let error = match select_serve_model(temp.path(), Some("not-in-registry")) {
+            Ok(_) => panic!("unknown model unexpectedly selected"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("loxa pull not-in-registry"));
     }
 
     #[test]

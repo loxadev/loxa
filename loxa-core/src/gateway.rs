@@ -63,7 +63,7 @@ impl GatewayState {
     }
 
     fn cancel_requests(&self) {
-        let _ = self.cancellation.send(true);
+        self.cancellation.send_replace(true);
     }
 }
 
@@ -159,6 +159,13 @@ async fn chat(
     request["model"] = Value::String(target.backend_alias.clone());
     let streaming = request.get("stream").and_then(Value::as_bool) == Some(true);
     let mut cancellation = state.cancellation.subscribe();
+    if *cancellation.borrow() {
+        return openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the gateway is shutting down",
+            "engine_unavailable",
+        );
+    }
     let send = state
         .client
         .post(format!("{}/v1/chat/completions", target.base_url))
@@ -202,7 +209,15 @@ async fn chat(
             .expect("valid streaming response");
     }
     let status = upstream.status();
-    let mut body = match upstream.json::<Value>().await {
+    let body = upstream.json::<Value>();
+    let mut body = match tokio::select! {
+        body = body => body,
+        _ = cancellation.changed() => return openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the gateway is shutting down",
+            "engine_unavailable",
+        ),
+    } {
         Ok(body) => body,
         Err(_) => {
             return openai_error(
@@ -213,6 +228,9 @@ async fn chat(
         }
     };
     normalize_aliases(&mut body, &target.backend_alias);
+    if !status.is_success() {
+        normalize_embedded_aliases(&mut body, &target.backend_alias);
+    }
     let status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     (status, Json(body)).into_response()
 }
@@ -242,10 +260,24 @@ fn normalize_sse(
         },
         |mut state| async move {
             loop {
+                if *state.cancellation.borrow() {
+                    return None;
+                }
                 if let Some(chunk) = state.ready.pop_front() {
                     return Some((Ok(chunk), state));
                 }
                 while let Some((end, delimiter_len)) = next_sse_boundary(&state.buffer) {
+                    if end > MAX_SSE_EVENT_BYTES {
+                        state.buffer.clear();
+                        state.finished = true;
+                        return Some((
+                            Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "upstream SSE event exceeds gateway limit",
+                            )),
+                            state,
+                        ));
+                    }
                     let event = state
                         .buffer
                         .drain(..end + delimiter_len)
@@ -272,6 +304,8 @@ fn normalize_sse(
                     ));
                 }
                 if state.buffer.len() > MAX_SSE_EVENT_BYTES {
+                    state.buffer.clear();
+                    state.finished = true;
                     return Some((
                         Err(io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -314,38 +348,32 @@ fn next_sse_boundary(bytes: &[u8]) -> Option<(usize, usize)> {
 }
 
 fn normalize_sse_event(event: &[u8], backend_alias: &str) -> Vec<u8> {
-    let text = String::from_utf8_lossy(event);
-    let delimiter = if text.ends_with("\r\n\r\n") {
-        "\r\n\r\n"
-    } else if text.ends_with("\n\n") {
-        "\n\n"
-    } else {
-        ""
+    let Ok(text) = std::str::from_utf8(event) else {
+        return event.to_vec();
     };
-    let content = text.strip_suffix(delimiter).unwrap_or(&text);
-    let lines = content
-        .lines()
-        .map(|line| {
-            let Some(data) = line.strip_prefix("data:") else {
-                return line.to_owned();
-            };
-            let data = data.trim_start();
-            if data == "[DONE]" {
-                return "data: [DONE]".to_owned();
+    let mut normalized = Vec::with_capacity(event.len());
+    for line_with_ending in text.split_inclusive('\n') {
+        let (line, ending) = match line_with_ending.strip_suffix("\r\n") {
+            Some(line) => (line, "\r\n"),
+            None => match line_with_ending.strip_suffix('\n') {
+                Some(line) => (line, "\n"),
+                None => (line_with_ending, ""),
+            },
+        };
+        let replacement = line.strip_prefix("data:").and_then(|data| {
+            let whitespace_len = data.len() - data.trim_start().len();
+            let payload = &data[whitespace_len..];
+            if payload == "[DONE]" {
+                return None;
             }
-            let Ok(mut json) = serde_json::from_str::<Value>(data) else {
-                return line.to_owned();
-            };
+            let mut json = serde_json::from_str::<Value>(payload).ok()?;
             normalize_aliases(&mut json, backend_alias);
-            format!("data: {json}")
-        })
-        .collect::<Vec<_>>()
-        .join(if delimiter.starts_with("\r\n") {
-            "\r\n"
-        } else {
-            "\n"
+            Some(format!("data:{}{}", &data[..whitespace_len], json))
         });
-    format!("{lines}{delimiter}").into_bytes()
+        normalized.extend_from_slice(replacement.as_deref().unwrap_or(line).as_bytes());
+        normalized.extend_from_slice(ending.as_bytes());
+    }
+    normalized
 }
 
 fn normalize_aliases(value: &mut Value, backend_alias: &str) {
@@ -362,6 +390,23 @@ fn normalize_aliases(value: &mut Value, backend_alias: &str) {
             }
             if object.contains_key("model") {
                 object.insert("model".into(), Value::String(MODEL_ALIAS.into()));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalize_embedded_aliases(value: &mut Value, backend_alias: &str) {
+    match value {
+        Value::String(text) => *text = text.replace(backend_alias, MODEL_ALIAS),
+        Value::Array(values) => {
+            for value in values {
+                normalize_embedded_aliases(value, backend_alias);
+            }
+        }
+        Value::Object(object) => {
+            for value in object.values_mut() {
+                normalize_embedded_aliases(value, backend_alias);
             }
         }
         _ => {}
@@ -442,7 +487,11 @@ mod tests {
         next_sse_boundary, normalize_sse, router, EngineTarget, GatewayServer, GatewayState,
         MAX_SSE_EVENT_BYTES,
     };
-    use axum::{body::Body, response::Response};
+    use axum::http::StatusCode;
+    use axum::{
+        body::{Body, Bytes},
+        response::{IntoResponse, Response},
+    };
     use axum::{extract::State, routing::post, Json, Router};
     use futures_util::stream;
     use futures_util::StreamExt;
@@ -590,6 +639,46 @@ mod tests {
         assert!(json["error"].get("param").is_some());
     }
 
+    #[tokio::test]
+    async fn invalid_model_and_transport_errors_are_openai_shaped() {
+        let state = GatewayState::new("node-test");
+        let base = spawn_gateway(state.clone()).await;
+        let invalid = Client::new()
+            .post(format!("{base}/v1/chat/completions"))
+            .json(&json!({"model": "backend", "messages": []}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        let invalid: Value = invalid.json().await.unwrap();
+        assert_eq!(invalid["error"]["code"], "invalid_model");
+        assert_eq!(invalid["error"]["param"], "model");
+
+        let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_address = dead.local_addr().unwrap();
+        drop(dead);
+        state.publish(EngineTarget {
+            base_url: format!("http://{dead_address}"),
+            backend_alias: "backend".into(),
+            engine: "llama.cpp".into(),
+            engine_version: "b9999".into(),
+            model_id: "gemma-3-4b-it-q4".into(),
+            profile: "default".into(),
+        });
+        let transport = Client::new()
+            .post(format!("{base}/v1/chat/completions"))
+            .json(&json!({"model": "loxa", "messages": []}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(transport.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let transport: Value = transport.json().await.unwrap();
+        assert_eq!(transport["error"]["code"], "upstream_error");
+        assert!(transport["error"]["message"].is_string());
+        assert!(transport["error"]["type"].is_string());
+        assert!(transport["error"].get("param").is_some());
+    }
+
     async fn fake_stream_chat() -> Response {
         let chunks = vec![
             Ok::<_, std::convert::Infallible>("data: {\"model\":\"loxa-node-"),
@@ -639,6 +728,38 @@ mod tests {
         assert!(!text.contains("loxa-node-test-g0"));
     }
 
+    #[tokio::test]
+    async fn first_sse_event_is_emitted_before_delayed_final_event() {
+        let upstream = stream::unfold(0, |step| async move {
+            match step {
+                0 => Some((
+                    Ok::<_, reqwest::Error>(Bytes::from_static(
+                        b"data: {\"model\":\"backend\"}\n\n",
+                    )),
+                    1,
+                )),
+                1 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    Some((
+                        Ok::<_, reqwest::Error>(Bytes::from_static(b"data: [DONE]\n\n")),
+                        2,
+                    ))
+                }
+                _ => None,
+            }
+        });
+        let (_cancellation_tx, cancellation) = tokio::sync::watch::channel(false);
+        let mut output = Box::pin(normalize_sse(upstream, "backend".into(), cancellation));
+
+        let first = tokio::time::timeout(std::time::Duration::from_millis(50), output.next())
+            .await
+            .expect("first event was buffered behind final event")
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, "data: {\"model\":\"loxa\"}\n\n");
+        assert_eq!(output.next().await.unwrap().unwrap(), "data: [DONE]\n\n");
+    }
+
     #[test]
     fn target_snapshots_and_mixed_sse_boundaries_are_stable() {
         let state = GatewayState::new("node-test");
@@ -659,6 +780,41 @@ mod tests {
             next_sse_boundary(b"data: first\n\ndata: second\r\n\r\n"),
             Some((11, 2))
         );
+    }
+
+    #[tokio::test]
+    async fn stream_preserves_non_json_data_comments_done_and_line_endings() {
+        let (_cancellation_tx, cancellation) = tokio::sync::watch::channel(false);
+        let input = b": keep  two spaces\r\ndata:plain text  \r\n\r\ndata:[DONE]\n\n";
+        let mut output = Box::pin(normalize_sse(
+            stream::iter([Ok::<_, reqwest::Error>(Bytes::from_static(input))]),
+            "backend".into(),
+            cancellation,
+        ));
+        let mut actual = Vec::new();
+        while let Some(chunk) = output.next().await {
+            actual.extend_from_slice(&chunk.unwrap());
+        }
+
+        assert_eq!(actual, input);
+    }
+
+    #[tokio::test]
+    async fn completed_oversized_sse_event_is_rejected() {
+        let (_cancellation_tx, cancellation) = tokio::sync::watch::channel(false);
+        let mut event = vec![b'x'; MAX_SSE_EVENT_BYTES + 1];
+        event.extend_from_slice(b"\n\n");
+        let mut output = Box::pin(normalize_sse(
+            stream::iter([Ok::<_, reqwest::Error>(Bytes::from(event))]),
+            "backend".into(),
+            cancellation,
+        ));
+
+        assert_eq!(
+            output.next().await.unwrap().unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert!(output.next().await.is_none());
     }
 
     #[tokio::test]
@@ -685,6 +841,115 @@ mod tests {
             .header("content-type", "text/event-stream")
             .body(Body::from_stream(first.chain(pending)))
             .unwrap()
+    }
+
+    async fn stalled_json() -> Response {
+        let first = stream::once(async { Ok::<_, std::convert::Infallible>("{") });
+        let pending = stream::pending::<Result<&'static str, std::convert::Infallible>>();
+        Response::builder()
+            .header("content-type", "application/json")
+            .body(Body::from_stream(first.chain(pending)))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_non_stream_body_parsing_after_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/v1/chat/completions", post(stalled_json)),
+            )
+            .await
+            .unwrap()
+        });
+        let state = GatewayState::new("node-test");
+        state.publish(EngineTarget {
+            base_url: format!("http://{address}"),
+            backend_alias: "backend".into(),
+            engine: "llama.cpp".into(),
+            engine_version: "b9999".into(),
+            model_id: "gemma-3-4b-it-q4".into(),
+            profile: "default".into(),
+        });
+        let server = GatewayServer::start(0, state).unwrap();
+        let port = server.port();
+        let request = tokio::spawn(async move {
+            Client::new()
+                .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+                .json(&json!({"model": "loxa", "messages": []}))
+                .send()
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            tokio::task::spawn_blocking(move || server.shutdown()),
+        )
+        .await
+        .expect("gateway shutdown waited on stalled JSON body")
+        .unwrap()
+        .unwrap();
+        request.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn stream_subscribed_after_shutdown_observes_cancellation() {
+        let state = GatewayState::new("node-test");
+        state.cancel_requests();
+        let mut output = Box::pin(normalize_sse(
+            stream::pending::<Result<Bytes, reqwest::Error>>(),
+            "backend".into(),
+            state.cancellation.subscribe(),
+        ));
+
+        let next = tokio::time::timeout(std::time::Duration::from_millis(100), output.next())
+            .await
+            .expect("late subscriber missed cancellation");
+        assert!(next.is_none());
+    }
+
+    async fn aliased_upstream_error() -> Response {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": {"message": "model backend is unavailable", "type": "invalid_request_error", "param": "model", "code": "bad_model"}})),
+        )
+            .into_response()
+    }
+
+    #[tokio::test]
+    async fn upstream_error_prose_does_not_leak_backend_alias() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/v1/chat/completions", post(aliased_upstream_error)),
+            )
+            .await
+            .unwrap()
+        });
+        let state = GatewayState::new("node-test");
+        state.publish(EngineTarget {
+            base_url: format!("http://{address}"),
+            backend_alias: "backend".into(),
+            engine: "llama.cpp".into(),
+            engine_version: "b9999".into(),
+            model_id: "gemma-3-4b-it-q4".into(),
+            profile: "default".into(),
+        });
+        let base = spawn_gateway(state).await;
+        let response = Client::new()
+            .post(format!("{base}/v1/chat/completions"))
+            .json(&json!({"model": "loxa", "messages": []}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let text = response.text().await.unwrap();
+        assert!(!text.contains("backend"));
+        assert!(text.contains("model loxa is unavailable"));
     }
 
     #[tokio::test]
@@ -753,6 +1018,77 @@ mod tests {
         fn drop(&mut self) {
             self.dropped.store(true, Ordering::SeqCst);
         }
+    }
+
+    struct HttpDropAwareStream {
+        yielded: bool,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl futures_util::Stream for HttpDropAwareStream {
+        type Item = Result<&'static str, std::convert::Infallible>;
+
+        fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            if self.yielded {
+                Poll::Pending
+            } else {
+                self.yielded = true;
+                Poll::Ready(Some(Ok("data: {\"model\":\"backend\"}\n\n")))
+            }
+        }
+    }
+
+    impl Drop for HttpDropAwareStream {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    async fn http_drop_stream(State(dropped): State<Arc<AtomicBool>>) -> Response {
+        Response::builder()
+            .header("content-type", "text/event-stream")
+            .body(Body::from_stream(HttpDropAwareStream {
+                yielded: false,
+                dropped,
+            }))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn real_downstream_http_drop_cancels_fake_upstream() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/v1/chat/completions", post(http_drop_stream))
+            .with_state(dropped.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = GatewayState::new("node-test");
+        state.publish(EngineTarget {
+            base_url: format!("http://{address}"),
+            backend_alias: "backend".into(),
+            engine: "llama.cpp".into(),
+            engine_version: "b9999".into(),
+            model_id: "gemma-3-4b-it-q4".into(),
+            profile: "default".into(),
+        });
+        let base = spawn_gateway(state).await;
+        let mut response = Client::new()
+            .post(format!("{base}/v1/chat/completions"))
+            .json(&json!({"model": "loxa", "stream": true, "messages": []}))
+            .send()
+            .await
+            .unwrap();
+        assert!(response.chunk().await.unwrap().is_some());
+        drop(response);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping downstream HTTP body did not cancel upstream");
     }
 
     #[tokio::test]
