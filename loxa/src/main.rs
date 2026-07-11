@@ -15,6 +15,8 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod bench;
+
 #[derive(Parser)]
 #[command(name = "loxa", version, about = "Measured local AI infrastructure")]
 struct Cli {
@@ -201,11 +203,13 @@ fn run_with_paths<W: Write, E: Write>(
             ollama_model,
             ctx,
             confirm_exclusive,
-        } => bench_preflight(
+        } => bench::run(
             &managed_id,
             &ollama_model,
             ctx,
             confirm_exclusive,
+            paths,
+            &mut stdout,
             &mut stderr,
         ),
         Command::Ps => print_managed_servers(paths, &mut stdout),
@@ -242,28 +246,6 @@ fn pull_model<W: Write, E: Write>(
             Ok(ExitCode::from(1))
         }
     }
-}
-
-fn bench_preflight<E: Write>(
-    managed_id: &str,
-    _ollama_model: &str,
-    _ctx: u32,
-    confirm_exclusive: bool,
-    stderr: &mut E,
-) -> io::Result<ExitCode> {
-    if !confirm_exclusive {
-        writeln!(stderr, "bench requires --confirm-exclusive")?;
-        return Ok(ExitCode::from(1));
-    }
-    if registry::find(managed_id).is_none() {
-        write_unknown_id(managed_id, stderr)?;
-        return Ok(ExitCode::from(1));
-    }
-    writeln!(
-        stderr,
-        "bench orchestration is unavailable until the next implementation step"
-    )?;
-    Ok(ExitCode::from(1))
 }
 
 fn print_list<W: Write>(stdout: &mut W) -> io::Result<ExitCode> {
@@ -2189,31 +2171,6 @@ mod tests {
     fn bench_is_listed_in_help() {
         let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("bench"));
-    }
-
-    #[test]
-    fn bench_preflight_requires_confirmation_before_registry_lookup() {
-        let mut stderr = Vec::new();
-        let exit = bench_preflight("missing-model", "unused", 8192, false, &mut stderr)
-            .expect("bench preflight");
-
-        assert_eq!(exit, ExitCode::from(1));
-        assert_eq!(
-            String::from_utf8(stderr).expect("utf8 stderr"),
-            "bench requires --confirm-exclusive\n"
-        );
-    }
-
-    #[test]
-    fn bench_preflight_rejects_unknown_managed_id_before_orchestration() {
-        let mut stderr = Vec::new();
-        let exit = bench_preflight("missing-model", "unused", 8192, true, &mut stderr)
-            .expect("bench preflight");
-
-        assert_eq!(exit, ExitCode::from(1));
-        let stderr = String::from_utf8(stderr).expect("utf8 stderr");
-        assert!(stderr.contains("unknown model id: missing-model"));
-        assert!(!stderr.contains("orchestration is unavailable"));
     }
 
     #[test]

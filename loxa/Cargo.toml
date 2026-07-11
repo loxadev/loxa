@@ -9,3 +9,6 @@ repository.workspace = true
 [dependencies]
 loxa-core = { path = "../loxa-core" }
 clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"
