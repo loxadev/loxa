@@ -34,6 +34,8 @@ pub struct StartNodeRequest {
 
 struct OwnedNode {
     child: Child,
+    #[cfg(test)]
+    fail_termination_once: bool,
 }
 
 pub struct BootstrapState {
@@ -85,17 +87,28 @@ impl BootstrapState {
         config: &BootstrapConfig,
     ) -> Result<BootstrapSnapshot, String> {
         self.refresh_child();
-        let address = parse_loopback_endpoint(&request.endpoint)?;
-        validate_engine(&request.engine)?;
+        if self.owned.is_some() {
+            if request.endpoint == self.endpoint {
+                return Ok(self.current_snapshot());
+            }
+            return self.fail(format!(
+                "an exact app-owned child is already retained at {}; stop it before targeting {}",
+                self.endpoint, request.endpoint
+            ));
+        }
+        let address = match parse_loopback_endpoint(&request.endpoint) {
+            Ok(address) => address,
+            Err(error) => return self.fail(error),
+        };
+        if let Err(error) = validate_engine(&request.engine) {
+            return self.fail(error);
+        }
         if request.model.is_empty() {
-            return Err("model must not be empty".into());
+            return self.fail("model must not be empty".into());
         }
         self.endpoint = request.endpoint;
         self.error = None;
 
-        if self.owned.is_some() {
-            return Ok(self.current_snapshot());
-        }
         if probe_ready(address, config.poll_interval) {
             self.ownership = Ownership::Attached;
             return Ok(self.current_snapshot());
@@ -105,7 +118,7 @@ impl BootstrapState {
             .executable
             .clone()
             .unwrap_or_else(|| PathBuf::from("loxa"));
-        let child = Command::new(&executable)
+        let child = match Command::new(&executable)
             .arg("serve")
             .arg("--model")
             .arg(&request.model)
@@ -117,13 +130,20 @@ impl BootstrapState {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|error| {
-                format!(
+        {
+            Ok(child) => child,
+            Err(error) => {
+                return self.fail(format!(
                     "failed to start loxa executable {}: {error}",
                     executable.display()
-                )
-            })?;
-        self.owned = Some(OwnedNode { child });
+                ));
+            }
+        };
+        self.owned = Some(OwnedNode {
+            child,
+            #[cfg(test)]
+            fail_termination_once: false,
+        });
         self.ownership = Ownership::Owned;
 
         let deadline = Instant::now() + config.startup_timeout;
@@ -146,13 +166,14 @@ impl BootstrapState {
                 return Ok(self.current_snapshot());
             }
             if Instant::now() >= deadline {
-                self.cleanup_owned();
                 let message = format!(
                     "loxa startup timed out after {} ms",
                     config.startup_timeout.as_millis()
                 );
-                self.error = Some(message.clone());
-                return Err(message);
+                return match self.cleanup_owned(&message) {
+                    Ok(()) => self.fail(message),
+                    Err(error) => Err(error),
+                };
             }
             thread::sleep(config.poll_interval);
         }
@@ -164,7 +185,19 @@ impl BootstrapState {
         config: &BootstrapConfig,
     ) -> Result<BootstrapSnapshot, String> {
         self.refresh_child();
-        let address = parse_loopback_endpoint(&endpoint)?;
+        if self.owned.is_some() {
+            if endpoint == self.endpoint {
+                return Ok(self.current_snapshot());
+            }
+            return self.fail(format!(
+                "an exact app-owned child is already retained at {}; stop it before attaching to {}",
+                self.endpoint, endpoint
+            ));
+        }
+        let address = match parse_loopback_endpoint(&endpoint) {
+            Ok(address) => address,
+            Err(error) => return self.fail(error),
+        };
         self.endpoint = endpoint;
         let deadline = Instant::now() + config.startup_timeout;
         loop {
@@ -199,15 +232,15 @@ impl BootstrapState {
         match owned.child.try_wait() {
             Ok(Some(_)) => {}
             Ok(None) => {
-                terminate_exact_child(&mut owned.child)?;
+                if let Err(error) = terminate_owned_node(&mut owned) {
+                    return self.preserve_after_termination_failure(owned, error);
+                }
             }
             Err(error) => {
-                self.owned = Some(owned);
-                self.ownership = Ownership::Owned;
-                let message =
-                    format!("ownership could not be proven; preserved retained child: {error}");
-                self.error = Some(message.clone());
-                return Err(message);
+                return self.preserve_after_termination_failure(
+                    owned,
+                    format!("ownership could not be proven: {error}"),
+                );
             }
         }
         self.ownership = Ownership::None;
@@ -222,10 +255,11 @@ impl BootstrapState {
         }
     }
 
-    pub fn exit_app(&mut self) {
+    pub fn exit_app(&mut self) -> Result<(), String> {
         if self.owned.is_some() {
-            self.cleanup_owned();
+            self.cleanup_owned("application exit cleanup failed")?;
         }
+        Ok(())
     }
 
     fn refresh_child(&mut self) {
@@ -249,14 +283,45 @@ impl BootstrapState {
         }
     }
 
-    fn cleanup_owned(&mut self) {
+    fn cleanup_owned(&mut self, context: &str) -> Result<(), String> {
         if let Some(mut owned) = self.owned.take() {
-            if matches!(owned.child.try_wait(), Ok(None)) {
-                let _ = terminate_exact_child(&mut owned.child);
+            match owned.child.try_wait() {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    if let Err(error) = terminate_owned_node(&mut owned) {
+                        return self.preserve_after_termination_failure(
+                            owned,
+                            format!("{context}: {error}"),
+                        );
+                    }
+                }
+                Err(error) => {
+                    return self.preserve_after_termination_failure(
+                        owned,
+                        format!("{context}: failed to inspect exact owned child: {error}"),
+                    );
+                }
             }
-            let _ = owned.child.wait();
         }
         self.ownership = Ownership::None;
+        Ok(())
+    }
+
+    fn preserve_after_termination_failure<T>(
+        &mut self,
+        owned: OwnedNode,
+        error: String,
+    ) -> Result<T, String> {
+        let message = format!("recovery required; exact owned child was preserved: {error}");
+        self.owned = Some(owned);
+        self.ownership = Ownership::Owned;
+        self.error = Some(message.clone());
+        Err(message)
+    }
+
+    fn fail<T>(&mut self, message: String) -> Result<T, String> {
+        self.error = Some(message.clone());
+        Err(message)
     }
 
     fn current_snapshot(&self) -> BootstrapSnapshot {
@@ -267,6 +332,14 @@ impl BootstrapState {
             error: self.error.clone(),
         }
     }
+}
+
+fn terminate_owned_node(owned: &mut OwnedNode) -> Result<(), String> {
+    #[cfg(test)]
+    if std::mem::take(&mut owned.fail_termination_once) {
+        return Err("injected termination failure".into());
+    }
+    terminate_exact_child(&mut owned.child)
 }
 
 fn terminate_exact_child(child: &mut Child) -> Result<(), String> {
@@ -282,27 +355,29 @@ fn terminate_exact_child(child: &mut Child) -> Result<(), String> {
                 std::io::Error::last_os_error()
             ));
         }
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            match child.try_wait() {
-                Ok(Some(_)) => return Ok(()),
-                Ok(None) => thread::sleep(Duration::from_millis(20)),
-                Err(error) => return Err(format!("failed to inspect exact owned child: {error}")),
-            }
+        if wait_for_child_exit(child, Duration::from_secs(5))? {
+            return Ok(());
         }
     }
     child
         .kill()
         .map_err(|error| format!("failed to stop exact owned child: {error}"))?;
-    child
-        .wait()
-        .map_err(|error| format!("failed to reap exact owned child: {error}"))?;
-    Ok(())
+    if wait_for_child_exit(child, Duration::from_secs(1))? {
+        Ok(())
+    } else {
+        Err("exact owned child did not exit after forced termination".into())
+    }
 }
 
-impl Drop for BootstrapState {
-    fn drop(&mut self) {
-        self.exit_app();
+fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> Result<bool, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(true),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+            Ok(None) => return Ok(false),
+            Err(error) => return Err(format!("failed to inspect exact owned child: {error}")),
+        }
     }
 }
 
@@ -323,8 +398,11 @@ fn parse_loopback_endpoint(endpoint: &str) -> Result<SocketAddr, String> {
     let address: SocketAddr = authority
         .parse()
         .map_err(|_| "endpoint must contain a numeric loopback address and port".to_string())?;
-    if !address.ip().is_loopback() {
-        return Err("endpoint must use a loopback address".into());
+    if !address.ip().is_ipv4() || !address.ip().is_loopback() {
+        return Err("endpoint must use an IPv4 loopback address".into());
+    }
+    if address.port() == 0 {
+        return Err("endpoint port must be between 1 and 65535".into());
     }
     Ok(address)
 }
@@ -411,5 +489,63 @@ pub fn stop_owned_node(
 pub fn window_closed(state: &SharedBootstrapState) {
     if let Ok(mut state) = state.lock() {
         state.close_window();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state_with_sleeping_child() -> BootstrapState {
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        BootstrapState {
+            endpoint: "http://127.0.0.1:18080".into(),
+            ownership: Ownership::Owned,
+            owned: Some(OwnedNode {
+                child,
+                fail_termination_once: true,
+            }),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn termination_failure_preserves_handle_and_safe_retry() {
+        let mut state = state_with_sleeping_child();
+        let error = state.stop_owned().unwrap_err();
+        assert!(error.contains("recovery required"), "{error}");
+        let failed = state.snapshot();
+        assert_eq!(failed.ownership, Ownership::Owned);
+        assert!(failed.child_running);
+        assert_eq!(failed.error.as_deref(), Some(error.as_str()));
+
+        let stopped = state.stop_owned().unwrap();
+        assert_eq!(stopped.ownership, Ownership::None);
+        assert!(!stopped.child_running);
+    }
+
+    #[test]
+    fn exit_cleanup_failure_is_bounded_observable_and_retryable() {
+        let mut state = state_with_sleeping_child();
+        let began = Instant::now();
+        let error = state.exit_app().unwrap_err();
+        assert!(began.elapsed() < Duration::from_secs(1));
+        assert!(error.contains("recovery required"), "{error}");
+        assert!(state.snapshot().child_running);
+        state.stop_owned().unwrap();
+    }
+
+    #[test]
+    fn timeout_cleanup_failure_is_bounded_and_retains_error_and_handle() {
+        let mut state = state_with_sleeping_child();
+        let began = Instant::now();
+        let error = state.cleanup_owned("loxa startup timed out").unwrap_err();
+        assert!(began.elapsed() < Duration::from_secs(1));
+        assert!(error.contains("startup timed out"), "{error}");
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.ownership, Ownership::Owned);
+        assert!(snapshot.child_running);
+        assert_eq!(snapshot.error.as_deref(), Some(error.as_str()));
+        state.stop_owned().unwrap();
     }
 }
