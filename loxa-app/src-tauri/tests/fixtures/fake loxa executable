@@ -1,0 +1,48 @@
+#!/bin/sh
+exec python3 - "$@" <<'PY'
+import os
+import socket
+import sys
+import threading
+import time
+
+args = sys.argv[1:]
+
+def value_after(flag):
+    return args[args.index(flag) + 1]
+
+model = value_after("--model")
+port = int(value_after("--port"))
+
+if model == "early-exit":
+    sys.exit(23)
+
+if os.path.sep in model:
+    with open(model, "w", encoding="utf-8") as capture:
+        capture.write("\n".join(args))
+
+if model == "timeout":
+    while True:
+        time.sleep(1)
+
+if model == "exit-after-ready":
+    threading.Timer(1, lambda: os._exit(0)).start()
+
+body = b'{"node_id":"fixture","health":"ready","model":"loxa","engine":null,"runtime_model":null}'
+response = (
+    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+    + str(len(body)).encode("ascii")
+    + b"\r\nConnection: close\r\n\r\n"
+    + body
+)
+
+with socket.socket() as listener:
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", port))
+    listener.listen()
+    while True:
+        connection, _ = listener.accept()
+        with connection:
+            connection.recv(1024)
+            connection.sendall(response)
+PY
