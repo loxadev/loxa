@@ -2,6 +2,8 @@ use loxa_app_lib::bootstrap::{BootstrapConfig, BootstrapState, Ownership, StartN
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -9,15 +11,31 @@ fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake loxa executable")
 }
 
-fn fixture_with_spaces() -> PathBuf {
+fn fixture_named(name: &str) -> PathBuf {
+    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
     let directory = std::env::temp_dir().join(format!(
-        "loxa fixture directory with spaces {}",
-        std::process::id()
+        "loxa fixture directory with spaces {} {}",
+        std::process::id(),
+        NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed),
     ));
     std::fs::create_dir_all(&directory).unwrap();
-    let executable = directory.join("fake loxa executable");
+    let executable = directory.join(name);
     std::fs::copy(fixture(), &executable).unwrap();
     executable
+}
+
+fn args_path(executable: &std::path::Path) -> PathBuf {
+    let mut path = executable.as_os_str().to_os_string();
+    path.push(".args");
+    PathBuf::from(path)
+}
+
+fn test_guard() -> MutexGuard<'static, ()> {
+    static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+    GUARD
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn port() -> u16 {
@@ -33,32 +51,42 @@ fn endpoint(port: u16) -> String {
 }
 
 fn config(executable: PathBuf) -> BootstrapConfig {
+    let credential_path = std::env::temp_dir()
+        .join(format!("loxa-bootstrap-auth-{}", std::process::id()))
+        .join("control.token");
+    std::fs::create_dir_all(credential_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &credential_path,
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            credential_path.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        std::fs::set_permissions(&credential_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
     BootstrapConfig {
         executable: Some(executable),
+        credential_path,
         startup_timeout: Duration::from_secs(2),
         poll_interval: Duration::from_millis(10),
     }
 }
 
-fn request(port: u16, model: impl Into<String>) -> StartNodeRequest {
+fn request(port: u16) -> StartNodeRequest {
     StartNodeRequest {
         endpoint: endpoint(port),
-        model: model.into(),
-        engine: "llama-cpp".into(),
     }
 }
 
-fn spawn_fixture(port: u16, model: &str) -> Child {
+fn spawn_fixture(port: u16) -> Child {
     Command::new(fixture())
-        .args([
-            "serve",
-            "--model",
-            model,
-            "--port",
-            &port.to_string(),
-            "--engine",
-            "llama-cpp",
-        ])
+        .args(["--port", &port.to_string()])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -66,20 +94,25 @@ fn spawn_fixture(port: u16, model: &str) -> Child {
 }
 
 fn wait_ready(port: u16) {
+    wait_health(port, "ready");
+}
+
+fn wait_health(port: u16, expected: &str) {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) {
             use std::io::{Read, Write};
             stream
                 .write_all(
-                    b"GET /loxa/status HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+                    b"GET /loxa/v1/node HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Loxa-Challenge: 0101010101010101010101010101010101010101010101010101010101010101\r\nConnection: close\r\n\r\n",
                 )
                 .unwrap();
             let mut response = Vec::new();
             stream.read_to_end(&mut response).unwrap();
+            let marker = format!("\"status\":\"{expected}\"");
             if response
-                .windows(b"\"health\":\"ready\"".len())
-                .any(|window| window == b"\"health\":\"ready\"")
+                .windows(marker.len())
+                .any(|window| window == marker.as_bytes())
             {
                 return;
             }
@@ -90,49 +123,113 @@ fn wait_ready(port: u16) {
 }
 
 #[test]
+fn start_attaches_to_an_existing_unloaded_node_without_spawning_a_second_node() {
+    let _guard = test_guard();
+    let p = port();
+    let mut external = Command::new(fixture())
+        .args(["--port", &p.to_string(), "--unavailable"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    wait_health(p, "unloaded");
+
+    let mut state = BootstrapState::default();
+    let snapshot = state
+        .start_with_config(
+            request(p),
+            &config(PathBuf::from("/must-not-be-spawned/loxa-node")),
+        )
+        .unwrap();
+    assert_eq!(snapshot.ownership, Ownership::Attached);
+    assert!(!snapshot.child_running);
+    assert!(
+        external.try_wait().unwrap().is_none(),
+        "existing node exited"
+    );
+
+    external.kill().unwrap();
+    external.wait().unwrap();
+}
+
+#[test]
+fn start_rejects_a_spoof_or_old_node_that_cannot_prove_the_user_credential() {
+    let _guard = test_guard();
+    let p = port();
+    let mut external = spawn_fixture(p);
+    wait_ready(p);
+    let wrong = config(PathBuf::from("/must-not-be-spawned/loxa-node"));
+    std::fs::write(
+        &wrong.credential_path,
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            &wrong.credential_path,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
+    let mut state = BootstrapState::default();
+    let error = state.start_with_config(request(p), &wrong).unwrap_err();
+    assert!(error.contains("must-not-be-spawned"), "{error}");
+    assert_eq!(state.snapshot().ownership, Ownership::None);
+    assert!(external.try_wait().unwrap().is_none());
+    external.kill().unwrap();
+    external.wait().unwrap();
+}
+
+#[test]
 fn native_bootstrap_ownership_matrix() {
+    let _guard = test_guard();
     let missing = PathBuf::from("/definitely missing/loxa executable");
     let mut state = BootstrapState::default();
     let error = state
-        .start_with_config(request(port(), "ready"), &config(missing))
+        .start_with_config(request(port()), &config(missing))
         .unwrap_err();
     assert!(error.contains("executable"), "{error}");
 
     let p = port();
-    let capture =
-        std::env::temp_dir().join(format!("loxa args with spaces {}.txt", std::process::id()));
-    let spaced_executable = fixture_with_spaces();
+    let spaced_executable = fixture_named("fake loxa executable with spaces");
     let snapshot = state
-        .start_with_config(
-            request(p, capture.display().to_string()),
-            &config(spaced_executable.clone()),
-        )
+        .start_with_config(request(p), &config(spaced_executable.clone()))
         .unwrap();
     assert_eq!(snapshot.ownership, Ownership::Owned);
-    let captured = std::fs::read_to_string(&capture).unwrap();
-    assert!(
-        captured
-            .lines()
-            .any(|arg| arg == capture.display().to_string())
+    let captured = std::fs::read_to_string(args_path(&spaced_executable)).unwrap();
+    assert_eq!(
+        captured.lines().collect::<Vec<_>>(),
+        ["--port", p.to_string().as_str()]
     );
     state.stop_owned().unwrap();
-    let _ = std::fs::remove_file(capture);
+    let _ = std::fs::remove_file(args_path(&spaced_executable));
     let _ = std::fs::remove_file(&spaced_executable);
     let _ = std::fs::remove_dir(spaced_executable.parent().unwrap());
 
-    let mut quick = config(fixture());
+    let timeout_executable = fixture_named("timeout loxa-node");
+    let mut quick = config(timeout_executable.clone());
     quick.startup_timeout = Duration::from_millis(100);
     let error = state
-        .start_with_config(request(port(), "timeout"), &quick)
+        .start_with_config(request(port()), &quick)
         .unwrap_err();
     assert!(error.contains("timed out"), "{error}");
+    assert!(
+        !state.snapshot().child_running,
+        "timeout must reap the child"
+    );
+    let early_exit_executable = PathBuf::from("/usr/bin/false");
     let error = state
-        .start_with_config(request(port(), "early-exit"), &config(fixture()))
+        .start_with_config(request(port()), &config(early_exit_executable.clone()))
         .unwrap_err();
-    assert!(error.contains("23"), "{error}");
+    assert!(error.contains("status"), "{error}");
+    assert!(!state.snapshot().child_running, "early exit must clear ownership");
+    let _ = std::fs::remove_file(timeout_executable);
 
     let attached_port = port();
-    let mut external = spawn_fixture(attached_port, "ready");
+    let mut external = spawn_fixture(attached_port);
     wait_ready(attached_port);
     let snapshot = state
         .attach_with_config(endpoint(attached_port), &config(fixture()))
@@ -155,11 +252,12 @@ fn native_bootstrap_ownership_matrix() {
 
 #[test]
 fn exact_child_cleanup_replacement_and_ten_cycles() {
+    let _guard = test_guard();
     let mut state = BootstrapState::default();
     for _ in 0..10 {
         let p = port();
         let started = state
-            .start_with_config(request(p, "ready"), &config(fixture()))
+            .start_with_config(request(p), &config(fixture()))
             .unwrap();
         assert_eq!(started.ownership, Ownership::Owned);
         let stopped = state.stop_owned().unwrap();
@@ -170,10 +268,10 @@ fn exact_child_cleanup_replacement_and_ten_cycles() {
 
     let p = port();
     state
-        .start_with_config(request(p, "ready"), &config(fixture()))
+        .start_with_config(request(p), &config(fixture()))
         .unwrap();
     state.stop_owned().unwrap();
-    let mut replacement = spawn_fixture(p, "ready");
+    let mut replacement = spawn_fixture(p);
     wait_ready(p);
     let snapshot = state.snapshot();
     assert_ne!(snapshot.ownership, Ownership::Owned);
@@ -187,7 +285,7 @@ fn exact_child_cleanup_replacement_and_ten_cycles() {
 
     let p = port();
     state
-        .start_with_config(request(p, "ready"), &config(fixture()))
+        .start_with_config(request(p), &config(fixture()))
         .unwrap();
     state.exit_app().unwrap();
     let snapshot = state.snapshot();
@@ -197,17 +295,26 @@ fn exact_child_cleanup_replacement_and_ten_cycles() {
 
 #[test]
 fn child_exit_clears_stale_ownership_and_preserves_replacement() {
+    let _guard = test_guard();
     let mut state = BootstrapState::default();
     let p = port();
     let started = state
-        .start_with_config(request(p, "exit-after-ready"), &config(fixture()))
+        .start_with_config(
+            request(p),
+            &config(fixture_named("exit-after-ready loxa-node")),
+        )
         .unwrap();
     assert_eq!(started.ownership, Ownership::Owned);
-    thread::sleep(Duration::from_millis(1_100));
+    thread::sleep(Duration::from_millis(1_500));
+    let exited = state.snapshot();
+    assert_eq!(exited.ownership, Ownership::None);
+    assert!(!exited.child_running);
 
-    let mut replacement = spawn_fixture(p, "ready");
+    let mut replacement = spawn_fixture(p);
     wait_ready(p);
-    let refreshed = state.snapshot();
+    let refreshed = state
+        .attach_with_config(endpoint(p), &config(fixture()))
+        .unwrap();
     assert_eq!(refreshed.ownership, Ownership::Attached);
     assert!(!refreshed.child_running);
     assert!(state.stop_owned().is_err());
@@ -221,12 +328,8 @@ fn child_exit_clears_stale_ownership_and_preserves_replacement() {
 
 #[test]
 fn rejects_untyped_or_unsafe_start_inputs() {
+    let _guard = test_guard();
     let mut state = BootstrapState::default();
-    for engine in ["", "metal", "llama-cpp; touch /tmp/no"] {
-        let mut req = request(port(), "ready");
-        req.engine = engine.into();
-        assert!(state.start_with_config(req, &config(fixture())).is_err());
-    }
     for endpoint in [
         "http://example.com:8080",
         "https://127.0.0.1:8080",
@@ -236,8 +339,6 @@ fn rejects_untyped_or_unsafe_start_inputs() {
     ] {
         let req = StartNodeRequest {
             endpoint: endpoint.into(),
-            model: "ready".into(),
-            engine: "llama-cpp".into(),
         };
         assert!(state.start_with_config(req, &config(fixture())).is_err());
     }
@@ -245,6 +346,7 @@ fn rejects_untyped_or_unsafe_start_inputs() {
 
 #[test]
 fn rejects_ipv6_loopback_and_port_zero_during_validation() {
+    let _guard = test_guard();
     let mut state = BootstrapState::default();
     let initial = state.snapshot();
     let began = Instant::now();
@@ -252,8 +354,6 @@ fn rejects_ipv6_loopback_and_port_zero_during_validation() {
         .start_with_config(
             StartNodeRequest {
                 endpoint: "http://[::1]:8080".into(),
-                model: "ready".into(),
-                engine: "llama-cpp".into(),
             },
             &config(fixture()),
         )
@@ -263,8 +363,6 @@ fn rejects_ipv6_loopback_and_port_zero_during_validation() {
         .start_with_config(
             StartNodeRequest {
                 endpoint: "http://127.0.0.1:0".into(),
-                model: "ready".into(),
-                engine: "llama-cpp".into(),
             },
             &config(fixture()),
         )
@@ -276,10 +374,11 @@ fn rejects_ipv6_loopback_and_port_zero_during_validation() {
 
 #[test]
 fn owned_child_cannot_be_retargeted_by_start_or_attach() {
+    let _guard = test_guard();
     let mut state = BootstrapState::default();
     let original_port = port();
     let original = state
-        .start_with_config(request(original_port, "ready"), &config(fixture()))
+        .start_with_config(request(original_port), &config(fixture()))
         .unwrap();
     let different_endpoint = endpoint(port());
 
@@ -287,8 +386,6 @@ fn owned_child_cannot_be_retargeted_by_start_or_attach() {
         .start_with_config(
             StartNodeRequest {
                 endpoint: different_endpoint.clone(),
-                model: "ready".into(),
-                engine: "llama-cpp".into(),
             },
             &config(fixture()),
         )
@@ -310,13 +407,12 @@ fn owned_child_cannot_be_retargeted_by_start_or_attach() {
 
 #[test]
 fn input_and_spawn_failures_are_visible_without_corrupting_state() {
+    let _guard = test_guard();
     let mut state = BootstrapState::default();
     let initial = state.snapshot();
 
     let invalid = StartNodeRequest {
         endpoint: "http://127.0.0.1:0".into(),
-        model: "ready".into(),
-        engine: "llama-cpp".into(),
     };
     let input_error = state
         .start_with_config(invalid, &config(fixture()))
@@ -331,8 +427,6 @@ fn input_and_spawn_failures_are_visible_without_corrupting_state() {
         .start_with_config(
             StartNodeRequest {
                 endpoint: requested_endpoint.clone(),
-                model: "ready".into(),
-                engine: "llama-cpp".into(),
             },
             &config(PathBuf::from("/missing/loxa")),
         )

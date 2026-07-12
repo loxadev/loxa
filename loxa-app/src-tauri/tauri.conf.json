@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "pnpm build",
+    "beforeBuildCommand": "pnpm build:desktop",
     "frontendDist": "../dist"
   },
   "app": {
@@ -25,6 +25,7 @@
   "bundle": {
     "active": true,
     "targets": ["app", "dmg"],
+    "externalBin": ["binaries/loxa-node"],
     "icon": [
       "icons/AppIcon.appiconset/icon_16x16.png",
       "icons/AppIcon.appiconset/icon_16x16@2x.png",

@@ -1,6 +1,13 @@
 #!/bin/sh
-exec python3 - "$@" <<'PY'
+case "$0" in
+  *early-exit*) exit 23 ;;
+  *timeout*) while true; do sleep 1; done ;;
+esac
+LOXA_FAKE_EXECUTABLE="$0" exec python3 - "$@" <<'PY'
 import os
+import hashlib
+import hmac
+import struct
 import socket
 import sys
 import threading
@@ -11,30 +18,18 @@ args = sys.argv[1:]
 def value_after(flag):
     return args[args.index(flag) + 1]
 
-model = value_after("--model")
 port = int(value_after("--port"))
+mode = os.path.basename(os.environ.get("LOXA_FAKE_EXECUTABLE", sys.argv[0]))
 
-if model == "early-exit":
-    sys.exit(23)
-
-if os.path.sep in model:
-    with open(model, "w", encoding="utf-8") as capture:
+if "with spaces" in mode:
+    with open(os.path.realpath(os.environ["LOXA_FAKE_EXECUTABLE"]) + ".args", "w", encoding="utf-8") as capture:
         capture.write("\n".join(args))
 
-if model == "timeout":
-    while True:
-        time.sleep(1)
-
-if model == "exit-after-ready":
+if "exit-after-ready" in mode:
     threading.Timer(1, lambda: os._exit(0)).start()
 
-body = b'{"node_id":"fixture","health":"ready","model":"loxa","engine":null,"runtime_model":null}'
-response = (
-    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
-    + str(len(body)).encode("ascii")
-    + b"\r\nConnection: close\r\n\r\n"
-    + body
-)
+status = "unloaded" if "--unavailable" in args else "ready"
+secret = bytes.fromhex("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
 
 with socket.socket() as listener:
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -43,6 +38,33 @@ with socket.socket() as listener:
     while True:
         connection, _ = listener.accept()
         with connection:
-            connection.recv(1024)
+            request = b""
+            while b"\r\n\r\n" not in request and len(request) < 4096:
+                chunk = connection.recv(4096 - len(request))
+                if not chunk:
+                    break
+                request += chunk
+            challenge_line = next((line for line in request.split(b"\r\n") if line.startswith(b"X-Loxa-Challenge: ")), None)
+            authorized = challenge_line is not None and b"Authorization:" not in request and request.startswith(b"GET /loxa/v1/node ")
+            if authorized:
+                nonce = challenge_line.split(b": ", 1)[1].decode("ascii")
+                status_discriminant = 0 if status == "unloaded" else 2
+                node_id = b"fixture"
+                runtime_identity = b"fixture-runtime"
+                message = (b"loxa-control-node-identity-v1\0" + struct.pack(">I", 1) + bytes.fromhex(nonce)
+                    + struct.pack(">I", len(node_id)) + node_id
+                    + struct.pack(">I", len(runtime_identity)) + runtime_identity
+                    + bytes([status_discriminant]))
+                proof = hmac.new(secret, message, hashlib.sha256).hexdigest()
+                response_body = ('{"protocol_version":1,"node_id":"fixture","runtime_identity":"fixture-runtime","status":"%s","challenge_proof":"%s"}' % (status, proof)).encode("ascii")
+            else:
+                response_body = b'{"error":"unauthorized"}'
+            status_line = b"HTTP/1.1 200 OK" if authorized else b"HTTP/1.1 401 Unauthorized"
+            response = (
+                status_line + b"\r\nContent-Type: application/json\r\nContent-Length: "
+                + str(len(response_body)).encode("ascii")
+                + b"\r\nConnection: close\r\n\r\n"
+                + response_body
+            )
             connection.sendall(response)
 PY
