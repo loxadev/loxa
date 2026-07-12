@@ -16,6 +16,7 @@ pub mod actor;
 pub mod control_router;
 pub mod download_control;
 mod engine_session;
+pub mod model_lifecycle;
 
 use engine_session::EngineSession;
 
@@ -543,7 +544,48 @@ pub fn run_model(
                 return Ok(termination);
             }
         };
-        let mut session = EngineSession::new(child, run, server, backend.process_label());
+        let observed_child_pid = server.pid;
+        let observed_child_start = match server.process_start_time_unix_s {
+            Some(start) => start,
+            None => {
+                let cleanup = supervisor::cleanup_post_spawn_failure(
+                    &mut child,
+                    &paths.state_path,
+                    &run.identity(),
+                )
+                .map_err(supervisor_error_to_io)?;
+                if cleanup == supervisor::PostSpawnCleanupOutcome::RecoveryRequired {
+                    return emit_recovery_required(events, &run.run_id);
+                }
+                return Err(io::Error::other(
+                    "spawned engine process identity is unavailable",
+                ));
+            }
+        };
+        let correlation_identity = run.identity();
+        let correlation_run_id = run.run_id.clone();
+        let mut session = match EngineSession::new(
+            child,
+            run,
+            server,
+            backend.process_label(),
+            observed_child_pid,
+            observed_child_start,
+        ) {
+            Ok(session) => session,
+            Err((mut child, error)) => {
+                let cleanup = supervisor::cleanup_post_spawn_failure(
+                    &mut child,
+                    &paths.state_path,
+                    &correlation_identity,
+                )
+                .map_err(supervisor_error_to_io)?;
+                if cleanup == supervisor::PostSpawnCleanupOutcome::RecoveryRequired {
+                    return emit_recovery_required(events, &correlation_run_id);
+                }
+                return Err(io::Error::other(error));
+            }
+        };
         let state_identity = session.identity();
 
         if let Some(outcome) =
