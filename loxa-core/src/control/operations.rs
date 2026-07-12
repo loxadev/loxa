@@ -41,12 +41,10 @@ mod tests {
         let snapshot = store.snapshot_since(0);
         assert!(snapshot.cursor_gap);
         assert_eq!(snapshot.operations.len(), 2);
-        assert!(
-            snapshot
-                .events
-                .windows(2)
-                .all(|pair| pair[0].sequence < pair[1].sequence)
-        );
+        assert!(snapshot
+            .events
+            .windows(2)
+            .all(|pair| pair[0].sequence < pair[1].sequence));
         assert_eq!(snapshot.operations[0].id, second);
     }
 
@@ -92,7 +90,7 @@ use super::contracts::{
     ReconnectSnapshot,
 };
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{mpsc, Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CancellationSafety {

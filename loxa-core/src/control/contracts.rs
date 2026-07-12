@@ -25,16 +25,19 @@ mod tests {
             "\"recovery_required\""
         );
         assert!(serde_json::from_str::<OperationStatus>("\"recovery_required\"").is_err());
-        assert!(
-            serde_json::from_str::<ModelRequest>(r#"{"model_id":"gemma-3-4b-it-q4","extra":true}"#)
-                .is_err()
-        );
+        assert!(serde_json::from_str::<ModelRequest>(
+            r#"{"model_id":"gemma-3-4b-it-q4","extra":true}"#
+        )
+        .is_err());
     }
 
     #[test]
     fn node_identity_challenge_and_response_are_closed_and_strictly_typed() {
         let nonce = "01".repeat(32);
-        assert!(serde_json::from_value::<NodeIdentityChallenge>(serde_json::json!({"nonce": nonce})).is_ok());
+        assert!(serde_json::from_value::<NodeIdentityChallenge>(
+            serde_json::json!({"nonce": nonce})
+        )
+        .is_ok());
         for invalid in [
             serde_json::json!({}),
             serde_json::json!({"nonce": "01", "extra": true}),
@@ -49,12 +52,24 @@ mod tests {
         });
         assert!(serde_json::from_value::<NodeIdentityProofResponse>(valid.clone()).is_ok());
         let mut extra = valid.clone();
-        extra.as_object_mut().unwrap().insert("extra".into(), true.into());
+        extra
+            .as_object_mut()
+            .unwrap()
+            .insert("extra".into(), true.into());
         assert!(serde_json::from_value::<NodeIdentityProofResponse>(extra).is_err());
-        for field in ["protocol_version", "node_id", "runtime_identity", "status", "challenge_proof"] {
+        for field in [
+            "protocol_version",
+            "node_id",
+            "runtime_identity",
+            "status",
+            "challenge_proof",
+        ] {
             let mut missing = valid.clone();
             missing.as_object_mut().unwrap().remove(field);
-            assert!(serde_json::from_value::<NodeIdentityProofResponse>(missing).is_err(), "{field}");
+            assert!(
+                serde_json::from_value::<NodeIdentityProofResponse>(missing).is_err(),
+                "{field}"
+            );
         }
         for invalid in [
             serde_json::json!({"protocol_version": 2, "node_id": "node", "runtime_identity": "runtime", "status": "unloaded", "challenge_proof": "00".repeat(32)}),
@@ -188,9 +203,13 @@ pub struct NodeIdentityChallenge {
 impl NodeIdentityChallenge {
     pub fn new(nonce: &str) -> Result<Self, ContractError> {
         if nonce.len() == 64
-            && nonce.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            && nonce
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
         {
-            Ok(Self { nonce: nonce.to_owned() })
+            Ok(Self {
+                nonce: nonce.to_owned(),
+            })
         } else {
             Err(ContractError::InvalidChallenge)
         }
@@ -201,9 +220,12 @@ impl<'de> Deserialize<'de> for NodeIdentityChallenge {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
-        struct WireChallenge { nonce: String }
+        struct WireChallenge {
+            nonce: String,
+        }
         let wire = WireChallenge::deserialize(deserializer)?;
-        Self::new(&wire.nonce).map_err(|_| serde::de::Error::custom("invalid node identity challenge"))
+        Self::new(&wire.nonce)
+            .map_err(|_| serde::de::Error::custom("invalid node identity challenge"))
     }
 }
 
@@ -236,7 +258,13 @@ impl NodeIdentityProofResponse {
         {
             return Err(ContractError::InvalidProofResponse);
         }
-        Ok(Self { protocol_version, node_id, runtime_identity, status, challenge_proof })
+        Ok(Self {
+            protocol_version,
+            node_id,
+            runtime_identity,
+            status,
+            challenge_proof,
+        })
     }
 }
 
