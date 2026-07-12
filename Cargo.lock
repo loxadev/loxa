@@ -840,6 +840,7 @@ version = "0.1.0-dev"
 dependencies = [
  "clap",
  "loxa-core",
+ "loxa-node",
 ]
 
 [[package]]
@@ -856,6 +857,13 @@ dependencies = [
  "sysinfo",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "loxa-node"
+version = "0.1.0-dev"
+dependencies = [
+ "loxa-core",
 ]
 
 [[package]]

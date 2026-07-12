@@ -1,5 +1,5 @@
 [package]
-name = "loxa"
+name = "loxa-node"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,5 +8,3 @@ repository.workspace = true
 
 [dependencies]
 loxa-core = { path = "../loxa-core" }
-loxa-node = { path = "../loxa-node" }
-clap = { version = "4", features = ["derive"] }

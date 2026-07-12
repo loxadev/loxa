@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["loxa-core", "loxa"]
+members = ["loxa-core", "loxa-node", "loxa"]
 
 [workspace.package]
 version = "0.1.0-dev"
