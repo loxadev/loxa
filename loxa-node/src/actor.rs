@@ -22,7 +22,7 @@ impl MutationCancellation {
         self.0.load(Ordering::SeqCst)
     }
 
-    fn cancel(&self) {
+    pub(crate) fn cancel(&self) {
         self.0.store(true, Ordering::SeqCst);
     }
 }
