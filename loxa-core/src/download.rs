@@ -34,6 +34,7 @@ pub enum DownloadError {
     AuthRequired,
     Forbidden,
     InvalidFilename,
+    UnsafeArtifactPath,
     InvalidContentRange,
     ChecksumMismatch { expected: String, actual: String },
     SizeMismatch { expected: u64, actual: u64 },
@@ -55,6 +56,7 @@ impl fmt::Display for DownloadError {
                 "Hugging Face returned 403 forbidden; check HF_TOKEN and gated repos access"
             ),
             DownloadError::InvalidFilename => write!(f, "invalid flat model filename"),
+            DownloadError::UnsafeArtifactPath => write!(f, "model artifact path is not a regular file"),
             DownloadError::InvalidContentRange => write!(f, "invalid Content-Range header"),
             DownloadError::ChecksumMismatch { expected, actual } => {
                 write!(f, "checksum mismatch: expected {expected}, got {actual}")
@@ -311,6 +313,7 @@ fn download_with_transport_and_observer(
     }
     let filename = sanitize_filename(entry.filename())?;
     fs::create_dir_all(dest_dir)?;
+    cleanup_stale_restart(&part_path(dest_dir, &filename))?;
 
     let mut warnings = StderrWarnings;
     if let ExistingDownload::Ready(path) =
@@ -526,7 +529,7 @@ fn hash_existing_prefix_into_observed(
     path: &Path,
     observer: &mut dyn DownloadObserver,
 ) -> Result<u64, DownloadError> {
-    let mut file = File::open(path)?;
+    let mut file = open_regular_read_no_follow(path)?;
     let mut buffer = [0_u8; COPY_BUFFER_BYTES];
     let mut total = 0_u64;
 
@@ -584,8 +587,8 @@ fn inspect_existing_download_with_observer(
     let final_path = dest_dir.join(&filename);
     let part_path = part_path(dest_dir, &filename);
 
-    if final_path.exists() {
-        let final_size = fs::metadata(&final_path)?.len();
+    if let Some(final_metadata) = regular_artifact_metadata(&final_path)? {
+        let final_size = final_metadata.len();
         if final_size == entry.size_bytes() {
             if entry.sha256() == TODO_VERIFY {
                 warnings.warn(&hash_unverified_warning(&final_path));
@@ -606,8 +609,8 @@ fn inspect_existing_download_with_observer(
         }
     }
 
-    if part_path.exists() {
-        let part_size = fs::metadata(&part_path)?.len();
+    if let Some(part_metadata) = regular_artifact_metadata(&part_path)? {
+        let part_size = part_metadata.len();
         if part_size > entry.size_bytes() {
             fs::remove_file(&part_path)?;
             return Ok(ExistingDownload::Download { resume_from: 0 });
@@ -728,12 +731,12 @@ fn download_body(
             offset,
             context.entry.size_bytes(),
         )?;
-        OpenOptions::new().append(true).open(context.part_path)?
+        open_regular_append_no_follow(context.part_path)?
     } else {
         if restart_from_zero && restart_path.exists() {
             fs::remove_file(&restart_path)?;
         }
-        File::create(transfer_path)?
+        create_regular_truncate_no_follow(transfer_path)?
     };
 
     let total = match copy_response_to_part(
@@ -950,6 +953,122 @@ fn restart_path(part_path: &Path) -> PathBuf {
     let mut name = part_path.as_os_str().to_os_string();
     name.push(".restart");
     PathBuf::from(name)
+}
+
+fn cleanup_stale_restart(part_path: &Path) -> Result<(), DownloadError> {
+    let path = restart_path(part_path);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
+            fs::remove_file(path)?;
+            Ok(())
+        }
+        Ok(_) => Err(DownloadError::UnsafeArtifactPath),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn regular_artifact_metadata(path: &Path) -> Result<Option<fs::Metadata>, DownloadError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(Some(metadata)),
+        Ok(_) => Err(DownloadError::UnsafeArtifactPath),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const DOWNLOAD_NO_FOLLOW: i32 = 0x20_000;
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+const DOWNLOAD_NO_FOLLOW: i32 = 0x100;
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd"
+))]
+fn apply_no_follow(options: &mut OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+    options.custom_flags(DOWNLOAD_NO_FOLLOW);
+}
+
+#[cfg(windows)]
+fn apply_no_follow(options: &mut OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt;
+    options.custom_flags(0x0020_0000);
+}
+
+#[cfg(not(any(
+    windows,
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd"
+)))]
+fn apply_no_follow(_options: &mut OpenOptions) {}
+
+fn open_regular_read_no_follow(path: &Path) -> Result<File, DownloadError> {
+    open_regular_no_follow(path, |options| {
+        options.read(true);
+    })
+}
+
+fn open_regular_append_no_follow(path: &Path) -> Result<File, DownloadError> {
+    open_regular_no_follow(path, |options| {
+        options.append(true);
+    })
+}
+
+fn create_regular_truncate_no_follow(path: &Path) -> Result<File, DownloadError> {
+    if let Some(metadata) = regular_artifact_metadata(path)? {
+        if !metadata.file_type().is_file() {
+            return Err(DownloadError::UnsafeArtifactPath);
+        }
+    }
+    open_regular_no_follow(path, |options| {
+        options.write(true).create(true).truncate(true);
+    })
+}
+
+fn open_regular_no_follow(
+    path: &Path,
+    configure: impl FnOnce(&mut OpenOptions),
+) -> Result<File, DownloadError> {
+    let before = fs::symlink_metadata(path).ok();
+    if before
+        .as_ref()
+        .is_some_and(|metadata| !metadata.file_type().is_file())
+    {
+        return Err(DownloadError::UnsafeArtifactPath);
+    }
+    let mut options = OpenOptions::new();
+    configure(&mut options);
+    apply_no_follow(&mut options);
+    let file = options.open(path)?;
+    let opened = file.metadata()?;
+    if !opened.file_type().is_file() {
+        return Err(DownloadError::UnsafeArtifactPath);
+    }
+    if let Some(before) = before {
+        if !same_file_identity(&before, &opened) {
+            return Err(DownloadError::UnsafeArtifactPath);
+        }
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.len() == right.len() && left.modified().ok() == right.modified().ok()
 }
 
 fn hash_unverified_warning(path: &Path) -> String {
@@ -1253,6 +1372,101 @@ mod tests {
         assert!(matches!(error, DownloadError::Cancelled));
         assert!(transport.offsets().is_empty());
         assert!(!dir.path().join("model.gguf.part").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mutating_downloader_rejects_final_and_partial_symlinks_without_touching_targets() {
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let target = outside.path().join("target");
+        fs::write(&target, b"outside").unwrap();
+        let model = entry(
+            "model.gguf",
+            Box::leak(sha256_hex(b"model").into_boxed_str()),
+            5,
+        );
+        symlink(&target, dir.path().join("model.gguf")).unwrap();
+        assert!(matches!(
+            download_with_transport(
+                &model,
+                dir.path(),
+                HF_BASE_URL,
+                &FakeTransport::new(5, vec![])
+            ),
+            Err(DownloadError::UnsafeArtifactPath)
+        ));
+        assert_eq!(fs::read(&target).unwrap(), b"outside");
+
+        fs::remove_file(dir.path().join("model.gguf")).unwrap();
+        symlink(&target, dir.path().join("model.gguf.part")).unwrap();
+        assert!(matches!(
+            download_with_transport(
+                &model,
+                dir.path(),
+                HF_BASE_URL,
+                &FakeTransport::new(5, vec![])
+            ),
+            Err(DownloadError::UnsafeArtifactPath)
+        ));
+        assert_eq!(fs::read(&target).unwrap(), b"outside");
+
+        fs::remove_file(dir.path().join("model.gguf.part")).unwrap();
+        let part = dir.path().join("model.gguf.part");
+        fs::write(&part, b"mod").unwrap();
+        symlink(&target, restart_path(&part)).unwrap();
+        cleanup_stale_restart(&part).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"outside");
+        assert!(!restart_path(&part).exists());
+    }
+
+    #[test]
+    fn mutating_downloader_rejects_artifact_directories() {
+        let dir = tempdir().unwrap();
+        let model = entry(
+            "model.gguf",
+            Box::leak(sha256_hex(b"model").into_boxed_str()),
+            5,
+        );
+        fs::create_dir(dir.path().join("model.gguf.part")).unwrap();
+        assert!(matches!(
+            download_with_transport(
+                &model,
+                dir.path(),
+                HF_BASE_URL,
+                &FakeTransport::new(5, vec![])
+            ),
+            Err(DownloadError::UnsafeArtifactPath)
+        ));
+    }
+
+    #[test]
+    fn honored_range_removes_stale_restart_before_resuming() {
+        let dir = tempdir().unwrap();
+        let bytes = b"prefix-and-suffix".to_vec();
+        let split = 7;
+        let model = entry(
+            "model.gguf",
+            Box::leak(sha256_hex(&bytes).into_boxed_str()),
+            bytes.len() as u64,
+        );
+        let part = dir.path().join("model.gguf.part");
+        fs::write(&part, &bytes[..split]).unwrap();
+        fs::write(restart_path(&part), b"stale replacement").unwrap();
+        let transport = FakeTransport::new(
+            bytes.len() as u64,
+            vec![FakeBody {
+                status: StatusCode::PARTIAL_CONTENT,
+                content_range: Some(format!("bytes {split}-{}/{}", bytes.len() - 1, bytes.len())),
+                body: bytes[split..].to_vec(),
+            }],
+        );
+
+        let path = download_with_transport(&model, dir.path(), HF_BASE_URL, &transport).unwrap();
+
+        assert_eq!(fs::read(path).unwrap(), bytes);
+        assert!(!restart_path(&part).exists());
     }
 
     #[test]
