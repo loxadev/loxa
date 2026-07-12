@@ -1,6 +1,7 @@
 //! Loxa core library.
 
 pub mod calibration;
+pub mod control;
 pub mod detect;
 pub mod download;
 pub mod engine;
