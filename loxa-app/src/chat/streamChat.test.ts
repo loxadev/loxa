@@ -36,6 +36,38 @@ function responseFrom(chunks: Uint8Array[], onCancel = vi.fn()): Response {
 }
 
 describe("streamChat", () => {
+  it("times out only while waiting for response headers and aborts the request", async () => {
+    const observed = callbacks();
+    let requestSignal: AbortSignal | undefined;
+    const fetch = vi.fn((_url: string, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      requestSignal = init?.signal ?? undefined;
+      requestSignal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
+    }));
+
+    const result = await streamChat("http://node", {}, observed.value, undefined, fetch, 1).finished;
+
+    expect(result).toEqual({ kind: "error", message: "Timed out waiting for the Loxa node to begin responding." });
+    expect(requestSignal?.aborted).toBe(true);
+    expect(observed.terminals).toEqual([result]);
+  });
+
+  it("classifies cancellation between headers and body inspection exactly once", async () => {
+    const observed = callbacks();
+    let resolveResponse!: (response: Response) => void;
+    const fetch = vi.fn(() => new Promise<Response>((resolve) => { resolveResponse = resolve; }));
+    const handle = streamChat("http://node", {}, observed.value, undefined, fetch);
+    resolveResponse({
+      ok: true,
+      status: 200,
+      get body() {
+        handle.cancel();
+        return null;
+      },
+    } as Response);
+
+    await expect(handle.finished).resolves.toEqual({ kind: "cancelled" });
+    expect(observed.terminals).toEqual([{ kind: "cancelled" }]);
+  });
   it("posts the stable streaming request and emits deltas then one completion", async () => {
     const seen: { url?: string; init?: RequestInit } = {};
     const fetch = vi.fn(async (url: string, init?: RequestInit) => {

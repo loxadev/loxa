@@ -257,7 +257,12 @@ export function ChatScreen({ services, endpoint }: { services: ChatScreenService
       publishReconciledBusy = true;
       if (node.status !== "ready" || node.activeModelId !== selectedModel) throw new Error("The node did not confirm the selected model as ready.");
       reconciledBusy = node.operationId !== null || [...operations.current.values()].some((operation) => operation.status === "queued" || operation.status === "running");
-      if (mounted.current) setActiveModel(node.activeModelId);
+      if (mounted.current) {
+        setActiveModel(node.activeModelId);
+        setSelectedModel(node.activeModelId);
+        setConnectionError("");
+        setConnection("ready");
+      }
     } catch (reason) {
       if (mounted.current && !controller.signal.aborted) {
         setConnectionError(message(reason));
@@ -315,7 +320,7 @@ export function ChatScreen({ services, endpoint }: { services: ChatScreenService
 
       <p className="model-line">Public API model alias <span className="technical-value">{requestModel ?? "Unavailable"}</span></p>
 
-      <div className="chat-output" aria-label="Conversation" aria-live="polite">
+      <div className="chat-output" aria-label="Conversation">
         {turns.length === 0 ? <p className="empty-state">Responses appear here.</p> : turns.map((turn) => (
           <article className="chat-turn" key={turn.id} aria-label={`Chat turn using ${turn.model}`}>
             <div className="chat-message chat-message-user"><p className="message-label">You</p><p>{turn.prompt}</p></div>
@@ -359,7 +364,7 @@ export function ChatScreen({ services, endpoint }: { services: ChatScreenService
                 <option value="">No active model</option>
                 {eligibleModels.map((model) => <option key={model.id} value={model.id}>{model.id}</option>)}
               </select>
-              {selectedModel !== activeModel && <button className="secondary-button interactive-target" type="button" disabled={modelOperation === "switching" || controlBusy || responseInProgress} onClick={() => void switchModel()} aria-label={`Switch to ${selectedModel}`}>{modelOperation === "switching" ? "Switching…" : "Switch"}</button>}
+              {selectedModel !== activeModel && <button className="secondary-button interactive-target" type="button" disabled={modelOperation === "switching" || controlBusy || responseInProgress} onClick={() => void switchModel()} aria-label={`${activeModel === null ? "Load" : "Switch to"} ${selectedModel}`}>{modelOperation === "switching" ? "Loading…" : activeModel === null ? "Load" : "Switch"}</button>}
               <span id="model-control-help" className="attachment-reason">Active: <span className="technical-value">{activeModel ?? "None"}</span>. Selecting a model does not load it.</span>
             </div>
           </div>
