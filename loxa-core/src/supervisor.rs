@@ -32,9 +32,10 @@ pub use readiness::{
     PROCESS_IDENTITY_POLL_INTERVAL, PROCESS_IDENTITY_TIMEOUT,
 };
 pub use state::{
-    create_starting_run, current_runtime_state_run, finish_runtime_state_run, read_runtime_state,
-    remove_runtime_state_entry, runtime_dir, runtime_logs_dir, runtime_state_path,
-    update_runtime_state_run, update_runtime_state_run_committed, ManagedRun, ManagedRunIdentity,
+    admit_offline_model_mutation, create_starting_run, current_runtime_state_run,
+    finish_runtime_state_run, read_runtime_state, remove_runtime_state_entry, runtime_dir,
+    runtime_logs_dir, runtime_state_path, update_runtime_state_run,
+    update_runtime_state_run_committed, ManagedRun, ManagedRunIdentity, OfflineModelMutationGuard,
     RunLifecycle, RuntimeStateRead, RUNTIME_STATE_LOCK_POLL_INTERVAL, RUNTIME_STATE_LOCK_TIMEOUT,
     RUNTIME_STATE_SCHEMA_VERSION,
 };
