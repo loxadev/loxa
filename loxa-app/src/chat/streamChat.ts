@@ -29,13 +29,20 @@ export function streamChat(
   const controller = new AbortController();
   let abortCause: "caller" | "dispose" | null = null;
   let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  let readerCancelled = false;
   let terminalNotified = false;
+
+  const cancelReader = async () => {
+    if (!reader || readerCancelled) return;
+    readerCancelled = true;
+    await Promise.resolve(reader.cancel()).catch(() => undefined);
+  };
 
   const abortOnce = (cause: "caller" | "dispose") => {
     if (abortCause !== null) return;
     abortCause = cause;
     controller.abort();
-    if (reader) void Promise.resolve(reader.cancel()).catch(() => undefined);
+    void cancelReader();
   };
   const abortFromCaller = () => abortOnce("caller");
   if (signal?.aborted) abortOnce("caller");
@@ -53,10 +60,12 @@ export function streamChat(
     }
     return terminal;
   };
+  const settle = (terminal: StreamTerminal): StreamTerminal =>
+    notifyTerminal(abortCause === null ? terminal : { kind: "cancelled" });
 
   const finished = (async (): Promise<StreamTerminal> => {
     if (abortCause !== null) {
-      return notifyTerminal({ kind: "cancelled" });
+      return settle({ kind: "cancelled" });
     }
     try {
       const response = await fetch(
@@ -73,13 +82,13 @@ export function streamChat(
       );
       if (!response.ok) {
         if (abortCause !== null) {
-          return notifyTerminal({ kind: "cancelled" });
+          return settle({ kind: "cancelled" });
         }
         const message = await httpErrorMessage(response);
         if (abortCause !== null) {
-          return notifyTerminal({ kind: "cancelled" });
+          return settle({ kind: "cancelled" });
         }
-        return notifyTerminal({
+        return settle({
           kind: "error",
           message,
         });
@@ -93,38 +102,39 @@ export function streamChat(
 
       reader = response.body.getReader();
       if (abortCause !== null) {
-        await reader.cancel().catch(() => undefined);
-        return notifyTerminal({ kind: "cancelled" });
+        await cancelReader();
+        return settle({ kind: "cancelled" });
       }
       const decoder = new SseDecoder();
       while (true) {
         const result = await reader.read();
         if (abortCause !== null) {
-          return notifyTerminal({ kind: "cancelled" });
+          return settle({ kind: "cancelled" });
         }
         if (result.done) {
           for (const event of decoder.finish()) {
-            const terminal = consumeEvent(event.data, callbacks, abortCause);
-            if (terminal) return notifyTerminal(terminal);
+            const terminal = consumeEvent(event.data, callbacks, () => abortCause !== null);
+            if (terminal) return settle(terminal);
           }
-          return notifyTerminal({
+          await cancelReader();
+          return settle({
             kind: "error",
             message: "The chat stream ended before [DONE].",
           });
         }
         for (const event of decoder.push(result.value)) {
-          const terminal = consumeEvent(event.data, callbacks, abortCause);
+          const terminal = consumeEvent(event.data, callbacks, () => abortCause !== null);
           if (terminal) {
-            void Promise.resolve(reader.cancel()).catch(() => undefined);
-            return notifyTerminal(terminal);
+            return settle(terminal);
           }
         }
       }
     } catch (error) {
       if (abortCause !== null || controller.signal.aborted) {
-        return notifyTerminal({ kind: "cancelled" });
+        return settle({ kind: "cancelled" });
       }
-      return notifyTerminal({
+      await cancelReader();
+      return settle({
         kind: "error",
         message:
           error instanceof SseDecodeError || error instanceof SyntaxError
@@ -162,18 +172,22 @@ async function httpErrorMessage(response: Response): Promise<string> {
 function consumeEvent(
   data: string,
   callbacks: StreamCallbacks,
-  abortCause: "caller" | "dispose" | null,
+  isAborted: () => boolean,
 ): StreamTerminal | null {
+  if (isAborted()) return { kind: "cancelled" };
   if (data.trim() === "[DONE]") return { kind: "completed" };
   const payload = JSON.parse(data) as unknown;
   if (!isRecord(payload) || !Array.isArray(payload.choices)) {
     throw new SyntaxError("invalid OpenAI stream chunk");
   }
   for (const choice of payload.choices) {
+    if (isAborted()) return { kind: "cancelled" };
     if (!isRecord(choice) || !isRecord(choice.delta)) continue;
     const content = choice.delta.content;
-    if (typeof content === "string" && content.length > 0 && abortCause === null) {
+    if (typeof content === "string" && content.length > 0) {
+      if (isAborted()) return { kind: "cancelled" };
       callbacks.onDelta(content);
+      if (isAborted()) return { kind: "cancelled" };
     }
   }
   return null;

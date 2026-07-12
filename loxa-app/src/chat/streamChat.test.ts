@@ -85,28 +85,96 @@ describe("streamChat", () => {
   });
 
   it.each([
-    ["malformed JSON", "data: {nope}\n\n", /malformed/i],
-    ["EOF before DONE", delta("partial"), /before.*done/i],
-    ["no DONE", "", /before.*done/i],
-  ])("reports %s once", async (_name, body, message) => {
+    ["malformed JSON", [chunk("data: {nope}\n\n")], /malformed/i],
+    ["invalid UTF-8", [Uint8Array.of(0xff, 0x0a, 0x0a)], /malformed/i],
+    ["oversized event", [chunk(`data: ${"x".repeat(1024 * 1024 + 1)}`)], /malformed/i],
+    ["EOF before DONE", [chunk(delta("partial"))], /before.*done/i],
+    ["no DONE", [], /before.*done/i],
+    ["unterminated DONE", [chunk("data: [DONE]")], /before.*done/i],
+  ])("reports %s once and cancels the response body", async (_name, chunks, message) => {
     const observed = callbacks();
-    const fetch = vi.fn(async () => responseFrom(body ? [chunk(body)] : []));
+    const cancel = vi.fn(async () => undefined);
+    const fetch = vi.fn(async () => responseFrom(chunks, cancel));
 
     const result = await streamChat("http://node", {}, observed.value, undefined, fetch).finished;
 
     expect(result).toMatchObject({ kind: "error", message: expect.stringMatching(message) });
     expect(observed.terminals).toEqual([result]);
+    expect(cancel).toHaveBeenCalledOnce();
   });
 
   it("ignores duplicate DONE frames and data after the first terminal", async () => {
     const observed = callbacks();
+    const cancel = vi.fn(async () => undefined);
     const fetch = vi.fn(async () =>
-      responseFrom([chunk(delta("before") + "data: [DONE]\n\ndata: [DONE]\n\n" + delta("after"))]),
+      responseFrom(
+        [chunk(delta("before") + "data: [DONE]\n\ndata: [DONE]\n\n" + delta("after"))],
+        cancel,
+      ),
     );
 
     await streamChat("http://node", {}, observed.value, undefined, fetch).finished;
     expect(observed.deltas).toEqual(["before"]);
     expect(observed.terminals).toEqual([{ kind: "completed" }]);
+    expect(cancel).not.toHaveBeenCalled();
+  });
+
+  it("stops callbacks immediately when onDelta disposes a multi-choice event", async () => {
+    const deltas: string[] = [];
+    const terminals: StreamTerminal[] = [];
+    const cancel = vi.fn(async () => undefined);
+    const payload = JSON.stringify({
+      choices: [
+        { delta: { content: "first" } },
+        { delta: { content: "second" } },
+      ],
+    });
+    const fetch = vi.fn(async () =>
+      responseFrom([chunk(`data: ${payload}\n\ndata: [DONE]\n\n`)], cancel),
+    );
+    const handle = streamChat(
+      "http://node",
+      {},
+      {
+        onDelta: (text) => {
+          deltas.push(text);
+          handle.dispose();
+        },
+        onTerminal: (terminal) => terminals.push(terminal),
+      },
+      undefined,
+      fetch,
+    );
+
+    await expect(handle.finished).resolves.toEqual({ kind: "cancelled" });
+    expect(deltas).toEqual(["first"]);
+    expect(terminals).toEqual([]);
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it("cancels a never-ending body after a malformed event", async () => {
+    const cancel = vi.fn(async () => undefined);
+    const reader = {
+      read: vi
+        .fn()
+        .mockResolvedValueOnce({ done: false, value: chunk("data: {bad}\n\n") })
+        .mockImplementation(() => new Promise(() => undefined)),
+      cancel,
+      releaseLock: vi.fn(),
+    };
+    const fetch = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      body: { getReader: () => reader },
+    }) as unknown as Response);
+    const observed = callbacks();
+
+    await expect(
+      streamChat("http://node", {}, observed.value, undefined, fetch).finished,
+    ).resolves.toMatchObject({ kind: "error" });
+    expect(reader.read).toHaveBeenCalledOnce();
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(reader.releaseLock).toHaveBeenCalledOnce();
   });
 
   it("preserves OpenAI error details for HTTP failures", async () => {
