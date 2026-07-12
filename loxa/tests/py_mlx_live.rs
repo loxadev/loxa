@@ -128,7 +128,7 @@ mod live {
             u32::try_from(child_pgid).expect("positive child pgid"),
             "the directly spawned Python leader must own its process group"
         );
-        assert_eq!(managed.model_id, model.display().to_string());
+        assert_eq!(managed.model_id, Some(model.display().to_string()));
         assert!(managed.log_path.is_file(), "managed log must exist");
         assert!(
             managed

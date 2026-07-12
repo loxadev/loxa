@@ -352,7 +352,7 @@ mod tests {
         ManagedRun {
             schema_version: RUNTIME_STATE_SCHEMA_VERSION,
             run_id: format!("test-run-{}", server.pid),
-            model_id: server.id.clone(),
+            model_id: Some(server.id.clone()),
             owner_pid: 42,
             owner_process_start_time_unix_s: 456,
             stop_requested: false,
@@ -371,7 +371,7 @@ mod tests {
         ManagedRun {
             schema_version: RUNTIME_STATE_SCHEMA_VERSION,
             run_id: run_id.to_string(),
-            model_id: "gemma-3-4b-it-q4".to_string(),
+            model_id: Some("gemma-3-4b-it-q4".to_string()),
             owner_pid: 42,
             owner_process_start_time_unix_s: 456,
             stop_requested: false,
@@ -492,7 +492,7 @@ mod tests {
         let model_path = temp.path().join("model.gguf");
         let attacher = thread::spawn(move || {
             let server = ManagedServer {
-                id: attach_starting.model_id.clone(),
+                id: attach_starting.model_id.clone().expect("model id"),
                 pid: 777,
                 port: attach_starting.port,
                 model_path,

@@ -10,11 +10,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const RUNTIME_STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 pub const RUNTIME_STATE_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(25);
-pub const RUNTIME_STATE_SCHEMA_VERSION: u32 = 2;
+const LEGACY_RUNTIME_STATE_SCHEMA_VERSION: u32 = 2;
+pub const RUNTIME_STATE_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunLifecycle {
+    Unloaded,
     Starting,
     Running,
     Restarting,
@@ -26,7 +28,8 @@ pub enum RunLifecycle {
 pub struct ManagedRun {
     pub schema_version: u32,
     pub run_id: String,
-    pub model_id: String,
+    #[serde(default)]
+    pub model_id: Option<String>,
     pub owner_pid: u32,
     pub owner_process_start_time_unix_s: u64,
     pub stop_requested: bool,
@@ -108,6 +111,29 @@ pub fn read_runtime_state(path: &Path) -> Result<RuntimeStateRead, SupervisorErr
             }
 
             match serde_json::from_slice::<RuntimeStateEnvelope>(&bytes) {
+                Ok(mut envelope)
+                    if envelope.schema_version == LEGACY_RUNTIME_STATE_SCHEMA_VERSION =>
+                {
+                    if envelope.runs.iter().any(|run| {
+                        run.schema_version != LEGACY_RUNTIME_STATE_SCHEMA_VERSION
+                            || run.model_id.is_none()
+                            || run.lifecycle == RunLifecycle::Unloaded
+                    }) {
+                        return Ok(RuntimeStateRead::Corrupt(
+                            "invalid legacy managed state schema 2 record".to_string(),
+                        ));
+                    }
+                    for run in &mut envelope.runs {
+                        run.schema_version = RUNTIME_STATE_SCHEMA_VERSION;
+                    }
+                    if envelope.runs.len() > 1 {
+                        Ok(RuntimeStateRead::Corrupt(
+                            "managed state contains more than one active run".to_string(),
+                        ))
+                    } else {
+                        Ok(RuntimeStateRead::Loaded(envelope.runs))
+                    }
+                }
                 Ok(envelope) if envelope.schema_version != RUNTIME_STATE_SCHEMA_VERSION => {
                     Ok(RuntimeStateRead::Corrupt(format!(
                         "unsupported managed state schema version {}",
@@ -211,13 +237,15 @@ fn create_starting_run_with_lock_options(
     interval: Duration,
 ) -> Result<ManagedRun, SupervisorError> {
     validate_runtime_run(&run).map_err(SupervisorError::RunStateConflict)?;
-    if run.lifecycle != RunLifecycle::Starting
-        || run.child_pid.is_some()
+    if !matches!(
+        run.lifecycle,
+        RunLifecycle::Starting | RunLifecycle::Unloaded
+    ) || run.child_pid.is_some()
         || run.child_process_start_time_unix_s.is_some()
         || run.child_pgid.is_some()
     {
         return Err(SupervisorError::RunStateConflict(
-            "new run must be childless and in the starting lifecycle".to_string(),
+            "new run must be childless and starting or unloaded".to_string(),
         ));
     }
     let _lock = acquire_runtime_state_lock_for_mutation(path, timeout, interval)?;
@@ -401,7 +429,7 @@ where
     let Some(run) = runs.first_mut() else {
         return Ok(StopRequestMatch::NoMatch);
     };
-    if target != "all" && run.model_id != target {
+    if target != "all" && run.model_id.as_deref() != Some(target) {
         return Ok(StopRequestMatch::NoMatch);
     }
 
@@ -482,8 +510,8 @@ fn validate_runtime_run(run: &ManagedRun) -> Result<(), String> {
     if run.run_id.is_empty() {
         return Err("managed run ID must not be empty".to_string());
     }
-    if run.model_id.is_empty() {
-        return Err("managed run model ID must not be empty".to_string());
+    if run.model_id.as_ref().is_some_and(String::is_empty) {
+        return Err("managed run model ID must not be empty when present".to_string());
     }
     if run.generation_alias.is_empty() {
         return Err("managed run generation alias must not be empty".to_string());
@@ -647,7 +675,7 @@ mod tests {
         ManagedRun {
             schema_version: RUNTIME_STATE_SCHEMA_VERSION,
             run_id: format!("test-run-{}", server.pid),
-            model_id: server.id.clone(),
+            model_id: Some(server.id.clone()),
             owner_pid: 42,
             owner_process_start_time_unix_s: 456,
             stop_requested: false,
@@ -666,7 +694,7 @@ mod tests {
         ManagedRun {
             schema_version: RUNTIME_STATE_SCHEMA_VERSION,
             run_id: run_id.to_string(),
-            model_id: "gemma-3-4b-it-q4".to_string(),
+            model_id: Some("gemma-3-4b-it-q4".to_string()),
             owner_pid: 42,
             owner_process_start_time_unix_s: 456,
             stop_requested: false,
@@ -807,6 +835,47 @@ mod tests {
             read_runtime_state(&state_path).expect("read legacy state"),
             RuntimeStateRead::Legacy(state_path.clone())
         );
+    }
+
+    #[test]
+    fn unloaded_owner_round_trips_without_a_fake_model_and_legacy_model_strings_remain_valid() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let mut unloaded = childless_starting_run(temp.path(), "unloaded-owner");
+        unloaded.model_id = None;
+        unloaded.lifecycle = RunLifecycle::Unloaded;
+        create_starting_run(&state_path, unloaded.clone()).expect("create unloaded owner");
+        assert_eq!(
+            read_runtime_state(&state_path).unwrap(),
+            RuntimeStateRead::Loaded(vec![unloaded])
+        );
+
+        let mut legacy_model = childless_starting_run(temp.path(), "legacy-model");
+        legacy_model.model_id = Some("gemma-3-4b-it-q4".into());
+        write_runtime_state(&state_path, std::slice::from_ref(&legacy_model)).unwrap();
+        let mut legacy_value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        legacy_value["schema_version"] = serde_json::json!(LEGACY_RUNTIME_STATE_SCHEMA_VERSION);
+        legacy_value["runs"][0]["schema_version"] =
+            serde_json::json!(LEGACY_RUNTIME_STATE_SCHEMA_VERSION);
+        fs::write(&state_path, serde_json::to_vec(&legacy_value).unwrap()).unwrap();
+        assert_eq!(
+            read_runtime_state(&state_path).unwrap(),
+            RuntimeStateRead::Loaded(vec![legacy_model])
+        );
+
+        let mut falsely_labeled_unloaded = legacy_value;
+        falsely_labeled_unloaded["runs"][0]["model_id"] = serde_json::Value::Null;
+        falsely_labeled_unloaded["runs"][0]["lifecycle"] = serde_json::json!("unloaded");
+        fs::write(
+            &state_path,
+            serde_json::to_vec(&falsely_labeled_unloaded).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            read_runtime_state(&state_path).unwrap(),
+            RuntimeStateRead::Corrupt(message) if message.contains("invalid legacy")
+        ));
     }
 
     #[test]
@@ -979,8 +1048,8 @@ mod tests {
             record_stop_request(&state_path, "missing-model").expect("no-match transaction"),
             StopRequestMatch::NoMatch
         );
-        let requested =
-            record_stop_request(&state_path, &run.model_id).expect("model stop transaction");
+        let requested = record_stop_request(&state_path, run.model_id.as_deref().unwrap())
+            .expect("model stop transaction");
         let StopRequestMatch::Requested(first) = requested else {
             panic!("expected requested run");
         };
@@ -1102,7 +1171,7 @@ mod tests {
 
         let outcome = request_managed_stop_with(
             &state_path,
-            &run.model_id,
+            run.model_id.as_deref().unwrap(),
             &probe,
             StopWaitTiming::test(Duration::from_secs(15), Duration::from_secs(5)),
             || now.get(),

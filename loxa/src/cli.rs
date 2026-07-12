@@ -169,13 +169,17 @@ fn serve_node_cli<W: Write, E: Write>(
     stdout: &mut W,
     stderr: &mut E,
 ) -> io::Result<ExitCode> {
-    if engine == RuntimeBackendKind::PyMlxLm && requested_model.is_none() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "--model <local-directory> is required with --engine py-mlx-lm",
-        ));
-    }
-    if engine == RuntimeBackendKind::LlamaCpp {
+    validate_cli_serve_request(requested_model, engine, paths)?;
+    let mut events = CliLifecycleSink { stdout, stderr };
+    serve_node(requested_model, port, engine, paths, &mut events).map(exit_code_for_termination)
+}
+
+fn validate_cli_serve_request(
+    requested_model: Option<&str>,
+    engine: RuntimeBackendKind,
+    paths: &NodePaths,
+) -> io::Result<()> {
+    if engine == RuntimeBackendKind::LlamaCpp && requested_model.is_some() {
         if let Err(error) = select_cli_serve_model(&paths.models_dir, requested_model) {
             let kind = match &error {
                 ModelSelectionError::UnknownModel { .. }
@@ -201,8 +205,7 @@ fn serve_node_cli<W: Write, E: Write>(
             ));
         }
     }
-    let mut events = CliLifecycleSink { stdout, stderr };
-    serve_node(requested_model, port, engine, paths, &mut events).map(exit_code_for_termination)
+    Ok(())
 }
 
 fn select_cli_serve_model(
@@ -362,7 +365,11 @@ fn render_managed_servers<W: Write>(
                 writeln!(
                     stdout,
                     "{:<19} {:>6}  {:>5}  {:<19} {}",
-                    row.model_id, pid, row.port, row.status, model_path
+                    row.model_id.as_deref().unwrap_or("-"),
+                    pid,
+                    row.port,
+                    row.status,
+                    model_path
                 )?;
             }
         }
@@ -386,7 +393,11 @@ fn render_stop_outcome<W: Write, E: Write>(
             Ok(ExitCode::from(1))
         }
         StopOutcome::Completed { model_id } => {
-            writeln!(stdout, "stop completed for {model_id}")?;
+            writeln!(
+                stdout,
+                "stop completed for {}",
+                model_id.as_deref().unwrap_or("node")
+            )?;
             Ok(ExitCode::SUCCESS)
         }
         StopOutcome::RecoveryRequired {
@@ -396,14 +407,16 @@ fn render_stop_outcome<W: Write, E: Write>(
         } => {
             writeln!(
                 stderr,
-                "stop requested for {model_id}, but owner identity is {owner_status:?}; recovery required for {run_id}"
+                "stop requested for {}, but owner identity is {owner_status:?}; recovery required for {run_id}",
+                model_id.as_deref().unwrap_or("node")
             )?;
             Ok(ExitCode::from(1))
         }
         StopOutcome::TimedOut { run_id, model_id } => {
             writeln!(
                 stderr,
-                "stop requested for {model_id}, but the owner did not finish within {} seconds; recovery required for {run_id}",
+                "stop requested for {}, but the owner did not finish within {} seconds; recovery required for {run_id}",
+                model_id.as_deref().unwrap_or("node"),
                 supervisor::STOP_OWNER_WAIT_TIMEOUT.as_secs()
             )?;
             Ok(ExitCode::from(1))
@@ -721,7 +734,7 @@ mod tests {
     fn persist_run_for_server(state_path: &Path, server: &ManagedServer) -> supervisor::ManagedRun {
         let run_id = format!("test-run-{}", server.pid);
         let mut run = starting_run_for_test(state_path, &run_id);
-        run.model_id = server.id.clone();
+        run.model_id = Some(server.id.clone());
         run.port = server.port;
         run.generation_alias = format!("loxa-{run_id}-g0");
         run.log_path = state_path
@@ -744,7 +757,7 @@ mod tests {
         supervisor::ManagedRun {
             schema_version: supervisor::RUNTIME_STATE_SCHEMA_VERSION,
             run_id: run_id.to_string(),
-            model_id: "gemma-3-4b-it-q4".to_string(),
+            model_id: Some("gemma-3-4b-it-q4".to_string()),
             owner_pid: 42,
             owner_process_start_time_unix_s: 456,
             stop_requested: false,
@@ -1489,32 +1502,14 @@ mod tests {
     }
 
     #[test]
-    fn python_serve_requires_an_explicit_local_model_before_gateway_start() {
+    fn python_serve_without_a_model_passes_unloaded_node_validation() {
         let temp = TempDir::new("loxa-python-serve-no-model");
         let paths = NodePaths {
             models_dir: temp.path().join("models"),
             state_path: temp.path().join("managed.json"),
             logs_dir: temp.path().join("logs"),
         };
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-
-        let error = serve_node_cli(
-            None,
-            Some(0),
-            RuntimeBackendKind::PyMlxLm,
-            &paths,
-            &mut stdout,
-            &mut stderr,
-        )
-        .expect_err("Python serve needs --model");
-
-        assert_eq!(
-            error.to_string(),
-            "--model <local-directory> is required with --engine py-mlx-lm"
-        );
-        assert!(stdout.is_empty());
-        assert!(stderr.is_empty());
+        assert!(validate_cli_serve_request(None, RuntimeBackendKind::PyMlxLm, &paths).is_ok());
         assert!(!paths.state_path.exists());
     }
 
@@ -1829,10 +1824,10 @@ mod tests {
         let mut stderr = Vec::new();
 
         let exit = render_stop_outcome(
-            &run.model_id,
+            run.model_id.as_deref().unwrap(),
             stop_managed_servers(
                 StopRequest {
-                    target: &run.model_id,
+                    target: run.model_id.as_deref().unwrap(),
                 },
                 &paths,
             ),
