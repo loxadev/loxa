@@ -12,6 +12,7 @@ use std::time::UNIX_EPOCH;
 
 const GIB: f64 = 1_073_741_824.0;
 const DEFAULT_CACHE_CAPACITY: usize = 64;
+const DEFAULT_MAX_CONCURRENT_VERIFICATIONS: usize = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -139,6 +140,58 @@ struct VerificationFlight {
     ready: Condvar,
 }
 
+struct VerificationGate {
+    max: usize,
+    active: Mutex<usize>,
+    available: Condvar,
+    max_observed: AtomicU64,
+}
+
+struct VerificationPermit {
+    gate: Arc<VerificationGate>,
+}
+
+impl VerificationGate {
+    fn acquire(
+        self: &Arc<Self>,
+        cancellation: &dyn VerificationCancellation,
+    ) -> io::Result<VerificationPermit> {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while *active >= self.max {
+            if cancellation.is_cancelled() {
+                return Err(cancelled_error());
+            }
+            let (next, _) = self
+                .available
+                .wait_timeout(active, std::time::Duration::from_millis(10))
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            active = next;
+        }
+        if cancellation.is_cancelled() {
+            return Err(cancelled_error());
+        }
+        *active += 1;
+        self.max_observed
+            .fetch_max(*active as u64, Ordering::Relaxed);
+        Ok(VerificationPermit { gate: self.clone() })
+    }
+}
+
+impl Drop for VerificationPermit {
+    fn drop(&mut self) {
+        let mut active = self
+            .gate
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *active = active.saturating_sub(1);
+        self.gate.available.notify_one();
+    }
+}
+
 pub trait VerificationCancellation: Send + Sync {
     fn is_cancelled(&self) -> bool;
 }
@@ -156,6 +209,7 @@ pub struct VerificationCache {
     capacity: usize,
     state: Mutex<CacheState>,
     verification_runs: AtomicU64,
+    gate: Arc<VerificationGate>,
 }
 
 impl Default for VerificationCache {
@@ -166,10 +220,20 @@ impl Default for VerificationCache {
 
 impl VerificationCache {
     pub fn new(capacity: usize) -> Self {
+        Self::with_limits(capacity, DEFAULT_MAX_CONCURRENT_VERIFICATIONS)
+    }
+
+    pub fn with_limits(capacity: usize, max_concurrent_verifications: usize) -> Self {
         Self {
             capacity: capacity.max(1),
             state: Mutex::new(CacheState::default()),
             verification_runs: AtomicU64::new(0),
+            gate: Arc::new(VerificationGate {
+                max: max_concurrent_verifications.max(1),
+                active: Mutex::new(0),
+                available: Condvar::new(),
+                max_observed: AtomicU64::new(0),
+            }),
         }
     }
 
@@ -212,7 +276,9 @@ impl VerificationCache {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(item) = state.entries.get(&path).filter(|item| {
-                item.metadata == stable && item.evidence.expected_sha256 == recipe.sha256
+                item.metadata == stable
+                    && item.evidence.expected_sha256 == recipe.sha256
+                    && evidence_reusable(&item.evidence, positive_cache_reusable())
             }) {
                 return Ok(item.evidence.clone());
             }
@@ -226,9 +292,24 @@ impl VerificationCache {
         };
 
         if !leader {
-            return wait_for_flight(&flight);
+            return wait_for_flight(&flight, cancellation);
         }
 
+        let permit = match self.gate.acquire(cancellation) {
+            Ok(permit) => permit,
+            Err(error) => {
+                publish_flight(
+                    &flight,
+                    &Err(io::Error::new(error.kind(), error.to_string())),
+                );
+                self.state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .in_flight
+                    .remove(&key);
+                return Err(error);
+            }
+        };
         self.verification_runs.fetch_add(1, Ordering::Relaxed);
         let result = (|| {
             let matches = hash_file_with_cancellation(&path, cancellation)? == recipe.sha256;
@@ -245,6 +326,7 @@ impl VerificationCache {
                 matches,
             })
         })();
+        drop(permit);
 
         if let Ok(evidence) = &result {
             self.insert(
@@ -268,18 +350,36 @@ impl VerificationCache {
         self.verification_runs.load(Ordering::Relaxed)
     }
 
+    pub fn max_observed_concurrency(&self) -> usize {
+        self.gate.max_observed.load(Ordering::Relaxed) as usize
+    }
+
     fn cached(
         &self,
         path: &Path,
         metadata: &StableMetadata,
         expected: &str,
     ) -> Option<VerifiedArtifact> {
+        self.cached_with_positive_policy(path, metadata, expected, positive_cache_reusable())
+    }
+
+    fn cached_with_positive_policy(
+        &self,
+        path: &Path,
+        metadata: &StableMetadata,
+        expected: &str,
+        allow_positive: bool,
+    ) -> Option<VerifiedArtifact> {
         self.state
             .lock()
             .ok()?
             .entries
             .get(path)
-            .filter(|item| &item.metadata == metadata && item.evidence.expected_sha256 == expected)
+            .filter(|item| {
+                &item.metadata == metadata
+                    && item.evidence.expected_sha256 == expected
+                    && evidence_reusable(&item.evidence, allow_positive)
+            })
             .map(|item| item.evidence.clone())
     }
 
@@ -297,6 +397,20 @@ impl VerificationCache {
             }
         }
     }
+}
+
+fn evidence_reusable(evidence: &VerifiedArtifact, allow_positive: bool) -> bool {
+    !evidence.matches || allow_positive
+}
+
+#[cfg(unix)]
+fn positive_cache_reusable() -> bool {
+    true
+}
+
+#[cfg(not(unix))]
+fn positive_cache_reusable() -> bool {
+    false
 }
 
 static DEFAULT_CACHE: OnceLock<VerificationCache> = OnceLock::new();
@@ -488,21 +602,35 @@ fn publish_flight(flight: &VerificationFlight, result: &io::Result<VerifiedArtif
     flight.ready.notify_all();
 }
 
-fn wait_for_flight(flight: &VerificationFlight) -> io::Result<VerifiedArtifact> {
+fn wait_for_flight(
+    flight: &VerificationFlight,
+    cancellation: &dyn VerificationCancellation,
+) -> io::Result<VerifiedArtifact> {
     let mut result = flight
         .result
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     while result.is_none() {
-        result = flight
+        if cancellation.is_cancelled() {
+            return Err(cancelled_error());
+        }
+        let (next, _) = flight
             .ready
-            .wait(result)
+            .wait_timeout(result, std::time::Duration::from_millis(10))
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        result = next;
     }
     match result.as_ref().unwrap() {
         Ok(value) => Ok(value.clone()),
         Err(error) => Err(io::Error::new(error.kind, error.message.clone())),
     }
+}
+
+fn cancelled_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Interrupted,
+        "artifact verification cancelled",
+    )
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -721,8 +849,89 @@ mod tests {
         assert_eq!(cache.verification_runs(), 1);
     }
 
+    #[test]
+    fn distinct_verifications_respect_global_concurrency_limit() {
+        let dir = tempdir().unwrap();
+        let bytes = Box::leak(vec![4_u8; 4 * 1024 * 1024].into_boxed_slice());
+        let cache = Arc::new(VerificationCache::with_limits(64, 1));
+        let barrier = Arc::new(Barrier::new(5));
+        let mut workers = Vec::new();
+        for index in 0..4 {
+            let mut recipe = fixture(bytes);
+            recipe.id = Box::leak(format!("fixture-{index}").into_boxed_str());
+            recipe.filename = Box::leak(format!("fixture-{index}.gguf").into_boxed_str());
+            fs::write(dir.path().join(recipe.filename), &*bytes).unwrap();
+            let cache = cache.clone();
+            let barrier = barrier.clone();
+            let models_dir = dir.path().to_path_buf();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                cache.verify_recipe(&models_dir, &recipe).unwrap()
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            assert!(worker.join().unwrap().matches);
+        }
+        assert_eq!(cache.verification_runs(), 4);
+        assert_eq!(cache.max_observed_concurrency(), 1);
+    }
+
     struct GatedCancellation {
         release: std::sync::atomic::AtomicBool,
+    }
+
+    struct GatedProceed {
+        release: std::sync::atomic::AtomicBool,
+    }
+    impl VerificationCancellation for GatedProceed {
+        fn is_cancelled(&self) -> bool {
+            while !self.release.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            false
+        }
+    }
+    struct AlwaysCancelled;
+    impl VerificationCancellation for AlwaysCancelled {
+        fn is_cancelled(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn cancelled_follower_detaches_promptly_without_cancelling_leader() {
+        let dir = tempdir().unwrap();
+        let recipe = Arc::new(fixture(b"good"));
+        fs::write(dir.path().join(recipe.filename), b"good").unwrap();
+        let cache = Arc::new(VerificationCache::default());
+        let gate = Arc::new(GatedProceed {
+            release: std::sync::atomic::AtomicBool::new(false),
+        });
+        let path = dir.path().to_path_buf();
+        let leader = {
+            let cache = cache.clone();
+            let recipe = recipe.clone();
+            let gate = gate.clone();
+            let path = path.clone();
+            std::thread::spawn(move || {
+                cache.verify_recipe_with_cancellation(&path, &recipe, gate.as_ref())
+            })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while cache.state.lock().unwrap().in_flight.is_empty() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let started = std::time::Instant::now();
+        let error = cache
+            .verify_recipe_with_cancellation(dir.path(), &recipe, &AlwaysCancelled)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(started.elapsed() < std::time::Duration::from_millis(200));
+        gate.release.store(true, Ordering::Release);
+        assert!(leader.join().unwrap().unwrap().matches);
+        assert_eq!(cache.verification_runs(), 1);
     }
     impl VerificationCancellation for GatedCancellation {
         fn is_cancelled(&self) -> bool {
@@ -794,9 +1003,9 @@ mod tests {
             follower.join().unwrap().unwrap_err().kind(),
             io::ErrorKind::Interrupted
         );
-        assert_eq!(cache.verification_runs(), 1);
+        assert_eq!(cache.verification_runs(), 0);
         assert!(cache.verify_recipe(dir.path(), &recipe).unwrap().matches);
-        assert_eq!(cache.verification_runs(), 2);
+        assert_eq!(cache.verification_runs(), 1);
     }
 
     #[cfg(unix)]
@@ -826,6 +1035,26 @@ mod tests {
             ArtifactState::Invalid {
                 reason: ArtifactInvalidReason::Unreadable
             }
+        );
+    }
+
+    #[test]
+    fn portable_identity_policy_never_reuses_positive_evidence() {
+        let dir = tempdir().unwrap();
+        let recipe = fixture(b"good");
+        let path = dir.path().join(recipe.filename);
+        fs::write(&path, b"good").unwrap();
+        let cache = VerificationCache::default();
+        assert!(cache.verify_recipe(dir.path(), &recipe).unwrap().matches);
+        let metadata = StableMetadata::from(&fs::symlink_metadata(&path).unwrap());
+        assert!(cache
+            .cached_with_positive_policy(&path, &metadata, recipe.sha256, false)
+            .is_none());
+        assert!(
+            cache
+                .cached_with_positive_policy(&path, &metadata, recipe.sha256, true)
+                .unwrap()
+                .matches
         );
     }
 }
