@@ -1,6 +1,10 @@
 use crate::actor::{
     Mutation, MutationCancellation, MutationExecutor, NodeActor, NodeActorHandle, SubmitError,
 };
+use crate::model_lifecycle::{
+    EngineLifecycleDriver, GatewayPublisher, LaunchPlan, LifecycleError, LifecycleSnapshot,
+    ModelLifecycle,
+};
 use loxa_core::control::contracts::{
     OperationKind, OperationStatus, OperationView, ReconnectSnapshot,
 };
@@ -27,12 +31,15 @@ pub struct DownloadControl {
     models_dir: Arc<PathBuf>,
     verification_cache: Arc<VerificationCache>,
     recipes: &'static [ModelEntry],
+    lifecycle_snapshot: Option<Arc<Mutex<LifecycleSnapshot>>>,
+    lifecycle_destructive: Option<crate::model_lifecycle::CancellationBoundary>,
 }
 
 pub struct DownloadControlWorker {
     actor: NodeActorHandle,
     worker: Option<JoinHandle<()>>,
     verification: Option<VerificationWorker>,
+    lifecycle_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 struct VerificationWorker {
@@ -46,6 +53,8 @@ pub enum DownloadControlError {
     Missing,
     Terminal,
     Stopping,
+    CancellationNotSafe,
+    ModelUnavailable,
 }
 
 impl DownloadControl {
@@ -76,6 +85,7 @@ impl DownloadControl {
             verifier: Box::new(CacheArtifactVerifier {
                 cache: Arc::clone(&verification_cache),
             }),
+            lifecycle: None,
         };
         let (actor, worker) = NodeActor::spawn(executor);
         let background_cancellation = verification_cancellation.clone();
@@ -96,6 +106,8 @@ impl DownloadControl {
                 models_dir,
                 verification_cache,
                 recipes,
+                lifecycle_snapshot: None,
+                lifecycle_destructive: None,
             },
             DownloadControlWorker {
                 actor,
@@ -104,6 +116,73 @@ impl DownloadControl {
                     cancellation: verification_cancellation,
                     worker: verification_worker,
                 }),
+                lifecycle_stop: None,
+            },
+        )
+    }
+
+    pub(crate) fn spawn_with_lifecycle<D, G>(
+        models_dir: PathBuf,
+        lifecycle: ModelLifecycle<D, G>,
+    ) -> (Self, DownloadControlWorker)
+    where
+        D: EngineLifecycleDriver + Send + 'static,
+        D::Session: Send + 'static,
+        G: GatewayPublisher + Send + 'static,
+    {
+        let verification_cache = Arc::new(VerificationCache::default());
+        let operations = Arc::new(Mutex::new(OperationStore::new(OPERATION_CAPACITY)));
+        let models_dir = Arc::new(models_dir);
+        let verification_cancellation = MutationCancellation::new();
+        let lifecycle_snapshot = Arc::new(Mutex::new(lifecycle.snapshot()));
+        let lifecycle_destructive = lifecycle.destructive_commit_token();
+        let lifecycle_stop = lifecycle.stop_token();
+        let executor = DownloadExecutor {
+            models_dir: (*models_dir).clone(),
+            operations: Arc::clone(&operations),
+            downloader: Box::new(VerifiedDownloader),
+            recipes: REGISTRY,
+            verification_cancellation: verification_cancellation.clone(),
+            verifier: Box::new(CacheArtifactVerifier {
+                cache: Arc::clone(&verification_cache),
+            }),
+            lifecycle: Some(Box::new(LifecycleExecutor {
+                lifecycle,
+                snapshot: Arc::clone(&lifecycle_snapshot),
+                models_dir: (*models_dir).clone(),
+                verification_cache: Arc::clone(&verification_cache),
+            })),
+        };
+        let (actor, worker) = NodeActor::spawn(executor);
+        let background_cancellation = verification_cancellation.clone();
+        let background_models_dir = Arc::clone(&models_dir);
+        let background_cache = Arc::clone(&verification_cache);
+        let verification_worker = thread::spawn(move || {
+            verify_existing_recipes(
+                &background_models_dir,
+                REGISTRY,
+                &background_cache,
+                &background_cancellation,
+            );
+        });
+        (
+            Self {
+                operations,
+                actor: actor.clone(),
+                models_dir,
+                verification_cache,
+                recipes: REGISTRY,
+                lifecycle_snapshot: Some(lifecycle_snapshot),
+                lifecycle_destructive: Some(lifecycle_destructive),
+            },
+            DownloadControlWorker {
+                actor,
+                worker: Some(worker),
+                verification: Some(VerificationWorker {
+                    cancellation: verification_cancellation,
+                    worker: verification_worker,
+                }),
+                lifecycle_stop: Some(lifecycle_stop),
             },
         )
     }
@@ -153,10 +232,108 @@ impl DownloadControl {
         ) {
             return Err(DownloadControlError::Terminal);
         }
-        self.actor.cancel(id);
+        if matches!(operation.kind, OperationKind::Load | OperationKind::Unload) {
+            let boundary = self
+                .lifecycle_destructive
+                .as_ref()
+                .ok_or(DownloadControlError::Missing)?;
+            if !boundary.try_cancel(|| {
+                self.actor.cancel(id);
+            }) {
+                return Err(DownloadControlError::CancellationNotSafe);
+            }
+        } else {
+            self.actor.cancel(id);
+        }
         operations
             .cancel(id, CancellationSafety::Safe, now_ms())
             .map_err(map_operation_error)
+    }
+
+    pub fn start_load(&self, model_id: &str) -> Result<String, DownloadControlError> {
+        if self.lifecycle_snapshot.is_none() {
+            return Err(DownloadControlError::Missing);
+        }
+        let entry = self
+            .inventory(loxa_core::model_inventory::current_available_memory_bytes())
+            .into_iter()
+            .find(|entry| entry.id == model_id)
+            .ok_or(DownloadControlError::Missing)?;
+        LaunchPlan::from_verified_inventory(&entry, &self.models_dir)
+            .map_err(|_| DownloadControlError::ModelUnavailable)?;
+        self.start_lifecycle(
+            OperationKind::Load,
+            Some(model_id),
+            Mutation::Load {
+                model_id: model_id.to_owned(),
+            },
+        )
+    }
+
+    pub fn start_unload(&self) -> Result<String, DownloadControlError> {
+        if self.lifecycle_snapshot.is_none() {
+            return Err(DownloadControlError::Missing);
+        }
+        self.start_lifecycle(OperationKind::Unload, None, Mutation::Unload)
+    }
+
+    fn start_lifecycle(
+        &self,
+        kind: OperationKind,
+        model_id: Option<&str>,
+        mutation: Mutation,
+    ) -> Result<String, DownloadControlError> {
+        let id = self
+            .operations
+            .lock()
+            .expect("operation store poisoned")
+            .enqueue_unique(kind, model_id.map(str::to_owned), now_ms())
+            .map_err(map_operation_error)?;
+        match self.actor.submit(id.clone(), mutation) {
+            Ok(()) => Ok(id),
+            Err(error) => {
+                let message = match error {
+                    SubmitError::Conflict => "model lifecycle admission conflicted",
+                    SubmitError::Stopping => "node is stopping",
+                };
+                let _ = self
+                    .operations
+                    .lock()
+                    .expect("operation store poisoned")
+                    .fail(&id, message, now_ms());
+                Err(match error {
+                    SubmitError::Conflict => DownloadControlError::Conflict,
+                    SubmitError::Stopping => DownloadControlError::Stopping,
+                })
+            }
+        }
+    }
+
+    pub fn lifecycle_snapshot(&self) -> Option<LifecycleSnapshot> {
+        self.lifecycle_snapshot.as_ref().map(|snapshot| {
+            snapshot
+                .lock()
+                .expect("lifecycle snapshot poisoned")
+                .clone()
+        })
+    }
+
+    pub fn active_lifecycle_operation_id(&self) -> Option<String> {
+        self.operations
+            .lock()
+            .expect("operation store poisoned")
+            .snapshot_since(0)
+            .operations
+            .into_iter()
+            .rev()
+            .find(|operation| {
+                matches!(operation.kind, OperationKind::Load | OperationKind::Unload)
+                    && matches!(
+                        operation.status,
+                        OperationStatus::Queued | OperationStatus::Running
+                    )
+            })
+            .map(|operation| operation.id)
     }
 
     pub fn operation(&self, id: &str) -> Option<OperationView> {
@@ -223,6 +400,9 @@ impl DownloadControlWorker {
     }
 
     pub fn stop_and_join(mut self) -> std::io::Result<()> {
+        if let Some(stop) = &self.lifecycle_stop {
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         self.actor.stop();
         if let Some(verification) = &self.verification {
             verification.cancellation.cancel();
@@ -253,6 +433,71 @@ struct DownloadExecutor {
     verification_cancellation: MutationCancellation,
     verifier: Box<dyn ArtifactVerifier>,
     recipes: &'static [ModelEntry],
+    lifecycle: Option<Box<dyn LifecycleMutationExecutor>>,
+}
+
+trait LifecycleMutationExecutor: Send {
+    fn execute(
+        &mut self,
+        mutation: &Mutation,
+        cancellation: &MutationCancellation,
+    ) -> Result<(), LifecycleError>;
+    fn shutdown(&mut self) -> Result<(), LifecycleError>;
+}
+
+struct LifecycleExecutor<D: EngineLifecycleDriver, G: GatewayPublisher> {
+    lifecycle: ModelLifecycle<D, G>,
+    snapshot: Arc<Mutex<LifecycleSnapshot>>,
+    models_dir: PathBuf,
+    verification_cache: Arc<VerificationCache>,
+}
+
+impl<D, G> LifecycleMutationExecutor for LifecycleExecutor<D, G>
+where
+    D: EngineLifecycleDriver + Send + 'static,
+    D::Session: Send + 'static,
+    G: GatewayPublisher + Send + 'static,
+{
+    fn execute(
+        &mut self,
+        mutation: &Mutation,
+        cancellation: &MutationCancellation,
+    ) -> Result<(), LifecycleError> {
+        {
+            let mut snapshot = self.snapshot.lock().expect("lifecycle snapshot poisoned");
+            snapshot.status = match mutation {
+                Mutation::Load { .. } => crate::model_lifecycle::NodeLifecycleStatus::Loading,
+                Mutation::Unload => crate::model_lifecycle::NodeLifecycleStatus::Unloading,
+                Mutation::Download { .. } => snapshot.status.clone(),
+            };
+            snapshot.error = None;
+        }
+        let result = match mutation {
+            Mutation::Load { model_id } => {
+                let entry = loxa_core::model_inventory::verified_recipe_inventory_with_cache(
+                    REGISTRY,
+                    &self.models_dir,
+                    loxa_core::model_inventory::current_available_memory_bytes(),
+                    &self.verification_cache,
+                )
+                .into_iter()
+                .find(|entry| entry.id == *model_id)
+                .ok_or(LifecycleError::ModelNotVerified)?;
+                let plan = LaunchPlan::from_verified_inventory(&entry, &self.models_dir)?;
+                self.lifecycle.load(plan, cancellation)
+            }
+            Mutation::Unload => self.lifecycle.unload(cancellation),
+            Mutation::Download { .. } => Ok(()),
+        };
+        *self.snapshot.lock().expect("lifecycle snapshot poisoned") = self.lifecycle.snapshot();
+        result
+    }
+
+    fn shutdown(&mut self) -> Result<(), LifecycleError> {
+        let result = self.lifecycle.shutdown();
+        *self.snapshot.lock().expect("lifecycle snapshot poisoned") = self.lifecycle.snapshot();
+        result
+    }
 }
 
 trait ArtifactVerifier: Send {
@@ -383,8 +628,37 @@ impl DownloadObserver for OperationObserver<'_> {
 
 impl MutationExecutor for DownloadExecutor {
     fn execute(&mut self, id: &str, mutation: &Mutation, cancellation: &MutationCancellation) {
-        let Mutation::Download { model_id } = mutation else {
+        if !matches!(mutation, Mutation::Download { .. }) {
+            if self
+                .operations
+                .lock()
+                .expect("operation store poisoned")
+                .start(id, now_ms())
+                .is_err()
+            {
+                return;
+            }
+            let result = self
+                .lifecycle
+                .as_mut()
+                .ok_or_else(|| LifecycleError::StartFailed("model lifecycle unavailable".into()))
+                .and_then(|lifecycle| lifecycle.execute(mutation, cancellation));
+            let mut operations = self.operations.lock().expect("operation store poisoned");
+            match result {
+                Ok(()) => {
+                    let _ = operations.succeed(id, now_ms());
+                }
+                Err(LifecycleError::Cancelled) => {
+                    let _ = operations.cancel(id, CancellationSafety::Safe, now_ms());
+                }
+                Err(error) => {
+                    let _ = operations.fail(id, public_lifecycle_error(&error), now_ms());
+                }
+            }
             return;
+        }
+        let Mutation::Download { model_id } = mutation else {
+            unreachable!("download mutation checked")
         };
         if self
             .operations
@@ -465,6 +739,28 @@ impl MutationExecutor for DownloadExecutor {
             }
         }
     }
+
+    fn stop(&mut self) {
+        if let Some(lifecycle) = &mut self.lifecycle {
+            let _ = lifecycle.shutdown();
+        }
+    }
+}
+
+fn public_lifecycle_error(error: &LifecycleError) -> &'static str {
+    match error {
+        LifecycleError::ModelNotVerified => "model artifact is not downloaded and verified",
+        LifecycleError::Incompatible(_) => "model is incompatible with this node",
+        LifecycleError::EngineIneligible(_) => "model is not eligible for the selected engine",
+        LifecycleError::Cancelled => "model operation cancelled",
+        LifecycleError::CancellationNotSafe => "model operation passed its safe cancellation point",
+        LifecycleError::Stopping => "node is stopping",
+        LifecycleError::RecoveryRequired { .. } => "node recovery is required",
+        LifecycleError::InvalidCandidate(_)
+        | LifecycleError::StartFailed(_)
+        | LifecycleError::ReadinessFailed(_)
+        | LifecycleError::TeardownFailed(_) => "model lifecycle operation failed safely",
+    }
 }
 
 fn find_recipe(recipes: &'static [ModelEntry], model_id: &str) -> Option<&'static ModelEntry> {
@@ -529,6 +825,7 @@ pub(crate) fn panicking_worker() -> DownloadControlWorker {
         actor,
         worker: Some(worker),
         verification: None,
+        lifecycle_stop: None,
     }
 }
 
@@ -539,6 +836,38 @@ mod tests {
     use loxa_core::registry::{self, ModelEntry};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    struct NoopLifecycleDriver;
+    impl EngineLifecycleDriver for NoopLifecycleDriver {
+        type Session = ();
+        fn start(
+            &mut self,
+            _: &crate::model_lifecycle::StableNodeOwner,
+            _: &LaunchPlan,
+            _: u64,
+        ) -> Result<crate::model_lifecycle::StartedSession<()>, LifecycleError> {
+            panic!("unload must not spawn an engine")
+        }
+        fn wait_ready(
+            &mut self,
+            _: &mut crate::model_lifecycle::StartedSession<()>,
+            _: crate::model_lifecycle::LifecycleSignals<'_>,
+        ) -> Result<(), LifecycleError> {
+            panic!("unload must not wait for readiness")
+        }
+        fn stop_exact(
+            &mut self,
+            _: crate::model_lifecycle::StartedSession<()>,
+        ) -> Result<(), LifecycleError> {
+            Ok(())
+        }
+    }
+
+    struct NoopGateway;
+    impl GatewayPublisher for NoopGateway {
+        fn withdraw(&mut self) {}
+        fn publish(&mut self, _: &LaunchPlan, _: &crate::model_lifecycle::SessionCorrelation) {}
+    }
 
     struct FakeDownloader {
         result: Option<Result<(), DownloadError>>,
@@ -638,6 +967,7 @@ mod tests {
                 })),
             }),
             recipes: REGISTRY,
+            lifecycle: None,
         };
         executor.execute(
             &id,
@@ -712,6 +1042,7 @@ mod tests {
                 result: Some(Err(std::io::Error::other("verification unavailable"))),
             }),
             recipes: REGISTRY,
+            lifecycle: None,
         };
 
         executor.execute(
@@ -772,6 +1103,7 @@ mod tests {
                 cache: Arc::clone(&cache),
             }),
             recipes,
+            lifecycle: None,
         };
         let operation_cancellation = MutationCancellation::new();
         let worker_cancellation = operation_cancellation.clone();
@@ -998,6 +1330,7 @@ mod tests {
             actor,
             worker: Some(worker),
             verification: None,
+            lifecycle_stop: None,
         };
         assert_eq!(
             runtime.stop_and_join().unwrap_err().to_string(),
@@ -1035,6 +1368,7 @@ mod tests {
                 cancellation,
                 worker: verification,
             }),
+            lifecycle_stop: None,
         };
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let join = std::thread::spawn(move || {
@@ -1070,6 +1404,73 @@ mod tests {
             .iter()
             .any(|event| event.operation.id == operation.id
                 && event.operation.status == OperationStatus::Failed));
+        worker.stop_and_join().unwrap();
+    }
+
+    #[test]
+    fn unified_actor_runs_unload_and_publishes_operation_events() {
+        let lifecycle = ModelLifecycle::new(
+            crate::model_lifecycle::StableNodeOwner {
+                run_id: "owner".into(),
+                pid: 1,
+                process_start_time_unix_s: 2,
+                gateway_port: 8080,
+            },
+            NoopLifecycleDriver,
+            NoopGateway,
+        );
+        let (control, worker) =
+            DownloadControl::spawn_with_lifecycle(std::env::temp_dir(), lifecycle);
+        let id = control.start_unload().unwrap();
+        let operation = (0..100)
+            .find_map(|_| {
+                let operation = control.operation(&id)?;
+                if matches!(
+                    operation.status,
+                    OperationStatus::Succeeded | OperationStatus::Failed
+                ) {
+                    Some(operation)
+                } else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    None
+                }
+            })
+            .expect("unload reaches terminal operation");
+        assert_eq!(operation.status, OperationStatus::Succeeded);
+        assert_eq!(
+            control.lifecycle_snapshot().unwrap().status,
+            crate::model_lifecycle::NodeLifecycleStatus::Unloaded
+        );
+        assert!(control
+            .snapshot_since(0)
+            .events
+            .iter()
+            .any(|event| event.operation.id == id
+                && event.operation.status == OperationStatus::Succeeded));
+        worker.stop_and_join().unwrap();
+    }
+
+    #[test]
+    fn lifecycle_admission_failure_never_leaves_a_queued_orphan() {
+        let lifecycle = ModelLifecycle::new(
+            crate::model_lifecycle::StableNodeOwner {
+                run_id: "owner".into(),
+                pid: 1,
+                process_start_time_unix_s: 2,
+                gateway_port: 8080,
+            },
+            NoopLifecycleDriver,
+            NoopGateway,
+        );
+        let (control, worker) =
+            DownloadControl::spawn_with_lifecycle(std::env::temp_dir(), lifecycle);
+        control.stop_actor();
+        assert_eq!(control.start_unload(), Err(DownloadControlError::Stopping));
+        let snapshot = control.snapshot_since(0);
+        let operation = snapshot.operations.last().unwrap();
+        assert_eq!(operation.kind, OperationKind::Unload);
+        assert_eq!(operation.status, OperationStatus::Failed);
+        assert_eq!(operation.error.as_deref(), Some("node is stopping"));
         worker.stop_and_join().unwrap();
     }
 }

@@ -169,6 +169,18 @@ fn map_download_error(error: DownloadControlError, origin: Option<&str>) -> Resp
             "node is stopping",
             origin,
         ),
+        DownloadControlError::CancellationNotSafe => control_error(
+            StatusCode::CONFLICT,
+            "cancellation_not_safe",
+            "the model operation passed its safe cancellation point",
+            origin,
+        ),
+        DownloadControlError::ModelUnavailable => control_error(
+            StatusCode::CONFLICT,
+            "model_unavailable",
+            "the model must be downloaded, verified, compatible, and engine eligible",
+            origin,
+        ),
     }
 }
 
@@ -208,6 +220,75 @@ async fn start_download(
         }
     };
     match state.downloads.start(&request.model_id) {
+        Ok(operation_id) => cors(
+            (
+                StatusCode::ACCEPTED,
+                Json(OperationAccepted { operation_id }),
+            )
+                .into_response(),
+            origin.as_deref(),
+        ),
+        Err(error) => map_download_error(error, origin.as_deref()),
+    }
+}
+
+async fn start_load(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let origin = match request_origin(&headers) {
+        Ok(origin) => origin,
+        Err(status) => return status.into_response(),
+    };
+    if let Err(status) = authorize(&state, &headers) {
+        return cors(status.into_response(), origin.as_deref());
+    }
+    if headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_none_or(|value| value.split(';').next() != Some("application/json"))
+    {
+        return control_error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_media_type",
+            "content type must be application/json",
+            origin.as_deref(),
+        );
+    }
+    let request = match serde_json::from_slice::<ModelRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return control_error(
+                StatusCode::BAD_REQUEST,
+                "unknown_model",
+                "request must name a known registry model",
+                origin.as_deref(),
+            );
+        }
+    };
+    match state.downloads.start_load(&request.model_id) {
+        Ok(operation_id) => cors(
+            (
+                StatusCode::ACCEPTED,
+                Json(OperationAccepted { operation_id }),
+            )
+                .into_response(),
+            origin.as_deref(),
+        ),
+        Err(error) => map_download_error(error, origin.as_deref()),
+    }
+}
+
+async fn start_unload(State(state): State<ControlState>, headers: HeaderMap) -> Response {
+    let origin = match request_origin(&headers) {
+        Ok(origin) => origin,
+        Err(status) => return status.into_response(),
+    };
+    if let Err(status) = authorize(&state, &headers) {
+        return cors(status.into_response(), origin.as_deref());
+    }
+    match state.downloads.start_unload() {
         Ok(operation_id) => cors(
             (
                 StatusCode::ACCEPTED,
@@ -362,7 +443,7 @@ async fn node_proof(
         Ok(challenge) => challenge,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
-    let status = NodeStatus::Unloaded;
+    let status = node_status(&state);
     let proof = match state.token.node_identity_proof(
         &challenge.nonce,
         &state.node_id,
@@ -430,16 +511,34 @@ async fn node_snapshot(State(state): State<ControlState>, headers: HeaderMap) ->
     if let Err(status) = authorize(&state, &headers) {
         return cors(status.into_response(), origin.as_deref());
     }
+    let lifecycle = state.downloads.lifecycle_snapshot();
     cors(
         Json(NodeSnapshot {
-            status: NodeStatus::Unloaded,
-            active_model_id: None,
-            operation_id: None,
-            error: None,
+            status: node_status(&state),
+            active_model_id: lifecycle
+                .as_ref()
+                .and_then(|snapshot| snapshot.active_model_id.clone()),
+            operation_id: state.downloads.active_lifecycle_operation_id(),
+            error: lifecycle.and_then(|snapshot| snapshot.error),
         })
         .into_response(),
         origin.as_deref(),
     )
+}
+
+fn node_status(state: &ControlState) -> NodeStatus {
+    use crate::model_lifecycle::NodeLifecycleStatus;
+    match state
+        .downloads
+        .lifecycle_snapshot()
+        .map(|snapshot| snapshot.status)
+    {
+        None | Some(NodeLifecycleStatus::Unloaded) => NodeStatus::Unloaded,
+        Some(NodeLifecycleStatus::Loading) => NodeStatus::Loading,
+        Some(NodeLifecycleStatus::Ready) => NodeStatus::Ready,
+        Some(NodeLifecycleStatus::Unloading) => NodeStatus::Unloading,
+        Some(NodeLifecycleStatus::RecoveryRequired) => NodeStatus::RecoveryRequired,
+    }
 }
 
 pub fn router(state: ControlState) -> Router {
@@ -450,6 +549,14 @@ pub fn router(state: ControlState) -> Router {
         .route(
             "/loxa/v1/models/download",
             post(start_download).options(post_preflight),
+        )
+        .route(
+            "/loxa/v1/models/load",
+            post(start_load).options(post_preflight),
+        )
+        .route(
+            "/loxa/v1/models/unload",
+            post(start_unload).options(post_preflight),
         )
         .route(
             "/loxa/v1/operations/{id}",
@@ -473,6 +580,45 @@ mod tests {
     use loxa_core::model_inventory::VerificationCache;
     use loxa_core::registry::ModelEntry;
     use std::path::PathBuf;
+
+    struct RouterDriver;
+    impl crate::model_lifecycle::EngineLifecycleDriver for RouterDriver {
+        type Session = ();
+        fn start(
+            &mut self,
+            _: &crate::model_lifecycle::StableNodeOwner,
+            _: &crate::model_lifecycle::LaunchPlan,
+            _: u64,
+        ) -> Result<
+            crate::model_lifecycle::StartedSession<()>,
+            crate::model_lifecycle::LifecycleError,
+        > {
+            panic!("unload does not spawn")
+        }
+        fn wait_ready(
+            &mut self,
+            _: &mut crate::model_lifecycle::StartedSession<()>,
+            _: crate::model_lifecycle::LifecycleSignals<'_>,
+        ) -> Result<(), crate::model_lifecycle::LifecycleError> {
+            panic!("unload does not wait")
+        }
+        fn stop_exact(
+            &mut self,
+            _: crate::model_lifecycle::StartedSession<()>,
+        ) -> Result<(), crate::model_lifecycle::LifecycleError> {
+            Ok(())
+        }
+    }
+    struct RouterGateway;
+    impl crate::model_lifecycle::GatewayPublisher for RouterGateway {
+        fn withdraw(&mut self) {}
+        fn publish(
+            &mut self,
+            _: &crate::model_lifecycle::LaunchPlan,
+            _: &crate::model_lifecycle::SessionCorrelation,
+        ) {
+        }
+    }
 
     struct TestDir(PathBuf);
 
@@ -560,6 +706,59 @@ mod tests {
         assert_eq!(inventory[0]["id"], "fixture");
         assert_eq!(inventory[0]["artifact"], "downloaded");
 
+        worker.stop_and_join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn authenticated_unload_route_returns_operation_and_rejects_missing_bearer() {
+        let temp = TestDir::new("unload-route");
+        let lifecycle = crate::model_lifecycle::ModelLifecycle::new(
+            crate::model_lifecycle::StableNodeOwner {
+                run_id: "owner".into(),
+                pid: 1,
+                process_start_time_unix_s: 2,
+                gateway_port: 8080,
+            },
+            RouterDriver,
+            RouterGateway,
+        );
+        let (downloads, worker) =
+            DownloadControl::spawn_with_lifecycle(temp.0.join("models"), lifecycle);
+        let token = ControlToken::load_or_create(&temp.0.join("control.token")).unwrap();
+        let state = ControlState::new(
+            token.clone(),
+            "node".into(),
+            "runtime".into(),
+            downloads.clone(),
+        );
+        let mut unauthorized = HeaderMap::new();
+        unauthorized.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("tauri://localhost"),
+        );
+        assert_eq!(
+            start_unload(State(state.clone()), unauthorized)
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let mut authorized = HeaderMap::new();
+        authorized.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("tauri://localhost"),
+        );
+        authorized.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", token.expose_for_authorization())).unwrap(),
+        );
+        let response = start_unload(State(state), authorized).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let accepted: OperationAccepted = serde_json::from_slice(&body).unwrap();
+        assert!(accepted.operation_id.starts_with("op-"));
         worker.stop_and_join().unwrap();
     }
 

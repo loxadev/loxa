@@ -17,6 +17,7 @@ pub mod control_router;
 pub mod download_control;
 mod engine_session;
 pub mod model_lifecycle;
+mod production_lifecycle;
 
 use engine_session::EngineSession;
 
@@ -888,11 +889,33 @@ pub fn serve_node(
     } else {
         (port.unwrap_or(DEFAULT_GATEWAY_PORT), None)
     };
-    let mut download_runtime = unloaded_run
-        .as_ref()
-        .map(|_| download_control::DownloadControl::spawn(paths.models_dir.clone()));
     let node_id = format!("loxa-node-{}", std::process::id());
     let gateway_state = loxa_core::gateway::GatewayState::new(node_id);
+    let mut download_runtime = unloaded_run.as_ref().map(|run| {
+        if engine == RuntimeBackendKind::LlamaCpp {
+            let owner = model_lifecycle::StableNodeOwner {
+                run_id: run.run_id.clone(),
+                pid: run.owner_pid,
+                process_start_time_unix_s: run.owner_process_start_time_unix_s,
+                gateway_port,
+            };
+            let lifecycle = model_lifecycle::ModelLifecycle::new(
+                owner,
+                production_lifecycle::ProductionEngineDriver::new(
+                    paths.state_path.clone(),
+                    paths.logs_dir.clone(),
+                    gateway_port,
+                ),
+                production_lifecycle::ProductionGatewayPublisher(gateway_state.clone()),
+            );
+            download_control::DownloadControl::spawn_with_lifecycle(
+                paths.models_dir.clone(),
+                lifecycle,
+            )
+        } else {
+            download_control::DownloadControl::spawn(paths.models_dir.clone())
+        }
+    });
     let gateway_router = match (|| -> io::Result<_> {
         Ok(if let Some(run) = &unloaded_run {
             let state_dir = paths
@@ -1011,11 +1034,10 @@ fn run_unloaded_actor(
                 "download actor worker terminated unexpectedly",
             ));
         }
-        let current =
-            match supervisor::current_runtime_state_run(&paths.state_path, &run.identity()) {
-                Ok(current) => current,
-                Err(error) => break Err(supervisor_error_to_io(error)),
-            };
+        let current = match current_same_owner_run(paths, &run) {
+            Ok(current) => current,
+            Err(error) => break Err(error),
+        };
         if current.stop_requested || signal_guard.interrupted() {
             let stopped = current.stop_requested;
             break Ok(if stopped {
@@ -1036,8 +1058,48 @@ fn run_unloaded_actor(
     }
 }
 
+fn current_same_owner_run(
+    paths: &NodePaths,
+    owner: &supervisor::ManagedRun,
+) -> io::Result<supervisor::ManagedRun> {
+    let supervisor::RuntimeStateRead::Loaded(runs) =
+        supervisor::read_runtime_state(&paths.state_path).map_err(supervisor_error_to_io)?
+    else {
+        return Err(io::Error::other("stable node owner state is unavailable"));
+    };
+    if runs.len() != 1 {
+        return Err(io::Error::other("stable node owner state is not singular"));
+    }
+    let current = runs.into_iter().next().expect("one run exists");
+    if current.run_id != owner.run_id
+        || current.owner_pid != owner.owner_pid
+        || current.owner_process_start_time_unix_s != owner.owner_process_start_time_unix_s
+    {
+        return Err(io::Error::other("stable node owner identity changed"));
+    }
+    Ok(current)
+}
+
 fn finish_unloaded_owner(paths: &NodePaths, run: &supervisor::ManagedRun) -> io::Result<()> {
-    supervisor::finish_childless_runtime_state_run(&paths.state_path, &run.identity())
+    let current = match supervisor::read_runtime_state(&paths.state_path)
+        .map_err(supervisor_error_to_io)?
+    {
+        supervisor::RuntimeStateRead::Loaded(runs) => runs.into_iter().next().ok_or_else(|| {
+            io::Error::other("stable node owner disappeared before final cleanup")
+        })?,
+        _ => return Err(io::Error::other("stable node owner state is unavailable")),
+    };
+    if current.run_id != run.run_id
+        || current.owner_pid != run.owner_pid
+        || current.owner_process_start_time_unix_s != run.owner_process_start_time_unix_s
+        || current.lifecycle != supervisor::RunLifecycle::Unloaded
+        || current.child_pid.is_some()
+    {
+        return Err(io::Error::other(
+            "stable node owner is not safely unloaded at final cleanup",
+        ));
+    }
+    supervisor::finish_childless_runtime_state_run(&paths.state_path, &current.identity())
         .map(|_| ())
         .map_err(supervisor_error_to_io)
 }
@@ -2415,6 +2477,33 @@ mod lifecycle_api_tests {
     }
 
     #[test]
+    fn final_owner_cleanup_resolves_the_current_unloaded_generation() {
+        let temp = TestDir::new("advanced-unloaded-owner");
+        let paths = NodePaths {
+            models_dir: temp.0.join("models"),
+            state_path: temp.0.join("managed.json"),
+            logs_dir: temp.0.join("logs"),
+        };
+        let original = claim_unloaded_owner(&paths, 11_438).expect("claim unloaded owner");
+        let mut advanced = original.clone();
+        advanced.generation = 3;
+        advanced.generation_alias = format!("loxa-{}-g3", original.run_id);
+        supervisor::update_runtime_state_run_committed(
+            &paths.state_path,
+            &original.identity(),
+            advanced,
+        )
+        .unwrap()
+        .expect("advance owner generation");
+
+        finish_unloaded_owner(&paths, &original).expect("finish current owner generation");
+        assert_eq!(
+            managed_servers(&paths).unwrap(),
+            ManagedRunsSnapshot::Runs(Vec::new())
+        );
+    }
+
+    #[test]
     fn unloaded_actor_observes_durable_stop_and_cleans_up_without_deadlock() {
         let _signal_lock = SIGNAL_TEST_LOCK.lock().expect("signal test lock");
         let temp = TestDir::new("unloaded-stop");
@@ -2450,6 +2539,47 @@ mod lifecycle_api_tests {
         assert_eq!(
             managed_servers(&paths).unwrap(),
             ManagedRunsSnapshot::Runs(Vec::new())
+        );
+    }
+
+    #[test]
+    fn unloaded_actor_monitor_accepts_same_owner_generation_advances() {
+        let _signal_lock = SIGNAL_TEST_LOCK.lock().expect("signal test lock");
+        let temp = TestDir::new("unloaded-generation-advance");
+        let paths = NodePaths {
+            models_dir: temp.0.join("models"),
+            state_path: temp.0.join("managed.json"),
+            logs_dir: temp.0.join("logs"),
+        };
+        let actor_paths = paths.clone();
+        let run = claim_unloaded_owner(&paths, 11_439).expect("claim unloaded owner");
+        let (_, worker) = download_control::DownloadControl::spawn(paths.models_dir.clone());
+        let original = run.clone();
+        let actor = std::thread::spawn(move || run_unloaded_actor(&actor_paths, run, worker));
+
+        let mut advanced = original.clone();
+        advanced.generation = 2;
+        advanced.generation_alias = format!("loxa-{}-g2", original.run_id);
+        supervisor::update_runtime_state_run_committed(
+            &paths.state_path,
+            &original.identity(),
+            advanced,
+        )
+        .unwrap()
+        .expect("advance stable owner generation");
+        std::thread::sleep(Duration::from_millis(75));
+        assert!(
+            !actor.is_finished(),
+            "same-owner generation must not stop node"
+        );
+
+        assert!(matches!(
+            stop_managed_servers(StopRequest { target: "all" }, &paths).unwrap(),
+            StopOutcome::Completed { .. }
+        ));
+        assert_eq!(
+            actor.join().unwrap().unwrap(),
+            RunTermination::RequestedStop
         );
     }
 
