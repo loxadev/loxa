@@ -30,6 +30,7 @@ const XDG_CACHE_HOME: &str = "XDG_CACHE_HOME";
 
 #[derive(Debug)]
 pub enum DownloadError {
+    Cancelled,
     AuthRequired,
     Forbidden,
     InvalidFilename,
@@ -44,6 +45,7 @@ pub enum DownloadError {
 impl fmt::Display for DownloadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            DownloadError::Cancelled => write!(f, "download cancelled"),
             DownloadError::AuthRequired => write!(
                 f,
                 "authentication required by Hugging Face; set HF_TOKEN if this is a private or gated repo"
@@ -69,6 +71,24 @@ impl fmt::Display for DownloadError {
         }
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DownloadProgress {
+    pub downloaded_bytes: u64,
+    pub total_bytes: u64,
+}
+
+/// Product-neutral hook used by control surfaces to observe and cooperatively
+/// cancel a download. Implementations must make `is_cancelled` cheap.
+pub trait DownloadObserver {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+    fn progress(&mut self, _progress: DownloadProgress) {}
+}
+
+pub struct NoopDownloadObserver;
+impl DownloadObserver for NoopDownloadObserver {}
 
 impl Error for DownloadError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
@@ -130,6 +150,7 @@ struct DownloadBodyContext<'a> {
     final_path: &'a Path,
     progress: &'a ProgressBar,
     available_space_override: Option<u64>,
+    observer: &'a mut dyn DownloadObserver,
 }
 
 impl DownloadTransport for ReqwestTransport {
@@ -215,6 +236,14 @@ pub fn download(entry: &dyn VerifiedModel, dest_dir: &Path) -> Result<PathBuf, D
     download_from_base_url(entry, dest_dir, HF_BASE_URL)
 }
 
+pub fn download_with_observer(
+    entry: &dyn VerifiedModel,
+    dest_dir: &Path,
+    observer: &mut dyn DownloadObserver,
+) -> Result<PathBuf, DownloadError> {
+    download_from_base_url_with_observer(entry, dest_dir, HF_BASE_URL, observer)
+}
+
 fn download_from_base_url(
     entry: &dyn VerifiedModel,
     dest_dir: &Path,
@@ -226,6 +255,20 @@ fn download_from_base_url(
         .build()?;
     let transport = ReqwestTransport { client };
     download_with_transport(entry, dest_dir, base_url, &transport)
+}
+
+fn download_from_base_url_with_observer(
+    entry: &dyn VerifiedModel,
+    dest_dir: &Path,
+    base_url: &str,
+    observer: &mut dyn DownloadObserver,
+) -> Result<PathBuf, DownloadError> {
+    let client = Client::builder()
+        .user_agent(LOXA_USER_AGENT)
+        .connect_timeout(std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS))
+        .build()?;
+    let transport = ReqwestTransport { client };
+    download_with_transport_and_observer(entry, dest_dir, base_url, &transport, observer, None)
 }
 
 fn download_with_transport(
@@ -244,6 +287,28 @@ fn download_with_transport_and_available_space(
     transport: &impl DownloadTransport,
     available_space_override: Option<u64>,
 ) -> Result<PathBuf, DownloadError> {
+    let mut observer = NoopDownloadObserver;
+    download_with_transport_and_observer(
+        entry,
+        dest_dir,
+        base_url,
+        transport,
+        &mut observer,
+        available_space_override,
+    )
+}
+
+fn download_with_transport_and_observer(
+    entry: &dyn VerifiedModel,
+    dest_dir: &Path,
+    base_url: &str,
+    transport: &impl DownloadTransport,
+    observer: &mut dyn DownloadObserver,
+    available_space_override: Option<u64>,
+) -> Result<PathBuf, DownloadError> {
+    if observer.is_cancelled() {
+        return Err(DownloadError::Cancelled);
+    }
     let filename = sanitize_filename(entry.filename())?;
     fs::create_dir_all(dest_dir)?;
 
@@ -256,6 +321,9 @@ fn download_with_transport_and_available_space(
 
     let url = build_download_url(base_url, entry.repo(), entry.revision(), &filename)?;
     let remote_size = transport.probe_size(&url)?;
+    if observer.is_cancelled() {
+        return Err(DownloadError::Cancelled);
+    }
     if remote_size != entry.size_bytes() {
         return Err(DownloadError::SizeMismatch {
             expected: entry.size_bytes(),
@@ -273,7 +341,6 @@ fn download_with_transport_and_available_space(
     ensure_disk_space_for_download(dest_dir, bytes_needed, available_space_override)?;
 
     let progress = progress_bar(entry.size_bytes(), &filename, resume_from);
-
     let result = download_body(
         transport,
         url,
@@ -284,6 +351,7 @@ fn download_with_transport_and_available_space(
             final_path: &final_path,
             progress: &progress,
             available_space_override,
+            observer,
         },
     );
 
@@ -586,6 +654,9 @@ fn download_body(
     }
 
     let mut response = transport.body(&url, offset)?;
+    if context.observer.is_cancelled() {
+        return Err(DownloadError::Cancelled);
+    }
     let mut restart_from_zero = false;
     match (offset, response.status) {
         (_, StatusCode::UNAUTHORIZED) => return Err(DownloadError::AuthRequired),
@@ -617,6 +688,15 @@ fn download_body(
         context.progress.set_length(context.entry.size_bytes());
         context.progress.set_position(0);
         context.progress.reset_eta();
+        context.observer.progress(DownloadProgress {
+            downloaded_bytes: 0,
+            total_bytes: context.entry.size_bytes(),
+        });
+    } else {
+        context.observer.progress(DownloadProgress {
+            downloaded_bytes: offset,
+            total_bytes: context.entry.size_bytes(),
+        });
     }
 
     let mut file = if offset > 0 {
@@ -636,6 +716,8 @@ fn download_body(
         &mut hasher,
         context.progress,
         offset,
+        context.observer,
+        context.entry.size_bytes(),
     )?;
     if total != context.entry.size_bytes() {
         return Err(DownloadError::SizeMismatch {
@@ -720,11 +802,17 @@ fn copy_response_to_part(
     hasher: &mut Sha256,
     progress: &ProgressBar,
     start: u64,
+    observer: &mut dyn DownloadObserver,
+    expected_total: u64,
 ) -> Result<u64, DownloadError> {
     let mut buffer = [0_u8; COPY_BUFFER_BYTES];
     let mut total = start;
 
     loop {
+        if observer.is_cancelled() {
+            file.flush()?;
+            return Err(DownloadError::Cancelled);
+        }
         let read = response.read(&mut buffer)?;
         if read == 0 {
             break;
@@ -733,6 +821,10 @@ fn copy_response_to_part(
         hasher.update(&buffer[..read]);
         total += read as u64;
         progress.set_position(total.saturating_sub(start));
+        observer.progress(DownloadProgress {
+            downloaded_bytes: total,
+            total_bytes: expected_total,
+        });
     }
 
     file.flush()?;
@@ -979,6 +1071,108 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingObserver {
+        progress: Vec<DownloadProgress>,
+        cancel_after: Option<u64>,
+        cancelled: bool,
+    }
+
+    impl DownloadObserver for RecordingObserver {
+        fn is_cancelled(&self) -> bool {
+            self.cancelled
+        }
+
+        fn progress(&mut self, progress: DownloadProgress) {
+            self.progress.push(progress);
+            if self
+                .cancel_after
+                .is_some_and(|limit| progress.downloaded_bytes >= limit)
+            {
+                self.cancelled = true;
+            }
+        }
+    }
+
+    #[test]
+    fn observer_cancels_before_transfer_without_creating_a_partial() {
+        let dir = tempdir().unwrap();
+        let bytes = b"never requested".to_vec();
+        let model = entry(
+            "model.gguf",
+            Box::leak(sha256_hex(&bytes).into_boxed_str()),
+            bytes.len() as u64,
+        );
+        let transport = FakeTransport::new(bytes.len() as u64, vec![]);
+        let mut observer = RecordingObserver {
+            cancelled: true,
+            ..Default::default()
+        };
+
+        let error = download_with_transport_and_observer(
+            &model,
+            dir.path(),
+            HF_BASE_URL,
+            &transport,
+            &mut observer,
+            Some(u64::MAX),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, DownloadError::Cancelled));
+        assert!(transport.offsets().is_empty());
+        assert!(!dir.path().join("model.gguf.part").exists());
+    }
+
+    #[test]
+    fn observer_progress_is_monotonic_and_mid_transfer_cancel_keeps_resumable_part() {
+        let dir = tempdir().unwrap();
+        let bytes = vec![7_u8; COPY_BUFFER_BYTES * 2 + 11];
+        let model = entry(
+            "model.gguf",
+            Box::leak(sha256_hex(&bytes).into_boxed_str()),
+            bytes.len() as u64,
+        );
+        let transport = FakeTransport::new(
+            bytes.len() as u64,
+            vec![FakeBody {
+                status: StatusCode::OK,
+                content_range: None,
+                body: bytes,
+            }],
+        );
+        let mut observer = RecordingObserver {
+            cancel_after: Some(COPY_BUFFER_BYTES as u64),
+            ..Default::default()
+        };
+
+        let error = download_with_transport_and_observer(
+            &model,
+            dir.path(),
+            HF_BASE_URL,
+            &transport,
+            &mut observer,
+            Some(u64::MAX),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, DownloadError::Cancelled));
+        assert_eq!(
+            fs::metadata(dir.path().join("model.gguf.part"))
+                .unwrap()
+                .len(),
+            COPY_BUFFER_BYTES as u64
+        );
+        assert!(observer
+            .progress
+            .windows(2)
+            .all(|pair| pair[0].downloaded_bytes <= pair[1].downloaded_bytes));
+        assert!(observer
+            .progress
+            .iter()
+            .all(|item| item.total_bytes == model.size_bytes));
+    }
+
     #[test]
     fn download_url_uses_the_verified_revision() {
         let url = build_download_url(
@@ -1102,8 +1296,17 @@ mod tests {
         let mut hasher = Sha256::new();
         let progress = progress_bar(10, "model.gguf", 4);
 
-        let total =
-            copy_response_to_part(&mut response, &mut file, &mut hasher, &progress, 4).unwrap();
+        let mut observer = NoopDownloadObserver;
+        let total = copy_response_to_part(
+            &mut response,
+            &mut file,
+            &mut hasher,
+            &progress,
+            4,
+            &mut observer,
+            10,
+        )
+        .unwrap();
 
         assert_eq!(total, 8);
         assert_eq!(progress.length(), Some(6));

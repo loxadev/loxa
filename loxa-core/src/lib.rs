@@ -7,6 +7,7 @@ pub mod engine;
 pub mod evidence;
 pub mod gateway;
 pub mod hardware;
+pub mod model_inventory;
 pub mod provider;
 pub mod registry;
 pub mod resolve;
