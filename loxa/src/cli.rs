@@ -5,17 +5,22 @@ use crate::model_commands::{
 };
 use crate::model_commands::{print_list, pull_model, remove_model, write_unknown_id};
 use clap::Parser;
+use loxa_core::control::auth::ControlToken;
+use loxa_core::control::client::LiveControlClient;
 use loxa_core::detect::{DetectedTool, LocalToolsReport};
 use loxa_core::engine::RuntimeBackendKind;
 use loxa_core::hardware::HardwareReport;
 use loxa_core::registry::{self, ModelEntry, REGISTRY};
-use loxa_core::supervisor::{self, SupervisorError};
 #[cfg(test)]
-use loxa_core::supervisor::{ManagedServer, RuntimeStateRead};
+use loxa_core::supervisor::ManagedServer;
+use loxa_core::supervisor::RuntimeStateRead;
+use loxa_core::supervisor::{self, SupervisorError};
 use loxa_node::*;
 use std::io::{self, Write};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::process::ExitCode;
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "loxa", version, about = "Measured local AI infrastructure")]
@@ -37,6 +42,10 @@ enum Command {
     Rm {
         id: String,
     },
+    Load {
+        id: String,
+    },
+    Unload,
     Run {
         id: String,
         #[arg(long)]
@@ -80,40 +89,212 @@ fn run_with_paths<W: Write, E: Write>(
     if let Err(error) = validate_cli_contract(&cli) {
         return finish_cli_result(Err(error), &mut stderr);
     }
-    let result = match cli.command {
-        Command::Calibrate => run_calibration(&mut stdout),
-        Command::Doctor => print_doctor(&mut stdout),
-        Command::Pull { id, quant } => pull_model(&id, quant.as_deref(), &mut stdout, &mut stderr),
-        Command::List => print_list(&mut stdout),
-        Command::Rm { id } => remove_model(&id, &mut stdout, &mut stderr),
-        Command::Run {
-            id,
-            ctx,
-            port,
-            engine,
-        } => run_model_cli(&id, ctx, port, engine, paths, &mut stdout, &mut stderr),
-        Command::Serve {
-            model,
-            port,
-            engine,
-        } => serve_node_cli(
-            model.as_deref(),
-            port,
-            engine,
-            paths,
-            &mut stdout,
-            &mut stderr,
-        ),
-        Command::Ps => render_managed_servers(managed_servers(paths), &mut stdout),
-        Command::Stop { target } => render_stop_outcome(
-            &target,
-            stop_managed_servers(StopRequest { target: &target }, paths),
-            &mut stdout,
-            &mut stderr,
-        ),
-    };
+    let result = (|| -> io::Result<ExitCode> {
+        match cli.command {
+            Command::Calibrate => run_calibration(&mut stdout),
+            Command::Doctor => print_doctor(&mut stdout),
+            Command::Pull { id, quant } => match live_control(paths)? {
+                Some(client) => live_pull(&client, &id, quant.as_deref(), &mut stdout),
+                None => pull_model(&id, quant.as_deref(), &mut stdout, &mut stderr),
+            },
+            Command::List => match live_control(paths)? {
+                Some(client) => live_list(&client, &mut stdout),
+                None => print_list(&mut stdout),
+            },
+            Command::Rm { id } => match live_control(paths)? {
+                Some(_) => {
+                    writeln!(
+                        stderr,
+                        "cannot remove {id} while a managed node is running; stop the node first (no authenticated remove API is approved)"
+                    )?;
+                    Ok(ExitCode::from(1))
+                }
+                None => remove_model(&id, &mut stdout, &mut stderr),
+            },
+            Command::Load { id } => match live_control(paths)? {
+                Some(client) => live_operation(&client, client.load(&id), "load", &mut stdout),
+                None => {
+                    writeln!(
+                        stderr,
+                        "no managed node is running; start one with `loxa serve`, then run `loxa load {id}`"
+                    )?;
+                    Ok(ExitCode::from(1))
+                }
+            },
+            Command::Unload => match live_control(paths)? {
+                Some(client) => live_operation(&client, client.unload(), "unload", &mut stdout),
+                None => {
+                    writeln!(stderr, "no managed node is running; nothing to unload")?;
+                    Ok(ExitCode::from(1))
+                }
+            },
+            Command::Run {
+                id,
+                ctx,
+                port,
+                engine,
+            } => run_model_cli(&id, ctx, port, engine, paths, &mut stdout, &mut stderr),
+            Command::Serve {
+                model,
+                port,
+                engine,
+            } => serve_node_cli(
+                model.as_deref(),
+                port,
+                engine,
+                paths,
+                &mut stdout,
+                &mut stderr,
+            ),
+            Command::Ps => render_managed_servers(managed_servers(paths), &mut stdout),
+            Command::Stop { target } => render_stop_outcome(
+                &target,
+                stop_managed_servers(StopRequest { target: &target }, paths),
+                &mut stdout,
+                &mut stderr,
+            ),
+        }
+    })();
 
     finish_cli_result(result, &mut stderr)
+}
+
+fn live_control(paths: &NodePaths) -> io::Result<Option<LiveControlClient>> {
+    let runs =
+        match supervisor::read_runtime_state(&paths.state_path).map_err(supervisor_error_to_io)? {
+            RuntimeStateRead::Missing => return Ok(None),
+            RuntimeStateRead::Legacy(path) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "legacy managed node state at {}; recovery required before model control",
+                        path.display()
+                    ),
+                ));
+            }
+            RuntimeStateRead::Corrupt(message) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("managed node state is corrupt: {message}; recovery required"),
+                ));
+            }
+            RuntimeStateRead::Loaded(runs) => runs,
+        };
+    if runs.len() > 1 {
+        return Err(io::Error::other(
+            "multiple managed node owners are present; recovery required before model control",
+        ));
+    }
+    let Some(run) = runs.into_iter().next() else {
+        return Ok(None);
+    };
+    let inspection = supervisor::inspect_managed_run(&run);
+    if inspection.owner_status != supervisor::OwnerIdentityStatus::Live
+        || matches!(
+            inspection.status,
+            supervisor::ManagedRunStatus::RecoveryRequired
+        )
+    {
+        return Err(io::Error::other(format!(
+            "managed node ownership is {:?}; recovery required before model control",
+            inspection.owner_status
+        )));
+    }
+    if matches!(inspection.status, supervisor::ManagedRunStatus::Stopping) {
+        return Err(io::Error::other(
+            "managed node is stopping; model control is unavailable",
+        ));
+    }
+    if !matches!(
+        inspection.status,
+        supervisor::ManagedRunStatus::Unloaded | supervisor::ManagedRunStatus::Running
+    ) {
+        return Err(io::Error::other(format!(
+            "managed node is {:?}; wait for a stable unloaded or running state",
+            inspection.status
+        )));
+    }
+    let state_dir = paths
+        .state_path
+        .parent()
+        .ok_or_else(|| io::Error::other("managed state path has no parent"))?;
+    let loxa_dir = if state_dir.file_name().is_some_and(|name| name == "run") {
+        state_dir
+            .parent()
+            .ok_or_else(|| io::Error::other("managed state path has no Loxa directory"))?
+    } else {
+        state_dir
+    };
+    let token = ControlToken::load(&loxa_dir.join("control.token"))?;
+    let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), run.port);
+    let client =
+        LiveControlClient::connect(address, token, &run.run_id, Duration::from_millis(750))
+            .map_err(io::Error::other)?;
+    match supervisor::read_runtime_state(&paths.state_path).map_err(supervisor_error_to_io)? {
+        RuntimeStateRead::Loaded(current)
+            if current.len() == 1 && current[0].identity() == run.identity() => {}
+        _ => {
+            return Err(io::Error::other(
+                "managed node state changed during peer proof; retry the command",
+            ))
+        }
+    }
+    Ok(Some(client))
+}
+
+fn live_operation<W: Write>(
+    client: &LiveControlClient,
+    started: Result<String, loxa_core::control::client::ClientError>,
+    label: &str,
+    stdout: &mut W,
+) -> io::Result<ExitCode> {
+    let operation_id = started.map_err(io::Error::other)?;
+    writeln!(stdout, "{label} operation {operation_id} accepted")?;
+    client
+        .wait_terminal(&operation_id, Duration::from_secs(24 * 60 * 60))
+        .map_err(io::Error::other)?;
+    writeln!(stdout, "{label} completed")?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn live_pull<W: Write>(
+    client: &LiveControlClient,
+    id: &str,
+    quant: Option<&str>,
+    stdout: &mut W,
+) -> io::Result<ExitCode> {
+    if quant.is_some() || id.starts_with("hf://") || id.matches('/').count() == 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a running node accepts only known registry recipe IDs; stop it before resolving a Hugging Face reference or custom quantization",
+        ));
+    }
+    live_operation(client, client.download(id), "download", stdout)
+}
+
+fn live_list<W: Write>(client: &LiveControlClient, stdout: &mut W) -> io::Result<ExitCode> {
+    writeln!(stdout, "id  status  compatible  engine")?;
+    for model in client.models().map_err(io::Error::other)? {
+        writeln!(
+            stdout,
+            "{}  {}  {}  {}",
+            model.id,
+            live_artifact_status(&model.artifact),
+            model.compatibility.compatible,
+            model.engine.engine
+        )?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn live_artifact_status(artifact: &loxa_core::model_inventory::ArtifactState) -> &'static str {
+    use loxa_core::model_inventory::ArtifactState;
+    match artifact {
+        ArtifactState::NotDownloaded => "not_downloaded",
+        ArtifactState::Partial { .. } => "partial",
+        ArtifactState::Downloaded => "downloaded",
+        ArtifactState::Invalid { .. } => "invalid",
+    }
 }
 
 fn run_model_cli<W: Write, E: Write>(
@@ -1008,6 +1189,16 @@ mod tests {
         assert!(Cli::try_parse_from(["loxa", "pull", "gemma-3-4b-it-q4"]).is_ok());
         assert!(Cli::try_parse_from(["loxa", "rm", "gemma-3-4b-it-q4"]).is_ok());
         assert!(matches!(
+            Cli::try_parse_from(["loxa", "load", "gemma-3-4b-it-q4"]),
+            Ok(Cli { command: Command::Load { id } }) if id == "gemma-3-4b-it-q4"
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["loxa", "unload"]),
+            Ok(Cli {
+                command: Command::Unload
+            })
+        ));
+        assert!(matches!(
             Cli::try_parse_from(["loxa", "run", "gemma-3-4b-it-q4", "--ctx", "4096", "--port", "9000"]),
             Ok(Cli {
                 command: Command::Run {
@@ -1030,6 +1221,83 @@ mod tests {
                 command: Command::Stop { target },
             }) if target == "all"
         ));
+    }
+
+    #[test]
+    fn load_without_a_live_node_fails_without_creating_runtime_or_model_state() {
+        let temp = TempDir::new("offline-load");
+        let paths = NodePaths {
+            models_dir: temp.path().join("models"),
+            state_path: temp.path().join("run").join("managed.json"),
+            logs_dir: temp.path().join("logs"),
+        };
+        let cli = Cli::try_parse_from(["loxa", "load", "gemma-3-4b-it-q4"]).unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        assert_eq!(
+            run_with_paths(cli, &paths, &mut stdout, &mut stderr),
+            ExitCode::from(1)
+        );
+        assert!(stdout.is_empty());
+        assert!(String::from_utf8(stderr)
+            .unwrap()
+            .contains("no managed node"));
+        assert!(!paths.state_path.exists());
+        assert!(!paths.models_dir.exists());
+    }
+
+    #[test]
+    fn corrupt_live_owner_state_fails_closed_before_rm_can_mutate_models() {
+        let temp = TempDir::new("corrupt-live-rm");
+        let paths = NodePaths {
+            models_dir: temp.path().join("models"),
+            state_path: temp.path().join("run").join("managed.json"),
+            logs_dir: temp.path().join("logs"),
+        };
+        fs::create_dir_all(paths.state_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(&paths.models_dir).unwrap();
+        let artifact = paths.models_dir.join(REGISTRY[0].filename);
+        fs::write(&artifact, b"sentinel").unwrap();
+        fs::write(&paths.state_path, b"not-json").unwrap();
+        let cli = Cli::try_parse_from(["loxa", "rm", REGISTRY[0].id]).unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        assert_eq!(
+            run_with_paths(cli, &paths, &mut stdout, &mut stderr),
+            ExitCode::from(1)
+        );
+        assert_eq!(fs::read(&artifact).unwrap(), b"sentinel");
+        assert!(String::from_utf8(stderr).unwrap().contains("corrupt"));
+    }
+
+    #[test]
+    fn dead_managed_owner_fails_closed_before_rm_can_mutate_models() {
+        let temp = TempDir::new("dead-live-rm");
+        let paths = NodePaths {
+            models_dir: temp.path().join("models"),
+            state_path: temp.path().join("run").join("managed.json"),
+            logs_dir: temp.path().join("logs"),
+        };
+        fs::create_dir_all(&paths.models_dir).unwrap();
+        let artifact = paths.models_dir.join(REGISTRY[0].filename);
+        fs::write(&artifact, b"sentinel").unwrap();
+        let mut run = starting_run_for_test(&paths.state_path, "dead-owner");
+        run.lifecycle = supervisor::RunLifecycle::Unloaded;
+        supervisor::create_starting_run(&paths.state_path, run).unwrap();
+        let cli = Cli::try_parse_from(["loxa", "rm", REGISTRY[0].id]).unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        assert_eq!(
+            run_with_paths(cli, &paths, &mut stdout, &mut stderr),
+            ExitCode::from(1)
+        );
+        assert_eq!(fs::read(&artifact).unwrap(), b"sentinel");
+        assert!(String::from_utf8(stderr)
+            .unwrap()
+            .contains("recovery required"));
     }
 
     #[test]
