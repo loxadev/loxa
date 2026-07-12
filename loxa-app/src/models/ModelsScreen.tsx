@@ -6,6 +6,8 @@ import type {
   getControlNode as defaultGetControlNode,
   getInventory as defaultGetInventory,
   getOperation as defaultGetOperation,
+  loadModel as defaultLoadModel,
+  unloadModel as defaultUnloadModel,
 } from "../control/client";
 import type {
   ControlStreamHandle,
@@ -25,6 +27,8 @@ export type ModelsScreenServices = {
   getControlNode: typeof defaultGetControlNode;
   getInventory: typeof defaultGetInventory;
   downloadModel: typeof defaultDownloadModel;
+  loadModel: typeof defaultLoadModel;
+  unloadModel: typeof defaultUnloadModel;
   getOperation: typeof defaultGetOperation;
   cancelOperation: typeof defaultCancelOperation;
   createControlEventStream: typeof defaultStreamControlEvents;
@@ -59,6 +63,7 @@ export function ModelsScreen({
   const streamRef = useRef<ControlStreamHandle | null>(null);
   const lifetimeSignalRef = useRef<AbortSignal | null>(null);
   const activeRef = useRef(true);
+  const nodeRevisionRef = useRef(0);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -123,12 +128,15 @@ export function ModelsScreen({
       }
     };
 
-    const refreshInventory = async () => {
-      const token = await services.readControlToken(endpoint);
-      if (disposed) return;
-      const next = await services.getInventory(endpoint, token, { signal: controller.signal });
+    const refreshTruth = async (version: number) => {
+      const [nextModels, nextNode] = await Promise.all([
+        services.readControlToken(endpoint).then((token) => services.getInventory(endpoint, token, { signal: controller.signal })),
+        services.readControlToken(endpoint).then((token) => services.getControlNode(endpoint, token, { signal: controller.signal })),
+      ]);
+      if (disposed || version !== nodeRevisionRef.current) return;
       verificationAttempts = 0;
-      publishModels(next);
+      publishModels(nextModels);
+      setNode(nextNode);
     };
 
     const connectEvents = async () => {
@@ -152,11 +160,13 @@ export function ModelsScreen({
           },
           onEvent: (event) => {
             if (disposed) return;
+            if (event.sequence <= cursorRef.current) return;
             cursorRef.current = event.sequence;
             applyOperation(event.operation);
             setNotice(operationAnnouncement(event.operation));
             if (isTerminal(event.operation.status)) {
-              void refreshInventory().catch((reason: unknown) => {
+              const nodeVersion = ++nodeRevisionRef.current;
+              void refreshTruth(nodeVersion).catch((reason: unknown) => {
                 if (!disposed && !controller.signal.aborted) setError(message(reason));
               });
             }
@@ -193,6 +203,7 @@ export function ModelsScreen({
         ]).then(([nextNode, nextModels]) => {
           if (disposed) return;
           setNode(nextNode);
+          nodeRevisionRef.current += 1;
           verificationAttempts = 0;
           publishModels(nextModels);
           setError("");
@@ -219,6 +230,7 @@ export function ModelsScreen({
     ]).then(async ([nextNode, nextModels]) => {
       if (disposed) return;
       setNode(nextNode);
+      nodeRevisionRef.current += 1;
       publishModels(nextModels);
       await connectEvents();
     }).catch((reason: unknown) => {
@@ -249,7 +261,7 @@ export function ModelsScreen({
   const latestByModel = useMemo(() => {
     const latest = new Map<string, OperationView>();
     for (const operation of Object.values(operations)) {
-      if (operation.kind !== "download" || operation.modelId === null) continue;
+      if (operation.modelId === null) continue;
       const current = latest.get(operation.modelId);
       if (current === undefined || operation.updatedAtUnixMs >= current.updatedAtUnixMs) {
         latest.set(operation.modelId, operation);
@@ -279,10 +291,10 @@ export function ModelsScreen({
     }
   };
 
-  const cancel = async (operation: OperationView) => {
+  const cancel = async (operation: OperationView, modelId: string) => {
     const signal = lifetimeSignalRef.current;
-    if (signal === null || signal.aborted || operation.modelId === null) return;
-    setPendingModels((current) => withValue(current, operation.modelId as string, true));
+    if (signal === null || signal.aborted) return;
+    setPendingModels((current) => withValue(current, modelId, true));
     setError("");
     try {
       const token = await services.readControlToken(endpoint);
@@ -294,10 +306,50 @@ export function ModelsScreen({
       if (activeRef.current && !signal.aborted) setError(message(reason));
     } finally {
       if (activeRef.current) {
-        setPendingModels((current) => withValue(current, operation.modelId as string, false));
+        setPendingModels((current) => withValue(current, modelId, false));
       }
     }
   };
+
+  const startLifecycle = async (kind: "load" | "unload", modelId: string) => {
+    const signal = lifetimeSignalRef.current;
+    if (signal === null || signal.aborted || node?.status === "recovery_required") return;
+    setPendingModels((current) => withValue(current, modelId, true));
+    setError("");
+    try {
+      const nodeRevision = nodeRevisionRef.current;
+      const token = await services.readControlToken(endpoint);
+      const accepted = kind === "load"
+        ? await services.loadModel(endpoint, token, modelId, { signal })
+        : await services.unloadModel(endpoint, token, { signal });
+      if (!activeRef.current || signal.aborted) return;
+      const operationToken = await services.readControlToken(endpoint);
+      const nodeToken = await services.readControlToken(endpoint);
+      const [authoritative, nextNode] = await Promise.all([
+        services.getOperation(endpoint, operationToken, accepted.operationId, { signal }),
+        services.getControlNode(endpoint, nodeToken, { signal }),
+      ]);
+      if (!activeRef.current || signal.aborted) return;
+      setOperations((current) => {
+        const existing = current[authoritative.id];
+        return existing !== undefined && existing.updatedAtUnixMs >= authoritative.updatedAtUnixMs
+          ? current
+          : { ...current, [authoritative.id]: authoritative };
+      });
+      if (nodeRevisionRef.current === nodeRevision) setNode(nextNode);
+      setNotice(operationAnnouncement(authoritative));
+    } catch (reason) {
+      if (activeRef.current && !signal.aborted) setError(message(reason));
+    } finally {
+      if (activeRef.current) setPendingModels((current) => withValue(current, modelId, false));
+    }
+  };
+
+  const activeUnload = node?.activeModelId === null ? undefined : Object.values(operations)
+    .filter((operation) => operation.kind === "unload" && operation.id === node?.operationId)
+    .sort((left, right) => right.updatedAtUnixMs - left.updatedAtUnixMs)[0];
+  const mutationBusy = pendingModels.size > 0 || node?.operationId !== null || Object.values(operations).some((operation) =>
+    operation.status === "queued" || operation.status === "running");
 
   return (
     <section className="models-screen" aria-labelledby="models-heading">
@@ -317,6 +369,7 @@ export function ModelsScreen({
       </div>
 
       {error && <p className="error-panel" role="alert">{error}</p>}
+      {node?.status === "recovery_required" && <p className="error-panel" role="alert">Recovery required. Model and chat controls are blocked until the node is safely restarted.</p>}
       {liveState === "error" && (
         <button className="secondary-button interactive-target" type="button" onClick={() => setRetryNonce((value) => value + 1)}>
           Retry live updates
@@ -329,10 +382,15 @@ export function ModelsScreen({
             key={entry.id}
             entry={entry}
             operation={latestByModel.get(entry.id)}
+            unloadOperation={node?.activeModelId === entry.id ? activeUnload : undefined}
             pending={pendingModels.has(entry.id)}
             active={node?.activeModelId === entry.id}
+            node={node}
+            mutationBusy={mutationBusy}
             onDownload={() => void download(entry.id)}
-            onCancel={(operation) => void cancel(operation)}
+            onLoad={() => void startLifecycle("load", entry.id)}
+            onUnload={() => void startLifecycle("unload", entry.id)}
+            onCancel={(operation) => void cancel(operation, entry.id)}
           />
         ))}
       </div>
@@ -344,24 +402,35 @@ export function ModelsScreen({
 function ModelRow({
   entry,
   operation,
+  unloadOperation,
   pending,
   active,
+  node,
+  mutationBusy,
   onDownload,
+  onLoad,
+  onUnload,
   onCancel,
 }: {
   entry: ModelInventoryEntry;
   operation?: OperationView;
+  unloadOperation?: OperationView;
   pending: boolean;
   active: boolean;
+  node: NodeSnapshot | null;
+  mutationBusy: boolean;
   onDownload(): void;
+  onLoad(): void;
+  onUnload(): void;
   onCancel(operation: OperationView): void;
 }) {
   const headingId = `model-${entry.id}`;
   const reasonId = `model-reason-${entry.id}`;
   const actionable = entry.compatibility.compatible && entry.engine.eligible;
-  const inProgress = operation?.status === "queued" || operation?.status === "running";
-  const status = inProgress && operation
-    ? operationLabel(operation)
+  const displayedOperation = unloadOperation ?? operation;
+  const inProgress = displayedOperation?.status === "queued" || displayedOperation?.status === "running";
+  const status = inProgress && displayedOperation
+    ? operationLabel(displayedOperation)
     : artifactLabel(entry.artifact, entry.sizeBytes);
   const showDownload = !inProgress && entry.artifact.kind !== "downloaded" &&
     !(entry.artifact.kind === "invalid" && entry.artifact.reason === "verification_required");
@@ -387,45 +456,55 @@ function ModelRow({
         <p id={reasonId} className={actionable ? "model-reason" : "model-reason model-reason-blocking"}>
           {entry.compatibility.reason} {entry.engine.reason}
         </p>
-        {operation?.progress && (
+        {displayedOperation?.progress && (
           <div className="operation-progress">
-            {operation.progress.totalBytes === null ? (
+            {displayedOperation.progress.totalBytes === null ? (
               <progress aria-label={`Download progress for ${entry.id}`} />
             ) : (
               <progress
                 aria-label={`Download progress for ${entry.id}`}
-                value={operation.progress.completedBytes}
-                max={operation.progress.totalBytes}
+                value={displayedOperation.progress.completedBytes}
+                max={displayedOperation.progress.totalBytes}
               />
             )}
             <span className="technical-value">
-              {formatBytes(operation.progress.completedBytes)}{operation.progress.totalBytes === null ? " downloaded" : ` of ${formatBytes(operation.progress.totalBytes)}`}
+              {formatBytes(displayedOperation.progress.completedBytes)}{displayedOperation.progress.totalBytes === null ? " downloaded" : ` of ${formatBytes(displayedOperation.progress.totalBytes)}`}
             </span>
           </div>
         )}
-        {operation?.error && <p className="operation-error">{operation.error}</p>}
-        {operation && !inProgress && <p className="operation-history">Last operation: {operationLabel(operation)}</p>}
+        {displayedOperation?.error && <p className="operation-error">{displayedOperation.error}</p>}
+        {displayedOperation && !inProgress && <p className="operation-history">Last operation: {operationLabel(displayedOperation)}</p>}
       </div>
       <div className="model-actions">
-        {inProgress && operation ? (
+        {inProgress && displayedOperation?.kind === "download" ? (
           <button
             className="secondary-button interactive-target"
             type="button"
             disabled={pending}
-            onClick={() => onCancel(operation)}
-            aria-label={`Cancel download ${entry.id}`}
+            onClick={() => onCancel(displayedOperation)}
+            aria-label={`Cancel ${displayedOperation.kind} ${entry.id}`}
           >Cancel</button>
+        ) : inProgress && displayedOperation ? (
+          <span className="model-action-label">{operationLabel(displayedOperation)}</span>
         ) : showDownload ? (
           <button
             className="primary-button interactive-target"
             type="button"
-            disabled={!actionable || pending}
+            disabled={!actionable || pending || mutationBusy}
             aria-describedby={reasonId}
             aria-label={actionLabel}
             onClick={onDownload}
           >{entry.artifact.kind === "partial" ? "Resume" : entry.artifact.kind === "invalid" ? "Repair" : "Download"}</button>
+        ) : entry.artifact.kind === "downloaded" && actionable && node?.status !== "recovery_required" ? (
+          <button
+            className={active ? "secondary-button interactive-target" : "primary-button interactive-target"}
+            type="button"
+            disabled={pending || mutationBusy}
+            onClick={active ? onUnload : onLoad}
+            aria-label={active ? `Unload ${entry.id}` : node?.activeModelId ? `Switch to ${entry.id}` : `Load ${entry.id}`}
+          >{active ? "Unload" : node?.activeModelId ? "Switch" : "Load"}</button>
         ) : (
-          <span className="model-action-label">{entry.artifact.kind === "downloaded" ? "Ready to load" : "Awaiting verification"}</span>
+          <span className="model-action-label">{entry.artifact.kind === "downloaded" ? "Unavailable to load" : "Awaiting verification"}</span>
         )}
       </div>
     </article>
@@ -446,10 +525,11 @@ function artifactLabel(artifact: ArtifactState, sizeBytes: number): string {
 }
 
 function operationLabel(operation: OperationView): string {
-  if (operation.status === "running") return "Downloading";
-  if (operation.status === "succeeded") return "Download completed";
-  if (operation.status === "failed") return "Download failed";
-  return operation.status[0].toUpperCase() + operation.status.slice(1);
+  const action = operation.kind === "download" ? "Download" : operation.kind === "load" ? "Load" : "Unload";
+  if (operation.status === "running") return `${action} in progress`;
+  if (operation.status === "succeeded") return `${action} completed`;
+  if (operation.status === "failed") return `${action} failed`;
+  return `${action} ${operation.status}`;
 }
 
 function operationAnnouncement(operation: OperationView): string {

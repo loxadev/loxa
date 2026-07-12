@@ -8,6 +8,8 @@ import {
   getControlNode,
   getInventory,
   getOperation,
+  loadModel,
+  unloadModel,
 } from "../control/client";
 import { streamControlEvents } from "../control/events";
 import { getModels, getStatus } from "../node/client";
@@ -32,6 +34,8 @@ export const appServices: AppServices = {
   getControlNode,
   getInventory,
   downloadModel,
+  loadModel,
+  unloadModel,
   getOperation,
   cancelOperation,
   createControlEventStream: streamControlEvents,

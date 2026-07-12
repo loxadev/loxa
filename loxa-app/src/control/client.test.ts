@@ -4,6 +4,8 @@ import {
   ControlClientError,
   cancelOperation,
   downloadModel,
+  loadModel,
+  unloadModel,
   getCapabilities,
   getControlNode,
   getNodeIdentityProof,
@@ -84,6 +86,25 @@ describe("control client", () => {
       "http://127.0.0.1:8080/loxa/v1/operations/op-1",
       "http://127.0.0.1:8080/loxa/v1/operations/op-1/cancel",
     ]);
+  });
+
+  it("starts authenticated load and unload operations without accepting launch details", async () => {
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(Response.json({ operation_id: "op-load" }, { status: 202 }))
+      .mockResolvedValueOnce(Response.json({ operation_id: "op-unload" }, { status: 202 }));
+
+    await expect(loadModel("http://127.0.0.1:8080", token, "gemma-3-4b-it-q4", { fetch })).resolves.toEqual({ operationId: "op-load" });
+    await expect(unloadModel("http://127.0.0.1:8080", token, { fetch })).resolves.toEqual({ operationId: "op-unload" });
+
+    expect(fetch).toHaveBeenNthCalledWith(1, "http://127.0.0.1:8080/loxa/v1/models/load", expect.objectContaining({
+      method: "POST",
+      body: JSON.stringify({ model_id: "gemma-3-4b-it-q4" }),
+      headers: expect.objectContaining({ authorization: `Bearer ${token}` }),
+    }));
+    expect(fetch).toHaveBeenNthCalledWith(2, "http://127.0.0.1:8080/loxa/v1/models/unload", expect.objectContaining({
+      method: "POST",
+      headers: expect.objectContaining({ authorization: `Bearer ${token}` }),
+    }));
   });
 
   it("decodes capabilities and inventory", async () => {
