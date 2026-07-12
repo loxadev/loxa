@@ -849,11 +849,13 @@ version = "0.1.0-dev"
 dependencies = [
  "axum",
  "futures-util",
+ "getrandom 0.4.3",
  "indicatif",
  "reqwest",
  "serde",
  "serde_json",
  "sha2",
+ "subtle",
  "sysinfo",
  "tempfile",
  "tokio",
