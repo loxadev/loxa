@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+pub mod actor;
+
 #[derive(Clone, Debug)]
 pub struct NodePaths {
     pub models_dir: PathBuf,
@@ -399,7 +401,7 @@ pub fn run_model(
                     supervisor::ManagedRun {
                         schema_version: supervisor::RUNTIME_STATE_SCHEMA_VERSION,
                         run_id: run_id.clone(),
-                        model_id: id.to_string(),
+                        model_id: Some(id.to_string()),
                         owner_pid,
                         owner_process_start_time_unix_s,
                         stop_requested: false,
@@ -792,6 +794,22 @@ fn select_serve_model(
         })
 }
 
+fn requested_startup_model<'a>(
+    models_dir: &Path,
+    requested_model: Option<&'a str>,
+    engine: RuntimeBackendKind,
+) -> Result<Option<&'a str>, ModelSelectionError> {
+    let Some(requested_model) = requested_model else {
+        return Ok(None);
+    };
+    match engine {
+        RuntimeBackendKind::LlamaCpp => {
+            select_serve_model(models_dir, Some(requested_model)).map(|entry| Some(entry.id))
+        }
+        RuntimeBackendKind::PyMlxLm => Ok(Some(requested_model)),
+    }
+}
+
 pub fn serve_node(
     requested_model: Option<&str>,
     port: Option<u16>,
@@ -799,41 +817,55 @@ pub fn serve_node(
     paths: &NodePaths,
     events: &mut dyn LifecycleEventSink,
 ) -> io::Result<RunTermination> {
-    let model_id = match engine {
-        RuntimeBackendKind::LlamaCpp => {
-            select_serve_model(&paths.models_dir, requested_model)
-                .map_err(io::Error::other)?
-                .id
-        }
-        RuntimeBackendKind::PyMlxLm => requested_model.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                ModelSelectionError::MissingModelRequest { backend: engine },
-            )
-        })?,
+    let startup_model = requested_startup_model(&paths.models_dir, requested_model, engine)
+        .map_err(io::Error::other)?;
+    let (gateway_port, unloaded_run) = if startup_model.is_none() {
+        let reservation =
+            supervisor::reserve_localhost_port(Some(port.unwrap_or(DEFAULT_GATEWAY_PORT)))
+                .map_err(supervisor_error_to_io)?;
+        let gateway_port = reservation.port();
+        let run = claim_unloaded_owner(paths, gateway_port)?;
+        drop(reservation);
+        (gateway_port, Some(run))
+    } else {
+        (port.unwrap_or(DEFAULT_GATEWAY_PORT), None)
     };
     let node_id = format!("loxa-node-{}", std::process::id());
     let gateway_state = loxa_core::gateway::GatewayState::new(node_id);
-    let gateway = loxa_core::gateway::GatewayServer::start(
-        port.unwrap_or(DEFAULT_GATEWAY_PORT),
-        gateway_state.clone(),
-    )?;
+    let gateway =
+        match loxa_core::gateway::GatewayServer::start(gateway_port, gateway_state.clone()) {
+            Ok(gateway) => gateway,
+            Err(error) => {
+                if let Some(run) = &unloaded_run {
+                    let _ = finish_unloaded_owner(paths, run);
+                }
+                return Err(error);
+            }
+        };
     let outcome = (|| {
-        events.emit(LifecycleEvent::NodeListening {
+        if let Err(error) = events.emit(LifecycleEvent::NodeListening {
             port: gateway.port(),
             model_alias: "loxa".to_string(),
-        })?;
-        run_model(
-            RunRequest {
-                id: model_id,
-                ctx: None,
-                port: None,
-                engine,
-            },
-            paths,
-            Some(&gateway_state),
-            events,
-        )
+        }) {
+            if let Some(run) = &unloaded_run {
+                let _ = finish_unloaded_owner(paths, run);
+            }
+            return Err(error);
+        }
+        match startup_model {
+            Some(model_id) => run_model(
+                RunRequest {
+                    id: model_id,
+                    ctx: None,
+                    port: None,
+                    engine,
+                },
+                paths,
+                Some(&gateway_state),
+                events,
+            ),
+            None => run_unloaded_actor(paths, unloaded_run.expect("unloaded owner claimed")),
+        }
     })();
     gateway_state.withdraw();
     let shutdown = gateway.shutdown();
@@ -842,6 +874,88 @@ pub fn serve_node(
         (Ok(_), Err(error)) => Err(error),
         (Ok(exit), Ok(())) => Ok(exit),
     }
+}
+
+fn run_unloaded_actor(
+    paths: &NodePaths,
+    run: supervisor::ManagedRun,
+) -> io::Result<RunTermination> {
+    let signal_guard = match SignalGuard::install() {
+        Ok(guard) => guard,
+        Err(error) => {
+            let _ = finish_unloaded_owner(paths, &run);
+            return Err(error);
+        }
+    };
+    struct IdleExecutor;
+    impl actor::MutationExecutor for IdleExecutor {
+        fn execute(&mut self, _: &str, _: &actor::Mutation, _: &actor::MutationCancellation) {}
+    }
+    let (actor_handle, actor_worker) = actor::NodeActor::spawn(IdleExecutor);
+    let outcome = loop {
+        let current =
+            match supervisor::current_runtime_state_run(&paths.state_path, &run.identity()) {
+                Ok(current) => current,
+                Err(error) => break Err(supervisor_error_to_io(error)),
+            };
+        if current.stop_requested || signal_guard.interrupted() {
+            actor_handle.stop();
+            let stopped = current.stop_requested;
+            break Ok(if stopped {
+                RunTermination::RequestedStop
+            } else {
+                RunTermination::Interrupted
+            });
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    actor_handle.stop();
+    if actor_worker.join().is_err() {
+        return Err(io::Error::other("node actor worker panicked"));
+    }
+    let cleanup = finish_unloaded_owner(paths, &run);
+    match (outcome, cleanup) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(outcome), Ok(_)) => Ok(outcome),
+    }
+}
+
+fn finish_unloaded_owner(paths: &NodePaths, run: &supervisor::ManagedRun) -> io::Result<()> {
+    supervisor::finish_childless_runtime_state_run(&paths.state_path, &run.identity())
+        .map(|_| ())
+        .map_err(supervisor_error_to_io)
+}
+
+fn claim_unloaded_owner(
+    paths: &NodePaths,
+    gateway_port: u16,
+) -> io::Result<supervisor::ManagedRun> {
+    let owner_pid = std::process::id();
+    let owner_start = supervisor::process_start_time_with_retry(owner_pid)
+        .ok_or_else(|| io::Error::other("node owner process identity is unavailable"))?;
+    let now = unix_timestamp_now();
+    let run_id = format!("node-{owner_pid}-{owner_start}-{now}-{gateway_port}");
+    supervisor::create_starting_run(
+        &paths.state_path,
+        supervisor::ManagedRun {
+            schema_version: supervisor::RUNTIME_STATE_SCHEMA_VERSION,
+            run_id: run_id.clone(),
+            model_id: None,
+            owner_pid,
+            owner_process_start_time_unix_s: owner_start,
+            stop_requested: false,
+            lifecycle: supervisor::RunLifecycle::Unloaded,
+            generation: 0,
+            generation_alias: format!("loxa-{run_id}-g0"),
+            port: gateway_port,
+            log_path: paths.logs_dir.join(format!("{run_id}.log")),
+            child_pid: None,
+            child_process_start_time_unix_s: None,
+            child_pgid: None,
+        },
+    )
+    .map_err(supervisor_error_to_io)
 }
 
 fn resolve_managed_attachment_typed(
@@ -936,7 +1050,7 @@ pub enum ManagedRunsSnapshot {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ManagedRunSummary {
-    pub model_id: String,
+    pub model_id: Option<String>,
     pub child_pid: Option<u32>,
     pub port: u16,
     pub status: &'static str,
@@ -955,8 +1069,11 @@ pub fn managed_servers(paths: &NodePaths) -> Result<ManagedRunsSnapshot, Supervi
         .into_iter()
         .map(|run| {
             let inspection = supervisor::inspect_managed_run(&run);
-            let model_path =
-                registry::find(&run.model_id).map(|entry| paths.models_dir.join(entry.filename));
+            let model_path = run
+                .model_id
+                .as_deref()
+                .and_then(registry::find)
+                .map(|entry| paths.models_dir.join(entry.filename));
             ManagedRunSummary {
                 model_id: run.model_id,
                 child_pid: run.child_pid,
@@ -978,16 +1095,16 @@ pub struct StopRequest<'a> {
 pub enum StopOutcome {
     NoMatch,
     Completed {
-        model_id: String,
+        model_id: Option<String>,
     },
     RecoveryRequired {
         run_id: String,
-        model_id: String,
+        model_id: Option<String>,
         owner_status: supervisor::OwnerIdentityStatus,
     },
     TimedOut {
         run_id: String,
-        model_id: String,
+        model_id: Option<String>,
     },
 }
 
@@ -1449,6 +1566,7 @@ fn ensure_runtime_state_is_mutable(state_path: &Path) -> io::Result<()> {
 
 fn managed_run_status(inspection: &supervisor::ManagedRunInspection) -> &'static str {
     match inspection.status {
+        supervisor::ManagedRunStatus::Unloaded => "unloaded",
         supervisor::ManagedRunStatus::Starting => "starting",
         supervisor::ManagedRunStatus::Running => "running",
         supervisor::ManagedRunStatus::Stopping => "stopping",
@@ -1694,7 +1812,7 @@ mod lifecycle_api_tests {
     use std::cell::{Cell, RefCell};
     use std::fs;
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::sync::Arc;
     use std::sync::Mutex;
 
@@ -1743,6 +1861,24 @@ mod lifecycle_api_tests {
             self.events.push(event);
             Ok(())
         }
+    }
+
+    struct ChannelLifecycleSink(std::sync::mpsc::Sender<LifecycleEvent>);
+
+    impl LifecycleEventSink for ChannelLifecycleSink {
+        fn emit(&mut self, event: LifecycleEvent) -> io::Result<()> {
+            self.0
+                .send(event)
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "test receiver dropped"))
+        }
+    }
+
+    fn http_request(port: u16, request: &str) -> String {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect gateway");
+        stream.write_all(request.as_bytes()).expect("write request");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read response");
+        response
     }
 
     struct FailingLifecycleSink {
@@ -1855,9 +1991,9 @@ mod lifecycle_api_tests {
         let mut sink = FailingFirstLifecycleSink::default();
 
         let error = serve_node(
-            Some("/unused/model"),
+            None,
             Some(0),
-            RuntimeBackendKind::PyMlxLm,
+            RuntimeBackendKind::LlamaCpp,
             &paths,
             &mut sink,
         )
@@ -1866,6 +2002,11 @@ mod lifecycle_api_tests {
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
         let port = sink.listening_port.expect("listening payload captured");
         TcpListener::bind(("127.0.0.1", port)).expect("gateway joined and released listener");
+        assert_eq!(
+            managed_servers(&paths).unwrap(),
+            ManagedRunsSnapshot::Runs(Vec::new()),
+            "failed listening publication releases unloaded ownership"
+        );
     }
 
     #[test]
@@ -1939,7 +2080,7 @@ mod lifecycle_api_tests {
         let run = supervisor::ManagedRun {
             schema_version: supervisor::RUNTIME_STATE_SCHEMA_VERSION,
             run_id: "run-1".to_string(),
-            model_id: "gemma-3-4b-it-q4".to_string(),
+            model_id: Some("gemma-3-4b-it-q4".to_string()),
             owner_pid: 42,
             owner_process_start_time_unix_s: 456,
             stop_requested: false,
@@ -1954,7 +2095,7 @@ mod lifecycle_api_tests {
         };
         supervisor::create_starting_run(&state_path, run.clone()).expect("persist starting run");
         let server = ManagedServer {
-            id: run.model_id.clone(),
+            id: run.model_id.clone().expect("model id"),
             pid: 777,
             port: run.port,
             model_path: temp.0.join("model.gguf"),
@@ -2100,41 +2241,136 @@ mod lifecycle_api_tests {
     }
 
     #[test]
-    fn python_serve_missing_model_error_is_typed_and_product_neutral() {
+    fn clean_install_startup_is_unloaded_for_every_engine() {
         let temp = std::env::temp_dir().join(format!(
             "loxa-node-missing-model-{}-{}",
             std::process::id(),
             unix_timestamp_now()
         ));
-        let paths = NodePaths {
-            models_dir: temp.join("models"),
-            state_path: temp.join("managed.json"),
-            logs_dir: temp.join("logs"),
-        };
-        let mut events = RecordingLifecycleSink::default();
+        assert_eq!(
+            requested_startup_model(&temp, None, RuntimeBackendKind::LlamaCpp),
+            Ok(None)
+        );
+        assert_eq!(
+            requested_startup_model(&temp, None, RuntimeBackendKind::PyMlxLm),
+            Ok(None)
+        );
+    }
 
-        let error = serve_node(
-            None,
-            Some(0),
-            RuntimeBackendKind::PyMlxLm,
-            &paths,
-            &mut events,
-        )
-        .expect_err("Python serve needs a model request");
-        let selection = error
-            .get_ref()
-            .and_then(|source| source.downcast_ref::<ModelSelectionError>())
-            .expect("missing model remains a typed selection error");
+    #[test]
+    fn unloaded_node_claim_is_visible_and_prevents_a_second_owner() {
+        let temp = TestDir::new("unloaded-owner");
+        let paths = NodePaths {
+            models_dir: temp.0.join("models"),
+            state_path: temp.0.join("managed.json"),
+            logs_dir: temp.0.join("logs"),
+        };
+        let run = claim_unloaded_owner(&paths, 11_435).expect("claim unloaded node");
+
+        let ManagedRunsSnapshot::Runs(rows) = managed_servers(&paths).expect("inspect owner")
+        else {
+            panic!("unloaded owner must be visible");
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].model_id, None);
+        assert_eq!(rows[0].status, "unloaded");
+        assert_eq!(rows[0].port, 11_435);
+        assert!(claim_unloaded_owner(&paths, 12_435).is_err());
 
         assert_eq!(
-            selection,
-            &ModelSelectionError::MissingModelRequest {
-                backend: RuntimeBackendKind::PyMlxLm,
-            }
+            supervisor::finish_childless_runtime_state_run(&paths.state_path, &run.identity())
+                .unwrap(),
+            supervisor::ChildlessFinishOutcome::Finished
         );
-        assert!(!error.to_string().contains("--model"));
-        assert!(!error.to_string().contains("--engine"));
-        assert!(events.events.is_empty());
+        assert_eq!(
+            managed_servers(&paths).unwrap(),
+            ManagedRunsSnapshot::Runs(Vec::new())
+        );
+    }
+
+    #[test]
+    fn unloaded_actor_observes_durable_stop_and_cleans_up_without_deadlock() {
+        let _signal_lock = SIGNAL_TEST_LOCK.lock().expect("signal test lock");
+        let temp = TestDir::new("unloaded-stop");
+        let paths = NodePaths {
+            models_dir: temp.0.join("models"),
+            state_path: temp.0.join("managed.json"),
+            logs_dir: temp.0.join("logs"),
+        };
+        let actor_paths = paths.clone();
+        let run = claim_unloaded_owner(&paths, 11_436).expect("claim unloaded owner");
+        let actor = std::thread::spawn(move || run_unloaded_actor(&actor_paths, run));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while matches!(managed_servers(&paths), Ok(ManagedRunsSnapshot::Missing)) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "owner was not published"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(matches!(
+            stop_managed_servers(StopRequest { target: "all" }, &paths).unwrap(),
+            StopOutcome::Completed { model_id } if model_id.is_none()
+        ));
+        assert_eq!(
+            actor.join().expect("join unloaded actor").unwrap(),
+            RunTermination::RequestedStop
+        );
+        assert_eq!(
+            managed_servers(&paths).unwrap(),
+            ManagedRunsSnapshot::Runs(Vec::new())
+        );
+    }
+
+    #[test]
+    fn production_serve_starts_unloaded_reports_unavailable_and_stops_cleanly() {
+        let _signal_lock = SIGNAL_TEST_LOCK.lock().expect("signal test lock");
+        let temp = TestDir::new("serve-unloaded-integration");
+        let paths = NodePaths {
+            models_dir: temp.0.join("models"),
+            state_path: temp.0.join("managed.json"),
+            logs_dir: temp.0.join("logs"),
+        };
+        let serve_paths = paths.clone();
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            serve_node(
+                None,
+                Some(0),
+                RuntimeBackendKind::LlamaCpp,
+                &serve_paths,
+                &mut ChannelLifecycleSink(event_tx),
+            )
+        });
+        let LifecycleEvent::NodeListening { port, .. } = event_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("node listening event")
+        else {
+            panic!("first event must publish listening node");
+        };
+        let status = http_request(
+            port,
+            "GET /loxa/status HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        );
+        assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+        assert!(status.contains("\"health\":\"unavailable\""), "{status}");
+        let chat = http_request(
+            port,
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: 30\r\n\r\n{\"model\":\"loxa\",\"messages\":[]}",
+        );
+        assert!(chat.starts_with("HTTP/1.1 503"), "{chat}");
+        assert!(claim_unloaded_owner(&paths, port.saturating_add(1)).is_err());
+        assert!(matches!(
+            stop_managed_servers(StopRequest { target: "all" }, &paths).unwrap(),
+            StopOutcome::Completed { model_id: None }
+        ));
+        assert_eq!(
+            server.join().expect("join node").unwrap(),
+            RunTermination::RequestedStop
+        );
+        TcpListener::bind(("127.0.0.1", port)).expect("gateway released port");
     }
 
     #[test]
@@ -2201,7 +2437,7 @@ mod lifecycle_api_tests {
     fn persist_run_for_server(state_path: &Path, server: &ManagedServer) -> supervisor::ManagedRun {
         let run_id = format!("test-run-{}", server.pid);
         let mut run = starting_run_for_test(state_path, &run_id);
-        run.model_id = server.id.clone();
+        run.model_id = Some(server.id.clone());
         run.port = server.port;
         run.generation_alias = format!("loxa-{run_id}-g0");
         run.log_path = state_path
@@ -2224,7 +2460,7 @@ mod lifecycle_api_tests {
         supervisor::ManagedRun {
             schema_version: supervisor::RUNTIME_STATE_SCHEMA_VERSION,
             run_id: run_id.to_string(),
-            model_id: "gemma-3-4b-it-q4".to_string(),
+            model_id: Some("gemma-3-4b-it-q4".to_string()),
             owner_pid: 42,
             owner_process_start_time_unix_s: 456,
             stop_requested: false,
@@ -2516,7 +2752,7 @@ mod lifecycle_api_tests {
                 starting = request_stop_for_test(&state_path, &starting.identity());
             }
             let server = ManagedServer {
-                id: starting.model_id.clone(),
+                id: starting.model_id.clone().expect("model id"),
                 pid: 778,
                 port: starting.port,
                 model_path: temp.path().join("model.gguf"),

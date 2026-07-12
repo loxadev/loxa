@@ -1219,7 +1219,7 @@ mod tests {
         let persisted = crate::supervisor::ManagedRun {
             schema_version: crate::supervisor::RUNTIME_STATE_SCHEMA_VERSION,
             run_id: "run-pgid-diagnostic".to_string(),
-            model_id: "gemma-3-4b-it-q4".to_string(),
+            model_id: Some("gemma-3-4b-it-q4".to_string()),
             owner_pid: std::process::id(),
             owner_process_start_time_unix_s: 1,
             stop_requested: false,

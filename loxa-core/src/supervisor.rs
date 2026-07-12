@@ -148,7 +148,7 @@ fn validate_calibration_attached_state(
     let exact = current == expected
         && current.lifecycle == RunLifecycle::Running
         && !current.stop_requested
-        && current.model_id == server.id
+        && current.model_id.as_deref() == Some(server.id.as_str())
         && current.port == server.port
         && current.child_pid == Some(server.pid)
         && current.child_process_start_time_unix_s == server.process_start_time_unix_s
@@ -192,7 +192,7 @@ impl ManagedCalibrationSession {
             ManagedRun {
                 schema_version: RUNTIME_STATE_SCHEMA_VERSION,
                 run_id: run_id.clone(),
-                model_id: model_id.to_owned(),
+                model_id: Some(model_id.to_owned()),
                 owner_pid,
                 owner_process_start_time_unix_s: owner_start,
                 stop_requested: false,
@@ -449,6 +449,7 @@ pub struct ManagedServerInspection {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ManagedRunStatus {
+    Unloaded,
     Starting,
     Running,
     Stopping,
@@ -480,16 +481,16 @@ pub enum StopRequestOutcome {
     NoMatch,
     Completed {
         run_id: String,
-        model_id: String,
+        model_id: Option<String>,
     },
     RecoveryRequired {
         run_id: String,
-        model_id: String,
+        model_id: Option<String>,
         owner_status: OwnerIdentityStatus,
     },
     TimedOut {
         run_id: String,
-        model_id: String,
+        model_id: Option<String>,
     },
 }
 
@@ -756,6 +757,8 @@ where
         ManagedRunStatus::Stopping
     } else if run.lifecycle == RunLifecycle::RecoveryRequired {
         ManagedRunStatus::RecoveryRequired
+    } else if run.lifecycle == RunLifecycle::Unloaded && run.child_pid.is_none() {
+        ManagedRunStatus::Unloaded
     } else if matches!(
         run.lifecycle,
         RunLifecycle::Starting | RunLifecycle::Restarting
@@ -844,7 +847,7 @@ where
     let error = if server.process_start_time_unix_s.is_none() {
         SupervisorError::ProcessIdentityUnavailable(server.pid)
     } else {
-        run.model_id = server.id;
+        run.model_id = Some(server.id);
         run.lifecycle = RunLifecycle::Running;
         run.port = server.port;
         run.child_pid = Some(server.pid);
@@ -1386,7 +1389,7 @@ mod tests {
         ManagedRun {
             schema_version: RUNTIME_STATE_SCHEMA_VERSION,
             run_id: format!("test-run-{}", server.pid),
-            model_id: server.id.clone(),
+            model_id: Some(server.id.clone()),
             owner_pid: 42,
             owner_process_start_time_unix_s: 456,
             stop_requested: false,
@@ -1405,7 +1408,7 @@ mod tests {
         ManagedRun {
             schema_version: RUNTIME_STATE_SCHEMA_VERSION,
             run_id: run_id.to_string(),
-            model_id: "gemma-3-4b-it-q4".to_string(),
+            model_id: Some("gemma-3-4b-it-q4".to_string()),
             owner_pid: 42,
             owner_process_start_time_unix_s: 456,
             stop_requested: false,
@@ -1566,7 +1569,7 @@ mod tests {
         let child_pid = child.pid();
         let child_pgid = child.owned_pgid();
         let server = ManagedServer {
-            id: starting.model_id.clone(),
+            id: starting.model_id.clone().expect("model id"),
             pid: child_pid,
             port,
             model_path: temp.path().join("test-model"),
@@ -1714,7 +1717,7 @@ mod tests {
             let reservation = reserve_localhost_port(None).expect("reserve localhost port");
             run.port = reservation.port();
             create_starting_run(&state_path, run.clone()).expect("publish childless generation");
-            let entry = registry::find(&run.model_id).expect("registry entry");
+            let entry = registry::find(run.model_id.as_deref().unwrap()).expect("registry entry");
             let spec = ServerSpec {
                 entry,
                 model_path: temp.path().join(entry.filename),
@@ -1776,7 +1779,7 @@ mod tests {
                 stopped,
                 state::StopRequestMatch::Requested(ref current) if current.stop_requested
             ));
-            let entry = registry::find(&run.model_id).expect("registry entry");
+            let entry = registry::find(run.model_id.as_deref().unwrap()).expect("registry entry");
             let spec = ServerSpec {
                 entry,
                 model_path: temp.path().join(entry.filename),
@@ -2344,7 +2347,7 @@ mod tests {
                 .expect("commit stop before identity failure")
         );
         let server = ManagedServer {
-            id: starting.model_id.clone(),
+            id: starting.model_id.clone().expect("model id"),
             pid: 777,
             port: starting.port,
             model_path: temp.path().join("model.gguf"),
@@ -2400,7 +2403,7 @@ mod tests {
         let mut child =
             spawn_managed_command(command, writer, || Ok(())).expect("spawn owned group child");
         let server = ManagedServer {
-            id: starting.model_id.clone(),
+            id: starting.model_id.clone().expect("model id"),
             pid: child.pid(),
             port: starting.port,
             model_path: temp.path().join("model.gguf"),
@@ -2441,7 +2444,7 @@ mod tests {
                 .expect("publish newer state")
         );
         let server = ManagedServer {
-            id: starting.model_id.clone(),
+            id: starting.model_id.clone().expect("model id"),
             pid: 777,
             port: starting.port,
             model_path: temp.path().join("model.gguf"),
@@ -2482,7 +2485,7 @@ mod tests {
         let starting = childless_starting_run(temp.path(), "run-1");
         create_starting_run(&state_path, starting.clone()).expect("create starting run");
         let server = ManagedServer {
-            id: starting.model_id.clone(),
+            id: starting.model_id.clone().expect("model id"),
             pid: 777,
             port: starting.port,
             model_path: temp.path().join("model.gguf"),
@@ -2521,7 +2524,7 @@ mod tests {
         let starting = childless_starting_run(temp.path(), "run-1");
         create_starting_run(&state_path, starting.clone()).expect("create starting run");
         let server = ManagedServer {
-            id: starting.model_id.clone(),
+            id: starting.model_id.clone().expect("model id"),
             pid: 777,
             port: starting.port,
             model_path: temp.path().join("model.gguf"),
@@ -2857,7 +2860,7 @@ fn calibration_session_rejects_attached_state_drift() {
     let mut expected = ManagedRun {
         schema_version: RUNTIME_STATE_SCHEMA_VERSION,
         run_id: "run".into(),
-        model_id: "model".into(),
+        model_id: Some("model".into()),
         owner_pid: 1,
         owner_process_start_time_unix_s: 1,
         stop_requested: false,
