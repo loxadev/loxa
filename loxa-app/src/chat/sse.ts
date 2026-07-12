@@ -23,7 +23,7 @@ export class SseDecoder {
     } catch {
       throw new SseDecodeError("The SSE stream contains invalid UTF-8.");
     }
-    return this.drain();
+    return this.drain(false);
   }
 
   finish(): SseEvent[] {
@@ -34,29 +34,49 @@ export class SseDecoder {
     } catch {
       throw new SseDecodeError("The SSE stream contains invalid UTF-8.");
     }
-    const events = this.drain();
+    const events = this.drain(true);
     this.buffer = "";
     return events;
   }
 
-  private drain(): SseEvent[] {
+  private drain(final: boolean): SseEvent[] {
     const events: SseEvent[] = [];
-    let boundary = this.nextBoundary();
+    let boundary = this.nextBoundary(final);
     while (boundary !== null) {
       const raw = this.buffer.slice(0, boundary.index);
       this.assertWithinLimit(raw);
       this.buffer = this.buffer.slice(boundary.index + boundary.length);
       const event = this.parse(raw);
       if (event) events.push(event);
-      boundary = this.nextBoundary();
+      boundary = this.nextBoundary(final);
     }
     this.assertWithinLimit(this.buffer);
     return events;
   }
 
-  private nextBoundary(): { index: number; length: number } | null {
-    const match = /\r\n\r\n|\n\n|\r\r/.exec(this.buffer);
-    return match ? { index: match.index, length: match[0].length } : null;
+  private nextBoundary(final: boolean): { index: number; length: number } | null {
+    let index = 0;
+    while (index < this.buffer.length) {
+      const first = this.lineEndingLength(index, final);
+      if (first === null) return null;
+      if (first === 0) {
+        index += 1;
+        continue;
+      }
+      const second = this.lineEndingLength(index + first, final);
+      if (second === null) return null;
+      if (second > 0) return { index, length: first + second };
+      index += first;
+    }
+    return null;
+  }
+
+  private lineEndingLength(index: number, final: boolean): number | null {
+    const character = this.buffer[index];
+    if (character === "\n") return 1;
+    if (character !== "\r") return 0;
+    if (index + 1 === this.buffer.length) return final ? 1 : null;
+    return this.buffer[index + 1] === "\n" ? 2 : 1;
   }
 
   private assertWithinLimit(value: string): void {

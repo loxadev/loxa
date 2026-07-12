@@ -52,8 +52,15 @@ describe("SseDecoder", () => {
     expect(keepalive.finish()).toEqual([]);
   });
 
-  it("supports bare-CR separators across every byte split without breaking CRLF", () => {
-    const bytes = encode("data: one\r\rdata: two\r\ndata: three\r\n\r\n");
+  it.each([
+    ["CRLF + CR", "\r\n\r"],
+    ["CRLF + LF", "\r\n\n"],
+    ["LF + CRLF", "\n\r\n"],
+    ["LF + CR", "\n\r"],
+    ["CR + CRLF", "\r\r\n"],
+    ["CR + CR", "\r\r"],
+  ])("supports %s blank separators across every byte split", (_name, separator) => {
+    const bytes = encode(`data: one${separator}data: two\r\ndata: three\r\n\r\n`);
     for (let split = 0; split <= bytes.length; split += 1) {
       const decoder = new SseDecoder();
       expect([

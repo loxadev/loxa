@@ -125,6 +125,7 @@ export function streamChat(
         for (const event of decoder.push(result.value)) {
           const terminal = consumeEvent(event.data, callbacks, () => abortCause !== null);
           if (terminal) {
+            if (terminal.kind === "completed") await cancelReader();
             return settle(terminal);
           }
         }
