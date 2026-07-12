@@ -1,6 +1,6 @@
 export type NodeStatus = {
   node_id: string;
-  health: string;
+  health: "ready" | "unavailable";
   model: "loxa";
   engine: { name: string; version: string } | null;
   runtime_model: string | null;
@@ -47,7 +47,7 @@ export function decodeNodeStatus(value: unknown): NodeStatus {
   if (
     !isRecord(value) ||
     typeof value.node_id !== "string" ||
-    typeof value.health !== "string" ||
+    (value.health !== "ready" && value.health !== "unavailable") ||
     value.model !== "loxa" ||
     !isNullableString(value.runtime_model) ||
     !isNullableString(value.profile)
@@ -57,6 +57,19 @@ export function decodeNodeStatus(value: unknown): NodeStatus {
 
   const engine = value.engine;
   if (engine !== null && !isEngine(engine)) {
+    return invalid("node status");
+  }
+
+  const runtimeFieldsReady =
+    isEngine(engine) &&
+    typeof value.runtime_model === "string" &&
+    typeof value.profile === "string";
+  const runtimeFieldsUnavailable =
+    engine === null && value.runtime_model === null && value.profile === null;
+  if (
+    (value.health === "ready" && !runtimeFieldsReady) ||
+    (value.health === "unavailable" && !runtimeFieldsUnavailable)
+  ) {
     return invalid("node status");
   }
 

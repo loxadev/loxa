@@ -35,6 +35,17 @@ export type ActionGuards = {
   canStop: boolean;
 };
 
+const legalEvents: Record<NodePhase, readonly NodeEvent["type"][]> = {
+  disconnected: ["connect", "start", "ownership", "status", "failure", "recoveryRequired"],
+  connecting: ["ownership", "status", "failure", "recoveryRequired"],
+  starting: ["ownership", "status", "failure", "recoveryRequired"],
+  attached: ["ownership", "status", "failure", "stop", "recoveryRequired"],
+  ready: ["ownership", "status", "failure", "stop", "recoveryRequired"],
+  stopping: ["ownership", "failure", "stopped", "recoveryRequired"],
+  "recovery-required": ["ownership", "recoveryRequired"],
+  error: ["connect", "start", "ownership", "stop", "failure", "recoveryRequired"],
+};
+
 export function initialNodeState(): NodeState {
   return {
     phase: "disconnected",
@@ -58,6 +69,7 @@ export function actionGuards(state: NodeState): ActionGuards {
 }
 
 export function nodeReducer(state: NodeState, event: NodeEvent): NodeState {
+  if (!legalEvents[state.phase].includes(event.type)) return state;
   switch (event.type) {
     case "connect":
       return actionGuards(state).canAttachRetry
@@ -83,7 +95,9 @@ export function nodeReducer(state: NodeState, event: NodeEvent): NodeState {
         ? { ...state, phase: "stopping", error: null }
         : state;
     case "stopped":
-      return initialNodeState();
+      return state.phase === "stopping" && state.ownership === "owned"
+        ? initialNodeState()
+        : state;
     case "recoveryRequired":
       return {
         ...state,

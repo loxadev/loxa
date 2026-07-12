@@ -35,6 +35,18 @@ describe("decodeNodeStatus", () => {
   });
 
   it.each([
+    ["ready with null engine", { ...readyStatus, engine: null }],
+    ["ready with null runtime model", { ...readyStatus, runtime_model: null }],
+    ["ready with null profile", { ...readyStatus, profile: null }],
+    ["unavailable with an engine", { ...unavailableStatus, engine: readyStatus.engine }],
+    ["unavailable with a runtime model", { ...unavailableStatus, runtime_model: "model" }],
+    ["unavailable with a profile", { ...unavailableStatus, profile: "default" }],
+    ["unknown health", { ...unavailableStatus, health: "starting" }],
+  ])("rejects relationally invalid status: %s", (_label, payload) => {
+    expect(() => decodeNodeStatus(payload)).toThrow(ContractError);
+  });
+
+  it.each([
     ["missing node id", { ...readyStatus, node_id: undefined }],
     ["wrong model alias", { ...readyStatus, model: "backend" }],
     ["partial engine", { ...readyStatus, engine: { name: "llama.cpp" } }],
