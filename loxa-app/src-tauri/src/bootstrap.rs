@@ -1,7 +1,7 @@
 use loxa_core::control::auth::ControlToken;
-use loxa_core::control::contracts::{CONTROL_PROTOCOL_VERSION, NodeIdentityProofResponse};
 #[cfg(test)]
 use loxa_core::control::contracts::NodeStatus;
+use loxa_core::control::contracts::{CONTROL_PROTOCOL_VERSION, NodeIdentityProofResponse};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
@@ -30,6 +30,13 @@ pub struct BootstrapSnapshot {
     pub error: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VerifiedPeerIdentity {
+    address: SocketAddr,
+    node_id: String,
+    runtime_identity: String,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StartNodeRequest {
@@ -52,6 +59,7 @@ pub struct BootstrapState {
     owned: Option<OwnedNode>,
     error: Option<String>,
     credential_path: PathBuf,
+    verified_peer: Option<VerifiedPeerIdentity>,
     #[cfg(test)]
     fail_startup_inspection_once: bool,
 }
@@ -64,6 +72,7 @@ impl Default for BootstrapState {
             owned: None,
             error: None,
             credential_path: default_credential_path(),
+            verified_peer: None,
             #[cfg(test)]
             fail_startup_inspection_once: false,
         }
@@ -92,6 +101,34 @@ impl Default for BootstrapConfig {
 }
 
 impl BootstrapState {
+    pub fn read_control_token(
+        &mut self,
+        endpoint: &str,
+        proof_timeout: Duration,
+    ) -> Result<String, String> {
+        self.refresh_child();
+        let requested_address =
+            parse_loopback_endpoint(endpoint).map_err(|_| token_read_error())?;
+        let current_address =
+            parse_loopback_endpoint(&self.endpoint).map_err(|_| token_read_error())?;
+        let expected = self
+            .verified_peer
+            .clone()
+            .filter(|peer| {
+                self.ownership != Ownership::None
+                    && peer.address == requested_address
+                    && peer.address == current_address
+            })
+            .ok_or_else(token_read_error)?;
+        let token = ControlToken::load(&self.credential_path).map_err(|_| token_read_error())?;
+        let proved = prove_compatible_with_token(requested_address, proof_timeout, &token);
+        if proved.as_ref() != Some(&expected) {
+            self.verified_peer = None;
+            return Err(token_read_error());
+        }
+        Ok(token.expose_for_authorization())
+    }
+
     pub fn snapshot(&mut self) -> BootstrapSnapshot {
         self.refresh_child();
         self.current_snapshot()
@@ -118,9 +155,12 @@ impl BootstrapState {
         };
         self.endpoint = request.endpoint;
         self.credential_path = config.credential_path.clone();
+        self.verified_peer = None;
         self.error = None;
 
-        if probe_compatible(address, config.poll_interval, &config.credential_path) {
+        if let Some(peer) = prove_compatible(address, config.poll_interval, &config.credential_path)
+        {
+            self.verified_peer = Some(peer);
             self.ownership = Ownership::Attached;
             return Ok(self.current_snapshot());
         }
@@ -167,6 +207,7 @@ impl BootstrapState {
                 Ok(Some(status)) => {
                     self.owned = None;
                     self.ownership = Ownership::None;
+                    self.verified_peer = None;
                     let message = format!("loxa-node exited before startup with status {status}");
                     self.error = Some(message.clone());
                     return Err(message);
@@ -183,7 +224,10 @@ impl BootstrapState {
                     );
                 }
             }
-            if probe_compatible(address, config.poll_interval, &config.credential_path) {
+            if let Some(peer) =
+                prove_compatible(address, config.poll_interval, &config.credential_path)
+            {
+                self.verified_peer = Some(peer);
                 return Ok(self.current_snapshot());
             }
             if Instant::now() >= deadline {
@@ -221,9 +265,13 @@ impl BootstrapState {
         };
         self.endpoint = endpoint;
         self.credential_path = config.credential_path.clone();
+        self.verified_peer = None;
         let deadline = Instant::now() + config.startup_timeout;
         loop {
-            if probe_compatible(address, config.poll_interval, &config.credential_path) {
+            if let Some(peer) =
+                prove_compatible(address, config.poll_interval, &config.credential_path)
+            {
+                self.verified_peer = Some(peer);
                 if self.owned.is_none() {
                     self.ownership = Ownership::Attached;
                 }
@@ -236,6 +284,9 @@ impl BootstrapState {
                 } else {
                     Ownership::None
                 };
+                if self.ownership == Ownership::None {
+                    self.verified_peer = None;
+                }
                 let message = format!(
                     "attach timed out after {} ms",
                     config.startup_timeout.as_millis()
@@ -266,6 +317,7 @@ impl BootstrapState {
             }
         }
         self.ownership = Ownership::None;
+        self.verified_peer = None;
         self.error = None;
         Ok(self.current_snapshot())
     }
@@ -274,6 +326,7 @@ impl BootstrapState {
         self.refresh_child();
         if self.ownership == Ownership::Attached {
             self.ownership = Ownership::None;
+            self.verified_peer = None;
         }
     }
 
@@ -291,16 +344,17 @@ impl BootstrapState {
         match owned.child.try_wait() {
             Ok(Some(_)) => {
                 self.owned = None;
-                self.ownership = parse_loopback_endpoint(&self.endpoint)
+                let peer = parse_loopback_endpoint(&self.endpoint)
                     .ok()
-                    .filter(|address| {
-                        probe_compatible(
-                            *address,
-                            Duration::from_millis(500),
-                            &self.credential_path,
-                        )
-                    })
-                    .map_or(Ownership::None, |_| Ownership::Attached);
+                    .and_then(|address| {
+                        prove_compatible(address, Duration::from_millis(500), &self.credential_path)
+                    });
+                self.ownership = if peer.is_some() {
+                    Ownership::Attached
+                } else {
+                    Ownership::None
+                };
+                self.verified_peer = peer;
             }
             Ok(None) => {}
             Err(error) => {
@@ -332,6 +386,7 @@ impl BootstrapState {
             }
         }
         self.ownership = Ownership::None;
+        self.verified_peer = None;
         Ok(())
     }
 
@@ -455,6 +510,10 @@ fn default_credential_path() -> PathBuf {
         .join(".loxa/control.token")
 }
 
+fn token_read_error() -> String {
+    "The local Loxa control credential is unavailable or unsafe.".to_string()
+}
+
 fn parse_loopback_endpoint(endpoint: &str) -> Result<SocketAddr, String> {
     let authority = endpoint
         .strip_prefix("http://")
@@ -474,23 +533,40 @@ fn parse_loopback_endpoint(endpoint: &str) -> Result<SocketAddr, String> {
     Ok(address)
 }
 
+#[cfg(test)]
 fn probe_compatible(
     address: SocketAddr,
     timeout: Duration,
     credential_path: &std::path::Path,
 ) -> bool {
+    prove_compatible(address, timeout, credential_path).is_some()
+}
+
+fn prove_compatible(
+    address: SocketAddr,
+    timeout: Duration,
+    credential_path: &std::path::Path,
+) -> Option<VerifiedPeerIdentity> {
     let Ok(token) = ControlToken::load(credential_path) else {
-        return false;
+        return None;
     };
+    prove_compatible_with_token(address, timeout, &token)
+}
+
+fn prove_compatible_with_token(
+    address: SocketAddr,
+    timeout: Duration,
+    token: &ControlToken,
+) -> Option<VerifiedPeerIdentity> {
     let mut nonce_bytes = [0_u8; 32];
     if getrandom::fill(&mut nonce_bytes).is_err() {
-        return false;
+        return None;
     }
     let nonce = encode_hex(&nonce_bytes);
     let deadline = Instant::now() + timeout.max(Duration::from_millis(1));
     let timeout = timeout.max(Duration::from_millis(1));
     let Ok(mut stream) = TcpStream::connect_timeout(&address, timeout) else {
-        return false;
+        return None;
     };
     let _ = stream.set_read_timeout(Some(timeout));
     let _ = stream.set_write_timeout(Some(timeout));
@@ -505,48 +581,52 @@ fn probe_compatible(
     )
     .is_err()
     {
-        return false;
+        return None;
     }
     let mut response = Vec::with_capacity(1024);
     loop {
-        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            return false;
-        };
+        let remaining = deadline.checked_duration_since(Instant::now())?;
         let _ = stream.set_read_timeout(Some(remaining.max(Duration::from_millis(1))));
         let mut chunk = [0_u8; 1024];
         match stream.read(&mut chunk) {
             Ok(0) => break,
             Ok(count) => {
                 if response.len() + count > MAX_PEER_RESPONSE_BYTES {
-                    return false;
+                    return None;
                 }
                 response.extend_from_slice(&chunk[..count]);
             }
-            Err(_) => return false,
+            Err(_) => return None,
         }
     }
-    let Some(body_offset) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
-        return false;
-    };
+    let body_offset = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")?;
     let headers = &response[..body_offset];
     if !headers.starts_with(b"HTTP/1.1 200 ") && !headers.starts_with(b"HTTP/1.0 200 ") {
-        return false;
+        return None;
     }
-    serde_json::from_slice::<NodeIdentityProofResponse>(&response[body_offset + 4..])
-        .ok()
-        .is_some_and(|value| {
-            let proof_is_valid = token.verify_node_identity_proof(
-                &nonce,
-                &value.node_id,
-                &value.runtime_identity,
-                value.status,
-                &value.challenge_proof,
-            );
-            value.protocol_version == CONTROL_PROTOCOL_VERSION
-                && !value.node_id.is_empty()
-                && !value.runtime_identity.is_empty()
-                && proof_is_valid
-        })
+    let value =
+        serde_json::from_slice::<NodeIdentityProofResponse>(&response[body_offset + 4..]).ok()?;
+    let proof_is_valid = token.verify_node_identity_proof(
+        &nonce,
+        &value.node_id,
+        &value.runtime_identity,
+        value.status,
+        &value.challenge_proof,
+    );
+    if value.protocol_version != CONTROL_PROTOCOL_VERSION
+        || value.node_id.is_empty()
+        || value.runtime_identity.is_empty()
+        || !proof_is_valid
+    {
+        return None;
+    }
+    Some(VerifiedPeerIdentity {
+        address,
+        node_id: value.node_id,
+        runtime_identity: value.runtime_identity,
+    })
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -596,6 +676,17 @@ pub fn stop_owned_node(
         .stop_owned()
 }
 
+#[tauri::command]
+pub fn read_control_token(
+    endpoint: String,
+    state: tauri::State<'_, SharedBootstrapState>,
+) -> Result<String, String> {
+    state
+        .lock()
+        .map_err(|_| "bootstrap state poisoned".to_string())?
+        .read_control_token(&endpoint, Duration::from_millis(500))
+}
+
 pub fn window_closed(state: &SharedBootstrapState) {
     if let Ok(mut state) = state.lock() {
         state.close_window();
@@ -620,12 +711,18 @@ pub fn handle_exit_event<W: Write>(state: &SharedBootstrapState, stderr: &mut W)
 mod tests {
     use super::*;
     use std::net::TcpListener;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     const TEST_SECRET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    static TOKEN_PATH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     fn test_token_path() -> PathBuf {
         let path = std::env::temp_dir()
-            .join(format!("loxa-probe-token-{}", std::process::id()))
+            .join(format!(
+                "loxa-probe-token-{}-{}",
+                std::process::id(),
+                TOKEN_PATH_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+            ))
             .join("control.token");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, format!("{TEST_SECRET}\n")).unwrap();
@@ -696,6 +793,47 @@ mod tests {
         format!(r#"{{"protocol_version":{version},"node_id":"node","runtime_identity":"runtime","status":"unloaded","challenge_proof":"__PROOF__"}}"#).into_bytes()
     }
 
+    fn serve_identity_response(
+        node_id: &str,
+        runtime_identity: &str,
+    ) -> (SocketAddr, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let node_id = node_id.to_owned();
+        let runtime_identity = runtime_identity.to_owned();
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let mut chunk = [0_u8; 1024];
+                let count = stream.read(&mut chunk).unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..count]);
+            }
+            let request = String::from_utf8_lossy(&request);
+            assert!(!request.contains("Authorization:"));
+            let nonce = request
+                .lines()
+                .find_map(|line| line.strip_prefix("X-Loxa-Challenge: "))
+                .unwrap();
+            let token = ControlToken::load(&test_token_path()).unwrap();
+            let proof = token
+                .node_identity_proof(nonce, &node_id, &runtime_identity, NodeStatus::Unloaded)
+                .unwrap();
+            let body = format!(
+                r#"{{"protocol_version":1,"node_id":"{node_id}","runtime_identity":"{runtime_identity}","status":"unloaded","challenge_proof":"{proof}"}}"#
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        (address, worker)
+    }
+
     #[test]
     fn authenticated_probe_rejects_legacy_spoofs_wrong_versions_and_extra_fields() {
         let token = test_token_path();
@@ -725,6 +863,145 @@ mod tests {
         let (address, worker) = serve_probe_response(identity_json(1), None);
         assert!(probe_compatible(address, Duration::from_secs(1), &token));
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn narrow_control_token_read_requires_a_fresh_exact_peer_proof() {
+        let credential_path = test_token_path();
+        let mut disconnected = BootstrapState {
+            credential_path: credential_path.clone(),
+            ..BootstrapState::default()
+        };
+        assert!(
+            disconnected
+                .read_control_token("http://127.0.0.1:8080", Duration::from_secs(1))
+                .is_err()
+        );
+
+        let (address, worker) = serve_identity_response("node", "runtime");
+        let endpoint = format!("http://{address}");
+        let mut attached = BootstrapState {
+            endpoint: endpoint.clone(),
+            ownership: Ownership::Attached,
+            credential_path,
+            verified_peer: Some(VerifiedPeerIdentity {
+                address,
+                node_id: "node".into(),
+                runtime_identity: "runtime".into(),
+            }),
+            ..BootstrapState::default()
+        };
+        assert_eq!(
+            attached
+                .read_control_token(&endpoint, Duration::from_secs(1))
+                .unwrap(),
+            TEST_SECRET
+        );
+        worker.join().unwrap();
+        assert!(
+            attached
+                .read_control_token("http://127.0.0.1:1", Duration::from_millis(10))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn narrow_control_token_read_rejects_a_valid_replacement_identity() {
+        let (address, worker) = serve_identity_response("replacement", "new-runtime");
+        let endpoint = format!("http://{address}");
+        let mut state = BootstrapState {
+            endpoint: endpoint.clone(),
+            ownership: Ownership::Attached,
+            credential_path: test_token_path(),
+            verified_peer: Some(VerifiedPeerIdentity {
+                address,
+                node_id: "original".into(),
+                runtime_identity: "old-runtime".into(),
+            }),
+            ..BootstrapState::default()
+        };
+        assert!(
+            state
+                .read_control_token(&endpoint, Duration::from_secs(1))
+                .is_err()
+        );
+        assert!(state.verified_peer.is_none());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn narrow_control_token_read_never_offers_the_secret_to_an_unproven_spoof() {
+        let (address, worker) = serve_probe_response(
+            br#"{"node_id":"spoof","health":"ready","model":"loxa"}"#.to_vec(),
+            None,
+        );
+        let endpoint = format!("http://{address}");
+        let mut state = BootstrapState {
+            endpoint: endpoint.clone(),
+            ownership: Ownership::Attached,
+            credential_path: test_token_path(),
+            verified_peer: Some(VerifiedPeerIdentity {
+                address,
+                node_id: "node".into(),
+                runtime_identity: "runtime".into(),
+            }),
+            ..BootstrapState::default()
+        };
+
+        assert!(
+            state
+                .read_control_token(&endpoint, Duration::from_secs(1))
+                .is_err()
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn narrow_control_token_read_sanitizes_credential_failures() {
+        let parent = std::env::temp_dir().join(format!(
+            "loxa-token-read-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&parent).unwrap();
+        let path = parent.join("control.token");
+        std::fs::write(&path, format!("{TEST_SECRET}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let mut state = BootstrapState {
+            endpoint: "http://127.0.0.1:8080".into(),
+            ownership: Ownership::Attached,
+            credential_path: path.clone(),
+            verified_peer: Some(VerifiedPeerIdentity {
+                address: "127.0.0.1:8080".parse().unwrap(),
+                node_id: "node".into(),
+                runtime_identity: "runtime".into(),
+            }),
+            ..BootstrapState::default()
+        };
+        std::fs::write(&path, "unsafe-secret\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let error = state
+            .read_control_token("http://127.0.0.1:8080", Duration::from_millis(10))
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "The local Loxa control credential is unavailable or unsafe."
+        );
+        assert!(!error.contains("unsafe-secret"));
+        assert!(!error.contains(path.to_string_lossy().as_ref()));
+        std::fs::remove_dir_all(parent).unwrap();
     }
 
     #[test]
@@ -776,6 +1053,7 @@ mod tests {
             }),
             error: None,
             credential_path: default_credential_path(),
+            verified_peer: None,
             fail_startup_inspection_once: false,
         }
     }

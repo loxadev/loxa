@@ -87,7 +87,7 @@ describe("streamChat", () => {
   it.each([
     ["malformed JSON", [chunk("data: {nope}\n\n")], /malformed/i],
     ["invalid UTF-8", [Uint8Array.of(0xff, 0x0a, 0x0a)], /malformed/i],
-    ["oversized event", [chunk(`data: ${"x".repeat(1024 * 1024 + 1)}`)], /malformed/i],
+    ["oversized event", [chunk(`data: ${"x".repeat(2 * 1024 * 1024 + 1)}`)], /larger than 2 MiB/i],
     ["EOF before DONE", [chunk(delta("partial"))], /before.*done/i],
     ["no DONE", [], /before.*done/i],
     ["unterminated DONE", [chunk("data: [DONE]")], /before.*done/i],
@@ -223,6 +223,33 @@ describe("streamChat", () => {
     await expect(
       streamChat("http://node", {}, observed.value, undefined, fetch).finished,
     ).resolves.toEqual({ kind: "error", message: "The Loxa node returned HTTP 502." });
+  });
+
+  it("rejects a streaming response after the cumulative body exceeds 2 MiB", async () => {
+    const observed = callbacks();
+    const cancel = vi.fn(async () => undefined);
+    const payload = chunk(`: ${"x".repeat(700 * 1024)}\n\n`);
+    const fetch = vi.fn(async () => responseFrom([payload, payload, payload], cancel));
+
+    const result = await streamChat("http://node", {}, observed.value, undefined, fetch).finished;
+
+    expect(result).toEqual({ kind: "error", message: "The Loxa node returned a chat response larger than 2 MiB." });
+    expect(observed.terminals).toEqual([result]);
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it("bounds an HTTP error body before attempting to decode it", async () => {
+    const observed = callbacks();
+    const cancel = vi.fn(async () => undefined);
+    const payload = chunk("x".repeat(1024 * 1024 + 1));
+    const response = responseFrom([payload, payload], cancel) as Response & { status: number };
+    Object.defineProperties(response, { ok: { value: false }, status: { value: 500 } });
+    const fetch = vi.fn(async () => response);
+
+    const result = await streamChat("http://node", {}, observed.value, undefined, fetch).finished;
+
+    expect(result).toEqual({ kind: "error", message: "The Loxa node returned HTTP 500." });
+    expect(cancel).toHaveBeenCalledOnce();
   });
 
   it("reports reader failure once and releases its lock", async () => {

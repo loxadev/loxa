@@ -34,6 +34,17 @@ describe("Cargo workspace isolation", () => {
     expect(packageJson.scripts["package:app"]).toContain("package-app.mjs");
   });
 
+  it("uses the one exact development origin allowed by the control service", () => {
+    const config = JSON.parse(
+      readFileSync(resolve(appRoot, "src-tauri/tauri.conf.json"), "utf8"),
+    ) as { build: { devUrl: string } };
+    const vite = readFileSync(resolve(appRoot, "vite.config.ts"), "utf8");
+
+    expect(config.build.devUrl).toBe("http://127.0.0.1:1420");
+    expect(vite).toContain('host: "127.0.0.1"');
+    expect(vite).not.toContain("TAURI_DEV_HOST");
+  });
+
   it("selects an explicit packaging target instead of silently using the host", () => {
     const selected = execFileSync(process.execPath, [resolve(appRoot, "scripts/prepare-sidecar.mjs"), "--print-target"], {
       encoding: "utf8",

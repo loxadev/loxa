@@ -1,6 +1,15 @@
 import { invoke } from "@tauri-apps/api/core";
 
 import { streamChat } from "../chat/streamChat";
+import {
+  cancelOperation,
+  downloadModel,
+  getCapabilities,
+  getControlNode,
+  getInventory,
+  getOperation,
+} from "../control/client";
+import { streamControlEvents } from "../control/events";
 import { getModels, getStatus } from "../node/client";
 import type { BootstrapSnapshot, StartNodeRequest } from "../node/NodeScreen";
 import type { AppServices } from "./App";
@@ -18,6 +27,14 @@ export const appServices: AppServices = {
   },
   getStatus,
   getModels,
+  getCapabilities,
+  readControlToken: (endpoint: string) => invoke<string>("read_control_token", { endpoint }),
+  getControlNode,
+  getInventory,
+  downloadModel,
+  getOperation,
+  cancelOperation,
+  createControlEventStream: streamControlEvents,
   createChatStream: streamChat,
   copyText: (text: string) => navigator.clipboard.writeText(text),
 };

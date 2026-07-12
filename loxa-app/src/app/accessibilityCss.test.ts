@@ -41,4 +41,16 @@ describe("accessibility CSS contract", () => {
     expect(css).not.toMatch(/#[0-9a-f]{3,8}/i);
     expect(css).not.toMatch(/gradient|backdrop-filter|box-shadow/i);
   });
+
+  it("keeps model controls readable, keyboard-sized, and visible in forced colors", () => {
+    expect(css).toMatch(/\.model-row[^}]*display: grid/s);
+    expect(css).toMatch(/\.model-actions button[^}]*min-height: var\(--loxa-component-minimum-interactive-target\)/s);
+    expect(css).toMatch(/@media \(prefers-contrast: more\)[\s\S]*\.model-row/);
+    expect(css).toMatch(/@media \(forced-colors: active\)[\s\S]*\.state-chip/);
+  });
+
+  it("pins the chat composer to the bottom of its independently scrolling screen", () => {
+    expect(css).toMatch(/\.chat-screen[^}]*min-height: 100%/s);
+    expect(css).toMatch(/\.chat-screen \.composer[^}]*position: sticky[^}]*bottom: 0/s);
+  });
 });

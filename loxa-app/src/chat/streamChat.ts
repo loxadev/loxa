@@ -1,6 +1,10 @@
 import { decodeOpenAIError } from "../node/contracts";
 import { SseDecodeError, SseDecoder } from "./sse";
 
+const MAX_CHAT_RESPONSE_BYTES = 2 * 1024 * 1024;
+
+class ChatResponseTooLargeError extends Error {}
+
 export type StreamTerminal =
   | { kind: "completed" }
   | { kind: "cancelled" }
@@ -106,6 +110,7 @@ export function streamChat(
         return settle({ kind: "cancelled" });
       }
       const decoder = new SseDecoder();
+      let responseBytes = 0;
       while (true) {
         const result = await reader.read();
         if (abortCause !== null) {
@@ -121,6 +126,10 @@ export function streamChat(
             kind: "error",
             message: "The chat stream ended before [DONE].",
           });
+        }
+        responseBytes += result.value.byteLength;
+        if (responseBytes > MAX_CHAT_RESPONSE_BYTES) {
+          throw new ChatResponseTooLargeError();
         }
         for (const event of decoder.push(result.value)) {
           const terminal = consumeEvent(event.data, callbacks, () => abortCause !== null);
@@ -138,7 +147,9 @@ export function streamChat(
       return settle({
         kind: "error",
         message:
-          error instanceof SseDecodeError || error instanceof SyntaxError
+          error instanceof ChatResponseTooLargeError
+            ? "The Loxa node returned a chat response larger than 2 MiB."
+            : error instanceof SseDecodeError || error instanceof SyntaxError
             ? "The Loxa node returned a malformed chat stream."
             : reader
               ? "The chat stream failed while reading."
@@ -163,10 +174,30 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 async function httpErrorMessage(response: Response): Promise<string> {
   try {
-    const details = decodeOpenAIError(JSON.parse(await response.text()) as unknown);
+    const details = decodeOpenAIError(JSON.parse(await readBoundedBody(response)) as unknown);
     return details.message;
   } catch {
     return `The Loxa node returned HTTP ${response.status}.`;
+  }
+}
+
+async function readBoundedBody(response: Response): Promise<string> {
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let bytes = 0;
+  let text = "";
+  try {
+    while (true) {
+      const result = await reader.read();
+      if (result.done) return text + decoder.decode();
+      bytes += result.value.byteLength;
+      if (bytes > MAX_CHAT_RESPONSE_BYTES) throw new ChatResponseTooLargeError();
+      text += decoder.decode(result.value, { stream: true });
+    }
+  } finally {
+    await Promise.resolve(reader.cancel()).catch(() => undefined);
+    reader.releaseLock();
   }
 }
 
