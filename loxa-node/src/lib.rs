@@ -32,7 +32,7 @@ impl NodePaths {
         }
     }
 
-    pub fn log_path(&self, id: &str, port: u16, started_at_unix_s: u64) -> PathBuf {
+    fn log_path(&self, id: &str, port: u16, started_at_unix_s: u64) -> PathBuf {
         self.logs_dir
             .join(format!("{id}-{port}-{started_at_unix_s}.log"))
     }
@@ -784,7 +784,7 @@ impl fmt::Display for ModelSelectionError {
 
 impl std::error::Error for ModelSelectionError {}
 
-pub fn select_serve_model(
+fn select_serve_model(
     models_dir: &Path,
     requested: Option<&str>,
 ) -> Result<&'static ModelEntry, ModelSelectionError> {
@@ -830,21 +830,23 @@ pub fn serve_node(
         port.unwrap_or(DEFAULT_GATEWAY_PORT),
         gateway_state.clone(),
     )?;
-    events.emit(LifecycleEvent::NodeListening {
-        port: gateway.port(),
-        model_alias: "loxa".to_string(),
-    })?;
-    let outcome = run_model(
-        RunRequest {
-            id: model_id,
-            ctx: None,
-            port: None,
-            engine,
-        },
-        paths,
-        Some(&gateway_state),
-        events,
-    );
+    let outcome = (|| {
+        events.emit(LifecycleEvent::NodeListening {
+            port: gateway.port(),
+            model_alias: "loxa".to_string(),
+        })?;
+        run_model(
+            RunRequest {
+                id: model_id,
+                ctx: None,
+                port: None,
+                engine,
+            },
+            paths,
+            Some(&gateway_state),
+            events,
+        )
+    })();
     gateway_state.withdraw();
     let shutdown = gateway.shutdown();
     match (outcome, shutdown) {
@@ -2111,6 +2113,23 @@ mod lifecycle_api_tests {
         }
     }
 
+    #[derive(Default)]
+    struct FailingFirstLifecycleSink {
+        listening_port: Option<u16>,
+    }
+
+    impl LifecycleEventSink for FailingFirstLifecycleSink {
+        fn emit(&mut self, event: LifecycleEvent) -> io::Result<()> {
+            if let LifecycleEvent::NodeListening { port, .. } = event {
+                self.listening_port = Some(port);
+            }
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "injected first lifecycle event failure",
+            ))
+        }
+    }
+
     struct CleanupChild {
         events: RefCell<Vec<&'static str>>,
     }
@@ -2177,6 +2196,30 @@ mod lifecycle_api_tests {
             }
         );
         assert_eq!(RunTermination::Interrupted, RunTermination::Interrupted);
+    }
+
+    #[test]
+    fn node_listening_sink_failure_joins_gateway_before_returning() {
+        let temp = TestDir::new("listening-sink-failure");
+        let paths = NodePaths {
+            models_dir: temp.0.join("models"),
+            state_path: temp.0.join("managed.json"),
+            logs_dir: temp.0.join("logs"),
+        };
+        let mut sink = FailingFirstLifecycleSink::default();
+
+        let error = serve_node(
+            Some("/unused/model"),
+            Some(0),
+            RuntimeBackendKind::PyMlxLm,
+            &paths,
+            &mut sink,
+        )
+        .expect_err("first event failure must escape");
+
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        let port = sink.listening_port.expect("listening payload captured");
+        TcpListener::bind(("127.0.0.1", port)).expect("gateway joined and released listener");
     }
 
     #[test]

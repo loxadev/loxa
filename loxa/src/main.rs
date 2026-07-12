@@ -173,7 +173,7 @@ fn serve_node_cli<W: Write, E: Write>(
         ));
     }
     if engine == RuntimeBackendKind::LlamaCpp {
-        if let Err(error) = select_serve_model(&paths.models_dir, requested_model) {
+        if let Err(error) = select_cli_serve_model(&paths.models_dir, requested_model) {
             let kind = match &error {
                 ModelSelectionError::UnknownModel { .. }
                 | ModelSelectionError::MissingModelRequest { .. } => io::ErrorKind::InvalidInput,
@@ -200,6 +200,26 @@ fn serve_node_cli<W: Write, E: Write>(
     }
     let mut events = CliLifecycleSink { stdout, stderr };
     serve_node(requested_model, port, engine, paths, &mut events).map(exit_code_for_termination)
+}
+
+fn select_cli_serve_model(
+    models_dir: &Path,
+    requested: Option<&str>,
+) -> Result<&'static ModelEntry, ModelSelectionError> {
+    if let Some(id) = requested {
+        let entry = registry::find(id)
+            .ok_or_else(|| ModelSelectionError::UnknownModel { id: id.to_string() })?;
+        if !models_dir.join(entry.filename).is_file() {
+            return Err(ModelSelectionError::NotDownloaded { id: id.to_string() });
+        }
+        return Ok(entry);
+    }
+    REGISTRY
+        .iter()
+        .find(|entry| models_dir.join(entry.filename).is_file())
+        .ok_or_else(|| ModelSelectionError::NoDownloadedModels {
+            suggested_id: REGISTRY[0].id.to_string(),
+        })
 }
 
 fn exit_code_for_termination(outcome: RunTermination) -> ExitCode {
@@ -1116,7 +1136,7 @@ mod tests {
         fs::write(temp.path().join(later.filename), b"later").unwrap();
         fs::write(temp.path().join(first.filename), b"first").unwrap();
 
-        let selected = select_serve_model(temp.path(), None).unwrap();
+        let selected = select_cli_serve_model(temp.path(), None).unwrap();
 
         assert_eq!(selected.id, first.id);
     }
@@ -1125,7 +1145,7 @@ mod tests {
     fn serve_selection_error_remains_product_neutral() {
         let temp = TempDir::new("serve-selection");
 
-        let error = match select_serve_model(temp.path(), Some("not-in-registry")) {
+        let error = match select_cli_serve_model(temp.path(), Some("not-in-registry")) {
             Ok(_) => panic!("unknown model unexpectedly selected"),
             Err(error) => error,
         };
