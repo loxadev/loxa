@@ -12,10 +12,9 @@ use loxa_core::control::contracts::{
     NodeIdentityProofResponse, NodeSnapshot, NodeStatus, OperationAccepted,
     CONTROL_PROTOCOL_VERSION,
 };
-use loxa_core::model_inventory::{current_available_memory_bytes, known_registry_inventory};
+use loxa_core::model_inventory::current_available_memory_bytes;
 use serde::Deserialize;
 use std::convert::Infallible;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,7 +24,6 @@ pub struct ControlState {
     policy: Arc<AuthPolicy>,
     node_id: Arc<str>,
     runtime_identity: Arc<str>,
-    models_dir: PathBuf,
     downloads: DownloadControl,
 }
 
@@ -34,7 +32,6 @@ impl ControlState {
         token: ControlToken,
         node_id: String,
         runtime_identity: String,
-        models_dir: PathBuf,
         downloads: DownloadControl,
     ) -> Self {
         let policy = AuthPolicy::new(
@@ -46,7 +43,6 @@ impl ControlState {
             policy: Arc::new(policy),
             node_id: node_id.into(),
             runtime_identity: runtime_identity.into(),
-            models_dir,
             downloads,
         }
     }
@@ -421,11 +417,7 @@ async fn models(State(state): State<ControlState>, headers: HeaderMap) -> Respon
         return cors(status.into_response(), origin.as_deref());
     }
     cors(
-        Json(known_registry_inventory(
-            &state.models_dir,
-            current_available_memory_bytes(),
-        ))
-        .into_response(),
+        Json(state.downloads.inventory(current_available_memory_bytes())).into_response(),
         origin.as_deref(),
     )
 }
@@ -477,6 +469,31 @@ pub fn router(state: ControlState) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use loxa_core::control::contracts::OperationStatus;
+    use loxa_core::model_inventory::VerificationCache;
+    use loxa_core::registry::ModelEntry;
+    use std::path::PathBuf;
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(label: &str) -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "loxa-{label}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn malformed_present_origin_is_rejected_not_treated_as_native() {
@@ -484,5 +501,82 @@ mod tests {
         headers.insert(header::ORIGIN, HeaderValue::from_bytes(b"\xff").unwrap());
         assert_eq!(request_origin(&headers), Err(StatusCode::FORBIDDEN));
         assert_eq!(request_origin(&HeaderMap::new()), Ok(None));
+    }
+
+    #[tokio::test]
+    async fn successful_download_publishes_shared_evidence_to_authorized_models_route() {
+        let temp = TestDir::new("download-models-e2e");
+        let models_dir = temp.0.join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let recipes: &'static [ModelEntry] = Box::leak(
+            vec![ModelEntry {
+                id: "fixture",
+                repo: "owner/repo",
+                revision: "main",
+                filename: "fixture.gguf",
+                sha256: "770e607624d689265ca6c44884d0807d9b054d23c473c106c72be9de08b7376c",
+                size_bytes: 4,
+                license: "apache-2.0",
+                params: "tiny",
+                quant: "Q4",
+                min_free_mem_gb: 0.1,
+            }]
+            .into_boxed_slice(),
+        );
+        let cache = Arc::new(VerificationCache::default());
+
+        let (downloads, worker) = DownloadControl::spawn_fixture_for_test(
+            models_dir,
+            Arc::clone(&cache),
+            recipes,
+            b"good",
+        );
+        let operation_id = downloads.start("fixture").unwrap();
+        let operation = wait_for_terminal_operation(&downloads, &operation_id);
+        assert_eq!(operation.status, OperationStatus::Succeeded);
+        let token = ControlToken::load_or_create(&temp.0.join("control.token")).unwrap();
+        let state = ControlState::new(
+            token.clone(),
+            "node-id".into(),
+            "runtime-id".into(),
+            downloads,
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("tauri://localhost"),
+        );
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", token.expose_for_authorization())).unwrap(),
+        );
+
+        let response = models(State(state), headers).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let inventory: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(inventory[0]["id"], "fixture");
+        assert_eq!(inventory[0]["artifact"], "downloaded");
+
+        worker.stop_and_join().unwrap();
+    }
+
+    fn wait_for_terminal_operation(
+        downloads: &DownloadControl,
+        operation_id: &str,
+    ) -> loxa_core::control::contracts::OperationView {
+        for _ in 0..1_000 {
+            let operation = downloads.operation(operation_id).unwrap();
+            if matches!(
+                operation.status,
+                OperationStatus::Succeeded | OperationStatus::Failed | OperationStatus::Cancelled
+            ) {
+                return operation;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("fixture download did not reach a terminal state");
     }
 }

@@ -312,7 +312,8 @@ impl VerificationCache {
         };
         self.verification_runs.fetch_add(1, Ordering::Relaxed);
         let result = (|| {
-            let matches = hash_file_with_cancellation(&path, cancellation)? == recipe.sha256;
+            let matches =
+                hash_file_with_cancellation(&path, &stable, cancellation)? == recipe.sha256;
             let after = fs::symlink_metadata(&path)?;
             if !after.file_type().is_file() || StableMetadata::from(&after) != stable {
                 return Err(io::Error::new(
@@ -352,6 +353,25 @@ impl VerificationCache {
 
     pub fn max_observed_concurrency(&self) -> usize {
         self.gate.max_observed.load(Ordering::Relaxed) as usize
+    }
+
+    /// Returns the current non-blocking artifact state using only evidence
+    /// already published into this cache.
+    pub fn artifact_state(&self, models_dir: &Path, recipe: &ModelEntry) -> ArtifactState {
+        artifact_state(recipe, models_dir, self)
+    }
+
+    /// Invalidates cached evidence after a failed or destructive artifact
+    /// mutation. A later inventory snapshot stays fail-closed until a worker
+    /// verifies the current on-disk bytes again.
+    pub fn invalidate_recipe(&self, models_dir: &Path, recipe: &ModelEntry) {
+        let path = models_dir.join(recipe.filename);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.entries.remove(&path);
+        state.order.retain(|known| known != &path);
     }
 
     fn cached(
@@ -439,7 +459,16 @@ pub fn known_registry_inventory_with_cache(
     available_memory_bytes: u64,
     cache: &VerificationCache,
 ) -> Vec<VerifiedRecipeInventoryEntry> {
-    REGISTRY
+    verified_recipe_inventory_with_cache(REGISTRY, models_dir, available_memory_bytes, cache)
+}
+
+pub fn verified_recipe_inventory_with_cache(
+    recipes: &[ModelEntry],
+    models_dir: &Path,
+    available_memory_bytes: u64,
+    cache: &VerificationCache,
+) -> Vec<VerifiedRecipeInventoryEntry> {
+    recipes
         .iter()
         .map(|recipe| inspect_recipe(recipe, models_dir, available_memory_bytes, cache))
         .collect()
@@ -568,9 +597,25 @@ fn checked_regular_path(models_dir: &Path, filename: &str) -> io::Result<PathBuf
 
 fn hash_file_with_cancellation(
     path: &Path,
+    expected: &StableMetadata,
     cancellation: &dyn VerificationCancellation,
 ) -> io::Result<String> {
     let mut file = open_regular_no_follow(path)?;
+    hash_open_file_with_cancellation(&mut file, expected, cancellation)
+}
+
+fn hash_open_file_with_cancellation(
+    file: &mut File,
+    expected: &StableMetadata,
+    cancellation: &dyn VerificationCancellation,
+) -> io::Result<String> {
+    let opened = file.metadata()?;
+    if !opened.file_type().is_file() || StableMetadata::from(&opened) != *expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "artifact changed while opening for verification",
+        ));
+    }
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
@@ -795,6 +840,99 @@ mod tests {
                 reason: ArtifactInvalidReason::ChecksumMismatch
             }
         );
+    }
+
+    #[test]
+    fn explicit_invalidation_withdraws_positive_evidence_until_reverified() {
+        let dir = tempdir().unwrap();
+        let recipe = fixture(b"good");
+        fs::write(dir.path().join(recipe.filename), b"good").unwrap();
+        let cache = VerificationCache::default();
+        assert!(cache.verify_recipe(dir.path(), &recipe).unwrap().matches);
+        assert_eq!(
+            cache.artifact_state(dir.path(), &recipe),
+            ArtifactState::Downloaded
+        );
+
+        cache.invalidate_recipe(dir.path(), &recipe);
+
+        assert_eq!(
+            cache.artifact_state(dir.path(), &recipe),
+            ArtifactState::Invalid {
+                reason: ArtifactInvalidReason::VerificationRequired
+            }
+        );
+        assert!(cache.verify_recipe(dir.path(), &recipe).unwrap().matches);
+        assert_eq!(cache.verification_runs(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verification_rejects_rename_swap_between_path_check_and_open_file() {
+        struct RenameSwap {
+            calls: std::sync::atomic::AtomicUsize,
+            target: PathBuf,
+            original: PathBuf,
+            replacement: PathBuf,
+        }
+
+        impl VerificationCancellation for RenameSwap {
+            fn is_cancelled(&self) -> bool {
+                match self.calls.fetch_add(1, Ordering::SeqCst) {
+                    0 => {
+                        fs::rename(&self.target, &self.original).unwrap();
+                        fs::rename(&self.replacement, &self.target).unwrap();
+                    }
+                    1 => {
+                        fs::rename(&self.target, &self.replacement).unwrap();
+                        fs::rename(&self.original, &self.target).unwrap();
+                    }
+                    _ => {}
+                }
+                false
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let recipe = fixture(b"good");
+        let target = dir.path().join(recipe.filename);
+        let original = dir.path().join("original-bad.gguf");
+        let replacement = dir.path().join("replacement-good.gguf");
+        fs::write(&target, b"evil").unwrap();
+        fs::write(&replacement, b"good").unwrap();
+        let cancellation = RenameSwap {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            target,
+            original,
+            replacement,
+        };
+
+        let error = VerificationCache::default()
+            .verify_recipe_with_cancellation(dir.path(), &recipe, &cancellation)
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            !cancellation.is_cancelled(),
+            "test hook restores original path"
+        );
+        assert_eq!(fs::read(dir.path().join(recipe.filename)).unwrap(), b"evil");
+    }
+
+    #[test]
+    fn opened_file_identity_must_match_the_checked_path_identity() {
+        let dir = tempdir().unwrap();
+        let checked = dir.path().join("checked.gguf");
+        let opened = dir.path().join("opened.gguf");
+        fs::write(&checked, b"good").unwrap();
+        fs::write(&opened, b"good").unwrap();
+        let expected = StableMetadata::from(&fs::symlink_metadata(&checked).unwrap());
+        let mut file = open_regular_no_follow(&opened).unwrap();
+
+        let error =
+            hash_open_file_with_cancellation(&mut file, &expected, &NeverCancel).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[cfg(unix)]

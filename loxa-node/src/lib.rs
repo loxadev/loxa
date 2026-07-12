@@ -871,7 +871,6 @@ pub fn serve_node(
                     token,
                     format!("loxa-node-{}", std::process::id()),
                     run.run_id.clone(),
-                    paths.models_dir.clone(),
                     download_runtime
                         .as_ref()
                         .expect("unloaded node has download control")
