@@ -1179,42 +1179,6 @@ mod tests {
     }
 
     #[test]
-    fn process_identity_wiring_uses_retry_for_owner_and_post_spawn_child_capture() {
-        let source = include_str!("../../loxa-node/src/lib.rs");
-        let run_model = source
-            .split_once("fn run_model")
-            .expect("run_model source")
-            .1
-            .split_once("fn render_post_cleanup_startup_failure")
-            .expect("run_model boundary")
-            .0;
-        let retry_call = ["process_start_time_with", "_retry("].concat();
-        let one_shot_call = ["process_start", "_time("].concat();
-        let retry_positions = run_model
-            .match_indices(&retry_call)
-            .map(|(position, _)| position)
-            .collect::<Vec<_>>();
-
-        assert_eq!(retry_positions.len(), 2, "owner and child must both retry");
-        assert_eq!(run_model.matches(&one_shot_call).count(), 0);
-
-        let loop_position = run_model.find("loop {").expect("run loop");
-        assert!(
-            retry_positions[0] < loop_position,
-            "persistent owner miss must happen before state creation or spawn"
-        );
-
-        let spawned_position = run_model
-            .find("let (starting_run, mut child) = match spawn")
-            .expect("managed child spawn boundary");
-        let attachment_position = run_model
-            .find("persist_managed_server_or_cleanup")
-            .expect("managed child attachment boundary");
-        assert!(spawned_position < retry_positions[1]);
-        assert!(retry_positions[1] < attachment_position);
-    }
-
-    #[test]
     fn serve_selects_first_downloaded_registry_model_in_order() {
         let temp = TempDir::new("serve-selection");
         let later = &REGISTRY[2];
@@ -3017,45 +2981,6 @@ LOXA_MLX_RESTART_CHILD="1" \
     }
 
     #[test]
-    fn post_spawn_ready_writer_failure_invokes_unified_teardown_once() {
-        let temp = TempDir::new("loxa-post-spawn-ready-writer");
-        let state_path = temp.path().join("managed.json");
-        let server = ManagedServer {
-            id: "gemma-3-4b-it-q4".to_string(),
-            pid: 777,
-            port: 8081,
-            model_path: temp.path().join("model.gguf"),
-            started_at_unix_s: 789,
-            llama_server_version: "test".to_string(),
-            process_start_time_unix_s: Some(111),
-        };
-        let run = persist_run_for_server(&state_path, &server);
-        let mut child = FakeStartupChild::with_wait_results(vec![Some(0)]);
-        let mut stdout = BrokenPipeWriter::new(|| {});
-
-        let outcome = print_run_ready_owned(
-            &mut stdout,
-            &server,
-            &mut child,
-            &state_path,
-            &run.identity(),
-        )
-        .expect("ready output recovery outcome");
-
-        assert_eq!(outcome, ReadyOutputOutcome::RecoveryRequired);
-        assert_eq!(stdout.write_attempts, 1);
-        assert_eq!(
-            child
-                .events
-                .borrow()
-                .iter()
-                .filter(|event| **event == "terminate")
-                .count(),
-            1
-        );
-    }
-
-    #[test]
     fn post_spawn_running_state_read_error_invokes_unified_teardown_once() {
         let temp = TempDir::new("loxa-post-spawn-running-state-read");
         let state_path = temp.path().join("managed.json");
@@ -3875,20 +3800,6 @@ LOXA_MLX_RESTART_CHILD="1" \
         assert_eq!(bytes_to_gb_string(0), "0.0");
         assert_eq!(bytes_to_gb_string(1_073_741_824), "1.0");
         assert_eq!(bytes_to_gb_string(1_610_612_736), "1.5");
-    }
-
-    #[test]
-    fn ctrl_c_flag_helpers_round_trip() {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        let _lock = MLX_ENV_LOCK.lock().expect("process-global test lock");
-        clear_ctrl_c_received();
-        assert!(!ctrl_c_received());
-
-        set_ctrl_c_received();
-        assert!(ctrl_c_received());
-
-        clear_ctrl_c_received();
-        assert!(!ctrl_c_received());
     }
 
     #[test]

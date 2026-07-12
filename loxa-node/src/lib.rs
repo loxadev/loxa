@@ -82,7 +82,7 @@ pub enum StartupWaitOutcome {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReadyOutputOutcome {
+enum ReadyOutputOutcome {
     Ready,
     RequestedStop,
     RecoveryRequired,
@@ -119,7 +119,7 @@ pub fn set_ctrl_c_received() {
     CTRL_C_RECEIVED.store(true, Ordering::SeqCst);
 }
 
-pub fn ctrl_c_received() -> bool {
+fn ctrl_c_received() -> bool {
     CTRL_C_RECEIVED.load(Ordering::SeqCst)
 }
 
@@ -1801,32 +1801,7 @@ pub fn print_run_ready<W: Write>(stdout: &mut W, server: &ManagedServer) -> io::
     stdout.flush()
 }
 
-pub fn print_run_ready_owned<C, W>(
-    stdout: &mut W,
-    server: &ManagedServer,
-    child: &mut C,
-    state_path: &Path,
-    state_identity: &supervisor::ManagedRunIdentity,
-) -> io::Result<ReadyOutputOutcome>
-where
-    C: ManagedChild + LogDrainingChild,
-    W: Write,
-{
-    let Err(output_error) = print_run_ready(stdout, server) else {
-        return Ok(ReadyOutputOutcome::Ready);
-    };
-    match supervisor::cleanup_post_spawn_failure(child, state_path, state_identity)
-        .map_err(supervisor_error_to_io)?
-    {
-        supervisor::PostSpawnCleanupOutcome::Cleaned => Err(output_error),
-        supervisor::PostSpawnCleanupOutcome::RequestedStop => Ok(ReadyOutputOutcome::RequestedStop),
-        supervisor::PostSpawnCleanupOutcome::RecoveryRequired => {
-            Ok(ReadyOutputOutcome::RecoveryRequired)
-        }
-    }
-}
-
-pub fn emit_run_ready_owned<C>(
+fn emit_run_ready_owned<C>(
     events: &mut dyn LifecycleEventSink,
     server: &ManagedServer,
     child: &mut C,
@@ -2060,6 +2035,8 @@ impl InterruptStatus for SignalGuard {
 #[cfg(test)]
 mod lifecycle_api_tests {
     use super::*;
+    use loxa_core::supervisor::{LogDrainingChild, ManagedChild};
+    use std::cell::RefCell;
 
     #[derive(Default)]
     struct RecordingLifecycleSink {
@@ -2070,6 +2047,72 @@ mod lifecycle_api_tests {
         fn emit(&mut self, event: LifecycleEvent) -> io::Result<()> {
             self.events.push(event);
             Ok(())
+        }
+    }
+
+    struct FailingLifecycleSink {
+        events: Vec<LifecycleEvent>,
+    }
+
+    impl LifecycleEventSink for FailingLifecycleSink {
+        fn emit(&mut self, event: LifecycleEvent) -> io::Result<()> {
+            self.events.push(event);
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "injected lifecycle sink failure",
+            ))
+        }
+    }
+
+    struct CleanupChild {
+        events: RefCell<Vec<&'static str>>,
+    }
+
+    impl ManagedChild for CleanupChild {
+        fn pid(&self) -> u32 {
+            777
+        }
+
+        fn terminate(&mut self) -> io::Result<()> {
+            self.events.borrow_mut().push("terminate");
+            Ok(())
+        }
+
+        fn kill(&mut self) -> io::Result<()> {
+            self.events.borrow_mut().push("kill");
+            Ok(())
+        }
+
+        fn try_wait(&mut self) -> io::Result<Option<i32>> {
+            self.events.borrow_mut().push("try_wait");
+            Ok(Some(0))
+        }
+    }
+
+    impl LogDrainingChild for CleanupChild {
+        fn join_log_drains(&mut self) -> Result<(), SupervisorError> {
+            self.events.borrow_mut().push("join_log_drains");
+            Ok(())
+        }
+    }
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "loxa-node-{label}-{}-{}",
+                std::process::id(),
+                unix_timestamp_now()
+            ));
+            std::fs::create_dir_all(&path).expect("create test directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
@@ -2087,6 +2130,118 @@ mod lifecycle_api_tests {
             }
         );
         assert_eq!(RunTermination::Interrupted, RunTermination::Interrupted);
+    }
+
+    #[test]
+    fn lifecycle_sink_preserves_event_order_and_payloads() {
+        let mut sink = RecordingLifecycleSink::default();
+        let events = [
+            LifecycleEvent::NodeListening {
+                port: 11_435,
+                model_alias: "loxa".to_string(),
+            },
+            LifecycleEvent::Restarting {
+                process_label: "llama-server".to_string(),
+                before_healthy: true,
+            },
+            LifecycleEvent::RecoveryRequired {
+                run_id: "run-7".to_string(),
+            },
+        ];
+
+        for event in events.clone() {
+            sink.emit(event).expect("record lifecycle event");
+        }
+
+        assert_eq!(sink.events, events);
+    }
+
+    #[test]
+    fn model_ready_sink_failure_cleans_up_the_owned_generation_once() {
+        let temp = TestDir::new("sink-cleanup");
+        let state_path = temp.0.join("managed.json");
+        let run = supervisor::ManagedRun {
+            schema_version: supervisor::RUNTIME_STATE_SCHEMA_VERSION,
+            run_id: "run-1".to_string(),
+            model_id: "gemma-3-4b-it-q4".to_string(),
+            owner_pid: 42,
+            owner_process_start_time_unix_s: 456,
+            stop_requested: false,
+            lifecycle: supervisor::RunLifecycle::Starting,
+            generation: 0,
+            generation_alias: "loxa-run-1-g0".to_string(),
+            port: 8081,
+            log_path: temp.0.join("run-1.log"),
+            child_pid: None,
+            child_process_start_time_unix_s: None,
+            child_pgid: None,
+        };
+        supervisor::create_starting_run(&state_path, run.clone()).expect("persist starting run");
+        let server = ManagedServer {
+            id: run.model_id.clone(),
+            pid: 777,
+            port: run.port,
+            model_path: temp.0.join("model.gguf"),
+            started_at_unix_s: 789,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: Some(111),
+        };
+        let mut attached = run.clone();
+        attached.lifecycle = supervisor::RunLifecycle::Running;
+        attached.child_pid = Some(server.pid);
+        attached.child_process_start_time_unix_s = server.process_start_time_unix_s;
+        assert!(supervisor::update_runtime_state_run(
+            &state_path,
+            &run.identity(),
+            attached.clone()
+        )
+        .expect("attach child"));
+        let mut sink = FailingLifecycleSink { events: Vec::new() };
+        let mut child = CleanupChild {
+            events: RefCell::new(Vec::new()),
+        };
+
+        let outcome = emit_run_ready_owned(
+            &mut sink,
+            &server,
+            &mut child,
+            &state_path,
+            &attached.identity(),
+        );
+
+        assert_eq!(
+            outcome.expect("cleanup outcome"),
+            ReadyOutputOutcome::RecoveryRequired
+        );
+        assert_eq!(
+            sink.events,
+            vec![LifecycleEvent::ModelReady {
+                server: server.clone()
+            }]
+        );
+        assert_eq!(
+            child
+                .events
+                .borrow()
+                .iter()
+                .filter(|event| **event == "terminate")
+                .count(),
+            1
+        );
+        assert!(matches!(
+            supervisor::read_runtime_state(&state_path).expect("read retained state"),
+            RuntimeStateRead::Loaded(runs) if runs == vec![attached]
+        ));
+    }
+
+    #[test]
+    fn ctrl_c_flag_helpers_round_trip() {
+        clear_ctrl_c_received();
+        assert!(!ctrl_c_received());
+        set_ctrl_c_received();
+        assert!(ctrl_c_received());
+        clear_ctrl_c_received();
+        assert!(!ctrl_c_received());
     }
 
     #[test]
