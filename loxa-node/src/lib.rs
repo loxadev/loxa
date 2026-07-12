@@ -1,5 +1,5 @@
 use loxa_core::download;
-use loxa_core::engine::{py_mlx_lm, EngineLaunchSpec, ReadinessStrategy, RuntimeBackendKind};
+use loxa_core::engine::{EngineLaunchSpec, ReadinessStrategy, RuntimeBackendKind, py_mlx_lm};
 use loxa_core::registry::{self, ModelEntry, REGISTRY};
 use loxa_core::supervisor::{
     self, InterruptStatus, LogDrainingChild, ManagedChild, ManagedServer, ObservedChildExit,
@@ -7,8 +7,11 @@ use loxa_core::supervisor::{
 };
 use std::ffi::OsString;
 use std::fmt;
-use std::io::{self, Write};
+use std::io;
+#[cfg(test)]
+use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -36,7 +39,7 @@ impl NodePaths {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RunOutcome {
+enum RunOutcome {
     RequestedStop,
     Interrupted,
     Restart { run: supervisor::ManagedRun },
@@ -45,19 +48,21 @@ pub enum RunOutcome {
 }
 
 #[derive(Debug)]
-pub enum ManagedAttachmentBoundary {
+#[cfg(test)]
+#[allow(dead_code)]
+enum ManagedAttachmentBoundary {
     Attached(supervisor::ManagedRun),
     Terminal(ExitCode),
 }
 
 #[derive(Debug)]
-pub enum TypedManagedAttachmentBoundary {
+enum TypedManagedAttachmentBoundary {
     Attached(supervisor::ManagedRun),
     Terminal(RunTermination),
 }
 
 #[derive(Debug)]
-pub enum OwnedReplacementPreparation<R, D> {
+enum OwnedReplacementPreparation<R, D> {
     Prepared {
         run: supervisor::ManagedRun,
         resolved: R,
@@ -68,13 +73,13 @@ pub enum OwnedReplacementPreparation<R, D> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StartupPoll {
+enum StartupPoll {
     Pending,
     Ready,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StartupWaitOutcome {
+enum StartupWaitOutcome {
     Ready,
     RequestedStop,
     Interrupted,
@@ -89,7 +94,8 @@ enum ReadyOutputOutcome {
 }
 
 #[derive(Debug)]
-pub enum StartupWaitFailure {
+#[allow(dead_code)]
+enum StartupWaitFailure {
     BeforeTeardown(SupervisorError),
     AfterTeardown(SupervisorError),
     AfterChildReaped {
@@ -98,24 +104,24 @@ pub enum StartupWaitFailure {
     },
 }
 
-pub struct RunSession<'a> {
-    pub id: &'a str,
-    pub state_identity: &'a supervisor::ManagedRunIdentity,
-    pub log_path: &'a Path,
-    pub state_path: &'a Path,
+struct RunSession<'a> {
+    id: &'a str,
+    state_identity: &'a supervisor::ManagedRunIdentity,
+    log_path: &'a Path,
+    state_path: &'a Path,
 }
 
-pub trait InterruptSource {
+trait InterruptSource {
     fn interrupted(&self) -> bool;
 }
 
 static CTRL_C_RECEIVED: AtomicBool = AtomicBool::new(false);
 
-pub fn clear_ctrl_c_received() {
+fn clear_ctrl_c_received() {
     CTRL_C_RECEIVED.store(false, Ordering::SeqCst);
 }
 
-pub fn set_ctrl_c_received() {
+fn set_ctrl_c_received() {
     CTRL_C_RECEIVED.store(true, Ordering::SeqCst);
 }
 
@@ -129,12 +135,12 @@ extern "C" fn handle_sigint(_signal: std::ffi::c_int) {
 }
 
 #[derive(Clone, Debug)]
-pub struct ResolvedRuntimeBackend {
-    pub kind: RuntimeBackendKind,
-    pub model_id: String,
-    pub model_path: PathBuf,
-    pub program: PathBuf,
-    pub engine_version: String,
+struct ResolvedRuntimeBackend {
+    kind: RuntimeBackendKind,
+    model_id: String,
+    model_path: PathBuf,
+    program: PathBuf,
+    engine_version: String,
 }
 
 impl ResolvedRuntimeBackend {
@@ -195,7 +201,7 @@ impl ResolvedRuntimeBackend {
     }
 }
 
-pub fn resolve_runtime_backend(
+fn resolve_runtime_backend(
     kind: RuntimeBackendKind,
     id: &str,
     models_dir: &Path,
@@ -235,11 +241,11 @@ pub fn resolve_runtime_backend(
     }
 }
 
-pub fn py_mlx_error_to_supervisor(error: py_mlx_lm::PyMlxLmError) -> SupervisorError {
+fn py_mlx_error_to_supervisor(error: py_mlx_lm::PyMlxLmError) -> SupervisorError {
     SupervisorError::Io(io::Error::other(error))
 }
 
-pub fn gateway_target(
+fn gateway_target(
     backend: &ResolvedRuntimeBackend,
     spec: &EngineLaunchSpec,
 ) -> loxa_core::gateway::EngineTarget {
@@ -369,7 +375,7 @@ pub fn run_model(
                         detected: (),
                     } => (backend, run, false, None),
                     OwnedReplacementPreparation::RequestedStop => {
-                        return Ok(RunTermination::RequestedStop)
+                        return Ok(RunTermination::RequestedStop);
                     }
                     OwnedReplacementPreparation::Interrupted => {
                         return Ok(RunTermination::Interrupted);
@@ -454,7 +460,7 @@ pub fn run_model(
                     supervisor::ChildlessFinishOutcome::Finished => {
                         Err(supervisor_error_to_io(error))
                     }
-                }
+                };
             }
         };
         let spawn = supervisor::spawn_starting_engine(
@@ -467,7 +473,7 @@ pub fn run_model(
         let (starting_run, mut child) = match spawn {
             Ok(supervisor::SpawnStartingRunOutcome::Spawned { run, value }) => (run, value),
             Ok(supervisor::SpawnStartingRunOutcome::RequestedStop) => {
-                return Ok(RunTermination::RequestedStop)
+                return Ok(RunTermination::RequestedStop);
             }
             Err(error) => {
                 return match supervisor::finish_childless_runtime_state_run(
@@ -482,7 +488,7 @@ pub fn run_model(
                     supervisor::ChildlessFinishOutcome::Finished => {
                         Err(supervisor_error_to_io(error))
                     }
-                }
+                };
             }
         };
         let initialization_error = child.take_initialization_error();
@@ -600,7 +606,7 @@ pub fn run_model(
                     ReadyOutputOutcome::Ready => {}
                     ReadyOutputOutcome::RequestedStop => return Ok(RunTermination::RequestedStop),
                     ReadyOutputOutcome::RecoveryRequired => {
-                        return emit_recovery_required(events, &run.run_id)
+                        return emit_recovery_required(events, &run.run_id);
                     }
                 }
                 if let Some(gateway) = gateway {
@@ -655,7 +661,7 @@ pub fn run_model(
             Ok(StartupWaitOutcome::RequestedStop) => return Ok(RunTermination::RequestedStop),
             Ok(StartupWaitOutcome::Interrupted) => return Ok(RunTermination::Interrupted),
             Ok(StartupWaitOutcome::RecoveryRequired) => {
-                return emit_recovery_required(events, &run.run_id)
+                return emit_recovery_required(events, &run.run_id);
             }
             Err(StartupWaitFailure::AfterChildReaped {
                 log_tail,
@@ -691,7 +697,7 @@ pub fn run_model(
                         return Ok(RunTermination::Failed);
                     }
                     ObservedChildExit::RecoveryRequired => {
-                        return emit_recovery_required(events, &run.run_id)
+                        return emit_recovery_required(events, &run.run_id);
                     }
                 }
             }
@@ -848,7 +854,8 @@ pub fn serve_node(
     }
 }
 
-pub fn render_post_cleanup_startup_failure<E: Write>(
+#[cfg(test)]
+fn render_post_cleanup_startup_failure<E: Write>(
     stderr: &mut E,
     log_path: &Path,
     process_label: &str,
@@ -868,7 +875,8 @@ pub fn render_post_cleanup_startup_failure<E: Write>(
     }
 }
 
-pub fn resolve_managed_attachment<E: Write>(
+#[cfg(test)]
+fn resolve_managed_attachment<E: Write>(
     outcome: supervisor::PersistManagedServerOutcome,
     stderr: &mut E,
     run_id: &str,
@@ -886,7 +894,7 @@ pub fn resolve_managed_attachment<E: Write>(
     }
 }
 
-pub fn resolve_managed_attachment_typed(
+fn resolve_managed_attachment_typed(
     outcome: supervisor::PersistManagedServerOutcome,
 ) -> TypedManagedAttachmentBoundary {
     match outcome {
@@ -902,7 +910,8 @@ pub fn resolve_managed_attachment_typed(
     }
 }
 
-pub fn recovery_required_exit<E: Write>(stderr: &mut E, run_id: &str) -> io::Result<ExitCode> {
+#[cfg(test)]
+fn recovery_required_exit<E: Write>(stderr: &mut E, run_id: &str) -> io::Result<ExitCode> {
     writeln!(
         stderr,
         "cleanup could not be confirmed for managed run {run_id}; recovery required"
@@ -910,7 +919,8 @@ pub fn recovery_required_exit<E: Write>(stderr: &mut E, run_id: &str) -> io::Res
     Ok(ExitCode::from(1))
 }
 
-pub fn retain_restart_after_best_effort_announcement<W: Write>(
+#[cfg(test)]
+fn retain_restart_after_best_effort_announcement<W: Write>(
     stdout: &mut W,
     message: &str,
     run: supervisor::ManagedRun,
@@ -919,7 +929,7 @@ pub fn retain_restart_after_best_effort_announcement<W: Write>(
     run
 }
 
-pub fn prepare_owned_replacement_run<R, D, I, RF, DF>(
+fn prepare_owned_replacement_run<R, D, I, RF, DF>(
     state_path: &Path,
     run: supervisor::ManagedRun,
     interrupt: &I,
@@ -958,7 +968,7 @@ where
     })
 }
 
-pub fn finish_owned_replacement_interrupt<R, D>(
+fn finish_owned_replacement_interrupt<R, D>(
     state_path: &Path,
     run: &supervisor::ManagedRun,
 ) -> Result<OwnedReplacementPreparation<R, D>, SupervisorError> {
@@ -972,7 +982,7 @@ pub fn finish_owned_replacement_interrupt<R, D>(
     }
 }
 
-pub fn finish_owned_replacement_error<R, D>(
+fn finish_owned_replacement_error<R, D>(
     state_path: &Path,
     run: &supervisor::ManagedRun,
     error: SupervisorError,
@@ -985,7 +995,8 @@ pub fn finish_owned_replacement_error<R, D>(
     }
 }
 
-pub fn finish_childless_owner_error(
+#[cfg(test)]
+fn finish_childless_owner_error(
     state_path: &Path,
     run: &supervisor::ManagedRun,
     error: SupervisorError,
@@ -1085,7 +1096,8 @@ pub fn stop_managed_servers(
     }
 }
 
-pub fn observe_attached_stop_with<C, H, T>(
+#[cfg(test)]
+fn observe_attached_stop_with<C, H, T>(
     child: &mut C,
     state_path: &Path,
     state_identity: &supervisor::ManagedRunIdentity,
@@ -1110,7 +1122,7 @@ where
     )?))
 }
 
-pub fn observe_attached_stop<C>(
+fn observe_attached_stop<C>(
     child: &mut C,
     state_path: &Path,
     state_identity: &supervisor::ManagedRunIdentity,
@@ -1145,7 +1157,7 @@ where
     .map(Some)
 }
 
-pub fn finish_spawn_initialization<C>(
+fn finish_spawn_initialization<C>(
     child: &mut C,
     state_path: &Path,
     state_identity: &supervisor::ManagedRunIdentity,
@@ -1164,7 +1176,7 @@ where
     }
 }
 
-pub fn finish_spawned_interrupt<C>(
+fn finish_spawned_interrupt<C>(
     child: &mut C,
     state_path: &Path,
     state_identity: &supervisor::ManagedRunIdentity,
@@ -1180,7 +1192,8 @@ where
     )
 }
 
-pub fn owner_teardown_child<C>(
+#[cfg(test)]
+fn owner_teardown_child<C>(
     child: &mut C,
     decision: supervisor::OwnerTeardownDecision,
 ) -> supervisor::TeardownConfirmation
@@ -1214,7 +1227,7 @@ where
     }
 }
 
-pub fn wait_for_startup_owned<C, I, W>(
+fn wait_for_startup_owned<C, I, W>(
     child: &mut C,
     state_identity: &supervisor::ManagedRunIdentity,
     state_path: &Path,
@@ -1238,7 +1251,7 @@ where
                     state_identity,
                     &mut readiness_worker,
                     error,
-                )
+                );
             }
         };
         if current.stop_requested {
@@ -1278,7 +1291,7 @@ where
                     state_identity,
                     &mut readiness_worker,
                     SupervisorError::Io(error),
-                )
+                );
             }
         }
 
@@ -1317,7 +1330,7 @@ where
                                 state_path,
                                 state_identity,
                                 error,
-                            )
+                            );
                         }
                     };
                 if current.stop_requested {
@@ -1335,13 +1348,13 @@ where
                 return Err(StartupWaitFailure::AfterChildReaped {
                     log_tail,
                     diagnostics_error: None,
-                })
+                });
             }
             Err(SupervisorError::ChildReapedDiagnosticsFailed(error)) => {
                 return Err(StartupWaitFailure::AfterChildReaped {
                     log_tail: String::new(),
                     diagnostics_error: Some(error),
-                })
+                });
             }
             Err(error) => {
                 return finish_owned_startup_failure_after_readiness(
@@ -1350,7 +1363,7 @@ where
                     state_identity,
                     &mut readiness_worker,
                     error,
-                )
+                );
             }
         }
         if readiness_worker.is_some() {
@@ -1359,7 +1372,7 @@ where
     }
 }
 
-pub fn cancel_startup_readiness(
+fn cancel_startup_readiness(
     worker: &mut Option<&mut supervisor::ChatCompletionReadinessWorker>,
 ) -> Result<(), SupervisorError> {
     let result = match worker.as_deref_mut() {
@@ -1370,7 +1383,7 @@ pub fn cancel_startup_readiness(
     result
 }
 
-pub fn finish_owned_startup_failure_after_readiness<C>(
+fn finish_owned_startup_failure_after_readiness<C>(
     child: &mut C,
     state_path: &Path,
     state_identity: &supervisor::ManagedRunIdentity,
@@ -1384,7 +1397,7 @@ where
     finish_owned_startup_failure(child, state_path, state_identity, error)
 }
 
-pub fn finish_owned_startup_transition_after_readiness<C>(
+fn finish_owned_startup_transition_after_readiness<C>(
     child: &mut C,
     state_path: &Path,
     state_identity: &supervisor::ManagedRunIdentity,
@@ -1403,7 +1416,7 @@ where
     map_owned_startup_transition(outcome)
 }
 
-pub fn finish_owned_startup_failure<C>(
+fn finish_owned_startup_failure<C>(
     child: &mut C,
     state_path: &Path,
     state_identity: &supervisor::ManagedRunIdentity,
@@ -1425,7 +1438,7 @@ where
     }
 }
 
-pub fn map_owned_startup_transition(
+fn map_owned_startup_transition(
     outcome: supervisor::OwnerTerminalOutcome,
 ) -> Result<StartupWaitOutcome, StartupWaitFailure> {
     Ok(match outcome {
@@ -1435,7 +1448,8 @@ pub fn map_owned_startup_transition(
     })
 }
 
-pub fn wait_for_startup<C, I, W, T>(
+#[cfg(test)]
+fn wait_for_startup<C, I, W, T>(
     child: &mut C,
     state_identity: &supervisor::ManagedRunIdentity,
     state_path: &Path,
@@ -1462,7 +1476,8 @@ where
     )
 }
 
-pub fn wait_for_startup_with_finalizer<C, I, W, T, F>(
+#[cfg(test)]
+fn wait_for_startup_with_finalizer<C, I, W, T, F>(
     child: &mut C,
     state_identity: &supervisor::ManagedRunIdentity,
     state_path: &Path,
@@ -1552,7 +1567,8 @@ where
     }
 }
 
-pub fn finish_startup_owner_transition<C, T, F>(
+#[cfg(test)]
+fn finish_startup_owner_transition<C, T, F>(
     child: &mut C,
     state_path: &Path,
     state_identity: &supervisor::ManagedRunIdentity,
@@ -1579,7 +1595,7 @@ where
     })
 }
 
-pub fn supervise_running_server<C, I: InterruptSource + InterruptStatus>(
+fn supervise_running_server<C, I: InterruptSource + InterruptStatus>(
     session: RunSession<'_>,
     child: &mut C,
     interrupt: &I,
@@ -1673,7 +1689,7 @@ where
     }
 }
 
-pub fn owner_terminal_to_run_outcome(outcome: supervisor::OwnerTerminalOutcome) -> RunOutcome {
+fn owner_terminal_to_run_outcome(outcome: supervisor::OwnerTerminalOutcome) -> RunOutcome {
     match outcome {
         supervisor::OwnerTerminalOutcome::RequestedStop => RunOutcome::RequestedStop,
         supervisor::OwnerTerminalOutcome::Interrupted => RunOutcome::Interrupted,
@@ -1681,7 +1697,8 @@ pub fn owner_terminal_to_run_outcome(outcome: supervisor::OwnerTerminalOutcome) 
     }
 }
 
-pub fn owner_terminal_exit_code(outcome: supervisor::OwnerTerminalOutcome) -> ExitCode {
+#[cfg(test)]
+fn owner_terminal_exit_code(outcome: supervisor::OwnerTerminalOutcome) -> ExitCode {
     match outcome {
         supervisor::OwnerTerminalOutcome::RequestedStop => ExitCode::SUCCESS,
         supervisor::OwnerTerminalOutcome::Interrupted => ExitCode::from(130),
@@ -1689,7 +1706,8 @@ pub fn owner_terminal_exit_code(outcome: supervisor::OwnerTerminalOutcome) -> Ex
     }
 }
 
-pub fn observed_terminal_exit_code(outcome: &ObservedChildExit) -> Option<ExitCode> {
+#[cfg(test)]
+fn observed_terminal_exit_code(outcome: &ObservedChildExit) -> Option<ExitCode> {
     match outcome {
         ObservedChildExit::RequestedStop => Some(ExitCode::SUCCESS),
         ObservedChildExit::Interrupted => Some(ExitCode::from(130)),
@@ -1700,7 +1718,8 @@ pub fn observed_terminal_exit_code(outcome: &ObservedChildExit) -> Option<ExitCo
     }
 }
 
-pub fn supervise_running_server_with<C, W, E, I, T, S>(
+#[cfg(test)]
+fn supervise_running_server_with<C, W, E, I, T, S>(
     session: RunSession<'_>,
     child: &mut C,
     interrupt: &I,
@@ -1788,19 +1807,6 @@ where
     }
 }
 
-pub fn print_run_ready<W: Write>(stdout: &mut W, server: &ManagedServer) -> io::Result<()> {
-    writeln!(stdout, "model id: {}", server.id)?;
-    writeln!(stdout, "pid: {}", server.pid)?;
-    writeln!(stdout, "port: {}", server.port)?;
-    writeln!(stdout, "model path: {}", server.model_path.display())?;
-    writeln!(
-        stdout,
-        "health url: http://127.0.0.1:{}/health",
-        server.port
-    )?;
-    stdout.flush()
-}
-
 fn emit_run_ready_owned<C>(
     events: &mut dyn LifecycleEventSink,
     server: &ManagedServer,
@@ -1827,7 +1833,7 @@ where
     }
 }
 
-pub fn ensure_runtime_state_is_mutable(state_path: &Path) -> io::Result<()> {
+fn ensure_runtime_state_is_mutable(state_path: &Path) -> io::Result<()> {
     match supervisor::read_runtime_state(state_path).map_err(supervisor_error_to_io)? {
         RuntimeStateRead::Corrupt(message) => Err(io::Error::other(format!(
             "managed sidecar state is corrupt: {message}"
@@ -1840,7 +1846,7 @@ pub fn ensure_runtime_state_is_mutable(state_path: &Path) -> io::Result<()> {
     }
 }
 
-pub fn managed_run_status(inspection: &supervisor::ManagedRunInspection) -> &'static str {
+fn managed_run_status(inspection: &supervisor::ManagedRunInspection) -> &'static str {
     match inspection.status {
         supervisor::ManagedRunStatus::Starting => "starting",
         supervisor::ManagedRunStatus::Running => "running",
@@ -1849,11 +1855,12 @@ pub fn managed_run_status(inspection: &supervisor::ManagedRunInspection) -> &'st
     }
 }
 
-pub fn supervisor_error_to_io(error: SupervisorError) -> io::Error {
+fn supervisor_error_to_io(error: SupervisorError) -> io::Error {
     io::Error::other(error.to_string())
 }
 
-pub fn write_log_tail<W: Write>(writer: &mut W, log_tail: &str) -> io::Result<()> {
+#[cfg(test)]
+fn write_log_tail<W: Write>(writer: &mut W, log_tail: &str) -> io::Result<()> {
     if log_tail.trim().is_empty() {
         return Ok(());
     }
@@ -1861,7 +1868,7 @@ pub fn write_log_tail<W: Write>(writer: &mut W, log_tail: &str) -> io::Result<()
     writeln!(writer, "{log_tail}")
 }
 
-pub fn unix_timestamp_now() -> u64 {
+fn unix_timestamp_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -1869,7 +1876,7 @@ pub fn unix_timestamp_now() -> u64 {
 }
 
 #[cfg(unix)]
-pub struct SignalGuard {
+struct SignalGuard {
     previous: usize,
 }
 
@@ -1927,7 +1934,7 @@ impl Drop for SignalGuard {
 }
 
 #[cfg(windows)]
-pub struct SignalGuard;
+struct SignalGuard;
 
 #[cfg(windows)]
 impl SignalGuard {
@@ -2002,7 +2009,7 @@ unsafe extern "system" fn handle_console_ctrl(control_type: u32) -> i32 {
 }
 
 #[cfg(not(any(unix, windows)))]
-pub struct SignalGuard;
+struct SignalGuard;
 
 #[cfg(not(any(unix, windows)))]
 impl SignalGuard {
@@ -2036,7 +2043,47 @@ impl InterruptStatus for SignalGuard {
 mod lifecycle_api_tests {
     use super::*;
     use loxa_core::supervisor::{LogDrainingChild, ManagedChild};
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
+    use std::fs;
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    static SIGNAL_TEST_LOCK: Mutex<()> = Mutex::new(());
+    use std::sync::atomic::{AtomicBool as TestAtomicBool, Ordering as TestOrdering};
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    static MLX_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    struct TestEnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    impl TestEnvRestore {
+        fn set(values: &[(&'static str, &std::ffi::OsStr)]) -> Self {
+            let previous = values
+                .iter()
+                .map(|(name, _)| (*name, std::env::var_os(name)))
+                .collect();
+            for (name, value) in values {
+                unsafe { std::env::set_var(name, value) };
+            }
+            Self(previous)
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    impl Drop for TestEnvRestore {
+        fn drop(&mut self) {
+            for (name, value) in self.0.drain(..) {
+                match value {
+                    Some(value) => unsafe { std::env::set_var(name, value) },
+                    None => unsafe { std::env::remove_var(name) },
+                }
+            }
+        }
+    }
 
     #[derive(Default)]
     struct RecordingLifecycleSink {
@@ -2133,16 +2180,56 @@ mod lifecycle_api_tests {
     }
 
     #[test]
+    fn python_gateway_metadata_uses_default_model_and_pinned_mlx_identity() {
+        let backend = ResolvedRuntimeBackend {
+            kind: RuntimeBackendKind::PyMlxLm,
+            model_id: "/tmp/mlx model".to_string(),
+            model_path: PathBuf::from("/tmp/mlx model"),
+            program: PathBuf::from("/tmp/bin/mlx_lm.server"),
+            engine_version: "0.31.3".to_string(),
+        };
+        let spec = backend.launch_spec(8123, supervisor::DEFAULT_CTX_TOKENS, "ignored-g0");
+
+        let target = gateway_target(&backend, &spec);
+
+        assert_eq!(target.backend_alias, "default_model");
+        assert_eq!(target.engine, "mlx-lm");
+        assert_eq!(target.engine_version, "0.31.3");
+        assert_eq!(target.model_id, "/tmp/mlx model");
+        assert_eq!(target.profile, "mlx-lm:/tmp/mlx model");
+    }
+
+    #[test]
     fn lifecycle_sink_preserves_event_order_and_payloads() {
         let mut sink = RecordingLifecycleSink::default();
-        let events = [
+        let server = ManagedServer {
+            id: "gemma-3-4b-it-q4".to_string(),
+            pid: 77,
+            port: 11_435,
+            model_path: PathBuf::from("/models/gemma.gguf"),
+            started_at_unix_s: 123,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: Some(122),
+        };
+        let events = vec![
             LifecycleEvent::NodeListening {
                 port: 11_435,
                 model_alias: "loxa".to_string(),
             },
+            LifecycleEvent::ModelReady { server },
             LifecycleEvent::Restarting {
                 process_label: "llama-server".to_string(),
                 before_healthy: true,
+            },
+            LifecycleEvent::EngineExited {
+                process_label: "llama-server".to_string(),
+                model_id: "gemma-3-4b-it-q4".to_string(),
+                before_healthy: false,
+                log_tail: "engine exited".to_string(),
+            },
+            LifecycleEvent::HealthTimeout {
+                process_label: "llama-server".to_string(),
+                log_path: PathBuf::from("/logs/run.log"),
             },
             LifecycleEvent::RecoveryRequired {
                 run_id: "run-7".to_string(),
@@ -2190,12 +2277,10 @@ mod lifecycle_api_tests {
         attached.lifecycle = supervisor::RunLifecycle::Running;
         attached.child_pid = Some(server.pid);
         attached.child_process_start_time_unix_s = server.process_start_time_unix_s;
-        assert!(supervisor::update_runtime_state_run(
-            &state_path,
-            &run.identity(),
-            attached.clone()
-        )
-        .expect("attach child"));
+        assert!(
+            supervisor::update_runtime_state_run(&state_path, &run.identity(), attached.clone())
+                .expect("attach child")
+        );
         let mut sink = FailingLifecycleSink { events: Vec::new() };
         let mut child = CleanupChild {
             events: RefCell::new(Vec::new()),
@@ -2236,12 +2321,29 @@ mod lifecycle_api_tests {
 
     #[test]
     fn ctrl_c_flag_helpers_round_trip() {
+        let _lock = SIGNAL_TEST_LOCK.lock().expect("signal test lock");
         clear_ctrl_c_received();
         assert!(!ctrl_c_received());
         set_ctrl_c_received();
         assert!(ctrl_c_received());
         clear_ctrl_c_received();
         assert!(!ctrl_c_received());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_guard_can_install_drop_and_restore_repeatedly() {
+        let _lock = SIGNAL_TEST_LOCK.lock().expect("signal test lock");
+        clear_ctrl_c_received();
+
+        let first = SignalGuard::install().expect("install first signal guard");
+        assert!(!first.interrupted());
+        drop(first);
+
+        let second = SignalGuard::install().expect("restore then install second signal guard");
+        assert!(!second.interrupted());
+        drop(second);
+        clear_ctrl_c_received();
     }
 
     #[test]
@@ -2322,5 +2424,1989 @@ mod lifecycle_api_tests {
             stop_managed_servers(StopRequest { target: "all" }, &paths).unwrap(),
             StopOutcome::NoMatch
         );
+    }
+    fn read_test_http_request(stream: &mut std::net::TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set request timeout");
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let read = stream.read(&mut chunk).expect("read request");
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..read]);
+            let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") else {
+                continue;
+            };
+            let header_end = header_end + 4;
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if request.len() >= header_end + content_length {
+                break;
+            }
+        }
+        String::from_utf8(request).expect("request is utf8")
+    }
+
+    fn respond_test_http(stream: &mut std::net::TcpStream, body: &str) {
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .expect("write response");
+        stream.flush().expect("flush response");
+    }
+
+    fn persist_run_for_server(state_path: &Path, server: &ManagedServer) -> supervisor::ManagedRun {
+        let run_id = format!("test-run-{}", server.pid);
+        let mut run = starting_run_for_test(state_path, &run_id);
+        run.model_id = server.id.clone();
+        run.port = server.port;
+        run.generation_alias = format!("loxa-{run_id}-g0");
+        run.log_path = state_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(format!("{run_id}.log"));
+        supervisor::create_starting_run(state_path, run.clone()).expect("create starting run");
+        let starting_identity = run.identity();
+        run.lifecycle = supervisor::RunLifecycle::Running;
+        run.child_pid = Some(server.pid);
+        run.child_process_start_time_unix_s = server.process_start_time_unix_s;
+        assert!(
+            supervisor::update_runtime_state_run(state_path, &starting_identity, run.clone())
+                .expect("attach test child")
+        );
+        run
+    }
+
+    fn starting_run_for_test(state_path: &Path, run_id: &str) -> supervisor::ManagedRun {
+        supervisor::ManagedRun {
+            schema_version: supervisor::RUNTIME_STATE_SCHEMA_VERSION,
+            run_id: run_id.to_string(),
+            model_id: "gemma-3-4b-it-q4".to_string(),
+            owner_pid: 42,
+            owner_process_start_time_unix_s: 456,
+            stop_requested: false,
+            lifecycle: supervisor::RunLifecycle::Starting,
+            generation: 0,
+            generation_alias: format!("loxa-{run_id}-g0"),
+            port: 8080,
+            log_path: state_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(format!("{run_id}.log")),
+            child_pid: None,
+            child_process_start_time_unix_s: None,
+            child_pgid: None,
+        }
+    }
+
+    fn request_stop_for_test(
+        state_path: &Path,
+        identity: &supervisor::ManagedRunIdentity,
+    ) -> supervisor::ManagedRun {
+        let mut run = supervisor::current_runtime_state_run(state_path, identity)
+            .expect("read current run before test stop");
+        run.stop_requested = true;
+        supervisor::update_runtime_state_run_committed(state_path, identity, run)
+            .expect("commit test stop")
+            .expect("exact test stop")
+    }
+
+    #[test]
+    fn childless_spawn_error_cleanup_conflict_preserves_a_newer_generation() {
+        let temp = TempDir::new("loxa-pre-spawn-cleanup-conflict");
+        let state_path = temp.path().join("managed.json");
+        let run = starting_run_for_test(&state_path, "run-1");
+        let starting_identity = run.identity();
+        let mut newer_generation = run.clone();
+        newer_generation.generation = 1;
+        newer_generation.generation_alias = "loxa-run-1-g1".to_string();
+        supervisor::create_starting_run(&state_path, run.clone()).expect("publish starting run");
+        assert!(
+            supervisor::update_runtime_state_run(
+                &state_path,
+                &starting_identity,
+                newer_generation.clone(),
+            )
+            .expect("advance generation before stale cleanup")
+        );
+
+        let error = finish_childless_owner_error(&state_path, &run, SupervisorError::NoFreePort)
+            .expect_err("cleanup conflict must replace the spawn error");
+
+        assert!(matches!(error, SupervisorError::RunStateConflict(_)));
+        assert_eq!(
+            supervisor::read_runtime_state(&state_path).expect("read preserved newer state"),
+            RuntimeStateRead::Loaded(vec![newer_generation])
+        );
+    }
+
+    #[test]
+    fn published_replacement_resolution_failure_exact_finishes_childless_run() {
+        let temp = TempDir::new("loxa-replacement-resolution-failure");
+        let state_path = temp.path().join("managed.json");
+        let mut run = starting_run_for_test(&state_path, "run-1");
+        run.generation = 1;
+        run.generation_alias = "loxa-run-1-g1".to_string();
+        supervisor::create_starting_run(&state_path, run.clone()).expect("publish generation one");
+        let signal = FakeInterruptSource::new(vec![false]);
+
+        let error = prepare_owned_replacement_run(
+            &state_path,
+            run,
+            &signal,
+            || Err::<(), _>(SupervisorError::NoFreePort),
+            || -> Result<(), SupervisorError> {
+                panic!("detection must not run after resolution failure")
+            },
+        )
+        .expect_err("resolution failure");
+
+        assert!(matches!(error, SupervisorError::NoFreePort));
+        assert_eq!(
+            supervisor::read_runtime_state(&state_path).expect("read terminal state"),
+            RuntimeStateRead::Loaded(Vec::new())
+        );
+    }
+
+    #[test]
+    fn published_replacement_detection_failure_exact_finishes_childless_run() {
+        let temp = TempDir::new("loxa-replacement-detection-failure");
+        let state_path = temp.path().join("managed.json");
+        let mut run = starting_run_for_test(&state_path, "run-1");
+        run.generation = 1;
+        run.generation_alias = "loxa-run-1-g1".to_string();
+        supervisor::create_starting_run(&state_path, run.clone()).expect("publish generation one");
+        let signal = FakeInterruptSource::new(vec![false, false]);
+
+        let error = prepare_owned_replacement_run(
+            &state_path,
+            run,
+            &signal,
+            || Ok("resolved"),
+            || Err::<(), _>(SupervisorError::LlamaServerNotFound),
+        )
+        .expect_err("detection failure");
+
+        assert!(matches!(error, SupervisorError::LlamaServerNotFound));
+        assert_eq!(
+            supervisor::read_runtime_state(&state_path).expect("read terminal state"),
+            RuntimeStateRead::Loaded(Vec::new())
+        );
+    }
+
+    #[test]
+    fn published_replacement_interrupt_after_resolution_exact_finishes_childless_run() {
+        let temp = TempDir::new("loxa-replacement-interrupt-after-resolution");
+        let state_path = temp.path().join("managed.json");
+        let mut run = starting_run_for_test(&state_path, "run-1");
+        run.generation = 1;
+        run.generation_alias = "loxa-run-1-g1".to_string();
+        supervisor::create_starting_run(&state_path, run.clone()).expect("publish generation one");
+        let signal = FakeInterruptSource::new(vec![false, true]);
+
+        let outcome = prepare_owned_replacement_run(
+            &state_path,
+            run,
+            &signal,
+            || Ok("resolved"),
+            || -> Result<(), SupervisorError> { panic!("detection must not run after interrupt") },
+        )
+        .expect("interrupt outcome");
+
+        assert!(matches!(outcome, OwnedReplacementPreparation::Interrupted));
+        assert_eq!(
+            supervisor::read_runtime_state(&state_path).expect("read terminal state"),
+            RuntimeStateRead::Loaded(Vec::new())
+        );
+    }
+
+    #[test]
+    fn published_replacement_interrupt_after_detection_exact_finishes_childless_run() {
+        let temp = TempDir::new("loxa-replacement-interrupt-after-detection");
+        let state_path = temp.path().join("managed.json");
+        let mut run = starting_run_for_test(&state_path, "run-1");
+        run.generation = 1;
+        run.generation_alias = "loxa-run-1-g1".to_string();
+        supervisor::create_starting_run(&state_path, run.clone()).expect("publish generation one");
+        let signal = FakeInterruptSource::new(vec![false, false, true]);
+
+        let outcome = prepare_owned_replacement_run(
+            &state_path,
+            run,
+            &signal,
+            || Ok("resolved"),
+            || Ok("detected"),
+        )
+        .expect("interrupt outcome");
+
+        assert!(matches!(outcome, OwnedReplacementPreparation::Interrupted));
+        assert_eq!(
+            supervisor::read_runtime_state(&state_path).expect("read terminal state"),
+            RuntimeStateRead::Loaded(Vec::new())
+        );
+    }
+
+    #[test]
+    fn published_replacement_concurrent_stop_and_interrupt_prefers_requested_stop() {
+        let temp = TempDir::new("loxa-replacement-stop-interrupt");
+        let state_path = temp.path().join("managed.json");
+        let mut run = starting_run_for_test(&state_path, "run-1");
+        run.generation = 1;
+        run.generation_alias = "loxa-run-1-g1".to_string();
+        supervisor::create_starting_run(&state_path, run.clone()).expect("publish generation one");
+        let signal = FakeInterruptSource::new(vec![false, true]);
+        let identity = run.identity();
+        let spawn_count = Cell::new(0_u8);
+
+        let outcome = prepare_owned_replacement_run(
+            &state_path,
+            run,
+            &signal,
+            || {
+                request_stop_for_test(&state_path, &identity);
+                Ok("resolved")
+            },
+            || Ok("detected"),
+        )
+        .expect("requested stop outcome");
+        if matches!(outcome, OwnedReplacementPreparation::Prepared { .. }) {
+            spawn_count.set(spawn_count.get() + 1);
+        }
+
+        assert!(matches!(
+            outcome,
+            OwnedReplacementPreparation::RequestedStop
+        ));
+        assert_eq!(spawn_count.get(), 0);
+        assert_eq!(
+            supervisor::read_runtime_state(&state_path).expect("read terminal state"),
+            RuntimeStateRead::Loaded(Vec::new())
+        );
+    }
+
+    #[test]
+    fn replacement_reservation_failure_exact_finishes_childless_state_and_stop_still_wins() {
+        let ordinary_temp = TempDir::new("loxa-replacement-reservation-failure");
+        let ordinary_state_path = ordinary_temp.path().join("managed.json");
+        let ordinary_blocker =
+            TcpListener::bind(("127.0.0.1", 0)).expect("block ordinary replacement port");
+        let ordinary_port = ordinary_blocker
+            .local_addr()
+            .expect("ordinary blocker address")
+            .port();
+        let mut ordinary_run = starting_run_for_test(&ordinary_state_path, "run-ordinary");
+        ordinary_run.generation = 1;
+        ordinary_run.generation_alias = "loxa-run-ordinary-g1".to_string();
+        ordinary_run.port = ordinary_port;
+        supervisor::create_starting_run(&ordinary_state_path, ordinary_run.clone())
+            .expect("publish ordinary replacement");
+        let reservation_error = match supervisor::reserve_localhost_port(Some(ordinary_port)) {
+            Err(error) => error,
+            Ok(_) => panic!("blocked port must reject a replacement reservation"),
+        };
+        let ordinary_error =
+            finish_childless_owner_error(&ordinary_state_path, &ordinary_run, reservation_error)
+                .expect_err("blocked replacement reservation must fail");
+
+        assert!(matches!(ordinary_error, SupervisorError::NoFreePort));
+        assert_eq!(
+            supervisor::read_runtime_state(&ordinary_state_path)
+                .expect("read ordinary terminal state"),
+            RuntimeStateRead::Loaded(Vec::new())
+        );
+
+        let stopped_temp = TempDir::new("loxa-stopped-replacement-reservation-failure");
+        let stopped_state_path = stopped_temp.path().join("managed.json");
+        let stopped_blocker =
+            TcpListener::bind(("127.0.0.1", 0)).expect("block stopped replacement port");
+        let stopped_port = stopped_blocker
+            .local_addr()
+            .expect("stopped blocker address")
+            .port();
+        let mut stopped_run = starting_run_for_test(&stopped_state_path, "run-stopped");
+        stopped_run.generation = 1;
+        stopped_run.generation_alias = "loxa-run-stopped-g1".to_string();
+        stopped_run.port = stopped_port;
+        supervisor::create_starting_run(&stopped_state_path, stopped_run.clone())
+            .expect("publish stopped replacement");
+        let stopped_identity = stopped_run.identity();
+        request_stop_for_test(&stopped_state_path, &stopped_identity);
+        let reservation_error = match supervisor::reserve_localhost_port(Some(stopped_port)) {
+            Err(error) => error,
+            Ok(_) => panic!("blocked port must reject a stopped replacement reservation"),
+        };
+        let stopped_exit =
+            finish_childless_owner_error(&stopped_state_path, &stopped_run, reservation_error)
+                .expect("durable stop must win over replacement reservation failure");
+
+        assert_eq!(stopped_exit, ExitCode::SUCCESS);
+        assert_eq!(
+            supervisor::read_runtime_state(&stopped_state_path)
+                .expect("read stopped terminal state"),
+            RuntimeStateRead::Loaded(Vec::new())
+        );
+    }
+
+    #[test]
+    fn attachment_boundary_stop_during_and_immediately_after_tears_down_once_without_generation_two()
+     {
+        for stop_during_attachment in [true, false] {
+            let temp = TempDir::new("loxa-attachment-stop-boundary");
+            let state_path = temp.path().join("managed.json");
+            let mut starting = starting_run_for_test(&state_path, "run-1");
+            starting.generation = 1;
+            starting.generation_alias = "loxa-run-1-g1".to_string();
+            supervisor::create_starting_run(&state_path, starting.clone())
+                .expect("publish generation one");
+            if stop_during_attachment {
+                starting = request_stop_for_test(&state_path, &starting.identity());
+            }
+            let server = ManagedServer {
+                id: starting.model_id.clone(),
+                pid: 778,
+                port: starting.port,
+                model_path: temp.path().join("model.gguf"),
+                started_at_unix_s: 789,
+                llama_server_version: "test".to_string(),
+                process_start_time_unix_s: Some(222),
+            };
+            let mut child = FakeStartupChild::with_wait_results(vec![Some(0)]);
+            let attached = supervisor::persist_managed_server_or_cleanup(
+                &mut child,
+                &state_path,
+                starting,
+                server,
+                Duration::from_millis(10),
+            )
+            .expect("attach replacement");
+            let supervisor::PersistManagedServerOutcome::Attached(attached) = attached else {
+                panic!("replacement attachment must remain owned");
+            };
+            let events = RefCell::new(Vec::new());
+            let identity = attached.identity();
+
+            let outcome = observe_attached_stop_with(
+                &mut child,
+                &state_path,
+                &attached.identity(),
+                || {
+                    events.borrow_mut().push("after_attachment");
+                    if !stop_during_attachment {
+                        request_stop_for_test(&state_path, &identity);
+                    }
+                },
+                |_, decision| {
+                    assert_eq!(decision, supervisor::OwnerTeardownDecision::RequestedStop);
+                    events.borrow_mut().push("requested_stop_teardown");
+                    supervisor::TeardownConfirmation::Confirmed
+                },
+            )
+            .expect("attachment stop outcome");
+
+            assert_eq!(
+                outcome,
+                Some(supervisor::OwnerTerminalOutcome::RequestedStop)
+            );
+            assert_eq!(
+                events.into_inner(),
+                vec!["after_attachment", "requested_stop_teardown"]
+            );
+            assert_eq!(
+                supervisor::read_runtime_state(&state_path).expect("read terminal state"),
+                RuntimeStateRead::Loaded(Vec::new())
+            );
+        }
+    }
+
+    #[test]
+    fn post_spawn_interrupt_before_attachment_invokes_unified_teardown_once() {
+        let temp = TempDir::new("loxa-post-spawn-pre-attach-interrupt");
+        let state_path = temp.path().join("managed.json");
+        let run = starting_run_for_test(&state_path, "run-1");
+        supervisor::create_starting_run(&state_path, run.clone()).expect("create starting run");
+        let mut child = FakeStartupChild::with_wait_results(vec![Some(0)]);
+
+        let outcome = finish_spawned_interrupt(&mut child, &state_path, &run.identity())
+            .expect("interrupt cleanup outcome");
+
+        assert_eq!(outcome, supervisor::OwnerTerminalOutcome::RecoveryRequired);
+        assert_eq!(
+            child
+                .events
+                .borrow()
+                .iter()
+                .filter(|event| **event == "terminate")
+                .count(),
+            1
+        );
+        assert_eq!(
+            supervisor::read_runtime_state(&state_path).expect("read preserved starting run"),
+            RuntimeStateRead::Loaded(vec![run])
+        );
+    }
+
+    #[test]
+    fn post_spawn_initialization_failure_invokes_unified_teardown_once() {
+        let temp = TempDir::new("loxa-post-spawn-initialization-failure");
+        let state_path = temp.path().join("managed.json");
+        let run = starting_run_for_test(&state_path, "run-1");
+        supervisor::create_starting_run(&state_path, run.clone()).expect("create starting run");
+        let mut child = FakeStartupChild::with_wait_results(vec![Some(0)]);
+
+        let outcome = finish_spawn_initialization(
+            &mut child,
+            &state_path,
+            &run.identity(),
+            Some(SupervisorError::Io(io::Error::other(
+                "injected drain initialization failure",
+            ))),
+        )
+        .expect("initialization cleanup outcome");
+
+        assert_eq!(
+            outcome,
+            Some(supervisor::PostSpawnCleanupOutcome::RecoveryRequired)
+        );
+        assert_eq!(
+            child
+                .events
+                .borrow()
+                .iter()
+                .filter(|event| **event == "terminate")
+                .count(),
+            1
+        );
+        assert_eq!(
+            supervisor::read_runtime_state(&state_path).expect("read preserved starting run"),
+            RuntimeStateRead::Loaded(vec![run])
+        );
+    }
+
+    #[test]
+    fn post_spawn_immediate_attachment_reread_error_invokes_unified_teardown_once() {
+        let temp = TempDir::new("loxa-post-spawn-attachment-reread");
+        let state_path = temp.path().join("managed.json");
+        let server = ManagedServer {
+            id: "gemma-3-4b-it-q4".to_string(),
+            pid: 777,
+            port: 8081,
+            model_path: temp.path().join("model.gguf"),
+            started_at_unix_s: 789,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: Some(111),
+        };
+        let run = persist_run_for_server(&state_path, &server);
+        fs::write(&state_path, b"{corrupt").expect("corrupt state after attachment");
+        let mut child = FakeStartupChild::with_wait_results(vec![Some(0)]);
+
+        let outcome = observe_attached_stop(&mut child, &state_path, &run.identity())
+            .expect("reread recovery outcome");
+
+        assert_eq!(
+            outcome,
+            Some(supervisor::OwnerTerminalOutcome::RecoveryRequired)
+        );
+        assert_eq!(
+            child
+                .events
+                .borrow()
+                .iter()
+                .filter(|event| **event == "terminate")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn post_spawn_startup_state_read_error_invokes_unified_teardown_once() {
+        let temp = TempDir::new("loxa-post-spawn-startup-state-read");
+        let state_path = temp.path().join("managed.json");
+        let server = ManagedServer {
+            id: "gemma-3-4b-it-q4".to_string(),
+            pid: 777,
+            port: 8081,
+            model_path: temp.path().join("model.gguf"),
+            started_at_unix_s: 789,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: Some(111),
+        };
+        let run = persist_run_for_server(&state_path, &server);
+        fs::write(&state_path, b"{corrupt").expect("corrupt startup state");
+        let signal = FakeInterruptSource::new(vec![false]);
+        let mut child = FakeStartupChild::with_wait_results(vec![Some(0)]);
+
+        let outcome = wait_for_startup_owned(
+            &mut child,
+            &run.identity(),
+            &state_path,
+            &signal,
+            None,
+            |_, _, _| panic!("state read error must precede readiness polling"),
+        )
+        .expect("startup recovery outcome");
+
+        assert_eq!(outcome, StartupWaitOutcome::RecoveryRequired);
+        assert_eq!(
+            child
+                .events
+                .borrow()
+                .iter()
+                .filter(|event| **event == "terminate")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn post_spawn_startup_readiness_error_invokes_unified_teardown_once() {
+        let temp = TempDir::new("loxa-post-spawn-startup-readiness");
+        let state_path = temp.path().join("managed.json");
+        let server = ManagedServer {
+            id: "gemma-3-4b-it-q4".to_string(),
+            pid: 777,
+            port: 8081,
+            model_path: temp.path().join("model.gguf"),
+            started_at_unix_s: 789,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: Some(111),
+        };
+        let run = persist_run_for_server(&state_path, &server);
+        let signal = FakeInterruptSource::new(vec![false]);
+        let mut child = FakeStartupChild::with_wait_results(vec![None, Some(0)]);
+
+        let outcome = wait_for_startup_owned(
+            &mut child,
+            &run.identity(),
+            &state_path,
+            &signal,
+            None,
+            |_, _, _| Err(SupervisorError::NoFreePort),
+        )
+        .expect("startup recovery outcome");
+
+        assert_eq!(outcome, StartupWaitOutcome::RecoveryRequired);
+        assert_eq!(
+            child
+                .events
+                .borrow()
+                .iter()
+                .filter(|event| **event == "terminate")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn python_startup_accepts_completion_slower_than_llama_poll_interval() {
+        let temp = TempDir::new("loxa-python-slow-readiness");
+        let state_path = temp.path().join("managed.json");
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind fake MLX server");
+        let port = listener.local_addr().expect("fake MLX address").port();
+        let exited = Arc::new(TestAtomicBool::new(false));
+        let server_exit = Arc::clone(&exited);
+        let server_thread = std::thread::spawn(move || {
+            let (mut health, _) = listener.accept().expect("accept health request");
+            read_test_http_request(&mut health);
+            respond_test_http(&mut health, r#"{"status":"ok"}"#);
+
+            let (mut completion, _) = listener.accept().expect("accept completion request");
+            read_test_http_request(&mut completion);
+            std::thread::sleep(Duration::from_millis(400));
+            respond_test_http(
+                &mut completion,
+                r#"{"choices":[{"message":{"content":"ok"}}]}"#,
+            );
+            std::thread::sleep(Duration::from_millis(500));
+            server_exit.store(true, TestOrdering::SeqCst);
+        });
+        let server = ManagedServer {
+            id: "/tmp/mlx-model".to_string(),
+            pid: 777,
+            port,
+            model_path: PathBuf::from("/tmp/mlx-model"),
+            started_at_unix_s: 789,
+            llama_server_version: "0.31.3".to_string(),
+            process_start_time_unix_s: Some(111),
+        };
+        let run = persist_run_for_server(&state_path, &server);
+        let signal = FakeInterruptSource::new(vec![false]);
+        let mut child = FakeStartupChild::with_shared_exit(exited);
+        let mut worker = supervisor::spawn_chat_completion_readiness_worker(
+            port,
+            "default_model".to_string(),
+            supervisor::HEALTH_TIMEOUT,
+            supervisor::HEALTH_POLL_INTERVAL,
+        )
+        .expect("spawn slow readiness worker");
+
+        let outcome = wait_for_startup_owned(
+            &mut child,
+            &run.identity(),
+            &state_path,
+            &signal,
+            Some(&mut worker),
+            |_, _, _| panic!("worker owns Python readiness"),
+        );
+        server_thread.join().expect("join fake MLX server");
+
+        assert_eq!(
+            outcome.expect("slow completion readiness"),
+            StartupWaitOutcome::Ready
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn py_mlx_restart_helper() {
+        if std::env::var_os("LOXA_MLX_RESTART_CHILD").as_deref() != Some(std::ffi::OsStr::new("1"))
+        {
+            return;
+        }
+        let Some(port) = std::env::var_os("LOXA_MLX_RESTART_HELPER_PORT") else {
+            return;
+        };
+        let port = port.to_string_lossy().parse::<u16>().expect("helper port");
+        let generation =
+            std::env::var("LOXA_MLX_RESTART_HELPER_GENERATION").expect("helper generation");
+        let requests_path = PathBuf::from(
+            std::env::var_os("LOXA_MLX_RESTART_REQUESTS").expect("helper requests path"),
+        );
+        let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind restart helper");
+
+        let (mut health, _) = listener.accept().expect("accept restart health");
+        let health_request = read_test_http_request(&mut health);
+        assert!(health_request.starts_with("GET /health "));
+        respond_test_http(&mut health, r#"{"status":"ok"}"#);
+
+        let (mut completion, _) = listener.accept().expect("accept restart completion");
+        let completion_request = read_test_http_request(&mut completion);
+        assert!(completion_request.starts_with("POST /v1/chat/completions "));
+        assert!(completion_request.contains(r#""model":"default_model""#));
+        let mut requests = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(requests_path)
+            .expect("open readiness evidence");
+        writeln!(requests, "generation={generation} health completion")
+            .expect("write readiness evidence");
+        if let Some(marker) = std::env::var_os("LOXA_MLX_RESTART_MARKER") {
+            fs::write(marker, generation.as_bytes()).expect("write completion marker");
+        }
+        let delay = std::env::var("LOXA_MLX_RESTART_DELAY_MS")
+            .expect("helper delay")
+            .parse::<u64>()
+            .expect("numeric helper delay");
+        if delay > 0 {
+            completion
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("set cancellation poll timeout");
+            let deadline = std::time::Instant::now() + Duration::from_millis(delay);
+            let mut byte = [0_u8; 1];
+            while std::time::Instant::now() < deadline {
+                match completion.read(&mut byte) {
+                    Ok(0) => return,
+                    Ok(_) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(_) => return,
+                }
+            }
+        }
+        respond_test_http(
+            &mut completion,
+            r#"{"choices":[{"message":{"content":"ok"}}]}"#,
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
+    fn run_model_for_test(
+        id: &str,
+        paths: &NodePaths,
+    ) -> io::Result<(RunTermination, Vec<LifecycleEvent>)> {
+        let mut events = RecordingLifecycleSink::default();
+        let outcome = run_model(
+            RunRequest {
+                id,
+                ctx: None,
+                port: None,
+                engine: RuntimeBackendKind::PyMlxLm,
+            },
+            paths,
+            None,
+            &mut events,
+        )?;
+        Ok((outcome, events.events))
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn actual_run_model_restarts_python_once_with_same_backend_plan() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = MLX_ENV_LOCK.lock().expect("MLX environment lock");
+        let temp = TempDir::new("loxa-python-actual-restart");
+        let bin_dir = temp.path().join("fake bin");
+        let model_dir = temp.path().join("mlx model with spaces");
+        let wrapper = bin_dir.join("mlx_lm.server");
+        let version = bin_dir.join("mlx_lm");
+        let count_path = temp.path().join("generation-count");
+        let args_path = temp.path().join("launch-args");
+        let requests_path = temp.path().join("readiness-requests");
+        let marker_path = temp.path().join("completion-marker");
+        fs::create_dir_all(&bin_dir).expect("create fake bin");
+        fs::create_dir_all(&model_dir).expect("create fake model");
+        fs::write(
+            &wrapper,
+            r#"#!/bin/sh
+count=0
+if [ -f "$LOXA_MLX_RESTART_COUNT" ]; then
+  count=$(<"$LOXA_MLX_RESTART_COUNT")
+fi
+count=$((count + 1))
+printf '%s\n' "$count" > "$LOXA_MLX_RESTART_COUNT"
+printf 'generation=%s\n' "$count" >> "$LOXA_MLX_RESTART_ARGS"
+for arg in "$@"; do
+  printf 'arg=%s\n' "$arg" >> "$LOXA_MLX_RESTART_ARGS"
+done
+port=''
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = '--port' ]; then
+    shift
+    port="$1"
+  fi
+  shift
+done
+LOXA_MLX_RESTART_HELPER_PORT="$port" \
+LOXA_MLX_RESTART_HELPER_GENERATION="$count" \
+LOXA_MLX_RESTART_CHILD="1" \
+"$LOXA_MLX_RESTART_TEST_EXE" --exact lifecycle_api_tests::py_mlx_restart_helper --nocapture
+"#,
+        )
+        .expect("write fake server");
+        fs::write(&version, "#!/bin/sh\nprintf '0.31.3\\n'\n").expect("write fake version command");
+        for path in [&wrapper, &version] {
+            let mut permissions = fs::metadata(path).expect("fake metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions).expect("make fake executable");
+        }
+        let test_exe = std::env::current_exe().expect("test executable");
+        let _environment = TestEnvRestore::set(&[
+            ("LOXA_MLX_LM_SERVER", wrapper.as_os_str()),
+            ("LOXA_MLX_RESTART_COUNT", count_path.as_os_str()),
+            ("LOXA_MLX_RESTART_ARGS", args_path.as_os_str()),
+            ("LOXA_MLX_RESTART_REQUESTS", requests_path.as_os_str()),
+            ("LOXA_MLX_RESTART_TEST_EXE", test_exe.as_os_str()),
+            ("LOXA_MLX_RESTART_MARKER", marker_path.as_os_str()),
+            ("LOXA_MLX_RESTART_DELAY_MS", std::ffi::OsStr::new("0")),
+        ]);
+        let paths = NodePaths {
+            models_dir: temp.path().join("models"),
+            state_path: temp.path().join("managed.json"),
+            logs_dir: temp.path().join("logs"),
+        };
+        let (outcome, events) =
+            run_model_for_test(model_dir.to_str().expect("utf8 model path"), &paths)
+                .expect("run fake Python engine");
+
+        assert_eq!(
+            outcome,
+            RunTermination::Failed,
+            "generation one must exhaust restart"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    LifecycleEvent::Restarting {
+                        before_healthy: false,
+                        ..
+                    }
+                ))
+                .count(),
+            1,
+            "{events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, LifecycleEvent::ModelReady { .. }))
+                .count(),
+            2,
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                LifecycleEvent::EngineExited {
+                    before_healthy: false,
+                    ..
+                }
+            )),
+            "{events:?}"
+        );
+
+        let canonical_model = fs::canonicalize(&model_dir).expect("canonical model");
+        let args = fs::read_to_string(&args_path).expect("read launch arguments");
+        let generations = args
+            .split("generation=")
+            .filter(|block| !block.is_empty())
+            .map(|block| {
+                let mut lines = block.lines();
+                let generation = lines.next().expect("generation number").to_string();
+                let argv = lines
+                    .map(|line| {
+                        line.strip_prefix("arg=")
+                            .expect("only argv evidence follows generation")
+                            .to_string()
+                    })
+                    .collect::<Vec<_>>();
+                (generation, argv)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(generations.len(), 2, "{args}");
+        assert_eq!(generations[0].0, "1");
+        assert_eq!(generations[1].0, "2");
+        for (_, argv) in &generations {
+            assert_eq!(argv.len(), 6, "unexpected extra argv: {argv:?}");
+            assert_eq!(argv[0], "--model");
+            assert_eq!(argv[1], canonical_model.display().to_string());
+            assert_eq!(argv[2], "--host");
+            assert_eq!(argv[3], "127.0.0.1");
+            assert_eq!(argv[4], "--port");
+            assert!(argv[5].parse::<u16>().is_ok(), "invalid port: {argv:?}");
+        }
+        assert_eq!(generations[0].1, generations[1].1);
+        let requests = fs::read_to_string(&requests_path).expect("read readiness evidence");
+        assert!(
+            requests.contains("generation=1 health completion"),
+            "{requests}"
+        );
+        assert!(
+            requests.contains("generation=2 health completion"),
+            "{requests}"
+        );
+        assert_eq!(
+            supervisor::read_runtime_state(&paths.state_path).expect("read final state"),
+            RuntimeStateRead::Loaded(Vec::new())
+        );
+
+        for path in [&count_path, &args_path, &requests_path, &marker_path] {
+            let _ = fs::remove_file(path);
+        }
+        unsafe { std::env::set_var("LOXA_MLX_RESTART_DELAY_MS", "5000") };
+        let stop_paths = NodePaths {
+            models_dir: temp.path().join("models-stop"),
+            state_path: temp.path().join("managed-stop.json"),
+            logs_dir: temp.path().join("logs-stop"),
+        };
+        let stop_state = stop_paths.state_path.clone();
+        let stop_marker = marker_path.clone();
+        let stop_thread = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !stop_marker.is_file() {
+                assert!(std::time::Instant::now() < deadline, "stop marker timeout");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            supervisor::request_managed_stop(&stop_state, "all").expect("request external stop")
+        });
+        let stop_started = std::time::Instant::now();
+        let (stop_outcome_kind, _) =
+            run_model_for_test(model_dir.to_str().expect("utf8 model path"), &stop_paths)
+                .expect("stop stalled Python readiness");
+        let stop_outcome = stop_thread.join().expect("join external stop request");
+        assert_eq!(stop_outcome_kind, RunTermination::RequestedStop);
+        assert!(
+            matches!(
+                stop_outcome,
+                supervisor::StopRequestOutcome::Completed { .. }
+            ),
+            "{stop_outcome:?}"
+        );
+        assert!(
+            stop_started.elapsed() < Duration::from_secs(2),
+            "external stop was blocked for {:?}",
+            stop_started.elapsed()
+        );
+        assert_eq!(
+            fs::read_to_string(&count_path)
+                .expect("stop generation count")
+                .trim(),
+            "1"
+        );
+        assert_eq!(
+            supervisor::read_runtime_state(&stop_paths.state_path).expect("read stopped state"),
+            RuntimeStateRead::Loaded(Vec::new())
+        );
+
+        for path in [&count_path, &args_path, &requests_path, &marker_path] {
+            let _ = fs::remove_file(path);
+        }
+        let interrupt_paths = NodePaths {
+            models_dir: temp.path().join("models-interrupt"),
+            state_path: temp.path().join("managed-interrupt.json"),
+            logs_dir: temp.path().join("logs-interrupt"),
+        };
+        let interrupt_marker = marker_path.clone();
+        let interrupt_thread = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !interrupt_marker.is_file() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "interrupt marker timeout"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            set_ctrl_c_received();
+        });
+        let interrupt_started = std::time::Instant::now();
+        let (interrupt_outcome, _) = run_model_for_test(
+            model_dir.to_str().expect("utf8 model path"),
+            &interrupt_paths,
+        )
+        .expect("interrupt stalled Python readiness");
+        interrupt_thread.join().expect("join interrupt request");
+        clear_ctrl_c_received();
+        assert_eq!(interrupt_outcome, RunTermination::Interrupted);
+        assert!(
+            interrupt_started.elapsed() < Duration::from_secs(2),
+            "interrupt was blocked for {:?}",
+            interrupt_started.elapsed()
+        );
+        assert_eq!(
+            fs::read_to_string(&count_path)
+                .expect("interrupt generation count")
+                .trim(),
+            "1"
+        );
+        assert_eq!(
+            supervisor::read_runtime_state(&interrupt_paths.state_path)
+                .expect("read interrupted state"),
+            RuntimeStateRead::Loaded(Vec::new())
+        );
+    }
+
+    #[test]
+    fn post_spawn_running_state_read_error_invokes_unified_teardown_once() {
+        let temp = TempDir::new("loxa-post-spawn-running-state-read");
+        let state_path = temp.path().join("managed.json");
+        let server = ManagedServer {
+            id: "gemma-3-4b-it-q4".to_string(),
+            pid: 777,
+            port: 8081,
+            model_path: temp.path().join("model.gguf"),
+            started_at_unix_s: 789,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: Some(111),
+        };
+        let run = persist_run_for_server(&state_path, &server);
+        fs::write(&state_path, b"{corrupt").expect("corrupt running state");
+        let signal = FakeInterruptSource::new(vec![false]);
+        let mut child = FakeStartupChild::with_wait_results(vec![Some(0)]);
+        let mut events = RecordingLifecycleSink::default();
+
+        let outcome = supervise_running_server(
+            RunSession {
+                id: &server.id,
+                state_identity: &run.identity(),
+                log_path: run.log_path.as_path(),
+                state_path: &state_path,
+            },
+            &mut child,
+            &signal,
+            None,
+            "llama-server",
+            &mut events,
+        )
+        .expect("running recovery outcome");
+
+        assert_eq!(outcome, RunOutcome::RecoveryRequired);
+        assert_eq!(
+            child
+                .events
+                .borrow()
+                .iter()
+                .filter(|event| **event == "terminate")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn post_spawn_running_try_wait_error_invokes_unified_teardown_once() {
+        let temp = TempDir::new("loxa-post-spawn-running-try-wait");
+        let state_path = temp.path().join("managed.json");
+        let server = ManagedServer {
+            id: "gemma-3-4b-it-q4".to_string(),
+            pid: 777,
+            port: 8081,
+            model_path: temp.path().join("model.gguf"),
+            started_at_unix_s: 789,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: Some(111),
+        };
+        let run = persist_run_for_server(&state_path, &server);
+        let signal = FakeInterruptSource::new(vec![false]);
+        let mut child = FakeStartupChild::with_wait_error_then(vec![Some(0)]);
+        let mut events = RecordingLifecycleSink::default();
+
+        let outcome = supervise_running_server(
+            RunSession {
+                id: &server.id,
+                state_identity: &run.identity(),
+                log_path: run.log_path.as_path(),
+                state_path: &state_path,
+            },
+            &mut child,
+            &signal,
+            None,
+            "llama-server",
+            &mut events,
+        )
+        .expect("running recovery outcome");
+
+        assert_eq!(outcome, RunOutcome::RecoveryRequired);
+        assert_eq!(
+            child
+                .events
+                .borrow()
+                .iter()
+                .filter(|event| **event == "terminate")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn startup_interrupt_after_state_write_cleans_up_and_returns_130() {
+        let temp = TempDir::new("loxa-run-interrupt");
+        let state_path = temp.path().join("managed.json");
+        let server = ManagedServer {
+            id: "gemma-3-4b-it-q4".to_string(),
+            pid: 777,
+            port: 8081,
+            model_path: temp.path().join("model.gguf"),
+            started_at_unix_s: 789,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: Some(1),
+        };
+        let run = persist_run_for_server(&state_path, &server);
+        let signal = FakeInterruptSource::new(vec![false, true]);
+        let mut child = FakeStartupChild::with_wait_results(vec![Some(0)]);
+
+        let outcome = wait_for_startup(
+            &mut child,
+            &run.identity(),
+            &state_path,
+            &signal,
+            |_, _, _| Ok(StartupPoll::Pending),
+            owner_teardown_child,
+        )
+        .expect("startup wait outcome");
+
+        assert_eq!(outcome, StartupWaitOutcome::Interrupted);
+        assert!(child.events.borrow().contains(&"terminate"));
+        assert!(child.events.borrow().contains(&"join_log_drains"));
+        assert_eq!(
+            supervisor::read_runtime_state(&state_path).expect("runtime state after interrupt"),
+            RuntimeStateRead::Loaded(Vec::new())
+        );
+    }
+
+    #[test]
+    fn startup_polling_external_stop_confirmed_and_unconfirmed_results_are_gated() {
+        for confirmation in [
+            supervisor::TeardownConfirmation::Confirmed,
+            supervisor::TeardownConfirmation::Unconfirmed,
+        ] {
+            let temp = TempDir::new("loxa-startup-stop-poll");
+            let state_path = temp.path().join("managed.json");
+            let server = ManagedServer {
+                id: "gemma-3-4b-it-q4".to_string(),
+                pid: 777,
+                port: 8081,
+                model_path: temp.path().join("model.gguf"),
+                started_at_unix_s: 789,
+                llama_server_version: "test".to_string(),
+                process_start_time_unix_s: Some(111),
+            };
+            let run = persist_run_for_server(&state_path, &server);
+            let signal = FakeInterruptSource::new(vec![false]);
+            let mut child = FakeStartupChild::with_wait_results(vec![Some(0)]);
+            let events = RefCell::new(Vec::new());
+            let identity = run.identity();
+
+            let outcome = wait_for_startup(
+                &mut child,
+                &identity,
+                &state_path,
+                &signal,
+                |_, _, _| {
+                    events.borrow_mut().push("startup_poll");
+                    request_stop_for_test(&state_path, &identity);
+                    Ok(StartupPoll::Pending)
+                },
+                |_, decision| {
+                    assert_eq!(decision, supervisor::OwnerTeardownDecision::RequestedStop);
+                    events.borrow_mut().push("requested_stop_teardown");
+                    confirmation
+                },
+            )
+            .expect("startup stop outcome");
+
+            let expected = if confirmation == supervisor::TeardownConfirmation::Confirmed {
+                StartupWaitOutcome::RequestedStop
+            } else {
+                StartupWaitOutcome::RecoveryRequired
+            };
+            assert_eq!(outcome, expected);
+            assert_eq!(
+                events.into_inner(),
+                vec!["startup_poll", "requested_stop_teardown"]
+            );
+            let RuntimeStateRead::Loaded(runs) =
+                supervisor::read_runtime_state(&state_path).expect("read startup state")
+            else {
+                panic!("expected loaded state");
+            };
+            assert_eq!(
+                runs.is_empty(),
+                confirmation == supervisor::TeardownConfirmation::Confirmed
+            );
+            if confirmation == supervisor::TeardownConfirmation::Unconfirmed {
+                assert!(runs[0].stop_requested);
+            }
+        }
+    }
+
+    #[test]
+    fn running_loop_external_stop_confirmed_and_unconfirmed_results_are_gated() {
+        for confirmation in [
+            supervisor::TeardownConfirmation::Confirmed,
+            supervisor::TeardownConfirmation::Unconfirmed,
+        ] {
+            let temp = TempDir::new("loxa-running-stop-poll");
+            let state_path = temp.path().join("managed.json");
+            let server = ManagedServer {
+                id: "gemma-3-4b-it-q4".to_string(),
+                pid: 777,
+                port: 8081,
+                model_path: temp.path().join("model.gguf"),
+                started_at_unix_s: 789,
+                llama_server_version: "test".to_string(),
+                process_start_time_unix_s: Some(111),
+            };
+            let run = persist_run_for_server(&state_path, &server);
+            let stopped = request_stop_for_test(&state_path, &run.identity());
+            let signal = FakeInterruptSource::new(vec![false]);
+            let mut child = FakeStartupChild::with_wait_results(vec![None]);
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let events = RefCell::new(Vec::new());
+
+            let outcome = supervise_running_server_with(
+                RunSession {
+                    id: &server.id,
+                    state_identity: &stopped.identity(),
+                    log_path: stopped.log_path.as_path(),
+                    state_path: &state_path,
+                },
+                &mut child,
+                &signal,
+                &mut stdout,
+                &mut stderr,
+                |_, decision| {
+                    assert_eq!(decision, supervisor::OwnerTeardownDecision::RequestedStop);
+                    events.borrow_mut().push("requested_stop_teardown");
+                    confirmation
+                },
+                |_| panic!("running loop must return before sleeping"),
+            )
+            .expect("running stop outcome");
+
+            let expected = if confirmation == supervisor::TeardownConfirmation::Confirmed {
+                RunOutcome::RequestedStop
+            } else {
+                RunOutcome::RecoveryRequired
+            };
+            assert_eq!(outcome, expected);
+            assert_eq!(events.into_inner(), vec!["requested_stop_teardown"]);
+            let RuntimeStateRead::Loaded(runs) =
+                supervisor::read_runtime_state(&state_path).expect("read running state")
+            else {
+                panic!("expected loaded state");
+            };
+            assert_eq!(
+                runs.is_empty(),
+                confirmation == supervisor::TeardownConfirmation::Confirmed
+            );
+            if confirmation == supervisor::TeardownConfirmation::Unconfirmed {
+                assert!(runs[0].stop_requested);
+            }
+        }
+    }
+
+    #[test]
+    fn running_reaped_exit_with_concurrent_stop_never_resignals_child() {
+        let temp = TempDir::new("loxa-running-reaped-stop");
+        let state_path = temp.path().join("managed.json");
+        let server = ManagedServer {
+            id: "gemma-3-4b-it-q4".to_string(),
+            pid: 777,
+            port: 8081,
+            model_path: temp.path().join("model.gguf"),
+            started_at_unix_s: 789,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: Some(111),
+        };
+        let run = persist_run_for_server(&state_path, &server);
+        fs::write(&run.log_path, b"reaped crash\n").expect("write crash log");
+        let signal = FakeInterruptSource::new(vec![false]);
+        let mut child = FakeStartupChild::with_wait_results(vec![Some(1)]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let identity = run.identity();
+
+        let outcome = supervise_running_server_with(
+            RunSession {
+                id: &server.id,
+                state_identity: &identity,
+                log_path: run.log_path.as_path(),
+                state_path: &state_path,
+            },
+            &mut child,
+            &signal,
+            &mut stdout,
+            &mut stderr,
+            |child, decision| {
+                assert_eq!(decision, supervisor::OwnerTeardownDecision::UnexpectedExit);
+                request_stop_for_test(&state_path, &identity);
+                owner_teardown_child(child, decision)
+            },
+            |_| panic!("reaped exit must return before sleeping"),
+        )
+        .expect("reaped stop outcome");
+
+        assert_eq!(outcome, RunOutcome::RequestedStop);
+        assert_eq!(
+            child.events.into_inner(),
+            vec!["try_wait", "join_log_drains"]
+        );
+        assert_eq!(
+            supervisor::read_runtime_state(&state_path).expect("read terminal state"),
+            RuntimeStateRead::Loaded(Vec::new())
+        );
+    }
+
+    #[test]
+    fn running_reaped_exit_with_concurrent_interrupt_never_resignals_child() {
+        let temp = TempDir::new("loxa-running-reaped-interrupt");
+        let state_path = temp.path().join("managed.json");
+        let server = ManagedServer {
+            id: "gemma-3-4b-it-q4".to_string(),
+            pid: 777,
+            port: 8081,
+            model_path: temp.path().join("model.gguf"),
+            started_at_unix_s: 789,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: Some(111),
+        };
+        let run = persist_run_for_server(&state_path, &server);
+        fs::write(&run.log_path, b"reaped crash\n").expect("write crash log");
+        let signal = FakeInterruptSource::new(vec![false, true]);
+        let mut child = FakeStartupChild::with_wait_results(vec![Some(1)]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let outcome = supervise_running_server_with(
+            RunSession {
+                id: &server.id,
+                state_identity: &run.identity(),
+                log_path: run.log_path.as_path(),
+                state_path: &state_path,
+            },
+            &mut child,
+            &signal,
+            &mut stdout,
+            &mut stderr,
+            owner_teardown_child,
+            |_| panic!("reaped exit must return before sleeping"),
+        )
+        .expect("reaped interrupt outcome");
+
+        assert_eq!(outcome, RunOutcome::Interrupted);
+        assert_eq!(
+            child.events.into_inner(),
+            vec!["try_wait", "join_log_drains"]
+        );
+        assert_eq!(
+            supervisor::read_runtime_state(&state_path).expect("read terminal state"),
+            RuntimeStateRead::Loaded(Vec::new())
+        );
+    }
+
+    #[test]
+    fn running_restart_announcement_broken_pipe_retains_handoff_and_stop_wins() {
+        let temp = TempDir::new("loxa-running-restart-broken-pipe");
+        let state_path = temp.path().join("managed.json");
+        let server = ManagedServer {
+            id: "gemma-3-4b-it-q4".to_string(),
+            pid: 777,
+            port: 8081,
+            model_path: temp.path().join("model.gguf"),
+            started_at_unix_s: 789,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: Some(111),
+        };
+        let run = persist_run_for_server(&state_path, &server);
+        fs::write(&run.log_path, b"reaped crash\n").expect("write crash log");
+        let generation_one_identity = supervisor::ManagedRunIdentity {
+            run_id: run.run_id.clone(),
+            generation: 1,
+            child_pid: None,
+            child_process_start_time_unix_s: None,
+        };
+        let signal = FakeInterruptSource::new(vec![false, false]);
+        let mut child = FakeStartupChild::with_wait_results(vec![Some(1)]);
+        let mut stdout = BrokenPipeWriter::new(|| {
+            request_stop_for_test(&state_path, &generation_one_identity);
+        });
+        let mut stderr = Vec::new();
+
+        let outcome = supervise_running_server_with(
+            RunSession {
+                id: &server.id,
+                state_identity: &run.identity(),
+                log_path: run.log_path.as_path(),
+                state_path: &state_path,
+            },
+            &mut child,
+            &signal,
+            &mut stdout,
+            &mut stderr,
+            owner_teardown_child,
+            |_| panic!("reaped exit must return before sleeping"),
+        )
+        .expect("restart announcement BrokenPipe must not drop the owned handoff");
+        let RunOutcome::Restart { run: replacement } = outcome else {
+            panic!("expected owned replacement handoff, got {outcome:?}");
+        };
+        let exit =
+            finish_childless_owner_error(&state_path, &replacement, SupervisorError::NoFreePort)
+                .expect("committed stop must win after the non-fatal announcement");
+
+        assert_eq!(exit, ExitCode::SUCCESS);
+        assert_eq!(stdout.write_attempts, 1);
+        assert_eq!(
+            supervisor::read_runtime_state(&state_path).expect("read terminal state"),
+            RuntimeStateRead::Loaded(Vec::new())
+        );
+    }
+
+    #[test]
+    fn startup_finalization_error_after_teardown_does_not_retry_cleanup() {
+        let temp = TempDir::new("loxa-startup-finalization-error");
+        let state_path = temp.path().join("managed.json");
+        let server = ManagedServer {
+            id: "gemma-3-4b-it-q4".to_string(),
+            pid: 777,
+            port: 8081,
+            model_path: temp.path().join("model.gguf"),
+            started_at_unix_s: 789,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: Some(111),
+        };
+        let run = persist_run_for_server(&state_path, &server);
+        let stopped = request_stop_for_test(&state_path, &run.identity());
+        let signal = FakeInterruptSource::new(vec![false]);
+        let mut child = FakeStartupChild::with_wait_results(vec![Some(0)]);
+        let finalizations = Cell::new(0_u8);
+
+        let error = wait_for_startup_with_finalizer(
+            &mut child,
+            &stopped.identity(),
+            &state_path,
+            &signal,
+            |_, _, _| panic!("durable stop must win before startup polling"),
+            owner_teardown_child,
+            |_, _, _, confirmation| {
+                assert_eq!(confirmation, supervisor::TeardownConfirmation::Confirmed);
+                finalizations.set(finalizations.get() + 1);
+                Err(SupervisorError::Io(io::Error::other(
+                    "injected exact-finalization failure",
+                )))
+            },
+        )
+        .expect_err("finalization failure");
+
+        assert!(matches!(error, StartupWaitFailure::AfterTeardown(_)));
+        assert_eq!(finalizations.get(), 1);
+        assert_eq!(
+            child.events.into_inner(),
+            vec!["terminate", "try_wait", "join_log_drains"]
+        );
+        let RuntimeStateRead::Loaded(runs) =
+            supervisor::read_runtime_state(&state_path).expect("read preserved stopped state")
+        else {
+            panic!("expected loaded state");
+        };
+        assert_eq!(runs, vec![stopped]);
+    }
+
+    fn assert_startup_reaped_diagnostic_failure_never_resignals(drain_fails: bool) {
+        let temp = TempDir::new("loxa-startup-reaped-diagnostics");
+        let state_path = temp.path().join("managed.json");
+        let server = ManagedServer {
+            id: "gemma-3-4b-it-q4".to_string(),
+            pid: 777,
+            port: 65_535,
+            model_path: temp.path().join("model.gguf"),
+            started_at_unix_s: 789,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: Some(111),
+        };
+        let run = persist_run_for_server(&state_path, &server);
+        if drain_fails {
+            fs::write(
+                &run.log_path,
+                b"diagnostics exist but drain joining failed\n",
+            )
+            .expect("write crash log for drain failure");
+        }
+        let signal = FakeInterruptSource::new(vec![false]);
+        let mut child =
+            FakeStartupChild::with_wait_results_and_drain_error(vec![Some(1)], drain_fails);
+
+        let failure = wait_for_startup(
+            &mut child,
+            &run.identity(),
+            &state_path,
+            &signal,
+            |child, _, _| match supervisor::wait_for_generation_ready_or_exit(
+                child,
+                server.port,
+                &run.generation_alias,
+                Duration::ZERO,
+                Duration::ZERO,
+            ) {
+                Ok(()) => Ok(StartupPoll::Ready),
+                Err(SupervisorError::HealthTimeout) => Ok(StartupPoll::Pending),
+                Err(error) => Err(error),
+            },
+            owner_teardown_child,
+        )
+        .expect_err("reaped child diagnostic failure");
+
+        let observed_exit = match failure {
+            StartupWaitFailure::AfterChildReaped {
+                log_tail,
+                diagnostics_error,
+            } => Some(
+                supervisor::decide_observed_child_exit(
+                    diagnostics_error
+                        .map(|error| format!("crash diagnostics unavailable: {error}"))
+                        .unwrap_or(log_tail),
+                    &state_path,
+                    &run.identity(),
+                    &signal,
+                    |decision| owner_teardown_child(&mut child, decision),
+                )
+                .expect("transition already-reaped startup child"),
+            ),
+            StartupWaitFailure::BeforeTeardown(_) => {
+                let _ = supervisor::cleanup_after_ctrl_c(
+                    &mut child,
+                    &state_path,
+                    &run.identity(),
+                    supervisor::CTRL_C_GRACE_PERIOD,
+                );
+                let _ = child.join_log_drains();
+                None
+            }
+            StartupWaitFailure::AfterTeardown(_) => None,
+        };
+
+        let events = child.events.into_inner();
+        assert_eq!(
+            events.iter().filter(|event| **event == "terminate").count(),
+            0,
+            "an already-reaped PID must never be terminated again: {events:?}"
+        );
+        assert_eq!(
+            events.iter().filter(|event| **event == "kill").count(),
+            0,
+            "an already-reaped PID must never be killed again: {events:?}"
+        );
+        if drain_fails {
+            assert_eq!(observed_exit, Some(ObservedChildExit::RecoveryRequired));
+            assert!(matches!(
+                supervisor::read_runtime_state(&state_path).expect("read preserved state"),
+                RuntimeStateRead::Loaded(runs) if runs.len() == 1
+            ));
+        } else {
+            assert!(matches!(
+                observed_exit,
+                Some(ObservedChildExit::Restart { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn startup_reaped_drain_failure_never_resignals_child() {
+        assert_startup_reaped_diagnostic_failure_never_resignals(true);
+    }
+
+    #[test]
+    fn startup_reaped_log_tail_failure_never_resignals_child() {
+        assert_startup_reaped_diagnostic_failure_never_resignals(false);
+    }
+
+    #[test]
+    fn startup_restart_announcement_broken_pipe_retains_handoff_and_cas_conflict_wins() {
+        let temp = TempDir::new("loxa-startup-restart-broken-pipe");
+        let state_path = temp.path().join("managed.json");
+        let server = ManagedServer {
+            id: "gemma-3-4b-it-q4".to_string(),
+            pid: 777,
+            port: 8081,
+            model_path: temp.path().join("model.gguf"),
+            started_at_unix_s: 789,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: Some(111),
+        };
+        let run = persist_run_for_server(&state_path, &server);
+        let signal = FakeInterruptSource::new(vec![false]);
+        let observed = supervisor::decide_observed_child_exit(
+            "startup crash".to_string(),
+            &state_path,
+            &run.identity(),
+            &signal,
+            |decision| {
+                assert_eq!(decision, supervisor::OwnerTeardownDecision::UnexpectedExit);
+                supervisor::TeardownConfirmation::Confirmed
+            },
+        )
+        .expect("publish owned generation one");
+        let ObservedChildExit::Restart { run: replacement } = observed else {
+            panic!("expected replacement handoff, got {observed:?}");
+        };
+        let replacement_identity = replacement.identity();
+        let newer_run = starting_run_for_test(&state_path, "newer-run");
+        let newer_for_write = newer_run.clone();
+        let mut stdout = BrokenPipeWriter::new(|| {
+            assert!(
+                supervisor::finish_runtime_state_run(&state_path, &replacement_identity)
+                    .expect("exact-finish generation one during failed announcement")
+            );
+            supervisor::create_starting_run(&state_path, newer_for_write)
+                .expect("publish newer state during failed announcement");
+        });
+
+        let replacement = retain_restart_after_best_effort_announcement(
+            &mut stdout,
+            "llama-server exited before becoming healthy; restarting once...",
+            replacement,
+        );
+        let error =
+            finish_childless_owner_error(&state_path, &replacement, SupervisorError::NoFreePort)
+                .expect_err("newer exact state must beat the stale generation-one handoff");
+
+        assert!(matches!(error, SupervisorError::RunStateConflict(_)));
+        assert_eq!(stdout.write_attempts, 1);
+        assert_eq!(
+            supervisor::read_runtime_state(&state_path).expect("read newer state"),
+            RuntimeStateRead::Loaded(vec![newer_run])
+        );
+    }
+
+    #[test]
+    fn truthful_owner_terminal_exit_codes_never_map_unconfirmed_cleanup_to_130() {
+        assert_eq!(
+            owner_terminal_exit_code(supervisor::OwnerTerminalOutcome::RequestedStop),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            owner_terminal_exit_code(supervisor::OwnerTerminalOutcome::Interrupted),
+            ExitCode::from(130)
+        );
+        assert_eq!(
+            owner_terminal_exit_code(supervisor::OwnerTerminalOutcome::RecoveryRequired),
+            ExitCode::from(1)
+        );
+    }
+
+    #[test]
+    fn attachment_requested_stop_outcome_maps_to_exit_0() {
+        let mut stderr = Vec::new();
+
+        let boundary = resolve_managed_attachment(
+            supervisor::PersistManagedServerOutcome::RequestedStop,
+            &mut stderr,
+            "run-1",
+        )
+        .expect("map requested-stop attachment outcome");
+
+        assert!(matches!(
+            boundary,
+            ManagedAttachmentBoundary::Terminal(exit) if exit == ExitCode::SUCCESS
+        ));
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn unconfirmed_requested_stop_exits_1_and_preserves_state() {
+        let temp = TempDir::new("loxa-unconfirmed-requested-stop-exit");
+        let state_path = temp.path().join("managed.json");
+        let server = ManagedServer {
+            id: "gemma-3-4b-it-q4".to_string(),
+            pid: 777,
+            port: 8081,
+            model_path: temp.path().join("model.gguf"),
+            started_at_unix_s: 789,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: Some(111),
+        };
+        let run = persist_run_for_server(&state_path, &server);
+        let stopped = request_stop_for_test(&state_path, &run.identity());
+        let teardown_calls = Cell::new(0_u8);
+
+        let outcome = supervisor::finish_owner_teardown_with(
+            &state_path,
+            &stopped.identity(),
+            supervisor::OwnerTeardownDecision::RequestedStop,
+            |_| {
+                teardown_calls.set(teardown_calls.get() + 1);
+                supervisor::TeardownConfirmation::Unconfirmed
+            },
+        )
+        .expect("unconfirmed stop outcome");
+
+        assert_eq!(outcome, supervisor::OwnerTerminalOutcome::RecoveryRequired);
+        assert_eq!(owner_terminal_exit_code(outcome), ExitCode::from(1));
+        assert_eq!(teardown_calls.get(), 1);
+        assert_eq!(
+            supervisor::read_runtime_state(&state_path).expect("read preserved stopped state"),
+            RuntimeStateRead::Loaded(vec![stopped])
+        );
+    }
+
+    #[test]
+    fn unconfirmed_generation_zero_unexpected_exit_exits_1_without_restart_and_preserves_exact_state()
+     {
+        let temp = TempDir::new("loxa-unconfirmed-generation-zero-exit");
+        let state_path = temp.path().join("managed.json");
+        let server = ManagedServer {
+            id: "gemma-3-4b-it-q4".to_string(),
+            pid: 777,
+            port: 8081,
+            model_path: temp.path().join("model.gguf"),
+            started_at_unix_s: 789,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: Some(111),
+        };
+        let run = persist_run_for_server(&state_path, &server);
+        let signal = FakeInterruptSource::new(vec![false]);
+        let teardown_calls = Cell::new(0_u8);
+
+        let outcome = supervisor::decide_observed_child_exit(
+            "first crash".to_string(),
+            &state_path,
+            &run.identity(),
+            &signal,
+            |_| {
+                teardown_calls.set(teardown_calls.get() + 1);
+                supervisor::TeardownConfirmation::Unconfirmed
+            },
+        )
+        .expect("unconfirmed generation-zero outcome");
+
+        assert_eq!(outcome, ObservedChildExit::RecoveryRequired);
+        assert_eq!(
+            observed_terminal_exit_code(&outcome),
+            Some(ExitCode::from(1))
+        );
+        assert_eq!(teardown_calls.get(), 1);
+        assert_eq!(
+            supervisor::read_runtime_state(&state_path).expect("read preserved generation zero"),
+            RuntimeStateRead::Loaded(vec![run])
+        );
+    }
+
+    #[test]
+    fn confirmed_second_crash_removes_exact_state_then_exits_1() {
+        let temp = TempDir::new("loxa-confirmed-second-crash-exit");
+        let state_path = temp.path().join("managed.json");
+        let server = ManagedServer {
+            id: "gemma-3-4b-it-q4".to_string(),
+            pid: 778,
+            port: 8081,
+            model_path: temp.path().join("model.gguf"),
+            started_at_unix_s: 789,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: Some(222),
+        };
+        let mut run = persist_run_for_server(&state_path, &server);
+        let old_identity = run.identity();
+        run.generation = 1;
+        run.generation_alias = "loxa-test-run-778-g1".to_string();
+        assert!(
+            supervisor::update_runtime_state_run(&state_path, &old_identity, run.clone(),)
+                .expect("publish generation one")
+        );
+        let signal = FakeInterruptSource::new(vec![false]);
+
+        let outcome = supervisor::decide_observed_child_exit(
+            "second crash".to_string(),
+            &state_path,
+            &run.identity(),
+            &signal,
+            |_| supervisor::TeardownConfirmation::Confirmed,
+        )
+        .expect("confirmed second-crash outcome");
+
+        assert!(matches!(outcome, ObservedChildExit::Exhausted { .. }));
+        assert_eq!(
+            observed_terminal_exit_code(&outcome),
+            Some(ExitCode::from(1))
+        );
+        assert_eq!(
+            supervisor::read_runtime_state(&state_path).expect("read removed generation one"),
+            RuntimeStateRead::Loaded(Vec::new())
+        );
+    }
+
+    #[test]
+    fn post_spawn_startup_timeout_preserves_existing_output_after_unified_teardown() {
+        let log_path = PathBuf::from("/tmp/loxa-startup-timeout.log");
+        let mut stderr = Vec::new();
+
+        let exit = render_post_cleanup_startup_failure(
+            &mut stderr,
+            &log_path,
+            "llama-server",
+            SupervisorError::HealthTimeout,
+        )
+        .expect("render confirmed startup timeout");
+
+        assert_eq!(exit, ExitCode::from(1));
+        assert_eq!(
+            String::from_utf8(stderr).expect("utf8 timeout output"),
+            format!(
+                "llama-server did not become healthy within {} seconds\nlog file: {}\n",
+                supervisor::HEALTH_TIMEOUT.as_secs(),
+                log_path.display()
+            )
+        );
+    }
+
+    #[test]
+    fn recovery_required_exit_writes_guidance_and_status_1() {
+        let mut stderr = Vec::new();
+
+        let exit = recovery_required_exit(&mut stderr, "run-1").expect("recovery exit");
+
+        assert_eq!(exit, ExitCode::from(1));
+        let stderr = String::from_utf8(stderr).expect("utf8 guidance");
+        assert!(stderr.contains("recovery required"));
+        assert!(stderr.contains("run-1"));
+    }
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(prefix: &str) -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time after unix epoch")
+                .as_nanos();
+            let path =
+                std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()));
+            fs::create_dir_all(&path).expect("create temp dir");
+            Self { path }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    struct FakeInterruptSource {
+        states: Vec<bool>,
+        index: Cell<usize>,
+    }
+
+    impl FakeInterruptSource {
+        fn new(states: Vec<bool>) -> Self {
+            Self {
+                states,
+                index: Cell::new(0),
+            }
+        }
+    }
+
+    impl InterruptSource for FakeInterruptSource {
+        fn interrupted(&self) -> bool {
+            let index = self.index.get();
+            let value = self
+                .states
+                .get(index)
+                .copied()
+                .or_else(|| self.states.last().copied())
+                .unwrap_or(false);
+            if index + 1 < self.states.len() {
+                self.index.set(index + 1);
+            }
+            value
+        }
+    }
+
+    impl InterruptStatus for FakeInterruptSource {
+        fn interrupted(&self) -> bool {
+            InterruptSource::interrupted(self)
+        }
+    }
+
+    struct FakeStartupChild {
+        events: RefCell<Vec<&'static str>>,
+        wait_results: RefCell<Vec<Option<i32>>>,
+        drain_error: bool,
+        wait_error_once: Cell<bool>,
+        shared_exit: Option<Arc<TestAtomicBool>>,
+    }
+
+    impl FakeStartupChild {
+        fn with_wait_results(wait_results: Vec<Option<i32>>) -> Self {
+            Self::with_wait_results_and_drain_error(wait_results, false)
+        }
+
+        fn with_wait_results_and_drain_error(
+            wait_results: Vec<Option<i32>>,
+            drain_error: bool,
+        ) -> Self {
+            Self {
+                events: RefCell::new(Vec::new()),
+                wait_results: RefCell::new(wait_results),
+                drain_error,
+                wait_error_once: Cell::new(false),
+                shared_exit: None,
+            }
+        }
+
+        fn with_shared_exit(shared_exit: Arc<TestAtomicBool>) -> Self {
+            let mut child = Self::with_wait_results(vec![None]);
+            child.shared_exit = Some(shared_exit);
+            child
+        }
+
+        fn with_wait_error_then(wait_results: Vec<Option<i32>>) -> Self {
+            let child = Self::with_wait_results(wait_results);
+            child.wait_error_once.set(true);
+            child
+        }
+    }
+
+    impl ManagedChild for FakeStartupChild {
+        fn pid(&self) -> u32 {
+            777
+        }
+
+        fn terminate(&mut self) -> io::Result<()> {
+            self.events.borrow_mut().push("terminate");
+            Ok(())
+        }
+
+        fn kill(&mut self) -> io::Result<()> {
+            self.events.borrow_mut().push("kill");
+            Ok(())
+        }
+
+        fn try_wait(&mut self) -> io::Result<Option<i32>> {
+            self.events.borrow_mut().push("try_wait");
+            if self
+                .shared_exit
+                .as_ref()
+                .is_some_and(|exited| exited.load(TestOrdering::SeqCst))
+            {
+                return Ok(Some(0));
+            }
+            if self.wait_error_once.replace(false) {
+                return Err(io::Error::other("injected try_wait failure"));
+            }
+            let mut wait_results = self.wait_results.borrow_mut();
+            if wait_results.len() > 1 {
+                Ok(wait_results.remove(0))
+            } else {
+                Ok(wait_results.first().copied().unwrap_or(Some(0)))
+            }
+        }
+    }
+
+    impl LogDrainingChild for FakeStartupChild {
+        fn join_log_drains(&mut self) -> Result<(), SupervisorError> {
+            self.events.borrow_mut().push("join_log_drains");
+            if self.drain_error {
+                Err(SupervisorError::Io(io::Error::other(
+                    "injected log-drain join failure",
+                )))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    struct BrokenPipeWriter<F> {
+        on_write: Option<F>,
+        write_attempts: usize,
+    }
+
+    impl<F> BrokenPipeWriter<F> {
+        fn new(on_write: F) -> Self {
+            Self {
+                on_write: Some(on_write),
+                write_attempts: 0,
+            }
+        }
+    }
+
+    impl<F: FnOnce()> Write for BrokenPipeWriter<F> {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            self.write_attempts += 1;
+            if let Some(on_write) = self.on_write.take() {
+                on_write();
+            }
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "injected restart announcement failure",
+            ))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 }
