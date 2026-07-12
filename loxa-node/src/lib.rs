@@ -15,6 +15,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub mod actor;
 pub mod control_router;
 pub mod download_control;
+mod engine_session;
+
+use engine_session::EngineSession;
 
 #[derive(Clone, Debug)]
 pub struct NodePaths {
@@ -540,13 +543,15 @@ pub fn run_model(
                 return Ok(termination);
             }
         };
-        let state_identity = run.identity();
+        let mut session = EngineSession::new(child, run, server, backend.process_label());
+        let state_identity = session.identity();
 
-        if let Some(outcome) = observe_attached_stop(&mut child, &paths.state_path, &state_identity)
-            .map_err(supervisor_error_to_io)?
+        if let Some(outcome) =
+            observe_attached_stop(session.child_mut(), &paths.state_path, &state_identity)
+                .map_err(supervisor_error_to_io)?
         {
             if outcome == supervisor::OwnerTerminalOutcome::RecoveryRequired {
-                return emit_recovery_required(events, &run.run_id);
+                return emit_recovery_required(events, &session.run().run_id);
             }
             return Ok(owner_terminal_termination(outcome));
         }
@@ -555,7 +560,7 @@ pub fn run_model(
             ReadinessStrategy::LlamaModelAlias { .. } => Ok(None),
             ReadinessStrategy::ChatCompletionProbe { request_model } => {
                 supervisor::spawn_chat_completion_readiness_worker(
-                    server.port,
+                    session.server().port,
                     request_model.clone(),
                     supervisor::HEALTH_TIMEOUT,
                     supervisor::HEALTH_POLL_INTERVAL,
@@ -563,16 +568,17 @@ pub fn run_model(
                 .map(Some)
             }
         };
+        let engine_port = session.server().port;
         let startup = match readiness_worker {
             Ok(mut readiness_worker) => wait_for_startup_owned(
-                &mut child,
+                session.child_mut(),
                 &state_identity,
                 &paths.state_path,
                 &signal_guard,
                 readiness_worker.as_mut(),
                 |child, timeout, interval| match supervisor::wait_for_engine_ready_or_exit(
                     child,
-                    server.port,
+                    engine_port,
                     &spec.readiness,
                     timeout,
                     interval,
@@ -582,39 +588,46 @@ pub fn run_model(
                     Err(error) => Err(error),
                 },
             ),
-            Err(error) => {
-                finish_owned_startup_failure(&mut child, &paths.state_path, &state_identity, error)
-            }
+            Err(error) => finish_owned_startup_failure(
+                session.child_mut(),
+                &paths.state_path,
+                &state_identity,
+                error,
+            ),
         };
         match startup {
             Ok(StartupWaitOutcome::Ready) => {
+                let ready_server = session.server().clone();
                 match emit_run_ready_owned(
                     events,
-                    &server,
-                    &mut child,
+                    &ready_server,
+                    session.child_mut(),
                     &paths.state_path,
                     &state_identity,
                 )? {
                     ReadyOutputOutcome::Ready => {}
                     ReadyOutputOutcome::RequestedStop => return Ok(RunTermination::RequestedStop),
                     ReadyOutputOutcome::RecoveryRequired => {
-                        return emit_recovery_required(events, &run.run_id);
+                        return emit_recovery_required(events, &session.run().run_id);
                     }
                 }
                 if let Some(gateway) = gateway {
                     gateway.publish(gateway_target(&backend, &spec));
                 }
+                let session_model_id = session.server().id.clone();
+                let session_log_path = session.run().log_path.clone();
+                let session_process_label = session.process_label().to_owned();
                 match supervise_running_server(
                     RunSession {
-                        id: &backend.model_id,
+                        id: &session_model_id,
                         state_identity: &state_identity,
-                        log_path: &log_path,
+                        log_path: &session_log_path,
                         state_path: &paths.state_path,
                     },
-                    &mut child,
+                    session.child_mut(),
                     &signal_guard,
                     gateway,
-                    backend.process_label(),
+                    &session_process_label,
                     events,
                 )? {
                     RunOutcome::RequestedStop => {
@@ -646,23 +659,24 @@ pub fn run_model(
                         if let Some(gateway) = gateway {
                             gateway.withdraw();
                         }
-                        return emit_recovery_required(events, &run.run_id);
+                        return emit_recovery_required(events, &session.run().run_id);
                     }
                 }
             }
             Ok(StartupWaitOutcome::RequestedStop) => return Ok(RunTermination::RequestedStop),
             Ok(StartupWaitOutcome::Interrupted) => return Ok(RunTermination::Interrupted),
             Ok(StartupWaitOutcome::RecoveryRequired) => {
-                return emit_recovery_required(events, &run.run_id);
+                return emit_recovery_required(events, &session.run().run_id);
             }
             Err(StartupWaitFailure::AfterChildReaped {
                 log_tail,
                 diagnostics_error,
             }) => {
                 let _ = (log_tail, diagnostics_error);
+                let session_log_path = session.run().log_path.clone();
                 match supervisor::handle_observed_child_exit(
-                    &mut child,
-                    &log_path,
+                    session.child_mut(),
+                    &session_log_path,
                     &paths.state_path,
                     &state_identity,
                     &signal_guard,
@@ -689,7 +703,7 @@ pub fn run_model(
                         return Ok(RunTermination::Failed);
                     }
                     ObservedChildExit::RecoveryRequired => {
-                        return emit_recovery_required(events, &run.run_id);
+                        return emit_recovery_required(events, &session.run().run_id);
                     }
                 }
             }
@@ -698,7 +712,7 @@ pub fn run_model(
             }
             Err(StartupWaitFailure::BeforeTeardown(error)) => {
                 let cleanup = supervisor::cleanup_post_spawn_failure(
-                    &mut child,
+                    session.child_mut(),
                     &paths.state_path,
                     &state_identity,
                 )
@@ -707,7 +721,7 @@ pub fn run_model(
                     return Ok(RunTermination::RequestedStop);
                 }
                 if cleanup == supervisor::PostSpawnCleanupOutcome::RecoveryRequired {
-                    return emit_recovery_required(events, &run.run_id);
+                    return emit_recovery_required(events, &session.run().run_id);
                 }
                 return finish_startup_failure(events, &log_path, backend.process_label(), error);
             }
