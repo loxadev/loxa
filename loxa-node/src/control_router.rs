@@ -148,7 +148,7 @@ fn map_download_error(error: DownloadControlError, origin: Option<&str>) -> Resp
         DownloadControlError::Conflict => control_error(
             StatusCode::CONFLICT,
             "operation_conflict",
-            "a download for this model is already active",
+            "a conflicting model operation is already active",
             origin,
         ),
         DownloadControlError::Missing => control_error(
@@ -512,13 +512,16 @@ async fn node_snapshot(State(state): State<ControlState>, headers: HeaderMap) ->
         return cors(status.into_response(), origin.as_deref());
     }
     let lifecycle = state.downloads.lifecycle_snapshot();
+    let status = lifecycle_status(lifecycle.as_ref());
     cors(
         Json(NodeSnapshot {
-            status: node_status(&state),
+            status,
             active_model_id: lifecycle
                 .as_ref()
                 .and_then(|snapshot| snapshot.active_model_id.clone()),
-            operation_id: state.downloads.active_lifecycle_operation_id(),
+            operation_id: lifecycle
+                .as_ref()
+                .and_then(|snapshot| snapshot.operation_id.clone()),
             error: lifecycle.and_then(|snapshot| snapshot.error),
         })
         .into_response(),
@@ -527,12 +530,13 @@ async fn node_snapshot(State(state): State<ControlState>, headers: HeaderMap) ->
 }
 
 fn node_status(state: &ControlState) -> NodeStatus {
+    let lifecycle = state.downloads.lifecycle_snapshot();
+    lifecycle_status(lifecycle.as_ref())
+}
+
+fn lifecycle_status(snapshot: Option<&crate::model_lifecycle::LifecycleSnapshot>) -> NodeStatus {
     use crate::model_lifecycle::NodeLifecycleStatus;
-    match state
-        .downloads
-        .lifecycle_snapshot()
-        .map(|snapshot| snapshot.status)
-    {
+    match snapshot.map(|snapshot| &snapshot.status) {
         None | Some(NodeLifecycleStatus::Unloaded) => NodeStatus::Unloaded,
         Some(NodeLifecycleStatus::Loading) => NodeStatus::Loading,
         Some(NodeLifecycleStatus::Ready) => NodeStatus::Ready,

@@ -287,7 +287,7 @@ impl DownloadControl {
             .operations
             .lock()
             .expect("operation store poisoned")
-            .enqueue_unique(kind, model_id.map(str::to_owned), now_ms())
+            .enqueue_unique_lifecycle(kind, model_id.map(str::to_owned), now_ms())
             .map_err(map_operation_error)?;
         match self.actor.submit(id.clone(), mutation) {
             Ok(()) => Ok(id),
@@ -319,21 +319,8 @@ impl DownloadControl {
     }
 
     pub fn active_lifecycle_operation_id(&self) -> Option<String> {
-        self.operations
-            .lock()
-            .expect("operation store poisoned")
-            .snapshot_since(0)
-            .operations
-            .into_iter()
-            .rev()
-            .find(|operation| {
-                matches!(operation.kind, OperationKind::Load | OperationKind::Unload)
-                    && matches!(
-                        operation.status,
-                        OperationStatus::Queued | OperationStatus::Running
-                    )
-            })
-            .map(|operation| operation.id)
+        self.lifecycle_snapshot()
+            .and_then(|snapshot| snapshot.operation_id)
     }
 
     pub fn operation(&self, id: &str) -> Option<OperationView> {
@@ -439,9 +426,11 @@ struct DownloadExecutor {
 trait LifecycleMutationExecutor: Send {
     fn execute(
         &mut self,
+        operation_id: &str,
         mutation: &Mutation,
         cancellation: &MutationCancellation,
     ) -> Result<(), LifecycleError>;
+    fn complete_operation(&mut self);
     fn shutdown(&mut self) -> Result<(), LifecycleError>;
 }
 
@@ -460,6 +449,7 @@ where
 {
     fn execute(
         &mut self,
+        operation_id: &str,
         mutation: &Mutation,
         cancellation: &MutationCancellation,
     ) -> Result<(), LifecycleError> {
@@ -470,9 +460,10 @@ where
                 Mutation::Unload => crate::model_lifecycle::NodeLifecycleStatus::Unloading,
                 Mutation::Download { .. } => snapshot.status.clone(),
             };
+            snapshot.operation_id = Some(operation_id.to_owned());
             snapshot.error = None;
         }
-        let result = match mutation {
+        match mutation {
             Mutation::Load { model_id } => {
                 let entry = loxa_core::model_inventory::verified_recipe_inventory_with_cache(
                     REGISTRY,
@@ -488,15 +479,18 @@ where
             }
             Mutation::Unload => self.lifecycle.unload(cancellation),
             Mutation::Download { .. } => Ok(()),
-        };
-        *self.snapshot.lock().expect("lifecycle snapshot poisoned") = self.lifecycle.snapshot();
-        result
+        }
     }
 
     fn shutdown(&mut self) -> Result<(), LifecycleError> {
         let result = self.lifecycle.shutdown();
         *self.snapshot.lock().expect("lifecycle snapshot poisoned") = self.lifecycle.snapshot();
         result
+    }
+
+    fn complete_operation(&mut self) {
+        *self.snapshot.lock().expect("lifecycle snapshot poisoned") = self.lifecycle.snapshot();
+        self.lifecycle.complete_operation();
     }
 }
 
@@ -642,7 +636,7 @@ impl MutationExecutor for DownloadExecutor {
                 .lifecycle
                 .as_mut()
                 .ok_or_else(|| LifecycleError::StartFailed("model lifecycle unavailable".into()))
-                .and_then(|lifecycle| lifecycle.execute(mutation, cancellation));
+                .and_then(|lifecycle| lifecycle.execute(id, mutation, cancellation));
             let mut operations = self.operations.lock().expect("operation store poisoned");
             match result {
                 Ok(()) => {
@@ -654,6 +648,12 @@ impl MutationExecutor for DownloadExecutor {
                 Err(error) => {
                     let _ = operations.fail(id, public_lifecycle_error(&error), now_ms());
                 }
+            }
+            if let Some(lifecycle) = self.lifecycle.as_mut() {
+                // Cancellation takes this same store lock before reading the boundary,
+                // so a destructive operation cannot be cancelled between publication
+                // and its authoritative terminal transition.
+                lifecycle.complete_operation();
             }
             return;
         }
@@ -1448,6 +1448,116 @@ mod tests {
             .any(|event| event.operation.id == id
                 && event.operation.status == OperationStatus::Succeeded));
         worker.stop_and_join().unwrap();
+    }
+
+    #[test]
+    fn lifecycle_admission_keeps_one_exact_active_operation() {
+        let lifecycle = ModelLifecycle::new(
+            crate::model_lifecycle::StableNodeOwner {
+                run_id: "owner".into(),
+                pid: 1,
+                process_start_time_unix_s: 2,
+                gateway_port: 8080,
+            },
+            NoopLifecycleDriver,
+            NoopGateway,
+        );
+        let (control, worker) =
+            DownloadControl::spawn_with_lifecycle(std::env::temp_dir(), lifecycle);
+        let first = control
+            .operations
+            .lock()
+            .unwrap()
+            .enqueue_unique_lifecycle(OperationKind::Load, Some("first".into()), now_ms())
+            .unwrap();
+
+        assert_eq!(control.start_unload(), Err(DownloadControlError::Conflict));
+        assert_eq!(control.active_lifecycle_operation_id(), None);
+        assert_eq!(
+            control.operation(&first).unwrap().status,
+            OperationStatus::Queued
+        );
+        assert_eq!(
+            control
+                .snapshot_since(0)
+                .operations
+                .iter()
+                .filter(|operation| matches!(
+                    operation.kind,
+                    OperationKind::Load | OperationKind::Unload
+                ))
+                .count(),
+            1
+        );
+        worker.stop_and_join().unwrap();
+    }
+
+    #[test]
+    fn destructive_completion_stays_uncancellable_until_operation_is_terminal() {
+        let mut lifecycle = ModelLifecycle::new(
+            crate::model_lifecycle::StableNodeOwner {
+                run_id: "owner".into(),
+                pid: 1,
+                process_start_time_unix_s: 2,
+                gateway_port: 8080,
+            },
+            NoopLifecycleDriver,
+            NoopGateway,
+        );
+        let boundary = lifecycle.destructive_commit_token();
+        let mut operations = OperationStore::new(2);
+        let id = operations
+            .enqueue_unique_lifecycle(OperationKind::Unload, None, 1)
+            .unwrap();
+        operations.start(&id, 2).unwrap();
+
+        lifecycle.unload(&MutationCancellation::new()).unwrap();
+        assert!(!boundary.try_cancel(|| panic!("completed unload must not be cancelled")));
+        operations.succeed(&id, 3).unwrap();
+        lifecycle.complete_operation();
+        assert_eq!(
+            operations.cancel(&id, CancellationSafety::Safe, 4),
+            Err(OperationError::Terminal)
+        );
+    }
+
+    #[test]
+    fn public_lifecycle_snapshot_correlates_transition_and_operation_under_one_lock() {
+        let lifecycle = ModelLifecycle::new(
+            crate::model_lifecycle::StableNodeOwner {
+                run_id: "owner".into(),
+                pid: 1,
+                process_start_time_unix_s: 2,
+                gateway_port: 8080,
+            },
+            NoopLifecycleDriver,
+            NoopGateway,
+        );
+        let snapshot = Arc::new(Mutex::new(lifecycle.snapshot()));
+        let mut executor = LifecycleExecutor {
+            lifecycle,
+            snapshot: Arc::clone(&snapshot),
+            models_dir: std::env::temp_dir(),
+            verification_cache: Arc::new(VerificationCache::default()),
+        };
+
+        executor
+            .execute("op-unload", &Mutation::Unload, &MutationCancellation::new())
+            .unwrap();
+        let transitioning = snapshot.lock().unwrap().clone();
+        assert_eq!(
+            transitioning.status,
+            crate::model_lifecycle::NodeLifecycleStatus::Unloading
+        );
+        assert_eq!(transitioning.operation_id.as_deref(), Some("op-unload"));
+
+        executor.complete_operation();
+        let completed = snapshot.lock().unwrap().clone();
+        assert_eq!(
+            completed.status,
+            crate::model_lifecycle::NodeLifecycleStatus::Unloaded
+        );
+        assert_eq!(completed.operation_id, None);
     }
 
     #[test]
