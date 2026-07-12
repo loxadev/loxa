@@ -95,7 +95,9 @@ fn run_with_paths<W: Write, E: Write>(
             Command::Doctor => print_doctor(&mut stdout),
             Command::Pull { id, quant } => match live_control(paths)? {
                 Some(client) => live_pull(&client, &id, quant.as_deref(), &mut stdout),
-                None => pull_model(&id, quant.as_deref(), &mut stdout, &mut stderr),
+                None => offline_pull_with(paths, || {
+                    pull_model(&id, quant.as_deref(), &mut stdout, &mut stderr)
+                }),
             },
             Command::List => match live_control(paths)? {
                 Some(client) => live_list(&client, &mut stdout),
@@ -109,7 +111,7 @@ fn run_with_paths<W: Write, E: Write>(
                     )?;
                     Ok(ExitCode::from(1))
                 }
-                None => remove_model(&id, &mut stdout, &mut stderr),
+                None => offline_rm_with(paths, || remove_model(&id, &mut stdout, &mut stderr)),
             },
             Command::Load { id } => match live_control(paths)? {
                 Some(client) => live_operation(&client, client.load(&id), "load", &mut stdout),
@@ -157,6 +159,24 @@ fn run_with_paths<W: Write, E: Write>(
     })();
 
     finish_cli_result(result, &mut stderr)
+}
+
+fn offline_pull_with(
+    paths: &NodePaths,
+    mutation: impl FnOnce() -> io::Result<ExitCode>,
+) -> io::Result<ExitCode> {
+    let _admission = supervisor::admit_offline_model_mutation(&paths.state_path)
+        .map_err(supervisor_error_to_io)?;
+    mutation()
+}
+
+fn offline_rm_with(
+    paths: &NodePaths,
+    mutation: impl FnOnce() -> io::Result<ExitCode>,
+) -> io::Result<ExitCode> {
+    let _admission = supervisor::admit_offline_model_mutation(&paths.state_path)
+        .map_err(supervisor_error_to_io)?;
+    mutation()
 }
 
 fn live_control(paths: &NodePaths) -> io::Result<Option<LiveControlClient>> {
@@ -1298,6 +1318,68 @@ mod tests {
         assert!(String::from_utf8(stderr)
             .unwrap()
             .contains("recovery required"));
+    }
+
+    fn assert_offline_model_mutation_excludes_owner_start(use_pull: bool) {
+        let temp = TempDir::new(if use_pull {
+            "pull-owner-race"
+        } else {
+            "rm-owner-race"
+        });
+        let paths = NodePaths {
+            models_dir: temp.path().join("models"),
+            state_path: temp.path().join("run").join("managed.json"),
+            logs_dir: temp.path().join("logs"),
+        };
+        let mutation_paths = paths.clone();
+        let artifact = temp.path().join("mutation-finished");
+        let mutation_artifact = artifact.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mutation = std::thread::spawn(move || {
+            let execute = || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                fs::write(&mutation_artifact, b"complete")?;
+                Ok(ExitCode::SUCCESS)
+            };
+            if use_pull {
+                offline_pull_with(&mutation_paths, execute)
+            } else {
+                offline_rm_with(&mutation_paths, execute)
+            }
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let owner_state_path = paths.state_path.clone();
+        let (owner_tx, owner_rx) = std::sync::mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            let run = starting_run_for_test(&owner_state_path, "racing-owner");
+            owner_tx
+                .send(supervisor::create_starting_run(&owner_state_path, run))
+                .unwrap();
+        });
+        assert!(owner_rx.recv_timeout(Duration::from_millis(100)).is_err());
+        assert!(!paths.state_path.exists());
+
+        release_tx.send(()).unwrap();
+        assert_eq!(mutation.join().unwrap().unwrap(), ExitCode::SUCCESS);
+        assert_eq!(fs::read(&artifact).unwrap(), b"complete");
+        assert!(owner_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .is_ok());
+        owner.join().unwrap();
+    }
+
+    #[test]
+    fn offline_pull_excludes_a_concurrent_managed_owner_start() {
+        assert_offline_model_mutation_excludes_owner_start(true);
+    }
+
+    #[test]
+    fn offline_rm_excludes_a_concurrent_managed_owner_start() {
+        assert_offline_model_mutation_excludes_owner_start(false);
     }
 
     #[test]

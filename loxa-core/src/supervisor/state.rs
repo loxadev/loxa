@@ -222,10 +222,13 @@ where
 }
 
 pub fn create_starting_run(path: &Path, run: ManagedRun) -> Result<ManagedRun, SupervisorError> {
+    // Owner creation must wait out an admitted offline model mutation, which
+    // can legitimately include a long download. Once admitted it re-reads
+    // state under the same lock and either creates or fails closed.
     create_starting_run_with_lock_options(
         path,
         run,
-        RUNTIME_STATE_LOCK_TIMEOUT,
+        Duration::MAX,
         RUNTIME_STATE_LOCK_POLL_INTERVAL,
     )
 }
@@ -532,6 +535,38 @@ fn validate_runtime_run(run: &ManagedRun) -> Result<(), String> {
 
 pub(super) struct RuntimeStateLock {
     _file: File,
+}
+
+/// Admission token for a product-neutral model filesystem mutation that is
+/// legal only while no managed node owner exists. Holding this guard excludes
+/// node creation through the same runtime-state advisory lock.
+pub struct OfflineModelMutationGuard {
+    _lock: RuntimeStateLock,
+}
+
+pub fn admit_offline_model_mutation(
+    state_path: &Path,
+) -> Result<OfflineModelMutationGuard, SupervisorError> {
+    let lock = acquire_runtime_state_lock_for_mutation(
+        state_path,
+        RUNTIME_STATE_LOCK_TIMEOUT,
+        RUNTIME_STATE_LOCK_POLL_INTERVAL,
+    )?;
+    match read_runtime_state(state_path)? {
+        RuntimeStateRead::Missing => Ok(OfflineModelMutationGuard { _lock: lock }),
+        RuntimeStateRead::Loaded(ref runs) if runs.is_empty() => {
+            Ok(OfflineModelMutationGuard { _lock: lock })
+        }
+        RuntimeStateRead::Loaded(_) => Err(SupervisorError::Io(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "a managed node owner exists; offline model mutation is not permitted",
+        ))),
+        RuntimeStateRead::Legacy(path) => Err(SupervisorError::LegacyRuntimeState(path)),
+        RuntimeStateRead::Corrupt(message) => Err(SupervisorError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("managed sidecar state is corrupt: {message}"),
+        ))),
+    }
 }
 
 pub(super) fn acquire_runtime_state_lock_for_mutation(
@@ -1734,6 +1769,45 @@ mod tests {
             Duration::from_millis(1),
         )
         .expect("released kernel lock must be immediately reusable");
+    }
+
+    #[test]
+    fn offline_model_mutation_admission_excludes_concurrent_node_creation() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_path = temp.path().join("managed.json");
+        let guard = admit_offline_model_mutation(&state_path).expect("admit offline mutation");
+        let thread_path = state_path.clone();
+        let (sent, received) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let run = childless_starting_run(thread_path.parent().unwrap(), "concurrent-owner");
+            let result = create_starting_run(&thread_path, run);
+            sent.send(result).unwrap();
+        });
+
+        assert!(received
+            .recv_timeout(RUNTIME_STATE_LOCK_TIMEOUT + Duration::from_millis(100))
+            .is_err());
+        drop(guard);
+        assert!(received
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .is_ok());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn offline_model_mutation_admission_rejects_owner_legacy_and_corrupt_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_path = temp.path().join("managed.json");
+        let run = childless_starting_run(temp.path(), "owner");
+        create_starting_run(&state_path, run).unwrap();
+        assert!(admit_offline_model_mutation(&state_path).is_err());
+
+        fs::write(&state_path, b"corrupt").unwrap();
+        assert!(admit_offline_model_mutation(&state_path).is_err());
+
+        fs::write(&state_path, b"[]").unwrap();
+        assert!(admit_offline_model_mutation(&state_path).is_err());
     }
 
     #[test]
