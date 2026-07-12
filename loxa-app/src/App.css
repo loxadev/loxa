@@ -70,6 +70,16 @@ button:disabled { cursor: not-allowed; opacity: 0.6; }
 .composer label { font-weight: 500; }
 .composer textarea { min-height: 96px; resize: vertical; padding: var(--loxa-space-3); color: var(--loxa-foreground); background: var(--loxa-background); border: 1px solid var(--loxa-control-border); border-radius: var(--loxa-radius-md); }
 .composer .action-row { margin-top: var(--loxa-space-2); }
+.settings-group { margin: var(--loxa-space-8) 0 0; padding: 0; border: 0; }
+.settings-group legend { font: var(--loxa-type-title-weight) var(--loxa-type-title-size)/var(--loxa-type-title-line-height) var(--loxa-type-title-family); letter-spacing: var(--loxa-type-title-letter-spacing); }
+.settings-description { margin: var(--loxa-space-2) 0 var(--loxa-space-4); color: var(--loxa-muted-foreground); }
+.theme-options { display: grid; gap: var(--loxa-space-3); max-width: 560px; }
+.theme-option { display: flex; align-items: center; gap: var(--loxa-space-3); padding: var(--loxa-space-3) var(--loxa-space-4); color: var(--loxa-foreground); background: var(--loxa-background); border: 1px solid var(--loxa-control-border); border-radius: var(--loxa-radius-md); cursor: pointer; }
+.theme-option:has(input:checked) { color: var(--loxa-selected-foreground); background: var(--loxa-selected-surface); }
+.theme-option input { width: 20px; height: 20px; margin: 0; accent-color: var(--loxa-accent); }
+.theme-option span { display: grid; gap: var(--loxa-space-1); }
+.theme-option strong { font-weight: 600; }
+.theme-option small { color: inherit; font-size: var(--loxa-type-body-small-size); line-height: var(--loxa-type-body-small-line-height); }
 .visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 
 @media (max-width: 760px) {
@@ -81,12 +91,13 @@ button:disabled { cursor: not-allowed; opacity: 0.6; }
 }
 
 @media (prefers-contrast: more) {
-  .navigation-rail, .screen-header, .status-grid, .status-field, .chat-output, .composer textarea { border-width: 2px; }
+  .navigation-rail, .screen-header, .status-grid, .status-field, .chat-output, .composer textarea, .theme-option { border-width: 2px; }
 }
 
 @media (forced-colors: active) {
   .nav-link[aria-current="page"], .primary-button { color: HighlightText; background: Highlight; }
-  .status-badge, .primary-button, .secondary-button, .quiet-button, .chat-output, .composer textarea { border-color: ButtonText; forced-color-adjust: auto; }
+  .status-badge, .primary-button, .secondary-button, .quiet-button, .chat-output, .composer textarea, .theme-option { border-color: ButtonText; forced-color-adjust: auto; }
+  .theme-option:has(input:checked) { color: HighlightText; background: Highlight; }
 }
 
 @media (prefers-reduced-motion: reduce) {

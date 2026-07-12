@@ -35,6 +35,10 @@ describe("App", () => {
     await user.click(screen.getByRole("link", { name: "Chat" }));
     expect(screen.getByRole("heading", { name: "Chat" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Chat" })).toHaveAttribute("aria-current", "page");
+
+    await user.click(screen.getByRole("link", { name: "Settings" }));
+    expect(screen.getByRole("heading", { name: "Settings" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Settings" })).toHaveAttribute("aria-current", "page");
   });
 
   it("has a logical keyboard focus order and no unsupported controls", async () => {
@@ -46,6 +50,8 @@ describe("App", () => {
     expect(screen.getByRole("link", { name: "Node" })).toHaveFocus();
     await user.tab();
     expect(screen.getByRole("link", { name: "Chat" })).toHaveFocus();
+    await user.tab();
+    expect(screen.getByRole("link", { name: "Settings" })).toHaveFocus();
 
     expect(screen.queryByRole("button", { name: /load|unload|switch|download/i })).not.toBeInTheDocument();
   });
