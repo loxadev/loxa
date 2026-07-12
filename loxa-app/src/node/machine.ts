@@ -24,8 +24,9 @@ export type NodeEvent =
   | { type: "start" }
   | { type: "ownership"; ownership: NodeOwnership }
   | { type: "status"; status: NodeStatus }
-  | { type: "failure"; message: string }
+  | { type: "probeFailed"; message: string }
   | { type: "stop" }
+  | { type: "stopFailed"; message: string }
   | { type: "stopped" }
   | { type: "recoveryRequired"; message: string };
 
@@ -36,14 +37,14 @@ export type ActionGuards = {
 };
 
 const legalEvents: Record<NodePhase, readonly NodeEvent["type"][]> = {
-  disconnected: ["connect", "start", "ownership", "status", "failure", "recoveryRequired"],
-  connecting: ["ownership", "status", "failure", "recoveryRequired"],
-  starting: ["ownership", "status", "failure", "recoveryRequired"],
-  attached: ["ownership", "status", "failure", "stop", "recoveryRequired"],
-  ready: ["ownership", "status", "failure", "stop", "recoveryRequired"],
-  stopping: ["ownership", "failure", "stopped", "recoveryRequired"],
+  disconnected: ["connect", "start", "ownership", "status", "probeFailed", "recoveryRequired"],
+  connecting: ["ownership", "status", "probeFailed", "recoveryRequired"],
+  starting: ["ownership", "status", "probeFailed", "recoveryRequired"],
+  attached: ["ownership", "status", "probeFailed", "stop", "recoveryRequired"],
+  ready: ["ownership", "status", "probeFailed", "stop", "recoveryRequired"],
+  stopping: ["ownership", "stopFailed", "stopped", "recoveryRequired"],
   "recovery-required": ["ownership", "recoveryRequired"],
-  error: ["connect", "start", "ownership", "stop", "failure", "recoveryRequired"],
+  error: ["connect", "start", "ownership", "stop", "recoveryRequired"],
 };
 
 export function initialNodeState(): NodeState {
@@ -88,7 +89,8 @@ export function nodeReducer(state: NodeState, event: NodeEvent): NodeState {
         status: event.status,
         error: null,
       };
-    case "failure":
+    case "probeFailed":
+    case "stopFailed":
       return { ...state, phase: "error", status: null, error: event.message };
     case "stop":
       return actionGuards(state).canStop

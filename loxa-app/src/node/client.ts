@@ -71,17 +71,20 @@ async function requestJson(
   options: ClientOptions,
 ): Promise<unknown> {
   const controller = new AbortController();
-  let timedOut = false;
-  const abortFromCaller = () => controller.abort();
+  let abortCause: "caller" | "timeout" | null = null;
+  const abortOnce = (cause: "caller" | "timeout") => {
+    if (abortCause !== null) return;
+    abortCause = cause;
+    if (cause === "caller") clearTimeout(timeout);
+    controller.abort();
+  };
+  const abortFromCaller = () => abortOnce("caller");
   if (options.signal?.aborted) {
     throw new NodeClientError("aborted", "The Loxa node request was cancelled.");
   }
   options.signal?.addEventListener("abort", abortFromCaller, { once: true });
   const timeout = setTimeout(
-    () => {
-      timedOut = true;
-      controller.abort();
-    },
+    () => abortOnce("timeout"),
     options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
   );
   try {
@@ -101,7 +104,7 @@ async function requestJson(
     return await parseJson(response);
   } catch (error) {
     if (controller.signal.aborted) {
-      if (timedOut) {
+      if (abortCause === "timeout") {
         throw new NodeClientError("timeout", "The Loxa node request timed out.");
       }
       throw new NodeClientError("aborted", "The Loxa node request was cancelled.");
