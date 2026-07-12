@@ -90,11 +90,17 @@ impl StableMetadata {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct VerifiedArtifact {
+    pub size_bytes: u64,
+    pub expected_sha256: String,
+    pub matches: bool,
+}
+
 #[derive(Clone)]
 struct CachedVerification {
     metadata: StableMetadata,
-    expected_sha256: String,
-    matches: bool,
+    evidence: VerifiedArtifact,
 }
 
 #[derive(Default)]
@@ -127,7 +133,11 @@ impl VerificationCache {
     }
 
     /// Potentially expensive; intended for a bounded background/blocking worker.
-    pub fn verify_recipe(&self, models_dir: &Path, recipe: &ModelEntry) -> io::Result<bool> {
+    pub fn verify_recipe(
+        &self,
+        models_dir: &Path,
+        recipe: &ModelEntry,
+    ) -> io::Result<VerifiedArtifact> {
         let path = checked_regular_path(models_dir, recipe.filename)?;
         let metadata = fs::symlink_metadata(&path)?;
         if !metadata.file_type().is_file() {
@@ -137,8 +147,8 @@ impl VerificationCache {
             ));
         }
         let stable = StableMetadata::from(&metadata);
-        if let Some(matches) = self.cached(&path, &stable, recipe.sha256) {
-            return Ok(matches);
+        if let Some(evidence) = self.cached(&path, &stable, recipe.sha256) {
+            return Ok(evidence);
         }
 
         self.verification_runs.fetch_add(1, Ordering::Relaxed);
@@ -150,29 +160,38 @@ impl VerificationCache {
                 "artifact changed during verification",
             ));
         }
+        let evidence = VerifiedArtifact {
+            size_bytes: stable.len,
+            expected_sha256: recipe.sha256.into(),
+            matches,
+        };
         self.insert(
             path,
             CachedVerification {
                 metadata: stable,
-                expected_sha256: recipe.sha256.into(),
-                matches,
+                evidence: evidence.clone(),
             },
         );
-        Ok(matches)
+        Ok(evidence)
     }
 
     pub fn verification_runs(&self) -> u64 {
         self.verification_runs.load(Ordering::Relaxed)
     }
 
-    fn cached(&self, path: &Path, metadata: &StableMetadata, expected: &str) -> Option<bool> {
+    fn cached(
+        &self,
+        path: &Path,
+        metadata: &StableMetadata,
+        expected: &str,
+    ) -> Option<VerifiedArtifact> {
         self.state
             .lock()
             .ok()?
             .entries
             .get(path)
-            .filter(|item| &item.metadata == metadata && item.expected_sha256 == expected)
-            .map(|item| item.matches)
+            .filter(|item| &item.metadata == metadata && item.evidence.expected_sha256 == expected)
+            .map(|item| item.evidence.clone())
     }
 
     fn insert(&self, path: PathBuf, item: CachedVerification) {
@@ -275,8 +294,8 @@ fn artifact_state(
             }
             return match cache.cached(&final_path, &StableMetadata::from(&metadata), recipe.sha256)
             {
-                Some(true) => ArtifactState::Downloaded,
-                Some(false) => ArtifactState::Invalid {
+                Some(evidence) if evidence.matches => ArtifactState::Downloaded,
+                Some(_) => ArtifactState::Invalid {
                     reason: ArtifactInvalidReason::ChecksumMismatch,
                 },
                 None => ArtifactState::Invalid {
@@ -301,7 +320,7 @@ fn artifact_state(
         },
         Ok(Some(metadata)) => {
             match cache.cached(&part_path, &StableMetadata::from(&metadata), recipe.sha256) {
-                Some(false) => ArtifactState::Invalid {
+                Some(evidence) if !evidence.matches => ArtifactState::Invalid {
                     reason: ArtifactInvalidReason::ChecksumMismatch,
                 },
                 _ => ArtifactState::Partial {
@@ -491,8 +510,8 @@ mod tests {
                 reason: ArtifactInvalidReason::VerificationRequired
             }
         );
-        assert!(cache.verify_recipe(dir.path(), &recipe).unwrap());
-        assert!(cache.verify_recipe(dir.path(), &recipe).unwrap());
+        assert!(cache.verify_recipe(dir.path(), &recipe).unwrap().matches);
+        assert!(cache.verify_recipe(dir.path(), &recipe).unwrap().matches);
         assert_eq!(cache.verification_runs(), 1);
         assert_eq!(
             artifact_state(&recipe, dir.path(), &cache),
@@ -503,7 +522,7 @@ mod tests {
             artifact_state(&recipe, dir.path(), &cache),
             ArtifactState::Downloaded
         );
-        assert!(!cache.verify_recipe(dir.path(), &recipe).unwrap());
+        assert!(!cache.verify_recipe(dir.path(), &recipe).unwrap().matches);
         assert_eq!(cache.verification_runs(), 2);
         assert_eq!(
             artifact_state(&recipe, dir.path(), &cache),
