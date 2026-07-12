@@ -86,6 +86,31 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_admission_rejects_any_overlapping_load_or_unload() {
+        let mut store = OperationStore::new(4);
+        assert_eq!(
+            store.enqueue_unique_lifecycle(OperationKind::Download, Some("a".into()), 0),
+            Err(OperationError::IllegalTransition)
+        );
+        let load = store
+            .enqueue_unique_lifecycle(OperationKind::Load, Some("a".into()), 1)
+            .unwrap();
+        assert_eq!(
+            store.enqueue_unique_lifecycle(OperationKind::Load, Some("b".into()), 2),
+            Err(OperationError::Conflict)
+        );
+        assert_eq!(
+            store.enqueue_unique_lifecycle(OperationKind::Unload, None, 3),
+            Err(OperationError::Conflict)
+        );
+        store.start(&load, 4).unwrap();
+        store.succeed(&load, 5).unwrap();
+        assert!(store
+            .enqueue_unique_lifecycle(OperationKind::Unload, None, 6)
+            .is_ok());
+    }
+
+    #[test]
     fn slow_event_subscriber_is_disconnected_before_queue_can_grow_unbounded() {
         let mut store = OperationStore::new(1);
         let _subscription = store.subscribe();
@@ -191,6 +216,28 @@ impl OperationStore {
                 )
         });
         if active {
+            return Err(OperationError::Conflict);
+        }
+        Ok(self.enqueue(kind, model_id, now))
+    }
+
+    pub fn enqueue_unique_lifecycle(
+        &mut self,
+        kind: OperationKind,
+        model_id: Option<String>,
+        now: u64,
+    ) -> Result<String, OperationError> {
+        if !matches!(kind, OperationKind::Load | OperationKind::Unload) {
+            return Err(OperationError::IllegalTransition);
+        }
+        let lifecycle_active = self.operations.iter().any(|item| {
+            matches!(item.kind, OperationKind::Load | OperationKind::Unload)
+                && matches!(
+                    item.status,
+                    OperationStatus::Queued | OperationStatus::Running
+                )
+        });
+        if lifecycle_active {
             return Err(OperationError::Conflict);
         }
         Ok(self.enqueue(kind, model_id, now))

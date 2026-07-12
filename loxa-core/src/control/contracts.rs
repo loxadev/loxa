@@ -14,6 +14,9 @@ mod tests {
             ContractError::UnknownModel
         );
         assert!(serde_json::from_str::<ModelRequest>(r#"{"model_id":"unknown"}"#).is_err());
+        assert!(registry::REGISTRY
+            .iter()
+            .all(|entry| ModelRequest::known(entry.id).is_ok()));
     }
 
     #[test]
@@ -114,7 +117,9 @@ impl<'de> Deserialize<'de> for ModelRequest {
 
 impl ModelRequest {
     pub fn known(model_id: &str) -> Result<Self, ContractError> {
-        registry::find(model_id)
+        registry::REGISTRY
+            .iter()
+            .find(|entry| entry.id == model_id)
             .map(|_| Self {
                 model_id: model_id.to_owned(),
             })

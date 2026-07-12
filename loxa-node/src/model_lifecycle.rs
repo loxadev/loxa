@@ -38,6 +38,12 @@ impl LaunchPlan {
                 entry.engine.reason.clone(),
             ));
         }
+        if entry.engine.engine != "llama-cpp" {
+            return Err(LifecycleError::EngineIneligible(format!(
+                "unsupported managed engine {}",
+                entry.engine.engine
+            )));
+        }
         Ok(Self {
             model_id: entry.id.clone(),
             artifact_path: models_dir.join(&entry.filename),
@@ -81,6 +87,7 @@ pub enum NodeLifecycleStatus {
 pub struct LifecycleSnapshot {
     pub status: NodeLifecycleStatus,
     pub active_model_id: Option<String>,
+    pub operation_id: Option<String>,
     pub generation: u64,
     pub error: Option<String>,
 }
@@ -215,6 +222,10 @@ where
         self.destructive_commit.is_safe()
     }
 
+    pub(crate) fn complete_operation(&self) {
+        self.destructive_commit.set(false);
+    }
+
     pub(crate) fn destructive_commit_token(&self) -> CancellationBoundary {
         self.destructive_commit.clone()
     }
@@ -223,6 +234,7 @@ where
         LifecycleSnapshot {
             status: self.status.clone(),
             active_model_id: self.current.as_ref().map(|(plan, _)| plan.model_id.clone()),
+            operation_id: None,
             generation: self.generation,
             error: self.error.clone(),
         }
@@ -255,7 +267,6 @@ where
             }
         }
         if let Err(error) = self.ensure_not_stopping() {
-            self.destructive_commit.set(false);
             self.status = NodeLifecycleStatus::Unloaded;
             return Err(error);
         }
@@ -263,7 +274,6 @@ where
         match self.start_ready(&plan, cancellation) {
             Ok(session) => {
                 self.publish(plan, session);
-                self.destructive_commit.set(false);
                 Ok(())
             }
             Err(replacement_error) => {
@@ -274,13 +284,11 @@ where
                         self.status = NodeLifecycleStatus::Unloaded;
                         self.error = Some(format!("{replacement_error:?}"));
                     }
-                    self.destructive_commit.set(false);
                     return Err(replacement_error);
                 };
                 match self.start_ready(&prior_plan, cancellation) {
                     Ok(session) => {
                         self.publish(prior_plan, session);
-                        self.destructive_commit.set(false);
                         Err(replacement_error)
                     }
                     Err(rollback_error) => {
@@ -288,7 +296,6 @@ where
                         self.error = Some(format!(
                             "replacement failed: {replacement_error:?}; rollback failed: {rollback_error:?}"
                         ));
-                        self.destructive_commit.set(false);
                         Err(LifecycleError::RecoveryRequired {
                             replacement: format!("{replacement_error:?}"),
                             rollback: format!("{rollback_error:?}"),
@@ -314,7 +321,6 @@ where
             }
         }
         self.status = NodeLifecycleStatus::Unloaded;
-        self.destructive_commit.set(false);
         Ok(())
     }
 
@@ -401,7 +407,6 @@ where
     fn require_recovery(&mut self, error: String) {
         self.status = NodeLifecycleStatus::RecoveryRequired;
         self.error = Some(error);
-        self.destructive_commit.set(false);
     }
 
     fn publish(&mut self, plan: LaunchPlan, session: StartedSession<D::Session>) {
@@ -556,7 +561,7 @@ mod tests {
                 reason: "compatible".into(),
             },
             engine: loxa_core::model_inventory::EngineEligibility {
-                engine: "llama.cpp".into(),
+                engine: "llama-cpp".into(),
                 eligible: true,
                 reason: "eligible".into(),
             },
@@ -572,6 +577,12 @@ mod tests {
             LaunchPlan::from_verified_inventory(&entry, std::path::Path::new("models")),
             Err(LifecycleError::ModelNotVerified)
         );
+        entry.artifact = ArtifactState::Downloaded;
+        entry.engine.engine = "future-engine".into();
+        assert!(matches!(
+            LaunchPlan::from_verified_inventory(&entry, std::path::Path::new("models")),
+            Err(LifecycleError::EngineIneligible(reason)) if reason.contains("future-engine")
+        ));
     }
 
     #[test]
@@ -877,6 +888,8 @@ mod tests {
         assert!(cancellation.is_cancelled());
         assert_eq!(lifecycle.snapshot().status, NodeLifecycleStatus::Ready);
         assert_eq!(lifecycle.snapshot().active_model_id.as_deref(), Some("a"));
+        assert!(!lifecycle.cancellation_is_safe());
+        lifecycle.complete_operation();
         assert!(lifecycle.cancellation_is_safe());
     }
 }
