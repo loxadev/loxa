@@ -1877,33 +1877,94 @@ fn unix_timestamp_now() -> u64 {
         .as_secs()
 }
 
-#[cfg(unix)]
-struct SignalGuard {
-    previous: usize,
+trait SignalRegistration {
+    type Installed;
+
+    fn install(&self) -> io::Result<Self::Installed>;
+    fn restore(&self, installed: &mut Self::Installed);
 }
 
-#[cfg(unix)]
-impl SignalGuard {
-    fn install() -> io::Result<Self> {
-        use std::ffi::c_int;
-        const SIGINT: c_int = 2;
-        const SIG_ERR: usize = usize::MAX;
+struct RegistrationGuard<R: SignalRegistration> {
+    registration: R,
+    installed: R::Installed,
+}
 
-        unsafe extern "C" {
-            fn signal(signal: c_int, handler: usize) -> usize;
-        }
-
+impl<R: SignalRegistration> RegistrationGuard<R> {
+    fn install(registration: R) -> io::Result<Self> {
         clear_ctrl_c_received();
-        let previous = unsafe { signal(SIGINT, handle_sigint as *const () as usize) };
-        if previous == SIG_ERR {
-            return Err(io::Error::last_os_error());
-        }
-
-        Ok(Self { previous })
+        let installed = registration.install()?;
+        Ok(Self {
+            registration,
+            installed,
+        })
     }
 
     fn interrupted(&self) -> bool {
         ctrl_c_received()
+    }
+}
+
+impl<R: SignalRegistration> InterruptSource for RegistrationGuard<R> {
+    fn interrupted(&self) -> bool {
+        RegistrationGuard::interrupted(self)
+    }
+}
+
+impl<R: SignalRegistration> InterruptStatus for RegistrationGuard<R> {
+    fn interrupted(&self) -> bool {
+        RegistrationGuard::interrupted(self)
+    }
+}
+
+impl<R: SignalRegistration> Drop for RegistrationGuard<R> {
+    fn drop(&mut self) {
+        self.registration.restore(&mut self.installed);
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+struct UnixSignalRegistration;
+
+#[cfg(unix)]
+impl SignalRegistration for UnixSignalRegistration {
+    type Installed = usize;
+
+    fn install(&self) -> io::Result<Self::Installed> {
+        use std::ffi::c_int;
+        const SIGINT: c_int = 2;
+        const SIG_ERR: usize = usize::MAX;
+        unsafe extern "C" {
+            fn signal(signal: c_int, handler: usize) -> usize;
+        }
+        let previous = unsafe { signal(SIGINT, handle_sigint as *const () as usize) };
+        if previous == SIG_ERR {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(previous)
+    }
+
+    fn restore(&self, previous: &mut Self::Installed) {
+        use std::ffi::c_int;
+        const SIGINT: c_int = 2;
+        unsafe extern "C" {
+            fn signal(signal: c_int, handler: usize) -> usize;
+        }
+        let _ = unsafe { signal(SIGINT, *previous) };
+    }
+}
+
+#[cfg(unix)]
+struct SignalGuard(RegistrationGuard<UnixSignalRegistration>);
+
+#[cfg(unix)]
+impl SignalGuard {
+    fn install() -> io::Result<Self> {
+        RegistrationGuard::install(UnixSignalRegistration).map(Self)
+    }
+
+    fn interrupted(&self) -> bool {
+        self.0.interrupted()
     }
 }
 
@@ -1921,26 +1982,15 @@ impl InterruptStatus for SignalGuard {
     }
 }
 
-#[cfg(unix)]
-impl Drop for SignalGuard {
-    fn drop(&mut self) {
-        use std::ffi::c_int;
-
-        unsafe extern "C" {
-            fn signal(signal: c_int, handler: usize) -> usize;
-        }
-
-        const SIGINT: c_int = 2;
-        let _ = unsafe { signal(SIGINT, self.previous) };
-    }
-}
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+struct WindowsSignalRegistration;
 
 #[cfg(windows)]
-struct SignalGuard;
+impl SignalRegistration for WindowsSignalRegistration {
+    type Installed = ();
 
-#[cfg(windows)]
-impl SignalGuard {
-    fn install() -> io::Result<Self> {
+    fn install(&self) -> io::Result<Self::Installed> {
         type Bool = i32;
         type Dword = u32;
         type HandlerRoutine = Option<unsafe extern "system" fn(Dword) -> Bool>;
@@ -1951,37 +2001,15 @@ impl SignalGuard {
             fn SetConsoleCtrlHandler(handler: HandlerRoutine, add: Bool) -> Bool;
         }
 
-        clear_ctrl_c_received();
         let registered = unsafe { SetConsoleCtrlHandler(Some(handle_console_ctrl), TRUE) };
         if registered == 0 {
             return Err(io::Error::last_os_error());
         }
 
-        Ok(Self)
+        Ok(())
     }
 
-    fn interrupted(&self) -> bool {
-        ctrl_c_received()
-    }
-}
-
-#[cfg(windows)]
-impl InterruptSource for SignalGuard {
-    fn interrupted(&self) -> bool {
-        SignalGuard::interrupted(self)
-    }
-}
-
-#[cfg(windows)]
-impl InterruptStatus for SignalGuard {
-    fn interrupted(&self) -> bool {
-        SignalGuard::interrupted(self)
-    }
-}
-
-#[cfg(windows)]
-impl Drop for SignalGuard {
-    fn drop(&mut self) {
+    fn restore(&self, _installed: &mut Self::Installed) {
         type Bool = i32;
         type Dword = u32;
         type HandlerRoutine = Option<unsafe extern "system" fn(Dword) -> Bool>;
@@ -1993,6 +2021,34 @@ impl Drop for SignalGuard {
         }
 
         let _ = unsafe { SetConsoleCtrlHandler(Some(handle_console_ctrl), FALSE) };
+    }
+}
+
+#[cfg(windows)]
+struct SignalGuard(RegistrationGuard<WindowsSignalRegistration>);
+
+#[cfg(windows)]
+impl SignalGuard {
+    fn install() -> io::Result<Self> {
+        RegistrationGuard::install(WindowsSignalRegistration).map(Self)
+    }
+
+    fn interrupted(&self) -> bool {
+        self.0.interrupted()
+    }
+}
+
+#[cfg(windows)]
+impl InterruptSource for SignalGuard {
+    fn interrupted(&self) -> bool {
+        SignalGuard::interrupted(self)
+    }
+}
+
+#[cfg(windows)]
+impl InterruptStatus for SignalGuard {
+    fn interrupted(&self) -> bool {
+        SignalGuard::interrupted(self)
     }
 }
 
@@ -2371,6 +2427,44 @@ mod lifecycle_api_tests {
         assert!(ctrl_c_received());
         clear_ctrl_c_received();
         assert!(!ctrl_c_received());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_signal_handler_records_interrupt_without_platform_state_leaking() {
+        let _lock = SIGNAL_TEST_LOCK.lock().expect("signal test lock");
+        clear_ctrl_c_received();
+        handle_sigint(2);
+        assert!(ctrl_c_received());
+        clear_ctrl_c_received();
+    }
+
+    #[derive(Clone, Default)]
+    struct FakeSignalRegistration {
+        calls: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl SignalRegistration for FakeSignalRegistration {
+        type Installed = ();
+
+        fn install(&self) -> io::Result<Self::Installed> {
+            self.calls.lock().unwrap().push(true);
+            Ok(())
+        }
+
+        fn restore(&self, _installed: &mut Self::Installed) {
+            self.calls.lock().unwrap().push(false);
+        }
+    }
+
+    #[test]
+    fn portable_signal_registration_guard_installs_and_restores_exactly_once() {
+        let registration = FakeSignalRegistration::default();
+        let calls = registration.calls.clone();
+        let guard = RegistrationGuard::install(registration).expect("install fake registration");
+        assert_eq!(*calls.lock().unwrap(), vec![true]);
+        drop(guard);
+        assert_eq!(*calls.lock().unwrap(), vec![true, false]);
     }
 
     #[cfg(unix)]
