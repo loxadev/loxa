@@ -1,4 +1,4 @@
-export const MAX_SSE_EVENT_BYTES = 1024 * 1024;
+export const MAX_SSE_EVENT_BYTES = 2 * 1024 * 1024;
 
 export class SseDecodeError extends Error {
   constructor(message: string) {
@@ -7,12 +7,16 @@ export class SseDecodeError extends Error {
   }
 }
 
-export type SseEvent = { data: string };
+export type SseEvent = { data: string; event?: string; id?: string };
 
 export class SseDecoder {
   private readonly decoder = new TextDecoder("utf-8", { fatal: true });
   private buffer = "";
   private finished = false;
+
+  hasPendingFrame(): boolean {
+    return this.buffer.length > 0;
+  }
 
   push(chunk: Uint8Array): SseEvent[] {
     if (this.finished) {
@@ -87,6 +91,8 @@ export class SseDecoder {
 
   private parse(raw: string): SseEvent | null {
     const data: string[] = [];
+    let event: string | undefined;
+    let id: string | undefined;
     for (const line of raw.split(/\r\n|\n|\r/)) {
       if (line.startsWith(":")) continue;
       const colon = line.indexOf(":");
@@ -94,7 +100,14 @@ export class SseDecoder {
       let value = colon === -1 ? "" : line.slice(colon + 1);
       if (value.startsWith(" ")) value = value.slice(1);
       if (field === "data") data.push(value);
+      else if (field === "event") event = value;
+      else if (field === "id" && !value.includes("\0")) id = value;
     }
-    return data.length === 0 ? null : { data: data.join("\n") };
+    if (data.length === 0) return null;
+    return {
+      ...(event === undefined ? {} : { event }),
+      ...(id === undefined ? {} : { id }),
+      data: data.join("\n"),
+    };
   }
 }

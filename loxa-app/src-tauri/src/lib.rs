@@ -12,7 +12,8 @@ pub fn run() {
             bootstrap::bootstrap_snapshot,
             bootstrap::start_node,
             bootstrap::attach_node,
-            bootstrap::stop_owned_node
+            bootstrap::stop_owned_node,
+            bootstrap::read_control_token
         ])
         .on_window_event(|window, event| {
             if matches!(event, tauri::WindowEvent::Destroyed) {

@@ -39,7 +39,7 @@ describe("SseDecoder", () => {
       ),
     );
 
-    expect(events).toEqual([{ data: "first\nsecond" }]);
+    expect(events).toEqual([{ event: "message", id: "7", data: "first\nsecond" }]);
   });
 
   it("does not dispatch an unterminated final event", () => {

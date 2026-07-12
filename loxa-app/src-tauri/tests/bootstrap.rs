@@ -225,7 +225,10 @@ fn native_bootstrap_ownership_matrix() {
         .start_with_config(request(port()), &config(early_exit_executable.clone()))
         .unwrap_err();
     assert!(error.contains("status"), "{error}");
-    assert!(!state.snapshot().child_running, "early exit must clear ownership");
+    assert!(
+        !state.snapshot().child_running,
+        "early exit must clear ownership"
+    );
     let _ = std::fs::remove_file(timeout_executable);
 
     let attached_port = port();
