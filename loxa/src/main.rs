@@ -170,10 +170,17 @@ fn serve_node_cli<W: Write, E: Write>(
     stdout: &mut W,
     stderr: &mut E,
 ) -> io::Result<ExitCode> {
+    if engine == RuntimeBackendKind::PyMlxLm && requested_model.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--model <local-directory> is required with --engine py-mlx-lm",
+        ));
+    }
     if engine == RuntimeBackendKind::LlamaCpp {
         if let Err(error) = select_serve_model(&paths.models_dir, requested_model) {
             let kind = match &error {
-                ModelSelectionError::UnknownModel { .. } => io::ErrorKind::InvalidInput,
+                ModelSelectionError::UnknownModel { .. }
+                | ModelSelectionError::MissingModelRequest { .. } => io::ErrorKind::InvalidInput,
                 _ => io::ErrorKind::NotFound,
             };
             return Err(io::Error::new(
@@ -187,6 +194,9 @@ fn serve_node_cli<W: Write, E: Write>(
                     }
                     ModelSelectionError::NoDownloadedModels { suggested_id } => {
                         format!("no registry model is downloaded; run `loxa pull {suggested_id}`")
+                    }
+                    ModelSelectionError::MissingModelRequest { backend } => {
+                        format!("--model <local-directory> is required with --engine {backend}")
                     }
                 },
             ));
@@ -1897,7 +1907,10 @@ mod tests {
         )
         .expect_err("Python serve needs --model");
 
-        assert!(error.to_string().contains("--model <local-directory>"));
+        assert_eq!(
+            error.to_string(),
+            "--model <local-directory> is required with --engine py-mlx-lm"
+        );
         assert!(stdout.is_empty());
         assert!(stderr.is_empty());
         assert!(!paths.state_path.exists());

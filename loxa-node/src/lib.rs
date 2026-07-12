@@ -760,6 +760,7 @@ pub enum ModelSelectionError {
     UnknownModel { id: String },
     NotDownloaded { id: String },
     NoDownloadedModels { suggested_id: String },
+    MissingModelRequest { backend: RuntimeBackendKind },
 }
 
 impl fmt::Display for ModelSelectionError {
@@ -768,6 +769,9 @@ impl fmt::Display for ModelSelectionError {
             Self::UnknownModel { id } => write!(formatter, "unknown model: {id}"),
             Self::NotDownloaded { id } => write!(formatter, "model not downloaded: {id}"),
             Self::NoDownloadedModels { .. } => write!(formatter, "no registry model is downloaded"),
+            Self::MissingModelRequest { backend } => {
+                write!(formatter, "model request is required for backend {backend}")
+            }
         }
     }
 }
@@ -810,7 +814,7 @@ pub fn serve_node(
         RuntimeBackendKind::PyMlxLm => requested_model.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "--model <local-directory> is required with --engine py-mlx-lm",
+                ModelSelectionError::MissingModelRequest { backend: engine },
             )
         })?,
     };
@@ -2057,6 +2061,18 @@ impl InterruptStatus for SignalGuard {
 mod lifecycle_api_tests {
     use super::*;
 
+    #[derive(Default)]
+    struct RecordingLifecycleSink {
+        events: Vec<LifecycleEvent>,
+    }
+
+    impl LifecycleEventSink for RecordingLifecycleSink {
+        fn emit(&mut self, event: LifecycleEvent) -> io::Result<()> {
+            self.events.push(event);
+            Ok(())
+        }
+    }
+
     #[test]
     fn lifecycle_contract_is_product_neutral() {
         let event = LifecycleEvent::NodeListening {
@@ -2095,6 +2111,44 @@ mod lifecycle_api_tests {
         );
         assert!(!error.to_string().contains("loxa pull"));
         let _ = std::fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn python_serve_missing_model_error_is_typed_and_product_neutral() {
+        let temp = std::env::temp_dir().join(format!(
+            "loxa-node-missing-model-{}-{}",
+            std::process::id(),
+            unix_timestamp_now()
+        ));
+        let paths = NodePaths {
+            models_dir: temp.join("models"),
+            state_path: temp.join("managed.json"),
+            logs_dir: temp.join("logs"),
+        };
+        let mut events = RecordingLifecycleSink::default();
+
+        let error = serve_node(
+            None,
+            Some(0),
+            RuntimeBackendKind::PyMlxLm,
+            &paths,
+            &mut events,
+        )
+        .expect_err("Python serve needs a model request");
+        let selection = error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<ModelSelectionError>())
+            .expect("missing model remains a typed selection error");
+
+        assert_eq!(
+            selection,
+            &ModelSelectionError::MissingModelRequest {
+                backend: RuntimeBackendKind::PyMlxLm,
+            }
+        );
+        assert!(!error.to_string().contains("--model"));
+        assert!(!error.to_string().contains("--engine"));
+        assert!(events.events.is_empty());
     }
 
     #[test]
