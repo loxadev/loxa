@@ -18,8 +18,13 @@ mod tests {
 
     #[test]
     fn schemas_are_closed_and_use_stable_snake_case_states() {
-        let json = serde_json::to_string(&OperationStatus::RecoveryRequired).unwrap();
-        assert_eq!(json, "\"recovery_required\"");
+        let json = serde_json::to_string(&OperationStatus::Failed).unwrap();
+        assert_eq!(json, "\"failed\"");
+        assert_eq!(
+            serde_json::to_string(&NodeStatus::RecoveryRequired).unwrap(),
+            "\"recovery_required\""
+        );
+        assert!(serde_json::from_str::<OperationStatus>("\"recovery_required\"").is_err());
         assert!(
             serde_json::from_str::<ModelRequest>(r#"{"model_id":"gemma-3-4b-it-q4","extra":true}"#)
                 .is_err()
@@ -77,7 +82,6 @@ pub enum OperationStatus {
     Succeeded,
     Failed,
     Cancelled,
-    RecoveryRequired,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]

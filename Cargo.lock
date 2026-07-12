@@ -851,6 +851,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.3",
  "indicatif",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",
