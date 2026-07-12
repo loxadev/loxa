@@ -23,7 +23,7 @@ export class SseDecoder {
     } catch {
       throw new SseDecodeError("The SSE stream contains invalid UTF-8.");
     }
-    return this.drain(false);
+    return this.drain();
   }
 
   finish(): SseEvent[] {
@@ -34,10 +34,12 @@ export class SseDecoder {
     } catch {
       throw new SseDecodeError("The SSE stream contains invalid UTF-8.");
     }
-    return this.drain(true);
+    const events = this.drain();
+    this.buffer = "";
+    return events;
   }
 
-  private drain(flush: boolean): SseEvent[] {
+  private drain(): SseEvent[] {
     const events: SseEvent[] = [];
     let boundary = this.nextBoundary();
     while (boundary !== null) {
@@ -49,16 +51,11 @@ export class SseDecoder {
       boundary = this.nextBoundary();
     }
     this.assertWithinLimit(this.buffer);
-    if (flush && this.buffer.length > 0) {
-      const event = this.parse(this.buffer);
-      this.buffer = "";
-      if (event) events.push(event);
-    }
     return events;
   }
 
   private nextBoundary(): { index: number; length: number } | null {
-    const match = /\r\n\r\n|\n\n/.exec(this.buffer);
+    const match = /\r\n\r\n|\n\n|\r\r/.exec(this.buffer);
     return match ? { index: match.index, length: match[0].length } : null;
   }
 
@@ -70,7 +67,7 @@ export class SseDecoder {
 
   private parse(raw: string): SseEvent | null {
     const data: string[] = [];
-    for (const line of raw.split(/\r\n|\n/)) {
+    for (const line of raw.split(/\r\n|\n|\r/)) {
       if (line.startsWith(":")) continue;
       const colon = line.indexOf(":");
       const field = colon === -1 ? line : line.slice(0, colon);

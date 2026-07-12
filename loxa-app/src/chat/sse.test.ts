@@ -42,14 +42,25 @@ describe("SseDecoder", () => {
     expect(events).toEqual([{ data: "first\nsecond" }]);
   });
 
-  it("flushes only a complete final event and ignores comment-only tails", () => {
+  it("does not dispatch an unterminated final event", () => {
     const decoder = new SseDecoder();
     expect(decoder.push(encode("data: final"))).toEqual([]);
-    expect(decoder.finish()).toEqual([{ data: "final" }]);
+    expect(decoder.finish()).toEqual([]);
 
     const keepalive = new SseDecoder();
     keepalive.push(encode(": still alive"));
     expect(keepalive.finish()).toEqual([]);
+  });
+
+  it("supports bare-CR separators across every byte split without breaking CRLF", () => {
+    const bytes = encode("data: one\r\rdata: two\r\ndata: three\r\n\r\n");
+    for (let split = 0; split <= bytes.length; split += 1) {
+      const decoder = new SseDecoder();
+      expect([
+        ...decoder.push(bytes.slice(0, split)),
+        ...decoder.push(bytes.slice(split)),
+      ]).toEqual([{ data: "one" }, { data: "two\nthree" }]);
+    }
   });
 
   it("rejects invalid UTF-8 instead of replacing bytes", () => {
