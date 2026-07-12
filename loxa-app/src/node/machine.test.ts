@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import type { NodeStatus } from "./contracts";
 import { actionGuards, initialNodeState, nodeReducer, type NodePhase } from "./machine";
 
 const readyStatus = {
@@ -9,7 +10,7 @@ const readyStatus = {
   engine: { name: "llama.cpp", version: "b9999" },
   runtime_model: "gemma-3-4b-it-q4",
   profile: "default",
-};
+} satisfies NodeStatus;
 
 const unavailableStatus = {
   ...readyStatus,
@@ -17,7 +18,7 @@ const unavailableStatus = {
   engine: null,
   runtime_model: null,
   profile: null,
-};
+} satisfies NodeStatus;
 
 describe("nodeReducer", () => {
   it("covers every required presentation phase", () => {
@@ -109,6 +110,37 @@ describe("nodeReducer", () => {
     };
     expect(nodeReducer(attached, { type: "start" })).toBe(attached);
     expect(nodeReducer(attached, { type: "stop" })).toBe(attached);
+  });
+
+  it.each(["stopping", "recovery-required", "error"] as const)(
+    "ignores a late ready status while %s",
+    (phase) => {
+      const state = {
+        phase,
+        ownership: "owned" as const,
+        status: null,
+        error: phase === "stopping" ? null : "preserve me",
+      };
+      expect(nodeReducer(state, { type: "status", status: readyStatus })).toBe(state);
+    },
+  );
+
+  it("accepts stopped only after an owned stop is in progress", () => {
+    const ready = {
+      phase: "ready" as const,
+      ownership: "owned" as const,
+      status: readyStatus,
+      error: null,
+    };
+    const attached = { ...ready, phase: "attached" as const };
+    const externallyStopping = { ...ready, phase: "stopping" as const, ownership: "attached" as const };
+
+    expect(nodeReducer(ready, { type: "stopped" })).toBe(ready);
+    expect(nodeReducer(attached, { type: "stopped" })).toBe(attached);
+    expect(nodeReducer(externallyStopping, { type: "stopped" })).toBe(externallyStopping);
+    expect(
+      nodeReducer({ ...ready, phase: "stopping" }, { type: "stopped" }),
+    ).toEqual(initialNodeState());
   });
 });
 

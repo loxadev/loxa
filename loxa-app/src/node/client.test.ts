@@ -89,6 +89,54 @@ describe("node client", () => {
     ).rejects.toMatchObject({ kind: "timeout" });
   }, 100);
 
+  it("classifies a timeout while reading a non-2xx body as timeout", async () => {
+    const fetch = vi.fn(async (_url: string, init?: RequestInit) => ({
+      ok: false,
+      status: 503,
+      text: () =>
+        new Promise<string>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () =>
+            reject(new DOMException("aborted", "AbortError")),
+          );
+        }),
+    }) as Response);
+
+    await expect(
+      getStatus("http://127.0.0.1:31000", { fetch, timeoutMs: 5 }),
+    ).rejects.toMatchObject({ kind: "timeout" });
+  }, 100);
+
+  it("keeps caller cancellation distinct from timeout", async () => {
+    const controller = new AbortController();
+    const fetch = vi.fn((_url: string, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () =>
+          reject(new DOMException("aborted", "AbortError")),
+        );
+      }),
+    );
+    const pending = getStatus("http://127.0.0.1:31000", {
+      fetch,
+      timeoutMs: 1_000,
+      signal: controller.signal,
+    });
+
+    controller.abort();
+
+    await expect(pending).rejects.toMatchObject({ kind: "aborted" });
+  });
+
+  it("honors a caller signal that was already aborted", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const fetch = vi.fn(async () => Response.json(readyStatus));
+
+    await expect(
+      getStatus("http://127.0.0.1:31000", { fetch, signal: controller.signal }),
+    ).rejects.toMatchObject({ kind: "aborted" });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it("preserves OpenAI-shaped details from a non-2xx response", async () => {
     const error = {
       error: {

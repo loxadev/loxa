@@ -8,7 +8,12 @@ import {
   type OpenAIError,
 } from "./contracts";
 
-export type ClientErrorKind = "transport" | "timeout" | "http" | "invalid-response";
+export type ClientErrorKind =
+  | "transport"
+  | "timeout"
+  | "aborted"
+  | "http"
+  | "invalid-response";
 
 export class NodeClientError extends Error {
   constructor(
@@ -27,6 +32,7 @@ export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>
 export type ClientOptions = {
   fetch?: FetchLike;
   timeoutMs?: number;
+  signal?: AbortSignal;
 };
 
 const DEFAULT_TIMEOUT_MS = 5_000;
@@ -50,8 +56,11 @@ async function parseJson(response: Response): Promise<unknown> {
 async function openAIError(response: Response): Promise<OpenAIError | undefined> {
   try {
     return decodeOpenAIError(await parseJson(response));
-  } catch {
-    return undefined;
+  } catch (error) {
+    if (error instanceof NodeClientError && error.kind === "invalid-response") {
+      return undefined;
+    }
+    throw error;
   }
 }
 
@@ -62,8 +71,17 @@ async function requestJson(
   options: ClientOptions,
 ): Promise<unknown> {
   const controller = new AbortController();
+  let timedOut = false;
+  const abortFromCaller = () => controller.abort();
+  if (options.signal?.aborted) {
+    throw new NodeClientError("aborted", "The Loxa node request was cancelled.");
+  }
+  options.signal?.addEventListener("abort", abortFromCaller, { once: true });
   const timeout = setTimeout(
-    () => controller.abort(),
+    () => {
+      timedOut = true;
+      controller.abort();
+    },
     options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
   );
   try {
@@ -82,13 +100,17 @@ async function requestJson(
     }
     return await parseJson(response);
   } catch (error) {
-    if (error instanceof NodeClientError) throw error;
     if (controller.signal.aborted) {
-      throw new NodeClientError("timeout", "The Loxa node request timed out.");
+      if (timedOut) {
+        throw new NodeClientError("timeout", "The Loxa node request timed out.");
+      }
+      throw new NodeClientError("aborted", "The Loxa node request was cancelled.");
     }
+    if (error instanceof NodeClientError) throw error;
     throw new NodeClientError("transport", "Could not connect to the Loxa node.");
   } finally {
     clearTimeout(timeout);
+    options.signal?.removeEventListener("abort", abortFromCaller);
   }
 }
 
