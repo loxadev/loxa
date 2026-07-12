@@ -1,16 +1,23 @@
-use axum::extract::{RawQuery, State};
+use crate::download_control::{DownloadControl, DownloadControlError};
+use axum::body::Bytes;
+use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, options};
+use axum::routing::{get, options, post};
 use axum::{Json, Router};
 use loxa_core::control::auth::{AuthPolicy, ControlToken};
 use loxa_core::control::contracts::{
-    CapabilitiesSnapshot, NodeIdentityChallenge, NodeIdentityProofResponse, NodeSnapshot,
-    NodeStatus, CONTROL_PROTOCOL_VERSION,
+    CapabilitiesSnapshot, ControlErrorBody, ModelRequest, NodeIdentityChallenge,
+    NodeIdentityProofResponse, NodeSnapshot, NodeStatus, OperationAccepted,
+    CONTROL_PROTOCOL_VERSION,
 };
 use loxa_core::model_inventory::{current_available_memory_bytes, known_registry_inventory};
+use serde::Deserialize;
+use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Clone)]
 pub struct ControlState {
@@ -19,6 +26,7 @@ pub struct ControlState {
     node_id: Arc<str>,
     runtime_identity: Arc<str>,
     models_dir: PathBuf,
+    downloads: DownloadControl,
 }
 
 impl ControlState {
@@ -27,6 +35,7 @@ impl ControlState {
         node_id: String,
         runtime_identity: String,
         models_dir: PathBuf,
+        downloads: DownloadControl,
     ) -> Self {
         let policy = AuthPolicy::new(
             token.clone(),
@@ -38,6 +47,7 @@ impl ControlState {
             node_id: node_id.into(),
             runtime_identity: runtime_identity.into(),
             models_dir,
+            downloads,
         }
     }
 }
@@ -77,21 +87,255 @@ fn cors(mut response: Response, origin: Option<&str>) -> Response {
     response
 }
 
-async fn preflight(headers: HeaderMap) -> Response {
+async fn preflight(headers: HeaderMap, methods: &'static str) -> Response {
     let origin = match request_origin(&headers) {
         Ok(Some(origin)) => origin,
         _ => return StatusCode::FORBIDDEN.into_response(),
     };
     let mut response = StatusCode::NO_CONTENT.into_response();
+    let requested_method = headers
+        .get(header::ACCESS_CONTROL_REQUEST_METHOD)
+        .and_then(|value| value.to_str().ok());
+    let expected_method = methods.split(',').next().expect("method exists");
+    if requested_method != Some(expected_method) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if let Some(requested_headers) = headers
+        .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
+        .and_then(|value| value.to_str().ok())
+    {
+        let allowed = requested_headers.split(',').all(|name| {
+            matches!(
+                name.trim().to_ascii_lowercase().as_str(),
+                "authorization" | "content-type" | "x-loxa-challenge"
+            )
+        });
+        if !allowed {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+    }
     response.headers_mut().insert(
         header::ACCESS_CONTROL_ALLOW_METHODS,
-        HeaderValue::from_static("GET, OPTIONS"),
+        HeaderValue::from_static(methods),
     );
     response.headers_mut().insert(
         header::ACCESS_CONTROL_ALLOW_HEADERS,
         HeaderValue::from_static("authorization, content-type, x-loxa-challenge"),
     );
     cors(response, Some(&origin))
+}
+
+async fn get_preflight(headers: HeaderMap) -> Response {
+    preflight(headers, "GET, OPTIONS").await
+}
+
+async fn post_preflight(headers: HeaderMap) -> Response {
+    preflight(headers, "POST, OPTIONS").await
+}
+
+fn control_error(status: StatusCode, code: &str, message: &str, origin: Option<&str>) -> Response {
+    cors(
+        (
+            status,
+            Json(ControlErrorBody {
+                code: code.into(),
+                message: message.into(),
+            }),
+        )
+            .into_response(),
+        origin,
+    )
+}
+
+fn map_download_error(error: DownloadControlError, origin: Option<&str>) -> Response {
+    match error {
+        DownloadControlError::Conflict => control_error(
+            StatusCode::CONFLICT,
+            "operation_conflict",
+            "a download for this model is already active",
+            origin,
+        ),
+        DownloadControlError::Missing => control_error(
+            StatusCode::NOT_FOUND,
+            "operation_not_found",
+            "operation or model was not found",
+            origin,
+        ),
+        DownloadControlError::Terminal => control_error(
+            StatusCode::CONFLICT,
+            "operation_terminal",
+            "operation is already terminal",
+            origin,
+        ),
+        DownloadControlError::Stopping => control_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "node_stopping",
+            "node is stopping",
+            origin,
+        ),
+    }
+}
+
+async fn start_download(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let origin = match request_origin(&headers) {
+        Ok(origin) => origin,
+        Err(status) => return status.into_response(),
+    };
+    if let Err(status) = authorize(&state, &headers) {
+        return cors(status.into_response(), origin.as_deref());
+    }
+    if headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_none_or(|value| value.split(';').next() != Some("application/json"))
+    {
+        return control_error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_media_type",
+            "content type must be application/json",
+            origin.as_deref(),
+        );
+    }
+    let request = match serde_json::from_slice::<ModelRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return control_error(
+                StatusCode::BAD_REQUEST,
+                "unknown_model",
+                "request must name a known registry model",
+                origin.as_deref(),
+            )
+        }
+    };
+    match state.downloads.start(&request.model_id) {
+        Ok(operation_id) => cors(
+            (
+                StatusCode::ACCEPTED,
+                Json(OperationAccepted { operation_id }),
+            )
+                .into_response(),
+            origin.as_deref(),
+        ),
+        Err(error) => map_download_error(error, origin.as_deref()),
+    }
+}
+
+async fn operation(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let origin = match request_origin(&headers) {
+        Ok(origin) => origin,
+        Err(status) => return status.into_response(),
+    };
+    if let Err(status) = authorize(&state, &headers) {
+        return cors(status.into_response(), origin.as_deref());
+    }
+    match state.downloads.operation(&id) {
+        Some(operation) => cors(Json(operation).into_response(), origin.as_deref()),
+        None => map_download_error(DownloadControlError::Missing, origin.as_deref()),
+    }
+}
+
+async fn cancel_operation(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let origin = match request_origin(&headers) {
+        Ok(origin) => origin,
+        Err(status) => return status.into_response(),
+    };
+    if let Err(status) = authorize(&state, &headers) {
+        return cors(status.into_response(), origin.as_deref());
+    }
+    match state.downloads.cancel(&id) {
+        Ok(_) => cors(
+            Json(
+                state
+                    .downloads
+                    .operation(&id)
+                    .expect("cancelled operation exists"),
+            )
+            .into_response(),
+            origin.as_deref(),
+        ),
+        Err(error) => map_download_error(error, origin.as_deref()),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EventsQuery {
+    #[serde(default)]
+    cursor: u64,
+}
+
+async fn events(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    Query(query): Query<EventsQuery>,
+) -> Response {
+    let origin = match request_origin(&headers) {
+        Ok(origin) => origin,
+        Err(status) => return status.into_response(),
+    };
+    if let Err(status) = authorize(&state, &headers) {
+        return cors(status.into_response(), origin.as_deref());
+    }
+    let (snapshot, subscription) = state.downloads.subscribe_with_snapshot(query.cursor);
+    let initial = serde_json::to_string(&snapshot).expect("snapshot serializes");
+    let (sender, receiver) = tokio::sync::mpsc::channel(128);
+    std::thread::spawn(move || loop {
+        match subscription
+            .receiver
+            .recv_timeout(Duration::from_millis(250))
+        {
+            Ok(event) => {
+                if sender.blocking_send(event).is_err() {
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) if sender.is_closed() => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    });
+    let stream = futures_util::stream::unfold(
+        (Some(initial), receiver),
+        |(initial, mut receiver)| async move {
+            if let Some(initial) = initial {
+                return Some((
+                    Ok::<_, Infallible>(Event::default().event("snapshot").data(initial)),
+                    (None, receiver),
+                ));
+            }
+            match receiver.recv().await {
+                Some(control_event) => Some((
+                    Ok(Event::default()
+                        .event("operation")
+                        .id(control_event.sequence.to_string())
+                        .data(
+                            serde_json::to_string(&control_event)
+                                .expect("control event serializes"),
+                        )),
+                    (None, receiver),
+                )),
+                None => None,
+            }
+        },
+    );
+    cors(
+        Sse::new(stream)
+            .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+            .into_response(),
+        origin.as_deref(),
+    )
 }
 
 async fn node_proof(
@@ -211,9 +455,22 @@ pub fn router(state: ControlState) -> Router {
         .route("/loxa/v1/node", get(node_proof))
         .route("/loxa/v1/capabilities", get(capabilities))
         .route("/loxa/v1/models", get(models))
-        .route("/loxa/v1/node", options(preflight))
-        .route("/loxa/v1/capabilities", options(preflight))
-        .route("/loxa/v1/models", options(preflight))
+        .route(
+            "/loxa/v1/models/download",
+            post(start_download).options(post_preflight),
+        )
+        .route(
+            "/loxa/v1/operations/{id}",
+            get(operation).options(get_preflight),
+        )
+        .route(
+            "/loxa/v1/operations/{id}/cancel",
+            post(cancel_operation).options(post_preflight),
+        )
+        .route("/loxa/v1/events", get(events).options(get_preflight))
+        .route("/loxa/v1/node", options(get_preflight))
+        .route("/loxa/v1/capabilities", options(get_preflight))
+        .route("/loxa/v1/models", options(get_preflight))
         .with_state(state)
 }
 

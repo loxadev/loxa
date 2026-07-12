@@ -14,6 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub mod actor;
 pub mod control_router;
+pub mod download_control;
 
 #[derive(Clone, Debug)]
 pub struct NodePaths {
@@ -831,6 +832,9 @@ pub fn serve_node(
     } else {
         (port.unwrap_or(DEFAULT_GATEWAY_PORT), None)
     };
+    let mut download_runtime = unloaded_run
+        .as_ref()
+        .map(|_| download_control::DownloadControl::spawn(paths.models_dir.clone()));
     let node_id = format!("loxa-node-{}", std::process::id());
     let gateway_state = loxa_core::gateway::GatewayState::new(node_id);
     let gateway_router = match (|| -> io::Result<_> {
@@ -854,6 +858,11 @@ pub fn serve_node(
                     format!("loxa-node-{}", std::process::id()),
                     run.run_id.clone(),
                     paths.models_dir.clone(),
+                    download_runtime
+                        .as_ref()
+                        .expect("unloaded node has download control")
+                        .0
+                        .clone(),
                 ),
             ))
         } else {
@@ -864,6 +873,9 @@ pub fn serve_node(
         Err(error) => {
             if let Some(run) = &unloaded_run {
                 let _ = finish_unloaded_owner(paths, run);
+            }
+            if let Some((_, worker)) = download_runtime.take() {
+                let _ = worker.stop_and_join();
             }
             return Err(error);
         }
@@ -877,6 +889,9 @@ pub fn serve_node(
         Err(error) => {
             if let Some(run) = &unloaded_run {
                 let _ = finish_unloaded_owner(paths, run);
+            }
+            if let Some((_, worker)) = download_runtime.take() {
+                let _ = worker.stop_and_join();
             }
             return Err(error);
         }
@@ -903,7 +918,14 @@ pub fn serve_node(
                 Some(&gateway_state),
                 events,
             ),
-            None => run_unloaded_actor(paths, unloaded_run.expect("unloaded owner claimed")),
+            None => run_unloaded_actor(
+                paths,
+                unloaded_run.expect("unloaded owner claimed"),
+                download_runtime
+                    .take()
+                    .expect("unloaded node has download control")
+                    .1,
+            ),
         }
     })();
     gateway_state.withdraw();
@@ -918,27 +940,28 @@ pub fn serve_node(
 fn run_unloaded_actor(
     paths: &NodePaths,
     run: supervisor::ManagedRun,
+    download_worker: download_control::DownloadControlWorker,
 ) -> io::Result<RunTermination> {
     let signal_guard = match SignalGuard::install() {
         Ok(guard) => guard,
         Err(error) => {
+            let _ = download_worker.stop_and_join();
             let _ = finish_unloaded_owner(paths, &run);
             return Err(error);
         }
     };
-    struct IdleExecutor;
-    impl actor::MutationExecutor for IdleExecutor {
-        fn execute(&mut self, _: &str, _: &actor::Mutation, _: &actor::MutationCancellation) {}
-    }
-    let (actor_handle, actor_worker) = actor::NodeActor::spawn(IdleExecutor);
     let outcome = loop {
+        if download_worker.is_finished() {
+            break Err(io::Error::other(
+                "download actor worker terminated unexpectedly",
+            ));
+        }
         let current =
             match supervisor::current_runtime_state_run(&paths.state_path, &run.identity()) {
                 Ok(current) => current,
                 Err(error) => break Err(supervisor_error_to_io(error)),
             };
         if current.stop_requested || signal_guard.interrupted() {
-            actor_handle.stop();
             let stopped = current.stop_requested;
             break Ok(if stopped {
                 RunTermination::RequestedStop
@@ -948,15 +971,13 @@ fn run_unloaded_actor(
         }
         std::thread::sleep(Duration::from_millis(25));
     };
-    actor_handle.stop();
-    if actor_worker.join().is_err() {
-        return Err(io::Error::other("node actor worker panicked"));
-    }
+    let worker_cleanup = download_worker.stop_and_join();
     let cleanup = finish_unloaded_owner(paths, &run);
-    match (outcome, cleanup) {
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
-        (Ok(outcome), Ok(_)) => Ok(outcome),
+    match (outcome, worker_cleanup, cleanup) {
+        (Err(error), _, _) => Err(error),
+        (Ok(_), Err(error), _) => Err(error),
+        (Ok(_), Ok(()), Err(error)) => Err(error),
+        (Ok(outcome), Ok(()), Ok(())) => Ok(outcome),
     }
 }
 
@@ -1920,6 +1941,17 @@ mod lifecycle_api_tests {
         response
     }
 
+    fn http_stream_prefix(port: u16, request: &str) -> String {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect gateway");
+        stream.write_all(request.as_bytes()).expect("write request");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut bytes = [0_u8; 8192];
+        let read = stream.read(&mut bytes).expect("read stream prefix");
+        String::from_utf8_lossy(&bytes[..read]).into_owned()
+    }
+
     struct FailingLifecycleSink {
         events: Vec<LifecycleEvent>,
     }
@@ -2338,7 +2370,10 @@ mod lifecycle_api_tests {
         };
         let actor_paths = paths.clone();
         let run = claim_unloaded_owner(&paths, 11_436).expect("claim unloaded owner");
-        let actor = std::thread::spawn(move || run_unloaded_actor(&actor_paths, run));
+        let (_, download_worker) =
+            download_control::DownloadControl::spawn(paths.models_dir.clone());
+        let actor =
+            std::thread::spawn(move || run_unloaded_actor(&actor_paths, run, download_worker));
 
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while matches!(managed_servers(&paths), Ok(ManagedRunsSnapshot::Missing)) {
@@ -2357,6 +2392,25 @@ mod lifecycle_api_tests {
             actor.join().expect("join unloaded actor").unwrap(),
             RunTermination::RequestedStop
         );
+        assert_eq!(
+            managed_servers(&paths).unwrap(),
+            ManagedRunsSnapshot::Runs(Vec::new())
+        );
+    }
+
+    #[test]
+    fn unloaded_actor_worker_panic_is_typed_and_cleans_exact_owner() {
+        let _signal_lock = SIGNAL_TEST_LOCK.lock().expect("signal test lock");
+        let temp = TestDir::new("unloaded-worker-panic");
+        let paths = NodePaths {
+            models_dir: temp.0.join("models"),
+            state_path: temp.0.join("managed.json"),
+            logs_dir: temp.0.join("logs"),
+        };
+        let run = claim_unloaded_owner(&paths, 11_437).unwrap();
+        let error = run_unloaded_actor(&paths, run, download_control::panicking_worker())
+            .expect_err("worker panic terminates node");
+        assert!(error.to_string().contains("worker"));
         assert_eq!(
             managed_servers(&paths).unwrap(),
             ManagedRunsSnapshot::Runs(Vec::new())
@@ -2475,6 +2529,34 @@ mod lifecycle_api_tests {
             "{authenticated_models}"
         );
         assert!(authenticated_models.contains("gemma-3-4b-it-q4"));
+        let download_preflight = http_request(port, "OPTIONS /loxa/v1/models/download HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: tauri://localhost\r\nAccess-Control-Request-Method: POST\r\nAccess-Control-Request-Headers: authorization, content-type\r\nConnection: close\r\n\r\n");
+        assert!(
+            download_preflight.starts_with("HTTP/1.1 204"),
+            "{download_preflight}"
+        );
+        assert!(download_preflight.contains("access-control-allow-methods: POST, OPTIONS"));
+        let wrong_download_preflight = http_request(port, "OPTIONS /loxa/v1/models/download HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: tauri://localhost\r\nAccess-Control-Request-Method: GET\r\nConnection: close\r\n\r\n");
+        assert!(
+            wrong_download_preflight.starts_with("HTTP/1.1 403"),
+            "{wrong_download_preflight}"
+        );
+        let unauthenticated_download = http_request(port, "POST /loxa/v1/models/download HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: 31\r\nConnection: close\r\n\r\n{\"model_id\":\"gemma-3-4b-it-q4\"}");
+        assert!(
+            unauthenticated_download.starts_with("HTTP/1.1 401"),
+            "{unauthenticated_download}"
+        );
+        let unknown_download = http_request(port, &format!("POST /loxa/v1/models/download HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {bearer}\r\nOrigin: tauri://localhost\r\nContent-Type: application/json\r\nContent-Length: 22\r\nConnection: close\r\n\r\n{{\"model_id\":\"unknown\"}}"));
+        assert!(
+            unknown_download.starts_with("HTTP/1.1 400"),
+            "{unknown_download}"
+        );
+        let events = http_stream_prefix(port, &format!("GET /loxa/v1/events?cursor=0 HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {bearer}\r\nOrigin: tauri://localhost\r\nConnection: close\r\n\r\n"));
+        assert!(events.starts_with("HTTP/1.1 200"), "{events}");
+        assert!(
+            events.contains("content-type: text/event-stream"),
+            "{events}"
+        );
+        assert!(events.contains("event: snapshot"), "{events}");
         let chat = http_request(
             port,
             "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: 30\r\n\r\n{\"model\":\"loxa\",\"messages\":[]}",
