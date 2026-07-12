@@ -1,3 +1,3 @@
-import { prepaintTheme } from "./theme";
+import { prepaintTheme } from "./themeRuntime";
 
 prepaintTheme();
