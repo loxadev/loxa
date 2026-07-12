@@ -116,7 +116,33 @@ describe("streamChat", () => {
     await streamChat("http://node", {}, observed.value, undefined, fetch).finished;
     expect(observed.deltas).toEqual(["before"]);
     expect(observed.terminals).toEqual([{ kind: "completed" }]);
-    expect(cancel).not.toHaveBeenCalled();
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it("cancels a body kept open after the first framed DONE", async () => {
+    const cancel = vi.fn(async () => undefined);
+    const reader = {
+      read: vi
+        .fn()
+        .mockResolvedValueOnce({ done: false, value: chunk("data: [DONE]\n\n") })
+        .mockImplementation(() => new Promise(() => undefined)),
+      cancel,
+      releaseLock: vi.fn(),
+    };
+    const fetch = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      body: { getReader: () => reader },
+    }) as unknown as Response);
+    const observed = callbacks();
+
+    await expect(
+      streamChat("http://node", {}, observed.value, undefined, fetch).finished,
+    ).resolves.toEqual({ kind: "completed" });
+    expect(reader.read).toHaveBeenCalledOnce();
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(reader.releaseLock).toHaveBeenCalledOnce();
+    expect(observed.terminals).toEqual([{ kind: "completed" }]);
   });
 
   it("stops callbacks immediately when onDelta disposes a multi-choice event", async () => {
