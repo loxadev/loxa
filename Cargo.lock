@@ -892,7 +892,11 @@ dependencies = [
 name = "loxa-node"
 version = "0.1.0-dev"
 dependencies = [
+ "axum",
  "loxa-core",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

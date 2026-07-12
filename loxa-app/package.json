@@ -11,6 +11,10 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && tsc --noEmit -p tsconfig.node.json && vite build",
+    "build:desktop": "pnpm prepare:sidecar && pnpm build",
+    "prepare:sidecar": "node scripts/prepare-sidecar.mjs",
+    "verify:sidecar": "node scripts/verify-sidecar.mjs",
+    "package:app": "node scripts/package-app.mjs",
     "lint": "eslint .",
     "preview": "vite preview",
     "test": "vitest run",

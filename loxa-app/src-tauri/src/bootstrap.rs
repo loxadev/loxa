@@ -1,3 +1,7 @@
+use loxa_core::control::auth::ControlToken;
+use loxa_core::control::contracts::{CONTROL_PROTOCOL_VERSION, NodeIdentityProofResponse};
+#[cfg(test)]
+use loxa_core::control::contracts::NodeStatus;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
@@ -6,6 +10,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+const MAX_PEER_RESPONSE_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -28,8 +34,6 @@ pub struct BootstrapSnapshot {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StartNodeRequest {
     pub endpoint: String,
-    pub model: String,
-    pub engine: String,
 }
 
 struct OwnedNode {
@@ -47,6 +51,7 @@ pub struct BootstrapState {
     ownership: Ownership,
     owned: Option<OwnedNode>,
     error: Option<String>,
+    credential_path: PathBuf,
     #[cfg(test)]
     fail_startup_inspection_once: bool,
 }
@@ -58,6 +63,7 @@ impl Default for BootstrapState {
             ownership: Ownership::None,
             owned: None,
             error: None,
+            credential_path: default_credential_path(),
             #[cfg(test)]
             fail_startup_inspection_once: false,
         }
@@ -69,6 +75,7 @@ pub type SharedBootstrapState = Arc<Mutex<BootstrapState>>;
 #[derive(Clone, Debug)]
 pub struct BootstrapConfig {
     pub executable: Option<PathBuf>,
+    pub credential_path: PathBuf,
     pub startup_timeout: Duration,
     pub poll_interval: Duration,
 }
@@ -76,7 +83,8 @@ pub struct BootstrapConfig {
 impl Default for BootstrapConfig {
     fn default() -> Self {
         Self {
-            executable: std::env::var_os("LOXA_EXECUTABLE").map(PathBuf::from),
+            executable: Some(private_node_executable()),
+            credential_path: default_credential_path(),
             startup_timeout: Duration::from_secs(15),
             poll_interval: Duration::from_millis(100),
         }
@@ -108,16 +116,11 @@ impl BootstrapState {
             Ok(address) => address,
             Err(error) => return self.fail(error),
         };
-        if let Err(error) = validate_engine(&request.engine) {
-            return self.fail(error);
-        }
-        if request.model.is_empty() {
-            return self.fail("model must not be empty".into());
-        }
         self.endpoint = request.endpoint;
+        self.credential_path = config.credential_path.clone();
         self.error = None;
 
-        if probe_ready(address, config.poll_interval) {
+        if probe_compatible(address, config.poll_interval, &config.credential_path) {
             self.ownership = Ownership::Attached;
             return Ok(self.current_snapshot());
         }
@@ -125,15 +128,10 @@ impl BootstrapState {
         let executable = config
             .executable
             .clone()
-            .unwrap_or_else(|| PathBuf::from("loxa"));
+            .unwrap_or_else(private_node_executable);
         let child = match Command::new(&executable)
-            .arg("serve")
-            .arg("--model")
-            .arg(&request.model)
             .arg("--port")
             .arg(address.port().to_string())
-            .arg("--engine")
-            .arg(&request.engine)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -142,7 +140,7 @@ impl BootstrapState {
             Ok(child) => child,
             Err(error) => {
                 return self.fail(format!(
-                    "failed to start loxa executable {}: {error}",
+                    "failed to start private loxa-node executable {}: {error}",
                     executable.display()
                 ));
             }
@@ -169,7 +167,7 @@ impl BootstrapState {
                 Ok(Some(status)) => {
                     self.owned = None;
                     self.ownership = Ownership::None;
-                    let message = format!("loxa exited before readiness with status {status}");
+                    let message = format!("loxa-node exited before startup with status {status}");
                     self.error = Some(message.clone());
                     return Err(message);
                 }
@@ -185,12 +183,12 @@ impl BootstrapState {
                     );
                 }
             }
-            if probe_ready(address, config.poll_interval) {
+            if probe_compatible(address, config.poll_interval, &config.credential_path) {
                 return Ok(self.current_snapshot());
             }
             if Instant::now() >= deadline {
                 let message = format!(
-                    "loxa startup timed out after {} ms",
+                    "loxa-node startup timed out after {} ms",
                     config.startup_timeout.as_millis()
                 );
                 return match self.cleanup_owned(&message) {
@@ -222,9 +220,10 @@ impl BootstrapState {
             Err(error) => return self.fail(error),
         };
         self.endpoint = endpoint;
+        self.credential_path = config.credential_path.clone();
         let deadline = Instant::now() + config.startup_timeout;
         loop {
-            if probe_ready(address, config.poll_interval) {
+            if probe_compatible(address, config.poll_interval, &config.credential_path) {
                 if self.owned.is_none() {
                     self.ownership = Ownership::Attached;
                 }
@@ -294,7 +293,13 @@ impl BootstrapState {
                 self.owned = None;
                 self.ownership = parse_loopback_endpoint(&self.endpoint)
                     .ok()
-                    .filter(|address| probe_ready(*address, Duration::from_millis(100)))
+                    .filter(|address| {
+                        probe_compatible(
+                            *address,
+                            Duration::from_millis(500),
+                            &self.credential_path,
+                        )
+                    })
                     .map_or(Ownership::None, |_| Ownership::Attached);
             }
             Ok(None) => {}
@@ -427,11 +432,27 @@ fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> Result<bool, Str
     }
 }
 
-fn validate_engine(engine: &str) -> Result<(), String> {
-    match engine {
-        "llama-cpp" | "py-mlx-lm" => Ok(()),
-        _ => Err("engine must be llama-cpp or py-mlx-lm".into()),
-    }
+fn private_node_executable() -> PathBuf {
+    let file_name = if cfg!(windows) {
+        "loxa-node.exe"
+    } else {
+        "loxa-node"
+    };
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.join(file_name)))
+        .unwrap_or_else(|| PathBuf::from("__missing_private_loxa_node__").join(file_name))
+}
+
+fn default_credential_path() -> PathBuf {
+    let home = if cfg!(windows) {
+        std::env::var_os("USERPROFILE")
+    } else {
+        std::env::var_os("HOME")
+    };
+    home.map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("__missing_loxa_home__"))
+        .join(".loxa/control.token")
 }
 
 fn parse_loopback_endpoint(endpoint: &str) -> Result<SocketAddr, String> {
@@ -453,7 +474,20 @@ fn parse_loopback_endpoint(endpoint: &str) -> Result<SocketAddr, String> {
     Ok(address)
 }
 
-fn probe_ready(address: SocketAddr, timeout: Duration) -> bool {
+fn probe_compatible(
+    address: SocketAddr,
+    timeout: Duration,
+    credential_path: &std::path::Path,
+) -> bool {
+    let Ok(token) = ControlToken::load(credential_path) else {
+        return false;
+    };
+    let mut nonce_bytes = [0_u8; 32];
+    if getrandom::fill(&mut nonce_bytes).is_err() {
+        return false;
+    }
+    let nonce = encode_hex(&nonce_bytes);
+    let deadline = Instant::now() + timeout.max(Duration::from_millis(1));
     let timeout = timeout.max(Duration::from_millis(1));
     let Ok(mut stream) = TcpStream::connect_timeout(&address, timeout) else {
         return false;
@@ -466,16 +500,30 @@ fn probe_ready(address: SocketAddr, timeout: Duration) -> bool {
     };
     if write!(
         stream,
-        "GET /loxa/status HTTP/1.1\r\nHost: {host}:{}\r\nConnection: close\r\n\r\n",
-        address.port()
+        "GET /loxa/v1/node HTTP/1.1\r\nHost: {host}:{}\r\nX-Loxa-Challenge: {nonce}\r\nConnection: close\r\n\r\n",
+        address.port(),
     )
     .is_err()
     {
         return false;
     }
-    let mut response = Vec::new();
-    if stream.read_to_end(&mut response).is_err() {
-        return false;
+    let mut response = Vec::with_capacity(1024);
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return false;
+        };
+        let _ = stream.set_read_timeout(Some(remaining.max(Duration::from_millis(1))));
+        let mut chunk = [0_u8; 1024];
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => {
+                if response.len() + count > MAX_PEER_RESPONSE_BYTES {
+                    return false;
+                }
+                response.extend_from_slice(&chunk[..count]);
+            }
+            Err(_) => return false,
+        }
     }
     let Some(body_offset) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
         return false;
@@ -484,15 +532,31 @@ fn probe_ready(address: SocketAddr, timeout: Duration) -> bool {
     if !headers.starts_with(b"HTTP/1.1 200 ") && !headers.starts_with(b"HTTP/1.0 200 ") {
         return false;
     }
-    serde_json::from_slice::<serde_json::Value>(&response[body_offset + 4..])
+    serde_json::from_slice::<NodeIdentityProofResponse>(&response[body_offset + 4..])
         .ok()
-        .and_then(|value| {
-            value
-                .get("health")
-                .and_then(|health| health.as_str())
-                .map(str::to_owned)
+        .is_some_and(|value| {
+            let proof_is_valid = token.verify_node_identity_proof(
+                &nonce,
+                &value.node_id,
+                &value.runtime_identity,
+                value.status,
+                &value.challenge_proof,
+            );
+            value.protocol_version == CONTROL_PROTOCOL_VERSION
+                && !value.node_id.is_empty()
+                && !value.runtime_identity.is_empty()
+                && proof_is_valid
         })
-        .is_some_and(|health| health == "ready")
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
 }
 
 #[tauri::command]
@@ -555,6 +619,149 @@ pub fn handle_exit_event<W: Write>(state: &SharedBootstrapState, stderr: &mut W)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
+
+    const TEST_SECRET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn test_token_path() -> PathBuf {
+        let path = std::env::temp_dir()
+            .join(format!("loxa-probe-token-{}", std::process::id()))
+            .join("control.token");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, format!("{TEST_SECRET}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                path.parent().unwrap(),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        path
+    }
+
+    fn serve_probe_response(
+        body: Vec<u8>,
+        drip: Option<Duration>,
+    ) -> (SocketAddr, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let mut chunk = [0_u8; 1024];
+                let count = stream.read(&mut chunk).unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..count]);
+            }
+            let request = String::from_utf8_lossy(&request);
+            assert!(!request.contains("Authorization:"));
+            let nonce = request
+                .lines()
+                .find_map(|line| line.strip_prefix("X-Loxa-Challenge: "))
+                .unwrap();
+            let token = ControlToken::load(&test_token_path()).unwrap();
+            let proof = token
+                .node_identity_proof(nonce, "node", "runtime", NodeStatus::Unloaded)
+                .unwrap();
+            let body = String::from_utf8(body)
+                .unwrap()
+                .replace("__PROOF__", &proof)
+                .into_bytes();
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).unwrap();
+            if let Some(delay) = drip {
+                for byte in body {
+                    if stream.write_all(&[byte]).is_err() {
+                        break;
+                    }
+                    thread::sleep(delay);
+                }
+            } else {
+                let _ = stream.write_all(&body);
+            }
+        });
+        (address, worker)
+    }
+
+    fn identity_json(version: u32) -> Vec<u8> {
+        format!(r#"{{"protocol_version":{version},"node_id":"node","runtime_identity":"runtime","status":"unloaded","challenge_proof":"__PROOF__"}}"#).into_bytes()
+    }
+
+    #[test]
+    fn authenticated_probe_rejects_legacy_spoofs_wrong_versions_and_extra_fields() {
+        let token = test_token_path();
+        for body in [
+            br#"{"node_id":"spoof","health":"ready","model":"loxa"}"#.to_vec(),
+            identity_json(0),
+            br#"{"protocol_version":1,"node_id":"node","runtime_identity":"runtime","status":"unloaded","challenge_proof":"__PROOF__","extra":true}"#.to_vec(),
+        ] {
+            let (address, worker) = serve_probe_response(body, None);
+            assert!(!probe_compatible(address, Duration::from_secs(1), &token));
+            worker.join().unwrap();
+        }
+        let malformed = token.with_file_name("wrong.token");
+        std::fs::write(&malformed, "wrong\n").unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        assert!(!probe_compatible(
+            address,
+            Duration::from_secs(1),
+            &malformed
+        ));
+    }
+
+    #[test]
+    fn authenticated_probe_accepts_only_the_closed_current_identity() {
+        let token = test_token_path();
+        let (address, worker) = serve_probe_response(identity_json(1), None);
+        assert!(probe_compatible(address, Duration::from_secs(1), &token));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn a_valid_old_proof_is_rejected_when_replayed_for_a_fresh_nonce() {
+        let token = ControlToken::load(&test_token_path()).unwrap();
+        let old_nonce = "01".repeat(32);
+        let fresh_nonce = "02".repeat(32);
+        let proof = token
+            .node_identity_proof(&old_nonce, "node", "runtime", NodeStatus::Unloaded)
+            .unwrap();
+        assert!(!token.verify_node_identity_proof(
+            &fresh_nonce,
+            "node",
+            "runtime",
+            NodeStatus::Unloaded,
+            &proof,
+        ));
+    }
+
+    #[test]
+    fn probe_rejects_oversize_and_absolute_deadline_drip_responses() {
+        let token = test_token_path();
+        let (address, worker) = serve_probe_response(vec![b'x'; MAX_PEER_RESPONSE_BYTES + 1], None);
+        assert!(!probe_compatible(address, Duration::from_secs(1), &token));
+        worker.join().unwrap();
+
+        let (address, worker) =
+            serve_probe_response(identity_json(1), Some(Duration::from_millis(20)));
+        let began = Instant::now();
+        assert!(!probe_compatible(
+            address,
+            Duration::from_millis(80),
+            &token
+        ));
+        assert!(began.elapsed() < Duration::from_millis(300));
+        worker.join().unwrap();
+    }
 
     fn state_with_sleeping_child() -> BootstrapState {
         let child = Command::new("sleep").arg("30").spawn().unwrap();
@@ -568,6 +775,7 @@ mod tests {
                 exit_before_signal_once: false,
             }),
             error: None,
+            credential_path: default_credential_path(),
             fail_startup_inspection_once: false,
         }
     }
@@ -624,11 +832,10 @@ mod tests {
             .start_with_config(
                 StartNodeRequest {
                     endpoint: "http://127.0.0.1:49191".into(),
-                    model: "timeout".into(),
-                    engine: "llama-cpp".into(),
                 },
                 &BootstrapConfig {
                     executable: Some(fixture),
+                    credential_path: default_credential_path(),
                     startup_timeout: Duration::from_millis(200),
                     poll_interval: Duration::from_millis(10),
                 },

@@ -77,7 +77,7 @@ describe("NodeScreen", () => {
     render(<NodeScreen services={api} />);
     await screen.findByText("Disconnected");
     await user.click(screen.getByRole("button", { name: "Start node" }));
-    expect(api.bootstrap.start).toHaveBeenCalledWith({ endpoint, model: "loxa", engine: "llama-cpp" });
+    expect(api.bootstrap.start).toHaveBeenCalledWith({ endpoint });
     expect(await screen.findByText("App-owned node")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Stop node" })).toBeEnabled();
   });

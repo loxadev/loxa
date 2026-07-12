@@ -12,8 +12,6 @@ export type BootstrapSnapshot = {
 
 export type StartNodeRequest = {
   endpoint: string;
-  model: string;
-  engine: "llama-cpp" | "py-mlx-lm";
 };
 
 export type BootstrapApi = {
@@ -77,7 +75,7 @@ export function NodeScreen({ services, initialPhase, onEndpointChange }: { servi
     dispatch({ type: kind === "attach" ? "connect" : kind });
     try {
       const snapshot = kind === "start"
-        ? await services.bootstrap.start({ endpoint, model: "loxa", engine: "llama-cpp" })
+        ? await services.bootstrap.start({ endpoint })
         : kind === "attach"
           ? await services.bootstrap.attach(endpoint)
           : await services.bootstrap.stop();

@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
@@ -13,6 +14,51 @@ describe("Cargo workspace isolation", () => {
     ) as { permissions: string[] };
 
     expect(capability.permissions).toEqual([]);
+  });
+
+  it("bundles the private node without granting frontend process or filesystem access", () => {
+    const config = JSON.parse(
+      readFileSync(resolve(appRoot, "src-tauri/tauri.conf.json"), "utf8"),
+    ) as { bundle: { externalBin?: string[] }; app: { security: { csp: string } } };
+
+    expect(config.bundle.externalBin).toEqual(["binaries/loxa-node"]);
+    expect(config.app.security.csp).not.toMatch(/shell|filesystem|fs:/i);
+    const bootstrap = readFileSync(resolve(appRoot, "src-tauri/src/bootstrap.rs"), "utf8");
+    expect(bootstrap).not.toContain("LOXA_NODE_EXECUTABLE");
+    expect(bootstrap).not.toMatch(/PathBuf::from\("loxa(?:-node)?"\)/);
+    const packageJson = JSON.parse(readFileSync(resolve(appRoot, "package.json"), "utf8")) as {
+      scripts: Record<string, string>;
+    };
+    expect(packageJson.scripts["build:desktop"]).toContain("prepare:sidecar");
+    expect(packageJson.scripts["verify:sidecar"]).toContain("verify-sidecar.mjs");
+    expect(packageJson.scripts["package:app"]).toContain("package-app.mjs");
+  });
+
+  it("selects an explicit packaging target instead of silently using the host", () => {
+    const selected = execFileSync(process.execPath, [resolve(appRoot, "scripts/prepare-sidecar.mjs"), "--print-target"], {
+      encoding: "utf8",
+      env: { ...process.env, LOXA_SIDECAR_TARGET: "x86_64-apple-darwin" },
+    });
+    expect(selected.trim()).toBe("x86_64-apple-darwin");
+  });
+
+  it("fails closed when the prepared sidecar hash differs from its manifest", () => {
+    const root = mkdtempSync(resolve(tmpdir(), "loxa-sidecar-proof-"));
+    const binaries = resolve(root, "src-tauri/binaries");
+    mkdirSync(binaries, { recursive: true });
+    const binary = resolve(binaries, "loxa-node-aarch64-apple-darwin");
+    writeFileSync(binary, "not-the-reviewed-binary");
+    chmodSync(binary, 0o755);
+    writeFileSync(resolve(binaries, "loxa-node-manifest.json"), JSON.stringify({
+      triple: "aarch64-apple-darwin",
+      sourceHash: "0".repeat(64),
+      destinationHash: "0".repeat(64),
+      destination: "loxa-node-aarch64-apple-darwin",
+    }));
+    expect(() => execFileSync(process.execPath, [resolve(appRoot, "scripts/verify-sidecar.mjs")], {
+      env: { ...process.env, LOXA_SIDECAR_APP_ROOT: root },
+      stdio: "pipe",
+    })).toThrow(/sidecar hash verification failed/);
   });
 
   it("declares the desktop crate as its own workspace", () => {

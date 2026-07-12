@@ -21,6 +21,8 @@ tauri-build = { version = "=2.6.3", features = [] }
 
 [dependencies]
 libc = "=0.2.186"
+loxa-core = { path = "../../loxa-core" }
+getrandom = "=0.4.3"
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.150"
 tauri = { version = "=2.11.5", features = [] }
