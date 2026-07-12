@@ -175,7 +175,7 @@ pub const REGISTRY: &[ModelEntry] = &[
     ModelEntry {
         id: "qwen3-coder-30b-a3b-q4",
         repo: "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
-        revision: "main",
+        revision: "b17cb02dd882d5b6ab62fc777ad2995f19668350",
         filename: "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf",
         sha256: "fadc3e5f8d42bf7e894a785b05082e47daee4df26680389817e2093056f088ad",
         size_bytes: 18_556_689_568,
@@ -187,7 +187,7 @@ pub const REGISTRY: &[ModelEntry] = &[
     ModelEntry {
         id: "qwen3-coder-30b-a3b-q8",
         repo: "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
-        revision: "main",
+        revision: "b17cb02dd882d5b6ab62fc777ad2995f19668350",
         filename: "Qwen3-Coder-30B-A3B-Instruct-Q8_0.gguf",
         sha256: "4ff1cff607804037bf6d2168249c570baa4e1621292b159c0e06591e0d7c3066",
         size_bytes: 32_483_935_392,
@@ -199,7 +199,7 @@ pub const REGISTRY: &[ModelEntry] = &[
     ModelEntry {
         id: "qwen25-coder-7b-q4",
         repo: "unsloth/Qwen2.5-Coder-7B-Instruct-GGUF",
-        revision: "main",
+        revision: "0ecf11859560b2bf42e703207f9371186d02245f",
         filename: "Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf",
         sha256: "9a961bb225cb2b9fd84b2297df0d53089895c049d7d9dc5f5f8aebbcd3247872",
         size_bytes: 4_683_073_504,
@@ -211,7 +211,7 @@ pub const REGISTRY: &[ModelEntry] = &[
     ModelEntry {
         id: "qwen25-coder-7b-q8",
         repo: "unsloth/Qwen2.5-Coder-7B-Instruct-GGUF",
-        revision: "main",
+        revision: "0ecf11859560b2bf42e703207f9371186d02245f",
         filename: "Qwen2.5-Coder-7B-Instruct-Q8_0.gguf",
         sha256: "3b879bf3c429aeb01ae5edec57eb2e787b24eb317991dfe491d69357c7f02735",
         size_bytes: 8_098_525_152,
@@ -224,7 +224,7 @@ pub const REGISTRY: &[ModelEntry] = &[
         // Verified recipe retained, but Gemma 3 is wrong for native tool use.
         id: "gemma-3-4b-it-q4",
         repo: "unsloth/gemma-3-4b-it-GGUF",
-        revision: "main",
+        revision: "5a3566e716d80f709ed7b79817eaf7733d2a1fce",
         filename: "gemma-3-4b-it-Q4_K_M.gguf",
         sha256: "04a43a22e8d2003deda5acc262f68ec1005fa76c735a9962a8c77042a74a7d19",
         size_bytes: 2_489_894_016,
@@ -236,7 +236,7 @@ pub const REGISTRY: &[ModelEntry] = &[
     ModelEntry {
         id: "qwen3-14b-q4",
         repo: "unsloth/Qwen3-14B-GGUF",
-        revision: "main",
+        revision: "a04a82c4739b3ef5fa6da7d10261db2c67dd1985",
         filename: "Qwen3-14B-Q4_K_M.gguf",
         sha256: "5eaa0870bd81ed3b58a630a271234cfa604e43ffb3a19cd68e54a80dd9d52a66",
         size_bytes: 9_001_753_984,
@@ -367,6 +367,47 @@ mod tests {
         let expected_ids = EXPECTED_IDS.iter().copied().collect::<HashSet<_>>();
 
         assert_eq!(actual_ids, expected_ids);
+    }
+
+    #[test]
+    fn compiled_registry_revisions_are_immutable_verified_commits() {
+        let expected = [
+            (
+                "qwen3-coder-30b-a3b-q4",
+                "b17cb02dd882d5b6ab62fc777ad2995f19668350",
+            ),
+            (
+                "qwen3-coder-30b-a3b-q8",
+                "b17cb02dd882d5b6ab62fc777ad2995f19668350",
+            ),
+            (
+                "qwen25-coder-7b-q4",
+                "0ecf11859560b2bf42e703207f9371186d02245f",
+            ),
+            (
+                "qwen25-coder-7b-q8",
+                "0ecf11859560b2bf42e703207f9371186d02245f",
+            ),
+            (
+                "gemma-3-4b-it-q4",
+                "5a3566e716d80f709ed7b79817eaf7733d2a1fce",
+            ),
+            ("qwen3-14b-q4", "a04a82c4739b3ef5fa6da7d10261db2c67dd1985"),
+            (
+                "gemma-4-e4b-it-q4",
+                "0720adb23527c2cd5ea01d1db067cd960327fdac",
+            ),
+        ];
+        for (id, revision) in expected {
+            let entry = REGISTRY.iter().find(|entry| entry.id == id).unwrap();
+            assert_eq!(entry.revision, revision, "unexpected revision for {id}");
+            assert_eq!(
+                entry.revision.len(),
+                40,
+                "revision must be a full commit for {id}"
+            );
+            assert!(entry.revision.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        }
     }
 
     #[test]
