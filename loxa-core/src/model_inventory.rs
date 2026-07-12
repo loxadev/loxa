@@ -14,7 +14,7 @@ const GIB: f64 = 1_073_741_824.0;
 const DEFAULT_CACHE_CAPACITY: usize = 64;
 const DEFAULT_MAX_CONCURRENT_VERIFICATIONS: usize = 2;
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactState {
     NotDownloaded,
@@ -23,7 +23,7 @@ pub enum ArtifactState {
     Invalid { reason: ArtifactInvalidReason },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactInvalidReason {
     SizeMismatch,
@@ -32,20 +32,20 @@ pub enum ArtifactInvalidReason {
     VerificationRequired,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct Compatibility {
     pub compatible: bool,
     pub reason: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct EngineEligibility {
     pub engine: String,
     pub eligible: bool,
     pub reason: String,
 }
 
-#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct VerifiedRecipeInventoryEntry {
     pub id: String,
     pub repo: String,
@@ -545,7 +545,7 @@ fn artifact_state(
         Err(_) => {
             return ArtifactState::Invalid {
                 reason: ArtifactInvalidReason::Unreadable,
-            }
+            };
         }
     }
     let part_path = models_dir.join(format!("{}.part", recipe.filename));
