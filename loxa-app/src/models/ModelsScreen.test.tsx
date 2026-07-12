@@ -60,6 +60,8 @@ function setup() {
       model("model-incompatible", { kind: "not_downloaded" }, false),
     ]),
     downloadModel: vi.fn().mockResolvedValue({ operationId: "op-1" }),
+    loadModel: vi.fn().mockResolvedValue({ operationId: "op-load" }),
+    unloadModel: vi.fn().mockResolvedValue({ operationId: "op-unload" }),
     getOperation: vi.fn().mockResolvedValue(operation("queued")),
     cancelOperation: vi.fn().mockResolvedValue(operation("cancelled")),
     createControlEventStream: vi.fn((_endpoint, _token, _cursor, next) => {
@@ -71,7 +73,7 @@ function setup() {
 }
 
 describe("ModelsScreen", () => {
-  it("renders every backend-owned artifact and compatibility state without load controls", async () => {
+  it("renders only legal node-authoritative lifecycle actions", async () => {
     const { api } = setup();
     render(<ModelsScreen endpoint="http://127.0.0.1:8080" services={api} />);
 
@@ -85,7 +87,68 @@ describe("ModelsScreen", () => {
     expect(screen.getByRole("button", { name: "Download model-ready" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Resume model-partial" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Download model-incompatible" })).toBeDisabled();
-    expect(screen.queryByRole("button", { name: /^(load|switch|unload)\b/i })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Load model-downloaded" })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: /^load model-ready/i })).not.toBeInTheDocument();
+  });
+
+  it("starts load, uses Switch wording when another model is active, and refreshes authoritative node truth", async () => {
+    const user = userEvent.setup();
+    const setupState = setup();
+    vi.mocked(setupState.api.getControlNode)
+      .mockResolvedValueOnce({ status: "ready", activeModelId: "model-old", operationId: null, error: null })
+      .mockResolvedValueOnce({ status: "loading", activeModelId: "model-old", operationId: "op-load", error: null });
+    vi.mocked(setupState.api.getOperation).mockResolvedValueOnce({ ...operation("queued"), id: "op-load", kind: "load", modelId: "model-downloaded" });
+    render(<ModelsScreen endpoint="http://127.0.0.1:8080" services={setupState.api} />);
+    await user.click(await screen.findByRole("button", { name: "Switch to model-downloaded" }));
+    expect(setupState.api.loadModel).toHaveBeenCalledWith("http://127.0.0.1:8080", token, "model-downloaded", expect.objectContaining({ signal: expect.any(AbortSignal) }));
+    expect(screen.getByLabelText("Model control summary")).toHaveTextContent("Node Loading");
+    expect(screen.queryByRole("button", { name: "Cancel load model-downloaded" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Download model-ready" })).toBeDisabled();
+  });
+
+  it("offers unload only for the active model and leaves it active after a failed operation", async () => {
+    const user = userEvent.setup();
+    const setupState = setup();
+    vi.mocked(setupState.api.getControlNode).mockResolvedValue({ status: "ready", activeModelId: "model-downloaded", operationId: null, error: null });
+    render(<ModelsScreen endpoint="http://127.0.0.1:8080" services={setupState.api} />);
+    await user.click(await screen.findByRole("button", { name: "Unload model-downloaded" }));
+    expect(setupState.api.unloadModel).toHaveBeenCalledWith("http://127.0.0.1:8080", token, expect.objectContaining({ signal: expect.any(AbortSignal) }));
+    act(() => setupState.callbacks()?.onEvent({ sequence: 8, operation: { ...operation("failed"), id: "op-unload", kind: "unload", modelId: null, error: "teardown failed" } }));
+    expect(await screen.findByText("Active")).toBeInTheDocument();
+  });
+
+  it("blocks lifecycle controls during recovery and ignores stale operation events", async () => {
+    const setupState = setup();
+    vi.mocked(setupState.api.getControlNode).mockResolvedValue({ status: "recovery_required", activeModelId: "model-downloaded", operationId: null, error: "private detail" });
+    render(<ModelsScreen endpoint="http://127.0.0.1:8080" services={setupState.api} />);
+    expect(await screen.findByRole("alert")).toHaveTextContent("Recovery required");
+    expect(screen.queryByText("private detail")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Unload model-downloaded/ })).not.toBeInTheDocument();
+    act(() => setupState.callbacks()?.onSnapshot({ cursor: 10, cursorGap: false, operations: [], events: [] }));
+    act(() => setupState.callbacks()?.onEvent({ sequence: 9, operation: operation("running") }));
+    expect(screen.queryByRole("progressbar", { name: "Download progress for model-ready" })).not.toBeInTheDocument();
+  });
+
+  it("keeps the newest terminal node refresh when an older request resolves last", async () => {
+    const setupState = setup();
+    render(<ModelsScreen endpoint="http://127.0.0.1:8080" services={setupState.api} />);
+    await screen.findByRole("heading", { name: "model-downloaded" });
+    let resolveOlder!: (value: Awaited<ReturnType<ModelsScreenServices["getControlNode"]>>) => void;
+    let resolveOlderInventory!: (value: ModelInventoryEntry[]) => void;
+    vi.mocked(setupState.api.getControlNode)
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveOlder = resolve; }))
+      .mockResolvedValueOnce({ status: "ready", activeModelId: "model-downloaded", operationId: null, error: null });
+    vi.mocked(setupState.api.getInventory)
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveOlderInventory = resolve; }))
+      .mockResolvedValueOnce([model("model-downloaded", { kind: "downloaded" })]);
+    act(() => setupState.callbacks()?.onEvent({ sequence: 2, operation: { ...operation("succeeded"), id: "old" } }));
+    act(() => setupState.callbacks()?.onEvent({ sequence: 3, operation: { ...operation("succeeded"), id: "new", updatedAtUnixMs: 3 } }));
+    expect(await screen.findByText("Active")).toBeInTheDocument();
+    resolveOlder({ status: "unloaded", activeModelId: null, operationId: null, error: null });
+    resolveOlderInventory([model("model-downloaded", { kind: "not_downloaded" })]);
+    await Promise.resolve();
+    expect(screen.getByText("Active")).toBeInTheDocument();
+    expect(screen.getByText("Downloaded and verified")).toBeInTheDocument();
   });
 
   it("starts a download, then renders only the authoritative operation response", async () => {
@@ -93,10 +156,11 @@ describe("ModelsScreen", () => {
     const { api } = setup();
     render(<ModelsScreen endpoint="http://127.0.0.1:8080" services={api} />);
     await user.click(await screen.findByRole("button", { name: "Download model-ready" }));
+    expect(screen.getByRole("button", { name: "Resume model-partial" })).toBeDisabled();
 
     expect(api.downloadModel).toHaveBeenCalledWith("http://127.0.0.1:8080", token, "model-ready", expect.objectContaining({ signal: expect.any(AbortSignal) }));
     expect(api.getOperation).toHaveBeenCalledWith("http://127.0.0.1:8080", token, "op-1", expect.objectContaining({ signal: expect.any(AbortSignal) }));
-    expect(await screen.findByText("Queued")).toBeInTheDocument();
+    expect(await screen.findByText("Download queued")).toBeInTheDocument();
   });
 
   it("applies snapshot and progress events, announces byte progress, and cancels by operation ID", async () => {
@@ -112,7 +176,7 @@ describe("ModelsScreen", () => {
     expect(screen.getByText("512 B of 1 KB")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Cancel download model-ready" }));
     expect(setupState.api.cancelOperation).toHaveBeenCalledWith("http://127.0.0.1:8080", token, "op-1", expect.objectContaining({ signal: expect.any(AbortSignal) }));
-    expect(await screen.findByText(/Last operation: Cancelled/)).toBeInTheDocument();
+    expect(await screen.findByText(/Last operation: Download cancelled/)).toBeInTheDocument();
   });
 
   it("renders unknown-total progress as indeterminate instead of a false percentage", async () => {

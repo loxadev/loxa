@@ -25,6 +25,8 @@ function services(): AppServices {
     getControlNode: vi.fn().mockResolvedValue({ status: "unloaded", activeModelId: null, operationId: null, error: null }),
     getInventory: vi.fn().mockResolvedValue([]),
     downloadModel: vi.fn(),
+    loadModel: vi.fn(),
+    unloadModel: vi.fn(),
     getOperation: vi.fn(),
     cancelOperation: vi.fn(),
     createControlEventStream: vi.fn(() => ({

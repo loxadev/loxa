@@ -246,6 +246,20 @@ export async function downloadModel(
   return decode(() => decodeOperationAccepted(payload));
 }
 
+export async function loadModel(endpoint: string, token: string, modelId: string, options: ControlClientOptions = {}): Promise<OperationAccepted> {
+  if (!MODEL_ID_PATTERN.test(modelId)) throw new ControlClientError("invalid-response", "The selected registry model ID is invalid.");
+  const payload = await request(endpoint, "/loxa/v1/models/load", token, {
+    method: "POST",
+    body: JSON.stringify({ model_id: modelId }),
+  }, options);
+  return decode(() => decodeOperationAccepted(payload));
+}
+
+export async function unloadModel(endpoint: string, token: string, options: ControlClientOptions = {}): Promise<OperationAccepted> {
+  const payload = await request(endpoint, "/loxa/v1/models/unload", token, { method: "POST" }, options);
+  return decode(() => decodeOperationAccepted(payload));
+}
+
 export async function getOperation(
   endpoint: string,
   token: string,
