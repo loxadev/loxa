@@ -428,6 +428,12 @@ pub fn known_registry_inventory(
     )
 }
 
+pub fn current_available_memory_bytes() -> u64 {
+    let mut system = sysinfo::System::new();
+    system.refresh_memory();
+    system.available_memory()
+}
+
 pub fn known_registry_inventory_with_cache(
     models_dir: &Path,
     available_memory_bytes: u64,

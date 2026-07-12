@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub mod actor;
+pub mod control_router;
 
 #[derive(Clone, Debug)]
 pub struct NodePaths {
@@ -832,16 +833,54 @@ pub fn serve_node(
     };
     let node_id = format!("loxa-node-{}", std::process::id());
     let gateway_state = loxa_core::gateway::GatewayState::new(node_id);
-    let gateway =
-        match loxa_core::gateway::GatewayServer::start(gateway_port, gateway_state.clone()) {
-            Ok(gateway) => gateway,
-            Err(error) => {
-                if let Some(run) = &unloaded_run {
-                    let _ = finish_unloaded_owner(paths, run);
-                }
-                return Err(error);
+    let gateway_router = match (|| -> io::Result<_> {
+        Ok(if let Some(run) = &unloaded_run {
+            let state_dir = paths
+                .state_path
+                .parent()
+                .ok_or_else(|| io::Error::other("runtime state path has no parent directory"))?;
+            let loxa_dir = if state_dir.file_name().is_some_and(|name| name == "run") {
+                state_dir
+                    .parent()
+                    .ok_or_else(|| io::Error::other("runtime run path has no Loxa directory"))?
+            } else {
+                state_dir
+            };
+            let token_path = loxa_dir.join("control.token");
+            let token = loxa_core::control::auth::ControlToken::load_or_create(&token_path)?;
+            loxa_core::gateway::router(gateway_state.clone()).merge(control_router::router(
+                control_router::ControlState::new(
+                    token,
+                    format!("loxa-node-{}", std::process::id()),
+                    run.run_id.clone(),
+                    paths.models_dir.clone(),
+                ),
+            ))
+        } else {
+            loxa_core::gateway::router(gateway_state.clone())
+        })
+    })() {
+        Ok(router) => router,
+        Err(error) => {
+            if let Some(run) = &unloaded_run {
+                let _ = finish_unloaded_owner(paths, run);
             }
-        };
+            return Err(error);
+        }
+    };
+    let gateway = match loxa_core::gateway::GatewayServer::start_with_router(
+        gateway_port,
+        gateway_state.clone(),
+        gateway_router,
+    ) {
+        Ok(gateway) => gateway,
+        Err(error) => {
+            if let Some(run) = &unloaded_run {
+                let _ = finish_unloaded_owner(paths, run);
+            }
+            return Err(error);
+        }
+    };
     let outcome = (|| {
         if let Err(error) = events.emit(LifecycleEvent::NodeListening {
             port: gateway.port(),
@@ -2356,6 +2395,86 @@ mod lifecycle_api_tests {
         );
         assert!(status.starts_with("HTTP/1.1 200"), "{status}");
         assert!(status.contains("\"health\":\"unavailable\""), "{status}");
+        let nonce = "01".repeat(32);
+        let proof = http_request(
+            port,
+            &format!(
+                "GET /loxa/v1/node HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Loxa-Challenge: {nonce}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(proof.starts_with("HTTP/1.1 200"), "{proof}");
+        assert!(proof.contains("\"protocol_version\":1"), "{proof}");
+        assert!(proof.contains("\"status\":\"unloaded\""), "{proof}");
+        assert!(!proof.contains("active_model_id"), "{proof}");
+        for bad_proof in [
+            "GET /loxa/v1/node?nonce=00 HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Loxa-Challenge: 0000000000000000000000000000000000000000000000000000000000000000\r\nConnection: close\r\n\r\n".to_string(),
+            "GET /loxa/v1/node HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Loxa-Challenge: bad\r\nConnection: close\r\n\r\n".to_string(),
+            format!("GET /loxa/v1/node HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://evil.invalid\r\nX-Loxa-Challenge: {nonce}\r\nConnection: close\r\n\r\n"),
+        ] {
+            let response = http_request(port, &bad_proof);
+            assert!(response.starts_with("HTTP/1.1 400") || response.starts_with("HTTP/1.1 403"), "{response}");
+        }
+        let preflight = http_request(
+            port,
+            "OPTIONS /loxa/v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: tauri://localhost\r\nAccess-Control-Request-Method: GET\r\nAccess-Control-Request-Headers: authorization\r\nConnection: close\r\n\r\n",
+        );
+        assert!(preflight.starts_with("HTTP/1.1 204"), "{preflight}");
+        assert!(
+            preflight.contains("access-control-allow-origin: tauri://localhost"),
+            "{preflight}"
+        );
+        assert!(preflight.contains("vary: Origin"), "{preflight}");
+        let dev_preflight = http_request(port, "OPTIONS /loxa/v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://127.0.0.1:1420\r\nAccess-Control-Request-Method: GET\r\nConnection: close\r\n\r\n");
+        assert!(dev_preflight.starts_with("HTTP/1.1 204"), "{dev_preflight}");
+        assert!(dev_preflight.contains("access-control-allow-origin: http://127.0.0.1:1420"));
+        let evil_preflight = http_request(
+            port,
+            "OPTIONS /loxa/v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://evil.invalid\r\nAccess-Control-Request-Method: GET\r\nConnection: close\r\n\r\n",
+        );
+        assert!(
+            evil_preflight.starts_with("HTTP/1.1 403"),
+            "{evil_preflight}"
+        );
+        assert!(!evil_preflight.contains("access-control-allow-origin"));
+        let unauthenticated_models = http_request(
+            port,
+            "GET /loxa/v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        );
+        assert!(
+            unauthenticated_models.starts_with("HTTP/1.1 401"),
+            "{unauthenticated_models}"
+        );
+        let wrong_bearer = http_request(
+            port,
+            "GET /loxa/v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: tauri://localhost\r\nAuthorization: Bearer 0000000000000000000000000000000000000000000000000000000000000000\r\nConnection: close\r\n\r\n",
+        );
+        assert!(wrong_bearer.starts_with("HTTP/1.1 401"), "{wrong_bearer}");
+        assert!(wrong_bearer.contains("access-control-allow-origin: tauri://localhost"));
+        let token = loxa_core::control::auth::ControlToken::load(&temp.0.join("control.token"))
+            .expect("load control token");
+        let bearer = token.expose_for_authorization();
+        let authenticated_node = http_request(port, &format!("GET /loxa/v1/node HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {bearer}\r\nOrigin: tauri://localhost\r\nConnection: close\r\n\r\n"));
+        assert!(
+            authenticated_node.starts_with("HTTP/1.1 200"),
+            "{authenticated_node}"
+        );
+        assert!(authenticated_node.contains("\"active_model_id\":null"));
+        assert!(!authenticated_node.contains("challenge_proof"));
+        let capabilities = http_request(port, &format!("GET /loxa/v1/capabilities HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {bearer}\r\nOrigin: tauri://localhost\r\nConnection: close\r\n\r\n"));
+        assert!(capabilities.starts_with("HTTP/1.1 200"), "{capabilities}");
+        assert!(capabilities.contains("\"document_input\":false"));
+        let authenticated_models = http_request(
+            port,
+            &format!(
+                "GET /loxa/v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {}\r\nOrigin: tauri://localhost\r\nConnection: close\r\n\r\n",
+                bearer
+            ),
+        );
+        assert!(
+            authenticated_models.starts_with("HTTP/1.1 200"),
+            "{authenticated_models}"
+        );
+        assert!(authenticated_models.contains("gemma-3-4b-it-q4"));
         let chat = http_request(
             port,
             "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: 30\r\n\r\n{\"model\":\"loxa\",\"messages\":[]}",
