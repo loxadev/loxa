@@ -7,7 +7,7 @@ use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
 const GIB: f64 = 1_073_741_824.0;
@@ -69,6 +69,10 @@ struct StableMetadata {
     device: u64,
     #[cfg(unix)]
     inode: u64,
+    #[cfg(unix)]
+    change_time_s: i64,
+    #[cfg(unix)]
+    change_time_ns: i64,
 }
 
 impl StableMetadata {
@@ -86,6 +90,10 @@ impl StableMetadata {
             device: metadata.dev(),
             #[cfg(unix)]
             inode: metadata.ino(),
+            #[cfg(unix)]
+            change_time_s: metadata.ctime(),
+            #[cfg(unix)]
+            change_time_ns: metadata.ctime_nsec(),
         }
     }
 }
@@ -103,10 +111,43 @@ struct CachedVerification {
     evidence: VerifiedArtifact,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct VerificationKey {
+    path: PathBuf,
+    metadata: StableMetadata,
+    expected_sha256: String,
+}
+
 #[derive(Default)]
 struct CacheState {
     entries: HashMap<PathBuf, CachedVerification>,
     order: VecDeque<PathBuf>,
+    in_flight: HashMap<VerificationKey, Arc<VerificationFlight>>,
+}
+
+#[derive(Clone)]
+struct SharedVerificationError {
+    kind: io::ErrorKind,
+    message: String,
+}
+
+type SharedVerificationResult = Result<VerifiedArtifact, SharedVerificationError>;
+
+#[derive(Default)]
+struct VerificationFlight {
+    result: Mutex<Option<SharedVerificationResult>>,
+    ready: Condvar,
+}
+
+pub trait VerificationCancellation: Send + Sync {
+    fn is_cancelled(&self) -> bool;
+}
+
+struct NeverCancel;
+impl VerificationCancellation for NeverCancel {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
 }
 
 /// Bounded checksum evidence store. `snapshot` users never perform file hashing.
@@ -138,6 +179,15 @@ impl VerificationCache {
         models_dir: &Path,
         recipe: &ModelEntry,
     ) -> io::Result<VerifiedArtifact> {
+        self.verify_recipe_with_cancellation(models_dir, recipe, &NeverCancel)
+    }
+
+    pub fn verify_recipe_with_cancellation(
+        &self,
+        models_dir: &Path,
+        recipe: &ModelEntry,
+        cancellation: &dyn VerificationCancellation,
+    ) -> io::Result<VerifiedArtifact> {
         let path = checked_regular_path(models_dir, recipe.filename)?;
         let metadata = fs::symlink_metadata(&path)?;
         if !metadata.file_type().is_file() {
@@ -151,28 +201,67 @@ impl VerificationCache {
             return Ok(evidence);
         }
 
-        self.verification_runs.fetch_add(1, Ordering::Relaxed);
-        let matches = hash_file(&path)? == recipe.sha256;
-        let after = fs::symlink_metadata(&path)?;
-        if !after.file_type().is_file() || StableMetadata::from(&after) != stable {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "artifact changed during verification",
-            ));
-        }
-        let evidence = VerifiedArtifact {
-            size_bytes: stable.len,
+        let key = VerificationKey {
+            path: path.clone(),
+            metadata: stable.clone(),
             expected_sha256: recipe.sha256.into(),
-            matches,
         };
-        self.insert(
-            path,
-            CachedVerification {
-                metadata: stable,
-                evidence: evidence.clone(),
-            },
-        );
-        Ok(evidence)
+        let (flight, leader) = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(item) = state.entries.get(&path).filter(|item| {
+                item.metadata == stable && item.evidence.expected_sha256 == recipe.sha256
+            }) {
+                return Ok(item.evidence.clone());
+            }
+            if let Some(flight) = state.in_flight.get(&key) {
+                (flight.clone(), false)
+            } else {
+                let flight = Arc::new(VerificationFlight::default());
+                state.in_flight.insert(key.clone(), flight.clone());
+                (flight, true)
+            }
+        };
+
+        if !leader {
+            return wait_for_flight(&flight);
+        }
+
+        self.verification_runs.fetch_add(1, Ordering::Relaxed);
+        let result = (|| {
+            let matches = hash_file_with_cancellation(&path, cancellation)? == recipe.sha256;
+            let after = fs::symlink_metadata(&path)?;
+            if !after.file_type().is_file() || StableMetadata::from(&after) != stable {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "artifact changed during verification",
+                ));
+            }
+            Ok(VerifiedArtifact {
+                size_bytes: stable.len,
+                expected_sha256: recipe.sha256.into(),
+                matches,
+            })
+        })();
+
+        if let Ok(evidence) = &result {
+            self.insert(
+                path.clone(),
+                CachedVerification {
+                    metadata: stable,
+                    evidence: evidence.clone(),
+                },
+            );
+        }
+        publish_flight(&flight, &result);
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .in_flight
+            .remove(&key);
+        result
     }
 
     pub fn verification_runs(&self) -> u64 {
@@ -357,11 +446,20 @@ fn checked_regular_path(models_dir: &Path, filename: &str) -> io::Result<PathBuf
     Ok(models_dir.join(filename))
 }
 
-fn hash_file(path: &Path) -> io::Result<String> {
+fn hash_file_with_cancellation(
+    path: &Path,
+    cancellation: &dyn VerificationCancellation,
+) -> io::Result<String> {
     let mut file = open_regular_no_follow(path)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
+        if cancellation.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "artifact verification cancelled",
+            ));
+        }
         let read = file.read(&mut buffer)?;
         if read == 0 {
             break;
@@ -373,6 +471,38 @@ fn hash_file(path: &Path) -> io::Result<String> {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect())
+}
+
+fn publish_flight(flight: &VerificationFlight, result: &io::Result<VerifiedArtifact>) {
+    let shared = match result {
+        Ok(value) => Ok(value.clone()),
+        Err(error) => Err(SharedVerificationError {
+            kind: error.kind(),
+            message: error.to_string(),
+        }),
+    };
+    *flight
+        .result
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(shared);
+    flight.ready.notify_all();
+}
+
+fn wait_for_flight(flight: &VerificationFlight) -> io::Result<VerifiedArtifact> {
+    let mut result = flight
+        .result
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    while result.is_none() {
+        result = flight
+            .ready
+            .wait(result)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+    match result.as_ref().unwrap() {
+        Ok(value) => Ok(value.clone()),
+        Err(error) => Err(io::Error::new(error.kind, error.message.clone())),
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -448,6 +578,7 @@ fn open_regular_no_follow(path: &Path) -> io::Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Barrier;
     use tempfile::tempdir;
 
     fn fixture(bytes: &'static [u8]) -> ModelEntry {
@@ -530,6 +661,142 @@ mod tests {
                 reason: ArtifactInvalidReason::ChecksumMismatch
             }
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_invalidates_same_length_rewrite_even_when_modified_time_is_restored() {
+        let dir = tempdir().unwrap();
+        let recipe = fixture(b"good");
+        let path = dir.path().join(recipe.filename);
+        fs::write(&path, b"good").unwrap();
+        let original_modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let cache = VerificationCache::default();
+        assert!(cache.verify_recipe(dir.path(), &recipe).unwrap().matches);
+
+        fs::write(&path, b"evil").unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(original_modified))
+            .unwrap();
+
+        assert_ne!(
+            artifact_state(&recipe, dir.path(), &cache),
+            ArtifactState::Downloaded
+        );
+        assert!(!cache.verify_recipe(dir.path(), &recipe).unwrap().matches);
+        assert_eq!(cache.verification_runs(), 2);
+    }
+
+    #[test]
+    fn concurrent_verification_is_single_flight_and_shares_typed_evidence() {
+        let dir = tempdir().unwrap();
+        let bytes = Box::leak(vec![7_u8; 8 * 1024 * 1024].into_boxed_slice());
+        let recipe = Arc::new(fixture(bytes));
+        fs::write(dir.path().join(recipe.filename), &*bytes).unwrap();
+        let cache = Arc::new(VerificationCache::default());
+        let barrier = Arc::new(Barrier::new(9));
+        let models_dir = dir.path().to_path_buf();
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let cache = cache.clone();
+            let barrier = barrier.clone();
+            let recipe = recipe.clone();
+            let models_dir = models_dir.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                cache.verify_recipe(&models_dir, &recipe).unwrap()
+            }));
+        }
+        barrier.wait();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert!(results
+            .iter()
+            .all(|evidence| evidence == &results[0] && evidence.matches));
+        assert_eq!(cache.verification_runs(), 1);
+    }
+
+    struct GatedCancellation {
+        release: std::sync::atomic::AtomicBool,
+    }
+    impl VerificationCancellation for GatedCancellation {
+        fn is_cancelled(&self) -> bool {
+            while !self.release.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            true
+        }
+    }
+
+    #[test]
+    fn concurrent_cancelled_verification_shares_failure_and_releases_flight_for_retry() {
+        let dir = tempdir().unwrap();
+        let recipe = Arc::new(fixture(b"good"));
+        fs::write(dir.path().join(recipe.filename), b"good").unwrap();
+        let cache = Arc::new(VerificationCache::default());
+        let cancellation = Arc::new(GatedCancellation {
+            release: std::sync::atomic::AtomicBool::new(false),
+        });
+        let path = dir.path().to_path_buf();
+        let leader = {
+            let cache = cache.clone();
+            let recipe = recipe.clone();
+            let cancellation = cancellation.clone();
+            let path = path.clone();
+            std::thread::spawn(move || {
+                cache.verify_recipe_with_cancellation(&path, &recipe, cancellation.as_ref())
+            })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while cache.state.lock().unwrap().in_flight.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "leader did not publish flight"
+            );
+            std::thread::yield_now();
+        }
+        let follower = {
+            let cache = cache.clone();
+            let recipe = recipe.clone();
+            let path = path.clone();
+            std::thread::spawn(move || cache.verify_recipe(&path, &recipe))
+        };
+        loop {
+            let joined = cache
+                .state
+                .lock()
+                .unwrap()
+                .in_flight
+                .values()
+                .next()
+                .map(Arc::strong_count)
+                .unwrap_or(0);
+            if joined >= 3 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "follower did not join flight"
+            );
+            std::thread::yield_now();
+        }
+        cancellation.release.store(true, Ordering::Release);
+        assert_eq!(
+            leader.join().unwrap().unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(
+            follower.join().unwrap().unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(cache.verification_runs(), 1);
+        assert!(cache.verify_recipe(dir.path(), &recipe).unwrap().matches);
+        assert_eq!(cache.verification_runs(), 2);
     }
 
     #[cfg(unix)]

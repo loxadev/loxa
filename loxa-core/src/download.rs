@@ -434,29 +434,6 @@ fn ensure_disk_space_for_download(
     ensure_enough_disk_space(available, bytes_needed)
 }
 
-fn ensure_disk_space_after_reclaiming_part(
-    dest_dir: &Path,
-    part_path: &Path,
-    bytes_needed: u64,
-    available_space_override: Option<u64>,
-) -> Result<(), DownloadError> {
-    if bytes_needed == 0 {
-        return Ok(());
-    }
-
-    let available = match available_space_override {
-        Some(available) => available,
-        None => available_space_for_path(dest_dir)?,
-    };
-    let reclaimable = match fs::metadata(part_path) {
-        Ok(metadata) => metadata.len(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(error) => return Err(DownloadError::Io(error)),
-    };
-
-    ensure_enough_disk_space(available.saturating_add(reclaimable), bytes_needed)
-}
-
 fn available_space_for_path(path: &Path) -> Result<u64, DownloadError> {
     let canonical_path = path.canonicalize()?;
     let disks = Disks::new_with_refreshed_list_specifics(DiskRefreshKind::nothing().with_storage());
@@ -716,9 +693,10 @@ fn download_body(
     }
 
     if restart_from_zero {
-        ensure_disk_space_after_reclaiming_part(
+        // The verified partial remains rollback evidence until replacement is
+        // promoted, so none of its bytes are reclaimable during preflight.
+        ensure_disk_space_for_download(
             context.final_path.parent().unwrap_or(Path::new(".")),
-            context.part_path,
             context.entry.size_bytes(),
             context.available_space_override,
         )?;
@@ -791,7 +769,12 @@ fn download_body(
         }
         return Err(error);
     }
-    fs::rename(transfer_path, context.final_path)?;
+    if let Err(error) = fs::rename(transfer_path, context.final_path) {
+        if restart_from_zero && restart_path.exists() {
+            let _ = fs::remove_file(&restart_path);
+        }
+        return Err(DownloadError::Io(error));
+    }
     if restart_from_zero && context.part_path.exists() {
         fs::remove_file(context.part_path)?;
     }
@@ -1148,6 +1131,45 @@ mod tests {
         }
     }
 
+    struct RenameBlockingReader {
+        body: Cursor<Vec<u8>>,
+        final_path: PathBuf,
+        blocked: bool,
+    }
+
+    impl Read for RenameBlockingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let read = self.body.read(buffer)?;
+            if read == 0 && !self.blocked {
+                fs::create_dir(&self.final_path)?;
+                self.blocked = true;
+            }
+            Ok(read)
+        }
+    }
+
+    struct RenameFailureTransport {
+        bytes: Vec<u8>,
+        final_path: PathBuf,
+    }
+
+    impl DownloadTransport for RenameFailureTransport {
+        fn probe_size(&self, _url: &Url) -> Result<u64, DownloadError> {
+            Ok(self.bytes.len() as u64)
+        }
+        fn body(&self, _url: &Url, _offset: u64) -> Result<BodyResponse, DownloadError> {
+            Ok(BodyResponse {
+                status: StatusCode::OK,
+                content_range: None,
+                reader: Box::new(RenameBlockingReader {
+                    body: Cursor::new(self.bytes.clone()),
+                    final_path: self.final_path.clone(),
+                    blocked: false,
+                }),
+            })
+        }
+    }
+
     #[derive(Default)]
     struct RecordingObserver {
         progress: Vec<DownloadProgress>,
@@ -1403,6 +1425,40 @@ mod tests {
             model.size_bytes
         );
         assert!(!dir.path().join("model.gguf.part").exists());
+    }
+
+    #[test]
+    fn ignored_range_rename_failure_cleans_restart_and_preserves_original_partial() {
+        let dir = tempdir().unwrap();
+        let bytes = b"replacement body".to_vec();
+        let split = 5;
+        let model = entry(
+            "model.gguf",
+            Box::leak(sha256_hex(&bytes).into_boxed_str()),
+            bytes.len() as u64,
+        );
+        let original = bytes[..split].to_vec();
+        let part = dir.path().join("model.gguf.part");
+        fs::write(&part, &original).unwrap();
+        let transport = RenameFailureTransport {
+            bytes,
+            final_path: dir.path().join("model.gguf"),
+        };
+        let mut observer = RecordingObserver::default();
+
+        let error = download_with_transport_and_observer(
+            &model,
+            dir.path(),
+            HF_BASE_URL,
+            &transport,
+            &mut observer,
+            Some(u64::MAX),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, DownloadError::Io(_)));
+        assert_eq!(fs::read(&part).unwrap(), original);
+        assert!(!restart_path(&part).exists());
     }
 
     #[test]
@@ -1710,7 +1766,7 @@ mod tests {
     }
 
     #[test]
-    fn ignored_resume_range_counts_reclaimable_part_space_before_restart() {
+    fn ignored_resume_range_requires_full_replacement_space_while_preserving_partial() {
         let dir = tempdir().unwrap();
         let bytes = b"01234567890123456789".to_vec();
         let split = 10;
@@ -1729,18 +1785,28 @@ mod tests {
             }],
         );
 
-        let path = download_with_transport_and_available_space(
+        let error = download_with_transport_and_available_space(
             &model,
             dir.path(),
             HF_BASE_URL,
             &transport,
             Some(12),
         )
-        .unwrap();
+        .unwrap_err();
 
-        assert_eq!(fs::read(path).unwrap(), bytes);
+        assert!(matches!(
+            error,
+            DownloadError::InsufficientDiskSpace {
+                needed: 20,
+                available: 12
+            }
+        ));
         assert_eq!(transport.offsets(), vec![split as u64]);
-        assert!(!dir.path().join("model.gguf.part").exists());
+        assert_eq!(
+            fs::read(dir.path().join("model.gguf.part")).unwrap(),
+            bytes[..split]
+        );
+        assert!(!restart_path(&dir.path().join("model.gguf.part")).exists());
     }
 
     #[test]
