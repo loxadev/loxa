@@ -17,8 +17,24 @@ describe("accessibility CSS contract", () => {
     expect(css).toContain("@media (prefers-reduced-motion: reduce)");
     expect(css).toContain("@media (prefers-contrast: more)");
     expect(css).toContain("@media (forced-colors: active)");
-    expect(css).toContain("transition-duration: 0.01ms !important");
+    expect(tokens).toContain("--loxa-motion-theme: 0.01ms");
     expect(css).toContain("background: Highlight");
+  });
+
+  it("applies the canonical theme transition to scoped theme-bearing properties", () => {
+    expect(css).toContain("transition-property: color, background-color, border-color, outline-color, fill, stroke");
+    expect(css).toContain("transition-duration: var(--loxa-motion-theme)");
+    expect(css).toContain("transition-timing-function: var(--loxa-motion-easing)");
+    expect(css).toMatch(/\.app-shell svg,\s*\.app-shell svg \*/);
+  });
+
+  it("keeps theme choices at 44px with focus, contrast, and forced-color coverage", () => {
+    expect(css).toMatch(/\.theme-option[^}]*min-height: var\(--loxa-component-minimum-interactive-target\)/s);
+    expect(css).toContain(".theme-option:has(input:focus-visible)");
+    expect(css).toContain("outline: 2px solid var(--loxa-focus)");
+    expect(css).toMatch(/@media \(prefers-contrast: more\)[\s\S]*\.theme-option/);
+    expect(css).toMatch(/@media \(forced-colors: active\)[\s\S]*\.theme-option/);
+    expect(css).toMatch(/@media \(prefers-reduced-motion: reduce\)/);
   });
 
   it("does not introduce a component palette or visual gimmicks", () => {
