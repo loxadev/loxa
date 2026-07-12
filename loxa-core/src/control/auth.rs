@@ -6,7 +6,7 @@ mod tests {
     #[test]
     fn token_is_created_once_private_and_never_disclosed_by_debug() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("control.token");
+        let path = dir.path().join(".loxa").join("control.token");
         let first = ControlToken::load_or_create(&path).unwrap();
         let second = ControlToken::load_or_create(&path).unwrap();
         assert!(first.matches(&second));
@@ -24,7 +24,7 @@ mod tests {
     #[test]
     fn concurrent_token_creation_publishes_one_value_without_overwrite() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("control.token");
+        let path = dir.path().join(".loxa").join("control.token");
         let workers = (0..8)
             .map(|_| {
                 let path = path.clone();
@@ -36,6 +36,29 @@ mod tests {
             .map(|worker| worker.join().unwrap())
             .collect::<Vec<_>>();
         assert!(tokens.iter().all(|token| token.matches(&tokens[0])));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_creation_makes_a_private_owned_parent() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join(".loxa");
+        ControlToken::load_or_create(&parent.join("control.token")).unwrap();
+        let metadata = fs::metadata(parent).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        assert_eq!(metadata.uid(), current_user_id());
+    }
+
+    #[test]
+    fn token_matching_rejects_a_difference_in_every_byte_position() {
+        let expected = ControlToken::from_bytes([7; TOKEN_BYTES]);
+        assert!(expected.matches(&ControlToken::from_bytes([7; TOKEN_BYTES])));
+        for index in 0..TOKEN_BYTES {
+            let mut different = [7; TOKEN_BYTES];
+            different[index] ^= 1;
+            assert!(!expected.matches(&ControlToken::from_bytes(different)));
+        }
     }
 
     #[test]
@@ -94,18 +117,77 @@ mod tests {
         );
         assert!(!format!("{policy:?}").contains(&exposed));
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_load_rejects_symlinks_unsafe_parents_and_wrong_owner_evidence() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.token");
+        fs::write(
+            &real,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
+        )
+        .unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join("link.token");
+        symlink(&real, &link).unwrap();
+        assert_eq!(
+            ControlToken::load(&link).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        assert_eq!(
+            ControlToken::load(&real).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+
+        let file = open_token_file(&real).unwrap();
+        assert_eq!(
+            validate_open_token(&file, file.metadata().unwrap().uid().saturating_add(1))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_token_descriptor_is_not_redirected_by_path_swap() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.token");
+        fs::write(
+            &path,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut file = open_token_file(&path).unwrap();
+        validate_open_token(&file, current_user_id()).unwrap();
+        let moved = dir.path().join("moved.token");
+        fs::rename(&path, &moved).unwrap();
+        symlink("/dev/null", &path).unwrap();
+        let token = read_token_from(&mut file).unwrap();
+        assert_eq!(
+            token.expose_for_authorization(),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        );
+    }
 }
 use std::collections::BTreeSet;
 use std::fmt;
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
 use std::path::Path;
 use subtle::ConstantTimeEq;
 
 const TOKEN_BYTES: usize = 32;
 const TOKEN_HEX_LEN: usize = TOKEN_BYTES * 2;
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct ControlToken([u8; TOKEN_BYTES]);
 
 impl fmt::Debug for ControlToken {
@@ -121,16 +203,16 @@ impl ControlToken {
     }
 
     pub fn load_or_create(path: &Path) -> io::Result<Self> {
-        if path.exists() {
-            return Self::load(path);
-        }
         let parent = path.parent().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "control token path has no parent",
             )
         })?;
-        fs::create_dir_all(parent)?;
+        ensure_secure_parent(parent)?;
+        if path.exists() {
+            return Self::load(path);
+        }
         let mut bytes = [0_u8; TOKEN_BYTES];
         getrandom::fill(&mut bytes).map_err(io::Error::other)?;
         let token = Self(bytes);
@@ -176,9 +258,20 @@ impl ControlToken {
     }
 
     pub fn load(path: &Path) -> io::Result<Self> {
-        validate_permissions(path)?;
-        let text = fs::read_to_string(path)?;
-        let trimmed = text.strip_suffix('\n').unwrap_or(&text);
+        let parent = path.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "control token path has no parent",
+            )
+        })?;
+        ensure_secure_parent(parent)?;
+        let mut file = open_token_file(path)?;
+        validate_open_token(&file, current_user_id())?;
+        read_token_from(&mut file)
+    }
+
+    fn parse(text: &str) -> io::Result<Self> {
+        let trimmed = text.strip_suffix('\n').unwrap_or(text);
         if trimmed.len() != TOKEN_HEX_LEN || trimmed.contains(char::is_whitespace) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -243,10 +336,8 @@ impl AuthPolicy {
         let supplied = authorization
             .strip_prefix("Bearer ")
             .ok_or(AuthError::WrongBearer)?;
-        let expected = self.token.expose_for_authorization();
-        if supplied.len() != expected.len()
-            || !bool::from(supplied.as_bytes().ct_eq(expected.as_bytes()))
-        {
+        let supplied = ControlToken::parse(supplied).map_err(|_| AuthError::WrongBearer)?;
+        if !self.token.matches(&supplied) {
             return Err(AuthError::WrongBearer);
         }
         Ok(())
@@ -281,30 +372,110 @@ fn nibble(byte: u8) -> io::Result<u8> {
     }
 }
 
+fn read_token_from(file: &mut File) -> io::Result<ControlToken> {
+    let mut text = String::new();
+    file.take((TOKEN_HEX_LEN + 2) as u64)
+        .read_to_string(&mut text)?;
+    ControlToken::parse(&text)
+}
+
 #[cfg(unix)]
-fn validate_permissions(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink()
-        || !metadata.file_type().is_file()
+fn open_token_file(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => Ok(file),
+        Err(_error)
+            if fs::symlink_metadata(path)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink()) =>
+        {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "control token must not be a symlink",
+            ))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(unix))]
+fn open_token_file(path: &Path) -> io::Result<File> {
+    OpenOptions::new().read(true).open(path)
+}
+
+#[cfg(unix)]
+fn validate_open_token(file: &File, expected_uid: u32) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file()
         || metadata.permissions().mode() & 0o777 != 0o600
+        || metadata.uid() != expected_uid
     {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "control token permissions must be 0600",
+            "control token must be a user-owned regular file with mode 0600",
         ));
     }
     Ok(())
 }
+
 #[cfg(not(unix))]
-fn validate_permissions(path: &Path) -> io::Result<()> {
-    if fs::symlink_metadata(path)?.file_type().is_symlink() {
+fn validate_open_token(file: &File, _expected_uid: u32) -> io::Result<()> {
+    if !file.metadata()?.file_type().is_file() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "control token must not be a symlink",
+            "control token must be a regular file",
         ));
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn current_user_id() -> u32 {
+    unsafe { libc::geteuid() }
+}
+#[cfg(not(unix))]
+fn current_user_id() -> u32 {
+    0
+}
+
+#[cfg(unix)]
+fn ensure_secure_parent(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_dir()
+                || metadata.uid() != current_user_id()
+                || metadata.permissions().mode() & 0o022 != 0
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "control token directory must be user-owned and not group/other writable",
+                ));
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700);
+            match builder.create(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    ensure_secure_parent(path)
+                }
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(unix))]
+fn ensure_secure_parent(path: &Path) -> io::Result<()> {
+    fs::create_dir_all(path)
 }
 
 fn sync_parent(path: &Path) -> io::Result<()> {

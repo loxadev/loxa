@@ -197,20 +197,6 @@ impl OperationStore {
     pub fn fail(&mut self, id: &str, message: &str, now: u64) -> Result<(), OperationError> {
         self.transition(id, OperationStatus::Failed, Some(message.to_owned()), now)
     }
-    pub fn recovery_required(
-        &mut self,
-        id: &str,
-        message: &str,
-        now: u64,
-    ) -> Result<(), OperationError> {
-        self.transition(
-            id,
-            OperationStatus::RecoveryRequired,
-            Some(message.to_owned()),
-            now,
-        )
-    }
-
     pub fn progress(
         &mut self,
         id: &str,
@@ -297,10 +283,7 @@ impl OperationStore {
         let operation = self.find_mut(id)?;
         if matches!(
             operation.status,
-            OperationStatus::Succeeded
-                | OperationStatus::Failed
-                | OperationStatus::Cancelled
-                | OperationStatus::RecoveryRequired
+            OperationStatus::Succeeded | OperationStatus::Failed | OperationStatus::Cancelled
         ) {
             return Err(OperationError::Terminal);
         }
@@ -311,10 +294,7 @@ impl OperationStore {
                 OperationStatus::Running | OperationStatus::Cancelled | OperationStatus::Failed
             ) | (
                 OperationStatus::Running,
-                OperationStatus::Succeeded
-                    | OperationStatus::Failed
-                    | OperationStatus::Cancelled
-                    | OperationStatus::RecoveryRequired
+                OperationStatus::Succeeded | OperationStatus::Failed | OperationStatus::Cancelled
             )
         );
         if !legal {
@@ -375,9 +355,6 @@ impl OperationStore {
 fn is_terminal(status: OperationStatus) -> bool {
     matches!(
         status,
-        OperationStatus::Succeeded
-            | OperationStatus::Failed
-            | OperationStatus::Cancelled
-            | OperationStatus::RecoveryRequired
+        OperationStatus::Succeeded | OperationStatus::Failed | OperationStatus::Cancelled
     )
 }
