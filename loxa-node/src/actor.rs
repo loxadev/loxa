@@ -14,7 +14,7 @@ pub enum Mutation {
 pub struct MutationCancellation(Arc<AtomicBool>);
 
 impl MutationCancellation {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self(Arc::new(AtomicBool::new(false)))
     }
 
@@ -51,7 +51,7 @@ struct PendingMutation {
 #[derive(Default)]
 struct ActorState {
     pending: VecDeque<PendingMutation>,
-    tracked: HashMap<Mutation, MutationCancellation>,
+    tracked: HashMap<Mutation, (String, MutationCancellation)>,
     stopping: bool,
 }
 
@@ -77,14 +77,43 @@ impl NodeActorHandle {
             return Err(SubmitError::Conflict);
         }
         let cancellation = MutationCancellation::new();
-        state.tracked.insert(mutation.clone(), cancellation.clone());
+        state.tracked.insert(
+            mutation.clone(),
+            (operation_id.into(), cancellation.clone()),
+        );
+        let operation_id = state
+            .tracked
+            .get(&mutation)
+            .expect("tracked mutation exists")
+            .0
+            .clone();
         state.pending.push_back(PendingMutation {
-            operation_id: operation_id.into(),
+            operation_id,
             mutation,
             cancellation,
         });
         self.0.changed.notify_one();
         Ok(())
+    }
+
+    pub fn cancel(&self, operation_id: &str) -> bool {
+        let mut state = self.0.state.lock().expect("node actor lock poisoned");
+        let Some(mutation) = state
+            .tracked
+            .iter()
+            .find_map(|(mutation, tracked)| (tracked.0 == operation_id).then(|| mutation.clone()))
+        else {
+            return false;
+        };
+        let (_, cancellation) = state
+            .tracked
+            .remove(&mutation)
+            .expect("tracked mutation exists");
+        cancellation.cancel();
+        state
+            .pending
+            .retain(|pending| pending.operation_id != operation_id);
+        true
     }
 
     pub fn stop(&self) {
@@ -93,7 +122,7 @@ impl NodeActorHandle {
             return;
         }
         state.stopping = true;
-        for cancellation in state.tracked.values() {
+        for (_, cancellation) in state.tracked.values() {
             cancellation.cancel();
         }
         state.pending.clear();
@@ -130,7 +159,13 @@ impl NodeActor {
                 &command.cancellation,
             );
             let mut state = shared.state.lock().expect("node actor lock poisoned");
-            state.tracked.remove(&command.mutation);
+            if state
+                .tracked
+                .get(&command.mutation)
+                .is_some_and(|tracked| tracked.0 == command.operation_id)
+            {
+                state.tracked.remove(&command.mutation);
+            }
         });
         (handle, worker)
     }
@@ -214,5 +249,38 @@ mod tests {
             started_rx.try_recv().is_err(),
             "pending mutation must be dropped"
         );
+    }
+
+    #[test]
+    fn cancelling_one_operation_does_not_cancel_another() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (_release_tx, release_rx) = mpsc::channel();
+        let (handle, worker) = NodeActor::spawn(BlockingExecutor {
+            started: started_tx,
+            release: release_rx,
+            running: Arc::new(AtomicBool::new(false)),
+            overlap: Arc::new(AtomicBool::new(false)),
+        });
+        handle.submit("one", load("a")).unwrap();
+        let (id, first) = started_rx.recv().unwrap();
+        assert_eq!(id, "one");
+        assert!(handle.cancel("one"));
+        assert!(!handle.cancel("missing"));
+        assert_eq!(handle.submit("resumed", load("a")), Ok(()));
+        while !first.is_cancelled() {
+            std::thread::yield_now();
+        }
+        let (id, resumed) = started_rx.recv().unwrap();
+        assert_eq!(id, "resumed");
+        assert_eq!(
+            handle.submit("third", load("a")),
+            Err(SubmitError::Conflict)
+        );
+        assert!(handle.cancel("resumed"));
+        while !resumed.is_cancelled() {
+            std::thread::yield_now();
+        }
+        handle.stop();
+        worker.join().unwrap();
     }
 }

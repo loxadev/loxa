@@ -58,6 +58,16 @@ mod tests {
     }
 
     #[test]
+    fn atomic_snapshot_subscription_cannot_lose_boundary_event() {
+        let mut store = OperationStore::new(4);
+        let before = store.enqueue(OperationKind::Download, Some("a".into()), 1);
+        let (snapshot, subscription) = store.subscribe_with_snapshot(0);
+        assert!(snapshot.operations.iter().any(|item| item.id == before));
+        let after = store.enqueue(OperationKind::Download, Some("b".into()), 2);
+        assert_eq!(subscription.receiver.recv().unwrap().operation.id, after);
+    }
+
+    #[test]
     fn conflicting_active_operation_is_rejected_and_never_evicted() {
         let mut store = OperationStore::new(1);
         let active = store.enqueue(OperationKind::Download, Some("a".into()), 1);
@@ -184,6 +194,19 @@ impl OperationStore {
             return Err(OperationError::Conflict);
         }
         Ok(self.enqueue(kind, model_id, now))
+    }
+
+    pub fn get(&self, id: &str) -> Option<OperationView> {
+        self.operations.iter().find(|item| item.id == id).cloned()
+    }
+
+    pub fn subscribe_with_snapshot(
+        &mut self,
+        cursor: u64,
+    ) -> (ReconnectSnapshot, EventSubscription) {
+        let subscription = self.subscribe();
+        let snapshot = self.snapshot_since(cursor);
+        (snapshot, subscription)
     }
 
     pub fn start(&mut self, id: &str, now: u64) -> Result<(), OperationError> {
