@@ -430,6 +430,11 @@ pub struct GatewayServer {
 
 impl GatewayServer {
     pub fn start(port: u16, state: GatewayState) -> io::Result<Self> {
+        let app = router(state.clone());
+        Self::start_with_router(port, state, app)
+    }
+
+    pub fn start_with_router(port: u16, state: GatewayState, app: Router) -> io::Result<Self> {
         let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))?;
         listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();
@@ -441,7 +446,8 @@ impl GatewayServer {
                 let runtime = tokio::runtime::Runtime::new().map_err(io::Error::other)?;
                 runtime.block_on(async move {
                     let listener = tokio::net::TcpListener::from_std(listener)?;
-                    axum::serve(listener, router(server_state))
+                    let _ = server_state;
+                    axum::serve(listener, app)
                         .with_graceful_shutdown(async move {
                             let _ = receiver.await;
                         })
