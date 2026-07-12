@@ -29,9 +29,10 @@ export function streamChat(
   callbacks: StreamCallbacks,
   signal?: AbortSignal,
   fetch: StreamFetch = globalThis.fetch,
+  headerTimeoutMs = 10_000,
 ): StreamHandle {
   const controller = new AbortController();
-  let abortCause: "caller" | "dispose" | null = null;
+  let abortCause: "caller" | "dispose" | "timeout" | null = null;
   let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   let readerCancelled = false;
   let terminalNotified = false;
@@ -42,7 +43,7 @@ export function streamChat(
     await Promise.resolve(reader.cancel()).catch(() => undefined);
   };
 
-  const abortOnce = (cause: "caller" | "dispose") => {
+  const abortOnce = (cause: "caller" | "dispose" | "timeout") => {
     if (abortCause !== null) return;
     abortCause = cause;
     controller.abort();
@@ -65,7 +66,9 @@ export function streamChat(
     return terminal;
   };
   const settle = (terminal: StreamTerminal): StreamTerminal =>
-    notifyTerminal(abortCause === null ? terminal : { kind: "cancelled" });
+    notifyTerminal(abortCause === null || abortCause === "timeout" ? terminal : { kind: "cancelled" });
+
+  let headerTimer: ReturnType<typeof setTimeout> | undefined = setTimeout(() => abortOnce("timeout"), headerTimeoutMs);
 
   const finished = (async (): Promise<StreamTerminal> => {
     if (abortCause !== null) {
@@ -84,6 +87,10 @@ export function streamChat(
           signal: controller.signal,
         },
       );
+      if (headerTimer !== undefined) {
+        clearTimeout(headerTimer);
+        headerTimer = undefined;
+      }
       if (!response.ok) {
         if (abortCause !== null) {
           return settle({ kind: "cancelled" });
@@ -97,17 +104,25 @@ export function streamChat(
           message,
         });
       }
-      if (!response.body) {
-        return notifyTerminal({
+      const body = response.body;
+      if (!body) {
+        if (abortCause !== null) {
+          return abortCause === "timeout"
+            ? settle({ kind: "error", message: "Timed out waiting for the Loxa node to begin responding." })
+            : settle({ kind: "cancelled" });
+        }
+        return settle({
           kind: "error",
           message: "The Loxa node returned a stream without a response body.",
         });
       }
 
-      reader = response.body.getReader();
+      reader = body.getReader();
       if (abortCause !== null) {
         await cancelReader();
-        return settle({ kind: "cancelled" });
+        return abortCause === "timeout"
+          ? settle({ kind: "error", message: "Timed out waiting for the Loxa node to begin responding." })
+          : settle({ kind: "cancelled" });
       }
       const decoder = new SseDecoder();
       let responseBytes = 0;
@@ -140,6 +155,9 @@ export function streamChat(
         }
       }
     } catch (error) {
+      if (abortCause === "timeout") {
+        return settle({ kind: "error", message: "Timed out waiting for the Loxa node to begin responding." });
+      }
       if (abortCause !== null || controller.signal.aborted) {
         return settle({ kind: "cancelled" });
       }
@@ -156,6 +174,7 @@ export function streamChat(
               : "Could not connect to the Loxa node.",
       });
     } finally {
+      if (headerTimer !== undefined) clearTimeout(headerTimer);
       signal?.removeEventListener("abort", abortFromCaller);
       reader?.releaseLock();
     }

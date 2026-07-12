@@ -92,6 +92,21 @@ describe("ChatScreen", () => {
     expect(await screen.findByText("other", { selector: ".technical-value" })).toBeInTheDocument();
   });
 
+  it("loads explicitly from an unloaded node and enables chat only after ready confirmation", async () => {
+    const user = userEvent.setup();
+    const setup = services();
+    vi.mocked(setup.api.getControlNode)
+      .mockResolvedValueOnce({ status: "unloaded", activeModelId: null, operationId: null, error: null })
+      .mockResolvedValueOnce({ status: "ready", activeModelId: "gemma", operationId: null, error: null });
+    vi.mocked(setup.api.getOperation).mockResolvedValue({ id: "op-load", kind: "load", status: "succeeded", modelId: "gemma", progress: null, error: null, createdAtUnixMs: 1, updatedAtUnixMs: 2 });
+    render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
+    expect(await screen.findByRole("status")).toHaveTextContent("Disconnected");
+    expect(screen.getByLabelText("Message")).toBeDisabled();
+    await user.click(screen.getByRole("button", { name: "Load gemma" }));
+    expect(await screen.findByRole("status")).toHaveTextContent("Ready");
+    expect(screen.getByLabelText("Message")).toBeEnabled();
+  });
+
   it("keeps the previous active model when a switch fails", async () => {
     const user = userEvent.setup();
     const setup = services();
