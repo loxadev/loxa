@@ -4,10 +4,10 @@ use loxa_core::download;
 use loxa_core::engine::RuntimeBackendKind;
 use loxa_core::hardware::HardwareReport;
 use loxa_core::registry::{self, ModelEntry, REGISTRY};
+use loxa_core::supervisor::{self, SupervisorError};
 #[cfg(test)]
 use loxa_core::supervisor::{
-    self, InterruptStatus, ManagedChild, ManagedServer, ObservedChildExit, RuntimeStateRead,
-    SupervisorError,
+    InterruptStatus, ManagedChild, ManagedServer, ObservedChildExit, RuntimeStateRead,
 };
 use loxa_node::*;
 use std::fmt;
@@ -92,23 +92,12 @@ fn run_with_paths<W: Write, E: Write>(
             ctx,
             port,
             engine,
-        } => run_model(
-            RunRequest {
-                id: &id,
-                ctx,
-                port,
-                engine,
-            },
-            paths,
-            &mut stdout,
-            &mut stderr,
-            None,
-        ),
+        } => run_model_cli(&id, ctx, port, engine, paths, &mut stdout, &mut stderr),
         Command::Serve {
             model,
             port,
             engine,
-        } => serve_node(
+        } => serve_node_cli(
             model.as_deref(),
             port,
             engine,
@@ -116,11 +105,246 @@ fn run_with_paths<W: Write, E: Write>(
             &mut stdout,
             &mut stderr,
         ),
-        Command::Ps => print_managed_servers(paths, &mut stdout),
-        Command::Stop { target } => stop_managed_servers(&target, paths, &mut stdout, &mut stderr),
+        Command::Ps => render_managed_servers(managed_servers(paths), &mut stdout),
+        Command::Stop { target } => render_stop_outcome(
+            &target,
+            stop_managed_servers(StopRequest { target: &target }, paths),
+            &mut stdout,
+            &mut stderr,
+        ),
     };
 
     finish_cli_result(result, &mut stderr)
+}
+
+fn run_model_cli<W: Write, E: Write>(
+    id: &str,
+    ctx: Option<u32>,
+    port: Option<u16>,
+    engine: RuntimeBackendKind,
+    paths: &NodePaths,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> io::Result<ExitCode> {
+    if engine == RuntimeBackendKind::LlamaCpp {
+        let Some(_) = registry::find(id) else {
+            write_unknown_id(id, stderr)?;
+            return Ok(ExitCode::from(1));
+        };
+    }
+    let outcome = {
+        let mut events = CliLifecycleSink { stdout, stderr };
+        run_model(
+            RunRequest {
+                id,
+                ctx,
+                port,
+                engine,
+            },
+            paths,
+            None,
+            &mut events,
+        )
+    };
+    match outcome {
+        Err(error)
+            if engine == RuntimeBackendKind::LlamaCpp
+                && error.kind() == io::ErrorKind::NotFound =>
+        {
+            writeln!(
+                stderr,
+                "model not downloaded for {id}; run `loxa pull {id}`"
+            )?;
+            Ok(ExitCode::from(1))
+        }
+        Ok(outcome) => Ok(exit_code_for_termination(outcome)),
+        Err(error) => Err(error),
+    }
+}
+
+fn serve_node_cli<W: Write, E: Write>(
+    requested_model: Option<&str>,
+    port: Option<u16>,
+    engine: RuntimeBackendKind,
+    paths: &NodePaths,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> io::Result<ExitCode> {
+    if engine == RuntimeBackendKind::LlamaCpp {
+        if let Err(error) = select_serve_model(&paths.models_dir, requested_model) {
+            let kind = match &error {
+                ModelSelectionError::UnknownModel { .. } => io::ErrorKind::InvalidInput,
+                _ => io::ErrorKind::NotFound,
+            };
+            return Err(io::Error::new(
+                kind,
+                match error {
+                    ModelSelectionError::UnknownModel { id } => {
+                        format!("unknown model: {id}; check `loxa list`, then run `loxa pull {id}`")
+                    }
+                    ModelSelectionError::NotDownloaded { id } => {
+                        format!("model not downloaded for {id}; run `loxa pull {id}`")
+                    }
+                    ModelSelectionError::NoDownloadedModels { suggested_id } => {
+                        format!("no registry model is downloaded; run `loxa pull {suggested_id}`")
+                    }
+                },
+            ));
+        }
+    }
+    let mut events = CliLifecycleSink { stdout, stderr };
+    serve_node(requested_model, port, engine, paths, &mut events).map(exit_code_for_termination)
+}
+
+fn exit_code_for_termination(outcome: RunTermination) -> ExitCode {
+    match outcome {
+        RunTermination::RequestedStop => ExitCode::SUCCESS,
+        RunTermination::Interrupted => ExitCode::from(130),
+        RunTermination::Failed | RunTermination::RecoveryRequired => ExitCode::from(1),
+    }
+}
+
+struct CliLifecycleSink<'a, W, E> {
+    stdout: &'a mut W,
+    stderr: &'a mut E,
+}
+
+impl<W: Write, E: Write> LifecycleEventSink for CliLifecycleSink<'_, W, E> {
+    fn emit(&mut self, event: LifecycleEvent) -> io::Result<()> {
+        match event {
+            LifecycleEvent::NodeListening { port, model_alias } => writeln!(
+                self.stdout,
+                "loxa node listening on http://127.0.0.1:{port} with model alias {model_alias}"
+            ),
+            LifecycleEvent::ModelReady { server } => print_run_ready(self.stdout, &server),
+            LifecycleEvent::Restarting {
+                process_label,
+                before_healthy,
+            } => {
+                if before_healthy {
+                    writeln!(
+                        self.stdout,
+                        "{process_label} exited before becoming healthy; restarting once..."
+                    )
+                } else {
+                    writeln!(
+                        self.stdout,
+                        "{process_label} exited unexpectedly; restarting once..."
+                    )
+                }
+            }
+            LifecycleEvent::EngineExited {
+                process_label,
+                model_id,
+                before_healthy,
+                log_tail,
+            } => {
+                if before_healthy {
+                    writeln!(
+                        self.stderr,
+                        "{process_label} exited before becoming healthy for {model_id}"
+                    )?;
+                } else {
+                    writeln!(
+                        self.stderr,
+                        "{process_label} exited unexpectedly for {model_id}"
+                    )?;
+                }
+                write_log_tail(self.stderr, &log_tail)
+            }
+            LifecycleEvent::HealthTimeout {
+                process_label,
+                log_path,
+            } => {
+                writeln!(
+                    self.stderr,
+                    "{process_label} did not become healthy within {} seconds",
+                    supervisor::HEALTH_TIMEOUT.as_secs()
+                )?;
+                writeln!(self.stderr, "log file: {}", log_path.display())
+            }
+            LifecycleEvent::RecoveryRequired { run_id } => writeln!(
+                self.stderr,
+                "cleanup could not be confirmed for managed run {run_id}; recovery required"
+            ),
+        }
+    }
+}
+
+fn render_managed_servers<W: Write>(
+    snapshot: Result<ManagedRunsSnapshot, SupervisorError>,
+    stdout: &mut W,
+) -> io::Result<ExitCode> {
+    match snapshot.map_err(supervisor_error_to_io)? {
+        ManagedRunsSnapshot::Missing => {
+            writeln!(stdout, "no managed sidecars")?;
+        }
+        ManagedRunsSnapshot::Runs(rows) if rows.is_empty() => {
+            writeln!(stdout, "no managed sidecars")?;
+        }
+        ManagedRunsSnapshot::Corrupt { message } => {
+            writeln!(stdout, "managed sidecar state is corrupt: {message}")?;
+        }
+        ManagedRunsSnapshot::Legacy { path } => {
+            writeln!(stdout, "legacy managed sidecar state requires manual recovery at {}; confirm no old Loxa process remains, then archive it manually", path.display())?;
+        }
+        ManagedRunsSnapshot::Runs(rows) => {
+            writeln!(
+                stdout,
+                "id                  pid    port   status               model"
+            )?;
+            for row in rows {
+                let pid = row
+                    .child_pid
+                    .map(|pid| pid.to_string())
+                    .unwrap_or_else(|| "-".into());
+                let model_path = row
+                    .model_path
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "-".into());
+                writeln!(
+                    stdout,
+                    "{:<19} {:>6}  {:>5}  {:<19} {}",
+                    row.model_id, pid, row.port, row.status, model_path
+                )?;
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn render_stop_outcome<W: Write, E: Write>(
+    target: &str,
+    outcome: Result<StopOutcome, SupervisorError>,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> io::Result<ExitCode> {
+    match outcome.map_err(supervisor_error_to_io)? {
+        StopOutcome::NoMatch if target == "all" => {
+            writeln!(stdout, "no managed sidecars")?;
+            Ok(ExitCode::SUCCESS)
+        }
+        StopOutcome::NoMatch => {
+            writeln!(stderr, "no managed sidecar found for {target}")?;
+            Ok(ExitCode::from(1))
+        }
+        StopOutcome::Completed { model_id } => {
+            writeln!(stdout, "stop completed for {model_id}")?;
+            Ok(ExitCode::SUCCESS)
+        }
+        StopOutcome::RecoveryRequired {
+            run_id,
+            model_id,
+            owner_status,
+        } => {
+            writeln!(stderr, "stop requested for {model_id}, but owner identity is {owner_status:?}; recovery required for {run_id}")?;
+            Ok(ExitCode::from(1))
+        }
+        StopOutcome::TimedOut { run_id, model_id } => {
+            writeln!(stderr, "stop requested for {model_id}, but the owner did not finish within {} seconds; recovery required for {run_id}", supervisor::STOP_OWNER_WAIT_TIMEOUT.as_secs())?;
+            Ok(ExitCode::from(1))
+        }
+    }
 }
 
 fn validate_cli_contract(cli: &Cli) -> io::Result<()> {
@@ -994,7 +1218,7 @@ mod tests {
     }
 
     #[test]
-    fn serve_unknown_explicit_model_includes_pull_guidance() {
+    fn serve_selection_error_remains_product_neutral() {
         let temp = TempDir::new("serve-selection");
 
         let error = match select_serve_model(temp.path(), Some("not-in-registry")) {
@@ -1002,7 +1226,13 @@ mod tests {
             Err(error) => error,
         };
 
-        assert!(error.to_string().contains("loxa pull not-in-registry"));
+        assert_eq!(
+            error,
+            ModelSelectionError::UnknownModel {
+                id: "not-in-registry".into()
+            }
+        );
+        assert!(!error.to_string().contains("loxa pull"));
     }
 
     #[test]
@@ -1657,7 +1887,7 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
-        let error = serve_node(
+        let error = serve_node_cli(
             None,
             Some(0),
             RuntimeBackendKind::PyMlxLm,
@@ -2586,17 +2816,14 @@ LOXA_MLX_RESTART_CHILD="1" \
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
-        let exit = run_model(
-            RunRequest {
-                id: model_dir.to_str().expect("utf8 model path"),
-                ctx: None,
-                port: None,
-                engine: RuntimeBackendKind::PyMlxLm,
-            },
+        let exit = run_model_cli(
+            model_dir.to_str().expect("utf8 model path"),
+            None,
+            None,
+            RuntimeBackendKind::PyMlxLm,
             &paths,
             &mut stdout,
             &mut stderr,
-            None,
         )
         .expect("run fake Python engine");
 
@@ -2687,17 +2914,14 @@ LOXA_MLX_RESTART_CHILD="1" \
         let mut stop_stdout = Vec::new();
         let mut stop_stderr = Vec::new();
         let stop_started = std::time::Instant::now();
-        let stop_exit = run_model(
-            RunRequest {
-                id: model_dir.to_str().expect("utf8 model path"),
-                ctx: None,
-                port: None,
-                engine: RuntimeBackendKind::PyMlxLm,
-            },
+        let stop_exit = run_model_cli(
+            model_dir.to_str().expect("utf8 model path"),
+            None,
+            None,
+            RuntimeBackendKind::PyMlxLm,
             &stop_paths,
             &mut stop_stdout,
             &mut stop_stderr,
-            None,
         )
         .expect("stop stalled Python readiness");
         let stop_outcome = stop_thread.join().expect("join external stop request");
@@ -2748,17 +2972,14 @@ LOXA_MLX_RESTART_CHILD="1" \
         let mut interrupt_stdout = Vec::new();
         let mut interrupt_stderr = Vec::new();
         let interrupt_started = std::time::Instant::now();
-        let interrupt_exit = run_model(
-            RunRequest {
-                id: model_dir.to_str().expect("utf8 model path"),
-                ctx: None,
-                port: None,
-                engine: RuntimeBackendKind::PyMlxLm,
-            },
+        let interrupt_exit = run_model_cli(
+            model_dir.to_str().expect("utf8 model path"),
+            None,
+            None,
+            RuntimeBackendKind::PyMlxLm,
             &interrupt_paths,
             &mut interrupt_stdout,
             &mut interrupt_stderr,
-            None,
         )
         .expect("interrupt stalled Python readiness");
         interrupt_thread.join().expect("join interrupt request");
@@ -2840,6 +3061,10 @@ LOXA_MLX_RESTART_CHILD="1" \
         let mut child = FakeStartupChild::with_wait_results(vec![Some(0)]);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
+        let mut events = CliLifecycleSink {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+        };
 
         let outcome = supervise_running_server(
             RunSession {
@@ -2852,8 +3077,7 @@ LOXA_MLX_RESTART_CHILD="1" \
             &signal,
             None,
             "llama-server",
-            &mut stdout,
-            &mut stderr,
+            &mut events,
         )
         .expect("running recovery outcome");
 
@@ -2887,6 +3111,10 @@ LOXA_MLX_RESTART_CHILD="1" \
         let mut child = FakeStartupChild::with_wait_error_then(vec![Some(0)]);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
+        let mut events = CliLifecycleSink {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+        };
 
         let outcome = supervise_running_server(
             RunSession {
@@ -2899,8 +3127,7 @@ LOXA_MLX_RESTART_CHILD="1" \
             &signal,
             None,
             "llama-server",
-            &mut stdout,
-            &mut stderr,
+            &mut events,
         )
         .expect("running recovery outcome");
 
@@ -3533,8 +3760,18 @@ LOXA_MLX_RESTART_CHILD="1" \
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
-        let exit = stop_managed_servers(&run.model_id, &paths, &mut stdout, &mut stderr)
-            .expect("stop command result");
+        let exit = render_stop_outcome(
+            &run.model_id,
+            stop_managed_servers(
+                StopRequest {
+                    target: &run.model_id,
+                },
+                &paths,
+            ),
+            &mut stdout,
+            &mut stderr,
+        )
+        .expect("stop command result");
 
         assert_eq!(exit, ExitCode::from(1));
         assert!(stdout.is_empty());

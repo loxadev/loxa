@@ -6,6 +6,7 @@ use loxa_core::supervisor::{
     RuntimeStateRead, SupervisorError,
 };
 use std::ffi::OsString;
+use std::fmt;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -47,6 +48,12 @@ pub enum RunOutcome {
 pub enum ManagedAttachmentBoundary {
     Attached(supervisor::ManagedRun),
     Terminal(ExitCode),
+}
+
+#[derive(Debug)]
+pub enum TypedManagedAttachmentBoundary {
+    Attached(supervisor::ManagedRun),
+    Terminal(RunTermination),
 }
 
 #[derive(Debug)]
@@ -254,13 +261,52 @@ pub struct RunRequest<'a> {
     pub engine: RuntimeBackendKind,
 }
 
-pub fn run_model<W: Write, E: Write>(
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LifecycleEvent {
+    NodeListening {
+        port: u16,
+        model_alias: String,
+    },
+    ModelReady {
+        server: ManagedServer,
+    },
+    Restarting {
+        process_label: String,
+        before_healthy: bool,
+    },
+    EngineExited {
+        process_label: String,
+        model_id: String,
+        before_healthy: bool,
+        log_tail: String,
+    },
+    HealthTimeout {
+        process_label: String,
+        log_path: PathBuf,
+    },
+    RecoveryRequired {
+        run_id: String,
+    },
+}
+
+pub trait LifecycleEventSink {
+    fn emit(&mut self, event: LifecycleEvent) -> io::Result<()>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunTermination {
+    RequestedStop,
+    Interrupted,
+    Failed,
+    RecoveryRequired,
+}
+
+pub fn run_model(
     request: RunRequest<'_>,
     paths: &NodePaths,
-    stdout: &mut W,
-    stderr: &mut E,
     gateway: Option<&loxa_core::gateway::GatewayState>,
-) -> io::Result<ExitCode> {
+    events: &mut dyn LifecycleEventSink,
+) -> io::Result<RunTermination> {
     let RunRequest {
         id,
         ctx,
@@ -270,8 +316,10 @@ pub fn run_model<W: Write, E: Write>(
     let mut initial_backend = match engine {
         RuntimeBackendKind::LlamaCpp => {
             let Some(_) = registry::find(id) else {
-                write_unknown_id(id, stderr)?;
-                return Ok(ExitCode::from(1));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unknown model: {id}"),
+                ));
             };
             None
         }
@@ -307,11 +355,10 @@ pub fn run_model<W: Write, E: Write>(
                 let preparation = match preparation {
                     Ok(preparation) => preparation,
                     Err(SupervisorError::ModelNotDownloaded(_)) => {
-                        writeln!(
-                            stderr,
-                            "model not downloaded for {id}; run `loxa pull {id}`"
-                        )?;
-                        return Ok(ExitCode::from(1));
+                        return Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!("model not downloaded: {id}"),
+                        ));
                     }
                     Err(error) => return Err(supervisor_error_to_io(error)),
                 };
@@ -321,14 +368,16 @@ pub fn run_model<W: Write, E: Write>(
                         resolved: backend,
                         detected: (),
                     } => (backend, run, false, None),
-                    OwnedReplacementPreparation::RequestedStop => return Ok(ExitCode::SUCCESS),
+                    OwnedReplacementPreparation::RequestedStop => {
+                        return Ok(RunTermination::RequestedStop)
+                    }
                     OwnedReplacementPreparation::Interrupted => {
-                        return Ok(ExitCode::from(130));
+                        return Ok(RunTermination::Interrupted);
                     }
                 }
             } else {
                 if signal_guard.interrupted() {
-                    return Ok(ExitCode::from(130));
+                    return Ok(RunTermination::Interrupted);
                 }
                 let backend = match initial_backend
                     .take()
@@ -337,16 +386,15 @@ pub fn run_model<W: Write, E: Write>(
                 {
                     Ok(resolved) => resolved,
                     Err(SupervisorError::ModelNotDownloaded(_)) => {
-                        writeln!(
-                            stderr,
-                            "model not downloaded for {id}; run `loxa pull {id}`"
-                        )?;
-                        return Ok(ExitCode::from(1));
+                        return Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!("model not downloaded: {id}"),
+                        ));
                     }
                     Err(error) => return Err(supervisor_error_to_io(error)),
                 };
                 if signal_guard.interrupted() {
-                    return Ok(ExitCode::from(130));
+                    return Ok(RunTermination::Interrupted);
                 }
                 let reservation =
                     supervisor::reserve_localhost_port(port).map_err(supervisor_error_to_io)?;
@@ -394,8 +442,19 @@ pub fn run_model<W: Write, E: Write>(
         let reservation = match reservation {
             Ok(reservation) => reservation,
             Err(error) => {
-                return finish_childless_owner_error(&paths.state_path, &starting_run, error)
-                    .map_err(supervisor_error_to_io)
+                return match supervisor::finish_childless_runtime_state_run(
+                    &paths.state_path,
+                    &starting_run.identity(),
+                )
+                .map_err(supervisor_error_to_io)?
+                {
+                    supervisor::ChildlessFinishOutcome::RequestedStop => {
+                        Ok(RunTermination::RequestedStop)
+                    }
+                    supervisor::ChildlessFinishOutcome::Finished => {
+                        Err(supervisor_error_to_io(error))
+                    }
+                }
             }
         };
         let spawn = supervisor::spawn_starting_engine(
@@ -407,10 +466,23 @@ pub fn run_model<W: Write, E: Write>(
         );
         let (starting_run, mut child) = match spawn {
             Ok(supervisor::SpawnStartingRunOutcome::Spawned { run, value }) => (run, value),
-            Ok(supervisor::SpawnStartingRunOutcome::RequestedStop) => return Ok(ExitCode::SUCCESS),
+            Ok(supervisor::SpawnStartingRunOutcome::RequestedStop) => {
+                return Ok(RunTermination::RequestedStop)
+            }
             Err(error) => {
-                return finish_childless_owner_error(&paths.state_path, &starting_run, error)
-                    .map_err(supervisor_error_to_io)
+                return match supervisor::finish_childless_runtime_state_run(
+                    &paths.state_path,
+                    &starting_run.identity(),
+                )
+                .map_err(supervisor_error_to_io)?
+                {
+                    supervisor::ChildlessFinishOutcome::RequestedStop => {
+                        Ok(RunTermination::RequestedStop)
+                    }
+                    supervisor::ChildlessFinishOutcome::Finished => {
+                        Err(supervisor_error_to_io(error))
+                    }
+                }
             }
         };
         let initialization_error = child.take_initialization_error();
@@ -423,11 +495,13 @@ pub fn run_model<W: Write, E: Write>(
         .map_err(supervisor_error_to_io)?
         {
             return match outcome {
-                supervisor::PostSpawnCleanupOutcome::RequestedStop => Ok(ExitCode::SUCCESS),
-                supervisor::PostSpawnCleanupOutcome::RecoveryRequired => {
-                    recovery_required_exit(stderr, &starting_run.run_id)
+                supervisor::PostSpawnCleanupOutcome::RequestedStop => {
+                    Ok(RunTermination::RequestedStop)
                 }
-                supervisor::PostSpawnCleanupOutcome::Cleaned => Ok(ExitCode::from(1)),
+                supervisor::PostSpawnCleanupOutcome::RecoveryRequired => {
+                    emit_recovery_required(events, &starting_run.run_id)
+                }
+                supervisor::PostSpawnCleanupOutcome::Cleaned => Ok(RunTermination::Failed),
             };
         }
         let server = ManagedServer {
@@ -445,9 +519,9 @@ pub fn run_model<W: Write, E: Write>(
                 finish_spawned_interrupt(&mut child, &paths.state_path, &starting_run.identity())
                     .map_err(supervisor_error_to_io)?;
             if outcome == supervisor::OwnerTerminalOutcome::RecoveryRequired {
-                return recovery_required_exit(stderr, &starting_run.run_id);
+                return emit_recovery_required(events, &starting_run.run_id);
             }
-            return Ok(owner_terminal_exit_code(outcome));
+            return Ok(owner_terminal_termination(outcome));
         }
 
         let starting_run_id = starting_run.run_id.clone();
@@ -459,9 +533,14 @@ pub fn run_model<W: Write, E: Write>(
             supervisor::CTRL_C_GRACE_PERIOD,
         )
         .map_err(supervisor_error_to_io)?;
-        let run = match resolve_managed_attachment(persist_outcome, stderr, &starting_run_id)? {
-            ManagedAttachmentBoundary::Attached(run) => run,
-            ManagedAttachmentBoundary::Terminal(exit) => return Ok(exit),
+        let run = match resolve_managed_attachment_typed(persist_outcome) {
+            TypedManagedAttachmentBoundary::Attached(run) => run,
+            TypedManagedAttachmentBoundary::Terminal(termination) => {
+                if termination == RunTermination::RecoveryRequired {
+                    return emit_recovery_required(events, &starting_run_id);
+                }
+                return Ok(termination);
+            }
         };
         let state_identity = run.identity();
 
@@ -469,9 +548,9 @@ pub fn run_model<W: Write, E: Write>(
             .map_err(supervisor_error_to_io)?
         {
             if outcome == supervisor::OwnerTerminalOutcome::RecoveryRequired {
-                return recovery_required_exit(stderr, &run.run_id);
+                return emit_recovery_required(events, &run.run_id);
             }
-            return Ok(owner_terminal_exit_code(outcome));
+            return Ok(owner_terminal_termination(outcome));
         }
 
         let readiness_worker = match &spec.readiness {
@@ -511,17 +590,17 @@ pub fn run_model<W: Write, E: Write>(
         };
         match startup {
             Ok(StartupWaitOutcome::Ready) => {
-                match print_run_ready_owned(
-                    stdout,
+                match emit_run_ready_owned(
+                    events,
                     &server,
                     &mut child,
                     &paths.state_path,
                     &state_identity,
                 )? {
                     ReadyOutputOutcome::Ready => {}
-                    ReadyOutputOutcome::RequestedStop => return Ok(ExitCode::SUCCESS),
+                    ReadyOutputOutcome::RequestedStop => return Ok(RunTermination::RequestedStop),
                     ReadyOutputOutcome::RecoveryRequired => {
-                        return recovery_required_exit(stderr, &run.run_id)
+                        return emit_recovery_required(events, &run.run_id)
                     }
                 }
                 if let Some(gateway) = gateway {
@@ -538,20 +617,19 @@ pub fn run_model<W: Write, E: Write>(
                     &signal_guard,
                     gateway,
                     backend.process_label(),
-                    stdout,
-                    stderr,
+                    events,
                 )? {
                     RunOutcome::RequestedStop => {
                         if let Some(gateway) = gateway {
                             gateway.withdraw();
                         }
-                        return Ok(ExitCode::SUCCESS);
+                        return Ok(RunTermination::RequestedStop);
                     }
                     RunOutcome::Interrupted => {
                         if let Some(gateway) = gateway {
                             gateway.withdraw();
                         }
-                        return Ok(ExitCode::from(130));
+                        return Ok(RunTermination::Interrupted);
                     }
                     RunOutcome::Restart { run } => {
                         if let Some(gateway) = gateway {
@@ -564,20 +642,20 @@ pub fn run_model<W: Write, E: Write>(
                         if let Some(gateway) = gateway {
                             gateway.withdraw();
                         }
-                        return Ok(ExitCode::from(1));
+                        return Ok(RunTermination::Failed);
                     }
                     RunOutcome::RecoveryRequired => {
                         if let Some(gateway) = gateway {
                             gateway.withdraw();
                         }
-                        return recovery_required_exit(stderr, &run.run_id);
+                        return emit_recovery_required(events, &run.run_id);
                     }
                 }
             }
-            Ok(StartupWaitOutcome::RequestedStop) => return Ok(ExitCode::SUCCESS),
-            Ok(StartupWaitOutcome::Interrupted) => return Ok(ExitCode::from(130)),
+            Ok(StartupWaitOutcome::RequestedStop) => return Ok(RunTermination::RequestedStop),
+            Ok(StartupWaitOutcome::Interrupted) => return Ok(RunTermination::Interrupted),
             Ok(StartupWaitOutcome::RecoveryRequired) => {
-                return recovery_required_exit(stderr, &run.run_id)
+                return emit_recovery_required(events, &run.run_id)
             }
             Err(StartupWaitFailure::AfterChildReaped {
                 log_tail,
@@ -593,42 +671,32 @@ pub fn run_model<W: Write, E: Write>(
                 )
                 .map_err(supervisor_error_to_io)?
                 {
-                    ObservedChildExit::RequestedStop => return Ok(ExitCode::SUCCESS),
-                    ObservedChildExit::Interrupted => return Ok(ExitCode::from(130)),
+                    ObservedChildExit::RequestedStop => return Ok(RunTermination::RequestedStop),
+                    ObservedChildExit::Interrupted => return Ok(RunTermination::Interrupted),
                     ObservedChildExit::Restart { run } => {
-                        let run = retain_restart_after_best_effort_announcement(
-                            stdout,
-                            &format!(
-                                "{} exited before becoming healthy; restarting once...",
-                                backend.process_label()
-                            ),
-                            run,
-                        );
+                        let _ = events.emit(LifecycleEvent::Restarting {
+                            process_label: backend.process_label().to_string(),
+                            before_healthy: true,
+                        });
                         replacement_run = Some(run);
                         continue;
                     }
                     ObservedChildExit::Exhausted { log_tail } => {
-                        writeln!(
-                            stderr,
-                            "{} exited before becoming healthy for {}",
-                            backend.process_label(),
-                            backend.model_id
-                        )?;
-                        write_log_tail(stderr, &log_tail)?;
-                        return Ok(ExitCode::from(1));
+                        events.emit(LifecycleEvent::EngineExited {
+                            process_label: backend.process_label().to_string(),
+                            model_id: backend.model_id.clone(),
+                            before_healthy: true,
+                            log_tail,
+                        })?;
+                        return Ok(RunTermination::Failed);
                     }
                     ObservedChildExit::RecoveryRequired => {
-                        return recovery_required_exit(stderr, &run.run_id)
+                        return emit_recovery_required(events, &run.run_id)
                     }
                 }
             }
             Err(StartupWaitFailure::AfterTeardown(error)) => {
-                return render_post_cleanup_startup_failure(
-                    stderr,
-                    &log_path,
-                    backend.process_label(),
-                    error,
-                );
+                return finish_startup_failure(events, &log_path, backend.process_label(), error);
             }
             Err(StartupWaitFailure::BeforeTeardown(error)) => {
                 let cleanup = supervisor::cleanup_post_spawn_failure(
@@ -638,67 +706,107 @@ pub fn run_model<W: Write, E: Write>(
                 )
                 .map_err(supervisor_error_to_io)?;
                 if cleanup == supervisor::PostSpawnCleanupOutcome::RequestedStop {
-                    return Ok(ExitCode::SUCCESS);
+                    return Ok(RunTermination::RequestedStop);
                 }
                 if cleanup == supervisor::PostSpawnCleanupOutcome::RecoveryRequired {
-                    return recovery_required_exit(stderr, &run.run_id);
+                    return emit_recovery_required(events, &run.run_id);
                 }
-                return render_post_cleanup_startup_failure(
-                    stderr,
-                    &log_path,
-                    backend.process_label(),
-                    error,
-                );
+                return finish_startup_failure(events, &log_path, backend.process_label(), error);
             }
         }
     }
 }
 
+fn emit_recovery_required(
+    events: &mut dyn LifecycleEventSink,
+    run_id: &str,
+) -> io::Result<RunTermination> {
+    events.emit(LifecycleEvent::RecoveryRequired {
+        run_id: run_id.to_string(),
+    })?;
+    Ok(RunTermination::RecoveryRequired)
+}
+
+fn owner_terminal_termination(outcome: supervisor::OwnerTerminalOutcome) -> RunTermination {
+    match outcome {
+        supervisor::OwnerTerminalOutcome::RequestedStop => RunTermination::RequestedStop,
+        supervisor::OwnerTerminalOutcome::Interrupted => RunTermination::Interrupted,
+        supervisor::OwnerTerminalOutcome::RecoveryRequired => RunTermination::RecoveryRequired,
+    }
+}
+
+fn finish_startup_failure(
+    events: &mut dyn LifecycleEventSink,
+    log_path: &Path,
+    process_label: &str,
+    error: SupervisorError,
+) -> io::Result<RunTermination> {
+    match error {
+        SupervisorError::HealthTimeout => {
+            events.emit(LifecycleEvent::HealthTimeout {
+                process_label: process_label.to_string(),
+                log_path: log_path.to_path_buf(),
+            })?;
+            Ok(RunTermination::Failed)
+        }
+        other => Err(supervisor_error_to_io(other)),
+    }
+}
+
 const DEFAULT_GATEWAY_PORT: u16 = 11_435;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModelSelectionError {
+    UnknownModel { id: String },
+    NotDownloaded { id: String },
+    NoDownloadedModels { suggested_id: String },
+}
+
+impl fmt::Display for ModelSelectionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownModel { id } => write!(formatter, "unknown model: {id}"),
+            Self::NotDownloaded { id } => write!(formatter, "model not downloaded: {id}"),
+            Self::NoDownloadedModels { .. } => write!(formatter, "no registry model is downloaded"),
+        }
+    }
+}
+
+impl std::error::Error for ModelSelectionError {}
 
 pub fn select_serve_model(
     models_dir: &Path,
     requested: Option<&str>,
-) -> io::Result<&'static ModelEntry> {
+) -> Result<&'static ModelEntry, ModelSelectionError> {
     if let Some(id) = requested {
-        let entry = registry::find(id).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("unknown model: {id}; check `loxa list`, then run `loxa pull {id}`"),
-            )
-        })?;
+        let entry = registry::find(id)
+            .ok_or_else(|| ModelSelectionError::UnknownModel { id: id.to_string() })?;
         if !models_dir.join(entry.filename).is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("model not downloaded for {id}; run `loxa pull {id}`"),
-            ));
+            return Err(ModelSelectionError::NotDownloaded { id: id.to_string() });
         }
         return Ok(entry);
     }
     REGISTRY
         .iter()
         .find(|entry| models_dir.join(entry.filename).is_file())
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "no registry model is downloaded; run `loxa pull {}`",
-                    REGISTRY[0].id
-                ),
-            )
+        .ok_or_else(|| ModelSelectionError::NoDownloadedModels {
+            suggested_id: REGISTRY[0].id.to_string(),
         })
 }
 
-pub fn serve_node<W: Write, E: Write>(
+pub fn serve_node(
     requested_model: Option<&str>,
     port: Option<u16>,
     engine: RuntimeBackendKind,
     paths: &NodePaths,
-    stdout: &mut W,
-    stderr: &mut E,
-) -> io::Result<ExitCode> {
+    events: &mut dyn LifecycleEventSink,
+) -> io::Result<RunTermination> {
     let model_id = match engine {
-        RuntimeBackendKind::LlamaCpp => select_serve_model(&paths.models_dir, requested_model)?.id,
+        RuntimeBackendKind::LlamaCpp => {
+            select_serve_model(&paths.models_dir, requested_model)
+                .map_err(io::Error::other)?
+                .id
+        }
         RuntimeBackendKind::PyMlxLm => requested_model.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -712,11 +820,10 @@ pub fn serve_node<W: Write, E: Write>(
         port.unwrap_or(DEFAULT_GATEWAY_PORT),
         gateway_state.clone(),
     )?;
-    writeln!(
-        stdout,
-        "loxa node listening on http://127.0.0.1:{} with model alias loxa",
-        gateway.port()
-    )?;
+    events.emit(LifecycleEvent::NodeListening {
+        port: gateway.port(),
+        model_alias: "loxa".to_string(),
+    })?;
     let outcome = run_model(
         RunRequest {
             id: model_id,
@@ -725,9 +832,8 @@ pub fn serve_node<W: Write, E: Write>(
             engine,
         },
         paths,
-        stdout,
-        stderr,
         Some(&gateway_state),
+        events,
     );
     gateway_state.withdraw();
     let shutdown = gateway.shutdown();
@@ -773,6 +879,22 @@ pub fn resolve_managed_attachment<E: Write>(
         supervisor::PersistManagedServerOutcome::RecoveryRequired => Ok(
             ManagedAttachmentBoundary::Terminal(recovery_required_exit(stderr, run_id)?),
         ),
+    }
+}
+
+pub fn resolve_managed_attachment_typed(
+    outcome: supervisor::PersistManagedServerOutcome,
+) -> TypedManagedAttachmentBoundary {
+    match outcome {
+        supervisor::PersistManagedServerOutcome::Attached(run) => {
+            TypedManagedAttachmentBoundary::Attached(run)
+        }
+        supervisor::PersistManagedServerOutcome::RequestedStop => {
+            TypedManagedAttachmentBoundary::Terminal(RunTermination::RequestedStop)
+        }
+        supervisor::PersistManagedServerOutcome::RecoveryRequired => {
+            TypedManagedAttachmentBoundary::Terminal(RunTermination::RecoveryRequired)
+        }
     }
 }
 
@@ -870,102 +992,91 @@ pub fn finish_childless_owner_error(
     }
 }
 
-pub fn print_managed_servers<W: Write>(paths: &NodePaths, stdout: &mut W) -> io::Result<ExitCode> {
-    let state =
-        supervisor::read_runtime_state(&paths.state_path).map_err(supervisor_error_to_io)?;
-    let runs = match state {
-        RuntimeStateRead::Missing => {
-            writeln!(stdout, "no managed sidecars")?;
-            return Ok(ExitCode::SUCCESS);
-        }
-        RuntimeStateRead::Corrupt(message) => {
-            writeln!(stdout, "managed sidecar state is corrupt: {message}")?;
-            return Ok(ExitCode::SUCCESS);
-        }
-        RuntimeStateRead::Legacy(legacy_path) => {
-            writeln!(
-                stdout,
-                "legacy managed sidecar state requires manual recovery at {}; confirm no old Loxa process remains, then archive it manually",
-                legacy_path.display()
-            )?;
-            return Ok(ExitCode::SUCCESS);
-        }
-        RuntimeStateRead::Loaded(runs) => runs,
-    };
-
-    if runs.is_empty() {
-        writeln!(stdout, "no managed sidecars")?;
-        return Ok(ExitCode::SUCCESS);
-    }
-
-    writeln!(
-        stdout,
-        "id                  pid    port   status               model"
-    )?;
-    for run in runs {
-        let inspection = supervisor::inspect_managed_run(&run);
-        let pid = run
-            .child_pid
-            .map(|pid| pid.to_string())
-            .unwrap_or_else(|| "-".to_string());
-        let model_path = registry::find(&run.model_id)
-            .map(|entry| paths.models_dir.join(entry.filename))
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "-".to_string());
-        writeln!(
-            stdout,
-            "{:<19} {:>6}  {:>5}  {:<19} {}",
-            run.model_id,
-            pid,
-            run.port,
-            managed_run_status(&inspection),
-            model_path,
-        )?;
-    }
-
-    Ok(ExitCode::SUCCESS)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ManagedRunsSnapshot {
+    Missing,
+    Corrupt { message: String },
+    Legacy { path: PathBuf },
+    Runs(Vec<ManagedRunSummary>),
 }
 
-pub fn stop_managed_servers<W: Write, E: Write>(
-    target: &str,
-    paths: &NodePaths,
-    stdout: &mut W,
-    stderr: &mut E,
-) -> io::Result<ExitCode> {
-    match supervisor::request_managed_stop(&paths.state_path, target)
-        .map_err(supervisor_error_to_io)?
-    {
-        supervisor::StopRequestOutcome::NoMatch => {
-            if target == "all" {
-                writeln!(stdout, "no managed sidecars")?;
-                Ok(ExitCode::SUCCESS)
-            } else {
-                writeln!(stderr, "no managed sidecar found for {target}")?;
-                Ok(ExitCode::from(1))
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManagedRunSummary {
+    pub model_id: String,
+    pub child_pid: Option<u32>,
+    pub port: u16,
+    pub status: &'static str,
+    pub model_path: Option<PathBuf>,
+}
+
+pub fn managed_servers(paths: &NodePaths) -> Result<ManagedRunsSnapshot, SupervisorError> {
+    let state = supervisor::read_runtime_state(&paths.state_path)?;
+    let runs = match state {
+        RuntimeStateRead::Missing => return Ok(ManagedRunsSnapshot::Missing),
+        RuntimeStateRead::Corrupt(message) => return Ok(ManagedRunsSnapshot::Corrupt { message }),
+        RuntimeStateRead::Legacy(path) => return Ok(ManagedRunsSnapshot::Legacy { path }),
+        RuntimeStateRead::Loaded(runs) => runs,
+    };
+    let rows = runs
+        .into_iter()
+        .map(|run| {
+            let inspection = supervisor::inspect_managed_run(&run);
+            let model_path =
+                registry::find(&run.model_id).map(|entry| paths.models_dir.join(entry.filename));
+            ManagedRunSummary {
+                model_id: run.model_id,
+                child_pid: run.child_pid,
+                port: run.port,
+                status: managed_run_status(&inspection),
+                model_path,
             }
-        }
+        })
+        .collect();
+    Ok(ManagedRunsSnapshot::Runs(rows))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StopRequest<'a> {
+    pub target: &'a str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StopOutcome {
+    NoMatch,
+    Completed {
+        model_id: String,
+    },
+    RecoveryRequired {
+        run_id: String,
+        model_id: String,
+        owner_status: supervisor::OwnerIdentityStatus,
+    },
+    TimedOut {
+        run_id: String,
+        model_id: String,
+    },
+}
+
+pub fn stop_managed_servers(
+    request: StopRequest<'_>,
+    paths: &NodePaths,
+) -> Result<StopOutcome, SupervisorError> {
+    match supervisor::request_managed_stop(&paths.state_path, request.target)? {
+        supervisor::StopRequestOutcome::NoMatch => Ok(StopOutcome::NoMatch),
         supervisor::StopRequestOutcome::Completed { model_id, .. } => {
-            writeln!(stdout, "stop completed for {model_id}")?;
-            Ok(ExitCode::SUCCESS)
+            Ok(StopOutcome::Completed { model_id })
         }
         supervisor::StopRequestOutcome::RecoveryRequired {
             run_id,
             model_id,
             owner_status,
-        } => {
-            writeln!(
-                stderr,
-                "stop requested for {model_id}, but owner identity is {owner_status:?}; recovery required for {run_id}"
-            )?;
-            Ok(ExitCode::from(1))
-        }
+        } => Ok(StopOutcome::RecoveryRequired {
+            run_id,
+            model_id,
+            owner_status,
+        }),
         supervisor::StopRequestOutcome::TimedOut { run_id, model_id } => {
-            writeln!(
-                stderr,
-                "stop requested for {model_id}, but the owner did not finish within {} seconds; recovery required for {run_id}",
-                supervisor::STOP_OWNER_WAIT_TIMEOUT.as_secs()
-            )?;
-            Ok(ExitCode::from(1))
+            Ok(StopOutcome::TimedOut { run_id, model_id })
         }
     }
 }
@@ -1464,14 +1575,13 @@ where
     })
 }
 
-pub fn supervise_running_server<C, W: Write, E: Write, I: InterruptSource + InterruptStatus>(
+pub fn supervise_running_server<C, I: InterruptSource + InterruptStatus>(
     session: RunSession<'_>,
     child: &mut C,
     interrupt: &I,
     gateway: Option<&loxa_core::gateway::GatewayState>,
     process_label: &str,
-    stdout: &mut W,
-    stderr: &mut E,
+    events: &mut dyn LifecycleEventSink,
 ) -> io::Result<RunOutcome>
 where
     C: ManagedChild + LogDrainingChild,
@@ -1537,20 +1647,19 @@ where
                     ObservedChildExit::RequestedStop => return Ok(RunOutcome::RequestedStop),
                     ObservedChildExit::Interrupted => return Ok(RunOutcome::Interrupted),
                     ObservedChildExit::Restart { run } => {
-                        let run = retain_restart_after_best_effort_announcement(
-                            stdout,
-                            &format!("{process_label} exited unexpectedly; restarting once..."),
-                            run,
-                        );
+                        let _ = events.emit(LifecycleEvent::Restarting {
+                            process_label: process_label.to_string(),
+                            before_healthy: false,
+                        });
                         return Ok(RunOutcome::Restart { run });
                     }
                     ObservedChildExit::Exhausted { log_tail } => {
-                        writeln!(
-                            stderr,
-                            "{process_label} exited unexpectedly for {}",
-                            session.id
-                        )?;
-                        write_log_tail(stderr, &log_tail)?;
+                        events.emit(LifecycleEvent::EngineExited {
+                            process_label: process_label.to_string(),
+                            model_id: session.id.to_string(),
+                            before_healthy: false,
+                            log_tail: log_tail.clone(),
+                        })?;
                         return Ok(RunOutcome::Exhausted { log_tail });
                     }
                     ObservedChildExit::RecoveryRequired => return Ok(RunOutcome::RecoveryRequired),
@@ -1700,6 +1809,32 @@ where
     W: Write,
 {
     let Err(output_error) = print_run_ready(stdout, server) else {
+        return Ok(ReadyOutputOutcome::Ready);
+    };
+    match supervisor::cleanup_post_spawn_failure(child, state_path, state_identity)
+        .map_err(supervisor_error_to_io)?
+    {
+        supervisor::PostSpawnCleanupOutcome::Cleaned => Err(output_error),
+        supervisor::PostSpawnCleanupOutcome::RequestedStop => Ok(ReadyOutputOutcome::RequestedStop),
+        supervisor::PostSpawnCleanupOutcome::RecoveryRequired => {
+            Ok(ReadyOutputOutcome::RecoveryRequired)
+        }
+    }
+}
+
+pub fn emit_run_ready_owned<C>(
+    events: &mut dyn LifecycleEventSink,
+    server: &ManagedServer,
+    child: &mut C,
+    state_path: &Path,
+    state_identity: &supervisor::ManagedRunIdentity,
+) -> io::Result<ReadyOutputOutcome>
+where
+    C: ManagedChild + LogDrainingChild,
+{
+    let Err(output_error) = events.emit(LifecycleEvent::ModelReady {
+        server: server.clone(),
+    }) else {
         return Ok(ReadyOutputOutcome::Ready);
     };
     match supervisor::cleanup_post_spawn_failure(child, state_path, state_identity)
@@ -1918,14 +2053,65 @@ impl InterruptStatus for SignalGuard {
     }
 }
 
-fn valid_ids() -> String {
-    REGISTRY
-        .iter()
-        .map(|entry| entry.id)
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-fn write_unknown_id<W: Write>(id: &str, stderr: &mut W) -> io::Result<()> {
-    writeln!(stderr, "unknown model id: {id}")?;
-    writeln!(stderr, "valid ids: {}", valid_ids())
+#[cfg(test)]
+mod lifecycle_api_tests {
+    use super::*;
+
+    #[test]
+    fn lifecycle_contract_is_product_neutral() {
+        let event = LifecycleEvent::NodeListening {
+            port: 11_435,
+            model_alias: "loxa".to_string(),
+        };
+        assert_eq!(
+            event,
+            LifecycleEvent::NodeListening {
+                port: 11_435,
+                model_alias: "loxa".to_string(),
+            }
+        );
+        assert_eq!(RunTermination::Interrupted, RunTermination::Interrupted);
+    }
+
+    #[test]
+    fn serve_selection_reports_product_neutral_unknown_model_evidence() {
+        let temp = std::env::temp_dir().join(format!(
+            "loxa-node-selection-{}-{}",
+            std::process::id(),
+            unix_timestamp_now()
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+
+        let error = match select_serve_model(&temp, Some("missing-model")) {
+            Ok(_) => panic!("missing model unexpectedly selected"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error,
+            ModelSelectionError::UnknownModel {
+                id: "missing-model".to_string()
+            }
+        );
+        assert!(!error.to_string().contains("loxa pull"));
+        let _ = std::fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn stop_result_is_typed_instead_of_rendered() {
+        let paths = NodePaths {
+            models_dir: PathBuf::from("/unused"),
+            state_path: std::env::temp_dir().join(format!(
+                "loxa-node-stop-missing-{}-{}",
+                std::process::id(),
+                unix_timestamp_now()
+            )),
+            logs_dir: PathBuf::from("/unused"),
+        };
+
+        assert_eq!(
+            stop_managed_servers(StopRequest { target: "all" }, &paths).unwrap(),
+            StopOutcome::NoMatch
+        );
+    }
 }
