@@ -67,15 +67,38 @@ mod tests {
         let token = ControlToken::from_bytes([7; TOKEN_BYTES]);
         let nonce = "01".repeat(32);
         let vectors = [
-            (NodeStatus::Unloaded, "fec2cf06e169de949d213f6b0a9c7475890c0ff6a93070a6533deac9193a0e2d"),
-            (NodeStatus::Loading, "bc470c85531eb19dc0e6941a45731df9fc79e5e4b14311ef5f9010060d04e350"),
-            (NodeStatus::Ready, "a8168ad8ea645fdd1c91f495f8d28e3de0a1d13a7d728c218ce3797661baa1a0"),
-            (NodeStatus::Unloading, "cd67c4caeeac907169970d3a3cc421ffcff1b402977e63699b5bfe31d9fa5b7f"),
-            (NodeStatus::RecoveryRequired, "1433e64080eaeb1106f201d3bd5a35b7353da9452c0da10202fa0b7dfee07e1b"),
-            (NodeStatus::Error, "bce2ad7996d8d4e0c84fbef730ce63985b3fbf8f1a257317976e50f88a553319"),
+            (
+                NodeStatus::Unloaded,
+                "fec2cf06e169de949d213f6b0a9c7475890c0ff6a93070a6533deac9193a0e2d",
+            ),
+            (
+                NodeStatus::Loading,
+                "bc470c85531eb19dc0e6941a45731df9fc79e5e4b14311ef5f9010060d04e350",
+            ),
+            (
+                NodeStatus::Ready,
+                "a8168ad8ea645fdd1c91f495f8d28e3de0a1d13a7d728c218ce3797661baa1a0",
+            ),
+            (
+                NodeStatus::Unloading,
+                "cd67c4caeeac907169970d3a3cc421ffcff1b402977e63699b5bfe31d9fa5b7f",
+            ),
+            (
+                NodeStatus::RecoveryRequired,
+                "1433e64080eaeb1106f201d3bd5a35b7353da9452c0da10202fa0b7dfee07e1b",
+            ),
+            (
+                NodeStatus::Error,
+                "bce2ad7996d8d4e0c84fbef730ce63985b3fbf8f1a257317976e50f88a553319",
+            ),
         ];
         for (status, expected) in vectors {
-            assert_eq!(token.node_identity_proof(&nonce, "node", "runtime", status).unwrap(), expected);
+            assert_eq!(
+                token
+                    .node_identity_proof(&nonce, "node", "runtime", status)
+                    .unwrap(),
+                expected
+            );
             assert!(token.verify_node_identity_proof(&nonce, "node", "runtime", status, expected));
         }
         let proof = "fec2cf06e169de949d213f6b0a9c7475890c0ff6a93070a6533deac9193a0e2d";
@@ -93,12 +116,39 @@ mod tests {
             NodeStatus::Ready,
             proof,
         ));
-        assert!(!token.verify_node_identity_proof(&"02".repeat(32), "node", "runtime", NodeStatus::Unloaded, proof));
-        assert!(!token.verify_node_identity_proof(&nonce, "node-2", "runtime", NodeStatus::Unloaded, proof));
-        for malformed in [String::new(), "00".into(), "0".repeat(62), "0".repeat(66), "AA".repeat(32), format!("{}g", "0".repeat(63))] {
-            assert!(!token.verify_node_identity_proof(&nonce, "node", "runtime", NodeStatus::Unloaded, &malformed));
+        assert!(!token.verify_node_identity_proof(
+            &"02".repeat(32),
+            "node",
+            "runtime",
+            NodeStatus::Unloaded,
+            proof
+        ));
+        assert!(!token.verify_node_identity_proof(
+            &nonce,
+            "node-2",
+            "runtime",
+            NodeStatus::Unloaded,
+            proof
+        ));
+        for malformed in [
+            String::new(),
+            "00".into(),
+            "0".repeat(62),
+            "0".repeat(66),
+            "AA".repeat(32),
+            format!("{}g", "0".repeat(63)),
+        ] {
+            assert!(!token.verify_node_identity_proof(
+                &nonce,
+                "node",
+                "runtime",
+                NodeStatus::Unloaded,
+                &malformed
+            ));
         }
-        assert!(token.node_identity_proof("AA", "node", "runtime", NodeStatus::Ready).is_err());
+        assert!(token
+            .node_identity_proof("AA", "node", "runtime", NodeStatus::Ready)
+            .is_err());
     }
 
     #[test]
@@ -137,11 +187,9 @@ mod tests {
         let bearer = format!("Bearer {}", token.expose_for_authorization());
         let exposed = token.expose_for_authorization();
         let policy = AuthPolicy::new(token, ["tauri://localhost", "http://127.0.0.1:1420"]);
-        assert!(
-            policy
-                .authorize(Some("tauri://localhost"), Some(&bearer))
-                .is_ok()
-        );
+        assert!(policy
+            .authorize(Some("tauri://localhost"), Some(&bearer))
+            .is_ok());
         assert!(policy.authorize(None, Some(&bearer)).is_ok());
         assert_eq!(
             policy.authorize(Some("https://evil.invalid"), Some(&bearer)),
@@ -161,7 +209,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn token_load_rejects_symlinks_unsafe_parents_and_wrong_owner_evidence() {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
         let dir = tempfile::tempdir().unwrap();
         let real = dir.path().join("real.token");
         fs::write(
@@ -196,7 +244,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn opened_token_descriptor_is_not_redirected_by_path_swap() {
-        use std::os::unix::fs::{PermissionsExt, symlink};
+        use std::os::unix::fs::{symlink, PermissionsExt};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("control.token");
         fs::write(
