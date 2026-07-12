@@ -137,6 +137,94 @@ describe("node client", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
+  it("keeps caller-first abort classification after a delayed request rejection", async () => {
+    const caller = new AbortController();
+    const fetch = vi.fn((_url: string, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          setTimeout(() => reject(new DOMException("aborted", "AbortError")), 20);
+        });
+      }),
+    );
+    const pending = getStatus("http://127.0.0.1:31000", {
+      fetch,
+      timeoutMs: 5,
+      signal: caller.signal,
+    });
+
+    caller.abort();
+
+    await expect(pending).rejects.toMatchObject({ kind: "aborted" });
+  });
+
+  it("keeps timeout-first classification after a later caller abort", async () => {
+    const caller = new AbortController();
+    const fetch = vi.fn((_url: string, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          setTimeout(() => reject(new DOMException("aborted", "AbortError")), 20);
+        });
+      }),
+    );
+    const pending = getStatus("http://127.0.0.1:31000", {
+      fetch,
+      timeoutMs: 5,
+      signal: caller.signal,
+    });
+    setTimeout(() => caller.abort(), 10);
+
+    await expect(pending).rejects.toMatchObject({ kind: "timeout" });
+  });
+
+  it("keeps caller-first abort classification during a delayed body rejection", async () => {
+    const caller = new AbortController();
+    const fetch = vi.fn(async (_url: string, init?: RequestInit) => ({
+      ok: true,
+      status: 200,
+      text: () =>
+        new Promise<string>((_resolve, reject) => {
+          if (init?.signal?.aborted) {
+            setTimeout(() => reject(new DOMException("aborted", "AbortError")), 20);
+            return;
+          }
+          init?.signal?.addEventListener("abort", () => {
+            setTimeout(() => reject(new DOMException("aborted", "AbortError")), 20);
+          });
+        }),
+    }) as Response);
+    const pending = getStatus("http://127.0.0.1:31000", {
+      fetch,
+      timeoutMs: 5,
+      signal: caller.signal,
+    });
+
+    caller.abort();
+
+    await expect(pending).rejects.toMatchObject({ kind: "aborted" });
+  });
+
+  it("keeps timeout-first classification during a delayed body rejection", async () => {
+    const caller = new AbortController();
+    const fetch = vi.fn(async (_url: string, init?: RequestInit) => ({
+      ok: true,
+      status: 200,
+      text: () =>
+        new Promise<string>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            setTimeout(() => reject(new DOMException("aborted", "AbortError")), 20);
+          });
+        }),
+    }) as Response);
+    const pending = getStatus("http://127.0.0.1:31000", {
+      fetch,
+      timeoutMs: 5,
+      signal: caller.signal,
+    });
+    setTimeout(() => caller.abort(), 10);
+
+    await expect(pending).rejects.toMatchObject({ kind: "timeout" });
+  });
+
   it("preserves OpenAI-shaped details from a non-2xx response", async () => {
     const error = {
       error: {

@@ -38,7 +38,7 @@ describe("nodeReducer", () => {
       type: "recoveryRequired",
       message: "ownership could not be proven",
     });
-    const error = nodeReducer(connecting, { type: "failure", message: "refused" });
+    const error = nodeReducer(connecting, { type: "probeFailed", message: "refused" });
 
     expect([
       disconnected.phase,
@@ -141,6 +141,54 @@ describe("nodeReducer", () => {
     expect(
       nodeReducer({ ...ready, phase: "stopping" }, { type: "stopped" }),
     ).toEqual(initialNodeState());
+  });
+
+  it("ignores a stale probe failure while stopping", () => {
+    const stopping = {
+      phase: "stopping" as const,
+      ownership: "owned" as const,
+      status: readyStatus,
+      error: null,
+    };
+
+    expect(
+      nodeReducer(stopping, { type: "probeFailed", message: "late refusal" }),
+    ).toBe(stopping);
+  });
+
+  it("accepts a genuine failure from the active stop operation", () => {
+    const stopping = {
+      phase: "stopping" as const,
+      ownership: "owned" as const,
+      status: readyStatus,
+      error: null,
+    };
+
+    expect(
+      nodeReducer(stopping, { type: "stopFailed", message: "child did not exit" }),
+    ).toMatchObject({
+      phase: "error",
+      ownership: "owned",
+      status: null,
+      error: "child did not exit",
+    });
+  });
+
+  it("can complete a valid stop after ignoring a stale probe failure", () => {
+    const stopping = {
+      phase: "stopping" as const,
+      ownership: "owned" as const,
+      status: readyStatus,
+      error: null,
+    };
+    const afterStaleProbe = nodeReducer(stopping, {
+      type: "probeFailed",
+      message: "late refusal",
+    });
+
+    expect(nodeReducer(afterStaleProbe, { type: "stopped" })).toEqual(
+      initialNodeState(),
+    );
   });
 });
 
