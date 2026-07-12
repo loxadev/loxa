@@ -40,6 +40,8 @@ pub trait MutationExecutor: Send + 'static {
         mutation: &Mutation,
         cancellation: &MutationCancellation,
     );
+
+    fn stop(&mut self) {}
 }
 
 struct PendingMutation {
@@ -149,6 +151,8 @@ impl NodeActor {
                         .expect("node actor lock poisoned");
                 }
                 if state.stopping {
+                    drop(state);
+                    executor.stop();
                     return;
                 }
                 state.pending.pop_front().expect("pending command exists")

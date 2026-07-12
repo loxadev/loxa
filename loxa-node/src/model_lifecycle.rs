@@ -1,7 +1,7 @@
 use crate::actor::MutationCancellation;
 use loxa_core::model_inventory::{ArtifactState, VerifiedRecipeInventoryEntry};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub const PUBLIC_MODEL_ALIAS: &str = "loxa";
 
@@ -59,6 +59,7 @@ pub struct SessionCorrelation {
     pub owner_process_start_time_unix_s: u64,
     pub gateway_port: u16,
     pub generation_alias: String,
+    pub engine_version: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -141,7 +142,7 @@ pub trait GatewayPublisher {
     fn withdraw(&mut self);
     /// The production gateway implements publication as an infallible,
     /// in-process atomic target swap; no network or process work occurs here.
-    fn publish(&mut self, model_id: &str, alias: &str, port: u16);
+    fn publish(&mut self, plan: &LaunchPlan, session: &SessionCorrelation);
 }
 
 pub struct ModelLifecycle<D, G>
@@ -157,7 +158,30 @@ where
     status: NodeLifecycleStatus,
     error: Option<String>,
     stopping: Arc<AtomicBool>,
-    destructive_commit: Arc<AtomicBool>,
+    destructive_commit: CancellationBoundary,
+}
+
+#[derive(Clone)]
+pub(crate) struct CancellationBoundary(Arc<Mutex<bool>>);
+
+impl CancellationBoundary {
+    pub(crate) fn try_cancel(&self, cancel: impl FnOnce()) -> bool {
+        let committed = self.0.lock().expect("cancellation boundary poisoned");
+        if *committed {
+            false
+        } else {
+            cancel();
+            true
+        }
+    }
+
+    fn set(&self, committed: bool) {
+        *self.0.lock().expect("cancellation boundary poisoned") = committed;
+    }
+
+    fn is_safe(&self) -> bool {
+        !*self.0.lock().expect("cancellation boundary poisoned")
+    }
 }
 
 impl<D, G> ModelLifecycle<D, G>
@@ -175,7 +199,7 @@ where
             status: NodeLifecycleStatus::Unloaded,
             error: None,
             stopping: Arc::new(AtomicBool::new(false)),
-            destructive_commit: Arc::new(AtomicBool::new(false)),
+            destructive_commit: CancellationBoundary(Arc::new(Mutex::new(false))),
         }
     }
 
@@ -188,7 +212,11 @@ where
     }
 
     pub fn cancellation_is_safe(&self) -> bool {
-        !self.destructive_commit.load(Ordering::SeqCst)
+        self.destructive_commit.is_safe()
+    }
+
+    pub(crate) fn destructive_commit_token(&self) -> CancellationBoundary {
+        self.destructive_commit.clone()
     }
 
     pub fn snapshot(&self) -> LifecycleSnapshot {
@@ -218,7 +246,7 @@ where
         self.status = NodeLifecycleStatus::Loading;
         self.error = None;
         self.gateway.withdraw();
-        self.destructive_commit.store(true, Ordering::SeqCst);
+        self.destructive_commit.set(true);
 
         if let Some((_, prior_session)) = self.current.take() {
             if let Err(error) = self.driver.stop_exact(prior_session) {
@@ -227,7 +255,7 @@ where
             }
         }
         if let Err(error) = self.ensure_not_stopping() {
-            self.destructive_commit.store(false, Ordering::SeqCst);
+            self.destructive_commit.set(false);
             self.status = NodeLifecycleStatus::Unloaded;
             return Err(error);
         }
@@ -235,7 +263,7 @@ where
         match self.start_ready(&plan, cancellation) {
             Ok(session) => {
                 self.publish(plan, session);
-                self.destructive_commit.store(false, Ordering::SeqCst);
+                self.destructive_commit.set(false);
                 Ok(())
             }
             Err(replacement_error) => {
@@ -246,13 +274,13 @@ where
                         self.status = NodeLifecycleStatus::Unloaded;
                         self.error = Some(format!("{replacement_error:?}"));
                     }
-                    self.destructive_commit.store(false, Ordering::SeqCst);
+                    self.destructive_commit.set(false);
                     return Err(replacement_error);
                 };
                 match self.start_ready(&prior_plan, cancellation) {
                     Ok(session) => {
                         self.publish(prior_plan, session);
-                        self.destructive_commit.store(false, Ordering::SeqCst);
+                        self.destructive_commit.set(false);
                         Err(replacement_error)
                     }
                     Err(rollback_error) => {
@@ -260,7 +288,7 @@ where
                         self.error = Some(format!(
                             "replacement failed: {replacement_error:?}; rollback failed: {rollback_error:?}"
                         ));
-                        self.destructive_commit.store(false, Ordering::SeqCst);
+                        self.destructive_commit.set(false);
                         Err(LifecycleError::RecoveryRequired {
                             replacement: format!("{replacement_error:?}"),
                             rollback: format!("{rollback_error:?}"),
@@ -276,7 +304,7 @@ where
         self.status = NodeLifecycleStatus::Unloading;
         self.error = None;
         self.gateway.withdraw();
-        self.destructive_commit.store(true, Ordering::SeqCst);
+        self.destructive_commit.set(true);
         if let Some((_, session)) = self.current.take() {
             if let Err(error) = self.driver.stop_exact(session) {
                 self.require_recovery(format!(
@@ -286,7 +314,22 @@ where
             }
         }
         self.status = NodeLifecycleStatus::Unloaded;
-        self.destructive_commit.store(false, Ordering::SeqCst);
+        self.destructive_commit.set(false);
+        Ok(())
+    }
+
+    pub(crate) fn shutdown(&mut self) -> Result<(), LifecycleError> {
+        self.request_stop();
+        self.gateway.withdraw();
+        self.destructive_commit.set(true);
+        if let Some((_, session)) = self.current.take() {
+            if let Err(error) = self.driver.stop_exact(session) {
+                self.require_recovery(format!("node-stop teardown failed: {error:?}"));
+                return Err(error);
+            }
+        }
+        self.status = NodeLifecycleStatus::Unloaded;
+        self.destructive_commit.set(false);
         Ok(())
     }
 
@@ -358,12 +401,11 @@ where
     fn require_recovery(&mut self, error: String) {
         self.status = NodeLifecycleStatus::RecoveryRequired;
         self.error = Some(error);
-        self.destructive_commit.store(false, Ordering::SeqCst);
+        self.destructive_commit.set(false);
     }
 
     fn publish(&mut self, plan: LaunchPlan, session: StartedSession<D::Session>) {
-        self.gateway
-            .publish(&plan.model_id, PUBLIC_MODEL_ALIAS, session.correlation.port);
+        self.gateway.publish(&plan, &session.correlation);
         self.status = NodeLifecycleStatus::Ready;
         self.error = None;
         self.current = Some((plan, session));
@@ -435,6 +477,7 @@ mod tests {
                     owner_process_start_time_unix_s: owner.process_start_time_unix_s,
                     gateway_port: owner.gateway_port,
                     generation_alias: format!("loxa-{}-g{generation}", owner.run_id),
+                    engine_version: "test".into(),
                 },
             })
         }
@@ -469,8 +512,11 @@ mod tests {
         fn withdraw(&mut self) {
             self.0.push("withdraw".into());
         }
-        fn publish(&mut self, model_id: &str, alias: &str, port: u16) {
-            self.0.push(format!("publish:{model_id}:{alias}:{port}"));
+        fn publish(&mut self, plan: &LaunchPlan, session: &SessionCorrelation) {
+            self.0.push(format!(
+                "publish:{}:{}:{}",
+                plan.model_id, PUBLIC_MODEL_ALIAS, session.port
+            ));
         }
     }
 
@@ -649,6 +695,7 @@ mod tests {
                         owner_process_start_time_unix_s: owner.process_start_time_unix_s,
                         gateway_port: owner.gateway_port,
                         generation_alias: format!("loxa-{}-g{}", owner.run_id, generation - 1),
+                        engine_version: "test".into(),
                     },
                 })
             }
@@ -733,6 +780,20 @@ mod tests {
     }
 
     #[test]
+    fn node_shutdown_with_ready_model_withdraws_and_reaps_exact_generation() {
+        let mut lifecycle =
+            ModelLifecycle::new(owner(), FakeDriver::default(), FakeGateway::default());
+        lifecycle
+            .load(plan("a"), &MutationCancellation::new())
+            .unwrap();
+        lifecycle.shutdown().unwrap();
+        assert_eq!(lifecycle.snapshot().status, NodeLifecycleStatus::Unloaded);
+        assert_eq!(lifecycle.driver.stopped.len(), 1);
+        assert_eq!(lifecycle.driver.stopped[0].generation, 1);
+        assert_eq!(lifecycle.gateway.0.last().unwrap(), "withdraw");
+    }
+
+    #[test]
     fn switch_does_not_spawn_replacement_when_prior_exact_teardown_fails() {
         let driver = FakeDriver {
             stop_outcomes: VecDeque::from([Err(LifecycleError::TeardownFailed("stuck".into()))]),
@@ -778,6 +839,7 @@ mod tests {
                         owner_process_start_time_unix_s: owner.process_start_time_unix_s,
                         gateway_port: owner.gateway_port,
                         generation_alias: "stale".into(),
+                        engine_version: "test".into(),
                     },
                 })
             }
