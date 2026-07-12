@@ -1,12 +1,17 @@
-//! Read-only inventory for the compiled, verified model recipes.
+//! Non-blocking inventory snapshots for the compiled, verified model recipes.
 
 use crate::registry::{ModelEntry, REGISTRY};
 use sha2::{Digest, Sha256};
-use std::fs::File;
+use std::collections::{HashMap, VecDeque};
+use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::UNIX_EPOCH;
 
 const GIB: f64 = 1_073_741_824.0;
+const DEFAULT_CACHE_CAPACITY: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -23,6 +28,7 @@ pub enum ArtifactInvalidReason {
     SizeMismatch,
     ChecksumMismatch,
     Unreadable,
+    VerificationRequired,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -55,15 +61,159 @@ pub struct VerifiedRecipeInventoryEntry {
     pub engine: EngineEligibility,
 }
 
-/// Inspects only Loxa's compiled verified recipes. These recipes are not an
-/// allowlist for the wider model-intake product.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct StableMetadata {
+    len: u64,
+    modified_ns: Option<u128>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl StableMetadata {
+    fn from(metadata: &Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            len: metadata.len(),
+            modified_ns: metadata
+                .modified()
+                .ok()
+                .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+                .map(|value| value.as_nanos()),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CachedVerification {
+    metadata: StableMetadata,
+    expected_sha256: String,
+    matches: bool,
+}
+
+#[derive(Default)]
+struct CacheState {
+    entries: HashMap<PathBuf, CachedVerification>,
+    order: VecDeque<PathBuf>,
+}
+
+/// Bounded checksum evidence store. `snapshot` users never perform file hashing.
+/// Call `verify_recipe` from a worker before publishing a downloaded state.
+pub struct VerificationCache {
+    capacity: usize,
+    state: Mutex<CacheState>,
+    verification_runs: AtomicU64,
+}
+
+impl Default for VerificationCache {
+    fn default() -> Self {
+        Self::new(DEFAULT_CACHE_CAPACITY)
+    }
+}
+
+impl VerificationCache {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            state: Mutex::new(CacheState::default()),
+            verification_runs: AtomicU64::new(0),
+        }
+    }
+
+    /// Potentially expensive; intended for a bounded background/blocking worker.
+    pub fn verify_recipe(&self, models_dir: &Path, recipe: &ModelEntry) -> io::Result<bool> {
+        let path = checked_regular_path(models_dir, recipe.filename)?;
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "artifact is not a regular file",
+            ));
+        }
+        let stable = StableMetadata::from(&metadata);
+        if let Some(matches) = self.cached(&path, &stable, recipe.sha256) {
+            return Ok(matches);
+        }
+
+        self.verification_runs.fetch_add(1, Ordering::Relaxed);
+        let matches = hash_file(&path)? == recipe.sha256;
+        let after = fs::symlink_metadata(&path)?;
+        if !after.file_type().is_file() || StableMetadata::from(&after) != stable {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "artifact changed during verification",
+            ));
+        }
+        self.insert(
+            path,
+            CachedVerification {
+                metadata: stable,
+                expected_sha256: recipe.sha256.into(),
+                matches,
+            },
+        );
+        Ok(matches)
+    }
+
+    pub fn verification_runs(&self) -> u64 {
+        self.verification_runs.load(Ordering::Relaxed)
+    }
+
+    fn cached(&self, path: &Path, metadata: &StableMetadata, expected: &str) -> Option<bool> {
+        self.state
+            .lock()
+            .ok()?
+            .entries
+            .get(path)
+            .filter(|item| &item.metadata == metadata && item.expected_sha256 == expected)
+            .map(|item| item.matches)
+    }
+
+    fn insert(&self, path: PathBuf, item: CachedVerification) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.order.retain(|known| known != &path);
+        state.order.push_back(path.clone());
+        state.entries.insert(path, item);
+        while state.entries.len() > self.capacity {
+            if let Some(oldest) = state.order.pop_front() {
+                state.entries.remove(&oldest);
+            }
+        }
+    }
+}
+
+static DEFAULT_CACHE: OnceLock<VerificationCache> = OnceLock::new();
+
+/// Non-blocking snapshot over verified recipes. Full-size artifacts remain
+/// `verification_required` until checksum evidence is populated by a worker.
 pub fn known_registry_inventory(
     models_dir: &Path,
     available_memory_bytes: u64,
 ) -> Vec<VerifiedRecipeInventoryEntry> {
+    known_registry_inventory_with_cache(
+        models_dir,
+        available_memory_bytes,
+        DEFAULT_CACHE.get_or_init(VerificationCache::default),
+    )
+}
+
+pub fn known_registry_inventory_with_cache(
+    models_dir: &Path,
+    available_memory_bytes: u64,
+    cache: &VerificationCache,
+) -> Vec<VerifiedRecipeInventoryEntry> {
     REGISTRY
         .iter()
-        .map(|recipe| inspect_recipe(recipe, models_dir, available_memory_bytes))
+        .map(|recipe| inspect_recipe(recipe, models_dir, available_memory_bytes, cache))
         .collect()
 }
 
@@ -71,6 +221,7 @@ fn inspect_recipe(
     recipe: &ModelEntry,
     models_dir: &Path,
     available_memory_bytes: u64,
+    cache: &VerificationCache,
 ) -> VerifiedRecipeInventoryEntry {
     let required = (recipe.min_free_mem_gb as f64 * GIB).round() as u64;
     let compatibility = if available_memory_bytes >= required {
@@ -88,7 +239,6 @@ fn inspect_recipe(
             ),
         }
     };
-
     VerifiedRecipeInventoryEntry {
         id: recipe.id.into(),
         repo: recipe.repo.into(),
@@ -100,8 +250,8 @@ fn inspect_recipe(
         params: recipe.params.into(),
         quant: recipe.quant.into(),
         min_free_mem_gb: recipe.min_free_mem_gb,
-        artifact: artifact_state(recipe, models_dir),
-        compatibility: compatibility.clone(),
+        artifact: artifact_state(recipe, models_dir, cache),
+        compatibility,
         engine: EngineEligibility {
             engine: "llama-cpp".into(),
             eligible: true,
@@ -110,59 +260,86 @@ fn inspect_recipe(
     }
 }
 
-fn artifact_state(recipe: &ModelEntry, models_dir: &Path) -> ArtifactState {
+fn artifact_state(
+    recipe: &ModelEntry,
+    models_dir: &Path,
+    cache: &VerificationCache,
+) -> ArtifactState {
     let final_path = models_dir.join(recipe.filename);
-    if final_path.exists() {
-        return match file_matches(&final_path, recipe) {
-            Ok(true) => ArtifactState::Downloaded,
-            Ok(false)
-                if final_path.metadata().map(|m| m.len()).unwrap_or(0) != recipe.size_bytes =>
-            {
-                ArtifactState::Invalid {
+    match regular_metadata(&final_path) {
+        Ok(Some(metadata)) => {
+            if metadata.len() != recipe.size_bytes {
+                return ArtifactState::Invalid {
                     reason: ArtifactInvalidReason::SizeMismatch,
-                }
+                };
             }
-            Ok(false) => ArtifactState::Invalid {
-                reason: ArtifactInvalidReason::ChecksumMismatch,
-            },
-            Err(_) => ArtifactState::Invalid {
+            return match cache.cached(&final_path, &StableMetadata::from(&metadata), recipe.sha256)
+            {
+                Some(true) => ArtifactState::Downloaded,
+                Some(false) => ArtifactState::Invalid {
+                    reason: ArtifactInvalidReason::ChecksumMismatch,
+                },
+                None => ArtifactState::Invalid {
+                    reason: ArtifactInvalidReason::VerificationRequired,
+                },
+            };
+        }
+        Ok(None) => {}
+        Err(_) => {
+            return ArtifactState::Invalid {
                 reason: ArtifactInvalidReason::Unreadable,
-            },
-        };
+            }
+        }
     }
-
     let part_path = models_dir.join(format!("{}.part", recipe.filename));
-    match part_path.metadata() {
-        Ok(metadata) if metadata.len() < recipe.size_bytes => ArtifactState::Partial {
+    match regular_metadata(&part_path) {
+        Ok(Some(metadata)) if metadata.len() < recipe.size_bytes => ArtifactState::Partial {
             bytes: metadata.len(),
         },
-        Ok(metadata) if metadata.len() != recipe.size_bytes => ArtifactState::Invalid {
+        Ok(Some(metadata)) if metadata.len() > recipe.size_bytes => ArtifactState::Invalid {
             reason: ArtifactInvalidReason::SizeMismatch,
         },
-        Ok(_) => match file_matches(&part_path, recipe) {
-            Ok(true) => ArtifactState::Partial {
-                bytes: recipe.size_bytes,
-            },
-            Ok(false) => ArtifactState::Invalid {
-                reason: ArtifactInvalidReason::ChecksumMismatch,
-            },
-            Err(_) => ArtifactState::Invalid {
-                reason: ArtifactInvalidReason::Unreadable,
-            },
-        },
-        Err(error) if error.kind() == io::ErrorKind::NotFound => ArtifactState::NotDownloaded,
+        Ok(Some(metadata)) => {
+            match cache.cached(&part_path, &StableMetadata::from(&metadata), recipe.sha256) {
+                Some(false) => ArtifactState::Invalid {
+                    reason: ArtifactInvalidReason::ChecksumMismatch,
+                },
+                _ => ArtifactState::Partial {
+                    bytes: metadata.len(),
+                },
+            }
+        }
+        Ok(None) => ArtifactState::NotDownloaded,
         Err(_) => ArtifactState::Invalid {
             reason: ArtifactInvalidReason::Unreadable,
         },
     }
 }
 
-fn file_matches(path: &Path, recipe: &ModelEntry) -> io::Result<bool> {
-    let metadata = path.metadata()?;
-    if metadata.len() != recipe.size_bytes {
-        return Ok(false);
+fn regular_metadata(path: &Path) -> io::Result<Option<Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(Some(metadata)),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "artifact is not a regular file",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
     }
-    let mut file = File::open(path)?;
+}
+
+fn checked_regular_path(models_dir: &Path, filename: &str) -> io::Result<PathBuf> {
+    if filename.is_empty() || filename.contains(['/', '\\']) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "artifact filename is not flat",
+        ));
+    }
+    Ok(models_dir.join(filename))
+}
+
+fn hash_file(path: &Path) -> io::Result<String> {
+    let mut file = open_regular_no_follow(path)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
@@ -172,12 +349,81 @@ fn file_matches(path: &Path, recipe: &ModelEntry) -> io::Result<bool> {
         }
         hasher.update(&buffer[..read]);
     }
-    let digest = hasher.finalize();
-    let actual = digest
+    Ok(hasher
+        .finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    Ok(actual == recipe.sha256)
+        .collect())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const NO_FOLLOW_FLAG: i32 = 0x20_000;
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+const NO_FOLLOW_FLAG: i32 = 0x100;
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd"
+))]
+fn open_regular_no_follow(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(NO_FOLLOW_FLAG)
+        .open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "artifact is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn open_regular_no_follow(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "artifact is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(not(any(
+    windows,
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd"
+)))]
+fn open_regular_no_follow(path: &Path) -> io::Result<File> {
+    let before = fs::symlink_metadata(path)?;
+    if !before.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "artifact is not a regular file",
+        ));
+    }
+    let file = File::open(path)?;
+    if StableMetadata::from(&file.metadata()?) != StableMetadata::from(&before) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "artifact changed while opening",
+        ));
+    }
+    Ok(file)
 }
 
 #[cfg(test)]
@@ -185,78 +431,115 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    #[test]
-    fn inventory_exposes_verified_recipe_metadata_and_memory_reason() {
-        let dir = tempdir().unwrap();
-        let inventory = known_registry_inventory(dir.path(), 0);
-        assert_eq!(inventory.len(), REGISTRY.len());
-        let first = &inventory[0];
-        assert_eq!(first.id, REGISTRY[0].id);
-        assert_eq!(first.license, REGISTRY[0].license);
-        assert_eq!(first.quant, REGISTRY[0].quant);
-        assert_eq!(first.artifact, ArtifactState::NotDownloaded);
-        assert!(!first.compatibility.compatible);
-        assert!(first.compatibility.reason.contains("requires"));
-        assert_eq!(first.engine.engine, "llama-cpp");
-        assert!(first.engine.eligible);
-    }
-
-    #[test]
-    fn inventory_distinguishes_partial_and_invalid_final_artifacts() {
-        let dir = tempdir().unwrap();
-        let recipe = &REGISTRY[0];
-        std::fs::write(
-            dir.path().join(format!("{}.part", recipe.filename)),
-            b"partial",
-        )
-        .unwrap();
-        let entry = &known_registry_inventory(dir.path(), u64::MAX)[0];
-        assert_eq!(entry.artifact, ArtifactState::Partial { bytes: 7 });
-        assert!(entry.compatibility.compatible && entry.engine.eligible);
-
-        std::fs::write(dir.path().join(recipe.filename), b"wrong").unwrap();
-        let entry = &known_registry_inventory(dir.path(), u64::MAX)[0];
-        assert_eq!(
-            entry.artifact,
-            ArtifactState::Invalid {
-                reason: ArtifactInvalidReason::SizeMismatch
-            }
-        );
-    }
-
-    #[test]
-    fn artifact_inspection_distinguishes_checksum_invalid_from_downloaded() {
-        let dir = tempdir().unwrap();
-        let good = b"good";
-        let digest = Sha256::digest(good);
-        let sha = digest
+    fn fixture(bytes: &'static [u8]) -> ModelEntry {
+        let sha: String = Sha256::digest(bytes)
             .iter()
             .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        let recipe = ModelEntry {
+            .collect();
+        ModelEntry {
             id: "fixture",
             repo: "owner/repo",
             revision: "main",
             filename: "fixture.gguf",
             sha256: Box::leak(sha.into_boxed_str()),
-            size_bytes: good.len() as u64,
+            size_bytes: bytes.len() as u64,
             license: "apache-2.0",
             params: "tiny",
             quant: "Q4",
             min_free_mem_gb: 0.1,
-        };
+        }
+    }
 
-        std::fs::write(dir.path().join(recipe.filename), b"evil").unwrap();
+    #[test]
+    fn inventory_metadata_compatibility_and_partial_are_truthful() {
+        let dir = tempdir().unwrap();
+        let inventory =
+            known_registry_inventory_with_cache(dir.path(), 0, &VerificationCache::default());
+        assert_eq!(inventory.len(), REGISTRY.len());
+        assert_eq!(inventory[0].license, REGISTRY[0].license);
+        assert!(!inventory[0].compatibility.compatible);
+        assert!(inventory[0].compatibility.reason.contains("requires"));
+        assert!(
+            inventory[0].engine.eligible && inventory[0].engine.reason.contains("verified GGUF")
+        );
+        std::fs::write(
+            dir.path().join(format!("{}.part", REGISTRY[0].filename)),
+            b"partial",
+        )
+        .unwrap();
         assert_eq!(
-            artifact_state(&recipe, dir.path()),
+            known_registry_inventory_with_cache(
+                dir.path(),
+                u64::MAX,
+                &VerificationCache::default()
+            )[0]
+            .artifact,
+            ArtifactState::Partial { bytes: 7 }
+        );
+    }
+
+    #[test]
+    fn full_file_never_claims_downloaded_without_cached_checksum_and_invalidates_on_change() {
+        let dir = tempdir().unwrap();
+        let recipe = fixture(b"good");
+        let path = dir.path().join(recipe.filename);
+        fs::write(&path, b"good").unwrap();
+        let cache = VerificationCache::new(2);
+        assert_eq!(
+            artifact_state(&recipe, dir.path(), &cache),
+            ArtifactState::Invalid {
+                reason: ArtifactInvalidReason::VerificationRequired
+            }
+        );
+        assert!(cache.verify_recipe(dir.path(), &recipe).unwrap());
+        assert!(cache.verify_recipe(dir.path(), &recipe).unwrap());
+        assert_eq!(cache.verification_runs(), 1);
+        assert_eq!(
+            artifact_state(&recipe, dir.path(), &cache),
+            ArtifactState::Downloaded
+        );
+        fs::write(&path, b"evil").unwrap();
+        assert_ne!(
+            artifact_state(&recipe, dir.path(), &cache),
+            ArtifactState::Downloaded
+        );
+        assert!(!cache.verify_recipe(dir.path(), &recipe).unwrap());
+        assert_eq!(cache.verification_runs(), 2);
+        assert_eq!(
+            artifact_state(&recipe, dir.path(), &cache),
             ArtifactState::Invalid {
                 reason: ArtifactInvalidReason::ChecksumMismatch
             }
         );
-        std::fs::write(dir.path().join(recipe.filename), good).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inventory_never_follows_symlink_or_accepts_directory_for_final_or_part() {
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let recipe = fixture(b"good");
+        fs::write(outside.path().join("outside"), b"good").unwrap();
+        symlink(
+            outside.path().join("outside"),
+            dir.path().join(recipe.filename),
+        )
+        .unwrap();
+        let cache = VerificationCache::default();
         assert_eq!(
-            artifact_state(&recipe, dir.path()),
-            ArtifactState::Downloaded
+            artifact_state(&recipe, dir.path(), &cache),
+            ArtifactState::Invalid {
+                reason: ArtifactInvalidReason::Unreadable
+            }
+        );
+        fs::remove_file(dir.path().join(recipe.filename)).unwrap();
+        fs::create_dir(dir.path().join(format!("{}.part", recipe.filename))).unwrap();
+        assert_eq!(
+            artifact_state(&recipe, dir.path(), &cache),
+            ArtifactState::Invalid {
+                reason: ArtifactInvalidReason::Unreadable
+            }
         );
     }
 }

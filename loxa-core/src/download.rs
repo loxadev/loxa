@@ -314,7 +314,7 @@ fn download_with_transport_and_observer(
 
     let mut warnings = StderrWarnings;
     if let ExistingDownload::Ready(path) =
-        inspect_existing_download_with_warnings(entry, dest_dir, &mut warnings, false)?
+        inspect_existing_download_with_observer(entry, dest_dir, &mut warnings, false, observer)?
     {
         return Ok(path);
     }
@@ -333,7 +333,13 @@ fn download_with_transport_and_observer(
 
     let final_path = dest_dir.join(&filename);
     let part_path = part_path(dest_dir, &filename);
-    let resume_from = match inspect_existing_download(entry, dest_dir)? {
+    let resume_from = match inspect_existing_download_with_observer(
+        entry,
+        dest_dir,
+        &mut warnings,
+        true,
+        observer,
+    )? {
         ExistingDownload::Ready(path) => return Ok(path),
         ExistingDownload::Download { resume_from } => resume_from,
     };
@@ -525,18 +531,32 @@ fn validate_resume_content_range(
     Ok(())
 }
 
+#[cfg(test)]
 fn hash_file(path: &Path) -> Result<String, DownloadError> {
     let mut hasher = Sha256::new();
     hash_existing_prefix_into(&mut hasher, path)?;
     Ok(hex_bytes(hasher.finalize().as_ref()))
 }
 
+#[cfg(test)]
 fn hash_existing_prefix_into(hasher: &mut Sha256, path: &Path) -> Result<u64, DownloadError> {
+    let mut observer = NoopDownloadObserver;
+    hash_existing_prefix_into_observed(hasher, path, &mut observer)
+}
+
+fn hash_existing_prefix_into_observed(
+    hasher: &mut Sha256,
+    path: &Path,
+    observer: &mut dyn DownloadObserver,
+) -> Result<u64, DownloadError> {
     let mut file = File::open(path)?;
     let mut buffer = [0_u8; COPY_BUFFER_BYTES];
     let mut total = 0_u64;
 
     loop {
+        if observer.is_cancelled() {
+            return Err(DownloadError::Cancelled);
+        }
         let read = file.read(&mut buffer)?;
         if read == 0 {
             break;
@@ -548,6 +568,7 @@ fn hash_existing_prefix_into(hasher: &mut Sha256, path: &Path) -> Result<u64, Do
     Ok(total)
 }
 
+#[cfg(test)]
 fn inspect_existing_download(
     entry: &dyn VerifiedModel,
     dest_dir: &Path,
@@ -556,11 +577,29 @@ fn inspect_existing_download(
     inspect_existing_download_with_warnings(entry, dest_dir, &mut warnings, true)
 }
 
+#[cfg(test)]
 fn inspect_existing_download_with_warnings(
     entry: &dyn VerifiedModel,
     dest_dir: &Path,
     warnings: &mut impl WarningSink,
     announce_resume: bool,
+) -> Result<ExistingDownload, DownloadError> {
+    let mut observer = NoopDownloadObserver;
+    inspect_existing_download_with_observer(
+        entry,
+        dest_dir,
+        warnings,
+        announce_resume,
+        &mut observer,
+    )
+}
+
+fn inspect_existing_download_with_observer(
+    entry: &dyn VerifiedModel,
+    dest_dir: &Path,
+    warnings: &mut impl WarningSink,
+    announce_resume: bool,
+    observer: &mut dyn DownloadObserver,
 ) -> Result<ExistingDownload, DownloadError> {
     let filename = sanitize_filename(entry.filename())?;
     fs::create_dir_all(dest_dir)?;
@@ -576,7 +615,9 @@ fn inspect_existing_download_with_warnings(
                 return Ok(ExistingDownload::Ready(final_path));
             }
 
-            let actual = hash_file(&final_path)?;
+            let mut hasher = Sha256::new();
+            hash_existing_prefix_into_observed(&mut hasher, &final_path, observer)?;
+            let actual = hex_bytes(hasher.finalize().as_ref());
             if actual == entry.sha256() {
                 eprintln!("already present, verified: {}", final_path.display());
                 return Ok(ExistingDownload::Ready(final_path));
@@ -596,7 +637,7 @@ fn inspect_existing_download_with_warnings(
         }
 
         if part_size == entry.size_bytes() {
-            verify_part_and_rename(entry, &part_path, &final_path, warnings)?;
+            verify_part_and_rename_observed(entry, &part_path, &final_path, warnings, observer)?;
             return Ok(ExistingDownload::Ready(final_path));
         }
 
@@ -644,7 +685,8 @@ fn download_body(
     let mut hasher = Sha256::new();
     let mut offset = resume_from;
     if offset > 0 {
-        let hashed = hash_existing_prefix_into(&mut hasher, context.part_path)?;
+        let hashed =
+            hash_existing_prefix_into_observed(&mut hasher, context.part_path, context.observer)?;
         if hashed != offset {
             return Err(DownloadError::SizeMismatch {
                 expected: offset,
@@ -680,9 +722,6 @@ fn download_body(
             context.entry.size_bytes(),
             context.available_space_override,
         )?;
-        if context.part_path.exists() {
-            fs::remove_file(context.part_path)?;
-        }
         hasher = Sha256::new();
         offset = 0;
         context.progress.set_length(context.entry.size_bytes());
@@ -699,6 +738,12 @@ fn download_body(
         });
     }
 
+    let restart_path = restart_path(context.part_path);
+    let transfer_path = if restart_from_zero {
+        restart_path.as_path()
+    } else {
+        context.part_path
+    };
     let mut file = if offset > 0 {
         validate_resume_content_range(
             response.content_range.as_deref(),
@@ -707,10 +752,13 @@ fn download_body(
         )?;
         OpenOptions::new().append(true).open(context.part_path)?
     } else {
-        File::create(context.part_path)?
+        if restart_from_zero && restart_path.exists() {
+            fs::remove_file(&restart_path)?;
+        }
+        File::create(transfer_path)?
     };
 
-    let total = copy_response_to_part(
+    let total = match copy_response_to_part(
         response.reader.as_mut(),
         &mut file,
         &mut hasher,
@@ -718,16 +766,35 @@ fn download_body(
         offset,
         context.observer,
         context.entry.size_bytes(),
-    )?;
+    ) {
+        Ok(total) => total,
+        Err(error) => {
+            if restart_from_zero && restart_path.exists() {
+                let _ = fs::remove_file(&restart_path);
+            }
+            return Err(error);
+        }
+    };
     if total != context.entry.size_bytes() {
+        if restart_from_zero && restart_path.exists() {
+            let _ = fs::remove_file(&restart_path);
+        }
         return Err(DownloadError::SizeMismatch {
             expected: context.entry.size_bytes(),
             actual: total,
         });
     }
 
-    verify_hash_policy(context.entry, context.part_path, hasher)?;
-    fs::rename(context.part_path, context.final_path)?;
+    if let Err(error) = verify_hash_policy(context.entry, transfer_path, hasher) {
+        if restart_from_zero && restart_path.exists() {
+            let _ = fs::remove_file(&restart_path);
+        }
+        return Err(error);
+    }
+    fs::rename(transfer_path, context.final_path)?;
+    if restart_from_zero && context.part_path.exists() {
+        fs::remove_file(context.part_path)?;
+    }
     Ok(context.final_path.to_path_buf())
 }
 
@@ -831,11 +898,12 @@ fn copy_response_to_part(
     Ok(total)
 }
 
-fn verify_part_and_rename(
+fn verify_part_and_rename_observed(
     entry: &dyn VerifiedModel,
     part_path: &Path,
     final_path: &Path,
     warnings: &mut impl WarningSink,
+    observer: &mut dyn DownloadObserver,
 ) -> Result<(), DownloadError> {
     let actual_size = fs::metadata(part_path)?.len();
     if actual_size != entry.size_bytes() {
@@ -851,7 +919,9 @@ fn verify_part_and_rename(
         return Ok(());
     }
 
-    let actual = hash_file(part_path)?;
+    let mut hasher = Sha256::new();
+    hash_existing_prefix_into_observed(&mut hasher, part_path, observer)?;
+    let actual = hex_bytes(hasher.finalize().as_ref());
     if actual != entry.sha256() {
         fs::remove_file(part_path)?;
         return Err(DownloadError::ChecksumMismatch {
@@ -893,6 +963,12 @@ fn part_path(dest_dir: &Path, filename: &str) -> PathBuf {
     dest_dir.join(format!("{filename}.part"))
 }
 
+fn restart_path(part_path: &Path) -> PathBuf {
+    let mut name = part_path.as_os_str().to_os_string();
+    name.push(".restart");
+    PathBuf::from(name)
+}
+
 fn hash_unverified_warning(path: &Path) -> String {
     format!("warning: hash unverified for {}", path.display())
 }
@@ -924,6 +1000,7 @@ mod tests {
     use crate::registry::ModelEntry;
     use reqwest::header::AUTHORIZATION;
     use sha2::{Digest, Sha256};
+    use std::cell::Cell;
     use std::env;
     use std::ffi::OsString;
     use std::fs;
@@ -1094,6 +1171,38 @@ mod tests {
         }
     }
 
+    struct CheckCountObserver {
+        checks: Cell<usize>,
+        cancel_at: usize,
+    }
+
+    impl DownloadObserver for CheckCountObserver {
+        fn is_cancelled(&self) -> bool {
+            let next = self.checks.get() + 1;
+            self.checks.set(next);
+            next >= self.cancel_at
+        }
+    }
+
+    #[test]
+    fn cooperative_cancellation_interrupts_existing_prefix_hash_without_mutation() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("model.gguf.part");
+        let bytes = vec![3_u8; COPY_BUFFER_BYTES * 3];
+        fs::write(&path, &bytes).unwrap();
+        let mut observer = CheckCountObserver {
+            checks: Cell::new(0),
+            cancel_at: 2,
+        };
+        let mut hasher = Sha256::new();
+
+        let error =
+            hash_existing_prefix_into_observed(&mut hasher, &path, &mut observer).unwrap_err();
+
+        assert!(matches!(error, DownloadError::Cancelled));
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+
     #[test]
     fn observer_cancels_before_transfer_without_creating_a_partial() {
         let dir = tempdir().unwrap();
@@ -1171,6 +1280,129 @@ mod tests {
             .progress
             .iter()
             .all(|item| item.total_bytes == model.size_bytes));
+    }
+
+    #[test]
+    fn ignored_resume_range_cancelled_from_zero_progress_preserves_original_partial() {
+        let dir = tempdir().unwrap();
+        let bytes = vec![9_u8; COPY_BUFFER_BYTES + 3];
+        let split = 31;
+        let model = entry(
+            "model.gguf",
+            Box::leak(sha256_hex(&bytes).into_boxed_str()),
+            bytes.len() as u64,
+        );
+        let original = bytes[..split].to_vec();
+        fs::write(dir.path().join("model.gguf.part"), &original).unwrap();
+        let transport = FakeTransport::new(
+            bytes.len() as u64,
+            vec![FakeBody {
+                status: StatusCode::OK,
+                content_range: None,
+                body: bytes,
+            }],
+        );
+        let mut observer = RecordingObserver {
+            cancel_after: Some(0),
+            ..Default::default()
+        };
+
+        let error = download_with_transport_and_observer(
+            &model,
+            dir.path(),
+            HF_BASE_URL,
+            &transport,
+            &mut observer,
+            Some(u64::MAX),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, DownloadError::Cancelled));
+        assert_eq!(
+            fs::read(dir.path().join("model.gguf.part")).unwrap(),
+            original
+        );
+        assert!(!restart_path(&dir.path().join("model.gguf.part")).exists());
+    }
+
+    #[test]
+    fn ignored_resume_range_mid_replacement_cancel_preserves_original_partial() {
+        let dir = tempdir().unwrap();
+        let bytes = vec![5_u8; COPY_BUFFER_BYTES * 2 + 3];
+        let split = 19;
+        let model = entry(
+            "model.gguf",
+            Box::leak(sha256_hex(&bytes).into_boxed_str()),
+            bytes.len() as u64,
+        );
+        let original = bytes[..split].to_vec();
+        fs::write(dir.path().join("model.gguf.part"), &original).unwrap();
+        let transport = FakeTransport::new(
+            bytes.len() as u64,
+            vec![FakeBody {
+                status: StatusCode::OK,
+                content_range: None,
+                body: bytes,
+            }],
+        );
+        let mut observer = RecordingObserver {
+            cancel_after: Some(COPY_BUFFER_BYTES as u64),
+            ..Default::default()
+        };
+
+        let error = download_with_transport_and_observer(
+            &model,
+            dir.path(),
+            HF_BASE_URL,
+            &transport,
+            &mut observer,
+            Some(u64::MAX),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, DownloadError::Cancelled));
+        assert_eq!(
+            fs::read(dir.path().join("model.gguf.part")).unwrap(),
+            original
+        );
+        assert!(!restart_path(&dir.path().join("model.gguf.part")).exists());
+    }
+
+    #[test]
+    fn observer_completion_promotes_only_verified_sha_and_reports_total() {
+        let dir = tempdir().unwrap();
+        let bytes = b"verified completion".to_vec();
+        let model = entry(
+            "model.gguf",
+            Box::leak(sha256_hex(&bytes).into_boxed_str()),
+            bytes.len() as u64,
+        );
+        let transport = FakeTransport::new(
+            bytes.len() as u64,
+            vec![FakeBody {
+                status: StatusCode::OK,
+                content_range: None,
+                body: bytes.clone(),
+            }],
+        );
+        let mut observer = RecordingObserver::default();
+
+        let path = download_with_transport_and_observer(
+            &model,
+            dir.path(),
+            HF_BASE_URL,
+            &transport,
+            &mut observer,
+            Some(u64::MAX),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(path).unwrap(), bytes);
+        assert_eq!(
+            observer.progress.last().unwrap().downloaded_bytes,
+            model.size_bytes
+        );
+        assert!(!dir.path().join("model.gguf.part").exists());
     }
 
     #[test]
