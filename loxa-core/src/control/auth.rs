@@ -62,6 +62,46 @@ mod tests {
     }
 
     #[test]
+    fn node_identity_proof_is_domain_separated_binary_and_constant_time_verified() {
+        use crate::control::contracts::NodeStatus;
+        let token = ControlToken::from_bytes([7; TOKEN_BYTES]);
+        let nonce = "01".repeat(32);
+        let vectors = [
+            (NodeStatus::Unloaded, "fec2cf06e169de949d213f6b0a9c7475890c0ff6a93070a6533deac9193a0e2d"),
+            (NodeStatus::Loading, "bc470c85531eb19dc0e6941a45731df9fc79e5e4b14311ef5f9010060d04e350"),
+            (NodeStatus::Ready, "a8168ad8ea645fdd1c91f495f8d28e3de0a1d13a7d728c218ce3797661baa1a0"),
+            (NodeStatus::Unloading, "cd67c4caeeac907169970d3a3cc421ffcff1b402977e63699b5bfe31d9fa5b7f"),
+            (NodeStatus::RecoveryRequired, "1433e64080eaeb1106f201d3bd5a35b7353da9452c0da10202fa0b7dfee07e1b"),
+            (NodeStatus::Error, "bce2ad7996d8d4e0c84fbef730ce63985b3fbf8f1a257317976e50f88a553319"),
+        ];
+        for (status, expected) in vectors {
+            assert_eq!(token.node_identity_proof(&nonce, "node", "runtime", status).unwrap(), expected);
+            assert!(token.verify_node_identity_proof(&nonce, "node", "runtime", status, expected));
+        }
+        let proof = "fec2cf06e169de949d213f6b0a9c7475890c0ff6a93070a6533deac9193a0e2d";
+        assert!(!token.verify_node_identity_proof(
+            &nonce,
+            "node",
+            "runtime-2",
+            NodeStatus::Unloaded,
+            proof,
+        ));
+        assert!(!token.verify_node_identity_proof(
+            &nonce,
+            "node",
+            "runtime",
+            NodeStatus::Ready,
+            proof,
+        ));
+        assert!(!token.verify_node_identity_proof(&"02".repeat(32), "node", "runtime", NodeStatus::Unloaded, proof));
+        assert!(!token.verify_node_identity_proof(&nonce, "node-2", "runtime", NodeStatus::Unloaded, proof));
+        for malformed in [String::new(), "00".into(), "0".repeat(62), "0".repeat(66), "AA".repeat(32), format!("{}g", "0".repeat(63))] {
+            assert!(!token.verify_node_identity_proof(&nonce, "node", "runtime", NodeStatus::Unloaded, &malformed));
+        }
+        assert!(token.node_identity_proof("AA", "node", "runtime", NodeStatus::Ready).is_err());
+    }
+
+    #[test]
     fn malformed_and_insecure_existing_tokens_are_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("control.token");
@@ -177,6 +217,8 @@ mod tests {
         );
     }
 }
+use hmac::{Hmac, KeyInit, Mac};
+use sha2::Sha256;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -287,6 +329,70 @@ impl ControlToken {
     pub fn expose_for_authorization(&self) -> String {
         encode_hex(&self.0)
     }
+
+    pub fn node_identity_proof(
+        &self,
+        nonce_hex: &str,
+        node_id: &str,
+        runtime_identity: &str,
+        status: crate::control::contracts::NodeStatus,
+    ) -> io::Result<String> {
+        let nonce = decode_hex_32(nonce_hex)?;
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.0)
+            .map_err(|_| io::Error::other("invalid control proof key"))?;
+        mac.update(b"loxa-control-node-identity-v1\0");
+        mac.update(&crate::control::contracts::CONTROL_PROTOCOL_VERSION.to_be_bytes());
+        mac.update(&nonce);
+        update_length_prefixed(&mut mac, node_id.as_bytes())?;
+        update_length_prefixed(&mut mac, runtime_identity.as_bytes())?;
+        mac.update(&[status.proof_discriminant()]);
+        Ok(encode_hex(&mac.finalize().into_bytes()))
+    }
+
+    pub fn verify_node_identity_proof(
+        &self,
+        nonce_hex: &str,
+        node_id: &str,
+        runtime_identity: &str,
+        status: crate::control::contracts::NodeStatus,
+        supplied_hex: &str,
+    ) -> bool {
+        let Ok(expected) = self.node_identity_proof(nonce_hex, node_id, runtime_identity, status)
+        else {
+            return false;
+        };
+        let (Ok(expected), Ok(supplied)) = (decode_hex_32(&expected), decode_hex_32(supplied_hex))
+        else {
+            return false;
+        };
+        bool::from(expected.ct_eq(&supplied))
+    }
+}
+
+fn update_length_prefixed(mac: &mut Hmac<Sha256>, bytes: &[u8]) -> io::Result<()> {
+    let length = u32::try_from(bytes.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "control identity field too long",
+        )
+    })?;
+    mac.update(&length.to_be_bytes());
+    mac.update(bytes);
+    Ok(())
+}
+
+fn decode_hex_32(text: &str) -> io::Result<[u8; 32]> {
+    if text.len() != 64
+        || text
+            .bytes()
+            .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "malformed lowercase hex proof",
+        ));
+    }
+    decode_hex(text)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
