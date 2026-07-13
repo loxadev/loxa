@@ -10,6 +10,9 @@ import type {
 import type { ModelInventoryEntry, NodeControlStatus } from "../control/contracts";
 import type { ControlStreamHandle, streamControlEvents as defaultStreamControlEvents } from "../control/events";
 import type { getModels as defaultGetModels, getStatus as defaultGetStatus } from "../node/client";
+import { ChatComposer } from "./ChatComposer";
+import styles from "./ChatScreen.module.css";
+import { ChatTranscript, type ChatTurn } from "./ChatTranscript";
 import type { StreamCallbacks, StreamHandle, StreamTerminal } from "./streamChat";
 
 export type ChatScreenServices = {
@@ -27,17 +30,7 @@ export type ChatScreenServices = {
 
 type ConnectionState = "checking" | "disconnected" | "ready";
 type CapabilityState = "checking" | "supported" | "unsupported" | "unavailable";
-type ChatTurnStatus = "queued" | "streaming" | "completed" | "cancelled" | "failed";
-
-type ChatTurn = {
-  id: number;
-  model: string;
-  prompt: string;
-  response: string;
-  status: ChatTurnStatus;
-  error: string;
-};
-
+type ControlStreamState = "live" | "reconnecting" | "unavailable";
 export function ChatScreen({ services, endpoint }: { services: ChatScreenServices; endpoint: string }) {
   const [connection, setConnection] = useState<ConnectionState>("checking");
   const [requestModel, setRequestModel] = useState<string | null>(null);
@@ -46,12 +39,16 @@ export function ChatScreen({ services, endpoint }: { services: ChatScreenService
   const [eligibleModels, setEligibleModels] = useState<ModelInventoryEntry[]>([]);
   const [modelOperation, setModelOperation] = useState<"idle" | "switching">("idle");
   const [controlBusy, setControlBusy] = useState(false);
+  const [controlStreamState, setControlStreamState] = useState<ControlStreamState>("live");
   const [input, setInput] = useState("");
   const [turns, setTurns] = useState<ChatTurn[]>([]);
   const [connectionError, setConnectionError] = useState("");
   const [chatCapability, setChatCapability] = useState<CapabilityState>("checking");
   const [attachmentReason, setAttachmentReason] = useState("Checking document input support.");
   const handle = useRef<StreamHandle | null>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const focusAfterTerminal = useRef(false);
+  const stopRequested = useRef(false);
   const lifecycleController = useRef<AbortController | null>(null);
   const controlStream = useRef<ControlStreamHandle | null>(null);
   const operations = useRef(new Map<string, { status: string }>());
@@ -106,16 +103,39 @@ export function ChatScreen({ services, endpoint }: { services: ChatScreenService
         setConnectionError(nodeUnavailableReason(controlNode.status));
         setConnection("disconnected");
       }
-      const streamToken = await services.readControlToken(endpoint);
-      if (disposed) return;
-      controlStream.current = services.createControlEventStream(endpoint, streamToken, 0, {
+      const connectControlStream = async (cursor: number, reconcile: boolean) => {
+        if (reconcile) {
+          const [node, nextInventory] = await Promise.all([
+            services.readControlToken(endpoint).then((token) => services.getControlNode(endpoint, token, { signal: controller.signal })),
+            services.readControlToken(endpoint).then((token) => services.getInventory(endpoint, token, { signal: controller.signal })),
+          ]);
+          if (disposed) return;
+          const eligibleNext = nextInventory.filter((entry) => entry.artifact.kind === "downloaded" && entry.compatibility.compatible && entry.engine.eligible);
+          setEligibleModels(eligibleNext);
+          if (node.status === "ready" && node.activeModelId !== null) {
+            setActiveModel(node.activeModelId);
+            setSelectedModel(node.activeModelId);
+            setConnectionError("");
+            setConnection("ready");
+          } else {
+            setActiveModel(null);
+            setConnectionError(nodeUnavailableReason(node.status));
+            setConnection("disconnected");
+          }
+        }
+        const streamToken = await services.readControlToken(endpoint);
+        if (disposed) return;
+        const previousStream = controlStream.current;
+        controlStream.current = services.createControlEventStream(endpoint, streamToken, cursor, {
         onSnapshot: (snapshot) => {
           if (disposed) return;
           operations.current = new Map(snapshot.operations.map((operation) => [operation.id, operation]));
+          setControlStreamState("live");
           setControlBusy(snapshot.operations.some((operation) => operation.status === "queued" || operation.status === "running"));
         },
         onEvent: (event) => {
           if (disposed) return;
+          setControlStreamState("live");
           operations.current.set(event.operation.id, event.operation);
           setControlBusy([...operations.current.values()].some((operation) => operation.status === "queued" || operation.status === "running"));
           if ((event.operation.kind === "load" || event.operation.kind === "unload") && isTerminalOperation(event.operation.status)) {
@@ -144,10 +164,20 @@ export function ChatScreen({ services, endpoint }: { services: ChatScreenService
             });
           }
         },
-        onTerminal: () => {
-          if (!disposed) setControlBusy(true);
+        onTerminal: (terminal) => {
+          if (disposed) return;
+          setControlStreamState("reconnecting");
+          setControlBusy(true);
+          void connectControlStream(terminal.cursor, true).catch(() => {
+            if (disposed || controller.signal.aborted) return;
+            setControlStreamState("unavailable");
+            setControlBusy(true);
+          });
         },
       }, controller.signal);
+        previousStream?.dispose();
+      };
+      await connectControlStream(0, false);
       if (controlNode.status === "recovery_required") {
         recoveryRequired.current = true;
         setConnectionError("Recovery required. Restart the node safely before using chat.");
@@ -184,6 +214,12 @@ export function ChatScreen({ services, endpoint }: { services: ChatScreenService
   const canCompose = connection === "ready" && chatCapability === "supported" &&
     requestModel !== null && activeModel !== null && !responseInProgress && modelOperation === "idle" && !controlBusy;
 
+  useEffect(() => {
+    if (!focusAfterTerminal.current || responseInProgress) return;
+    focusAfterTerminal.current = false;
+    inputRef.current?.focus();
+  }, [latestTurn?.status, responseInProgress]);
+
   const updateTurn = (id: number, update: (current: ChatTurn) => ChatTurn) => {
     setTurns((current) => current.map((turn) => turn.id === id ? update(turn) : turn));
   };
@@ -193,6 +229,7 @@ export function ChatScreen({ services, endpoint }: { services: ChatScreenService
     if (!canCompose || !requestModel || !activeModel || !content) return;
     const id = nextTurnId.current++;
     activeTurnId.current = id;
+    stopRequested.current = false;
     setConnectionError("");
     setInput("");
     setTurns((current) => [...current, {
@@ -216,6 +253,8 @@ export function ChatScreen({ services, endpoint }: { services: ChatScreenService
           if (!mounted.current || activeTurnId.current !== id) return;
           activeTurnId.current = null;
           handle.current = null;
+          stopRequested.current = false;
+          focusAfterTerminal.current = true;
           updateTurn(id, (turn) => terminalTurn(turn, terminal));
         },
       });
@@ -223,8 +262,15 @@ export function ChatScreen({ services, endpoint }: { services: ChatScreenService
     } catch (reason) {
       activeTurnId.current = null;
       handle.current = null;
+      focusAfterTerminal.current = true;
       updateTurn(id, (turn) => ({ ...turn, status: "failed", error: message(reason) }));
     }
+  };
+
+  const stop = () => {
+    if (stopRequested.current || !responseInProgress) return;
+    stopRequested.current = true;
+    handle.current?.cancel();
   };
 
   const switchModel = async () => {
@@ -300,81 +346,51 @@ export function ChatScreen({ services, endpoint }: { services: ChatScreenService
     }
   };
 
-  const statusLabel = connectionLabel(connection, connectionError, chatCapability, latestTurn);
+  const statusLabel = connectionLabel(connection, connectionError, chatCapability, controlStreamState, controlBusy, modelOperation, latestTurn);
   const chatSupportReason = chatCapability === "unsupported"
     ? "Text chat is not supported by this node."
     : chatCapability === "unavailable"
       ? "Text chat support could not be verified. Start or attach the node from Node first."
       : chatCapability === "checking"
         ? "Checking text chat support."
-        : activeModel === null && connection === "ready"
-          ? "No active runtime model is available for chat."
-          : "";
+        : controlStreamState === "reconnecting"
+          ? "Reconnecting to live model updates. Chat will unlock after a fresh node snapshot."
+          : controlStreamState === "unavailable"
+            ? "Live model updates are unavailable. Return to Node or reopen Chat to retry."
+            : controlBusy
+              ? "A model operation is in progress. Chat will unlock after the node confirms completion."
+              : activeModel === null && connection === "ready"
+                ? "No active runtime model is available for chat."
+                : "";
+  const emptyMessage = emptyChatMessage(connection, chatCapability, connectionError, activeModel, eligibleModels.length, modelOperation, controlStreamState, controlBusy);
 
   return (
-    <section className="chat-screen" aria-labelledby="chat-heading">
+    <section className={styles.screen} aria-labelledby="chat-heading">
       <header className="screen-header">
         <div><p className="eyebrow">Operational tool</p><h1 id="chat-heading">Chat</h1></div>
         <p className="status-badge" role="status" aria-live="polite">{statusLabel}</p>
       </header>
 
-      <p className="model-line">Public API model alias <span className="technical-value">{requestModel ?? "Unavailable"}</span></p>
+      <ChatTranscript turns={turns} emptyMessage={emptyMessage} />
 
-      <div className="chat-output" aria-label="Conversation">
-        {turns.length === 0 ? <p className="empty-state">Responses appear here.</p> : turns.map((turn) => (
-          <article className="chat-turn" key={turn.id} aria-label={`Chat turn using ${turn.model}`}>
-            <div className="chat-message chat-message-user"><p className="message-label">You</p><p>{turn.prompt}</p></div>
-            <div className="chat-message chat-message-assistant">
-              <div className="message-heading"><p className="message-label">Loxa</p><span className="technical-value">{turn.model}</span></div>
-              <p>{turn.response || (turn.status === "queued" || turn.status === "streaming" ? "Waiting for the model…" : "No response was returned.")}</p>
-              <p className={`turn-state turn-${turn.status}`}>{turnStateLabel(turn.status)}{turn.error ? ` — ${turn.error}` : ""}</p>
-            </div>
-          </article>
-        ))}
-      </div>
-
-      <form className="composer" onSubmit={(event) => { event.preventDefault(); send(); }}>
-        <label htmlFor="message">Message</label>
-        <textarea
-          id="message"
-          value={input}
-          onChange={(event) => setInput(event.target.value)}
-          disabled={!canCompose}
-          aria-describedby={chatSupportReason ? "chat-support-reason" : undefined}
-        />
-        {chatSupportReason && <p id="chat-support-reason" className="composer-reason">{chatSupportReason}</p>}
-        <div className="composer-footer">
-          <div className="composer-tools">
-            <button
-              className="quiet-button interactive-target attachment-button"
-              type="button"
-              aria-label="Attach document"
-              aria-describedby="attachment-support-reason"
-              disabled
-            >+</button>
-            <div className="composer-model-control">
-              <label htmlFor="active-chat-model">Choose model</label>
-              <select
-                id="active-chat-model"
-                value={selectedModel}
-                aria-describedby="model-control-help"
-                disabled={modelOperation === "switching" || controlBusy || responseInProgress}
-                onChange={(event) => setSelectedModel(event.target.value)}
-              >
-                <option value="">No active model</option>
-                {eligibleModels.map((model) => <option key={model.id} value={model.id}>{model.id}</option>)}
-              </select>
-              {selectedModel !== activeModel && <button className="secondary-button interactive-target" type="button" disabled={modelOperation === "switching" || controlBusy || responseInProgress} onClick={() => void switchModel()} aria-label={`${activeModel === null ? "Load" : "Switch to"} ${selectedModel}`}>{modelOperation === "switching" ? "Loading…" : activeModel === null ? "Load" : "Switch"}</button>}
-              <span id="model-control-help" className="attachment-reason">Active: <span className="technical-value">{activeModel ?? "None"}</span>. Selecting a model does not load it.</span>
-            </div>
-          </div>
-          <div className="action-row">
-            <button className="primary-button interactive-target" type="submit" disabled={!canCompose || !input.trim()}>Send message</button>
-            {responseInProgress && <button className="secondary-button interactive-target" type="button" onClick={() => handle.current?.cancel()}>Cancel response</button>}
-          </div>
-        </div>
-        <p id="attachment-support-reason" className="attachment-reason">{attachmentReason}</p>
-      </form>
+      <ChatComposer
+        input={input}
+        inputRef={inputRef}
+        canCompose={canCompose}
+        responseInProgress={responseInProgress}
+        supportReason={chatSupportReason}
+        attachmentReason={attachmentReason}
+        activeModel={activeModel}
+        selectedModel={selectedModel}
+        eligibleModels={eligibleModels}
+        modelBusy={controlBusy}
+        modelOperation={modelOperation}
+        onInput={setInput}
+        onSelectedModel={setSelectedModel}
+        onSwitchModel={() => void switchModel()}
+        onSend={send}
+        onStop={stop}
+      />
     </section>
   );
 }
@@ -388,24 +404,50 @@ function connectionLabel(
   connection: ConnectionState,
   error: string,
   capability: CapabilityState,
+  controlStreamState: ControlStreamState,
+  controlBusy: boolean,
+  operation: "idle" | "switching",
   latest?: ChatTurn,
 ): string {
   if (connection === "checking") return "Checking node";
-  if (connection === "disconnected") return error ? `Disconnected. ${error}` : "Disconnected";
+  if (connection === "disconnected") return error || "Disconnected";
   if (error) return error;
   if (capability === "unsupported" || capability === "unavailable") return "Chat unavailable";
+  if (controlStreamState === "reconnecting") return "Reconnecting to live model updates";
+  if (controlStreamState === "unavailable") return "Live model updates unavailable";
+  if (operation === "switching") return "Loading selected model";
+  if (controlBusy) return "Model operation in progress";
   if (latest?.status === "failed") return latest.error;
   if (latest) return latest.status[0].toUpperCase() + latest.status.slice(1);
   return "Ready";
 }
 
-function turnStateLabel(status: ChatTurnStatus): string {
-  if (status === "failed") return "Turn failed";
-  return `Turn ${status}`;
-}
-
 function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function emptyChatMessage(
+  connection: ConnectionState,
+  capability: CapabilityState,
+  error: string,
+  activeModel: string | null,
+  eligibleModelCount: number,
+  operation: "idle" | "switching",
+  controlStreamState: ControlStreamState,
+  controlBusy: boolean,
+): string {
+  if (connection === "checking") return "Preparing the local chat session…";
+  if (error) return error;
+  if (capability === "checking") return "Checking text chat support…";
+  if (capability === "unsupported") return "Text chat is not supported by this node.";
+  if (capability === "unavailable") return "Text chat support could not be verified. Retry from Node.";
+  if (controlStreamState === "reconnecting") return "Reconnecting to live model updates. Chat will unlock after a fresh node snapshot.";
+  if (controlStreamState === "unavailable") return "Live model updates are unavailable. Return to Node or reopen Chat to retry.";
+  if (operation === "switching") return "Loading the selected model. Chat will unlock after the node confirms readiness.";
+  if (controlBusy) return "A model operation is in progress. Chat will unlock after the node confirms completion.";
+  if (eligibleModelCount === 0) return "No downloaded compatible model is available. Download one from Models.";
+  if (activeModel === null) return "No model is loaded. Choose a downloaded model below or open Models.";
+  return "Ask the active local model. Responses stay in this session only.";
 }
 
 function isTerminalOperation(status: string): boolean {
