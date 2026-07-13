@@ -13,7 +13,7 @@ import {
 } from "../control/client";
 import { streamControlEvents } from "../control/events";
 import { getModels, getStatus } from "../node/client";
-import type { BootstrapSnapshot, StartNodeRequest } from "../node/NodeScreen";
+import type { BootstrapSnapshot, StartNodeRequest } from "../node/NodeSession";
 import type { AppServices } from "./App";
 
 export const DEFAULT_ENDPOINT = "http://127.0.0.1:8080";
