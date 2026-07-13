@@ -127,6 +127,31 @@ pub trait EngineLifecycleDriver {
     ) -> Result<(), LifecycleError>;
 
     fn stop_exact(&mut self, session: StartedSession<Self::Session>) -> Result<(), LifecycleError>;
+
+    fn poll_exact(
+        &mut self,
+        _session: &mut StartedSession<Self::Session>,
+    ) -> Result<ExactSessionStatus, LifecycleError> {
+        Ok(ExactSessionStatus::Running)
+    }
+
+    fn finish_unexpected_exit(
+        &mut self,
+        session: StartedSession<Self::Session>,
+    ) -> Result<bool, LifecycleError> {
+        self.stop_exact(session)?;
+        Ok(true)
+    }
+
+    fn mark_recovery_required(&mut self, _owner: &StableNodeOwner) -> Result<(), LifecycleError> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExactSessionStatus {
+    Running,
+    Exited,
 }
 
 #[derive(Clone, Copy)]
@@ -166,6 +191,17 @@ where
     error: Option<String>,
     stopping: Arc<AtomicBool>,
     destructive_commit: CancellationBoundary,
+    crash_restart_used: bool,
+    #[cfg(test)]
+    destructive_test_hook: Option<DestructiveTestHook>,
+}
+
+#[cfg(test)]
+pub(crate) struct DestructiveTestHook {
+    pub before_entered: Option<std::sync::mpsc::Sender<()>>,
+    pub before_release: Option<std::sync::mpsc::Receiver<()>>,
+    pub after_entered: Option<std::sync::mpsc::Sender<()>>,
+    pub after_release: Option<std::sync::mpsc::Receiver<()>>,
 }
 
 #[derive(Clone)]
@@ -184,6 +220,18 @@ impl CancellationBoundary {
 
     fn set(&self, committed: bool) {
         *self.0.lock().expect("cancellation boundary poisoned") = committed;
+    }
+
+    pub(crate) fn begin_destructive(
+        &self,
+        cancellation: &MutationCancellation,
+    ) -> Result<(), LifecycleError> {
+        let mut committed = self.0.lock().expect("cancellation boundary poisoned");
+        if cancellation.is_cancelled() {
+            return Err(LifecycleError::Cancelled);
+        }
+        *committed = true;
+        Ok(())
     }
 
     fn is_safe(&self) -> bool {
@@ -207,6 +255,9 @@ where
             error: None,
             stopping: Arc::new(AtomicBool::new(false)),
             destructive_commit: CancellationBoundary(Arc::new(Mutex::new(false))),
+            crash_restart_used: false,
+            #[cfg(test)]
+            destructive_test_hook: None,
         }
     }
 
@@ -216,6 +267,10 @@ where
 
     pub fn request_stop(&self) {
         self.stopping.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn stop_requested(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
     }
 
     pub fn cancellation_is_safe(&self) -> bool {
@@ -228,6 +283,35 @@ where
 
     pub(crate) fn destructive_commit_token(&self) -> CancellationBoundary {
         self.destructive_commit.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_destructive_test_hook(&mut self, hook: DestructiveTestHook) {
+        self.destructive_test_hook = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn wait_before_destructive_test_hook(&mut self) {
+        if let Some(hook) = &mut self.destructive_test_hook {
+            if let Some(entered) = &hook.before_entered {
+                entered.send(()).unwrap();
+            }
+            if let Some(release) = &hook.before_release {
+                release.recv().unwrap();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn wait_after_destructive_test_hook(&mut self) {
+        if let Some(hook) = &mut self.destructive_test_hook {
+            if let Some(entered) = &hook.after_entered {
+                entered.send(()).unwrap();
+            }
+            if let Some(release) = &hook.after_release {
+                release.recv().unwrap();
+            }
+        }
     }
 
     pub fn snapshot(&self) -> LifecycleSnapshot {
@@ -255,10 +339,14 @@ where
         }
 
         let prior_plan = self.current.as_ref().map(|(prior, _)| prior.clone());
+        #[cfg(test)]
+        self.wait_before_destructive_test_hook();
+        self.destructive_commit.begin_destructive(cancellation)?;
+        #[cfg(test)]
+        self.wait_after_destructive_test_hook();
         self.status = NodeLifecycleStatus::Loading;
         self.error = None;
         self.gateway.withdraw();
-        self.destructive_commit.set(true);
 
         if let Some((_, prior_session)) = self.current.take() {
             if let Err(error) = self.driver.stop_exact(prior_session) {
@@ -274,6 +362,7 @@ where
         match self.start_ready(&plan, cancellation) {
             Ok(session) => {
                 self.publish(plan, session);
+                self.crash_restart_used = false;
                 Ok(())
             }
             Err(replacement_error) => {
@@ -289,6 +378,7 @@ where
                 match self.start_ready(&prior_plan, cancellation) {
                     Ok(session) => {
                         self.publish(prior_plan, session);
+                        self.crash_restart_used = false;
                         Err(replacement_error)
                     }
                     Err(rollback_error) => {
@@ -308,10 +398,14 @@ where
 
     pub fn unload(&mut self, cancellation: &MutationCancellation) -> Result<(), LifecycleError> {
         self.ensure_precommit(cancellation)?;
+        #[cfg(test)]
+        self.wait_before_destructive_test_hook();
+        self.destructive_commit.begin_destructive(cancellation)?;
+        #[cfg(test)]
+        self.wait_after_destructive_test_hook();
         self.status = NodeLifecycleStatus::Unloading;
         self.error = None;
         self.gateway.withdraw();
-        self.destructive_commit.set(true);
         if let Some((_, session)) = self.current.take() {
             if let Err(error) = self.driver.stop_exact(session) {
                 self.require_recovery(format!(
@@ -337,6 +431,78 @@ where
         self.status = NodeLifecycleStatus::Unloaded;
         self.destructive_commit.set(false);
         Ok(())
+    }
+
+    pub(crate) fn poll_ready_session(&mut self) -> Result<Option<String>, LifecycleError> {
+        let status = match self.current.as_mut() {
+            Some((_, session)) => self.driver.poll_exact(session),
+            None => return Ok(None),
+        };
+        match status {
+            Ok(ExactSessionStatus::Running) => return Ok(None),
+            Ok(ExactSessionStatus::Exited) => {}
+            Err(error) => {
+                self.gateway.withdraw();
+                if let Some((_, session)) = self.current.take() {
+                    let _ = self.driver.finish_unexpected_exit(session);
+                }
+                self.mark_recovery(format!("exact ready-session observation failed: {error:?}"));
+                return Err(error);
+            }
+        }
+
+        self.gateway.withdraw();
+        let (plan, session) = self.current.take().expect("ready session exists");
+        let restart_allowed = match self.driver.finish_unexpected_exit(session) {
+            Ok(restart_allowed) => restart_allowed,
+            Err(error) => {
+                self.mark_recovery(format!("unexpected engine exit cleanup failed: {error:?}"));
+                return Err(error);
+            }
+        };
+        self.status = NodeLifecycleStatus::Unloaded;
+        if !restart_allowed || self.stopping.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        if self.crash_restart_used {
+            let error = LifecycleError::RecoveryRequired {
+                replacement: "restarted engine exited unexpectedly".into(),
+                rollback: "automatic restart budget exhausted".into(),
+            };
+            self.mark_recovery(format!("{error:?}"));
+            return Err(error);
+        }
+        self.crash_restart_used = true;
+        self.status = NodeLifecycleStatus::Loading;
+        Ok(Some(plan.model_id))
+    }
+
+    pub(crate) fn restart_verified(
+        &mut self,
+        plan: LaunchPlan,
+        cancellation: &MutationCancellation,
+    ) -> Result<(), LifecycleError> {
+        match self.start_ready(&plan, cancellation) {
+            Ok(session) => {
+                self.publish(plan, session);
+                Ok(())
+            }
+            Err(error) => {
+                self.mark_recovery(format!("automatic engine restart failed: {error:?}"));
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn fail_supervision(&mut self, error: LifecycleError) {
+        self.gateway.withdraw();
+        self.mark_recovery(format!("automatic engine restart failed: {error:?}"));
+    }
+
+    pub(crate) fn finish_stopped_supervision(&mut self) {
+        self.gateway.withdraw();
+        self.status = NodeLifecycleStatus::Unloaded;
+        self.error = None;
     }
 
     fn ensure_precommit(&self, cancellation: &MutationCancellation) -> Result<(), LifecycleError> {
@@ -409,6 +575,14 @@ where
         self.error = Some(error);
     }
 
+    fn mark_recovery(&mut self, error: String) {
+        let durable = self.driver.mark_recovery_required(&self.owner).err();
+        self.require_recovery(match durable {
+            Some(durable) => format!("{error}; durable recovery marker failed: {durable:?}"),
+            None => error,
+        });
+    }
+
     fn publish(&mut self, plan: LaunchPlan, session: StartedSession<D::Session>) {
         self.gateway.publish(&plan, &session.correlation);
         self.status = NodeLifecycleStatus::Ready;
@@ -456,6 +630,8 @@ mod tests {
         stopped: Vec<SessionCorrelation>,
         stop_during_ready: bool,
         cancel_during_ready: bool,
+        polls: VecDeque<Result<ExactSessionStatus, LifecycleError>>,
+        unexpected_exit_outcomes: VecDeque<Result<bool, LifecycleError>>,
     }
 
     impl EngineLifecycleDriver for FakeDriver {
@@ -507,6 +683,25 @@ mod tests {
         ) -> Result<(), LifecycleError> {
             self.stopped.push(session.correlation);
             self.stop_outcomes.pop_front().unwrap_or(Ok(()))
+        }
+
+        fn poll_exact(
+            &mut self,
+            _: &mut StartedSession<Self::Session>,
+        ) -> Result<ExactSessionStatus, LifecycleError> {
+            self.polls
+                .pop_front()
+                .unwrap_or(Ok(ExactSessionStatus::Running))
+        }
+
+        fn finish_unexpected_exit(
+            &mut self,
+            session: StartedSession<Self::Session>,
+        ) -> Result<bool, LifecycleError> {
+            self.stopped.push(session.correlation);
+            self.unexpected_exit_outcomes
+                .pop_front()
+                .unwrap_or(Ok(true))
         }
     }
 
@@ -597,6 +792,119 @@ mod tests {
     }
 
     #[test]
+    fn ready_child_exit_withdraws_and_restarts_once_before_republishing() {
+        let driver = FakeDriver {
+            polls: VecDeque::from([Ok(ExactSessionStatus::Exited)]),
+            ..FakeDriver::default()
+        };
+        let mut lifecycle = ModelLifecycle::new(owner(), driver, FakeGateway::default());
+        lifecycle
+            .load(plan("a"), &MutationCancellation::new())
+            .unwrap();
+
+        assert_eq!(
+            lifecycle.poll_ready_session().unwrap().as_deref(),
+            Some("a")
+        );
+        lifecycle
+            .restart_verified(plan("a"), &MutationCancellation::new())
+            .unwrap();
+
+        assert_eq!(lifecycle.snapshot().status, NodeLifecycleStatus::Ready);
+        assert_eq!(lifecycle.snapshot().generation, 2);
+        assert_eq!(lifecycle.driver.stopped[0].generation, 1);
+        assert_eq!(
+            lifecycle.gateway.0,
+            [
+                "withdraw",
+                "publish:a:loxa:9001",
+                "withdraw",
+                "publish:a:loxa:9002"
+            ]
+        );
+    }
+
+    #[test]
+    fn restarted_child_exit_exhausts_budget_and_never_remains_ready() {
+        let driver = FakeDriver {
+            polls: VecDeque::from([
+                Ok(ExactSessionStatus::Exited),
+                Ok(ExactSessionStatus::Exited),
+            ]),
+            ..FakeDriver::default()
+        };
+        let mut lifecycle = ModelLifecycle::new(owner(), driver, FakeGateway::default());
+        lifecycle
+            .load(plan("a"), &MutationCancellation::new())
+            .unwrap();
+        assert_eq!(
+            lifecycle.poll_ready_session().unwrap().as_deref(),
+            Some("a")
+        );
+        lifecycle
+            .restart_verified(plan("a"), &MutationCancellation::new())
+            .unwrap();
+
+        assert!(matches!(
+            lifecycle.poll_ready_session(),
+            Err(LifecycleError::RecoveryRequired { .. })
+        ));
+        assert_eq!(
+            lifecycle.snapshot().status,
+            NodeLifecycleStatus::RecoveryRequired
+        );
+        assert_eq!(lifecycle.snapshot().active_model_id, None);
+        assert_eq!(lifecycle.driver.started.len(), 2);
+        assert_eq!(lifecycle.gateway.0.last().unwrap(), "withdraw");
+    }
+
+    #[test]
+    fn stop_token_suppresses_restart_after_exact_exit_cleanup() {
+        let driver = FakeDriver {
+            polls: VecDeque::from([Ok(ExactSessionStatus::Exited)]),
+            ..FakeDriver::default()
+        };
+        let mut lifecycle = ModelLifecycle::new(owner(), driver, FakeGateway::default());
+        lifecycle
+            .load(plan("a"), &MutationCancellation::new())
+            .unwrap();
+        lifecycle.request_stop();
+
+        assert_eq!(lifecycle.poll_ready_session().unwrap(), None);
+
+        assert_eq!(lifecycle.snapshot().status, NodeLifecycleStatus::Unloaded);
+        assert_eq!(lifecycle.snapshot().active_model_id, None);
+        assert_eq!(lifecycle.driver.started.len(), 1);
+        assert_eq!(lifecycle.gateway.0.last().unwrap(), "withdraw");
+    }
+
+    #[test]
+    fn unexpected_exit_cleanup_failure_requires_recovery_without_republish() {
+        let driver = FakeDriver {
+            polls: VecDeque::from([Ok(ExactSessionStatus::Exited)]),
+            unexpected_exit_outcomes: VecDeque::from([Err(LifecycleError::TeardownFailed(
+                "identity drift".into(),
+            ))]),
+            ..FakeDriver::default()
+        };
+        let mut lifecycle = ModelLifecycle::new(owner(), driver, FakeGateway::default());
+        lifecycle
+            .load(plan("a"), &MutationCancellation::new())
+            .unwrap();
+
+        assert!(matches!(
+            lifecycle.poll_ready_session(),
+            Err(LifecycleError::TeardownFailed(_))
+        ));
+        assert_eq!(
+            lifecycle.snapshot().status,
+            NodeLifecycleStatus::RecoveryRequired
+        );
+        assert_eq!(lifecycle.snapshot().active_model_id, None);
+        assert_eq!(lifecycle.gateway.0.last().unwrap(), "withdraw");
+    }
+
+    #[test]
     fn switch_tears_down_exact_prior_generation_and_rolls_back_once() {
         let driver = FakeDriver {
             outcomes: VecDeque::from([
@@ -679,6 +987,25 @@ mod tests {
             lifecycle.load(plan("a"), &MutationCancellation::new()),
             Err(LifecycleError::Stopping)
         );
+    }
+
+    #[test]
+    fn cancellation_and_destructive_commit_have_one_atomic_winner() {
+        let cancellation_wins = CancellationBoundary(Arc::new(Mutex::new(false)));
+        let cancelled = MutationCancellation::new();
+        assert!(cancellation_wins.try_cancel(|| cancelled.cancel()));
+        assert_eq!(
+            cancellation_wins.begin_destructive(&cancelled),
+            Err(LifecycleError::Cancelled)
+        );
+        assert!(cancellation_wins.is_safe());
+
+        let commit_wins = CancellationBoundary(Arc::new(Mutex::new(false)));
+        let not_cancelled = MutationCancellation::new();
+        commit_wins.begin_destructive(&not_cancelled).unwrap();
+        assert!(!commit_wins.try_cancel(|| not_cancelled.cancel()));
+        assert!(!not_cancelled.is_cancelled());
+        assert!(!commit_wins.is_safe());
     }
 
     #[test]

@@ -2,6 +2,9 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+pub(crate) const IDLE_TICK_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Mutation {
@@ -42,6 +45,12 @@ pub trait MutationExecutor: Send + 'static {
     );
 
     fn stop(&mut self) {}
+
+    fn tick(&mut self) {}
+
+    fn tick_interval(&self) -> Option<Duration> {
+        None
+    }
 }
 
 struct PendingMutation {
@@ -145,17 +154,32 @@ impl NodeActor {
             let command = {
                 let mut state = shared.state.lock().expect("node actor lock poisoned");
                 while state.pending.is_empty() && !state.stopping {
-                    state = shared
-                        .changed
-                        .wait(state)
-                        .expect("node actor lock poisoned");
+                    if let Some(interval) = executor.tick_interval() {
+                        let (next, timeout) = shared
+                            .changed
+                            .wait_timeout(state, interval)
+                            .expect("node actor lock poisoned");
+                        state = next;
+                        if timeout.timed_out() && state.pending.is_empty() && !state.stopping {
+                            break;
+                        }
+                    } else {
+                        state = shared
+                            .changed
+                            .wait(state)
+                            .expect("node actor lock poisoned");
+                    }
                 }
                 if state.stopping {
                     drop(state);
                     executor.stop();
                     return;
                 }
-                state.pending.pop_front().expect("pending command exists")
+                state.pending.pop_front()
+            };
+            let Some(command) = command else {
+                executor.tick();
+                continue;
             };
             executor.execute(
                 &command.operation_id,
@@ -286,5 +310,29 @@ mod tests {
         }
         handle.stop();
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn lifecycle_actor_ticks_only_when_idle_and_stop_wakes_it_immediately() {
+        struct TickExecutor(mpsc::Sender<()>);
+        impl MutationExecutor for TickExecutor {
+            fn execute(&mut self, _: &str, _: &Mutation, _: &MutationCancellation) {}
+            fn tick(&mut self) {
+                self.0.send(()).unwrap();
+            }
+            fn tick_interval(&self) -> Option<Duration> {
+                Some(Duration::from_millis(10))
+            }
+        }
+
+        let (tick_tx, tick_rx) = mpsc::channel();
+        let (handle, worker) = NodeActor::spawn(TickExecutor(tick_tx));
+        tick_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("idle lifecycle tick");
+        let started = std::time::Instant::now();
+        handle.stop();
+        worker.join().unwrap();
+        assert!(started.elapsed() < Duration::from_millis(100));
     }
 }

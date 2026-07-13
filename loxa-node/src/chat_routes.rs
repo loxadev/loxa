@@ -1,0 +1,1791 @@
+use crate::chat_history::{unix_time_ms, ChatHistory, ChatHistoryError};
+use axum::{
+    body::{Body, Bytes},
+    extract::{rejection::BytesRejection, DefaultBodyLimit, Path, Query, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
+};
+use futures_util::StreamExt;
+use loxa_core::{
+    chat_history::{
+        ChatCursor, ChatId, HistoryError, MessageContent, MessageId, MessageRole, Title,
+        TurnCursor, TurnId, TurnProvenance, TurnState, LIST_DEFAULT_LIMIT, LIST_MAX_LIMIT,
+    },
+    control::auth::{AuthPolicy, ControlToken},
+    gateway::{GatewayState, GenerationOutput},
+};
+use serde::Deserialize;
+use serde_json::json;
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    convert::Infallible,
+    pin::Pin,
+    sync::{Arc, Condvar, Mutex},
+    task::{Context, Poll},
+    time::{Duration, Instant},
+};
+
+const TURN_BODY_MAX_BYTES: usize = loxa_core::chat_history::USER_CONTENT_MAX_BYTES + 1024;
+const SMALL_MUTATION_BODY_MAX_BYTES: usize = 4 * 1024;
+const MAX_CONTEXT_TURNS: usize = 32;
+const CONSERVATIVE_CONTEXT_BYTES: usize = 24 * 1024;
+
+#[derive(Clone)]
+struct ActiveTurn {
+    turn_id: TurnId,
+    cancel: tokio::sync::watch::Sender<bool>,
+}
+
+#[derive(Default)]
+struct ActiveTurns {
+    starting: HashSet<String>,
+    running: HashMap<String, ActiveTurn>,
+    shutting_down: bool,
+}
+
+#[derive(Default)]
+struct ActiveTurnRegistry {
+    state: Mutex<ActiveTurns>,
+    empty: Condvar,
+}
+
+#[derive(Clone)]
+pub struct ChatRoutesState {
+    policy: Arc<AuthPolicy>,
+    history: ChatHistory,
+    gateway: GatewayState,
+    active: Arc<ActiveTurnRegistry>,
+}
+
+impl ChatRoutesState {
+    pub fn new(token: ControlToken, history: ChatHistory, gateway: GatewayState) -> Self {
+        Self {
+            policy: Arc::new(AuthPolicy::new(
+                token,
+                ["tauri://localhost", "http://127.0.0.1:1420"],
+            )),
+            history,
+            gateway,
+            active: Arc::new(ActiveTurnRegistry::default()),
+        }
+    }
+
+    pub fn shutdown_and_wait(&self) {
+        let mut active = self.active.state.lock().expect("active turns poisoned");
+        active.shutting_down = true;
+        for turn in active.running.values() {
+            turn.cancel.send_replace(true);
+        }
+        while !active.running.is_empty() || !active.starting.is_empty() {
+            active = self
+                .active
+                .empty
+                .wait(active)
+                .expect("active turns poisoned");
+        }
+    }
+}
+
+fn request_origin(headers: &HeaderMap) -> Result<Option<String>, StatusCode> {
+    let Some(value) = headers.get(header::ORIGIN) else {
+        return Ok(None);
+    };
+    let origin = value.to_str().map_err(|_| StatusCode::FORBIDDEN)?;
+    if matches!(origin, "tauri://localhost" | "http://127.0.0.1:1420") {
+        Ok(Some(origin.to_owned()))
+    } else {
+        Err(StatusCode::FORBIDDEN)
+    }
+}
+
+fn authorize(
+    state: &ChatRoutesState,
+    headers: &HeaderMap,
+) -> Result<Option<String>, Box<Response>> {
+    let origin = request_origin(headers).map_err(|status| Box::new(status.into_response()))?;
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    state
+        .policy
+        .authorize(origin.as_deref(), bearer)
+        .map_err(|_| {
+            Box::new(cors(
+                StatusCode::UNAUTHORIZED.into_response(),
+                origin.as_deref(),
+            ))
+        })?;
+    Ok(origin)
+}
+
+fn cors(mut response: Response, origin: Option<&str>) -> Response {
+    response
+        .headers_mut()
+        .append(header::VARY, HeaderValue::from_static("Origin"));
+    if let Some(value) = origin.and_then(|value| HeaderValue::from_str(value).ok()) {
+        response
+            .headers_mut()
+            .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, value);
+    }
+    response
+}
+
+fn error_response(error: ChatHistoryError, origin: Option<&str>) -> Response {
+    let (status, code, message) = match error {
+        ChatHistoryError::Busy => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "history_busy",
+            "chat history is temporarily busy",
+        ),
+        ChatHistoryError::Stopped => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "history_unavailable",
+            "chat history is unavailable",
+        ),
+        ChatHistoryError::Repository(HistoryError::NotFound) => (
+            StatusCode::NOT_FOUND,
+            "history_not_found",
+            "chat history record was not found",
+        ),
+        ChatHistoryError::Repository(HistoryError::Conflict) => (
+            StatusCode::CONFLICT,
+            "history_conflict",
+            "chat history operation conflicts with current state",
+        ),
+        ChatHistoryError::Repository(
+            HistoryError::InvalidId
+            | HistoryError::InvalidTitle
+            | HistoryError::InvalidContent
+            | HistoryError::InvalidTimestamp
+            | HistoryError::InvalidCursor
+            | HistoryError::InvalidPageLimit
+            | HistoryError::InvalidMetadata
+            | HistoryError::InvalidTurnState
+            | HistoryError::InvalidMessageRole,
+        ) => (
+            StatusCode::BAD_REQUEST,
+            "invalid_history_request",
+            "chat history request is invalid",
+        ),
+        ChatHistoryError::Repository(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "history_failed",
+            "chat history operation failed",
+        ),
+    };
+    cors(
+        (
+            status,
+            Json(json!({"error":{"code":code,"message":message}})),
+        )
+            .into_response(),
+        origin,
+    )
+}
+
+fn coded_error(
+    status: StatusCode,
+    code: &'static str,
+    message: &'static str,
+    origin: Option<&str>,
+) -> Response {
+    cors(
+        (
+            status,
+            Json(json!({"error":{"code":code,"message":message}})),
+        )
+            .into_response(),
+        origin,
+    )
+}
+
+fn chat_busy(origin: Option<&str>) -> Response {
+    coded_error(
+        StatusCode::CONFLICT,
+        "chat_busy",
+        "this chat already has an active turn",
+        origin,
+    )
+}
+
+fn bounded_body(
+    body: Result<Bytes, BytesRejection>,
+    origin: Option<&str>,
+) -> Result<Bytes, Box<Response>> {
+    body.map_err(|_| {
+        Box::new(coded_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_too_large",
+            "the request body exceeds this route's limit",
+            origin,
+        ))
+    })
+}
+
+fn chat_is_busy(state: &ChatRoutesState, chat: &ChatId) -> bool {
+    let active = state.active.state.lock().expect("active turns poisoned");
+    active.starting.contains(chat.as_str()) || active.running.contains_key(chat.as_str())
+}
+
+fn reserve_chat(state: &ChatRoutesState, chat: &ChatId) -> Result<(), ()> {
+    let mut active = state.active.state.lock().expect("active turns poisoned");
+    if active.shutting_down
+        || active.starting.contains(chat.as_str())
+        || active.running.contains_key(chat.as_str())
+    {
+        return Err(());
+    }
+    active.starting.insert(chat.to_string());
+    Ok(())
+}
+
+fn release_starting(state: &ChatRoutesState, chat: &ChatId) {
+    let mut active = state.active.state.lock().expect("active turns poisoned");
+    active.starting.remove(chat.as_str());
+    if active.starting.is_empty() && active.running.is_empty() {
+        state.active.empty.notify_all();
+    }
+}
+
+fn parse_id<T>(
+    value: &str,
+    parser: impl FnOnce(&str) -> Result<T, HistoryError>,
+    origin: Option<&str>,
+) -> Result<T, Box<Response>> {
+    parser(value)
+        .map_err(|error| Box::new(error_response(ChatHistoryError::Repository(error), origin)))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListQuery {
+    limit: Option<usize>,
+    before: Option<String>,
+}
+
+async fn list_chats(
+    State(state): State<ChatRoutesState>,
+    headers: HeaderMap,
+    Query(query): Query<ListQuery>,
+) -> Response {
+    let origin = match authorize(&state, &headers) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let before = match query.before.as_deref().map(ChatCursor::parse).transpose() {
+        Ok(value) => value,
+        Err(error) => {
+            return error_response(ChatHistoryError::Repository(error), origin.as_deref())
+        }
+    };
+    match state
+        .history
+        .list_chats(query.limit.unwrap_or(LIST_DEFAULT_LIMIT), before)
+        .await
+    {
+        Ok(page) => cors(Json(page).into_response(), origin.as_deref()),
+        Err(error) => error_response(error, origin.as_deref()),
+    }
+}
+
+async fn create_chat(
+    State(state): State<ChatRoutesState>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let origin = match authorize(&state, &headers) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let body = match bounded_body(body, origin.as_deref()) {
+        Ok(body) => body,
+        Err(response) => return *response,
+    };
+    if !body.is_empty() && body.as_ref() != b"{}" {
+        return error_response(
+            ChatHistoryError::Repository(HistoryError::InvalidMetadata),
+            origin.as_deref(),
+        );
+    }
+    match state.history.create_chat(unix_time_ms()).await {
+        Ok(chat) => cors(
+            (StatusCode::CREATED, Json(chat)).into_response(),
+            origin.as_deref(),
+        ),
+        Err(error) => error_response(error, origin.as_deref()),
+    }
+}
+
+async fn get_chat(
+    State(state): State<ChatRoutesState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let origin = match authorize(&state, &headers) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let id = match parse_id(&id, ChatId::parse, origin.as_deref()) {
+        Ok(id) => id,
+        Err(response) => return *response,
+    };
+    match state.history.get_chat(id).await {
+        Ok(chat) => cors(Json(chat).into_response(), origin.as_deref()),
+        Err(error) => error_response(error, origin.as_deref()),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RenameRequest {
+    title: String,
+}
+async fn rename_chat(
+    State(state): State<ChatRoutesState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let origin = match authorize(&state, &headers) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let body = match bounded_body(body, origin.as_deref()) {
+        Ok(body) => body,
+        Err(response) => return *response,
+    };
+    let id = match parse_id(&id, ChatId::parse, origin.as_deref()) {
+        Ok(id) => id,
+        Err(response) => return *response,
+    };
+    if chat_is_busy(&state, &id) {
+        return chat_busy(origin.as_deref());
+    }
+    let request: RenameRequest = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => {
+            return error_response(
+                ChatHistoryError::Repository(HistoryError::InvalidTitle),
+                origin.as_deref(),
+            )
+        }
+    };
+    let title = match Title::new(&request.title) {
+        Ok(value) => value,
+        Err(error) => {
+            return error_response(ChatHistoryError::Repository(error), origin.as_deref())
+        }
+    };
+    match state.history.rename_chat(id, title, unix_time_ms()).await {
+        Ok(chat) => cors(Json(chat).into_response(), origin.as_deref()),
+        Err(error) => error_response(error, origin.as_deref()),
+    }
+}
+
+async fn delete_chat(
+    State(state): State<ChatRoutesState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let origin = match authorize(&state, &headers) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let id = match parse_id(&id, ChatId::parse, origin.as_deref()) {
+        Ok(id) => id,
+        Err(response) => return *response,
+    };
+    if chat_is_busy(&state, &id) {
+        return chat_busy(origin.as_deref());
+    }
+    match state.history.delete_chat(id).await {
+        Ok(()) => cors(StatusCode::NO_CONTENT.into_response(), origin.as_deref()),
+        Err(error) => error_response(error, origin.as_deref()),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClearRequest {
+    confirm: String,
+}
+async fn clear_all(
+    State(state): State<ChatRoutesState>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let origin = match authorize(&state, &headers) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let body = match bounded_body(body, origin.as_deref()) {
+        Ok(body) => body,
+        Err(response) => return *response,
+    };
+    let request: ClearRequest = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => {
+            return error_response(
+                ChatHistoryError::Repository(HistoryError::InvalidMetadata),
+                origin.as_deref(),
+            )
+        }
+    };
+    if request.confirm != "delete_all_chat_history" {
+        return error_response(
+            ChatHistoryError::Repository(HistoryError::InvalidMetadata),
+            origin.as_deref(),
+        );
+    }
+    let any_chat_busy = {
+        let active = state.active.state.lock().expect("active turns poisoned");
+        !active.starting.is_empty() || !active.running.is_empty()
+    };
+    if any_chat_busy {
+        return coded_error(
+            StatusCode::CONFLICT,
+            "chat_busy",
+            "chat history cannot be cleared while a turn is active",
+            origin.as_deref(),
+        );
+    }
+    match state.history.clear_all().await {
+        Ok(deleted) => cors(
+            Json(json!({"deleted":deleted})).into_response(),
+            origin.as_deref(),
+        ),
+        Err(error) => error_response(error, origin.as_deref()),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TurnQuery {
+    limit: Option<usize>,
+    after: Option<String>,
+}
+async fn list_turns(
+    State(state): State<ChatRoutesState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(query): Query<TurnQuery>,
+) -> Response {
+    let origin = match authorize(&state, &headers) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let id = match parse_id(&id, ChatId::parse, origin.as_deref()) {
+        Ok(id) => id,
+        Err(response) => return *response,
+    };
+    let after = match query.after.as_deref().map(TurnCursor::parse).transpose() {
+        Ok(value) => value,
+        Err(error) => {
+            return error_response(ChatHistoryError::Repository(error), origin.as_deref())
+        }
+    };
+    match state
+        .history
+        .list_turns(id, query.limit.unwrap_or(LIST_DEFAULT_LIMIT), after)
+        .await
+    {
+        Ok(page) => cors(Json(page).into_response(), origin.as_deref()),
+        Err(error) => error_response(error, origin.as_deref()),
+    }
+}
+
+async fn message_summaries(
+    State(state): State<ChatRoutesState>,
+    headers: HeaderMap,
+    Path((chat, turn)): Path<(String, String)>,
+) -> Response {
+    let origin = match authorize(&state, &headers) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let chat = match parse_id(&chat, ChatId::parse, origin.as_deref()) {
+        Ok(id) => id,
+        Err(response) => return *response,
+    };
+    let turn = match parse_id(&turn, TurnId::parse, origin.as_deref()) {
+        Ok(id) => id,
+        Err(response) => return *response,
+    };
+    match state.history.get_turn(turn.clone()).await {
+        Ok(record) if record.chat_id == chat => {}
+        Ok(_) => {
+            return error_response(
+                ChatHistoryError::Repository(HistoryError::NotFound),
+                origin.as_deref(),
+            )
+        }
+        Err(error) => return error_response(error, origin.as_deref()),
+    }
+    match state.history.message_summaries(turn).await {
+        Ok(messages) => cors(
+            Json(json!({"messages":messages})).into_response(),
+            origin.as_deref(),
+        ),
+        Err(error) => error_response(error, origin.as_deref()),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SegmentQuery {
+    segment: Option<u32>,
+}
+async fn message_page(
+    State(state): State<ChatRoutesState>,
+    headers: HeaderMap,
+    Path((chat, turn, message)): Path<(String, String, String)>,
+    Query(query): Query<SegmentQuery>,
+) -> Response {
+    let origin = match authorize(&state, &headers) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let chat = match parse_id(&chat, ChatId::parse, origin.as_deref()) {
+        Ok(id) => id,
+        Err(response) => return *response,
+    };
+    let turn = match parse_id(&turn, TurnId::parse, origin.as_deref()) {
+        Ok(id) => id,
+        Err(response) => return *response,
+    };
+    let message = match parse_id(&message, MessageId::parse, origin.as_deref()) {
+        Ok(id) => id,
+        Err(response) => return *response,
+    };
+    match state.history.get_turn(turn.clone()).await {
+        Ok(record) if record.chat_id == chat => {}
+        Ok(_) => {
+            return error_response(
+                ChatHistoryError::Repository(HistoryError::NotFound),
+                origin.as_deref(),
+            )
+        }
+        Err(error) => return error_response(error, origin.as_deref()),
+    }
+    match state.history.message_summaries(turn).await {
+        Ok(summaries) if summaries.iter().any(|summary| summary.id == message) => {}
+        Ok(_) => {
+            return error_response(
+                ChatHistoryError::Repository(HistoryError::NotFound),
+                origin.as_deref(),
+            )
+        }
+        Err(error) => return error_response(error, origin.as_deref()),
+    }
+    match state
+        .history
+        .message_page(message, query.segment.unwrap_or(0))
+        .await
+    {
+        Ok(page) => cors(Json(page).into_response(), origin.as_deref()),
+        Err(error) => error_response(error, origin.as_deref()),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TurnRequest {
+    content: String,
+    model: String,
+}
+
+fn sse_event(name: &str, value: serde_json::Value) -> Bytes {
+    Bytes::from(format!("event: {name}\ndata: {value}\n\n"))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum UpstreamEvent {
+    Delta(Option<String>),
+    Done,
+    Ignored,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum UpstreamSseError {
+    Malformed,
+}
+
+fn parse_upstream_event(bytes: &[u8]) -> Result<UpstreamEvent, UpstreamSseError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| UpstreamSseError::Malformed)?;
+    let mut data = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:").map(str::trim));
+    let Some(payload) = data.next() else {
+        if text
+            .lines()
+            .all(|line| line.is_empty() || line.starts_with(':'))
+        {
+            return Ok(UpstreamEvent::Ignored);
+        }
+        return Err(UpstreamSseError::Malformed);
+    };
+    if data.next().is_some() {
+        return Err(UpstreamSseError::Malformed);
+    }
+    if payload == "[DONE]" {
+        return Ok(UpstreamEvent::Done);
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(payload).map_err(|_| UpstreamSseError::Malformed)?;
+    let delta = match value.pointer("/choices/0/delta/content") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(content)) => Some(content.clone()),
+        Some(_) => return Err(UpstreamSseError::Malformed),
+    };
+    Ok(UpstreamEvent::Delta(delta))
+}
+
+#[derive(Clone, Debug)]
+struct ContextTurn {
+    user: String,
+    assistant: String,
+}
+
+fn chat_message(role: &'static str, content: &str) -> serde_json::Value {
+    json!({"role":role,"content":content})
+}
+
+fn budget_context(
+    turns: Vec<ContextTurn>,
+    current: &str,
+    budget: usize,
+) -> Result<(Vec<serde_json::Value>, usize), HistoryError> {
+    let mut messages = vec![chat_message("user", current)];
+    if serde_json::to_vec(&messages)
+        .map_err(|_| HistoryError::Database)?
+        .len()
+        > budget
+    {
+        return Err(HistoryError::InvalidContent);
+    }
+    let candidate_count = turns.len().min(MAX_CONTEXT_TURNS);
+    let mut omitted = turns.len().saturating_sub(candidate_count);
+    let selected = turns
+        .into_iter()
+        .skip(omitted)
+        .collect::<Vec<ContextTurn>>();
+    for (index, turn) in selected.into_iter().rev().enumerate() {
+        let mut candidate = vec![
+            chat_message("user", &turn.user),
+            chat_message("assistant", &turn.assistant),
+        ];
+        candidate.extend(messages.clone());
+        if serde_json::to_vec(&candidate)
+            .map_err(|_| HistoryError::Database)?
+            .len()
+            <= budget
+        {
+            messages = candidate;
+        } else {
+            omitted += candidate_count - index;
+            break;
+        }
+    }
+    Ok((messages, omitted))
+}
+
+async fn read_message(
+    history: &ChatHistory,
+    message: MessageId,
+) -> Result<String, ChatHistoryError> {
+    let mut next = 0;
+    let mut content = String::new();
+    loop {
+        let page = history.message_page(message.clone(), next).await?;
+        for segment in page.segments {
+            content.push_str(&segment.content);
+        }
+        match page.next_segment {
+            Some(segment) => next = segment,
+            None => return Ok(content),
+        }
+    }
+}
+
+async fn conversation_context(
+    history: &ChatHistory,
+    chat: ChatId,
+    current: &str,
+) -> Result<(Vec<serde_json::Value>, usize), ChatHistoryError> {
+    let mut after = None;
+    let mut completed = VecDeque::with_capacity(MAX_CONTEXT_TURNS);
+    let mut completed_count = 0usize;
+    loop {
+        let page = history
+            .list_turns(chat.clone(), LIST_MAX_LIMIT, after)
+            .await?;
+        for turn in page
+            .turns
+            .into_iter()
+            .filter(|turn| turn.state == TurnState::Completed)
+        {
+            completed_count = completed_count.saturating_add(1);
+            if completed.len() == MAX_CONTEXT_TURNS {
+                completed.pop_front();
+            }
+            completed.push_back(turn);
+        }
+        match page.next_after {
+            Some(cursor) => after = Some(cursor),
+            None => break,
+        }
+    }
+    let mut context_turns = Vec::new();
+    let skipped = completed_count.saturating_sub(completed.len());
+    for turn in completed {
+        let summaries = history.message_summaries(turn.id).await?;
+        let user = summaries
+            .iter()
+            .find(|message| message.role == MessageRole::User)
+            .ok_or(ChatHistoryError::Repository(HistoryError::CorruptDatabase))?;
+        let assistant = summaries
+            .iter()
+            .find(|message| message.role == MessageRole::Assistant)
+            .ok_or(ChatHistoryError::Repository(HistoryError::CorruptDatabase))?;
+        context_turns.push(ContextTurn {
+            user: read_message(history, user.id.clone()).await?,
+            assistant: read_message(history, assistant.id.clone()).await?,
+        });
+    }
+    let (messages, budget_omitted) =
+        budget_context(context_turns, current, CONSERVATIVE_CONTEXT_BYTES)
+            .map_err(ChatHistoryError::Repository)?;
+    Ok((messages, skipped + budget_omitted))
+}
+
+struct GuardedReceiverStream {
+    receiver: tokio::sync::mpsc::Receiver<Result<Bytes, Infallible>>,
+    cancel: tokio::sync::watch::Sender<bool>,
+}
+
+impl futures_util::Stream for GuardedReceiverStream {
+    type Item = Result<Bytes, Infallible>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.receiver.poll_recv(cx)
+    }
+}
+
+impl Drop for GuardedReceiverStream {
+    fn drop(&mut self) {
+        self.cancel.send_replace(true);
+    }
+}
+
+async fn send_downstream(
+    sender: &tokio::sync::mpsc::Sender<Result<Bytes, Infallible>>,
+    cancelled: &mut tokio::sync::watch::Receiver<bool>,
+    event: Bytes,
+) -> bool {
+    tokio::select! {
+        biased;
+        _ = cancelled.changed() => false,
+        sent = sender.send(Ok(event)) => sent.is_ok(),
+    }
+}
+
+async fn persistent_turn(
+    State(state): State<ChatRoutesState>,
+    headers: HeaderMap,
+    Path(chat): Path<String>,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let origin = match authorize(&state, &headers) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let body = match bounded_body(body, origin.as_deref()) {
+        Ok(body) => body,
+        Err(response) => return *response,
+    };
+    let chat = match parse_id(&chat, ChatId::parse, origin.as_deref()) {
+        Ok(id) => id,
+        Err(response) => return *response,
+    };
+    let request: TurnRequest = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => {
+            return error_response(
+                ChatHistoryError::Repository(HistoryError::InvalidContent),
+                origin.as_deref(),
+            )
+        }
+    };
+    if request.model != "loxa" {
+        return error_response(
+            ChatHistoryError::Repository(HistoryError::InvalidMetadata),
+            origin.as_deref(),
+        );
+    }
+    let content = match MessageContent::user(&request.content) {
+        Ok(value) => value,
+        Err(error) => {
+            return error_response(ChatHistoryError::Repository(error), origin.as_deref())
+        }
+    };
+    if reserve_chat(&state, &chat).is_err() {
+        return chat_busy(origin.as_deref());
+    }
+    let (messages, omitted_turns) =
+        match conversation_context(&state.history, chat.clone(), content.as_str()).await {
+            Ok(value) => value,
+            Err(error) => {
+                release_starting(&state, &chat);
+                return error_response(error, origin.as_deref());
+            }
+        };
+    let prepared = match state
+        .gateway
+        .prepare_generation(json!({"model":"loxa","stream":true,"messages":messages}))
+    {
+        Ok(value) => value,
+        Err(_) => {
+            release_starting(&state, &chat);
+            return coded_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "model_unavailable",
+                "the Loxa model is not ready",
+                origin.as_deref(),
+            );
+        }
+    };
+    let provenance = match TurnProvenance::new(
+        &prepared.provenance().model_id,
+        Some(&prepared.provenance().engine),
+        Some(&prepared.provenance().engine_version),
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            release_starting(&state, &chat);
+            return error_response(ChatHistoryError::Repository(error), origin.as_deref());
+        }
+    };
+    let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
+    let turn = match state
+        .history
+        .begin_turn(chat.clone(), content, provenance, unix_time_ms())
+        .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            release_starting(&state, &chat);
+            return error_response(error, origin.as_deref());
+        }
+    };
+    let turn_id = turn.id.clone();
+    {
+        let mut active = state.active.state.lock().expect("active turns poisoned");
+        active.starting.remove(chat.as_str());
+        active.running.insert(
+            chat.to_string(),
+            ActiveTurn {
+                turn_id: turn_id.clone(),
+                cancel: cancel.clone(),
+            },
+        );
+        if active.shutting_down {
+            cancel.send_replace(true);
+        }
+    }
+    let (sender, receiver) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(32);
+    let task_state = state.clone();
+    tokio::spawn(async move {
+        let started = sse_event(
+            "turn.started",
+            json!({"chat_id":chat,"turn_id":turn_id,"state":"streaming","omitted_turns":omitted_turns}),
+        );
+        let mut receiver_alive = send_downstream(&sender, &mut cancelled, started).await;
+        let mut assistant = String::new();
+        let mut terminal = TurnState::Failed;
+        let mut error_code: Option<String>;
+        let mut last_checkpoint = Instant::now();
+        let mut checkpoint_bytes = 0usize;
+        if receiver_alive {
+            match tokio::select! { value = prepared.execute() => Some(value), _ = cancelled.changed() => None }
+            {
+                Some(Ok(GenerationOutput::Stream(mut stream))) => {
+                    terminal = TurnState::Completed;
+                    error_code = None;
+                    let mut saw_done = false;
+                    loop {
+                        let next = tokio::select! { value = stream.next() => value, _ = cancelled.changed() => { terminal = TurnState::Cancelled; error_code = None; break; } };
+                        match next {
+                            Some(Ok(bytes)) => match parse_upstream_event(&bytes) {
+                                Ok(UpstreamEvent::Done) => {
+                                    saw_done = true;
+                                    break;
+                                }
+                                Ok(UpstreamEvent::Delta(None)) => continue,
+                                Ok(UpstreamEvent::Ignored) => continue,
+                                Err(UpstreamSseError::Malformed) => {
+                                    terminal = TurnState::Failed;
+                                    error_code = Some("malformed_upstream_event".into());
+                                    break;
+                                }
+                                Ok(UpstreamEvent::Delta(Some(delta))) => {
+                                    if assistant.len().saturating_add(delta.len())
+                                        > loxa_core::chat_history::ASSISTANT_CONTENT_MAX_BYTES
+                                    {
+                                        terminal = TurnState::Failed;
+                                        error_code = Some("response_too_large".into());
+                                        break;
+                                    }
+                                    assistant.push_str(&delta);
+                                    checkpoint_bytes += delta.len();
+                                    receiver_alive = send_downstream(
+                                        &sender,
+                                        &mut cancelled,
+                                        sse_event(
+                                            "turn.delta",
+                                            json!({"turn_id":turn_id,"content":delta}),
+                                        ),
+                                    )
+                                    .await;
+                                    if !receiver_alive {
+                                        terminal = TurnState::Cancelled;
+                                        error_code = None;
+                                        break;
+                                    }
+                                    if checkpoint_bytes >= 2 * 1024
+                                        && last_checkpoint.elapsed() >= Duration::from_millis(250)
+                                    {
+                                        let checkpoint = MessageContent::assistant(&assistant)
+                                            .expect("bounded assistant content");
+                                        if task_state
+                                            .history
+                                            .checkpoint(turn_id.clone(), checkpoint, unix_time_ms())
+                                            .await
+                                            .is_err()
+                                        {
+                                            terminal = TurnState::Failed;
+                                            error_code = Some("history_write_failed".into());
+                                            break;
+                                        }
+                                        checkpoint_bytes = 0;
+                                        last_checkpoint = Instant::now();
+                                    }
+                                }
+                            },
+                            Some(Err(_)) => {
+                                terminal = TurnState::Failed;
+                                error_code = Some("generation_failed".into());
+                                break;
+                            }
+                            None => {
+                                terminal = TurnState::Failed;
+                                error_code = Some("incomplete_upstream_stream".into());
+                                break;
+                            }
+                        }
+                    }
+                    if terminal == TurnState::Completed && !saw_done {
+                        terminal = TurnState::Failed;
+                        error_code = Some("incomplete_upstream_stream".into());
+                    }
+                }
+                Some(Ok(GenerationOutput::Json { .. })) => {
+                    error_code = Some("invalid_generation_response".into());
+                }
+                Some(Err(_)) => {
+                    error_code = Some("generation_failed".into());
+                }
+                None => {
+                    terminal = TurnState::Cancelled;
+                    error_code = None;
+                }
+            }
+        } else {
+            terminal = TurnState::Cancelled;
+            error_code = None;
+        }
+        let content = MessageContent::assistant(&assistant)
+            .unwrap_or_else(|_| MessageContent::assistant("").expect("empty assistant content"));
+        let persisted = task_state
+            .history
+            .finalize(
+                turn_id.clone(),
+                terminal,
+                content,
+                error_code.clone(),
+                unix_time_ms(),
+            )
+            .await;
+        if receiver_alive {
+            let (event, state_name, code) = if persisted.is_err() {
+                ("turn.failed", "failed", Some("history_write_failed"))
+            } else {
+                match terminal {
+                    TurnState::Completed => ("turn.completed", "completed", None),
+                    TurnState::Cancelled => ("turn.cancelled", "cancelled", None),
+                    _ => ("turn.failed", "failed", error_code.as_deref()),
+                }
+            };
+            let _ = send_downstream(
+                &sender,
+                &mut cancelled,
+                sse_event(
+                    event,
+                    json!({"turn_id":turn_id,"state":state_name,"error_code":code}),
+                ),
+            )
+            .await;
+        }
+        {
+            let mut active = task_state
+                .active
+                .state
+                .lock()
+                .expect("active turns poisoned");
+            active.running.remove(chat.as_str());
+            if active.starting.is_empty() && active.running.is_empty() {
+                task_state.active.empty.notify_all();
+            }
+        }
+    });
+    let stream = GuardedReceiverStream { receiver, cancel };
+    let mut response = Response::new(Body::from_stream(stream));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    cors(response, origin.as_deref())
+}
+
+async fn cancel_turn(
+    State(state): State<ChatRoutesState>,
+    headers: HeaderMap,
+    Path((chat, turn)): Path<(String, String)>,
+) -> Response {
+    let origin = match authorize(&state, &headers) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let chat = match parse_id(&chat, ChatId::parse, origin.as_deref()) {
+        Ok(id) => id,
+        Err(response) => return *response,
+    };
+    let turn = match parse_id(&turn, TurnId::parse, origin.as_deref()) {
+        Ok(id) => id,
+        Err(response) => return *response,
+    };
+    let record = match state.history.get_turn(turn.clone()).await {
+        Ok(value) => value,
+        Err(error) => return error_response(error, origin.as_deref()),
+    };
+    if record.chat_id != chat {
+        return error_response(
+            ChatHistoryError::Repository(HistoryError::NotFound),
+            origin.as_deref(),
+        );
+    }
+    let requested = {
+        let active = state.active.state.lock().expect("active turns poisoned");
+        active
+            .running
+            .get(chat.as_str())
+            .filter(|active| active.turn_id == turn)
+            .map(|active| active.cancel.clone())
+    };
+    let Some(cancel) = requested else {
+        return coded_error(
+            StatusCode::CONFLICT,
+            "turn_not_active",
+            "the requested turn is not active",
+            origin.as_deref(),
+        );
+    };
+    cancel.send_replace(true);
+    cors(
+        (
+            StatusCode::ACCEPTED,
+            Json(json!({"turn_id":turn,"cancel_requested":true})),
+        )
+            .into_response(),
+        origin.as_deref(),
+    )
+}
+
+fn preflight_method_allowed(method: &str, allowed: &[&str]) -> bool {
+    allowed.contains(&method)
+}
+
+async fn preflight_for(headers: HeaderMap, allowed: &'static [&'static str]) -> Response {
+    let origin = match request_origin(&headers) {
+        Ok(Some(value)) => value,
+        _ => return StatusCode::FORBIDDEN.into_response(),
+    };
+    let method = headers
+        .get(header::ACCESS_CONTROL_REQUEST_METHOD)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    if !preflight_method_allowed(method, allowed) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if let Some(requested) = headers
+        .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
+        .and_then(|value| value.to_str().ok())
+    {
+        let permits_content_type = matches!(method, "POST" | "PATCH");
+        if !requested.split(',').all(|name| {
+            let name = name.trim();
+            name.is_empty()
+                || name.eq_ignore_ascii_case("authorization")
+                || (permits_content_type && name.eq_ignore_ascii_case("content-type"))
+        }) {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+    }
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    response.headers_mut().insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_str(&format!("{}, OPTIONS", allowed.join(", ")))
+            .expect("static preflight methods are valid"),
+    );
+    response.headers_mut().insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static("authorization, content-type"),
+    );
+    cors(response, Some(&origin))
+}
+
+async fn preflight_chats(headers: HeaderMap) -> Response {
+    preflight_for(headers, &["GET", "POST"]).await
+}
+async fn preflight_post(headers: HeaderMap) -> Response {
+    preflight_for(headers, &["POST"]).await
+}
+async fn preflight_chat(headers: HeaderMap) -> Response {
+    preflight_for(headers, &["GET", "PATCH", "DELETE"]).await
+}
+async fn preflight_get(headers: HeaderMap) -> Response {
+    preflight_for(headers, &["GET"]).await
+}
+async fn preflight_turns(headers: HeaderMap) -> Response {
+    preflight_for(headers, &["GET", "POST"]).await
+}
+
+pub fn router(state: ChatRoutesState) -> Router {
+    Router::new()
+        .route(
+            "/loxa/v1/chats",
+            get(list_chats)
+                .post(create_chat)
+                .options(preflight_chats)
+                .layer(DefaultBodyLimit::max(SMALL_MUTATION_BODY_MAX_BYTES)),
+        )
+        .route(
+            "/loxa/v1/chats/clear",
+            post(clear_all)
+                .options(preflight_post)
+                .layer(DefaultBodyLimit::max(SMALL_MUTATION_BODY_MAX_BYTES)),
+        )
+        .route(
+            "/loxa/v1/chats/{chat}",
+            get(get_chat)
+                .patch(rename_chat)
+                .delete(delete_chat)
+                .options(preflight_chat)
+                .layer(DefaultBodyLimit::max(SMALL_MUTATION_BODY_MAX_BYTES)),
+        )
+        .route(
+            "/loxa/v1/chats/{chat}/turns",
+            get(list_turns)
+                .post(persistent_turn)
+                .options(preflight_turns)
+                .layer(DefaultBodyLimit::max(TURN_BODY_MAX_BYTES)),
+        )
+        .route(
+            "/loxa/v1/chats/{chat}/turns/{turn}/cancel",
+            post(cancel_turn)
+                .options(preflight_post)
+                .layer(DefaultBodyLimit::max(0)),
+        )
+        .route(
+            "/loxa/v1/chats/{chat}/turns/{turn}/messages",
+            get(message_summaries)
+                .options(preflight_get)
+                .layer(DefaultBodyLimit::max(0)),
+        )
+        .route(
+            "/loxa/v1/chats/{chat}/turns/{turn}/messages/{message}",
+            get(message_page)
+                .options(preflight_get)
+                .layer(DefaultBodyLimit::max(0)),
+        )
+        .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::Method;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_history_path() -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "loxa-node-routes-{}-{nonce}-{}",
+                std::process::id(),
+                TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+            ))
+            .join("chat-history.sqlite3")
+    }
+
+    struct RouteFixture {
+        base: String,
+        bearer: String,
+        history: ChatHistory,
+        gateway: GatewayState,
+        state: ChatRoutesState,
+        server: Option<loxa_core::gateway::GatewayServer>,
+        worker: Option<crate::chat_history::ChatHistoryWorker>,
+        root: std::path::PathBuf,
+    }
+
+    impl RouteFixture {
+        fn shutdown(mut self) {
+            self.state.shutdown_and_wait();
+            self.server.take().unwrap().shutdown().unwrap();
+            self.worker.take().unwrap().stop_and_join().unwrap();
+            std::fs::remove_dir_all(&self.root).unwrap();
+        }
+    }
+
+    fn route_fixture() -> RouteFixture {
+        let history_path = temp_history_path();
+        let root = history_path.parent().unwrap().to_owned();
+        let token = ControlToken::load_or_create(&root.join("control.token")).unwrap();
+        let bearer = format!("Bearer {}", token.expose_for_authorization());
+        let (history, worker) = ChatHistory::spawn(history_path).unwrap();
+        let gateway = GatewayState::new("route-test");
+        let state = ChatRoutesState::new(token, history.clone(), gateway.clone());
+        let proof_token = ControlToken::load(&root.join("control.token")).unwrap();
+        let proof_router = Router::new().route(
+            "/loxa/v1/node",
+            get(move |headers: HeaderMap| {
+                let token = proof_token.clone();
+                async move {
+                    let nonce = headers
+                        .get("X-Loxa-Challenge")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap();
+                    let status = loxa_core::control::contracts::NodeStatus::Ready;
+                    let challenge_proof = token
+                        .node_identity_proof(nonce, "route-test-node", "route-test-runtime", status)
+                        .unwrap();
+                    Json(json!({
+                        "protocol_version": 1,
+                        "node_id": "route-test-node",
+                        "runtime_identity": "route-test-runtime",
+                        "status": status,
+                        "challenge_proof": challenge_proof,
+                    }))
+                }
+            }),
+        );
+        let server = loxa_core::gateway::GatewayServer::start_with_router(
+            0,
+            gateway.clone(),
+            proof_router.merge(router(state.clone())),
+        )
+        .unwrap();
+        RouteFixture {
+            base: format!("http://127.0.0.1:{}", server.port()),
+            bearer,
+            history,
+            gateway,
+            state,
+            server: Some(server),
+            worker: Some(worker),
+            root,
+        }
+    }
+
+    async fn publish_fake_engine(fixture: &RouteFixture, body: &'static str) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || async move {
+                let mut response = Response::new(Body::from(body));
+                response.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("text/event-stream"),
+                );
+                response
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        fixture.gateway.publish(loxa_core::gateway::EngineTarget {
+            base_url: format!("http://{address}"),
+            backend_alias: "backend".into(),
+            engine: "test".into(),
+            engine_version: "1".into(),
+            model_id: "recipe".into(),
+            profile: "test".into(),
+        });
+    }
+
+    async fn publish_stalled_engine(fixture: &RouteFixture) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                let pending = futures_util::stream::pending::<Result<Bytes, Infallible>>();
+                let mut response = Response::new(Body::from_stream(pending));
+                response.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("text/event-stream"),
+                );
+                response
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        fixture.gateway.publish(loxa_core::gateway::EngineTarget {
+            base_url: format!("http://{address}"),
+            backend_alias: "backend".into(),
+            engine: "test".into(),
+            engine_version: "1".into(),
+            model_id: "recipe".into(),
+            profile: "test".into(),
+        });
+    }
+
+    #[test]
+    fn upstream_sse_requires_typed_json_or_done() {
+        assert_eq!(
+            parse_upstream_event(b"data: [DONE]\n\n"),
+            Ok(UpstreamEvent::Done)
+        );
+        assert_eq!(
+            parse_upstream_event(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"),
+            Ok(UpstreamEvent::Delta(Some("hi".into())))
+        );
+        assert_eq!(
+            parse_upstream_event(b"data: not-json\n\n"),
+            Err(UpstreamSseError::Malformed)
+        );
+        assert_eq!(
+            parse_upstream_event(b"event: message\n\n"),
+            Err(UpstreamSseError::Malformed)
+        );
+        assert_eq!(
+            parse_upstream_event(b": keepalive\n\n"),
+            Ok(UpstreamEvent::Ignored)
+        );
+    }
+
+    #[test]
+    fn context_budget_keeps_complete_recent_turns_and_counts_omissions() {
+        let old = vec![
+            ContextTurn {
+                user: "old user".into(),
+                assistant: "old answer".into(),
+            },
+            ContextTurn {
+                user: "recent user".into(),
+                assistant: "recent answer".into(),
+            },
+        ];
+        let (messages, omitted) = budget_context(old, "current", 150).unwrap();
+        assert_eq!(omitted, 1);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["content"], "recent user");
+        assert_eq!(messages[2]["content"], "current");
+    }
+
+    #[test]
+    fn context_is_capped_at_32_complete_turn_pairs() {
+        let turns = (0..40)
+            .map(|index| ContextTurn {
+                user: format!("user {index}"),
+                assistant: format!("answer {index}"),
+            })
+            .collect();
+        let (messages, omitted) = budget_context(turns, "current", usize::MAX).unwrap();
+        assert_eq!(omitted, 8);
+        assert_eq!(messages.len(), 65);
+        assert_eq!(messages[0]["content"], "user 8");
+        assert_eq!(messages[64]["content"], "current");
+    }
+
+    #[test]
+    fn dropping_the_response_stream_immediately_requests_cancellation() {
+        let (cancel, cancelled) = tokio::sync::watch::channel(false);
+        let (_sender, receiver) = tokio::sync::mpsc::channel(1);
+        drop(GuardedReceiverStream { receiver, cancel });
+        assert!(*cancelled.borrow());
+    }
+
+    #[tokio::test]
+    async fn live_client_cancellation_drives_real_worker_to_durable_cancelled_state() {
+        let fixture = route_fixture();
+        publish_stalled_engine(&fixture).await;
+        let address = fixture
+            .base
+            .strip_prefix("http://")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let token_path = fixture.root.join("control.token");
+        let control_client = loxa_core::control::client::LiveControlClient::connect(
+            address,
+            ControlToken::load(&token_path).unwrap(),
+            "route-test-runtime",
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let chat = control_client.create_chat().unwrap();
+        let stream_client = loxa_core::control::client::LiveControlClient::connect(
+            address,
+            ControlToken::load(&token_path).unwrap(),
+            "route-test-runtime",
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let stream_chat = chat.id.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let stream_worker = std::thread::spawn(move || {
+            stream_client.stream_turn(&stream_chat, "cancel me", |event| {
+                if let loxa_core::control::client::TurnStreamEvent::Started {
+                    chat_id,
+                    turn_id,
+                    ..
+                } = &event
+                {
+                    started_tx.send((chat_id.clone(), turn_id.clone())).unwrap();
+                }
+                Ok(())
+            })
+        });
+        let (started_chat, started_turn) = started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(started_chat, chat.id);
+
+        control_client
+            .cancel_turn(&started_chat, &started_turn)
+            .unwrap();
+        let terminal = stream_worker.join().unwrap().unwrap();
+        assert!(matches!(
+            terminal,
+            loxa_core::control::client::TurnStreamEvent::Terminal {
+                ref turn_id,
+                ref state,
+                error_code: None,
+            } if turn_id == &started_turn && state == "cancelled"
+        ));
+        let stored = fixture
+            .history
+            .get_turn(TurnId::parse(&started_turn).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(stored.id.as_str(), started_turn);
+        assert_eq!(stored.state, TurnState::Cancelled);
+        fixture.shutdown();
+    }
+
+    #[tokio::test]
+    async fn conversation_context_excludes_non_completed_turns() {
+        let path = temp_history_path();
+        let (history, worker) = ChatHistory::spawn(path.clone()).unwrap();
+        let chat = history.create_chat(1).await.unwrap();
+        let provenance = TurnProvenance::new("recipe", Some("engine"), Some("1")).unwrap();
+        let completed = history
+            .begin_turn(
+                chat.id.clone(),
+                MessageContent::user("kept user").unwrap(),
+                provenance.clone(),
+                2,
+            )
+            .await
+            .unwrap();
+        history
+            .finalize(
+                completed.id,
+                TurnState::Completed,
+                MessageContent::assistant("kept answer").unwrap(),
+                None,
+                3,
+            )
+            .await
+            .unwrap();
+        let cancelled = history
+            .begin_turn(
+                chat.id.clone(),
+                MessageContent::user("excluded user").unwrap(),
+                provenance,
+                4,
+            )
+            .await
+            .unwrap();
+        history
+            .finalize(
+                cancelled.id,
+                TurnState::Cancelled,
+                MessageContent::assistant("excluded answer").unwrap(),
+                None,
+                5,
+            )
+            .await
+            .unwrap();
+
+        let (messages, omitted) = conversation_context(&history, chat.id, "current")
+            .await
+            .unwrap();
+        assert_eq!(omitted, 0);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["content"], "kept user");
+        assert_eq!(messages[1]["content"], "kept answer");
+        assert_eq!(messages[2]["content"], "current");
+
+        worker.stop_and_join().unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn route_specific_preflight_rejects_methods_not_owned_by_the_route() {
+        assert!(preflight_method_allowed("GET", &["GET"]));
+        assert!(!preflight_method_allowed("DELETE", &["GET"]));
+        assert!(preflight_method_allowed(
+            "PATCH",
+            &["GET", "PATCH", "DELETE"]
+        ));
+    }
+
+    #[tokio::test]
+    async fn routes_enforce_specific_cors_and_turn_body_limit() {
+        let fixture = route_fixture();
+        let client = reqwest::Client::new();
+        let chat = fixture.history.create_chat(1).await.unwrap();
+
+        let denied = client
+            .request(
+                Method::OPTIONS,
+                format!("{}/loxa/v1/chats/{}/turns", fixture.base, chat.id),
+            )
+            .header(header::ORIGIN, "tauri://localhost")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "DELETE")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        let allowed = client
+            .request(
+                Method::OPTIONS,
+                format!("{}/loxa/v1/chats/{}/turns", fixture.base, chat.id),
+            )
+            .header(header::ORIGIN, "tauri://localhost")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+            .header(
+                header::ACCESS_CONTROL_REQUEST_HEADERS,
+                "authorization, content-type",
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            allowed
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_METHODS)
+                .unwrap(),
+            "GET, POST, OPTIONS"
+        );
+
+        let oversized = client
+            .post(format!("{}/loxa/v1/chats/{}/turns", fixture.base, chat.id))
+            .header(header::AUTHORIZATION, &fixture.bearer)
+            .header(header::ORIGIN, "tauri://localhost")
+            .body("x".repeat(TURN_BODY_MAX_BYTES + 1))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            oversized
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "tauri://localhost"
+        );
+        fixture.shutdown();
+    }
+
+    #[tokio::test]
+    async fn nested_message_routes_enforce_chat_and_turn_parent_ids() {
+        let fixture = route_fixture();
+        let first = fixture.history.create_chat(1).await.unwrap();
+        let second = fixture.history.create_chat(2).await.unwrap();
+        let turn = fixture
+            .history
+            .begin_turn(
+                first.id.clone(),
+                MessageContent::user("hello").unwrap(),
+                TurnProvenance::new("recipe", Some("engine"), Some("1")).unwrap(),
+                3,
+            )
+            .await
+            .unwrap();
+        fixture
+            .history
+            .finalize(
+                turn.id.clone(),
+                TurnState::Completed,
+                MessageContent::assistant("world").unwrap(),
+                None,
+                4,
+            )
+            .await
+            .unwrap();
+        let message = fixture
+            .history
+            .message_summaries(turn.id.clone())
+            .await
+            .unwrap()[0]
+            .id
+            .clone();
+        let client = reqwest::Client::new();
+        for path in [
+            format!("/loxa/v1/chats/{}/turns/{}/messages", second.id, turn.id),
+            format!(
+                "/loxa/v1/chats/{}/turns/{}/messages/{}",
+                second.id, turn.id, message
+            ),
+        ] {
+            let response = client
+                .get(format!("{}{path}", fixture.base))
+                .header(header::AUTHORIZATION, &fixture.bearer)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+        fixture.shutdown();
+    }
+
+    #[tokio::test]
+    async fn upstream_eof_without_done_persists_a_failed_terminal_turn() {
+        let fixture = route_fixture();
+        publish_fake_engine(
+            &fixture,
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+        )
+        .await;
+        let chat = fixture.history.create_chat(1).await.unwrap();
+        let response = reqwest::Client::new()
+            .post(format!("{}/loxa/v1/chats/{}/turns", fixture.base, chat.id))
+            .header(header::AUTHORIZATION, &fixture.bearer)
+            .json(&json!({"model":"loxa","content":"hello"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await.unwrap();
+        assert!(body.contains("event: turn.failed"));
+        assert!(body.contains("incomplete_upstream_stream"));
+
+        let turn = fixture
+            .history
+            .list_turns(chat.id, LIST_DEFAULT_LIMIT, None)
+            .await
+            .unwrap()
+            .turns
+            .pop()
+            .unwrap();
+        assert_eq!(turn.state, TurnState::Failed);
+        assert_eq!(
+            turn.error_code.as_deref(),
+            Some("incomplete_upstream_stream")
+        );
+        fixture.shutdown();
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_a_turn_blocked_by_full_downstream_backpressure() {
+        let path = temp_history_path();
+        let root = path.parent().unwrap().to_owned();
+        let token = ControlToken::load_or_create(&root.join("control.token")).unwrap();
+        let (history, worker) = ChatHistory::spawn(path).unwrap();
+        let state = ChatRoutesState::new(token, history.clone(), GatewayState::new("test"));
+        let chat = history.create_chat(1).await.unwrap();
+        let turn = history
+            .begin_turn(
+                chat.id.clone(),
+                MessageContent::user("hello").unwrap(),
+                TurnProvenance::new("recipe", Some("engine"), Some("1")).unwrap(),
+                2,
+            )
+            .await
+            .unwrap();
+        let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
+        state.active.state.lock().unwrap().running.insert(
+            chat.id.to_string(),
+            ActiveTurn {
+                turn_id: turn.id.clone(),
+                cancel,
+            },
+        );
+        let (sender, _stalled_receiver) =
+            tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(32);
+        for _ in 0..32 {
+            sender.try_send(Ok(Bytes::from_static(b"full"))).unwrap();
+        }
+        let task_state = state.clone();
+        let chat_id = chat.id.clone();
+        let turn_id = turn.id.clone();
+        tokio::spawn(async move {
+            assert!(
+                !send_downstream(&sender, &mut cancelled, Bytes::from_static(b"blocked")).await
+            );
+            task_state
+                .history
+                .finalize(
+                    turn_id,
+                    TurnState::Cancelled,
+                    MessageContent::assistant("").unwrap(),
+                    None,
+                    3,
+                )
+                .await
+                .unwrap();
+            let mut active = task_state.active.state.lock().unwrap();
+            active.running.remove(chat_id.as_str());
+            task_state.active.empty.notify_all();
+        });
+
+        let shutdown_state = state.clone();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::task::spawn_blocking(move || shutdown_state.shutdown_and_wait()),
+        )
+        .await
+        .expect("shutdown must not deadlock on a full downstream channel")
+        .unwrap();
+        assert_eq!(
+            history.get_turn(turn.id).await.unwrap().state,
+            TurnState::Cancelled
+        );
+        worker.stop_and_join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

@@ -130,7 +130,50 @@ impl DownloadControl {
         D::Session: Send + 'static,
         G: GatewayPublisher + Send + 'static,
     {
-        let verification_cache = Arc::new(VerificationCache::default());
+        Self::spawn_with_lifecycle_components(
+            models_dir,
+            lifecycle,
+            Arc::new(VerificationCache::default()),
+            REGISTRY,
+        )
+    }
+
+    fn spawn_with_lifecycle_components<D, G>(
+        models_dir: PathBuf,
+        lifecycle: ModelLifecycle<D, G>,
+        verification_cache: Arc<VerificationCache>,
+        recipes: &'static [ModelEntry],
+    ) -> (Self, DownloadControlWorker)
+    where
+        D: EngineLifecycleDriver + Send + 'static,
+        D::Session: Send + 'static,
+        G: GatewayPublisher + Send + 'static,
+    {
+        let restart_verifier: Box<dyn RestartArtifactVerifier> =
+            Box::new(CacheRestartArtifactVerifier {
+                cache: Arc::clone(&verification_cache),
+            });
+        Self::spawn_with_lifecycle_components_and_verifier(
+            models_dir,
+            lifecycle,
+            verification_cache,
+            recipes,
+            restart_verifier,
+        )
+    }
+
+    fn spawn_with_lifecycle_components_and_verifier<D, G>(
+        models_dir: PathBuf,
+        lifecycle: ModelLifecycle<D, G>,
+        verification_cache: Arc<VerificationCache>,
+        recipes: &'static [ModelEntry],
+        restart_verifier: Box<dyn RestartArtifactVerifier>,
+    ) -> (Self, DownloadControlWorker)
+    where
+        D: EngineLifecycleDriver + Send + 'static,
+        D::Session: Send + 'static,
+        G: GatewayPublisher + Send + 'static,
+    {
         let operations = Arc::new(Mutex::new(OperationStore::new(OPERATION_CAPACITY)));
         let models_dir = Arc::new(models_dir);
         let verification_cancellation = MutationCancellation::new();
@@ -141,7 +184,7 @@ impl DownloadControl {
             models_dir: (*models_dir).clone(),
             operations: Arc::clone(&operations),
             downloader: Box::new(VerifiedDownloader),
-            recipes: REGISTRY,
+            recipes,
             verification_cancellation: verification_cancellation.clone(),
             verifier: Box::new(CacheArtifactVerifier {
                 cache: Arc::clone(&verification_cache),
@@ -151,6 +194,8 @@ impl DownloadControl {
                 snapshot: Arc::clone(&lifecycle_snapshot),
                 models_dir: (*models_dir).clone(),
                 verification_cache: Arc::clone(&verification_cache),
+                recipes,
+                restart_verifier,
             })),
         };
         let (actor, worker) = NodeActor::spawn(executor);
@@ -160,7 +205,7 @@ impl DownloadControl {
         let verification_worker = thread::spawn(move || {
             verify_existing_recipes(
                 &background_models_dir,
-                REGISTRY,
+                recipes,
                 &background_cache,
                 &background_cancellation,
             );
@@ -171,7 +216,7 @@ impl DownloadControl {
                 actor: actor.clone(),
                 models_dir,
                 verification_cache,
-                recipes: REGISTRY,
+                recipes,
                 lifecycle_snapshot: Some(lifecycle_snapshot),
                 lifecycle_destructive: Some(lifecycle_destructive),
             },
@@ -261,6 +306,22 @@ impl DownloadControl {
             .ok_or(DownloadControlError::Missing)?;
         LaunchPlan::from_verified_inventory(&entry, &self.models_dir)
             .map_err(|_| DownloadControlError::ModelUnavailable)?;
+        self.start_lifecycle(
+            OperationKind::Load,
+            Some(model_id),
+            Mutation::Load {
+                model_id: model_id.to_owned(),
+            },
+        )
+    }
+
+    pub(crate) fn start_startup_load(
+        &self,
+        model_id: &str,
+    ) -> Result<String, DownloadControlError> {
+        if self.lifecycle_snapshot.is_none() || find_recipe(self.recipes, model_id).is_none() {
+            return Err(DownloadControlError::Missing);
+        }
         self.start_lifecycle(
             OperationKind::Load,
             Some(model_id),
@@ -432,6 +493,7 @@ trait LifecycleMutationExecutor: Send {
     ) -> Result<(), LifecycleError>;
     fn complete_operation(&mut self);
     fn shutdown(&mut self) -> Result<(), LifecycleError>;
+    fn tick(&mut self);
 }
 
 struct LifecycleExecutor<D: EngineLifecycleDriver, G: GatewayPublisher> {
@@ -439,6 +501,44 @@ struct LifecycleExecutor<D: EngineLifecycleDriver, G: GatewayPublisher> {
     snapshot: Arc<Mutex<LifecycleSnapshot>>,
     models_dir: PathBuf,
     verification_cache: Arc<VerificationCache>,
+    recipes: &'static [ModelEntry],
+    restart_verifier: Box<dyn RestartArtifactVerifier>,
+}
+
+trait RestartArtifactVerifier: Send {
+    fn verify(
+        &mut self,
+        models_dir: &std::path::Path,
+        recipe: &'static ModelEntry,
+        cancellation: &dyn VerificationCancellation,
+    ) -> std::io::Result<VerifiedArtifact>;
+}
+
+struct CacheRestartArtifactVerifier {
+    cache: Arc<VerificationCache>,
+}
+
+impl RestartArtifactVerifier for CacheRestartArtifactVerifier {
+    fn verify(
+        &mut self,
+        models_dir: &std::path::Path,
+        recipe: &'static ModelEntry,
+        cancellation: &dyn VerificationCancellation,
+    ) -> std::io::Result<VerifiedArtifact> {
+        self.cache
+            .verify_recipe_with_cancellation(models_dir, recipe, cancellation)
+    }
+}
+
+struct RestartVerificationCancellation {
+    operation: MutationCancellation,
+    stopping: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl VerificationCancellation for RestartVerificationCancellation {
+    fn is_cancelled(&self) -> bool {
+        self.operation.is_cancelled() || self.stopping.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 impl<D, G> LifecycleMutationExecutor for LifecycleExecutor<D, G>
@@ -465,8 +565,13 @@ where
         }
         match mutation {
             Mutation::Load { model_id } => {
+                let recipe =
+                    find_recipe(self.recipes, model_id).ok_or(LifecycleError::ModelNotVerified)?;
+                self.verification_cache
+                    .verify_recipe_with_cancellation(&self.models_dir, recipe, cancellation)
+                    .map_err(|_| LifecycleError::ModelNotVerified)?;
                 let entry = loxa_core::model_inventory::verified_recipe_inventory_with_cache(
-                    REGISTRY,
+                    self.recipes,
                     &self.models_dir,
                     loxa_core::model_inventory::current_available_memory_bytes(),
                     &self.verification_cache,
@@ -486,6 +591,42 @@ where
         let result = self.lifecycle.shutdown();
         *self.snapshot.lock().expect("lifecycle snapshot poisoned") = self.lifecycle.snapshot();
         result
+    }
+
+    fn tick(&mut self) {
+        if let Ok(Some(model_id)) = self.lifecycle.poll_ready_session() {
+            let cancellation = MutationCancellation::new();
+            let verification_cancellation = RestartVerificationCancellation {
+                operation: cancellation.clone(),
+                stopping: self.lifecycle.stop_token(),
+            };
+            let restart = find_recipe(self.recipes, &model_id)
+                .ok_or(LifecycleError::ModelNotVerified)
+                .and_then(|recipe| {
+                    self.restart_verifier
+                        .verify(&self.models_dir, recipe, &verification_cancellation)
+                        .map_err(|_| LifecycleError::ModelNotVerified)?;
+                    let entry = loxa_core::model_inventory::verified_recipe_inventory_with_cache(
+                        self.recipes,
+                        &self.models_dir,
+                        loxa_core::model_inventory::current_available_memory_bytes(),
+                        &self.verification_cache,
+                    )
+                    .into_iter()
+                    .find(|entry| entry.id == model_id)
+                    .ok_or(LifecycleError::ModelNotVerified)?;
+                    LaunchPlan::from_verified_inventory(&entry, &self.models_dir)
+                })
+                .and_then(|plan| self.lifecycle.restart_verified(plan, &cancellation));
+            if let Err(error) = restart {
+                if self.lifecycle.stop_requested() {
+                    self.lifecycle.finish_stopped_supervision();
+                } else {
+                    self.lifecycle.fail_supervision(error);
+                }
+            }
+        }
+        *self.snapshot.lock().expect("lifecycle snapshot poisoned") = self.lifecycle.snapshot();
     }
 
     fn complete_operation(&mut self) {
@@ -745,6 +886,18 @@ impl MutationExecutor for DownloadExecutor {
             let _ = lifecycle.shutdown();
         }
     }
+
+    fn tick(&mut self) {
+        if let Some(lifecycle) = &mut self.lifecycle {
+            lifecycle.tick();
+        }
+    }
+
+    fn tick_interval(&self) -> Option<std::time::Duration> {
+        self.lifecycle
+            .as_ref()
+            .map(|_| crate::actor::IDLE_TICK_INTERVAL)
+    }
 }
 
 fn public_lifecycle_error(error: &LifecycleError) -> &'static str {
@@ -756,10 +909,10 @@ fn public_lifecycle_error(error: &LifecycleError) -> &'static str {
         LifecycleError::CancellationNotSafe => "model operation passed its safe cancellation point",
         LifecycleError::Stopping => "node is stopping",
         LifecycleError::RecoveryRequired { .. } => "node recovery is required",
-        LifecycleError::InvalidCandidate(_)
-        | LifecycleError::StartFailed(_)
-        | LifecycleError::ReadinessFailed(_)
-        | LifecycleError::TeardownFailed(_) => "model lifecycle operation failed safely",
+        LifecycleError::InvalidCandidate(_) => "engine candidate validation failed safely",
+        LifecycleError::StartFailed(_) => "engine startup failed safely",
+        LifecycleError::ReadinessFailed(_) => "engine readiness failed safely",
+        LifecycleError::TeardownFailed(_) => "engine teardown failed safely",
     }
 }
 
@@ -869,6 +1022,133 @@ mod tests {
         fn publish(&mut self, _: &LaunchPlan, _: &crate::model_lifecycle::SessionCorrelation) {}
     }
 
+    struct ReadyLifecycleDriver;
+    impl EngineLifecycleDriver for ReadyLifecycleDriver {
+        type Session = ();
+
+        fn start(
+            &mut self,
+            owner: &crate::model_lifecycle::StableNodeOwner,
+            plan: &LaunchPlan,
+            generation: u64,
+        ) -> Result<crate::model_lifecycle::StartedSession<()>, LifecycleError> {
+            Ok(crate::model_lifecycle::StartedSession {
+                value: (),
+                correlation: crate::model_lifecycle::SessionCorrelation {
+                    generation,
+                    child_pid: 101,
+                    child_process_start_time_unix_s: 202,
+                    server_id: "fixture-server".into(),
+                    model_id: plan.model_id.clone(),
+                    port: 9_001,
+                    committed_run_id: owner.run_id.clone(),
+                    owner_pid: owner.pid,
+                    owner_process_start_time_unix_s: owner.process_start_time_unix_s,
+                    gateway_port: owner.gateway_port,
+                    generation_alias: format!("loxa-{}-g{generation}", owner.run_id),
+                    engine_version: "fixture".into(),
+                },
+            })
+        }
+
+        fn wait_ready(
+            &mut self,
+            _: &mut crate::model_lifecycle::StartedSession<()>,
+            _: crate::model_lifecycle::LifecycleSignals<'_>,
+        ) -> Result<(), LifecycleError> {
+            Ok(())
+        }
+
+        fn stop_exact(
+            &mut self,
+            _: crate::model_lifecycle::StartedSession<()>,
+        ) -> Result<(), LifecycleError> {
+            Ok(())
+        }
+    }
+
+    struct RestartProbeDriver {
+        starts: Arc<AtomicUsize>,
+        exit_requested: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl EngineLifecycleDriver for RestartProbeDriver {
+        type Session = ();
+
+        fn start(
+            &mut self,
+            owner: &crate::model_lifecycle::StableNodeOwner,
+            plan: &LaunchPlan,
+            generation: u64,
+        ) -> Result<crate::model_lifecycle::StartedSession<()>, LifecycleError> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::model_lifecycle::StartedSession {
+                value: (),
+                correlation: crate::model_lifecycle::SessionCorrelation {
+                    generation,
+                    child_pid: 100 + generation as u32,
+                    child_process_start_time_unix_s: 200 + generation,
+                    server_id: format!("fixture-server-{generation}"),
+                    model_id: plan.model_id.clone(),
+                    port: 9_000 + generation as u16,
+                    committed_run_id: owner.run_id.clone(),
+                    owner_pid: owner.pid,
+                    owner_process_start_time_unix_s: owner.process_start_time_unix_s,
+                    gateway_port: owner.gateway_port,
+                    generation_alias: format!("loxa-{}-g{generation}", owner.run_id),
+                    engine_version: "fixture".into(),
+                },
+            })
+        }
+
+        fn wait_ready(
+            &mut self,
+            _: &mut crate::model_lifecycle::StartedSession<()>,
+            _: crate::model_lifecycle::LifecycleSignals<'_>,
+        ) -> Result<(), LifecycleError> {
+            Ok(())
+        }
+
+        fn stop_exact(
+            &mut self,
+            _: crate::model_lifecycle::StartedSession<()>,
+        ) -> Result<(), LifecycleError> {
+            Ok(())
+        }
+
+        fn poll_exact(
+            &mut self,
+            _: &mut crate::model_lifecycle::StartedSession<Self::Session>,
+        ) -> Result<crate::model_lifecycle::ExactSessionStatus, LifecycleError> {
+            Ok(if self.exit_requested.swap(false, Ordering::SeqCst) {
+                crate::model_lifecycle::ExactSessionStatus::Exited
+            } else {
+                crate::model_lifecycle::ExactSessionStatus::Running
+            })
+        }
+    }
+
+    struct CountingGateway(Arc<AtomicUsize>);
+    impl GatewayPublisher for CountingGateway {
+        fn withdraw(&mut self) {}
+        fn publish(&mut self, _: &LaunchPlan, _: &crate::model_lifecycle::SessionCorrelation) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct RaceGateway {
+        withdraws: Arc<AtomicUsize>,
+        publishes: Arc<AtomicUsize>,
+    }
+    impl GatewayPublisher for RaceGateway {
+        fn withdraw(&mut self) {
+            self.withdraws.fetch_add(1, Ordering::SeqCst);
+        }
+        fn publish(&mut self, _: &LaunchPlan, _: &crate::model_lifecycle::SessionCorrelation) {
+            self.publishes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     struct FakeDownloader {
         result: Option<Result<(), DownloadError>>,
     }
@@ -884,6 +1164,51 @@ mod tests {
         entered: std::sync::mpsc::Sender<()>,
         release: std::sync::mpsc::Receiver<()>,
         cache: Arc<VerificationCache>,
+    }
+
+    struct GatedRestartVerifier {
+        entered: std::sync::mpsc::Sender<()>,
+        cache: Arc<VerificationCache>,
+    }
+
+    impl RestartArtifactVerifier for GatedRestartVerifier {
+        fn verify(
+            &mut self,
+            models_dir: &std::path::Path,
+            recipe: &'static ModelEntry,
+            cancellation: &dyn VerificationCancellation,
+        ) -> std::io::Result<VerifiedArtifact> {
+            struct HashLoopGate<'a> {
+                cancellation: &'a dyn VerificationCancellation,
+                entered: &'a std::sync::mpsc::Sender<()>,
+                checks: AtomicUsize,
+            }
+
+            impl VerificationCancellation for HashLoopGate<'_> {
+                fn is_cancelled(&self) -> bool {
+                    // The verification gate performs the first cancellation check. The
+                    // second check is the checksum loop's first iteration, after a cache
+                    // miss has acquired a verification permit and opened the artifact.
+                    if self.checks.fetch_add(1, Ordering::SeqCst) == 1 {
+                        self.entered.send(()).unwrap();
+                        while !self.cancellation.is_cancelled() {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                    }
+                    self.cancellation.is_cancelled()
+                }
+            }
+
+            self.cache.verify_recipe_with_cancellation(
+                models_dir,
+                recipe,
+                &HashLoopGate {
+                    cancellation,
+                    entered: &self.entered,
+                    checks: AtomicUsize::new(0),
+                },
+            )
+        }
     }
 
     impl ArtifactVerifier for FakeArtifactVerifier {
@@ -1408,6 +1733,282 @@ mod tests {
     }
 
     #[test]
+    fn startup_load_verifies_known_artifact_then_uses_the_serial_lifecycle_actor() {
+        let dir = std::env::temp_dir().join(format!("loxa-startup-load-{}", now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let recipe = Box::leak(Box::new(ModelEntry {
+            id: "fixture",
+            repo: "owner/repo",
+            revision: "pinned",
+            filename: "fixture.gguf",
+            sha256: "770e607624d689265ca6c44884d0807d9b054d23c473c106c72be9de08b7376c",
+            size_bytes: 4,
+            license: "apache-2.0",
+            params: "tiny",
+            quant: "Q4",
+            min_free_mem_gb: 0.0,
+        }));
+        let recipes: &'static [ModelEntry] = std::slice::from_ref(recipe);
+        std::fs::write(dir.join(recipe.filename), b"good").unwrap();
+        let lifecycle = ModelLifecycle::new(
+            crate::model_lifecycle::StableNodeOwner {
+                run_id: "owner".into(),
+                pid: 1,
+                process_start_time_unix_s: 2,
+                gateway_port: 8_080,
+            },
+            ReadyLifecycleDriver,
+            NoopGateway,
+        );
+        let (control, worker) = DownloadControl::spawn_with_lifecycle_components(
+            dir.clone(),
+            lifecycle,
+            Arc::new(VerificationCache::default()),
+            recipes,
+        );
+
+        let id = control.start_startup_load("fixture").unwrap();
+        let operation = (0..200)
+            .find_map(|_| {
+                let operation = control.operation(&id)?;
+                if matches!(
+                    operation.status,
+                    OperationStatus::Succeeded | OperationStatus::Failed
+                ) {
+                    Some(operation)
+                } else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    None
+                }
+            })
+            .expect("startup load reaches a terminal operation");
+
+        assert_eq!(operation.status, OperationStatus::Succeeded);
+        assert_eq!(
+            control
+                .lifecycle_snapshot()
+                .unwrap()
+                .active_model_id
+                .as_deref(),
+            Some("fixture")
+        );
+        let unload = control.start_unload().unwrap();
+        for _ in 0..200 {
+            if control
+                .operation(&unload)
+                .is_some_and(|operation| operation.status == OperationStatus::Succeeded)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            control.operation(&unload).unwrap().status,
+            OperationStatus::Succeeded
+        );
+        let reload = control.start_load("fixture").unwrap();
+        for _ in 0..200 {
+            if control
+                .operation(&reload)
+                .is_some_and(|operation| operation.status == OperationStatus::Succeeded)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            control.operation(&reload).unwrap().status,
+            OperationStatus::Succeeded
+        );
+        worker.stop_and_join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn automatic_restart_reverifies_mutated_artifact_before_any_spawn_or_publish() {
+        let dir = std::env::temp_dir().join(format!("loxa-restart-reverify-{}", now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let recipe = Box::leak(Box::new(ModelEntry {
+            id: "fixture-restart",
+            repo: "owner/repo",
+            revision: "pinned",
+            filename: "fixture.gguf",
+            sha256: "770e607624d689265ca6c44884d0807d9b054d23c473c106c72be9de08b7376c",
+            size_bytes: 4,
+            license: "apache-2.0",
+            params: "tiny",
+            quant: "Q4",
+            min_free_mem_gb: 0.0,
+        }));
+        let recipes: &'static [ModelEntry] = std::slice::from_ref(recipe);
+        std::fs::write(dir.join(recipe.filename), b"good").unwrap();
+        let starts = Arc::new(AtomicUsize::new(0));
+        let publishes = Arc::new(AtomicUsize::new(0));
+        let exit_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let lifecycle = ModelLifecycle::new(
+            crate::model_lifecycle::StableNodeOwner {
+                run_id: "owner".into(),
+                pid: 1,
+                process_start_time_unix_s: 2,
+                gateway_port: 8_080,
+            },
+            RestartProbeDriver {
+                starts: Arc::clone(&starts),
+                exit_requested: Arc::clone(&exit_requested),
+            },
+            CountingGateway(Arc::clone(&publishes)),
+        );
+        let (control, worker) = DownloadControl::spawn_with_lifecycle_components(
+            dir.clone(),
+            lifecycle,
+            Arc::new(VerificationCache::default()),
+            recipes,
+        );
+        let initial = control.start_startup_load(recipe.id).unwrap();
+        for _ in 0..200 {
+            if control
+                .operation(&initial)
+                .is_some_and(|operation| operation.status == OperationStatus::Succeeded)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert_eq!(publishes.load(Ordering::SeqCst), 1);
+
+        std::fs::write(dir.join(recipe.filename), b"evil!").unwrap();
+        exit_requested.store(true, Ordering::SeqCst);
+        for _ in 0..40 {
+            if control.lifecycle_snapshot().is_some_and(|snapshot| {
+                snapshot.status == crate::model_lifecycle::NodeLifecycleStatus::RecoveryRequired
+            }) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let snapshot = control.lifecycle_snapshot().unwrap();
+        assert_eq!(
+            snapshot.status,
+            crate::model_lifecycle::NodeLifecycleStatus::RecoveryRequired
+        );
+        assert_eq!(snapshot.active_model_id, None);
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert_eq!(publishes.load(Ordering::SeqCst), 1);
+        worker.stop_and_join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn restart_verification_cancellation_is_connected_to_shared_lifecycle_stop() {
+        let operation = MutationCancellation::new();
+        let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancellation = RestartVerificationCancellation {
+            operation: operation.clone(),
+            stopping: Arc::clone(&stopping),
+        };
+        assert!(!cancellation.is_cancelled());
+        stopping.store(true, Ordering::SeqCst);
+        assert!(cancellation.is_cancelled());
+
+        stopping.store(false, Ordering::SeqCst);
+        operation.cancel();
+        assert!(cancellation.is_cancelled());
+    }
+
+    #[test]
+    fn actor_stop_cancels_in_progress_restart_hash_without_spawn_or_recovery() {
+        let dir = std::env::temp_dir().join(format!(
+            "loxa-stop-restart-hash-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let recipe = Box::leak(Box::new(ModelEntry {
+            id: "stop-restart-fixture",
+            repo: "owner/repo",
+            revision: "pinned",
+            filename: "fixture.gguf",
+            sha256: "770e607624d689265ca6c44884d0807d9b054d23c473c106c72be9de08b7376c",
+            size_bytes: 4,
+            license: "apache-2.0",
+            params: "tiny",
+            quant: "Q4",
+            min_free_mem_gb: 0.0,
+        }));
+        let recipes: &'static [ModelEntry] = std::slice::from_ref(recipe);
+        std::fs::write(dir.join(recipe.filename), b"good").unwrap();
+        let starts = Arc::new(AtomicUsize::new(0));
+        let publishes = Arc::new(AtomicUsize::new(0));
+        let exit_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let owner = crate::model_lifecycle::StableNodeOwner {
+            run_id: "stable-owner".into(),
+            pid: 1,
+            process_start_time_unix_s: 2,
+            gateway_port: 8_080,
+        };
+        let lifecycle = ModelLifecycle::new(
+            owner.clone(),
+            RestartProbeDriver {
+                starts: Arc::clone(&starts),
+                exit_requested: Arc::clone(&exit_requested),
+            },
+            CountingGateway(Arc::clone(&publishes)),
+        );
+        let verification_cache = Arc::new(VerificationCache::default());
+        let (control, worker) = DownloadControl::spawn_with_lifecycle_components_and_verifier(
+            dir.clone(),
+            lifecycle,
+            Arc::clone(&verification_cache),
+            recipes,
+            Box::new(GatedRestartVerifier {
+                entered: entered_tx,
+                cache: Arc::clone(&verification_cache),
+            }),
+        );
+        let initial = control.start_startup_load(recipe.id).unwrap();
+        for _ in 0..200 {
+            if control
+                .operation(&initial)
+                .is_some_and(|operation| operation.status == OperationStatus::Succeeded)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert_eq!(publishes.load(Ordering::SeqCst), 1);
+        std::thread::sleep(Duration::from_millis(10));
+        std::fs::write(dir.join(recipe.filename), b"evil").unwrap();
+        assert_ne!(
+            verification_cache.artifact_state(&dir, recipe),
+            loxa_core::model_inventory::ArtifactState::Downloaded
+        );
+        exit_requested.store(true, Ordering::SeqCst);
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("restart verification entered the checksum loop after a cache miss");
+
+        let started = std::time::Instant::now();
+        worker.stop_and_join().unwrap();
+        assert!(started.elapsed() < Duration::from_millis(500));
+        let snapshot = control.lifecycle_snapshot().unwrap();
+        assert_eq!(
+            snapshot.status,
+            crate::model_lifecycle::NodeLifecycleStatus::Unloaded
+        );
+        assert_ne!(
+            snapshot.status,
+            crate::model_lifecycle::NodeLifecycleStatus::RecoveryRequired
+        );
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert_eq!(publishes.load(Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn unified_actor_runs_unload_and_publishes_operation_events() {
         let lifecycle = ModelLifecycle::new(
             crate::model_lifecycle::StableNodeOwner {
@@ -1522,6 +2123,150 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_control_cancel_and_destructive_commit_publish_one_truthful_terminal_state() {
+        let recipe = Box::leak(Box::new(ModelEntry {
+            id: "race-fixture",
+            repo: "owner/repo",
+            revision: "pinned",
+            filename: "race.gguf",
+            sha256: "770e607624d689265ca6c44884d0807d9b054d23c473c106c72be9de08b7376c",
+            size_bytes: 4,
+            license: "apache-2.0",
+            params: "tiny",
+            quant: "Q4",
+            min_free_mem_gb: 0.0,
+        }));
+        let recipes: &'static [ModelEntry] = std::slice::from_ref(recipe);
+        for kind in [OperationKind::Load, OperationKind::Unload] {
+            for cancel_wins in [true, false] {
+                let dir = std::env::temp_dir().join(format!(
+                    "loxa-lifecycle-race-{}-{}-{}",
+                    now_ms(),
+                    kind as u8,
+                    cancel_wins
+                ));
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join(recipe.filename), b"good").unwrap();
+                let cache = Arc::new(VerificationCache::default());
+                cache.verify_recipe(&dir, recipe).unwrap();
+                let starts = Arc::new(AtomicUsize::new(0));
+                let withdraws = Arc::new(AtomicUsize::new(0));
+                let publishes = Arc::new(AtomicUsize::new(0));
+                let mut lifecycle = ModelLifecycle::new(
+                    crate::model_lifecycle::StableNodeOwner {
+                        run_id: "owner".into(),
+                        pid: 1,
+                        process_start_time_unix_s: 2,
+                        gateway_port: 8080,
+                    },
+                    RestartProbeDriver {
+                        starts: Arc::clone(&starts),
+                        exit_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    },
+                    RaceGateway {
+                        withdraws: Arc::clone(&withdraws),
+                        publishes: Arc::clone(&publishes),
+                    },
+                );
+                if kind == OperationKind::Unload {
+                    lifecycle
+                        .load(
+                            LaunchPlan {
+                                model_id: recipe.id.into(),
+                                artifact_path: dir.join(recipe.filename),
+                                engine: "llama.cpp".into(),
+                            },
+                            &MutationCancellation::new(),
+                        )
+                        .unwrap();
+                    lifecycle.complete_operation();
+                }
+                let baseline_starts = starts.load(Ordering::SeqCst);
+                let baseline_withdraws = withdraws.load(Ordering::SeqCst);
+                let baseline_publishes = publishes.load(Ordering::SeqCst);
+                let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                let (before_release, after_release) = if cancel_wins {
+                    (Some(release_rx), None)
+                } else {
+                    (None, Some(release_rx))
+                };
+                lifecycle.set_destructive_test_hook(crate::model_lifecycle::DestructiveTestHook {
+                    before_entered: cancel_wins.then_some(entered_tx.clone()),
+                    before_release,
+                    after_entered: (!cancel_wins).then_some(entered_tx),
+                    after_release,
+                });
+                let (control, worker) = DownloadControl::spawn_with_lifecycle_components(
+                    dir.clone(),
+                    lifecycle,
+                    cache,
+                    recipes,
+                );
+                let id = if kind == OperationKind::Load {
+                    control.start_load(recipe.id).unwrap()
+                } else {
+                    control.start_unload().unwrap()
+                };
+                entered_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("operation reaches destructive race hook");
+                let cancelled = control.cancel(&id);
+                release_tx.send(()).unwrap();
+                let operation = (0..200)
+                    .find_map(|_| {
+                        let operation = control.operation(&id)?;
+                        matches!(
+                            operation.status,
+                            OperationStatus::Succeeded
+                                | OperationStatus::Failed
+                                | OperationStatus::Cancelled
+                        )
+                        .then_some(operation)
+                        .or_else(|| {
+                            std::thread::sleep(Duration::from_millis(5));
+                            None
+                        })
+                    })
+                    .expect("operation reaches terminal state");
+
+                if cancel_wins {
+                    assert_eq!(cancelled, Ok(OperationStatus::Cancelled));
+                    assert_eq!(operation.status, OperationStatus::Cancelled);
+                    assert_eq!(starts.load(Ordering::SeqCst), baseline_starts);
+                    assert_eq!(withdraws.load(Ordering::SeqCst), baseline_withdraws);
+                    assert_eq!(publishes.load(Ordering::SeqCst), baseline_publishes);
+                } else {
+                    assert_eq!(cancelled, Err(DownloadControlError::CancellationNotSafe));
+                    assert_eq!(operation.status, OperationStatus::Succeeded);
+                    assert_eq!(withdraws.load(Ordering::SeqCst), baseline_withdraws + 1);
+                    if kind == OperationKind::Load {
+                        assert_eq!(starts.load(Ordering::SeqCst), baseline_starts + 1);
+                        assert_eq!(publishes.load(Ordering::SeqCst), baseline_publishes + 1);
+                    } else {
+                        assert_eq!(starts.load(Ordering::SeqCst), baseline_starts);
+                    }
+                }
+                assert_eq!(
+                    control
+                        .snapshot_since(0)
+                        .events
+                        .iter()
+                        .filter(|event| event.operation.id == id
+                            && matches!(
+                                event.operation.status,
+                                OperationStatus::Succeeded | OperationStatus::Cancelled
+                            ))
+                        .count(),
+                    1
+                );
+                worker.stop_and_join().unwrap();
+                std::fs::remove_dir_all(dir).unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn public_lifecycle_snapshot_correlates_transition_and_operation_under_one_lock() {
         let lifecycle = ModelLifecycle::new(
             crate::model_lifecycle::StableNodeOwner {
@@ -1539,6 +2284,10 @@ mod tests {
             snapshot: Arc::clone(&snapshot),
             models_dir: std::env::temp_dir(),
             verification_cache: Arc::new(VerificationCache::default()),
+            recipes: REGISTRY,
+            restart_verifier: Box::new(CacheRestartArtifactVerifier {
+                cache: Arc::new(VerificationCache::default()),
+            }),
         };
 
         executor

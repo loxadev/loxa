@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub mod actor;
+pub mod chat_history;
+pub mod chat_routes;
 pub mod control_router;
 pub mod download_control;
 mod engine_session;
@@ -40,6 +42,27 @@ impl NodePaths {
     fn log_path(&self, id: &str, port: u16, started_at_unix_s: u64) -> PathBuf {
         self.logs_dir
             .join(format!("{id}-{port}-{started_at_unix_s}.log"))
+    }
+
+    fn loxa_dir(&self) -> io::Result<&Path> {
+        let state_dir = self
+            .state_path
+            .parent()
+            .ok_or_else(|| io::Error::other("runtime state path has no parent directory"))?;
+        if state_dir.file_name().is_some_and(|name| name == "run") {
+            state_dir
+                .parent()
+                .ok_or_else(|| io::Error::other("runtime run path has no Loxa directory"))
+        } else {
+            Ok(state_dir)
+        }
+    }
+
+    fn history_path(&self) -> io::Result<PathBuf> {
+        Ok(self
+            .loxa_dir()?
+            .join("history")
+            .join("chat-history.sqlite3"))
     }
 }
 
@@ -273,6 +296,16 @@ pub enum LifecycleEvent {
     ModelReady {
         server: ManagedServer,
     },
+    StableModelReady {
+        model_id: String,
+        port: u16,
+        model_alias: String,
+    },
+    StableModelFailed {
+        model_id: String,
+        reason: String,
+        recovery_required: bool,
+    },
     Restarting {
         process_label: String,
         before_healthy: bool,
@@ -415,6 +448,7 @@ pub fn run_model(
                         lifecycle: supervisor::RunLifecycle::Starting,
                         generation: 0,
                         generation_alias: format!("loxa-{run_id}-g0"),
+                        control_port: None,
                         port: selected_port,
                         log_path,
                         child_pid: None,
@@ -869,6 +903,10 @@ fn requested_startup_model<'a>(
     }
 }
 
+fn uses_stable_node_host(startup_model: Option<&str>, engine: RuntimeBackendKind) -> bool {
+    startup_model.is_none() || engine == RuntimeBackendKind::LlamaCpp
+}
+
 pub fn serve_node(
     requested_model: Option<&str>,
     port: Option<u16>,
@@ -878,7 +916,8 @@ pub fn serve_node(
 ) -> io::Result<RunTermination> {
     let startup_model = requested_startup_model(&paths.models_dir, requested_model, engine)
         .map_err(io::Error::other)?;
-    let (gateway_port, unloaded_run) = if startup_model.is_none() {
+    let stable_llama_node = engine == RuntimeBackendKind::LlamaCpp;
+    let (gateway_port, unloaded_run) = if uses_stable_node_host(startup_model, engine) {
         let reservation =
             supervisor::reserve_localhost_port(Some(port.unwrap_or(DEFAULT_GATEWAY_PORT)))
                 .map_err(supervisor_error_to_io)?;
@@ -916,47 +955,42 @@ pub fn serve_node(
             download_control::DownloadControl::spawn(paths.models_dir.clone())
         }
     });
-    let gateway_router = match (|| -> io::Result<_> {
-        Ok(if let Some(run) = &unloaded_run {
-            let state_dir = paths
-                .state_path
-                .parent()
-                .ok_or_else(|| io::Error::other("runtime state path has no parent directory"))?;
-            let loxa_dir = if state_dir.file_name().is_some_and(|name| name == "run") {
-                state_dir
-                    .parent()
-                    .ok_or_else(|| io::Error::other("runtime run path has no Loxa directory"))?
-            } else {
-                state_dir
-            };
-            let token_path = loxa_dir.join("control.token");
-            let token = loxa_core::control::auth::ControlToken::load_or_create(&token_path)?;
-            loxa_core::gateway::router(gateway_state.clone()).merge(control_router::router(
-                control_router::ControlState::new(
-                    token,
-                    format!("loxa-node-{}", std::process::id()),
-                    run.run_id.clone(),
-                    download_runtime
-                        .as_ref()
-                        .expect("unloaded node has download control")
-                        .0
-                        .clone(),
-                ),
-            ))
-        } else {
-            loxa_core::gateway::router(gateway_state.clone())
-        })
-    })() {
-        Ok(router) => router,
+    let loxa_dir = paths.loxa_dir()?;
+    let token_path = loxa_dir.join("control.token");
+    let token = match loxa_core::control::auth::ControlToken::load_or_create(&token_path) {
+        Ok(token) => token,
         Err(error) => {
-            if let Some(run) = &unloaded_run {
-                let _ = finish_unloaded_owner(paths, run);
-            }
-            if let Some((_, worker)) = download_runtime.take() {
-                let _ = worker.stop_and_join();
-            }
+            let _ =
+                cleanup_stable_node_runtime(paths, unloaded_run.as_ref(), &mut download_runtime);
             return Err(error);
         }
+    };
+    let history_path = paths.history_path()?;
+    let (history, history_worker) = match chat_history::ChatHistory::spawn(history_path) {
+        Ok(history) => history,
+        Err(error) => {
+            let _ =
+                cleanup_stable_node_runtime(paths, unloaded_run.as_ref(), &mut download_runtime);
+            return Err(io::Error::other(error));
+        }
+    };
+    let chat_routes_state =
+        chat_routes::ChatRoutesState::new(token.clone(), history, gateway_state.clone());
+    let router = loxa_core::gateway::router(gateway_state.clone())
+        .merge(chat_routes::router(chat_routes_state.clone()));
+    let gateway_router = if let Some(run) = &unloaded_run {
+        router.merge(control_router::router(control_router::ControlState::new(
+            token,
+            format!("loxa-node-{}", std::process::id()),
+            run.run_id.clone(),
+            download_runtime
+                .as_ref()
+                .expect("unloaded node has download control")
+                .0
+                .clone(),
+        )))
+    } else {
+        router
     };
     let gateway = match loxa_core::gateway::GatewayServer::start_with_router(
         gateway_port,
@@ -965,12 +999,9 @@ pub fn serve_node(
     ) {
         Ok(gateway) => gateway,
         Err(error) => {
-            if let Some(run) = &unloaded_run {
-                let _ = finish_unloaded_owner(paths, run);
-            }
-            if let Some((_, worker)) = download_runtime.take() {
-                let _ = worker.stop_and_join();
-            }
+            let _ = history_worker.stop_and_join();
+            let _ =
+                cleanup_stable_node_runtime(paths, unloaded_run.as_ref(), &mut download_runtime);
             return Err(error);
         }
     };
@@ -979,12 +1010,33 @@ pub fn serve_node(
             port: gateway.port(),
             model_alias: "loxa".to_string(),
         }) {
-            if let Some(run) = &unloaded_run {
-                let _ = finish_unloaded_owner(paths, run);
-            }
-            return Err(error);
+            return match cleanup_stable_node_runtime(
+                paths,
+                unloaded_run.as_ref(),
+                &mut download_runtime,
+            ) {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(cleanup),
+            };
         }
         match startup_model {
+            Some(model_id) if stable_llama_node => run_stable_node_actor(
+                paths,
+                unloaded_run.expect("stable llama node owner claimed"),
+                Some(
+                    download_runtime
+                        .as_ref()
+                        .expect("stable llama node has model control")
+                        .0
+                        .clone(),
+                ),
+                download_runtime
+                    .take()
+                    .expect("stable llama node has model control")
+                    .1,
+                Some(model_id),
+                Some(events),
+            ),
             Some(model_id) => run_model(
                 RunRequest {
                     id: model_id,
@@ -996,29 +1048,70 @@ pub fn serve_node(
                 Some(&gateway_state),
                 events,
             ),
-            None => run_unloaded_actor(
+            None => run_stable_node_actor(
                 paths,
                 unloaded_run.expect("unloaded owner claimed"),
+                Some(
+                    download_runtime
+                        .as_ref()
+                        .expect("unloaded node has download control")
+                        .0
+                        .clone(),
+                ),
                 download_runtime
                     .take()
                     .expect("unloaded node has download control")
                     .1,
+                None,
+                Some(events),
             ),
         }
     })();
     gateway_state.withdraw();
+    chat_routes_state.shutdown_and_wait();
     let shutdown = gateway.shutdown();
-    match (outcome, shutdown) {
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
-        (Ok(exit), Ok(())) => Ok(exit),
+    let history_shutdown = history_worker.stop_and_join().map_err(io::Error::other);
+    match (outcome, shutdown, history_shutdown) {
+        (Err(error), _, _) => Err(error),
+        (Ok(_), Err(error), _) => Err(error),
+        (Ok(_), Ok(()), Err(error)) => Err(error),
+        (Ok(exit), Ok(()), Ok(())) => Ok(exit),
     }
 }
 
+fn cleanup_stable_node_runtime(
+    paths: &NodePaths,
+    run: Option<&supervisor::ManagedRun>,
+    runtime: &mut Option<(
+        download_control::DownloadControl,
+        download_control::DownloadControlWorker,
+    )>,
+) -> io::Result<()> {
+    let worker = runtime.take().map(|(_, worker)| worker.stop_and_join());
+    let owner = run.map(|run| finish_unloaded_owner(paths, run));
+    match (worker, owner) {
+        (Some(Err(error)), _) => Err(error),
+        (_, Some(Err(error))) => Err(error),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
 fn run_unloaded_actor(
     paths: &NodePaths,
     run: supervisor::ManagedRun,
     download_worker: download_control::DownloadControlWorker,
+) -> io::Result<RunTermination> {
+    run_stable_node_actor(paths, run, None, download_worker, None, None)
+}
+
+fn run_stable_node_actor(
+    paths: &NodePaths,
+    run: supervisor::ManagedRun,
+    download_control: Option<download_control::DownloadControl>,
+    download_worker: download_control::DownloadControlWorker,
+    startup_model: Option<&str>,
+    mut events: Option<&mut dyn LifecycleEventSink>,
 ) -> io::Result<RunTermination> {
     let signal_guard = match SignalGuard::install() {
         Ok(guard) => guard,
@@ -1028,25 +1121,106 @@ fn run_unloaded_actor(
             return Err(error);
         }
     };
-    let outcome = loop {
-        if download_worker.is_finished() {
-            break Err(io::Error::other(
-                "download actor worker terminated unexpectedly",
-            ));
+    let startup = if let Some(model_id) = startup_model {
+        let download_control = download_control
+            .as_ref()
+            .expect("startup model requires stable model control");
+        match download_control.start_startup_load(model_id) {
+            Err(error) => Some(Err(io::Error::other(format!(
+                "startup model admission failed: {error:?}"
+            )))),
+            Ok(operation_id) => loop {
+                if download_worker.is_finished() {
+                    break Some(Err(io::Error::other(
+                        "model lifecycle actor worker terminated unexpectedly",
+                    )));
+                }
+                let current = match current_same_owner_run(paths, &run) {
+                    Ok(current) => current,
+                    Err(error) => break Some(Err(error)),
+                };
+                if current.stop_requested || signal_guard.interrupted() {
+                    break Some(Ok(if current.stop_requested {
+                        RunTermination::RequestedStop
+                    } else {
+                        RunTermination::Interrupted
+                    }));
+                }
+                let Some(operation) = download_control.operation(&operation_id) else {
+                    break Some(Err(io::Error::other("startup model operation disappeared")));
+                };
+                match operation.status {
+                    loxa_core::control::contracts::OperationStatus::Succeeded => {
+                        if let Some(events) = events.as_deref_mut() {
+                            if let Err(error) = events.emit(LifecycleEvent::StableModelReady {
+                                model_id: model_id.to_owned(),
+                                port: run.control_port.unwrap_or(run.port),
+                                model_alias: model_lifecycle::PUBLIC_MODEL_ALIAS.to_owned(),
+                            }) {
+                                break Some(Err(error));
+                            }
+                        }
+                        break None;
+                    }
+                    loxa_core::control::contracts::OperationStatus::Failed
+                    | loxa_core::control::contracts::OperationStatus::Cancelled => {
+                        let recovery_required =
+                            download_control
+                                .lifecycle_snapshot()
+                                .is_some_and(|snapshot| {
+                                    snapshot.status
+                                        == model_lifecycle::NodeLifecycleStatus::RecoveryRequired
+                                });
+                        if let Some(events) = events.as_deref_mut() {
+                            if let Err(error) = events.emit(LifecycleEvent::StableModelFailed {
+                                model_id: model_id.to_owned(),
+                                reason: operation
+                                    .error
+                                    .clone()
+                                    .unwrap_or_else(|| "model startup was cancelled".into()),
+                                recovery_required,
+                            }) {
+                                break Some(Err(error));
+                            }
+                        }
+                        break Some(Ok(if recovery_required {
+                            RunTermination::RecoveryRequired
+                        } else {
+                            RunTermination::Failed
+                        }));
+                    }
+                    loxa_core::control::contracts::OperationStatus::Queued
+                    | loxa_core::control::contracts::OperationStatus::Running => {}
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            },
         }
-        let current = match current_same_owner_run(paths, &run) {
-            Ok(current) => current,
-            Err(error) => break Err(error),
-        };
-        if current.stop_requested || signal_guard.interrupted() {
-            let stopped = current.stop_requested;
-            break Ok(if stopped {
-                RunTermination::RequestedStop
-            } else {
-                RunTermination::Interrupted
-            });
+    } else {
+        None
+    };
+    let outcome = if let Some(startup) = startup {
+        startup
+    } else {
+        loop {
+            if download_worker.is_finished() {
+                break Err(io::Error::other(
+                    "download actor worker terminated unexpectedly",
+                ));
+            }
+            let current = match current_same_owner_run(paths, &run) {
+                Ok(current) => current,
+                Err(error) => break Err(error),
+            };
+            if current.stop_requested || signal_guard.interrupted() {
+                let stopped = current.stop_requested;
+                break Ok(if stopped {
+                    RunTermination::RequestedStop
+                } else {
+                    RunTermination::Interrupted
+                });
+            }
+            std::thread::sleep(Duration::from_millis(25));
         }
-        std::thread::sleep(Duration::from_millis(25));
     };
     let worker_cleanup = download_worker.stop_and_join();
     let cleanup = finish_unloaded_owner(paths, &run);
@@ -1113,7 +1287,7 @@ fn claim_unloaded_owner(
         .ok_or_else(|| io::Error::other("node owner process identity is unavailable"))?;
     let now = unix_timestamp_now();
     let run_id = format!("node-{owner_pid}-{owner_start}-{now}-{gateway_port}");
-    supervisor::create_starting_run(
+    supervisor::create_unloaded_node_owner(
         &paths.state_path,
         supervisor::ManagedRun {
             schema_version: supervisor::RUNTIME_STATE_SCHEMA_VERSION,
@@ -1125,6 +1299,7 @@ fn claim_unloaded_owner(
             lifecycle: supervisor::RunLifecycle::Unloaded,
             generation: 0,
             generation_alias: format!("loxa-{run_id}-g0"),
+            control_port: Some(gateway_port),
             port: gateway_port,
             log_path: paths.logs_dir.join(format!("{run_id}.log")),
             child_pid: None,
@@ -2142,6 +2317,13 @@ mod lifecycle_api_tests {
                 unix_timestamp_now()
             ));
             std::fs::create_dir_all(&path).expect("create test directory");
+            let path = std::fs::canonicalize(path).expect("canonical test directory");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                    .expect("secure test directory");
+            }
             Self(path)
         }
     }
@@ -2275,6 +2457,7 @@ mod lifecycle_api_tests {
             lifecycle: supervisor::RunLifecycle::Starting,
             generation: 0,
             generation_alias: "loxa-run-1-g0".to_string(),
+            control_port: None,
             port: 8081,
             log_path: temp.0.join("run-1.log"),
             child_pid: None,
@@ -2446,6 +2629,96 @@ mod lifecycle_api_tests {
     }
 
     #[test]
+    fn node_paths_place_history_in_a_dedicated_private_subdirectory() {
+        let temp = TestDir::new("history-path");
+        let paths = NodePaths {
+            models_dir: temp.0.join("models"),
+            state_path: temp.0.join("run").join("managed.json"),
+            logs_dir: temp.0.join("run").join("logs"),
+        };
+
+        assert_eq!(
+            paths.history_path().unwrap(),
+            temp.0.join("history").join("chat-history.sqlite3")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_startup_uses_private_child_without_repairing_or_migrating_loxa_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TestDir::new("history-private-child");
+        std::fs::set_permissions(&temp.0, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let unsafe_old = temp.0.join("chat-history.sqlite3");
+        std::fs::write(&unsafe_old, b"unshipped sentinel").unwrap();
+        let paths = NodePaths {
+            models_dir: temp.0.join("models"),
+            state_path: temp.0.join("run").join("managed.json"),
+            logs_dir: temp.0.join("run").join("logs"),
+        };
+        let history_path = paths.history_path().unwrap();
+
+        let (_history, worker) = chat_history::ChatHistory::spawn(history_path.clone()).unwrap();
+        worker.stop_and_join().unwrap();
+
+        assert!(history_path.is_file());
+        assert_eq!(std::fs::read(&unsafe_old).unwrap(), b"unshipped sentinel");
+        assert_eq!(
+            std::fs::metadata(&temp.0).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            std::fs::metadata(history_path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_startup_fails_closed_when_dedicated_destination_is_unsafe() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TestDir::new("history-unsafe-destination");
+        let history_dir = temp.0.join("history");
+        std::fs::create_dir(&history_dir).unwrap();
+        std::fs::set_permissions(&history_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let paths = NodePaths {
+            models_dir: temp.0.join("models"),
+            state_path: temp.0.join("run").join("managed.json"),
+            logs_dir: temp.0.join("run").join("logs"),
+        };
+
+        assert!(chat_history::ChatHistory::spawn(paths.history_path().unwrap()).is_err());
+        assert_eq!(
+            std::fs::metadata(&history_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+    }
+
+    #[test]
+    fn known_llama_startup_and_all_unloaded_modes_use_the_stable_node_host() {
+        assert!(uses_stable_node_host(
+            Some("gemma-3-4b-it-q4"),
+            RuntimeBackendKind::LlamaCpp
+        ));
+        assert!(uses_stable_node_host(None, RuntimeBackendKind::LlamaCpp));
+        assert!(uses_stable_node_host(None, RuntimeBackendKind::PyMlxLm));
+        assert!(!uses_stable_node_host(
+            Some("external-mlx-model"),
+            RuntimeBackendKind::PyMlxLm
+        ));
+    }
+
+    #[test]
     fn unloaded_node_claim_is_visible_and_prevents_a_second_owner() {
         let temp = TestDir::new("unloaded-owner");
         let paths = NodePaths {
@@ -2473,6 +2746,56 @@ mod lifecycle_api_tests {
         assert_eq!(
             managed_servers(&paths).unwrap(),
             ManagedRunsSnapshot::Runs(Vec::new())
+        );
+    }
+
+    #[test]
+    fn unloaded_node_claim_recovers_a_dead_childless_model_free_owner() {
+        let temp = TestDir::new("dead-unloaded-owner");
+        let paths = NodePaths {
+            models_dir: temp.0.join("models"),
+            state_path: temp.0.join("managed.json"),
+            logs_dir: temp.0.join("logs"),
+        };
+        let stale = supervisor::ManagedRun {
+            schema_version: supervisor::RUNTIME_STATE_SCHEMA_VERSION,
+            run_id: "dead-node-owner".to_string(),
+            model_id: None,
+            owner_pid: u32::MAX,
+            owner_process_start_time_unix_s: 1,
+            stop_requested: false,
+            lifecycle: supervisor::RunLifecycle::Unloaded,
+            generation: 4,
+            generation_alias: "loxa-dead-node-owner-g4".to_string(),
+            control_port: Some(11_440),
+            port: 11_440,
+            log_path: paths.logs_dir.join("dead-node-owner.log"),
+            child_pid: None,
+            child_process_start_time_unix_s: None,
+            child_pgid: None,
+        };
+        supervisor::create_starting_run(&paths.state_path, stale)
+            .expect("seed dead unloaded owner");
+
+        let replacement = claim_unloaded_owner(&paths, 11_441)
+            .expect("recover dead unloaded owner through production probe");
+
+        assert_eq!(replacement.model_id, None);
+        assert_eq!(replacement.lifecycle, supervisor::RunLifecycle::Unloaded);
+        assert_eq!(replacement.control_port, Some(11_441));
+        let supervisor::RuntimeStateRead::Loaded(runs) =
+            supervisor::read_runtime_state(&paths.state_path).expect("read replacement")
+        else {
+            panic!("replacement state must be loaded");
+        };
+        assert_eq!(runs, vec![replacement.clone()]);
+        assert_eq!(
+            supervisor::finish_childless_runtime_state_run(
+                &paths.state_path,
+                &replacement.identity(),
+            )
+            .expect("clean replacement"),
+            supervisor::ChildlessFinishOutcome::Finished
         );
     }
 
@@ -2760,6 +3083,86 @@ mod lifecycle_api_tests {
     }
 
     #[test]
+    fn loaded_llama_startup_mounts_stable_authenticated_control_before_model_work() {
+        struct BlockingListeningSink {
+            listening: std::sync::mpsc::Sender<u16>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+
+        impl LifecycleEventSink for BlockingListeningSink {
+            fn emit(&mut self, event: LifecycleEvent) -> io::Result<()> {
+                if let LifecycleEvent::NodeListening { port, .. } = event {
+                    self.listening.send(port).unwrap();
+                    self.release.recv().unwrap();
+                }
+                Ok(())
+            }
+        }
+
+        let _signal_lock = SIGNAL_TEST_LOCK.lock().expect("signal test lock");
+        let temp = TestDir::new("serve-loaded-control-integration");
+        let paths = NodePaths {
+            models_dir: temp.0.join("models"),
+            state_path: temp.0.join("managed.json"),
+            logs_dir: temp.0.join("logs"),
+        };
+        std::fs::create_dir_all(&paths.models_dir).unwrap();
+        let recipe = &REGISTRY[0];
+        std::fs::write(paths.models_dir.join(recipe.filename), b"invalid fixture").unwrap();
+        let serve_paths = paths.clone();
+        let (listening_tx, listening_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            serve_node(
+                Some(recipe.id),
+                Some(0),
+                RuntimeBackendKind::LlamaCpp,
+                &serve_paths,
+                &mut BlockingListeningSink {
+                    listening: listening_tx,
+                    release: release_rx,
+                },
+            )
+        });
+        let port = listening_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("loaded node listening event");
+
+        let supervisor::RuntimeStateRead::Loaded(runs) =
+            supervisor::read_runtime_state(&paths.state_path).unwrap()
+        else {
+            panic!("stable owner state must be visible before startup load")
+        };
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].model_id, None);
+        assert_eq!(runs[0].control_port, Some(port));
+        assert!(claim_unloaded_owner(&paths, port.saturating_add(1)).is_err());
+        let token = loxa_core::control::auth::ControlToken::load(&temp.0.join("control.token"))
+            .expect("loaded startup control token");
+        let models = http_request(
+            port,
+            &format!(
+                "GET /loxa/v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {}\r\nOrigin: tauri://localhost\r\nConnection: close\r\n\r\n",
+                token.expose_for_authorization()
+            ),
+        );
+        assert!(models.starts_with("HTTP/1.1 200"), "{models}");
+        assert!(models.contains(recipe.id), "{models}");
+
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            server.join().unwrap().unwrap(),
+            RunTermination::Failed,
+            "invalid startup artifact must fail truthfully"
+        );
+        assert_eq!(
+            managed_servers(&paths).unwrap(),
+            ManagedRunsSnapshot::Runs(Vec::new())
+        );
+        TcpListener::bind(("127.0.0.1", port)).expect("gateway released after startup failure");
+    }
+
+    #[test]
     fn stop_result_is_typed_instead_of_rendered() {
         let paths = NodePaths {
             models_dir: PathBuf::from("/unused"),
@@ -2853,6 +3256,7 @@ mod lifecycle_api_tests {
             lifecycle: supervisor::RunLifecycle::Starting,
             generation: 0,
             generation_alias: format!("loxa-{run_id}-g0"),
+            control_port: None,
             port: 8080,
             log_path: state_path
                 .parent()
@@ -4495,6 +4899,13 @@ LOXA_MLX_RESTART_CHILD="1" \
             let path =
                 std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()));
             fs::create_dir_all(&path).expect("create temp dir");
+            let path = fs::canonicalize(path).expect("canonical temp dir");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                    .expect("secure temp dir");
+            }
             Self { path }
         }
 

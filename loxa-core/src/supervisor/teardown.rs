@@ -1,3 +1,5 @@
+#[cfg(debug_assertions)]
+use super::MAX_LOG_BYTES;
 use super::{BoundedLogWriter, SupervisorError};
 #[cfg(unix)]
 use std::ffi::c_int;
@@ -6,6 +8,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+#[cfg(debug_assertions)]
+use std::{fs::File, path::Path};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -576,6 +580,25 @@ impl SpawnedServer {
             log_drains: Vec::new(),
             initialization_error,
         }
+    }
+
+    #[doc(hidden)]
+    #[cfg(debug_assertions)]
+    pub fn from_debug_child_for_composition_test(
+        child: Child,
+        log_path: &Path,
+    ) -> io::Result<Self> {
+        let writer = Arc::new(Mutex::new(BoundedLogWriter {
+            file: File::create(log_path)?,
+            remaining: MAX_LOG_BYTES,
+            truncated: false,
+        }));
+        let mut spawned = Self::from_spawned_child(child);
+        spawned.initialize_log_drains_with(writer, spawn_log_drain);
+        if let Some(error) = spawned.take_initialization_error() {
+            return Err(io::Error::other(error.to_string()));
+        }
+        Ok(spawned)
     }
 
     fn record_initialization_error(&mut self, error: impl Into<SupervisorError>) {
@@ -1226,6 +1249,7 @@ mod tests {
             lifecycle: crate::supervisor::RunLifecycle::Running,
             generation: 0,
             generation_alias: "loxa-run-pgid-diagnostic-g0".to_string(),
+            control_port: None,
             port: 8080,
             log_path: temp.path().join("managed.log"),
             child_pid: Some(77),

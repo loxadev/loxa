@@ -1,7 +1,7 @@
 use crate::engine_session::EngineSession;
 use crate::model_lifecycle::{
-    EngineLifecycleDriver, GatewayPublisher, LaunchPlan, LifecycleError, LifecycleSignals,
-    SessionCorrelation, StableNodeOwner, StartedSession,
+    EngineLifecycleDriver, ExactSessionStatus, GatewayPublisher, LaunchPlan, LifecycleError,
+    LifecycleSignals, SessionCorrelation, StableNodeOwner, StartedSession,
 };
 use loxa_core::engine::{EngineLaunchSpec, ReadinessStrategy};
 use loxa_core::gateway::{EngineTarget, GatewayState};
@@ -143,6 +143,7 @@ impl EngineLifecycleDriver for ProductionEngineDriver {
                 run.run_id == owner.run_id
                     && run.owner_pid == owner.pid
                     && run.owner_process_start_time_unix_s == owner.process_start_time_unix_s
+                    && run.control_port == Some(self.gateway_port)
                     && run.child_pid.is_none()
                     && run.lifecycle == RunLifecycle::Unloaded
             })
@@ -363,6 +364,86 @@ impl EngineLifecycleDriver for ProductionEngineDriver {
             .ok_or_else(|| LifecycleError::TeardownFailed("engine generation changed".into()))?;
         Ok(())
     }
+
+    fn poll_exact(
+        &mut self,
+        session: &mut StartedSession<Self::Session>,
+    ) -> Result<ExactSessionStatus, LifecycleError> {
+        session
+            .value
+            .child_mut()
+            .try_wait()
+            .map(|status| {
+                if status.is_some() {
+                    ExactSessionStatus::Exited
+                } else {
+                    ExactSessionStatus::Running
+                }
+            })
+            .map_err(|error| LifecycleError::TeardownFailed(error.to_string()))
+    }
+
+    fn finish_unexpected_exit(
+        &mut self,
+        session: StartedSession<Self::Session>,
+    ) -> Result<bool, LifecycleError> {
+        let owner_run_id = session.correlation.committed_run_id.clone();
+        self.stop_exact(session)?;
+        let supervisor::RuntimeStateRead::Loaded(runs) =
+            supervisor::read_runtime_state(&self.state_path).map_err(Self::public_error)?
+        else {
+            return Err(LifecycleError::TeardownFailed(
+                "stable owner state unavailable after unexpected exit".into(),
+            ));
+        };
+        let current = runs
+            .into_iter()
+            .next()
+            .filter(|run| run.run_id == owner_run_id && run.lifecycle == RunLifecycle::Unloaded)
+            .ok_or_else(|| {
+                LifecycleError::TeardownFailed(
+                    "stable owner was not restored after unexpected exit".into(),
+                )
+            })?;
+        Ok(!current.stop_requested)
+    }
+
+    fn mark_recovery_required(&mut self, owner: &StableNodeOwner) -> Result<(), LifecycleError> {
+        let supervisor::RuntimeStateRead::Loaded(runs) =
+            supervisor::read_runtime_state(&self.state_path).map_err(Self::public_error)?
+        else {
+            return Err(LifecycleError::TeardownFailed(
+                "stable owner state unavailable for recovery marker".into(),
+            ));
+        };
+        let current = runs
+            .into_iter()
+            .next()
+            .filter(|run| {
+                run.run_id == owner.run_id
+                    && run.owner_pid == owner.pid
+                    && run.owner_process_start_time_unix_s == owner.process_start_time_unix_s
+            })
+            .ok_or_else(|| {
+                LifecycleError::TeardownFailed(
+                    "stable owner identity changed before recovery marker".into(),
+                )
+            })?;
+        let mut recovery = current.clone();
+        recovery.lifecycle = RunLifecycle::RecoveryRequired;
+        supervisor::update_runtime_state_run_committed(
+            &self.state_path,
+            &current.identity(),
+            recovery,
+        )
+        .map_err(Self::public_error)?
+        .ok_or_else(|| {
+            LifecycleError::TeardownFailed(
+                "stable owner generation changed before recovery marker".into(),
+            )
+        })?;
+        Ok(())
+    }
 }
 
 pub(crate) struct ProductionGatewayPublisher(pub(crate) GatewayState);
@@ -387,6 +468,7 @@ impl GatewayPublisher for ProductionGatewayPublisher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::{Command, Stdio};
 
     struct TestDir(PathBuf);
     impl TestDir {
@@ -418,6 +500,7 @@ mod tests {
             lifecycle: RunLifecycle::Starting,
             generation,
             generation_alias: format!("loxa-{}-g{generation}", owner.run_id),
+            control_port: Some(owner.gateway_port),
             port: 9000,
             log_path: PathBuf::from("engine.log"),
             child_pid: None,
@@ -511,5 +594,145 @@ mod tests {
         assert_eq!(runs[0].lifecycle, RunLifecycle::Unloaded);
         assert_eq!(runs[0].child_pid, None);
         assert_eq!(runs[0].generation, 5);
+    }
+
+    #[test]
+    fn recovery_marker_preserves_stable_owner_and_control_endpoint() {
+        let dir = TestDir::new("recovery-marker");
+        let state_path = dir.0.join("managed.json");
+        let owner = StableNodeOwner {
+            run_id: "owner".into(),
+            pid: 11,
+            process_start_time_unix_s: 22,
+            gateway_port: 8080,
+        };
+        let mut run = starting(&owner, 6);
+        run.model_id = None;
+        run.lifecycle = RunLifecycle::Unloaded;
+        run.port = owner.gateway_port;
+        supervisor::create_starting_run(&state_path, run).unwrap();
+        let mut driver = ProductionEngineDriver::new(state_path.clone(), dir.0.clone(), 8080);
+
+        driver.mark_recovery_required(&owner).unwrap();
+
+        let supervisor::RuntimeStateRead::Loaded(runs) =
+            supervisor::read_runtime_state(&state_path).unwrap()
+        else {
+            panic!("recovery state loaded")
+        };
+        assert_eq!(runs[0].run_id, owner.run_id);
+        assert_eq!(runs[0].control_port, Some(owner.gateway_port));
+        assert_eq!(runs[0].lifecycle, RunLifecycle::RecoveryRequired);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_exact_child_exit_is_reaped_and_cas_restores_unloaded_with_stop_priority() {
+        let dir = TestDir::new("real-exit-composition");
+        let state_path = dir.0.join("managed.json");
+        let owner = StableNodeOwner {
+            run_id: "owner".into(),
+            pid: 11,
+            process_start_time_unix_s: 22,
+            gateway_port: 8080,
+        };
+        let mut unloaded = starting(&owner, 1);
+        unloaded.model_id = None;
+        unloaded.lifecycle = RunLifecycle::Unloaded;
+        unloaded.port = owner.gateway_port;
+        supervisor::create_starting_run(&state_path, unloaded.clone()).unwrap();
+        let child = Command::new("sh")
+            .args([
+                "-c",
+                "printf 'stdout-drain-evidence\\n'; printf 'stderr-drain-evidence\\n' >&2; exit 0",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let child_pid = child.id();
+        let child_start = 333;
+        let mut running = unloaded.clone();
+        running.model_id = Some("model".into());
+        running.lifecycle = RunLifecycle::Running;
+        running.port = 9001;
+        running.log_path = dir.0.join("engine.log");
+        running.child_pid = Some(child_pid);
+        running.child_process_start_time_unix_s = Some(child_start);
+        running.stop_requested = true;
+        let running = supervisor::update_runtime_state_run_committed(
+            &state_path,
+            &unloaded.identity(),
+            running,
+        )
+        .unwrap()
+        .unwrap();
+        let server = ManagedServer {
+            id: "model".into(),
+            pid: child_pid,
+            port: 9001,
+            model_path: PathBuf::from("model.gguf"),
+            started_at_unix_s: 1,
+            llama_server_version: "test".into(),
+            process_start_time_unix_s: Some(child_start),
+        };
+        let session = EngineSession::new(
+            supervisor::SpawnedServer::from_debug_child_for_composition_test(
+                child,
+                &running.log_path,
+            )
+            .unwrap(),
+            running.clone(),
+            server,
+            "test-child",
+            child_pid,
+            child_start,
+        );
+        let session = match session {
+            Ok(session) => session,
+            Err(_) => panic!("exact child session must correlate"),
+        };
+        let mut started = StartedSession {
+            value: session,
+            correlation: SessionCorrelation {
+                generation: 1,
+                child_pid,
+                child_process_start_time_unix_s: child_start,
+                server_id: "child".into(),
+                model_id: "model".into(),
+                port: 9001,
+                committed_run_id: owner.run_id.clone(),
+                owner_pid: owner.pid,
+                owner_process_start_time_unix_s: owner.process_start_time_unix_s,
+                gateway_port: owner.gateway_port,
+                generation_alias: format!("loxa-{}-g1", owner.run_id),
+                engine_version: "test".into(),
+            },
+        };
+        let mut driver = ProductionEngineDriver::new(state_path.clone(), dir.0.clone(), 8080);
+        for _ in 0..100 {
+            if driver.poll_exact(&mut started).unwrap() == ExactSessionStatus::Exited {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            driver.poll_exact(&mut started).unwrap(),
+            ExactSessionStatus::Exited
+        );
+
+        assert!(!driver.finish_unexpected_exit(started).unwrap());
+        let supervisor::RuntimeStateRead::Loaded(runs) =
+            supervisor::read_runtime_state(&state_path).unwrap()
+        else {
+            panic!("stable owner remains")
+        };
+        assert_eq!(runs[0].lifecycle, RunLifecycle::Unloaded);
+        assert_eq!(runs[0].child_pid, None);
+        assert_eq!(runs[0].port, owner.gateway_port);
+        assert!(runs[0].stop_requested);
+        let log = std::fs::read_to_string(&running.log_path).unwrap();
+        assert!(log.contains("stdout-drain-evidence"));
+        assert!(log.contains("stderr-drain-evidence"));
     }
 }

@@ -32,12 +32,12 @@ pub use readiness::{
     PROCESS_IDENTITY_POLL_INTERVAL, PROCESS_IDENTITY_TIMEOUT,
 };
 pub use state::{
-    admit_offline_model_mutation, create_starting_run, current_runtime_state_run,
-    finish_runtime_state_run, read_runtime_state, remove_runtime_state_entry, runtime_dir,
-    runtime_logs_dir, runtime_state_path, update_runtime_state_run,
-    update_runtime_state_run_committed, ManagedRun, ManagedRunIdentity, OfflineModelMutationGuard,
-    RunLifecycle, RuntimeStateRead, RUNTIME_STATE_LOCK_POLL_INTERVAL, RUNTIME_STATE_LOCK_TIMEOUT,
-    RUNTIME_STATE_SCHEMA_VERSION,
+    admit_offline_model_mutation, create_starting_run, create_unloaded_node_owner,
+    current_runtime_state_run, finish_runtime_state_run, read_runtime_state,
+    remove_runtime_state_entry, runtime_dir, runtime_logs_dir, runtime_state_path,
+    update_runtime_state_run, update_runtime_state_run_committed, ManagedRun, ManagedRunIdentity,
+    OfflineModelMutationGuard, RunLifecycle, RuntimeStateRead, RUNTIME_STATE_LOCK_POLL_INTERVAL,
+    RUNTIME_STATE_LOCK_TIMEOUT, RUNTIME_STATE_SCHEMA_VERSION,
 };
 use state::{record_stop_request, stable_run_is_present, StopRequestMatch};
 use teardown::prepare_managed_command;
@@ -200,6 +200,7 @@ impl ManagedCalibrationSession {
                 lifecycle: RunLifecycle::Starting,
                 generation: 0,
                 generation_alias: format!("loxa-{run_id}-g0"),
+                control_port: None,
                 port,
                 log_path: log_path.clone(),
                 child_pid: None,
@@ -1397,6 +1398,7 @@ mod tests {
             lifecycle: RunLifecycle::Running,
             generation: 0,
             generation_alias: format!("loxa-test-run-{}-g0", server.pid),
+            control_port: None,
             port: server.port,
             log_path: PathBuf::from(format!("/tmp/test-run-{}.log", server.pid)),
             child_pid: Some(server.pid),
@@ -1416,6 +1418,7 @@ mod tests {
             lifecycle: RunLifecycle::Starting,
             generation: 0,
             generation_alias: format!("loxa-{run_id}-g0"),
+            control_port: None,
             port: 8080,
             log_path: root.join(format!("{run_id}.log")),
             child_pid: None,
@@ -2868,6 +2871,7 @@ fn calibration_session_rejects_attached_state_drift() {
         lifecycle: RunLifecycle::Running,
         generation: 0,
         generation_alias: "alias".into(),
+        control_port: None,
         port: 8080,
         log_path: PathBuf::from("run.log"),
         child_pid: Some(10),
