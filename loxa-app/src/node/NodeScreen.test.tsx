@@ -1,6 +1,8 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 
 import { NodeScreen, type NodeScreenServices } from "./NodeScreen";
 import {
@@ -45,12 +47,12 @@ function services(overrides: Partial<NodeSessionServices & NodeScreenServices> =
   };
 }
 
-function renderNode(api = services()) {
+function renderNode(api = services(), onNavigateModels = vi.fn()) {
   return {
     api,
     ...render(
       <NodeSessionProvider services={api} endpoint={endpoint}>
-        <NodeScreen services={api} />
+        <NodeScreen services={api} onNavigateModels={onNavigateModels} />
       </NodeSessionProvider>,
     ),
   };
@@ -58,12 +60,15 @@ function renderNode(api = services()) {
 
 describe("NodeScreen", () => {
   it("automatically ensures the node and renders unloaded as a successful state", async () => {
-    const { api } = renderNode();
+    const navigate = vi.fn();
+    const { api } = renderNode(services(), navigate);
     expect(await screen.findByText("Node ready — no model loaded")).toBeInTheDocument();
     expect(api.bootstrap.start).toHaveBeenCalledWith({ endpoint });
     expect(screen.getByText("App-owned node")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Stop node" })).toBeEnabled();
     expect(screen.queryByRole("button", { name: /attach/i })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Browse verified models" }));
+    expect(navigate).toHaveBeenCalledTimes(1);
   });
 
   it("renders starting and recovery-required as live state", async () => {
@@ -128,5 +133,35 @@ describe("NodeScreen", () => {
   it("applies the canonical 44px target contract", async () => {
     renderNode();
     expect(await screen.findByRole("button", { name: "Stop node" })).toHaveClass("interactive-target");
+  });
+
+  it("uses a feature-local canonical responsive and contrast contract", () => {
+    const css = readFileSync(resolve(process.cwd(), "src/node/NodeScreen.module.css"), "utf8");
+    expect(css).toContain("var(--loxa-component-minimum-interactive-target)");
+    expect(css).toContain("@media (max-width:");
+    expect(css).toContain("@media (prefers-contrast: more)");
+    expect(css).toContain("@media (forced-colors: active)");
+    expect(css).toContain("@media (prefers-reduced-motion: reduce)");
+    expect(css).not.toMatch(/#[0-9a-f]{3,8}\b/i);
+  });
+
+  it("uses only variables defined by the distributed canonical Loxa tokens", () => {
+    const canonical = readFileSync(resolve(process.cwd(), "src/styles/loxa.css"), "utf8");
+    const definitions = new Set(
+      Array.from(canonical.matchAll(/(--loxa-[a-z0-9-]+)\s*:/gi), ([, name]) => name),
+    );
+    const modules = [
+      "src/node/NodeScreen.module.css",
+      "src/models/ModelsScreen.module.css",
+      "src/settings/SettingsScreen.module.css",
+    ];
+    const undefinedReferences = modules.flatMap((file) => {
+      const css = readFileSync(resolve(process.cwd(), file), "utf8");
+      return Array.from(css.matchAll(/var\((--loxa-[a-z0-9-]+)/gi), ([, name]) => name)
+        .filter((name) => !definitions.has(name))
+        .map((name) => `${file}: ${name}`);
+    });
+
+    expect(undefinedReferences).toEqual([]);
   });
 });

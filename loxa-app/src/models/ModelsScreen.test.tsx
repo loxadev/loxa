@@ -1,6 +1,8 @@
 import { act, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 
 import type { ControlStreamCallbacks, ControlStreamHandle } from "../control/events";
 import type { ArtifactState, ModelInventoryEntry, OperationView } from "../control/contracts";
@@ -73,6 +75,25 @@ function setup() {
 }
 
 describe("ModelsScreen", () => {
+  it("distinguishes a completed empty known registry from loading", async () => {
+    const { api } = setup();
+    vi.mocked(api.getInventory).mockResolvedValue([]);
+    render(<ModelsScreen endpoint="http://127.0.0.1:8080" services={api} />);
+    expect(screen.getByText("Checking the known model registry…")).toBeInTheDocument();
+    expect(await screen.findByText("No verified recipes are available in this build.")).toBeInTheDocument();
+  });
+
+  it("uses a compact canonical catalog style contract", () => {
+    const css = readFileSync(resolve(process.cwd(), "src/models/ModelsScreen.module.css"), "utf8");
+    expect(css).toContain("var(--loxa-component-minimum-interactive-target)");
+    expect(css).toContain("overflow-wrap: anywhere");
+    expect(css).toContain("@media (max-width:");
+    expect(css).toContain("@media (prefers-contrast: more)");
+    expect(css).toContain("@media (forced-colors: active)");
+    expect(css).toContain("@media (prefers-reduced-motion: reduce)");
+    expect(css).not.toMatch(/#[0-9a-f]{3,8}\b/i);
+  });
+
   it("renders only legal node-authoritative lifecycle actions", async () => {
     const { api } = setup();
     render(<ModelsScreen endpoint="http://127.0.0.1:8080" services={api} />);

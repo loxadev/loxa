@@ -51,7 +51,7 @@ function AppWorkspace({ services }: { services: AppServices }) {
       </aside>
       <main className="workspace">
         {route === "node" ? (
-          <NodeScreen services={services} />
+          <NodeScreen services={services} onNavigateModels={() => setRoute("models")} />
         ) : route === "models" ? (
           <NodeSessionGate heading="Models">
             <ModelsScreen services={services} endpoint={session.endpoint} />
@@ -61,7 +61,16 @@ function AppWorkspace({ services }: { services: AppServices }) {
             <ChatScreen services={services} endpoint={session.endpoint} />
           </NodeSessionGate>
         ) : (
-          <SettingsScreen theme={theme} onThemeChange={setTheme} />
+          <SettingsScreen
+            theme={theme}
+            onThemeChange={setTheme}
+            runtime={{
+              phase: session.phase,
+              endpoint: session.endpoint,
+              ownership: session.ownership,
+              status: session.status,
+            }}
+          />
         )}
       </main>
     </div>
