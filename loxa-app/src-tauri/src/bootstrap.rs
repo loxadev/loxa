@@ -1,5 +1,4 @@
 use loxa_core::control::auth::ControlToken;
-#[cfg(test)]
 use loxa_core::control::contracts::NodeStatus;
 use loxa_core::control::contracts::{CONTROL_PROTOCOL_VERSION, NodeIdentityProofResponse};
 use serde::{Deserialize, Serialize};
@@ -12,6 +11,133 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const MAX_PEER_RESPONSE_BYTES: usize = 16 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SidecarCandidate {
+    ExecutableSibling,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PeerCheckOutcome {
+    Compatible,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadinessClass {
+    Unloaded,
+    Loading,
+    Ready,
+    Unloading,
+    RecoveryRequired,
+    Failed,
+}
+
+impl From<NodeStatus> for ReadinessClass {
+    fn from(status: NodeStatus) -> Self {
+        match status {
+            NodeStatus::Unloaded => Self::Unloaded,
+            NodeStatus::Loading => Self::Loading,
+            NodeStatus::Ready => Self::Ready,
+            NodeStatus::Unloading => Self::Unloading,
+            NodeStatus::RecoveryRequired => Self::RecoveryRequired,
+            NodeStatus::Error => Self::Failed,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExitClass {
+    RequestedStop,
+    EarlyStartupExit,
+    UnexpectedOwnedChildExit,
+    AppShutdown,
+    RecoveryRequired,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BootstrapDiagnostic {
+    Resolve {
+        candidate: SidecarCandidate,
+    },
+    PeerCheck {
+        outcome: PeerCheckOutcome,
+        elapsed_ms: u128,
+    },
+    Ownership {
+        class: Ownership,
+    },
+    Spawn {
+        pid: u32,
+    },
+    Readiness {
+        class: ReadinessClass,
+        elapsed_ms: u128,
+    },
+    Exit {
+        class: ExitClass,
+    },
+}
+
+impl BootstrapDiagnostic {
+    #[cfg(debug_assertions)]
+    fn emit(self) {
+        match self {
+            Self::Resolve { candidate } => {
+                tracing::debug!(phase = "resolve", candidate = ?candidate)
+            }
+            Self::PeerCheck {
+                outcome,
+                elapsed_ms,
+            } => tracing::debug!(
+                phase = "peer_check",
+                outcome = ?outcome,
+                elapsed_ms = elapsed_ms
+            ),
+            Self::Ownership { class } => {
+                tracing::debug!(phase = "ownership", class = ?class)
+            }
+            Self::Spawn { pid } => tracing::debug!(phase = "spawn", pid = pid),
+            Self::Readiness { class, elapsed_ms } => tracing::debug!(
+                phase = "readiness",
+                class = ?class,
+                elapsed_ms = elapsed_ms
+            ),
+            Self::Exit { class } => tracing::debug!(phase = "exit", class = ?class),
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn emit(self) {
+        let _ = self;
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChildStreamPolicy {
+    InheritStderr,
+    Silent,
+}
+
+const fn private_child_stream_policy() -> ChildStreamPolicy {
+    if cfg!(debug_assertions) {
+        ChildStreamPolicy::InheritStderr
+    } else {
+        ChildStreamPolicy::Silent
+    }
+}
+
+fn configure_private_child_streams(command: &mut Command, inherit_debug_stderr: bool) {
+    command.stdin(Stdio::null()).stdout(Stdio::null());
+    match (private_child_stream_policy(), inherit_debug_stderr) {
+        (ChildStreamPolicy::InheritStderr, true) => {
+            command.stderr(Stdio::inherit());
+        }
+        (ChildStreamPolicy::InheritStderr, false) | (ChildStreamPolicy::Silent, _) => {
+            command.stderr(Stdio::null());
+        }
+    }
+}
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -87,6 +213,7 @@ pub struct BootstrapConfig {
     pub credential_path: PathBuf,
     pub startup_timeout: Duration,
     pub poll_interval: Duration,
+    pub inherit_debug_stderr: bool,
 }
 
 impl Default for BootstrapConfig {
@@ -96,6 +223,7 @@ impl Default for BootstrapConfig {
             credential_path: default_credential_path(),
             startup_timeout: Duration::from_secs(15),
             poll_interval: Duration::from_millis(100),
+            inherit_debug_stderr: true,
         }
     }
 }
@@ -158,33 +286,50 @@ impl BootstrapState {
         self.verified_peer = None;
         self.error = None;
 
+        let proof_started = Instant::now();
         if let Some(peer) = prove_compatible(address, config.poll_interval, &config.credential_path)
         {
+            BootstrapDiagnostic::PeerCheck {
+                outcome: PeerCheckOutcome::Compatible,
+                elapsed_ms: proof_started.elapsed().as_millis(),
+            }
+            .emit();
             self.verified_peer = Some(peer);
             self.ownership = Ownership::Attached;
+            BootstrapDiagnostic::Ownership {
+                class: Ownership::Attached,
+            }
+            .emit();
             return Ok(self.current_snapshot());
         }
+        BootstrapDiagnostic::PeerCheck {
+            outcome: PeerCheckOutcome::Unavailable,
+            elapsed_ms: proof_started.elapsed().as_millis(),
+        }
+        .emit();
 
         let executable = config
             .executable
             .clone()
             .unwrap_or_else(private_node_executable);
-        let child = match Command::new(&executable)
-            .arg("--port")
-            .arg(address.port().to_string())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
+        let mut command = Command::new(&executable);
+        command.arg("--port").arg(address.port().to_string());
+        configure_private_child_streams(&mut command, config.inherit_debug_stderr);
+        let child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
+                BootstrapDiagnostic::Readiness {
+                    class: ReadinessClass::Failed,
+                    elapsed_ms: proof_started.elapsed().as_millis(),
+                }
+                .emit();
                 return self.fail(format!(
                     "failed to start private loxa-node executable {}: {error}",
                     executable.display()
                 ));
             }
         };
+        BootstrapDiagnostic::Spawn { pid: child.id() }.emit();
         self.owned = Some(OwnedNode {
             child,
             #[cfg(test)]
@@ -195,8 +340,13 @@ impl BootstrapState {
             exit_before_signal_once: false,
         });
         self.ownership = Ownership::Owned;
+        BootstrapDiagnostic::Ownership {
+            class: Ownership::Owned,
+        }
+        .emit();
 
         let deadline = Instant::now() + config.startup_timeout;
+        let startup_started = Instant::now();
         loop {
             let inspection = inspect_owned_node(
                 self.owned
@@ -205,6 +355,15 @@ impl BootstrapState {
             );
             match inspection {
                 Ok(Some(status)) => {
+                    BootstrapDiagnostic::Exit {
+                        class: ExitClass::EarlyStartupExit,
+                    }
+                    .emit();
+                    BootstrapDiagnostic::Readiness {
+                        class: ReadinessClass::Failed,
+                        elapsed_ms: startup_started.elapsed().as_millis(),
+                    }
+                    .emit();
                     self.owned = None;
                     self.ownership = Ownership::None;
                     self.verified_peer = None;
@@ -231,6 +390,11 @@ impl BootstrapState {
                 return Ok(self.current_snapshot());
             }
             if Instant::now() >= deadline {
+                BootstrapDiagnostic::Readiness {
+                    class: ReadinessClass::Failed,
+                    elapsed_ms: startup_started.elapsed().as_millis(),
+                }
+                .emit();
                 let message = format!(
                     "loxa-node startup timed out after {} ms",
                     config.startup_timeout.as_millis()
@@ -267,18 +431,38 @@ impl BootstrapState {
         self.credential_path = config.credential_path.clone();
         self.verified_peer = None;
         let deadline = Instant::now() + config.startup_timeout;
+        let attach_started = Instant::now();
         loop {
             if let Some(peer) =
                 prove_compatible(address, config.poll_interval, &config.credential_path)
             {
+                BootstrapDiagnostic::PeerCheck {
+                    outcome: PeerCheckOutcome::Compatible,
+                    elapsed_ms: attach_started.elapsed().as_millis(),
+                }
+                .emit();
                 self.verified_peer = Some(peer);
                 if self.owned.is_none() {
                     self.ownership = Ownership::Attached;
                 }
+                BootstrapDiagnostic::Ownership {
+                    class: self.ownership.clone(),
+                }
+                .emit();
                 self.error = None;
                 return Ok(self.current_snapshot());
             }
             if Instant::now() >= deadline {
+                BootstrapDiagnostic::PeerCheck {
+                    outcome: PeerCheckOutcome::Unavailable,
+                    elapsed_ms: attach_started.elapsed().as_millis(),
+                }
+                .emit();
+                BootstrapDiagnostic::Readiness {
+                    class: ReadinessClass::Failed,
+                    elapsed_ms: attach_started.elapsed().as_millis(),
+                }
+                .emit();
                 self.ownership = if self.owned.is_some() {
                     Ownership::Owned
                 } else {
@@ -319,6 +503,10 @@ impl BootstrapState {
         self.ownership = Ownership::None;
         self.verified_peer = None;
         self.error = None;
+        BootstrapDiagnostic::Exit {
+            class: ExitClass::RequestedStop,
+        }
+        .emit();
         Ok(self.current_snapshot())
     }
 
@@ -333,6 +521,10 @@ impl BootstrapState {
     pub fn exit_app(&mut self) -> Result<(), String> {
         if self.owned.is_some() {
             self.cleanup_owned("application exit cleanup failed")?;
+            BootstrapDiagnostic::Exit {
+                class: ExitClass::AppShutdown,
+            }
+            .emit();
         }
         Ok(())
     }
@@ -343,6 +535,10 @@ impl BootstrapState {
         };
         match owned.child.try_wait() {
             Ok(Some(_)) => {
+                BootstrapDiagnostic::Exit {
+                    class: ExitClass::UnexpectedOwnedChildExit,
+                }
+                .emit();
                 self.owned = None;
                 let peer = parse_loopback_endpoint(&self.endpoint)
                     .ok()
@@ -399,6 +595,10 @@ impl BootstrapState {
         self.owned = Some(owned);
         self.ownership = Ownership::Owned;
         self.error = Some(message.clone());
+        BootstrapDiagnostic::Exit {
+            class: ExitClass::RecoveryRequired,
+        }
+        .emit();
         Err(message)
     }
 
@@ -488,6 +688,10 @@ fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> Result<bool, Str
 }
 
 fn private_node_executable() -> PathBuf {
+    BootstrapDiagnostic::Resolve {
+        candidate: SidecarCandidate::ExecutableSibling,
+    }
+    .emit();
     let file_name = if cfg!(windows) {
         "loxa-node.exe"
     } else {
@@ -558,6 +762,7 @@ fn prove_compatible_with_token(
     timeout: Duration,
     token: &ControlToken,
 ) -> Option<VerifiedPeerIdentity> {
+    let check_started = Instant::now();
     let mut nonce_bytes = [0_u8; 32];
     if getrandom::fill(&mut nonce_bytes).is_err() {
         return None;
@@ -622,6 +827,11 @@ fn prove_compatible_with_token(
     {
         return None;
     }
+    BootstrapDiagnostic::Readiness {
+        class: value.status.into(),
+        elapsed_ms: check_started.elapsed().as_millis(),
+    }
+    .emit();
     Some(VerifiedPeerIdentity {
         address,
         node_id: value.node_id,
@@ -710,11 +920,131 @@ pub fn handle_exit_event<W: Write>(state: &SharedBootstrapState, stderr: &mut W)
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(debug_assertions)]
+    use std::io;
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     const TEST_SECRET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     static TOKEN_PATH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(debug_assertions)]
+    #[derive(Clone, Default)]
+    struct DiagnosticWriter(Arc<Mutex<Vec<u8>>>);
+
+    #[cfg(debug_assertions)]
+    struct DiagnosticGuard(Arc<Mutex<Vec<u8>>>);
+
+    #[cfg(debug_assertions)]
+    impl io::Write for DiagnosticGuard {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for DiagnosticWriter {
+        type Writer = DiagnosticGuard;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            DiagnosticGuard(self.0.clone())
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn capture_diagnostics(action: impl FnOnce()) -> String {
+        let writer = DiagnosticWriter::default();
+        let output = writer.0.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_target(false)
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(writer)
+            .finish();
+        tracing::subscriber::with_default(subscriber, action);
+        let bytes = output.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn bootstrap_diagnostics_have_a_closed_safe_vocabulary() {
+        let diagnostics = [
+            BootstrapDiagnostic::Resolve {
+                candidate: SidecarCandidate::ExecutableSibling,
+            },
+            BootstrapDiagnostic::PeerCheck {
+                outcome: PeerCheckOutcome::Compatible,
+                elapsed_ms: 7,
+            },
+            BootstrapDiagnostic::PeerCheck {
+                outcome: PeerCheckOutcome::Unavailable,
+                elapsed_ms: 8,
+            },
+            BootstrapDiagnostic::Ownership {
+                class: Ownership::Attached,
+            },
+            BootstrapDiagnostic::Spawn { pid: 42 },
+            BootstrapDiagnostic::Readiness {
+                class: ReadinessClass::Unloaded,
+                elapsed_ms: 9,
+            },
+            BootstrapDiagnostic::Readiness {
+                class: ReadinessClass::Failed,
+                elapsed_ms: 10,
+            },
+            BootstrapDiagnostic::Exit {
+                class: ExitClass::RequestedStop,
+            },
+            BootstrapDiagnostic::Exit {
+                class: ExitClass::EarlyStartupExit,
+            },
+            BootstrapDiagnostic::Exit {
+                class: ExitClass::UnexpectedOwnedChildExit,
+            },
+            BootstrapDiagnostic::Exit {
+                class: ExitClass::AppShutdown,
+            },
+            BootstrapDiagnostic::Exit {
+                class: ExitClass::RecoveryRequired,
+            },
+        ];
+
+        let rendered = diagnostics
+            .iter()
+            .map(|diagnostic| format!("{diagnostic:?}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase();
+        for forbidden in [
+            "token",
+            "nonce",
+            "proof",
+            "authorization",
+            "prompt",
+            "response",
+            "credential",
+            "path",
+        ] {
+            assert!(!rendered.contains(forbidden), "{forbidden}: {rendered}");
+        }
+    }
+
+    #[test]
+    fn private_child_stream_policy_follows_the_build_profile() {
+        #[cfg(debug_assertions)]
+        assert_eq!(
+            private_child_stream_policy(),
+            ChildStreamPolicy::InheritStderr
+        );
+        #[cfg(not(debug_assertions))]
+        assert_eq!(private_child_stream_policy(), ChildStreamPolicy::Silent);
+    }
 
     fn test_token_path() -> PathBuf {
         let path = std::env::temp_dir()
@@ -1058,6 +1388,62 @@ mod tests {
         }
     }
 
+    #[cfg(debug_assertions)]
+    #[test]
+    fn refresh_reports_one_unexpected_owned_child_exit_after_readiness() {
+        let child = Command::new("sh").arg("-c").arg("exit 0").spawn().unwrap();
+        let mut state = BootstrapState {
+            endpoint: "http://127.0.0.1:1".into(),
+            ownership: Ownership::Owned,
+            owned: Some(OwnedNode {
+                child,
+                fail_termination_once: false,
+                fail_inspection_once: false,
+                exit_before_signal_once: false,
+            }),
+            credential_path: default_credential_path(),
+            ..BootstrapState::default()
+        };
+        state.owned.as_mut().unwrap().child.wait().unwrap();
+
+        let diagnostics = capture_diagnostics(|| {
+            let snapshot = state.snapshot();
+            assert_eq!(snapshot.ownership, Ownership::None);
+            assert!(!snapshot.child_running);
+            let second = state.snapshot();
+            assert_eq!(second.ownership, Ownership::None);
+            assert!(!second.child_running);
+        });
+
+        assert_eq!(
+            diagnostics
+                .matches("class=UnexpectedOwnedChildExit")
+                .count(),
+            1,
+            "{diagnostics}"
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn successful_app_cleanup_reports_one_app_shutdown() {
+        let mut state = state_with_sleeping_child();
+        state.owned.as_mut().unwrap().fail_termination_once = false;
+
+        let diagnostics = capture_diagnostics(|| {
+            state.exit_app().unwrap();
+            assert_eq!(state.ownership, Ownership::None);
+            assert!(state.owned.is_none());
+            state.exit_app().unwrap();
+        });
+
+        assert_eq!(
+            diagnostics.matches("class=AppShutdown").count(),
+            1,
+            "{diagnostics}"
+        );
+    }
+
     #[test]
     fn termination_failure_preserves_handle_and_safe_retry() {
         let mut state = state_with_sleeping_child();
@@ -1116,6 +1502,7 @@ mod tests {
                     credential_path: default_credential_path(),
                     startup_timeout: Duration::from_millis(200),
                     poll_interval: Duration::from_millis(10),
+                    inherit_debug_stderr: false,
                 },
             )
             .unwrap_err();

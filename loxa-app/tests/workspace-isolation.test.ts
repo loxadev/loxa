@@ -45,6 +45,37 @@ describe("Cargo workspace isolation", () => {
     expect(vite).not.toContain("TAURI_DEV_HOST");
   });
 
+  it("prepares the fixed private sidecar before starting Vite", () => {
+    const config = JSON.parse(
+      readFileSync(resolve(appRoot, "src-tauri/tauri.conf.json"), "utf8"),
+    ) as { build: { beforeDevCommand: string } };
+
+    expect(config.build.beforeDevCommand).toBe("pnpm prepare:sidecar && pnpm dev");
+  });
+
+  it("keeps desktop diagnostics debug-only, structured, and non-persistent", () => {
+    const manifest = readFileSync(resolve(appRoot, "src-tauri/Cargo.toml"), "utf8");
+    const bootstrap = readFileSync(resolve(appRoot, "src-tauri/src/bootstrap.rs"), "utf8");
+    const nativeShell = readFileSync(resolve(appRoot, "src-tauri/src/lib.rs"), "utf8");
+
+    expect(manifest).toContain(
+      'tracing = { version = "=0.1.44", default-features = false, features = ["std", "max_level_debug", "release_max_level_off"] }',
+    );
+    expect(manifest).toContain(
+      'tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "std"] }',
+    );
+    const tracingDependencies = manifest
+      .split("\n")
+      .filter((line) => line.startsWith("tracing"))
+      .join("\n");
+    expect(tracingDependencies).not.toMatch(/env-filter|regex|json|ansi/i);
+    expect(nativeShell).toContain("#[cfg(debug_assertions)]");
+    expect(nativeShell).toContain("try_init");
+    expect(bootstrap).toContain("Stdio::inherit()");
+    expect(bootstrap).toContain("Stdio::null()");
+    expect(bootstrap).not.toMatch(/tracing::(?:debug|info|warn|error)!\([^)]*(?:token|nonce|proof|authorization|prompt|response|credential_path)/s);
+  });
+
   it("selects an explicit packaging target instead of silently using the host", () => {
     const selected = execFileSync(process.execPath, [resolve(appRoot, "scripts/prepare-sidecar.mjs"), "--print-target"], {
       encoding: "utf8",
