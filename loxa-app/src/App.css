@@ -63,15 +63,20 @@ a {
 
 .app-shell {
   display: grid;
-  grid-template-columns: 184px minmax(0, 1fr);
+  grid-template-columns: var(--loxa-rail-width, 280px) minmax(0, 1fr);
   height: 100vh;
   min-height: 520px;
+  color: var(--loxa-foreground);
+  background: var(--loxa-background);
 }
 
 .navigation-rail {
+  position: relative;
+  display: flex;
+  flex-direction: column;
   min-height: 0;
   padding: var(--loxa-space-6) var(--loxa-space-4);
-  overflow-y: auto;
+  overflow: hidden;
   background: var(--loxa-secondary-surface);
   border-right: 1px solid var(--loxa-control-border);
 }
@@ -91,9 +96,59 @@ a {
   color: var(--loxa-foreground);
 }
 
-.navigation-rail nav {
+.navigation-primary-nav,
+.navigation-secondary-nav {
+  flex: 0 0 auto;
+  min-height: 0;
+}
+
+.navigation-primary,
+.navigation-secondary {
   display: grid;
   gap: var(--loxa-space-1);
+}
+
+.navigation-secondary {
+  padding-top: var(--loxa-space-4);
+}
+
+.conversation-rail-slot {
+  flex: 1 1 auto;
+  min-height: 0;
+  margin-top: var(--loxa-space-4);
+  overflow: hidden;
+  border-top: 1px solid var(--loxa-control-border);
+}
+
+.rail-resize-handle {
+  position: absolute;
+  z-index: 2;
+  top: 0;
+  right: calc(var(--loxa-component-minimum-interactive-target) / -2);
+  width: var(--loxa-component-minimum-interactive-target);
+  height: 100%;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.rail-resize-handle::after {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 1px;
+  content: "";
+  background: transparent;
+}
+
+.rail-resize-handle:hover::after,
+.rail-resize-handle:focus-visible::after {
+  background: var(--loxa-focus);
+}
+
+.rail-resize-handle:focus-visible {
+  outline: 2px solid var(--loxa-focus);
+  outline-offset: -4px;
 }
 
 .nav-link {
@@ -110,12 +165,52 @@ a {
   background: var(--loxa-selected-surface);
 }
 
+.global-node-status {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-height: var(--loxa-component-minimum-interactive-target);
+  margin-bottom: var(--loxa-space-2);
+  padding: var(--loxa-space-2) var(--loxa-space-3);
+  color: var(--loxa-foreground);
+  text-decoration: none;
+  border: 1px solid var(--loxa-control-border);
+  border-radius: var(--loxa-radius-md);
+}
+
+.global-node-status-label {
+  font-size: var(--loxa-type-label-size);
+  font-weight: var(--loxa-type-label-weight);
+  line-height: var(--loxa-type-label-line-height);
+}
+
+.global-node-status-model {
+  overflow: hidden;
+  color: var(--loxa-muted-foreground);
+  font-family: var(--loxa-font-mono);
+  font-size: var(--loxa-type-code-compact-size);
+  line-height: var(--loxa-type-code-compact-line-height);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .workspace {
   min-width: 0;
   min-height: 0;
   height: 100vh;
-  padding: var(--loxa-space-8);
   overflow-y: auto;
+}
+
+.workspace-canvas {
+  padding: var(--loxa-space-8);
+  background: var(--loxa-background);
+}
+
+.workspace-frame {
+  width: min(100%, 1200px);
+  min-height: 100%;
+  height: 100%;
+  margin-inline: auto;
 }
 
 .screen-header {
@@ -215,7 +310,9 @@ body,
 .navigation-rail,
 .brand-lockup img,
 .nav-link,
+.global-node-status,
 .workspace,
+.workspace-canvas,
 .screen-header,
 .eyebrow,
 dt,
@@ -238,10 +335,10 @@ dt,
   }
 
   .app-shell {
-    grid-template-columns: 144px minmax(0, 1fr);
+    grid-template-columns: var(--loxa-rail-width, 280px) minmax(0, 1fr);
   }
 
-  .workspace {
+  .workspace-canvas {
     padding: var(--loxa-space-6);
   }
 
@@ -250,10 +347,17 @@ dt,
   }
 }
 
+@media (min-width: 1440px) {
+  .workspace-canvas {
+    padding: var(--loxa-space-12);
+  }
+}
+
 @media (prefers-contrast: more) {
   .navigation-rail,
   .screen-header,
   .status-badge,
+  .global-node-status,
   .primary-button,
   .secondary-button,
   .quiet-button {
@@ -269,12 +373,15 @@ dt,
   }
 
   .status-badge,
+  .global-node-status,
   .primary-button,
   .secondary-button,
   .quiet-button {
     border-color: ButtonText;
     forced-color-adjust: auto;
   }
+
+  .rail-resize-handle::after { background: ButtonText; }
 }
 
 @media (prefers-reduced-motion: reduce) {

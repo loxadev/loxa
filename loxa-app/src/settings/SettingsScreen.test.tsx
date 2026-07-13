@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { act, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
@@ -81,6 +81,54 @@ describe("SettingsScreen", () => {
     render(<SettingsScreen theme="system" onThemeChange={vi.fn()} runtime={{ ...runtime, phase: "starting", ownership: "none", status: null }} />);
     expect(screen.getByText("Checking", { selector: "dd" })).toBeInTheDocument();
     expect(screen.getAllByText("Unavailable", { selector: "dd" }).length).toBeGreaterThan(1);
+  });
+
+  it("discloses plaintext local history and requires confirmation before clearing it", async () => {
+    const user = userEvent.setup();
+    const clear = vi.fn().mockResolvedValue(3);
+    render(<SettingsScreen theme="system" onThemeChange={vi.fn()} runtime={runtime} onClearChatHistory={clear} />);
+    expect(screen.getByText(/stored as local plaintext/i)).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Clear chat history" }));
+    expect(clear).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "Confirm clear chat history" }));
+    expect(clear).toHaveBeenCalledOnce();
+    expect(await screen.findByRole("status")).toHaveTextContent("Deleted 3 conversations");
+  });
+
+  it("aborts a rejecting clear request on unmount without publishing a stale error", async () => {
+    const user = userEvent.setup();
+    let signal: AbortSignal | undefined;
+    const clear = vi.fn((nextSignal: AbortSignal) => new Promise<number>((_resolve, reject) => {
+      signal = nextSignal;
+      nextSignal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+    }));
+    const view = render(<SettingsScreen theme="system" onThemeChange={vi.fn()} runtime={runtime} onClearChatHistory={clear} />);
+    await user.click(screen.getByRole("button", { name: "Clear chat history" }));
+    await user.click(screen.getByRole("button", { name: "Confirm clear chat history" }));
+    expect(signal).toBeInstanceOf(AbortSignal);
+
+    view.unmount();
+    expect(signal?.aborted).toBe(true);
+    await act(async () => undefined);
+  });
+
+  it("aborts clear on window close and ignores a late successful completion", async () => {
+    const user = userEvent.setup();
+    let signal: AbortSignal | undefined;
+    let resolveClear!: (deleted: number) => void;
+    const clear = vi.fn((nextSignal: AbortSignal) => {
+      signal = nextSignal;
+      return new Promise<number>((resolve) => { resolveClear = resolve; });
+    });
+    render(<SettingsScreen theme="system" onThemeChange={vi.fn()} runtime={runtime} onClearChatHistory={clear} />);
+    await user.click(screen.getByRole("button", { name: "Clear chat history" }));
+    await user.click(screen.getByRole("button", { name: "Confirm clear chat history" }));
+
+    window.dispatchEvent(new Event("beforeunload"));
+    expect(signal?.aborted).toBe(true);
+    resolveClear(9);
+    await act(async () => undefined);
+    expect(screen.getByRole("status")).not.toHaveTextContent(/Deleted 9|Could not clear/i);
   });
 
   it("uses a feature-local canonical accessibility contract", () => {

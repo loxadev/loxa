@@ -34,6 +34,19 @@ describe("integrated accessibility CSS contract", () => {
     }
   });
 
+  it("owns one responsive canvas and page frame for every route", () => {
+    expect(globalCss).toMatch(/\.workspace-canvas\s*\{[^}]*background:\s*var\(--loxa-background\)/s);
+    expect(globalCss).toMatch(/\.workspace-frame\s*\{[^}]*width:\s*min\(100%,\s*1200px\)/s);
+    expect(globalCss).toMatch(/\.workspace-frame\s*\{[^}]*margin-inline:\s*auto/s);
+    expect(responsiveCanvasErrors(globalCss)).toEqual([]);
+  });
+
+  it("anchors the operational navigation group at the rail bottom", () => {
+    expect(globalCss).toMatch(/\.conversation-rail-slot\s*\{[^}]*flex:\s*1\s+1\s+auto/s);
+    expect(globalCss).toMatch(/\.navigation-secondary-nav\s*\{[^}]*flex:\s*0\s+0\s+auto/s);
+    expect(globalCss).toMatch(/\.global-node-status\s*\{[^}]*min-height:\s*var\(--loxa-component-minimum-interactive-target\)/s);
+  });
+
   it("resolves every feature variable through the canonical distributed token sheet", () => {
     const definitions = new Set(
       [...tokens.matchAll(/(--loxa-[a-z0-9-]+)\s*:/gi)].map((match) => match[1]),
@@ -72,6 +85,23 @@ describe("integrated accessibility CSS contract", () => {
     );
   });
 
+  it("fails when either compact or wide canvas rule is removed from its media block", () => {
+    const compactMutation = globalCss.replace(
+      "@media (max-width: 760px) {",
+      "@media (max-width: 760px) {\n  .workspace-canvas-removed { padding: var(--loxa-space-6); }",
+    ).replace(
+      /(@media \(max-width: 760px\) \{[\s\S]*?)\.workspace-canvas\s*\{[^}]*\}/,
+      "$1",
+    );
+    const wideMutation = globalCss.replace(
+      /(@media \(min-width: 1440px\) \{[\s\S]*?)\.workspace-canvas\s*\{[^}]*\}/,
+      "$1",
+    );
+
+    expect(responsiveCanvasErrors(compactMutation)).toContain("missing compact canvas gutter");
+    expect(responsiveCanvasErrors(wideMutation)).toContain("missing wide canvas gutter");
+  });
+
   it("keeps shared theme transitions scoped and removable for reduced motion", () => {
     expect(globalCss).toContain("transition-property: color, background-color, border-color, outline-color, fill, stroke");
     expect(globalCss).toContain("transition-duration: var(--loxa-motion-theme)");
@@ -92,4 +122,32 @@ function featureContractErrors(css: string, tokenCss: string) {
   }
   if (references.some((reference) => !definitions.has(reference))) errors.push("undefined canonical token");
   return errors;
+}
+
+function responsiveCanvasErrors(css: string) {
+  const errors: string[] = [];
+  const compact = mediaContents(css, "max-width: 760px");
+  const wide = mediaContents(css, "min-width: 1440px");
+  if (!/\.workspace-canvas\s*\{[^}]*padding:\s*var\(--loxa-space-6\)/s.test(compact)) {
+    errors.push("missing compact canvas gutter");
+  }
+  if (!/\.workspace-canvas\s*\{[^}]*padding:\s*var\(--loxa-space-12\)/s.test(wide)) {
+    errors.push("missing wide canvas gutter");
+  }
+  return errors;
+}
+
+function mediaContents(css: string, condition: string) {
+  const marker = `@media (${condition})`;
+  const start = css.indexOf(marker);
+  if (start < 0) return "";
+  const open = css.indexOf("{", start + marker.length);
+  if (open < 0) return "";
+  let depth = 1;
+  for (let index = open + 1; index < css.length; index += 1) {
+    if (css[index] === "{") depth += 1;
+    if (css[index] === "}") depth -= 1;
+    if (depth === 0) return css.slice(open + 1, index);
+  }
+  return "";
 }

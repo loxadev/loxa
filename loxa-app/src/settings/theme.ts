@@ -3,6 +3,7 @@ import { useCallback, useEffect, useState } from "react";
 import {
   applyTheme,
   DARK_THEME_QUERY,
+  isThemeMode,
   readThemePreference,
   writeThemePreference,
   type ThemeMode,
@@ -42,6 +43,9 @@ export function useThemePreference(): readonly [ThemeMode, (mode: ThemeMode) => 
   }, [mode]);
 
   const selectMode = useCallback((next: ThemeMode) => {
+    if (!isThemeMode(next)) return;
+    const media = getDarkPreference();
+    applyTheme(document.documentElement, next, media?.matches ?? false);
     setMode(next);
     persistMode(next);
   }, []);

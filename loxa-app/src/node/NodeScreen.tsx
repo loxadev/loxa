@@ -16,6 +16,7 @@ const phaseLabels = {
   starting: "Starting",
   unloaded: "Node ready — no model loaded",
   ready: "Ready",
+  reconciling: "Updating model status",
   stopping: "Stopping",
   "recovery-required": "Recovery required",
   error: "Error",
@@ -86,6 +87,7 @@ function Field({ label, value, action }: { label: string; value: string; action?
 function phaseSummary(phase: keyof typeof phaseLabels) {
   if (phase === "unloaded") return "The private node is authenticated and ready for a verified model.";
   if (phase === "ready") return "The private node is authenticated and serving the active model.";
+  if (phase === "reconciling") return "Refreshing authoritative node and model status.";
   if (phase === "checking" || phase === "starting") return "Proving local node identity.";
   if (phase === "stopping") return "Stopping the app-owned node safely.";
   if (phase === "recovery-required") return "Runtime recovery is required before model controls can continue.";

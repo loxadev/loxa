@@ -1,9 +1,9 @@
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
 import { App, type AppServices } from "./App";
-import type { ControlStreamTerminal } from "../control/events";
+import type { ControlStreamCallbacks, ControlStreamTerminal } from "../control/events";
 import type { BootstrapSnapshot } from "../node/NodeSession";
 import type { NodeStatus } from "../node/contracts";
 
@@ -74,6 +74,439 @@ describe("App", () => {
     expect(screen.getByRole("link", { name: "Settings" })).toHaveAttribute("aria-current", "page");
   });
 
+  it("threads the Settings lifecycle signal through authenticated history clearing", async () => {
+    const user = userEvent.setup();
+    const api = services();
+    api.clearChats = vi.fn().mockResolvedValue({ deleted: 2 });
+    render(<App services={api} />);
+    await screen.findByRole("link", { name: "Node online. No active model" });
+    await user.click(screen.getByRole("link", { name: "Settings" }));
+    await user.click(screen.getByRole("button", { name: "Clear chat history" }));
+    await user.click(screen.getByRole("button", { name: "Confirm clear chat history" }));
+
+    await waitFor(() => expect(api.clearChats).toHaveBeenCalledWith(
+      "http://127.0.0.1:8080",
+      "ab".repeat(32),
+      { signal: expect.any(AbortSignal) },
+    ));
+    expect(await screen.findByRole("status")).toHaveTextContent("Deleted 2 conversations");
+  });
+
+  it("groups Node and Models as primary controls while keeping Chat and Settings at the rail bottom", async () => {
+    render(<App services={services()} />);
+    await screen.findByText("Node ready — no model loaded");
+
+    const primary = screen.getByRole("group", { name: "Node control" });
+    const secondary = screen.getByRole("group", { name: "Operational tools" });
+    expect(primary).toContainElement(screen.getByRole("link", { name: "Node" }));
+    expect(primary).toContainElement(screen.getByRole("link", { name: "Models" }));
+    expect(primary).not.toContainElement(screen.getByRole("link", { name: "Chat" }));
+    expect(secondary).toContainElement(screen.getByRole("link", { name: "Chat" }));
+    expect(secondary).toContainElement(screen.getByRole("link", { name: "Settings" }));
+  });
+
+  it("places Chat history in the global resizable rail and keeps route navigation", async () => {
+    const user = userEvent.setup();
+    const api = services();
+    const chatId = "0123456789abcdef0123456789abcdef";
+    api.listChats = vi.fn().mockResolvedValue({ chats: [{ id: chatId, title: "Runtime notes", createdAtMs: 1, updatedAtMs: 2 }], nextBefore: null });
+    api.listTurns = vi.fn().mockResolvedValue({ turns: [], nextAfter: null });
+    api.listMessageSummaries = vi.fn();
+    api.getMessageContent = vi.fn();
+    const removeListener = vi.spyOn(window, "removeEventListener");
+    const view = render(<App services={api} />);
+    await user.click(await screen.findByRole("link", { name: "Chat" }));
+
+    const globalRail = screen.getByRole("complementary", { name: "Primary" });
+    expect(within(globalRail).getByRole("navigation", { name: "Chat conversations" })).toBeVisible();
+    expect(within(globalRail).getByRole("button", { name: "Open Runtime notes" })).toBeVisible();
+    expect(within(screen.getByRole("main")).queryByRole("navigation", { name: "Chat conversations" })).not.toBeInTheDocument();
+    expect(within(globalRail).getByRole("link", { name: "Node" })).toBeVisible();
+    expect(within(globalRail).getByRole("link", { name: "Settings" })).toBeVisible();
+
+    const separator = screen.getByRole("separator", { name: "Resize navigation and conversation rail" });
+    expect(separator).toHaveAttribute("aria-valuemin", "220");
+    expect(separator).toHaveAttribute("aria-valuemax", "420");
+    fireEvent.keyDown(separator, { key: "End" });
+    expect(separator).toHaveAttribute("aria-valuenow", "420");
+    fireEvent.keyDown(separator, { key: "ArrowRight" });
+    expect(separator).toHaveAttribute("aria-valuenow", "420");
+    fireEvent.keyDown(separator, { key: "Home" });
+    expect(separator).toHaveAttribute("aria-valuenow", "220");
+    fireEvent.keyDown(separator, { key: "ArrowLeft" });
+    expect(separator).toHaveAttribute("aria-valuenow", "220");
+    fireEvent.pointerDown(separator, { pointerId: 7, button: 0, clientX: 220 });
+    fireEvent.pointerMove(window, { pointerId: 7, clientX: 700 });
+    expect(separator).toHaveAttribute("aria-valuenow", "420");
+    fireEvent.pointerMove(window, { pointerId: 7, clientX: -200 });
+    expect(separator).toHaveAttribute("aria-valuenow", "220");
+    fireEvent.pointerUp(window, { pointerId: 7 });
+
+    view.unmount();
+    expect(removeListener).toHaveBeenCalledWith("pointermove", expect.any(Function));
+    expect(removeListener).toHaveBeenCalledWith("pointerup", expect.any(Function));
+    expect(removeListener).toHaveBeenCalledWith("pointercancel", expect.any(Function));
+    removeListener.mockRestore();
+  });
+
+  it("shows authoritative node health and active model on every route and links recovery to Node", async () => {
+    const api = services();
+    api.getStatus = vi.fn().mockResolvedValue({
+      node_id: "loxa-node-77", health: "ready", model: "loxa",
+      engine: { name: "llama.cpp", version: "b777" }, runtime_model: "gemma-ready", profile: "default",
+    });
+    const user = userEvent.setup();
+    render(<App services={api} />);
+
+    const health = await screen.findByRole("link", { name: "Node ready. Active model gemma-ready" });
+    expect(health).toHaveAttribute("href", "#node");
+    for (const route of ["Models", "Chat", "Settings"]) {
+      await user.click(screen.getByRole("link", { name: route }));
+      expect(screen.getByRole("link", { name: "Node ready. Active model gemma-ready" })).toBeVisible();
+    }
+
+    await user.click(screen.getByRole("link", { name: "Node ready. Active model gemma-ready" }));
+    expect(screen.getByRole("heading", { name: "Node" })).toBeInTheDocument();
+  });
+
+  it("reports an authenticated unloaded node without implying model readiness", async () => {
+    render(<App services={services()} />);
+
+    expect(await screen.findByRole("link", { name: "Node online. No active model" })).toBeVisible();
+  });
+
+  it("settles global model truth from a terminal snapshot after the initiating route unmounts", async () => {
+    const api = services();
+    const controlCallbacks: ControlStreamCallbacks[] = [];
+    api.getStatus = vi.fn()
+      .mockResolvedValueOnce({
+        node_id: "node-7", health: "unavailable", model: "loxa",
+        engine: null, runtime_model: null, profile: null,
+      })
+      .mockResolvedValueOnce({
+        node_id: "node-7", health: "ready", model: "loxa",
+        engine: { name: "llama.cpp", version: "b777" }, runtime_model: "gemma-ready", profile: "default",
+      });
+    api.getInventory = vi.fn().mockResolvedValue([{
+      id: "gemma-ready", repo: "loxa/gemma", revision: "rev", filename: "gemma.gguf",
+      sha256: "ab".repeat(32), sizeBytes: 1, license: "Apache-2.0", params: "4B", quant: "Q4",
+      minFreeMemoryGiB: 1, artifact: { kind: "downloaded" },
+      compatibility: { compatible: true, reason: "Compatible" },
+      engine: { engine: "llama-cpp", eligible: true, reason: "Eligible" },
+    }]);
+    api.getControlNode = vi.fn()
+      .mockResolvedValueOnce({ status: "unloaded", activeModelId: null, operationId: null, error: null })
+      .mockResolvedValueOnce({ status: "loading", activeModelId: null, operationId: "op-load", error: null })
+      .mockResolvedValueOnce({ status: "ready", activeModelId: "gemma-ready", operationId: null, error: null });
+    api.loadModel = vi.fn().mockResolvedValue({ operationId: "op-load" });
+    api.getOperation = vi.fn().mockResolvedValue({
+      id: "op-load", kind: "load", status: "queued", modelId: "gemma-ready", progress: null,
+      error: null, createdAtUnixMs: 1, updatedAtUnixMs: 2,
+    });
+    api.createControlEventStream = vi.fn((_endpoint, _token, _cursor, callbacks) => {
+      controlCallbacks.push(callbacks);
+      return { cancel: vi.fn(), dispose: vi.fn(), finished: new Promise<ControlStreamTerminal>(() => undefined) };
+    });
+    const user = userEvent.setup();
+    render(<App services={api} />);
+
+    expect(await screen.findByRole("link", { name: "Node online. No active model" })).toBeVisible();
+    await user.click(screen.getByRole("link", { name: "Models" }));
+    await user.click(await screen.findByRole("button", { name: "Load gemma-ready" }));
+    expect(screen.getByRole("link", { name: "Updating node. Model status unavailable" })).toBeVisible();
+
+    await user.click(screen.getByRole("link", { name: "Node" }));
+    const initialStreamCount = controlCallbacks.length;
+    act(() => controlCallbacks.forEach((callbacks) => callbacks.onTerminal({
+      kind: "error",
+      cursor: 1,
+      message: "Live model updates disconnected.",
+    })));
+    await waitFor(() => expect(controlCallbacks.length).toBeGreaterThan(initialStreamCount));
+
+    act(() => controlCallbacks.slice(initialStreamCount).forEach((callbacks) => callbacks.onSnapshot({
+      cursor: 1,
+      cursorGap: true,
+      operations: [{
+        id: "op-load", kind: "load", status: "succeeded", modelId: "gemma-ready", progress: null,
+        error: null, createdAtUnixMs: 1, updatedAtUnixMs: 3,
+      }],
+      events: [],
+    })));
+
+    expect(await screen.findByRole("link", { name: "Node ready. Active model gemma-ready" })).toBeVisible();
+  });
+
+  it("refreshes the shared node session after Chat loads a model without requiring navigation", async () => {
+    const api = services();
+    const controlCallbacks: ControlStreamCallbacks[] = [];
+    api.getStatus = vi.fn()
+      .mockResolvedValueOnce({
+        node_id: "node-7", health: "unavailable", model: "loxa",
+        engine: null, runtime_model: null, profile: null,
+      })
+      .mockResolvedValue({
+        node_id: "node-7", health: "ready", model: "loxa",
+        engine: { name: "llama.cpp", version: "b777" }, runtime_model: "gemma-ready", profile: "default",
+      });
+    api.getInventory = vi.fn().mockResolvedValue([{
+      id: "gemma-ready", repo: "loxa/gemma", revision: "rev", filename: "gemma.gguf",
+      sha256: "ab".repeat(32), sizeBytes: 1, license: "Apache-2.0", params: "4B", quant: "Q4",
+      minFreeMemoryGiB: 1, artifact: { kind: "downloaded" },
+      compatibility: { compatible: true, reason: "Compatible" },
+      engine: { engine: "llama-cpp", eligible: true, reason: "Eligible" },
+    }]);
+    api.getControlNode = vi.fn()
+      .mockResolvedValueOnce({ status: "unloaded", activeModelId: null, operationId: null, error: null })
+      .mockResolvedValue({ status: "ready", activeModelId: "gemma-ready", operationId: null, error: null });
+    api.loadModel = vi.fn().mockResolvedValue({ operationId: "op-load" });
+    api.getOperation = vi.fn().mockResolvedValue({
+      id: "op-load", kind: "load", status: "succeeded", modelId: "gemma-ready", progress: null,
+      error: null, createdAtUnixMs: 1, updatedAtUnixMs: 2,
+    });
+    api.createControlEventStream = vi.fn((_endpoint, _token, _cursor, callbacks) => {
+      controlCallbacks.push(callbacks);
+      return { cancel: vi.fn(), dispose: vi.fn(), finished: new Promise<ControlStreamTerminal>(() => undefined) };
+    });
+    const user = userEvent.setup();
+    render(<App services={api} />);
+
+    await user.click(await screen.findByRole("link", { name: "Chat" }));
+    await user.click(await screen.findByRole("button", { name: "Load gemma-ready" }));
+    act(() => controlCallbacks.forEach((callbacks) => callbacks.onEvent({
+      sequence: 3,
+      operation: {
+        id: "op-load", kind: "load", status: "succeeded", modelId: "gemma-ready",
+        progress: null, error: null, createdAtUnixMs: 1, updatedAtUnixMs: 2,
+      },
+    })));
+
+    await waitFor(() => expect(api.getStatus).toHaveBeenCalledTimes(3));
+    expect(await screen.findByRole("link", { name: "Node ready. Active model gemma-ready" })).toBeVisible();
+    expect(screen.getByLabelText("Message")).toBeEnabled();
+  });
+
+  it("joins a Chat completion and terminal event into one authoritative status proof", async () => {
+    const api = services();
+    const controlCallbacks: ControlStreamCallbacks[] = [];
+    const settlementSignals: AbortSignal[] = [];
+    let statusCalls = 0;
+    let resolveStatus!: (status: NodeStatus) => void;
+    let resolveOperation!: (operation: Awaited<ReturnType<AppServices["getOperation"]>>) => void;
+    api.getStatus = vi.fn((_endpoint, options) => {
+      statusCalls += 1;
+      if (statusCalls === 1) return Promise.resolve({
+        node_id: "node-7", health: "unavailable", model: "loxa",
+        engine: null, runtime_model: null, profile: null,
+      } satisfies NodeStatus);
+      if (statusCalls === 2 || statusCalls > 3) return Promise.resolve({
+        node_id: "node-7", health: "ready", model: "loxa",
+        engine: { name: "llama.cpp", version: "b777" },
+        runtime_model: statusCalls === 2 ? "old-model" : "gemma-ready",
+        profile: "default",
+      } satisfies NodeStatus);
+      if (options?.signal) settlementSignals.push(options.signal);
+      return new Promise<NodeStatus>((resolve) => { resolveStatus = resolve; });
+    });
+    api.getInventory = vi.fn().mockResolvedValue([{
+      id: "gemma-ready", repo: "loxa/gemma", revision: "rev", filename: "gemma.gguf",
+      sha256: "ab".repeat(32), sizeBytes: 1, license: "Apache-2.0", params: "4B", quant: "Q4",
+      minFreeMemoryGiB: 1, artifact: { kind: "downloaded" },
+      compatibility: { compatible: true, reason: "Compatible" },
+      engine: { engine: "llama-cpp", eligible: true, reason: "Eligible" },
+    }]);
+    api.getControlNode = vi.fn()
+      .mockResolvedValueOnce({ status: "ready", activeModelId: "old-model", operationId: null, error: null })
+      .mockResolvedValue({ status: "ready", activeModelId: "gemma-ready", operationId: null, error: null });
+    api.loadModel = vi.fn().mockResolvedValue({ operationId: "op-load" });
+    api.getOperation = vi.fn(() => new Promise<Awaited<ReturnType<AppServices["getOperation"]>>>((resolve) => { resolveOperation = resolve; }));
+    api.createControlEventStream = vi.fn((_endpoint, _token, _cursor, callbacks) => {
+      controlCallbacks.push(callbacks);
+      return { cancel: vi.fn(), dispose: vi.fn(), finished: new Promise<ControlStreamTerminal>(() => undefined) };
+    });
+    const user = userEvent.setup();
+    render(<App services={api} />);
+
+    await user.click(await screen.findByRole("link", { name: "Chat" }));
+    await user.selectOptions(await screen.findByRole("combobox", { name: "Choose model" }), "gemma-ready");
+    await user.click(screen.getByRole("button", { name: "Switch to gemma-ready" }));
+    await waitFor(() => expect(api.getOperation).toHaveBeenCalledTimes(1));
+
+    act(() => controlCallbacks.forEach((callbacks) => callbacks.onEvent({
+      sequence: 7,
+      operation: {
+        id: "op-load", kind: "load", status: "succeeded", modelId: "gemma-ready",
+        progress: null, error: null, createdAtUnixMs: 1, updatedAtUnixMs: 2,
+      },
+    })));
+    act(() => resolveOperation({
+      id: "op-load", kind: "load", status: "succeeded", modelId: "gemma-ready",
+      progress: null, error: null, createdAtUnixMs: 1, updatedAtUnixMs: 2,
+    }));
+
+    await waitFor(() => expect(api.getStatus).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(screen.getByLabelText("Message")).toBeDisabled());
+    expect(settlementSignals).toHaveLength(1);
+    expect(settlementSignals[0]?.aborted).toBe(false);
+
+    act(() => resolveStatus({
+      node_id: "node-7", health: "ready", model: "loxa",
+      engine: { name: "llama.cpp", version: "b777" }, runtime_model: "gemma-ready", profile: "default",
+    }));
+    expect(await screen.findByRole("link", { name: "Node ready. Active model gemma-ready" })).toBeVisible();
+    await waitFor(() => expect(screen.getByLabelText("Message")).toBeEnabled());
+    expect(settlementSignals[0]?.aborted).toBe(false);
+  });
+
+  it("settles from the local Chat terminal when the global stream initially cannot connect", async () => {
+    const api = services();
+    api.getStatus = vi.fn()
+      .mockResolvedValueOnce({
+        node_id: "node-7", health: "unavailable", model: "loxa",
+        engine: null, runtime_model: null, profile: null,
+      })
+      .mockResolvedValue({
+        node_id: "node-7", health: "ready", model: "loxa",
+        engine: { name: "llama.cpp", version: "b777" }, runtime_model: "gemma-ready", profile: "default",
+      });
+    api.readControlToken = vi.fn()
+      .mockRejectedValueOnce(new Error("global stream token unavailable"))
+      .mockResolvedValue("ab".repeat(32));
+    api.getInventory = vi.fn().mockResolvedValue([{
+      id: "gemma-ready", repo: "loxa/gemma", revision: "rev", filename: "gemma.gguf",
+      sha256: "ab".repeat(32), sizeBytes: 1, license: "Apache-2.0", params: "4B", quant: "Q4",
+      minFreeMemoryGiB: 1, artifact: { kind: "downloaded" },
+      compatibility: { compatible: true, reason: "Compatible" },
+      engine: { engine: "llama-cpp", eligible: true, reason: "Eligible" },
+    }]);
+    api.getControlNode = vi.fn()
+      .mockResolvedValueOnce({ status: "unloaded", activeModelId: null, operationId: null, error: null })
+      .mockResolvedValue({ status: "ready", activeModelId: "gemma-ready", operationId: null, error: null });
+    api.loadModel = vi.fn().mockResolvedValue({ operationId: "op-load" });
+    api.getOperation = vi.fn().mockResolvedValue({
+      id: "op-load", kind: "load", status: "succeeded", modelId: "gemma-ready", progress: null,
+      error: null, createdAtUnixMs: 1, updatedAtUnixMs: 2,
+    });
+    const user = userEvent.setup();
+    render(<App services={api} />);
+
+    expect(await screen.findByRole("link", { name: "Node online. No active model" })).toBeVisible();
+    await waitFor(() => expect(api.readControlToken).toHaveBeenCalledTimes(1));
+    expect(api.createControlEventStream).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("link", { name: "Chat" }));
+    await user.click(await screen.findByRole("button", { name: "Load gemma-ready" }));
+
+    expect(await screen.findByRole("link", { name: "Node ready. Active model gemma-ready" })).toBeVisible();
+    await waitFor(() => expect(screen.getByLabelText("Message")).toBeEnabled());
+    expect(api.getStatus).toHaveBeenCalledTimes(3);
+  });
+
+  it("reconnects the session stream and settles after the initiating route unmounts", async () => {
+    const api = services();
+    const handles: Array<{ callbacks: ControlStreamCallbacks; dispose: ReturnType<typeof vi.fn> }> = [];
+    const proofSignals: AbortSignal[] = [];
+    api.getStatus = vi.fn()
+      .mockResolvedValueOnce({
+        node_id: "node-7", health: "unavailable", model: "loxa",
+        engine: null, runtime_model: null, profile: null,
+      })
+      .mockImplementation((_endpoint, options) => {
+        if (options?.signal) proofSignals.push(options.signal);
+        return Promise.resolve({
+          node_id: "node-7", health: "ready", model: "loxa",
+          engine: { name: "llama.cpp", version: "b777" }, runtime_model: "gemma-ready", profile: "default",
+        });
+      });
+    api.getInventory = vi.fn().mockResolvedValue([{
+      id: "gemma-ready", repo: "loxa/gemma", revision: "rev", filename: "gemma.gguf",
+      sha256: "ab".repeat(32), sizeBytes: 1, license: "Apache-2.0", params: "4B", quant: "Q4",
+      minFreeMemoryGiB: 1, artifact: { kind: "downloaded" },
+      compatibility: { compatible: true, reason: "Compatible" },
+      engine: { engine: "llama-cpp", eligible: true, reason: "Eligible" },
+    }]);
+    api.getControlNode = vi.fn().mockResolvedValue({ status: "unloaded", activeModelId: null, operationId: null, error: null });
+    api.loadModel = vi.fn().mockResolvedValue({ operationId: "op-load" });
+    api.getOperation = vi.fn(() => new Promise<never>(() => undefined));
+    api.createControlEventStream = vi.fn()
+      .mockImplementationOnce(() => { throw new Error("initial global stream unavailable"); })
+      .mockImplementation((_endpoint, _token, _cursor, callbacks) => {
+        const dispose = vi.fn();
+        handles.push({ callbacks, dispose });
+        return { cancel: vi.fn(), dispose, finished: new Promise<ControlStreamTerminal>(() => undefined) };
+      });
+    const user = userEvent.setup();
+    render(<App services={api} />);
+
+    expect(await screen.findByRole("link", { name: "Node online. No active model" })).toBeVisible();
+    await waitFor(() => expect(api.createControlEventStream).toHaveBeenCalledTimes(1));
+    await user.click(screen.getByRole("link", { name: "Models" }));
+    await user.click(await screen.findByRole("button", { name: "Load gemma-ready" }));
+    expect(screen.getByRole("link", { name: "Updating node. Model status unavailable" })).toBeVisible();
+    await user.click(screen.getByRole("link", { name: "Node" }));
+
+    await waitFor(() => expect(handles.some((handle) => !handle.dispose.mock.calls.length)).toBe(true));
+    const sessionHandle = handles.find((handle) => !handle.dispose.mock.calls.length);
+    expect(sessionHandle).toBeDefined();
+    act(() => sessionHandle?.callbacks.onSnapshot({
+      cursor: 10,
+      cursorGap: true,
+      operations: [
+        { id: "op-old-1", kind: "load", status: "succeeded", modelId: "old", progress: null, error: null, createdAtUnixMs: 1, updatedAtUnixMs: 2 },
+        { id: "op-load", kind: "load", status: "succeeded", modelId: "gemma-ready", progress: null, error: null, createdAtUnixMs: 1, updatedAtUnixMs: 3 },
+        { id: "op-old-2", kind: "unload", status: "failed", modelId: null, progress: null, error: "old", createdAtUnixMs: 1, updatedAtUnixMs: 2 },
+      ],
+      events: [],
+    }));
+
+    expect(await screen.findByRole("link", { name: "Node ready. Active model gemma-ready" })).toBeVisible();
+    expect(api.getStatus).toHaveBeenCalledTimes(2);
+    expect(proofSignals).toHaveLength(1);
+    expect(proofSignals[0]?.aborted).toBe(false);
+  });
+
+  it("does not claim that no model is active before the node session is proven", async () => {
+    const api = services();
+    api.bootstrap.start = vi.fn(() => new Promise<BootstrapSnapshot>(() => undefined));
+    render(<App services={api} />);
+
+    expect(await screen.findByRole("link", { name: "Starting node. Model status unavailable" })).toBeVisible();
+    expect(screen.queryByRole("link", { name: /Starting node\. No active model/ })).not.toBeInTheDocument();
+  });
+
+  it("keeps every route inside the same shell-owned page frame", async () => {
+    const user = userEvent.setup();
+    const { container } = render(<App services={services()} />);
+    await screen.findByText("Node ready — no model loaded");
+
+    const canvas = container.querySelector(".workspace-canvas");
+    const frame = container.querySelector(".workspace-frame");
+    expect(canvas).toContainElement(frame as HTMLElement);
+    expect(frame).toContainElement(screen.getByRole("heading", { name: "Node" }));
+
+    for (const route of ["Models", "Chat", "Settings"] as const) {
+      await user.click(screen.getByRole("link", { name: route }));
+      expect(frame).toContainElement(screen.getByRole("heading", { name: route }));
+    }
+  });
+
+  it("keeps the complete Chat surface visible and inert while node identity is unproven", async () => {
+    const api = services();
+    api.bootstrap.start = vi.fn(() => new Promise<BootstrapSnapshot>(() => undefined));
+    const user = userEvent.setup();
+    render(<App services={api} />);
+
+    await user.click(screen.getByRole("link", { name: "Chat" }));
+
+    expect(screen.getByRole("log", { name: "Conversation" })).toBeVisible();
+    expect(screen.getByRole("form", { name: "Message composer" })).toBeVisible();
+    expect(screen.getByLabelText("Message")).toBeDisabled();
+    expect(screen.getByRole("combobox", { name: "Choose model" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Attach document" })).toBeDisabled();
+    expect(screen.getByText(/document input support cannot be checked until the node is connected/i)).toBeVisible();
+    expect(api.getStatus).not.toHaveBeenCalled();
+    expect(api.readControlToken).not.toHaveBeenCalled();
+  });
+
   it("has a logical keyboard focus order and no unsupported controls", async () => {
     const user = userEvent.setup();
     render(<App services={services()} />);
@@ -83,6 +516,8 @@ describe("App", () => {
     expect(screen.getByRole("link", { name: "Node" })).toHaveFocus();
     await user.tab();
     expect(screen.getByRole("link", { name: "Models" })).toHaveFocus();
+    await user.tab();
+    expect(screen.getByRole("link", { name: "Node online. No active model" })).toHaveFocus();
     await user.tab();
     expect(screen.getByRole("link", { name: "Chat" })).toHaveFocus();
     await user.tab();
@@ -138,6 +573,8 @@ describe("App", () => {
     render(<App services={api} />);
 
     const stop = await screen.findByRole("button", { name: "Stop node" });
+    await waitFor(() => expect(api.readControlToken).toHaveBeenCalled());
+    vi.mocked(api.readControlToken).mockClear();
     await user.click(stop);
     await user.click(screen.getByRole("link", { name: "Models" }));
     expect(screen.getByRole("status")).toHaveTextContent(/stopping|node/i);
@@ -171,6 +608,6 @@ describe("App", () => {
     expect(screen.getByRole("region", { name: "Local node/runtime" })).toHaveTextContent("loxa-node-77");
     expect(screen.getByText("gemma-ready")).toBeInTheDocument();
     expect(api.bootstrap.start).toHaveBeenCalledTimes(1);
-    expect(api.readControlToken).not.toHaveBeenCalled();
+    await waitFor(() => expect(api.readControlToken).toHaveBeenCalledTimes(1));
   });
 });

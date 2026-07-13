@@ -44,6 +44,8 @@ export function ModelsScreen({
   verificationPollMs = 2_000,
   verificationPollLimit = 6,
   reconnectLimit = 6,
+  onModelMutationStart,
+  onModelMutationSettled,
 }: {
   endpoint: string;
   services: ModelsScreenServices;
@@ -51,6 +53,8 @@ export function ModelsScreen({
   verificationPollMs?: number;
   verificationPollLimit?: number;
   reconnectLimit?: number;
+  onModelMutationStart?: (operationId: string) => void;
+  onModelMutationSettled?: (operationId: string) => void | Promise<void>;
 }) {
   const [models, setModels] = useState<ModelInventoryEntry[]>([]);
   const [inventoryLoaded, setInventoryLoaded] = useState(false);
@@ -155,6 +159,10 @@ export function ModelsScreen({
             if (disposed) return;
             cursorRef.current = snapshot.cursor;
             replaceOperations(snapshot.operations);
+            snapshot.operations.filter(isActiveLifecycleOperation)
+              .forEach((operation) => onModelMutationStart?.(operation.id));
+            snapshot.operations.filter(isTerminalLifecycleOperation)
+              .forEach((operation) => { void onModelMutationSettled?.(operation.id); });
             setLiveState("live");
             setError("");
             setNotice(snapshot.cursorGap
@@ -167,11 +175,18 @@ export function ModelsScreen({
             cursorRef.current = event.sequence;
             applyOperation(event.operation);
             setNotice(operationAnnouncement(event.operation));
+            if (isActiveLifecycleOperation(event.operation)) onModelMutationStart?.(event.operation.id);
             if (isTerminal(event.operation.status)) {
               const nodeVersion = ++nodeRevisionRef.current;
-              void refreshTruth(nodeVersion).catch((reason: unknown) => {
-                if (!disposed && !controller.signal.aborted) setError(message(reason));
-              });
+              void refreshTruth(nodeVersion)
+                .catch((reason: unknown) => {
+                  if (!disposed && !controller.signal.aborted) setError(message(reason));
+                })
+                .finally(() => {
+                  if (!disposed && (event.operation.kind === "load" || event.operation.kind === "unload")) {
+                    void onModelMutationSettled?.(event.operation.id);
+                  }
+                });
             }
           },
           onTerminal: (terminal) => {
@@ -259,7 +274,7 @@ export function ModelsScreen({
       window.removeEventListener("beforeunload", disposeWork);
       disposeWork();
     };
-  }, [endpoint, reconnectDelayMs, reconnectLimit, retryNonce, services, verificationPollLimit, verificationPollMs]);
+  }, [endpoint, onModelMutationSettled, onModelMutationStart, reconnectDelayMs, reconnectLimit, retryNonce, services, verificationPollLimit, verificationPollMs]);
 
   const latestByModel = useMemo(() => {
     const latest = new Map<string, OperationView>();
@@ -325,6 +340,7 @@ export function ModelsScreen({
       const accepted = kind === "load"
         ? await services.loadModel(endpoint, token, modelId, { signal })
         : await services.unloadModel(endpoint, token, { signal });
+      onModelMutationStart?.(accepted.operationId);
       if (!activeRef.current || signal.aborted) return;
       const operationToken = await services.readControlToken(endpoint);
       const nodeToken = await services.readControlToken(endpoint);
@@ -341,6 +357,7 @@ export function ModelsScreen({
       });
       if (nodeRevisionRef.current === nodeRevision) setNode(nextNode);
       setNotice(operationAnnouncement(authoritative));
+      if (isTerminal(authoritative.status)) await onModelMutationSettled?.(authoritative.id);
     } catch (reason) {
       if (activeRef.current && !signal.aborted) setError(message(reason));
     } finally {
@@ -404,6 +421,15 @@ export function ModelsScreen({
       <p className="visually-hidden" aria-live="polite">{notice}</p>
     </section>
   );
+}
+
+function isActiveLifecycleOperation(operation: OperationView): boolean {
+  return (operation.kind === "load" || operation.kind === "unload") &&
+    (operation.status === "queued" || operation.status === "running");
+}
+
+function isTerminalLifecycleOperation(operation: OperationView): boolean {
+  return (operation.kind === "load" || operation.kind === "unload") && isTerminal(operation.status);
 }
 
 function ModelRow({

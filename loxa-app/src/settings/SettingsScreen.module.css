@@ -1,5 +1,5 @@
 .screen {
-  max-width: 880px;
+  width: 100%;
 }
 
 .group {
@@ -71,6 +71,26 @@
   color: inherit;
   font-size: var(--loxa-type-body-small-size);
   line-height: var(--loxa-type-body-small-line-height);
+}
+
+.destructiveActions button,
+.confirmClear button {
+  min-height: var(--loxa-component-minimum-interactive-target);
+}
+
+.confirmClear {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--loxa-space-2);
+  padding: var(--loxa-space-3);
+  border: 1px solid var(--loxa-control-border);
+  border-radius: var(--loxa-radius-md);
+}
+
+.confirmClear p {
+  flex-basis: 100%;
+  margin: 0;
 }
 
 .facts {

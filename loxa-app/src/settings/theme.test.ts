@@ -64,6 +64,49 @@ describe("theme preferences", () => {
     expect(media.removeEventListener).toHaveBeenCalledWith("change", listener);
   });
 
+  it("applies each setter selection to the document root before the event returns", () => {
+    const media = {
+      matches: true,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    };
+    vi.stubGlobal("matchMedia", vi.fn().mockReturnValue(media));
+    const { result } = renderHook(() => useThemePreference());
+    expect(document.documentElement).toHaveAttribute("data-loxa-theme", "dark");
+
+    act(() => {
+      result.current[1]("light");
+      expect(document.documentElement).toHaveAttribute("data-loxa-theme-preference", "light");
+      expect(document.documentElement).toHaveAttribute("data-loxa-theme", "light");
+    });
+    act(() => {
+      result.current[1]("dark");
+      expect(document.documentElement).toHaveAttribute("data-loxa-theme", "dark");
+    });
+    media.matches = false;
+    act(() => {
+      result.current[1]("system");
+      expect(document.documentElement).toHaveAttribute("data-loxa-theme-preference", "system");
+      expect(document.documentElement).toHaveAttribute("data-loxa-theme", "light");
+    });
+    expect(window.localStorage.getItem("loxa.theme")).toBe("system");
+  });
+
+  it("rejects an invalid runtime setter value without changing root or storage", () => {
+    vi.stubGlobal("matchMedia", vi.fn().mockReturnValue({
+      matches: false,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    }));
+    window.localStorage.setItem("loxa.theme", "light");
+    const { result } = renderHook(() => useThemePreference());
+
+    act(() => result.current[1]("sepia" as never));
+
+    expect(document.documentElement).toHaveAttribute("data-loxa-theme", "light");
+    expect(window.localStorage.getItem("loxa.theme")).toBe("light");
+  });
+
   it("applies a validated stored preference before React renders", () => {
     window.localStorage.setItem("loxa.theme", "dark");
     vi.stubGlobal("matchMedia", vi.fn().mockReturnValue({ matches: false }));

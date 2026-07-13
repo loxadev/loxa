@@ -2,6 +2,18 @@ import { invoke } from "@tauri-apps/api/core";
 
 import { streamChat } from "../chat/streamChat";
 import {
+  clearChats,
+  createChat,
+  deleteChat,
+  getChat,
+  getMessageContent,
+  listChats,
+  listMessageSummaries,
+  listTurns,
+  renameChat,
+  streamPersistentTurn,
+} from "../chat/historyClient";
+import {
   cancelOperation,
   downloadModel,
   getCapabilities,
@@ -40,5 +52,15 @@ export const appServices: AppServices = {
   cancelOperation,
   createControlEventStream: streamControlEvents,
   createChatStream: streamChat,
+  listChats,
+  createChat,
+  getChat,
+  listTurns,
+  listMessageSummaries,
+  getMessageContent,
+  renameChat,
+  deleteChat,
+  createPersistentTurn: streamPersistentTurn,
+  clearChats,
   copyText: (text: string) => navigator.clipboard.writeText(text),
 };
