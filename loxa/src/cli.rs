@@ -6,7 +6,9 @@ use crate::model_commands::{
 use crate::model_commands::{print_list, pull_model, remove_model, write_unknown_id};
 use clap::Parser;
 use loxa_core::control::auth::ControlToken;
-use loxa_core::control::client::LiveControlClient;
+use loxa_core::control::client::{
+    ChatView, LiveControlClient, MessagePageView, MessageSummaryView, TurnStreamEvent, TurnView,
+};
 use loxa_core::detect::{DetectedTool, LocalToolsReport};
 use loxa_core::engine::RuntimeBackendKind;
 use loxa_core::hardware::HardwareReport;
@@ -20,7 +22,67 @@ use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::process::ExitCode;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+#[cfg(unix)]
+static CHAT_INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn record_chat_interrupt(_signal: std::ffi::c_int) {
+    CHAT_INTERRUPTED.store(true, Ordering::SeqCst);
+}
+
+#[cfg(unix)]
+struct ChatInterruptGuard {
+    previous: usize,
+}
+
+#[cfg(unix)]
+impl ChatInterruptGuard {
+    fn install() -> io::Result<Self> {
+        extern "C" {
+            fn signal(signal: std::ffi::c_int, handler: usize) -> usize;
+        }
+        CHAT_INTERRUPTED.store(false, Ordering::SeqCst);
+        let previous = unsafe { signal(2, record_chat_interrupt as *const () as usize) };
+        if previous == usize::MAX {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(Self { previous })
+        }
+    }
+
+    fn interrupted(&self) -> bool {
+        CHAT_INTERRUPTED.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ChatInterruptGuard {
+    fn drop(&mut self) {
+        extern "C" {
+            fn signal(signal: std::ffi::c_int, handler: usize) -> usize;
+        }
+        let _ = unsafe { signal(2, self.previous) };
+        CHAT_INTERRUPTED.store(false, Ordering::SeqCst);
+    }
+}
+
+#[cfg(not(unix))]
+struct ChatInterruptGuard;
+
+#[cfg(not(unix))]
+impl ChatInterruptGuard {
+    fn install() -> io::Result<Self> {
+        Ok(Self)
+    }
+
+    fn interrupted(&self) -> bool {
+        false
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "loxa", version, about = "Measured local AI infrastructure")]
@@ -46,6 +108,15 @@ enum Command {
         id: String,
     },
     Unload,
+    Chat {
+        #[arg(long)]
+        chat: Option<String>,
+        prompt: String,
+    },
+    Chats {
+        #[command(subcommand)]
+        command: ChatsCommand,
+    },
     Run {
         id: String,
         #[arg(long)]
@@ -66,6 +137,36 @@ enum Command {
     Ps,
     Stop {
         target: String,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum ChatsCommand {
+    List {
+        #[arg(long, default_value_t = 30)]
+        limit: usize,
+        #[arg(long)]
+        before: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    Show {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Rename {
+        id: String,
+        title: String,
+    },
+    Delete {
+        id: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    Clear {
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -130,6 +231,14 @@ fn run_with_paths<W: Write, E: Write>(
                     Ok(ExitCode::from(1))
                 }
             },
+            Command::Chat { chat, prompt } => {
+                let client = require_live_control(paths, "chat")?;
+                live_chat(&client, chat.as_deref(), &prompt, &mut stdout, &mut stderr)
+            }
+            Command::Chats { command } => {
+                let client = require_live_control(paths, "chat history")?;
+                live_chats(&client, command, &mut stdout)
+            }
             Command::Run {
                 id,
                 ctx,
@@ -159,6 +268,427 @@ fn run_with_paths<W: Write, E: Write>(
     })();
 
     finish_cli_result(result, &mut stderr)
+}
+
+fn require_live_control(paths: &NodePaths, action: &str) -> io::Result<LiveControlClient> {
+    live_control(paths)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotConnected,
+            format!(
+                "no managed node is running; start one with `loxa serve` before using {action}"
+            ),
+        )
+    })
+}
+
+fn live_chat<W: Write, E: Write>(
+    client: &LiveControlClient,
+    requested_chat: Option<&str>,
+    prompt: &str,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> io::Result<ExitCode> {
+    let chat = match requested_chat {
+        Some(id) => client.chat(id),
+        None => client.create_chat(),
+    }
+    .map_err(io::Error::other)?;
+    writeln!(stderr, "chat: {}", chat.id)?;
+    let interrupt = ChatInterruptGuard::install()?;
+    let streamed = client.stream_turn_with_cancel(
+        &chat.id,
+        prompt,
+        || interrupt.interrupted(),
+        |event| {
+            if interrupt.interrupted() {
+                return Err(loxa_core::control::client::ClientError::OperationCancelled);
+            }
+            match &event {
+                TurnStreamEvent::Started { omitted_turns, .. } if *omitted_turns > 0 => {
+                    writeln!(
+                    stderr,
+                    "note: {omitted_turns} older completed turns were omitted from model context"
+                )
+                    .map_err(|error| {
+                        loxa_core::control::client::ClientError::Transport(error.to_string())
+                    })?;
+                }
+                TurnStreamEvent::Delta { content, .. } => {
+                    write!(stdout, "{content}")
+                        .and_then(|_| stdout.flush())
+                        .map_err(|error| {
+                            loxa_core::control::client::ClientError::Transport(error.to_string())
+                        })?;
+                }
+                _ => {}
+            }
+            Ok(())
+        },
+    );
+    if interrupt.interrupted() && streamed.is_err() {
+        writeln!(stdout)?;
+        writeln!(stderr, "chat turn cancelled")?;
+        return Ok(ExitCode::from(130));
+    }
+    let terminal = streamed.map_err(io::Error::other)?;
+    writeln!(stdout)?;
+    match terminal {
+        TurnStreamEvent::Terminal { state, .. } if state == "completed" => Ok(ExitCode::SUCCESS),
+        TurnStreamEvent::Terminal { state, .. } if state == "cancelled" => {
+            writeln!(stderr, "chat turn cancelled")?;
+            Ok(ExitCode::from(130))
+        }
+        TurnStreamEvent::Terminal { error_code, .. } => Err(io::Error::other(format!(
+            "chat turn failed{}",
+            error_code
+                .as_deref()
+                .map(|code| format!(" ({code})"))
+                .unwrap_or_default()
+        ))),
+        _ => Err(io::Error::other(
+            "chat stream ended without a terminal event",
+        )),
+    }
+}
+
+fn live_chats<W: Write>(
+    client: &LiveControlClient,
+    command: ChatsCommand,
+    stdout: &mut W,
+) -> io::Result<ExitCode> {
+    match command {
+        ChatsCommand::List {
+            limit,
+            before,
+            json,
+        } => {
+            let page = client
+                .chats(limit, before.as_deref())
+                .map_err(io::Error::other)?;
+            if json {
+                write_chat_list_json(stdout, &page.chats, page.next_before.as_deref())?;
+            } else {
+                writeln!(
+                    stdout,
+                    "id                                updated        title"
+                )?;
+                for chat in page.chats {
+                    writeln!(
+                        stdout,
+                        "{}  {:>13}  {}",
+                        chat.id, chat.updated_at_ms, chat.title
+                    )?;
+                }
+                if let Some(cursor) = page.next_before {
+                    writeln!(stdout, "more chats available; next cursor: {cursor}")?;
+                }
+            }
+        }
+        ChatsCommand::Show { id, json } => {
+            let chat = client.chat(&id).map_err(io::Error::other)?;
+            let turns = fetch_all_turns(client, &id)?;
+            let messages = fetch_turn_messages(client, &id, &turns)?;
+            if json {
+                write_chat_show_json(stdout, &chat, &turns, &messages)?;
+            } else {
+                writeln!(stdout, "{} ({})", chat.title, chat.id)?;
+                if turns.len() != messages.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "turn and message history groups do not match",
+                    ));
+                }
+                for (turn_index, turn) in turns.iter().enumerate() {
+                    let turn_messages = &messages[turn_index];
+                    writeln!(stdout, "\nturn {} [{}]", turn.ordinal, turn.state)?;
+                    for (summary, content) in turn_messages {
+                        writeln!(stdout, "\n{}:\n{}", summary.role, content)?;
+                    }
+                }
+            }
+        }
+        ChatsCommand::Rename { id, title } => {
+            let chat = client.rename_chat(&id, &title).map_err(io::Error::other)?;
+            writeln!(stdout, "renamed {} to {}", chat.id, chat.title)?;
+        }
+        ChatsCommand::Delete { id, yes } => {
+            require_confirmation(yes, "delete").map_err(io::Error::other)?;
+            client.delete_chat(&id).map_err(io::Error::other)?;
+            writeln!(stdout, "deleted chat {id}")?;
+        }
+        ChatsCommand::Clear { yes } => {
+            require_confirmation(yes, "clear").map_err(io::Error::other)?;
+            let deleted = client.clear_chats().map_err(io::Error::other)?;
+            writeln!(stdout, "deleted {deleted} chats")?;
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn require_confirmation(yes: bool, action: &str) -> Result<(), &'static str> {
+    if yes {
+        Ok(())
+    } else if action == "delete" {
+        Err("refusing to delete chat history without --yes")
+    } else {
+        Err("refusing to clear chat history without --yes")
+    }
+}
+
+type CliMessages = Vec<Vec<(MessageSummaryView, String)>>;
+
+fn fetch_all_turns(client: &LiveControlClient, chat_id: &str) -> io::Result<Vec<TurnView>> {
+    let mut turns = Vec::new();
+    let mut after = None;
+    loop {
+        let page = client
+            .turns(chat_id, 100, after.as_deref())
+            .map_err(io::Error::other)?;
+        append_turn_page(chat_id, &mut turns, page.turns)?;
+        match page.next_after {
+            Some(next) if after.as_deref() != Some(next.as_str()) => after = Some(next),
+            Some(_) => return Err(io::Error::other("history pagination cursor repeated")),
+            None => return Ok(turns),
+        }
+    }
+}
+
+fn append_turn_page(
+    chat_id: &str,
+    turns: &mut Vec<TurnView>,
+    page: Vec<TurnView>,
+) -> io::Result<()> {
+    for turn in page {
+        if turn.chat_id != chat_id
+            || turns
+                .last()
+                .is_some_and(|previous| turn.ordinal <= previous.ordinal)
+            || turns.iter().any(|previous| previous.id == turn.id)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "turn history is not strictly ordered",
+            ));
+        }
+        turns.push(turn);
+    }
+    Ok(())
+}
+
+fn fetch_turn_messages(
+    client: &LiveControlClient,
+    chat_id: &str,
+    turns: &[TurnView],
+) -> io::Result<CliMessages> {
+    let mut output = Vec::with_capacity(turns.len());
+    for turn in turns {
+        let summaries = client
+            .message_summaries(chat_id, &turn.id)
+            .map_err(io::Error::other)?;
+        if summaries.messages.len() != 2
+            || summaries.messages[0].turn_id != turn.id
+            || summaries.messages[0].role != "user"
+            || summaries.messages[1].turn_id != turn.id
+            || summaries.messages[1].role != "assistant"
+            || summaries.messages[0].id == summaries.messages[1].id
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "turn message history is incomplete or inconsistent",
+            ));
+        }
+        let mut messages = Vec::with_capacity(summaries.messages.len());
+        for summary in summaries.messages {
+            let mut pages = Vec::new();
+            let mut segment = 0;
+            loop {
+                let page = client
+                    .message_page(chat_id, &turn.id, &summary.id, segment)
+                    .map_err(io::Error::other)?;
+                let next = page.next_segment;
+                pages.push(page);
+                match next {
+                    Some(next) if next > segment => segment = next,
+                    Some(_) => return Err(io::Error::other("message segment cursor repeated")),
+                    None => break,
+                }
+            }
+            let content = join_message_pages(&summary, &pages)?;
+            messages.push((summary, content));
+        }
+        output.push(messages);
+    }
+    Ok(output)
+}
+
+fn join_message_pages(
+    summary: &MessageSummaryView,
+    pages: &[MessagePageView],
+) -> io::Result<String> {
+    if pages.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "message history has no segments",
+        ));
+    }
+    let mut content = String::new();
+    let mut expected = 0_u32;
+    let expected_count = pages.first().map(|page| page.segment_count).unwrap_or(0);
+    if expected_count == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "message history declared zero segments",
+        ));
+    }
+    for page in pages {
+        if page.message_id != summary.id
+            || page.turn_id != summary.turn_id
+            || page.role != summary.role
+            || page.segment_count != expected_count
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "message history metadata changed between segments",
+            ));
+        }
+        for segment in &page.segments {
+            if segment.message_id != summary.id
+                || segment.turn_id != summary.turn_id
+                || segment.role != summary.role
+                || segment.segment_index != expected
+                || segment.segment_count != expected_count
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "message history segments are out of order",
+                ));
+            }
+            content.push_str(&segment.content);
+            expected += 1;
+        }
+    }
+    if expected != expected_count {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "message history is missing segments",
+        ));
+    }
+    if content.len() != summary.content_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "message history byte count does not match its summary",
+        ));
+    }
+    Ok(content)
+}
+
+fn write_json_string<W: Write>(writer: &mut W, value: &str) -> io::Result<()> {
+    writer.write_all(b"\"")?;
+    for character in value.chars() {
+        match character {
+            '"' => writer.write_all(b"\\\"")?,
+            '\\' => writer.write_all(b"\\\\")?,
+            '\n' => writer.write_all(b"\\n")?,
+            '\r' => writer.write_all(b"\\r")?,
+            '\t' => writer.write_all(b"\\t")?,
+            character if character.is_control() => write!(writer, "\\u{:04x}", character as u32)?,
+            character => write!(writer, "{character}")?,
+        }
+    }
+    writer.write_all(b"\"")
+}
+
+fn write_chat_json<W: Write>(writer: &mut W, chat: &ChatView) -> io::Result<()> {
+    writer.write_all(b"{\"id\":")?;
+    write_json_string(writer, &chat.id)?;
+    writer.write_all(b",\"title\":")?;
+    write_json_string(writer, &chat.title)?;
+    write!(
+        writer,
+        ",\"created_at_ms\":{},\"updated_at_ms\":{}}}",
+        chat.created_at_ms, chat.updated_at_ms
+    )
+}
+
+fn write_chat_list_json<W: Write>(
+    writer: &mut W,
+    chats: &[ChatView],
+    next_before: Option<&str>,
+) -> io::Result<()> {
+    writer.write_all(b"{\"chats\":[")?;
+    for (index, chat) in chats.iter().enumerate() {
+        if index > 0 {
+            writer.write_all(b",")?;
+        }
+        write_chat_json(writer, chat)?;
+    }
+    writer.write_all(b"],\"next_before\":")?;
+    match next_before {
+        Some(cursor) => write_json_string(writer, cursor)?,
+        None => writer.write_all(b"null")?,
+    }
+    writer.write_all(b"}\n")
+}
+
+fn write_chat_show_json<W: Write>(
+    writer: &mut W,
+    chat: &ChatView,
+    turns: &[TurnView],
+    messages: &CliMessages,
+) -> io::Result<()> {
+    if turns.len() != messages.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "turn and message history groups do not match",
+        ));
+    }
+    writer.write_all(b"{\"chat\":")?;
+    write_chat_json(writer, chat)?;
+    writer.write_all(b",\"turns\":[")?;
+    for (turn_index, turn) in turns.iter().enumerate() {
+        let turn_messages = &messages[turn_index];
+        if turn_index > 0 {
+            writer.write_all(b",")?;
+        }
+        writer.write_all(b"{\"id\":")?;
+        write_json_string(writer, &turn.id)?;
+        write!(writer, ",\"ordinal\":{},\"state\":", turn.ordinal)?;
+        write_json_string(writer, &turn.state)?;
+        writer.write_all(b",\"provenance\":{\"model_alias\":")?;
+        write_json_string(writer, &turn.provenance.model_alias)?;
+        writer.write_all(b",\"recipe_id\":")?;
+        write_json_string(writer, &turn.provenance.recipe_id)?;
+        writer.write_all(b",\"engine_name\":")?;
+        match turn.provenance.engine_name.as_deref() {
+            Some(value) => write_json_string(writer, value)?,
+            None => writer.write_all(b"null")?,
+        }
+        writer.write_all(b",\"engine_version\":")?;
+        match turn.provenance.engine_version.as_deref() {
+            Some(value) => write_json_string(writer, value)?,
+            None => writer.write_all(b"null")?,
+        }
+        writer.write_all(b"},\"error_code\":")?;
+        match turn.error_code.as_deref() {
+            Some(value) => write_json_string(writer, value)?,
+            None => writer.write_all(b"null")?,
+        }
+        writer.write_all(b",\"messages\":[")?;
+        for (message_index, (summary, content)) in turn_messages.iter().enumerate() {
+            if message_index > 0 {
+                writer.write_all(b",")?;
+            }
+            writer.write_all(b"{\"id\":")?;
+            write_json_string(writer, &summary.id)?;
+            writer.write_all(b",\"role\":")?;
+            write_json_string(writer, &summary.role)?;
+            writer.write_all(b",\"content\":")?;
+            write_json_string(writer, content)?;
+            writer.write_all(b"}")?;
+        }
+        writer.write_all(b"]}")?;
+    }
+    writer.write_all(b"]}\n")
 }
 
 fn offline_pull_with(
@@ -234,6 +764,7 @@ fn live_control(paths: &NodePaths) -> io::Result<Option<LiveControlClient>> {
             inspection.status
         )));
     }
+    let address = live_control_address(&run)?;
     let state_dir = paths
         .state_path
         .parent()
@@ -246,13 +777,14 @@ fn live_control(paths: &NodePaths) -> io::Result<Option<LiveControlClient>> {
         state_dir
     };
     let token = ControlToken::load(&loxa_dir.join("control.token"))?;
-    let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), run.port);
     let client =
         LiveControlClient::connect(address, token, &run.run_id, Duration::from_millis(750))
             .map_err(io::Error::other)?;
     match supervisor::read_runtime_state(&paths.state_path).map_err(supervisor_error_to_io)? {
         RuntimeStateRead::Loaded(current)
-            if current.len() == 1 && current[0].identity() == run.identity() => {}
+            if current.len() == 1
+                && current[0].identity() == run.identity()
+                && current[0].control_port == run.control_port => {}
         _ => {
             return Err(io::Error::other(
                 "managed node state changed during peer proof; retry the command",
@@ -260,6 +792,16 @@ fn live_control(paths: &NodePaths) -> io::Result<Option<LiveControlClient>> {
         }
     }
     Ok(Some(client))
+}
+
+fn live_control_address(run: &supervisor::ManagedRun) -> io::Result<SocketAddr> {
+    let port = run.control_port.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "the managed runtime does not expose an authenticated node-control endpoint; stop it and start `loxa serve` with this version",
+        )
+    })?;
+    Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
 }
 
 fn live_operation<W: Write>(
@@ -450,6 +992,28 @@ impl<W: Write, E: Write> LifecycleEventSink for CliLifecycleSink<'_, W, E> {
                 "loxa node listening on http://127.0.0.1:{port} with model alias {model_alias}"
             ),
             LifecycleEvent::ModelReady { server } => print_run_ready(self.stdout, &server),
+            LifecycleEvent::StableModelReady {
+                model_id,
+                port,
+                model_alias,
+            } => writeln!(
+                self.stdout,
+                "model {model_id} is ready on http://127.0.0.1:{port} with alias {model_alias}"
+            ),
+            LifecycleEvent::StableModelFailed {
+                model_id,
+                reason,
+                recovery_required,
+            } => {
+                if recovery_required {
+                    writeln!(
+                        self.stderr,
+                        "model {model_id} failed to start: {reason}; node recovery is required"
+                    )
+                } else {
+                    writeln!(self.stderr, "model {model_id} failed to start: {reason}")
+                }
+            }
             LifecycleEvent::Restarting {
                 process_label,
                 before_healthy,
@@ -882,9 +1446,52 @@ mod tests {
     use loxa_core::detect::{InstallState, RunState, ToolDetection};
     use loxa_core::registry::REGISTRY;
     use std::fs;
+    use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn stable_startup_events_render_truthful_ready_and_sanitized_failures() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        {
+            let mut sink = CliLifecycleSink {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+            };
+            sink.emit(LifecycleEvent::StableModelReady {
+                model_id: "gemma-3-4b-it-q4".into(),
+                port: 11_435,
+                model_alias: "loxa".into(),
+            })
+            .unwrap();
+            for (reason, recovery_required) in [
+                ("model artifact is not downloaded and verified", false),
+                ("engine readiness failed safely", false),
+                ("model startup was cancelled", false),
+                ("node recovery is required", true),
+            ] {
+                sink.emit(LifecycleEvent::StableModelFailed {
+                    model_id: "gemma-3-4b-it-q4".into(),
+                    reason: reason.into(),
+                    recovery_required,
+                })
+                .unwrap();
+            }
+        }
+
+        let stdout = String::from_utf8(stdout).unwrap();
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert!(stdout.contains("model gemma-3-4b-it-q4 is ready"));
+        assert!(stdout.contains("alias loxa"));
+        assert!(stderr.contains("not downloaded and verified"));
+        assert!(stderr.contains("readiness failed safely"));
+        assert!(stderr.contains("startup was cancelled"));
+        assert!(stderr.contains("node recovery is required"));
+        assert!(!stderr.contains("/Users/"));
+        assert!(!stderr.contains("127.0.0.1:"));
+    }
 
     #[test]
     fn doctor_report_renders_injected_python_mlx_evidence() {
@@ -965,6 +1572,7 @@ mod tests {
             lifecycle: supervisor::RunLifecycle::Starting,
             generation: 0,
             generation_alias: format!("loxa-{run_id}-g0"),
+            control_port: None,
             port: 8080,
             log_path: state_path
                 .parent()
@@ -991,6 +1599,158 @@ mod tests {
             supervisor::process_start_time_with_retry(std::process::id())
                 .expect("current test child process start time"),
         );
+    }
+
+    #[test]
+    fn live_control_keeps_targeting_the_stable_node_endpoint_after_engine_load() {
+        let temp = TempDir::new("live-control-stable-endpoint");
+        let state_path = temp.path().join("run").join("managed.json");
+        let mut run = starting_run_for_test(&state_path, "stable-owner");
+        run.control_port = Some(45_678);
+        run.port = 45_679;
+        run.lifecycle = supervisor::RunLifecycle::Running;
+
+        assert_eq!(
+            live_control_address(&run).unwrap(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 45_678)
+        );
+        assert_ne!(run.control_port, Some(run.port));
+    }
+
+    #[test]
+    fn live_control_fails_closed_when_migrated_state_has_no_proven_control_endpoint() {
+        let temp = TempDir::new("live-control-missing-endpoint");
+        let run = starting_run_for_test(&temp.path().join("managed.json"), "old-owner");
+
+        let error = live_control_address(&run).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("start `loxa serve`"));
+    }
+
+    #[test]
+    fn live_control_reports_missing_migrated_endpoint_before_loading_credentials() {
+        let temp = TempDir::new("live-control-migrated-missing-endpoint");
+        let paths = NodePaths {
+            models_dir: temp.path().join("models"),
+            state_path: temp.path().join("run").join("managed.json"),
+            logs_dir: temp.path().join("logs"),
+        };
+        let engine_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut run = starting_run_for_test(&paths.state_path, "migrated-live-owner");
+        set_test_owner_to_current_process(&mut run);
+        set_test_child_to_current_process(&mut run, &engine_listener);
+        fs::create_dir_all(paths.state_path.parent().unwrap()).unwrap();
+        fs::write(
+            &paths.state_path,
+            format!(
+                r#"{{
+  "schema_version": 3,
+  "runs": [{{
+    "schema_version": 3,
+    "run_id": "{}",
+    "model_id": "{}",
+    "owner_pid": {},
+    "owner_process_start_time_unix_s": {},
+    "stop_requested": false,
+    "lifecycle": "running",
+    "generation": {},
+    "generation_alias": "{}",
+    "port": {},
+    "log_path": "{}",
+    "child_pid": {},
+    "child_process_start_time_unix_s": {},
+    "child_pgid": null
+  }}]
+}}"#,
+                run.run_id,
+                run.model_id.as_deref().unwrap(),
+                run.owner_pid,
+                run.owner_process_start_time_unix_s,
+                run.generation,
+                run.generation_alias,
+                run.port,
+                run.log_path.display(),
+                run.child_pid.unwrap(),
+                run.child_process_start_time_unix_s.unwrap(),
+            ),
+        )
+        .unwrap();
+
+        let token_path = temp.path().join("control.token");
+        assert!(!token_path.exists());
+        let error = live_control(&paths).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("start `loxa serve`"));
+        assert!(!token_path.exists());
+    }
+
+    #[test]
+    fn live_control_proves_the_persisted_custom_node_endpoint_after_engine_attachment() {
+        use loxa_core::control::contracts::NodeStatus;
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new("live-control-custom-endpoint");
+        #[cfg(unix)]
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = NodePaths {
+            models_dir: temp.path().join("models"),
+            state_path: temp.path().join("run").join("managed.json"),
+            logs_dir: temp.path().join("logs"),
+        };
+        let token = ControlToken::load_or_create(&temp.path().join("control.token")).unwrap();
+        let control_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let control_port = control_listener.local_addr().unwrap().port();
+        let engine_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut run = starting_run_for_test(&paths.state_path, "stable-custom-owner");
+        set_test_owner_to_current_process(&mut run);
+        run.control_port = Some(control_port);
+        set_test_child_to_current_process(&mut run, &engine_listener);
+        let runtime_identity = run.run_id.clone();
+        persist_test_run(&paths.state_path, run.clone());
+
+        let server_token = token.clone();
+        let proof_server = std::thread::spawn(move || {
+            let (mut socket, _) = control_listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(!request.to_ascii_lowercase().contains("authorization:"));
+            let nonce = request
+                .lines()
+                .find_map(|line| line.strip_prefix("X-Loxa-Challenge: "))
+                .unwrap();
+            let proof = server_token
+                .node_identity_proof(nonce, "test-node", &runtime_identity, NodeStatus::Ready)
+                .unwrap();
+            let body = format!(
+                r#"{{"protocol_version":1,"node_id":"test-node","runtime_identity":"{runtime_identity}","status":"ready","challenge_proof":"{proof}"}}"#
+            );
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        assert!(live_control(&paths).unwrap().is_some());
+        proof_server.join().unwrap();
+        let RuntimeStateRead::Loaded(stored) =
+            supervisor::read_runtime_state(&paths.state_path).unwrap()
+        else {
+            panic!("persisted loaded state")
+        };
+        assert_eq!(stored[0].control_port, Some(control_port));
+        assert_eq!(stored[0].port, engine_listener.local_addr().unwrap().port());
+        assert_ne!(stored[0].control_port, Some(stored[0].port));
     }
 
     fn persist_test_run(state_path: &Path, run: supervisor::ManagedRun) {
@@ -1241,6 +2001,158 @@ mod tests {
                 command: Command::Stop { target },
             }) if target == "all"
         ));
+        assert!(matches!(
+            Cli::try_parse_from(["loxa", "chat", "hello"]),
+            Ok(Cli {
+                command: Command::Chat { chat: None, prompt }
+            }) if prompt == "hello"
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["loxa", "chat", "--chat", "0123456789abcdef0123456789abcdef", "follow up"]),
+            Ok(Cli {
+                command: Command::Chat { chat: Some(chat), prompt }
+            }) if chat == "0123456789abcdef0123456789abcdef" && prompt == "follow up"
+        ));
+        assert!(Cli::try_parse_from([
+            "loxa", "chats", "list", "--limit", "50", "--before", "cursor_1", "--json"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "loxa",
+            "chats",
+            "show",
+            "0123456789abcdef0123456789abcdef",
+            "--json"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "loxa",
+            "chats",
+            "rename",
+            "0123456789abcdef0123456789abcdef",
+            "A title"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "loxa",
+            "chats",
+            "delete",
+            "0123456789abcdef0123456789abcdef",
+            "--yes"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from(["loxa", "chats", "clear", "--yes"]).is_ok());
+    }
+
+    #[test]
+    fn destructive_history_commands_require_explicit_confirmation() {
+        assert_eq!(
+            require_confirmation(false, "delete"),
+            Err("refusing to delete chat history without --yes")
+        );
+        assert_eq!(require_confirmation(true, "delete"), Ok(()));
+    }
+
+    #[test]
+    fn segmented_messages_are_joined_in_order_for_cli_show() {
+        let pages = vec![
+            loxa_core::control::client::MessagePageView {
+                message_id: "11111111111111111111111111111111".into(),
+                turn_id: "22222222222222222222222222222222".into(),
+                role: "assistant".into(),
+                segment_count: 2,
+                segments: vec![loxa_core::control::client::MessageSegmentView {
+                    message_id: "11111111111111111111111111111111".into(),
+                    turn_id: "22222222222222222222222222222222".into(),
+                    role: "assistant".into(),
+                    segment_index: 0,
+                    segment_count: 2,
+                    content: "first ".into(),
+                }],
+                next_segment: Some(1),
+            },
+            loxa_core::control::client::MessagePageView {
+                message_id: "11111111111111111111111111111111".into(),
+                turn_id: "22222222222222222222222222222222".into(),
+                role: "assistant".into(),
+                segment_count: 2,
+                segments: vec![loxa_core::control::client::MessageSegmentView {
+                    message_id: "11111111111111111111111111111111".into(),
+                    turn_id: "22222222222222222222222222222222".into(),
+                    role: "assistant".into(),
+                    segment_index: 1,
+                    segment_count: 2,
+                    content: "second".into(),
+                }],
+                next_segment: None,
+            },
+        ];
+
+        let summary = loxa_core::control::client::MessageSummaryView {
+            id: "11111111111111111111111111111111".into(),
+            turn_id: "22222222222222222222222222222222".into(),
+            role: "assistant".into(),
+            content_bytes: 12,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+        assert_eq!(
+            join_message_pages(&summary, &pages).unwrap(),
+            "first second"
+        );
+
+        let mut invalid = pages;
+        invalid[1].segments[0].role = "user".into();
+        assert!(join_message_pages(&summary, &invalid).is_err());
+    }
+
+    #[test]
+    fn multi_page_turns_require_matching_chat_unique_ids_and_ascending_ordinals() {
+        let chat = "0123456789abcdef0123456789abcdef";
+        let turn = |id: &str, ordinal| loxa_core::control::client::TurnView {
+            id: id.into(),
+            chat_id: chat.into(),
+            ordinal,
+            state: "completed".into(),
+            provenance: loxa_core::control::client::TurnProvenanceView {
+                model_alias: "loxa".into(),
+                recipe_id: "recipe".into(),
+                engine_name: None,
+                engine_version: None,
+            },
+            error_code: None,
+            created_at_ms: ordinal,
+            updated_at_ms: ordinal,
+        };
+        let mut turns = Vec::new();
+        append_turn_page(
+            chat,
+            &mut turns,
+            vec![turn("11111111111111111111111111111111", 1)],
+        )
+        .unwrap();
+        append_turn_page(
+            chat,
+            &mut turns,
+            vec![turn("22222222222222222222222222222222", 2)],
+        )
+        .unwrap();
+        assert_eq!(turns.len(), 2);
+        assert!(append_turn_page(
+            chat,
+            &mut turns,
+            vec![turn("11111111111111111111111111111111", 3)]
+        )
+        .is_err());
+        assert!(append_turn_page(
+            chat,
+            &mut turns,
+            vec![turn("33333333333333333333333333333333", 2)]
+        )
+        .is_err());
+        let mut wrong_chat = turn("44444444444444444444444444444444", 3);
+        wrong_chat.chat_id = "ffffffffffffffffffffffffffffffff".into();
+        assert!(append_turn_page(chat, &mut turns, vec![wrong_chat]).is_err());
     }
 
     #[test]
@@ -1265,6 +2177,29 @@ mod tests {
             .contains("no managed node"));
         assert!(!paths.state_path.exists());
         assert!(!paths.models_dir.exists());
+    }
+
+    #[test]
+    fn chat_history_without_a_live_node_is_actionable_and_never_opens_storage() {
+        let temp = TempDir::new("offline-history");
+        let paths = NodePaths {
+            models_dir: temp.path().join("models"),
+            state_path: temp.path().join("run").join("managed.json"),
+            logs_dir: temp.path().join("logs"),
+        };
+        let cli = Cli::try_parse_from(["loxa", "chats", "list"]).unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        assert_eq!(
+            run_with_paths(cli, &paths, &mut stdout, &mut stderr),
+            ExitCode::from(1)
+        );
+        assert!(stdout.is_empty());
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert!(stderr.contains("start one with `loxa serve`"));
+        assert!(!paths.state_path.exists());
+        assert!(!temp.path().join("chat-history.sqlite3").exists());
     }
 
     #[test]
