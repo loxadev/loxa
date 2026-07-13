@@ -1,6 +1,7 @@
 //! Loxa core library.
 
 pub mod calibration;
+pub mod chat_history;
 pub mod control;
 pub mod detect;
 pub mod download;

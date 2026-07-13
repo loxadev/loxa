@@ -11,7 +11,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub const RUNTIME_STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 pub const RUNTIME_STATE_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const LEGACY_RUNTIME_STATE_SCHEMA_VERSION: u32 = 2;
-pub const RUNTIME_STATE_SCHEMA_VERSION: u32 = 3;
+const PREVIOUS_RUNTIME_STATE_SCHEMA_VERSION: u32 = 3;
+pub const RUNTIME_STATE_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -36,6 +37,11 @@ pub struct ManagedRun {
     pub lifecycle: RunLifecycle,
     pub generation: u32,
     pub generation_alias: String,
+    /// Stable authenticated node-control endpoint, when this run is owned by a node host.
+    ///
+    /// `port` remains the replaceable engine endpoint used for exact-child health checks.
+    #[serde(default)]
+    pub control_port: Option<u16>,
     pub port: u16,
     pub log_path: PathBuf,
     pub child_pid: Option<u32>,
@@ -125,11 +131,51 @@ pub fn read_runtime_state(path: &Path) -> Result<RuntimeStateRead, SupervisorErr
                     }
                     for run in &mut envelope.runs {
                         run.schema_version = RUNTIME_STATE_SCHEMA_VERSION;
+                        run.control_port = None;
                     }
                     if envelope.runs.len() > 1 {
                         Ok(RuntimeStateRead::Corrupt(
                             "managed state contains more than one active run".to_string(),
                         ))
+                    } else {
+                        Ok(RuntimeStateRead::Loaded(envelope.runs))
+                    }
+                }
+                Ok(mut envelope)
+                    if envelope.schema_version == PREVIOUS_RUNTIME_STATE_SCHEMA_VERSION =>
+                {
+                    if envelope
+                        .runs
+                        .iter()
+                        .any(|run| run.schema_version != PREVIOUS_RUNTIME_STATE_SCHEMA_VERSION)
+                    {
+                        return Ok(RuntimeStateRead::Corrupt(
+                            "invalid previous managed state schema 3 record".to_string(),
+                        ));
+                    }
+                    for run in &mut envelope.runs {
+                        run.schema_version = RUNTIME_STATE_SCHEMA_VERSION;
+                        run.control_port = if run.model_id.is_none()
+                            && run.lifecycle == RunLifecycle::Unloaded
+                            && run.child_pid.is_none()
+                            && run.child_process_start_time_unix_s.is_none()
+                            && run.child_pgid.is_none()
+                        {
+                            Some(run.port)
+                        } else {
+                            None
+                        };
+                    }
+                    if envelope.runs.len() > 1 {
+                        Ok(RuntimeStateRead::Corrupt(
+                            "managed state contains more than one active run".to_string(),
+                        ))
+                    } else if let Some(message) = envelope
+                        .runs
+                        .iter()
+                        .find_map(|run| validate_runtime_run(run).err())
+                    {
+                        Ok(RuntimeStateRead::Corrupt(message))
                     } else {
                         Ok(RuntimeStateRead::Loaded(envelope.runs))
                     }
@@ -231,6 +277,66 @@ pub fn create_starting_run(path: &Path, run: ManagedRun) -> Result<ManagedRun, S
         Duration::MAX,
         RUNTIME_STATE_LOCK_POLL_INTERVAL,
     )
+}
+
+/// Creates the stable, unloaded node owner, replacing an abandoned owner only
+/// when its exact process identity is provably dead and its record cannot own
+/// a model or child process.
+pub fn create_unloaded_node_owner(
+    path: &Path,
+    run: ManagedRun,
+) -> Result<ManagedRun, SupervisorError> {
+    create_unloaded_node_owner_with_probe(path, run, |pid, expected_start| {
+        super::OwnerIdentityProbe::probe(&super::SystemOwnerIdentityProbe, pid, expected_start)
+    })
+}
+
+fn create_unloaded_node_owner_with_probe<F>(
+    path: &Path,
+    run: ManagedRun,
+    mut owner_probe: F,
+) -> Result<ManagedRun, SupervisorError>
+where
+    F: FnMut(u32, u64) -> super::OwnerIdentityStatus,
+{
+    validate_runtime_run(&run).map_err(SupervisorError::RunStateConflict)?;
+    if run.model_id.is_some()
+        || run.lifecycle != RunLifecycle::Unloaded
+        || run.stop_requested
+        || run.generation != 0
+        || run.control_port.is_none()
+        || run.child_pid.is_some()
+        || run.child_process_start_time_unix_s.is_some()
+        || run.child_pgid.is_some()
+    {
+        return Err(SupervisorError::RunStateConflict(
+            "new unloaded node owner must be an initial childless model-free record".to_string(),
+        ));
+    }
+
+    let _lock = acquire_runtime_state_lock_for_mutation(
+        path,
+        Duration::MAX,
+        RUNTIME_STATE_LOCK_POLL_INTERVAL,
+    )?;
+    let runs = runtime_state_runs_for_mutation(path)?;
+    if let Some(existing) = runs.first() {
+        let safely_reclaimable_shape = existing.model_id.is_none()
+            && existing.lifecycle == RunLifecycle::Unloaded
+            && !existing.stop_requested
+            && existing.child_pid.is_none()
+            && existing.child_process_start_time_unix_s.is_none()
+            && existing.child_pgid.is_none();
+        if !safely_reclaimable_shape
+            || owner_probe(existing.owner_pid, existing.owner_process_start_time_unix_s)
+                != super::OwnerIdentityStatus::Dead
+        {
+            return Err(SupervisorError::ActiveRun(existing.run_id.clone()));
+        }
+    }
+
+    write_runtime_state(path, std::slice::from_ref(&run))?;
+    Ok(run)
 }
 
 fn create_starting_run_with_lock_options(
@@ -367,6 +473,12 @@ where
         return Err(SupervisorError::RunStateConflict(format!(
             "run ID changed from {} to {}",
             current.run_id, updated.run_id
+        )));
+    }
+    if updated.control_port != current.control_port {
+        return Err(SupervisorError::RunStateConflict(format!(
+            "stable control port changed for run {}",
+            current.run_id
         )));
     }
 
@@ -521,6 +633,18 @@ fn validate_runtime_run(run: &ManagedRun) -> Result<(), String> {
     }
     if run.port == 0 {
         return Err("managed run port must not be zero".to_string());
+    }
+    if run.control_port == Some(0) {
+        return Err("managed run control port must not be zero".to_string());
+    }
+    if run.model_id.is_none()
+        && run.lifecycle == RunLifecycle::Unloaded
+        && run.child_pid.is_none()
+        && run.child_process_start_time_unix_s.is_none()
+        && run.child_pgid.is_none()
+        && run.control_port.is_none()
+    {
+        return Err("managed unloaded node owner requires a control port".to_string());
     }
     if run.log_path.as_os_str().is_empty() {
         return Err("managed run log path must not be empty".to_string());
@@ -717,6 +841,7 @@ mod tests {
             lifecycle: RunLifecycle::Running,
             generation: 0,
             generation_alias: format!("loxa-test-run-{}-g0", server.pid),
+            control_port: None,
             port: server.port,
             log_path: PathBuf::from(format!("/tmp/test-run-{}.log", server.pid)),
             child_pid: Some(server.pid),
@@ -736,12 +861,56 @@ mod tests {
             lifecycle: RunLifecycle::Starting,
             generation: 0,
             generation_alias: format!("loxa-{run_id}-g0"),
+            control_port: None,
             port: 8080,
             log_path: root.join(format!("{run_id}.log")),
             child_pid: None,
             child_process_start_time_unix_s: None,
             child_pgid: None,
         }
+    }
+
+    fn unloaded_node_owner(root: &Path, run_id: &str) -> ManagedRun {
+        let mut run = childless_starting_run(root, run_id);
+        run.model_id = None;
+        run.lifecycle = RunLifecycle::Unloaded;
+        run.control_port = Some(8_080);
+        run
+    }
+
+    fn assert_owner_preserved_without_probe(
+        state_path: &Path,
+        replacement: ManagedRun,
+    ) -> SupervisorError {
+        let committed = fs::read(state_path).expect("read committed owner");
+        let probe_called = Cell::new(false);
+        let error = create_unloaded_node_owner_with_probe(state_path, replacement, |_, _| {
+            probe_called.set(true);
+            OwnerIdentityStatus::Dead
+        })
+        .expect_err("unsafe owner must be preserved");
+
+        assert!(
+            !probe_called.get(),
+            "unsafe owner must be rejected before identity probing"
+        );
+        assert_eq!(
+            fs::read(state_path).expect("read preserved owner"),
+            committed
+        );
+        error
+    }
+
+    fn set_serialized_run_field(state_path: &Path, field: &str, value: serde_json::Value) {
+        let mut envelope: serde_json::Value =
+            serde_json::from_slice(&fs::read(state_path).expect("read state envelope"))
+                .expect("parse state envelope");
+        envelope["runs"][0][field] = value;
+        fs::write(
+            state_path,
+            serde_json::to_vec_pretty(&envelope).expect("serialize mutated state envelope"),
+        )
+        .expect("write mutated state envelope");
     }
 
     fn run_runtime_state_lock_helper_if_requested() -> bool {
@@ -879,6 +1048,7 @@ mod tests {
         let mut unloaded = childless_starting_run(temp.path(), "unloaded-owner");
         unloaded.model_id = None;
         unloaded.lifecycle = RunLifecycle::Unloaded;
+        unloaded.control_port = Some(8_080);
         create_starting_run(&state_path, unloaded.clone()).expect("create unloaded owner");
         assert_eq!(
             read_runtime_state(&state_path).unwrap(),
@@ -911,6 +1081,39 @@ mod tests {
             read_runtime_state(&state_path).unwrap(),
             RuntimeStateRead::Corrupt(message) if message.contains("invalid legacy")
         ));
+    }
+
+    #[test]
+    fn current_unloaded_childless_owner_requires_a_control_endpoint() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let mut run = childless_starting_run(temp.path(), "endpointless-unloaded-owner");
+        run.model_id = None;
+        run.lifecycle = RunLifecycle::Unloaded;
+        run.control_port = Some(8_080);
+        write_runtime_state(&state_path, std::slice::from_ref(&run)).unwrap();
+        let valid: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+
+        for endpoint in [None, Some(serde_json::Value::Null)] {
+            let mut invalid = valid.clone();
+            let record = invalid["runs"][0].as_object_mut().unwrap();
+            match endpoint {
+                None => {
+                    record.remove("control_port");
+                }
+                Some(value) => {
+                    record.insert("control_port".to_string(), value);
+                }
+            }
+            fs::write(&state_path, serde_json::to_vec_pretty(&invalid).unwrap()).unwrap();
+
+            assert!(matches!(
+                read_runtime_state(&state_path).unwrap(),
+                RuntimeStateRead::Corrupt(message)
+                    if message.contains("unloaded node owner requires a control port")
+            ));
+        }
     }
 
     #[test]
@@ -949,6 +1152,240 @@ mod tests {
             read_runtime_state(&state_path).expect("read first run"),
             RuntimeStateRead::Loaded(vec![first])
         );
+    }
+
+    #[test]
+    fn node_owner_creation_replaces_only_a_provably_dead_unloaded_owner() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let mut stale = childless_starting_run(temp.path(), "stale-node-owner");
+        stale.model_id = None;
+        stale.lifecycle = RunLifecycle::Unloaded;
+        stale.control_port = Some(8_080);
+        create_starting_run(&state_path, stale.clone()).expect("seed stale owner");
+        let mut replacement = stale.clone();
+        replacement.run_id = "replacement-node-owner".to_string();
+        replacement.owner_pid = 84;
+        replacement.owner_process_start_time_unix_s = 912;
+        replacement.control_port = Some(8_081);
+        replacement.port = 8_081;
+        replacement.generation_alias = "loxa-replacement-node-owner-g0".to_string();
+
+        let stored = create_unloaded_node_owner_with_probe(
+            &state_path,
+            replacement.clone(),
+            |pid, start| {
+                assert_eq!(
+                    (pid, start),
+                    (stale.owner_pid, stale.owner_process_start_time_unix_s)
+                );
+                OwnerIdentityStatus::Dead
+            },
+        )
+        .expect("replace provably dead unloaded owner");
+
+        assert_eq!(stored, replacement);
+        assert_eq!(
+            read_runtime_state(&state_path).expect("read replacement"),
+            RuntimeStateRead::Loaded(vec![replacement])
+        );
+    }
+
+    #[test]
+    fn node_owner_creation_recovers_the_previous_unloaded_state_schema() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let mut stale = childless_starting_run(temp.path(), "schema-three-node-owner");
+        stale.model_id = None;
+        stale.lifecycle = RunLifecycle::Unloaded;
+        stale.generation = 4;
+        stale.generation_alias = "loxa-schema-three-node-owner-g4".to_string();
+        stale.port = 8_080;
+        stale.control_port = Some(8_080);
+        write_runtime_state(&state_path, std::slice::from_ref(&stale)).expect("seed current state");
+        let mut previous: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).expect("read current state"))
+                .expect("parse current state");
+        previous["schema_version"] = serde_json::json!(PREVIOUS_RUNTIME_STATE_SCHEMA_VERSION);
+        previous["runs"][0]["schema_version"] =
+            serde_json::json!(PREVIOUS_RUNTIME_STATE_SCHEMA_VERSION);
+        previous["runs"][0]
+            .as_object_mut()
+            .expect("run object")
+            .remove("control_port");
+        fs::write(
+            &state_path,
+            serde_json::to_vec_pretty(&previous).expect("serialize previous state"),
+        )
+        .expect("write previous state");
+        let mut replacement = stale.clone();
+        replacement.run_id = "replacement-node-owner".to_string();
+        replacement.owner_pid = 84;
+        replacement.owner_process_start_time_unix_s = 912;
+        replacement.generation = 0;
+        replacement.generation_alias = "loxa-replacement-node-owner-g0".to_string();
+        replacement.control_port = Some(8_081);
+        replacement.port = 8_081;
+
+        create_unloaded_node_owner_with_probe(&state_path, replacement.clone(), |_, _| {
+            OwnerIdentityStatus::Dead
+        })
+        .expect("recover previous unloaded node owner");
+
+        assert_eq!(
+            read_runtime_state(&state_path).expect("read replacement"),
+            RuntimeStateRead::Loaded(vec![replacement])
+        );
+    }
+
+    #[test]
+    fn node_owner_creation_preserves_stop_requested_owner_without_probing() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let mut existing = unloaded_node_owner(temp.path(), "stopping-node-owner");
+        existing.stop_requested = true;
+        write_runtime_state(&state_path, std::slice::from_ref(&existing))
+            .expect("seed stopping owner");
+        let mut replacement = unloaded_node_owner(temp.path(), "replacement-owner");
+        replacement.control_port = Some(8_081);
+        let error = assert_owner_preserved_without_probe(&state_path, replacement);
+
+        assert!(matches!(
+            error,
+            SupervisorError::ActiveRun(run_id) if run_id == existing.run_id
+        ));
+    }
+
+    #[test]
+    fn node_owner_creation_fails_closed_for_unproven_existing_owner() {
+        for owner_status in [
+            OwnerIdentityStatus::Live,
+            OwnerIdentityStatus::Unavailable,
+            OwnerIdentityStatus::Mismatched,
+        ] {
+            let temp = tempdir().expect("tempdir");
+            let state_path = temp.path().join("managed.json");
+            let mut existing = childless_starting_run(temp.path(), "existing-node-owner");
+            existing.model_id = None;
+            existing.lifecycle = RunLifecycle::Unloaded;
+            existing.control_port = Some(8_080);
+            create_starting_run(&state_path, existing.clone()).expect("seed owner");
+            let mut replacement = existing.clone();
+            replacement.run_id = "replacement-node-owner".to_string();
+            replacement.generation_alias = "loxa-replacement-node-owner-g0".to_string();
+            let committed = fs::read(&state_path).expect("read committed owner");
+
+            let error = create_unloaded_node_owner_with_probe(&state_path, replacement, |_, _| {
+                owner_status
+            })
+            .expect_err("unproven owner must be preserved");
+
+            assert!(
+                matches!(error, SupervisorError::ActiveRun(run_id) if run_id == existing.run_id)
+            );
+            assert_eq!(
+                fs::read(&state_path).expect("read preserved owner"),
+                committed
+            );
+        }
+    }
+
+    #[test]
+    fn node_owner_creation_preserves_model_bearing_owner_without_probing() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let mut existing = unloaded_node_owner(temp.path(), "model-bearing-owner");
+        existing.model_id = Some("gemma-3-4b-it-q4".to_string());
+        write_runtime_state(&state_path, std::slice::from_ref(&existing))
+            .expect("seed model-bearing owner");
+
+        let error = assert_owner_preserved_without_probe(
+            &state_path,
+            unloaded_node_owner(temp.path(), "replacement-owner"),
+        );
+
+        assert!(matches!(
+            error,
+            SupervisorError::ActiveRun(run_id) if run_id == existing.run_id
+        ));
+    }
+
+    #[test]
+    fn node_owner_creation_preserves_recovery_required_owner_without_probing() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let mut existing = unloaded_node_owner(temp.path(), "recovery-required-owner");
+        existing.lifecycle = RunLifecycle::RecoveryRequired;
+        write_runtime_state(&state_path, std::slice::from_ref(&existing))
+            .expect("seed recovery-required owner");
+
+        let error = assert_owner_preserved_without_probe(
+            &state_path,
+            unloaded_node_owner(temp.path(), "replacement-owner"),
+        );
+
+        assert!(matches!(
+            error,
+            SupervisorError::ActiveRun(run_id) if run_id == existing.run_id
+        ));
+    }
+
+    #[test]
+    fn node_owner_creation_preserves_child_pid_owner_without_probing() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let mut existing = unloaded_node_owner(temp.path(), "child-pid-owner");
+        existing.child_pid = Some(777);
+        write_runtime_state(&state_path, std::slice::from_ref(&existing))
+            .expect("seed child-pid owner");
+
+        let error = assert_owner_preserved_without_probe(
+            &state_path,
+            unloaded_node_owner(temp.path(), "replacement-owner"),
+        );
+
+        assert!(matches!(
+            error,
+            SupervisorError::ActiveRun(run_id) if run_id == existing.run_id
+        ));
+    }
+
+    #[test]
+    fn node_owner_creation_preserves_child_start_time_owner_without_probing() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let existing = unloaded_node_owner(temp.path(), "child-start-time-owner");
+        write_runtime_state(&state_path, std::slice::from_ref(&existing))
+            .expect("seed childless owner");
+        set_serialized_run_field(
+            &state_path,
+            "child_process_start_time_unix_s",
+            serde_json::json!(111),
+        );
+
+        let error = assert_owner_preserved_without_probe(
+            &state_path,
+            unloaded_node_owner(temp.path(), "replacement-owner"),
+        );
+
+        assert!(matches!(error, SupervisorError::Io(_)));
+    }
+
+    #[test]
+    fn node_owner_creation_preserves_child_pgid_owner_without_probing() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let existing = unloaded_node_owner(temp.path(), "child-pgid-owner");
+        write_runtime_state(&state_path, std::slice::from_ref(&existing))
+            .expect("seed childless owner");
+        set_serialized_run_field(&state_path, "child_pgid", serde_json::json!(777));
+
+        let error = assert_owner_preserved_without_probe(
+            &state_path,
+            unloaded_node_owner(temp.path(), "replacement-owner"),
+        );
+
+        assert!(matches!(error, SupervisorError::Io(_)));
     }
 
     #[test]
@@ -1573,6 +2010,115 @@ mod tests {
         );
         assert!(!state_path.exists());
         assert!(!runtime_state_lock_path(&state_path).exists());
+    }
+
+    #[test]
+    fn node_control_endpoint_round_trips_independently_from_engine_port() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let mut run = childless_starting_run(temp.path(), "stable-owner");
+        run.control_port = Some(8_080);
+        run.port = 49_321;
+
+        write_runtime_state(&state_path, std::slice::from_ref(&run)).unwrap();
+
+        assert_eq!(
+            read_runtime_state(&state_path).unwrap(),
+            RuntimeStateRead::Loaded(vec![run])
+        );
+    }
+
+    #[test]
+    fn schema_three_state_migrates_without_guessing_a_control_endpoint() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let run = childless_starting_run(temp.path(), "previous-owner");
+        write_runtime_state(&state_path, std::slice::from_ref(&run)).unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        value["schema_version"] = serde_json::json!(PREVIOUS_RUNTIME_STATE_SCHEMA_VERSION);
+        value["runs"][0]["schema_version"] =
+            serde_json::json!(PREVIOUS_RUNTIME_STATE_SCHEMA_VERSION);
+        value["runs"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("control_port");
+        let previous_bytes = serde_json::to_vec_pretty(&value).unwrap();
+        fs::write(&state_path, &previous_bytes).unwrap();
+
+        let RuntimeStateRead::Loaded(runs) = read_runtime_state(&state_path).unwrap() else {
+            panic!("schema three state should remain inspectable")
+        };
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].schema_version, RUNTIME_STATE_SCHEMA_VERSION);
+        assert_eq!(runs[0].control_port, None);
+        assert_eq!(fs::read(&state_path).unwrap(), previous_bytes);
+    }
+
+    #[test]
+    fn schema_three_unloaded_childless_owner_safely_migrates_its_control_endpoint() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let mut run = childless_starting_run(temp.path(), "previous-unloaded-owner");
+        run.model_id = None;
+        run.lifecycle = RunLifecycle::Unloaded;
+        run.port = 47_777;
+        run.control_port = Some(run.port);
+        write_runtime_state(&state_path, std::slice::from_ref(&run)).unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        value["schema_version"] = serde_json::json!(PREVIOUS_RUNTIME_STATE_SCHEMA_VERSION);
+        value["runs"][0]["schema_version"] =
+            serde_json::json!(PREVIOUS_RUNTIME_STATE_SCHEMA_VERSION);
+        value["runs"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("control_port");
+        let previous_bytes = serde_json::to_vec_pretty(&value).unwrap();
+        fs::write(&state_path, &previous_bytes).unwrap();
+
+        let RuntimeStateRead::Loaded(runs) = read_runtime_state(&state_path).unwrap() else {
+            panic!("schema three unloaded state should migrate")
+        };
+        assert_eq!(runs[0].schema_version, RUNTIME_STATE_SCHEMA_VERSION);
+        assert_eq!(runs[0].control_port, Some(47_777));
+        assert_eq!(runs[0].port, 47_777);
+        assert_eq!(fs::read(&state_path).unwrap(), previous_bytes);
+    }
+
+    #[test]
+    fn zero_control_endpoint_is_rejected() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let mut run = childless_starting_run(temp.path(), "invalid-control-owner");
+        run.control_port = Some(0);
+
+        let error = create_starting_run(&state_path, run).unwrap_err();
+
+        assert!(error.to_string().contains("control port must not be zero"));
+        assert!(!state_path.exists());
+    }
+
+    #[test]
+    fn stable_control_endpoint_cannot_be_removed_or_changed_across_engine_generation_updates() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let mut owner = childless_starting_run(temp.path(), "stable-control-owner");
+        owner.control_port = Some(8_080);
+        create_starting_run(&state_path, owner.clone()).unwrap();
+        for invalid_control_port in [None, Some(8_081)] {
+            let mut invalid = owner.clone();
+            invalid.control_port = invalid_control_port;
+
+            let error = update_runtime_state_run_committed(&state_path, &owner.identity(), invalid)
+                .unwrap_err();
+
+            assert!(error.to_string().contains("control port changed"));
+            assert_eq!(
+                read_runtime_state(&state_path).unwrap(),
+                RuntimeStateRead::Loaded(vec![owner.clone()])
+            );
+        }
     }
 
     #[test]

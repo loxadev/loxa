@@ -28,6 +28,109 @@ pub struct EngineTarget {
     pub profile: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenerationProvenance {
+    pub engine: String,
+    pub engine_version: String,
+    pub model_id: String,
+    pub profile: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GenerationError {
+    InvalidModel,
+    EngineUnavailable,
+    GatewayShuttingDown,
+    UpstreamUnavailable,
+    UpstreamRejected,
+    InvalidResponse,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GenerationStreamError {
+    Upstream,
+    EventTooLarge,
+}
+
+impl std::fmt::Display for GenerationStreamError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::Upstream => "the managed engine stream ended unexpectedly",
+            Self::EventTooLarge => "the managed engine stream exceeded the event size limit",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for GenerationStreamError {}
+
+pub type GenerationStream =
+    Pin<Box<dyn Stream<Item = Result<Bytes, GenerationStreamError>> + Send + 'static>>;
+
+pub enum GenerationOutput {
+    Json { status: StatusCode, body: Value },
+    Stream(GenerationStream),
+}
+
+pub struct PreparedGeneration {
+    request: Value,
+    target: Arc<EngineTarget>,
+    client: reqwest::Client,
+    cancellation: tokio::sync::watch::Receiver<bool>,
+    streaming: bool,
+    provenance: GenerationProvenance,
+}
+
+impl PreparedGeneration {
+    pub fn provenance(&self) -> &GenerationProvenance {
+        &self.provenance
+    }
+
+    pub async fn execute(self) -> Result<GenerationOutput, GenerationError> {
+        let Self {
+            request,
+            target,
+            client,
+            mut cancellation,
+            streaming,
+            provenance: _,
+        } = self;
+        let send = client
+            .post(format!("{}/v1/chat/completions", target.base_url))
+            .json(&request)
+            .send();
+        let upstream = match tokio::select! {
+            response = send => response,
+            _ = cancellation.changed() => return Err(GenerationError::GatewayShuttingDown),
+        } {
+            Ok(response) => response,
+            Err(_) => return Err(GenerationError::UpstreamUnavailable),
+        };
+        if streaming {
+            if !upstream.status().is_success() {
+                return Err(GenerationError::UpstreamRejected);
+            }
+            return Ok(GenerationOutput::Stream(Box::pin(normalize_sse(
+                upstream.bytes_stream(),
+                target.backend_alias.clone(),
+                cancellation,
+            ))));
+        }
+        let status = upstream.status();
+        let body = upstream.json::<Value>();
+        let mut body = tokio::select! {
+            body = body => body.map_err(|_| GenerationError::InvalidResponse)?,
+            _ = cancellation.changed() => return Err(GenerationError::GatewayShuttingDown),
+        };
+        normalize_aliases(&mut body, &target.backend_alias);
+        if !status.is_success() {
+            normalize_embedded_aliases(&mut body, &target.backend_alias);
+        }
+        let status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        Ok(GenerationOutput::Json { status, body })
+    }
+}
+
 #[derive(Clone)]
 pub struct GatewayState {
     node_id: Arc<str>,
@@ -60,6 +163,36 @@ impl GatewayState {
             .read()
             .expect("gateway target lock poisoned")
             .clone()
+    }
+
+    pub fn prepare_generation(
+        &self,
+        mut request: Value,
+    ) -> Result<PreparedGeneration, GenerationError> {
+        if request.get("model").and_then(Value::as_str) != Some(MODEL_ALIAS) {
+            return Err(GenerationError::InvalidModel);
+        }
+        let target = self.snapshot().ok_or(GenerationError::EngineUnavailable)?;
+        request["model"] = Value::String(target.backend_alias.clone());
+        let streaming = request.get("stream").and_then(Value::as_bool) == Some(true);
+        let cancellation = self.cancellation.subscribe();
+        if *cancellation.borrow() {
+            return Err(GenerationError::GatewayShuttingDown);
+        }
+        let provenance = GenerationProvenance {
+            engine: target.engine.clone(),
+            engine_version: target.engine_version.clone(),
+            model_id: target.model_id.clone(),
+            profile: target.profile.clone(),
+        };
+        Ok(PreparedGeneration {
+            request,
+            target,
+            client: self.client.clone(),
+            cancellation,
+            streaming,
+            provenance,
+        })
     }
 
     fn cancel_requests(&self) {
@@ -233,7 +366,7 @@ async fn chat(
 }
 
 async fn chat_inner(state: GatewayState, payload: Result<Json<Value>, JsonRejection>) -> Response {
-    let Json(mut request) = match payload {
+    let Json(request) = match payload {
         Ok(payload) => payload,
         Err(_) => {
             return openai_error(
@@ -243,97 +376,55 @@ async fn chat_inner(state: GatewayState, payload: Result<Json<Value>, JsonReject
             )
         }
     };
-    if request.get("model").and_then(Value::as_str) != Some(MODEL_ALIAS) {
-        return openai_error(
-            StatusCode::BAD_REQUEST,
-            "model must be the stable alias 'loxa'",
-            "invalid_model",
-        );
-    }
-    let Some(target) = state.snapshot() else {
-        return openai_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "the managed engine is temporarily unavailable",
-            "engine_unavailable",
-        );
+    let generation = match state.prepare_generation(request) {
+        Ok(generation) => generation,
+        Err(error) => return generation_error_response(error),
     };
-    request["model"] = Value::String(target.backend_alias.clone());
-    let streaming = request.get("stream").and_then(Value::as_bool) == Some(true);
-    let mut cancellation = state.cancellation.subscribe();
-    if *cancellation.borrow() {
-        return openai_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "the gateway is shutting down",
-            "engine_unavailable",
-        );
-    }
-    let send = state
-        .client
-        .post(format!("{}/v1/chat/completions", target.base_url))
-        .json(&request)
-        .send();
-    let upstream = match tokio::select! {
-        response = send => response,
-        _ = cancellation.changed() => return openai_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "the gateway is shutting down",
-            "engine_unavailable",
-        ),
-    } {
-        Ok(response) => response,
-        Err(_) => {
-            return openai_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "the managed engine could not accept the request",
-                "upstream_error",
-            )
-        }
-    };
-    if streaming {
-        if !upstream.status().is_success() {
-            return openai_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "the managed engine rejected the streaming request",
-                "upstream_error",
-            );
-        }
-        let stream = normalize_sse(
-            upstream.bytes_stream(),
-            target.backend_alias.clone(),
-            state.cancellation.subscribe(),
-        );
-        return Response::builder()
+    match generation.execute().await {
+        Ok(GenerationOutput::Json { status, body }) => (status, Json(body)).into_response(),
+        Ok(GenerationOutput::Stream(stream)) => Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/event-stream")
             .header(header::CACHE_CONTROL, "no-cache")
             .body(Body::from_stream(stream))
-            .expect("valid streaming response");
+            .expect("valid streaming response"),
+        Err(error) => generation_error_response(error),
     }
-    let status = upstream.status();
-    let body = upstream.json::<Value>();
-    let mut body = match tokio::select! {
-        body = body => body,
-        _ = cancellation.changed() => return openai_error(
+}
+
+fn generation_error_response(error: GenerationError) -> Response {
+    match error {
+        GenerationError::InvalidModel => openai_error(
+            StatusCode::BAD_REQUEST,
+            "model must be the stable alias 'loxa'",
+            "invalid_model",
+        ),
+        GenerationError::EngineUnavailable => openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the managed engine is temporarily unavailable",
+            "engine_unavailable",
+        ),
+        GenerationError::GatewayShuttingDown => openai_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "the gateway is shutting down",
             "engine_unavailable",
         ),
-    } {
-        Ok(body) => body,
-        Err(_) => {
-            return openai_error(
-                StatusCode::BAD_GATEWAY,
-                "the managed engine returned an invalid response",
-                "upstream_error",
-            )
-        }
-    };
-    normalize_aliases(&mut body, &target.backend_alias);
-    if !status.is_success() {
-        normalize_embedded_aliases(&mut body, &target.backend_alias);
+        GenerationError::UpstreamUnavailable => openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the managed engine could not accept the request",
+            "upstream_error",
+        ),
+        GenerationError::UpstreamRejected => openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the managed engine rejected the streaming request",
+            "upstream_error",
+        ),
+        GenerationError::InvalidResponse => openai_error(
+            StatusCode::BAD_GATEWAY,
+            "the managed engine returned an invalid response",
+            "upstream_error",
+        ),
     }
-    let status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    (status, Json(body)).into_response()
 }
 
 struct SseState {
@@ -349,7 +440,7 @@ fn normalize_sse(
     upstream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
     backend_alias: String,
     cancellation: tokio::sync::watch::Receiver<bool>,
-) -> impl Stream<Item = Result<Bytes, io::Error>> + Send {
+) -> impl Stream<Item = Result<Bytes, GenerationStreamError>> + Send {
     futures_util::stream::unfold(
         SseState {
             upstream: Box::pin(upstream),
@@ -371,13 +462,7 @@ fn normalize_sse(
                     if end > MAX_SSE_EVENT_BYTES {
                         state.buffer.clear();
                         state.finished = true;
-                        return Some((
-                            Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "upstream SSE event exceeds gateway limit",
-                            )),
-                            state,
-                        ));
+                        return Some((Err(GenerationStreamError::EventTooLarge), state));
                     }
                     let event = state
                         .buffer
@@ -407,13 +492,7 @@ fn normalize_sse(
                 if state.buffer.len() > MAX_SSE_EVENT_BYTES {
                     state.buffer.clear();
                     state.finished = true;
-                    return Some((
-                        Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "upstream SSE event exceeds gateway limit",
-                        )),
-                        state,
-                    ));
+                    return Some((Err(GenerationStreamError::EventTooLarge), state));
                 }
                 let next = tokio::select! {
                     next = state.upstream.next() => next,
@@ -421,9 +500,9 @@ fn normalize_sse(
                 };
                 match next {
                     Some(Ok(chunk)) => state.buffer.extend_from_slice(&chunk),
-                    Some(Err(error)) => {
+                    Some(Err(_error)) => {
                         state.finished = true;
-                        return Some((Err(io::Error::other(error)), state));
+                        return Some((Err(GenerationStreamError::Upstream), state));
                     }
                     None => state.finished = true,
                 }
@@ -592,6 +671,7 @@ impl Drop for GatewayServer {
 mod tests {
     use super::{
         next_sse_boundary, normalize_sse, router, EngineTarget, GatewayServer, GatewayState,
+        GenerationError, GenerationOutput, GenerationProvenance, GenerationStreamError,
         MAX_SSE_EVENT_BYTES,
     };
     use axum::http::{header, Method, StatusCode};
@@ -898,6 +978,56 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn internal_generation_service_holds_one_target_snapshot_and_normalizes_output() {
+        let seen = Arc::new(Mutex::new(None));
+        let engine = spawn_fake_engine(seen.clone()).await;
+        let state = GatewayState::new("node-test");
+        state.publish(EngineTarget {
+            base_url: engine,
+            backend_alias: "loxa-node-test-g0".into(),
+            engine: "llama.cpp".into(),
+            engine_version: "b9999".into(),
+            model_id: "gemma-3-4b-it-q4".into(),
+            profile: "default".into(),
+        });
+
+        let prepared = state
+            .prepare_generation(json!({
+                "model": "loxa",
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap();
+        assert_eq!(
+            prepared.provenance(),
+            &GenerationProvenance {
+                engine: "llama.cpp".into(),
+                engine_version: "b9999".into(),
+                model_id: "gemma-3-4b-it-q4".into(),
+                profile: "default".into(),
+            }
+        );
+
+        state.publish(EngineTarget {
+            base_url: "http://127.0.0.1:1".into(),
+            backend_alias: "replacement".into(),
+            engine: "replacement-engine".into(),
+            engine_version: "replacement-version".into(),
+            model_id: "replacement-model".into(),
+            profile: "replacement-profile".into(),
+        });
+
+        let GenerationOutput::Json { status, body } = prepared.execute().await.unwrap() else {
+            panic!("non-stream request returned a stream");
+        };
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["model"], "loxa");
+        assert_eq!(
+            seen.lock().unwrap().as_ref().unwrap()["model"],
+            "loxa-node-test-g0"
+        );
+    }
+
     async fn fake_default_model_chat(
         State(seen): State<Arc<Mutex<Option<Value>>>>,
         Json(request): Json<Value>,
@@ -1018,6 +1148,48 @@ mod tests {
             .header("content-type", "text/event-stream")
             .body(Body::from_stream(stream::iter(chunks)))
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn internal_generation_service_reuses_the_bounded_normalized_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/v1/chat/completions", post(fake_stream_chat)),
+            )
+            .await
+            .unwrap()
+        });
+        let state = GatewayState::new("node-test");
+        state.publish(EngineTarget {
+            base_url: format!("http://{address}"),
+            backend_alias: "loxa-node-test-g0".into(),
+            engine: "llama.cpp".into(),
+            engine_version: "b9999".into(),
+            model_id: "gemma-3-4b-it-q4".into(),
+            profile: "default".into(),
+        });
+
+        let generation = state
+            .prepare_generation(json!({
+                "model": "loxa",
+                "stream": true,
+                "messages": []
+            }))
+            .unwrap();
+        let GenerationOutput::Stream(mut stream) = generation.execute().await.unwrap() else {
+            panic!("stream request returned JSON");
+        };
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            bytes.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(
+            bytes,
+            b"data: {\"choices\":[],\"model\":\"loxa\"}\n\ndata: [DONE]\n\n"
+        );
     }
 
     async fn fake_default_model_stream_chat(
@@ -1257,6 +1429,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn generation_preparation_distinguishes_unloaded_from_shutdown() {
+        let state = GatewayState::new("node-test");
+        assert_eq!(
+            state.prepare_generation(json!({"model": "loxa"})).err(),
+            Some(GenerationError::EngineUnavailable)
+        );
+
+        state.publish(EngineTarget {
+            base_url: "http://127.0.0.1:1".into(),
+            backend_alias: "backend".into(),
+            engine: "llama.cpp".into(),
+            engine_version: "b9999".into(),
+            model_id: "gemma-3-4b-it-q4".into(),
+            profile: "default".into(),
+        });
+        state.cancel_requests();
+        assert_eq!(
+            state.prepare_generation(json!({"model": "loxa"})).err(),
+            Some(GenerationError::GatewayShuttingDown)
+        );
+    }
+
     #[tokio::test]
     async fn stream_preserves_non_json_data_comments_done_and_line_endings() {
         let (_cancellation_tx, cancellation) = tokio::sync::watch::channel(false);
@@ -1275,6 +1470,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reusable_stream_closes_transport_errors_without_retaining_private_material() {
+        let raw = Client::new()
+            .get("http://[::1/private-token-and-prompt")
+            .build()
+            .unwrap_err();
+        let (_cancellation_tx, cancellation) = tokio::sync::watch::channel(false);
+        let mut output = Box::pin(normalize_sse(
+            stream::iter([Err(raw)]),
+            "private-backend-alias".into(),
+            cancellation,
+        ));
+
+        let error = output.next().await.unwrap().unwrap_err();
+        assert_eq!(error, GenerationStreamError::Upstream);
+        let rendered = format!("{error:?} {error}");
+        for secret in [
+            "private-token-and-prompt",
+            "private-backend-alias",
+            "http://",
+            "[::1",
+        ] {
+            assert!(!rendered.contains(secret), "leaked {secret}: {rendered}");
+        }
+    }
+
+    #[tokio::test]
     async fn completed_oversized_sse_event_is_rejected() {
         let (_cancellation_tx, cancellation) = tokio::sync::watch::channel(false);
         let mut event = vec![b'x'; MAX_SSE_EVENT_BYTES + 1];
@@ -1286,8 +1507,8 @@ mod tests {
         ));
 
         assert_eq!(
-            output.next().await.unwrap().unwrap_err().kind(),
-            std::io::ErrorKind::InvalidData
+            output.next().await.unwrap().unwrap_err(),
+            GenerationStreamError::EventTooLarge
         );
         assert!(output.next().await.is_none());
     }
@@ -1593,8 +1814,8 @@ mod tests {
             cancellation,
         ));
         assert_eq!(
-            output.next().await.unwrap().unwrap_err().kind(),
-            std::io::ErrorKind::InvalidData
+            output.next().await.unwrap().unwrap_err(),
+            GenerationStreamError::EventTooLarge
         );
     }
 }
