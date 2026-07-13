@@ -157,4 +157,20 @@ describe("App", () => {
     await user.click(screen.getByRole("button", { name: "Retry node startup" }));
     await waitFor(() => expect(api.readControlToken).toHaveBeenCalled());
   });
+
+  it("passes read-only shared session facts to Settings without another bootstrap", async () => {
+    const api = services();
+    api.getStatus = vi.fn().mockResolvedValue({
+      node_id: "loxa-node-77", health: "ready", model: "loxa",
+      engine: { name: "llama.cpp", version: "b777" }, runtime_model: "gemma-ready", profile: "default",
+    });
+    const user = userEvent.setup();
+    render(<App services={api} />);
+    await screen.findByText("Ready");
+    await user.click(screen.getByRole("link", { name: "Settings" }));
+    expect(screen.getByRole("region", { name: "Local node/runtime" })).toHaveTextContent("loxa-node-77");
+    expect(screen.getByText("gemma-ready")).toBeInTheDocument();
+    expect(api.bootstrap.start).toHaveBeenCalledTimes(1);
+    expect(api.readControlToken).not.toHaveBeenCalled();
+  });
 });

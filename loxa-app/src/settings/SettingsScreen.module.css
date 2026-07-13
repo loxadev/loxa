@@ -1,0 +1,142 @@
+.screen {
+  max-width: 880px;
+}
+
+.group {
+  margin: var(--loxa-space-8) 0 0;
+  padding: 0;
+  border: 0;
+}
+
+.group legend,
+.group h2 {
+  margin: 0;
+  font: var(--loxa-type-title-weight) var(--loxa-type-title-size)/var(--loxa-type-title-line-height) var(--loxa-type-title-family);
+  letter-spacing: var(--loxa-type-title-letter-spacing);
+}
+
+.description,
+.disclosure {
+  margin: var(--loxa-space-2) 0 var(--loxa-space-4);
+  color: var(--loxa-muted-foreground);
+}
+
+.disclosure {
+  max-width: 640px;
+  font-size: var(--loxa-type-body-small-size);
+}
+
+.themeOptions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--loxa-space-3);
+}
+
+.themeOption {
+  display: flex;
+  align-items: center;
+  gap: var(--loxa-space-3);
+  min-height: var(--loxa-component-minimum-interactive-target);
+  padding: var(--loxa-space-3) var(--loxa-space-4);
+  color: var(--loxa-foreground);
+  background: var(--loxa-background);
+  border: 1px solid var(--loxa-control-border);
+  border-radius: var(--loxa-radius-md);
+  cursor: pointer;
+}
+
+.themeOption:has(input:checked) {
+  color: var(--loxa-selected-foreground);
+  background: var(--loxa-selected-surface);
+}
+
+.themeOption:has(input:focus-visible) {
+  outline: 2px solid var(--loxa-focus);
+  outline-offset: 2px;
+}
+
+.themeOption input {
+  width: 20px;
+  height: 20px;
+  margin: 0;
+  accent-color: var(--loxa-accent);
+}
+
+.themeOption span {
+  display: grid;
+  gap: var(--loxa-space-1);
+}
+
+.themeOption small {
+  color: inherit;
+  font-size: var(--loxa-type-body-small-size);
+  line-height: var(--loxa-type-body-small-line-height);
+}
+
+.facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: 0;
+  border-top: 1px solid var(--loxa-control-border);
+}
+
+.fact {
+  min-width: 0;
+  padding: var(--loxa-space-4) 0;
+  border-bottom: 1px solid var(--loxa-control-border);
+}
+
+.fact:nth-child(odd) {
+  padding-right: var(--loxa-space-6);
+}
+
+.fact:nth-child(even) {
+  padding-left: var(--loxa-space-6);
+  border-left: 1px solid var(--loxa-control-border);
+}
+
+.fact dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 760px) {
+  .themeOptions,
+  .facts {
+    grid-template-columns: 1fr;
+  }
+
+  .fact:nth-child(n) {
+    padding: var(--loxa-space-4) 0;
+    border-left: 0;
+  }
+}
+
+@media (prefers-contrast: more) {
+  .themeOption,
+  .facts,
+  .fact {
+    border-width: 2px;
+  }
+}
+
+@media (forced-colors: active) {
+  .themeOption,
+  .facts,
+  .fact {
+    border-color: ButtonText;
+    forced-color-adjust: auto;
+  }
+
+  .themeOption:has(input:checked) {
+    color: HighlightText;
+    background: Highlight;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .screen,
+  .screen * {
+    transition-duration: 0.01ms;
+  }
+}

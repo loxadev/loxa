@@ -21,6 +21,7 @@ import type {
   OperationStatus,
   OperationView,
 } from "../control/contracts";
+import styles from "./ModelsScreen.module.css";
 
 export type ModelsScreenServices = {
   readControlToken(endpoint: string): Promise<string>;
@@ -52,6 +53,7 @@ export function ModelsScreen({
   reconnectLimit?: number;
 }) {
   const [models, setModels] = useState<ModelInventoryEntry[]>([]);
+  const [inventoryLoaded, setInventoryLoaded] = useState(false);
   const [node, setNode] = useState<NodeSnapshot | null>(null);
   const [operations, setOperations] = useState<Record<string, OperationView>>({});
   const [pendingModels, setPendingModels] = useState<Set<string>>(() => new Set());
@@ -117,6 +119,7 @@ export function ModelsScreen({
     const publishModels = (next: ModelInventoryEntry[]) => {
       if (disposed) return;
       setModels(next);
+      setInventoryLoaded(true);
       verificationPending = next.some((entry) =>
         entry.artifact.kind === "invalid" && entry.artifact.reason === "verification_required");
       if (!verificationPending && verificationTimer !== undefined) {
@@ -352,7 +355,7 @@ export function ModelsScreen({
     operation.status === "queued" || operation.status === "running");
 
   return (
-    <section className="models-screen" aria-labelledby="models-heading">
+    <section className={styles.screen} aria-labelledby="models-heading">
       <header className="screen-header">
         <div>
           <p className="eyebrow">Verified registry</p>
@@ -362,21 +365,25 @@ export function ModelsScreen({
         <p className={`status-badge live-${liveState}`} role="status" aria-live="polite">{liveLabel(liveState)}</p>
       </header>
 
-      <div className="models-toolbar" aria-label="Model control summary">
+      <div className={styles.toolbar} aria-label="Model control summary">
         <span>Node <strong>{node === null ? "Checking" : nodeStatusLabel(node)}</strong></span>
         <span>Endpoint <span className="technical-value">{endpoint}</span></span>
         <span>{models.length} verified recipes</span>
       </div>
 
-      {error && <p className="error-panel" role="alert">{error}</p>}
-      {node?.status === "recovery_required" && <p className="error-panel" role="alert">Recovery required. Model and chat controls are blocked until the node is safely restarted.</p>}
+      {error && <p className={styles.panel} role="alert">{error}</p>}
+      {node?.status === "recovery_required" && <p className={styles.panel} role="alert">Recovery required. Model and chat controls are blocked until the node is safely restarted.</p>}
       {liveState === "error" && (
         <button className="secondary-button interactive-target" type="button" onClick={() => setRetryNonce((value) => value + 1)}>
           Retry live updates
         </button>
       )}
-      {!error && models.length === 0 && <p className="empty-state">Checking the known model registry…</p>}
-      <div className="model-list">
+      {!error && models.length === 0 && (
+        <p className={styles.empty}>
+          {inventoryLoaded ? "No verified recipes are available in this build." : "Checking the known model registry…"}
+        </p>
+      )}
+      <div className={styles.list}>
         {models.map((entry) => (
           <ModelRow
             key={entry.id}
@@ -441,23 +448,23 @@ function ModelRow({
       : `Download ${entry.id}`;
 
   return (
-    <article className="model-row" aria-labelledby={headingId}>
-      <div className="model-main">
-        <div className="model-heading-line">
+    <article className={styles.row} aria-labelledby={headingId}>
+      <div className={styles.main}>
+        <div className={styles.headingLine}>
           <h2 id={headingId}>{entry.id}</h2>
-          {active && <span className="state-chip">Active</span>}
-          <span className="state-chip">{status}</span>
+          {active && <span className={`${styles.chip} ${styles.activeChip}`}>Active</span>}
+          <span className={styles.chip}>{status}</span>
         </div>
-        <p className="model-metadata">
+        <p className={styles.metadata}>
           <span>{entry.params}</span><span>{entry.quant}</span><span>{formatBytes(entry.sizeBytes)}</span>
           <span>{entry.license}</span><span>{entry.engine.engine}</span>
         </p>
-        <p className="technical-value model-repository">{entry.repo}@{entry.revision}</p>
-        <p id={reasonId} className={actionable ? "model-reason" : "model-reason model-reason-blocking"}>
+        <p className={`technical-value ${styles.repository}`}>{entry.repo}@{entry.revision}</p>
+        <p id={reasonId} className={actionable ? styles.reason : `${styles.reason} ${styles.reasonBlocking}`}>
           {entry.compatibility.reason} {entry.engine.reason}
         </p>
         {displayedOperation?.progress && (
-          <div className="operation-progress">
+          <div className={styles.progress}>
             {displayedOperation.progress.totalBytes === null ? (
               <progress aria-label={`Download progress for ${entry.id}`} />
             ) : (
@@ -472,10 +479,10 @@ function ModelRow({
             </span>
           </div>
         )}
-        {displayedOperation?.error && <p className="operation-error">{displayedOperation.error}</p>}
-        {displayedOperation && !inProgress && <p className="operation-history">Last operation: {operationLabel(displayedOperation)}</p>}
+        {displayedOperation?.error && <p className={styles.operationError}>{displayedOperation.error}</p>}
+        {displayedOperation && !inProgress && <p className={styles.operationHistory}>Last operation: {operationLabel(displayedOperation)}</p>}
       </div>
-      <div className="model-actions">
+      <div className={styles.actions}>
         {inProgress && displayedOperation?.kind === "download" ? (
           <button
             className="secondary-button interactive-target"
@@ -485,7 +492,7 @@ function ModelRow({
             aria-label={`Cancel ${displayedOperation.kind} ${entry.id}`}
           >Cancel</button>
         ) : inProgress && displayedOperation ? (
-          <span className="model-action-label">{operationLabel(displayedOperation)}</span>
+          <span className={styles.actionLabel}>{operationLabel(displayedOperation)}</span>
         ) : showDownload ? (
           <button
             className="primary-button interactive-target"
@@ -504,7 +511,7 @@ function ModelRow({
             aria-label={active ? `Unload ${entry.id}` : node?.activeModelId ? `Switch to ${entry.id}` : `Load ${entry.id}`}
           >{active ? "Unload" : node?.activeModelId ? "Switch" : "Load"}</button>
         ) : (
-          <span className="model-action-label">{entry.artifact.kind === "downloaded" ? "Unavailable to load" : "Awaiting verification"}</span>
+          <span className={styles.actionLabel}>{entry.artifact.kind === "downloaded" ? "Unavailable to load" : "Awaiting verification"}</span>
         )}
       </div>
     </article>
