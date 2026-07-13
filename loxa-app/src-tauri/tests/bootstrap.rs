@@ -75,6 +75,7 @@ fn config(executable: PathBuf) -> BootstrapConfig {
         credential_path,
         startup_timeout: Duration::from_secs(2),
         poll_interval: Duration::from_millis(10),
+        inherit_debug_stderr: false,
     }
 }
 

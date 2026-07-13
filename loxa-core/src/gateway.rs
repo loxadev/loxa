@@ -1,7 +1,7 @@
 use axum::{
     body::{Body, Bytes},
     extract::{rejection::JsonRejection, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -80,37 +80,129 @@ struct Model {
     owned_by: &'static str,
 }
 
-async fn models() -> Json<ModelList> {
-    Json(ModelList {
-        object: "list",
-        data: [Model {
-            id: MODEL_ALIAS,
-            object: "model",
-            owned_by: "loxa",
-        }],
-    })
+const DESKTOP_ORIGINS: [&str; 2] = ["tauri://localhost", "http://127.0.0.1:1420"];
+
+fn request_origin(headers: &HeaderMap) -> Result<Option<String>, StatusCode> {
+    let Some(value) = headers.get(header::ORIGIN) else {
+        return Ok(None);
+    };
+    let origin = value.to_str().map_err(|_| StatusCode::FORBIDDEN)?;
+    if DESKTOP_ORIGINS.contains(&origin) {
+        Ok(Some(origin.to_owned()))
+    } else {
+        Err(StatusCode::FORBIDDEN)
+    }
 }
 
-async fn status(State(state): State<GatewayState>) -> Json<Value> {
+fn cors(mut response: Response, origin: Option<&str>) -> Response {
+    response
+        .headers_mut()
+        .append(header::VARY, HeaderValue::from_static("Origin"));
+    if let Some(origin) = origin.and_then(|value| HeaderValue::from_str(value).ok()) {
+        response
+            .headers_mut()
+            .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+    }
+    response
+}
+
+async fn preflight(headers: HeaderMap, method: &'static str) -> Response {
+    let origin = match request_origin(&headers) {
+        Ok(Some(origin)) => origin,
+        _ => return StatusCode::FORBIDDEN.into_response(),
+    };
+    if headers
+        .get(header::ACCESS_CONTROL_REQUEST_METHOD)
+        .and_then(|value| value.to_str().ok())
+        != Some(method)
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if let Some(requested_headers) = headers
+        .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
+        .and_then(|value| value.to_str().ok())
+    {
+        let allowed = requested_headers.split(',').all(|name| {
+            name.trim().is_empty()
+                || (method == "POST" && name.trim().eq_ignore_ascii_case("content-type"))
+        });
+        if !allowed {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+    }
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    response.headers_mut().insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static(if method == "GET" {
+            "GET, OPTIONS"
+        } else {
+            "POST, OPTIONS"
+        }),
+    );
+    if method == "POST" {
+        response.headers_mut().insert(
+            header::ACCESS_CONTROL_ALLOW_HEADERS,
+            HeaderValue::from_static("content-type"),
+        );
+    }
+    cors(response, Some(&origin))
+}
+
+async fn get_preflight(headers: HeaderMap) -> Response {
+    preflight(headers, "GET").await
+}
+
+async fn post_preflight(headers: HeaderMap) -> Response {
+    preflight(headers, "POST").await
+}
+
+async fn models(headers: HeaderMap) -> Response {
+    let origin = match request_origin(&headers) {
+        Ok(origin) => origin,
+        Err(status) => return status.into_response(),
+    };
+    cors(
+        Json(ModelList {
+            object: "list",
+            data: [Model {
+                id: MODEL_ALIAS,
+                object: "model",
+                owned_by: "loxa",
+            }],
+        })
+        .into_response(),
+        origin.as_deref(),
+    )
+}
+
+async fn status(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
+    let origin = match request_origin(&headers) {
+        Ok(origin) => origin,
+        Err(status) => return status.into_response(),
+    };
     let target = state.snapshot();
-    Json(match target {
-        Some(target) => json!({
-            "node_id": &*state.node_id,
-            "health": "ready",
-            "model": MODEL_ALIAS,
-            "engine": { "name": target.engine, "version": target.engine_version },
-            "runtime_model": target.model_id,
-            "profile": target.profile,
-        }),
-        None => json!({
-            "node_id": &*state.node_id,
-            "health": "unavailable",
-            "model": MODEL_ALIAS,
-            "engine": null,
-            "runtime_model": null,
-            "profile": null,
-        }),
-    })
+    cors(
+        Json(match target {
+            Some(target) => json!({
+                "node_id": &*state.node_id,
+                "health": "ready",
+                "model": MODEL_ALIAS,
+                "engine": { "name": target.engine, "version": target.engine_version },
+                "runtime_model": target.model_id,
+                "profile": target.profile,
+            }),
+            None => json!({
+                "node_id": &*state.node_id,
+                "health": "unavailable",
+                "model": MODEL_ALIAS,
+                "engine": null,
+                "runtime_model": null,
+                "profile": null,
+            }),
+        })
+        .into_response(),
+        origin.as_deref(),
+    )
 }
 
 fn openai_error(status: StatusCode, message: &str, code: &'static str) -> Response {
@@ -130,8 +222,17 @@ fn openai_error(status: StatusCode, message: &str, code: &'static str) -> Respon
 
 async fn chat(
     State(state): State<GatewayState>,
+    headers: HeaderMap,
     payload: Result<Json<Value>, JsonRejection>,
 ) -> Response {
+    let origin = match request_origin(&headers) {
+        Ok(origin) => origin,
+        Err(status) => return status.into_response(),
+    };
+    cors(chat_inner(state, payload).await, origin.as_deref())
+}
+
+async fn chat_inner(state: GatewayState, payload: Result<Json<Value>, JsonRejection>) -> Response {
     let Json(mut request) = match payload {
         Ok(payload) => payload,
         Err(_) => {
@@ -415,9 +516,9 @@ fn normalize_embedded_aliases(value: &mut Value, backend_alias: &str) {
 
 pub fn router(state: GatewayState) -> Router {
     Router::new()
-        .route("/v1/models", get(models))
-        .route("/v1/chat/completions", post(chat))
-        .route("/loxa/status", get(status))
+        .route("/v1/models", get(models).options(get_preflight))
+        .route("/v1/chat/completions", post(chat).options(post_preflight))
+        .route("/loxa/status", get(status).options(get_preflight))
         .with_state(state)
 }
 
@@ -493,7 +594,7 @@ mod tests {
         next_sse_boundary, normalize_sse, router, EngineTarget, GatewayServer, GatewayState,
         MAX_SSE_EVENT_BYTES,
     };
-    use axum::http::StatusCode;
+    use axum::http::{header, Method, StatusCode};
     use axum::{
         body::{Body, Bytes},
         response::{IntoResponse, Response},
@@ -509,12 +610,182 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
     use tokio::net::TcpListener;
+    use tokio::sync::Notify;
 
     async fn spawn_gateway(state: GatewayState) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
         format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn public_routes_allow_only_the_two_desktop_origins() {
+        let base = spawn_gateway(GatewayState::new("node-test")).await;
+        let client = Client::new();
+
+        for origin in ["tauri://localhost", "http://127.0.0.1:1420"] {
+            for path in ["/loxa/status", "/v1/models"] {
+                let response = client
+                    .get(format!("{base}{path}"))
+                    .header(header::ORIGIN, origin)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                        .unwrap(),
+                    origin
+                );
+                assert_eq!(response.headers().get(header::VARY).unwrap(), "Origin");
+            }
+
+            let response = client
+                .post(format!("{base}/v1/chat/completions"))
+                .header(header::ORIGIN, origin)
+                .json(&json!({"model": "loxa", "messages": []}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                    .unwrap(),
+                origin
+            );
+            assert_eq!(response.headers().get(header::VARY).unwrap(), "Origin");
+        }
+
+        for path in ["/loxa/status", "/v1/models", "/v1/chat/completions"] {
+            let request = if path == "/v1/chat/completions" {
+                client.post(format!("{base}{path}")).json(&json!({
+                    "model": "loxa",
+                    "messages": []
+                }))
+            } else {
+                client.get(format!("{base}{path}"))
+            };
+            let response = request
+                .header(header::ORIGIN, "https://attacker.invalid")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+            assert!(
+                response
+                    .headers()
+                    .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                    .is_none(),
+                "{path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn public_preflights_are_route_specific_and_fail_closed() {
+        let base = spawn_gateway(GatewayState::new("node-test")).await;
+        let client = Client::new();
+
+        for (path, method, allowed_methods, allowed_headers) in [
+            ("/loxa/status", Method::GET, "GET, OPTIONS", None),
+            ("/v1/models", Method::GET, "GET, OPTIONS", None),
+            (
+                "/v1/chat/completions",
+                Method::POST,
+                "POST, OPTIONS",
+                Some("content-type"),
+            ),
+        ] {
+            let response = client
+                .request(Method::OPTIONS, format!("{base}{path}"))
+                .header(header::ORIGIN, "tauri://localhost")
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, method.as_str())
+                .header(
+                    header::ACCESS_CONTROL_REQUEST_HEADERS,
+                    if method == Method::POST {
+                        "content-type"
+                    } else {
+                        ""
+                    },
+                )
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT, "{path}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                    .unwrap(),
+                "tauri://localhost"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::ACCESS_CONTROL_ALLOW_METHODS)
+                    .unwrap(),
+                allowed_methods
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::ACCESS_CONTROL_ALLOW_HEADERS)
+                    .and_then(|value| value.to_str().ok()),
+                allowed_headers
+            );
+        }
+
+        for (path, origin, method, headers) in [
+            (
+                "/v1/chat/completions",
+                "https://attacker.invalid",
+                "GET",
+                "",
+            ),
+            ("/v1/chat/completions", "tauri://localhost", "DELETE", ""),
+            (
+                "/v1/chat/completions",
+                "tauri://localhost",
+                "POST",
+                "authorization",
+            ),
+            ("/loxa/status", "tauri://localhost", "GET", "content-type"),
+        ] {
+            let response = client
+                .request(Method::OPTIONS, format!("{base}{path}"))
+                .header(header::ORIGIN, origin)
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, method)
+                .header(header::ACCESS_CONTROL_REQUEST_HEADERS, headers)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert!(response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn public_routes_preserve_originless_api_clients() {
+        let base = spawn_gateway(GatewayState::new("node-test")).await;
+        let response = Client::new()
+            .get(format!("{base}/loxa/status"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none());
+        assert_eq!(response.headers().get(header::VARY).unwrap(), "Origin");
     }
 
     #[tokio::test]
@@ -766,6 +1037,90 @@ mod tests {
             .unwrap()
     }
 
+    async fn fake_gated_stream_chat(State(gate): State<Arc<Notify>>) -> Response {
+        let chunks = stream::unfold((0, gate), |(step, gate)| async move {
+            match step {
+                0 => Some((
+                    Ok::<_, std::convert::Infallible>(
+                        "data: {\"model\":\"backend\",\"choices\":[]}\n\n",
+                    ),
+                    (1, gate),
+                )),
+                1 => {
+                    gate.notified().await;
+                    Some((Ok("data: [DONE]\n\n"), (2, gate)))
+                }
+                _ => None,
+            }
+        });
+        Response::builder()
+            .header("content-type", "text/event-stream")
+            .body(Body::from_stream(chunks))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn allowed_origin_receives_headers_and_first_event_before_upstream_completion() {
+        let gate = Arc::new(Notify::new());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/v1/chat/completions", post(fake_gated_stream_chat))
+            .with_state(gate.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let state = GatewayState::new("node-test");
+        state.publish(EngineTarget {
+            base_url: format!("http://{address}"),
+            backend_alias: "backend".into(),
+            engine: "llama.cpp".into(),
+            engine_version: "b9999".into(),
+            model_id: "gemma-3-4b-it-q4".into(),
+            profile: "default".into(),
+        });
+        let base = spawn_gateway(state).await;
+
+        let response = Client::new()
+            .post(format!("{base}/v1/chat/completions"))
+            .header(header::ORIGIN, "tauri://localhost")
+            .json(&json!({"model": "loxa", "stream": true, "messages": []}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.headers()["content-type"], "text/event-stream");
+        assert_eq!(
+            response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "tauri://localhost"
+        );
+
+        let mut body = response.bytes_stream();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), body.next())
+            .await
+            .expect("first event was buffered behind upstream completion")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            first,
+            Bytes::from_static(b"data: {\"choices\":[],\"model\":\"loxa\"}\n\n")
+        );
+
+        let next = body.next();
+        tokio::pin!(next);
+        tokio::select! {
+            biased;
+            event = &mut next => panic!("stream completed before gate release: {event:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        gate.notify_one();
+        let final_event = tokio::time::timeout(std::time::Duration::from_secs(1), &mut next)
+            .await
+            .expect("final event did not arrive after gate release")
+            .unwrap()
+            .unwrap();
+        assert_eq!(final_event, Bytes::from_static(b"data: [DONE]\n\n"));
+        assert!(body.next().await.is_none());
+    }
+
     #[tokio::test]
     async fn streaming_default_model_alias_round_trips_as_loxa_with_one_done() {
         let seen = Arc::new(Mutex::new(None));
@@ -789,11 +1144,16 @@ mod tests {
 
         let response = Client::new()
             .post(format!("{base}/v1/chat/completions"))
+            .header(header::ORIGIN, "tauri://localhost")
             .json(&json!({"model": "loxa", "stream": true, "messages": []}))
             .send()
             .await
             .unwrap();
         assert_eq!(response.headers()["content-type"], "text/event-stream");
+        assert_eq!(
+            response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "tauri://localhost"
+        );
         let text = response.text().await.unwrap();
         assert_eq!(
             text,

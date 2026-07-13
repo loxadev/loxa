@@ -2,8 +2,21 @@ pub mod bootstrap;
 
 use tauri::Manager;
 
+#[cfg(debug_assertions)]
+fn init_debug_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .compact()
+        .with_target(false)
+        .without_time()
+        .try_init();
+}
+
+#[cfg(not(debug_assertions))]
+fn init_debug_tracing() {}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    init_debug_tracing();
     let bootstrap =
         std::sync::Arc::new(std::sync::Mutex::new(bootstrap::BootstrapState::default()));
     let app = tauri::Builder::default()
