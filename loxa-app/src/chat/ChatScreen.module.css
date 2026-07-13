@@ -2,9 +2,26 @@
   min-height: 0;
   height: 100%;
   display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: var(--loxa-space-4);
+  overflow: hidden;
+}
+
+.chatMain {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
   gap: var(--loxa-space-4);
   overflow: hidden;
+}
+
+.contextNotice {
+  min-height: var(--loxa-space-4);
+  color: var(--loxa-muted-foreground);
+  font-size: var(--loxa-type-body-small-size);
+  line-height: var(--loxa-type-body-small-line-height);
+  text-align: center;
 }
 
 .transcript {
@@ -37,7 +54,7 @@
 }
 
 .emptyState p,
-.message p,
+.userMessage p,
 .supportReason,
 .attachmentReason {
   margin: 0;
@@ -74,12 +91,153 @@
   width: 100%;
 }
 
+.markdownMessage {
+  min-width: 0;
+  max-width: 100%;
+  color: var(--loxa-foreground);
+  font-family: var(--loxa-type-body-family);
+  font-size: var(--loxa-type-body-size);
+  font-weight: var(--loxa-type-body-weight);
+  line-height: var(--loxa-type-body-line-height);
+  letter-spacing: var(--loxa-type-body-letter-spacing);
+  overflow-wrap: anywhere;
+}
+
+.markdownMessage > :first-child { margin-top: 0; }
+.markdownMessage > :last-child { margin-bottom: 0; }
+
+.markdownMessage p,
+.markdownMessage ul,
+.markdownMessage ol,
+.markdownMessage pre,
+.markdownMessage table,
+.markdownMessage blockquote {
+  margin: 0 0 var(--loxa-space-3);
+}
+
+.markdownMessage ul,
+.markdownMessage ol { padding-left: var(--loxa-space-6); }
+.markdownMessage li + li { margin-top: var(--loxa-space-1); }
+
+.markdownMessage :is(h1, h2, h3, h4, h5, h6) {
+  margin: var(--loxa-space-6) 0 var(--loxa-space-2);
+  color: var(--loxa-foreground);
+  font-family: var(--loxa-type-title-family);
+  font-size: var(--loxa-type-title-size);
+  font-weight: var(--loxa-type-title-weight);
+  line-height: var(--loxa-type-title-line-height);
+  letter-spacing: var(--loxa-type-title-letter-spacing);
+}
+
+.markdownMessage a {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: var(--loxa-space-1);
+}
+
+.markdownMessage a:focus-visible {
+  outline: 2px solid var(--loxa-focus);
+  outline-offset: 2px;
+}
+
+.markdownMessage code {
+  padding: 0 var(--loxa-space-1);
+  color: var(--loxa-foreground);
+  background: var(--loxa-secondary-surface);
+  border-radius: var(--loxa-radius-sm);
+  font-family: var(--loxa-type-code-family);
+  font-size: var(--loxa-type-code-size);
+  font-weight: var(--loxa-type-code-weight);
+  line-height: var(--loxa-type-code-line-height);
+  letter-spacing: var(--loxa-type-code-letter-spacing);
+}
+
+.markdownMessage pre {
+  max-width: 100%;
+  overflow-x: auto;
+  padding: var(--loxa-space-3);
+  color: var(--loxa-foreground);
+  background: var(--loxa-secondary-surface);
+  border: 1px solid var(--loxa-control-border);
+  border-radius: var(--loxa-radius-md);
+  overscroll-behavior-inline: contain;
+}
+
+.markdownMessage pre code {
+  padding: 0;
+  background: transparent;
+  white-space: pre;
+}
+
+.markdownMessage blockquote {
+  padding-left: var(--loxa-space-3);
+  color: var(--loxa-muted-foreground);
+  border-left: 2px solid var(--loxa-control-border);
+}
+
+.markdownMessage table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+  overscroll-behavior-inline: contain;
+}
+
+.markdownMessage th,
+.markdownMessage td {
+  min-width: 120px;
+  padding: var(--loxa-space-2) var(--loxa-space-3);
+  text-align: left;
+  border: 1px solid var(--loxa-control-border);
+}
+
+.markdownMessage th {
+  font-weight: var(--loxa-type-title-weight);
+  background: var(--loxa-secondary-surface);
+}
+
+.omittedImage {
+  color: var(--loxa-muted-foreground);
+  font-style: italic;
+}
+
 .messageHeading {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   justify-content: space-between;
   gap: var(--loxa-space-4);
   margin-bottom: var(--loxa-space-2);
+}
+
+.messageIdentity {
+  display: flex;
+  align-items: baseline;
+  gap: var(--loxa-space-2);
+  min-width: 0;
+}
+
+.copyResponseButton {
+  flex: 0 0 auto;
+  min-width: var(--loxa-component-minimum-interactive-target);
+  min-height: var(--loxa-component-minimum-interactive-target);
+}
+
+.copyResponseButton:focus-visible {
+  outline: 2px solid var(--loxa-focus);
+  outline-offset: 2px;
+}
+
+.copyStatus {
+  margin: var(--loxa-space-2) 0 0;
+  color: var(--loxa-muted-foreground);
+  font-size: var(--loxa-type-body-small-size);
+  line-height: var(--loxa-type-body-small-line-height);
+}
+
+.markdownFallback {
+  margin: 0;
+  color: var(--loxa-muted-foreground);
 }
 
 .messageLabel {
@@ -210,6 +368,7 @@
 
 @media (max-width: 760px) {
   .screen { gap: var(--loxa-space-3); }
+  .chatMain { min-height: 0; overflow: hidden; }
   .composer { padding: var(--loxa-space-3); }
   .composerFooter { align-items: flex-end; }
   .composerTools { align-items: flex-end; }
@@ -221,7 +380,10 @@
 @media (prefers-contrast: more) {
   .composer,
   .userMessage,
-  .modelPicker { border-width: 2px; }
+  .modelPicker,
+  .markdownMessage pre,
+  .markdownMessage th,
+  .markdownMessage td { border-width: 2px; }
 }
 
 @media (forced-colors: active) {
@@ -230,11 +392,16 @@
   .modelPicker,
   .primaryControl,
   .attachmentButton,
-  .modelControl button {
+  .modelControl button,
+  .copyResponseButton,
+  .markdownMessage pre,
+  .markdownMessage th,
+  .markdownMessage td {
     border-color: ButtonText;
     forced-color-adjust: auto;
   }
   .primaryControl:focus-visible,
+  .copyResponseButton:focus-visible,
   .attachmentButton:focus-visible,
   .modelPicker:focus-visible,
   .messageInput:focus-visible { outline-color: Highlight; }

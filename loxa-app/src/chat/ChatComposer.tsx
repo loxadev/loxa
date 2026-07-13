@@ -15,6 +15,7 @@ type ChatComposerProps = {
   eligibleModels: ModelInventoryEntry[];
   modelBusy: boolean;
   modelOperation: "idle" | "switching";
+  modelControlsAvailable: boolean;
   onInput(value: string): void;
   onSelectedModel(value: string): void;
   onSwitchModel(): void;
@@ -34,13 +35,14 @@ export function ChatComposer({
   eligibleModels,
   modelBusy,
   modelOperation,
+  modelControlsAvailable,
   onInput,
   onSelectedModel,
   onSwitchModel,
   onSend,
   onStop,
 }: ChatComposerProps) {
-  const switchingDisabled = modelOperation === "switching" || modelBusy || responseInProgress;
+  const switchingDisabled = !modelControlsAvailable || modelOperation === "switching" || modelBusy || responseInProgress;
   const submit = () => {
     if (responseInProgress) onStop();
     else onSend();

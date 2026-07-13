@@ -115,16 +115,32 @@ describe("ModelsScreen", () => {
   it("starts load, uses Switch wording when another model is active, and refreshes authoritative node truth", async () => {
     const user = userEvent.setup();
     const setupState = setup();
+    const onModelMutationStart = vi.fn();
+    const onModelMutationSettled = vi.fn();
     vi.mocked(setupState.api.getControlNode)
       .mockResolvedValueOnce({ status: "ready", activeModelId: "model-old", operationId: null, error: null })
       .mockResolvedValueOnce({ status: "loading", activeModelId: "model-old", operationId: "op-load", error: null });
     vi.mocked(setupState.api.getOperation).mockResolvedValueOnce({ ...operation("queued"), id: "op-load", kind: "load", modelId: "model-downloaded" });
-    render(<ModelsScreen endpoint="http://127.0.0.1:8080" services={setupState.api} />);
+    render(
+      <ModelsScreen
+        endpoint="http://127.0.0.1:8080"
+        services={setupState.api}
+        onModelMutationStart={onModelMutationStart}
+        onModelMutationSettled={onModelMutationSettled}
+      />,
+    );
     await user.click(await screen.findByRole("button", { name: "Switch to model-downloaded" }));
     expect(setupState.api.loadModel).toHaveBeenCalledWith("http://127.0.0.1:8080", token, "model-downloaded", expect.objectContaining({ signal: expect.any(AbortSignal) }));
+    expect(onModelMutationStart).toHaveBeenCalledWith("op-load");
+    expect(onModelMutationSettled).not.toHaveBeenCalled();
     expect(screen.getByLabelText("Model control summary")).toHaveTextContent("Node Loading");
     expect(screen.queryByRole("button", { name: "Cancel load model-downloaded" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Download model-ready" })).toBeDisabled();
+    act(() => setupState.callbacks()?.onEvent({
+      sequence: 4,
+      operation: { ...operation("succeeded"), id: "op-load", kind: "load", modelId: "model-downloaded" },
+    }));
+    await vi.waitFor(() => expect(onModelMutationSettled).toHaveBeenCalledOnce());
   });
 
   it("offers unload only for the active model and leaves it active after a failed operation", async () => {
@@ -136,6 +152,85 @@ describe("ModelsScreen", () => {
     expect(setupState.api.unloadModel).toHaveBeenCalledWith("http://127.0.0.1:8080", token, expect.objectContaining({ signal: expect.any(AbortSignal) }));
     act(() => setupState.callbacks()?.onEvent({ sequence: 8, operation: { ...operation("failed"), id: "op-unload", kind: "unload", modelId: null, error: "teardown failed" } }));
     expect(await screen.findByText("Active")).toBeInTheDocument();
+  });
+
+  it("releases shared model reconciliation even when terminal control refresh fails", async () => {
+    const setupState = setup();
+    const onModelMutationSettled = vi.fn();
+    render(
+      <ModelsScreen
+        endpoint="http://127.0.0.1:8080"
+        services={setupState.api}
+        onModelMutationSettled={onModelMutationSettled}
+      />,
+    );
+    await screen.findByRole("heading", { name: "model-downloaded" });
+    vi.mocked(setupState.api.getInventory).mockRejectedValueOnce(new Error("inventory unavailable"));
+
+    act(() => setupState.callbacks()?.onEvent({
+      sequence: 1,
+      operation: { ...operation("failed"), id: "op-load", kind: "load", error: "readiness failed" },
+    }));
+
+    await vi.waitFor(() => expect(onModelMutationSettled).toHaveBeenCalledWith("op-load"));
+  });
+
+  it("keeps an accepted operation tracked after a read failure until a terminal event settles it", async () => {
+    const setupState = setup();
+    const user = userEvent.setup();
+    const onModelMutationStart = vi.fn();
+    const onModelMutationSettled = vi.fn();
+    vi.mocked(setupState.api.getOperation).mockRejectedValueOnce(new Error("operation read unavailable"));
+    render(
+      <ModelsScreen
+        endpoint="http://127.0.0.1:8080"
+        services={setupState.api}
+        onModelMutationStart={onModelMutationStart}
+        onModelMutationSettled={onModelMutationSettled}
+      />,
+    );
+
+    await user.click(await screen.findByRole("button", { name: "Load model-downloaded" }));
+    expect(onModelMutationStart).toHaveBeenCalledWith("op-load");
+    expect(await screen.findByRole("alert")).toHaveTextContent("operation read unavailable");
+    expect(onModelMutationSettled).not.toHaveBeenCalled();
+
+    act(() => setupState.callbacks()?.onEvent({
+      sequence: 5,
+      operation: { ...operation("succeeded"), id: "op-load", kind: "load", modelId: "model-downloaded" },
+    }));
+    await vi.waitFor(() => expect(onModelMutationSettled).toHaveBeenCalledOnce());
+    expect(onModelMutationSettled).toHaveBeenCalledWith("op-load");
+  });
+
+  it("forwards active and terminal lifecycle ids from reconnect snapshots", async () => {
+    const setupState = setup();
+    const onModelMutationStart = vi.fn();
+    const onModelMutationSettled = vi.fn();
+    render(
+      <ModelsScreen
+        endpoint="http://127.0.0.1:8080"
+        services={setupState.api}
+        onModelMutationStart={onModelMutationStart}
+        onModelMutationSettled={onModelMutationSettled}
+      />,
+    );
+    await screen.findByRole("heading", { name: "model-downloaded" });
+
+    act(() => setupState.callbacks()?.onSnapshot({
+      cursor: 12,
+      cursorGap: true,
+      operations: [
+        { ...operation("running"), id: "op-active", kind: "load" },
+        { ...operation("succeeded"), id: "op-current", kind: "load" },
+        { ...operation("failed"), id: "op-old", kind: "unload" },
+      ],
+      events: [],
+    }));
+
+    expect(onModelMutationStart).toHaveBeenCalledWith("op-active");
+    expect(onModelMutationSettled).toHaveBeenCalledWith("op-current");
+    expect(onModelMutationSettled).toHaveBeenCalledWith("op-old");
   });
 
   it("blocks lifecycle controls during recovery and ignores stale operation events", async () => {

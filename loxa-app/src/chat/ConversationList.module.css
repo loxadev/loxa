@@ -1,0 +1,197 @@
+.rail {
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  color: var(--loxa-foreground);
+  background: transparent;
+  overflow: hidden;
+}
+
+.header {
+  display: grid;
+  gap: var(--loxa-space-3);
+  padding: var(--loxa-space-4) 0;
+  border-bottom: 1px solid var(--loxa-control-border);
+}
+
+.heading {
+  margin: 0;
+  font: var(--loxa-type-label-weight) var(--loxa-type-label-size)/var(--loxa-type-label-line-height) var(--loxa-type-label-family);
+}
+
+.newButton,
+.conversationButton,
+.itemActions button,
+.confirmActions button,
+.moreButton {
+  min-height: var(--loxa-component-minimum-interactive-target);
+  color: inherit;
+  background: transparent;
+  border: 1px solid var(--loxa-control-border);
+  border-radius: var(--loxa-radius-md);
+  font: inherit;
+  cursor: pointer;
+}
+
+.newButton {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--loxa-space-2);
+  width: 100%;
+  background: var(--loxa-secondary-surface);
+}
+
+.scrollRegion {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: var(--loxa-space-2);
+}
+
+.notice,
+.actionError {
+  margin: 0;
+  padding: var(--loxa-space-4);
+  color: var(--loxa-muted-foreground);
+  font-size: var(--loxa-type-body-small-size);
+  line-height: var(--loxa-type-body-small-line-height);
+  overflow-wrap: anywhere;
+}
+
+.notice p { margin: 0 0 var(--loxa-space-2); }
+.notice button { min-height: var(--loxa-component-minimum-interactive-target); }
+
+.list {
+  display: grid;
+  gap: var(--loxa-space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.item {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--loxa-space-1);
+  padding: var(--loxa-space-1);
+  border-radius: var(--loxa-radius-md);
+}
+
+.item:has(.conversationButton[aria-current='page']) {
+  background: var(--loxa-secondary-surface);
+}
+
+.conversationButton {
+  min-width: 0;
+  display: grid;
+  gap: var(--loxa-space-1);
+  padding: var(--loxa-space-2) var(--loxa-space-3);
+  text-align: left;
+  border-color: transparent;
+}
+
+.conversationButton[aria-current='page'] {
+  border-color: var(--loxa-control-border);
+}
+
+.title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: var(--loxa-type-label-weight);
+}
+
+.meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--loxa-space-2);
+  color: var(--loxa-muted-foreground);
+  font-size: var(--loxa-type-label-caps-size);
+  line-height: var(--loxa-type-label-caps-line-height);
+}
+
+.itemActions {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--loxa-space-1);
+}
+
+.itemActions button {
+  min-width: var(--loxa-component-minimum-interactive-target);
+  padding-inline: var(--loxa-space-2);
+  font-size: var(--loxa-type-label-size);
+}
+
+.renameForm,
+.deleteConfirm {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: var(--loxa-space-2);
+}
+
+.renameInput {
+  min-height: var(--loxa-component-minimum-interactive-target);
+  width: 100%;
+  color: var(--loxa-foreground);
+  background: var(--loxa-background);
+  border: 1px solid var(--loxa-control-border);
+  border-radius: var(--loxa-radius-md);
+  padding-inline: var(--loxa-space-3);
+  font: inherit;
+}
+
+.deleteConfirm {
+  padding: var(--loxa-space-3);
+  border: 1px solid var(--loxa-control-border);
+  border-radius: var(--loxa-radius-md);
+}
+
+.deleteConfirm p { margin: 0; }
+
+.confirmActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--loxa-space-2);
+}
+
+.confirmActions button { padding-inline: var(--loxa-space-3); }
+
+.moreButton {
+  width: 100%;
+  margin-top: var(--loxa-space-2);
+}
+
+.srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.rail button:disabled { cursor: not-allowed; opacity: 0.65; }
+
+@media (prefers-contrast: more) {
+  .rail,
+  .newButton,
+  .conversationButton[aria-current='page'],
+  .renameInput,
+  .deleteConfirm { border-width: 2px; }
+}
+
+@media (forced-colors: active) {
+  .conversationButton[aria-current='page'] { outline: 2px solid Highlight; }
+  .item:has(.conversationButton[aria-current='page']) { background: Canvas; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .scrollRegion { scroll-behavior: auto; }
+}

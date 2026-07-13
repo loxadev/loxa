@@ -42,6 +42,12 @@ function services(overrides: Partial<NodeSessionServices & NodeScreenServices> =
       stop: vi.fn().mockResolvedValue(snapshot({ ownership: "none", childRunning: false })),
     },
     getStatus: vi.fn().mockResolvedValue(unloadedStatus),
+    readControlToken: vi.fn().mockResolvedValue("ab".repeat(32)),
+    createControlEventStream: vi.fn(() => ({
+      cancel: vi.fn(),
+      dispose: vi.fn(),
+      finished: new Promise<never>(() => undefined),
+    })),
     copyText: vi.fn().mockResolvedValue(undefined),
     ...overrides,
   };

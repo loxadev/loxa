@@ -1,3 +1,4 @@
+import { useEffect, useRef, useState } from "react";
 import type { ThemeMode } from "./theme";
 import type { NodeStatus } from "../node/contracts";
 import type { NodeSessionPhase } from "../node/NodeSession";
@@ -14,6 +15,7 @@ export function SettingsScreen({
   theme,
   onThemeChange,
   runtime,
+  onClearChatHistory,
 }: {
   theme: ThemeMode;
   onThemeChange: (mode: ThemeMode) => void;
@@ -23,8 +25,53 @@ export function SettingsScreen({
     ownership: NodeOwnership;
     status: NodeStatus | null;
   };
+  onClearChatHistory?: (signal: AbortSignal) => Promise<number>;
 }) {
   const activeLabel = choices.find(({ mode }) => mode === theme)?.label ?? "System";
+  const [confirmClear, setConfirmClear] = useState(false);
+  const [clearing, setClearing] = useState(false);
+  const [historyStatus, setHistoryStatus] = useState("");
+  const mounted = useRef(true);
+  const clearController = useRef<AbortController | null>(null);
+  const clearGeneration = useRef(0);
+
+  useEffect(() => {
+    mounted.current = true;
+    const dispose = () => {
+      if (!mounted.current) return;
+      mounted.current = false;
+      clearGeneration.current += 1;
+      clearController.current?.abort();
+      clearController.current = null;
+    };
+    window.addEventListener("beforeunload", dispose);
+    return () => {
+      window.removeEventListener("beforeunload", dispose);
+      dispose();
+    };
+  }, []);
+
+  const clearHistory = async () => {
+    if (!onClearChatHistory || clearing || !mounted.current) return;
+    clearController.current?.abort();
+    const controller = new AbortController();
+    clearController.current = controller;
+    const generation = ++clearGeneration.current;
+    setClearing(true);
+    setHistoryStatus("");
+    try {
+      const deleted = await onClearChatHistory(controller.signal);
+      if (!mounted.current || controller.signal.aborted || generation !== clearGeneration.current) return;
+      setHistoryStatus(`Deleted ${deleted} ${deleted === 1 ? "conversation" : "conversations"}.`);
+      setConfirmClear(false);
+    } catch {
+      if (!mounted.current || controller.signal.aborted || generation !== clearGeneration.current) return;
+      setHistoryStatus("Could not clear local chat history.");
+    } finally {
+      if (clearController.current === controller) clearController.current = null;
+      if (mounted.current && !controller.signal.aborted && generation === clearGeneration.current) setClearing(false);
+    }
+  };
 
   return (
     <section className={styles.screen} aria-labelledby="settings-heading">
@@ -60,6 +107,24 @@ export function SettingsScreen({
       </fieldset>
       <p className={styles.disclosure}>Theme is the only preference saved on this Mac. Node and model state are not stored here.</p>
 
+      <section className={styles.group} aria-labelledby="chat-history-heading">
+        <h2 id="chat-history-heading">Chat history</h2>
+        <p className={styles.description}>Conversations are stored as local plaintext in Loxa's user-only data directory so the desktop app and CLI can share them. They are not synced.</p>
+        {onClearChatHistory ? (
+          <div className={styles.destructiveActions}>
+            {!confirmClear ? (
+              <button className="quiet-button interactive-target" type="button" onClick={() => setConfirmClear(true)}>Clear chat history</button>
+            ) : (
+              <div className={styles.confirmClear} role="group" aria-label="Confirm clear chat history">
+                <p>This permanently deletes every saved conversation.</p>
+                <button className="quiet-button interactive-target" type="button" disabled={clearing} onClick={() => void clearHistory()}>Confirm clear chat history</button>
+                <button className="quiet-button interactive-target" type="button" disabled={clearing} onClick={() => setConfirmClear(false)}>Cancel</button>
+              </div>
+            )}
+          </div>
+        ) : null}
+      </section>
+
       <section className={styles.group} aria-labelledby="local-runtime-heading">
         <h2 id="local-runtime-heading">Local node/runtime</h2>
         <p className={styles.description}>Read-only facts from the shared authenticated node session.</p>
@@ -73,7 +138,7 @@ export function SettingsScreen({
           <Fact label="Active model" value={runtime.status?.runtime_model ?? "Unavailable"} technical />
         </dl>
       </section>
-      <p className="visually-hidden" role="status" aria-live="polite">Theme set to {activeLabel}</p>
+      <p className="visually-hidden" role="status" aria-live="polite">Theme set to {activeLabel}. {historyStatus}</p>
     </section>
   );
 }
@@ -86,6 +151,7 @@ function runtimePhaseLabel(phase: NodeSessionPhase) {
   if (phase === "checking" || phase === "starting") return "Checking";
   if (phase === "unloaded") return "Ready — no model loaded";
   if (phase === "ready") return "Ready";
+  if (phase === "reconciling") return "Updating model status";
   if (phase === "recovery-required") return "Recovery required";
   return phase[0].toUpperCase() + phase.slice(1);
 }
