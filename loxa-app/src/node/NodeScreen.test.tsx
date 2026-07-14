@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
@@ -61,6 +61,30 @@ function renderNode(api = services(), onNavigateModels = vi.fn()) {
 }
 
 describe("NodeScreen", () => {
+  it("presents one truthful local node row without unsupported inventory controls", async () => {
+    renderNode();
+
+    expect(await screen.findByRole("heading", { level: 1, name: "Nodes" })).toBeVisible();
+    const table = screen.getByRole("table", { name: "Local node inventory" });
+    expect(
+      within(table)
+        .getAllByRole("columnheader")
+        .map((cell) => cell.textContent),
+    ).toEqual(["Node", "Status", "Active model", "Endpoint", "Ownership", "Actions"]);
+    const rows = within(table).getAllByRole("row");
+    expect(rows).toHaveLength(2);
+    const localNode = rows[1];
+    expect(within(localNode).getByText("Local node")).toBeVisible();
+    expect(within(localNode).getByText("node-7")).toBeVisible();
+    expect(within(localNode).getByText("Node ready — no model loaded")).toBeVisible();
+    expect(within(localNode).getByText("unavailable")).toBeVisible();
+    expect(within(localNode).getByText("No model loaded")).toBeVisible();
+    expect(within(localNode).getByText(endpoint)).toBeVisible();
+    expect(within(localNode).getByText("App-owned node")).toBeVisible();
+    expect(screen.queryByRole("combobox")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /add node/i })).not.toBeInTheDocument();
+  });
+
   it("automatically ensures the node and renders unloaded as a successful state", async () => {
     const navigate = vi.fn();
     const { api } = renderNode(services(), navigate);
@@ -91,7 +115,14 @@ describe("NodeScreen", () => {
         },
       }),
     );
-    expect(await screen.findByRole("status")).toHaveTextContent("Recovery required");
+    const status = await screen.findByRole("status");
+    expect(status).toHaveTextContent("Recovery required");
+    expect(status).not.toHaveTextContent("unsafe child exit");
+    expect(status).toHaveAttribute("data-variant", "danger");
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent("Recovery required after unsafe child exit.");
+    expect(alert).toHaveClass("bg-danger-surface");
+    expect(alert.querySelector("svg")).toHaveAttribute("aria-hidden", "true");
   });
 
   it("shows ready only from authoritative status and exposes technical fields", async () => {
@@ -124,7 +155,14 @@ describe("NodeScreen", () => {
 
   it("keeps safe owned-child recovery available when the public probe fails", async () => {
     renderNode(services({ getStatus: vi.fn().mockRejectedValue(new Error("Public status unavailable.")) }));
-    expect(await screen.findByRole("status")).toHaveTextContent("Public status unavailable.");
+    const status = await screen.findByRole("status");
+    expect(status).toHaveTextContent("Error");
+    expect(status).not.toHaveTextContent("Public status unavailable.");
+    expect(status).toHaveAttribute("data-variant", "danger");
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent("Public status unavailable.");
+    expect(alert).toHaveClass("bg-danger-surface");
+    expect(alert.querySelector("svg")).toHaveAttribute("aria-hidden", "true");
     expect(screen.getByText("App-owned node")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Stop node" })).toBeEnabled();
   });

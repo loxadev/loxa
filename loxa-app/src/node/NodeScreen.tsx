@@ -1,8 +1,11 @@
 import { useState } from "react";
+import { TriangleAlert } from "lucide-react";
 
+import { Alert, AlertDescription, AlertTitle } from "../components/ui/alert";
 import { useNodeSession } from "./NodeSession";
 import type { NodeOwnership } from "./machine";
 import styles from "./NodeScreen.module.css";
+import { NodeTable } from "./NodeTable";
 
 export type { BootstrapApi, BootstrapSnapshot, StartNodeRequest } from "./NodeSession";
 
@@ -46,22 +49,23 @@ export function NodeScreen({
       <header className="screen-header">
         <div>
           <p className="eyebrow">Local runtime</p>
-          <h1 id="node-heading">Node</h1>
+          <h1 id="node-heading">Nodes</h1>
         </div>
-        <p className={`status-badge status-${session.phase}`} role="status" aria-live="polite">
-          {phaseLabels[session.phase]}
-          {session.error ? `. ${session.error}` : ""}
-        </p>
       </header>
-      <div className={styles.summary}>
-        <p className={styles.ownership}>{ownershipLabel(session.ownership)}</p>
-        <p className={styles.summaryText}>{phaseSummary(session.phase)}</p>
-      </div>
-      <dl className={styles.facts}>
-        <Field
-          label="Endpoint"
-          value={session.endpoint}
-          action={
+      <p className={styles.intro}>{phaseSummary(session.phase)}</p>
+      <NodeTable
+        nodeId={session.status?.node_id ?? "—"}
+        statusLabel={phaseLabels[session.phase]}
+        statusTone={statusTone(session.phase)}
+        health={session.status?.health ?? "Not connected"}
+        activeModel={session.status?.runtime_model ?? "No model loaded"}
+        engineName={session.status?.engine?.name ?? "—"}
+        engineVersion={session.status?.engine?.version ?? "—"}
+        profile={session.status?.profile ?? "—"}
+        endpoint={session.endpoint}
+        ownership={ownershipLabel(session.ownership)}
+        actions={{
+          copyEndpoint: (
             <button
               className="quiet-button interactive-target"
               type="button"
@@ -70,54 +74,40 @@ export function NodeScreen({
             >
               Copy
             </button>
-          }
-        />
-        <Field label="Health" value={session.status?.health ?? "Not connected"} />
-        <Field label="Node ID" value={session.status?.node_id ?? "—"} />
-        <Field label="Engine" value={session.status?.engine?.name ?? "—"} />
-        <Field label="Engine version" value={session.status?.engine?.version ?? "—"} />
-        <Field label="Runtime model" value={session.status?.runtime_model ?? "—"} />
-        <Field label="Profile" value={session.status?.profile ?? "—"} />
-      </dl>
-      {session.phase === "unloaded" && (
-        <div className={styles.nextAction}>
+          ),
+          model:
+            session.phase === "unloaded" ? (
+              <button className="primary-button interactive-target" type="button" onClick={onNavigateModels}>
+                Browse verified models
+              </button>
+            ) : undefined,
+          retry:
+            session.phase === "error" || session.phase === "disconnected" ? (
+              <button className="primary-button interactive-target" type="button" onClick={() => void session.retry()}>
+                Retry node startup
+              </button>
+            ) : undefined,
+          lifecycle:
+            session.ownership === "owned" && !["checking", "starting", "stopping"].includes(session.phase) ? (
+              <button className="secondary-button interactive-target" type="button" onClick={() => void session.stop()}>
+                Stop node
+              </button>
+            ) : undefined,
+        }}
+      />
+      {session.error && (
+        <Alert className={styles.errorAlert} variant="danger">
+          <TriangleAlert aria-hidden="true" className={`${styles.errorIcon} text-danger`} />
           <div>
-            <h2>Node is running without a model</h2>
-            <p>Choose a verified recipe to download or load before starting a chat.</p>
+            <AlertTitle>{session.phase === "recovery-required" ? "Recovery required" : "Node unavailable"}</AlertTitle>
+            <AlertDescription>{session.error}</AlertDescription>
           </div>
-          <button className="primary-button interactive-target" type="button" onClick={onNavigateModels}>
-            Browse verified models
-          </button>
-        </div>
+        </Alert>
       )}
-      <div className={styles.actions}>
-        {(session.phase === "error" || session.phase === "disconnected") && (
-          <button className="primary-button interactive-target" type="button" onClick={() => void session.retry()}>
-            Retry node startup
-          </button>
-        )}
-        {session.ownership === "owned" && !["checking", "starting", "stopping"].includes(session.phase) && (
-          <button className="secondary-button interactive-target" type="button" onClick={() => void session.stop()}>
-            Stop node
-          </button>
-        )}
-      </div>
       <p className="visually-hidden" aria-live="polite">
         {announcement}
       </p>
     </section>
-  );
-}
-
-function Field({ label, value, action }: { label: string; value: string; action?: React.ReactNode }) {
-  return (
-    <div className={styles.field}>
-      <dt>{label}</dt>
-      <dd>
-        <span className="technical-value">{value}</span>
-        {action}
-      </dd>
-    </div>
   );
 }
 
@@ -135,4 +125,11 @@ function ownershipLabel(ownership: NodeOwnership) {
   if (ownership === "owned") return "App-owned node";
   if (ownership === "attached") return "Externally attached";
   return "No node ownership";
+}
+
+function statusTone(phase: keyof typeof phaseLabels) {
+  if (phase === "error" || phase === "recovery-required") return "danger";
+  if (phase === "ready" || phase === "unloaded") return "success";
+  if (phase === "checking" || phase === "starting" || phase === "reconciling" || phase === "stopping") return "info";
+  return "neutral";
 }
