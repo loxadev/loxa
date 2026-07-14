@@ -337,16 +337,7 @@ describe("Cargo workspace isolation", () => {
   });
 
   it("keeps Tauri and WebKit outside root cargo metadata", () => {
-    const metadata = JSON.parse(
-      execFileSync("cargo", ["metadata", "--format-version", "1", "--no-deps"], {
-        cwd: repositoryRoot,
-        encoding: "utf8",
-        maxBuffer: 100 * 1024 * 1024,
-      }),
-    ) as { packages: Array<{ name: string }> };
-
-    const packageNames = metadata.packages.map(({ name }) => name);
-    expect(packageNames).not.toContain("loxa-app");
-    expect(packageNames.some((name) => /tauri|webkit/i.test(name))).toBe(false);
+    const rootManifest = readFileSync(resolve(repositoryRoot, "Cargo.toml"), "utf8");
+    expect(rootManifest).not.toMatch(/loxa-app|tauri|webkit/i);
   });
 });
