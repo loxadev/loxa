@@ -47,13 +47,13 @@ function Button({ className, variant, size, busy = false, disabled, type = "butt
 
 type IconButtonProps = Omit<ButtonProps, "aria-describedby" | "aria-label" | "children" | "size"> & {
   children: React.ReactElement;
-  helpId: string;
+  helpId?: string;
   label: string;
 };
 
 function IconButton({ children, helpId, label, ...props }: IconButtonProps) {
   if (!label.trim()) throw new Error("IconButton label must not be empty");
-  if (!helpId.trim()) throw new Error("IconButton helpId must not be empty");
+  if (helpId !== undefined && !helpId.trim()) throw new Error("IconButton helpId must not be empty");
   const decorativeIcon = React.cloneElement(children as React.ReactElement<Record<string, unknown>>, {
     "aria-hidden": true,
     focusable: "false",

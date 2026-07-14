@@ -3,6 +3,7 @@ import { expect, test, vi } from "vitest";
 import { page } from "vitest/browser";
 
 import App from "@/App";
+import { desktopRuntimeUnavailableMessage } from "@/app/services";
 import type { ControlStreamCallbacks } from "@/control/events";
 import type { ModelInventoryEntry, OperationView } from "@/control/contracts";
 import { applyTheme } from "@/settings/theme";
@@ -104,6 +105,40 @@ test("covers the annotated Nodes, Models, Settings overview, and Runtime routes 
   expectNoViewportOverflow();
   await settleVisuals();
   await expectNoAxeViolations(document);
+});
+
+test("keeps neutral production runtime copy across Nodes, Models, and Chat surfaces", async () => {
+  await page.viewport(800, 600);
+  useWorkspaceStore.setState({ activeRoute: "node", sidebarCollapsed: false, expandedSidebarWidth: 220 });
+  const neutralMessage = desktopRuntimeUnavailableMessage(false);
+  const base = createAppServicesFixture();
+  const services = createAppServicesFixture({
+    bootstrap: { ...base.bootstrap, start: vi.fn().mockRejectedValue(new Error(neutralMessage)) },
+  });
+  services.listChats = undefined;
+  services.createChat = undefined;
+  services.getChat = undefined;
+  services.renameChat = undefined;
+  services.deleteChat = undefined;
+  mountBrowser(<App services={services} />);
+  await settleApp();
+
+  await expect.element(page.getByRole("heading", { name: "Nodes" })).toBeVisible();
+  await expect.element(page.getByText(neutralMessage).first()).toBeVisible();
+  expect(document.body).not.toHaveTextContent("browser preview");
+
+  await navigate("Models");
+  await expect.element(page.getByRole("heading", { name: "Models" })).toBeVisible();
+  await expect.element(page.getByText(neutralMessage).first()).toBeVisible();
+  expect(document.body).not.toHaveTextContent("browser preview");
+
+  await act(async () => page.getByRole("link", { name: "Chat", exact: true }).click());
+  await expect.element(page.getByRole("heading", { name: "Chat" })).toBeVisible();
+  const chatRegion = page.getByRole("region", { name: "Chat" });
+  expect(chatRegion.getByRole("status").element()).toHaveTextContent(neutralMessage);
+  expect(page.getByRole("log", { name: "Conversation" }).element()).toHaveTextContent(neutralMessage);
+  expect(page.getByRole("form", { name: "Message composer" }).element()).toHaveTextContent(neutralMessage);
+  expect(document.body).not.toHaveTextContent("browser preview");
 });
 
 test("wraps a long recovery-required error without hiding the Node recovery feedback", async () => {

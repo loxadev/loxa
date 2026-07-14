@@ -1008,8 +1008,10 @@ describe("App", () => {
     expect(screen.getByRole("form", { name: "Message composer" })).toBeVisible();
     expect(screen.getByLabelText("Message")).toBeDisabled();
     expect(screen.getByRole("combobox", { name: "Choose model" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Attach document" })).toBeDisabled();
-    expect(screen.getByText(/document input support cannot be checked until the node is connected/i)).toBeVisible();
+    expect(screen.getByRole("button", { name: "Attach document" })).toHaveAttribute("aria-disabled", "true");
+    expect(screen.getByRole("tooltip")).toHaveTextContent(
+      /document input support cannot be checked until the node is connected/i,
+    );
     expect(api.getStatus).not.toHaveBeenCalled();
     expect(api.readControlToken).not.toHaveBeenCalled();
   });

@@ -62,6 +62,37 @@ test("keeps expanded and collapsed shell geometry accessible at 800 by 600", asy
   await expectNoAxeViolations(document);
 });
 
+test("keeps Settings bottom-anchored in expanded and collapsed sidebars", async () => {
+  await page.viewport(800, 600);
+  useWorkspaceStore.setState({ activeRoute: "chat", sidebarCollapsed: false, expandedSidebarWidth: 280 });
+  mountBrowser(<App services={createAppServicesFixture()} />);
+  await settleShell();
+
+  const sidebar = document.querySelector<HTMLElement>(".app-sidebar");
+  const footer = document.querySelector<HTMLElement>(".sidebar-footer");
+  expect(sidebar).not.toBeNull();
+  expect(footer).not.toBeNull();
+
+  const expectBottomAnchored = () => {
+    const sidebarRect = sidebar!.getBoundingClientRect();
+    const footerRect = footer!.getBoundingClientRect();
+    const bottomInset = sidebarRect.bottom - footerRect.bottom;
+    expect(bottomInset).toBeGreaterThanOrEqual(7);
+    expect(bottomInset).toBeLessThanOrEqual(9);
+  };
+
+  for (const height of [600, 800]) {
+    await page.viewport(800, height);
+    expectBottomAnchored();
+
+    await act(async () => page.getByRole("button", { name: "Collapse sidebar" }).click());
+    expectBottomAnchored();
+
+    await act(async () => page.getByRole("button", { name: "Expand sidebar" }).click());
+    expectBottomAnchored();
+  }
+});
+
 test("shows keyboard focus on collapsed navigation without horizontal overflow", async () => {
   await page.viewport(800, 600);
   useWorkspaceStore.setState({ activeRoute: "chat", sidebarCollapsed: true, expandedSidebarWidth: 280 });

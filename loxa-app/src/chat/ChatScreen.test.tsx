@@ -551,7 +551,7 @@ describe("ChatScreen", () => {
     expect(screen.getByLabelText("Message")).toBeDisabled();
     expect(screen.getByRole("combobox", { name: "Choose model" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Attach document" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Attach document" })).toHaveAttribute("aria-disabled", "true");
     expect(setup.api.getStatus).not.toHaveBeenCalled();
     expect(setup.api.readControlToken).not.toHaveBeenCalled();
   });
@@ -958,7 +958,7 @@ describe("ChatScreen", () => {
     render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
     const picker = await screen.findByRole("combobox", { name: "Choose model" });
     await user.selectOptions(picker, "other");
-    expect(screen.getByText("gemma", { selector: ".technical-value" })).toBeInTheDocument();
+    expect(screen.getByText("Active model: gemma")).toBeInTheDocument();
     expect(setup.api.loadModel).not.toHaveBeenCalled();
     await user.click(screen.getByRole("button", { name: "Switch to other" }));
     expect(setup.api.loadModel).toHaveBeenCalledWith(
@@ -967,7 +967,7 @@ describe("ChatScreen", () => {
       "other",
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
-    expect(await screen.findByText("other", { selector: ".technical-value" })).toBeInTheDocument();
+    expect(await screen.findByText("Active model: other")).toBeInTheDocument();
   });
 
   it("does not abort its own model switch when shared truth enters reconciliation", async () => {
@@ -1213,7 +1213,7 @@ describe("ChatScreen", () => {
     await user.selectOptions(await screen.findByRole("combobox", { name: "Choose model" }), "other");
     await user.click(screen.getByRole("button", { name: "Switch to other" }));
     expect(await screen.findByRole("status")).toHaveTextContent("readiness failed");
-    expect(screen.getByText("gemma", { selector: ".technical-value" })).toBeInTheDocument();
+    expect(screen.getByText("Active model: gemma")).toBeInTheDocument();
   });
 
   it.each(["rejected", "empty"] as const)(
@@ -1310,10 +1310,10 @@ describe("ChatScreen", () => {
     });
     act(() => setup.controlCallbacks()?.onEvent(terminal("old", "gemma")));
     act(() => setup.controlCallbacks()?.onEvent(terminal("new", "other")));
-    expect(await screen.findByText("other", { selector: ".technical-value" })).toBeInTheDocument();
+    expect(await screen.findByText("Active model: other")).toBeInTheDocument();
     resolveOlder({ status: "ready", activeModelId: "gemma", operationId: null, error: null });
     await Promise.resolve();
-    expect(screen.getByText("other", { selector: ".technical-value" })).toBeInTheDocument();
+    expect(screen.getByText("Active model: other")).toBeInTheDocument();
   });
 
   it("keeps chat blocked until terminal lifecycle truth finishes reconciling", async () => {
@@ -1481,15 +1481,43 @@ describe("ChatScreen", () => {
     const setup = services();
     render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
     const attachment = await screen.findByRole("button", { name: "Attach document" });
-    expect(attachment).toBeDisabled();
+    expect(attachment).not.toBeDisabled();
+    expect(attachment).toHaveAttribute("aria-disabled", "true");
     expect(attachment).toHaveAttribute("aria-describedby", "attachment-support-reason");
-    expect(screen.getByText("Document input is not supported by this model and backend.")).toBeInTheDocument();
+    expect(screen.getByRole("tooltip")).toHaveTextContent("Document input is not supported by this model and backend.");
     expect(setup.api.getCapabilities).toHaveBeenCalledWith(
       "http://127.0.0.1:8080",
       "ab".repeat(32),
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
     expect(setup.api.readControlToken).toHaveBeenCalledWith("http://127.0.0.1:8080");
+  });
+
+  it("omits the document tooltip when no capability reason exists", async () => {
+    const setup = services();
+    vi.mocked(setup.api.getCapabilities).mockResolvedValue({
+      documentInput: false,
+      documentInputReason: "",
+      textChat: true,
+    });
+    render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
+
+    const attachment = await screen.findByRole("button", { name: "Attach document" });
+    await waitFor(() => expect(setup.api.getCapabilities).toHaveBeenCalled());
+    expect(attachment).not.toHaveAttribute("aria-describedby");
+    expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
+  });
+
+  it("puts authoritative active-model status in the Chat header without duplicating it under the selector", async () => {
+    const setup = services();
+    render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
+
+    const picker = await screen.findByRole("combobox", { name: "Choose model" });
+    const header = screen.getByRole("heading", { name: "Chat" }).closest("header");
+    expect(header).not.toBeNull();
+    expect(within(header!).getByText("Active model: gemma")).toBeVisible();
+    expect(picker).toHaveAccessibleName("Choose model");
+    expect(screen.queryByText(/Active:\s*gemma/)).not.toBeInTheDocument();
   });
 
   it("aborts status, model, and capability checks before window close and suppresses late results", async () => {
