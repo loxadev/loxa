@@ -1,8 +1,15 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { invoke } from "@tauri-apps/api/core";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { appServices, DESKTOP_RUNTIME_UNAVAILABLE_MESSAGE } from "./services";
 
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+
 describe("desktop app services in browser preview", () => {
+  beforeEach(() => {
+    vi.mocked(invoke).mockReset();
+  });
+
   afterEach(() => {
     Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
   });
@@ -24,5 +31,25 @@ describe("desktop app services in browser preview", () => {
     for (const call of calls) {
       await expect(call()).rejects.toEqual(new Error(expectedMessage));
     }
+  });
+
+  it("forwards exact commands and arguments when the Tauri runtime is available", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    vi.mocked(invoke).mockResolvedValue({});
+
+    await appServices.bootstrap.snapshot();
+    await appServices.bootstrap.start({ endpoint: "http://127.0.0.1:8080" });
+    await appServices.bootstrap.attach("http://127.0.0.1:8181");
+    await appServices.bootstrap.stop();
+    await appServices.readControlToken("http://127.0.0.1:8282");
+
+    expect(invoke).toHaveBeenNthCalledWith(1, "bootstrap_snapshot", undefined);
+    expect(invoke).toHaveBeenNthCalledWith(2, "start_node", {
+      request: { endpoint: "http://127.0.0.1:8080" },
+    });
+    expect(invoke).toHaveBeenNthCalledWith(3, "attach_node", { endpoint: "http://127.0.0.1:8181" });
+    expect(invoke).toHaveBeenNthCalledWith(4, "stop_owned_node", undefined);
+    expect(invoke).toHaveBeenNthCalledWith(5, "read_control_token", { endpoint: "http://127.0.0.1:8282" });
+    expect(invoke).toHaveBeenCalledTimes(5);
   });
 });
