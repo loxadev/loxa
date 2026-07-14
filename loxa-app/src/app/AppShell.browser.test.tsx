@@ -3,6 +3,7 @@ import { expect, test } from "vitest";
 import { page } from "vitest/browser";
 
 import App from "@/App";
+import { applyTheme } from "@/settings/theme";
 import { useWorkspaceStore } from "@/stores/workspace-store";
 import { expectNoAxeViolations } from "@/test/axe";
 import { mountBrowser } from "@/test/browser";
@@ -14,6 +15,29 @@ async function settleShell() {
     await Promise.resolve();
   });
   await expect.element(page.getByRole("heading", { name: "Chat" })).toBeVisible();
+}
+
+async function settleTheme() {
+  await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+  const animations = document.getAnimations().filter(({ playState }) => playState !== "finished");
+  await Promise.all(animations.map((animation) => animation.finished.catch(() => undefined)));
+}
+
+function relativeLuminance(color: string) {
+  const channels = color.match(/\d+/g)?.slice(0, 3).map(Number);
+  if (!channels || channels.length !== 3) throw new Error(`Unsupported color: ${color}`);
+  const [red, green, blue] = channels.map((channel) => {
+    const value = channel / 255;
+    return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+  });
+  return 0.2126 * red + 0.7152 * green + 0.0722 * blue;
+}
+
+function contrastRatio(foreground: string, background: string) {
+  const [lighter, darker] = [relativeLuminance(foreground), relativeLuminance(background)].sort(
+    (left, right) => right - left,
+  );
+  return (lighter + 0.05) / (darker + 0.05);
 }
 
 test("keeps expanded and collapsed shell geometry accessible at 800 by 600", async () => {
@@ -51,4 +75,36 @@ test("shows keyboard focus on collapsed navigation without horizontal overflow",
   expect(focusStyle.outlineStyle).toBe("solid");
   expect(focusStyle.outlineWidth).toBe("2px");
   expect(document.body.scrollWidth).toBeLessThanOrEqual(document.body.clientWidth);
+});
+
+test("renders the dark shell brand and new-chat foreground with visible contrast", async () => {
+  await page.viewport(800, 600);
+  useWorkspaceStore.setState({ activeRoute: "chat", sidebarCollapsed: false, expandedSidebarWidth: 280 });
+  mountBrowser(<App services={createAppServicesFixture()} />);
+  await settleShell();
+
+  applyTheme(document.documentElement, "dark", false);
+  await settleTheme();
+
+  const brandMark = document.querySelector<HTMLImageElement>(".brand-lockup img");
+  const newChat = page.getByRole("button", { name: "New chat" });
+  const newChatIcon = newChat.element().querySelector("svg");
+  const newChatText = newChat.element().querySelector("span");
+
+  expect(brandMark).not.toBeNull();
+  await expect.element(brandMark!).toBeVisible();
+  expect(brandMark!.complete).toBe(true);
+  expect(brandMark!.naturalWidth).toBeGreaterThan(0);
+  expect(getComputedStyle(brandMark!).filter).not.toBe("none");
+
+  await expect.element(newChat).toBeVisible();
+  expect(newChatIcon).not.toBeNull();
+  expect(newChatText).not.toBeNull();
+  await expect.element(newChatIcon!).toBeVisible();
+  await expect.element(newChatText!).toBeVisible();
+  expect(newChatIcon!.getBoundingClientRect().width).toBeGreaterThan(0);
+  expect(newChatText!.getBoundingClientRect().width).toBeGreaterThan(0);
+
+  const buttonStyle = getComputedStyle(newChat.element());
+  expect(contrastRatio(buttonStyle.color, buttonStyle.backgroundColor)).toBeGreaterThanOrEqual(4.5);
 });
