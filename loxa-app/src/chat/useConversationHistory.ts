@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
-  CONVERSATION_HISTORY_PAGE_SIZE,
   filterConversations,
   groupConversations,
   mergeBackendConversations,
@@ -11,7 +10,12 @@ import {
   type ConversationHistoryState,
   type ConversationSelection,
 } from "./conversationHistory";
-import type { ChatSummary } from "./historyClient";
+import {
+  ConversationHistoryRequests,
+  isConversationHistoryInvalidated,
+  type ConversationHistoryPageResult,
+} from "./conversationHistoryRequests";
+import type { ChatPage, ChatSummary } from "./historyClient";
 
 export type { ConversationHistoryController, ConversationHistoryServices } from "./conversationHistory";
 
@@ -36,18 +40,8 @@ export function useConversationHistory({
   const [nextBefore, setNextBefore] = useState<string | null>(null);
   const allRef = useRef<ChatSummary[]>([]);
   const selectionRef = useRef(selection);
-  const cursorRef = useRef<string | null>(null);
-  const seenCursorsRef = useRef(new Set<string>());
-  const pageFailedRef = useRef(false);
-  const failedBeforeRef = useRef<string | null>(null);
-  const controllersRef = useRef(new Set<AbortController>());
-  const pageFlightRef = useRef<Promise<void> | null>(null);
-  const generationRef = useRef(0);
-  const enabledRef = useRef(enabled);
-
-  useEffect(() => {
-    enabledRef.current = enabled;
-  }, [enabled]);
+  const queryRef = useRef("");
+  const requests = useMemo(() => new ConversationHistoryRequests(services, endpoint), [endpoint, services]);
 
   useEffect(() => {
     selectionRef.current = selection;
@@ -69,21 +63,6 @@ export function useConversationHistory({
     });
   }, []);
 
-  const abortOwnedWork = useCallback(() => {
-    for (const controller of controllersRef.current) controller.abort();
-    controllersRef.current.clear();
-    pageFlightRef.current = null;
-  }, []);
-
-  const ownAction = useCallback(() => {
-    const controller = new AbortController();
-    controllersRef.current.add(controller);
-    return {
-      controller,
-      finish: () => controllersRef.current.delete(controller),
-    };
-  }, []);
-
   const mergeBackendSummaries = useCallback(
     (summaries: readonly ChatSummary[]) => {
       return commitConversations(mergeBackendConversations(allRef.current, summaries));
@@ -91,134 +70,113 @@ export function useConversationHistory({
     [commitConversations],
   );
 
-  const loadPage = useCallback(
-    (before: string | null): Promise<void> => {
-      if (pageFlightRef.current) return pageFlightRef.current;
-      const generation = generationRef.current;
-      const owned = ownAction();
-      const flight = (async () => {
-        try {
-          const token = await services.readControlToken(endpoint);
-          if (owned.controller.signal.aborted) return;
-          const page = await services.listChats(
-            endpoint,
-            token,
-            before === null
-              ? { limit: CONVERSATION_HISTORY_PAGE_SIZE }
-              : { limit: CONVERSATION_HISTORY_PAGE_SIZE, before },
-            { signal: owned.controller.signal },
-          );
-          if (owned.controller.signal.aborted || generation !== generationRef.current || !enabledRef.current) return;
-          const ordered = mergeBackendSummaries(page.chats);
-          cursorRef.current = page.nextBefore;
-          setNextBefore(page.nextBefore);
-          if (page.nextBefore !== null) {
-            if (seenCursorsRef.current.has(page.nextBefore)) {
-              cursorRef.current = null;
-              setNextBefore(null);
-              pageFailedRef.current = true;
-              failedBeforeRef.current = before;
-              setState("error");
-              setMessage("Conversation history returned a repeated cursor.");
-              return;
-            }
-            seenCursorsRef.current.add(page.nextBefore);
-          }
-          const selected = selectionRef.current.chatId;
-          if (selected === null || !ordered.some(({ id }) => id === selected)) commitSelection(ordered[0]?.id ?? null);
-          failedBeforeRef.current = null;
-          setMessage("");
-          setState("ready");
-        } catch (error) {
-          if (owned.controller.signal.aborted || generation !== generationRef.current || !enabledRef.current) return;
-          pageFailedRef.current = true;
-          failedBeforeRef.current = before;
-          setMessage(errorMessage(error));
-          setState("error");
-          throw error;
-        } finally {
-          owned.finish();
-        }
-      })();
-      pageFlightRef.current = flight;
-      void flight.then(
-        () => {
-          if (pageFlightRef.current === flight) pageFlightRef.current = null;
-        },
-        () => {
-          if (pageFlightRef.current === flight) pageFlightRef.current = null;
-        },
-      );
-      return flight;
+  const applyPage = useCallback(
+    (page: ChatPage) => {
+      const ordered = mergeBackendSummaries(page.chats);
+      setNextBefore(requests.nextCursor);
+      const selected = selectionRef.current.chatId;
+      if (selected === null || !ordered.some(({ id }) => id === selected)) commitSelection(ordered[0]?.id ?? null);
     },
-    [commitSelection, endpoint, mergeBackendSummaries, ownAction, services],
+    [commitSelection, mergeBackendSummaries, requests],
+  );
+
+  const settlePageOutcome = useCallback(
+    (outcome: ConversationHistoryPageResult) => {
+      if (outcome.kind === "invalidated") return;
+      applyPage(outcome.page);
+      if (outcome.kind === "repeated-cursor") {
+        setMessage("Conversation history returned a repeated cursor.");
+        setState("error");
+      } else {
+        setMessage("");
+        setState(queryRef.current.trim() !== "" && requests.hasMore ? "loading" : "ready");
+      }
+    },
+    [applyPage, requests],
+  );
+
+  const reportRequestError = useCallback((error: unknown) => {
+    if (isConversationHistoryInvalidated(error)) return;
+    setMessage(errorMessage(error));
+    setState("error");
+  }, []);
+
+  const loadAndSettle = useCallback(
+    async (before: string | null) => {
+      try {
+        settlePageOutcome(await requests.loadPage(before));
+      } catch (error) {
+        reportRequestError(error);
+        throw error;
+      }
+    },
+    [reportRequestError, requests, settlePageOutcome],
   );
 
   const exhaustPages = useCallback(async () => {
-    pageFailedRef.current = false;
+    await Promise.resolve();
     setState("loading");
-    while (cursorRef.current !== null && enabledRef.current) {
-      await loadPage(cursorRef.current);
-      if (pageFlightRef.current) await pageFlightRef.current;
-      if (pageFailedRef.current) return;
+    try {
+      const outcome = await requests.exhaust(applyPage);
+      if (outcome.kind === "invalidated") return;
+      if (outcome.kind === "repeated-cursor") {
+        setMessage("Conversation history returned a repeated cursor.");
+        setState("error");
+      } else {
+        setMessage("");
+        setState("ready");
+      }
+    } catch (error) {
+      reportRequestError(error);
+      throw error;
     }
-    if (enabledRef.current) setState("ready");
-  }, [loadPage]);
+  }, [applyPage, reportRequestError, requests]);
 
   useEffect(() => {
-    generationRef.current += 1;
-    const generation = generationRef.current;
-    abortOwnedWork();
+    requests.invalidate();
+    let disposed = false;
     const initialize = async () => {
       await Promise.resolve();
-      if (generation !== generationRef.current) return;
+      if (disposed) return;
       allRef.current = [];
-      cursorRef.current = null;
-      seenCursorsRef.current = new Set();
-      pageFailedRef.current = false;
-      failedBeforeRef.current = null;
       setAllConversations([]);
       setNextBefore(null);
       setMessage("");
       setState("loading");
       commitSelection(null);
-      if (enabled) await loadPage(null);
+      if (enabled) await loadAndSettle(null);
     };
     void initialize().catch(() => undefined);
 
     return () => {
-      if (generation === generationRef.current) generationRef.current += 1;
-      abortOwnedWork();
+      disposed = true;
+      requests.invalidate();
     };
-  }, [abortOwnedWork, commitSelection, enabled, endpoint, loadPage, services]);
+  }, [commitSelection, enabled, loadAndSettle, requests]);
 
   useEffect(() => {
-    if (!enabled || query.trim() === "" || cursorRef.current === null) return;
-    void exhaustPages().catch(() => undefined);
+    if (!enabled || query.trim() === "" || nextBefore === null) return;
+    let disposed = false;
+    const beginSearch = async () => {
+      await Promise.resolve();
+      if (!disposed) await exhaustPages();
+    };
+    void beginSearch().catch(() => undefined);
+    return () => {
+      disposed = true;
+    };
   }, [enabled, exhaustPages, nextBefore, query]);
 
   const runWithToken = useCallback(
     async <T>(operation: (token: string, signal: AbortSignal) => Promise<T>): Promise<T> => {
-      const generation = generationRef.current;
-      const owned = ownAction();
       try {
-        const token = await services.readControlToken(endpoint);
-        if (owned.controller.signal.aborted) throw new DOMException("Aborted", "AbortError");
-        const result = await operation(token, owned.controller.signal);
-        if (owned.controller.signal.aborted || generation !== generationRef.current || !enabledRef.current)
-          throw new DOMException("Aborted", "AbortError");
-        return result;
+        return await requests.runAction(operation);
       } catch (error) {
-        if (!owned.controller.signal.aborted && generation === generationRef.current && enabledRef.current) {
-          setMessage(errorMessage(error));
-          setState("error");
-        }
+        reportRequestError(error);
         throw error;
-      } finally {
-        owned.finish();
       }
     },
-    [endpoint, ownAction, services],
+    [reportRequestError, requests],
   );
 
   const select = useCallback(
@@ -267,27 +225,24 @@ export function useConversationHistory({
   );
 
   const loadMore = useCallback(async () => {
-    if (cursorRef.current === null) return;
-    pageFailedRef.current = false;
+    if (requests.nextCursor === null) return;
     setState("loading");
-    await loadPage(cursorRef.current);
-  }, [loadPage]);
+    await loadAndSettle(requests.nextCursor);
+  }, [loadAndSettle, requests]);
 
   const retry = useCallback(async () => {
-    const retryBefore = failedBeforeRef.current;
-    const retryFailedPage = pageFailedRef.current;
-    pageFailedRef.current = false;
     setMessage("");
     setState("loading");
-    if (retryFailedPage) {
-      if (retryBefore === null) seenCursorsRef.current = new Set();
-      await loadPage(retryBefore);
-    } else if (allRef.current.length === 0) {
-      seenCursorsRef.current = new Set();
-      await loadPage(null);
-    } else if (cursorRef.current !== null) await loadPage(cursorRef.current);
-    else setState("ready");
-  }, [loadPage]);
+    try {
+      const outcome = await requests.retry();
+      if (outcome) settlePageOutcome(outcome);
+      else if (allRef.current.length === 0) await loadAndSettle(null);
+      else setState("ready");
+    } catch (error) {
+      reportRequestError(error);
+      throw error;
+    }
+  }, [loadAndSettle, reportRequestError, requests, settlePageOutcome]);
 
   const adoptCreatedChat = useCallback(
     (chat: ChatSummary) => {
@@ -305,18 +260,22 @@ export function useConversationHistory({
   );
 
   const clearAfterSettingsDelete = useCallback(() => {
+    requests.invalidate();
     commitConversations([]);
-    cursorRef.current = null;
-    seenCursorsRef.current = new Set();
-    pageFailedRef.current = false;
-    failedBeforeRef.current = null;
     setNextBefore(null);
     commitSelection(null);
     setMessage("");
     setState("ready");
-  }, [commitConversations, commitSelection]);
+  }, [commitConversations, commitSelection, requests]);
 
-  const setQuery = useCallback((value: string) => setQueryState(value), []);
+  const setQuery = useCallback(
+    (value: string) => {
+      queryRef.current = value;
+      setQueryState(value);
+      if (value.trim() !== "" && requests.hasMore) setState("loading");
+    },
+    [requests],
+  );
   const conversations = useMemo(() => filterConversations(allConversations, query), [allConversations, query]);
   const groupedConversations = useMemo(() => groupConversations(conversations), [conversations]);
 

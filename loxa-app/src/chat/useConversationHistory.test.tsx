@@ -110,19 +110,28 @@ describe("useConversationHistory", () => {
 
   it("exhausts search when the query is entered before initial loading finishes", async () => {
     const first = deferred<ChatPage>();
+    const second = deferred<ChatPage>();
+    const observedStates: string[] = [];
     const api = services({
       listChats: vi
         .fn()
         .mockImplementationOnce(() => first.promise)
-        .mockResolvedValueOnce({ chats: [chat("b", 1, "Needle")], nextBefore: null }),
+        .mockImplementationOnce(() => second.promise),
     });
-    const { result } = renderHook(() => useConversationHistory({ services: api, endpoint, enabled: true }));
+    const { result } = renderHook(() => {
+      const controller = useConversationHistory({ services: api, endpoint, enabled: true });
+      observedStates.push(controller.state);
+      return controller;
+    });
 
     act(() => result.current.setQuery("needle"));
+    observedStates.length = 0;
     first.resolve({ chats: [chat("a", 2, "Other")], nextBefore: "two" });
 
-    await waitFor(() => expect(result.current.state).toBe("ready"));
     await waitFor(() => expect(api.listChats).toHaveBeenCalledTimes(2));
+    expect(observedStates).not.toContain("ready");
+    second.resolve({ chats: [chat("b", 1, "Needle")], nextBefore: null });
+    await waitFor(() => expect(result.current.state).toBe("ready"));
     expect(result.current.conversations).toEqual([chat("b", 1, "Needle")]);
   });
 
@@ -309,6 +318,49 @@ describe("useConversationHistory", () => {
     expect(result.current.selection).toEqual({ chatId: null, revision: revision + 1 });
     act(() => result.current.clearAfterSettingsDelete());
     expect(result.current.selection.revision).toBe(revision + 1);
+  });
+
+  it("invalidates a pending search page when Settings clears history", async () => {
+    const searchPage = deferred<ChatPage>();
+    const api = services({
+      listChats: vi
+        .fn()
+        .mockResolvedValueOnce({ chats: [chat("a", 2, "Original")], nextBefore: "two" })
+        .mockImplementationOnce(() => searchPage.promise),
+    });
+    const { result } = renderHook(() => useConversationHistory({ services: api, endpoint, enabled: true }));
+    await waitFor(() => expect(result.current.state).toBe("ready"));
+    act(() => result.current.setQuery("late"));
+    await waitFor(() => expect(api.listChats).toHaveBeenCalledTimes(2));
+    const revision = result.current.selection.revision;
+
+    act(() => result.current.clearAfterSettingsDelete());
+    const clearedRevision = result.current.selection.revision;
+    expect(clearedRevision).toBe(revision + 1);
+    searchPage.resolve({ chats: [chat("late", 3, "Late")], nextBefore: null });
+    await act(async () => Promise.resolve());
+
+    expect(result.current.conversations).toEqual([]);
+    expect(result.current.selection).toEqual({ chatId: null, revision: clearedRevision });
+    expect(result.current.state).toBe("ready");
+  });
+
+  it("invalidates a pending create when Settings clears history", async () => {
+    const createResult = deferred<ChatSummary>();
+    const api = services({ createChat: vi.fn(() => createResult.promise) });
+    const { result } = renderHook(() => useConversationHistory({ services: api, endpoint, enabled: true }));
+    await waitFor(() => expect(result.current.state).toBe("ready"));
+    const pendingCreate = result.current.create().catch(() => undefined);
+    await waitFor(() => expect(api.createChat).toHaveBeenCalled());
+
+    act(() => result.current.clearAfterSettingsDelete());
+    const clearedRevision = result.current.selection.revision;
+    createResult.resolve(chat("late", 1));
+    await act(() => pendingCreate);
+
+    expect(result.current.conversations).toEqual([]);
+    expect(result.current.selection).toEqual({ chatId: null, revision: clearedRevision });
+    expect(result.current.state).toBe("ready");
   });
 
   it("does not expose tokens, services, clients, DOM, portal, turn, or runtime fields", async () => {
