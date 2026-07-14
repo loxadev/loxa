@@ -26,6 +26,11 @@
   text-align: center;
 }
 
+.emptyMark {
+  width: 48px;
+  height: 48px;
+}
+
 .emptyState p,
 .userMessage p {
   margin: 0;

@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import { MarkdownMessage } from "./MarkdownMessage";
+import mark from "../assets/brand/loxa-mark.svg?no-inline";
 import { Button } from "../components/ui/button";
 import styles from "./ChatTranscript.module.css";
 
@@ -52,6 +53,7 @@ export function ChatTranscript({
       <div className={styles.transcriptColumn}>
         {turns.length === 0 ? (
           <div className={styles.emptyState}>
+            <img className={styles.emptyMark} src={mark} alt="Loxa" width="48" height="48" />
             <p>{emptyMessage}</p>
             {onBrowseModels && (
               <Button variant="secondary" onClick={onBrowseModels}>

@@ -29,18 +29,26 @@ import type { BootstrapSnapshot, StartNodeRequest } from "../node/NodeSession";
 import type { AppServices } from "./App";
 
 export const DEFAULT_ENDPOINT = "http://127.0.0.1:8080";
+export const DESKTOP_RUNTIME_UNAVAILABLE_MESSAGE = "Desktop runtime is unavailable in browser preview.";
+
+function invokeDesktop<T>(command: string, args?: Record<string, unknown>) {
+  if (!("__TAURI_INTERNALS__" in window)) {
+    return Promise.reject(new Error(DESKTOP_RUNTIME_UNAVAILABLE_MESSAGE));
+  }
+  return invoke<T>(command, args);
+}
 
 export const appServices: AppServices = {
   bootstrap: {
-    snapshot: () => invoke<BootstrapSnapshot>("bootstrap_snapshot"),
-    start: (request: StartNodeRequest) => invoke<BootstrapSnapshot>("start_node", { request }),
-    attach: (endpoint: string) => invoke<BootstrapSnapshot>("attach_node", { endpoint }),
-    stop: () => invoke<BootstrapSnapshot>("stop_owned_node"),
+    snapshot: () => invokeDesktop<BootstrapSnapshot>("bootstrap_snapshot"),
+    start: (request: StartNodeRequest) => invokeDesktop<BootstrapSnapshot>("start_node", { request }),
+    attach: (endpoint: string) => invokeDesktop<BootstrapSnapshot>("attach_node", { endpoint }),
+    stop: () => invokeDesktop<BootstrapSnapshot>("stop_owned_node"),
   },
   getStatus,
   getModels,
   getCapabilities,
-  readControlToken: (endpoint: string) => invoke<string>("read_control_token", { endpoint }),
+  readControlToken: (endpoint: string) => invokeDesktop<string>("read_control_token", { endpoint }),
   getControlNode,
   getInventory,
   downloadModel,

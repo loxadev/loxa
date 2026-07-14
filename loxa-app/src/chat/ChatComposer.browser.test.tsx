@@ -7,6 +7,15 @@ import { useWorkspaceStore } from "@/stores/workspace-store";
 import { mountBrowser } from "@/test/browser";
 import { createAppServicesFixture } from "@/test/fixtures";
 
+function resolveColor(host: HTMLElement, color: string) {
+  const reference = document.createElement("div");
+  reference.style.color = color;
+  host.append(reference);
+  const resolved = getComputedStyle(reference).color;
+  reference.remove();
+  return resolved;
+}
+
 test.each(["light", "dark"] as const)(
   "keeps the %s message composer compact and usable at 800 by 600",
   async (theme) => {
@@ -26,11 +35,25 @@ test.each(["light", "dark"] as const)(
     const model = page.getByRole("combobox", { name: "Choose model" }).element();
     const send = page.getByRole("button", { name: "Send message" }).element();
     const composerRect = composer.getBoundingClientRect();
+    const composerStyle = getComputedStyle(composer);
+    const hostStyle = getComputedStyle(host);
 
     expect(composerRect.height).toBeLessThanOrEqual(190);
     expect(composer.scrollWidth).toBeLessThanOrEqual(composer.clientWidth);
-    expect(getComputedStyle(composer).borderLeftWidth).toBe("0px");
-    expect(getComputedStyle(composer).borderRadius).toBe("0px");
+    expect(composerStyle.borderTopWidth).toBe("1px");
+    expect(composerStyle.borderRightWidth).toBe("1px");
+    expect(composerStyle.borderBottomWidth).toBe("1px");
+    expect(composerStyle.borderLeftWidth).toBe("1px");
+    expect(composerStyle.borderColor).toBe(
+      resolveColor(host, hostStyle.getPropertyValue("--loxa-control-border").trim()),
+    );
+    expect(composerStyle.backgroundColor).toBe(
+      resolveColor(host, hostStyle.getPropertyValue("--loxa-background").trim()),
+    );
+    expect(composerStyle.borderRadius).toBe(hostStyle.getPropertyValue("--loxa-radius-lg").trim());
+    expect(getComputedStyle(page.getByRole("textbox", { name: "Message" }).element()).backgroundColor).toBe(
+      "rgba(0, 0, 0, 0)",
+    );
 
     for (const control of [attachment, model, send]) {
       const rect = control.getBoundingClientRect();
