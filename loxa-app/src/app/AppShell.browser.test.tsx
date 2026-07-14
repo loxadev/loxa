@@ -89,6 +89,7 @@ test("renders the dark shell brand and new-chat foreground with visible contrast
   expect(host.dataset.loxaTheme).toBe("dark");
 
   const brandMark = document.querySelector<HTMLImageElement>(".brand-lockup img");
+  const emptyMark = document.querySelector<HTMLImageElement>('img[alt="Loxa"]');
   const newChat = page.getByRole("button", { name: "New chat" });
   const newChatIcon = newChat.element().querySelector("svg");
   const newChatText = newChat.element().querySelector("span");
@@ -98,6 +99,12 @@ test("renders the dark shell brand and new-chat foreground with visible contrast
   expect(brandMark!.complete).toBe(true);
   expect(brandMark!.naturalWidth).toBeGreaterThan(0);
   expect(getComputedStyle(brandMark!).filter).not.toBe("none");
+
+  expect(emptyMark).not.toBeNull();
+  await expect.element(emptyMark!).toBeVisible();
+  expect(emptyMark!.complete).toBe(true);
+  expect(emptyMark!.naturalWidth).toBeGreaterThan(0);
+  expect(getComputedStyle(emptyMark!).filter).not.toBe("none");
 
   await expect.element(newChat).toBeVisible();
   expect(newChatIcon).not.toBeNull();

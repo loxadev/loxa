@@ -31,6 +31,10 @@
   height: 48px;
 }
 
+:global([data-loxa-theme="dark"]) .emptyMark {
+  filter: invert(1);
+}
+
 .emptyState p,
 .userMessage p {
   margin: 0;
