@@ -4,7 +4,7 @@
   display: grid;
   gap: var(--loxa-space-1);
   overflow: hidden;
-  padding: var(--loxa-space-2);
+  padding: var(--loxa-space-1) var(--loxa-space-2);
   color: var(--loxa-foreground);
   background: var(--loxa-background);
   border: 1px solid var(--loxa-control-border);

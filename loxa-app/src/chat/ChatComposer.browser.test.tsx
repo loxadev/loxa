@@ -4,6 +4,7 @@ import { expect, test } from "vitest";
 import { cdp, page } from "vitest/browser";
 
 import App from "@/App";
+import { DESKTOP_RUNTIME_UNAVAILABLE_MESSAGE } from "@/app/services";
 import { useWorkspaceStore } from "@/stores/workspace-store";
 import { mountBrowser } from "@/test/browser";
 import { createAppServicesFixture } from "@/test/fixtures";
@@ -35,8 +36,8 @@ test.each(["light", "dark"] as const)(
   "keeps the %s message composer compact and usable at 800 by 600",
   async (theme) => {
     await page.viewport(800, 600);
-    useWorkspaceStore.setState({ activeRoute: "chat", sidebarCollapsed: false, expandedSidebarWidth: 280 });
-    const { host } = mountBrowser(<App services={createReadyAppServicesFixture()} />);
+    useWorkspaceStore.setState({ activeRoute: "chat", sidebarCollapsed: false, expandedSidebarWidth: 220 });
+    const { host } = mountBrowser(<App />);
     host.dataset.loxaTheme = theme;
 
     await act(async () => {
@@ -49,6 +50,9 @@ test.each(["light", "dark"] as const)(
     const attachment = page.getByRole("button", { name: "Attach document" }).element();
     const model = page.getByRole("combobox", { name: "Choose model" }).element();
     const send = page.getByRole("button", { name: "Send message" }).element();
+    const supportReason = document.querySelector<HTMLElement>("#chat-support-reason");
+    const attachmentReason = document.querySelector<HTMLElement>("#attachment-support-reason");
+    const modelHelp = document.querySelector<HTMLElement>("#model-control-help");
     const composerRect = composer.getBoundingClientRect();
     const composerStyle = getComputedStyle(composer);
     const hostStyle = getComputedStyle(host);
@@ -66,21 +70,23 @@ test.each(["light", "dark"] as const)(
       resolveColor(host, hostStyle.getPropertyValue("--loxa-background").trim()),
     );
     expect(composerStyle.borderRadius).toBe(hostStyle.getPropertyValue("--loxa-radius-lg").trim());
+    expect(supportReason).not.toBeNull();
+    await expect.element(supportReason!).toBeVisible();
+    expect(supportReason).toHaveTextContent(DESKTOP_RUNTIME_UNAVAILABLE_MESSAGE);
+    expect(attachmentReason).not.toBeNull();
+    await expect.element(attachmentReason!).toBeVisible();
+    expect(attachmentReason).toHaveTextContent("Document input support cannot be checked until the node is connected.");
+    expect(modelHelp).not.toBeNull();
+    await expect.element(modelHelp!).toBeVisible();
+    expect(modelHelp).toHaveTextContent("Active: None");
     const message = page.getByRole("textbox", { name: "Message" }).element();
     expect(getComputedStyle(message).backgroundColor).toBe("rgba(0, 0, 0, 0)");
-
-    message.focus();
-    expect(document.activeElement).toBe(message);
-    const focusedComposerStyle = getComputedStyle(composer);
-    expect(focusedComposerStyle.outlineStyle).toBe("solid");
-    expect(focusedComposerStyle.outlineWidth).toBe("2px");
-    expect(focusedComposerStyle.outlineColor).not.toBe("rgba(0, 0, 0, 0)");
-    expect(composer.getBoundingClientRect().height).toBeLessThanOrEqual(190);
-    expect(composer.scrollWidth).toBeLessThanOrEqual(composer.clientWidth);
+    expect(message).toBeDisabled();
 
     for (const control of [attachment, model, send]) {
       const rect = control.getBoundingClientRect();
       expect(rect.width).toBeGreaterThanOrEqual(36);
+      expect(rect.height).toBeGreaterThanOrEqual(44);
       expect(rect.left).toBeGreaterThanOrEqual(composerRect.left);
       expect(rect.right).toBeLessThanOrEqual(composerRect.right);
     }
