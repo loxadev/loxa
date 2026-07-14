@@ -7,11 +7,12 @@ export type CapturedConsole = {
   error: ConsoleMethod;
 };
 
-const installations = new WeakSet<CapturedConsole>();
+const installations = new WeakMap<CapturedConsole, object>();
 
 export function installConsoleCountProbe(target: CapturedConsole): () => void {
   if (installations.has(target)) throw new Error("Console count probe is already installed");
 
+  const token = {};
   const originalWarn = target.warn;
   const originalError = target.error;
   const wrappedWarn: ConsoleMethod = (...args) => {
@@ -25,11 +26,14 @@ export function installConsoleCountProbe(target: CapturedConsole): () => void {
 
   target.warn = wrappedWarn;
   target.error = wrappedError;
-  installations.add(target);
+  installations.set(target, token);
+  let cleaned = false;
 
   return () => {
+    if (cleaned) return;
+    cleaned = true;
     if (target.warn === wrappedWarn) target.warn = originalWarn;
     if (target.error === wrappedError) target.error = originalError;
-    installations.delete(target);
+    if (installations.get(target) === token) installations.delete(target);
   };
 }
