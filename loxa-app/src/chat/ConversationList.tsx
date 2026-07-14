@@ -17,6 +17,7 @@ type Props = {
   onLoadMore(): void | Promise<void>;
   onRetry?(): void | Promise<void>;
   isLifecycleActive?(): boolean;
+  mutationsDisabled?: boolean;
 };
 
 export function ConversationList({
@@ -32,6 +33,7 @@ export function ConversationList({
   onLoadMore,
   onRetry,
   isLifecycleActive,
+  mutationsDisabled = false,
 }: Props) {
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
@@ -154,7 +156,7 @@ export function ConversationList({
           className={styles.newButton}
           type="button"
           onClick={() => void runListAction("create", onCreate)}
-          disabled={pendingListAction !== null}
+          disabled={mutationsDisabled || pendingListAction !== null}
         >
           <span aria-hidden="true">+</span>
           <span>New chat</span>
@@ -252,7 +254,7 @@ export function ConversationList({
                             setActionError(null);
                             setDeletingId(conversation.id);
                           }}
-                          disabled={deletingId === conversation.id}
+                          disabled={mutationsDisabled || deletingId === conversation.id}
                         >
                           Delete
                         </button>
@@ -279,7 +281,7 @@ export function ConversationList({
                           ref={(node) => setButtonRef(deleteConfirmButtons.current, conversation.id, node)}
                           type="button"
                           onClick={() => void confirmDelete(conversation.id)}
-                          disabled={isPending}
+                          disabled={mutationsDisabled || isPending}
                         >
                           Delete conversation
                         </button>

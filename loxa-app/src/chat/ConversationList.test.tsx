@@ -104,6 +104,15 @@ describe("ConversationList", () => {
     expect(more).toBeEnabled();
   });
 
+  it("blocks New chat and delete mutations while a Chat turn is active", () => {
+    render(<ConversationList {...baseProps} mutationsDisabled />);
+
+    expect(screen.getByRole("button", { name: "New chat" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Delete Node health" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Delete Download model" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Open Download model" })).toBeEnabled();
+  });
+
   it("renames accessibly and restores focus after cancelling", async () => {
     const user = userEvent.setup();
     const onRename = vi.fn(async () => undefined);
