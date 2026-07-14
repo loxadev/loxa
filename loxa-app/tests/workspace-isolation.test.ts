@@ -7,6 +7,29 @@ import { describe, expect, it } from "vitest";
 const appRoot = resolve(import.meta.dirname, "..");
 const repositoryRoot = resolve(appRoot, "..");
 
+function yamlBlock(source: string, key: string, indent: number) {
+  const lines = source.split("\n");
+  const padding = " ".repeat(indent);
+  const start = lines.findIndex((line) => line === `${padding}${key}:`);
+  if (start < 0) throw new Error(`missing ${key} block`);
+  let end = start + 1;
+  while (end < lines.length) {
+    const line = lines[end];
+    if (line?.trim() && (line.match(/^ */)?.[0].length ?? 0) <= indent) break;
+    end += 1;
+  }
+  return lines.slice(start, end).join("\n");
+}
+
+function workflowStep(job: string, name: string) {
+  const lines = job.split("\n");
+  const start = lines.findIndex((line) => line === `      - name: ${name}`);
+  if (start < 0) throw new Error(`missing ${name} step`);
+  let end = start + 1;
+  while (end < lines.length && !lines[end]?.startsWith("      - name: ")) end += 1;
+  return lines.slice(start, end).join("\n");
+}
+
 describe("Cargo workspace isolation", () => {
   it("enforces the complete desktop frontend gate in CI", () => {
     const manifest = JSON.parse(readFileSync(resolve(appRoot, "package.json"), "utf8"));
@@ -18,16 +41,57 @@ describe("Cargo workspace isolation", () => {
     });
 
     const ci = readFileSync(resolve(repositoryRoot, ".github/workflows/ci.yml"), "utf8");
-    for (const command of [
-      "pnpm install --frozen-lockfile",
-      "pnpm format:check",
-      "pnpm lint",
-      "pnpm typecheck",
-      "pnpm test:unit",
-      "pnpm test:browser",
-      "pnpm build",
-    ])
-      expect(ci).toContain(command);
+    const frontend = yamlBlock(ci, "frontend", 2);
+    expect(frontend).toMatch(/^    name: desktop frontend$/m);
+    expect(frontend).toMatch(/^    runs-on: ubuntu-latest$/m);
+    expect(frontend).toMatch(/^    timeout-minutes: 20$/m);
+    expect(frontend).toMatch(/^        working-directory: loxa-app$/m);
+
+    expect(workflowStep(frontend, "Checkout")).toMatch(
+      /^        uses: actions\/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0(?: # v7\.0\.0)?\n        with:\n          persist-credentials: false$/m,
+    );
+    expect(workflowStep(frontend, "Install pnpm")).toMatch(
+      /^        uses: pnpm\/action-setup@9fd676a19091d4595eefd76e4bd31c97133911f1(?: # v4\.2\.0)?\n        with:\n          version: 11\.7\.0$/m,
+    );
+    expect(workflowStep(frontend, "Install Node")).toMatch(
+      /^        uses: actions\/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903(?: # v6\.0\.0)?\n        with:\n          node-version: 24\.18\.0\n          cache: pnpm\n          cache-dependency-path: loxa-app\/pnpm-lock\.yaml$/m,
+    );
+
+    const commands = new Map([
+      ["Install dependencies", "pnpm install --frozen-lockfile"],
+      ["Install Chromium", "pnpm exec playwright install --with-deps chromium"],
+      ["Check formatting", "pnpm format:check"],
+      ["Lint", "pnpm lint"],
+      ["Typecheck", "pnpm typecheck"],
+      ["Unit tests", "pnpm test:unit"],
+      ["Browser tests", "pnpm test:browser"],
+      ["Build", "pnpm build"],
+    ]);
+    for (const [name, command] of commands) {
+      expect(workflowStep(frontend, name)).toMatch(new RegExp(`^        run: ${command.replaceAll(".", "\\.")}$`, "m"));
+    }
+  });
+
+  it("enforces a deterministic shared-platform browser baseline", () => {
+    const browserConfig = readFileSync(resolve(appRoot, "vitest.browser.config.ts"), "utf8");
+    const baselineTest = readFileSync(resolve(appRoot, "src/test/BaselineApp.browser.test.tsx"), "utf8");
+    const appCss = readFileSync(resolve(appRoot, "src/App.css"), "utf8");
+
+    expect(browserConfig).toContain("platform");
+    expect(browserConfig).toMatch(/"__screenshots__",\s*"shared",\s*browserName/);
+    expect(baselineTest).toContain('document.fonts.load(`600 48px "Instrument Sans"`, "Node")');
+    expect(baselineTest).toContain('document.fonts.load(`500 12px "IBM Plex Mono"`, "LOCAL RUNTIME")');
+    expect(baselineTest).toContain('document.fonts.check(`600 48px "Instrument Sans"`, "Node")');
+    expect(baselineTest).toContain('document.fonts.check(`500 12px "IBM Plex Mono"`, "LOCAL RUNTIME")');
+    expect(baselineTest).toContain('animations: "disabled"');
+    expect(baselineTest).toContain('caret: "hide"');
+    expect(baselineTest).toContain('scale: "css"');
+    expect(baselineTest).toContain("allowedMismatchedPixelRatio: 0.005");
+    expect(baselineTest).toContain("await expectNoAxeViolations(document)");
+    expect(appCss).toContain('url("./assets/fonts/InstrumentSans-Variable.woff2")');
+    expect(appCss).toContain('url("./assets/fonts/IBMPlexMono-Regular.woff2")');
+    expect(appCss).toContain('url("./assets/fonts/IBMPlexMono-Medium.woff2")');
+
   });
 
   it("starts with no frontend capability permissions", () => {

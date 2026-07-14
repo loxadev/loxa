@@ -61,3 +61,14 @@ test("removes portal content, focus guards, hidden state, inert state, and body 
   expect(document.body.style.cssText).toBe("");
   expect(document.querySelector("#loxa-portal-root")).toBeNull();
 });
+
+test("clears local and session storage during cleanup", () => {
+  window.localStorage.setItem("loxa.theme", "dark");
+  window.localStorage.setItem("loxa.rail-order", "models-first");
+  window.sessionStorage.setItem("loxa.browser-state", "open");
+
+  cleanupBrowser();
+
+  expect(window.localStorage).toHaveLength(0);
+  expect(window.sessionStorage).toHaveLength(0);
+});

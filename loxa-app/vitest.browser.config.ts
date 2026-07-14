@@ -20,8 +20,12 @@ export default defineConfig({
       instances: [{ browser: "chromium" }],
       expect: {
         toMatchScreenshot: {
-          resolveScreenshotPath: ({ arg, browserName, ext, root, testFileDirectory }) =>
-            resolve(root, testFileDirectory, "__screenshots__", browserName, `${arg}${ext}`),
+          resolveScreenshotPath: ({ arg, browserName, ext, platform, root, testFileDirectory }) => {
+            if (!new Set(["darwin", "linux", "win32"]).has(platform)) {
+              throw new Error(`Unsupported screenshot platform: ${platform}`);
+            }
+            return resolve(root, testFileDirectory, "__screenshots__", "shared", browserName, `${arg}${ext}`);
+          },
         },
       },
     },
