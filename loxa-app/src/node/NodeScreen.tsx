@@ -58,7 +58,7 @@ export function NodeScreen({
         statusLabel={phaseLabels[session.phase]}
         statusTone={statusTone(session.phase)}
         health={session.status?.health ?? "Not connected"}
-        activeModel={session.status?.runtime_model ?? "No model loaded"}
+        activeModel={session.status ? (session.status.runtime_model ?? "No model loaded") : "—"}
         engineName={session.status?.engine?.name ?? "—"}
         engineVersion={session.status?.engine?.version ?? "—"}
         profile={session.status?.profile ?? "—"}
