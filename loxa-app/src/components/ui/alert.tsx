@@ -3,7 +3,7 @@ import { cva, type VariantProps } from "class-variance-authority";
 
 import { cn } from "../../lib/utils";
 
-const alertVariants = cva("grid w-full gap-1 rounded-lg border p-4 text-sm", {
+const alertVariants = cva("box-border grid w-full gap-1 rounded-lg border p-4 text-sm contrast-more:border-2", {
   variants: {
     variant: {
       neutral: "border-border bg-card text-card-foreground",
