@@ -77,7 +77,10 @@ a {
 .brand-lockup img {
   width: 24px;
   height: 24px;
-  color: var(--loxa-foreground);
+}
+
+[data-loxa-theme="dark"] .brand-lockup img {
+  filter: invert(1);
 }
 
 .sidebar-navigation {
