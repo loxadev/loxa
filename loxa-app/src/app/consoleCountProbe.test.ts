@@ -71,4 +71,19 @@ describe("console count probe", () => {
     expect(target.warn).toBe(replacementWarn);
     expect(target.error).toBe(originalError);
   });
+
+  it("keeps a newer installation registered when stale cleanup runs again", () => {
+    cspProbeStore.reset();
+    const target = consoleTarget();
+    const cleanupA = installConsoleCountProbe(target);
+    cleanupA();
+    const cleanupB = installConsoleCountProbe(target);
+
+    cleanupA();
+
+    expect(() => installConsoleCountProbe(target)).toThrow(/already installed/i);
+    target.warn("one call through installation B");
+    expect(cspProbeStore.getEvidenceSnapshot().consoleCounts.warn).toBe(1);
+    cleanupB();
+  });
 });
