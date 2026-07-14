@@ -15,6 +15,39 @@ function sourceFiles(directory: string): string[] {
   });
 }
 
+const disallowedIconPackages = [
+  "@fortawesome/react-fontawesome",
+  "@heroicons/react",
+  "@mui/icons-material",
+  "@phosphor-icons/react",
+  "@radix-ui/react-icons",
+  "@tabler/icons-react",
+  "iconoir-react",
+  "phosphor-react",
+  "react-feather",
+  "react-icons",
+];
+
+function isForeignIconPackage(name: string) {
+  return disallowedIconPackages.some((packageName) => name === packageName || name.startsWith(`${packageName}/`));
+}
+
+function hasForeignIconImport(source: string) {
+  const moduleSpecifiers = [...source.matchAll(/(?:\bfrom\s*|\bimport\s*(?:\(\s*)?)["']([^"']+)["']/g)].map(
+    (match) => match[1] ?? "",
+  );
+  return moduleSpecifiers.some(isForeignIconPackage);
+}
+
+function foreignIconDependencies(manifest: {
+  dependencies?: Record<string, string>;
+  devDependencies?: Record<string, string>;
+}) {
+  return [
+    ...new Set([...Object.keys(manifest.dependencies ?? {}), ...Object.keys(manifest.devDependencies ?? {})]),
+  ].filter(isForeignIconPackage);
+}
+
 function yamlBlock(source: string, key: string, indent: number) {
   const lines = source.split("\n");
   const padding = " ".repeat(indent);
@@ -42,16 +75,9 @@ describe("Cargo workspace isolation", () => {
   it("keeps product icons on Lucide and direct Radix imports inside owned UI wrappers", () => {
     const manifest = JSON.parse(readFileSync(resolve(appRoot, "package.json"), "utf8")) as {
       dependencies: Record<string, string>;
+      devDependencies: Record<string, string>;
     };
-    const disallowedIconPackages = [
-      "@fortawesome/react-fontawesome",
-      "@heroicons/react",
-      "iconoir-react",
-      "phosphor-react",
-      "react-feather",
-      "react-icons",
-    ];
-    expect(Object.keys(manifest.dependencies).filter((name) => disallowedIconPackages.includes(name))).toEqual([]);
+    expect(foreignIconDependencies(manifest)).toEqual([]);
 
     const files = sourceFiles(resolve(appRoot, "src"));
     const featureViolations = files
@@ -61,13 +87,41 @@ describe("Cargo workspace isolation", () => {
 
     const iconViolations = files
       .filter((path) => !path.includes(".test."))
-      .filter((path) =>
-        /from\s+["'](?:react-icons|react-feather|phosphor-react|iconoir-react|@heroicons\/react|@fortawesome\/)/.test(
-          readFileSync(path, "utf8"),
-        ),
-      );
+      .filter((path) => hasForeignIconImport(readFileSync(path, "utf8")));
     expect(iconViolations).toEqual([]);
   });
+
+  it("rejects every known foreign icon dependency and import shape while allowing Lucide", () => {
+    const foreignPackages = [
+      "@fortawesome/react-fontawesome",
+      "@heroicons/react",
+      "@mui/icons-material",
+      "@phosphor-icons/react",
+      "@radix-ui/react-icons",
+      "@tabler/icons-react",
+      "iconoir-react",
+      "phosphor-react",
+      "react-feather",
+      "react-icons",
+    ];
+
+    for (const packageName of foreignPackages) {
+      expect(foreignIconDependencies({ dependencies: { [packageName]: "1.0.0" } }), packageName).toEqual([packageName]);
+      expect(foreignIconDependencies({ devDependencies: { [packageName]: "1.0.0" } }), packageName).toEqual([
+        packageName,
+      ]);
+      expect(hasForeignIconImport(`import { Icon } from "${packageName}";`), packageName).toBe(true);
+      expect(hasForeignIconImport(`import Icon from "${packageName}/Icon";`), packageName).toBe(true);
+      expect(hasForeignIconImport(`import "${packageName}";`), packageName).toBe(true);
+      expect(hasForeignIconImport(`const icons = import("${packageName}");`), packageName).toBe(true);
+    }
+
+    expect(foreignIconDependencies({ dependencies: { "lucide-react": "1.24.0" } })).toEqual([]);
+    expect(hasForeignIconImport('import { Copy } from "lucide-react";')).toBe(false);
+    expect(hasForeignIconImport('import mark from "./assets/mark.svg";')).toBe(false);
+    expect(hasForeignIconImport('import font from "./assets/font.woff2";')).toBe(false);
+  });
+
   it("keeps generated Tauri schemas outside the formatting gate", () => {
     const prettierIgnore = readFileSync(resolve(appRoot, ".prettierignore"), "utf8").split("\n");
     expect(prettierIgnore).toContain("src-tauri/gen/schemas");

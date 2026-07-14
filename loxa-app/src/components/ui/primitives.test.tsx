@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
+import type { FormEvent } from "react";
 import {
   Check,
   ChevronDown,
@@ -18,7 +19,7 @@ import {
   Unplug,
   X,
 } from "lucide-react";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { Alert, AlertDescription, AlertTitle } from "./alert";
 import { Badge } from "./badge";
@@ -80,6 +81,7 @@ describe("native UI primitive source contracts", () => {
     expect(progress).toContain("<progress");
     expect(progress).toContain("max={total}");
     expect(progress).toContain("value={value}");
+    expect(progress).toContain("value?: number");
     expect(readOrEmpty("components/ui/separator.tsx")).toContain("<hr");
     expect(readOrEmpty("components/ui/label.tsx")).toContain("<label");
 
@@ -109,6 +111,37 @@ describe("native UI primitive runtime contracts", () => {
 
     expect(screen.getByRole("button", { name: "Start" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Start" })).toHaveAttribute("aria-busy", "true");
+  });
+
+  it("keeps computed busy state authoritative over native prop overrides", () => {
+    render(
+      <Button busy aria-busy={false} disabled={false}>
+        Start
+      </Button>,
+    );
+
+    const button = screen.getByRole("button", { name: "Start" });
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute("aria-busy", "true");
+  });
+
+  it("defaults to a non-submitting button while preserving explicit submit", () => {
+    const onSubmit = vi.fn((event: FormEvent) => event.preventDefault());
+    render(
+      <form onSubmit={onSubmit}>
+        <Button>Safe action</Button>
+        <Button type="submit">Submit action</Button>
+      </form>,
+    );
+
+    const safeAction = screen.getByRole("button", { name: "Safe action" });
+    const submitAction = screen.getByRole("button", { name: "Submit action" });
+    expect(safeAction).toHaveAttribute("type", "button");
+    expect(submitAction).toHaveAttribute("type", "submit");
+    fireEvent.click(safeAction);
+    expect(onSubmit).not.toHaveBeenCalled();
+    fireEvent.click(submitAction);
+    expect(onSubmit).toHaveBeenCalledOnce();
   });
 
   it("gives IconButton one explicit name and persistent visible help", () => {
@@ -188,6 +221,7 @@ describe("native UI primitive runtime contracts", () => {
         <Input id="endpoint" />
         <Textarea aria-label="Prompt" />
         <Progress aria-label="Download progress" value={4} total={10} />
+        <Progress aria-label="Indeterminate progress" />
         <Separator />
         <Badge>Ready</Badge>
         <Alert>
@@ -202,6 +236,9 @@ describe("native UI primitive runtime contracts", () => {
     expect(screen.getByLabelText("Prompt")).toBeInstanceOf(HTMLTextAreaElement);
     expect(screen.getByRole("progressbar", { name: "Download progress" })).toHaveAttribute("max", "10");
     expect(screen.getByRole("progressbar", { name: "Download progress" })).toHaveAttribute("value", "4");
+    const indeterminate = screen.getByRole("progressbar", { name: "Indeterminate progress" });
+    expect(indeterminate).not.toHaveAttribute("max");
+    expect(indeterminate).not.toHaveAttribute("value");
     expect(container.querySelector("hr[data-slot='separator']")).toBeInTheDocument();
     expect(screen.getByRole("alert")).toHaveTextContent("ConnectedThe node is ready.");
     expect(screen.getByText("Additional context")).toHaveClass("sr-only");
