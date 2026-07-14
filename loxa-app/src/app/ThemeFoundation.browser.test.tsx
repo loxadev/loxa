@@ -6,6 +6,7 @@ import App from "@/App";
 import { applyTheme, writeThemePreference, type ThemeMode } from "@/settings/theme";
 import { mountBrowser } from "@/test/browser";
 import { createAppServicesFixture } from "@/test/fixtures";
+import { shellScreenshotOptions } from "@/test/screenshot";
 
 async function settleRenderedTheme() {
   await document.fonts.ready;
@@ -62,11 +63,7 @@ test("keeps the shell within the measured pixel delta while exposing the semanti
     expect(getComputedStyle(utilityProbe!).backgroundColor).toBe(
       mode === "light" ? "rgb(244, 246, 240)" : "rgb(183, 237, 98)",
     );
-    await expect(document.body).toMatchScreenshot(`baseline-shell-${mode}-800x600`, {
-      comparatorName: "pixelmatch",
-      comparatorOptions: { allowedMismatchedPixels: 24, includeAA: false, threshold: 0.2 },
-      screenshotOptions: { animations: "allow", caret: "hide", scale: "css" },
-    });
+    await expect(document.body).toMatchScreenshot(`baseline-shell-${mode}-800x600`, shellScreenshotOptions);
   }
 
   const settingsLink = document.querySelector<HTMLAnchorElement>('a[href="#settings"]');

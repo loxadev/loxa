@@ -7,6 +7,7 @@ import { applyTheme, writeThemePreference, type ThemeMode } from "@/settings/the
 import { expectNoAxeViolations } from "@/test/axe";
 import { mountBrowser } from "@/test/browser";
 import { createAppServicesFixture } from "@/test/fixtures";
+import { shellScreenshotOptions } from "@/test/screenshot";
 
 async function waitForThemeTransition() {
   const nextFrame = () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
@@ -51,18 +52,6 @@ test("captures the chat-first desktop shell in fixed light and dark modes", asyn
     host.dataset.loxaTheme = mode;
     await waitForThemeTransition();
     await expectNoAxeViolations(document);
-    await expect(document.body).toMatchScreenshot(`baseline-shell-${mode}-800x600`, {
-      comparatorName: "pixelmatch",
-      comparatorOptions: {
-        allowedMismatchedPixelRatio: 0.005,
-        includeAA: false,
-        threshold: 0.2,
-      },
-      screenshotOptions: {
-        animations: "allow",
-        caret: "hide",
-        scale: "css",
-      },
-    });
+    await expect(document.body).toMatchScreenshot(`baseline-shell-${mode}-800x600`, shellScreenshotOptions);
   }
 });
