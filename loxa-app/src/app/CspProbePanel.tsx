@@ -1,40 +1,32 @@
-import { useSyncExternalStore } from "react";
+import { useReducer, useSyncExternalStore } from "react";
 
-import { cspProbeStore } from "./cspProbeStore";
-
-function exportSnapshot() {
-  const blob = new Blob([cspProbeStore.exportJson()], { type: "application/json" });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.download = "loxa-csp-probe.json";
-  link.href = url;
-  document.body.append(link);
-  link.click();
-  link.remove();
-  window.setTimeout(() => URL.revokeObjectURL(url), 0);
-}
+import { cspProbeStore, serializeEvidence } from "./cspProbeStore";
 
 export function CspProbePanel() {
-  const records = useSyncExternalStore(cspProbeStore.subscribe, cspProbeStore.getSnapshot);
+  const evidence = useSyncExternalStore(cspProbeStore.subscribe, cspProbeStore.getEvidenceSnapshot);
+  const [, refreshEvidence] = useReducer((value: number) => value + 1, 0);
+  const records = evidence.cspViolations;
+  const { warn, error } = evidence.consoleCounts;
 
   return (
-    <section className="csp-probe-panel" role="status" aria-live="polite" aria-label="CSP probe">
+    <section className="csp-probe-panel" aria-label="Packaged probe evidence">
       <div className="csp-probe-heading">
-        <strong>
-          CSP probe: {records.length} {records.length === 1 ? "violation" : "violations"}
-        </strong>
+        <strong>Packaged probe evidence</strong>
         <div className="csp-probe-actions">
-          <button type="button" onClick={cspProbeStore.reset}>
-            Reset
+          <button type="button" onClick={cspProbeStore.clearViolations}>
+            Reset CSP
           </button>
-          <button type="button" onClick={exportSnapshot}>
-            Export JSON
+          <button type="button" onClick={refreshEvidence}>
+            Refresh evidence
           </button>
         </div>
       </div>
-      {records.length > 0 && (
+      <p role="status" aria-live="polite">
+        CSP violations: {records.length}; console warnings: {warn}; console errors: {error}
+      </p>
+      {evidence.cspViolations.length > 0 && (
         <ol className="csp-probe-records">
-          {records.map((record, index) => (
+          {evidence.cspViolations.map((record, index) => (
             <li key={`${record.effectiveDirective}-${record.line}-${record.column}-${index}`}>
               <code>
                 {record.effectiveDirective} {record.blockedTarget} {record.sourceBasename}:{record.line}:{record.column}
@@ -43,6 +35,16 @@ export function CspProbePanel() {
           ))}
         </ol>
       )}
+      <label className="csp-probe-json-label" htmlFor="loxa-probe-json">
+        Sanitized probe JSON
+      </label>
+      <textarea
+        id="loxa-probe-json"
+        className="csp-probe-json"
+        readOnly
+        spellCheck={false}
+        value={serializeEvidence(evidence)}
+      />
     </section>
   );
 }

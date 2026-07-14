@@ -38,3 +38,23 @@
   padding-inline-start: var(--loxa-space-6);
   overflow-wrap: anywhere;
 }
+
+.csp-probe-json-label {
+  display: block;
+  margin-block-start: var(--loxa-space-3);
+  font-weight: 600;
+}
+
+.csp-probe-json {
+  display: block;
+  width: 100%;
+  min-height: 5rem;
+  margin-block-start: var(--loxa-space-2);
+  padding: var(--loxa-space-2);
+  overflow-wrap: anywhere;
+  resize: vertical;
+  color: inherit;
+  background: var(--loxa-background);
+  border: 1px solid var(--loxa-control-border);
+  border-radius: var(--loxa-radius-sm);
+}

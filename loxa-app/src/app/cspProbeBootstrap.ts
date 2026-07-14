@@ -1,8 +1,10 @@
 import { cspProbeStore } from "./cspProbeStore";
+import { installConsoleCountProbe } from "./consoleCountProbe";
 
 const probeEnabled = import.meta.env.VITE_LOXA_CSP_PROBE === "1";
 
 if (probeEnabled) {
+  installConsoleCountProbe(console);
   window.addEventListener("securitypolicyviolation", (event) => cspProbeStore.recordViolation(event));
 
   if (import.meta.env.VITE_LOXA_CSP_PROBE_CASE === "early-blocked-image") {
