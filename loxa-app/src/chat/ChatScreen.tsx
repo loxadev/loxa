@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import type {
   getCapabilities as defaultGetCapabilities,
@@ -146,6 +146,30 @@ export function ChatScreen({
   const historyControllers = useRef(new Set<AbortController>());
   const restoreController = useRef<AbortController | null>(null);
   const restoreGeneration = useRef(0);
+
+  useLayoutEffect(() => {
+    if (!availabilityBlocked) return;
+    const turnId = activeTurnId.current;
+    if (turnId === null) return;
+    if (displayFrame.current !== null) {
+      cancelScheduledFrame(displayFrame.current);
+      displayFrame.current = null;
+    }
+    const bufferedResponse = displayBuffer.current?.turnId === turnId ? displayBuffer.current.response : null;
+    displayBuffer.current = null;
+    activeTurnId.current = null;
+    stopRequested.current = false;
+    focusAfterTerminal.current = true;
+    setTurns((current) =>
+      current.map((turn) =>
+        turn.id === turnId
+          ? terminalTurn(bufferedResponse === null ? turn : { ...turn, response: bufferedResponse }, {
+              kind: "cancelled",
+            })
+          : turn,
+      ),
+    );
+  }, [availabilityBlocked]);
 
   const ownHistoryAction = useCallback((parent?: AbortSignal) => {
     const controller = new AbortController();
@@ -545,10 +569,10 @@ export function ChatScreen({
   useEffect(() => () => onInteractionLockChange?.(false), [onInteractionLockChange]);
 
   useEffect(() => {
-    if (!focusAfterTerminal.current || responseInProgress) return;
+    if (!focusAfterTerminal.current || responseInProgress || !canCompose) return;
     focusAfterTerminal.current = false;
     inputRef.current?.focus();
-  }, [latestTurn?.status, responseInProgress]);
+  }, [canCompose, latestTurn?.status, responseInProgress]);
 
   const updateTurn = (id: number | string, update: (current: ChatTurn) => ChatTurn) => {
     setTurns((current) => current.map((turn) => (turn.id === id ? update(turn) : turn)));
