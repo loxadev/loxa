@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { Search } from "lucide-react";
 
 import type {
   cancelOperation as defaultCancelOperation,
@@ -10,14 +11,10 @@ import type {
   unloadModel as defaultUnloadModel,
 } from "../control/client";
 import type { ControlStreamHandle, streamControlEvents as defaultStreamControlEvents } from "../control/events";
-import type {
-  ArtifactState,
-  ArtifactInvalidReason,
-  ModelInventoryEntry,
-  NodeSnapshot,
-  OperationStatus,
-  OperationView,
-} from "../control/contracts";
+import type { ModelInventoryEntry, NodeSnapshot, OperationStatus, OperationView } from "../control/contracts";
+import { Input } from "../components/ui/input";
+import { ModelRow } from "./ModelRow";
+import { operationLabel } from "./modelRowLabels";
 import styles from "./ModelsScreen.module.css";
 
 export type ModelsScreenServices = {
@@ -62,6 +59,7 @@ export function ModelsScreen({
   const [notice, setNotice] = useState("Connecting to model controls");
   const [error, setError] = useState("");
   const [retryNonce, setRetryNonce] = useState(0);
+  const [searchQuery, setSearchQuery] = useState("");
   const cursorRef = useRef(0);
   const streamRef = useRef<ControlStreamHandle | null>(null);
   const lifetimeSignalRef = useRef<AbortSignal | null>(null);
@@ -309,6 +307,15 @@ export function ModelsScreen({
     }
     return latest;
   }, [operations]);
+  const normalizedSearchQuery = searchQuery.trim().toLowerCase();
+  const visibleModels = useMemo(() => {
+    if (normalizedSearchQuery === "") return models;
+    return models.filter((entry) =>
+      [entry.id, entry.repo, entry.engine.engine, entry.params, entry.quant, entry.license].some((value) =>
+        value.toLowerCase().includes(normalizedSearchQuery),
+      ),
+    );
+  }, [models, normalizedSearchQuery]);
 
   const download = async (modelId: string) => {
     const signal = lifetimeSignalRef.current;
@@ -419,7 +426,22 @@ export function ModelsScreen({
         <span>
           Endpoint <span className="technical-value">{endpoint}</span>
         </span>
-        <span>{models.length} verified recipes</span>
+        <span>
+          {normalizedSearchQuery === ""
+            ? `${models.length} verified recipes`
+            : `${visibleModels.length} of ${models.length} verified recipes`}
+        </span>
+      </div>
+
+      <div className={styles.searchControl}>
+        <Search aria-hidden="true" size={16} strokeWidth={1.8} />
+        <Input
+          type="search"
+          aria-label="Search models"
+          placeholder="Search models"
+          value={searchQuery}
+          onChange={(event) => setSearchQuery(event.currentTarget.value)}
+        />
       </div>
 
       {error && (
@@ -446,8 +468,11 @@ export function ModelsScreen({
           {inventoryLoaded ? "No verified recipes are available in this build." : "Checking the known model registry…"}
         </p>
       )}
+      {!error && inventoryLoaded && models.length > 0 && visibleModels.length === 0 && normalizedSearchQuery !== "" && (
+        <p className={styles.empty}>No models match “{searchQuery.trim()}”.</p>
+      )}
       <div className={styles.list}>
-        {models.map((entry) => (
+        {visibleModels.map((entry) => (
           <ModelRow
             key={entry.id}
             entry={entry}
@@ -482,163 +507,6 @@ function isTerminalLifecycleOperation(operation: OperationView): boolean {
   return (operation.kind === "load" || operation.kind === "unload") && isTerminal(operation.status);
 }
 
-function ModelRow({
-  entry,
-  operation,
-  unloadOperation,
-  pending,
-  active,
-  node,
-  mutationBusy,
-  onDownload,
-  onLoad,
-  onUnload,
-  onCancel,
-}: {
-  entry: ModelInventoryEntry;
-  operation?: OperationView;
-  unloadOperation?: OperationView;
-  pending: boolean;
-  active: boolean;
-  node: NodeSnapshot | null;
-  mutationBusy: boolean;
-  onDownload(): void;
-  onLoad(): void;
-  onUnload(): void;
-  onCancel(operation: OperationView): void;
-}) {
-  const headingId = `model-${entry.id}`;
-  const reasonId = `model-reason-${entry.id}`;
-  const actionable = entry.compatibility.compatible && entry.engine.eligible;
-  const displayedOperation = unloadOperation ?? operation;
-  const inProgress = displayedOperation?.status === "queued" || displayedOperation?.status === "running";
-  const status =
-    inProgress && displayedOperation
-      ? operationLabel(displayedOperation)
-      : artifactLabel(entry.artifact, entry.sizeBytes);
-  const showDownload =
-    !inProgress &&
-    entry.artifact.kind !== "downloaded" &&
-    !(entry.artifact.kind === "invalid" && entry.artifact.reason === "verification_required");
-  const actionLabel =
-    entry.artifact.kind === "partial"
-      ? `Resume ${entry.id}`
-      : entry.artifact.kind === "invalid"
-        ? `Repair ${entry.id}`
-        : `Download ${entry.id}`;
-
-  return (
-    <article className={styles.row} aria-labelledby={headingId}>
-      <div className={styles.main}>
-        <div className={styles.headingLine}>
-          <h2 id={headingId}>{entry.id}</h2>
-          {active && <span className={`${styles.chip} ${styles.activeChip}`}>Active</span>}
-          <span className={styles.chip}>{status}</span>
-        </div>
-        <p className={styles.metadata}>
-          <span>{entry.params}</span>
-          <span>{entry.quant}</span>
-          <span>{formatBytes(entry.sizeBytes)}</span>
-          <span>{entry.license}</span>
-          <span>{entry.engine.engine}</span>
-        </p>
-        <p className={`technical-value ${styles.repository}`}>
-          {entry.repo}@{entry.revision}
-        </p>
-        <p id={reasonId} className={actionable ? styles.reason : `${styles.reason} ${styles.reasonBlocking}`}>
-          {entry.compatibility.reason} {entry.engine.reason}
-        </p>
-        {displayedOperation?.progress && (
-          <div className={styles.progress}>
-            {displayedOperation.progress.totalBytes === null ? (
-              <progress aria-label={`Download progress for ${entry.id}`} />
-            ) : (
-              <progress
-                aria-label={`Download progress for ${entry.id}`}
-                value={displayedOperation.progress.completedBytes}
-                max={displayedOperation.progress.totalBytes}
-              />
-            )}
-            <span className="technical-value">
-              {formatBytes(displayedOperation.progress.completedBytes)}
-              {displayedOperation.progress.totalBytes === null
-                ? " downloaded"
-                : ` of ${formatBytes(displayedOperation.progress.totalBytes)}`}
-            </span>
-          </div>
-        )}
-        {displayedOperation?.error && <p className={styles.operationError}>{displayedOperation.error}</p>}
-        {displayedOperation && !inProgress && (
-          <p className={styles.operationHistory}>Last operation: {operationLabel(displayedOperation)}</p>
-        )}
-      </div>
-      <div className={styles.actions}>
-        {inProgress && displayedOperation?.kind === "download" ? (
-          <button
-            className="secondary-button interactive-target"
-            type="button"
-            disabled={pending}
-            onClick={() => onCancel(displayedOperation)}
-            aria-label={`Cancel ${displayedOperation.kind} ${entry.id}`}
-          >
-            Cancel
-          </button>
-        ) : inProgress && displayedOperation ? (
-          <span className={styles.actionLabel}>{operationLabel(displayedOperation)}</span>
-        ) : showDownload ? (
-          <button
-            className="primary-button interactive-target"
-            type="button"
-            disabled={!actionable || pending || mutationBusy}
-            aria-describedby={reasonId}
-            aria-label={actionLabel}
-            onClick={onDownload}
-          >
-            {entry.artifact.kind === "partial" ? "Resume" : entry.artifact.kind === "invalid" ? "Repair" : "Download"}
-          </button>
-        ) : entry.artifact.kind === "downloaded" && actionable && node?.status !== "recovery_required" ? (
-          <button
-            className={active ? "secondary-button interactive-target" : "primary-button interactive-target"}
-            type="button"
-            disabled={pending || mutationBusy}
-            onClick={active ? onUnload : onLoad}
-            aria-label={
-              active ? `Unload ${entry.id}` : node?.activeModelId ? `Switch to ${entry.id}` : `Load ${entry.id}`
-            }
-          >
-            {active ? "Unload" : node?.activeModelId ? "Switch" : "Load"}
-          </button>
-        ) : (
-          <span className={styles.actionLabel}>
-            {entry.artifact.kind === "downloaded" ? "Unavailable to load" : "Awaiting verification"}
-          </span>
-        )}
-      </div>
-    </article>
-  );
-}
-
-function artifactLabel(artifact: ArtifactState, sizeBytes: number): string {
-  if (artifact.kind === "not_downloaded") return "Not downloaded";
-  if (artifact.kind === "partial") return `Partial — ${formatBytes(artifact.bytes)} of ${formatBytes(sizeBytes)}`;
-  if (artifact.kind === "downloaded") return "Downloaded and verified";
-  const labels: Record<ArtifactInvalidReason, string> = {
-    size_mismatch: "Size mismatch",
-    checksum_mismatch: "Checksum invalid",
-    unreadable: "Unreadable artifact",
-    verification_required: "Verification required",
-  };
-  return labels[artifact.reason];
-}
-
-function operationLabel(operation: OperationView): string {
-  const action = operation.kind === "download" ? "Download" : operation.kind === "load" ? "Load" : "Unload";
-  if (operation.status === "running") return `${action} in progress`;
-  if (operation.status === "succeeded") return `${action} completed`;
-  if (operation.status === "failed") return `${action} failed`;
-  return `${action} ${operation.status}`;
-}
-
 function operationAnnouncement(operation: OperationView): string {
   const model = operation.modelId ?? "model";
   return `${model}: ${operationLabel(operation)}`;
@@ -665,19 +533,6 @@ function withValue(source: Set<string>, value: string, present: boolean): Set<st
   if (present) next.add(value);
   else next.delete(value);
   return next;
-}
-
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  const units = ["KB", "MB", "GB", "TB"];
-  let value = bytes / 1024;
-  let index = 0;
-  while (value >= 1024 && index < units.length - 1) {
-    value /= 1024;
-    index += 1;
-  }
-  const formatted = value >= 10 || Number.isInteger(value) ? value.toFixed(0) : value.toFixed(1);
-  return `${formatted} ${units[index]}`;
 }
 
 function message(error: unknown): string {

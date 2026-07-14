@@ -16,6 +16,26 @@
   color: var(--loxa-foreground);
 }
 
+.searchControl {
+  position: relative;
+  width: min(100%, 360px);
+  margin: 0 0 var(--loxa-space-4);
+  color: var(--loxa-muted-foreground);
+}
+
+.searchControl svg {
+  position: absolute;
+  z-index: 1;
+  top: 50%;
+  left: var(--loxa-space-3);
+  pointer-events: none;
+  transform: translateY(-50%);
+}
+
+.searchControl input {
+  padding-left: var(--loxa-space-8);
+}
+
 .list {
   border-top: 1px solid var(--loxa-control-border);
 }
