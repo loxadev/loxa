@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { cspProbeStore } from "./cspProbeStore";
+import { cspProbeStore, serializeEvidence } from "./cspProbeStore";
 
 function violation(overrides: Record<string, unknown> = {}) {
   return {
@@ -14,6 +14,16 @@ function violation(overrides: Record<string, unknown> = {}) {
 }
 
 describe("CSP probe store", () => {
+  it("starts with a stable, deterministic evidence schema", () => {
+    cspProbeStore.reset();
+    const snapshot = cspProbeStore.getEvidenceSnapshot();
+
+    expect(cspProbeStore.getEvidenceSnapshot()).toBe(snapshot);
+    expect(serializeEvidence(snapshot)).toBe(
+      '{"schemaVersion":1,"cspViolations":[],"consoleCounts":{"warn":0,"error":0}}',
+    );
+  });
+
   it("publishes only sanitized immutable records", () => {
     cspProbeStore.reset();
     const before = cspProbeStore.getSnapshot();
@@ -94,5 +104,43 @@ describe("CSP probe store", () => {
     cspProbeStore.reset();
     expect(listener).toHaveBeenCalledTimes(1);
     expect(cspProbeStore.getSnapshot()).toEqual([]);
+  });
+
+  it("counts only fixed console severities without notifying live subscribers", () => {
+    cspProbeStore.reset();
+    const listener = vi.fn();
+    const unsubscribe = cspProbeStore.subscribe(listener);
+    const before = cspProbeStore.getEvidenceSnapshot();
+
+    cspProbeStore.recordConsole("warn");
+    cspProbeStore.recordConsole("warn");
+    cspProbeStore.recordConsole("error");
+    cspProbeStore.recordConsole("log");
+    cspProbeStore.recordConsole({ category: "warn", secret: "model-token" });
+
+    const after = cspProbeStore.getEvidenceSnapshot();
+    expect(after).not.toBe(before);
+    expect(cspProbeStore.getEvidenceSnapshot()).toBe(after);
+    expect(after.consoleCounts).toEqual({ warn: 2, error: 1 });
+    expect(Object.keys(after.consoleCounts)).toEqual(["warn", "error"]);
+    expect(listener).not.toHaveBeenCalled();
+    expect(serializeEvidence(after)).not.toContain("model-token");
+    unsubscribe();
+  });
+
+  it("clears CSP evidence without erasing cold-start console counts", () => {
+    cspProbeStore.reset();
+    cspProbeStore.recordConsole("warn");
+    cspProbeStore.recordViolation(violation());
+
+    cspProbeStore.clearViolations();
+
+    expect(cspProbeStore.getSnapshot()).toEqual([]);
+    expect(cspProbeStore.getEvidenceSnapshot()).toMatchObject({
+      cspViolations: [],
+      consoleCounts: { warn: 1, error: 0 },
+    });
+    cspProbeStore.reset();
+    expect(cspProbeStore.getEvidenceSnapshot().consoleCounts).toEqual({ warn: 0, error: 0 });
   });
 });

@@ -6,14 +6,33 @@ export interface CspProbeRecord {
   column: number;
 }
 
+export type ConsoleProbeCategory = "warn" | "error";
+
+export interface CspProbeEvidence {
+  schemaVersion: 1;
+  cspViolations: readonly CspProbeRecord[];
+  consoleCounts: Readonly<Record<ConsoleProbeCategory, number>>;
+}
+
 type ViolationInput = Pick<
   SecurityPolicyViolationEvent,
   "effectiveDirective" | "blockedURI" | "sourceFile" | "lineNumber" | "columnNumber"
 >;
 
-const EMPTY_SNAPSHOT: readonly CspProbeRecord[] = Object.freeze([]);
+const EMPTY_SNAPSHOT: readonly CspProbeRecord[] = /* @__PURE__ */ Object.freeze([]);
+const EMPTY_CONSOLE_COUNTS = /* @__PURE__ */ Object.freeze({ warn: 0, error: 0 });
 const listeners = new Set<() => void>();
 let snapshot = EMPTY_SNAPSHOT;
+let consoleCounts: Readonly<Record<ConsoleProbeCategory, number>> = EMPTY_CONSOLE_COUNTS;
+let evidenceSnapshot = /* @__PURE__ */ createEvidenceSnapshot();
+
+function createEvidenceSnapshot(): CspProbeEvidence {
+  return Object.freeze({
+    schemaVersion: 1 as const,
+    cspViolations: snapshot,
+    consoleCounts,
+  });
+}
 
 function blockedTarget(value: string): string {
   if (value === "inline" || value === "eval") return value;
@@ -48,6 +67,14 @@ function emit() {
   listeners.forEach((listener) => listener());
 }
 
+function increment(value: number): number {
+  return value < Number.MAX_SAFE_INTEGER ? value + 1 : Number.MAX_SAFE_INTEGER;
+}
+
+export function serializeEvidence(snapshotToSerialize = evidenceSnapshot): string {
+  return JSON.stringify(snapshotToSerialize);
+}
+
 export const cspProbeStore = {
   recordViolation(event: ViolationInput): void {
     const record = Object.freeze({
@@ -58,7 +85,16 @@ export const cspProbeStore = {
       column: coordinate(event.columnNumber),
     });
     snapshot = Object.freeze([...snapshot, record]);
+    evidenceSnapshot = createEvidenceSnapshot();
     emit();
+  },
+  recordConsole(category: unknown): void {
+    if (category !== "warn" && category !== "error") return;
+    consoleCounts = Object.freeze({
+      warn: category === "warn" ? increment(consoleCounts.warn) : consoleCounts.warn,
+      error: category === "error" ? increment(consoleCounts.error) : consoleCounts.error,
+    });
+    evidenceSnapshot = createEvidenceSnapshot();
   },
   subscribe(listener: () => void): () => void {
     listeners.add(listener);
@@ -67,9 +103,20 @@ export const cspProbeStore = {
   getSnapshot(): readonly CspProbeRecord[] {
     return snapshot;
   },
-  reset(): void {
+  getEvidenceSnapshot(): CspProbeEvidence {
+    return evidenceSnapshot;
+  },
+  clearViolations(): void {
     if (snapshot.length === 0) return;
     snapshot = EMPTY_SNAPSHOT;
+    evidenceSnapshot = createEvidenceSnapshot();
+    emit();
+  },
+  reset(): void {
+    if (snapshot.length === 0 && consoleCounts.warn === 0 && consoleCounts.error === 0) return;
+    snapshot = EMPTY_SNAPSHOT;
+    consoleCounts = EMPTY_CONSOLE_COUNTS;
+    evidenceSnapshot = createEvidenceSnapshot();
     emit();
   },
   exportJson(): string {
