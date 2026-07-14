@@ -8,18 +8,41 @@ const appRoot = resolve(import.meta.dirname, "..");
 const repositoryRoot = resolve(appRoot, "..");
 
 describe("Cargo workspace isolation", () => {
+  it("enforces the complete desktop frontend gate in CI", () => {
+    const manifest = JSON.parse(readFileSync(resolve(appRoot, "package.json"), "utf8"));
+    expect(manifest.scripts).toMatchObject({
+      "format:check": "prettier --check .",
+      "test:unit": "vitest run",
+      "test:browser": "vitest run --config vitest.browser.config.ts",
+      check: "pnpm format:check && pnpm lint && pnpm typecheck && pnpm test:unit && pnpm test:browser && pnpm build",
+    });
+
+    const ci = readFileSync(resolve(repositoryRoot, ".github/workflows/ci.yml"), "utf8");
+    for (const command of [
+      "pnpm install --frozen-lockfile",
+      "pnpm format:check",
+      "pnpm lint",
+      "pnpm typecheck",
+      "pnpm test:unit",
+      "pnpm test:browser",
+      "pnpm build",
+    ])
+      expect(ci).toContain(command);
+  });
+
   it("starts with no frontend capability permissions", () => {
-    const capability = JSON.parse(
-      readFileSync(resolve(appRoot, "src-tauri/capabilities/default.json"), "utf8"),
-    ) as { permissions: string[] };
+    const capability = JSON.parse(readFileSync(resolve(appRoot, "src-tauri/capabilities/default.json"), "utf8")) as {
+      permissions: string[];
+    };
 
     expect(capability.permissions).toEqual([]);
   });
 
   it("bundles the private node without granting frontend process or filesystem access", () => {
-    const config = JSON.parse(
-      readFileSync(resolve(appRoot, "src-tauri/tauri.conf.json"), "utf8"),
-    ) as { bundle: { externalBin?: string[] }; app: { security: { csp: string } } };
+    const config = JSON.parse(readFileSync(resolve(appRoot, "src-tauri/tauri.conf.json"), "utf8")) as {
+      bundle: { externalBin?: string[] };
+      app: { security: { csp: string } };
+    };
 
     expect(config.bundle.externalBin).toEqual(["binaries/loxa-node"]);
     expect(config.app.security.csp).not.toMatch(/shell|filesystem|fs:/i);
@@ -35,9 +58,9 @@ describe("Cargo workspace isolation", () => {
   });
 
   it("uses the one exact development origin allowed by the control service", () => {
-    const config = JSON.parse(
-      readFileSync(resolve(appRoot, "src-tauri/tauri.conf.json"), "utf8"),
-    ) as { build: { devUrl: string } };
+    const config = JSON.parse(readFileSync(resolve(appRoot, "src-tauri/tauri.conf.json"), "utf8")) as {
+      build: { devUrl: string };
+    };
     const vite = readFileSync(resolve(appRoot, "vite.config.ts"), "utf8");
 
     expect(config.build.devUrl).toBe("http://127.0.0.1:1420");
@@ -46,9 +69,9 @@ describe("Cargo workspace isolation", () => {
   });
 
   it("prepares the fixed private sidecar before starting Vite", () => {
-    const config = JSON.parse(
-      readFileSync(resolve(appRoot, "src-tauri/tauri.conf.json"), "utf8"),
-    ) as { build: { beforeDevCommand: string } };
+    const config = JSON.parse(readFileSync(resolve(appRoot, "src-tauri/tauri.conf.json"), "utf8")) as {
+      build: { beforeDevCommand: string };
+    };
 
     expect(config.build.beforeDevCommand).toBe("pnpm prepare:sidecar && pnpm dev");
   });
@@ -73,14 +96,20 @@ describe("Cargo workspace isolation", () => {
     expect(nativeShell).toContain("try_init");
     expect(bootstrap).toContain("Stdio::inherit()");
     expect(bootstrap).toContain("Stdio::null()");
-    expect(bootstrap).not.toMatch(/tracing::(?:debug|info|warn|error)!\([^)]*(?:token|nonce|proof|authorization|prompt|response|credential_path)/s);
+    expect(bootstrap).not.toMatch(
+      /tracing::(?:debug|info|warn|error)!\([^)]*(?:token|nonce|proof|authorization|prompt|response|credential_path)/s,
+    );
   });
 
   it("selects an explicit packaging target instead of silently using the host", () => {
-    const selected = execFileSync(process.execPath, [resolve(appRoot, "scripts/prepare-sidecar.mjs"), "--print-target"], {
-      encoding: "utf8",
-      env: { ...process.env, LOXA_SIDECAR_TARGET: "x86_64-apple-darwin" },
-    });
+    const selected = execFileSync(
+      process.execPath,
+      [resolve(appRoot, "scripts/prepare-sidecar.mjs"), "--print-target"],
+      {
+        encoding: "utf8",
+        env: { ...process.env, LOXA_SIDECAR_TARGET: "x86_64-apple-darwin" },
+      },
+    );
     expect(selected.trim()).toBe("x86_64-apple-darwin");
   });
 
@@ -91,16 +120,21 @@ describe("Cargo workspace isolation", () => {
     const binary = resolve(binaries, "loxa-node-aarch64-apple-darwin");
     writeFileSync(binary, "not-the-reviewed-binary");
     chmodSync(binary, 0o755);
-    writeFileSync(resolve(binaries, "loxa-node-manifest.json"), JSON.stringify({
-      triple: "aarch64-apple-darwin",
-      sourceHash: "0".repeat(64),
-      destinationHash: "0".repeat(64),
-      destination: "loxa-node-aarch64-apple-darwin",
-    }));
-    expect(() => execFileSync(process.execPath, [resolve(appRoot, "scripts/verify-sidecar.mjs")], {
-      env: { ...process.env, LOXA_SIDECAR_APP_ROOT: root },
-      stdio: "pipe",
-    })).toThrow(/sidecar hash verification failed/);
+    writeFileSync(
+      resolve(binaries, "loxa-node-manifest.json"),
+      JSON.stringify({
+        triple: "aarch64-apple-darwin",
+        sourceHash: "0".repeat(64),
+        destinationHash: "0".repeat(64),
+        destination: "loxa-node-aarch64-apple-darwin",
+      }),
+    );
+    expect(() =>
+      execFileSync(process.execPath, [resolve(appRoot, "scripts/verify-sidecar.mjs")], {
+        env: { ...process.env, LOXA_SIDECAR_APP_ROOT: root },
+        stdio: "pipe",
+      }),
+    ).toThrow(/sidecar hash verification failed/);
   });
 
   it("declares the desktop crate as its own workspace", () => {
