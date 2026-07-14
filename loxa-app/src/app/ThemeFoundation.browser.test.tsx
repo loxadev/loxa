@@ -31,7 +31,10 @@ test("keeps the shell within the measured pixel delta while exposing the semanti
     await Promise.resolve();
     await Promise.resolve();
   });
-  await expect.element(page.getByText("Node ready — no model loaded")).toBeVisible();
+  await expect.element(page.getByRole("heading", { name: "Chat" })).toBeVisible();
+  await expect.element(page.getByRole("link", { name: "Chat" })).toHaveAttribute("aria-current", "page");
+  await expect.element(page.getByRole("navigation", { name: "Chat conversations" })).toBeVisible();
+  await expect.element(page.getByText("No conversations yet.")).toBeVisible();
   const utilityProbe = document.querySelector<HTMLElement>("#theme-utility-probe");
   expect(utilityProbe).not.toBeNull();
   const loadedCss = [...document.styleSheets]
@@ -62,7 +65,7 @@ test("keeps the shell within the measured pixel delta while exposing the semanti
     await expect(document.body).toMatchScreenshot(`baseline-shell-${mode}-800x600`, {
       comparatorName: "pixelmatch",
       comparatorOptions: { allowedMismatchedPixels: 24, includeAA: false, threshold: 0.2 },
-      screenshotOptions: { animations: "disabled", caret: "hide", scale: "css" },
+      screenshotOptions: { animations: "allow", caret: "hide", scale: "css" },
     });
   }
 
