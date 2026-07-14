@@ -29,14 +29,8 @@ function isNullableString(value: unknown): value is string | null {
   return typeof value === "string" || value === null;
 }
 
-function isEngine(
-  value: unknown,
-): value is { name: string; version: string } {
-  return (
-    isRecord(value) &&
-    typeof value.name === "string" &&
-    typeof value.version === "string"
-  );
+function isEngine(value: unknown): value is { name: string; version: string } {
+  return isRecord(value) && typeof value.name === "string" && typeof value.version === "string";
 }
 
 function invalid(contract: string): never {
@@ -61,11 +55,8 @@ export function decodeNodeStatus(value: unknown): NodeStatus {
   }
 
   const runtimeFieldsReady =
-    isEngine(engine) &&
-    typeof value.runtime_model === "string" &&
-    typeof value.profile === "string";
-  const runtimeFieldsUnavailable =
-    engine === null && value.runtime_model === null && value.profile === null;
+    isEngine(engine) && typeof value.runtime_model === "string" && typeof value.profile === "string";
+  const runtimeFieldsUnavailable = engine === null && value.runtime_model === null && value.profile === null;
   if (
     (value.health === "ready" && !runtimeFieldsReady) ||
     (value.health === "unavailable" && !runtimeFieldsUnavailable)
@@ -77,29 +68,18 @@ export function decodeNodeStatus(value: unknown): NodeStatus {
     node_id: value.node_id,
     health: value.health,
     model: value.model,
-    engine:
-      engine === null ? null : { name: engine.name, version: engine.version },
+    engine: engine === null ? null : { name: engine.name, version: engine.version },
     runtime_model: value.runtime_model,
     profile: value.profile,
   };
 }
 
 export function decodeModelList(value: unknown): ModelList {
-  if (
-    !isRecord(value) ||
-    value.object !== "list" ||
-    !Array.isArray(value.data) ||
-    value.data.length !== 1
-  ) {
+  if (!isRecord(value) || value.object !== "list" || !Array.isArray(value.data) || value.data.length !== 1) {
     return invalid("model list");
   }
   const model = value.data[0];
-  if (
-    !isRecord(model) ||
-    model.id !== "loxa" ||
-    model.object !== "model" ||
-    typeof model.owned_by !== "string"
-  ) {
+  if (!isRecord(model) || model.id !== "loxa" || model.object !== "model" || typeof model.owned_by !== "string") {
     return invalid("model list");
   }
   return {

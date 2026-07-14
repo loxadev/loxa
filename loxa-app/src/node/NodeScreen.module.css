@@ -74,7 +74,8 @@
 
 .nextAction h2 {
   margin: 0;
-  font: var(--loxa-type-title-weight) var(--loxa-type-title-size)/var(--loxa-type-title-line-height) var(--loxa-type-title-family);
+  font: var(--loxa-type-title-weight) var(--loxa-type-title-size)/var(--loxa-type-title-line-height)
+    var(--loxa-type-title-family);
 }
 
 .nextAction p {

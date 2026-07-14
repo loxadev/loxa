@@ -1,8 +1,4 @@
-export type ArtifactInvalidReason =
-  | "size_mismatch"
-  | "checksum_mismatch"
-  | "unreadable"
-  | "verification_required";
+export type ArtifactInvalidReason = "size_mismatch" | "checksum_mismatch" | "unreadable" | "verification_required";
 
 export type ArtifactState =
   | { kind: "not_downloaded" }
@@ -26,13 +22,7 @@ export type ModelInventoryEntry = {
   engine: { engine: string; eligible: boolean; reason: string };
 };
 
-export type NodeControlStatus =
-  | "unloaded"
-  | "loading"
-  | "ready"
-  | "unloading"
-  | "recovery_required"
-  | "error";
+export type NodeControlStatus = "unloaded" | "loading" | "ready" | "unloading" | "recovery_required" | "error";
 
 export type NodeSnapshot = {
   status: NodeControlStatus;
@@ -127,7 +117,12 @@ function decodeArtifact(value: unknown): ArtifactState {
   }
   if (isRecord(value.invalid) && hasKeys(value.invalid, ["reason"])) {
     const reason = value.invalid.reason;
-    if (reason === "size_mismatch" || reason === "checksum_mismatch" || reason === "unreadable" || reason === "verification_required") {
+    if (
+      reason === "size_mismatch" ||
+      reason === "checksum_mismatch" ||
+      reason === "unreadable" ||
+      reason === "verification_required"
+    ) {
       return { kind: "invalid", reason };
     }
   }
@@ -138,20 +133,49 @@ export function decodeInventory(value: unknown): ModelInventoryEntry[] {
   if (!Array.isArray(value)) return invalid("model inventory");
   const seen = new Set<string>();
   return value.map((item) => {
-    if (!isRecord(item) || !hasKeys(item, [
-      "id", "repo", "revision", "filename", "sha256", "size_bytes", "license", "params",
-      "quant", "min_free_mem_gb", "artifact", "compatibility", "engine",
-    ])) return invalid("model inventory");
     if (
-      !nonEmpty(item.id) || seen.has(item.id) || !nonEmpty(item.repo) || !nonEmpty(item.revision) ||
-      !nonEmpty(item.filename) || !nonEmpty(item.sha256) || !/^[0-9a-f]{64}$/.test(item.sha256) ||
-      !isSafeNonNegativeInteger(item.size_bytes) || !nonEmpty(item.license) || !nonEmpty(item.params) ||
-      !nonEmpty(item.quant) || !isFiniteNonNegative(item.min_free_mem_gb) ||
-      !isRecord(item.compatibility) || !hasKeys(item.compatibility, ["compatible", "reason"]) ||
-      typeof item.compatibility.compatible !== "boolean" || typeof item.compatibility.reason !== "string" ||
-      !isRecord(item.engine) || !hasKeys(item.engine, ["engine", "eligible", "reason"]) ||
-      !nonEmpty(item.engine.engine) || typeof item.engine.eligible !== "boolean" || typeof item.engine.reason !== "string"
-    ) return invalid("model inventory");
+      !isRecord(item) ||
+      !hasKeys(item, [
+        "id",
+        "repo",
+        "revision",
+        "filename",
+        "sha256",
+        "size_bytes",
+        "license",
+        "params",
+        "quant",
+        "min_free_mem_gb",
+        "artifact",
+        "compatibility",
+        "engine",
+      ])
+    )
+      return invalid("model inventory");
+    if (
+      !nonEmpty(item.id) ||
+      seen.has(item.id) ||
+      !nonEmpty(item.repo) ||
+      !nonEmpty(item.revision) ||
+      !nonEmpty(item.filename) ||
+      !nonEmpty(item.sha256) ||
+      !/^[0-9a-f]{64}$/.test(item.sha256) ||
+      !isSafeNonNegativeInteger(item.size_bytes) ||
+      !nonEmpty(item.license) ||
+      !nonEmpty(item.params) ||
+      !nonEmpty(item.quant) ||
+      !isFiniteNonNegative(item.min_free_mem_gb) ||
+      !isRecord(item.compatibility) ||
+      !hasKeys(item.compatibility, ["compatible", "reason"]) ||
+      typeof item.compatibility.compatible !== "boolean" ||
+      typeof item.compatibility.reason !== "string" ||
+      !isRecord(item.engine) ||
+      !hasKeys(item.engine, ["engine", "eligible", "reason"]) ||
+      !nonEmpty(item.engine.engine) ||
+      typeof item.engine.eligible !== "boolean" ||
+      typeof item.engine.reason !== "string"
+    )
+      return invalid("model inventory");
     seen.add(item.id);
     return {
       id: item.id,
@@ -172,13 +196,26 @@ export function decodeInventory(value: unknown): ModelInventoryEntry[] {
 }
 
 function decodeNodeStatus(value: unknown): NodeControlStatus {
-  if (value === "unloaded" || value === "loading" || value === "ready" || value === "unloading" || value === "recovery_required" || value === "error") return value;
+  if (
+    value === "unloaded" ||
+    value === "loading" ||
+    value === "ready" ||
+    value === "unloading" ||
+    value === "recovery_required" ||
+    value === "error"
+  )
+    return value;
   return invalid("node status");
 }
 
 export function decodeNodeSnapshot(value: unknown): NodeSnapshot {
-  if (!isRecord(value) || !hasKeys(value, ["status", "active_model_id", "operation_id", "error"]) ||
-    !nullableString(value.active_model_id) || !nullableString(value.operation_id) || !nullableString(value.error)) {
+  if (
+    !isRecord(value) ||
+    !hasKeys(value, ["status", "active_model_id", "operation_id", "error"]) ||
+    !nullableString(value.active_model_id) ||
+    !nullableString(value.operation_id) ||
+    !nullableString(value.error)
+  ) {
     return invalid("node snapshot");
   }
   return {
@@ -190,10 +227,15 @@ export function decodeNodeSnapshot(value: unknown): NodeSnapshot {
 }
 
 export function decodeCapabilities(value: unknown): Capabilities {
-  if (!isRecord(value) || !hasKeys(value, ["document_input", "document_input_reason", "text_chat"]) ||
-    typeof value.document_input !== "boolean" || typeof value.document_input_reason !== "string" ||
+  if (
+    !isRecord(value) ||
+    !hasKeys(value, ["document_input", "document_input_reason", "text_chat"]) ||
+    typeof value.document_input !== "boolean" ||
+    typeof value.document_input_reason !== "string" ||
     typeof value.text_chat !== "boolean" ||
-    (!value.document_input && value.document_input_reason.trim().length === 0)) return invalid("capabilities");
+    (!value.document_input && value.document_input_reason.trim().length === 0)
+  )
+    return invalid("capabilities");
   return {
     documentInput: value.document_input,
     documentInputReason: value.document_input_reason,
@@ -202,20 +244,45 @@ export function decodeCapabilities(value: unknown): Capabilities {
 }
 
 export function decodeOperation(value: unknown): OperationView {
-  if (!isRecord(value) || !hasKeys(value, [
-    "id", "kind", "status", "model_id", "progress", "error", "created_at_unix_ms", "updated_at_unix_ms",
-  ]) || !nonEmpty(value.id) || !nullableString(value.model_id) || !nullableString(value.error) ||
-    !isSafeNonNegativeInteger(value.created_at_unix_ms) || !isSafeNonNegativeInteger(value.updated_at_unix_ms) ||
-    value.updated_at_unix_ms < value.created_at_unix_ms) return invalid("operation");
+  if (
+    !isRecord(value) ||
+    !hasKeys(value, [
+      "id",
+      "kind",
+      "status",
+      "model_id",
+      "progress",
+      "error",
+      "created_at_unix_ms",
+      "updated_at_unix_ms",
+    ]) ||
+    !nonEmpty(value.id) ||
+    !nullableString(value.model_id) ||
+    !nullableString(value.error) ||
+    !isSafeNonNegativeInteger(value.created_at_unix_ms) ||
+    !isSafeNonNegativeInteger(value.updated_at_unix_ms) ||
+    value.updated_at_unix_ms < value.created_at_unix_ms
+  )
+    return invalid("operation");
   if (value.kind !== "download" && value.kind !== "load" && value.kind !== "unload") return invalid("operation");
-  if (value.status !== "queued" && value.status !== "running" && value.status !== "succeeded" && value.status !== "failed" && value.status !== "cancelled") return invalid("operation");
+  if (
+    value.status !== "queued" &&
+    value.status !== "running" &&
+    value.status !== "succeeded" &&
+    value.status !== "failed" &&
+    value.status !== "cancelled"
+  )
+    return invalid("operation");
   if ((value.status === "failed") !== nonEmpty(value.error)) return invalid("operation");
   let progress: OperationView["progress"] = null;
   if (value.progress !== null) {
-    if (!isRecord(value.progress) || !hasKeys(value.progress, ["completed_bytes", "total_bytes"]) ||
+    if (
+      !isRecord(value.progress) ||
+      !hasKeys(value.progress, ["completed_bytes", "total_bytes"]) ||
       !isSafeNonNegativeInteger(value.progress.completed_bytes) ||
       !(value.progress.total_bytes === null || isSafeNonNegativeInteger(value.progress.total_bytes)) ||
-      (typeof value.progress.total_bytes === "number" && value.progress.completed_bytes > value.progress.total_bytes)) {
+      (typeof value.progress.total_bytes === "number" && value.progress.completed_bytes > value.progress.total_bytes)
+    ) {
       return invalid("operation progress");
     }
     progress = { completedBytes: value.progress.completed_bytes, totalBytes: value.progress.total_bytes };
@@ -233,14 +300,21 @@ export function decodeOperation(value: unknown): OperationView {
 }
 
 export function decodeControlEvent(value: unknown): ControlEvent {
-  if (!isRecord(value) || !hasKeys(value, ["sequence", "operation"]) || !isSafeNonNegativeInteger(value.sequence)) return invalid("control event");
+  if (!isRecord(value) || !hasKeys(value, ["sequence", "operation"]) || !isSafeNonNegativeInteger(value.sequence))
+    return invalid("control event");
   return { sequence: value.sequence, operation: decodeOperation(value.operation) };
 }
 
 export function decodeReconnectSnapshot(value: unknown): ReconnectSnapshot {
-  if (!isRecord(value) || !hasKeys(value, ["cursor", "cursor_gap", "operations", "events"]) ||
-    !isSafeNonNegativeInteger(value.cursor) || typeof value.cursor_gap !== "boolean" ||
-    !Array.isArray(value.operations) || !Array.isArray(value.events)) return invalid("reconnect snapshot");
+  if (
+    !isRecord(value) ||
+    !hasKeys(value, ["cursor", "cursor_gap", "operations", "events"]) ||
+    !isSafeNonNegativeInteger(value.cursor) ||
+    typeof value.cursor_gap !== "boolean" ||
+    !Array.isArray(value.operations) ||
+    !Array.isArray(value.events)
+  )
+    return invalid("reconnect snapshot");
   const operations = value.operations.map(decodeOperation);
   if (new Set(operations.map((item) => item.id)).size !== operations.length) return invalid("reconnect snapshot");
   const events = value.events.map(decodeControlEvent);
@@ -253,19 +327,27 @@ export function decodeReconnectSnapshot(value: unknown): ReconnectSnapshot {
 }
 
 export function decodeOperationAccepted(value: unknown): OperationAccepted {
-  if (!isRecord(value) || !hasKeys(value, ["operation_id"]) || !nonEmpty(value.operation_id)) return invalid("operation acceptance");
+  if (!isRecord(value) || !hasKeys(value, ["operation_id"]) || !nonEmpty(value.operation_id))
+    return invalid("operation acceptance");
   return { operationId: value.operation_id };
 }
 
 export function decodeControlError(value: unknown): ControlError {
-  if (!isRecord(value) || !hasKeys(value, ["code", "message"]) || !nonEmpty(value.code) || !nonEmpty(value.message)) return invalid("control error");
+  if (!isRecord(value) || !hasKeys(value, ["code", "message"]) || !nonEmpty(value.code) || !nonEmpty(value.message))
+    return invalid("control error");
   return { code: value.code, message: value.message };
 }
 
 export function decodeNodeIdentityProof(value: unknown): NodeIdentityProof {
-  if (!isRecord(value) || !hasKeys(value, ["protocol_version", "node_id", "runtime_identity", "status", "challenge_proof"]) ||
-    value.protocol_version !== 1 || !nonEmpty(value.node_id) || !nonEmpty(value.runtime_identity) ||
-    typeof value.challenge_proof !== "string" || !/^[0-9a-f]{64}$/.test(value.challenge_proof)) {
+  if (
+    !isRecord(value) ||
+    !hasKeys(value, ["protocol_version", "node_id", "runtime_identity", "status", "challenge_proof"]) ||
+    value.protocol_version !== 1 ||
+    !nonEmpty(value.node_id) ||
+    !nonEmpty(value.runtime_identity) ||
+    typeof value.challenge_proof !== "string" ||
+    !/^[0-9a-f]{64}$/.test(value.challenge_proof)
+  ) {
     return invalid("node identity proof");
   }
   return {

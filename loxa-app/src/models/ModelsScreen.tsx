@@ -9,10 +9,7 @@ import type {
   loadModel as defaultLoadModel,
   unloadModel as defaultUnloadModel,
 } from "../control/client";
-import type {
-  ControlStreamHandle,
-  streamControlEvents as defaultStreamControlEvents,
-} from "../control/events";
+import type { ControlStreamHandle, streamControlEvents as defaultStreamControlEvents } from "../control/events";
 import type {
   ArtifactState,
   ArtifactInvalidReason,
@@ -98,15 +95,13 @@ export function ModelsScreen({
         setNotice("Model verification is still pending. Refresh Models or wait for a new node update to check again");
         return;
       }
-      const backoff = Math.min(
-        30_000,
-        verificationPollMs * (2 ** Math.min(verificationAttempts, 4)),
-      );
+      const backoff = Math.min(30_000, verificationPollMs * 2 ** Math.min(verificationAttempts, 4));
       verificationTimer = setTimeout(() => {
         verificationTimer = undefined;
         if (disposed || !verificationPending) return;
         verificationAttempts += 1;
-        void services.readControlToken(endpoint)
+        void services
+          .readControlToken(endpoint)
           .then((token) => services.getInventory(endpoint, token, { signal: controller.signal }))
           .then((next) => {
             if (disposed) return;
@@ -124,8 +119,9 @@ export function ModelsScreen({
       if (disposed) return;
       setModels(next);
       setInventoryLoaded(true);
-      verificationPending = next.some((entry) =>
-        entry.artifact.kind === "invalid" && entry.artifact.reason === "verification_required");
+      verificationPending = next.some(
+        (entry) => entry.artifact.kind === "invalid" && entry.artifact.reason === "verification_required",
+      );
       if (!verificationPending && verificationTimer !== undefined) {
         clearTimeout(verificationTimer);
         verificationTimer = undefined;
@@ -137,8 +133,12 @@ export function ModelsScreen({
 
     const refreshTruth = async (version: number) => {
       const [nextModels, nextNode] = await Promise.all([
-        services.readControlToken(endpoint).then((token) => services.getInventory(endpoint, token, { signal: controller.signal })),
-        services.readControlToken(endpoint).then((token) => services.getControlNode(endpoint, token, { signal: controller.signal })),
+        services
+          .readControlToken(endpoint)
+          .then((token) => services.getInventory(endpoint, token, { signal: controller.signal })),
+        services
+          .readControlToken(endpoint)
+          .then((token) => services.getControlNode(endpoint, token, { signal: controller.signal })),
       ]);
       if (disposed || version !== nodeRevisionRef.current) return;
       verificationAttempts = 0;
@@ -149,7 +149,7 @@ export function ModelsScreen({
     const connectEvents = async () => {
       const token = await services.readControlToken(endpoint);
       if (disposed) return;
-      setLiveState((current) => current === "reconnecting" ? "reconnecting" : "connecting");
+      setLiveState((current) => (current === "reconnecting" ? "reconnecting" : "connecting"));
       streamRef.current = services.createControlEventStream(
         endpoint,
         token,
@@ -159,15 +159,19 @@ export function ModelsScreen({
             if (disposed) return;
             cursorRef.current = snapshot.cursor;
             replaceOperations(snapshot.operations);
-            snapshot.operations.filter(isActiveLifecycleOperation)
+            snapshot.operations
+              .filter(isActiveLifecycleOperation)
               .forEach((operation) => onModelMutationStart?.(operation.id));
-            snapshot.operations.filter(isTerminalLifecycleOperation)
-              .forEach((operation) => { void onModelMutationSettled?.(operation.id); });
+            snapshot.operations.filter(isTerminalLifecycleOperation).forEach((operation) => {
+              void onModelMutationSettled?.(operation.id);
+            });
             setLiveState("live");
             setError("");
-            setNotice(snapshot.cursorGap
-              ? "Live updates restored; older compacted events were replaced by the current snapshot"
-              : "Live model updates connected");
+            setNotice(
+              snapshot.cursorGap
+                ? "Live updates restored; older compacted events were replaced by the current snapshot"
+                : "Live model updates connected",
+            );
           },
           onEvent: (event) => {
             if (disposed) return;
@@ -209,26 +213,30 @@ export function ModelsScreen({
         setNotice("Live model updates stopped after repeated failures. Retry when the node is available");
         return;
       }
-      const delay = Math.min(30_000, reconnectDelayMs * (2 ** Math.min(reconnectAttempts, 4)));
+      const delay = Math.min(30_000, reconnectDelayMs * 2 ** Math.min(reconnectAttempts, 4));
       reconnectTimer = setTimeout(() => {
         if (disposed) return;
         reconnectAttempts += 1;
         void Promise.all([
-          services.readControlToken(endpoint).then((token) =>
-            services.getControlNode(endpoint, token, { signal: controller.signal })),
-          services.readControlToken(endpoint).then((token) =>
-            services.getInventory(endpoint, token, { signal: controller.signal })),
-        ]).then(([nextNode, nextModels]) => {
-          if (disposed) return;
-          setNode(nextNode);
-          nodeRevisionRef.current += 1;
-          verificationAttempts = 0;
-          publishModels(nextModels);
-          setError("");
-          void connectEvents().catch(handleReconnectFailure);
-        }).catch((reason: unknown) => {
-          handleReconnectFailure(reason);
-        });
+          services
+            .readControlToken(endpoint)
+            .then((token) => services.getControlNode(endpoint, token, { signal: controller.signal })),
+          services
+            .readControlToken(endpoint)
+            .then((token) => services.getInventory(endpoint, token, { signal: controller.signal })),
+        ])
+          .then(([nextNode, nextModels]) => {
+            if (disposed) return;
+            setNode(nextNode);
+            nodeRevisionRef.current += 1;
+            verificationAttempts = 0;
+            publishModels(nextModels);
+            setError("");
+            void connectEvents().catch(handleReconnectFailure);
+          })
+          .catch((reason: unknown) => {
+            handleReconnectFailure(reason);
+          });
       }, delay);
     }
 
@@ -241,22 +249,26 @@ export function ModelsScreen({
     }
 
     void Promise.all([
-      services.readControlToken(endpoint).then((token) =>
-        services.getControlNode(endpoint, token, { signal: controller.signal })),
-      services.readControlToken(endpoint).then((token) =>
-        services.getInventory(endpoint, token, { signal: controller.signal })),
-    ]).then(async ([nextNode, nextModels]) => {
-      if (disposed) return;
-      setNode(nextNode);
-      nodeRevisionRef.current += 1;
-      publishModels(nextModels);
-      await connectEvents();
-    }).catch((reason: unknown) => {
-      if (disposed || controller.signal.aborted) return;
-      setError(message(reason));
-      setLiveState("error");
-      setNotice("Model controls unavailable");
-    });
+      services
+        .readControlToken(endpoint)
+        .then((token) => services.getControlNode(endpoint, token, { signal: controller.signal })),
+      services
+        .readControlToken(endpoint)
+        .then((token) => services.getInventory(endpoint, token, { signal: controller.signal })),
+    ])
+      .then(async ([nextNode, nextModels]) => {
+        if (disposed) return;
+        setNode(nextNode);
+        nodeRevisionRef.current += 1;
+        publishModels(nextModels);
+        await connectEvents();
+      })
+      .catch((reason: unknown) => {
+        if (disposed || controller.signal.aborted) return;
+        setError(message(reason));
+        setLiveState("error");
+        setNotice("Model controls unavailable");
+      });
 
     const disposeWork = () => {
       if (disposed) return;
@@ -274,7 +286,17 @@ export function ModelsScreen({
       window.removeEventListener("beforeunload", disposeWork);
       disposeWork();
     };
-  }, [endpoint, onModelMutationSettled, onModelMutationStart, reconnectDelayMs, reconnectLimit, retryNonce, services, verificationPollLimit, verificationPollMs]);
+  }, [
+    endpoint,
+    onModelMutationSettled,
+    onModelMutationStart,
+    reconnectDelayMs,
+    reconnectLimit,
+    retryNonce,
+    services,
+    verificationPollLimit,
+    verificationPollMs,
+  ]);
 
   const latestByModel = useMemo(() => {
     const latest = new Map<string, OperationView>();
@@ -337,9 +359,10 @@ export function ModelsScreen({
     try {
       const nodeRevision = nodeRevisionRef.current;
       const token = await services.readControlToken(endpoint);
-      const accepted = kind === "load"
-        ? await services.loadModel(endpoint, token, modelId, { signal })
-        : await services.unloadModel(endpoint, token, { signal });
+      const accepted =
+        kind === "load"
+          ? await services.loadModel(endpoint, token, modelId, { signal })
+          : await services.unloadModel(endpoint, token, { signal });
       onModelMutationStart?.(accepted.operationId);
       if (!activeRef.current || signal.aborted) return;
       const operationToken = await services.readControlToken(endpoint);
@@ -365,11 +388,16 @@ export function ModelsScreen({
     }
   };
 
-  const activeUnload = node?.activeModelId === null ? undefined : Object.values(operations)
-    .filter((operation) => operation.kind === "unload" && operation.id === node?.operationId)
-    .sort((left, right) => right.updatedAtUnixMs - left.updatedAtUnixMs)[0];
-  const mutationBusy = pendingModels.size > 0 || node?.operationId !== null || Object.values(operations).some((operation) =>
-    operation.status === "queued" || operation.status === "running");
+  const activeUnload =
+    node?.activeModelId === null
+      ? undefined
+      : Object.values(operations)
+          .filter((operation) => operation.kind === "unload" && operation.id === node?.operationId)
+          .sort((left, right) => right.updatedAtUnixMs - left.updatedAtUnixMs)[0];
+  const mutationBusy =
+    pendingModels.size > 0 ||
+    node?.operationId !== null ||
+    Object.values(operations).some((operation) => operation.status === "queued" || operation.status === "running");
 
   return (
     <section className={styles.screen} aria-labelledby="models-heading">
@@ -379,19 +407,37 @@ export function ModelsScreen({
           <h1 id="models-heading">Models</h1>
           <p className="screen-summary">Download Loxa-tested recipes. Downloading never loads or switches a model.</p>
         </div>
-        <p className={`status-badge live-${liveState}`} role="status" aria-live="polite">{liveLabel(liveState)}</p>
+        <p className={`status-badge live-${liveState}`} role="status" aria-live="polite">
+          {liveLabel(liveState)}
+        </p>
       </header>
 
       <div className={styles.toolbar} aria-label="Model control summary">
-        <span>Node <strong>{node === null ? "Checking" : nodeStatusLabel(node)}</strong></span>
-        <span>Endpoint <span className="technical-value">{endpoint}</span></span>
+        <span>
+          Node <strong>{node === null ? "Checking" : nodeStatusLabel(node)}</strong>
+        </span>
+        <span>
+          Endpoint <span className="technical-value">{endpoint}</span>
+        </span>
         <span>{models.length} verified recipes</span>
       </div>
 
-      {error && <p className={styles.panel} role="alert">{error}</p>}
-      {node?.status === "recovery_required" && <p className={styles.panel} role="alert">Recovery required. Model and chat controls are blocked until the node is safely restarted.</p>}
+      {error && (
+        <p className={styles.panel} role="alert">
+          {error}
+        </p>
+      )}
+      {node?.status === "recovery_required" && (
+        <p className={styles.panel} role="alert">
+          Recovery required. Model and chat controls are blocked until the node is safely restarted.
+        </p>
+      )}
       {liveState === "error" && (
-        <button className="secondary-button interactive-target" type="button" onClick={() => setRetryNonce((value) => value + 1)}>
+        <button
+          className="secondary-button interactive-target"
+          type="button"
+          onClick={() => setRetryNonce((value) => value + 1)}
+        >
           Retry live updates
         </button>
       )}
@@ -418,14 +464,18 @@ export function ModelsScreen({
           />
         ))}
       </div>
-      <p className="visually-hidden" aria-live="polite">{notice}</p>
+      <p className="visually-hidden" aria-live="polite">
+        {notice}
+      </p>
     </section>
   );
 }
 
 function isActiveLifecycleOperation(operation: OperationView): boolean {
-  return (operation.kind === "load" || operation.kind === "unload") &&
-    (operation.status === "queued" || operation.status === "running");
+  return (
+    (operation.kind === "load" || operation.kind === "unload") &&
+    (operation.status === "queued" || operation.status === "running")
+  );
 }
 
 function isTerminalLifecycleOperation(operation: OperationView): boolean {
@@ -462,16 +512,20 @@ function ModelRow({
   const actionable = entry.compatibility.compatible && entry.engine.eligible;
   const displayedOperation = unloadOperation ?? operation;
   const inProgress = displayedOperation?.status === "queued" || displayedOperation?.status === "running";
-  const status = inProgress && displayedOperation
-    ? operationLabel(displayedOperation)
-    : artifactLabel(entry.artifact, entry.sizeBytes);
-  const showDownload = !inProgress && entry.artifact.kind !== "downloaded" &&
+  const status =
+    inProgress && displayedOperation
+      ? operationLabel(displayedOperation)
+      : artifactLabel(entry.artifact, entry.sizeBytes);
+  const showDownload =
+    !inProgress &&
+    entry.artifact.kind !== "downloaded" &&
     !(entry.artifact.kind === "invalid" && entry.artifact.reason === "verification_required");
-  const actionLabel = entry.artifact.kind === "partial"
-    ? `Resume ${entry.id}`
-    : entry.artifact.kind === "invalid"
-      ? `Repair ${entry.id}`
-      : `Download ${entry.id}`;
+  const actionLabel =
+    entry.artifact.kind === "partial"
+      ? `Resume ${entry.id}`
+      : entry.artifact.kind === "invalid"
+        ? `Repair ${entry.id}`
+        : `Download ${entry.id}`;
 
   return (
     <article className={styles.row} aria-labelledby={headingId}>
@@ -482,10 +536,15 @@ function ModelRow({
           <span className={styles.chip}>{status}</span>
         </div>
         <p className={styles.metadata}>
-          <span>{entry.params}</span><span>{entry.quant}</span><span>{formatBytes(entry.sizeBytes)}</span>
-          <span>{entry.license}</span><span>{entry.engine.engine}</span>
+          <span>{entry.params}</span>
+          <span>{entry.quant}</span>
+          <span>{formatBytes(entry.sizeBytes)}</span>
+          <span>{entry.license}</span>
+          <span>{entry.engine.engine}</span>
         </p>
-        <p className={`technical-value ${styles.repository}`}>{entry.repo}@{entry.revision}</p>
+        <p className={`technical-value ${styles.repository}`}>
+          {entry.repo}@{entry.revision}
+        </p>
         <p id={reasonId} className={actionable ? styles.reason : `${styles.reason} ${styles.reasonBlocking}`}>
           {entry.compatibility.reason} {entry.engine.reason}
         </p>
@@ -501,12 +560,17 @@ function ModelRow({
               />
             )}
             <span className="technical-value">
-              {formatBytes(displayedOperation.progress.completedBytes)}{displayedOperation.progress.totalBytes === null ? " downloaded" : ` of ${formatBytes(displayedOperation.progress.totalBytes)}`}
+              {formatBytes(displayedOperation.progress.completedBytes)}
+              {displayedOperation.progress.totalBytes === null
+                ? " downloaded"
+                : ` of ${formatBytes(displayedOperation.progress.totalBytes)}`}
             </span>
           </div>
         )}
         {displayedOperation?.error && <p className={styles.operationError}>{displayedOperation.error}</p>}
-        {displayedOperation && !inProgress && <p className={styles.operationHistory}>Last operation: {operationLabel(displayedOperation)}</p>}
+        {displayedOperation && !inProgress && (
+          <p className={styles.operationHistory}>Last operation: {operationLabel(displayedOperation)}</p>
+        )}
       </div>
       <div className={styles.actions}>
         {inProgress && displayedOperation?.kind === "download" ? (
@@ -516,7 +580,9 @@ function ModelRow({
             disabled={pending}
             onClick={() => onCancel(displayedOperation)}
             aria-label={`Cancel ${displayedOperation.kind} ${entry.id}`}
-          >Cancel</button>
+          >
+            Cancel
+          </button>
         ) : inProgress && displayedOperation ? (
           <span className={styles.actionLabel}>{operationLabel(displayedOperation)}</span>
         ) : showDownload ? (
@@ -527,17 +593,25 @@ function ModelRow({
             aria-describedby={reasonId}
             aria-label={actionLabel}
             onClick={onDownload}
-          >{entry.artifact.kind === "partial" ? "Resume" : entry.artifact.kind === "invalid" ? "Repair" : "Download"}</button>
+          >
+            {entry.artifact.kind === "partial" ? "Resume" : entry.artifact.kind === "invalid" ? "Repair" : "Download"}
+          </button>
         ) : entry.artifact.kind === "downloaded" && actionable && node?.status !== "recovery_required" ? (
           <button
             className={active ? "secondary-button interactive-target" : "primary-button interactive-target"}
             type="button"
             disabled={pending || mutationBusy}
             onClick={active ? onUnload : onLoad}
-            aria-label={active ? `Unload ${entry.id}` : node?.activeModelId ? `Switch to ${entry.id}` : `Load ${entry.id}`}
-          >{active ? "Unload" : node?.activeModelId ? "Switch" : "Load"}</button>
+            aria-label={
+              active ? `Unload ${entry.id}` : node?.activeModelId ? `Switch to ${entry.id}` : `Load ${entry.id}`
+            }
+          >
+            {active ? "Unload" : node?.activeModelId ? "Switch" : "Load"}
+          </button>
         ) : (
-          <span className={styles.actionLabel}>{entry.artifact.kind === "downloaded" ? "Unavailable to load" : "Awaiting verification"}</span>
+          <span className={styles.actionLabel}>
+            {entry.artifact.kind === "downloaded" ? "Unavailable to load" : "Awaiting verification"}
+          </span>
         )}
       </div>
     </article>

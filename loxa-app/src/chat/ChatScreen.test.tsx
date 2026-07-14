@@ -29,10 +29,18 @@ function services(ready = true) {
     finished: Promise.resolve({ kind: "completed" }),
   };
   const api: ChatScreenServices = {
-    getStatus: vi.fn().mockResolvedValue(ready ? {
-      node_id: "node-7", health: "ready", model: "loxa",
-      engine: { name: "llama.cpp", version: "b9999" }, runtime_model: "gemma", profile: "default",
-    } : { node_id: "node-7", health: "unavailable", model: "loxa", engine: null, runtime_model: null, profile: null }),
+    getStatus: vi.fn().mockResolvedValue(
+      ready
+        ? {
+            node_id: "node-7",
+            health: "ready",
+            model: "loxa",
+            engine: { name: "llama.cpp", version: "b9999" },
+            runtime_model: "gemma",
+            profile: "default",
+          }
+        : { node_id: "node-7", health: "unavailable", model: "loxa", engine: null, runtime_model: null, profile: null },
+    ),
     getModels: vi.fn().mockResolvedValue({ object: "list", data: [{ id: "loxa", object: "model", owned_by: "loxa" }] }),
     readControlToken: vi.fn().mockResolvedValue("ab".repeat(32)),
     getCapabilities: vi.fn().mockResolvedValue({
@@ -40,13 +48,52 @@ function services(ready = true) {
       documentInputReason: "Document input is not supported by this model and backend.",
       textChat: true,
     }),
-    getControlNode: vi.fn().mockResolvedValue({ status: "ready", activeModelId: "gemma", operationId: null, error: null }),
+    getControlNode: vi
+      .fn()
+      .mockResolvedValue({ status: "ready", activeModelId: "gemma", operationId: null, error: null }),
     getInventory: vi.fn().mockResolvedValue([
-      { id: "gemma", repo: "loxa/gemma", revision: "rev", filename: "gemma.gguf", sha256: "ab".repeat(32), sizeBytes: 1, license: "Apache-2.0", params: "4B", quant: "Q4", minFreeMemoryGiB: 1, artifact: { kind: "downloaded" }, compatibility: { compatible: true, reason: "Compatible" }, engine: { engine: "llama-cpp", eligible: true, reason: "Eligible" } },
-      { id: "other", repo: "loxa/other", revision: "rev", filename: "other.gguf", sha256: "cd".repeat(32), sizeBytes: 1, license: "Apache-2.0", params: "4B", quant: "Q4", minFreeMemoryGiB: 1, artifact: { kind: "downloaded" }, compatibility: { compatible: true, reason: "Compatible" }, engine: { engine: "llama-cpp", eligible: true, reason: "Eligible" } },
+      {
+        id: "gemma",
+        repo: "loxa/gemma",
+        revision: "rev",
+        filename: "gemma.gguf",
+        sha256: "ab".repeat(32),
+        sizeBytes: 1,
+        license: "Apache-2.0",
+        params: "4B",
+        quant: "Q4",
+        minFreeMemoryGiB: 1,
+        artifact: { kind: "downloaded" },
+        compatibility: { compatible: true, reason: "Compatible" },
+        engine: { engine: "llama-cpp", eligible: true, reason: "Eligible" },
+      },
+      {
+        id: "other",
+        repo: "loxa/other",
+        revision: "rev",
+        filename: "other.gguf",
+        sha256: "cd".repeat(32),
+        sizeBytes: 1,
+        license: "Apache-2.0",
+        params: "4B",
+        quant: "Q4",
+        minFreeMemoryGiB: 1,
+        artifact: { kind: "downloaded" },
+        compatibility: { compatible: true, reason: "Compatible" },
+        engine: { engine: "llama-cpp", eligible: true, reason: "Eligible" },
+      },
     ]),
     loadModel: vi.fn().mockResolvedValue({ operationId: "op-load" }),
-    getOperation: vi.fn().mockResolvedValue({ id: "op-load", kind: "load", status: "succeeded", modelId: "other", progress: null, error: null, createdAtUnixMs: 1, updatedAtUnixMs: 2 }),
+    getOperation: vi.fn().mockResolvedValue({
+      id: "op-load",
+      kind: "load",
+      status: "succeeded",
+      modelId: "other",
+      progress: null,
+      error: null,
+      createdAtUnixMs: 1,
+      updatedAtUnixMs: 2,
+    }),
     createControlEventStream: vi.fn((_endpoint, _token, _cursor, next) => {
       controlCallbacks = next;
       controlCallbackHistory.push(next);
@@ -61,14 +108,30 @@ function services(ready = true) {
     }),
     copyText: vi.fn().mockResolvedValue(undefined),
   };
-  return { api, handle, callbacks: () => callbacks, controlCallbacks: () => controlCallbacks, callbackHistory, controlCallbackHistory, controlHandles };
+  return {
+    api,
+    handle,
+    callbacks: () => callbacks,
+    controlCallbacks: () => controlCallbacks,
+    callbackHistory,
+    controlCallbackHistory,
+    controlHandles,
+  };
 }
 
 function historyTurn(id: string, chatId: string) {
   return {
-    id, chatId, ordinal: 0, state: "completed" as const, modelAlias: "loxa" as const,
-    recipeId: "gemma", engineName: "llama.cpp", engineVersion: null, errorCode: null,
-    createdAtMs: 1, updatedAtMs: 2,
+    id,
+    chatId,
+    ordinal: 0,
+    state: "completed" as const,
+    modelAlias: "loxa" as const,
+    recipeId: "gemma",
+    engineName: "llama.cpp",
+    engineVersion: null,
+    errorCode: null,
+    createdAtMs: 1,
+    updatedAtMs: 2,
   };
 }
 
@@ -86,7 +149,13 @@ function conversationRailTarget() {
 describe("ChatScreen", () => {
   it("uses a named scrolling transcript and a final-row message composer", async () => {
     const setup = services();
-    render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" conversationRailTarget={conversationRailTarget()} />);
+    render(
+      <ChatScreen
+        services={setup.api}
+        endpoint="http://127.0.0.1:8080"
+        conversationRailTarget={conversationRailTarget()}
+      />,
+    );
 
     expect(await screen.findByRole("log", { name: "Conversation" })).toBeInTheDocument();
     expect(screen.getByRole("form", { name: "Message composer" })).toBeInTheDocument();
@@ -101,31 +170,72 @@ describe("ChatScreen", () => {
     const assistantMessageId = "3123456789abcdef0123456789abcdef";
     let persistentCallbacks: import("./historyClient").PersistentTurnCallbacks | undefined;
     Object.assign(setup.api, {
-      listChats: vi.fn().mockResolvedValue({ chats: [{ id: chatId, title: "Node notes", createdAtMs: 1, updatedAtMs: 4 }], nextBefore: null }),
+      listChats: vi.fn().mockResolvedValue({
+        chats: [{ id: chatId, title: "Node notes", createdAtMs: 1, updatedAtMs: 4 }],
+        nextBefore: null,
+      }),
       createChat: vi.fn(),
       getChat: vi.fn().mockResolvedValue({ id: chatId, title: "Next question", createdAtMs: 1, updatedAtMs: 5 }),
-      listTurns: vi.fn().mockResolvedValue({ turns: [{ id: turnId, chatId, ordinal: 0, state: "completed", modelAlias: "loxa", recipeId: "gemma", engineName: "llama.cpp", engineVersion: null, errorCode: null, createdAtMs: 2, updatedAtMs: 3 }], nextAfter: null }),
+      listTurns: vi.fn().mockResolvedValue({
+        turns: [
+          {
+            id: turnId,
+            chatId,
+            ordinal: 0,
+            state: "completed",
+            modelAlias: "loxa",
+            recipeId: "gemma",
+            engineName: "llama.cpp",
+            engineVersion: null,
+            errorCode: null,
+            createdAtMs: 2,
+            updatedAtMs: 3,
+          },
+        ],
+        nextAfter: null,
+      }),
       listMessageSummaries: vi.fn().mockResolvedValue([
         { id: userMessageId, turnId, role: "user", contentBytes: 5, createdAtMs: 2, updatedAtMs: 2 },
         { id: assistantMessageId, turnId, role: "assistant", contentBytes: 8, createdAtMs: 3, updatedAtMs: 3 },
       ]),
-      getMessageContent: vi.fn((_endpoint: string, _token: string, _chat: string, _turn: string, messageId: string) => Promise.resolve(messageId === userMessageId ? "Hello" : "**Answer**")),
+      getMessageContent: vi.fn((_endpoint: string, _token: string, _chat: string, _turn: string, messageId: string) =>
+        Promise.resolve(messageId === userMessageId ? "Hello" : "**Answer**"),
+      ),
       renameChat: vi.fn(),
       deleteChat: vi.fn(),
-      createPersistentTurn: vi.fn((_endpoint: string, _token: string, _chat: string, _content: string, callbacks: import("./historyClient").PersistentTurnCallbacks) => {
-        persistentCallbacks = callbacks;
-        return { cancel: vi.fn(), dispose: vi.fn(), finished: new Promise(() => undefined) };
-      }),
+      createPersistentTurn: vi.fn(
+        (
+          _endpoint: string,
+          _token: string,
+          _chat: string,
+          _content: string,
+          callbacks: import("./historyClient").PersistentTurnCallbacks,
+        ) => {
+          persistentCallbacks = callbacks;
+          return { cancel: vi.fn(), dispose: vi.fn(), finished: new Promise(() => undefined) };
+        },
+      ),
     });
 
-    render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" conversationRailTarget={conversationRailTarget()} />);
+    render(
+      <ChatScreen
+        services={setup.api}
+        endpoint="http://127.0.0.1:8080"
+        conversationRailTarget={conversationRailTarget()}
+      />,
+    );
     expect(await screen.findByRole("navigation", { name: "Chat conversations" })).toBeInTheDocument();
     expect(await screen.findByRole("button", { name: "Open Node notes" })).toHaveAttribute("aria-current", "page");
     expect(await screen.findByText("Answer", { selector: "strong" })).toBeInTheDocument();
     await user.type(screen.getByLabelText("Message"), "Next question");
     await user.click(screen.getByRole("button", { name: "Send message" }));
     expect(setup.api.createPersistentTurn).toHaveBeenCalledWith(
-      "http://127.0.0.1:8080", "ab".repeat(32), chatId, "Next question", expect.any(Object), expect.any(AbortSignal),
+      "http://127.0.0.1:8080",
+      "ab".repeat(32),
+      chatId,
+      "Next question",
+      expect.any(Object),
+      expect.any(AbortSignal),
     );
     act(() => persistentCallbacks?.onStarted("4123456789abcdef0123456789abcdef", 2));
     expect(screen.getByText("2 earlier turns were omitted from the model context.")).toBeVisible();
@@ -142,18 +252,31 @@ describe("ChatScreen", () => {
     const setup = services();
     const chatId = "0123456789abcdef0123456789abcdef";
     Object.assign(setup.api, {
-      listChats: vi.fn()
+      listChats: vi
+        .fn()
         .mockRejectedValueOnce(new Error("history unavailable"))
-        .mockResolvedValueOnce({ chats: [{ id: chatId, title: "Recovered", createdAtMs: 1, updatedAtMs: 2 }], nextBefore: null }),
+        .mockResolvedValueOnce({
+          chats: [{ id: chatId, title: "Recovered", createdAtMs: 1, updatedAtMs: 2 }],
+          nextBefore: null,
+        }),
       createChat: vi.fn(),
-      listTurns: vi.fn()
+      listTurns: vi
+        .fn()
         .mockResolvedValueOnce({ turns: [], nextAfter: "repeat" })
         .mockResolvedValueOnce({ turns: [], nextAfter: "repeat" }),
       listMessageSummaries: vi.fn(),
       getMessageContent: vi.fn(),
-      renameChat: vi.fn(), deleteChat: vi.fn(), createPersistentTurn: vi.fn(),
+      renameChat: vi.fn(),
+      deleteChat: vi.fn(),
+      createPersistentTurn: vi.fn(),
     });
-    render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" conversationRailTarget={conversationRailTarget()} />);
+    render(
+      <ChatScreen
+        services={setup.api}
+        endpoint="http://127.0.0.1:8080"
+        conversationRailTarget={conversationRailTarget()}
+      />,
+    );
     expect(await screen.findByText("history unavailable")).toBeVisible();
     await user.click(screen.getByRole("button", { name: "Retry conversation history" }));
     expect(await screen.findByRole("button", { name: "Open Recovered" })).toBeInTheDocument();
@@ -171,29 +294,51 @@ describe("ChatScreen", () => {
     let resolveStale!: (page: Awaited<ReturnType<NonNullable<ChatScreenServices["listTurns"]>>>) => void;
     let staleSignal: AbortSignal | undefined;
     Object.assign(setup.api, {
-      listChats: vi.fn().mockResolvedValue({ chats: [
-        { id: firstChat, title: "First", createdAtMs: 1, updatedAtMs: 1 },
-        { id: staleChat, title: "Stale", createdAtMs: 2, updatedAtMs: 2 },
-        { id: freshChat, title: "Fresh", createdAtMs: 3, updatedAtMs: 3 },
-      ], nextBefore: null }),
-      listTurns: vi.fn((_endpoint: string, _token: string, chatId: string, _page: unknown, options?: { signal?: AbortSignal }) => {
-        if (chatId === staleChat) {
-          staleSignal = options?.signal;
-          return new Promise((resolve) => { resolveStale = resolve; });
-        }
-        if (chatId === freshChat) return Promise.resolve({ turns: [historyTurn(freshTurn, freshChat)], nextAfter: null });
-        return Promise.resolve({ turns: [], nextAfter: null });
+      listChats: vi.fn().mockResolvedValue({
+        chats: [
+          { id: firstChat, title: "First", createdAtMs: 1, updatedAtMs: 1 },
+          { id: staleChat, title: "Stale", createdAtMs: 2, updatedAtMs: 2 },
+          { id: freshChat, title: "Fresh", createdAtMs: 3, updatedAtMs: 3 },
+        ],
+        nextBefore: null,
       }),
-      listMessageSummaries: vi.fn((_endpoint: string, _token: string, _chat: string, turnId: string) => Promise.resolve([
-        historyMessage(`${turnId.slice(0, 31)}a`, turnId, "user"),
-        historyMessage(`${turnId.slice(0, 31)}b`, turnId, "assistant"),
-      ])),
+      listTurns: vi.fn(
+        (_endpoint: string, _token: string, chatId: string, _page: unknown, options?: { signal?: AbortSignal }) => {
+          if (chatId === staleChat) {
+            staleSignal = options?.signal;
+            return new Promise((resolve) => {
+              resolveStale = resolve;
+            });
+          }
+          if (chatId === freshChat)
+            return Promise.resolve({ turns: [historyTurn(freshTurn, freshChat)], nextAfter: null });
+          return Promise.resolve({ turns: [], nextAfter: null });
+        },
+      ),
+      listMessageSummaries: vi.fn((_endpoint: string, _token: string, _chat: string, turnId: string) =>
+        Promise.resolve([
+          historyMessage(`${turnId.slice(0, 31)}a`, turnId, "user"),
+          historyMessage(`${turnId.slice(0, 31)}b`, turnId, "assistant"),
+        ]),
+      ),
       getMessageContent: vi.fn((_endpoint: string, _token: string, _chat: string, turnId: string, messageId: string) =>
-        Promise.resolve(messageId.endsWith("a") ? "Prompt" : turnId === freshTurn ? "Fresh assistant" : "Stale assistant")),
-      createChat: vi.fn(), renameChat: vi.fn(), deleteChat: vi.fn(), createPersistentTurn: vi.fn(),
+        Promise.resolve(
+          messageId.endsWith("a") ? "Prompt" : turnId === freshTurn ? "Fresh assistant" : "Stale assistant",
+        ),
+      ),
+      createChat: vi.fn(),
+      renameChat: vi.fn(),
+      deleteChat: vi.fn(),
+      createPersistentTurn: vi.fn(),
     });
 
-    render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" conversationRailTarget={conversationRailTarget()} />);
+    render(
+      <ChatScreen
+        services={setup.api}
+        endpoint="http://127.0.0.1:8080"
+        conversationRailTarget={conversationRailTarget()}
+      />,
+    );
     await user.click(await screen.findByRole("button", { name: "Open Stale" }));
     await vi.waitFor(() => expect(staleSignal).toBeInstanceOf(AbortSignal));
     await user.click(screen.getByRole("button", { name: "Open Fresh" }));
@@ -211,18 +356,34 @@ describe("ChatScreen", () => {
     const setup = services();
     let retrySignal: AbortSignal | undefined;
     Object.assign(setup.api, {
-      listChats: vi.fn()
+      listChats: vi
+        .fn()
         .mockRejectedValueOnce(new Error("history unavailable"))
-        .mockImplementationOnce((_endpoint: string, _token: string, _page: unknown, options?: { signal?: AbortSignal }) => {
-          retrySignal = options?.signal;
-          return new Promise((_resolve, reject) => options?.signal?.addEventListener(
-            "abort", () => reject(new DOMException("aborted", "AbortError")), { once: true },
-          ));
-        }),
-      listTurns: vi.fn(), listMessageSummaries: vi.fn(), getMessageContent: vi.fn(),
-      createChat: vi.fn(), renameChat: vi.fn(), deleteChat: vi.fn(), createPersistentTurn: vi.fn(),
+        .mockImplementationOnce(
+          (_endpoint: string, _token: string, _page: unknown, options?: { signal?: AbortSignal }) => {
+            retrySignal = options?.signal;
+            return new Promise((_resolve, reject) =>
+              options?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), {
+                once: true,
+              }),
+            );
+          },
+        ),
+      listTurns: vi.fn(),
+      listMessageSummaries: vi.fn(),
+      getMessageContent: vi.fn(),
+      createChat: vi.fn(),
+      renameChat: vi.fn(),
+      deleteChat: vi.fn(),
+      createPersistentTurn: vi.fn(),
     });
-    render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" conversationRailTarget={conversationRailTarget()} />);
+    render(
+      <ChatScreen
+        services={setup.api}
+        endpoint="http://127.0.0.1:8080"
+        conversationRailTarget={conversationRailTarget()}
+      />,
+    );
     await user.click(await screen.findByRole("button", { name: "Retry conversation history" }));
     await vi.waitFor(() => expect(retrySignal).toBeInstanceOf(AbortSignal));
 
@@ -237,19 +398,42 @@ describe("ChatScreen", () => {
     const setup = services();
     const chatId = "0123456789abcdef0123456789abcdef";
     let requestSignal: AbortSignal | undefined;
-    const productionFetch = vi.fn((_url: string, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
-      requestSignal = init?.signal ?? undefined;
-      init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
-    }));
+    const productionFetch = vi.fn(
+      (_url: string, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          requestSignal = init?.signal ?? undefined;
+          init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), {
+            once: true,
+          });
+        }),
+    );
     Object.assign(setup.api, {
-      listChats: vi.fn().mockResolvedValue({ chats: [{ id: chatId, title: "Live", createdAtMs: 1, updatedAtMs: 1 }], nextBefore: null }),
+      listChats: vi.fn().mockResolvedValue({
+        chats: [{ id: chatId, title: "Live", createdAtMs: 1, updatedAtMs: 1 }],
+        nextBefore: null,
+      }),
       listTurns: vi.fn().mockResolvedValue({ turns: [], nextAfter: null }),
-      listMessageSummaries: vi.fn(), getMessageContent: vi.fn(),
-      createChat: vi.fn(), renameChat: vi.fn(), deleteChat: vi.fn(),
-      createPersistentTurn: (endpoint: string, token: string, selectedChat: string, content: string, callbacks: import("./historyClient").PersistentTurnCallbacks, signal?: AbortSignal) =>
-        streamPersistentTurn(endpoint, token, selectedChat, content, callbacks, signal, productionFetch),
+      listMessageSummaries: vi.fn(),
+      getMessageContent: vi.fn(),
+      createChat: vi.fn(),
+      renameChat: vi.fn(),
+      deleteChat: vi.fn(),
+      createPersistentTurn: (
+        endpoint: string,
+        token: string,
+        selectedChat: string,
+        content: string,
+        callbacks: import("./historyClient").PersistentTurnCallbacks,
+        signal?: AbortSignal,
+      ) => streamPersistentTurn(endpoint, token, selectedChat, content, callbacks, signal, productionFetch),
     });
-    const view = render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" conversationRailTarget={conversationRailTarget()} />);
+    const view = render(
+      <ChatScreen
+        services={setup.api}
+        endpoint="http://127.0.0.1:8080"
+        conversationRailTarget={conversationRailTarget()}
+      />,
+    );
     await screen.findByRole("button", { name: "Open Live" });
     await user.type(screen.getByLabelText("Message"), "Hello");
     await user.click(screen.getByRole("button", { name: "Send message" }));
@@ -420,12 +604,25 @@ describe("ChatScreen", () => {
     render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
     await screen.findByRole("combobox", { name: "Choose model" });
 
-    act(() => setup.controlCallbacks()?.onSnapshot({
-      cursor: 4,
-      cursorGap: false,
-      operations: [{ id: "load-4", kind: "load", status: "running", modelId: "other", progress: null, error: null, createdAtUnixMs: 1, updatedAtUnixMs: 2 }],
-      events: [],
-    }));
+    act(() =>
+      setup.controlCallbacks()?.onSnapshot({
+        cursor: 4,
+        cursorGap: false,
+        operations: [
+          {
+            id: "load-4",
+            kind: "load",
+            status: "running",
+            modelId: "other",
+            progress: null,
+            error: null,
+            createdAtUnixMs: 1,
+            updatedAtUnixMs: 2,
+          },
+        ],
+        events: [],
+      }),
+    );
 
     expect(screen.getByRole("status")).toHaveTextContent(/model operation in progress/i);
     expect(screen.getByRole("status")).not.toHaveTextContent("Ready");
@@ -439,7 +636,13 @@ describe("ChatScreen", () => {
     render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
     await screen.findByRole("combobox", { name: "Choose model" });
 
-    act(() => setup.controlCallbackHistory[0].onTerminal({ kind: "error", cursor: 7, message: "Live model updates disconnected." }));
+    act(() =>
+      setup.controlCallbackHistory[0].onTerminal({
+        kind: "error",
+        cursor: 7,
+        message: "Live model updates disconnected.",
+      }),
+    );
     expect(screen.getByRole("status")).toHaveTextContent(/reconnecting to live model updates/i);
     expect(screen.getByRole("status")).not.toHaveTextContent("Ready");
     expect(screen.getByLabelText("Message")).toBeDisabled();
@@ -466,13 +669,17 @@ describe("ChatScreen", () => {
     Object.defineProperty(transcript, "clientHeight", { configurable: true, value: 200 });
     transcript.scrollTop = 760;
     fireEvent.scroll(transcript);
-    view.rerender(<ChatTranscript turns={[{ ...first, response: "One two" }]} emptyMessage="Empty" copyText={copyText} />);
+    view.rerender(
+      <ChatTranscript turns={[{ ...first, response: "One two" }]} emptyMessage="Empty" copyText={copyText} />,
+    );
     expect(transcript.scrollTop).toBe(1_000);
 
     transcript.scrollTop = 200;
     fireEvent.scroll(transcript);
     Object.defineProperty(transcript, "scrollHeight", { configurable: true, value: 1_200 });
-    view.rerender(<ChatTranscript turns={[{ ...first, response: "One two three" }]} emptyMessage="Empty" copyText={copyText} />);
+    view.rerender(
+      <ChatTranscript turns={[{ ...first, response: "One two three" }]} emptyMessage="Empty" copyText={copyText} />,
+    );
     expect(transcript.scrollTop).toBe(200);
   });
 
@@ -588,7 +795,12 @@ describe("ChatScreen", () => {
     expect(screen.getByText("gemma", { selector: ".technical-value" })).toBeInTheDocument();
     expect(setup.api.loadModel).not.toHaveBeenCalled();
     await user.click(screen.getByRole("button", { name: "Switch to other" }));
-    expect(setup.api.loadModel).toHaveBeenCalledWith("http://127.0.0.1:8080", "ab".repeat(32), "other", expect.objectContaining({ signal: expect.any(AbortSignal) }));
+    expect(setup.api.loadModel).toHaveBeenCalledWith(
+      "http://127.0.0.1:8080",
+      "ab".repeat(32),
+      "other",
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
     expect(await screen.findByText("other", { selector: ".technical-value" })).toBeInTheDocument();
   });
 
@@ -596,7 +808,12 @@ describe("ChatScreen", () => {
     const user = userEvent.setup();
     const setup = services();
     let resolveOperation!: (operation: Awaited<ReturnType<ChatScreenServices["getOperation"]>>) => void;
-    vi.mocked(setup.api.getOperation).mockImplementationOnce(() => new Promise((resolve) => { resolveOperation = resolve; }));
+    vi.mocked(setup.api.getOperation).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveOperation = resolve;
+        }),
+    );
     vi.mocked(setup.api.getControlNode)
       .mockResolvedValueOnce({ status: "ready", activeModelId: "gemma", operationId: null, error: null })
       .mockResolvedValueOnce({ status: "ready", activeModelId: "other", operationId: null, error: null })
@@ -626,8 +843,14 @@ describe("ChatScreen", () => {
     const operationSignal = vi.mocked(setup.api.getOperation).mock.calls[0][3]?.signal;
     expect(operationSignal?.aborted).toBe(false);
     resolveOperation({
-      id: "op-load", kind: "load", status: "succeeded", modelId: "other", progress: null,
-      error: null, createdAtUnixMs: 1, updatedAtUnixMs: 2,
+      id: "op-load",
+      kind: "load",
+      status: "succeeded",
+      modelId: "other",
+      progress: null,
+      error: null,
+      createdAtUnixMs: 1,
+      updatedAtUnixMs: 2,
     });
     await vi.waitFor(() => expect(setup.api.getControlNode).toHaveBeenCalledTimes(2));
     expect(operationSignal?.aborted).toBe(false);
@@ -655,13 +878,21 @@ describe("ChatScreen", () => {
     await vi.waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("operation read unavailable"));
     expect(onModelMutationSettled).not.toHaveBeenCalled();
 
-    act(() => setup.controlCallbacks()?.onEvent({
-      sequence: 6,
-      operation: {
-        id: "op-load", kind: "load", status: "succeeded", modelId: "other", progress: null,
-        error: null, createdAtUnixMs: 1, updatedAtUnixMs: 2,
-      },
-    }));
+    act(() =>
+      setup.controlCallbacks()?.onEvent({
+        sequence: 6,
+        operation: {
+          id: "op-load",
+          kind: "load",
+          status: "succeeded",
+          modelId: "other",
+          progress: null,
+          error: null,
+          createdAtUnixMs: 1,
+          updatedAtUnixMs: 2,
+        },
+      }),
+    );
     await vi.waitFor(() => expect(onModelMutationSettled).toHaveBeenCalledOnce());
     expect(onModelMutationSettled).toHaveBeenCalledWith("op-load");
   });
@@ -680,16 +911,45 @@ describe("ChatScreen", () => {
     );
     await screen.findByRole("combobox", { name: "Choose model" });
 
-    act(() => setup.controlCallbacks()?.onSnapshot({
-      cursor: 14,
-      cursorGap: true,
-      operations: [
-        { id: "op-active", kind: "load", status: "running", modelId: "other", progress: null, error: null, createdAtUnixMs: 1, updatedAtUnixMs: 2 },
-        { id: "op-current", kind: "load", status: "succeeded", modelId: "other", progress: null, error: null, createdAtUnixMs: 1, updatedAtUnixMs: 2 },
-        { id: "op-old", kind: "unload", status: "failed", modelId: null, progress: null, error: "old", createdAtUnixMs: 1, updatedAtUnixMs: 2 },
-      ],
-      events: [],
-    }));
+    act(() =>
+      setup.controlCallbacks()?.onSnapshot({
+        cursor: 14,
+        cursorGap: true,
+        operations: [
+          {
+            id: "op-active",
+            kind: "load",
+            status: "running",
+            modelId: "other",
+            progress: null,
+            error: null,
+            createdAtUnixMs: 1,
+            updatedAtUnixMs: 2,
+          },
+          {
+            id: "op-current",
+            kind: "load",
+            status: "succeeded",
+            modelId: "other",
+            progress: null,
+            error: null,
+            createdAtUnixMs: 1,
+            updatedAtUnixMs: 2,
+          },
+          {
+            id: "op-old",
+            kind: "unload",
+            status: "failed",
+            modelId: null,
+            progress: null,
+            error: "old",
+            createdAtUnixMs: 1,
+            updatedAtUnixMs: 2,
+          },
+        ],
+        events: [],
+      }),
+    );
 
     expect(onModelMutationStart).toHaveBeenCalledWith("op-active");
     expect(onModelMutationSettled).toHaveBeenCalledWith("op-current");
@@ -702,7 +962,16 @@ describe("ChatScreen", () => {
     vi.mocked(setup.api.getControlNode)
       .mockResolvedValueOnce({ status: "unloaded", activeModelId: null, operationId: null, error: null })
       .mockResolvedValueOnce({ status: "ready", activeModelId: "gemma", operationId: null, error: null });
-    vi.mocked(setup.api.getOperation).mockResolvedValue({ id: "op-load", kind: "load", status: "succeeded", modelId: "gemma", progress: null, error: null, createdAtUnixMs: 1, updatedAtUnixMs: 2 });
+    vi.mocked(setup.api.getOperation).mockResolvedValue({
+      id: "op-load",
+      kind: "load",
+      status: "succeeded",
+      modelId: "gemma",
+      progress: null,
+      error: null,
+      createdAtUnixMs: 1,
+      updatedAtUnixMs: 2,
+    });
     render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
     expect(await screen.findByRole("status")).toHaveTextContent("No model is loaded");
     expect(screen.getByRole("status")).not.toHaveTextContent("Disconnected");
@@ -718,25 +987,47 @@ describe("ChatScreen", () => {
     const chatId = "0123456789abcdef0123456789abcdef";
     const turnId = "1123456789abcdef0123456789abcdef";
     vi.mocked(setup.api.getModels)
-      .mockResolvedValueOnce({ object: "list", data: [] } as unknown as Awaited<ReturnType<ChatScreenServices["getModels"]>>)
+      .mockResolvedValueOnce({ object: "list", data: [] } as unknown as Awaited<
+        ReturnType<ChatScreenServices["getModels"]>
+      >)
       .mockResolvedValueOnce({ object: "list", data: [{ id: "loxa", object: "model", owned_by: "loxa" }] });
     vi.mocked(setup.api.getControlNode)
       .mockResolvedValueOnce({ status: "unloaded", activeModelId: null, operationId: null, error: null })
       .mockResolvedValueOnce({ status: "ready", activeModelId: "gemma", operationId: null, error: null });
-    vi.mocked(setup.api.getOperation).mockResolvedValue({ id: "op-load", kind: "load", status: "succeeded", modelId: "gemma", progress: null, error: null, createdAtUnixMs: 1, updatedAtUnixMs: 2 });
+    vi.mocked(setup.api.getOperation).mockResolvedValue({
+      id: "op-load",
+      kind: "load",
+      status: "succeeded",
+      modelId: "gemma",
+      progress: null,
+      error: null,
+      createdAtUnixMs: 1,
+      updatedAtUnixMs: 2,
+    });
     Object.assign(setup.api, {
-      listChats: vi.fn().mockResolvedValue({ chats: [{ id: chatId, title: "Restored", createdAtMs: 1, updatedAtMs: 2 }], nextBefore: null }),
+      listChats: vi.fn().mockResolvedValue({
+        chats: [{ id: chatId, title: "Restored", createdAtMs: 1, updatedAtMs: 2 }],
+        nextBefore: null,
+      }),
       listTurns: vi.fn().mockResolvedValue({ turns: [historyTurn(turnId, chatId)], nextAfter: null }),
-      listMessageSummaries: vi.fn().mockResolvedValue([
-        historyMessage("2123456789abcdef0123456789abcdef", turnId, "user"),
-        historyMessage("3123456789abcdef0123456789abcdef", turnId, "assistant"),
-      ]),
+      listMessageSummaries: vi
+        .fn()
+        .mockResolvedValue([
+          historyMessage("2123456789abcdef0123456789abcdef", turnId, "user"),
+          historyMessage("3123456789abcdef0123456789abcdef", turnId, "assistant"),
+        ]),
       getMessageContent: vi.fn((_endpoint: string, _token: string, _chat: string, _turn: string, messageId: string) =>
-        Promise.resolve(messageId.startsWith("2") ? "Earlier prompt" : "Earlier answer")),
-      createChat: vi.fn(), renameChat: vi.fn(), deleteChat: vi.fn(), createPersistentTurn: vi.fn(),
+        Promise.resolve(messageId.startsWith("2") ? "Earlier prompt" : "Earlier answer"),
+      ),
+      createChat: vi.fn(),
+      renameChat: vi.fn(),
+      deleteChat: vi.fn(),
+      createPersistentTurn: vi.fn(),
     });
     const target = conversationRailTarget();
-    const view = render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" conversationRailTarget={target} />);
+    const view = render(
+      <ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" conversationRailTarget={target} />,
+    );
     expect(await screen.findByText("Earlier answer")).toBeVisible();
     expect(screen.getByLabelText("Message")).toBeDisabled();
 
@@ -751,7 +1042,16 @@ describe("ChatScreen", () => {
   it("keeps the previous active model when a switch fails", async () => {
     const user = userEvent.setup();
     const setup = services();
-    vi.mocked(setup.api.getOperation).mockResolvedValue({ id: "op-load", kind: "load", status: "failed", modelId: "other", progress: null, error: "readiness failed", createdAtUnixMs: 1, updatedAtUnixMs: 2 });
+    vi.mocked(setup.api.getOperation).mockResolvedValue({
+      id: "op-load",
+      kind: "load",
+      status: "failed",
+      modelId: "other",
+      progress: null,
+      error: "readiness failed",
+      createdAtUnixMs: 1,
+      updatedAtUnixMs: 2,
+    });
     render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
     await user.selectOptions(await screen.findByRole("combobox", { name: "Choose model" }), "other");
     await user.click(screen.getByRole("button", { name: "Switch to other" }));
@@ -759,28 +1059,52 @@ describe("ChatScreen", () => {
     expect(screen.getByText("gemma", { selector: ".technical-value" })).toBeInTheDocument();
   });
 
-  it.each(["rejected", "empty"] as const)("keeps the composer disabled when fresh post-load request-model evidence is %s", async (outcome) => {
-    const user = userEvent.setup();
-    const setup = services();
-    vi.mocked(setup.api.getControlNode)
-      .mockResolvedValueOnce({ status: "ready", activeModelId: "gemma", operationId: null, error: null })
-      .mockResolvedValue({ status: "ready", activeModelId: "other", operationId: null, error: null });
-    vi.mocked(setup.api.getOperation).mockResolvedValue({ id: "op-load", kind: "load", status: "succeeded", modelId: "other", progress: null, error: null, createdAtUnixMs: 1, updatedAtUnixMs: 2 });
-    vi.mocked(setup.api.getModels).mockResolvedValueOnce({ object: "list", data: [{ id: "loxa", object: "model", owned_by: "loxa" }] });
-    if (outcome === "rejected") vi.mocked(setup.api.getModels).mockRejectedValueOnce(new Error("fresh models unavailable"));
-    else vi.mocked(setup.api.getModels).mockResolvedValueOnce({ object: "list", data: [] } as unknown as Awaited<ReturnType<ChatScreenServices["getModels"]>>);
-    render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
-    const picker = await screen.findByRole("combobox", { name: "Choose model" });
-    await user.selectOptions(picker, "other");
-    await user.click(screen.getByRole("button", { name: "Switch to other" }));
+  it.each(["rejected", "empty"] as const)(
+    "keeps the composer disabled when fresh post-load request-model evidence is %s",
+    async (outcome) => {
+      const user = userEvent.setup();
+      const setup = services();
+      vi.mocked(setup.api.getControlNode)
+        .mockResolvedValueOnce({ status: "ready", activeModelId: "gemma", operationId: null, error: null })
+        .mockResolvedValue({ status: "ready", activeModelId: "other", operationId: null, error: null });
+      vi.mocked(setup.api.getOperation).mockResolvedValue({
+        id: "op-load",
+        kind: "load",
+        status: "succeeded",
+        modelId: "other",
+        progress: null,
+        error: null,
+        createdAtUnixMs: 1,
+        updatedAtUnixMs: 2,
+      });
+      vi.mocked(setup.api.getModels).mockResolvedValueOnce({
+        object: "list",
+        data: [{ id: "loxa", object: "model", owned_by: "loxa" }],
+      });
+      if (outcome === "rejected")
+        vi.mocked(setup.api.getModels).mockRejectedValueOnce(new Error("fresh models unavailable"));
+      else
+        vi.mocked(setup.api.getModels).mockResolvedValueOnce({ object: "list", data: [] } as unknown as Awaited<
+          ReturnType<ChatScreenServices["getModels"]>
+        >);
+      render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
+      const picker = await screen.findByRole("combobox", { name: "Choose model" });
+      await user.selectOptions(picker, "other");
+      await user.click(screen.getByRole("button", { name: "Switch to other" }));
 
-    await waitFor(() => expect(setup.api.getModels).toHaveBeenCalledTimes(2));
-    expect(screen.getByLabelText("Message")).toBeDisabled();
-  });
+      await waitFor(() => expect(setup.api.getModels).toHaveBeenCalledTimes(2));
+      expect(screen.getByLabelText("Message")).toBeDisabled();
+    },
+  );
 
   it("blocks model switching while the node reports an active operation", async () => {
     const setup = services();
-    vi.mocked(setup.api.getControlNode).mockResolvedValue({ status: "loading", activeModelId: "gemma", operationId: "op-existing", error: null });
+    vi.mocked(setup.api.getControlNode).mockResolvedValue({
+      status: "loading",
+      activeModelId: "gemma",
+      operationId: "op-existing",
+      error: null,
+    });
     render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
     expect(await screen.findByRole("combobox", { name: "Choose model" })).toBeDisabled();
     expect(screen.getByLabelText("Message")).toBeDisabled();
@@ -807,9 +1131,26 @@ describe("ChatScreen", () => {
     await screen.findByRole("combobox", { name: "Choose model" });
     let resolveOlder!: (value: Awaited<ReturnType<ChatScreenServices["getControlNode"]>>) => void;
     vi.mocked(setup.api.getControlNode)
-      .mockImplementationOnce(() => new Promise((resolve) => { resolveOlder = resolve; }))
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveOlder = resolve;
+          }),
+      )
       .mockResolvedValueOnce({ status: "ready", activeModelId: "other", operationId: null, error: null });
-    const terminal = (id: string, modelId: string) => ({ sequence: id === "old" ? 2 : 3, operation: { id, kind: "load" as const, status: "succeeded" as const, modelId, progress: null, error: null, createdAtUnixMs: 1, updatedAtUnixMs: id === "old" ? 2 : 3 } });
+    const terminal = (id: string, modelId: string) => ({
+      sequence: id === "old" ? 2 : 3,
+      operation: {
+        id,
+        kind: "load" as const,
+        status: "succeeded" as const,
+        modelId,
+        progress: null,
+        error: null,
+        createdAtUnixMs: 1,
+        updatedAtUnixMs: id === "old" ? 2 : 3,
+      },
+    });
     act(() => setup.controlCallbacks()?.onEvent(terminal("old", "gemma")));
     act(() => setup.controlCallbacks()?.onEvent(terminal("new", "other")));
     expect(await screen.findByText("other", { selector: ".technical-value" })).toBeInTheDocument();
@@ -823,8 +1164,27 @@ describe("ChatScreen", () => {
     render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
     await screen.findByRole("combobox", { name: "Choose model" });
     let resolveNode!: (value: Awaited<ReturnType<ChatScreenServices["getControlNode"]>>) => void;
-    vi.mocked(setup.api.getControlNode).mockImplementationOnce(() => new Promise((resolve) => { resolveNode = resolve; }));
-    act(() => setup.controlCallbacks()?.onEvent({ sequence: 2, operation: { id: "load-2", kind: "load", status: "succeeded", modelId: "other", progress: null, error: null, createdAtUnixMs: 1, updatedAtUnixMs: 2 } }));
+    vi.mocked(setup.api.getControlNode).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveNode = resolve;
+        }),
+    );
+    act(() =>
+      setup.controlCallbacks()?.onEvent({
+        sequence: 2,
+        operation: {
+          id: "load-2",
+          kind: "load",
+          status: "succeeded",
+          modelId: "other",
+          progress: null,
+          error: null,
+          createdAtUnixMs: 1,
+          updatedAtUnixMs: 2,
+        },
+      }),
+    );
     expect(screen.getByLabelText("Message")).toBeDisabled();
     await vi.waitFor(() => expect(setup.api.getControlNode).toHaveBeenCalledTimes(2));
     resolveNode({ status: "ready", activeModelId: "other", operationId: null, error: null });
@@ -839,7 +1199,12 @@ describe("ChatScreen", () => {
     ["recovery_required", /Recovery required/i],
   ] as const)("blocks chat when authoritative node status is %s", async (status, reason) => {
     const setup = services();
-    vi.mocked(setup.api.getControlNode).mockResolvedValue({ status, activeModelId: status === "loading" ? "gemma" : null, operationId: null, error: null });
+    vi.mocked(setup.api.getControlNode).mockResolvedValue({
+      status,
+      activeModelId: status === "loading" ? "gemma" : null,
+      operationId: null,
+      error: null,
+    });
     render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
     expect(await screen.findByRole("status")).toHaveTextContent(reason);
     expect(screen.getByRole("status")).not.toHaveTextContent("Disconnected");
@@ -849,7 +1214,16 @@ describe("ChatScreen", () => {
   it("keeps a running switch blocked and aborts its polling on window close", async () => {
     const user = userEvent.setup();
     const setup = services();
-    vi.mocked(setup.api.getOperation).mockResolvedValue({ id: "op-load", kind: "load", status: "running", modelId: "other", progress: null, error: null, createdAtUnixMs: 1, updatedAtUnixMs: 2 });
+    vi.mocked(setup.api.getOperation).mockResolvedValue({
+      id: "op-load",
+      kind: "load",
+      status: "running",
+      modelId: "other",
+      progress: null,
+      error: null,
+      createdAtUnixMs: 1,
+      updatedAtUnixMs: 2,
+    });
     render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
     const picker = await screen.findByRole("combobox", { name: "Choose model" });
     await user.selectOptions(picker, "other");
@@ -966,9 +1340,24 @@ describe("ChatScreen", () => {
     let resolveStatus!: (value: Awaited<ReturnType<ChatScreenServices["getStatus"]>>) => void;
     let resolveModels!: (value: Awaited<ReturnType<ChatScreenServices["getModels"]>>) => void;
     let resolveCapabilities!: (value: Awaited<ReturnType<ChatScreenServices["getCapabilities"]>>) => void;
-    vi.mocked(setup.api.getStatus).mockImplementation(() => new Promise((resolve) => { resolveStatus = resolve; }));
-    vi.mocked(setup.api.getModels).mockImplementation(() => new Promise((resolve) => { resolveModels = resolve; }));
-    vi.mocked(setup.api.getCapabilities).mockImplementation(() => new Promise((resolve) => { resolveCapabilities = resolve; }));
+    vi.mocked(setup.api.getStatus).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveStatus = resolve;
+        }),
+    );
+    vi.mocked(setup.api.getModels).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveModels = resolve;
+        }),
+    );
+    vi.mocked(setup.api.getCapabilities).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveCapabilities = resolve;
+        }),
+    );
     render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
     await vi.waitFor(() => expect(setup.api.getCapabilities).toHaveBeenCalledOnce());
     const statusSignal = vi.mocked(setup.api.getStatus).mock.calls[0][1]?.signal;
@@ -980,8 +1369,12 @@ describe("ChatScreen", () => {
     expect(modelSignal?.aborted).toBe(true);
     expect(capabilitySignal?.aborted).toBe(true);
     resolveStatus({
-      node_id: "node-7", health: "ready", model: "loxa",
-      engine: { name: "llama.cpp", version: "b9999" }, runtime_model: "late-model", profile: "default",
+      node_id: "node-7",
+      health: "ready",
+      model: "loxa",
+      engine: { name: "llama.cpp", version: "b9999" },
+      runtime_model: "late-model",
+      profile: "default",
     });
     resolveModels({ object: "list", data: [{ id: "loxa", object: "model", owned_by: "loxa" }] });
     resolveCapabilities({ documentInput: false, documentInputReason: "late", textChat: true });

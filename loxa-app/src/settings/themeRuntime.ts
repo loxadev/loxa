@@ -45,8 +45,6 @@ export function prepaintTheme(): void {
   } catch {
     // Storage can be unavailable; keep the safe session default.
   }
-  const systemIsDark = typeof window.matchMedia === "function"
-    ? window.matchMedia(DARK_THEME_QUERY).matches
-    : false;
+  const systemIsDark = typeof window.matchMedia === "function" ? window.matchMedia(DARK_THEME_QUERY).matches : false;
   applyTheme(document.documentElement, mode, systemIsDark);
 }

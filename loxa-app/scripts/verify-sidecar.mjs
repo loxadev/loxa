@@ -13,9 +13,14 @@ const binary = resolve(appRoot, "src-tauri/binaries", manifest.destination);
 accessSync(binary, constants.R_OK | (process.platform === "win32" ? 0 : constants.X_OK));
 if (!statSync(binary).isFile()) throw new Error("sidecar is not a regular file");
 const hash = createHash("sha256").update(readFileSync(binary)).digest("hex");
-if (hash !== manifest.sourceHash || hash !== manifest.destinationHash) throw new Error("sidecar hash verification failed");
+if (hash !== manifest.sourceHash || hash !== manifest.destinationHash)
+  throw new Error("sidecar hash verification failed");
 const identity = spawnSync("file", [binary], { encoding: "utf8" });
-const expectedArchitecture = manifest.triple.startsWith("aarch64-") ? "arm64" : manifest.triple.startsWith("x86_64-") ? "x86_64" : null;
+const expectedArchitecture = manifest.triple.startsWith("aarch64-")
+  ? "arm64"
+  : manifest.triple.startsWith("x86_64-")
+    ? "x86_64"
+    : null;
 if (!expectedArchitecture || identity.status !== 0 || !identity.stdout.toLowerCase().includes(expectedArchitecture)) {
   throw new Error(`sidecar architecture mismatch: ${identity.stdout || identity.stderr}`);
 }

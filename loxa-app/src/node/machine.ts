@@ -1,14 +1,7 @@
 import type { NodeStatus } from "./contracts";
 
 export type NodePhase =
-  | "disconnected"
-  | "connecting"
-  | "starting"
-  | "attached"
-  | "ready"
-  | "stopping"
-  | "recovery-required"
-  | "error";
+  "disconnected" | "connecting" | "starting" | "attached" | "ready" | "stopping" | "recovery-required" | "error";
 
 export type NodeOwnership = "none" | "attached" | "owned";
 
@@ -62,10 +55,7 @@ export function actionGuards(state: NodeState): ActionGuards {
     canStart: retryable && state.ownership === "none",
     canAttachRetry: retryable && state.ownership !== "owned",
     canStop:
-      state.ownership === "owned" &&
-      (state.phase === "attached" ||
-        state.phase === "ready" ||
-        state.phase === "error"),
+      state.ownership === "owned" && (state.phase === "attached" || state.phase === "ready" || state.phase === "error"),
   };
 }
 
@@ -73,13 +63,9 @@ export function nodeReducer(state: NodeState, event: NodeEvent): NodeState {
   if (!legalEvents[state.phase].includes(event.type)) return state;
   switch (event.type) {
     case "connect":
-      return actionGuards(state).canAttachRetry
-        ? { ...state, phase: "connecting", status: null, error: null }
-        : state;
+      return actionGuards(state).canAttachRetry ? { ...state, phase: "connecting", status: null, error: null } : state;
     case "start":
-      return actionGuards(state).canStart
-        ? { ...state, phase: "starting", status: null, error: null }
-        : state;
+      return actionGuards(state).canStart ? { ...state, phase: "starting", status: null, error: null } : state;
     case "ownership":
       return { ...state, ownership: event.ownership };
     case "status":
@@ -93,13 +79,9 @@ export function nodeReducer(state: NodeState, event: NodeEvent): NodeState {
     case "stopFailed":
       return { ...state, phase: "error", status: null, error: event.message };
     case "stop":
-      return actionGuards(state).canStop
-        ? { ...state, phase: "stopping", error: null }
-        : state;
+      return actionGuards(state).canStop ? { ...state, phase: "stopping", error: null } : state;
     case "stopped":
-      return state.phase === "stopping" && state.ownership === "owned"
-        ? initialNodeState()
-        : state;
+      return state.phase === "stopping" && state.ownership === "owned" ? initialNodeState() : state;
     case "recoveryRequired":
       return {
         ...state,

@@ -44,15 +44,34 @@ export function NodeScreen({
   return (
     <section className={styles.screen} aria-labelledby="node-heading">
       <header className="screen-header">
-        <div><p className="eyebrow">Local runtime</p><h1 id="node-heading">Node</h1></div>
-        <p className={`status-badge status-${session.phase}`} role="status" aria-live="polite">{phaseLabels[session.phase]}{session.error ? `. ${session.error}` : ""}</p>
+        <div>
+          <p className="eyebrow">Local runtime</p>
+          <h1 id="node-heading">Node</h1>
+        </div>
+        <p className={`status-badge status-${session.phase}`} role="status" aria-live="polite">
+          {phaseLabels[session.phase]}
+          {session.error ? `. ${session.error}` : ""}
+        </p>
       </header>
       <div className={styles.summary}>
         <p className={styles.ownership}>{ownershipLabel(session.ownership)}</p>
         <p className={styles.summaryText}>{phaseSummary(session.phase)}</p>
       </div>
       <dl className={styles.facts}>
-        <Field label="Endpoint" value={session.endpoint} action={<button className="quiet-button interactive-target" type="button" aria-label="Copy endpoint" onClick={() => void copyEndpoint()}>Copy</button>} />
+        <Field
+          label="Endpoint"
+          value={session.endpoint}
+          action={
+            <button
+              className="quiet-button interactive-target"
+              type="button"
+              aria-label="Copy endpoint"
+              onClick={() => void copyEndpoint()}
+            >
+              Copy
+            </button>
+          }
+        />
         <Field label="Health" value={session.status?.health ?? "Not connected"} />
         <Field label="Node ID" value={session.status?.node_id ?? "—"} />
         <Field label="Engine" value={session.status?.engine?.name ?? "—"} />
@@ -72,16 +91,34 @@ export function NodeScreen({
         </div>
       )}
       <div className={styles.actions}>
-        {(session.phase === "error" || session.phase === "disconnected") && <button className="primary-button interactive-target" type="button" onClick={() => void session.retry()}>Retry node startup</button>}
-        {session.ownership === "owned" && !["checking", "starting", "stopping"].includes(session.phase) && <button className="secondary-button interactive-target" type="button" onClick={() => void session.stop()}>Stop node</button>}
+        {(session.phase === "error" || session.phase === "disconnected") && (
+          <button className="primary-button interactive-target" type="button" onClick={() => void session.retry()}>
+            Retry node startup
+          </button>
+        )}
+        {session.ownership === "owned" && !["checking", "starting", "stopping"].includes(session.phase) && (
+          <button className="secondary-button interactive-target" type="button" onClick={() => void session.stop()}>
+            Stop node
+          </button>
+        )}
       </div>
-      <p className="visually-hidden" aria-live="polite">{announcement}</p>
+      <p className="visually-hidden" aria-live="polite">
+        {announcement}
+      </p>
     </section>
   );
 }
 
 function Field({ label, value, action }: { label: string; value: string; action?: React.ReactNode }) {
-  return <div className={styles.field}><dt>{label}</dt><dd><span className="technical-value">{value}</span>{action}</dd></div>;
+  return (
+    <div className={styles.field}>
+      <dt>{label}</dt>
+      <dd>
+        <span className="technical-value">{value}</span>
+        {action}
+      </dd>
+    </div>
+  );
 }
 
 function phaseSummary(phase: keyof typeof phaseLabels) {

@@ -42,7 +42,8 @@
 
 .headingLine h2 {
   margin: 0 var(--loxa-space-1) 0 0;
-  font: var(--loxa-type-title-weight) var(--loxa-type-title-size)/var(--loxa-type-title-line-height) var(--loxa-font-mono);
+  font: var(--loxa-type-title-weight) var(--loxa-type-title-size)/var(--loxa-type-title-line-height)
+    var(--loxa-font-mono);
   letter-spacing: 0;
   overflow-wrap: anywhere;
 }

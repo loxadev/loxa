@@ -5,10 +5,7 @@ const MAX_CHAT_RESPONSE_BYTES = 2 * 1024 * 1024;
 
 class ChatResponseTooLargeError extends Error {}
 
-export type StreamTerminal =
-  | { kind: "completed" }
-  | { kind: "cancelled" }
-  | { kind: "error"; message: string };
+export type StreamTerminal = { kind: "completed" } | { kind: "cancelled" } | { kind: "error"; message: string };
 
 export type StreamCallbacks = {
   onDelta(text: string): void;
@@ -75,18 +72,15 @@ export function streamChat(
       return settle({ kind: "cancelled" });
     }
     try {
-      const response = await fetch(
-        `${endpoint.replace(/\/$/, "")}/v1/chat/completions`,
-        {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            ...(isRecord(request) ? request : {}),
-            stream: true,
-          }),
-          signal: controller.signal,
-        },
-      );
+      const response = await fetch(`${endpoint.replace(/\/$/, "")}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          ...(isRecord(request) ? request : {}),
+          stream: true,
+        }),
+        signal: controller.signal,
+      });
       if (headerTimer !== undefined) {
         clearTimeout(headerTimer);
         headerTimer = undefined;
@@ -168,10 +162,10 @@ export function streamChat(
           error instanceof ChatResponseTooLargeError
             ? "The Loxa node returned a chat response larger than 2 MiB."
             : error instanceof SseDecodeError || error instanceof SyntaxError
-            ? "The Loxa node returned a malformed chat stream."
-            : reader
-              ? "The chat stream failed while reading."
-              : "Could not connect to the Loxa node.",
+              ? "The Loxa node returned a malformed chat stream."
+              : reader
+                ? "The chat stream failed while reading."
+                : "Could not connect to the Loxa node.",
       });
     } finally {
       if (headerTimer !== undefined) clearTimeout(headerTimer);
@@ -220,11 +214,7 @@ async function readBoundedBody(response: Response): Promise<string> {
   }
 }
 
-function consumeEvent(
-  data: string,
-  callbacks: StreamCallbacks,
-  isAborted: () => boolean,
-): StreamTerminal | null {
+function consumeEvent(data: string, callbacks: StreamCallbacks, isAborted: () => boolean): StreamTerminal | null {
   if (isAborted()) return { kind: "cancelled" };
   if (data.trim() === "[DONE]") return { kind: "completed" };
   const payload = JSON.parse(data) as unknown;

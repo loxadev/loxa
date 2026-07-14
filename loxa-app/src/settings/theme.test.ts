@@ -24,11 +24,21 @@ describe("theme preferences", () => {
 
   it("falls back to system for invalid or unavailable storage", () => {
     expect(readThemePreference({ getItem: vi.fn().mockReturnValue("sepia") })).toBe("system");
-    expect(readThemePreference({ getItem: vi.fn(() => { throw new Error("blocked"); }) })).toBe("system");
+    expect(
+      readThemePreference({
+        getItem: vi.fn(() => {
+          throw new Error("blocked");
+        }),
+      }),
+    ).toBe("system");
   });
 
   it("keeps the selected mode session-only when storage is unavailable", () => {
-    const storage = { setItem: vi.fn(() => { throw new Error("blocked"); }) };
+    const storage = {
+      setItem: vi.fn(() => {
+        throw new Error("blocked");
+      }),
+    };
 
     expect(writeThemePreference(storage, "dark")).toBe(false);
   });
@@ -48,7 +58,9 @@ describe("theme preferences", () => {
     let listener: (() => void) | undefined;
     const media = {
       matches: false,
-      addEventListener: vi.fn((_type: string, next: () => void) => { listener = next; }),
+      addEventListener: vi.fn((_type: string, next: () => void) => {
+        listener = next;
+      }),
       removeEventListener: vi.fn(),
     };
     vi.stubGlobal("matchMedia", vi.fn().mockReturnValue(media));
@@ -93,11 +105,14 @@ describe("theme preferences", () => {
   });
 
   it("rejects an invalid runtime setter value without changing root or storage", () => {
-    vi.stubGlobal("matchMedia", vi.fn().mockReturnValue({
-      matches: false,
-      addEventListener: vi.fn(),
-      removeEventListener: vi.fn(),
-    }));
+    vi.stubGlobal(
+      "matchMedia",
+      vi.fn().mockReturnValue({
+        matches: false,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+      }),
+    );
     window.localStorage.setItem("loxa.theme", "light");
     const { result } = renderHook(() => useThemePreference());
 

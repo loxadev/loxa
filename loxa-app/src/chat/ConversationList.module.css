@@ -18,7 +18,8 @@
 
 .heading {
   margin: 0;
-  font: var(--loxa-type-label-weight) var(--loxa-type-label-size)/var(--loxa-type-label-line-height) var(--loxa-type-label-family);
+  font: var(--loxa-type-label-weight) var(--loxa-type-label-size)/var(--loxa-type-label-line-height)
+    var(--loxa-type-label-family);
 }
 
 .newButton,
@@ -61,8 +62,12 @@
   overflow-wrap: anywhere;
 }
 
-.notice p { margin: 0 0 var(--loxa-space-2); }
-.notice button { min-height: var(--loxa-component-minimum-interactive-target); }
+.notice p {
+  margin: 0 0 var(--loxa-space-2);
+}
+.notice button {
+  min-height: var(--loxa-component-minimum-interactive-target);
+}
 
 .list {
   display: grid;
@@ -81,7 +86,7 @@
   border-radius: var(--loxa-radius-md);
 }
 
-.item:has(.conversationButton[aria-current='page']) {
+.item:has(.conversationButton[aria-current="page"]) {
   background: var(--loxa-secondary-surface);
 }
 
@@ -94,7 +99,7 @@
   border-color: transparent;
 }
 
-.conversationButton[aria-current='page'] {
+.conversationButton[aria-current="page"] {
   border-color: var(--loxa-control-border);
 }
 
@@ -150,7 +155,9 @@
   border-radius: var(--loxa-radius-md);
 }
 
-.deleteConfirm p { margin: 0; }
+.deleteConfirm p {
+  margin: 0;
+}
 
 .confirmActions {
   display: flex;
@@ -158,7 +165,9 @@
   gap: var(--loxa-space-2);
 }
 
-.confirmActions button { padding-inline: var(--loxa-space-3); }
+.confirmActions button {
+  padding-inline: var(--loxa-space-3);
+}
 
 .moreButton {
   width: 100%;
@@ -177,21 +186,32 @@
   border: 0;
 }
 
-.rail button:disabled { cursor: not-allowed; opacity: 0.65; }
+.rail button:disabled {
+  cursor: not-allowed;
+  opacity: 0.65;
+}
 
 @media (prefers-contrast: more) {
   .rail,
   .newButton,
-  .conversationButton[aria-current='page'],
+  .conversationButton[aria-current="page"],
   .renameInput,
-  .deleteConfirm { border-width: 2px; }
+  .deleteConfirm {
+    border-width: 2px;
+  }
 }
 
 @media (forced-colors: active) {
-  .conversationButton[aria-current='page'] { outline: 2px solid Highlight; }
-  .item:has(.conversationButton[aria-current='page']) { background: Canvas; }
+  .conversationButton[aria-current="page"] {
+    outline: 2px solid Highlight;
+  }
+  .item:has(.conversationButton[aria-current="page"]) {
+    background: Canvas;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .scrollRegion { scroll-behavior: auto; }
+  .scrollRegion {
+    scroll-behavior: auto;
+  }
 }

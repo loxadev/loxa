@@ -6,8 +6,20 @@ import { describe, expect, it, vi } from "vitest";
 import { ConversationList, type ConversationListItem } from "./ConversationList";
 
 const conversations: ConversationListItem[] = [
-  { id: "0123456789abcdef0123456789abcdef", title: "Node health", createdAtMs: 1, updatedAtMs: 20, terminalState: "completed" },
-  { id: "1123456789abcdef0123456789abcdef", title: "Download model", createdAtMs: 1, updatedAtMs: 10, terminalState: "failed" },
+  {
+    id: "0123456789abcdef0123456789abcdef",
+    title: "Node health",
+    createdAtMs: 1,
+    updatedAtMs: 20,
+    terminalState: "completed",
+  },
+  {
+    id: "1123456789abcdef0123456789abcdef",
+    title: "Download model",
+    createdAtMs: 1,
+    updatedAtMs: 10,
+    terminalState: "failed",
+  },
 ];
 
 const baseProps = {
@@ -52,7 +64,9 @@ describe("ConversationList", () => {
     rerender(<ConversationList {...baseProps} conversations={[]} state="ready" />);
     expect(screen.getByText("No conversations yet.")).toBeVisible();
 
-    rerender(<ConversationList {...baseProps} conversations={[]} state="error" errorMessage="History is unavailable." />);
+    rerender(
+      <ConversationList {...baseProps} conversations={[]} state="error" errorMessage="History is unavailable." />,
+    );
     expect(screen.getByRole("alert")).toHaveTextContent("History is unavailable.");
 
     rerender(<ConversationList {...baseProps} hasMore onLoadMore={onLoadMore} />);
@@ -63,8 +77,15 @@ describe("ConversationList", () => {
   it("awaits create and load-more actions, prevents duplicates, and catches failures", async () => {
     const user = userEvent.setup();
     let rejectCreate!: (reason?: unknown) => void;
-    const onCreate = vi.fn(() => new Promise<void>((_resolve, reject) => { rejectCreate = reject; }));
-    const onLoadMore = vi.fn(async () => { throw new Error("private failure"); });
+    const onCreate = vi.fn(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectCreate = reject;
+        }),
+    );
+    const onLoadMore = vi.fn(async () => {
+      throw new Error("private failure");
+    });
     render(<ConversationList {...baseProps} hasMore onCreate={onCreate} onLoadMore={onLoadMore} />);
 
     const create = screen.getByRole("button", { name: "New chat" });
@@ -131,14 +152,20 @@ describe("ConversationList", () => {
     expect(onDelete).not.toHaveBeenCalled();
 
     await user.click(screen.getByRole("button", { name: "Delete Node health" }));
-    await user.click(within(screen.getByRole("group", { name: "Delete Node health?" })).getByRole("button", { name: "Delete conversation" }));
+    await user.click(
+      within(screen.getByRole("group", { name: "Delete Node health?" })).getByRole("button", {
+        name: "Delete conversation",
+      }),
+    );
     expect(onDelete).toHaveBeenCalledWith(conversations[0].id);
     await waitFor(() => expect(screen.getByRole("button", { name: "New chat" })).toHaveFocus());
   });
 
   it("uses non-modal delete focus, cancels with Escape, and restores focus after failure", async () => {
     const user = userEvent.setup();
-    const onDelete = vi.fn(async () => { throw new Error("secret delete detail"); });
+    const onDelete = vi.fn(async () => {
+      throw new Error("secret delete detail");
+    });
     render(<ConversationList {...baseProps} onDelete={onDelete} />);
 
     const trigger = screen.getByRole("button", { name: "Delete Node health" });
@@ -160,18 +187,35 @@ describe("ConversationList", () => {
     dialog = screen.getByRole("group", { name: "Delete Node health?" });
     await user.click(within(dialog).getByRole("button", { name: "Delete conversation" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("Could not delete this conversation.");
-    expect(within(screen.getByRole("group", { name: "Delete Node health?" })).getByRole("button", { name: "Delete conversation" })).toHaveFocus();
-    expect(document.activeElement).toBe(within(screen.getByRole("group", { name: "Delete Node health?" })).getByRole("button", { name: "Delete conversation" }));
+    expect(
+      within(screen.getByRole("group", { name: "Delete Node health?" })).getByRole("button", {
+        name: "Delete conversation",
+      }),
+    ).toHaveFocus();
+    expect(document.activeElement).toBe(
+      within(screen.getByRole("group", { name: "Delete Node health?" })).getByRole("button", {
+        name: "Delete conversation",
+      }),
+    );
   });
 
   it("does not publish action failure or schedule focus after an unmount rejection", async () => {
     const user = userEvent.setup();
     let rejectDelete!: (reason?: unknown) => void;
-    const onDelete = vi.fn(() => new Promise<void>((_resolve, reject) => { rejectDelete = reject; }));
+    const onDelete = vi.fn(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectDelete = reject;
+        }),
+    );
     const focusFrame = vi.spyOn(window, "requestAnimationFrame");
     const view = render(<ConversationList {...baseProps} onDelete={onDelete} />);
     await user.click(screen.getByRole("button", { name: "Delete Node health" }));
-    await user.click(within(screen.getByRole("group", { name: "Delete Node health?" })).getByRole("button", { name: "Delete conversation" }));
+    await user.click(
+      within(screen.getByRole("group", { name: "Delete Node health?" })).getByRole("button", {
+        name: "Delete conversation",
+      }),
+    );
     expect(onDelete).toHaveBeenCalledOnce();
 
     view.unmount();

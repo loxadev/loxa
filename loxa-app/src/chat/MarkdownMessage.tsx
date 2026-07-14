@@ -43,7 +43,11 @@ const components: Components = {
     const safeUrl = safeHttpUrl(href);
     if (safeUrl === null) return <span>{children}</span>;
 
-    return <a href={safeUrl} target="_blank" rel="noopener noreferrer">{children}</a>;
+    return (
+      <a href={safeUrl} target="_blank" rel="noopener noreferrer">
+        {children}
+      </a>
+    );
   },
   img: ({ alt }: ComponentPropsWithoutRef<"img">) => (
     <span className={styles.omittedImage}>{alt || "Image omitted."}</span>
@@ -51,11 +55,17 @@ const components: Components = {
 };
 
 function safeHttpUrl(value: string | undefined): string | null {
-  if (!value || controlCharacter.test(value) || encodedControlCharacter.test(value) || whitespace.test(value)) return null;
+  if (!value || controlCharacter.test(value) || encodedControlCharacter.test(value) || whitespace.test(value))
+    return null;
 
   try {
     const parsed = new URL(value);
-    if ((parsed.protocol !== "http:" && parsed.protocol !== "https:") || !parsed.hostname || parsed.username || parsed.password) {
+    if (
+      (parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
+      !parsed.hostname ||
+      parsed.username ||
+      parsed.password
+    ) {
       return null;
     }
     return parsed.href;

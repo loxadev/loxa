@@ -10,7 +10,8 @@ const rustc = spawnSync("rustc", ["-vV"], { encoding: "utf8" });
 if (rustc.status !== 0) throw new Error(rustc.stderr || "rustc -vV failed");
 const hostTriple = rustc.stdout.match(/^host: (.+)$/m)?.[1];
 const triple = process.env.LOXA_SIDECAR_TARGET || hostTriple;
-if (!triple || !/^[a-z0-9_]+(?:-[a-z0-9_.]+)+$/.test(triple)) throw new Error("a valid sidecar target triple is required");
+if (!triple || !/^[a-z0-9_]+(?:-[a-z0-9_.]+)+$/.test(triple))
+  throw new Error("a valid sidecar target triple is required");
 if (process.argv.includes("--print-target")) {
   process.stdout.write(`${triple}\n`);
   process.exit(0);

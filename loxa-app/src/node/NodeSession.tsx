@@ -1,13 +1,4 @@
-import {
-  createContext,
-  useCallback,
-  useContext,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type ReactNode,
-} from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import type { getStatus as defaultGetStatus } from "./client";
 import type { NodeStatus } from "./contracts";
@@ -88,9 +79,11 @@ function ensureNode(bootstrap: BootstrapApi, endpoint: string) {
 
   const pending = bootstrap.start({ endpoint });
   byEndpoint.set(endpoint, pending);
-  void pending.finally(() => {
-    if (byEndpoint?.get(endpoint) === pending) byEndpoint.delete(endpoint);
-  }).catch(() => undefined);
+  void pending
+    .finally(() => {
+      if (byEndpoint?.get(endpoint) === pending) byEndpoint.delete(endpoint);
+    })
+    .catch(() => undefined);
   return pending;
 }
 
@@ -183,9 +176,7 @@ export function NodeSessionProvider({
       const detail = message(error);
       setState((current) => ({
         ...current,
-        phase: detail.toLowerCase().includes("recovery required")
-          ? "recovery-required"
-          : "error",
+        phase: detail.toLowerCase().includes("recovery required") ? "recovery-required" : "error",
         status: null,
         error: detail,
         proven: false,
@@ -256,9 +247,7 @@ export function NodeSessionProvider({
       setState((current) => {
         const next = {
           ...current,
-          phase: detail.toLowerCase().includes("recovery required")
-            ? "recovery-required"
-            : "error",
+          phase: detail.toLowerCase().includes("recovery required") ? "recovery-required" : "error",
           status: null,
           error: detail,
           proven: false,
@@ -270,38 +259,37 @@ export function NodeSessionProvider({
     }
   }, [services]);
 
-  const settleModelMutation = useCallback((operationId: string) => {
-    if (stopping.current || settledLifecycleOperations.current.has(operationId)) {
-      return Promise.resolve();
-    }
-    const current = pendingLifecycleSettlements.current.get(operationId);
-    if (current) return current;
-    if (!trackedLifecycleOperations.current.has(operationId)) {
-      return Promise.resolve();
-    }
-    rememberTerminalOperation(
-      trackedLifecycleOperations.current,
-      pendingLifecycleSettlements.current,
-      operationId,
-    );
+  const settleModelMutation = useCallback(
+    (operationId: string) => {
+      if (stopping.current || settledLifecycleOperations.current.has(operationId)) {
+        return Promise.resolve();
+      }
+      const current = pendingLifecycleSettlements.current.get(operationId);
+      if (current) return current;
+      if (!trackedLifecycleOperations.current.has(operationId)) {
+        return Promise.resolve();
+      }
+      rememberTerminalOperation(trackedLifecycleOperations.current, pendingLifecycleSettlements.current, operationId);
 
-    const generation = closingGeneration.current;
-    const pending = (async () => {
-      if (stopping.current || generation !== closingGeneration.current) return;
-      const proven = await refreshStatus();
-      if (proven && !stopping.current && generation === closingGeneration.current) {
-        rememberSettledOperation(settledLifecycleOperations.current, operationId);
-        trackedLifecycleOperations.current.delete(operationId);
-      }
-    })();
-    pendingLifecycleSettlements.current.set(operationId, pending);
-    void pending.finally(() => {
-      if (pendingLifecycleSettlements.current.get(operationId) === pending) {
-        pendingLifecycleSettlements.current.delete(operationId);
-      }
-    });
-    return pending;
-  }, [refreshStatus]);
+      const generation = closingGeneration.current;
+      const pending = (async () => {
+        if (stopping.current || generation !== closingGeneration.current) return;
+        const proven = await refreshStatus();
+        if (proven && !stopping.current && generation === closingGeneration.current) {
+          rememberSettledOperation(settledLifecycleOperations.current, operationId);
+          trackedLifecycleOperations.current.delete(operationId);
+        }
+      })();
+      pendingLifecycleSettlements.current.set(operationId, pending);
+      void pending.finally(() => {
+        if (pendingLifecycleSettlements.current.get(operationId) === pending) {
+          pendingLifecycleSettlements.current.delete(operationId);
+        }
+      });
+      return pending;
+    },
+    [refreshStatus],
+  );
 
   useEffect(() => {
     if (!state.proven) return;
@@ -315,36 +303,43 @@ export function NodeSessionProvider({
       const token = await services.readControlToken(state.endpoint);
       if (disposed || controller.signal.aborted) return;
       const previous = stream;
-      stream = services.createControlEventStream(state.endpoint, token, cursor, {
-        onSnapshot: (snapshot) => {
-          if (disposed) return;
-          reconnectAttempts = 0;
-          const lifecycle = snapshot.operations.filter(isLifecycleOperation);
-          lifecycle.filter((operation) => isActiveOperation(operation.status))
-            .forEach((operation) => invalidateModelTruth(operation.id));
-          lifecycle.filter((operation) => isTerminalOperation(operation.status))
-            .forEach((operation) => { void settleModelMutation(operation.id); });
+      stream = services.createControlEventStream(
+        state.endpoint,
+        token,
+        cursor,
+        {
+          onSnapshot: (snapshot) => {
+            if (disposed) return;
+            reconnectAttempts = 0;
+            const lifecycle = snapshot.operations.filter(isLifecycleOperation);
+            lifecycle
+              .filter((operation) => isActiveOperation(operation.status))
+              .forEach((operation) => invalidateModelTruth(operation.id));
+            lifecycle
+              .filter((operation) => isTerminalOperation(operation.status))
+              .forEach((operation) => {
+                void settleModelMutation(operation.id);
+              });
+          },
+          onEvent: (event) => {
+            if (disposed || stopping.current || !isLifecycleOperation(event.operation)) return;
+            if (isActiveOperation(event.operation.status)) invalidateModelTruth(event.operation.id);
+            else if (isTerminalOperation(event.operation.status)) void settleModelMutation(event.operation.id);
+          },
+          onTerminal: (terminal) => {
+            if (disposed || controller.signal.aborted) return;
+            scheduleReconnect(terminal.cursor);
+          },
         },
-        onEvent: (event) => {
-          if (disposed || stopping.current || !isLifecycleOperation(event.operation)) return;
-          if (isActiveOperation(event.operation.status)) invalidateModelTruth(event.operation.id);
-          else if (isTerminalOperation(event.operation.status)) void settleModelMutation(event.operation.id);
-        },
-        onTerminal: (terminal) => {
-          if (disposed || controller.signal.aborted) return;
-          scheduleReconnect(terminal.cursor);
-        },
-      }, controller.signal);
+        controller.signal,
+      );
       previous?.dispose();
     };
 
     const scheduleReconnect = (cursor: number) => {
       if (disposed || controller.signal.aborted || reconnectTimer !== undefined) return;
       if (reconnectAttempts >= STREAM_RECONNECT_LIMIT) return;
-      const delay = Math.min(
-        3_000,
-        STREAM_RECONNECT_BASE_DELAY_MS * (2 ** Math.min(reconnectAttempts, 4)),
-      );
+      const delay = Math.min(3_000, STREAM_RECONNECT_BASE_DELAY_MS * 2 ** Math.min(reconnectAttempts, 4));
       reconnectAttempts += 1;
       reconnectTimer = setTimeout(() => {
         reconnectTimer = undefined;
@@ -393,22 +388,23 @@ export function NodeSessionProvider({
       if (run !== bootstrapRun.current) return;
       setState((current) => ({
         ...current,
-        phase: message(error).toLowerCase().includes("recovery required")
-          ? "recovery-required"
-          : "error",
+        phase: message(error).toLowerCase().includes("recovery required") ? "recovery-required" : "error",
         error: message(error),
       }));
     }
   }, [resetLifecycleEpoch, services.bootstrap]);
 
-  const value = useMemo<NodeSessionValue>(() => ({
-    ...state,
-    invalidateModelTruth,
-    settleModelMutation,
-    refreshStatus,
-    retry: connect,
-    stop,
-  }), [connect, invalidateModelTruth, refreshStatus, settleModelMutation, state, stop]);
+  const value = useMemo<NodeSessionValue>(
+    () => ({
+      ...state,
+      invalidateModelTruth,
+      settleModelMutation,
+      refreshStatus,
+      retry: connect,
+      stop,
+    }),
+    [connect, invalidateModelTruth, refreshStatus, settleModelMutation, state, stop],
+  );
 
   return <NodeSessionContext.Provider value={value}>{children}</NodeSessionContext.Provider>;
 }
@@ -447,10 +443,7 @@ function rememberSettledOperation(operations: Map<string, true>, operationId: st
   }
 }
 
-function rememberActiveOperation(
-  operations: Map<string, TrackedLifecycleState>,
-  operationId: string,
-) {
+function rememberActiveOperation(operations: Map<string, TrackedLifecycleState>, operationId: string) {
   operations.delete(operationId);
   operations.set(operationId, "active");
 }
@@ -468,11 +461,7 @@ function rememberTerminalOperation(
   }
   if (retryable <= MAX_RETRYABLE_TERMINALS_PER_EPOCH) return;
   for (const [candidate, state] of operations) {
-    if (
-      state === "retryable-terminal" &&
-      candidate !== operationId &&
-      !pending.has(candidate)
-    ) {
+    if (state === "retryable-terminal" && candidate !== operationId && !pending.has(candidate)) {
       operations.delete(candidate);
       return;
     }

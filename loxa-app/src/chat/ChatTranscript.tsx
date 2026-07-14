@@ -51,15 +51,17 @@ export function ChatTranscript({
           <div className={styles.emptyState}>
             <p>{emptyMessage}</p>
           </div>
-        ) : turns.map((turn) => (
-          <article className={styles.turn} key={turn.id} aria-label={`Chat turn using ${turn.model}`}>
-            <div className={`${styles.message} ${styles.userMessage}`}>
-              <p className={styles.messageLabel}>You</p>
-              <p>{turn.prompt}</p>
-            </div>
-            <AssistantResponse turn={turn} copyText={copyText} />
-          </article>
-        ))}
+        ) : (
+          turns.map((turn) => (
+            <article className={styles.turn} key={turn.id} aria-label={`Chat turn using ${turn.model}`}>
+              <div className={`${styles.message} ${styles.userMessage}`}>
+                <p className={styles.messageLabel}>You</p>
+                <p>{turn.prompt}</p>
+              </div>
+              <AssistantResponse turn={turn} copyText={copyText} />
+            </article>
+          ))
+        )}
       </div>
     </div>
   );
@@ -75,17 +77,21 @@ function AssistantResponse({ turn, copyText }: { turn: ChatTurn; copyText(text: 
   const mounted = useRef(true);
   const copyGeneration = useRef(0);
   const currentTurn = useRef({ id: turn.id, status: turn.status, response: turn.response });
-  const copyPhase = copyState.turnId === turn.id && copyState.status === turn.status && copyState.source === turn.response
-    ? copyState.phase
-    : "idle";
+  const copyPhase =
+    copyState.turnId === turn.id && copyState.status === turn.status && copyState.source === turn.response
+      ? copyState.phase
+      : "idle";
   const copyStatusId = `copy-response-status-${turn.id}`;
   const responseComplete = turn.status !== "queued" && turn.status !== "streaming" && turn.response.length > 0;
   const responseBusy = turn.status === "queued" || turn.status === "streaming";
 
-  useEffect(() => () => {
-    mounted.current = false;
-    copyGeneration.current += 1;
-  }, []);
+  useEffect(
+    () => () => {
+      mounted.current = false;
+      copyGeneration.current += 1;
+    },
+    [],
+  );
 
   useLayoutEffect(() => {
     currentTurn.current = { id: turn.id, status: turn.status, response: turn.response };
@@ -101,10 +107,24 @@ function AssistantResponse({ turn, copyText }: { turn: ChatTurn; copyText(text: 
     setCopyState({ phase: "copying", turnId, status, source });
     try {
       await copyText(source);
-      if (!mounted.current || copyGeneration.current !== generation || currentTurn.current.id !== turnId || currentTurn.current.status !== status || currentTurn.current.response !== source) return;
+      if (
+        !mounted.current ||
+        copyGeneration.current !== generation ||
+        currentTurn.current.id !== turnId ||
+        currentTurn.current.status !== status ||
+        currentTurn.current.response !== source
+      )
+        return;
       setCopyState({ phase: "copied", turnId, status, source });
     } catch {
-      if (!mounted.current || copyGeneration.current !== generation || currentTurn.current.id !== turnId || currentTurn.current.status !== status || currentTurn.current.response !== source) return;
+      if (
+        !mounted.current ||
+        copyGeneration.current !== generation ||
+        currentTurn.current.id !== turnId ||
+        currentTurn.current.status !== status ||
+        currentTurn.current.response !== source
+      )
+        return;
       setCopyState({ phase: "failed", turnId, status, source });
     }
   };
@@ -133,14 +153,22 @@ function AssistantResponse({ turn, copyText }: { turn: ChatTurn; copyText(text: 
           {copyPhase === "copying" ? "Copying…" : "Copy response"}
         </button>
       </div>
-      <MarkdownMessage content={turn.response || (turn.status === "queued" || turn.status === "streaming" ? "Waiting for the model…" : "No response was returned.")} />
+      <MarkdownMessage
+        content={
+          turn.response ||
+          (turn.status === "queued" || turn.status === "streaming"
+            ? "Waiting for the model…"
+            : "No response was returned.")
+        }
+      />
       {(copyPhase === "copied" || copyPhase === "failed") && (
         <p id={copyStatusId} className={styles.copyStatus} role="status" aria-label="Copy response status">
           {copyPhase === "copied" ? "Response copied" : "Copy failed"}
         </p>
       )}
       <p className={`${styles.turnState} ${turn.status === "failed" ? styles.turnFailed : ""}`}>
-        {turnStateLabel(turn.status)}{turn.error ? ` — ${turn.error}` : ""}
+        {turnStateLabel(turn.status)}
+        {turn.error ? ` — ${turn.error}` : ""}
       </p>
     </div>
   );

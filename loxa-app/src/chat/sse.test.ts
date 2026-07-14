@@ -6,7 +6,7 @@ const encode = (value: string) => new TextEncoder().encode(value);
 
 describe("SseDecoder", () => {
   it("decodes an event across every possible byte split", () => {
-    const source = "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n";
+    const source = 'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n';
     const bytes = encode(source);
 
     for (let split = 0; split <= bytes.length; split += 1) {
@@ -24,19 +24,15 @@ describe("SseDecoder", () => {
     const emojiStart = bytes.findIndex((byte) => byte === 0xf0);
     const decoder = new SseDecoder();
 
-    expect([
-      ...decoder.push(bytes.slice(0, emojiStart + 2)),
-      ...decoder.push(bytes.slice(emojiStart + 2)),
-    ]).toEqual([{ data: "🙂 café" }]);
+    expect([...decoder.push(bytes.slice(0, emojiStart + 2)), ...decoder.push(bytes.slice(emojiStart + 2))]).toEqual([
+      { data: "🙂 café" },
+    ]);
   });
 
   it("accepts CRLF framing, comments, keepalives, fields, and multiline data", () => {
     const decoder = new SseDecoder();
     const events = decoder.push(
-      encode(
-        ": heartbeat\r\n\r\n" +
-          "event: message\r\nid: 7\r\ndata: first\r\ndata:second\r\nretry: 1000\r\n\r\n",
-      ),
+      encode(": heartbeat\r\n\r\n" + "event: message\r\nid: 7\r\ndata: first\r\ndata:second\r\nretry: 1000\r\n\r\n"),
     );
 
     expect(events).toEqual([{ event: "message", id: "7", data: "first\nsecond" }]);
@@ -63,18 +59,16 @@ describe("SseDecoder", () => {
     const bytes = encode(`data: one${separator}data: two\r\ndata: three\r\n\r\n`);
     for (let split = 0; split <= bytes.length; split += 1) {
       const decoder = new SseDecoder();
-      expect([
-        ...decoder.push(bytes.slice(0, split)),
-        ...decoder.push(bytes.slice(split)),
-      ]).toEqual([{ data: "one" }, { data: "two\nthree" }]);
+      expect([...decoder.push(bytes.slice(0, split)), ...decoder.push(bytes.slice(split))]).toEqual([
+        { data: "one" },
+        { data: "two\nthree" },
+      ]);
     }
   });
 
   it("rejects invalid UTF-8 instead of replacing bytes", () => {
     const decoder = new SseDecoder();
-    expect(() => decoder.push(Uint8Array.of(0xff, 0x0a, 0x0a))).toThrow(
-      SseDecodeError,
-    );
+    expect(() => decoder.push(Uint8Array.of(0xff, 0x0a, 0x0a))).toThrow(SseDecodeError);
   });
 
   it("bounds a single event to the gateway limit", () => {

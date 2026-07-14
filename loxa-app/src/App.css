@@ -226,7 +226,8 @@ a {
 dt {
   margin: 0 0 var(--loxa-space-2);
   color: var(--loxa-muted-foreground);
-  font: var(--loxa-type-label-caps-weight) var(--loxa-type-label-caps-size)/var(--loxa-type-label-caps-line-height) var(--loxa-type-label-caps-family);
+  font: var(--loxa-type-label-caps-weight) var(--loxa-type-label-caps-size)/var(--loxa-type-label-caps-line-height)
+    var(--loxa-type-label-caps-family);
   letter-spacing: var(--loxa-type-label-caps-letter-spacing);
   text-transform: uppercase;
 }
@@ -381,7 +382,9 @@ dt,
     forced-color-adjust: auto;
   }
 
-  .rail-resize-handle::after { background: ButtonText; }
+  .rail-resize-handle::after {
+    background: ButtonText;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {

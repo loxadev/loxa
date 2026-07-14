@@ -105,20 +105,41 @@ export function SettingsScreen({
           ))}
         </div>
       </fieldset>
-      <p className={styles.disclosure}>Theme is the only preference saved on this Mac. Node and model state are not stored here.</p>
+      <p className={styles.disclosure}>
+        Theme is the only preference saved on this Mac. Node and model state are not stored here.
+      </p>
 
       <section className={styles.group} aria-labelledby="chat-history-heading">
         <h2 id="chat-history-heading">Chat history</h2>
-        <p className={styles.description}>Conversations are stored as local plaintext in Loxa's user-only data directory so the desktop app and CLI can share them. They are not synced.</p>
+        <p className={styles.description}>
+          Conversations are stored as local plaintext in Loxa's user-only data directory so the desktop app and CLI can
+          share them. They are not synced.
+        </p>
         {onClearChatHistory ? (
           <div className={styles.destructiveActions}>
             {!confirmClear ? (
-              <button className="quiet-button interactive-target" type="button" onClick={() => setConfirmClear(true)}>Clear chat history</button>
+              <button className="quiet-button interactive-target" type="button" onClick={() => setConfirmClear(true)}>
+                Clear chat history
+              </button>
             ) : (
               <div className={styles.confirmClear} role="group" aria-label="Confirm clear chat history">
                 <p>This permanently deletes every saved conversation.</p>
-                <button className="quiet-button interactive-target" type="button" disabled={clearing} onClick={() => void clearHistory()}>Confirm clear chat history</button>
-                <button className="quiet-button interactive-target" type="button" disabled={clearing} onClick={() => setConfirmClear(false)}>Cancel</button>
+                <button
+                  className="quiet-button interactive-target"
+                  type="button"
+                  disabled={clearing}
+                  onClick={() => void clearHistory()}
+                >
+                  Confirm clear chat history
+                </button>
+                <button
+                  className="quiet-button interactive-target"
+                  type="button"
+                  disabled={clearing}
+                  onClick={() => setConfirmClear(false)}
+                >
+                  Cancel
+                </button>
               </div>
             )}
           </div>
@@ -138,13 +159,20 @@ export function SettingsScreen({
           <Fact label="Active model" value={runtime.status?.runtime_model ?? "Unavailable"} technical />
         </dl>
       </section>
-      <p className="visually-hidden" role="status" aria-live="polite">Theme set to {activeLabel}. {historyStatus}</p>
+      <p className="visually-hidden" role="status" aria-live="polite">
+        Theme set to {activeLabel}. {historyStatus}
+      </p>
     </section>
   );
 }
 
 function Fact({ label, value, technical = false }: { label: string; value: string; technical?: boolean }) {
-  return <div className={styles.fact}><dt>{label}</dt><dd className={technical ? "technical-value" : undefined}>{value}</dd></div>;
+  return (
+    <div className={styles.fact}>
+      <dt>{label}</dt>
+      <dd className={technical ? "technical-value" : undefined}>{value}</dd>
+    </div>
+  );
 }
 
 function runtimePhaseLabel(phase: NodeSessionPhase) {

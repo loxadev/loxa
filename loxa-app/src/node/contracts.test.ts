@@ -1,11 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import {
-  ContractError,
-  decodeModelList,
-  decodeNodeStatus,
-  decodeOpenAIError,
-} from "./contracts";
+import { ContractError, decodeModelList, decodeNodeStatus, decodeOpenAIError } from "./contracts";
 
 const readyStatus = {
   node_id: "node-test",

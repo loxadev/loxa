@@ -47,7 +47,9 @@ export function ConversationList({
 
   useEffect(() => {
     mounted.current = true;
-    return () => { mounted.current = false; };
+    return () => {
+      mounted.current = false;
+    };
   }, []);
 
   const actionIsActive = () => mounted.current && (isLifecycleActive?.() ?? true);
@@ -107,10 +109,7 @@ export function ConversationList({
     }
   };
 
-  const runListAction = async (
-    kind: "create" | "load-more" | "retry",
-    action: () => void | Promise<void>,
-  ) => {
+  const runListAction = async (kind: "create" | "load-more" | "retry", action: () => void | Promise<void>) => {
     if (pendingListAction !== null) return;
     setPendingListAction(kind);
     setActionError(null);
@@ -118,9 +117,13 @@ export function ConversationList({
       await action();
     } catch {
       if (!actionIsActive()) return;
-      setActionError(kind === "create"
-        ? "Could not create a new conversation."
-        : kind === "retry" ? "Could not retry conversation history." : "Could not load more conversations.");
+      setActionError(
+        kind === "create"
+          ? "Could not create a new conversation."
+          : kind === "retry"
+            ? "Could not retry conversation history."
+            : "Could not load more conversations.",
+      );
     } finally {
       if (actionIsActive()) setPendingListAction(null);
     }
@@ -160,12 +163,22 @@ export function ConversationList({
 
       <div className={styles.scrollRegion}>
         {state === "loading" && conversations.length === 0 ? (
-          <p className={styles.notice} role="status">Loading conversations…</p>
+          <p className={styles.notice} role="status">
+            Loading conversations…
+          </p>
         ) : null}
         {state === "error" ? (
           <div className={styles.notice} role="alert">
             <p>{errorMessage ?? "Conversation history is unavailable."}</p>
-            {onRetry ? <button type="button" onClick={() => void runListAction("retry", onRetry)} disabled={pendingListAction !== null}>Retry conversation history</button> : null}
+            {onRetry ? (
+              <button
+                type="button"
+                onClick={() => void runListAction("retry", onRetry)}
+                disabled={pendingListAction !== null}
+              >
+                Retry conversation history
+              </button>
+            ) : null}
           </div>
         ) : null}
         {state === "ready" && conversations.length === 0 ? (
@@ -180,7 +193,9 @@ export function ConversationList({
                 <li className={styles.item} key={conversation.id}>
                   {renamingId === conversation.id ? (
                     <form className={styles.renameForm} onSubmit={(event) => void submitRename(event)}>
-                      <label className={styles.srOnly} htmlFor={`rename-${conversation.id}`}>Conversation title</label>
+                      <label className={styles.srOnly} htmlFor={`rename-${conversation.id}`}>
+                        Conversation title
+                      </label>
                       <input
                         autoFocus
                         className={styles.renameInput}
@@ -192,8 +207,12 @@ export function ConversationList({
                         disabled={isPending}
                       />
                       <div className={styles.confirmActions}>
-                        <button type="submit" disabled={!validTitle(renameValue) || isPending}>Save title</button>
-                        <button type="button" onClick={cancelRename} disabled={isPending}>Cancel rename</button>
+                        <button type="submit" disabled={!validTitle(renameValue) || isPending}>
+                          Save title
+                        </button>
+                        <button type="button" onClick={cancelRename} disabled={isPending}>
+                          Cancel rename
+                        </button>
                       </div>
                     </form>
                   ) : (
@@ -208,7 +227,9 @@ export function ConversationList({
                       >
                         <span className={styles.title}>{conversation.title}</span>
                         <span className={styles.meta}>
-                          <time dateTime={new Date(conversation.updatedAtMs).toISOString()}>{formatTimestamp(conversation.updatedAtMs)}</time>
+                          <time dateTime={new Date(conversation.updatedAtMs).toISOString()}>
+                            {formatTimestamp(conversation.updatedAtMs)}
+                          </time>
                           {conversation.terminalState ? <span>{terminalLabel(conversation.terminalState)}</span> : null}
                         </span>
                       </button>
@@ -219,14 +240,22 @@ export function ConversationList({
                           aria-label={`Rename ${conversation.title}`}
                           onClick={() => startRename(conversation)}
                           disabled={deletingId === conversation.id}
-                        >Rename</button>
+                        >
+                          Rename
+                        </button>
                         <button
                           ref={(node) => setButtonRef(deleteButtons.current, conversation.id, node)}
                           type="button"
                           aria-label={`Delete ${conversation.title}`}
-                          onClick={() => { setRenamingId(null); setActionError(null); setDeletingId(conversation.id); }}
+                          onClick={() => {
+                            setRenamingId(null);
+                            setActionError(null);
+                            setDeletingId(conversation.id);
+                          }}
                           disabled={deletingId === conversation.id}
-                        >Delete</button>
+                        >
+                          Delete
+                        </button>
                       </div>
                     </>
                   )}
@@ -239,15 +268,21 @@ export function ConversationList({
                       aria-describedby={`delete-note-${conversation.id}`}
                       onKeyDown={(event) => deleteDialogKeyDown(event, conversation.id)}
                     >
-                      <p id={`delete-note-${conversation.id}`}><strong>Delete {conversation.title}?</strong> This cannot be undone.</p>
+                      <p id={`delete-note-${conversation.id}`}>
+                        <strong>Delete {conversation.title}?</strong> This cannot be undone.
+                      </p>
                       <div className={styles.confirmActions}>
-                        <button type="button" autoFocus onClick={cancelDelete} disabled={isPending}>Cancel delete</button>
+                        <button type="button" autoFocus onClick={cancelDelete} disabled={isPending}>
+                          Cancel delete
+                        </button>
                         <button
                           ref={(node) => setButtonRef(deleteConfirmButtons.current, conversation.id, node)}
                           type="button"
                           onClick={() => void confirmDelete(conversation.id)}
                           disabled={isPending}
-                        >Delete conversation</button>
+                        >
+                          Delete conversation
+                        </button>
                       </div>
                     </div>
                   ) : null}
@@ -268,7 +303,11 @@ export function ConversationList({
           </button>
         ) : null}
       </div>
-      {actionError ? <p className={styles.actionError} role="alert">{actionError}</p> : null}
+      {actionError ? (
+        <p className={styles.actionError} role="alert">
+          {actionError}
+        </p>
+      ) : null}
     </nav>
   );
 }
@@ -288,10 +327,15 @@ function formatTimestamp(timestamp: number): string {
 
 function terminalLabel(state: TurnState): string {
   switch (state) {
-    case "queued": return "Queued";
-    case "streaming": return "Streaming";
-    case "completed": return "Completed";
-    case "cancelled": return "Cancelled";
-    case "failed": return "Failed";
+    case "queued":
+      return "Queued";
+    case "streaming":
+      return "Streaming";
+    case "completed":
+      return "Completed";
+    case "cancelled":
+      return "Cancelled";
+    case "failed":
+      return "Failed";
   }
 }

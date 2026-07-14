@@ -21,40 +21,46 @@ const operation = {
   updated_at_unix_ms: 1_700_000_000_100,
 };
 
-const inventory = [{
-  id: "gemma-3-4b-it-q4",
-  repo: "publisher/model",
-  revision: "0123456789abcdef",
-  filename: "model.gguf",
-  sha256: "ab".repeat(32),
-  size_bytes: 1024,
-  license: "Apache-2.0",
-  params: "4B",
-  quant: "Q4_K_M",
-  min_free_mem_gb: 6,
-  artifact: { partial: { bytes: 512 } },
-  compatibility: { compatible: true, reason: "memory fits" },
-  engine: { engine: "llama-cpp", eligible: true, reason: "verified recipe" },
-}];
+const inventory = [
+  {
+    id: "gemma-3-4b-it-q4",
+    repo: "publisher/model",
+    revision: "0123456789abcdef",
+    filename: "model.gguf",
+    sha256: "ab".repeat(32),
+    size_bytes: 1024,
+    license: "Apache-2.0",
+    params: "4B",
+    quant: "Q4_K_M",
+    min_free_mem_gb: 6,
+    artifact: { partial: { bytes: 512 } },
+    compatibility: { compatible: true, reason: "memory fits" },
+    engine: { engine: "llama-cpp", eligible: true, reason: "verified recipe" },
+  },
+];
 
 describe("control contracts", () => {
   it("decodes the closed node and capability snapshots", () => {
-    expect(decodeNodeSnapshot({
-      status: "unloaded",
-      active_model_id: null,
-      operation_id: null,
-      error: null,
-    })).toEqual({
+    expect(
+      decodeNodeSnapshot({
+        status: "unloaded",
+        active_model_id: null,
+        operation_id: null,
+        error: null,
+      }),
+    ).toEqual({
       status: "unloaded",
       activeModelId: null,
       operationId: null,
       error: null,
     });
-    expect(decodeCapabilities({
-      document_input: false,
-      document_input_reason: "Document input is not supported.",
-      text_chat: true,
-    })).toEqual({
+    expect(
+      decodeCapabilities({
+        document_input: false,
+        document_input_reason: "Document input is not supported.",
+        text_chat: true,
+      }),
+    ).toEqual({
       documentInput: false,
       documentInputReason: "Document input is not supported.",
       textChat: true,
@@ -86,21 +92,39 @@ describe("control contracts", () => {
       sequence: 9,
       operation: { id: "op-7" },
     });
-    expect(decodeReconnectSnapshot({
-      cursor: 9,
-      cursor_gap: false,
-      operations: [operation],
-      events: [{ sequence: 9, operation }],
-    })).toMatchObject({ cursor: 9, cursorGap: false });
+    expect(
+      decodeReconnectSnapshot({
+        cursor: 9,
+        cursor_gap: false,
+        operations: [operation],
+        events: [{ sequence: 9, operation }],
+      }),
+    ).toMatchObject({ cursor: 9, cursorGap: false });
   });
 
   it.each([
-    ["extra node field", () => decodeNodeSnapshot({ status: "unloaded", active_model_id: null, operation_id: null, error: null, extra: true })],
+    [
+      "extra node field",
+      () =>
+        decodeNodeSnapshot({ status: "unloaded", active_model_id: null, operation_id: null, error: null, extra: true }),
+    ],
     ["contradictory operation", () => decodeOperation({ ...operation, status: "succeeded", error: "failed" })],
     ["unsafe byte count", () => decodeInventory([{ ...inventory[0], size_bytes: Number.MAX_SAFE_INTEGER + 1 }])],
     ["unknown artifact state", () => decodeInventory([{ ...inventory[0], artifact: "verifying" }])],
-    ["event beyond cursor", () => decodeReconnectSnapshot({ cursor: 8, cursor_gap: false, operations: [operation], events: [{ sequence: 9, operation }] })],
-    ["missing unsupported document reason", () => decodeCapabilities({ document_input: false, document_input_reason: "", text_chat: true })],
+    [
+      "event beyond cursor",
+      () =>
+        decodeReconnectSnapshot({
+          cursor: 8,
+          cursor_gap: false,
+          operations: [operation],
+          events: [{ sequence: 9, operation }],
+        }),
+    ],
+    [
+      "missing unsupported document reason",
+      () => decodeCapabilities({ document_input: false, document_input_reason: "", text_chat: true }),
+    ],
   ])("rejects %s", (_name, decode) => {
     expect(decode).toThrow(ControlContractError);
   });
