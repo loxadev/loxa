@@ -4,11 +4,7 @@ import mark from "../assets/brand/loxa-mark.svg";
 import { ChatScreen, type ChatScreenServices } from "../chat/ChatScreen";
 import { ModelsScreen, type ModelsScreenServices } from "../models/ModelsScreen";
 import { NodeScreen, type NodeScreenServices } from "../node/NodeScreen";
-import {
-  NodeSessionProvider,
-  useNodeSession,
-  type NodeSessionServices,
-} from "../node/NodeSession";
+import { NodeSessionProvider, useNodeSession, type NodeSessionServices } from "../node/NodeSession";
 import { SettingsScreen } from "../settings/SettingsScreen";
 import { useThemePreference } from "../settings/theme";
 import { appServices, DEFAULT_ENDPOINT } from "./services";
@@ -93,16 +89,44 @@ function AppWorkspace({ services }: { services: AppServices }) {
         </div>
         <nav className="navigation-primary-nav" aria-label="Primary node navigation">
           <div className="navigation-primary" role="group" aria-label="Node control">
-            <a className="nav-link interactive-target" href="#node" aria-current={route === "node" ? "page" : undefined} onClick={navigate("node")}>Node</a>
-            <a className="nav-link interactive-target" href="#models" aria-current={route === "models" ? "page" : undefined} onClick={navigate("models")}>Models</a>
+            <a
+              className="nav-link interactive-target"
+              href="#node"
+              aria-current={route === "node" ? "page" : undefined}
+              onClick={navigate("node")}
+            >
+              Node
+            </a>
+            <a
+              className="nav-link interactive-target"
+              href="#models"
+              aria-current={route === "models" ? "page" : undefined}
+              onClick={navigate("models")}
+            >
+              Models
+            </a>
           </div>
         </nav>
         {route === "chat" ? <div className="conversation-rail-slot" ref={setConversationRailTarget} /> : null}
         <nav className="navigation-secondary-nav" aria-label="Operational navigation">
           <div className="navigation-secondary" role="group" aria-label="Operational tools">
             <GlobalNodeStatus onNavigate={navigate("node")} />
-            <a className="nav-link interactive-target" href="#chat" aria-current={route === "chat" ? "page" : undefined} onClick={navigate("chat")}>Chat</a>
-            <a className="nav-link interactive-target" href="#settings" aria-current={route === "settings" ? "page" : undefined} onClick={navigate("settings")}>Settings</a>
+            <a
+              className="nav-link interactive-target"
+              href="#chat"
+              aria-current={route === "chat" ? "page" : undefined}
+              onClick={navigate("chat")}
+            >
+              Chat
+            </a>
+            <a
+              className="nav-link interactive-target"
+              href="#settings"
+              aria-current={route === "settings" ? "page" : undefined}
+              onClick={navigate("settings")}
+            >
+              Settings
+            </a>
           </div>
         </nav>
         <div
@@ -154,12 +178,16 @@ function AppWorkspace({ services }: { services: AppServices }) {
             <SettingsScreen
               theme={theme}
               onThemeChange={setTheme}
-              onClearChatHistory={services.clearChats ? async (signal) => {
-                const token = await services.readControlToken(session.endpoint);
-                if (signal.aborted) throw new DOMException("aborted", "AbortError");
-                const result = await services.clearChats?.(session.endpoint, token, { signal });
-                return result?.deleted ?? 0;
-              } : undefined}
+              onClearChatHistory={
+                services.clearChats
+                  ? async (signal) => {
+                      const token = await services.readControlToken(session.endpoint);
+                      if (signal.aborted) throw new DOMException("aborted", "AbortError");
+                      const result = await services.clearChats?.(session.endpoint, token, { signal });
+                      return result?.deleted ?? 0;
+                    }
+                  : undefined
+              }
               runtime={{
                 phase: session.phase,
                 endpoint: session.endpoint,
@@ -181,11 +209,12 @@ function clampRailWidth(width: number) {
 function GlobalNodeStatus({ onNavigate }: { onNavigate: (event: React.MouseEvent) => void }) {
   const session = useNodeSession();
   const health = globalHealthLabel(session.phase);
-  const model = session.phase === "ready" && session.status?.runtime_model
-    ? `Active model ${session.status.runtime_model}`
-    : session.phase === "unloaded"
-      ? "No active model"
-      : "Model status unavailable";
+  const model =
+    session.phase === "ready" && session.status?.runtime_model
+      ? `Active model ${session.status.runtime_model}`
+      : session.phase === "unloaded"
+        ? "No active model"
+        : "Model status unavailable";
 
   return (
     <a
@@ -221,12 +250,13 @@ function NodeSessionGate({ children, heading }: { children: ReactNode; heading: 
   return (
     <section aria-labelledby="node-session-gate-heading">
       <header className="screen-header">
-        <div><p className="eyebrow">Local runtime</p><h1 id="node-session-gate-heading">{heading}</h1></div>
+        <div>
+          <p className="eyebrow">Local runtime</p>
+          <h1 id="node-session-gate-heading">{heading}</h1>
+        </div>
       </header>
       <p role="status" aria-live="polite">
-        {waiting
-          ? "Starting the private Loxa node…"
-          : session.error ?? "The Loxa node is stopped."}
+        {waiting ? "Starting the private Loxa node…" : (session.error ?? "The Loxa node is stopped.")}
       </p>
       {!waiting && (
         <button className="primary-button interactive-target" type="button" onClick={() => void session.retry()}>

@@ -103,8 +103,12 @@
   overflow-wrap: anywhere;
 }
 
-.markdownMessage > :first-child { margin-top: 0; }
-.markdownMessage > :last-child { margin-bottom: 0; }
+.markdownMessage > :first-child {
+  margin-top: 0;
+}
+.markdownMessage > :last-child {
+  margin-bottom: 0;
+}
 
 .markdownMessage p,
 .markdownMessage ul,
@@ -116,8 +120,12 @@
 }
 
 .markdownMessage ul,
-.markdownMessage ol { padding-left: var(--loxa-space-6); }
-.markdownMessage li + li { margin-top: var(--loxa-space-1); }
+.markdownMessage ol {
+  padding-left: var(--loxa-space-6);
+}
+.markdownMessage li + li {
+  margin-top: var(--loxa-space-1);
+}
 
 .markdownMessage :is(h1, h2, h3, h4, h5, h6) {
   margin: var(--loxa-space-6) 0 var(--loxa-space-2);
@@ -367,14 +375,31 @@
 }
 
 @media (max-width: 760px) {
-  .screen { gap: var(--loxa-space-3); }
-  .chatMain { min-height: 0; overflow: hidden; }
-  .composer { padding: var(--loxa-space-3); }
-  .composerFooter { align-items: flex-end; }
-  .composerTools { align-items: flex-end; }
-  .modelControl { grid-template-columns: minmax(0, 1fr) auto; }
-  .modelControl label { grid-column: 1 / -1; }
-  .modelPicker { width: 100%; }
+  .screen {
+    gap: var(--loxa-space-3);
+  }
+  .chatMain {
+    min-height: 0;
+    overflow: hidden;
+  }
+  .composer {
+    padding: var(--loxa-space-3);
+  }
+  .composerFooter {
+    align-items: flex-end;
+  }
+  .composerTools {
+    align-items: flex-end;
+  }
+  .modelControl {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+  .modelControl label {
+    grid-column: 1 / -1;
+  }
+  .modelPicker {
+    width: 100%;
+  }
 }
 
 @media (prefers-contrast: more) {
@@ -383,7 +408,9 @@
   .modelPicker,
   .markdownMessage pre,
   .markdownMessage th,
-  .markdownMessage td { border-width: 2px; }
+  .markdownMessage td {
+    border-width: 2px;
+  }
 }
 
 @media (forced-colors: active) {
@@ -404,14 +431,20 @@
   .copyResponseButton:focus-visible,
   .attachmentButton:focus-visible,
   .modelPicker:focus-visible,
-  .messageInput:focus-visible { outline-color: Highlight; }
+  .messageInput:focus-visible {
+    outline-color: Highlight;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .transcript { scroll-behavior: auto; }
+  .transcript {
+    scroll-behavior: auto;
+  }
   .composer,
   .messageInput,
   .modelPicker,
   .primaryControl,
-  .attachmentButton { transition-duration: var(--loxa-motion-fast); }
+  .attachmentButton {
+    transition-duration: var(--loxa-motion-fast);
+  }
 }

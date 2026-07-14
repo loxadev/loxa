@@ -70,12 +70,24 @@ function Probe() {
       <output aria-label="endpoint">{session.endpoint}</output>
       <output aria-label="error">{session.error ?? ""}</output>
       <output aria-label="runtime model">{session.status?.runtime_model ?? ""}</output>
-      <button type="button" onClick={() => void session.retry()}>Retry</button>
-      <button type="button" onClick={() => session.invalidateModelTruth()}>Invalidate model truth</button>
-      <button type="button" onClick={() => session.invalidateModelTruth("op-1")}>Track current operation</button>
-      <button type="button" onClick={() => void session.settleModelMutation("op-1")}>Settle current operation</button>
-      <button type="button" onClick={() => void session.refreshStatus()}>Refresh status</button>
-      <button type="button" onClick={() => void session.stop()}>Stop</button>
+      <button type="button" onClick={() => void session.retry()}>
+        Retry
+      </button>
+      <button type="button" onClick={() => session.invalidateModelTruth()}>
+        Invalidate model truth
+      </button>
+      <button type="button" onClick={() => session.invalidateModelTruth("op-1")}>
+        Track current operation
+      </button>
+      <button type="button" onClick={() => void session.settleModelMutation("op-1")}>
+        Settle current operation
+      </button>
+      <button type="button" onClick={() => void session.refreshStatus()}>
+        Refresh status
+      </button>
+      <button type="button" onClick={() => void session.stop()}>
+        Stop
+      </button>
     </div>
   );
 }
@@ -111,7 +123,11 @@ describe("NodeSessionProvider", () => {
 
   it("publishes ready only after the authoritative status probe", async () => {
     const api = services({ getStatus: vi.fn().mockResolvedValue(readyStatus) });
-    render(<NodeSessionProvider services={api} endpoint={endpoint}><Probe /></NodeSessionProvider>);
+    render(
+      <NodeSessionProvider services={api} endpoint={endpoint}>
+        <Probe />
+      </NodeSessionProvider>,
+    );
 
     expect(await screen.findByText("ready")).toBeInTheDocument();
     expect(screen.getByLabelText("endpoint")).toHaveTextContent(endpoint);
@@ -119,12 +135,22 @@ describe("NodeSessionProvider", () => {
 
   it("fails closed while reconciling a model mutation and publishes only the refreshed model", async () => {
     let resolveRefresh!: (status: typeof readyStatus) => void;
-    const getStatus = vi.fn()
+    const getStatus = vi
+      .fn()
       .mockResolvedValueOnce(readyStatus)
-      .mockImplementationOnce(() => new Promise<typeof readyStatus>((resolve) => { resolveRefresh = resolve; }));
+      .mockImplementationOnce(
+        () =>
+          new Promise<typeof readyStatus>((resolve) => {
+            resolveRefresh = resolve;
+          }),
+      );
     const api = services({ getStatus });
     const user = userEvent.setup();
-    render(<NodeSessionProvider services={api} endpoint={endpoint}><Probe /></NodeSessionProvider>);
+    render(
+      <NodeSessionProvider services={api} endpoint={endpoint}>
+        <Probe />
+      </NodeSessionProvider>,
+    );
 
     expect(await screen.findByText("ready")).toBeInTheDocument();
     expect(screen.getByLabelText("runtime model")).toHaveTextContent("gemma-3-4b-it-q4");
@@ -141,12 +167,17 @@ describe("NodeSessionProvider", () => {
   });
 
   it("publishes an actionable error and retries the ensure operation", async () => {
-    const start = vi.fn()
+    const start = vi
+      .fn()
       .mockRejectedValueOnce(new Error("Private node exited before readiness."))
       .mockResolvedValueOnce(snapshot());
     const api = services({ bootstrap: { ...services().bootstrap, start } });
     const user = userEvent.setup();
-    render(<NodeSessionProvider services={api} endpoint={endpoint}><Probe /></NodeSessionProvider>);
+    render(
+      <NodeSessionProvider services={api} endpoint={endpoint}>
+        <Probe />
+      </NodeSessionProvider>,
+    );
 
     expect(await screen.findByText("error")).toBeInTheDocument();
     expect(screen.getByLabelText("error")).toHaveTextContent("Private node exited before readiness.");
@@ -159,7 +190,11 @@ describe("NodeSessionProvider", () => {
   it("retains exact native ownership when the public status probe fails", async () => {
     const api = services({ getStatus: vi.fn().mockRejectedValue(new Error("Public status unavailable.")) });
     const user = userEvent.setup();
-    render(<NodeSessionProvider services={api} endpoint={endpoint}><Probe /></NodeSessionProvider>);
+    render(
+      <NodeSessionProvider services={api} endpoint={endpoint}>
+        <Probe />
+      </NodeSessionProvider>,
+    );
 
     expect(await screen.findByText("error")).toBeInTheDocument();
     expect(screen.getByLabelText("ownership")).toHaveTextContent("owned");
@@ -170,7 +205,11 @@ describe("NodeSessionProvider", () => {
   it("stops only an app-owned node", async () => {
     const owned = services();
     const user = userEvent.setup();
-    const view = render(<NodeSessionProvider services={owned} endpoint={endpoint}><Probe /></NodeSessionProvider>);
+    const view = render(
+      <NodeSessionProvider services={owned} endpoint={endpoint}>
+        <Probe />
+      </NodeSessionProvider>,
+    );
     expect(await screen.findByText("unloaded")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Stop" }));
     await waitFor(() => expect(owned.bootstrap.stop).toHaveBeenCalledTimes(1));
@@ -183,7 +222,11 @@ describe("NodeSessionProvider", () => {
         start: vi.fn().mockResolvedValue(snapshot({ ownership: "attached" })),
       },
     });
-    const attachedView = render(<NodeSessionProvider services={attached} endpoint={endpoint}><Probe /></NodeSessionProvider>);
+    const attachedView = render(
+      <NodeSessionProvider services={attached} endpoint={endpoint}>
+        <Probe />
+      </NodeSessionProvider>,
+    );
     expect(await screen.findByText("unloaded")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Stop" }));
     expect(attached.bootstrap.stop).not.toHaveBeenCalled();
@@ -196,7 +239,12 @@ describe("NodeSessionProvider", () => {
     let callbacks!: ControlStreamCallbacks;
     let resolveStop!: (value: BootstrapSnapshot) => void;
     const dispose = vi.fn();
-    const stop = vi.fn(() => new Promise<BootstrapSnapshot>((resolve) => { resolveStop = resolve; }));
+    const stop = vi.fn(
+      () =>
+        new Promise<BootstrapSnapshot>((resolve) => {
+          resolveStop = resolve;
+        }),
+    );
     const api = services({
       bootstrap: { ...services().bootstrap, stop },
       createControlEventStream: vi.fn((_endpoint, _token, _cursor, nextCallbacks) => {
@@ -204,7 +252,11 @@ describe("NodeSessionProvider", () => {
         return { cancel: vi.fn(), dispose, finished: new Promise<never>(() => undefined) };
       }),
     });
-    render(<NodeSessionProvider services={api} endpoint={endpoint}><Probe /></NodeSessionProvider>);
+    render(
+      <NodeSessionProvider services={api} endpoint={endpoint}>
+        <Probe />
+      </NodeSessionProvider>,
+    );
 
     expect(await screen.findByText("unloaded")).toBeInTheDocument();
     await waitFor(() => expect(callbacks).toBeDefined());
@@ -214,8 +266,14 @@ describe("NodeSessionProvider", () => {
       callbacks.onEvent({
         sequence: 4,
         operation: {
-          id: "op-late", kind: "load", status: "succeeded", modelId: "gemma-ready",
-          progress: null, error: null, createdAtUnixMs: 1, updatedAtUnixMs: 2,
+          id: "op-late",
+          kind: "load",
+          status: "succeeded",
+          modelId: "gemma-ready",
+          progress: null,
+          error: null,
+          createdAtUnixMs: 1,
+          updatedAtUnixMs: 2,
         },
       });
     });
@@ -231,11 +289,14 @@ describe("NodeSessionProvider", () => {
     let callbacks!: ControlStreamCallbacks;
     let resolveProof!: (status: typeof readyStatus) => void;
     const proofSignals: AbortSignal[] = [];
-    const getStatus = vi.fn()
+    const getStatus = vi
+      .fn()
       .mockResolvedValueOnce(readyStatus)
       .mockImplementation((_endpoint, options) => {
         if (options?.signal) proofSignals.push(options.signal);
-        return new Promise<typeof readyStatus>((resolve) => { resolveProof = resolve; });
+        return new Promise<typeof readyStatus>((resolve) => {
+          resolveProof = resolve;
+        });
       });
     const api = services({
       getStatus,
@@ -245,20 +306,32 @@ describe("NodeSessionProvider", () => {
       }),
     });
     const user = userEvent.setup();
-    render(<NodeSessionProvider services={api} endpoint={endpoint}><Probe /></NodeSessionProvider>);
+    render(
+      <NodeSessionProvider services={api} endpoint={endpoint}>
+        <Probe />
+      </NodeSessionProvider>,
+    );
     expect(await screen.findByText("ready")).toBeInTheDocument();
     await waitFor(() => expect(callbacks).toBeDefined());
     await user.click(screen.getByRole("button", { name: "Track current operation" }));
 
-    act(() => callbacks.onSnapshot({
-      cursor: 9,
-      cursorGap: false,
-      operations: ["op-old-1", "op-1", "op-old-2"].map((id) => ({
-        id, kind: "load" as const, status: "succeeded" as const, modelId: "gemma-ready",
-        progress: null, error: null, createdAtUnixMs: 1, updatedAtUnixMs: 2,
-      })),
-      events: [],
-    }));
+    act(() =>
+      callbacks.onSnapshot({
+        cursor: 9,
+        cursorGap: false,
+        operations: ["op-old-1", "op-1", "op-old-2"].map((id) => ({
+          id,
+          kind: "load" as const,
+          status: "succeeded" as const,
+          modelId: "gemma-ready",
+          progress: null,
+          error: null,
+          createdAtUnixMs: 1,
+          updatedAtUnixMs: 2,
+        })),
+        events: [],
+      }),
+    );
 
     expect(getStatus).toHaveBeenCalledTimes(2);
     expect(proofSignals).toHaveLength(1);
@@ -270,7 +343,8 @@ describe("NodeSessionProvider", () => {
 
   it("retries an operation proof after a transient rejection", async () => {
     let callbacks!: ControlStreamCallbacks;
-    const getStatus = vi.fn()
+    const getStatus = vi
+      .fn()
       .mockResolvedValueOnce(readyStatus)
       .mockRejectedValueOnce(new Error("status temporarily unavailable"))
       .mockResolvedValueOnce(readyStatus);
@@ -282,14 +356,24 @@ describe("NodeSessionProvider", () => {
       }),
     });
     const user = userEvent.setup();
-    render(<NodeSessionProvider services={api} endpoint={endpoint}><Probe /></NodeSessionProvider>);
+    render(
+      <NodeSessionProvider services={api} endpoint={endpoint}>
+        <Probe />
+      </NodeSessionProvider>,
+    );
     expect(await screen.findByText("ready")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Track current operation" }));
     const terminal = {
       sequence: 2,
       operation: {
-        id: "op-1", kind: "load" as const, status: "succeeded" as const, modelId: "gemma-ready",
-        progress: null, error: null, createdAtUnixMs: 1, updatedAtUnixMs: 2,
+        id: "op-1",
+        kind: "load" as const,
+        status: "succeeded" as const,
+        modelId: "gemma-ready",
+        progress: null,
+        error: null,
+        createdAtUnixMs: 1,
+        updatedAtUnixMs: 2,
       },
     };
     act(() => callbacks.onEvent(terminal));
@@ -302,14 +386,20 @@ describe("NodeSessionProvider", () => {
   it("keeps an operation retryable when its proof is superseded", async () => {
     let callbacks!: ControlStreamCallbacks;
     const proofSignals: AbortSignal[] = [];
-    const getStatus = vi.fn()
+    const getStatus = vi
+      .fn()
       .mockResolvedValueOnce(readyStatus)
-      .mockImplementationOnce((_endpoint, options) => new Promise<typeof readyStatus>((_resolve, reject) => {
-        if (options?.signal) {
-          proofSignals.push(options.signal);
-          options.signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
-        }
-      }))
+      .mockImplementationOnce(
+        (_endpoint, options) =>
+          new Promise<typeof readyStatus>((_resolve, reject) => {
+            if (options?.signal) {
+              proofSignals.push(options.signal);
+              options.signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), {
+                once: true,
+              });
+            }
+          }),
+      )
       .mockResolvedValueOnce(readyStatus)
       .mockResolvedValueOnce(readyStatus);
     const api = services({
@@ -320,14 +410,24 @@ describe("NodeSessionProvider", () => {
       }),
     });
     const user = userEvent.setup();
-    render(<NodeSessionProvider services={api} endpoint={endpoint}><Probe /></NodeSessionProvider>);
+    render(
+      <NodeSessionProvider services={api} endpoint={endpoint}>
+        <Probe />
+      </NodeSessionProvider>,
+    );
     expect(await screen.findByText("ready")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Track current operation" }));
     const terminal = {
       sequence: 2,
       operation: {
-        id: "op-1", kind: "load" as const, status: "succeeded" as const, modelId: "gemma-ready",
-        progress: null, error: null, createdAtUnixMs: 1, updatedAtUnixMs: 2,
+        id: "op-1",
+        kind: "load" as const,
+        status: "succeeded" as const,
+        modelId: "gemma-ready",
+        progress: null,
+        error: null,
+        createdAtUnixMs: 1,
+        updatedAtUnixMs: 2,
       },
     };
     act(() => callbacks.onEvent(terminal));
@@ -347,14 +447,24 @@ describe("NodeSessionProvider", () => {
       callbacks = nextCallbacks;
       return { cancel: vi.fn(), dispose: vi.fn(), finished: new Promise<never>(() => undefined) };
     });
-    render(<NodeSessionProvider services={api} endpoint={endpoint}><Probe /></NodeSessionProvider>);
+    render(
+      <NodeSessionProvider services={api} endpoint={endpoint}>
+        <Probe />
+      </NodeSessionProvider>,
+    );
     expect(await screen.findByText("ready")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Track current operation" }));
     const terminal = {
       sequence: 2,
       operation: {
-        id: "op-1", kind: "load" as const, status: "succeeded" as const, modelId: "gemma-ready",
-        progress: null, error: null, createdAtUnixMs: 1, updatedAtUnixMs: 2,
+        id: "op-1",
+        kind: "load" as const,
+        status: "succeeded" as const,
+        modelId: "gemma-ready",
+        progress: null,
+        error: null,
+        createdAtUnixMs: 1,
+        updatedAtUnixMs: 2,
       },
     };
     act(() => callbacks.onEvent(terminal));
@@ -371,12 +481,14 @@ describe("NodeSessionProvider", () => {
   });
 
   it("bounds retryable terminal tracking without pruning an active operation", async () => {
-    const getStatus = vi.fn()
-      .mockResolvedValueOnce(readyStatus)
-      .mockRejectedValue(new Error("proof unavailable"));
+    const getStatus = vi.fn().mockResolvedValueOnce(readyStatus).mockRejectedValue(new Error("proof unavailable"));
     const api = services({ getStatus });
     capturedSession = null;
-    render(<NodeSessionProvider services={api} endpoint={endpoint}><CapturingProbe /></NodeSessionProvider>);
+    render(
+      <NodeSessionProvider services={api} endpoint={endpoint}>
+        <CapturingProbe />
+      </NodeSessionProvider>,
+    );
     expect(await screen.findByText("ready")).toBeInTheDocument();
     expect(capturedSession).not.toBeNull();
 
@@ -384,13 +496,19 @@ describe("NodeSessionProvider", () => {
     for (let index = 0; index < 129; index += 1) {
       const operationId = `op-failed-${index}`;
       act(() => capturedSession?.invalidateModelTruth(operationId));
-      await act(async () => { await capturedSession?.settleModelMutation(operationId); });
+      await act(async () => {
+        await capturedSession?.settleModelMutation(operationId);
+      });
     }
     expect(getStatus).toHaveBeenCalledTimes(130);
 
-    await act(async () => { await capturedSession?.settleModelMutation("op-failed-0"); });
+    await act(async () => {
+      await capturedSession?.settleModelMutation("op-failed-0");
+    });
     expect(getStatus).toHaveBeenCalledTimes(130);
-    await act(async () => { await capturedSession?.settleModelMutation("op-active"); });
+    await act(async () => {
+      await capturedSession?.settleModelMutation("op-active");
+    });
     expect(getStatus).toHaveBeenCalledTimes(131);
   });
 
@@ -398,7 +516,11 @@ describe("NodeSessionProvider", () => {
     const readControlToken = vi.fn().mockRejectedValue(new Error("token unavailable"));
     const api = services({ readControlToken });
     const user = userEvent.setup();
-    render(<NodeSessionProvider services={api} endpoint={endpoint}><Probe /></NodeSessionProvider>);
+    render(
+      <NodeSessionProvider services={api} endpoint={endpoint}>
+        <Probe />
+      </NodeSessionProvider>,
+    );
     expect(await screen.findByText("unloaded")).toBeInTheDocument();
     await waitFor(() => expect(readControlToken).toHaveBeenCalledTimes(1));
 
@@ -411,7 +533,11 @@ describe("NodeSessionProvider", () => {
   it("cancels an initial stream reconnect on unmount", async () => {
     const readControlToken = vi.fn().mockRejectedValue(new Error("token unavailable"));
     const api = services({ readControlToken });
-    const view = render(<NodeSessionProvider services={api} endpoint={endpoint}><Probe /></NodeSessionProvider>);
+    const view = render(
+      <NodeSessionProvider services={api} endpoint={endpoint}>
+        <Probe />
+      </NodeSessionProvider>,
+    );
     expect(await screen.findByText("unloaded")).toBeInTheDocument();
     await waitFor(() => expect(readControlToken).toHaveBeenCalledTimes(1));
 
@@ -421,12 +547,17 @@ describe("NodeSessionProvider", () => {
   });
 
   it("cancels the old stream reconnect when retry starts a new epoch", async () => {
-    const readControlToken = vi.fn()
+    const readControlToken = vi
+      .fn()
       .mockRejectedValueOnce(new Error("token unavailable"))
       .mockResolvedValue("ab".repeat(32));
     const api = services({ readControlToken });
     const user = userEvent.setup();
-    render(<NodeSessionProvider services={api} endpoint={endpoint}><Probe /></NodeSessionProvider>);
+    render(
+      <NodeSessionProvider services={api} endpoint={endpoint}>
+        <Probe />
+      </NodeSessionProvider>,
+    );
     expect(await screen.findByText("unloaded")).toBeInTheDocument();
     await waitFor(() => expect(readControlToken).toHaveBeenCalledTimes(1));
 
@@ -445,45 +576,67 @@ describe("NodeSessionProvider", () => {
         return { cancel: vi.fn(), dispose: vi.fn(), finished: new Promise<never>(() => undefined) };
       }),
     });
-    render(<NodeSessionProvider services={api} endpoint={endpoint}><Probe /></NodeSessionProvider>);
+    render(
+      <NodeSessionProvider services={api} endpoint={endpoint}>
+        <Probe />
+      </NodeSessionProvider>,
+    );
     expect(await screen.findByText("unloaded")).toBeInTheDocument();
     await waitFor(() => expect(callbackHistory).toHaveLength(1));
     vi.useFakeTimers();
     try {
       for (const [retryIndex, delay] of [100, 200, 400, 800, 1_600, 1_600].entries()) {
-        act(() => callbackHistory[callbackHistory.length - 1]?.onTerminal({
-          kind: "error",
-          cursor: retryIndex,
-          message: "stream ended before snapshot",
-        }));
-        await act(async () => { await vi.advanceTimersByTimeAsync(delay - 1); });
+        act(() =>
+          callbackHistory[callbackHistory.length - 1]?.onTerminal({
+            kind: "error",
+            cursor: retryIndex,
+            message: "stream ended before snapshot",
+          }),
+        );
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(delay - 1);
+        });
         expect(callbackHistory).toHaveLength(retryIndex + 1);
-        await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(1);
+        });
         expect(callbackHistory).toHaveLength(retryIndex + 2);
       }
 
-      act(() => callbackHistory[callbackHistory.length - 1]?.onTerminal({
-        kind: "error",
-        cursor: 7,
-        message: "stream still flapping",
-      }));
-      await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+      act(() =>
+        callbackHistory[callbackHistory.length - 1]?.onTerminal({
+          kind: "error",
+          cursor: 7,
+          message: "stream still flapping",
+        }),
+      );
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10_000);
+      });
       expect(callbackHistory).toHaveLength(7);
 
-      act(() => callbackHistory[callbackHistory.length - 1]?.onSnapshot({
-        cursor: 7,
-        cursorGap: false,
-        operations: [],
-        events: [],
-      }));
-      act(() => callbackHistory[callbackHistory.length - 1]?.onTerminal({
-        kind: "error",
-        cursor: 7,
-        message: "later independent disconnect",
-      }));
-      await act(async () => { await vi.advanceTimersByTimeAsync(99); });
+      act(() =>
+        callbackHistory[callbackHistory.length - 1]?.onSnapshot({
+          cursor: 7,
+          cursorGap: false,
+          operations: [],
+          events: [],
+        }),
+      );
+      act(() =>
+        callbackHistory[callbackHistory.length - 1]?.onTerminal({
+          kind: "error",
+          cursor: 7,
+          message: "later independent disconnect",
+        }),
+      );
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(99);
+      });
       expect(callbackHistory).toHaveLength(7);
-      await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1);
+      });
       expect(callbackHistory).toHaveLength(8);
     } finally {
       vi.useRealTimers();
@@ -498,7 +651,11 @@ describe("NodeSessionProvider", () => {
         return new Promise<never>(() => undefined);
       }),
     });
-    const view = render(<NodeSessionProvider services={api} endpoint={endpoint}><Probe /></NodeSessionProvider>);
+    const view = render(
+      <NodeSessionProvider services={api} endpoint={endpoint}>
+        <Probe />
+      </NodeSessionProvider>,
+    );
     await waitFor(() => expect(api.getStatus).toHaveBeenCalledTimes(1));
 
     act(() => view.unmount());

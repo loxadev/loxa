@@ -1,12 +1,5 @@
 export type HistoryClientErrorKind =
-  | "credential"
-  | "endpoint"
-  | "invalid-request"
-  | "transport"
-  | "timeout"
-  | "aborted"
-  | "http"
-  | "invalid-response";
+  "credential" | "endpoint" | "invalid-request" | "transport" | "timeout" | "aborted" | "http" | "invalid-response";
 
 export class HistoryClientError extends Error {
   constructor(
@@ -60,10 +53,7 @@ export type MessageSummary = {
   createdAtMs: number;
   updatedAtMs: number;
 };
-export type PersistentTurnTerminal =
-  | { kind: "completed" }
-  | { kind: "cancelled" }
-  | { kind: "error"; message: string };
+export type PersistentTurnTerminal = { kind: "completed" } | { kind: "cancelled" } | { kind: "error"; message: string };
 export type PersistentTurnCallbacks = {
   onStarted(turnId: string, omittedTurns: number): void;
   onDelta(content: string): void;
@@ -125,7 +115,10 @@ export async function listTurns(
 ): Promise<TurnPage> {
   assertId(chatId);
   const query = pageQuery(page.limit, "after", page.after);
-  return decodeTurnPage(await request(endpoint, `/loxa/v1/chats/${chatId}/turns${query}`, token, { method: "GET" }, options), chatId);
+  return decodeTurnPage(
+    await request(endpoint, `/loxa/v1/chats/${chatId}/turns${query}`, token, { method: "GET" }, options),
+    chatId,
+  );
 }
 
 export async function renameChat(
@@ -137,10 +130,18 @@ export async function renameChat(
 ): Promise<ChatSummary> {
   assertId(chatId);
   assertTitle(title);
-  return decodeChat(await request(endpoint, `/loxa/v1/chats/${chatId}`, token, {
-    method: "PATCH",
-    body: JSON.stringify({ title }),
-  }, options));
+  return decodeChat(
+    await request(
+      endpoint,
+      `/loxa/v1/chats/${chatId}`,
+      token,
+      {
+        method: "PATCH",
+        body: JSON.stringify({ title }),
+      },
+      options,
+    ),
+  );
 }
 
 export async function deleteChat(
@@ -158,10 +159,18 @@ export async function clearChats(
   token: string,
   options: HistoryClientOptions = {},
 ): Promise<{ deleted: number }> {
-  return decodeClearResult(await request(endpoint, "/loxa/v1/chats/clear", token, {
-    method: "POST",
-    body: JSON.stringify({ confirm: "delete_all_chat_history" }),
-  }, options));
+  return decodeClearResult(
+    await request(
+      endpoint,
+      "/loxa/v1/chats/clear",
+      token,
+      {
+        method: "POST",
+        body: JSON.stringify({ confirm: "delete_all_chat_history" }),
+      },
+      options,
+    ),
+  );
 }
 
 export async function listMessageSummaries(
@@ -173,12 +182,23 @@ export async function listMessageSummaries(
 ): Promise<MessageSummary[]> {
   assertId(chatId);
   assertId(turnId);
-  const value = await request(endpoint, `/loxa/v1/chats/${chatId}/turns/${turnId}/messages`, token, { method: "GET" }, options);
+  const value = await request(
+    endpoint,
+    `/loxa/v1/chats/${chatId}/turns/${turnId}/messages`,
+    token,
+    { method: "GET" },
+    options,
+  );
   if (!isRecord(value) || !hasExactKeys(value, ["messages"]) || !Array.isArray(value.messages)) throw invalidResponse();
   const messages = value.messages.map((entry) => decodeMessageSummary(entry, turnId));
-  if (messages.length < 1 || messages.length > 2 || messages[0]?.role !== "user" ||
+  if (
+    messages.length < 1 ||
+    messages.length > 2 ||
+    messages[0]?.role !== "user" ||
     (messages.length === 2 && messages[1]?.role !== "assistant") ||
-    new Set(messages.map(({ id }) => id)).size !== messages.length) throw invalidResponse();
+    new Set(messages.map(({ id }) => id)).size !== messages.length
+  )
+    throw invalidResponse();
   return messages;
 }
 
@@ -198,7 +218,13 @@ export async function getMessageContent(
   let content = "";
   let bytes = 0;
   while (true) {
-    const value = await request(endpoint, `/loxa/v1/chats/${chatId}/turns/${turnId}/messages/${messageId}?segment=${segment}`, token, { method: "GET" }, options);
+    const value = await request(
+      endpoint,
+      `/loxa/v1/chats/${chatId}/turns/${turnId}/messages/${messageId}?segment=${segment}`,
+      token,
+      { method: "GET" },
+      options,
+    );
     const page = decodeMessagePage(value, messageId, turnId, segment, expectedCount);
     expectedCount = page.segmentCount;
     for (const part of page.contents) {
@@ -222,14 +248,24 @@ export function streamPersistentTurn(
   fetch: HistoryFetch = globalThis.fetch,
 ): PersistentTurnHandle {
   assertId(chatId);
-  if (!TOKEN_PATTERN.test(token) || content.trim() === "" || content.includes("\0") || new TextEncoder().encode(content).byteLength > MAX_MESSAGE_BYTES) invalidRequest();
+  if (
+    !TOKEN_PATTERN.test(token) ||
+    content.trim() === "" ||
+    content.includes("\0") ||
+    new TextEncoder().encode(content).byteLength > MAX_MESSAGE_BYTES
+  )
+    invalidRequest();
   const controller = new AbortController();
   let disposed = false;
   let cancelRequested = false;
   let turnId: string | null = null;
   let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   let notified = false;
-  const callerAbort = () => { disposed = true; controller.abort(); void reader?.cancel(); };
+  const callerAbort = () => {
+    disposed = true;
+    controller.abort();
+    void reader?.cancel();
+  };
   if (signal?.aborted) callerAbort();
   else signal?.addEventListener("abort", callerAbort, { once: true });
   const notify = (terminal: PersistentTurnTerminal) => {
@@ -241,9 +277,16 @@ export function streamPersistentTurn(
   };
   const requestCancel = () => {
     if (turnId === null) return;
-    void request(endpoint, `/loxa/v1/chats/${chatId}/turns/${turnId}/cancel`, token, {
-      method: "POST", body: "",
-    }, { fetch, timeoutMs: DEFAULT_TIMEOUT_MS }).catch(() => undefined);
+    void request(
+      endpoint,
+      `/loxa/v1/chats/${chatId}/turns/${turnId}/cancel`,
+      token,
+      {
+        method: "POST",
+        body: "",
+      },
+      { fetch, timeoutMs: DEFAULT_TIMEOUT_MS },
+    ).catch(() => undefined);
   };
   const finished = (async (): Promise<PersistentTurnTerminal> => {
     if (disposed) return { kind: "cancelled" };
@@ -281,17 +324,37 @@ export function streamPersistentTurn(
       }
     } catch (error) {
       if (disposed || controller.signal.aborted) return { kind: "cancelled" };
-      if (error instanceof HistoryClientError && error.kind === "http") return notify({ kind: "error", message: error.message });
-      return notify({ kind: "error", message: error instanceof SseDecodeError ? "The Loxa node returned a malformed persistent chat stream." : "The persistent chat stream failed." });
+      if (error instanceof HistoryClientError && error.kind === "http")
+        return notify({ kind: "error", message: error.message });
+      return notify({
+        kind: "error",
+        message:
+          error instanceof SseDecodeError
+            ? "The Loxa node returned a malformed persistent chat stream."
+            : "The persistent chat stream failed.",
+      });
     } finally {
       signal?.removeEventListener("abort", callerAbort);
-      try { await reader?.cancel(); } catch { /* best effort */ }
+      try {
+        await reader?.cancel();
+      } catch {
+        /* best effort */
+      }
       reader?.releaseLock();
     }
   })();
   return {
-    cancel: () => { if (cancelRequested || disposed) return; cancelRequested = true; requestCancel(); },
-    dispose: () => { if (disposed) return; disposed = true; controller.abort(); void reader?.cancel(); },
+    cancel: () => {
+      if (cancelRequested || disposed) return;
+      cancelRequested = true;
+      requestCancel();
+    },
+    dispose: () => {
+      if (disposed) return;
+      disposed = true;
+      controller.abort();
+      void reader?.cancel();
+    },
     finished,
   };
 }
@@ -326,10 +389,17 @@ function historyUrl(endpoint: string, path: string): string {
   }
   const port = Number(parsed.port);
   if (
-    parsed.protocol !== "http:" || parsed.hostname !== "127.0.0.1" || parsed.port === "" ||
-    !Number.isSafeInteger(port) || port < 1 || port > 65_535 || parsed.username !== "" ||
-    parsed.password !== "" || (parsed.pathname !== "" && parsed.pathname !== "/") ||
-    parsed.search !== "" || parsed.hash !== ""
+    parsed.protocol !== "http:" ||
+    parsed.hostname !== "127.0.0.1" ||
+    parsed.port === "" ||
+    !Number.isSafeInteger(port) ||
+    port < 1 ||
+    port > 65_535 ||
+    parsed.username !== "" ||
+    parsed.password !== "" ||
+    (parsed.pathname !== "" && parsed.pathname !== "/") ||
+    parsed.search !== "" ||
+    parsed.hash !== ""
   ) {
     throw new HistoryClientError("endpoint", "Chat history is restricted to an explicit IPv4 loopback endpoint.");
   }
@@ -393,12 +463,17 @@ async function request(
 async function decodeHttpError(response: Response): Promise<HistoryClientError> {
   try {
     const body = parseJson(await readBoundedText(response));
-    const details = isRecord(body) && hasExactKeys(body, ["error"]) && isRecord(body.error)
-      ? body.error
-      : body;
-    if (!isRecord(details) || !hasExactKeys(details, ["code", "message"]) ||
-      typeof details.code !== "string" || !ERROR_CODE_PATTERN.test(details.code) ||
-      typeof details.message !== "string" || details.message.trim() === "" || details.message.length > 512 || details.message.includes("\0")) {
+    const details = isRecord(body) && hasExactKeys(body, ["error"]) && isRecord(body.error) ? body.error : body;
+    if (
+      !isRecord(details) ||
+      !hasExactKeys(details, ["code", "message"]) ||
+      typeof details.code !== "string" ||
+      !ERROR_CODE_PATTERN.test(details.code) ||
+      typeof details.message !== "string" ||
+      details.message.trim() === "" ||
+      details.message.length > 512 ||
+      details.message.includes("\0")
+    ) {
       throw new Error("invalid error");
     }
     return new HistoryClientError("http", details.message, response.status, details.code);
@@ -445,55 +520,116 @@ function invalidResponse(): HistoryClientError {
 }
 
 function decodeChatPage(value: unknown): ChatPage {
-  if (!isRecord(value) || !hasExactKeys(value, ["chats", "next_before"]) || !Array.isArray(value.chats) || !nullableCursor(value.next_before)) throw invalidResponse();
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, ["chats", "next_before"]) ||
+    !Array.isArray(value.chats) ||
+    !nullableCursor(value.next_before)
+  )
+    throw invalidResponse();
   const chats = value.chats.map(decodeChat);
   if (new Set(chats.map((chat) => chat.id)).size !== chats.length) throw invalidResponse();
   for (let index = 1; index < chats.length; index += 1) {
     const previous = chats[index - 1];
     const current = chats[index];
-    if (current.updatedAtMs > previous.updatedAtMs || (current.updatedAtMs === previous.updatedAtMs && current.id >= previous.id)) throw invalidResponse();
+    if (
+      current.updatedAtMs > previous.updatedAtMs ||
+      (current.updatedAtMs === previous.updatedAtMs && current.id >= previous.id)
+    )
+      throw invalidResponse();
   }
   return { chats, nextBefore: value.next_before };
 }
 
 function decodeChat(value: unknown): ChatSummary {
-  if (!isRecord(value) || !hasExactKeys(value, ["id", "title", "created_at_ms", "updated_at_ms"]) ||
-    typeof value.id !== "string" || !ID_PATTERN.test(value.id) || typeof value.title !== "string" ||
-    value.title.trim() === "" || value.title.includes("\0") || [...value.title].length > MAX_TITLE_SCALARS ||
-    !isTimestamp(value.created_at_ms) || !isTimestamp(value.updated_at_ms) || value.updated_at_ms < value.created_at_ms) throw invalidResponse();
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, ["id", "title", "created_at_ms", "updated_at_ms"]) ||
+    typeof value.id !== "string" ||
+    !ID_PATTERN.test(value.id) ||
+    typeof value.title !== "string" ||
+    value.title.trim() === "" ||
+    value.title.includes("\0") ||
+    [...value.title].length > MAX_TITLE_SCALARS ||
+    !isTimestamp(value.created_at_ms) ||
+    !isTimestamp(value.updated_at_ms) ||
+    value.updated_at_ms < value.created_at_ms
+  )
+    throw invalidResponse();
   return { id: value.id, title: value.title, createdAtMs: value.created_at_ms, updatedAtMs: value.updated_at_ms };
 }
 
 function decodeTurnPage(value: unknown, chatId: string): TurnPage {
-  if (!isRecord(value) || !hasExactKeys(value, ["turns", "next_after"]) || !Array.isArray(value.turns) || !nullableCursor(value.next_after)) throw invalidResponse();
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, ["turns", "next_after"]) ||
+    !Array.isArray(value.turns) ||
+    !nullableCursor(value.next_after)
+  )
+    throw invalidResponse();
   const turns = value.turns.map((turn) => decodeTurn(turn, chatId));
   if (new Set(turns.map((turn) => turn.id)).size !== turns.length) throw invalidResponse();
-  for (let index = 1; index < turns.length; index += 1) if (turns[index].ordinal <= turns[index - 1].ordinal) throw invalidResponse();
+  for (let index = 1; index < turns.length; index += 1)
+    if (turns[index].ordinal <= turns[index - 1].ordinal) throw invalidResponse();
   return { turns, nextAfter: value.next_after };
 }
 
 function decodeTurn(value: unknown, expectedChatId: string): HistoryTurn {
   const keys = ["id", "chat_id", "ordinal", "state", "provenance", "error_code", "created_at_ms", "updated_at_ms"];
-  if (!isRecord(value) || !hasExactKeys(value, keys) || typeof value.id !== "string" || !ID_PATTERN.test(value.id) ||
-    value.chat_id !== expectedChatId || !isTimestamp(value.ordinal) || !isTurnState(value.state) ||
-    !isRecord(value.provenance) || !hasExactKeys(value.provenance, ["model_alias", "recipe_id", "engine_name", "engine_version"]) ||
-    value.provenance.model_alias !== "loxa" || !boundedString(value.provenance.recipe_id, 256, false) ||
-    !nullableBoundedString(value.provenance.engine_name, 128) || !nullableBoundedString(value.provenance.engine_version, 128) ||
-    !(value.error_code === null || (typeof value.error_code === "string" && ERROR_CODE_PATTERN.test(value.error_code))) ||
-    !isTimestamp(value.created_at_ms) || !isTimestamp(value.updated_at_ms) || value.updated_at_ms < value.created_at_ms) throw invalidResponse();
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, keys) ||
+    typeof value.id !== "string" ||
+    !ID_PATTERN.test(value.id) ||
+    value.chat_id !== expectedChatId ||
+    !isTimestamp(value.ordinal) ||
+    !isTurnState(value.state) ||
+    !isRecord(value.provenance) ||
+    !hasExactKeys(value.provenance, ["model_alias", "recipe_id", "engine_name", "engine_version"]) ||
+    value.provenance.model_alias !== "loxa" ||
+    !boundedString(value.provenance.recipe_id, 256, false) ||
+    !nullableBoundedString(value.provenance.engine_name, 128) ||
+    !nullableBoundedString(value.provenance.engine_version, 128) ||
+    !(
+      value.error_code === null ||
+      (typeof value.error_code === "string" && ERROR_CODE_PATTERN.test(value.error_code))
+    ) ||
+    !isTimestamp(value.created_at_ms) ||
+    !isTimestamp(value.updated_at_ms) ||
+    value.updated_at_ms < value.created_at_ms
+  )
+    throw invalidResponse();
   return {
-    id: value.id, chatId: value.chat_id, ordinal: value.ordinal, state: value.state,
-    modelAlias: "loxa", recipeId: value.provenance.recipe_id,
-    engineName: value.provenance.engine_name, engineVersion: value.provenance.engine_version,
-    errorCode: value.error_code, createdAtMs: value.created_at_ms, updatedAtMs: value.updated_at_ms,
+    id: value.id,
+    chatId: value.chat_id,
+    ordinal: value.ordinal,
+    state: value.state,
+    modelAlias: "loxa",
+    recipeId: value.provenance.recipe_id,
+    engineName: value.provenance.engine_name,
+    engineVersion: value.provenance.engine_version,
+    errorCode: value.error_code,
+    createdAtMs: value.created_at_ms,
+    updatedAtMs: value.updated_at_ms,
   };
 }
 
 function decodeMessageSummary(value: unknown, expectedTurnId: string): MessageSummary {
   const keys = ["id", "turn_id", "role", "content_bytes", "created_at_ms", "updated_at_ms"];
-  if (!isRecord(value) || !hasExactKeys(value, keys) || typeof value.id !== "string" || !ID_PATTERN.test(value.id) ||
-    value.turn_id !== expectedTurnId || !isMessageRole(value.role) || !isTimestamp(value.content_bytes) || value.content_bytes > MAX_MESSAGE_BYTES ||
-    !isTimestamp(value.created_at_ms) || !isTimestamp(value.updated_at_ms) || value.updated_at_ms < value.created_at_ms) throw invalidResponse();
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, keys) ||
+    typeof value.id !== "string" ||
+    !ID_PATTERN.test(value.id) ||
+    value.turn_id !== expectedTurnId ||
+    !isMessageRole(value.role) ||
+    !isTimestamp(value.content_bytes) ||
+    value.content_bytes > MAX_MESSAGE_BYTES ||
+    !isTimestamp(value.created_at_ms) ||
+    !isTimestamp(value.updated_at_ms) ||
+    value.updated_at_ms < value.created_at_ms
+  )
+    throw invalidResponse();
   return {
     id: value.id,
     turnId: value.turn_id,
@@ -512,16 +648,35 @@ function decodeMessagePage(
   expectedCount: number | null,
 ): { segmentCount: number; contents: string[]; nextSegment: number | null } {
   const keys = ["message_id", "turn_id", "role", "segment_count", "segments", "next_segment"];
-  if (!isRecord(value) || !hasExactKeys(value, keys) || value.message_id !== messageId || value.turn_id !== turnId ||
-    !isMessageRole(value.role) || !isTimestamp(value.segment_count) || value.segment_count < 1 ||
-    (expectedCount !== null && value.segment_count !== expectedCount) || !Array.isArray(value.segments) || value.segments.length === 0 ||
-    !(value.next_segment === null || (isTimestamp(value.next_segment) && value.next_segment < value.segment_count))) throw invalidResponse();
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, keys) ||
+    value.message_id !== messageId ||
+    value.turn_id !== turnId ||
+    !isMessageRole(value.role) ||
+    !isTimestamp(value.segment_count) ||
+    value.segment_count < 1 ||
+    (expectedCount !== null && value.segment_count !== expectedCount) ||
+    !Array.isArray(value.segments) ||
+    value.segments.length === 0 ||
+    !(value.next_segment === null || (isTimestamp(value.next_segment) && value.next_segment < value.segment_count))
+  )
+    throw invalidResponse();
   let expectedIndex = startSegment;
   const contents = value.segments.map((segment) => {
     const segmentKeys = ["message_id", "turn_id", "role", "segment_index", "segment_count", "content"];
-    if (!isRecord(segment) || !hasExactKeys(segment, segmentKeys) || segment.message_id !== messageId || segment.turn_id !== turnId ||
-      segment.role !== value.role || segment.segment_count !== value.segment_count || segment.segment_index !== expectedIndex ||
-      typeof segment.content !== "string" || segment.content.includes("\0")) throw invalidResponse();
+    if (
+      !isRecord(segment) ||
+      !hasExactKeys(segment, segmentKeys) ||
+      segment.message_id !== messageId ||
+      segment.turn_id !== turnId ||
+      segment.role !== value.role ||
+      segment.segment_count !== value.segment_count ||
+      segment.segment_index !== expectedIndex ||
+      typeof segment.content !== "string" ||
+      segment.content.includes("\0")
+    )
+      throw invalidResponse();
     expectedIndex += 1;
     return segment.content;
   });
@@ -542,22 +697,56 @@ function decodeTurnEvent(
   const value = parseJson(data);
   if (!isRecord(value)) throw invalidResponse();
   if (event === "turn.started") {
-    if (!hasExactKeys(value, ["chat_id", "turn_id", "state", "omitted_turns"]) || value.chat_id !== expectedChatId ||
-      typeof value.turn_id !== "string" || !ID_PATTERN.test(value.turn_id) || value.state !== "streaming" ||
-      !Number.isSafeInteger(value.omitted_turns) || (value.omitted_turns as number) < 0 || (value.omitted_turns as number) > MAX_OMITTED_TURNS) throw invalidResponse();
+    if (
+      !hasExactKeys(value, ["chat_id", "turn_id", "state", "omitted_turns"]) ||
+      value.chat_id !== expectedChatId ||
+      typeof value.turn_id !== "string" ||
+      !ID_PATTERN.test(value.turn_id) ||
+      value.state !== "streaming" ||
+      !Number.isSafeInteger(value.omitted_turns) ||
+      (value.omitted_turns as number) < 0 ||
+      (value.omitted_turns as number) > MAX_OMITTED_TURNS
+    )
+      throw invalidResponse();
     return { kind: "started", turnId: value.turn_id, omittedTurns: value.omitted_turns as number };
   }
   if (event === "turn.delta") {
-    if (currentTurnId === null || !hasExactKeys(value, ["turn_id", "content"]) || value.turn_id !== currentTurnId ||
-      typeof value.content !== "string" || value.content.length === 0 || value.content.includes("\0")) throw invalidResponse();
+    if (
+      currentTurnId === null ||
+      !hasExactKeys(value, ["turn_id", "content"]) ||
+      value.turn_id !== currentTurnId ||
+      typeof value.content !== "string" ||
+      value.content.length === 0 ||
+      value.content.includes("\0")
+    )
+      throw invalidResponse();
     return { kind: "delta", content: value.content };
   }
   if (event === "turn.completed" || event === "turn.cancelled" || event === "turn.failed") {
-    if (currentTurnId === null || !hasExactKeys(value, ["turn_id", "state", "error_code"]) || value.turn_id !== currentTurnId ||
-      !(value.error_code === null || (typeof value.error_code === "string" && ERROR_CODE_PATTERN.test(value.error_code)))) throw invalidResponse();
-    if (event === "turn.completed" && value.state === "completed" && value.error_code === null) return { kind: "terminal", terminal: { kind: "completed" } };
-    if (event === "turn.cancelled" && value.state === "cancelled" && value.error_code === null) return { kind: "terminal", terminal: { kind: "cancelled" } };
-    if (event === "turn.failed" && value.state === "failed") return { kind: "terminal", terminal: { kind: "error", message: value.error_code ? `Turn failed: ${value.error_code.replace(/_/g, " ")}.` : "The persistent turn failed." } };
+    if (
+      currentTurnId === null ||
+      !hasExactKeys(value, ["turn_id", "state", "error_code"]) ||
+      value.turn_id !== currentTurnId ||
+      !(
+        value.error_code === null ||
+        (typeof value.error_code === "string" && ERROR_CODE_PATTERN.test(value.error_code))
+      )
+    )
+      throw invalidResponse();
+    if (event === "turn.completed" && value.state === "completed" && value.error_code === null)
+      return { kind: "terminal", terminal: { kind: "completed" } };
+    if (event === "turn.cancelled" && value.state === "cancelled" && value.error_code === null)
+      return { kind: "terminal", terminal: { kind: "cancelled" } };
+    if (event === "turn.failed" && value.state === "failed")
+      return {
+        kind: "terminal",
+        terminal: {
+          kind: "error",
+          message: value.error_code
+            ? `Turn failed: ${value.error_code.replace(/_/g, " ")}.`
+            : "The persistent turn failed.",
+        },
+      };
   }
   throw invalidResponse();
 }
@@ -576,7 +765,12 @@ function isTimestamp(value: unknown): value is number {
 }
 
 function boundedString(value: unknown, maxBytes: number, allowEmpty: boolean): value is string {
-  return typeof value === "string" && !value.includes("\0") && (allowEmpty || value.trim() !== "") && new TextEncoder().encode(value).byteLength <= maxBytes;
+  return (
+    typeof value === "string" &&
+    !value.includes("\0") &&
+    (allowEmpty || value.trim() !== "") &&
+    new TextEncoder().encode(value).byteLength <= maxBytes
+  );
 }
 
 function nullableBoundedString(value: unknown, maxBytes: number): value is string | null {
@@ -584,7 +778,9 @@ function nullableBoundedString(value: unknown, maxBytes: number): value is strin
 }
 
 function isTurnState(value: unknown): value is TurnState {
-  return value === "queued" || value === "streaming" || value === "completed" || value === "cancelled" || value === "failed";
+  return (
+    value === "queued" || value === "streaming" || value === "completed" || value === "cancelled" || value === "failed"
+  );
 }
 
 function isMessageRole(value: unknown): value is MessageRole {

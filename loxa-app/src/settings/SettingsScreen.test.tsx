@@ -68,17 +68,32 @@ describe("SettingsScreen", () => {
     const appearance = screen.getByRole("radiogroup", { name: "Appearance" });
     const local = screen.getByRole("region", { name: "Local node/runtime" });
     expect(appearance.compareDocumentPosition(local) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    for (const value of [runtime.endpoint, "Externally attached", "loxa-node-42", "llama.cpp", "b4321", "gemma-3-4b-it-q4"]) {
+    for (const value of [
+      runtime.endpoint,
+      "Externally attached",
+      "loxa-node-42",
+      "llama.cpp",
+      "b4321",
+      "gemma-3-4b-it-q4",
+    ]) {
       expect(screen.getByText(value)).toBeInTheDocument();
     }
-    expect(screen.getByText("Theme is the only preference saved on this Mac. Node and model state are not stored here.")).toBeVisible();
+    expect(
+      screen.getByText("Theme is the only preference saved on this Mac. Node and model state are not stored here."),
+    ).toBeVisible();
     expect(screen.getByText("llama.cpp")).toHaveClass("technical-value");
     expect(local.querySelectorAll("input, button, select, textarea")).toHaveLength(0);
     expect(screen.queryByText(/start on login|provider|sampling|authentication|LAN|logs/i)).not.toBeInTheDocument();
   });
 
   it("renders unavailable runtime facts truthfully", () => {
-    render(<SettingsScreen theme="system" onThemeChange={vi.fn()} runtime={{ ...runtime, phase: "starting", ownership: "none", status: null }} />);
+    render(
+      <SettingsScreen
+        theme="system"
+        onThemeChange={vi.fn()}
+        runtime={{ ...runtime, phase: "starting", ownership: "none", status: null }}
+      />,
+    );
     expect(screen.getByText("Checking", { selector: "dd" })).toBeInTheDocument();
     expect(screen.getAllByText("Unavailable", { selector: "dd" }).length).toBeGreaterThan(1);
   });
@@ -98,11 +113,16 @@ describe("SettingsScreen", () => {
   it("aborts a rejecting clear request on unmount without publishing a stale error", async () => {
     const user = userEvent.setup();
     let signal: AbortSignal | undefined;
-    const clear = vi.fn((nextSignal: AbortSignal) => new Promise<number>((_resolve, reject) => {
-      signal = nextSignal;
-      nextSignal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
-    }));
-    const view = render(<SettingsScreen theme="system" onThemeChange={vi.fn()} runtime={runtime} onClearChatHistory={clear} />);
+    const clear = vi.fn(
+      (nextSignal: AbortSignal) =>
+        new Promise<number>((_resolve, reject) => {
+          signal = nextSignal;
+          nextSignal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+        }),
+    );
+    const view = render(
+      <SettingsScreen theme="system" onThemeChange={vi.fn()} runtime={runtime} onClearChatHistory={clear} />,
+    );
     await user.click(screen.getByRole("button", { name: "Clear chat history" }));
     await user.click(screen.getByRole("button", { name: "Confirm clear chat history" }));
     expect(signal).toBeInstanceOf(AbortSignal);
@@ -118,7 +138,9 @@ describe("SettingsScreen", () => {
     let resolveClear!: (deleted: number) => void;
     const clear = vi.fn((nextSignal: AbortSignal) => {
       signal = nextSignal;
-      return new Promise<number>((resolve) => { resolveClear = resolve; });
+      return new Promise<number>((resolve) => {
+        resolveClear = resolve;
+      });
     });
     render(<SettingsScreen theme="system" onThemeChange={vi.fn()} runtime={runtime} onClearChatHistory={clear} />);
     await user.click(screen.getByRole("button", { name: "Clear chat history" }));

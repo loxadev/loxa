@@ -8,12 +8,7 @@ import {
   type OpenAIError,
 } from "./contracts";
 
-export type ClientErrorKind =
-  | "transport"
-  | "timeout"
-  | "aborted"
-  | "http"
-  | "invalid-response";
+export type ClientErrorKind = "transport" | "timeout" | "aborted" | "http" | "invalid-response";
 
 export class NodeClientError extends Error {
   constructor(
@@ -46,10 +41,7 @@ async function parseJson(response: Response): Promise<unknown> {
   try {
     return JSON.parse(text) as unknown;
   } catch {
-    throw new NodeClientError(
-      "invalid-response",
-      "The Loxa node returned invalid JSON.",
-    );
+    throw new NodeClientError("invalid-response", "The Loxa node returned invalid JSON.");
   }
 }
 
@@ -83,10 +75,7 @@ async function requestJson(
     throw new NodeClientError("aborted", "The Loxa node request was cancelled.");
   }
   options.signal?.addEventListener("abort", abortFromCaller, { once: true });
-  const timeout = setTimeout(
-    () => abortOnce("timeout"),
-    options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-  );
+  const timeout = setTimeout(() => abortOnce("timeout"), options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
   try {
     const response = await (options.fetch ?? globalThis.fetch)(url(endpoint, path), {
       ...init,
@@ -117,39 +106,27 @@ async function requestJson(
   }
 }
 
-export async function getStatus(
-  endpoint: string,
-  options: ClientOptions = {},
-): Promise<NodeStatus> {
+export async function getStatus(endpoint: string, options: ClientOptions = {}): Promise<NodeStatus> {
   const payload = await requestJson(endpoint, "/loxa/status", { method: "GET" }, options);
   try {
     return decodeNodeStatus(payload);
   } catch (error) {
     if (error instanceof NodeClientError) throw error;
     if (error instanceof ContractError) {
-      throw new NodeClientError(
-        "invalid-response",
-        "The Loxa node returned an invalid status payload.",
-      );
+      throw new NodeClientError("invalid-response", "The Loxa node returned an invalid status payload.");
     }
     throw error;
   }
 }
 
-export async function getModels(
-  endpoint: string,
-  options: ClientOptions = {},
-): Promise<ModelList> {
+export async function getModels(endpoint: string, options: ClientOptions = {}): Promise<ModelList> {
   const payload = await requestJson(endpoint, "/v1/models", { method: "GET" }, options);
   try {
     return decodeModelList(payload);
   } catch (error) {
     if (error instanceof NodeClientError) throw error;
     if (error instanceof ContractError) {
-      throw new NodeClientError(
-        "invalid-response",
-        "The Loxa node returned an invalid model list.",
-      );
+      throw new NodeClientError("invalid-response", "The Loxa node returned an invalid model list.");
     }
     throw error;
   }

@@ -34,9 +34,13 @@ function services(): AppServices {
       profile: null,
     }),
     getModels: vi.fn().mockResolvedValue({ object: "list", data: [{ id: "loxa", object: "model", owned_by: "loxa" }] }),
-    getCapabilities: vi.fn().mockResolvedValue({ documentInput: false, documentInputReason: "Not supported.", textChat: true }),
+    getCapabilities: vi
+      .fn()
+      .mockResolvedValue({ documentInput: false, documentInputReason: "Not supported.", textChat: true }),
     readControlToken: vi.fn().mockResolvedValue("ab".repeat(32)),
-    getControlNode: vi.fn().mockResolvedValue({ status: "unloaded", activeModelId: null, operationId: null, error: null }),
+    getControlNode: vi
+      .fn()
+      .mockResolvedValue({ status: "unloaded", activeModelId: null, operationId: null, error: null }),
     getInventory: vi.fn().mockResolvedValue([]),
     downloadModel: vi.fn(),
     loadModel: vi.fn(),
@@ -84,11 +88,11 @@ describe("App", () => {
     await user.click(screen.getByRole("button", { name: "Clear chat history" }));
     await user.click(screen.getByRole("button", { name: "Confirm clear chat history" }));
 
-    await waitFor(() => expect(api.clearChats).toHaveBeenCalledWith(
-      "http://127.0.0.1:8080",
-      "ab".repeat(32),
-      { signal: expect.any(AbortSignal) },
-    ));
+    await waitFor(() =>
+      expect(api.clearChats).toHaveBeenCalledWith("http://127.0.0.1:8080", "ab".repeat(32), {
+        signal: expect.any(AbortSignal),
+      }),
+    );
     expect(await screen.findByRole("status")).toHaveTextContent("Deleted 2 conversations");
   });
 
@@ -109,7 +113,10 @@ describe("App", () => {
     const user = userEvent.setup();
     const api = services();
     const chatId = "0123456789abcdef0123456789abcdef";
-    api.listChats = vi.fn().mockResolvedValue({ chats: [{ id: chatId, title: "Runtime notes", createdAtMs: 1, updatedAtMs: 2 }], nextBefore: null });
+    api.listChats = vi.fn().mockResolvedValue({
+      chats: [{ id: chatId, title: "Runtime notes", createdAtMs: 1, updatedAtMs: 2 }],
+      nextBefore: null,
+    });
     api.listTurns = vi.fn().mockResolvedValue({ turns: [], nextAfter: null });
     api.listMessageSummaries = vi.fn();
     api.getMessageContent = vi.fn();
@@ -120,7 +127,9 @@ describe("App", () => {
     const globalRail = screen.getByRole("complementary", { name: "Primary" });
     expect(within(globalRail).getByRole("navigation", { name: "Chat conversations" })).toBeVisible();
     expect(within(globalRail).getByRole("button", { name: "Open Runtime notes" })).toBeVisible();
-    expect(within(screen.getByRole("main")).queryByRole("navigation", { name: "Chat conversations" })).not.toBeInTheDocument();
+    expect(
+      within(screen.getByRole("main")).queryByRole("navigation", { name: "Chat conversations" }),
+    ).not.toBeInTheDocument();
     expect(within(globalRail).getByRole("link", { name: "Node" })).toBeVisible();
     expect(within(globalRail).getByRole("link", { name: "Settings" })).toBeVisible();
 
@@ -152,8 +161,12 @@ describe("App", () => {
   it("shows authoritative node health and active model on every route and links recovery to Node", async () => {
     const api = services();
     api.getStatus = vi.fn().mockResolvedValue({
-      node_id: "loxa-node-77", health: "ready", model: "loxa",
-      engine: { name: "llama.cpp", version: "b777" }, runtime_model: "gemma-ready", profile: "default",
+      node_id: "loxa-node-77",
+      health: "ready",
+      model: "loxa",
+      engine: { name: "llama.cpp", version: "b777" },
+      runtime_model: "gemma-ready",
+      profile: "default",
     });
     const user = userEvent.setup();
     render(<App services={api} />);
@@ -178,30 +191,56 @@ describe("App", () => {
   it("settles global model truth from a terminal snapshot after the initiating route unmounts", async () => {
     const api = services();
     const controlCallbacks: ControlStreamCallbacks[] = [];
-    api.getStatus = vi.fn()
+    api.getStatus = vi
+      .fn()
       .mockResolvedValueOnce({
-        node_id: "node-7", health: "unavailable", model: "loxa",
-        engine: null, runtime_model: null, profile: null,
+        node_id: "node-7",
+        health: "unavailable",
+        model: "loxa",
+        engine: null,
+        runtime_model: null,
+        profile: null,
       })
       .mockResolvedValueOnce({
-        node_id: "node-7", health: "ready", model: "loxa",
-        engine: { name: "llama.cpp", version: "b777" }, runtime_model: "gemma-ready", profile: "default",
+        node_id: "node-7",
+        health: "ready",
+        model: "loxa",
+        engine: { name: "llama.cpp", version: "b777" },
+        runtime_model: "gemma-ready",
+        profile: "default",
       });
-    api.getInventory = vi.fn().mockResolvedValue([{
-      id: "gemma-ready", repo: "loxa/gemma", revision: "rev", filename: "gemma.gguf",
-      sha256: "ab".repeat(32), sizeBytes: 1, license: "Apache-2.0", params: "4B", quant: "Q4",
-      minFreeMemoryGiB: 1, artifact: { kind: "downloaded" },
-      compatibility: { compatible: true, reason: "Compatible" },
-      engine: { engine: "llama-cpp", eligible: true, reason: "Eligible" },
-    }]);
-    api.getControlNode = vi.fn()
+    api.getInventory = vi.fn().mockResolvedValue([
+      {
+        id: "gemma-ready",
+        repo: "loxa/gemma",
+        revision: "rev",
+        filename: "gemma.gguf",
+        sha256: "ab".repeat(32),
+        sizeBytes: 1,
+        license: "Apache-2.0",
+        params: "4B",
+        quant: "Q4",
+        minFreeMemoryGiB: 1,
+        artifact: { kind: "downloaded" },
+        compatibility: { compatible: true, reason: "Compatible" },
+        engine: { engine: "llama-cpp", eligible: true, reason: "Eligible" },
+      },
+    ]);
+    api.getControlNode = vi
+      .fn()
       .mockResolvedValueOnce({ status: "unloaded", activeModelId: null, operationId: null, error: null })
       .mockResolvedValueOnce({ status: "loading", activeModelId: null, operationId: "op-load", error: null })
       .mockResolvedValueOnce({ status: "ready", activeModelId: "gemma-ready", operationId: null, error: null });
     api.loadModel = vi.fn().mockResolvedValue({ operationId: "op-load" });
     api.getOperation = vi.fn().mockResolvedValue({
-      id: "op-load", kind: "load", status: "queued", modelId: "gemma-ready", progress: null,
-      error: null, createdAtUnixMs: 1, updatedAtUnixMs: 2,
+      id: "op-load",
+      kind: "load",
+      status: "queued",
+      modelId: "gemma-ready",
+      progress: null,
+      error: null,
+      createdAtUnixMs: 1,
+      updatedAtUnixMs: 2,
     });
     api.createControlEventStream = vi.fn((_endpoint, _token, _cursor, callbacks) => {
       controlCallbacks.push(callbacks);
@@ -217,22 +256,38 @@ describe("App", () => {
 
     await user.click(screen.getByRole("link", { name: "Node" }));
     const initialStreamCount = controlCallbacks.length;
-    act(() => controlCallbacks.forEach((callbacks) => callbacks.onTerminal({
-      kind: "error",
-      cursor: 1,
-      message: "Live model updates disconnected.",
-    })));
+    act(() =>
+      controlCallbacks.forEach((callbacks) =>
+        callbacks.onTerminal({
+          kind: "error",
+          cursor: 1,
+          message: "Live model updates disconnected.",
+        }),
+      ),
+    );
     await waitFor(() => expect(controlCallbacks.length).toBeGreaterThan(initialStreamCount));
 
-    act(() => controlCallbacks.slice(initialStreamCount).forEach((callbacks) => callbacks.onSnapshot({
-      cursor: 1,
-      cursorGap: true,
-      operations: [{
-        id: "op-load", kind: "load", status: "succeeded", modelId: "gemma-ready", progress: null,
-        error: null, createdAtUnixMs: 1, updatedAtUnixMs: 3,
-      }],
-      events: [],
-    })));
+    act(() =>
+      controlCallbacks.slice(initialStreamCount).forEach((callbacks) =>
+        callbacks.onSnapshot({
+          cursor: 1,
+          cursorGap: true,
+          operations: [
+            {
+              id: "op-load",
+              kind: "load",
+              status: "succeeded",
+              modelId: "gemma-ready",
+              progress: null,
+              error: null,
+              createdAtUnixMs: 1,
+              updatedAtUnixMs: 3,
+            },
+          ],
+          events: [],
+        }),
+      ),
+    );
 
     expect(await screen.findByRole("link", { name: "Node ready. Active model gemma-ready" })).toBeVisible();
   });
@@ -240,29 +295,55 @@ describe("App", () => {
   it("refreshes the shared node session after Chat loads a model without requiring navigation", async () => {
     const api = services();
     const controlCallbacks: ControlStreamCallbacks[] = [];
-    api.getStatus = vi.fn()
+    api.getStatus = vi
+      .fn()
       .mockResolvedValueOnce({
-        node_id: "node-7", health: "unavailable", model: "loxa",
-        engine: null, runtime_model: null, profile: null,
+        node_id: "node-7",
+        health: "unavailable",
+        model: "loxa",
+        engine: null,
+        runtime_model: null,
+        profile: null,
       })
       .mockResolvedValue({
-        node_id: "node-7", health: "ready", model: "loxa",
-        engine: { name: "llama.cpp", version: "b777" }, runtime_model: "gemma-ready", profile: "default",
+        node_id: "node-7",
+        health: "ready",
+        model: "loxa",
+        engine: { name: "llama.cpp", version: "b777" },
+        runtime_model: "gemma-ready",
+        profile: "default",
       });
-    api.getInventory = vi.fn().mockResolvedValue([{
-      id: "gemma-ready", repo: "loxa/gemma", revision: "rev", filename: "gemma.gguf",
-      sha256: "ab".repeat(32), sizeBytes: 1, license: "Apache-2.0", params: "4B", quant: "Q4",
-      minFreeMemoryGiB: 1, artifact: { kind: "downloaded" },
-      compatibility: { compatible: true, reason: "Compatible" },
-      engine: { engine: "llama-cpp", eligible: true, reason: "Eligible" },
-    }]);
-    api.getControlNode = vi.fn()
+    api.getInventory = vi.fn().mockResolvedValue([
+      {
+        id: "gemma-ready",
+        repo: "loxa/gemma",
+        revision: "rev",
+        filename: "gemma.gguf",
+        sha256: "ab".repeat(32),
+        sizeBytes: 1,
+        license: "Apache-2.0",
+        params: "4B",
+        quant: "Q4",
+        minFreeMemoryGiB: 1,
+        artifact: { kind: "downloaded" },
+        compatibility: { compatible: true, reason: "Compatible" },
+        engine: { engine: "llama-cpp", eligible: true, reason: "Eligible" },
+      },
+    ]);
+    api.getControlNode = vi
+      .fn()
       .mockResolvedValueOnce({ status: "unloaded", activeModelId: null, operationId: null, error: null })
       .mockResolvedValue({ status: "ready", activeModelId: "gemma-ready", operationId: null, error: null });
     api.loadModel = vi.fn().mockResolvedValue({ operationId: "op-load" });
     api.getOperation = vi.fn().mockResolvedValue({
-      id: "op-load", kind: "load", status: "succeeded", modelId: "gemma-ready", progress: null,
-      error: null, createdAtUnixMs: 1, updatedAtUnixMs: 2,
+      id: "op-load",
+      kind: "load",
+      status: "succeeded",
+      modelId: "gemma-ready",
+      progress: null,
+      error: null,
+      createdAtUnixMs: 1,
+      updatedAtUnixMs: 2,
     });
     api.createControlEventStream = vi.fn((_endpoint, _token, _cursor, callbacks) => {
       controlCallbacks.push(callbacks);
@@ -273,13 +354,23 @@ describe("App", () => {
 
     await user.click(await screen.findByRole("link", { name: "Chat" }));
     await user.click(await screen.findByRole("button", { name: "Load gemma-ready" }));
-    act(() => controlCallbacks.forEach((callbacks) => callbacks.onEvent({
-      sequence: 3,
-      operation: {
-        id: "op-load", kind: "load", status: "succeeded", modelId: "gemma-ready",
-        progress: null, error: null, createdAtUnixMs: 1, updatedAtUnixMs: 2,
-      },
-    })));
+    act(() =>
+      controlCallbacks.forEach((callbacks) =>
+        callbacks.onEvent({
+          sequence: 3,
+          operation: {
+            id: "op-load",
+            kind: "load",
+            status: "succeeded",
+            modelId: "gemma-ready",
+            progress: null,
+            error: null,
+            createdAtUnixMs: 1,
+            updatedAtUnixMs: 2,
+          },
+        }),
+      ),
+    );
 
     await waitFor(() => expect(api.getStatus).toHaveBeenCalledTimes(3));
     expect(await screen.findByRole("link", { name: "Node ready. Active model gemma-ready" })).toBeVisible();
@@ -295,31 +386,57 @@ describe("App", () => {
     let resolveOperation!: (operation: Awaited<ReturnType<AppServices["getOperation"]>>) => void;
     api.getStatus = vi.fn((_endpoint, options) => {
       statusCalls += 1;
-      if (statusCalls === 1) return Promise.resolve({
-        node_id: "node-7", health: "unavailable", model: "loxa",
-        engine: null, runtime_model: null, profile: null,
-      } satisfies NodeStatus);
-      if (statusCalls === 2 || statusCalls > 3) return Promise.resolve({
-        node_id: "node-7", health: "ready", model: "loxa",
-        engine: { name: "llama.cpp", version: "b777" },
-        runtime_model: statusCalls === 2 ? "old-model" : "gemma-ready",
-        profile: "default",
-      } satisfies NodeStatus);
+      if (statusCalls === 1)
+        return Promise.resolve({
+          node_id: "node-7",
+          health: "unavailable",
+          model: "loxa",
+          engine: null,
+          runtime_model: null,
+          profile: null,
+        } satisfies NodeStatus);
+      if (statusCalls === 2 || statusCalls > 3)
+        return Promise.resolve({
+          node_id: "node-7",
+          health: "ready",
+          model: "loxa",
+          engine: { name: "llama.cpp", version: "b777" },
+          runtime_model: statusCalls === 2 ? "old-model" : "gemma-ready",
+          profile: "default",
+        } satisfies NodeStatus);
       if (options?.signal) settlementSignals.push(options.signal);
-      return new Promise<NodeStatus>((resolve) => { resolveStatus = resolve; });
+      return new Promise<NodeStatus>((resolve) => {
+        resolveStatus = resolve;
+      });
     });
-    api.getInventory = vi.fn().mockResolvedValue([{
-      id: "gemma-ready", repo: "loxa/gemma", revision: "rev", filename: "gemma.gguf",
-      sha256: "ab".repeat(32), sizeBytes: 1, license: "Apache-2.0", params: "4B", quant: "Q4",
-      minFreeMemoryGiB: 1, artifact: { kind: "downloaded" },
-      compatibility: { compatible: true, reason: "Compatible" },
-      engine: { engine: "llama-cpp", eligible: true, reason: "Eligible" },
-    }]);
-    api.getControlNode = vi.fn()
+    api.getInventory = vi.fn().mockResolvedValue([
+      {
+        id: "gemma-ready",
+        repo: "loxa/gemma",
+        revision: "rev",
+        filename: "gemma.gguf",
+        sha256: "ab".repeat(32),
+        sizeBytes: 1,
+        license: "Apache-2.0",
+        params: "4B",
+        quant: "Q4",
+        minFreeMemoryGiB: 1,
+        artifact: { kind: "downloaded" },
+        compatibility: { compatible: true, reason: "Compatible" },
+        engine: { engine: "llama-cpp", eligible: true, reason: "Eligible" },
+      },
+    ]);
+    api.getControlNode = vi
+      .fn()
       .mockResolvedValueOnce({ status: "ready", activeModelId: "old-model", operationId: null, error: null })
       .mockResolvedValue({ status: "ready", activeModelId: "gemma-ready", operationId: null, error: null });
     api.loadModel = vi.fn().mockResolvedValue({ operationId: "op-load" });
-    api.getOperation = vi.fn(() => new Promise<Awaited<ReturnType<AppServices["getOperation"]>>>((resolve) => { resolveOperation = resolve; }));
+    api.getOperation = vi.fn(
+      () =>
+        new Promise<Awaited<ReturnType<AppServices["getOperation"]>>>((resolve) => {
+          resolveOperation = resolve;
+        }),
+    );
     api.createControlEventStream = vi.fn((_endpoint, _token, _cursor, callbacks) => {
       controlCallbacks.push(callbacks);
       return { cancel: vi.fn(), dispose: vi.fn(), finished: new Promise<ControlStreamTerminal>(() => undefined) };
@@ -332,27 +449,51 @@ describe("App", () => {
     await user.click(screen.getByRole("button", { name: "Switch to gemma-ready" }));
     await waitFor(() => expect(api.getOperation).toHaveBeenCalledTimes(1));
 
-    act(() => controlCallbacks.forEach((callbacks) => callbacks.onEvent({
-      sequence: 7,
-      operation: {
-        id: "op-load", kind: "load", status: "succeeded", modelId: "gemma-ready",
-        progress: null, error: null, createdAtUnixMs: 1, updatedAtUnixMs: 2,
-      },
-    })));
-    act(() => resolveOperation({
-      id: "op-load", kind: "load", status: "succeeded", modelId: "gemma-ready",
-      progress: null, error: null, createdAtUnixMs: 1, updatedAtUnixMs: 2,
-    }));
+    act(() =>
+      controlCallbacks.forEach((callbacks) =>
+        callbacks.onEvent({
+          sequence: 7,
+          operation: {
+            id: "op-load",
+            kind: "load",
+            status: "succeeded",
+            modelId: "gemma-ready",
+            progress: null,
+            error: null,
+            createdAtUnixMs: 1,
+            updatedAtUnixMs: 2,
+          },
+        }),
+      ),
+    );
+    act(() =>
+      resolveOperation({
+        id: "op-load",
+        kind: "load",
+        status: "succeeded",
+        modelId: "gemma-ready",
+        progress: null,
+        error: null,
+        createdAtUnixMs: 1,
+        updatedAtUnixMs: 2,
+      }),
+    );
 
     await waitFor(() => expect(api.getStatus).toHaveBeenCalledTimes(3));
     await waitFor(() => expect(screen.getByLabelText("Message")).toBeDisabled());
     expect(settlementSignals).toHaveLength(1);
     expect(settlementSignals[0]?.aborted).toBe(false);
 
-    act(() => resolveStatus({
-      node_id: "node-7", health: "ready", model: "loxa",
-      engine: { name: "llama.cpp", version: "b777" }, runtime_model: "gemma-ready", profile: "default",
-    }));
+    act(() =>
+      resolveStatus({
+        node_id: "node-7",
+        health: "ready",
+        model: "loxa",
+        engine: { name: "llama.cpp", version: "b777" },
+        runtime_model: "gemma-ready",
+        profile: "default",
+      }),
+    );
     expect(await screen.findByRole("link", { name: "Node ready. Active model gemma-ready" })).toBeVisible();
     await waitFor(() => expect(screen.getByLabelText("Message")).toBeEnabled());
     expect(settlementSignals[0]?.aborted).toBe(false);
@@ -360,32 +501,59 @@ describe("App", () => {
 
   it("settles from the local Chat terminal when the global stream initially cannot connect", async () => {
     const api = services();
-    api.getStatus = vi.fn()
+    api.getStatus = vi
+      .fn()
       .mockResolvedValueOnce({
-        node_id: "node-7", health: "unavailable", model: "loxa",
-        engine: null, runtime_model: null, profile: null,
+        node_id: "node-7",
+        health: "unavailable",
+        model: "loxa",
+        engine: null,
+        runtime_model: null,
+        profile: null,
       })
       .mockResolvedValue({
-        node_id: "node-7", health: "ready", model: "loxa",
-        engine: { name: "llama.cpp", version: "b777" }, runtime_model: "gemma-ready", profile: "default",
+        node_id: "node-7",
+        health: "ready",
+        model: "loxa",
+        engine: { name: "llama.cpp", version: "b777" },
+        runtime_model: "gemma-ready",
+        profile: "default",
       });
-    api.readControlToken = vi.fn()
+    api.readControlToken = vi
+      .fn()
       .mockRejectedValueOnce(new Error("global stream token unavailable"))
       .mockResolvedValue("ab".repeat(32));
-    api.getInventory = vi.fn().mockResolvedValue([{
-      id: "gemma-ready", repo: "loxa/gemma", revision: "rev", filename: "gemma.gguf",
-      sha256: "ab".repeat(32), sizeBytes: 1, license: "Apache-2.0", params: "4B", quant: "Q4",
-      minFreeMemoryGiB: 1, artifact: { kind: "downloaded" },
-      compatibility: { compatible: true, reason: "Compatible" },
-      engine: { engine: "llama-cpp", eligible: true, reason: "Eligible" },
-    }]);
-    api.getControlNode = vi.fn()
+    api.getInventory = vi.fn().mockResolvedValue([
+      {
+        id: "gemma-ready",
+        repo: "loxa/gemma",
+        revision: "rev",
+        filename: "gemma.gguf",
+        sha256: "ab".repeat(32),
+        sizeBytes: 1,
+        license: "Apache-2.0",
+        params: "4B",
+        quant: "Q4",
+        minFreeMemoryGiB: 1,
+        artifact: { kind: "downloaded" },
+        compatibility: { compatible: true, reason: "Compatible" },
+        engine: { engine: "llama-cpp", eligible: true, reason: "Eligible" },
+      },
+    ]);
+    api.getControlNode = vi
+      .fn()
       .mockResolvedValueOnce({ status: "unloaded", activeModelId: null, operationId: null, error: null })
       .mockResolvedValue({ status: "ready", activeModelId: "gemma-ready", operationId: null, error: null });
     api.loadModel = vi.fn().mockResolvedValue({ operationId: "op-load" });
     api.getOperation = vi.fn().mockResolvedValue({
-      id: "op-load", kind: "load", status: "succeeded", modelId: "gemma-ready", progress: null,
-      error: null, createdAtUnixMs: 1, updatedAtUnixMs: 2,
+      id: "op-load",
+      kind: "load",
+      status: "succeeded",
+      modelId: "gemma-ready",
+      progress: null,
+      error: null,
+      createdAtUnixMs: 1,
+      updatedAtUnixMs: 2,
     });
     const user = userEvent.setup();
     render(<App services={api} />);
@@ -405,30 +573,54 @@ describe("App", () => {
     const api = services();
     const handles: Array<{ callbacks: ControlStreamCallbacks; dispose: ReturnType<typeof vi.fn> }> = [];
     const proofSignals: AbortSignal[] = [];
-    api.getStatus = vi.fn()
+    api.getStatus = vi
+      .fn()
       .mockResolvedValueOnce({
-        node_id: "node-7", health: "unavailable", model: "loxa",
-        engine: null, runtime_model: null, profile: null,
+        node_id: "node-7",
+        health: "unavailable",
+        model: "loxa",
+        engine: null,
+        runtime_model: null,
+        profile: null,
       })
       .mockImplementation((_endpoint, options) => {
         if (options?.signal) proofSignals.push(options.signal);
         return Promise.resolve({
-          node_id: "node-7", health: "ready", model: "loxa",
-          engine: { name: "llama.cpp", version: "b777" }, runtime_model: "gemma-ready", profile: "default",
+          node_id: "node-7",
+          health: "ready",
+          model: "loxa",
+          engine: { name: "llama.cpp", version: "b777" },
+          runtime_model: "gemma-ready",
+          profile: "default",
         });
       });
-    api.getInventory = vi.fn().mockResolvedValue([{
-      id: "gemma-ready", repo: "loxa/gemma", revision: "rev", filename: "gemma.gguf",
-      sha256: "ab".repeat(32), sizeBytes: 1, license: "Apache-2.0", params: "4B", quant: "Q4",
-      minFreeMemoryGiB: 1, artifact: { kind: "downloaded" },
-      compatibility: { compatible: true, reason: "Compatible" },
-      engine: { engine: "llama-cpp", eligible: true, reason: "Eligible" },
-    }]);
-    api.getControlNode = vi.fn().mockResolvedValue({ status: "unloaded", activeModelId: null, operationId: null, error: null });
+    api.getInventory = vi.fn().mockResolvedValue([
+      {
+        id: "gemma-ready",
+        repo: "loxa/gemma",
+        revision: "rev",
+        filename: "gemma.gguf",
+        sha256: "ab".repeat(32),
+        sizeBytes: 1,
+        license: "Apache-2.0",
+        params: "4B",
+        quant: "Q4",
+        minFreeMemoryGiB: 1,
+        artifact: { kind: "downloaded" },
+        compatibility: { compatible: true, reason: "Compatible" },
+        engine: { engine: "llama-cpp", eligible: true, reason: "Eligible" },
+      },
+    ]);
+    api.getControlNode = vi
+      .fn()
+      .mockResolvedValue({ status: "unloaded", activeModelId: null, operationId: null, error: null });
     api.loadModel = vi.fn().mockResolvedValue({ operationId: "op-load" });
     api.getOperation = vi.fn(() => new Promise<never>(() => undefined));
-    api.createControlEventStream = vi.fn()
-      .mockImplementationOnce(() => { throw new Error("initial global stream unavailable"); })
+    api.createControlEventStream = vi
+      .fn()
+      .mockImplementationOnce(() => {
+        throw new Error("initial global stream unavailable");
+      })
       .mockImplementation((_endpoint, _token, _cursor, callbacks) => {
         const dispose = vi.fn();
         handles.push({ callbacks, dispose });
@@ -447,16 +639,45 @@ describe("App", () => {
     await waitFor(() => expect(handles.some((handle) => !handle.dispose.mock.calls.length)).toBe(true));
     const sessionHandle = handles.find((handle) => !handle.dispose.mock.calls.length);
     expect(sessionHandle).toBeDefined();
-    act(() => sessionHandle?.callbacks.onSnapshot({
-      cursor: 10,
-      cursorGap: true,
-      operations: [
-        { id: "op-old-1", kind: "load", status: "succeeded", modelId: "old", progress: null, error: null, createdAtUnixMs: 1, updatedAtUnixMs: 2 },
-        { id: "op-load", kind: "load", status: "succeeded", modelId: "gemma-ready", progress: null, error: null, createdAtUnixMs: 1, updatedAtUnixMs: 3 },
-        { id: "op-old-2", kind: "unload", status: "failed", modelId: null, progress: null, error: "old", createdAtUnixMs: 1, updatedAtUnixMs: 2 },
-      ],
-      events: [],
-    }));
+    act(() =>
+      sessionHandle?.callbacks.onSnapshot({
+        cursor: 10,
+        cursorGap: true,
+        operations: [
+          {
+            id: "op-old-1",
+            kind: "load",
+            status: "succeeded",
+            modelId: "old",
+            progress: null,
+            error: null,
+            createdAtUnixMs: 1,
+            updatedAtUnixMs: 2,
+          },
+          {
+            id: "op-load",
+            kind: "load",
+            status: "succeeded",
+            modelId: "gemma-ready",
+            progress: null,
+            error: null,
+            createdAtUnixMs: 1,
+            updatedAtUnixMs: 3,
+          },
+          {
+            id: "op-old-2",
+            kind: "unload",
+            status: "failed",
+            modelId: null,
+            progress: null,
+            error: "old",
+            createdAtUnixMs: 1,
+            updatedAtUnixMs: 2,
+          },
+        ],
+        events: [],
+      }),
+    );
 
     expect(await screen.findByRole("link", { name: "Node ready. Active model gemma-ready" })).toBeVisible();
     expect(api.getStatus).toHaveBeenCalledTimes(2);
@@ -530,8 +751,18 @@ describe("App", () => {
     const api = services();
     let resolveStart!: (snapshot: BootstrapSnapshot) => void;
     let resolveStatus!: (status: NodeStatus) => void;
-    api.bootstrap.start = vi.fn(() => new Promise<BootstrapSnapshot>((resolve) => { resolveStart = resolve; }));
-    api.getStatus = vi.fn(() => new Promise<NodeStatus>((resolve) => { resolveStatus = resolve; }));
+    api.bootstrap.start = vi.fn(
+      () =>
+        new Promise<BootstrapSnapshot>((resolve) => {
+          resolveStart = resolve;
+        }),
+    );
+    api.getStatus = vi.fn(
+      () =>
+        new Promise<NodeStatus>((resolve) => {
+          resolveStatus = resolve;
+        }),
+    );
     const user = userEvent.setup();
     render(<App services={api} />);
 
@@ -568,7 +799,12 @@ describe("App", () => {
   it("closes route clients while an owned node is stopping and until retry proves it again", async () => {
     const api = services();
     let resolveStop!: (snapshot: BootstrapSnapshot) => void;
-    api.bootstrap.stop = vi.fn(() => new Promise<BootstrapSnapshot>((resolve) => { resolveStop = resolve; }));
+    api.bootstrap.stop = vi.fn(
+      () =>
+        new Promise<BootstrapSnapshot>((resolve) => {
+          resolveStop = resolve;
+        }),
+    );
     const user = userEvent.setup();
     render(<App services={api} />);
 
@@ -598,8 +834,12 @@ describe("App", () => {
   it("passes read-only shared session facts to Settings without another bootstrap", async () => {
     const api = services();
     api.getStatus = vi.fn().mockResolvedValue({
-      node_id: "loxa-node-77", health: "ready", model: "loxa",
-      engine: { name: "llama.cpp", version: "b777" }, runtime_model: "gemma-ready", profile: "default",
+      node_id: "loxa-node-77",
+      health: "ready",
+      model: "loxa",
+      engine: { name: "llama.cpp", version: "b777" },
+      runtime_model: "gemma-ready",
+      profile: "default",
     });
     const user = userEvent.setup();
     render(<App services={api} />);

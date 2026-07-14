@@ -9,8 +9,7 @@ import {
 } from "./contracts";
 
 export type ControlStreamTerminal =
-  | { kind: "cancelled"; cursor: number }
-  | { kind: "error"; cursor: number; message: string };
+  { kind: "cancelled"; cursor: number } | { kind: "error"; cursor: number; message: string };
 
 export type ControlStreamCallbacks = {
   onSnapshot(snapshot: ReconnectSnapshot): void;
@@ -143,9 +142,9 @@ export function streamControlEvents(
       if (error instanceof ControlContractError || error instanceof SseDecodeError || error instanceof SyntaxError) {
         return failed("The Loxa node returned an invalid model update stream.");
       }
-      return failed(reader === null
-        ? "Could not connect to live model updates."
-        : "Live model updates failed while reading.");
+      return failed(
+        reader === null ? "Could not connect to live model updates." : "Live model updates failed while reading.",
+      );
     } finally {
       clearTimeout(connectTimeout);
       signal?.removeEventListener("abort", callerAbort);

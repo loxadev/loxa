@@ -30,10 +30,7 @@ describe("nodeReducer", () => {
       { type: "status", status: unavailableStatus },
     );
     const ready = nodeReducer(attached, { type: "status", status: readyStatus });
-    const stopping = nodeReducer(
-      { ...ready, ownership: "owned" },
-      { type: "stop" },
-    );
+    const stopping = nodeReducer({ ...ready, ownership: "owned" }, { type: "stop" });
     const recovery = nodeReducer(stopping, {
       type: "recoveryRequired",
       message: "ownership could not be proven",
@@ -112,18 +109,15 @@ describe("nodeReducer", () => {
     expect(nodeReducer(attached, { type: "stop" })).toBe(attached);
   });
 
-  it.each(["stopping", "recovery-required", "error"] as const)(
-    "ignores a late ready status while %s",
-    (phase) => {
-      const state = {
-        phase,
-        ownership: "owned" as const,
-        status: null,
-        error: phase === "stopping" ? null : "preserve me",
-      };
-      expect(nodeReducer(state, { type: "status", status: readyStatus })).toBe(state);
-    },
-  );
+  it.each(["stopping", "recovery-required", "error"] as const)("ignores a late ready status while %s", (phase) => {
+    const state = {
+      phase,
+      ownership: "owned" as const,
+      status: null,
+      error: phase === "stopping" ? null : "preserve me",
+    };
+    expect(nodeReducer(state, { type: "status", status: readyStatus })).toBe(state);
+  });
 
   it("accepts stopped only after an owned stop is in progress", () => {
     const ready = {
@@ -138,9 +132,7 @@ describe("nodeReducer", () => {
     expect(nodeReducer(ready, { type: "stopped" })).toBe(ready);
     expect(nodeReducer(attached, { type: "stopped" })).toBe(attached);
     expect(nodeReducer(externallyStopping, { type: "stopped" })).toBe(externallyStopping);
-    expect(
-      nodeReducer({ ...ready, phase: "stopping" }, { type: "stopped" }),
-    ).toEqual(initialNodeState());
+    expect(nodeReducer({ ...ready, phase: "stopping" }, { type: "stopped" })).toEqual(initialNodeState());
   });
 
   it("ignores a stale probe failure while stopping", () => {
@@ -151,9 +143,7 @@ describe("nodeReducer", () => {
       error: null,
     };
 
-    expect(
-      nodeReducer(stopping, { type: "probeFailed", message: "late refusal" }),
-    ).toBe(stopping);
+    expect(nodeReducer(stopping, { type: "probeFailed", message: "late refusal" })).toBe(stopping);
   });
 
   it("accepts a genuine failure from the active stop operation", () => {
@@ -164,9 +154,7 @@ describe("nodeReducer", () => {
       error: null,
     };
 
-    expect(
-      nodeReducer(stopping, { type: "stopFailed", message: "child did not exit" }),
-    ).toMatchObject({
+    expect(nodeReducer(stopping, { type: "stopFailed", message: "child did not exit" })).toMatchObject({
       phase: "error",
       ownership: "owned",
       status: null,
@@ -186,9 +174,7 @@ describe("nodeReducer", () => {
       message: "late refusal",
     });
 
-    expect(nodeReducer(afterStaleProbe, { type: "stopped" })).toEqual(
-      initialNodeState(),
-    );
+    expect(nodeReducer(afterStaleProbe, { type: "stopped" })).toEqual(initialNodeState());
   });
 });
 

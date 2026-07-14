@@ -42,7 +42,8 @@ export function ChatComposer({
   onSend,
   onStop,
 }: ChatComposerProps) {
-  const switchingDisabled = !modelControlsAvailable || modelOperation === "switching" || modelBusy || responseInProgress;
+  const switchingDisabled =
+    !modelControlsAvailable || modelOperation === "switching" || modelBusy || responseInProgress;
   const submit = () => {
     if (responseInProgress) onStop();
     else onSend();
@@ -62,7 +63,9 @@ export function ChatComposer({
         submit();
       }}
     >
-      <label className={styles.messageLabel} htmlFor="message">Message</label>
+      <label className={styles.messageLabel} htmlFor="message">
+        Message
+      </label>
       <textarea
         ref={inputRef}
         id="message"
@@ -75,7 +78,11 @@ export function ChatComposer({
         aria-describedby={supportReason ? "chat-support-reason" : undefined}
         placeholder="Message the active local model"
       />
-      {supportReason && <p id="chat-support-reason" className={styles.supportReason}>{supportReason}</p>}
+      {supportReason && (
+        <p id="chat-support-reason" className={styles.supportReason}>
+          {supportReason}
+        </p>
+      )}
 
       <div className={styles.composerFooter}>
         <div className={styles.composerTools}>
@@ -85,7 +92,9 @@ export function ChatComposer({
             aria-label="Attach document"
             aria-describedby="attachment-support-reason"
             disabled
-          >+</button>
+          >
+            +
+          </button>
           <div className={styles.modelControl}>
             <label htmlFor="active-chat-model">Choose model</label>
             <select
@@ -97,7 +106,11 @@ export function ChatComposer({
               onChange={(event) => onSelectedModel(event.target.value)}
             >
               <option value="">No active model</option>
-              {eligibleModels.map((model) => <option key={model.id} value={model.id}>{model.id}</option>)}
+              {eligibleModels.map((model) => (
+                <option key={model.id} value={model.id}>
+                  {model.id}
+                </option>
+              ))}
             </select>
             {selectedModel !== activeModel && selectedModel && (
               <button
@@ -117,16 +130,28 @@ export function ChatComposer({
         </div>
 
         {responseInProgress ? (
-          <button className={`${styles.primaryControl} secondary-button interactive-target`} type="button" aria-label="Stop response" onClick={onStop}>
+          <button
+            className={`${styles.primaryControl} secondary-button interactive-target`}
+            type="button"
+            aria-label="Stop response"
+            onClick={onStop}
+          >
             <span aria-hidden="true">■</span> Stop<span className={styles.visuallyHidden}> response</span>
           </button>
         ) : (
-          <button className={`${styles.primaryControl} primary-button interactive-target`} type="submit" aria-label="Send message" disabled={!canCompose || !input.trim()}>
+          <button
+            className={`${styles.primaryControl} primary-button interactive-target`}
+            type="submit"
+            aria-label="Send message"
+            disabled={!canCompose || !input.trim()}
+          >
             Send<span className={styles.visuallyHidden}> message</span>
           </button>
         )}
       </div>
-      <p id="attachment-support-reason" className={styles.attachmentReason}>{attachmentReason}</p>
+      <p id="attachment-support-reason" className={styles.attachmentReason}>
+        {attachmentReason}
+      </p>
     </form>
   );
 }

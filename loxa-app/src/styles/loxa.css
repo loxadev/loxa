@@ -2,13 +2,15 @@
 
 :root {
   --loxa-color-ink: #101410;
-  --loxa-color-snow: #F4F6F0;
-  --loxa-color-mineral: #69716C;
-  --loxa-color-glacier: #C5DDD4;
-  --loxa-color-signal: #B7ED62;
+  --loxa-color-snow: #f4f6f0;
+  --loxa-color-mineral: #69716c;
+  --loxa-color-glacier: #c5ddd4;
+  --loxa-color-signal: #b7ed62;
 
-  --loxa-font-sans: "Instrument Sans", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  --loxa-font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  --loxa-font-sans:
+    "Instrument Sans", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --loxa-font-mono:
+    "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
 
   --loxa-type-display-family: var(--loxa-font-sans);
   --loxa-type-display-size: 64px;
@@ -96,17 +98,17 @@
 }
 
 :root,
-[data-loxa-theme='light'] {
+[data-loxa-theme="light"] {
   color-scheme: light;
-  --loxa-light-background: #F4F6F0;
+  --loxa-light-background: #f4f6f0;
   --loxa-light-foreground: #101410;
-  --loxa-light-muted-foreground: #555C58;
-  --loxa-light-secondary-surface: #E4EEE7;
-  --loxa-light-control-border: #69716C;
-  --loxa-light-selected-surface: #69716C;
-  --loxa-light-selected-foreground: #F4F6F0;
+  --loxa-light-muted-foreground: #555c58;
+  --loxa-light-secondary-surface: #e4eee7;
+  --loxa-light-control-border: #69716c;
+  --loxa-light-selected-surface: #69716c;
+  --loxa-light-selected-foreground: #f4f6f0;
   --loxa-light-focus: #101410;
-  --loxa-light-accent: #B7ED62;
+  --loxa-light-accent: #b7ed62;
   --loxa-light-accent-foreground: #101410;
 
   --loxa-background: var(--loxa-light-background);
@@ -121,17 +123,17 @@
   --loxa-accent-foreground: var(--loxa-light-accent-foreground);
 }
 
-[data-loxa-theme='dark'] {
+[data-loxa-theme="dark"] {
   color-scheme: dark;
   --loxa-dark-background: #101410;
-  --loxa-dark-foreground: #F4F6F0;
-  --loxa-dark-muted-foreground: #C5DDD4;
+  --loxa-dark-foreground: #f4f6f0;
+  --loxa-dark-muted-foreground: #c5ddd4;
   --loxa-dark-secondary-surface: #202420;
-  --loxa-dark-control-border: #C5DDD4;
-  --loxa-dark-selected-surface: #C5DDD4;
+  --loxa-dark-control-border: #c5ddd4;
+  --loxa-dark-selected-surface: #c5ddd4;
   --loxa-dark-selected-foreground: #101410;
-  --loxa-dark-focus: #B7ED62;
-  --loxa-dark-accent: #B7ED62;
+  --loxa-dark-focus: #b7ed62;
+  --loxa-dark-accent: #b7ed62;
   --loxa-dark-accent-foreground: #101410;
 
   --loxa-background: var(--loxa-dark-background);

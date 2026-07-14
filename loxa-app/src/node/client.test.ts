@@ -1,11 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import {
-  NodeClientError,
-  getModels,
-  getStatus,
-  postChatCompletion,
-} from "./client";
+import { NodeClientError, getModels, getStatus, postChatCompletion } from "./client";
 
 const readyStatus = {
   node_id: "node-test",
@@ -20,9 +15,7 @@ describe("node client", () => {
   it("requests and decodes gateway status", async () => {
     const fetch = vi.fn(async () => Response.json(readyStatus));
 
-    await expect(
-      getStatus("http://127.0.0.1:31000/", { fetch }),
-    ).resolves.toEqual(readyStatus);
+    await expect(getStatus("http://127.0.0.1:31000/", { fetch })).resolves.toEqual(readyStatus);
     expect(fetch).toHaveBeenCalledWith(
       "http://127.0.0.1:31000/loxa/status",
       expect.objectContaining({ method: "GET" }),
@@ -59,61 +52,61 @@ describe("node client", () => {
   });
 
   it("aborts bounded requests and classifies timeout", async () => {
-    const fetch = vi.fn((_url: string, init?: RequestInit) =>
-      new Promise<Response>((_resolve, reject) => {
-        init?.signal?.addEventListener("abort", () =>
-          reject(new DOMException("aborted", "AbortError")),
-        );
-      }),
+    const fetch = vi.fn(
+      (_url: string, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+        }),
     );
 
-    await expect(
-      getStatus("http://127.0.0.1:31000", { fetch, timeoutMs: 5 }),
-    ).rejects.toMatchObject({ kind: "timeout" });
+    await expect(getStatus("http://127.0.0.1:31000", { fetch, timeoutMs: 5 })).rejects.toMatchObject({
+      kind: "timeout",
+    });
   });
 
   it("keeps the timeout active while decoding the response body", async () => {
-    const fetch = vi.fn(async (_url: string, init?: RequestInit) => ({
-      ok: true,
-      status: 200,
-      text: () =>
-        new Promise<string>((_resolve, reject) => {
-          init?.signal?.addEventListener("abort", () =>
-            reject(new DOMException("aborted", "AbortError")),
-          );
-        }),
-    }) as Response);
+    const fetch = vi.fn(
+      async (_url: string, init?: RequestInit) =>
+        ({
+          ok: true,
+          status: 200,
+          text: () =>
+            new Promise<string>((_resolve, reject) => {
+              init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+            }),
+        }) as Response,
+    );
 
-    await expect(
-      getStatus("http://127.0.0.1:31000", { fetch, timeoutMs: 5 }),
-    ).rejects.toMatchObject({ kind: "timeout" });
+    await expect(getStatus("http://127.0.0.1:31000", { fetch, timeoutMs: 5 })).rejects.toMatchObject({
+      kind: "timeout",
+    });
   }, 100);
 
   it("classifies a timeout while reading a non-2xx body as timeout", async () => {
-    const fetch = vi.fn(async (_url: string, init?: RequestInit) => ({
-      ok: false,
-      status: 503,
-      text: () =>
-        new Promise<string>((_resolve, reject) => {
-          init?.signal?.addEventListener("abort", () =>
-            reject(new DOMException("aborted", "AbortError")),
-          );
-        }),
-    }) as Response);
+    const fetch = vi.fn(
+      async (_url: string, init?: RequestInit) =>
+        ({
+          ok: false,
+          status: 503,
+          text: () =>
+            new Promise<string>((_resolve, reject) => {
+              init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+            }),
+        }) as Response,
+    );
 
-    await expect(
-      getStatus("http://127.0.0.1:31000", { fetch, timeoutMs: 5 }),
-    ).rejects.toMatchObject({ kind: "timeout" });
+    await expect(getStatus("http://127.0.0.1:31000", { fetch, timeoutMs: 5 })).rejects.toMatchObject({
+      kind: "timeout",
+    });
   }, 100);
 
   it("keeps caller cancellation distinct from timeout", async () => {
     const controller = new AbortController();
-    const fetch = vi.fn((_url: string, init?: RequestInit) =>
-      new Promise<Response>((_resolve, reject) => {
-        init?.signal?.addEventListener("abort", () =>
-          reject(new DOMException("aborted", "AbortError")),
-        );
-      }),
+    const fetch = vi.fn(
+      (_url: string, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+        }),
     );
     const pending = getStatus("http://127.0.0.1:31000", {
       fetch,
@@ -131,20 +124,21 @@ describe("node client", () => {
     controller.abort();
     const fetch = vi.fn(async () => Response.json(readyStatus));
 
-    await expect(
-      getStatus("http://127.0.0.1:31000", { fetch, signal: controller.signal }),
-    ).rejects.toMatchObject({ kind: "aborted" });
+    await expect(getStatus("http://127.0.0.1:31000", { fetch, signal: controller.signal })).rejects.toMatchObject({
+      kind: "aborted",
+    });
     expect(fetch).not.toHaveBeenCalled();
   });
 
   it("keeps caller-first abort classification after a delayed request rejection", async () => {
     const caller = new AbortController();
-    const fetch = vi.fn((_url: string, init?: RequestInit) =>
-      new Promise<Response>((_resolve, reject) => {
-        init?.signal?.addEventListener("abort", () => {
-          setTimeout(() => reject(new DOMException("aborted", "AbortError")), 20);
-        });
-      }),
+    const fetch = vi.fn(
+      (_url: string, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            setTimeout(() => reject(new DOMException("aborted", "AbortError")), 20);
+          });
+        }),
     );
     const pending = getStatus("http://127.0.0.1:31000", {
       fetch,
@@ -159,12 +153,13 @@ describe("node client", () => {
 
   it("keeps timeout-first classification after a later caller abort", async () => {
     const caller = new AbortController();
-    const fetch = vi.fn((_url: string, init?: RequestInit) =>
-      new Promise<Response>((_resolve, reject) => {
-        init?.signal?.addEventListener("abort", () => {
-          setTimeout(() => reject(new DOMException("aborted", "AbortError")), 20);
-        });
-      }),
+    const fetch = vi.fn(
+      (_url: string, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            setTimeout(() => reject(new DOMException("aborted", "AbortError")), 20);
+          });
+        }),
     );
     const pending = getStatus("http://127.0.0.1:31000", {
       fetch,
@@ -178,20 +173,23 @@ describe("node client", () => {
 
   it("keeps caller-first abort classification during a delayed body rejection", async () => {
     const caller = new AbortController();
-    const fetch = vi.fn(async (_url: string, init?: RequestInit) => ({
-      ok: true,
-      status: 200,
-      text: () =>
-        new Promise<string>((_resolve, reject) => {
-          if (init?.signal?.aborted) {
-            setTimeout(() => reject(new DOMException("aborted", "AbortError")), 20);
-            return;
-          }
-          init?.signal?.addEventListener("abort", () => {
-            setTimeout(() => reject(new DOMException("aborted", "AbortError")), 20);
-          });
-        }),
-    }) as Response);
+    const fetch = vi.fn(
+      async (_url: string, init?: RequestInit) =>
+        ({
+          ok: true,
+          status: 200,
+          text: () =>
+            new Promise<string>((_resolve, reject) => {
+              if (init?.signal?.aborted) {
+                setTimeout(() => reject(new DOMException("aborted", "AbortError")), 20);
+                return;
+              }
+              init?.signal?.addEventListener("abort", () => {
+                setTimeout(() => reject(new DOMException("aborted", "AbortError")), 20);
+              });
+            }),
+        }) as Response,
+    );
     const pending = getStatus("http://127.0.0.1:31000", {
       fetch,
       timeoutMs: 5,
@@ -205,16 +203,19 @@ describe("node client", () => {
 
   it("keeps timeout-first classification during a delayed body rejection", async () => {
     const caller = new AbortController();
-    const fetch = vi.fn(async (_url: string, init?: RequestInit) => ({
-      ok: true,
-      status: 200,
-      text: () =>
-        new Promise<string>((_resolve, reject) => {
-          init?.signal?.addEventListener("abort", () => {
-            setTimeout(() => reject(new DOMException("aborted", "AbortError")), 20);
-          });
-        }),
-    }) as Response);
+    const fetch = vi.fn(
+      async (_url: string, init?: RequestInit) =>
+        ({
+          ok: true,
+          status: 200,
+          text: () =>
+            new Promise<string>((_resolve, reject) => {
+              init?.signal?.addEventListener("abort", () => {
+                setTimeout(() => reject(new DOMException("aborted", "AbortError")), 20);
+              });
+            }),
+        }) as Response,
+    );
     const pending = getStatus("http://127.0.0.1:31000", {
       fetch,
       timeoutMs: 5,
@@ -237,11 +238,7 @@ describe("node client", () => {
     const fetch = vi.fn(async () => Response.json(error, { status: 503 }));
 
     await expect(
-      postChatCompletion(
-        "http://127.0.0.1:31000",
-        { model: "loxa", messages: [] },
-        { fetch },
-      ),
+      postChatCompletion("http://127.0.0.1:31000", { model: "loxa", messages: [] }, { fetch }),
     ).rejects.toMatchObject({ kind: "http", status: 503, openAI: error.error });
   });
 
@@ -260,11 +257,7 @@ describe("node client", () => {
     const fetch = vi.fn(async () => Response.json(completion));
 
     await expect(
-      postChatCompletion(
-        "http://127.0.0.1:31000",
-        { model: "loxa", messages: [], stream: false },
-        { fetch },
-      ),
+      postChatCompletion("http://127.0.0.1:31000", { model: "loxa", messages: [], stream: false }, { fetch }),
     ).resolves.toEqual(completion);
     expect(fetch).toHaveBeenCalledWith(
       "http://127.0.0.1:31000/v1/chat/completions",

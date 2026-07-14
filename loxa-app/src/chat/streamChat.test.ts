@@ -4,8 +4,7 @@ import { streamChat, type StreamCallbacks, type StreamTerminal } from "./streamC
 
 const encoder = new TextEncoder();
 const chunk = (text: string) => encoder.encode(text);
-const delta = (text: string) =>
-  `data: ${JSON.stringify({ choices: [{ delta: { content: text } }] })}\n\n`;
+const delta = (text: string) => `data: ${JSON.stringify({ choices: [{ delta: { content: text } }] })}\n\n`;
 
 function callbacks() {
   const terminals: StreamTerminal[] = [];
@@ -39,10 +38,15 @@ describe("streamChat", () => {
   it("times out only while waiting for response headers and aborts the request", async () => {
     const observed = callbacks();
     let requestSignal: AbortSignal | undefined;
-    const fetch = vi.fn((_url: string, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
-      requestSignal = init?.signal ?? undefined;
-      requestSignal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
-    }));
+    const fetch = vi.fn(
+      (_url: string, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          requestSignal = init?.signal ?? undefined;
+          requestSignal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), {
+            once: true,
+          });
+        }),
+    );
 
     const result = await streamChat("http://node", {}, observed.value, undefined, fetch, 1).finished;
 
@@ -54,7 +58,12 @@ describe("streamChat", () => {
   it("classifies cancellation between headers and body inspection exactly once", async () => {
     const observed = callbacks();
     let resolveResponse!: (response: Response) => void;
-    const fetch = vi.fn(() => new Promise<Response>((resolve) => { resolveResponse = resolve; }));
+    const fetch = vi.fn(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolveResponse = resolve;
+        }),
+    );
     const handle = streamChat("http://node", {}, observed.value, undefined, fetch);
     resolveResponse({
       ok: true,
@@ -107,7 +116,9 @@ describe("streamChat", () => {
     const observed = callbacks();
     const fetch = vi.fn(async () =>
       responseFrom([
-        chunk(": keepalive\n\n" + delta("") + 'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n' + "data: [DONE]\n\n"),
+        chunk(
+          ": keepalive\n\n" + delta("") + 'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n' + "data: [DONE]\n\n",
+        ),
       ]),
     );
 
@@ -139,10 +150,7 @@ describe("streamChat", () => {
     const observed = callbacks();
     const cancel = vi.fn(async () => undefined);
     const fetch = vi.fn(async () =>
-      responseFrom(
-        [chunk(delta("before") + "data: [DONE]\n\ndata: [DONE]\n\n" + delta("after"))],
-        cancel,
-      ),
+      responseFrom([chunk(delta("before") + "data: [DONE]\n\ndata: [DONE]\n\n" + delta("after"))], cancel),
     );
 
     await streamChat("http://node", {}, observed.value, undefined, fetch).finished;
@@ -161,16 +169,19 @@ describe("streamChat", () => {
       cancel,
       releaseLock: vi.fn(),
     };
-    const fetch = vi.fn(async () => ({
-      ok: true,
-      status: 200,
-      body: { getReader: () => reader },
-    }) as unknown as Response);
+    const fetch = vi.fn(
+      async () =>
+        ({
+          ok: true,
+          status: 200,
+          body: { getReader: () => reader },
+        }) as unknown as Response,
+    );
     const observed = callbacks();
 
-    await expect(
-      streamChat("http://node", {}, observed.value, undefined, fetch).finished,
-    ).resolves.toEqual({ kind: "completed" });
+    await expect(streamChat("http://node", {}, observed.value, undefined, fetch).finished).resolves.toEqual({
+      kind: "completed",
+    });
     expect(reader.read).toHaveBeenCalledOnce();
     expect(cancel).toHaveBeenCalledOnce();
     expect(reader.releaseLock).toHaveBeenCalledOnce();
@@ -182,14 +193,9 @@ describe("streamChat", () => {
     const terminals: StreamTerminal[] = [];
     const cancel = vi.fn(async () => undefined);
     const payload = JSON.stringify({
-      choices: [
-        { delta: { content: "first" } },
-        { delta: { content: "second" } },
-      ],
+      choices: [{ delta: { content: "first" } }, { delta: { content: "second" } }],
     });
-    const fetch = vi.fn(async () =>
-      responseFrom([chunk(`data: ${payload}\n\ndata: [DONE]\n\n`)], cancel),
-    );
+    const fetch = vi.fn(async () => responseFrom([chunk(`data: ${payload}\n\ndata: [DONE]\n\n`)], cancel));
     const handle = streamChat(
       "http://node",
       {},
@@ -220,16 +226,19 @@ describe("streamChat", () => {
       cancel,
       releaseLock: vi.fn(),
     };
-    const fetch = vi.fn(async () => ({
-      ok: true,
-      status: 200,
-      body: { getReader: () => reader },
-    }) as unknown as Response);
+    const fetch = vi.fn(
+      async () =>
+        ({
+          ok: true,
+          status: 200,
+          body: { getReader: () => reader },
+        }) as unknown as Response,
+    );
     const observed = callbacks();
 
-    await expect(
-      streamChat("http://node", {}, observed.value, undefined, fetch).finished,
-    ).resolves.toMatchObject({ kind: "error" });
+    await expect(streamChat("http://node", {}, observed.value, undefined, fetch).finished).resolves.toMatchObject({
+      kind: "error",
+    });
     expect(reader.read).toHaveBeenCalledOnce();
     expect(cancel).toHaveBeenCalledOnce();
     expect(reader.releaseLock).toHaveBeenCalledOnce();
@@ -252,9 +261,10 @@ describe("streamChat", () => {
   it("reports malformed HTTP errors safely", async () => {
     const observed = callbacks();
     const fetch = vi.fn(async () => new Response("bad gateway", { status: 502 }));
-    await expect(
-      streamChat("http://node", {}, observed.value, undefined, fetch).finished,
-    ).resolves.toEqual({ kind: "error", message: "The Loxa node returned HTTP 502." });
+    await expect(streamChat("http://node", {}, observed.value, undefined, fetch).finished).resolves.toEqual({
+      kind: "error",
+      message: "The Loxa node returned HTTP 502.",
+    });
   });
 
   it("rejects a streaming response after the cumulative body exceeds 2 MiB", async () => {
@@ -291,11 +301,14 @@ describe("streamChat", () => {
       cancel: vi.fn(),
       releaseLock,
     };
-    const fetch = vi.fn(async () => ({
-      ok: true,
-      status: 200,
-      body: { getReader: () => reader },
-    }) as unknown as Response);
+    const fetch = vi.fn(
+      async () =>
+        ({
+          ok: true,
+          status: 200,
+          body: { getReader: () => reader },
+        }) as unknown as Response,
+    );
     const observed = callbacks();
 
     const result = await streamChat("http://node", {}, observed.value, undefined, fetch).finished;
@@ -309,13 +322,18 @@ describe("streamChat", () => {
     const cancel = vi.fn(async () => undefined);
     let releaseRead!: () => void;
     const reader = {
-      read: vi.fn(() => new Promise<ReadableStreamReadResult<Uint8Array>>((resolve) => {
-        releaseRead = () => resolve({ done: true, value: undefined });
-      })),
+      read: vi.fn(
+        () =>
+          new Promise<ReadableStreamReadResult<Uint8Array>>((resolve) => {
+            releaseRead = () => resolve({ done: true, value: undefined });
+          }),
+      ),
       cancel,
       releaseLock: vi.fn(),
     };
-    const fetch = vi.fn(async () => ({ ok: true, status: 200, body: { getReader: () => reader } }) as unknown as Response);
+    const fetch = vi.fn(
+      async () => ({ ok: true, status: 200, body: { getReader: () => reader } }) as unknown as Response,
+    );
     const observed = callbacks();
     const handle = streamChat("http://node", {}, observed.value, caller.signal, fetch);
     await vi.waitFor(() => expect(reader.read).toHaveBeenCalled());
@@ -332,13 +350,18 @@ describe("streamChat", () => {
     const cancel = vi.fn(async () => undefined);
     let releaseRead!: () => void;
     const reader = {
-      read: vi.fn(() => new Promise<ReadableStreamReadResult<Uint8Array>>((resolve) => {
-        releaseRead = () => resolve({ done: false, value: chunk(delta("late") + "data: [DONE]\n\n") });
-      })),
+      read: vi.fn(
+        () =>
+          new Promise<ReadableStreamReadResult<Uint8Array>>((resolve) => {
+            releaseRead = () => resolve({ done: false, value: chunk(delta("late") + "data: [DONE]\n\n") });
+          }),
+      ),
       cancel,
       releaseLock: vi.fn(),
     };
-    const fetch = vi.fn(async () => ({ ok: true, status: 200, body: { getReader: () => reader } }) as unknown as Response);
+    const fetch = vi.fn(
+      async () => ({ ok: true, status: 200, body: { getReader: () => reader } }) as unknown as Response,
+    );
     const observed = callbacks();
     const handle = streamChat("http://node", {}, observed.value, undefined, fetch);
     await vi.waitFor(() => expect(reader.read).toHaveBeenCalled());
@@ -357,7 +380,12 @@ describe("streamChat", () => {
     let resolveFetch!: (response: Response) => void;
     const cancel = vi.fn(async () => undefined);
     const reader = { read: vi.fn(), cancel, releaseLock: vi.fn() };
-    const fetch = vi.fn(() => new Promise<Response>((resolve) => { resolveFetch = resolve; }));
+    const fetch = vi.fn(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolveFetch = resolve;
+        }),
+    );
     const observed = callbacks();
     const handle = streamChat("http://node", {}, observed.value, undefined, fetch);
 
@@ -373,12 +401,13 @@ describe("streamChat", () => {
 
   it("keeps the first abort cause immutable", async () => {
     const caller = new AbortController();
-    const fetch = vi.fn((_url: string, init?: RequestInit) =>
-      new Promise<Response>((_resolve, reject) => {
-        init?.signal?.addEventListener("abort", () =>
-          setTimeout(() => reject(new DOMException("aborted", "AbortError")), 10),
-        );
-      }),
+    const fetch = vi.fn(
+      (_url: string, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () =>
+            setTimeout(() => reject(new DOMException("aborted", "AbortError")), 10),
+          );
+        }),
     );
     const observed = callbacks();
     const handle = streamChat("http://node", {}, observed.value, caller.signal, fetch);
@@ -396,9 +425,9 @@ describe("streamChat", () => {
     const fetch = vi.fn();
     const observed = callbacks();
 
-    await expect(
-      streamChat("http://node", {}, observed.value, caller.signal, fetch).finished,
-    ).resolves.toEqual({ kind: "cancelled" });
+    await expect(streamChat("http://node", {}, observed.value, caller.signal, fetch).finished).resolves.toEqual({
+      kind: "cancelled",
+    });
     expect(fetch).not.toHaveBeenCalled();
     expect(observed.terminals).toEqual([{ kind: "cancelled" }]);
   });

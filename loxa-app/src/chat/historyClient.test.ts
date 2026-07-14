@@ -39,7 +39,8 @@ describe("history client", () => {
   });
 
   it("creates, gets, renames, deletes, and explicitly clears chats", async () => {
-    const fetch = vi.fn()
+    const fetch = vi
+      .fn()
       .mockResolvedValueOnce(Response.json(chat, { status: 201 }))
       .mockResolvedValueOnce(Response.json(chat))
       .mockResolvedValueOnce(Response.json({ ...chat, title: "Renamed", updated_at_ms: 12 }))
@@ -48,7 +49,9 @@ describe("history client", () => {
 
     await expect(createChat(endpoint, token, { fetch })).resolves.toMatchObject({ id: chatId, title: "Node health" });
     await expect(getChat(endpoint, token, chatId, { fetch })).resolves.toMatchObject({ id: chatId });
-    await expect(renameChat(endpoint, token, chatId, "Renamed", { fetch })).resolves.toMatchObject({ title: "Renamed" });
+    await expect(renameChat(endpoint, token, chatId, "Renamed", { fetch })).resolves.toMatchObject({
+      title: "Renamed",
+    });
     await expect(deleteChat(endpoint, token, chatId, { fetch })).resolves.toBeUndefined();
     await expect(clearChats(endpoint, token, { fetch })).resolves.toEqual({ deleted: 2 });
 
@@ -59,49 +62,87 @@ describe("history client", () => {
       `${endpoint}/loxa/v1/chats/${chatId}`,
       `${endpoint}/loxa/v1/chats/clear`,
     ]);
-    expect(fetch.mock.calls[2][1]).toEqual(expect.objectContaining({ method: "PATCH", body: JSON.stringify({ title: "Renamed" }) }));
-    expect(fetch.mock.calls[4][1]).toEqual(expect.objectContaining({ method: "POST", body: JSON.stringify({ confirm: "delete_all_chat_history" }) }));
+    expect(fetch.mock.calls[2][1]).toEqual(
+      expect.objectContaining({ method: "PATCH", body: JSON.stringify({ title: "Renamed" }) }),
+    );
+    expect(fetch.mock.calls[4][1]).toEqual(
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ confirm: "delete_all_chat_history" }) }),
+    );
   });
 
   it("strictly decodes bounded turn metadata pages", async () => {
-    const fetch = vi.fn(async () => Response.json({
-      turns: [{
-        id: turnId,
-        chat_id: chatId,
-        ordinal: 0,
-        state: "completed",
-        provenance: { model_alias: "loxa", recipe_id: "gemma", engine_name: "llama.cpp", engine_version: null },
-        error_code: null,
-        created_at_ms: 20,
-        updated_at_ms: 22,
-      }],
-      next_after: null,
-    }));
+    const fetch = vi.fn(async () =>
+      Response.json({
+        turns: [
+          {
+            id: turnId,
+            chat_id: chatId,
+            ordinal: 0,
+            state: "completed",
+            provenance: { model_alias: "loxa", recipe_id: "gemma", engine_name: "llama.cpp", engine_version: null },
+            error_code: null,
+            created_at_ms: 20,
+            updated_at_ms: 22,
+          },
+        ],
+        next_after: null,
+      }),
+    );
 
     await expect(listTurns(endpoint, token, chatId, { limit: 30 }, { fetch })).resolves.toEqual({
-      turns: [expect.objectContaining({
-        id: turnId,
-        state: "completed",
-        recipeId: "gemma",
-      })],
+      turns: [
+        expect.objectContaining({
+          id: turnId,
+          state: "completed",
+          recipeId: "gemma",
+        }),
+      ],
       nextAfter: null,
     });
   });
 
   it("restores message content from bounded UTF-8 segments", async () => {
     const messageId = "2123456789abcdef0123456789abcdef";
-    const fetch = vi.fn()
-      .mockResolvedValueOnce(Response.json({ messages: [{ id: messageId, turn_id: turnId, role: "user", content_bytes: 8, created_at_ms: 20, updated_at_ms: 20 }] }))
-      .mockResolvedValueOnce(Response.json({
-        message_id: messageId, turn_id: turnId, role: "user", segment_count: 2,
-        segments: [{ message_id: messageId, turn_id: turnId, role: "user", segment_index: 0, segment_count: 2, content: "hi " }],
-        next_segment: 1,
-      }))
-      .mockResolvedValueOnce(Response.json({
-        message_id: messageId, turn_id: turnId, role: "user", segment_count: 2,
-        segments: [{ message_id: messageId, turn_id: turnId, role: "user", segment_index: 1, segment_count: 2, content: "🙂" }],
-        next_segment: null,
-      }));
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(
+        Response.json({
+          messages: [
+            { id: messageId, turn_id: turnId, role: "user", content_bytes: 8, created_at_ms: 20, updated_at_ms: 20 },
+          ],
+        }),
+      )
+      .mockResolvedValueOnce(
+        Response.json({
+          message_id: messageId,
+          turn_id: turnId,
+          role: "user",
+          segment_count: 2,
+          segments: [
+            {
+              message_id: messageId,
+              turn_id: turnId,
+              role: "user",
+              segment_index: 0,
+              segment_count: 2,
+              content: "hi ",
+            },
+          ],
+          next_segment: 1,
+        }),
+      )
+      .mockResolvedValueOnce(
+        Response.json({
+          message_id: messageId,
+          turn_id: turnId,
+          role: "user",
+          segment_count: 2,
+          segments: [
+            { message_id: messageId, turn_id: turnId, role: "user", segment_index: 1, segment_count: 2, content: "🙂" },
+          ],
+          next_segment: null,
+        }),
+      );
 
     await expect(listMessageSummaries(endpoint, token, chatId, turnId, { fetch })).resolves.toEqual([
       expect.objectContaining({ id: messageId, role: "user", contentBytes: 8 }),
@@ -120,18 +161,22 @@ describe("history client", () => {
     const body = new ReadableStream<Uint8Array>({
       start(controller) {
         streamController = controller;
-        controller.enqueue(encoder.encode(
-          `event: turn.started\ndata: ${JSON.stringify({ chat_id: chatId, turn_id: turnId, state: "streaming", omitted_turns: 3 })}\n\n` +
-          `event: turn.delta\ndata: ${JSON.stringify({ turn_id: turnId, content: "hello" })}\n\n`,
-        ));
+        controller.enqueue(
+          encoder.encode(
+            `event: turn.started\ndata: ${JSON.stringify({ chat_id: chatId, turn_id: turnId, state: "streaming", omitted_turns: 3 })}\n\n` +
+              `event: turn.delta\ndata: ${JSON.stringify({ turn_id: turnId, content: "hello" })}\n\n`,
+          ),
+        );
       },
     });
     const fetch = vi.fn(async (url: string, init?: RequestInit) => {
       if (url.endsWith(`/turns/${turnId}/cancel`)) {
         expect(init).toEqual(expect.objectContaining({ method: "POST", body: "" }));
-        streamController.enqueue(encoder.encode(
-          `event: turn.cancelled\ndata: ${JSON.stringify({ turn_id: turnId, state: "cancelled", error_code: null })}\n\n`,
-        ));
+        streamController.enqueue(
+          encoder.encode(
+            `event: turn.cancelled\ndata: ${JSON.stringify({ turn_id: turnId, state: "cancelled", error_code: null })}\n\n`,
+          ),
+        );
         streamController.close();
         return Response.json({ turn_id: turnId, cancel_requested: true }, { status: 202 });
       }
@@ -141,7 +186,15 @@ describe("history client", () => {
     const onDelta = vi.fn();
     const onTerminal = vi.fn();
 
-    const handle = streamPersistentTurn(endpoint, token, chatId, "hello", { onStarted, onDelta, onTerminal }, undefined, fetch);
+    const handle = streamPersistentTurn(
+      endpoint,
+      token,
+      chatId,
+      "hello",
+      { onStarted, onDelta, onTerminal },
+      undefined,
+      fetch,
+    );
     await vi.waitFor(() => expect(onStarted).toHaveBeenCalledWith(turnId, 3));
     handle.cancel();
     await expect(handle.finished).resolves.toEqual({ kind: "cancelled" });
@@ -160,9 +213,17 @@ describe("history client", () => {
   });
 
   it("decodes the node's nested typed error envelope", async () => {
-    const fetch = vi.fn(async () => Response.json({ error: { code: "history_conflict", message: "chat history operation conflicts with current state" } }, { status: 409 }));
+    const fetch = vi.fn(async () =>
+      Response.json(
+        { error: { code: "history_conflict", message: "chat history operation conflicts with current state" } },
+        { status: 409 },
+      ),
+    );
     await expect(deleteChat(endpoint, token, chatId, { fetch })).rejects.toMatchObject({
-      kind: "http", status: 409, code: "history_conflict", message: "chat history operation conflicts with current state",
+      kind: "http",
+      status: 409,
+      code: "history_conflict",
+      message: "chat history operation conflicts with current state",
     });
   });
 
@@ -172,7 +233,9 @@ describe("history client", () => {
     { chats: [{ ...chat, updated_at_ms: 9 }], next_before: null },
     { chats: [chat, chat], next_before: null },
   ])("rejects malformed list payloads without exposing data: %j", async (payload) => {
-    await expect(listChats(endpoint, token, {}, { fetch: vi.fn(async () => Response.json(payload)) })).rejects.toMatchObject({
+    await expect(
+      listChats(endpoint, token, {}, { fetch: vi.fn(async () => Response.json(payload)) }),
+    ).rejects.toMatchObject({
       kind: "invalid-response",
       message: "The Loxa node returned an invalid chat-history payload.",
     });
@@ -181,10 +244,18 @@ describe("history client", () => {
   it("rejects invalid IDs, limits, cursors, and rename content before fetch", async () => {
     const fetch = vi.fn();
     await expect(getChat(endpoint, token, "../secret", { fetch })).rejects.toMatchObject({ kind: "invalid-request" });
-    await expect(listChats(endpoint, token, { limit: 101 }, { fetch })).rejects.toMatchObject({ kind: "invalid-request" });
-    await expect(listChats(endpoint, token, { before: "x y" }, { fetch })).rejects.toMatchObject({ kind: "invalid-request" });
-    await expect(renameChat(endpoint, token, chatId, "\0secret", { fetch })).rejects.toMatchObject({ kind: "invalid-request" });
-    await expect(renameChat(endpoint, token, chatId, "x".repeat(161), { fetch })).rejects.toMatchObject({ kind: "invalid-request" });
+    await expect(listChats(endpoint, token, { limit: 101 }, { fetch })).rejects.toMatchObject({
+      kind: "invalid-request",
+    });
+    await expect(listChats(endpoint, token, { before: "x y" }, { fetch })).rejects.toMatchObject({
+      kind: "invalid-request",
+    });
+    await expect(renameChat(endpoint, token, chatId, "\0secret", { fetch })).rejects.toMatchObject({
+      kind: "invalid-request",
+    });
+    await expect(renameChat(endpoint, token, chatId, "x".repeat(161), { fetch })).rejects.toMatchObject({
+      kind: "invalid-request",
+    });
     expect(fetch).not.toHaveBeenCalled();
   });
 
@@ -198,19 +269,41 @@ describe("history client", () => {
   );
 
   it("classifies typed HTTP, transport, timeout, and caller cancellation safely", async () => {
-    const httpFetch = vi.fn(async () => Response.json({ code: "chat_busy", message: "Finish the active turn first." }, { status: 409 }));
+    const httpFetch = vi.fn(async () =>
+      Response.json({ code: "chat_busy", message: "Finish the active turn first." }, { status: 409 }),
+    );
     await expect(deleteChat(endpoint, token, chatId, { fetch: httpFetch })).rejects.toMatchObject({
-      kind: "http", status: 409, code: "chat_busy", message: "Finish the active turn first.",
+      kind: "http",
+      status: 409,
+      code: "chat_busy",
+      message: "Finish the active turn first.",
     });
 
-    await expect(listChats(endpoint, token, {}, { fetch: vi.fn(async () => { throw new Error("private detail"); }) })).rejects.toMatchObject({
-      kind: "transport", message: "Could not connect to Loxa chat history.",
+    await expect(
+      listChats(
+        endpoint,
+        token,
+        {},
+        {
+          fetch: vi.fn(async () => {
+            throw new Error("private detail");
+          }),
+        },
+      ),
+    ).rejects.toMatchObject({
+      kind: "transport",
+      message: "Could not connect to Loxa chat history.",
     });
 
-    const hanging = vi.fn((_url: string, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
-      init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
-    }));
-    await expect(listChats(endpoint, token, {}, { fetch: hanging, timeoutMs: 1 })).rejects.toMatchObject({ kind: "timeout" });
+    const hanging = vi.fn(
+      (_url: string, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+        }),
+    );
+    await expect(listChats(endpoint, token, {}, { fetch: hanging, timeoutMs: 1 })).rejects.toMatchObject({
+      kind: "timeout",
+    });
 
     const caller = new AbortController();
     caller.abort();
@@ -221,37 +314,82 @@ describe("history client", () => {
     const chunk = new Uint8Array(512 * 1024);
     let calls = 0;
     const reader = {
-      read: vi.fn(async () => ++calls <= 3 ? { done: false as const, value: chunk } : { done: true as const, value: undefined }),
+      read: vi.fn(async () =>
+        ++calls <= 3 ? { done: false as const, value: chunk } : { done: true as const, value: undefined },
+      ),
       cancel: vi.fn(async () => undefined),
       releaseLock: vi.fn(),
     };
     const response = { ok: true, status: 200, body: { getReader: () => reader } } as unknown as Response;
-    await expect(listChats(endpoint, token, {}, { fetch: vi.fn(async () => response) })).rejects.toMatchObject({ kind: "invalid-response" });
+    await expect(listChats(endpoint, token, {}, { fetch: vi.fn(async () => response) })).rejects.toMatchObject({
+      kind: "invalid-response",
+    });
     expect(reader.cancel).toHaveBeenCalledOnce();
     expect(reader.releaseLock).toHaveBeenCalledOnce();
   });
 
   it("rejects out-of-order turns and a mismatched chat", async () => {
     const payload = {
-      turns: [{
-        id: turnId, chat_id: chatId, ordinal: 0, state: "completed",
-        provenance: { model_alias: "loxa", recipe_id: "gemma", engine_name: null, engine_version: null },
-        error_code: null, created_at_ms: 20, updated_at_ms: 22,
-      }, {
-        id: "3123456789abcdef0123456789abcdef", chat_id: chatId, ordinal: 0, state: "completed",
-        provenance: { model_alias: "loxa", recipe_id: "gemma", engine_name: null, engine_version: null },
-        error_code: null, created_at_ms: 23, updated_at_ms: 24,
-      }], next_after: null,
+      turns: [
+        {
+          id: turnId,
+          chat_id: chatId,
+          ordinal: 0,
+          state: "completed",
+          provenance: { model_alias: "loxa", recipe_id: "gemma", engine_name: null, engine_version: null },
+          error_code: null,
+          created_at_ms: 20,
+          updated_at_ms: 22,
+        },
+        {
+          id: "3123456789abcdef0123456789abcdef",
+          chat_id: chatId,
+          ordinal: 0,
+          state: "completed",
+          provenance: { model_alias: "loxa", recipe_id: "gemma", engine_name: null, engine_version: null },
+          error_code: null,
+          created_at_ms: 23,
+          updated_at_ms: 24,
+        },
+      ],
+      next_after: null,
     };
-    await expect(listTurns(endpoint, token, chatId, {}, { fetch: vi.fn(async () => Response.json(payload)) })).rejects.toBeInstanceOf(HistoryClientError);
+    await expect(
+      listTurns(endpoint, token, chatId, {}, { fetch: vi.fn(async () => Response.json(payload)) }),
+    ).rejects.toBeInstanceOf(HistoryClientError);
   });
 
   it.each([
-    ["missing field", (turn: Record<string, unknown>) => { delete turn.updated_at_ms; }],
-    ["extra field", (turn: Record<string, unknown>) => { turn.extra = true; }],
-    ["bad provenance", (turn: Record<string, unknown>) => { turn.provenance = { model_alias: "other", recipe_id: "gemma", engine_name: null, engine_version: null }; }],
-    ["negative ordinal", (turn: Record<string, unknown>) => { turn.ordinal = -1; }],
-    ["unknown state", (turn: Record<string, unknown>) => { turn.state = "done"; }],
+    [
+      "missing field",
+      (turn: Record<string, unknown>) => {
+        delete turn.updated_at_ms;
+      },
+    ],
+    [
+      "extra field",
+      (turn: Record<string, unknown>) => {
+        turn.extra = true;
+      },
+    ],
+    [
+      "bad provenance",
+      (turn: Record<string, unknown>) => {
+        turn.provenance = { model_alias: "other", recipe_id: "gemma", engine_name: null, engine_version: null };
+      },
+    ],
+    [
+      "negative ordinal",
+      (turn: Record<string, unknown>) => {
+        turn.ordinal = -1;
+      },
+    ],
+    [
+      "unknown state",
+      (turn: Record<string, unknown>) => {
+        turn.state = "done";
+      },
+    ],
   ])("strictly rejects turn DTO %s", async (_case, mutate) => {
     const turn: Record<string, unknown> = {
       id: turnId,
@@ -264,8 +402,16 @@ describe("history client", () => {
       updated_at_ms: 22,
     };
     mutate(turn);
-    await expect(listTurns(endpoint, token, chatId, {}, {
-      fetch: vi.fn(async () => Response.json({ turns: [turn], next_after: null })),
-    })).rejects.toMatchObject({ kind: "invalid-response" });
+    await expect(
+      listTurns(
+        endpoint,
+        token,
+        chatId,
+        {},
+        {
+          fetch: vi.fn(async () => Response.json({ turns: [turn], next_after: null })),
+        },
+      ),
+    ).rejects.toMatchObject({ kind: "invalid-response" });
   });
 });

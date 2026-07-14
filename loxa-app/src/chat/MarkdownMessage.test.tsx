@@ -42,7 +42,8 @@ function deferred<T>() {
 describe("assistant Markdown rendering", () => {
   it("renders assistant headings, lists, emphasis, inline code, and GFM tables", () => {
     transcriptWith({
-      response: "# Runtime status\n\n- Model is **ready**\n- Alias is `loxa`\n\n| State | Value |\n| --- | --- |\n| Health | Ready |",
+      response:
+        "# Runtime status\n\n- Model is **ready**\n- Alias is `loxa`\n\n| State | Value |\n| --- | --- |\n| Health | Ready |",
     });
 
     expect(screen.getByRole("heading", { name: "Runtime status" })).toBeInTheDocument();
@@ -72,7 +73,8 @@ describe("assistant Markdown rendering", () => {
 
   it("keeps unsafe assistant links inert while allowing credential-free absolute HTTPS links", () => {
     transcriptWith({
-      response: "[Run](javascript:alert(1)) [Private](https://user:secret@example.com) [Status](https://loxa.dev/status)",
+      response:
+        "[Run](javascript:alert(1)) [Private](https://user:secret@example.com) [Status](https://loxa.dev/status)",
     });
 
     expect(screen.queryByRole("link", { name: "Run" })).not.toBeInTheDocument();
@@ -121,7 +123,8 @@ describe("assistant Markdown rendering", () => {
 
   it("renders the approved GFM and accessible prose surface", () => {
     transcriptWith({
-      response: "> Node quote\n\n```rust\nlet ready = true;\n```\n\n- [x] Verified\n  - Nested\n\n~~stale~~\n\n<https://loxa.dev/status>\n\nUnicode: مرحبا 🦊\n\nLine one  \nLine two\n\nFootnote[^1]\n\n[^1]: Local note",
+      response:
+        "> Node quote\n\n```rust\nlet ready = true;\n```\n\n- [x] Verified\n  - Nested\n\n~~stale~~\n\n<https://loxa.dev/status>\n\nUnicode: مرحبا 🦊\n\nLine one  \nLine two\n\nFootnote[^1]\n\n[^1]: Local note",
     });
 
     expect(screen.getByText("Node quote").closest("blockquote")).toBeInTheDocument();
@@ -129,40 +132,84 @@ describe("assistant Markdown rendering", () => {
     expect(screen.getByRole("checkbox")).toBeDisabled();
     expect(screen.getByText("Nested").closest("ul")).toBeInTheDocument();
     expect(screen.getByText("stale", { selector: "del" })).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "https://loxa.dev/status" })).toHaveAttribute("href", "https://loxa.dev/status");
+    expect(screen.getByRole("link", { name: "https://loxa.dev/status" })).toHaveAttribute(
+      "href",
+      "https://loxa.dev/status",
+    );
     expect(screen.getByText(/مرحبا 🦊/)).toBeInTheDocument();
-    const lineBreakParagraph = screen.getByText((_content, element) => element?.tagName === "P" && element.textContent?.includes("Line one") === true);
+    const lineBreakParagraph = screen.getByText(
+      (_content, element) => element?.tagName === "P" && element.textContent?.includes("Line one") === true,
+    );
     expect(lineBreakParagraph.querySelector("br")).toBeInTheDocument();
     expect(screen.getByText(/Local note/)).toBeInTheDocument();
   });
 
   it("handles incomplete streamed Markdown and renders the valid completion", () => {
     const copyText = vi.fn().mockResolvedValue(undefined);
-    const initial: ChatTurn = { id: 1, model: "gemma", prompt: "Plain", response: "**stream", status: "streaming", error: "" };
+    const initial: ChatTurn = {
+      id: 1,
+      model: "gemma",
+      prompt: "Plain",
+      response: "**stream",
+      status: "streaming",
+      error: "",
+    };
     const view = render(<ChatTranscript turns={[initial]} emptyMessage="Empty" copyText={copyText} />);
 
     expect(screen.getByText("**stream")).toBeInTheDocument();
-    view.rerender(<ChatTranscript turns={[{ ...initial, response: "**stream**", status: "completed" }]} emptyMessage="Empty" copyText={copyText} />);
+    view.rerender(
+      <ChatTranscript
+        turns={[{ ...initial, response: "**stream**", status: "completed" }]}
+        emptyMessage="Empty"
+        copyText={copyText}
+      />,
+    );
     expect(screen.getByText("stream", { selector: "strong" })).toBeInTheDocument();
   });
 
   it("recovers an incomplete streamed fence when the closing fence arrives", () => {
     const copyText = vi.fn().mockResolvedValue(undefined);
-    const initial: ChatTurn = { id: 1, model: "gemma", prompt: "Plain", response: "```rust\nlet ready = true;", status: "streaming", error: "" };
+    const initial: ChatTurn = {
+      id: 1,
+      model: "gemma",
+      prompt: "Plain",
+      response: "```rust\nlet ready = true;",
+      status: "streaming",
+      error: "",
+    };
     const view = render(<ChatTranscript turns={[initial]} emptyMessage="Empty" copyText={copyText} />);
 
     expect(screen.getByText("let ready = true;").closest("pre")).toBeInTheDocument();
-    view.rerender(<ChatTranscript turns={[{ ...initial, response: "```rust\nlet ready = true;\n```", status: "completed" }]} emptyMessage="Empty" copyText={copyText} />);
+    view.rerender(
+      <ChatTranscript
+        turns={[{ ...initial, response: "```rust\nlet ready = true;\n```", status: "completed" }]}
+        emptyMessage="Empty"
+        copyText={copyText}
+      />,
+    );
     expect(screen.getByText("let ready = true;").closest("code")).toHaveClass("language-rust");
   });
 
   it("recovers an incomplete streamed table when the remaining cells arrive", () => {
     const copyText = vi.fn().mockResolvedValue(undefined);
-    const initial: ChatTurn = { id: 1, model: "gemma", prompt: "Plain", response: "| State | Value |\n| ---", status: "streaming", error: "" };
+    const initial: ChatTurn = {
+      id: 1,
+      model: "gemma",
+      prompt: "Plain",
+      response: "| State | Value |\n| ---",
+      status: "streaming",
+      error: "",
+    };
     const view = render(<ChatTranscript turns={[initial]} emptyMessage="Empty" copyText={copyText} />);
 
     expect(screen.queryByRole("table")).not.toBeInTheDocument();
-    view.rerender(<ChatTranscript turns={[{ ...initial, response: "| State | Value |\n| --- | --- |\n| Health | Ready |", status: "completed" }]} emptyMessage="Empty" copyText={copyText} />);
+    view.rerender(
+      <ChatTranscript
+        turns={[{ ...initial, response: "| State | Value |\n| --- | --- |\n| Health | Ready |", status: "completed" }]}
+        emptyMessage="Empty"
+        copyText={copyText}
+      />,
+    );
     expect(within(screen.getByRole("table")).getByText("Health")).toBeInTheDocument();
     expect(within(screen.getByRole("table")).getByText("Ready")).toBeInTheDocument();
   });
@@ -227,20 +274,30 @@ describe("assistant Markdown rendering", () => {
     expect(copyText).not.toHaveBeenCalled();
   });
 
-  it.each(["completed", "cancelled", "failed"] as const)("copies the exact raw terminal source for a %s turn", async (status) => {
-    const user = userEvent.setup();
-    const raw = `Partial ${status} <button>not interpreted</button>`;
-    const copyText = vi.fn().mockResolvedValue(undefined);
-    transcriptWith({ response: raw, status, error: status === "failed" ? "runtime stopped" : "" }, copyText);
+  it.each(["completed", "cancelled", "failed"] as const)(
+    "copies the exact raw terminal source for a %s turn",
+    async (status) => {
+      const user = userEvent.setup();
+      const raw = `Partial ${status} <button>not interpreted</button>`;
+      const copyText = vi.fn().mockResolvedValue(undefined);
+      transcriptWith({ response: raw, status, error: status === "failed" ? "runtime stopped" : "" }, copyText);
 
-    await user.click(screen.getByRole("button", { name: "Copy response" }));
-    expect(copyText).toHaveBeenCalledWith(raw);
-  });
+      await user.click(screen.getByRole("button", { name: "Copy response" }));
+      expect(copyText).toHaveBeenCalledWith(raw);
+    },
+  );
 
   it("ignores deferred clipboard settlement after the turn is removed", async () => {
     const clipboard = deferred<void>();
     const copyText = vi.fn(() => clipboard.promise);
-    const turn: ChatTurn = { id: 1, model: "gemma", prompt: "Plain", response: "Old response", status: "completed", error: "" };
+    const turn: ChatTurn = {
+      id: 1,
+      model: "gemma",
+      prompt: "Plain",
+      response: "Old response",
+      status: "completed",
+      error: "",
+    };
     const view = render(<ChatTranscript turns={[turn]} emptyMessage="Empty" copyText={copyText} />);
     await userEvent.setup().click(screen.getByRole("button", { name: "Copy response" }));
 
@@ -264,11 +321,20 @@ describe("assistant Markdown rendering", () => {
   it("ignores deferred clipboard settlement when the current turn content changes", async () => {
     const clipboard = deferred<void>();
     const copyText = vi.fn(() => clipboard.promise);
-    const turn: ChatTurn = { id: 1, model: "gemma", prompt: "Plain", response: "Old response", status: "completed", error: "" };
+    const turn: ChatTurn = {
+      id: 1,
+      model: "gemma",
+      prompt: "Plain",
+      response: "Old response",
+      status: "completed",
+      error: "",
+    };
     const view = render(<ChatTranscript turns={[turn]} emptyMessage="Empty" copyText={copyText} />);
     await userEvent.setup().click(screen.getByRole("button", { name: "Copy response" }));
 
-    view.rerender(<ChatTranscript turns={[{ ...turn, response: "New response" }]} emptyMessage="Empty" copyText={copyText} />);
+    view.rerender(
+      <ChatTranscript turns={[{ ...turn, response: "New response" }]} emptyMessage="Empty" copyText={copyText} />,
+    );
     await act(async () => clipboard.resolve());
     expect(screen.queryByRole("status", { name: "Copy response status" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Copy response" })).toBeEnabled();
@@ -276,7 +342,14 @@ describe("assistant Markdown rendering", () => {
 
   it("keeps the labelled log navigable and streaming output silent until terminal status", () => {
     const copyText = vi.fn().mockResolvedValue(undefined);
-    const turn: ChatTurn = { id: 1, model: "gemma", prompt: "Plain", response: "Partial", status: "streaming", error: "" };
+    const turn: ChatTurn = {
+      id: 1,
+      model: "gemma",
+      prompt: "Plain",
+      response: "Partial",
+      status: "streaming",
+      error: "",
+    };
     const view = render(<ChatTranscript turns={[turn]} emptyMessage="Empty" copyText={copyText} />);
     const log = screen.getByRole("log", { name: "Conversation" });
 
@@ -288,7 +361,9 @@ describe("assistant Markdown rendering", () => {
     expect(response).toHaveAttribute("aria-busy", "true");
     expect(within(log).queryByRole("status")).not.toBeInTheDocument();
 
-    view.rerender(<ChatTranscript turns={[{ ...turn, status: "completed" }]} emptyMessage="Empty" copyText={copyText} />);
+    view.rerender(
+      <ChatTranscript turns={[{ ...turn, status: "completed" }]} emptyMessage="Empty" copyText={copyText} />,
+    );
     expect(screen.getByRole("region", { name: "Assistant response from gemma" })).toHaveAttribute("aria-busy", "false");
   });
 

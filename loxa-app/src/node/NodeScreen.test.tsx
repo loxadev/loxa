@@ -5,11 +5,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 import { NodeScreen, type NodeScreenServices } from "./NodeScreen";
-import {
-  NodeSessionProvider,
-  type BootstrapSnapshot,
-  type NodeSessionServices,
-} from "./NodeSession";
+import { NodeSessionProvider, type BootstrapSnapshot, type NodeSessionServices } from "./NodeSession";
 
 const endpoint = "http://127.0.0.1:8080";
 const readyStatus = {
@@ -79,29 +75,35 @@ describe("NodeScreen", () => {
 
   it("renders starting and recovery-required as live state", async () => {
     const pending = new Promise<BootstrapSnapshot>(() => undefined);
-    const first = renderNode(services({
-      bootstrap: { ...services().bootstrap, start: vi.fn(() => pending) },
-    }));
+    const first = renderNode(
+      services({
+        bootstrap: { ...services().bootstrap, start: vi.fn(() => pending) },
+      }),
+    );
     expect(await screen.findByRole("status")).toHaveTextContent("Starting");
     first.unmount();
 
-    renderNode(services({
-      bootstrap: {
-        ...services().bootstrap,
-        start: vi.fn().mockRejectedValue(new Error("Recovery required after unsafe child exit.")),
-      },
-    }));
+    renderNode(
+      services({
+        bootstrap: {
+          ...services().bootstrap,
+          start: vi.fn().mockRejectedValue(new Error("Recovery required after unsafe child exit.")),
+        },
+      }),
+    );
     expect(await screen.findByRole("status")).toHaveTextContent("Recovery required");
   });
 
   it("shows ready only from authoritative status and exposes technical fields", async () => {
-    renderNode(services({
-      bootstrap: {
-        ...services().bootstrap,
-        start: vi.fn().mockResolvedValue(snapshot({ ownership: "attached" })),
-      },
-      getStatus: vi.fn().mockResolvedValue(readyStatus),
-    }));
+    renderNode(
+      services({
+        bootstrap: {
+          ...services().bootstrap,
+          start: vi.fn().mockResolvedValue(snapshot({ ownership: "attached" })),
+        },
+        getStatus: vi.fn().mockResolvedValue(readyStatus),
+      }),
+    );
     expect(await screen.findByRole("status")).toHaveTextContent("Ready");
     expect(screen.getByText("Externally attached")).toBeInTheDocument();
     for (const value of [endpoint, "node-7", "llama.cpp", "b9999", "gemma-3-4b-it-q4", "default"]) {
@@ -153,9 +155,7 @@ describe("NodeScreen", () => {
 
   it("uses only variables defined by the distributed canonical Loxa tokens", () => {
     const canonical = readFileSync(resolve(process.cwd(), "src/styles/loxa.css"), "utf8");
-    const definitions = new Set(
-      Array.from(canonical.matchAll(/(--loxa-[a-z0-9-]+)\s*:/gi), ([, name]) => name),
-    );
+    const definitions = new Set(Array.from(canonical.matchAll(/(--loxa-[a-z0-9-]+)\s*:/gi), ([, name]) => name));
     const modules = [
       "src/node/NodeScreen.module.css",
       "src/models/ModelsScreen.module.css",

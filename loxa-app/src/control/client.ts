@@ -16,13 +16,7 @@ import {
 } from "./contracts";
 
 export type ControlClientErrorKind =
-  | "credential"
-  | "endpoint"
-  | "transport"
-  | "timeout"
-  | "aborted"
-  | "http"
-  | "invalid-response";
+  "credential" | "endpoint" | "transport" | "timeout" | "aborted" | "http" | "invalid-response";
 
 export class ControlClientError extends Error {
   constructor(
@@ -51,10 +45,7 @@ const NONCE_PATTERN = /^[0-9a-f]{64}$/;
 
 export function assertControlToken(token: string): void {
   if (!TOKEN_PATTERN.test(token)) {
-    throw new ControlClientError(
-      "credential",
-      "The local Loxa control credential is unavailable or unsafe.",
-    );
+    throw new ControlClientError("credential", "The local Loxa control credential is unavailable or unsafe.");
   }
 }
 
@@ -75,10 +66,7 @@ export function controlUrl(endpoint: string, path: string): string {
     parsed.search !== "" ||
     parsed.hash !== ""
   ) {
-    throw new ControlClientError(
-      "endpoint",
-      "Control requests are restricted to an explicit IPv4 loopback endpoint.",
-    );
+    throw new ControlClientError("endpoint", "Control requests are restricted to an explicit IPv4 loopback endpoint.");
   }
   const port = Number(parsed.port);
   if (!Number.isInteger(port) || port < 1 || port > 65_535) {
@@ -108,10 +96,7 @@ async function readBoundedText(response: Response): Promise<string> {
       total += result.value.byteLength;
       if (total > MAX_JSON_BYTES) {
         await Promise.resolve(reader.cancel()).catch(() => undefined);
-        throw new ControlClientError(
-          "invalid-response",
-          "The Loxa node returned an oversized control response.",
-        );
+        throw new ControlClientError("invalid-response", "The Loxa node returned an oversized control response.");
       }
       chunks.push(result.value);
     }
@@ -133,11 +118,7 @@ async function httpError(response: Response): Promise<ControlClientError> {
     return new ControlClientError("http", body.message, response.status, body.code);
   } catch (error) {
     if (error instanceof ControlClientError && error.kind !== "invalid-response") return error;
-    return new ControlClientError(
-      "http",
-      `The Loxa node returned HTTP ${response.status}.`,
-      response.status,
-    );
+    return new ControlClientError("http", `The Loxa node returned HTTP ${response.status}.`, response.status);
   }
 }
 
@@ -208,24 +189,42 @@ export async function getNodeIdentityProof(
   if (!NONCE_PATTERN.test(nonce)) {
     throw new ControlClientError("credential", "The node identity challenge is invalid.");
   }
-  const payload = await request(endpoint, "/loxa/v1/node", null, {
-    method: "GET",
-    headers: { "x-loxa-challenge": nonce },
-  }, options);
+  const payload = await request(
+    endpoint,
+    "/loxa/v1/node",
+    null,
+    {
+      method: "GET",
+      headers: { "x-loxa-challenge": nonce },
+    },
+    options,
+  );
   return decode(() => decodeNodeIdentityProof(payload));
 }
 
-export async function getControlNode(endpoint: string, token: string, options: ControlClientOptions = {}): Promise<NodeSnapshot> {
+export async function getControlNode(
+  endpoint: string,
+  token: string,
+  options: ControlClientOptions = {},
+): Promise<NodeSnapshot> {
   const payload = await request(endpoint, "/loxa/v1/node", token, { method: "GET" }, options);
   return decode(() => decodeNodeSnapshot(payload));
 }
 
-export async function getCapabilities(endpoint: string, token: string, options: ControlClientOptions = {}): Promise<Capabilities> {
+export async function getCapabilities(
+  endpoint: string,
+  token: string,
+  options: ControlClientOptions = {},
+): Promise<Capabilities> {
   const payload = await request(endpoint, "/loxa/v1/capabilities", token, { method: "GET" }, options);
   return decode(() => decodeCapabilities(payload));
 }
 
-export async function getInventory(endpoint: string, token: string, options: ControlClientOptions = {}): Promise<ModelInventoryEntry[]> {
+export async function getInventory(
+  endpoint: string,
+  token: string,
+  options: ControlClientOptions = {},
+): Promise<ModelInventoryEntry[]> {
   const payload = await request(endpoint, "/loxa/v1/models", token, { method: "GET" }, options);
   return decode(() => decodeInventory(payload));
 }
@@ -239,23 +238,45 @@ export async function downloadModel(
   if (!MODEL_ID_PATTERN.test(modelId)) {
     throw new ControlClientError("invalid-response", "The selected registry model ID is invalid.");
   }
-  const payload = await request(endpoint, "/loxa/v1/models/download", token, {
-    method: "POST",
-    body: JSON.stringify({ model_id: modelId }),
-  }, options);
+  const payload = await request(
+    endpoint,
+    "/loxa/v1/models/download",
+    token,
+    {
+      method: "POST",
+      body: JSON.stringify({ model_id: modelId }),
+    },
+    options,
+  );
   return decode(() => decodeOperationAccepted(payload));
 }
 
-export async function loadModel(endpoint: string, token: string, modelId: string, options: ControlClientOptions = {}): Promise<OperationAccepted> {
-  if (!MODEL_ID_PATTERN.test(modelId)) throw new ControlClientError("invalid-response", "The selected registry model ID is invalid.");
-  const payload = await request(endpoint, "/loxa/v1/models/load", token, {
-    method: "POST",
-    body: JSON.stringify({ model_id: modelId }),
-  }, options);
+export async function loadModel(
+  endpoint: string,
+  token: string,
+  modelId: string,
+  options: ControlClientOptions = {},
+): Promise<OperationAccepted> {
+  if (!MODEL_ID_PATTERN.test(modelId))
+    throw new ControlClientError("invalid-response", "The selected registry model ID is invalid.");
+  const payload = await request(
+    endpoint,
+    "/loxa/v1/models/load",
+    token,
+    {
+      method: "POST",
+      body: JSON.stringify({ model_id: modelId }),
+    },
+    options,
+  );
   return decode(() => decodeOperationAccepted(payload));
 }
 
-export async function unloadModel(endpoint: string, token: string, options: ControlClientOptions = {}): Promise<OperationAccepted> {
+export async function unloadModel(
+  endpoint: string,
+  token: string,
+  options: ControlClientOptions = {},
+): Promise<OperationAccepted> {
   const payload = await request(endpoint, "/loxa/v1/models/unload", token, { method: "POST" }, options);
   return decode(() => decodeOperationAccepted(payload));
 }
@@ -266,7 +287,13 @@ export async function getOperation(
   operationId: string,
   options: ControlClientOptions = {},
 ): Promise<OperationView> {
-  const payload = await request(endpoint, `/loxa/v1/operations/${encodeURIComponent(operationId)}`, token, { method: "GET" }, options);
+  const payload = await request(
+    endpoint,
+    `/loxa/v1/operations/${encodeURIComponent(operationId)}`,
+    token,
+    { method: "GET" },
+    options,
+  );
   return decode(() => decodeOperation(payload));
 }
 
@@ -276,6 +303,12 @@ export async function cancelOperation(
   operationId: string,
   options: ControlClientOptions = {},
 ): Promise<OperationView> {
-  const payload = await request(endpoint, `/loxa/v1/operations/${encodeURIComponent(operationId)}/cancel`, token, { method: "POST" }, options);
+  const payload = await request(
+    endpoint,
+    `/loxa/v1/operations/${encodeURIComponent(operationId)}/cancel`,
+    token,
+    { method: "POST" },
+    options,
+  );
   return decode(() => decodeOperation(payload));
 }
