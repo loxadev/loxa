@@ -2215,6 +2215,37 @@ mod lifecycle_api_tests {
         }
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    struct RestartRecordingLifecycleSink {
+        events: Vec<LifecycleEvent>,
+        ready_ack_path: PathBuf,
+        ready_generation: u64,
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    impl RestartRecordingLifecycleSink {
+        fn new(ready_ack_path: PathBuf) -> Self {
+            Self {
+                events: Vec::new(),
+                ready_ack_path,
+                ready_generation: 0,
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    impl LifecycleEventSink for RestartRecordingLifecycleSink {
+        fn emit(&mut self, event: LifecycleEvent) -> io::Result<()> {
+            let model_ready = matches!(event, LifecycleEvent::ModelReady { .. });
+            self.events.push(event);
+            if model_ready {
+                self.ready_generation += 1;
+                fs::write(&self.ready_ack_path, format!("{}\n", self.ready_generation))?;
+            }
+            Ok(())
+        }
+    }
+
     struct ChannelLifecycleSink(std::sync::mpsc::Sender<LifecycleEvent>);
 
     impl LifecycleEventSink for ChannelLifecycleSink {
@@ -2441,6 +2472,33 @@ mod lifecycle_api_tests {
         }
 
         assert_eq!(sink.events, events);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn restart_sink_acknowledges_each_published_model_ready_generation() {
+        let temp = TestDir::new("restart-ready-ack");
+        let ready_ack_path = temp.0.join("ready-generation");
+        let mut sink = RestartRecordingLifecycleSink::new(ready_ack_path.clone());
+        let server = ManagedServer {
+            id: "model".to_string(),
+            pid: 77,
+            port: 11_435,
+            model_path: PathBuf::from("/models/model"),
+            started_at_unix_s: 123,
+            llama_server_version: "test".to_string(),
+            process_start_time_unix_s: Some(122),
+        };
+
+        sink.emit(LifecycleEvent::ModelReady {
+            server: server.clone(),
+        })
+        .expect("acknowledge first ready generation");
+        assert_eq!(fs::read_to_string(&ready_ack_path).unwrap(), "1\n");
+
+        sink.emit(LifecycleEvent::ModelReady { server })
+            .expect("acknowledge replacement ready generation");
+        assert_eq!(fs::read_to_string(&ready_ack_path).unwrap(), "2\n");
     }
 
     #[test]
@@ -3887,14 +3945,37 @@ mod lifecycle_api_tests {
             &mut completion,
             r#"{"choices":[{"message":{"content":"ok"}}]}"#,
         );
-        std::thread::sleep(Duration::from_millis(300));
+        let expected_generation = generation.parse::<u64>().expect("numeric generation");
+        let ready_ack_path = PathBuf::from(
+            std::env::var_os("LOXA_MLX_RESTART_READY_ACK")
+                .expect("helper ready acknowledgement path"),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let acknowledged = fs::read_to_string(&ready_ack_path)
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .is_some_and(|ready_generation| ready_generation >= expected_generation);
+            if acknowledged {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "model-ready acknowledgement timeout for generation {generation}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn run_model_for_test(
         id: &str,
         paths: &NodePaths,
     ) -> io::Result<(RunTermination, Vec<LifecycleEvent>)> {
-        let mut events = RecordingLifecycleSink::default();
+        let ready_ack_path = PathBuf::from(
+            std::env::var_os("LOXA_MLX_RESTART_READY_ACK").expect("ready acknowledgement path"),
+        );
+        let mut events = RestartRecordingLifecycleSink::new(ready_ack_path);
         let outcome = run_model(
             RunRequest {
                 id,
@@ -3924,6 +4005,7 @@ mod lifecycle_api_tests {
         let args_path = temp.path().join("launch-args");
         let requests_path = temp.path().join("readiness-requests");
         let marker_path = temp.path().join("completion-marker");
+        let ready_ack_path = temp.path().join("ready-generation");
         fs::create_dir_all(&bin_dir).expect("create fake bin");
         fs::create_dir_all(&model_dir).expect("create fake model");
         fs::write(
@@ -3968,6 +4050,7 @@ LOXA_MLX_RESTART_CHILD="1" \
             ("LOXA_MLX_RESTART_REQUESTS", requests_path.as_os_str()),
             ("LOXA_MLX_RESTART_TEST_EXE", test_exe.as_os_str()),
             ("LOXA_MLX_RESTART_MARKER", marker_path.as_os_str()),
+            ("LOXA_MLX_RESTART_READY_ACK", ready_ack_path.as_os_str()),
             ("LOXA_MLX_RESTART_DELAY_MS", std::ffi::OsStr::new("0")),
         ]);
         let paths = NodePaths {
@@ -4062,7 +4145,13 @@ LOXA_MLX_RESTART_CHILD="1" \
             RuntimeStateRead::Loaded(Vec::new())
         );
 
-        for path in [&count_path, &args_path, &requests_path, &marker_path] {
+        for path in [
+            &count_path,
+            &args_path,
+            &requests_path,
+            &marker_path,
+            &ready_ack_path,
+        ] {
             let _ = fs::remove_file(path);
         }
         unsafe { std::env::set_var("LOXA_MLX_RESTART_DELAY_MS", "5000") };
@@ -4110,7 +4199,13 @@ LOXA_MLX_RESTART_CHILD="1" \
             RuntimeStateRead::Loaded(Vec::new())
         );
 
-        for path in [&count_path, &args_path, &requests_path, &marker_path] {
+        for path in [
+            &count_path,
+            &args_path,
+            &requests_path,
+            &marker_path,
+            &ready_ack_path,
+        ] {
             let _ = fs::remove_file(path);
         }
         let interrupt_paths = NodePaths {
