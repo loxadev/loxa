@@ -1,0 +1,312 @@
+/* Loxa canonical tokens v1.0.0 — source: loxa.tokens.json */
+
+@theme inline {
+  --font-heading: var(--loxa-font-sans);
+  --font-sans: var(--loxa-font-sans);
+  --font-mono: var(--loxa-font-mono);
+
+  --color-background: var(--loxa-background);
+  --color-foreground: var(--loxa-foreground);
+  --color-card: var(--loxa-surface);
+  --color-card-foreground: var(--loxa-foreground);
+  --color-popover: var(--loxa-surface);
+  --color-popover-foreground: var(--loxa-foreground);
+  --color-surface: var(--loxa-surface);
+  --color-surface-subtle: var(--loxa-surface-subtle);
+  --color-primary: var(--loxa-primary);
+  --color-primary-foreground: var(--loxa-primary-foreground);
+  --color-secondary: var(--loxa-secondary-surface);
+  --color-secondary-foreground: var(--loxa-foreground);
+  --color-muted: var(--loxa-surface-subtle);
+  --color-muted-foreground: var(--loxa-muted-foreground);
+  --color-accent: var(--loxa-accent);
+  --color-accent-foreground: var(--loxa-accent-foreground);
+  --color-destructive: var(--loxa-danger);
+  --color-destructive-foreground: var(--loxa-danger-foreground);
+  --color-border: var(--loxa-control-border);
+  --color-input: var(--loxa-control-border);
+  --color-ring: var(--loxa-focus);
+  --color-info: var(--loxa-info-icon);
+  --color-info-foreground: var(--loxa-info-foreground);
+  --color-info-surface: var(--loxa-info-surface);
+  --color-info-border: var(--loxa-info-border);
+  --color-success: var(--loxa-success-icon);
+  --color-success-foreground: var(--loxa-success-foreground);
+  --color-success-surface: var(--loxa-success-surface);
+  --color-success-border: var(--loxa-success-border);
+  --color-warning: var(--loxa-warning-icon);
+  --color-warning-foreground: var(--loxa-warning-foreground);
+  --color-warning-surface: var(--loxa-warning-surface);
+  --color-warning-border: var(--loxa-warning-border);
+  --color-danger: var(--loxa-danger-status-icon);
+  --color-danger-foreground: var(--loxa-danger-status-foreground);
+  --color-danger-surface: var(--loxa-danger-status-surface);
+  --color-danger-border: var(--loxa-danger-status-border);
+
+  --radius-sm: var(--loxa-radius-sm);
+  --radius-md: var(--loxa-radius-md);
+  --radius-lg: var(--loxa-radius-lg);
+  --radius-xl: var(--loxa-radius-xl);
+
+  --spacing-1: var(--loxa-space-1);
+  --spacing-2: var(--loxa-space-2);
+  --spacing-3: var(--loxa-space-3);
+  --spacing-4: var(--loxa-space-4);
+  --spacing-6: var(--loxa-space-6);
+  --spacing-8: var(--loxa-space-8);
+  --spacing-12: var(--loxa-space-12);
+  --spacing-16: var(--loxa-space-16);
+  --spacing-24: var(--loxa-space-24);
+  --spacing-32: var(--loxa-space-32);
+  --spacing-interactive: var(--loxa-component-minimum-interactive-target);
+  --size-interactive: var(--loxa-component-minimum-interactive-target);
+}
+
+:root {
+  --loxa-color-ink: #101410;
+  --loxa-color-snow: #f4f6f0;
+  --loxa-color-mineral: #69716c;
+  --loxa-color-glacier: #c5ddd4;
+  --loxa-color-signal: #b7ed62;
+
+  --loxa-font-sans:
+    "Instrument Sans", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --loxa-font-mono:
+    "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+
+  --loxa-type-display-family: var(--loxa-font-sans);
+  --loxa-type-display-size: 64px;
+  --loxa-type-display-weight: 600;
+  --loxa-type-display-line-height: 1;
+  --loxa-type-display-letter-spacing: -0.055em;
+  --loxa-type-h1-family: var(--loxa-font-sans);
+  --loxa-type-h1-size: 48px;
+  --loxa-type-h1-weight: 600;
+  --loxa-type-h1-line-height: 1.05;
+  --loxa-type-h1-letter-spacing: -0.045em;
+  --loxa-type-h2-family: var(--loxa-font-sans);
+  --loxa-type-h2-size: 36px;
+  --loxa-type-h2-weight: 600;
+  --loxa-type-h2-line-height: 1.1;
+  --loxa-type-h2-letter-spacing: -0.04em;
+  --loxa-type-h3-family: var(--loxa-font-sans);
+  --loxa-type-h3-size: 28px;
+  --loxa-type-h3-weight: 600;
+  --loxa-type-h3-line-height: 1.2;
+  --loxa-type-h3-letter-spacing: -0.03em;
+  --loxa-type-title-family: var(--loxa-font-sans);
+  --loxa-type-title-size: 20px;
+  --loxa-type-title-weight: 600;
+  --loxa-type-title-line-height: 1.3;
+  --loxa-type-title-letter-spacing: -0.02em;
+  --loxa-type-body-large-family: var(--loxa-font-sans);
+  --loxa-type-body-large-size: 18px;
+  --loxa-type-body-large-weight: 400;
+  --loxa-type-body-large-line-height: 1.6;
+  --loxa-type-body-large-letter-spacing: -0.015em;
+  --loxa-type-body-family: var(--loxa-font-sans);
+  --loxa-type-body-size: 16px;
+  --loxa-type-body-weight: 400;
+  --loxa-type-body-line-height: 1.6;
+  --loxa-type-body-letter-spacing: -0.01em;
+  --loxa-type-body-small-family: var(--loxa-font-sans);
+  --loxa-type-body-small-size: 14px;
+  --loxa-type-body-small-weight: 400;
+  --loxa-type-body-small-line-height: 1.5;
+  --loxa-type-body-small-letter-spacing: 0em;
+  --loxa-type-label-family: var(--loxa-font-sans);
+  --loxa-type-label-size: 13px;
+  --loxa-type-label-weight: 500;
+  --loxa-type-label-line-height: 1.3;
+  --loxa-type-label-letter-spacing: 0em;
+  --loxa-type-label-caps-family: var(--loxa-font-mono);
+  --loxa-type-label-caps-size: 12px;
+  --loxa-type-label-caps-weight: 500;
+  --loxa-type-label-caps-line-height: 1.3;
+  --loxa-type-label-caps-letter-spacing: 0.08em;
+  --loxa-type-code-family: var(--loxa-font-mono);
+  --loxa-type-code-size: 14px;
+  --loxa-type-code-weight: 400;
+  --loxa-type-code-line-height: 1.6;
+  --loxa-type-code-letter-spacing: 0em;
+  --loxa-type-code-compact-family: var(--loxa-font-mono);
+  --loxa-type-code-compact-size: 12px;
+  --loxa-type-code-compact-weight: 400;
+  --loxa-type-code-compact-line-height: 1.5;
+  --loxa-type-code-compact-letter-spacing: 0em;
+
+  --loxa-space-1: 4px;
+  --loxa-space-2: 8px;
+  --loxa-space-3: 12px;
+  --loxa-space-4: 16px;
+  --loxa-space-6: 24px;
+  --loxa-space-8: 32px;
+  --loxa-space-12: 48px;
+  --loxa-space-16: 64px;
+  --loxa-space-24: 96px;
+  --loxa-space-32: 128px;
+
+  --loxa-radius-sm: 4px;
+  --loxa-radius-md: 6px;
+  --loxa-radius-lg: 8px;
+  --loxa-radius-xl: 12px;
+
+  --loxa-motion-fast: 150ms;
+  --loxa-motion-theme: 190ms;
+  --loxa-motion-slow: 250ms;
+  --loxa-motion-easing: ease;
+
+  --loxa-component-minimum-interactive-target: 44px;
+}
+
+:root,
+[data-loxa-theme="light"] {
+  color-scheme: light;
+  --loxa-light-background: #f4f6f0;
+  --loxa-light-surface: #ffffff;
+  --loxa-light-surface-subtle: #e4eee7;
+  --loxa-light-foreground: #101410;
+  --loxa-light-muted-foreground: #555c58;
+  --loxa-light-secondary-surface: #e4eee7;
+  --loxa-light-control-border: #69716c;
+  --loxa-light-selected-surface: #69716c;
+  --loxa-light-selected-foreground: #f4f6f0;
+  --loxa-light-focus: #101410;
+  --loxa-light-accent: #b7ed62;
+  --loxa-light-accent-foreground: #101410;
+  --loxa-light-primary: #b7ed62;
+  --loxa-light-primary-foreground: #101410;
+  --loxa-light-danger: #a12c36;
+  --loxa-light-danger-foreground: #ffffff;
+  --loxa-light-info-surface: #e2eef4;
+  --loxa-light-info-foreground: #17445b;
+  --loxa-light-info-border: #27647f;
+  --loxa-light-info-icon: #27647f;
+  --loxa-light-success-surface: #e2efe4;
+  --loxa-light-success-foreground: #20552a;
+  --loxa-light-success-border: #34713e;
+  --loxa-light-success-icon: #34713e;
+  --loxa-light-warning-surface: #f5eccf;
+  --loxa-light-warning-foreground: #5b4510;
+  --loxa-light-warning-border: #80641d;
+  --loxa-light-warning-icon: #80641d;
+  --loxa-light-danger-status-surface: #f5e1e3;
+  --loxa-light-danger-status-foreground: #75202a;
+  --loxa-light-danger-status-border: #a12c36;
+  --loxa-light-danger-status-icon: #a12c36;
+
+  --loxa-background: var(--loxa-light-background);
+  --loxa-surface: var(--loxa-light-surface);
+  --loxa-surface-subtle: var(--loxa-light-surface-subtle);
+  --loxa-foreground: var(--loxa-light-foreground);
+  --loxa-muted-foreground: var(--loxa-light-muted-foreground);
+  --loxa-secondary-surface: var(--loxa-light-secondary-surface);
+  --loxa-control-border: var(--loxa-light-control-border);
+  --loxa-selected-surface: var(--loxa-light-selected-surface);
+  --loxa-selected-foreground: var(--loxa-light-selected-foreground);
+  --loxa-focus: var(--loxa-light-focus);
+  --loxa-accent: var(--loxa-light-accent);
+  --loxa-accent-foreground: var(--loxa-light-accent-foreground);
+  --loxa-primary: var(--loxa-light-primary);
+  --loxa-primary-foreground: var(--loxa-light-primary-foreground);
+  --loxa-danger: var(--loxa-light-danger);
+  --loxa-danger-foreground: var(--loxa-light-danger-foreground);
+  --loxa-info-surface: var(--loxa-light-info-surface);
+  --loxa-info-foreground: var(--loxa-light-info-foreground);
+  --loxa-info-border: var(--loxa-light-info-border);
+  --loxa-info-icon: var(--loxa-light-info-icon);
+  --loxa-success-surface: var(--loxa-light-success-surface);
+  --loxa-success-foreground: var(--loxa-light-success-foreground);
+  --loxa-success-border: var(--loxa-light-success-border);
+  --loxa-success-icon: var(--loxa-light-success-icon);
+  --loxa-warning-surface: var(--loxa-light-warning-surface);
+  --loxa-warning-foreground: var(--loxa-light-warning-foreground);
+  --loxa-warning-border: var(--loxa-light-warning-border);
+  --loxa-warning-icon: var(--loxa-light-warning-icon);
+  --loxa-danger-status-surface: var(--loxa-light-danger-status-surface);
+  --loxa-danger-status-foreground: var(--loxa-light-danger-status-foreground);
+  --loxa-danger-status-border: var(--loxa-light-danger-status-border);
+  --loxa-danger-status-icon: var(--loxa-light-danger-status-icon);
+}
+
+[data-loxa-theme="dark"] {
+  color-scheme: dark;
+  --loxa-dark-background: #101410;
+  --loxa-dark-surface: #171c18;
+  --loxa-dark-surface-subtle: #202420;
+  --loxa-dark-foreground: #f4f6f0;
+  --loxa-dark-muted-foreground: #c5ddd4;
+  --loxa-dark-secondary-surface: #202420;
+  --loxa-dark-control-border: #c5ddd4;
+  --loxa-dark-selected-surface: #c5ddd4;
+  --loxa-dark-selected-foreground: #101410;
+  --loxa-dark-focus: #b7ed62;
+  --loxa-dark-accent: #b7ed62;
+  --loxa-dark-accent-foreground: #101410;
+  --loxa-dark-primary: #b7ed62;
+  --loxa-dark-primary-foreground: #101410;
+  --loxa-dark-danger: #e48b92;
+  --loxa-dark-danger-foreground: #101410;
+  --loxa-dark-info-surface: #17242a;
+  --loxa-dark-info-foreground: #dceef4;
+  --loxa-dark-info-border: #66b5d1;
+  --loxa-dark-info-icon: #66b5d1;
+  --loxa-dark-success-surface: #17281e;
+  --loxa-dark-success-foreground: #e0f2e5;
+  --loxa-dark-success-border: #82c99a;
+  --loxa-dark-success-icon: #82c99a;
+  --loxa-dark-warning-surface: #2b2414;
+  --loxa-dark-warning-foreground: #f5eccf;
+  --loxa-dark-warning-border: #e4c35d;
+  --loxa-dark-warning-icon: #e4c35d;
+  --loxa-dark-danger-status-surface: #2c1b1d;
+  --loxa-dark-danger-status-foreground: #f5e1e3;
+  --loxa-dark-danger-status-border: #e48b92;
+  --loxa-dark-danger-status-icon: #e48b92;
+
+  --loxa-background: var(--loxa-dark-background);
+  --loxa-surface: var(--loxa-dark-surface);
+  --loxa-surface-subtle: var(--loxa-dark-surface-subtle);
+  --loxa-foreground: var(--loxa-dark-foreground);
+  --loxa-muted-foreground: var(--loxa-dark-muted-foreground);
+  --loxa-secondary-surface: var(--loxa-dark-secondary-surface);
+  --loxa-control-border: var(--loxa-dark-control-border);
+  --loxa-selected-surface: var(--loxa-dark-selected-surface);
+  --loxa-selected-foreground: var(--loxa-dark-selected-foreground);
+  --loxa-focus: var(--loxa-dark-focus);
+  --loxa-accent: var(--loxa-dark-accent);
+  --loxa-accent-foreground: var(--loxa-dark-accent-foreground);
+  --loxa-primary: var(--loxa-dark-primary);
+  --loxa-primary-foreground: var(--loxa-dark-primary-foreground);
+  --loxa-danger: var(--loxa-dark-danger);
+  --loxa-danger-foreground: var(--loxa-dark-danger-foreground);
+  --loxa-info-surface: var(--loxa-dark-info-surface);
+  --loxa-info-foreground: var(--loxa-dark-info-foreground);
+  --loxa-info-border: var(--loxa-dark-info-border);
+  --loxa-info-icon: var(--loxa-dark-info-icon);
+  --loxa-success-surface: var(--loxa-dark-success-surface);
+  --loxa-success-foreground: var(--loxa-dark-success-foreground);
+  --loxa-success-border: var(--loxa-dark-success-border);
+  --loxa-success-icon: var(--loxa-dark-success-icon);
+  --loxa-warning-surface: var(--loxa-dark-warning-surface);
+  --loxa-warning-foreground: var(--loxa-dark-warning-foreground);
+  --loxa-warning-border: var(--loxa-dark-warning-border);
+  --loxa-warning-icon: var(--loxa-dark-warning-icon);
+  --loxa-danger-status-surface: var(--loxa-dark-danger-status-surface);
+  --loxa-danger-status-foreground: var(--loxa-dark-danger-status-foreground);
+  --loxa-danger-status-border: var(--loxa-dark-danger-status-border);
+  --loxa-danger-status-icon: var(--loxa-dark-danger-status-icon);
+}
+
+:focus-visible {
+  outline: 2px solid var(--loxa-focus);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --loxa-motion-fast: 0.01ms;
+    --loxa-motion-theme: 0.01ms;
+    --loxa-motion-slow: 0.01ms;
+  }
+}

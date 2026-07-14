@@ -3,6 +3,9 @@
     "skipLibCheck": true,
     "module": "ESNext",
     "moduleResolution": "bundler",
+    "baseUrl": ".",
+    "ignoreDeprecations": "6.0",
+    "paths": { "@/*": ["./src/*"] },
     "allowSyntheticDefaultImports": true
   },
   "include": ["vite.config.ts", "vitest.config.ts", "vitest.browser.config.ts"]
