@@ -24,6 +24,12 @@ const conversations: ConversationListItem[] = [
 
 const baseProps = {
   conversations,
+  groupedConversations: [
+    { label: "Today" as const, conversations: [conversations[0]] },
+    { label: "Older" as const, conversations: [conversations[1]] },
+  ],
+  query: "",
+  setQuery: vi.fn(),
   selectedId: conversations[0].id,
   state: "ready" as const,
   hasMore: false,
@@ -35,6 +41,50 @@ const baseProps = {
 };
 
 describe("ConversationList", () => {
+  it("renders non-empty controller groups in fixed order and omits empty groups", () => {
+    render(<ConversationList {...baseProps} />);
+
+    const headings = screen.getAllByRole("heading").map((heading) => heading.textContent);
+    expect(headings).toEqual(["Conversations", "Today", "Older"]);
+    expect(screen.queryByRole("heading", { name: "Yesterday" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Previous 7 days" })).not.toBeInTheDocument();
+  });
+
+  it("uses a controlled labelled search and reports background loading and errors truthfully", async () => {
+    const setQuery = vi.fn();
+    const { rerender } = render(<ConversationList {...baseProps} query="NODE" setQuery={setQuery} state="loading" />);
+
+    const search = screen.getByRole("searchbox", { name: "Search conversations" });
+    expect(search).toHaveValue("NODE");
+    fireEvent.change(search, { target: { value: "NODE health" } });
+    expect(setQuery).toHaveBeenLastCalledWith("NODE health");
+    expect(screen.getByRole("status")).toHaveTextContent("Searching conversations");
+
+    rerender(<ConversationList {...baseProps} state="error" errorMessage="History is unavailable." />);
+    expect(screen.getByRole("alert")).toHaveTextContent("History is unavailable.");
+  });
+
+  it("uses Lucide-backed named controls and preserves the full title contract", () => {
+    const longTitle = "A very long conversation title that must truncate without losing its accessible name";
+    const longConversation = { ...conversations[0], title: longTitle };
+    render(
+      <ConversationList
+        {...baseProps}
+        conversations={[longConversation]}
+        groupedConversations={[{ label: "Today", conversations: [longConversation] }]}
+      />,
+    );
+
+    for (const control of [
+      screen.getByRole("button", { name: "New chat" }),
+      screen.getByRole("button", { name: `Rename ${longTitle}` }),
+      screen.getByRole("button", { name: `Delete ${longTitle}` }),
+    ]) {
+      expect(control.querySelector("svg")).toHaveAttribute("aria-hidden", "true");
+    }
+    expect(screen.getByRole("button", { name: `Open ${longTitle}` })).toHaveAttribute("title", longTitle);
+  });
+
   it("shows a compact recent-chat rail with selection, timestamps, and terminal text", async () => {
     const user = userEvent.setup();
     const onSelect = vi.fn();
@@ -104,13 +154,29 @@ describe("ConversationList", () => {
     expect(more).toBeEnabled();
   });
 
-  it("blocks New chat and delete mutations while a Chat turn is active", () => {
-    render(<ConversationList {...baseProps} mutationsDisabled />);
+  it("blocks every mutation with an accessible active-turn reason", async () => {
+    const user = userEvent.setup();
+    const onCreate = vi.fn();
+    const onRename = vi.fn();
+    const onDelete = vi.fn();
+    render(
+      <ConversationList {...baseProps} mutationsDisabled onCreate={onCreate} onRename={onRename} onDelete={onDelete} />,
+    );
 
-    expect(screen.getByRole("button", { name: "New chat" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Delete Node health" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Delete Download model" })).toBeDisabled();
+    const reason = screen.getByText("Unavailable while a response is active.");
+    for (const control of [
+      screen.getByRole("button", { name: "New chat" }),
+      screen.getByRole("button", { name: "Rename Node health" }),
+      screen.getByRole("button", { name: "Delete Node health" }),
+    ]) {
+      expect(control).toBeDisabled();
+      expect(control).toHaveAttribute("aria-describedby", reason.id);
+      await user.click(control);
+    }
     expect(screen.getByRole("button", { name: "Open Download model" })).toBeEnabled();
+    expect(onCreate).not.toHaveBeenCalled();
+    expect(onRename).not.toHaveBeenCalled();
+    expect(onDelete).not.toHaveBeenCalled();
   });
 
   it("renames accessibly and restores focus after cancelling", async () => {
@@ -146,9 +212,27 @@ describe("ConversationList", () => {
     expect(onRename).not.toHaveBeenCalled();
   });
 
+  it("keeps rename open and restores input focus when rename fails", async () => {
+    const user = userEvent.setup();
+    const onRename = vi.fn(async () => {
+      throw new Error("private rename detail");
+    });
+    render(<ConversationList {...baseProps} onRename={onRename} />);
+
+    await user.click(screen.getByRole("button", { name: "Rename Node health" }));
+    const input = screen.getByRole("textbox", { name: "Conversation title" });
+    await user.clear(input);
+    await user.type(input, "Runtime checks");
+    await user.click(screen.getByRole("button", { name: "Save title" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Could not rename this conversation.");
+    await waitFor(() => expect(input).toHaveFocus());
+    expect(screen.getByRole("button", { name: "Save title" })).toBeEnabled();
+  });
+
   it("requires explicit delete confirmation, supports cancel, and restores focus", async () => {
     const user = userEvent.setup();
-    const onDelete = vi.fn(async () => undefined);
+    const onDelete = vi.fn(async () => conversations[1].id);
     render(<ConversationList {...baseProps} onDelete={onDelete} />);
 
     const remove = screen.getByRole("button", { name: "Delete Node health" });
@@ -167,6 +251,29 @@ describe("ConversationList", () => {
       }),
     );
     expect(onDelete).toHaveBeenCalledWith(conversations[0].id);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Open Download model" })).toHaveFocus());
+  });
+
+  it("focuses the nearest survivor after a nonselected delete and New chat when none remains", async () => {
+    const user = userEvent.setup();
+    const onDelete = vi.fn(async () => null);
+    const view = render(<ConversationList {...baseProps} selectedId={conversations[0].id} onDelete={onDelete} />);
+
+    await user.click(screen.getByRole("button", { name: "Delete Download model" }));
+    await user.click(screen.getByRole("button", { name: "Delete conversation" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Open Node health" })).toHaveFocus());
+
+    view.rerender(
+      <ConversationList
+        {...baseProps}
+        conversations={[conversations[0]]}
+        groupedConversations={[{ label: "Today", conversations: [conversations[0]] }]}
+        selectedId={conversations[0].id}
+        onDelete={onDelete}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "Delete Node health" }));
+    await user.click(screen.getByRole("button", { name: "Delete conversation" }));
     await waitFor(() => expect(screen.getByRole("button", { name: "New chat" })).toHaveFocus());
   });
 
@@ -213,7 +320,7 @@ describe("ConversationList", () => {
     let rejectDelete!: (reason?: unknown) => void;
     const onDelete = vi.fn(
       () =>
-        new Promise<void>((_resolve, reject) => {
+        new Promise<string | null>((_resolve, reject) => {
           rejectDelete = reject;
         }),
     );
@@ -246,5 +353,7 @@ describe("ConversationList", () => {
     expect(css).toContain("@media (forced-colors: active)");
     expect(css).toContain("@media (prefers-reduced-motion: reduce)");
     expect(css).not.toMatch(/#[0-9a-f]{3,8}\b/i);
+    expect(css).toMatch(/grid-template-columns:\s*minmax\(0, 1fr\)\s+[^;]+/);
+    expect(css).toMatch(/\.conversationButton\[aria-current="page"\]::before/);
   });
 });
