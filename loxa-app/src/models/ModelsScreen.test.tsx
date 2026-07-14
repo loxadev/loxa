@@ -98,6 +98,61 @@ describe("ModelsScreen", () => {
     expect(css).not.toMatch(/#[0-9a-f]{3,8}\b/i);
   });
 
+  it("filters verified recipes locally across recipe metadata without refetching", async () => {
+    const user = userEvent.setup();
+    const { api } = setup();
+    const alpha = {
+      ...model("alpha-model", { kind: "not_downloaded" } as const),
+      repo: "acme/aurora",
+      params: "7B",
+      quant: "Q5_K_M",
+      license: "MIT",
+      engine: { engine: "mlx", eligible: true, reason: "Verified for MLX." },
+    };
+    const beta = {
+      ...model("beta-model", { kind: "downloaded" } as const),
+      repo: "loxa/nebula",
+      params: "13B",
+      quant: "Q8_0",
+      license: "Apache-2.0",
+      engine: { engine: "llama-cpp", eligible: true, reason: "Verified for llama.cpp." },
+    };
+    vi.mocked(api.getInventory).mockResolvedValue([alpha, beta]);
+
+    render(<ModelsScreen endpoint="http://127.0.0.1:8080" services={api} />);
+    const search = await screen.findByRole("searchbox", { name: "Search models" });
+    expect(screen.getByLabelText("Model control summary")).toHaveTextContent("2 verified recipes");
+
+    for (const query of [" ALPHA ", "aurora", "MLX", "7b", "q5_k_m", "mit"]) {
+      await user.clear(search);
+      await user.type(search, query);
+      expect(screen.getByRole("heading", { name: "alpha-model" })).toBeInTheDocument();
+      expect(screen.queryByRole("heading", { name: "beta-model" })).not.toBeInTheDocument();
+      expect(screen.getByLabelText("Model control summary")).toHaveTextContent("1 of 2 verified recipes");
+      expect(screen.queryByRole("button", { name: "Load beta-model" })).not.toBeInTheDocument();
+    }
+
+    await user.clear(search);
+    expect(screen.getAllByRole("heading", { level: 2 }).map((heading) => heading.textContent)).toEqual([
+      "alpha-model",
+      "beta-model",
+    ]);
+    expect(api.getInventory).toHaveBeenCalledTimes(1);
+  });
+
+  it("distinguishes a search with no matches from an empty authoritative registry", async () => {
+    const user = userEvent.setup();
+    const { api } = setup();
+    render(<ModelsScreen endpoint="http://127.0.0.1:8080" services={api} />);
+
+    const search = await screen.findByRole("searchbox", { name: "Search models" });
+    await user.type(search, "missing recipe");
+
+    expect(screen.getByText("No models match “missing recipe”.")).toBeInTheDocument();
+    expect(screen.queryByText("No verified recipes are available in this build.")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Model control summary")).toHaveTextContent("0 of 5 verified recipes");
+  });
+
   it("renders only legal node-authoritative lifecycle actions", async () => {
     const { api } = setup();
     render(<ModelsScreen endpoint="http://127.0.0.1:8080" services={api} />);
