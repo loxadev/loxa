@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { createPortal } from "react-dom";
 
 import type {
   getCapabilities as defaultGetCapabilities,
@@ -13,7 +12,7 @@ import type { ControlStreamHandle, streamControlEvents as defaultStreamControlEv
 import type { getModels as defaultGetModels, getStatus as defaultGetStatus } from "../node/client";
 import type { NodeSessionPhase } from "../node/NodeSession";
 import { ChatComposer } from "./ChatComposer";
-import { ConversationList, type ConversationListItem } from "./ConversationList";
+import type { ConversationHistoryController } from "./conversationHistory";
 import type { ChatSummary, PersistentTurnCallbacks, PersistentTurnHandle } from "./historyClient";
 import styles from "./ChatScreen.module.css";
 import { ChatTranscript, type ChatTurn } from "./ChatTranscript";
@@ -30,13 +29,6 @@ export type ChatScreenServices = {
   loadModel: typeof defaultLoadModel;
   createControlEventStream: typeof defaultStreamControlEvents;
   createChatStream(endpoint: string, request: unknown, callbacks: StreamCallbacks): StreamHandle;
-  listChats?(
-    endpoint: string,
-    token: string,
-    page?: { limit?: number; before?: string },
-    options?: { signal?: AbortSignal },
-  ): Promise<{ chats: ChatSummary[]; nextBefore: string | null }>;
-  createChat?(endpoint: string, token: string, options?: { signal?: AbortSignal }): Promise<ChatSummary>;
   getChat?(endpoint: string, token: string, chatId: string, options?: { signal?: AbortSignal }): Promise<ChatSummary>;
   listTurns?(
     endpoint: string,
@@ -60,15 +52,6 @@ export type ChatScreenServices = {
     messageId: string,
     options?: { signal?: AbortSignal },
   ): Promise<string>;
-  renameChat?(
-    endpoint: string,
-    token: string,
-    chatId: string,
-    title: string,
-    options?: { signal?: AbortSignal },
-  ): Promise<ChatSummary>;
-  deleteChat?(endpoint: string, token: string, chatId: string, options?: { signal?: AbortSignal }): Promise<void>;
-  clearChats?(endpoint: string, token: string, options?: { signal?: AbortSignal }): Promise<{ deleted: number }>;
   createPersistentTurn?(
     endpoint: string,
     token: string,
@@ -88,6 +71,7 @@ export type ChatNodeAvailability = {
   proven: boolean;
   error: string | null;
 };
+export type ChatScreenHistory = Pick<ConversationHistoryController, "selection" | "create" | "reconcileSummary">;
 
 export function ChatScreen({
   services,
@@ -95,14 +79,16 @@ export function ChatScreen({
   nodeAvailability,
   onModelMutationStart,
   onModelMutationSettled,
-  conversationRailTarget,
+  history,
+  onInteractionLockChange,
 }: {
   services: ChatScreenServices;
   endpoint: string;
   nodeAvailability?: ChatNodeAvailability;
   onModelMutationStart?: (operationId?: string) => void;
   onModelMutationSettled?: (operationId: string) => void | Promise<void>;
-  conversationRailTarget?: HTMLElement | null;
+  history?: ChatScreenHistory | null;
+  onInteractionLockChange?: (locked: boolean) => void;
 }) {
   const availabilityPhase = nodeAvailability?.phase;
   const availabilityProven = nodeAvailability?.proven;
@@ -117,11 +103,7 @@ export function ChatScreen({
   const [controlStreamState, setControlStreamState] = useState<ControlStreamState>("live");
   const [input, setInput] = useState("");
   const [turns, setTurns] = useState<ChatTurn[]>([]);
-  const [conversations, setConversations] = useState<ConversationListItem[]>([]);
-  const [historyState, setHistoryState] = useState<"loading" | "ready" | "error">("loading");
-  const [historyError, setHistoryError] = useState("");
-  const [nextBefore, setNextBefore] = useState<string | null>(null);
-  const [selectedChatId, setSelectedChatId] = useState<string | null>(null);
+  const [restoreError, setRestoreError] = useState("");
   const [omittedTurns, setOmittedTurns] = useState(0);
   const [connectionError, setConnectionError] = useState("");
   const [chatCapability, setChatCapability] = useState<CapabilityState>("checking");
@@ -156,8 +138,9 @@ export function ChatScreen({
   const onModelMutationSettledRef = useRef(onModelMutationSettled);
   onModelMutationStartRef.current = onModelMutationStart;
   onModelMutationSettledRef.current = onModelMutationSettled;
-  const selectedChatIdRef = useRef(selectedChatId);
-  selectedChatIdRef.current = selectedChatId;
+  const selectedChatIdRef = useRef(history?.selection.chatId ?? null);
+  const handledSelection = useRef<string | null>(null);
+  const suppressNextSelection = useRef(false);
   const historyControllers = useRef(new Set<AbortController>());
   const restoreController = useRef<AbortController | null>(null);
   const restoreGeneration = useRef(0);
@@ -188,10 +171,10 @@ export function ChatScreen({
   const restoreConversation = useCallback(
     async (chatId: string, signal: AbortSignal, generation: number) => {
       const { listTurns, listMessageSummaries, getMessageContent } = services;
-      if (!listTurns || !listMessageSummaries || !getMessageContent) return;
       if (!mounted.current || signal.aborted || generation !== restoreGeneration.current) return;
       setTurns([]);
-      setHistoryError("");
+      setRestoreError("");
+      if (!listTurns || !listMessageSummaries || !getMessageContent) return;
       try {
         const token = await services.readControlToken(endpoint);
         if (!mounted.current || signal.aborted || generation !== restoreGeneration.current) return;
@@ -245,12 +228,10 @@ export function ChatScreen({
         ) {
           setTurns(restored);
           setOmittedTurns(0);
-          setHistoryState("ready");
         }
       } catch (reason) {
         if (mounted.current && !signal.aborted && generation === restoreGeneration.current) {
-          setHistoryError(message(reason));
-          setHistoryState("error");
+          setRestoreError(message(reason));
         }
       }
     },
@@ -271,32 +252,6 @@ export function ChatScreen({
       }
     },
     [ownHistoryAction, restoreConversation],
-  );
-
-  const refreshHistory = useCallback(
-    async (signal?: AbortSignal) => {
-      const listChats = services.listChats;
-      if (!listChats || !mounted.current || signal?.aborted) return;
-      setHistoryState("loading");
-      setHistoryError("");
-      const token = await services.readControlToken(endpoint);
-      if (!mounted.current || signal?.aborted) return;
-      const page = await listChats(endpoint, token, { limit: 30 }, { signal });
-      if (!mounted.current || signal?.aborted) return;
-      setConversations(page.chats);
-      setNextBefore(page.nextBefore);
-      setHistoryState("ready");
-      const current = selectedChatIdRef.current;
-      const selected = current && page.chats.some(({ id }) => id === current) ? current : (page.chats[0]?.id ?? null);
-      setSelectedChatId(selected);
-      selectedChatIdRef.current = selected;
-      if (selected) await runRestore(selected, signal);
-      else {
-        setTurns([]);
-        setOmittedTurns(0);
-      }
-    },
-    [endpoint, runRestore, services],
   );
 
   useEffect(() => {
@@ -334,17 +289,6 @@ export function ChatScreen({
     setControlStreamState("live");
     setChatCapability("checking");
     setAttachmentReason("Checking document input support.");
-    setHistoryState("loading");
-    setHistoryError("");
-
-    if (services.listChats)
-      void refreshHistory(controller.signal).catch((reason: unknown) => {
-        if (disposed || controller.signal.aborted) return;
-        setHistoryError(message(reason));
-        setHistoryState("error");
-      });
-    else setHistoryState("ready");
-
     void Promise.all([
       services.getStatus(endpoint, { signal: controller.signal }),
       services.getModels(endpoint, { signal: controller.signal }),
@@ -557,7 +501,29 @@ export function ChatScreen({
       window.removeEventListener("beforeunload", disposeWork);
       disposeWork();
     };
-  }, [abortHistoryActions, availabilityBlocked, availabilityBlockedReason, endpoint, refreshHistory, services]);
+  }, [abortHistoryActions, availabilityBlocked, availabilityBlockedReason, endpoint, services]);
+
+  useEffect(() => {
+    if (!history) return;
+    const { chatId, revision } = history.selection;
+    const key = `${chatId ?? "new"}:${revision}`;
+    if (handledSelection.current === key) return;
+    handledSelection.current = key;
+    selectedChatIdRef.current = chatId;
+    if (suppressNextSelection.current && chatId !== null) {
+      suppressNextSelection.current = false;
+      return;
+    }
+    restoreController.current?.abort();
+    restoreGeneration.current += 1;
+    if (chatId === null) {
+      setTurns([]);
+      setOmittedTurns(0);
+      setRestoreError("");
+      return;
+    }
+    void runRestore(chatId);
+  }, [history, history?.selection.chatId, history?.selection.revision, runRestore]);
 
   const latestTurn = turns[turns.length - 1];
   const responseInProgress = latestTurn?.status === "queued" || latestTurn?.status === "streaming";
@@ -571,6 +537,12 @@ export function ChatScreen({
     !controlBusy;
 
   useEffect(() => {
+    onInteractionLockChange?.(responseInProgress);
+  }, [onInteractionLockChange, responseInProgress]);
+
+  useEffect(() => () => onInteractionLockChange?.(false), [onInteractionLockChange]);
+
+  useEffect(() => {
     if (!focusAfterTerminal.current || responseInProgress) return;
     focusAfterTerminal.current = false;
     inputRef.current?.focus();
@@ -578,109 +550,6 @@ export function ChatScreen({
 
   const updateTurn = (id: number | string, update: (current: ChatTurn) => ChatTurn) => {
     setTurns((current) => current.map((turn) => (turn.id === id ? update(turn) : turn)));
-  };
-
-  const createConversation = async () => {
-    if (responseInProgress) throw new Error("Finish or stop the active turn first.");
-    if (!services.createChat) return;
-    const owned = ownHistoryAction();
-    try {
-      const token = await services.readControlToken(endpoint);
-      if (!mounted.current || owned.controller.signal.aborted) return;
-      const chat = await services.createChat(endpoint, token, { signal: owned.controller.signal });
-      if (!mounted.current || owned.controller.signal.aborted) return;
-      restoreController.current?.abort();
-      restoreGeneration.current += 1;
-      setConversations((current) => [chat, ...current.filter(({ id }) => id !== chat.id)]);
-      setSelectedChatId(chat.id);
-      selectedChatIdRef.current = chat.id;
-      setTurns([]);
-      setOmittedTurns(0);
-      inputRef.current?.focus();
-    } finally {
-      owned.finish();
-    }
-  };
-
-  const selectConversation = (chatId: string) => {
-    if (responseInProgress || chatId === selectedChatId) return;
-    setSelectedChatId(chatId);
-    selectedChatIdRef.current = chatId;
-    setOmittedTurns(0);
-    void runRestore(chatId);
-  };
-
-  const renameConversation = async (chatId: string, title: string) => {
-    if (!services.renameChat) return;
-    const owned = ownHistoryAction();
-    try {
-      const token = await services.readControlToken(endpoint);
-      if (!mounted.current || owned.controller.signal.aborted) return;
-      const renamed = await services.renameChat(endpoint, token, chatId, title, { signal: owned.controller.signal });
-      if (!mounted.current || owned.controller.signal.aborted) return;
-      setConversations((current) => current.map((chat) => (chat.id === chatId ? { ...chat, ...renamed } : chat)));
-    } finally {
-      owned.finish();
-    }
-  };
-
-  const deleteConversation = async (chatId: string) => {
-    if (responseInProgress) throw new Error("Finish or stop the active turn first.");
-    if (!services.deleteChat) return;
-    const owned = ownHistoryAction();
-    try {
-      const token = await services.readControlToken(endpoint);
-      if (!mounted.current || owned.controller.signal.aborted) return;
-      await services.deleteChat(endpoint, token, chatId, { signal: owned.controller.signal });
-      if (!mounted.current || owned.controller.signal.aborted) return;
-      const remaining = conversations.filter(({ id }) => id !== chatId);
-      setConversations(remaining);
-      if (selectedChatId === chatId) {
-        const next = remaining[0]?.id ?? null;
-        setSelectedChatId(next);
-        selectedChatIdRef.current = next;
-        if (next) void runRestore(next);
-        else {
-          restoreController.current?.abort();
-          restoreGeneration.current += 1;
-          setTurns([]);
-        }
-      }
-    } finally {
-      owned.finish();
-    }
-  };
-
-  const loadMoreConversations = async () => {
-    if (!services.listChats || !nextBefore) return;
-    const owned = ownHistoryAction();
-    try {
-      const token = await services.readControlToken(endpoint);
-      if (!mounted.current || owned.controller.signal.aborted) return;
-      const page = await services.listChats(
-        endpoint,
-        token,
-        { limit: 30, before: nextBefore },
-        { signal: owned.controller.signal },
-      );
-      if (!mounted.current || owned.controller.signal.aborted) return;
-      setConversations((current) => [
-        ...current,
-        ...page.chats.filter((chat) => !current.some(({ id }) => id === chat.id)),
-      ]);
-      setNextBefore(page.nextBefore);
-    } finally {
-      owned.finish();
-    }
-  };
-
-  const retryHistory = async () => {
-    const owned = ownHistoryAction();
-    try {
-      await refreshHistory(owned.controller.signal);
-    } finally {
-      owned.finish();
-    }
   };
 
   const sendPersistent = async (content: string) => {
@@ -699,18 +568,23 @@ export function ChatScreen({
     const controller = new AbortController();
     persistentController.current = controller;
     try {
-      const token = await services.readControlToken(endpoint);
-      if (!mounted.current || controller.signal.aborted) return;
       let chatId = selectedChatIdRef.current;
       if (chatId === null) {
-        if (!services.createChat) throw new Error("Chat history is unavailable.");
-        const chat = await services.createChat(endpoint, token, { signal: controller.signal });
+        if (!history) throw new Error("Chat history is unavailable.");
+        suppressNextSelection.current = true;
+        let chat: ChatSummary;
+        try {
+          chat = await history.create();
+        } catch (error) {
+          suppressNextSelection.current = false;
+          throw error;
+        }
         if (!mounted.current || controller.signal.aborted) return;
         chatId = chat.id;
         selectedChatIdRef.current = chat.id;
-        setSelectedChatId(chat.id);
-        setConversations((current) => [chat, ...current]);
       }
+      const token = await services.readControlToken(endpoint);
+      if (!mounted.current || controller.signal.aborted) return;
       const stream = createPersistentTurn(
         endpoint,
         token,
@@ -748,18 +622,7 @@ export function ChatScreen({
             stopRequested.current = false;
             focusAfterTerminal.current = true;
             updateTurn(id, (turn) => terminalTurn({ ...turn, response: response || turn.response }, terminal));
-            setConversations((current) =>
-              current.map((chat) =>
-                chat.id === chatId
-                  ? {
-                      ...chat,
-                      updatedAtMs: Date.now(),
-                      terminalState: terminal.kind === "error" ? "failed" : terminal.kind,
-                    }
-                  : chat,
-              ),
-            );
-            if (services.getChat) {
+            if (services.getChat && history) {
               const owned = ownHistoryAction();
               void services
                 .readControlToken(endpoint)
@@ -769,9 +632,7 @@ export function ChatScreen({
                 })
                 .then((summary) => {
                   if (!summary || !mounted.current || owned.controller.signal.aborted) return;
-                  setConversations((current) =>
-                    current.map((chat) => (chat.id === summary.id ? { ...chat, ...summary } : chat)),
-                  );
+                  history.reconcileSummary(summary);
                 })
                 .catch(() => undefined)
                 .finally(owned.finish);
@@ -796,7 +657,7 @@ export function ChatScreen({
   const send = () => {
     const content = input.trim();
     if (!canCompose || !requestModel || !activeModel || !content) return;
-    if (services.createPersistentTurn) {
+    if (services.createPersistentTurn && history) {
       void sendPersistent(content);
       return;
     }
@@ -1028,30 +889,12 @@ export function ChatScreen({
         </p>
       </header>
 
-      {services.listChats && conversationRailTarget
-        ? createPortal(
-            <ConversationList
-              conversations={conversations}
-              selectedId={selectedChatId}
-              state={historyState}
-              errorMessage={historyError}
-              hasMore={nextBefore !== null}
-              onCreate={createConversation}
-              onSelect={selectConversation}
-              onRename={renameConversation}
-              onDelete={deleteConversation}
-              onLoadMore={loadMoreConversations}
-              onRetry={retryHistory}
-              isLifecycleActive={() => mounted.current}
-            />,
-            conversationRailTarget,
-          )
-        : null}
       <div className={styles.chatMain}>
         <div className={styles.contextNotice} aria-live="polite">
-          {omittedTurns > 0
-            ? `${omittedTurns} earlier ${omittedTurns === 1 ? "turn was" : "turns were"} omitted from the model context.`
-            : ""}
+          {restoreError ||
+            (omittedTurns > 0
+              ? `${omittedTurns} earlier ${omittedTurns === 1 ? "turn was" : "turns were"} omitted from the model context.`
+              : "")}
         </div>
         <ChatTranscript turns={turns} emptyMessage={emptyMessage} copyText={services.copyText} />
 

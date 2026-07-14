@@ -6,7 +6,7 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { ChatScreen, type ChatNodeAvailability, type ChatScreenServices } from "./ChatScreen";
+import { ChatScreen, type ChatNodeAvailability, type ChatScreenHistory, type ChatScreenServices } from "./ChatScreen";
 import { ChatTranscript, type ChatTurn } from "./ChatTranscript";
 import { streamPersistentTurn } from "./historyClient";
 import type { StreamCallbacks, StreamHandle } from "./streamChat";
@@ -14,7 +14,6 @@ import type { ControlStreamCallbacks, ControlStreamHandle } from "../control/eve
 
 afterEach(() => {
   vi.unstubAllGlobals();
-  document.querySelectorAll("[data-test-conversation-rail]").forEach((target) => target.remove());
 });
 
 function services(ready = true) {
@@ -139,23 +138,18 @@ function historyMessage(id: string, turnId: string, role: "user" | "assistant") 
   return { id, turnId, role, contentBytes: 8, createdAtMs: 1, updatedAtMs: 2 };
 }
 
-function conversationRailTarget() {
-  const target = document.createElement("div");
-  target.dataset.testConversationRail = "true";
-  document.body.append(target);
-  return target;
+function history(selection: ChatScreenHistory["selection"]): ChatScreenHistory {
+  return {
+    selection,
+    create: vi.fn(),
+    reconcileSummary: vi.fn(),
+  };
 }
 
 describe("ChatScreen", () => {
   it("uses a named scrolling transcript and a final-row message composer", async () => {
     const setup = services();
-    render(
-      <ChatScreen
-        services={setup.api}
-        endpoint="http://127.0.0.1:8080"
-        conversationRailTarget={conversationRailTarget()}
-      />,
-    );
+    render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
 
     expect(await screen.findByRole("log", { name: "Conversation" })).toBeInTheDocument();
     expect(screen.getByRole("form", { name: "Message composer" })).toBeInTheDocument();
@@ -168,13 +162,9 @@ describe("ChatScreen", () => {
     const turnId = "1123456789abcdef0123456789abcdef";
     const userMessageId = "2123456789abcdef0123456789abcdef";
     const assistantMessageId = "3123456789abcdef0123456789abcdef";
+    const shellHistory = history({ chatId, revision: 1 });
     let persistentCallbacks: import("./historyClient").PersistentTurnCallbacks | undefined;
     Object.assign(setup.api, {
-      listChats: vi.fn().mockResolvedValue({
-        chats: [{ id: chatId, title: "Node notes", createdAtMs: 1, updatedAtMs: 4 }],
-        nextBefore: null,
-      }),
-      createChat: vi.fn(),
       getChat: vi.fn().mockResolvedValue({ id: chatId, title: "Next question", createdAtMs: 1, updatedAtMs: 5 }),
       listTurns: vi.fn().mockResolvedValue({
         turns: [
@@ -201,8 +191,6 @@ describe("ChatScreen", () => {
       getMessageContent: vi.fn((_endpoint: string, _token: string, _chat: string, _turn: string, messageId: string) =>
         Promise.resolve(messageId === userMessageId ? "Hello" : "**Answer**"),
       ),
-      renameChat: vi.fn(),
-      deleteChat: vi.fn(),
       createPersistentTurn: vi.fn(
         (
           _endpoint: string,
@@ -217,15 +205,7 @@ describe("ChatScreen", () => {
       ),
     });
 
-    render(
-      <ChatScreen
-        services={setup.api}
-        endpoint="http://127.0.0.1:8080"
-        conversationRailTarget={conversationRailTarget()}
-      />,
-    );
-    expect(await screen.findByRole("navigation", { name: "Chat conversations" })).toBeInTheDocument();
-    expect(await screen.findByRole("button", { name: "Open Node notes" })).toHaveAttribute("aria-current", "page");
+    render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" history={shellHistory} />);
     expect(await screen.findByText("Answer", { selector: "strong" })).toBeInTheDocument();
     await user.type(screen.getByLabelText("Message"), "Next question");
     await user.click(screen.getByRole("button", { name: "Send message" }));
@@ -242,51 +222,98 @@ describe("ChatScreen", () => {
     act(() => persistentCallbacks?.onDelta("# Persisted"));
     act(() => persistentCallbacks?.onTerminal({ kind: "completed" }));
     expect(await screen.findByRole("heading", { name: "Persisted" })).toBeInTheDocument();
-    expect(await screen.findByRole("button", { name: "Open Next question" })).toBeInTheDocument();
+    await waitFor(() =>
+      expect(shellHistory.reconcileSummary).toHaveBeenCalledWith({
+        id: chatId,
+        title: "Next question",
+        createdAtMs: 1,
+        updatedAtMs: 5,
+      }),
+    );
     const copyButtons = screen.getAllByRole("button", { name: "Copy response" });
     expect(copyButtons[copyButtons.length - 1]).toBeEnabled();
   });
 
-  it("fails closed on repeated restore cursors and offers an in-place retry", async () => {
+  it("preserves the first persistent transcript while adopting its created selection and restores after remount", async () => {
     const user = userEvent.setup();
     const setup = services();
     const chatId = "0123456789abcdef0123456789abcdef";
+    const turnId = "1123456789abcdef0123456789abcdef";
+    const created = { id: chatId, title: "Created chat", createdAtMs: 1, updatedAtMs: 2 };
+    const create = vi.fn().mockResolvedValue(created);
+    const firstHistory: ChatScreenHistory = {
+      selection: { chatId: null, revision: 0 },
+      create,
+      reconcileSummary: vi.fn(),
+    };
+    let callbacks: import("./historyClient").PersistentTurnCallbacks | undefined;
     Object.assign(setup.api, {
-      listChats: vi
+      listTurns: vi.fn().mockResolvedValue({ turns: [historyTurn(turnId, chatId)], nextAfter: null }),
+      listMessageSummaries: vi
         .fn()
-        .mockRejectedValueOnce(new Error("history unavailable"))
-        .mockResolvedValueOnce({
-          chats: [{ id: chatId, title: "Recovered", createdAtMs: 1, updatedAtMs: 2 }],
-          nextBefore: null,
-        }),
-      createChat: vi.fn(),
+        .mockResolvedValue([
+          historyMessage("2123456789abcdef0123456789abcdef", turnId, "user"),
+          historyMessage("3123456789abcdef0123456789abcdef", turnId, "assistant"),
+        ]),
+      getMessageContent: vi.fn((_endpoint: string, _token: string, _chat: string, _turn: string, messageId: string) =>
+        Promise.resolve(messageId.startsWith("2") ? "Created prompt" : "Restored after remount"),
+      ),
+      createPersistentTurn: vi.fn(
+        (
+          _endpoint: string,
+          _token: string,
+          _chat: string,
+          _content: string,
+          next: import("./historyClient").PersistentTurnCallbacks,
+        ) => {
+          callbacks = next;
+          return { cancel: vi.fn(), dispose: vi.fn(), finished: new Promise(() => undefined) };
+        },
+      ),
+    });
+    const view = render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" history={firstHistory} />);
+    await waitFor(() => expect(screen.getByLabelText("Message")).toBeEnabled());
+    await user.type(screen.getByLabelText("Message"), "Created prompt");
+    await waitFor(() => expect(screen.getByRole("button", { name: "Send message" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(create).toHaveBeenCalledOnce());
+    await waitFor(() => expect(setup.api.createPersistentTurn).toHaveBeenCalledOnce());
+
+    const selectedHistory = history({ chatId, revision: 1 });
+    view.rerender(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" history={selectedHistory} />);
+    expect(screen.getByText("Created prompt")).toBeVisible();
+    expect(setup.api.listTurns).not.toHaveBeenCalled();
+    act(() => callbacks?.onStarted(turnId, 0));
+    act(() => callbacks?.onDelta("Created answer"));
+    act(() => callbacks?.onTerminal({ kind: "completed" }));
+    expect(await screen.findByText("Created answer")).toBeVisible();
+
+    view.unmount();
+    render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" history={selectedHistory} />);
+    expect(await screen.findByText("Restored after remount")).toBeVisible();
+    expect(setup.api.listTurns).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails closed on repeated restore cursors", async () => {
+    const setup = services();
+    const chatId = "0123456789abcdef0123456789abcdef";
+    Object.assign(setup.api, {
       listTurns: vi
         .fn()
         .mockResolvedValueOnce({ turns: [], nextAfter: "repeat" })
         .mockResolvedValueOnce({ turns: [], nextAfter: "repeat" }),
       listMessageSummaries: vi.fn(),
       getMessageContent: vi.fn(),
-      renameChat: vi.fn(),
-      deleteChat: vi.fn(),
       createPersistentTurn: vi.fn(),
     });
     render(
-      <ChatScreen
-        services={setup.api}
-        endpoint="http://127.0.0.1:8080"
-        conversationRailTarget={conversationRailTarget()}
-      />,
+      <ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" history={history({ chatId, revision: 1 })} />,
     );
-    expect(await screen.findByText("history unavailable")).toBeVisible();
-    await user.click(screen.getByRole("button", { name: "Retry conversation history" }));
-    expect(await screen.findByRole("button", { name: "Open Recovered" })).toBeInTheDocument();
     expect(await screen.findByText(/invalid chat history pagination/i)).toBeVisible();
   });
 
   it("aborts a stale restore when selection is superseded and ignores its late result", async () => {
-    const user = userEvent.setup();
     const setup = services();
-    const firstChat = "0123456789abcdef0123456789abcdef";
     const staleChat = "1123456789abcdef0123456789abcdef";
     const freshChat = "2123456789abcdef0123456789abcdef";
     const staleTurn = "3123456789abcdef0123456789abcdef";
@@ -294,14 +321,6 @@ describe("ChatScreen", () => {
     let resolveStale!: (page: Awaited<ReturnType<NonNullable<ChatScreenServices["listTurns"]>>>) => void;
     let staleSignal: AbortSignal | undefined;
     Object.assign(setup.api, {
-      listChats: vi.fn().mockResolvedValue({
-        chats: [
-          { id: firstChat, title: "First", createdAtMs: 1, updatedAtMs: 1 },
-          { id: staleChat, title: "Stale", createdAtMs: 2, updatedAtMs: 2 },
-          { id: freshChat, title: "Fresh", createdAtMs: 3, updatedAtMs: 3 },
-        ],
-        nextBefore: null,
-      }),
       listTurns: vi.fn(
         (_endpoint: string, _token: string, chatId: string, _page: unknown, options?: { signal?: AbortSignal }) => {
           if (chatId === staleChat) {
@@ -326,22 +345,24 @@ describe("ChatScreen", () => {
           messageId.endsWith("a") ? "Prompt" : turnId === freshTurn ? "Fresh assistant" : "Stale assistant",
         ),
       ),
-      createChat: vi.fn(),
-      renameChat: vi.fn(),
-      deleteChat: vi.fn(),
       createPersistentTurn: vi.fn(),
     });
 
-    render(
+    const view = render(
       <ChatScreen
         services={setup.api}
         endpoint="http://127.0.0.1:8080"
-        conversationRailTarget={conversationRailTarget()}
+        history={history({ chatId: staleChat, revision: 1 })}
       />,
     );
-    await user.click(await screen.findByRole("button", { name: "Open Stale" }));
     await vi.waitFor(() => expect(staleSignal).toBeInstanceOf(AbortSignal));
-    await user.click(screen.getByRole("button", { name: "Open Fresh" }));
+    view.rerender(
+      <ChatScreen
+        services={setup.api}
+        endpoint="http://127.0.0.1:8080"
+        history={history({ chatId: freshChat, revision: 2 })}
+      />,
+    );
     expect(staleSignal?.aborted).toBe(true);
     expect(await screen.findByText("Fresh assistant")).toBeVisible();
 
@@ -351,46 +372,33 @@ describe("ChatScreen", () => {
     expect(screen.getByText("Fresh assistant")).toBeVisible();
   });
 
-  it("suppresses a production-like retry abort at the window lifecycle boundary", async () => {
-    const user = userEvent.setup();
+  it("aborts a pending history restore at the window lifecycle boundary", async () => {
     const setup = services();
-    let retrySignal: AbortSignal | undefined;
+    const chatId = "0123456789abcdef0123456789abcdef";
+    let restoreSignal: AbortSignal | undefined;
     Object.assign(setup.api, {
-      listChats: vi
-        .fn()
-        .mockRejectedValueOnce(new Error("history unavailable"))
-        .mockImplementationOnce(
-          (_endpoint: string, _token: string, _page: unknown, options?: { signal?: AbortSignal }) => {
-            retrySignal = options?.signal;
-            return new Promise((_resolve, reject) =>
-              options?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), {
-                once: true,
-              }),
-            );
-          },
-        ),
-      listTurns: vi.fn(),
+      listTurns: vi.fn(
+        (_endpoint: string, _token: string, _chatId: string, _page: unknown, options?: { signal?: AbortSignal }) => {
+          restoreSignal = options?.signal;
+          return new Promise((_resolve, reject) =>
+            options?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), {
+              once: true,
+            }),
+          );
+        },
+      ),
       listMessageSummaries: vi.fn(),
       getMessageContent: vi.fn(),
-      createChat: vi.fn(),
-      renameChat: vi.fn(),
-      deleteChat: vi.fn(),
-      createPersistentTurn: vi.fn(),
     });
     render(
-      <ChatScreen
-        services={setup.api}
-        endpoint="http://127.0.0.1:8080"
-        conversationRailTarget={conversationRailTarget()}
-      />,
+      <ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" history={history({ chatId, revision: 1 })} />,
     );
-    await user.click(await screen.findByRole("button", { name: "Retry conversation history" }));
-    await vi.waitFor(() => expect(retrySignal).toBeInstanceOf(AbortSignal));
+    await vi.waitFor(() => expect(restoreSignal).toBeInstanceOf(AbortSignal));
 
     window.dispatchEvent(new Event("beforeunload"));
-    expect(retrySignal?.aborted).toBe(true);
+    expect(restoreSignal?.aborted).toBe(true);
     await act(async () => undefined);
-    expect(screen.queryByText("Could not retry conversation history.")).not.toBeInTheDocument();
+    expect(screen.queryByText("aborted")).not.toBeInTheDocument();
   });
 
   it("aborts the production persistent client request on unmount", async () => {
@@ -408,16 +416,9 @@ describe("ChatScreen", () => {
         }),
     );
     Object.assign(setup.api, {
-      listChats: vi.fn().mockResolvedValue({
-        chats: [{ id: chatId, title: "Live", createdAtMs: 1, updatedAtMs: 1 }],
-        nextBefore: null,
-      }),
       listTurns: vi.fn().mockResolvedValue({ turns: [], nextAfter: null }),
       listMessageSummaries: vi.fn(),
       getMessageContent: vi.fn(),
-      createChat: vi.fn(),
-      renameChat: vi.fn(),
-      deleteChat: vi.fn(),
       createPersistentTurn: (
         endpoint: string,
         token: string,
@@ -428,13 +429,9 @@ describe("ChatScreen", () => {
       ) => streamPersistentTurn(endpoint, token, selectedChat, content, callbacks, signal, productionFetch),
     });
     const view = render(
-      <ChatScreen
-        services={setup.api}
-        endpoint="http://127.0.0.1:8080"
-        conversationRailTarget={conversationRailTarget()}
-      />,
+      <ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" history={history({ chatId, revision: 1 })} />,
     );
-    await screen.findByRole("button", { name: "Open Live" });
+    await waitFor(() => expect(setup.api.listTurns).toHaveBeenCalledOnce());
     await user.type(screen.getByLabelText("Message"), "Hello");
     await user.click(screen.getByRole("button", { name: "Send message" }));
     await vi.waitFor(() => expect(productionFetch).toHaveBeenCalledOnce());
@@ -573,6 +570,40 @@ describe("ChatScreen", () => {
     act(() => setup.callbacks()?.onTerminal(terminal));
     expect(await screen.findByText(label)).toBeInTheDocument();
     await vi.waitFor(() => expect(message).toHaveFocus());
+  });
+
+  it("publishes and clears the route-local interaction lock across terminal and unmount", async () => {
+    const user = userEvent.setup();
+    const setup = services();
+    const chatId = "0123456789abcdef0123456789abcdef";
+    const lock = vi.fn();
+    let callbacks: import("./historyClient").PersistentTurnCallbacks | undefined;
+    setup.api.createPersistentTurn = vi.fn((_endpoint, _token, _chat, _content, next) => {
+      callbacks = next;
+      return { cancel: vi.fn(), dispose: vi.fn(), finished: new Promise<never>(() => undefined) };
+    });
+    const view = render(
+      <ChatScreen
+        services={setup.api}
+        endpoint="http://127.0.0.1:8080"
+        history={history({ chatId, revision: 1 })}
+        onInteractionLockChange={lock}
+      />,
+    );
+    await waitFor(() => expect(screen.getByLabelText("Message")).toBeEnabled());
+    await user.type(screen.getByLabelText("Message"), "Lock the rail");
+    await waitFor(() => expect(screen.getByRole("button", { name: "Send message" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(lock).toHaveBeenLastCalledWith(true));
+    act(() => callbacks?.onStarted("1123456789abcdef0123456789abcdef", 0));
+    act(() => callbacks?.onTerminal({ kind: "completed" }));
+    await waitFor(() => expect(lock).toHaveBeenLastCalledWith(false));
+
+    await user.type(screen.getByLabelText("Message"), "Unmount while active");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(lock).toHaveBeenLastCalledWith(true));
+    view.unmount();
+    expect(lock).toHaveBeenLastCalledWith(false);
   });
 
   it("defines a canonical responsive and accessible Chat module contract", () => {
@@ -1005,10 +1036,6 @@ describe("ChatScreen", () => {
       updatedAtUnixMs: 2,
     });
     Object.assign(setup.api, {
-      listChats: vi.fn().mockResolvedValue({
-        chats: [{ id: chatId, title: "Restored", createdAtMs: 1, updatedAtMs: 2 }],
-        nextBefore: null,
-      }),
       listTurns: vi.fn().mockResolvedValue({ turns: [historyTurn(turnId, chatId)], nextAfter: null }),
       listMessageSummaries: vi
         .fn()
@@ -1019,14 +1046,10 @@ describe("ChatScreen", () => {
       getMessageContent: vi.fn((_endpoint: string, _token: string, _chat: string, _turn: string, messageId: string) =>
         Promise.resolve(messageId.startsWith("2") ? "Earlier prompt" : "Earlier answer"),
       ),
-      createChat: vi.fn(),
-      renameChat: vi.fn(),
-      deleteChat: vi.fn(),
       createPersistentTurn: vi.fn(),
     });
-    const target = conversationRailTarget();
     const view = render(
-      <ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" conversationRailTarget={target} />,
+      <ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" history={history({ chatId, revision: 1 })} />,
     );
     expect(await screen.findByText("Earlier answer")).toBeVisible();
     expect(screen.getByLabelText("Message")).toBeDisabled();
@@ -1036,7 +1059,6 @@ describe("ChatScreen", () => {
     await waitFor(() => expect(setup.api.getModels).toHaveBeenCalledTimes(2));
     expect(screen.getByLabelText("Message")).toBeEnabled();
     view.unmount();
-    target.remove();
   });
 
   it("keeps the previous active model when a switch fails", async () => {

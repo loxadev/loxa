@@ -1,6 +1,9 @@
-import { useState, type ReactNode } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 
 import { ChatScreen, type ChatScreenServices } from "../chat/ChatScreen";
+import { ConversationList } from "../chat/ConversationList";
+import type { ConversationHistoryController, ConversationHistoryServices } from "../chat/conversationHistory";
+import { useConversationHistory } from "../chat/useConversationHistory";
 import { ModelsScreen, type ModelsScreenServices } from "../models/ModelsScreen";
 import { NodeScreen, type NodeScreenServices } from "../node/NodeScreen";
 import { NodeSessionProvider, useNodeSession, type NodeSessionServices } from "../node/NodeSession";
@@ -11,7 +14,13 @@ import mark from "../assets/brand/loxa-mark.svg?no-inline";
 import { AppShell } from "./AppShell";
 import { appServices, DEFAULT_ENDPOINT } from "./services";
 
-export type AppServices = NodeSessionServices & NodeScreenServices & ChatScreenServices & ModelsScreenServices;
+export type AppServices = NodeSessionServices &
+  NodeScreenServices &
+  ChatScreenServices &
+  ModelsScreenServices &
+  Partial<ConversationHistoryServices> & {
+    clearChats?(endpoint: string, token: string, options?: { signal?: AbortSignal }): Promise<{ deleted: number }>;
+  };
 
 export function App({ services = appServices }: { services?: AppServices }) {
   return (
@@ -22,10 +31,41 @@ export function App({ services = appServices }: { services?: AppServices }) {
 }
 
 function AppWorkspace({ services }: { services: AppServices }) {
+  const historyServices = useMemo(() => conversationHistoryServices(services), [services]);
+  return historyServices ? (
+    <HistoryWorkspace services={services} historyServices={historyServices} />
+  ) : (
+    <WorkspaceContents services={services} history={null} />
+  );
+}
+
+function HistoryWorkspace({
+  services,
+  historyServices,
+}: {
+  services: AppServices;
+  historyServices: ConversationHistoryServices;
+}) {
+  const session = useNodeSession();
+  const history = useConversationHistory({
+    services: historyServices,
+    endpoint: session.endpoint,
+    enabled: session.proven,
+  });
+  return <WorkspaceContents services={services} history={history} />;
+}
+
+function WorkspaceContents({
+  services,
+  history,
+}: {
+  services: AppServices;
+  history: ConversationHistoryController | null;
+}) {
   const route = useWorkspaceStore(selectActiveRoute);
   const setRoute = useWorkspaceStore(selectSetActiveRoute);
   const [theme, setTheme] = useThemePreference();
-  const [conversationRailTarget, setConversationRailTarget] = useState<HTMLDivElement | null>(null);
+  const [chatInteractionLocked, setChatInteractionLocked] = useState(false);
   const session = useNodeSession();
   const health = globalHealthLabel(session.phase);
   const model =
@@ -40,7 +80,15 @@ function AppWorkspace({ services }: { services: AppServices }) {
       brandMark={mark}
       runtimeHealth={health}
       runtimeModel={model}
-      onConversationTargetChange={setConversationRailTarget}
+      conversationRail={
+        history ? (
+          <GlobalConversationRail
+            history={history}
+            interactionLocked={chatInteractionLocked}
+            onOpenChat={() => setRoute("chat")}
+          />
+        ) : undefined
+      }
     >
       {route === "node" ? (
         <NodeScreen services={services} onNavigateModels={() => setRoute("models")} />
@@ -60,7 +108,8 @@ function AppWorkspace({ services }: { services: AppServices }) {
           nodeAvailability={{ phase: session.phase, proven: session.proven, error: session.error }}
           onModelMutationStart={session.invalidateModelTruth}
           onModelMutationSettled={session.settleModelMutation}
-          conversationRailTarget={conversationRailTarget}
+          history={history}
+          onInteractionLockChange={setChatInteractionLocked}
         />
       ) : (
         <SettingsScreen
@@ -72,6 +121,7 @@ function AppWorkspace({ services }: { services: AppServices }) {
                   const token = await services.readControlToken(session.endpoint);
                   if (signal.aborted) throw new DOMException("aborted", "AbortError");
                   const result = await services.clearChats?.(session.endpoint, token, { signal });
+                  if (!signal.aborted) history?.clearAfterSettingsDelete();
                   return result?.deleted ?? 0;
                 }
               : undefined
@@ -86,6 +136,57 @@ function AppWorkspace({ services }: { services: AppServices }) {
       )}
     </AppShell>
   );
+}
+
+function GlobalConversationRail({
+  history,
+  interactionLocked,
+  onOpenChat,
+}: {
+  history: ConversationHistoryController;
+  interactionLocked: boolean;
+  onOpenChat(): void;
+}) {
+  return (
+    <ConversationList
+      conversations={history.conversations}
+      selectedId={history.selectedChatId}
+      state={history.state}
+      errorMessage={history.errorMessage}
+      hasMore={history.hasMore}
+      mutationsDisabled={interactionLocked}
+      onCreate={async () => {
+        await history.create();
+        onOpenChat();
+      }}
+      onSelect={(chatId) => {
+        if (interactionLocked) return;
+        history.select(chatId);
+        onOpenChat();
+      }}
+      onRename={async (chatId, title) => {
+        await history.rename(chatId, title);
+      }}
+      onDelete={async (chatId) => {
+        await history.delete(chatId);
+      }}
+      onLoadMore={history.loadMore}
+      onRetry={history.retry}
+    />
+  );
+}
+
+function conversationHistoryServices(services: AppServices): ConversationHistoryServices | null {
+  const { listChats, createChat, getChat, renameChat, deleteChat } = services;
+  if (!listChats || !createChat || !getChat || !renameChat || !deleteChat) return null;
+  return {
+    readControlToken: services.readControlToken,
+    listChats,
+    createChat,
+    getChat,
+    renameChat,
+    deleteChat,
+  };
 }
 
 function globalHealthLabel(phase: ReturnType<typeof useNodeSession>["phase"]) {

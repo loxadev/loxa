@@ -70,6 +70,8 @@ describe("App", () => {
 
     expect(await screen.findByRole("heading", { name: "Chat" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Chat" })).toHaveAttribute("aria-current", "page");
+    expect(screen.queryByRole("navigation", { name: "Chat conversations" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "New chat" })).not.toBeInTheDocument();
 
     const primary = screen.getByRole("navigation", { name: "Primary navigation" });
     expect(
@@ -94,9 +96,59 @@ describe("App", () => {
   it("threads the Settings lifecycle signal through authenticated history clearing", async () => {
     const user = userEvent.setup();
     const api = services();
+    const chatId = "0123456789abcdef0123456789abcdef";
+    const turnId = "1123456789abcdef0123456789abcdef";
     api.clearChats = vi.fn().mockResolvedValue({ deleted: 2 });
+    api.listChats = vi.fn().mockResolvedValue({
+      chats: [{ id: chatId, title: "Clear me", createdAtMs: 1, updatedAtMs: 2 }],
+      nextBefore: null,
+    });
+    api.createChat = vi.fn();
+    api.getChat = vi.fn();
+    api.renameChat = vi.fn();
+    api.deleteChat = vi.fn();
+    api.listTurns = vi.fn().mockResolvedValue({
+      turns: [
+        {
+          id: turnId,
+          chatId,
+          ordinal: 0,
+          state: "completed",
+          modelAlias: "loxa",
+          recipeId: "gemma",
+          engineName: "llama.cpp",
+          engineVersion: null,
+          errorCode: null,
+          createdAtMs: 1,
+          updatedAtMs: 2,
+        },
+      ],
+      nextAfter: null,
+    });
+    api.listMessageSummaries = vi.fn().mockResolvedValue([
+      {
+        id: "2123456789abcdef0123456789abcdef",
+        turnId,
+        role: "user",
+        contentBytes: 6,
+        createdAtMs: 1,
+        updatedAtMs: 1,
+      },
+      {
+        id: "3123456789abcdef0123456789abcdef",
+        turnId,
+        role: "assistant",
+        contentBytes: 8,
+        createdAtMs: 2,
+        updatedAtMs: 2,
+      },
+    ]);
+    api.getMessageContent = vi.fn((_endpoint, _token, _chatId, _turnId, messageId) =>
+      Promise.resolve(messageId.startsWith("2") ? "Prompt" : "Clear this transcript"),
+    );
     render(<App services={api} />);
     await screen.findByRole("link", { name: "Node online. No active model" });
+    expect(await screen.findByText("Clear this transcript")).toBeVisible();
     await user.click(screen.getByRole("link", { name: "Settings" }));
     await user.click(screen.getByRole("button", { name: "Clear chat history" }));
     await user.click(screen.getByRole("button", { name: "Confirm clear chat history" }));
@@ -107,6 +159,10 @@ describe("App", () => {
       }),
     );
     expect(await screen.findByRole("status")).toHaveTextContent("Deleted 2 conversations");
+    expect(screen.queryByRole("button", { name: "Open Clear me" })).not.toBeInTheDocument();
+    expect(screen.getByText("No conversations yet.")).toBeVisible();
+    await user.click(screen.getByRole("link", { name: "Chat" }));
+    expect(screen.queryByText("Clear this transcript")).not.toBeInTheDocument();
   });
 
   it("keeps Chat, Models, and Node primary while Settings remains in the footer", async () => {
@@ -129,6 +185,10 @@ describe("App", () => {
       chats: [{ id: chatId, title: "Runtime notes", createdAtMs: 1, updatedAtMs: 2 }],
       nextBefore: null,
     });
+    api.createChat = vi.fn();
+    api.getChat = vi.fn();
+    api.renameChat = vi.fn();
+    api.deleteChat = vi.fn();
     api.listTurns = vi.fn().mockResolvedValue({ turns: [], nextAfter: null });
     api.listMessageSummaries = vi.fn();
     api.getMessageContent = vi.fn();
@@ -144,6 +204,13 @@ describe("App", () => {
     ).not.toBeInTheDocument();
     expect(within(globalRail).getByRole("link", { name: "Node" })).toBeVisible();
     expect(within(globalRail).getByRole("link", { name: "Settings" })).toBeVisible();
+
+    for (const route of ["Models", "Node", "Settings", "Chat"]) {
+      await user.click(within(globalRail).getByRole("link", { name: route }));
+      expect(await within(globalRail).findByRole("button", { name: "Open Runtime notes" })).toBeVisible();
+      expect(within(screen.getByRole("main")).queryByRole("navigation", { name: "Chat conversations" })).toBeNull();
+    }
+    expect(api.listChats).toHaveBeenCalledTimes(1);
 
     const separator = screen.getByRole("separator", { name: "Resize navigation and conversation rail" });
     const shell = screen.getByTestId("app-shell");
@@ -194,6 +261,92 @@ describe("App", () => {
     expect(removeListener).toHaveBeenCalledWith("pointerup", expect.any(Function));
     expect(removeListener).toHaveBeenCalledWith("pointercancel", expect.any(Function));
     removeListener.mockRestore();
+  });
+
+  it("selects history off-route, navigates to Chat, and restores the selection exactly once", async () => {
+    useWorkspaceStore.setState({ activeRoute: "models" });
+    const user = userEvent.setup();
+    const api = services();
+    const firstChat = "0123456789abcdef0123456789abcdef";
+    const selectedChat = "1123456789abcdef0123456789abcdef";
+    const turnId = "2123456789abcdef0123456789abcdef";
+    const userMessage = "3123456789abcdef0123456789abcdef";
+    const assistantMessage = "4123456789abcdef0123456789abcdef";
+    api.listChats = vi.fn().mockResolvedValue({
+      chats: [
+        { id: firstChat, title: "First chat", createdAtMs: 1, updatedAtMs: 3 },
+        { id: selectedChat, title: "Selected chat", createdAtMs: 1, updatedAtMs: 2 },
+      ],
+      nextBefore: null,
+    });
+    api.createChat = vi.fn();
+    api.getChat = vi.fn();
+    api.renameChat = vi.fn();
+    api.deleteChat = vi.fn();
+    api.listTurns = vi.fn().mockResolvedValue({
+      turns: [
+        {
+          id: turnId,
+          chatId: selectedChat,
+          ordinal: 0,
+          state: "completed",
+          modelAlias: "loxa",
+          recipeId: "gemma",
+          engineName: "llama.cpp",
+          engineVersion: null,
+          errorCode: null,
+          createdAtMs: 1,
+          updatedAtMs: 2,
+        },
+      ],
+      nextAfter: null,
+    });
+    api.listMessageSummaries = vi.fn().mockResolvedValue([
+      { id: userMessage, turnId, role: "user", contentBytes: 6, createdAtMs: 1, updatedAtMs: 1 },
+      { id: assistantMessage, turnId, role: "assistant", contentBytes: 8, createdAtMs: 2, updatedAtMs: 2 },
+    ]);
+    api.getMessageContent = vi.fn((_endpoint, _token, _chatId, _turnId, messageId) =>
+      Promise.resolve(messageId === userMessage ? "Prompt" : "Restored once"),
+    );
+
+    render(<App services={api} />);
+    await user.click(await screen.findByRole("button", { name: "Open Selected chat" }));
+
+    expect(await screen.findByRole("heading", { name: "Chat" })).toBeVisible();
+    expect(await screen.findByText("Restored once")).toBeVisible();
+    expect(api.listTurns).toHaveBeenCalledTimes(1);
+    await user.click(screen.getByRole("button", { name: "Open Selected chat" }));
+    expect(api.listTurns).toHaveBeenCalledTimes(1);
+    expect(api.listChats).toHaveBeenCalledTimes(1);
+  });
+
+  it("navigates only after New chat succeeds and preserves the current route after failure", async () => {
+    useWorkspaceStore.setState({ activeRoute: "models" });
+    const user = userEvent.setup();
+    const api = services();
+    const created = {
+      id: "0123456789abcdef0123456789abcdef",
+      title: "Created truth",
+      createdAtMs: 1,
+      updatedAtMs: 2,
+    };
+    api.listChats = vi.fn().mockResolvedValue({ chats: [], nextBefore: null });
+    api.createChat = vi.fn().mockResolvedValueOnce(created).mockRejectedValueOnce(new Error("backend rejected"));
+    api.getChat = vi.fn();
+    api.renameChat = vi.fn();
+    api.deleteChat = vi.fn();
+
+    render(<App services={api} />);
+    await screen.findByText("No conversations yet.");
+    await user.click(screen.getByRole("button", { name: "New chat" }));
+    expect(await screen.findByRole("heading", { name: "Chat" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Open Created truth" })).toHaveAttribute("aria-current", "page");
+
+    await user.click(screen.getByRole("link", { name: "Models" }));
+    await user.click(screen.getByRole("button", { name: "New chat" }));
+    expect(await screen.findByText("Could not create a new conversation.")).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Models" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Open Created truth" })).toHaveAttribute("aria-current", "page");
   });
 
   it("shows authoritative node health and active model on every route and links recovery to Node", async () => {

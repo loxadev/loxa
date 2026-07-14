@@ -6,18 +6,12 @@ import { AppSidebar } from "./AppSidebar";
 type AppShellProps = {
   brandMark: string;
   children: ReactNode;
+  conversationRail?: ReactNode;
   runtimeHealth: string;
   runtimeModel: string;
-  onConversationTargetChange: (target: HTMLDivElement | null) => void;
 };
 
-export function AppShell({
-  brandMark,
-  children,
-  runtimeHealth,
-  runtimeModel,
-  onConversationTargetChange,
-}: AppShellProps) {
+export function AppShell({ brandMark, children, conversationRail, runtimeHealth, runtimeModel }: AppShellProps) {
   const effectiveWidth = useWorkspaceStore(selectEffectiveSidebarWidth);
 
   return (
@@ -28,9 +22,9 @@ export function AppShell({
     >
       <AppSidebar
         brandMark={brandMark}
+        conversationRail={conversationRail}
         runtimeHealth={runtimeHealth}
         runtimeModel={runtimeModel}
-        onConversationTargetChange={onConversationTargetChange}
       />
       <main className="workspace workspace-canvas">
         <div className="workspace-frame">{children}</div>
