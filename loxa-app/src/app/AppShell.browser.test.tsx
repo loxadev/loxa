@@ -80,11 +80,13 @@ test("shows keyboard focus on collapsed navigation without horizontal overflow",
 test("renders the dark shell brand and new-chat foreground with visible contrast", async () => {
   await page.viewport(800, 600);
   useWorkspaceStore.setState({ activeRoute: "chat", sidebarCollapsed: false, expandedSidebarWidth: 280 });
-  mountBrowser(<App services={createAppServicesFixture()} />);
+  const { host } = mountBrowser(<App services={createAppServicesFixture()} />);
   await settleShell();
 
-  applyTheme(document.documentElement, "dark", false);
+  applyTheme(host, "dark", false);
   await settleTheme();
+
+  expect(host.dataset.loxaTheme).toBe("dark");
 
   const brandMark = document.querySelector<HTMLImageElement>(".brand-lockup img");
   const newChat = page.getByRole("button", { name: "New chat" });
