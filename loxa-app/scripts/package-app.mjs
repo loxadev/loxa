@@ -1,6 +1,7 @@
 import { dirname, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { calculateBundleDigest, createPackageRecord, formatPackageRecord } from "./bundle-digest.mjs";
 
 const appRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const rustc = spawnSync("rustc", ["-vV"], { encoding: "utf8" });
@@ -23,3 +24,6 @@ const profile = debug ? "debug" : "release";
 const bundle = resolve(appRoot, "src-tauri/target", target, profile, "bundle/macos/Loxa.app");
 const verify = spawnSync("node", ["scripts/verify-sidecar.mjs", bundle], { cwd: appRoot, stdio: "inherit" });
 if (verify.status !== 0) process.exit(verify.status ?? 1);
+const { bundleDigest } = await calculateBundleDigest(bundle);
+const packageRecord = createPackageRecord(bundle, target, profile, bundleDigest);
+console.log(formatPackageRecord(packageRecord));

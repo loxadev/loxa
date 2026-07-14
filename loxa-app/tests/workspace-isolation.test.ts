@@ -75,7 +75,7 @@ describe("Cargo workspace isolation", () => {
   it("enforces a deterministic shared-platform browser baseline", () => {
     const browserConfig = readFileSync(resolve(appRoot, "vitest.browser.config.ts"), "utf8");
     const baselineTest = readFileSync(resolve(appRoot, "src/test/BaselineApp.browser.test.tsx"), "utf8");
-    const appCss = readFileSync(resolve(appRoot, "src/App.css"), "utf8");
+    const fontCss = readFileSync(resolve(appRoot, "src/styles/fonts.css"), "utf8");
 
     expect(browserConfig).toContain("platform");
     expect(browserConfig).toMatch(/"__screenshots__",\s*"shared",\s*browserName/);
@@ -88,10 +88,9 @@ describe("Cargo workspace isolation", () => {
     expect(baselineTest).toContain('scale: "css"');
     expect(baselineTest).toContain("allowedMismatchedPixelRatio: 0.005");
     expect(baselineTest).toContain("await expectNoAxeViolations(document)");
-    expect(appCss).toContain('url("./assets/fonts/InstrumentSans-Variable.woff2")');
-    expect(appCss).toContain('url("./assets/fonts/IBMPlexMono-Regular.woff2")');
-    expect(appCss).toContain('url("./assets/fonts/IBMPlexMono-Medium.woff2")');
-
+    expect(fontCss).toContain('url("../assets/fonts/InstrumentSans-Variable.woff2")');
+    expect(fontCss).toContain('url("../assets/fonts/IBMPlexMono-Regular.woff2")');
+    expect(fontCss).toContain('url("../assets/fonts/IBMPlexMono-Medium.woff2")');
   });
 
   it("starts with no frontend capability permissions", () => {
@@ -175,6 +174,21 @@ describe("Cargo workspace isolation", () => {
       },
     );
     expect(selected.trim()).toBe("x86_64-apple-darwin");
+  });
+
+  it("verifies and digests the bundle before printing the exact package record", () => {
+    const packageScript = readFileSync(resolve(appRoot, "scripts/package-app.mjs"), "utf8");
+    expect(packageScript).toContain(
+      'import { calculateBundleDigest, createPackageRecord, formatPackageRecord } from "./bundle-digest.mjs"',
+    );
+    const verifyIndex = packageScript.indexOf('spawnSync("node", ["scripts/verify-sidecar.mjs", bundle]');
+    const digestIndex = packageScript.indexOf("calculateBundleDigest(bundle)");
+    const recordIndex = packageScript.indexOf("createPackageRecord(bundle, target, profile, bundleDigest)");
+    const outputIndex = packageScript.indexOf("console.log(formatPackageRecord(packageRecord))");
+    expect(verifyIndex).toBeGreaterThan(-1);
+    expect(digestIndex).toBeGreaterThan(verifyIndex);
+    expect(recordIndex).toBeGreaterThan(digestIndex);
+    expect(outputIndex).toBeGreaterThan(recordIndex);
   });
 
   it("fails closed when the prepared sidecar hash differs from its manifest", () => {
