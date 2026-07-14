@@ -30,16 +30,17 @@ type ButtonProps = React.ComponentProps<"button"> &
     busy?: boolean;
   };
 
-function Button({ className, variant, size, busy = false, disabled, ...props }: ButtonProps) {
+function Button({ className, variant, size, busy = false, disabled, type = "button", ...props }: ButtonProps) {
   return (
     <button
+      {...props}
+      type={type}
       data-slot="button"
       data-variant={variant ?? "primary"}
       data-size={size ?? "default"}
       aria-busy={busy || undefined}
       className={cn(buttonVariants({ variant, size }), className)}
       disabled={busy || disabled}
-      {...props}
     />
   );
 }
