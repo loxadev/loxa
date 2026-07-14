@@ -150,6 +150,9 @@ function GlobalConversationRail({
   return (
     <ConversationList
       conversations={history.conversations}
+      groupedConversations={history.groupedConversations}
+      query={history.query}
+      setQuery={history.setQuery}
       selectedId={history.selectedChatId}
       state={history.state}
       errorMessage={history.errorMessage}
@@ -168,7 +171,7 @@ function GlobalConversationRail({
         await history.rename(chatId, title);
       }}
       onDelete={async (chatId) => {
-        await history.delete(chatId);
+        return history.delete(chatId);
       }}
       onLoadMore={history.loadMore}
       onRetry={history.retry}

@@ -199,6 +199,12 @@ describe("App", () => {
     const globalRail = screen.getByRole("complementary", { name: "Primary" });
     expect(within(globalRail).getByRole("navigation", { name: "Chat conversations" })).toBeVisible();
     expect(await within(globalRail).findByRole("button", { name: "Open Runtime notes" })).toBeVisible();
+    const historySearch = within(globalRail).getByRole("searchbox", { name: "Search conversations" });
+    await user.type(historySearch, "missing");
+    expect(within(globalRail).queryByRole("button", { name: "Open Runtime notes" })).not.toBeInTheDocument();
+    expect(api.listChats).toHaveBeenCalledTimes(1);
+    await user.clear(historySearch);
+    expect(await within(globalRail).findByRole("button", { name: "Open Runtime notes" })).toBeVisible();
     expect(
       within(screen.getByRole("main")).queryByRole("navigation", { name: "Chat conversations" }),
     ).not.toBeInTheDocument();
