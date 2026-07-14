@@ -338,7 +338,7 @@ describe("Cargo workspace isolation", () => {
 
   it("keeps Tauri and WebKit outside root cargo metadata", () => {
     const metadata = JSON.parse(
-      execFileSync("cargo", ["metadata", "--format-version", "1"], {
+      execFileSync("cargo", ["metadata", "--format-version", "1", "--no-deps"], {
         cwd: repositoryRoot,
         encoding: "utf8",
         maxBuffer: 100 * 1024 * 1024,
