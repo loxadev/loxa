@@ -172,19 +172,22 @@ describe("Cargo workspace isolation", () => {
     const browserConfig = readFileSync(resolve(appRoot, "vitest.browser.config.ts"), "utf8");
     const baselineTest = readFileSync(resolve(appRoot, "src/test/BaselineApp.browser.test.tsx"), "utf8");
     const fontCss = readFileSync(resolve(appRoot, "src/styles/fonts.css"), "utf8");
+    const themeCss = readFileSync(resolve(appRoot, "src/styles/theme.css"), "utf8");
 
     expect(browserConfig).toContain("platform");
     expect(browserConfig).toMatch(/"__screenshots__",\s*"shared",\s*browserName/);
-    expect(baselineTest).toContain('document.fonts.load(`600 48px "Instrument Sans"`, "Node")');
-    expect(baselineTest).toContain('document.fonts.load(`500 12px "IBM Plex Mono"`, "LOCAL RUNTIME")');
-    expect(baselineTest).toContain('document.fonts.check(`600 48px "Instrument Sans"`, "Node")');
-    expect(baselineTest).toContain('document.fonts.check(`500 12px "IBM Plex Mono"`, "LOCAL RUNTIME")');
-    expect(baselineTest).toContain('animations: "disabled"');
+    expect(baselineTest).toContain('document.fonts.load(`400 12px "IBM Plex Mono"`, "No active model")');
+    expect(baselineTest).toContain('document.fonts.check(`400 12px "IBM Plex Mono"`, "No active model")');
+    expect(baselineTest).toContain('getComputedStyle(chatHeading.element()).fontFamily).toContain("ui-sans-serif")');
+    expect(baselineTest).toContain('getComputedStyle(document.body).fontFamily).toContain("ui-sans-serif")');
+    expect(baselineTest).toContain('animations: "allow"');
     expect(baselineTest).toContain('caret: "hide"');
     expect(baselineTest).toContain('scale: "css"');
     expect(baselineTest).toContain("allowedMismatchedPixelRatio: 0.005");
     expect(baselineTest).toContain("await expectNoAxeViolations(document)");
-    expect(fontCss).toContain('url("../assets/fonts/InstrumentSans-Variable.woff2")');
+    expect(themeCss).toContain(
+      '--loxa-font-sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+    );
     expect(fontCss).toContain('url("../assets/fonts/IBMPlexMono-Regular.woff2")');
     expect(fontCss).toContain('url("../assets/fonts/IBMPlexMono-Medium.woff2")');
   });
