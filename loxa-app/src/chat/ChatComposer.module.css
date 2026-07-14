@@ -3,9 +3,18 @@
   margin-inline: auto;
   display: grid;
   gap: var(--loxa-space-1);
-  padding: var(--loxa-space-2) 0 0;
+  overflow: hidden;
+  padding: var(--loxa-space-2);
   color: var(--loxa-foreground);
-  border-top: 1px solid var(--loxa-control-border);
+  background: var(--loxa-background);
+  border: 1px solid var(--loxa-control-border);
+  border-radius: var(--loxa-radius-lg);
+}
+
+.composer:focus-within {
+  border-color: var(--loxa-focus);
+  outline: 2px solid var(--loxa-focus);
+  outline-offset: -2px;
 }
 
 .messageLabel,
@@ -29,16 +38,14 @@
   resize: none;
   padding: var(--loxa-space-2) var(--loxa-space-3);
   color: var(--loxa-foreground);
-  background: var(--loxa-secondary-surface);
-  border: 1px solid transparent;
-  border-radius: var(--loxa-radius-md);
+  background: transparent;
+  border: 0;
+  border-radius: 0;
   line-height: var(--loxa-type-body-line-height);
 }
 
 .messageInput:focus-visible {
-  outline: 2px solid var(--loxa-focus);
-  outline-offset: 0;
-  border-radius: var(--loxa-radius-md);
+  outline: none;
 }
 
 .supportReason,
@@ -127,10 +134,9 @@
 
 @media (prefers-contrast: more) {
   .composer {
-    border-top-width: 2px;
+    border-width: 2px;
   }
 
-  .messageInput,
   .modelPicker {
     border-width: 2px;
     border-color: var(--loxa-control-border);
@@ -139,17 +145,17 @@
 
 @media (forced-colors: active) {
   .composer {
-    border-top-color: ButtonText;
+    border-color: ButtonText;
+    forced-color-adjust: auto;
   }
 
-  .messageInput,
   .modelPicker {
     border-color: ButtonText;
     forced-color-adjust: auto;
   }
 
-  .modelPicker:focus-visible,
-  .messageInput:focus-visible {
+  .composer:focus-within,
+  .modelPicker:focus-visible {
     outline-color: Highlight;
   }
 }
