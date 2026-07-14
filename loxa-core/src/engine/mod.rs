@@ -1,4 +1,5 @@
 pub mod py_mlx_lm;
+pub mod swift_mlx;
 
 use std::ffi::OsString;
 use std::fmt;

@@ -12,6 +12,7 @@ pub mod registry;
 pub mod resolve;
 pub mod selector;
 pub mod supervisor;
+pub mod swift_mlx_protocol;
 pub mod workload;
 
 #[cfg(test)]

@@ -1,3 +1,4 @@
+use crate::swift_mlx_protocol::EngineProtocol;
 use axum::{
     body::{Body, Bytes},
     extract::{rejection::JsonRejection, State},
@@ -21,7 +22,7 @@ const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EngineTarget {
     pub base_url: String,
-    pub backend_alias: String,
+    pub protocol: EngineProtocol,
     pub engine: String,
     pub engine_version: String,
     pub model_id: String,
@@ -156,7 +157,17 @@ async fn chat(
             "engine_unavailable",
         );
     };
-    request["model"] = Value::String(target.backend_alias.clone());
+    let backend_alias = match &target.protocol {
+        EngineProtocol::OpenAi { backend_alias } => backend_alias.clone(),
+        EngineProtocol::SwiftMlx { .. } => {
+            return openai_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the managed engine could not accept the request",
+                "upstream_error",
+            )
+        }
+    };
+    request["model"] = Value::String(backend_alias.clone());
     let streaming = request.get("stream").and_then(Value::as_bool) == Some(true);
     let mut cancellation = state.cancellation.subscribe();
     if *cancellation.borrow() {
@@ -198,7 +209,7 @@ async fn chat(
         }
         let stream = normalize_sse(
             upstream.bytes_stream(),
-            target.backend_alias.clone(),
+            backend_alias.clone(),
             state.cancellation.subscribe(),
         );
         return Response::builder()
@@ -227,9 +238,9 @@ async fn chat(
             )
         }
     };
-    normalize_aliases(&mut body, &target.backend_alias);
+    normalize_aliases(&mut body, &backend_alias);
     if !status.is_success() {
-        normalize_embedded_aliases(&mut body, &target.backend_alias);
+        normalize_embedded_aliases(&mut body, &backend_alias);
     }
     let status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     (status, Json(body)).into_response()
@@ -487,6 +498,7 @@ mod tests {
         next_sse_boundary, normalize_sse, router, EngineTarget, GatewayServer, GatewayState,
         MAX_SSE_EVENT_BYTES,
     };
+    use crate::swift_mlx_protocol::EngineProtocol;
     use axum::http::StatusCode;
     use axum::{
         body::{Body, Bytes},
