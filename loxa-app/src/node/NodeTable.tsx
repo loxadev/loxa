@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { Children, type ReactNode } from "react";
 
 import { StatusBadge, type StatusBadgeProps } from "../components/loxa/status-badge";
 import { Table, TableBody, TableCaption, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
@@ -38,7 +38,7 @@ export function NodeTable({
   ownership,
   actions,
 }: NodeTableProps) {
-  const hasActions = actions ? Object.values(actions).some((action) => action != null) : false;
+  const hasActions = actions ? Children.toArray(Object.values(actions)).length > 0 : false;
 
   return (
     <Table className={styles.table}>
