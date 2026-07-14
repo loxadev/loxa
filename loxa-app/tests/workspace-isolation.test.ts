@@ -166,6 +166,17 @@ describe("Cargo workspace isolation", () => {
     for (const [name, command] of commands) {
       expect(workflowStep(frontend, name)).toMatch(new RegExp(`^        run: ${command.replaceAll(".", "\\.")}$`, "m"));
     }
+
+    const packaging = yamlBlock(ci, "frontend-packaging", 2);
+    expect(packaging).toMatch(/^    name: desktop package \(macOS\)$/m);
+    expect(packaging).toMatch(/^    runs-on: macos-latest$/m);
+    expect(packaging).toMatch(/^    timeout-minutes: 30$/m);
+    expect(packaging).toMatch(/^        working-directory: loxa-app$/m);
+    expect(workflowStep(packaging, "Install dependencies")).toMatch(/^        run: pnpm install --frozen-lockfile$/m);
+    expect(workflowStep(packaging, "Packaging contract tests")).toMatch(
+      /^        run: pnpm exec vitest run tests\/workspace-isolation\.test\.ts$/m,
+    );
+    expect(workflowStep(packaging, "Build packaged app")).toMatch(/^        run: pnpm package:app -- --debug$/m);
   });
 
   it("enforces a deterministic shared-platform browser baseline", () => {
@@ -264,6 +275,8 @@ describe("Cargo workspace isolation", () => {
   });
 
   it("selects an explicit packaging target instead of silently using the host", () => {
+    const prepareScript = readFileSync(resolve(appRoot, "scripts/prepare-sidecar.mjs"), "utf8");
+    expect(prepareScript.indexOf("if (!triple)")).toBeLessThan(prepareScript.indexOf('spawnSync("rustc"'));
     const selected = execFileSync(
       process.execPath,
       [resolve(appRoot, "scripts/prepare-sidecar.mjs"), "--print-target"],
@@ -306,12 +319,16 @@ describe("Cargo workspace isolation", () => {
         destination: "loxa-node-aarch64-apple-darwin",
       }),
     );
+    const expectedFailure =
+      process.platform === "darwin"
+        ? /sidecar hash verification failed/
+        : /macOS-only and requires an Apple Darwin target/;
     expect(() =>
       execFileSync(process.execPath, [resolve(appRoot, "scripts/verify-sidecar.mjs")], {
         env: { ...process.env, LOXA_SIDECAR_APP_ROOT: root },
         stdio: "pipe",
       }),
-    ).toThrow(/sidecar hash verification failed/);
+    ).toThrow(expectedFailure);
   });
 
   it("declares the desktop crate as its own workspace", () => {
