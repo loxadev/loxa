@@ -138,6 +138,78 @@ describe("NodeScreen", () => {
     expect(within(table).getAllByRole("cell")).toHaveLength(5);
   });
 
+  it("omits the Actions column when every action slot is false", () => {
+    render(
+      <NodeTable
+        nodeId="node-7"
+        statusLabel="Ready"
+        statusTone="success"
+        health="ready"
+        activeModel="gemma-3-4b-it-q4"
+        engineName="llama.cpp"
+        engineVersion="b9999"
+        profile="default"
+        endpoint={endpoint}
+        ownership="App-owned node"
+        actions={{ copyEndpoint: false, model: false, retry: false, lifecycle: false }}
+      />,
+    );
+
+    const table = screen.getByRole("table", { name: "Local node inventory" });
+    expect(within(table).queryByRole("columnheader", { name: "Actions" })).not.toBeInTheDocument();
+    expect(within(table).getAllByRole("cell")).toHaveLength(5);
+  });
+
+  it("omits the Actions column when action slots contain only empty arrays", () => {
+    render(
+      <NodeTable
+        nodeId="node-7"
+        statusLabel="Ready"
+        statusTone="success"
+        health="ready"
+        activeModel="gemma-3-4b-it-q4"
+        engineName="llama.cpp"
+        engineVersion="b9999"
+        profile="default"
+        endpoint={endpoint}
+        ownership="App-owned node"
+        actions={{ copyEndpoint: [], model: [], retry: [], lifecycle: [] }}
+      />,
+    );
+
+    const table = screen.getByRole("table", { name: "Local node inventory" });
+    expect(within(table).queryByRole("columnheader", { name: "Actions" })).not.toBeInTheDocument();
+    expect(within(table).getAllByRole("cell")).toHaveLength(5);
+  });
+
+  it("shows the Actions column when mixed action slots include a renderable child", () => {
+    render(
+      <NodeTable
+        nodeId="node-7"
+        statusLabel="Ready"
+        statusTone="success"
+        health="ready"
+        activeModel="gemma-3-4b-it-q4"
+        engineName="llama.cpp"
+        engineVersion="b9999"
+        profile="default"
+        endpoint={endpoint}
+        ownership="App-owned node"
+        actions={{
+          copyEndpoint: [false, null, <button key="copy">Copy</button>],
+          model: [],
+          retry: undefined,
+          lifecycle: false,
+        }}
+      />,
+    );
+
+    const table = screen.getByRole("table", { name: "Local node inventory" });
+    expect(within(table).getByRole("columnheader", { name: "Actions" })).toBeVisible();
+    expect(within(table).getByRole("button", { name: "Copy" })).toBeVisible();
+    expect(within(table).getAllByRole("cell")).toHaveLength(6);
+  });
+
   it("keeps the status badge visual-only", () => {
     render(
       <NodeTable
