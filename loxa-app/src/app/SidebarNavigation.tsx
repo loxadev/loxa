@@ -6,6 +6,7 @@ import type { ComponentType, MouseEvent, SVGProps } from "react";
 
 import {
   selectActiveRoute,
+  selectSetActiveSettingsPage,
   selectSetActiveRoute,
   useWorkspaceStore,
   type WorkspaceRoute,
@@ -21,9 +22,11 @@ const primaryItems: Array<{ route: WorkspaceRoute; label: string; Icon: Icon }> 
 export function SidebarNavigation({ footer = false }: { footer?: boolean }) {
   const route = useWorkspaceStore(selectActiveRoute);
   const setRoute = useWorkspaceStore(selectSetActiveRoute);
+  const setSettingsPage = useWorkspaceStore(selectSetActiveSettingsPage);
   const items = footer ? [{ route: "settings" as const, label: "Settings", Icon: Settings }] : primaryItems;
   const navigate = (next: WorkspaceRoute) => (event: MouseEvent<HTMLAnchorElement>) => {
     event.preventDefault();
+    if (next === "settings") setSettingsPage("overview");
     setRoute(next);
   };
 

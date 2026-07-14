@@ -10,11 +10,13 @@ import {
   WORKSPACE_STORAGE_KEY,
   WORKSPACE_STORAGE_VERSION,
   createWorkspaceStore,
+  selectActiveSettingsPage,
   selectActiveRoute,
   selectEffectiveSidebarWidth,
   selectExpandedSidebarWidth,
   selectResetSidebarWidth,
   selectSetActiveRoute,
+  selectSetActiveSettingsPage,
   selectSetExpandedSidebarWidth,
   selectSidebarCollapsed,
   selectToggleSidebar,
@@ -49,6 +51,7 @@ describe("workspace store", () => {
     const store = createWorkspaceStore(storage);
 
     expect(selectActiveRoute(store.getState())).toBe("chat");
+    expect(selectActiveSettingsPage(store.getState())).toBe("overview");
     expect(selectSidebarCollapsed(store.getState())).toBe(false);
     expect(selectExpandedSidebarWidth(store.getState())).toBe(280);
     expect(selectEffectiveSidebarWidth(store.getState())).toBe(280);
@@ -57,6 +60,18 @@ describe("workspace store", () => {
     expect(MAX_EXPANDED_SIDEBAR_WIDTH).toBe(420);
     expect(COLLAPSED_SIDEBAR_WIDTH).toBe(56);
     expect(SIDEBAR_KEYBOARD_STEP).toBe(20);
+  });
+
+  it("changes the nested Settings page without persisting it", () => {
+    const store = createWorkspaceStore(storage);
+
+    selectSetActiveSettingsPage(store.getState())("runtime");
+
+    expect(selectActiveSettingsPage(store.getState())).toBe("runtime");
+    expect(JSON.parse(storage.values.get(WORKSPACE_STORAGE_KEY) ?? "null")).toEqual({
+      state: { sidebarCollapsed: false, expandedSidebarWidth: 280 },
+      version: WORKSPACE_STORAGE_VERSION,
+    });
   });
 
   it("changes route without persisting it", () => {
@@ -114,6 +129,7 @@ describe("workspace store", () => {
     const store = createWorkspaceStore(storage);
 
     store.getState().setActiveRoute("settings");
+    store.getState().setActiveSettingsPage("runtime");
     store.getState().setSidebarCollapsed(true);
     store.getState().setExpandedSidebarWidth(360);
 
@@ -131,6 +147,7 @@ describe("workspace store", () => {
     const store = createWorkspaceStore(storage);
 
     expect(selectActiveRoute(store.getState())).toBe("chat");
+    expect(selectActiveSettingsPage(store.getState())).toBe("overview");
     expect(selectSidebarCollapsed(store.getState())).toBe(true);
     expect(selectExpandedSidebarWidth(store.getState())).toBe(320);
     expect(selectEffectiveSidebarWidth(store.getState())).toBe(56);
@@ -151,6 +168,7 @@ describe("workspace store", () => {
     const state = createWorkspaceStore(storage).getState();
 
     expect(selectActiveRoute(state)).toBe("chat");
+    expect(selectActiveSettingsPage(state)).toBe("overview");
     expect(selectSidebarCollapsed(state)).toBe(false);
     expect(selectExpandedSidebarWidth(state)).toBe(280);
   });
@@ -211,12 +229,15 @@ describe("workspace store", () => {
   it("keeps action and selector references stable across updates", () => {
     const store = createWorkspaceStore(storage);
     const setRoute = selectSetActiveRoute(store.getState());
+    const setSettingsPage = selectSetActiveSettingsPage(store.getState());
     const setWidth = selectSetExpandedSidebarWidth(store.getState());
 
     setRoute("node");
+    setSettingsPage("runtime");
     setWidth(360);
 
     expect(selectSetActiveRoute(store.getState())).toBe(setRoute);
+    expect(selectSetActiveSettingsPage(store.getState())).toBe(setSettingsPage);
     expect(selectSetExpandedSidebarWidth(store.getState())).toBe(setWidth);
     expect(selectActiveRoute).toBe(selectActiveRoute);
     expect(selectEffectiveSidebarWidth).toBe(selectEffectiveSidebarWidth);
