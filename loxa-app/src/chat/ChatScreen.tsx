@@ -81,6 +81,7 @@ export function ChatScreen({
   onModelMutationSettled,
   history,
   onInteractionLockChange,
+  onNavigateModels,
 }: {
   services: ChatScreenServices;
   endpoint: string;
@@ -89,6 +90,7 @@ export function ChatScreen({
   onModelMutationSettled?: (operationId: string) => void | Promise<void>;
   history?: ChatScreenHistory | null;
   onInteractionLockChange?: (locked: boolean) => void;
+  onNavigateModels?: () => void;
 }) {
   const availabilityPhase = nodeAvailability?.phase;
   const availabilityProven = nodeAvailability?.proven;
@@ -876,27 +878,35 @@ export function ChatScreen({
     controlStreamState,
     controlBusy,
   );
+  const canBrowseModels =
+    connection === "disconnected" &&
+    connectionError === nodeUnavailableReason("unloaded") &&
+    controlStreamState === "live" &&
+    modelOperation === "idle" &&
+    !controlBusy;
 
   return (
     <section className={styles.screen} aria-labelledby="chat-heading">
-      <header className="screen-header">
-        <div>
-          <p className="eyebrow">Operational tool</p>
-          <h1 id="chat-heading">Chat</h1>
-        </div>
-        <p className="status-badge" role="status" aria-live="polite" aria-atomic="true">
+      <header className={styles.header}>
+        <h1 id="chat-heading">Chat</h1>
+        <p className={styles.liveStatus} role="status" aria-live="polite" aria-atomic="true">
           {statusLabel}
         </p>
       </header>
 
       <div className={styles.chatMain}>
-        <div className={styles.contextNotice} aria-live="polite">
+        <div className={styles.contextNotice}>
           {restoreError ||
             (omittedTurns > 0
               ? `${omittedTurns} earlier ${omittedTurns === 1 ? "turn was" : "turns were"} omitted from the model context.`
               : "")}
         </div>
-        <ChatTranscript turns={turns} emptyMessage={emptyMessage} copyText={services.copyText} />
+        <ChatTranscript
+          turns={turns}
+          emptyMessage={emptyMessage}
+          copyText={services.copyText}
+          onBrowseModels={canBrowseModels ? onNavigateModels : undefined}
+        />
 
         <ChatComposer
           input={input}

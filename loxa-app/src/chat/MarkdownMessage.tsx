@@ -3,7 +3,7 @@ import type { ComponentProps, ComponentPropsWithoutRef } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
-import styles from "./ChatScreen.module.css";
+import styles from "./ChatTranscript.module.css";
 
 const controlCharacter = /[\u0000-\u001F\u007F]/;
 const encodedControlCharacter = /%(?:0[0-9a-f]|1[0-9a-f]|7f)/i;

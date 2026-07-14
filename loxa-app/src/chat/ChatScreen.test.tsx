@@ -147,6 +147,93 @@ function history(selection: ChatScreenHistory["selection"]): ChatScreenHistory {
 }
 
 describe("ChatScreen", () => {
+  it("presents one compact Chat heading with one polite atomic live status", async () => {
+    const setup = services();
+    const { container } = render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
+
+    expect(await screen.findByRole("heading", { name: "Chat" })).toBeInTheDocument();
+    expect(screen.queryByText("Operational tool")).not.toBeInTheDocument();
+    expect(container.querySelectorAll('[aria-live="polite"][aria-atomic="true"]')).toHaveLength(1);
+  });
+
+  it("offers Models only after authoritative unloaded truth and invokes navigation", async () => {
+    const user = userEvent.setup();
+    const setup = services(false);
+    const onNavigateModels = vi.fn();
+    vi.mocked(setup.api.getControlNode).mockResolvedValue({
+      status: "unloaded",
+      activeModelId: null,
+      operationId: null,
+      error: null,
+    });
+    vi.mocked(setup.api.getInventory).mockResolvedValue([]);
+
+    render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" onNavigateModels={onNavigateModels} />);
+
+    const browse = await screen.findByRole("button", { name: "Browse models" });
+    await user.click(browse);
+    expect(onNavigateModels).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["checking", "checking"],
+    ["busy", "loading"],
+    ["ready", "ready"],
+    ["error", "error"],
+  ] as const)("hides Browse models while model truth is %s", async (_label, status) => {
+    const setup = services(status === "ready");
+    if (status === "checking") {
+      vi.mocked(setup.api.getControlNode).mockImplementation(() => new Promise(() => undefined));
+    } else {
+      vi.mocked(setup.api.getControlNode).mockResolvedValue({
+        status,
+        activeModelId: status === "ready" || status === "loading" ? "gemma" : null,
+        operationId: status === "loading" ? "operation-1" : null,
+        error: status === "error" ? "runtime failed" : null,
+      });
+    }
+
+    render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" onNavigateModels={vi.fn()} />);
+
+    if (status !== "checking") await screen.findByRole("status");
+    expect(screen.queryByRole("button", { name: "Browse models" })).not.toBeInTheDocument();
+  });
+
+  it("hides Browse models while the shared node session is reconciling", () => {
+    const setup = services(false);
+    render(
+      <ChatScreen
+        services={setup.api}
+        endpoint="http://127.0.0.1:8080"
+        nodeAvailability={{ phase: "reconciling", proven: true, error: null }}
+        onNavigateModels={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: "Browse models" })).not.toBeInTheDocument();
+  });
+
+  it("uses owned controls and Lucide icons for attachment, send, and stop", async () => {
+    const user = userEvent.setup();
+    const setup = services();
+    render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
+
+    const attachment = screen.getByRole("button", { name: "Attach document" });
+    expect(attachment).toHaveAttribute("data-slot", "button");
+    expect(attachment.querySelector("svg.lucide-paperclip")).not.toBeNull();
+
+    const message = await screen.findByLabelText("Message");
+    await user.type(message, "Explain this");
+    const send = screen.getByRole("button", { name: "Send message" });
+    expect(send).toHaveAttribute("data-slot", "button");
+    expect(send.querySelector("svg.lucide-send")).not.toBeNull();
+    await user.click(send);
+
+    const stop = screen.getByRole("button", { name: "Stop response" });
+    expect(stop).toHaveAttribute("data-slot", "button");
+    expect(stop.querySelector("svg.lucide-square")).not.toBeNull();
+  });
+
   it("uses a named scrolling transcript and a final-row message composer", async () => {
     const setup = services();
     render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
@@ -607,8 +694,10 @@ describe("ChatScreen", () => {
   });
 
   it("defines a canonical responsive and accessible Chat module contract", () => {
-    const path = resolve(process.cwd(), "src/chat/ChatScreen.module.css");
-    const css = existsSync(path) ? readFileSync(path, "utf8") : "";
+    const paths = ["ChatScreen.module.css", "ChatComposer.module.css", "ChatTranscript.module.css"].map((name) =>
+      resolve(process.cwd(), `src/chat/${name}`),
+    );
+    const css = paths.map((path) => (existsSync(path) ? readFileSync(path, "utf8") : "")).join("\n");
     const canonicalPath = resolve(process.cwd(), "src/styles/loxa.css");
     const canonicalCss = existsSync(canonicalPath) ? readFileSync(canonicalPath, "utf8") : "";
     const canonicalTokens = new Set(Array.from(canonicalCss.matchAll(/(--loxa-[\w-]+)\s*:/g), ([, token]) => token));

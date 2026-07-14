@@ -1,7 +1,8 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import { MarkdownMessage } from "./MarkdownMessage";
-import styles from "./ChatScreen.module.css";
+import { Button } from "../components/ui/button";
+import styles from "./ChatTranscript.module.css";
 
 export type ChatTurnStatus = "queued" | "streaming" | "completed" | "cancelled" | "failed";
 
@@ -18,10 +19,12 @@ export function ChatTranscript({
   turns,
   emptyMessage,
   copyText,
+  onBrowseModels,
 }: {
   turns: ChatTurn[];
   emptyMessage: string;
   copyText(text: string): Promise<void>;
+  onBrowseModels?: () => void;
 }) {
   const transcript = useRef<HTMLDivElement>(null);
   const nearBottom = useRef(true);
@@ -50,6 +53,11 @@ export function ChatTranscript({
         {turns.length === 0 ? (
           <div className={styles.emptyState}>
             <p>{emptyMessage}</p>
+            {onBrowseModels && (
+              <Button variant="secondary" onClick={onBrowseModels}>
+                Browse models
+              </Button>
+            )}
           </div>
         ) : (
           turns.map((turn) => (

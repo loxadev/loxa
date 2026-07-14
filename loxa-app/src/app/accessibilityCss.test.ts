@@ -8,11 +8,14 @@ const globalCss = readFileSync(`${root}/src/App.css`, "utf8");
 const tokens = readFileSync(`${root}/src/styles/loxa.css`, "utf8");
 const themeCss = readFileSync(`${root}/src/styles/theme.css`, "utf8");
 const featureModules = [
-  "src/node/NodeScreen.module.css",
-  "src/models/ModelsScreen.module.css",
-  "src/chat/ChatScreen.module.css",
-  "src/settings/SettingsScreen.module.css",
-].map((path) => ({ path, css: readFileSync(`${root}/${path}`, "utf8") }));
+  { path: "src/node/NodeScreen.module.css", files: ["src/node/NodeScreen.module.css"] },
+  { path: "src/models/ModelsScreen.module.css", files: ["src/models/ModelsScreen.module.css"] },
+  {
+    path: "src/chat/*.module.css",
+    files: ["src/chat/ChatScreen.module.css", "src/chat/ChatComposer.module.css", "src/chat/ChatTranscript.module.css"],
+  },
+  { path: "src/settings/SettingsScreen.module.css", files: ["src/settings/SettingsScreen.module.css"] },
+].map(({ path, files }) => ({ path, css: files.map((file) => readFileSync(`${root}/${file}`, "utf8")).join("\n") }));
 
 describe("integrated accessibility CSS contract", () => {
   it("keeps the global sheet limited to shell, navigation, and shared primitives", () => {

@@ -110,6 +110,7 @@ function WorkspaceContents({
           onModelMutationSettled={session.settleModelMutation}
           history={history}
           onInteractionLockChange={setChatInteractionLocked}
+          onNavigateModels={() => setRoute("models")}
         />
       ) : (
         <SettingsScreen
