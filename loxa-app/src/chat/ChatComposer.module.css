@@ -1,0 +1,159 @@
+.composer {
+  width: min(100%, 760px);
+  margin-inline: auto;
+  display: grid;
+  gap: var(--loxa-space-2);
+  padding: var(--loxa-space-3);
+  color: var(--loxa-foreground);
+  background: var(--loxa-background);
+  border: 1px solid var(--loxa-control-border);
+  border-radius: var(--loxa-radius-xl);
+}
+
+.messageLabel,
+.visuallyHidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.messageInput {
+  width: 100%;
+  min-height: 64px;
+  max-height: 180px;
+  resize: none;
+  padding: var(--loxa-space-2);
+  color: var(--loxa-foreground);
+  background: transparent;
+  border: 0;
+  line-height: var(--loxa-type-body-line-height);
+}
+
+.messageInput:focus-visible {
+  outline: 2px solid var(--loxa-focus);
+  outline-offset: 0;
+  border-radius: var(--loxa-radius-md);
+}
+
+.supportReason,
+.attachmentReason,
+.modelHelp {
+  margin: 0;
+  color: var(--loxa-muted-foreground);
+  font-size: var(--loxa-type-body-small-size);
+  line-height: var(--loxa-type-body-small-line-height);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.composerFooter,
+.composerTools {
+  display: flex;
+  align-items: center;
+  gap: var(--loxa-space-2);
+  min-width: 0;
+}
+
+.composerFooter {
+  justify-content: space-between;
+}
+
+.attachmentButton,
+.primaryControl {
+  flex: 0 0 auto;
+}
+
+.modelControl {
+  display: grid;
+  grid-template-columns: auto minmax(128px, 220px) auto;
+  align-items: center;
+  gap: var(--loxa-space-1) var(--loxa-space-2);
+  min-width: 0;
+}
+
+.modelControl label {
+  color: var(--loxa-muted-foreground);
+  font-size: var(--loxa-type-body-small-size);
+}
+
+.modelPicker {
+  min-width: 0;
+  min-height: var(--loxa-component-minimum-interactive-target);
+  padding: 0 var(--loxa-space-3);
+  color: var(--loxa-foreground);
+  background: var(--loxa-secondary-surface);
+  border: 1px solid transparent;
+  border-radius: var(--loxa-radius-md);
+  font-family: var(--loxa-font-mono);
+  text-overflow: ellipsis;
+}
+
+.modelPicker:focus-visible {
+  outline: 2px solid var(--loxa-focus);
+  outline-offset: 2px;
+}
+
+.modelHelp {
+  grid-column: 1 / -1;
+  min-width: 0;
+}
+
+@media (max-width: 760px) {
+  .composer {
+    padding: var(--loxa-space-3);
+  }
+
+  .composerFooter,
+  .composerTools {
+    align-items: flex-end;
+  }
+
+  .modelControl {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .modelControl label {
+    grid-column: 1 / -1;
+  }
+
+  .modelPicker {
+    width: 100%;
+  }
+}
+
+@media (prefers-contrast: more) {
+  .composer,
+  .modelPicker {
+    border-width: 2px;
+    border-color: var(--loxa-control-border);
+  }
+}
+
+@media (forced-colors: active) {
+  .composer,
+  .modelPicker {
+    border-color: ButtonText;
+    forced-color-adjust: auto;
+  }
+
+  .modelPicker:focus-visible,
+  .messageInput:focus-visible {
+    outline-color: Highlight;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .composer,
+  .messageInput,
+  .modelPicker,
+  .primaryControl,
+  .attachmentButton {
+    transition-duration: var(--loxa-motion-fast);
+  }
+}

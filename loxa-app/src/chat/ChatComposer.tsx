@@ -1,7 +1,9 @@
 import type { KeyboardEvent, RefObject } from "react";
+import { Paperclip, Send, Square } from "lucide-react";
 
 import type { ModelInventoryEntry } from "../control/contracts";
-import styles from "./ChatScreen.module.css";
+import { Button, IconButton } from "../components/ui/button";
+import styles from "./ChatComposer.module.css";
 
 type ChatComposerProps = {
   input: string;
@@ -86,15 +88,15 @@ export function ChatComposer({
 
       <div className={styles.composerFooter}>
         <div className={styles.composerTools}>
-          <button
-            className={`${styles.attachmentButton} quiet-button interactive-target`}
-            type="button"
-            aria-label="Attach document"
-            aria-describedby="attachment-support-reason"
+          <IconButton
+            className={styles.attachmentButton}
+            variant="quiet"
+            label="Attach document"
+            helpId="attachment-support-reason"
             disabled
           >
-            +
-          </button>
+            <Paperclip />
+          </IconButton>
           <div className={styles.modelControl}>
             <label htmlFor="active-chat-model">Choose model</label>
             <select
@@ -113,15 +115,15 @@ export function ChatComposer({
               ))}
             </select>
             {selectedModel !== activeModel && selectedModel && (
-              <button
-                className="secondary-button interactive-target"
+              <Button
+                variant="secondary"
                 type="button"
                 disabled={switchingDisabled}
                 onClick={onSwitchModel}
                 aria-label={`${activeModel === null ? "Load" : "Switch to"} ${selectedModel}`}
               >
                 {modelOperation === "switching" ? "Loading…" : activeModel === null ? "Load" : "Switch"}
-              </button>
+              </Button>
             )}
             <span id="model-control-help" className={styles.modelHelp}>
               Active: <span className="technical-value">{activeModel ?? "None"}</span>
@@ -130,23 +132,24 @@ export function ChatComposer({
         </div>
 
         {responseInProgress ? (
-          <button
-            className={`${styles.primaryControl} secondary-button interactive-target`}
+          <Button
+            className={styles.primaryControl}
+            variant="secondary"
             type="button"
             aria-label="Stop response"
             onClick={onStop}
           >
-            <span aria-hidden="true">■</span> Stop<span className={styles.visuallyHidden}> response</span>
-          </button>
+            <Square aria-hidden="true" /> Stop<span className={styles.visuallyHidden}> response</span>
+          </Button>
         ) : (
-          <button
-            className={`${styles.primaryControl} primary-button interactive-target`}
+          <Button
+            className={styles.primaryControl}
             type="submit"
             aria-label="Send message"
             disabled={!canCompose || !input.trim()}
           >
-            Send<span className={styles.visuallyHidden}> message</span>
-          </button>
+            <Send aria-hidden="true" /> Send<span className={styles.visuallyHidden}> message</span>
+          </Button>
         )}
       </div>
       <p id="attachment-support-reason" className={styles.attachmentReason}>

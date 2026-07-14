@@ -94,6 +94,32 @@ describe("App", () => {
     expect(screen.getByRole("link", { name: "Settings" })).toHaveAttribute("aria-current", "page");
   });
 
+  it("routes the authoritative unloaded Chat action to Models", async () => {
+    const user = userEvent.setup();
+    const api = services();
+    vi.mocked(api.getStatus).mockResolvedValue({
+      node_id: "node-7",
+      health: "unavailable",
+      model: "loxa",
+      engine: null,
+      runtime_model: null,
+      profile: null,
+    });
+    vi.mocked(api.getControlNode).mockResolvedValue({
+      status: "unloaded",
+      activeModelId: null,
+      operationId: null,
+      error: null,
+    });
+    vi.mocked(api.getInventory).mockResolvedValue([]);
+
+    render(<App services={api} />);
+    await user.click(await screen.findByRole("button", { name: "Browse models" }));
+
+    expect(screen.getByRole("heading", { name: "Models" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Models" })).toHaveAttribute("aria-current", "page");
+  });
+
   it("threads the Settings lifecycle signal through authenticated history clearing", async () => {
     const user = userEvent.setup();
     const api = services();

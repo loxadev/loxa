@@ -387,7 +387,7 @@ describe("assistant Markdown rendering", () => {
   });
 
   it("defines overflow, zoom, contrast, forced-color, reduced-motion, and selection contracts", () => {
-    const css = readFileSync(resolve(process.cwd(), "src/chat/ChatScreen.module.css"), "utf8");
+    const css = readFileSync(resolve(process.cwd(), "src/chat/ChatTranscript.module.css"), "utf8");
 
     expect(css).toMatch(/\.markdownMessage pre[\s\S]*overflow-x:\s*auto/);
     expect(css).toMatch(/\.markdownMessage table[\s\S]*overflow-x:\s*auto/);
