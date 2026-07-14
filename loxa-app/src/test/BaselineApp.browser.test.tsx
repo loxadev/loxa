@@ -20,25 +20,30 @@ async function waitForThemeTransition() {
   }
 }
 
-test("captures the untouched desktop shell in fixed light and dark modes", async () => {
+test("captures the chat-first desktop shell in fixed light and dark modes", async () => {
   await page.viewport(800, 600);
   const { host } = mountBrowser(<App services={createAppServicesFixture()} />);
   await act(async () => {
     await Promise.resolve();
     await Promise.resolve();
   });
-  await expect.element(page.getByText("Node ready — no model loaded")).toBeVisible();
-  const [instrumentSansFaces, ibmPlexMonoFaces] = await Promise.all([
-    document.fonts.load(`600 48px "Instrument Sans"`, "Node"),
-    document.fonts.load(`500 12px "IBM Plex Mono"`, "LOCAL RUNTIME"),
-  ]);
+  const chatHeading = page.getByRole("heading", { name: "Chat" });
+  const chatNavigation = page.getByRole("link", { name: "Chat" });
+  const conversationRail = page.getByRole("navigation", { name: "Chat conversations" });
+  await expect.element(chatHeading).toBeVisible();
+  await expect.element(chatNavigation).toHaveAttribute("aria-current", "page");
+  await expect.element(conversationRail).toBeVisible();
+  await expect.element(page.getByText("No conversations yet.")).toBeVisible();
+  await expect.element(page.getByRole("link", { name: "Node online. No active model" })).toBeVisible();
+  const technicalValue = document.querySelector<HTMLElement>(".global-node-status-model");
+  expect(technicalValue).not.toBeNull();
+  const ibmPlexMonoFaces = await document.fonts.load(`400 12px "IBM Plex Mono"`, "No active model");
   await document.fonts.ready;
-  expect(instrumentSansFaces.length).toBeGreaterThan(0);
   expect(ibmPlexMonoFaces.length).toBeGreaterThan(0);
-  expect(document.fonts.check(`600 48px "Instrument Sans"`, "Node")).toBe(true);
-  expect(document.fonts.check(`500 12px "IBM Plex Mono"`, "LOCAL RUNTIME")).toBe(true);
-  expect(getComputedStyle(document.querySelector("h1") as HTMLElement).fontFamily).toContain("Instrument Sans");
-  expect(getComputedStyle(document.querySelector(".eyebrow") as HTMLElement).fontFamily).toContain("IBM Plex Mono");
+  expect(document.fonts.check(`400 12px "IBM Plex Mono"`, "No active model")).toBe(true);
+  expect(getComputedStyle(chatHeading.element()).fontFamily).toContain("ui-sans-serif");
+  expect(getComputedStyle(document.body).fontFamily).toContain("ui-sans-serif");
+  expect(getComputedStyle(technicalValue!).fontFamily).toContain("IBM Plex Mono");
 
   for (const mode of ["light", "dark"] satisfies ThemeMode[]) {
     writeThemePreference(window.localStorage, mode);
@@ -54,7 +59,7 @@ test("captures the untouched desktop shell in fixed light and dark modes", async
         threshold: 0.2,
       },
       screenshotOptions: {
-        animations: "disabled",
+        animations: "allow",
         caret: "hide",
         scale: "css",
       },
