@@ -1,11 +1,19 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
 const appRoot = resolve(import.meta.dirname, "..");
 const repositoryRoot = resolve(appRoot, "..");
+
+function sourceFiles(directory: string): string[] {
+  return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    const path = resolve(directory, entry.name);
+    if (entry.isDirectory()) return sourceFiles(path);
+    return /\.[cm]?[jt]sx?$/.test(entry.name) ? [path] : [];
+  });
+}
 
 function yamlBlock(source: string, key: string, indent: number) {
   const lines = source.split("\n");
@@ -31,6 +39,35 @@ function workflowStep(job: string, name: string) {
 }
 
 describe("Cargo workspace isolation", () => {
+  it("keeps product icons on Lucide and direct Radix imports inside owned UI wrappers", () => {
+    const manifest = JSON.parse(readFileSync(resolve(appRoot, "package.json"), "utf8")) as {
+      dependencies: Record<string, string>;
+    };
+    const disallowedIconPackages = [
+      "@fortawesome/react-fontawesome",
+      "@heroicons/react",
+      "iconoir-react",
+      "phosphor-react",
+      "react-feather",
+      "react-icons",
+    ];
+    expect(Object.keys(manifest.dependencies).filter((name) => disallowedIconPackages.includes(name))).toEqual([]);
+
+    const files = sourceFiles(resolve(appRoot, "src"));
+    const featureViolations = files
+      .filter((path) => !path.includes("/components/ui/") && !path.includes(".test."))
+      .filter((path) => /from\s+["'](?:radix-ui|@radix-ui\/)/.test(readFileSync(path, "utf8")));
+    expect(featureViolations).toEqual([]);
+
+    const iconViolations = files
+      .filter((path) => !path.includes(".test."))
+      .filter((path) =>
+        /from\s+["'](?:react-icons|react-feather|phosphor-react|iconoir-react|@heroicons\/react|@fortawesome\/)/.test(
+          readFileSync(path, "utf8"),
+        ),
+      );
+    expect(iconViolations).toEqual([]);
+  });
   it("keeps generated Tauri schemas outside the formatting gate", () => {
     const prettierIgnore = readFileSync(resolve(appRoot, ".prettierignore"), "utf8").split("\n");
     expect(prettierIgnore).toContain("src-tauri/gen/schemas");
