@@ -28,4 +28,6 @@ export function cleanupBrowser() {
   document.documentElement.removeAttribute("class");
   document.documentElement.removeAttribute("data-loxa-theme");
   document.documentElement.removeAttribute("data-loxa-theme-preference");
+  window.localStorage.clear();
+  window.sessionStorage.clear();
 }
