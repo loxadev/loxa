@@ -1,0 +1,92 @@
+.table {
+  min-width: 740px;
+  border-collapse: collapse;
+  border-top: 1px solid var(--loxa-control-border);
+}
+
+.headerRow {
+  color: var(--loxa-muted-foreground);
+  text-align: left;
+}
+
+.headerRow th,
+.nodeRow td {
+  padding: var(--loxa-space-4);
+  border-bottom: 1px solid var(--loxa-control-border);
+  vertical-align: top;
+}
+
+.headerRow th:first-child,
+.nodeRow td:first-child {
+  padding-left: 0;
+}
+
+.headerRow th:last-child,
+.nodeRow td:last-child {
+  padding-right: 0;
+}
+
+.headerRow th {
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.primaryValue,
+.detail {
+  display: block;
+}
+
+.primaryValue {
+  color: var(--loxa-foreground);
+}
+
+.detail {
+  margin-top: var(--loxa-space-1);
+  color: var(--loxa-muted-foreground);
+  font-size: 0.8125rem;
+}
+
+.endpoint {
+  display: block;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--loxa-space-2);
+}
+
+.actions button {
+  min-width: var(--loxa-component-minimum-interactive-target);
+  min-height: var(--loxa-component-minimum-interactive-target);
+}
+
+@media (max-width: 760px) {
+  .table {
+    min-width: 680px;
+  }
+
+  .headerRow th,
+  .nodeRow td {
+    padding-inline: var(--loxa-space-3);
+  }
+}
+
+@media (prefers-contrast: more) {
+  .table,
+  .headerRow th,
+  .nodeRow td {
+    border-width: 2px;
+  }
+}
+
+@media (forced-colors: active) {
+  .table,
+  .headerRow th,
+  .nodeRow td {
+    border-color: ButtonText;
+    forced-color-adjust: auto;
+  }
+}

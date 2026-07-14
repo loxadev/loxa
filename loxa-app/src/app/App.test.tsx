@@ -91,7 +91,7 @@ describe("App", () => {
     expect(screen.getByRole("link", { name: "Models" })).toHaveAttribute("aria-current", "page");
 
     await user.click(screen.getByRole("link", { name: "Node" }));
-    expect(screen.getByRole("heading", { name: "Node" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Nodes" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Node" })).toHaveAttribute("aria-current", "page");
 
     await user.click(screen.getByRole("link", { name: "Settings" }));
@@ -454,7 +454,7 @@ describe("App", () => {
     }
 
     await user.click(screen.getByRole("link", { name: "Node ready. Active model gemma-ready" }));
-    expect(screen.getByRole("heading", { name: "Node" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Nodes" })).toBeInTheDocument();
   });
 
   it("reports an authenticated unloaded node without implying model readiness", async () => {
@@ -984,7 +984,8 @@ describe("App", () => {
 
     for (const route of ["Models", "Node", "Settings"] as const) {
       await user.click(screen.getByRole("link", { name: route }));
-      expect(frame).toContainElement(screen.getByRole("heading", { name: route }));
+      const heading = route === "Node" ? "Nodes" : route;
+      expect(frame).toContainElement(screen.getByRole("heading", { name: heading }));
     }
   });
 
