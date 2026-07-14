@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 import { NodeScreen, type NodeScreenServices } from "./NodeScreen";
-import { NodeSessionProvider, type BootstrapSnapshot, type NodeSessionServices } from "./NodeSession";
+import { NodeSessionProvider, type BootstrapSnapshot, type NodeSessionServices, useNodeSession } from "./NodeSession";
 
 const endpoint = "http://127.0.0.1:8080";
 const readyStatus = {
@@ -60,6 +60,27 @@ function renderNode(api = services(), onNavigateModels = vi.fn()) {
   };
 }
 
+function activeModelCell() {
+  const row = within(screen.getByRole("table", { name: "Local node inventory" })).getAllByRole("row")[1];
+  return within(row).getAllByRole("cell")[2];
+}
+
+function expectActiveModelUnavailable() {
+  const cell = activeModelCell();
+  expect(cell.firstElementChild).toHaveTextContent("—");
+  expect(cell.firstElementChild?.textContent).toBe("—");
+  expect(cell).not.toHaveTextContent("No model loaded");
+}
+
+function ReconcileControl() {
+  const session = useNodeSession();
+  return (
+    <button type="button" onClick={() => session.invalidateModelTruth()}>
+      Invalidate model truth
+    </button>
+  );
+}
+
 describe("NodeScreen", () => {
   it("presents one truthful local node row without unsupported inventory controls", async () => {
     renderNode();
@@ -105,6 +126,8 @@ describe("NodeScreen", () => {
       }),
     );
     expect(await screen.findByRole("status")).toHaveTextContent("Starting");
+    expectActiveModelUnavailable();
+    expect(screen.queryByRole("button", { name: "Browse verified models" })).not.toBeInTheDocument();
     first.unmount();
 
     renderNode(
@@ -123,6 +146,26 @@ describe("NodeScreen", () => {
     expect(alert).toHaveTextContent("Recovery required after unsafe child exit.");
     expect(alert).toHaveClass("bg-danger-surface");
     expect(alert.querySelector("svg")).toHaveAttribute("aria-hidden", "true");
+    expectActiveModelUnavailable();
+    expect(screen.queryByRole("button", { name: "Browse verified models" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Retry node startup" })).not.toBeInTheDocument();
+  });
+
+  it("fails model truth closed while reconciling", async () => {
+    const api = services();
+    render(
+      <NodeSessionProvider services={api} endpoint={endpoint}>
+        <NodeScreen services={api} />
+        <ReconcileControl />
+      </NodeSessionProvider>,
+    );
+    const user = userEvent.setup();
+    expect(await screen.findByText("Node ready — no model loaded")).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Invalidate model truth" }));
+
+    expect(screen.getByRole("status")).toHaveTextContent("Updating model status");
+    expectActiveModelUnavailable();
+    expect(screen.queryByRole("button", { name: "Browse verified models" })).not.toBeInTheDocument();
   });
 
   it("shows ready only from authoritative status and exposes technical fields", async () => {
@@ -150,6 +193,8 @@ describe("NodeScreen", () => {
     await user.click(screen.getByRole("button", { name: "Stop node" }));
     expect(api.bootstrap.stop).toHaveBeenCalledTimes(1);
     expect(await screen.findByRole("status")).toHaveTextContent("Disconnected");
+    expectActiveModelUnavailable();
+    expect(screen.queryByRole("button", { name: "Browse verified models" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Retry node startup" })).toBeEnabled();
   });
 
@@ -164,6 +209,9 @@ describe("NodeScreen", () => {
     expect(alert).toHaveClass("bg-danger-surface");
     expect(alert.querySelector("svg")).toHaveAttribute("aria-hidden", "true");
     expect(screen.getByText("App-owned node")).toBeInTheDocument();
+    expectActiveModelUnavailable();
+    expect(screen.queryByRole("button", { name: "Browse verified models" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Retry node startup" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Stop node" })).toBeEnabled();
   });
 
@@ -182,13 +230,25 @@ describe("NodeScreen", () => {
   });
 
   it("uses a feature-local canonical responsive and contrast contract", () => {
-    const css = readFileSync(resolve(process.cwd(), "src/node/NodeScreen.module.css"), "utf8");
+    const screenCss = readFileSync(resolve(process.cwd(), "src/node/NodeScreen.module.css"), "utf8");
+    const tableCss = readFileSync(resolve(process.cwd(), "src/node/NodeTable.module.css"), "utf8");
+    const tableSource = readFileSync(resolve(process.cwd(), "src/components/ui/table.tsx"), "utf8");
+    const css = `${screenCss}\n${tableCss}`;
     expect(css).toContain("var(--loxa-component-minimum-interactive-target)");
     expect(css).toContain("@media (max-width:");
     expect(css).toContain("@media (prefers-contrast: more)");
     expect(css).toContain("@media (forced-colors: active)");
     expect(css).toContain("@media (prefers-reduced-motion: reduce)");
     expect(css).not.toMatch(/#[0-9a-f]{3,8}\b/i);
+    expect(tableCss).toContain("overflow-wrap: anywhere");
+    expect(tableCss).toMatch(
+      /\.actions button\s*{[^}]*min-width:\s*var\(--loxa-component-minimum-interactive-target\)/s,
+    );
+    expect(tableCss).toMatch(
+      /\.actions button\s*{[^}]*min-height:\s*var\(--loxa-component-minimum-interactive-target\)/s,
+    );
+    expect(tableCss).toContain("@media (max-width: 760px)");
+    expect(tableSource).toContain("overflow-x-auto");
   });
 
   it("uses only variables defined by the distributed canonical Loxa tokens", () => {
@@ -196,6 +256,7 @@ describe("NodeScreen", () => {
     const definitions = new Set(Array.from(canonical.matchAll(/(--loxa-[a-z0-9-]+)\s*:/gi), ([, name]) => name));
     const modules = [
       "src/node/NodeScreen.module.css",
+      "src/node/NodeTable.module.css",
       "src/models/ModelsScreen.module.css",
       "src/settings/SettingsScreen.module.css",
     ];
