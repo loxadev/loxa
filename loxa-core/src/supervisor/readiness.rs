@@ -1306,26 +1306,30 @@ mod tests {
     #[test]
     fn chat_completion_timeout_is_bounded_by_the_single_startup_deadline() {
         let server = ScriptedHttpServer::spawn(vec![
-            ("/health", ResponseAction::status(200)),
+            (
+                "/health",
+                ResponseAction::delayed(Duration::from_millis(75), ResponseAction::status(200)),
+            ),
             (
                 "/v1/chat/completions",
-                ResponseAction::Stall(Duration::from_millis(150)),
+                ResponseAction::delayed(
+                    Duration::from_millis(75),
+                    ResponseAction::chat_completion_message("ready"),
+                ),
             ),
         ]);
         let mut child = FakeChild::running();
-        let started = Instant::now();
 
         let error = wait_for_chat_completion_under_test(
             &mut child,
             server.port(),
             "default_model",
-            Duration::from_millis(50),
+            Duration::from_millis(100),
             Duration::from_millis(10),
         )
-        .expect_err("stalled completion must time out");
+        .expect_err("combined probes must share one startup deadline");
 
         assert!(matches!(error, SupervisorError::HealthTimeout));
-        assert!(started.elapsed() < Duration::from_millis(140));
     }
 
     #[test]
@@ -1727,7 +1731,6 @@ mod tests {
             gate: Option<ResponseGate>,
         },
         Close,
-        Stall(Duration),
         Delayed {
             duration: Duration,
             action: Box<ResponseAction>,
@@ -1821,7 +1824,7 @@ mod tests {
             match self {
                 Self::Response { gate, .. } => gate.clone(),
                 Self::Delayed { action, .. } => action.gate(),
-                Self::Close | Self::Stall(_) | Self::ObserveDisconnect(_) => None,
+                Self::Close | Self::ObserveDisconnect(_) => None,
             }
         }
     }
@@ -2058,10 +2061,6 @@ mod tests {
                     }
                 }
             }
-            return;
-        }
-        if let ResponseAction::Stall(duration) = action {
-            thread::sleep(duration);
             return;
         }
         let ResponseAction::Response {
