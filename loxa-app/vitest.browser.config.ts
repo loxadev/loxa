@@ -12,6 +12,10 @@ export default defineConfig({
     alias: { "@": fileURLToPath(new URL("./src", import.meta.url)) },
   },
   test: {
+    env: {
+      VITE_LOXA_CSP_PROBE: "1",
+      VITE_LOXA_CSP_PROBE_CASE: "early-blocked-image",
+    },
     include: ["src/**/*.browser.test.{ts,tsx}"],
     setupFiles: ["./src/test/browser.setup.tsx"],
     browser: {

@@ -1,1 +1,40 @@
-/* Canonical platform styles are introduced with their owning components. */
+.csp-probe-panel {
+  position: fixed;
+  z-index: 1000;
+  right: var(--loxa-space-4);
+  bottom: var(--loxa-space-4);
+  width: min(36rem, calc(100vw - 2 * var(--loxa-space-4)));
+  max-height: 40vh;
+  padding: var(--loxa-space-3);
+  overflow: auto;
+  color: var(--loxa-foreground);
+  background: var(--loxa-surface);
+  border: 1px solid var(--loxa-control-border);
+  border-radius: var(--loxa-radius-md);
+}
+
+.csp-probe-heading,
+.csp-probe-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--loxa-space-2);
+}
+
+.csp-probe-heading {
+  justify-content: space-between;
+}
+
+.csp-probe-actions button {
+  min-height: var(--loxa-component-minimum-interactive-target);
+  padding-inline: var(--loxa-space-3);
+  color: inherit;
+  background: var(--loxa-background);
+  border: 1px solid var(--loxa-control-border);
+  border-radius: var(--loxa-radius-sm);
+}
+
+.csp-probe-records {
+  margin-block: var(--loxa-space-3) 0;
+  padding-inline-start: var(--loxa-space-6);
+  overflow-wrap: anywhere;
+}
