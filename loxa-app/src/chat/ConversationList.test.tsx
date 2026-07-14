@@ -356,4 +356,15 @@ describe("ConversationList", () => {
     expect(css).toMatch(/grid-template-columns:\s*minmax\(0, 1fr\)\s+[^;]+/);
     expect(css).toMatch(/\.conversationButton\[aria-current="page"\]::before/);
   });
+
+  it("uses only variables defined by the canonical Loxa token sheet", () => {
+    const css = readFileSync(resolve(process.cwd(), "src/chat/ConversationList.module.css"), "utf8");
+    const canonical = readFileSync(resolve(process.cwd(), "src/styles/loxa.css"), "utf8");
+    const definitions = new Set(Array.from(canonical.matchAll(/(--loxa-[a-z0-9-]+)\s*:/gi), ([, name]) => name));
+    const undefinedReferences = Array.from(css.matchAll(/var\((--loxa-[a-z0-9-]+)/gi), ([, name]) => name).filter(
+      (name) => !definitions.has(name),
+    );
+
+    expect(undefinedReferences).toEqual([]);
+  });
 });

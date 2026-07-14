@@ -138,7 +138,7 @@ function WorkspaceContents({
   );
 }
 
-function GlobalConversationRail({
+export function GlobalConversationRail({
   history,
   interactionLocked,
   onOpenChat,
@@ -163,7 +163,11 @@ function GlobalConversationRail({
         onOpenChat();
       }}
       onSelect={(chatId) => {
-        if (interactionLocked) return;
+        if (interactionLocked) {
+          if (chatId !== history.selectedChatId) return;
+          onOpenChat();
+          return;
+        }
         history.select(chatId);
         onOpenChat();
       }}

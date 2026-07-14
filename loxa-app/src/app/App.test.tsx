@@ -2,7 +2,8 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { App, type AppServices } from "./App";
+import { App, GlobalConversationRail, type AppServices } from "./App";
+import type { ConversationHistoryController } from "../chat/conversationHistory";
 import type { ControlStreamCallbacks, ControlStreamTerminal } from "../control/events";
 import type { BootstrapSnapshot } from "../node/NodeSession";
 import type { NodeStatus } from "../node/contracts";
@@ -324,6 +325,52 @@ describe("App", () => {
     await user.click(screen.getByRole("button", { name: "Open Selected chat" }));
     expect(api.listTurns).toHaveBeenCalledTimes(1);
     expect(api.listChats).toHaveBeenCalledTimes(1);
+  });
+
+  it("reopens the selected active conversation off-route while keeping other selection blocked", async () => {
+    const user = userEvent.setup();
+    const selectedChat = "0123456789abcdef0123456789abcdef";
+    const otherChat = "1123456789abcdef0123456789abcdef";
+    const conversations = [
+      { id: selectedChat, title: "Active response", createdAtMs: 1, updatedAtMs: 3 },
+      { id: otherChat, title: "Other history", createdAtMs: 1, updatedAtMs: 2 },
+    ];
+    const select = vi.fn();
+    const loadMore = vi.fn();
+    const retry = vi.fn();
+    const onOpenChat = vi.fn();
+    const history: ConversationHistoryController = {
+      conversations,
+      groupedConversations: [{ label: "Older", conversations }],
+      selectedChatId: selectedChat,
+      selection: { chatId: selectedChat, revision: 1 },
+      state: "ready",
+      errorMessage: "",
+      query: "",
+      hasMore: false,
+      setQuery: vi.fn(),
+      select,
+      create: vi.fn(),
+      rename: vi.fn(),
+      delete: vi.fn(),
+      loadMore,
+      retry,
+      adoptCreatedChat: vi.fn(),
+      reconcileSummary: vi.fn(),
+      clearAfterSettingsDelete: vi.fn(),
+    };
+
+    render(<GlobalConversationRail history={history} interactionLocked onOpenChat={onOpenChat} />);
+
+    await user.click(screen.getByRole("button", { name: "Open Other history" }));
+    expect(onOpenChat).not.toHaveBeenCalled();
+    expect(select).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "Open Active response" }));
+    expect(onOpenChat).toHaveBeenCalledOnce();
+    expect(select).not.toHaveBeenCalled();
+    expect(loadMore).not.toHaveBeenCalled();
+    expect(retry).not.toHaveBeenCalled();
   });
 
   it("navigates only after New chat succeeds and preserves the current route after failure", async () => {
