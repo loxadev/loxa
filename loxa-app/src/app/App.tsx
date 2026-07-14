@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type CSSProperties, type KeyboardEvent, type ReactNode } from "react";
 
-import mark from "../assets/brand/loxa-mark.svg";
+import mark from "../assets/brand/loxa-mark.svg?no-inline";
 import { ChatScreen, type ChatScreenServices } from "../chat/ChatScreen";
 import { ModelsScreen, type ModelsScreenServices } from "../models/ModelsScreen";
 import { NodeScreen, type NodeScreenServices } from "../node/NodeScreen";
