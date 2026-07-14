@@ -913,9 +913,14 @@ export function ChatScreen({
     <section className={styles.screen} aria-labelledby="chat-heading">
       <header className={styles.header}>
         <h1 id="chat-heading">Chat</h1>
-        <p className={styles.liveStatus} role="status" aria-live="polite" aria-atomic="true">
-          {statusLabel}
-        </p>
+        <div className={styles.headerStatus}>
+          <p className={styles.liveStatus} role="status" aria-live="polite" aria-atomic="true">
+            {statusLabel}
+          </p>
+          <p className={styles.activeModelStatus}>
+            {activeModel === null ? "No active model" : `Active model: ${activeModel}`}
+          </p>
+        </div>
       </header>
 
       <div className={styles.chatMain}>

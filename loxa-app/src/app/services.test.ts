@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { appServices, DESKTOP_RUNTIME_UNAVAILABLE_MESSAGE } from "./services";
+import { appServices, DESKTOP_RUNTIME_UNAVAILABLE_MESSAGE, desktopRuntimeUnavailableMessage } from "./services";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
@@ -31,6 +31,11 @@ describe("desktop app services in browser preview", () => {
     for (const call of calls) {
       await expect(call()).rejects.toEqual(new Error(expectedMessage));
     }
+  });
+
+  it("selects truthful missing-runtime copy for development and production", () => {
+    expect(desktopRuntimeUnavailableMessage(true)).toBe("Desktop runtime is unavailable in browser preview.");
+    expect(desktopRuntimeUnavailableMessage(false)).toBe("Desktop runtime is unavailable.");
   });
 
   it("forwards exact commands and arguments when the Tauri runtime is available", async () => {

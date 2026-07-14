@@ -91,6 +91,7 @@ a {
 .sidebar-footer {
   display: grid;
   gap: var(--loxa-space-1);
+  margin-top: auto;
 }
 
 .conversation-rail-slot {

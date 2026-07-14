@@ -22,7 +22,19 @@
   line-height: var(--loxa-type-h2-line-height);
 }
 
-.liveStatus {
+.headerStatus {
+  flex: 1 1 0;
+  min-width: 0;
+  max-width: 100%;
+  display: grid;
+  justify-items: end;
+  overflow: hidden;
+  text-align: right;
+}
+
+.liveStatus,
+.activeModelStatus {
+  width: 100%;
   min-width: 0;
   margin: 0;
   color: var(--loxa-muted-foreground);

@@ -29,7 +29,11 @@ import type { BootstrapSnapshot, StartNodeRequest } from "../node/NodeSession";
 import type { AppServices } from "./App";
 
 export const DEFAULT_ENDPOINT = "http://127.0.0.1:8080";
-export const DESKTOP_RUNTIME_UNAVAILABLE_MESSAGE = "Desktop runtime is unavailable in browser preview.";
+export function desktopRuntimeUnavailableMessage(development: boolean) {
+  return development ? "Desktop runtime is unavailable in browser preview." : "Desktop runtime is unavailable.";
+}
+
+export const DESKTOP_RUNTIME_UNAVAILABLE_MESSAGE = desktopRuntimeUnavailableMessage(import.meta.env.DEV);
 
 function invokeDesktop<T>(command: string, args?: Record<string, unknown>) {
   if (!("__TAURI_INTERNALS__" in window)) {

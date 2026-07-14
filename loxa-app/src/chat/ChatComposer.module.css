@@ -48,9 +48,7 @@
   outline: none;
 }
 
-.supportReason,
-.attachmentReason,
-.modelHelp {
+.supportReason {
   margin: 0;
   color: var(--loxa-muted-foreground);
   font-size: var(--loxa-type-body-small-size);
@@ -80,6 +78,35 @@
 .attachmentButton,
 .primaryControl {
   flex: 0 0 auto;
+}
+
+.attachmentControl {
+  position: relative;
+  display: inline-flex;
+  flex: 0 0 auto;
+}
+
+.attachmentTooltip {
+  position: absolute;
+  z-index: 3;
+  bottom: calc(100% + var(--loxa-space-2));
+  left: 0;
+  width: max-content;
+  max-width: min(280px, 70vw);
+  padding: var(--loxa-space-2) var(--loxa-space-3);
+  color: var(--loxa-foreground);
+  visibility: hidden;
+  pointer-events: none;
+  background: var(--loxa-background);
+  border: 1px solid var(--loxa-control-border);
+  border-radius: var(--loxa-radius-md);
+  opacity: 0;
+}
+
+.attachmentControl:hover .attachmentTooltip,
+.attachmentControl:focus-within .attachmentTooltip {
+  visibility: visible;
+  opacity: 1;
 }
 
 .modelControl {
@@ -119,11 +146,6 @@
 .modelPicker:focus-visible {
   outline: 2px solid var(--loxa-focus);
   outline-offset: 2px;
-}
-
-.modelHelp {
-  grid-column: 1 / -1;
-  min-width: 0;
 }
 
 @media (max-width: 760px) {

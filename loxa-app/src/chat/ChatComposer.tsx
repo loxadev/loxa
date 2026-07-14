@@ -88,22 +88,29 @@ export function ChatComposer({
 
       <div className={styles.composerFooter}>
         <div className={styles.composerTools}>
-          <IconButton
-            className={styles.attachmentButton}
-            variant="quiet"
-            label="Attach document"
-            helpId="attachment-support-reason"
-            disabled
-          >
-            <Paperclip />
-          </IconButton>
+          <span className={styles.attachmentControl}>
+            <IconButton
+              className={styles.attachmentButton}
+              variant="quiet"
+              label="Attach document"
+              helpId={attachmentReason ? "attachment-support-reason" : undefined}
+              aria-disabled="true"
+              onClick={(event) => event.preventDefault()}
+            >
+              <Paperclip />
+            </IconButton>
+            {attachmentReason && (
+              <span id="attachment-support-reason" className={styles.attachmentTooltip} role="tooltip">
+                {attachmentReason}
+              </span>
+            )}
+          </span>
           <div className={styles.modelControl}>
             <label htmlFor="active-chat-model">Choose model</label>
             <select
               id="active-chat-model"
               className={styles.modelPicker}
               value={selectedModel}
-              aria-describedby="model-control-help"
               disabled={switchingDisabled}
               onChange={(event) => onSelectedModel(event.target.value)}
             >
@@ -125,9 +132,6 @@ export function ChatComposer({
                 {modelOperation === "switching" ? "Loading…" : activeModel === null ? "Load" : "Switch"}
               </Button>
             )}
-            <span id="model-control-help" className={styles.modelHelp}>
-              Active: <span className="technical-value">{activeModel ?? "None"}</span>
-            </span>
           </div>
         </div>
 
@@ -152,9 +156,6 @@ export function ChatComposer({
           </Button>
         )}
       </div>
-      <p id="attachment-support-reason" className={styles.attachmentReason}>
-        {attachmentReason}
-      </p>
     </form>
   );
 }
