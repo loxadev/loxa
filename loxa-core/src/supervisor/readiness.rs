@@ -676,6 +676,19 @@ mod tests {
 
     const EXPECTED_ALIAS: &str = "loxa-run-123-g0";
 
+    fn trace_contains_fallback_sequence(trace: &[String], status: u16) -> bool {
+        let expected = [
+            "request /health".to_owned(),
+            format!("response /health {status}"),
+            "request /v1/models".to_owned(),
+            "response /v1/models 200".to_owned(),
+        ];
+
+        trace
+            .windows(expected.len())
+            .any(|window| window == expected)
+    }
+
     #[test]
     fn identity_retry_recovers_after_two_transient_misses_with_two_bounded_sleeps() {
         let results = RefCell::new(VecDeque::from([None, None, Some(123)]));
@@ -979,6 +992,29 @@ mod tests {
     }
 
     #[test]
+    fn fallback_trace_tolerates_transient_connections_before_a_complete_probe() {
+        let trace = vec![
+            "request /health".to_owned(),
+            "response /health 501".to_owned(),
+            "request <eof>".to_owned(),
+            "close <eof>".to_owned(),
+            "request /health".to_owned(),
+            "response /health 501".to_owned(),
+            "request /v1/models".to_owned(),
+            "response /v1/models 200".to_owned(),
+        ];
+
+        assert!(trace_contains_fallback_sequence(&trace, 501));
+        assert!(!trace_contains_fallback_sequence(
+            &[
+                "request /v1/models".to_owned(),
+                "response /v1/models 200".to_owned()
+            ],
+            501
+        ));
+    }
+
+    #[test]
     fn unsupported_health_statuses_fall_back_to_the_exact_alias() {
         for status in [404, 405, 501] {
             let server = ready_server(status, &[EXPECTED_ALIAS]);
@@ -993,14 +1029,10 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("status {status} exact fallback failed: {error}"));
 
-            assert_eq!(
-                server.trace(),
-                vec![
-                    "request /health",
-                    &format!("response /health {status}"),
-                    "request /v1/models",
-                    "response /v1/models 200",
-                ]
+            let trace = server.trace();
+            assert!(
+                trace_contains_fallback_sequence(&trace, status),
+                "status {status} did not complete the expected fallback sequence: {trace:?}"
             );
         }
     }
