@@ -45,7 +45,7 @@
 }
 
 .searchField input {
-  padding-inline-start: calc(var(--loxa-space-3) + var(--loxa-space-5));
+  padding-inline-start: var(--loxa-space-8);
 }
 
 .scrollRegion {
