@@ -104,7 +104,7 @@ export function SettingsOverview({
         </div>
       </fieldset>
       <p className={styles.disclosure}>
-        Theme is the only preference saved on this Mac. Node and model state are not stored here.
+        Theme and sidebar display preferences are saved on this Mac. Backend, node, and model state are not stored here.
       </p>
 
       <section className={styles.group} aria-labelledby="chat-history-heading">

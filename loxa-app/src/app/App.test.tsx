@@ -393,11 +393,18 @@ describe("App", () => {
 
     render(<GlobalConversationRail history={history} interactionLocked onOpenChat={onOpenChat} />);
 
-    await user.click(screen.getByRole("button", { name: "Open Other history" }));
+    const blockedConversation = screen.getByRole("button", { name: "Open Other history" });
+    expect(blockedConversation).toBeDisabled();
+    expect(blockedConversation).toHaveAccessibleDescription("Unavailable while a response is active.");
+    blockedConversation.focus();
+    await user.keyboard("{Enter}");
     expect(onOpenChat).not.toHaveBeenCalled();
     expect(select).not.toHaveBeenCalled();
 
-    await user.click(screen.getByRole("button", { name: "Open Active response" }));
+    const selectedConversation = screen.getByRole("button", { name: "Open Active response" });
+    expect(selectedConversation).toBeEnabled();
+    selectedConversation.focus();
+    await user.keyboard("{Enter}");
     expect(onOpenChat).toHaveBeenCalledOnce();
     expect(select).not.toHaveBeenCalled();
     expect(loadMore).not.toHaveBeenCalled();

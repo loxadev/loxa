@@ -46,6 +46,13 @@ describe("SettingsScreen", () => {
     expect(screen.getByRole("status")).toHaveTextContent("Theme set to Light");
   });
 
+  it("describes the complete persisted display-preference boundary", () => {
+    render(<SettingsScreen theme="light" onThemeChange={vi.fn()} runtime={runtime} />);
+
+    expect(screen.getByText(/theme and sidebar display preferences are saved on this Mac/i)).toBeVisible();
+    expect(screen.getByText(/backend, node, and model state are not stored here/i)).toBeVisible();
+  });
+
   it("tabs to the selected choice and moves selection with arrow keys", async () => {
     const user = userEvent.setup();
     function Harness() {

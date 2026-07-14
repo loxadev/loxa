@@ -105,6 +105,17 @@ describe("ConversationList", () => {
     expect(onSelect).toHaveBeenCalledWith(conversations[1].id);
   });
 
+  it("disables only non-selected conversation rows while a response is active", () => {
+    render(<ConversationList {...baseProps} mutationsDisabled />);
+
+    const selected = screen.getByRole("button", { name: "Open Node health" });
+    const blocked = screen.getByRole("button", { name: "Open Download model" });
+    expect(selected).toBeEnabled();
+    expect(selected).not.toHaveAttribute("aria-describedby");
+    expect(blocked).toBeDisabled();
+    expect(blocked).toHaveAccessibleDescription("Unavailable while a response is active.");
+  });
+
   it("provides loading, empty, error, and paginated states without color-only meaning", async () => {
     const user = userEvent.setup();
     const onLoadMore = vi.fn();
@@ -173,7 +184,8 @@ describe("ConversationList", () => {
       expect(control).toHaveAttribute("aria-describedby", reason.id);
       await user.click(control);
     }
-    expect(screen.getByRole("button", { name: "Open Download model" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Open Download model" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Open Download model" })).toHaveAttribute("aria-describedby", reason.id);
     expect(onCreate).not.toHaveBeenCalled();
     expect(onRename).not.toHaveBeenCalled();
     expect(onDelete).not.toHaveBeenCalled();

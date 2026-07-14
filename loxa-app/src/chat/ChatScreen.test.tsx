@@ -693,6 +693,52 @@ describe("ChatScreen", () => {
     expect(lock).toHaveBeenLastCalledWith(false);
   });
 
+  it("terminalizes an active response before node reconciliation disposes its stream", async () => {
+    const user = userEvent.setup();
+    const setup = services();
+    const lock = vi.fn();
+    const ready: ChatNodeAvailability = { phase: "ready", proven: true, error: null };
+    const view = render(
+      <ChatScreen
+        services={setup.api}
+        endpoint="http://127.0.0.1:8080"
+        nodeAvailability={ready}
+        onInteractionLockChange={lock}
+      />,
+    );
+    const message = await screen.findByLabelText("Message");
+    await user.type(message, "Preserve this turn");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    act(() => setup.callbacks()?.onDelta("Partial output"));
+    await waitFor(() => expect(lock).toHaveBeenLastCalledWith(true));
+
+    view.rerender(
+      <ChatScreen
+        services={setup.api}
+        endpoint="http://127.0.0.1:8080"
+        nodeAvailability={{ phase: "reconciling", proven: true, error: null }}
+        onInteractionLockChange={lock}
+      />,
+    );
+
+    expect(await screen.findByText("Partial output")).toBeVisible();
+    expect(screen.getByText("Turn cancelled")).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Stop response" })).not.toBeInTheDocument();
+    expect(setup.handle.dispose).toHaveBeenCalledOnce();
+    await waitFor(() => expect(lock).toHaveBeenLastCalledWith(false));
+
+    view.rerender(
+      <ChatScreen
+        services={setup.api}
+        endpoint="http://127.0.0.1:8080"
+        nodeAvailability={ready}
+        onInteractionLockChange={lock}
+      />,
+    );
+    await waitFor(() => expect(message).toBeEnabled());
+    await waitFor(() => expect(message).toHaveFocus());
+  });
+
   it("defines a canonical responsive and accessible Chat module contract", () => {
     const paths = ["ChatScreen.module.css", "ChatComposer.module.css", "ChatTranscript.module.css"].map((name) =>
       resolve(process.cwd(), `src/chat/${name}`),

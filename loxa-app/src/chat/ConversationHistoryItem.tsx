@@ -149,9 +149,10 @@ export function ConversationHistoryItem({
             type="button"
             aria-current={selected ? "page" : undefined}
             aria-label={`Open ${conversation.title}`}
+            aria-describedby={mutationsDisabled && !selected ? mutationDisabledReasonId : undefined}
             title={conversation.title}
             onClick={() => onOpen(conversation.id)}
-            disabled={mode === "delete"}
+            disabled={mode === "delete" || (mutationsDisabled && !selected)}
           >
             <span className={styles.title}>{conversation.title}</span>
             <span className={styles.meta}>
