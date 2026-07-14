@@ -46,7 +46,8 @@ describe("bundle digest", () => {
       bundleDigest: "a".repeat(64),
     });
     expect(formatPackageRecord(record)).toBe(JSON.stringify(record));
-    expect(() => createPackageRecord("Loxa.app", "target", "profile", "bad-hash")).toThrow(/profile|digest/);
+    expect(() => createPackageRecord("Loxa.app", "target", "profile", "a".repeat(64))).toThrow(/profile/);
+    expect(() => createPackageRecord("Loxa.app", "target", "debug", "bad-hash")).toThrow(/digest/);
   });
 
   it("rejects record-delimiter characters in paths", async () => {

@@ -1,11 +1,15 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { CspProbePanel } from "./CspProbePanel";
 import { cspProbeStore } from "./cspProbeStore";
 
 describe("CSP probe panel", () => {
   beforeEach(() => cspProbeStore.reset());
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
 
   it("renders live sanitized details and resets them", () => {
     render(<CspProbePanel />);
@@ -26,11 +30,16 @@ describe("CSP probe panel", () => {
   });
 
   it("exports the snapshot with a fixed filename through a short-lived object URL", async () => {
+    vi.useFakeTimers();
     const objectUrl = vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:csp-export");
     const revoke = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => undefined);
+    const append = vi.spyOn(document.body, "append");
+    const remove = vi.spyOn(HTMLAnchorElement.prototype, "remove");
     let download = "";
     let href = "";
+    let clickedWhileAttached = false;
     const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (this: HTMLAnchorElement) {
+      clickedWhileAttached = document.body.contains(this);
       download = this.download;
       href = this.href;
     });
@@ -42,15 +51,22 @@ describe("CSP probe panel", () => {
     const blob = objectUrl.mock.calls[0]?.[0];
     expect(blob).toBeInstanceOf(Blob);
     if (!(blob instanceof Blob)) throw new Error("expected a JSON Blob");
+    expect(download).toBe("loxa-csp-probe.json");
+    expect(href).toBe("blob:csp-export");
+    expect(clickedWhileAttached).toBe(true);
+    expect(append).toHaveBeenCalledOnce();
+    expect(remove).toHaveBeenCalledOnce();
+    expect(click).toHaveBeenCalledOnce();
+    expect(document.querySelector('a[download="loxa-csp-probe.json"]')).toBeNull();
+    expect(revoke).not.toHaveBeenCalled();
+    await vi.runAllTimersAsync();
+    expect(revoke).toHaveBeenCalledWith("blob:csp-export");
+    vi.useRealTimers();
     const contents = await new Promise<string>((resolve) => {
       const reader = new FileReader();
       reader.addEventListener("load", () => resolve(String(reader.result)));
       reader.readAsText(blob);
     });
     expect(contents).toBe("[]");
-    expect(download).toBe("loxa-csp-probe.json");
-    expect(href).toBe("blob:csp-export");
-    expect(click).toHaveBeenCalledOnce();
-    expect(revoke).toHaveBeenCalledWith("blob:csp-export");
   });
 });
