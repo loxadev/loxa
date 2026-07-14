@@ -11,8 +11,11 @@ describe("theme prepaint entrypoint", () => {
     expect(entry).toContain('import { prepaintTheme } from "./themeRuntime"');
     expect(entry).toContain("prepaintTheme();");
 
+    const probe = html.indexOf('src="/src/app/cspProbeBootstrap.ts"');
     const prepaint = html.indexOf('src="/src/settings/prepaint.ts"');
     const react = html.indexOf('src="/src/main.tsx"');
+    expect(probe).toBeGreaterThan(-1);
+    expect(prepaint).toBeGreaterThan(probe);
     expect(prepaint).toBeGreaterThan(-1);
     expect(react).toBeGreaterThan(prepaint);
   });
