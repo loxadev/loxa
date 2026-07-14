@@ -94,6 +94,47 @@
   margin: 0;
 }
 
+.navigationRow {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--loxa-space-3);
+  width: 100%;
+  min-height: var(--loxa-component-minimum-interactive-target);
+  padding: var(--loxa-space-4);
+  color: var(--loxa-foreground);
+  text-align: left;
+  background: var(--loxa-background);
+  border: 1px solid var(--loxa-control-border);
+  border-radius: var(--loxa-radius-md);
+  cursor: pointer;
+}
+
+.navigationRow span {
+  display: grid;
+  gap: var(--loxa-space-1);
+}
+
+.navigationRow small {
+  color: var(--loxa-muted-foreground);
+  font-size: var(--loxa-type-body-small-size);
+  line-height: var(--loxa-type-body-small-line-height);
+}
+
+.navigationRow svg,
+.backButton svg {
+  width: 20px;
+  height: 20px;
+}
+
+.backButton {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--loxa-space-2);
+  min-height: var(--loxa-component-minimum-interactive-target);
+  margin-bottom: var(--loxa-space-4);
+}
+
 .facts {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -135,6 +176,7 @@
 
 @media (prefers-contrast: more) {
   .themeOption,
+  .navigationRow,
   .facts,
   .fact {
     border-width: 2px;
@@ -143,6 +185,7 @@
 
 @media (forced-colors: active) {
   .themeOption,
+  .navigationRow,
   .facts,
   .fact {
     border-color: ButtonText;

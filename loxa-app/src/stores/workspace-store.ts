@@ -11,6 +11,7 @@ export const WORKSPACE_STORAGE_KEY = "loxa-workspace";
 export const WORKSPACE_STORAGE_VERSION = 1;
 
 export type WorkspaceRoute = "chat" | "models" | "node" | "settings";
+export type SettingsPage = "overview" | "runtime";
 
 type WorkspacePreferences = {
   sidebarCollapsed: boolean;
@@ -19,7 +20,9 @@ type WorkspacePreferences = {
 
 export type WorkspaceState = WorkspacePreferences & {
   activeRoute: WorkspaceRoute;
+  activeSettingsPage: SettingsPage;
   setActiveRoute: (route: WorkspaceRoute) => void;
+  setActiveSettingsPage: (page: SettingsPage) => void;
   setSidebarCollapsed: (collapsed: boolean) => void;
   toggleSidebar: () => void;
   setExpandedSidebarWidth: (width: number) => void;
@@ -103,8 +106,10 @@ export const createWorkspaceStore = (storage: StateStorage = resolveStorage()) =
     persist(
       (set) => ({
         activeRoute: "chat",
+        activeSettingsPage: "overview",
         ...DEFAULT_PREFERENCES,
         setActiveRoute: (activeRoute) => set({ activeRoute }),
+        setActiveSettingsPage: (activeSettingsPage) => set({ activeSettingsPage }),
         setSidebarCollapsed: (sidebarCollapsed) => set({ sidebarCollapsed }),
         toggleSidebar: () => set((state) => ({ sidebarCollapsed: !state.sidebarCollapsed })),
         setExpandedSidebarWidth: (expandedSidebarWidth) =>
@@ -135,12 +140,14 @@ export const createWorkspaceStore = (storage: StateStorage = resolveStorage()) =
 export const useWorkspaceStore = createWorkspaceStore();
 
 export const selectActiveRoute = (state: WorkspaceState) => state.activeRoute;
+export const selectActiveSettingsPage = (state: WorkspaceState) => state.activeSettingsPage;
 export const selectSidebarCollapsed = (state: WorkspaceState) => state.sidebarCollapsed;
 export const selectExpandedSidebarWidth = (state: WorkspaceState) => state.expandedSidebarWidth;
 export const selectEffectiveSidebarWidth = (state: WorkspaceState) =>
   state.sidebarCollapsed ? COLLAPSED_SIDEBAR_WIDTH : state.expandedSidebarWidth;
 
 export const selectSetActiveRoute = (state: WorkspaceState) => state.setActiveRoute;
+export const selectSetActiveSettingsPage = (state: WorkspaceState) => state.setActiveSettingsPage;
 export const selectSetSidebarCollapsed = (state: WorkspaceState) => state.setSidebarCollapsed;
 export const selectToggleSidebar = (state: WorkspaceState) => state.toggleSidebar;
 export const selectSetExpandedSidebarWidth = (state: WorkspaceState) => state.setExpandedSidebarWidth;

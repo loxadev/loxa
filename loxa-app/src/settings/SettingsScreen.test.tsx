@@ -1,11 +1,12 @@
 import { act, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 import { SettingsScreen } from "./SettingsScreen";
+import { useWorkspaceStore } from "../stores/workspace-store";
 
 const runtime = {
   phase: "ready" as const,
@@ -22,6 +23,10 @@ const runtime = {
 };
 
 describe("SettingsScreen", () => {
+  beforeEach(() => {
+    useWorkspaceStore.setState({ activeSettingsPage: "overview" });
+  });
+
   it("exposes Light, Dark, and System as an accessible keyboard-operated choice", async () => {
     const user = userEvent.setup();
     const onChange = vi.fn();
@@ -62,12 +67,21 @@ describe("SettingsScreen", () => {
     expect(screen.getByRole("status")).toHaveTextContent("Theme set to Dark");
   });
 
-  it("organizes appearance and read-only local runtime facts without unsupported controls", () => {
+  it("shows a keyboard-accessible Runtime row on the overview and hides runtime facts", async () => {
+    const user = userEvent.setup();
     render(<SettingsScreen theme="system" onThemeChange={vi.fn()} runtime={runtime} />);
 
-    const appearance = screen.getByRole("radiogroup", { name: "Appearance" });
-    const local = screen.getByRole("region", { name: "Local node/runtime" });
-    expect(appearance.compareDocumentPosition(local) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    const runtimeRow = screen.getByRole("button", { name: /Runtime/ });
+    expect(runtimeRow).toHaveTextContent("Read-only local node and runtime details");
+    expect(screen.queryByRole("region", { name: "Local node/runtime" })).not.toBeInTheDocument();
+    expect(screen.queryByText(runtime.endpoint)).not.toBeInTheDocument();
+
+    runtimeRow.focus();
+    await user.keyboard("{Enter}");
+
+    const heading = screen.getByRole("heading", { name: "Runtime", level: 1 });
+    expect(heading).toHaveFocus();
+    expect(screen.getByRole("region", { name: "Local node/runtime" })).toBeVisible();
     for (const value of [
       runtime.endpoint,
       "Externally attached",
@@ -78,15 +92,19 @@ describe("SettingsScreen", () => {
     ]) {
       expect(screen.getByText(value)).toBeInTheDocument();
     }
-    expect(
-      screen.getByText("Theme is the only preference saved on this Mac. Node and model state are not stored here."),
-    ).toBeVisible();
     expect(screen.getByText("llama.cpp")).toHaveClass("technical-value");
+    const local = screen.getByRole("region", { name: "Local node/runtime" });
     expect(local.querySelectorAll("input, button, select, textarea")).toHaveLength(0);
     expect(screen.queryByText(/start on login|provider|sampling|authentication|LAN|logs/i)).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Back to Settings" }));
+    expect(screen.getByRole("heading", { name: "Settings", level: 1 })).toHaveFocus();
+    expect(screen.getByRole("button", { name: /Runtime/ })).toBeVisible();
+    expect(screen.queryByText(runtime.endpoint)).not.toBeInTheDocument();
   });
 
   it("renders unavailable runtime facts truthfully", () => {
+    useWorkspaceStore.setState({ activeSettingsPage: "runtime" });
     render(
       <SettingsScreen
         theme="system"

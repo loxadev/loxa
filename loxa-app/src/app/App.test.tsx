@@ -62,7 +62,12 @@ function services(): AppServices {
 describe("App", () => {
   beforeEach(() => {
     window.localStorage.clear();
-    useWorkspaceStore.setState({ activeRoute: "chat", sidebarCollapsed: false, expandedSidebarWidth: 280 });
+    useWorkspaceStore.setState({
+      activeRoute: "chat",
+      activeSettingsPage: "overview",
+      sidebarCollapsed: false,
+      expandedSidebarWidth: 280,
+    });
   });
 
   it("opens on Chat and keeps the primary navigation in product order", async () => {
@@ -1107,7 +1112,7 @@ describe("App", () => {
     await waitFor(() => expect(api.readControlToken).toHaveBeenCalled());
   });
 
-  it("passes read-only shared session facts to Settings without another bootstrap", async () => {
+  it("keeps nested Settings navigation on the shared session and resets it from the sidebar", async () => {
     useWorkspaceStore.setState({ activeRoute: "node" });
     const api = services();
     api.getStatus = vi.fn().mockResolvedValue({
@@ -1122,9 +1127,20 @@ describe("App", () => {
     render(<App services={api} />);
     await screen.findByRole("link", { name: "Node ready. Active model gemma-ready" });
     await user.click(screen.getByRole("link", { name: "Settings" }));
+    expect(screen.getByRole("heading", { name: "Settings", level: 1 })).toBeVisible();
+    expect(screen.queryByText("loxa-node-77")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /Runtime/ }));
+    expect(screen.getByRole("heading", { name: "Runtime", level: 1 })).toHaveFocus();
     expect(screen.getByRole("region", { name: "Local node/runtime" })).toHaveTextContent("loxa-node-77");
     expect(screen.getByText("gemma-ready")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("link", { name: "Node" }));
+    await user.click(screen.getByRole("link", { name: "Settings" }));
+    expect(screen.getByRole("heading", { name: "Settings", level: 1 })).toBeVisible();
+    expect(screen.getByRole("button", { name: /Runtime/ })).toBeVisible();
+    expect(screen.queryByText("loxa-node-77")).not.toBeInTheDocument();
     expect(api.bootstrap.start).toHaveBeenCalledTimes(1);
     await waitFor(() => expect(api.readControlToken).toHaveBeenCalledTimes(1));
+    expect(api.createControlEventStream).toHaveBeenCalledTimes(1);
   });
 });
