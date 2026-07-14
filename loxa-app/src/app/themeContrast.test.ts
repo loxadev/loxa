@@ -17,6 +17,9 @@ const normalTextPairs: Pair[] = [
   ["foreground", "surface-subtle"],
   ["muted-foreground", "background"],
   ["muted-foreground", "surface"],
+  ["muted-foreground", "surface-subtle"],
+  ["selected-foreground", "selected-surface"],
+  ["accent-foreground", "accent"],
   ["primary-foreground", "primary"],
   ["danger-foreground", "danger"],
   ["info-foreground", "info-surface"],
@@ -39,6 +42,16 @@ const nonTextPairs: Pair[] = [
 ];
 
 describe("theme contrast", () => {
+  it("explicitly covers every active semantic text pair", () => {
+    for (const pair of [
+      ["muted-foreground", "surface-subtle"],
+      ["selected-foreground", "selected-surface"],
+      ["accent-foreground", "accent"],
+    ] satisfies Pair[]) {
+      expect(normalTextPairs).toContainEqual(pair);
+    }
+  });
+
   for (const scheme of ["light", "dark"] satisfies Scheme[]) {
     it(`${scheme} normal-text pairs meet 4.5:1`, () => {
       assertContrast(scheme, normalTextPairs, 4.5);
