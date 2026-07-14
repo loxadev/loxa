@@ -14,7 +14,11 @@ async function settleRenderedTheme() {
   await Promise.all(animations.map((animation) => animation.finished.catch(() => undefined)));
 }
 
-test("keeps the shell equivalent while exposing the semantic attribute theme", async () => {
+function remoteCssUrls(css: string) {
+  return [...css.matchAll(/url\(\s*(["']?)((?:https?:)?\/\/[^"')\s]+)\1\s*\)/gi)].map((match) => match[2]);
+}
+
+test("keeps the shell within the measured pixel delta while exposing the semantic attribute theme", async () => {
   await page.viewport(800, 600);
   const { host } = mountBrowser(
     <>
@@ -35,6 +39,14 @@ test("keeps the shell equivalent while exposing the semantic attribute theme", a
     .map((rule) => rule.cssText)
     .join("\n");
   expect(loadedCss).toContain(".bg-background");
+  expect(remoteCssUrls(loadedCss)).toEqual([]);
+  expect(
+    remoteCssUrls(`
+      .one { background-image: url("http://example.invalid/one.png"); }
+      .two { background-image: url('https://example.invalid/two.png'); }
+      .three { background-image: url(//example.invalid/three.png); }
+    `),
+  ).toEqual(["http://example.invalid/one.png", "https://example.invalid/two.png", "//example.invalid/three.png"]);
 
   for (const mode of ["light", "dark"] satisfies ThemeMode[]) {
     writeThemePreference(window.localStorage, mode);
@@ -49,7 +61,7 @@ test("keeps the shell equivalent while exposing the semantic attribute theme", a
     );
     await expect(document.body).toMatchScreenshot(`baseline-shell-${mode}-800x600`, {
       comparatorName: "pixelmatch",
-      comparatorOptions: { allowedMismatchedPixelRatio: 0.005, includeAA: false, threshold: 0.2 },
+      comparatorOptions: { allowedMismatchedPixels: 24, includeAA: false, threshold: 0.2 },
       screenshotOptions: { animations: "disabled", caret: "hide", scale: "css" },
     });
   }

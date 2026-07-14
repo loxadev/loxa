@@ -19,6 +19,7 @@ describe("canonical theme foundation", () => {
   const themeCss = readOrEmpty(resolve(root, "src/styles/theme.css"));
   const fontsCss = readOrEmpty(resolve(root, "src/styles/fonts.css"));
   const viteSource = readOrEmpty(resolve(root, "vite.config.ts"));
+  const browserViteSource = readOrEmpty(resolve(root, "vitest.browser.config.ts"));
 
   it("loads Tailwind theme and utilities without Preflight", () => {
     expect(indexCss).toContain('@import "tailwindcss/theme.css" layer(theme)');
@@ -34,7 +35,12 @@ describe("canonical theme foundation", () => {
   });
 
   it("configures Vite and both TypeScript projects with the source alias", () => {
-    expect(viteSource).toContain("tailwindcss()");
+    for (const [configPath, source] of [
+      ["vite.config.ts", viteSource],
+      ["vitest.browser.config.ts", browserViteSource],
+    ]) {
+      expect(source, configPath).toMatch(/plugins:\s*\[react\(\),\s*tailwindcss\(\)\]/);
+    }
     for (const configPath of ["tsconfig.json", "tsconfig.node.json"]) {
       const config = readJson(resolve(root, configPath));
       expect(config.compilerOptions?.baseUrl, configPath).toBe(".");
