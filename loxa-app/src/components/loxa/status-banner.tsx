@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { Alert, AlertDescription, AlertTitle } from "../ui/alert";
+import { hasRenderableContent } from "./renderable";
 import type { StatusBadgeProps } from "./status-badge";
 
 type StatusBannerProps = Omit<StatusBadgeProps, "children"> & {
@@ -12,7 +13,7 @@ function StatusBanner({ children, role = "status", title, tone }: StatusBannerPr
   return (
     <Alert data-slot="status-banner" role={role} variant={tone}>
       <AlertTitle>{title}</AlertTitle>
-      {children !== undefined && children !== null ? <AlertDescription>{children}</AlertDescription> : null}
+      {hasRenderableContent(children) ? <AlertDescription>{children}</AlertDescription> : null}
     </Alert>
   );
 }

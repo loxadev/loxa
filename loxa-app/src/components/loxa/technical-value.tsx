@@ -7,7 +7,7 @@ function TechnicalValue({ className, ...props }: TechnicalValueProps) {
   return (
     <code
       data-slot="technical-value"
-      className={cn("text-foreground font-mono text-sm break-all", className)}
+      className={cn("text-foreground block max-w-full font-mono text-sm break-all whitespace-normal", className)}
       {...props}
     />
   );

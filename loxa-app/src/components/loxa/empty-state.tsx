@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { hasRenderableContent } from "./renderable";
 
 type EmptyStateProps = { title: string; description: string; action?: ReactNode };
 
@@ -12,7 +13,7 @@ function EmptyState({ action, description, title }: EmptyStateProps) {
         <h2 className="text-foreground text-lg font-semibold">{title}</h2>
         <p className="text-muted-foreground text-sm">{description}</p>
       </div>
-      {action !== undefined && action !== null ? (
+      {hasRenderableContent(action) ? (
         <div data-slot="empty-state-action" className="flex flex-wrap items-center gap-2">
           {action}
         </div>
