@@ -61,6 +61,17 @@ describe("CSP probe store", () => {
     expect(cspProbeStore.getSnapshot()[0]?.sourceBasename).toBe(expected);
   });
 
+  it.each([
+    "file:///Users/alice/private/?secret=1#fragment",
+    "/Users/alice/private/#fragment",
+    "C:\\Users\\alice\\private\\?secret=1#fragment",
+  ])("rejects the trailing private directory in %s", (sourceFile) => {
+    cspProbeStore.reset();
+    cspProbeStore.recordViolation(violation({ sourceFile }));
+    expect(cspProbeStore.getSnapshot()[0]?.sourceBasename).toBe("unknown");
+    expect(cspProbeStore.exportJson()).not.toContain("private");
+  });
+
   it("normalizes invalid coordinates without changing stable snapshots between mutations", () => {
     cspProbeStore.reset();
     const empty = cspProbeStore.getSnapshot();

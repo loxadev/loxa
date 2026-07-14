@@ -29,6 +29,7 @@ function blockedTarget(value: string): string {
 
 function sourceBasename(value: string): string {
   const withoutSuffix = value.split(/[?#]/, 1)[0] ?? "";
+  if (/[\\/]$/.test(withoutSuffix)) return "unknown";
   const segments = withoutSuffix.split(/[\\/]/).filter(Boolean);
   const basename = segments[segments.length - 1] ?? "";
   return /^[a-zA-Z0-9._-]{1,128}$/.test(basename) ? basename : "unknown";

@@ -8,8 +8,10 @@ function exportSnapshot() {
   const link = document.createElement("a");
   link.download = "loxa-csp-probe.json";
   link.href = url;
+  document.body.append(link);
   link.click();
-  URL.revokeObjectURL(url);
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
 export function CspProbePanel() {
