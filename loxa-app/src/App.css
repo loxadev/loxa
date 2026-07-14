@@ -22,6 +22,7 @@ body {
   min-height: 520px;
   margin: 0;
   overflow: hidden;
+  font-size: var(--loxa-type-body-size);
 }
 
 button,
@@ -37,64 +38,72 @@ a {
 
 .app-shell {
   display: grid;
-  grid-template-columns: var(--loxa-rail-width, 280px) minmax(0, 1fr);
+  grid-template-columns: var(--loxa-sidebar-width, 280px) minmax(0, 1fr);
   height: 100vh;
   min-height: 520px;
   color: var(--loxa-foreground);
   background: var(--loxa-background);
 }
 
-.navigation-rail {
+.app-sidebar {
   position: relative;
   display: flex;
   flex-direction: column;
   min-height: 0;
-  padding: var(--loxa-space-6) var(--loxa-space-4);
+  padding: var(--loxa-space-2);
   overflow: hidden;
-  background: var(--loxa-secondary-surface);
+  background: var(--loxa-surface);
   border-right: 1px solid var(--loxa-control-border);
+}
+
+.sidebar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: var(--loxa-component-minimum-interactive-target);
+  margin-bottom: var(--loxa-space-3);
 }
 
 .brand-lockup {
   display: flex;
   align-items: center;
-  gap: var(--loxa-space-3);
-  margin: 0 var(--loxa-space-2) var(--loxa-space-8);
+  gap: var(--loxa-space-2);
+  min-width: 0;
+  padding-inline: var(--loxa-space-2);
   font-weight: 500;
-  letter-spacing: -0.04em;
+  letter-spacing: -0.02em;
 }
 
 .brand-lockup img {
-  width: 42px;
-  height: 34px;
+  width: 24px;
+  height: 24px;
   color: var(--loxa-foreground);
 }
 
-.navigation-primary-nav,
-.navigation-secondary-nav {
-  flex: 0 0 auto;
-  min-height: 0;
-}
-
-.navigation-primary,
-.navigation-secondary {
+.sidebar-navigation {
   display: grid;
   gap: var(--loxa-space-1);
 }
 
-.navigation-secondary {
-  padding-top: var(--loxa-space-4);
+.sidebar-footer {
+  display: grid;
+  gap: var(--loxa-space-1);
 }
 
 .conversation-rail-slot {
   flex: 1 1 auto;
   min-height: 0;
-  margin-top: var(--loxa-space-4);
+  margin-top: var(--loxa-space-3);
   overflow: hidden;
   border-top: 1px solid var(--loxa-control-border);
 }
 
-.rail-resize-handle {
+.sidebar-spacer {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.sidebar-resize-handle {
   position: absolute;
   z-index: 2;
   top: 0;
@@ -105,7 +114,7 @@ a {
   touch-action: none;
 }
 
-.rail-resize-handle::after {
+.sidebar-resize-handle::after {
   position: absolute;
   top: 0;
   bottom: 0;
@@ -115,12 +124,12 @@ a {
   background: transparent;
 }
 
-.rail-resize-handle:hover::after,
-.rail-resize-handle:focus-visible::after {
+.sidebar-resize-handle:hover::after,
+.sidebar-resize-handle:focus-visible::after {
   background: var(--loxa-focus);
 }
 
-.rail-resize-handle:focus-visible {
+.sidebar-resize-handle:focus-visible {
   outline: 2px solid var(--loxa-focus);
   outline-offset: -4px;
 }
@@ -128,10 +137,45 @@ a {
 .nav-link {
   display: flex;
   align-items: center;
+  gap: var(--loxa-space-3);
   padding: 0 var(--loxa-space-3);
+  font-size: var(--loxa-type-label-size);
   color: var(--loxa-foreground);
   text-decoration: none;
   border-radius: var(--loxa-radius-md);
+}
+
+.nav-link svg {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+}
+
+.app-sidebar[data-collapsed] .sidebar-header {
+  display: grid;
+  place-items: center;
+}
+
+.app-sidebar[data-collapsed] .brand-lockup {
+  display: none;
+}
+
+.app-sidebar[data-collapsed] .nav-link,
+.app-sidebar[data-collapsed] .global-node-status {
+  justify-content: center;
+  padding: 0;
+}
+
+.app-sidebar[data-collapsed] .sidebar-text {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  white-space: nowrap;
+  border: 0;
+  clip: rect(0, 0, 0, 0);
 }
 
 .nav-link[aria-current="page"] {
@@ -139,17 +183,34 @@ a {
   background: var(--loxa-selected-surface);
 }
 
+.nav-link:focus,
+.global-node-status:focus {
+  outline: 2px solid var(--loxa-focus);
+  outline-offset: 2px;
+}
+
 .global-node-status {
   display: flex;
-  flex-direction: column;
-  justify-content: center;
+  align-items: center;
+  gap: var(--loxa-space-3);
   min-height: var(--loxa-component-minimum-interactive-target);
-  margin-bottom: var(--loxa-space-2);
-  padding: var(--loxa-space-2) var(--loxa-space-3);
+  padding: 0 var(--loxa-space-3);
   color: var(--loxa-foreground);
   text-decoration: none;
-  border: 1px solid var(--loxa-control-border);
   border-radius: var(--loxa-radius-md);
+}
+
+.runtime-indicator {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  background: var(--loxa-muted-foreground);
+  border-radius: 50%;
+}
+
+.runtime-status-copy {
+  display: grid;
+  min-width: 0;
 }
 
 .global-node-status-label {
@@ -282,7 +343,7 @@ button:disabled {
 :root,
 body,
 .app-shell,
-.navigation-rail,
+.app-sidebar,
 .brand-lockup img,
 .nav-link,
 .global-node-status,
@@ -310,7 +371,7 @@ dt,
   }
 
   .app-shell {
-    grid-template-columns: var(--loxa-rail-width, 280px) minmax(0, 1fr);
+    grid-template-columns: var(--loxa-sidebar-width, 280px) minmax(0, 1fr);
   }
 
   .workspace-canvas {
@@ -329,7 +390,7 @@ dt,
 }
 
 @media (prefers-contrast: more) {
-  .navigation-rail,
+  .app-sidebar,
   .screen-header,
   .status-badge,
   .global-node-status,
@@ -356,7 +417,7 @@ dt,
     forced-color-adjust: auto;
   }
 
-  .rail-resize-handle::after {
+  .sidebar-resize-handle::after {
     background: ButtonText;
   }
 }

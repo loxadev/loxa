@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 const root = process.cwd();
 const globalCss = readFileSync(`${root}/src/App.css`, "utf8");
 const tokens = readFileSync(`${root}/src/styles/loxa.css`, "utf8");
+const themeCss = readFileSync(`${root}/src/styles/theme.css`, "utf8");
 const featureModules = [
   "src/node/NodeScreen.module.css",
   "src/models/ModelsScreen.module.css",
@@ -16,7 +17,7 @@ const featureModules = [
 describe("integrated accessibility CSS contract", () => {
   it("keeps the global sheet limited to shell, navigation, and shared primitives", () => {
     expect(globalCss).toContain(".app-shell");
-    expect(globalCss).toContain(".navigation-rail");
+    expect(globalCss).toContain(".app-sidebar");
     expect(globalCss).toContain(".screen-header");
     expect(globalCss).toContain(".interactive-target");
     for (const obsolete of [
@@ -43,7 +44,7 @@ describe("integrated accessibility CSS contract", () => {
 
   it("anchors the operational navigation group at the rail bottom", () => {
     expect(globalCss).toMatch(/\.conversation-rail-slot\s*\{[^}]*flex:\s*1\s+1\s+auto/s);
-    expect(globalCss).toMatch(/\.navigation-secondary-nav\s*\{[^}]*flex:\s*0\s+0\s+auto/s);
+    expect(globalCss).toMatch(/\.sidebar-footer\s*\{[^}]*display:\s*grid/s);
     expect(globalCss).toMatch(
       /\.global-node-status\s*\{[^}]*min-height:\s*var\(--loxa-component-minimum-interactive-target\)/s,
     );
@@ -113,6 +114,33 @@ describe("integrated accessibility CSS contract", () => {
     expect(globalCss).toContain("transition-duration: var(--loxa-motion-theme)");
     expect(globalCss).toContain("transition-timing-function: var(--loxa-motion-easing)");
     expect(globalCss).toContain("@media (prefers-reduced-motion: reduce)");
+  });
+
+  it("uses the compact native shell typography and semantic shell tokens", () => {
+    expect(themeCss).toContain(
+      '--loxa-font-sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+    );
+    expect(themeCss).toContain("--loxa-type-body-size: 14px");
+    expect(themeCss).toContain("--loxa-type-h2-size: 24px");
+    expect(globalCss).toContain("font-size: var(--loxa-type-body-size)");
+    expect(globalCss).toContain("min-height: var(--loxa-component-minimum-interactive-target)");
+    expect(globalCss).toContain("@media (prefers-contrast: more)");
+    expect(globalCss).toContain("@media (forced-colors: active)");
+    expect(globalCss).not.toMatch(/#[0-9a-f]{3,8}/i);
+  });
+
+  it("keeps backend and session ownership out of presentation-only shell modules", () => {
+    for (const file of [
+      "AppShell.tsx",
+      "AppSidebar.tsx",
+      "SidebarHeader.tsx",
+      "SidebarNavigation.tsx",
+      "SidebarRuntimeStatus.tsx",
+      "SidebarResizeHandle.tsx",
+    ]) {
+      const source = readFileSync(`${root}/src/app/${file}`, "utf8");
+      expect(source, file).not.toMatch(/\b(?:services|endpoint|ownership|token|credential|session)\b/i);
+    }
   });
 });
 

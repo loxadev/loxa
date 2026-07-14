@@ -1,11 +1,12 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { App, type AppServices } from "./App";
 import type { ControlStreamCallbacks, ControlStreamTerminal } from "../control/events";
 import type { BootstrapSnapshot } from "../node/NodeSession";
 import type { NodeStatus } from "../node/contracts";
+import { useWorkspaceStore } from "../stores/workspace-store";
 
 function services(): AppServices {
   return {
@@ -58,20 +59,32 @@ function services(): AppServices {
 }
 
 describe("App", () => {
-  it("opens on Node, keeps Models primary, and exposes Chat as the secondary tool", async () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+    useWorkspaceStore.setState({ activeRoute: "chat", sidebarCollapsed: false, expandedSidebarWidth: 280 });
+  });
+
+  it("opens on Chat and keeps the primary navigation in product order", async () => {
     const user = userEvent.setup();
     render(<App services={services()} />);
 
-    expect(await screen.findByRole("heading", { name: "Node" })).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "Node" })).toHaveAttribute("aria-current", "page");
+    expect(await screen.findByRole("heading", { name: "Chat" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Chat" })).toHaveAttribute("aria-current", "page");
+
+    const primary = screen.getByRole("navigation", { name: "Primary navigation" });
+    expect(
+      within(primary)
+        .getAllByRole("link")
+        .map((link) => link.getAttribute("aria-label")),
+    ).toEqual(["Chat", "Models", "Node"]);
 
     await user.click(screen.getByRole("link", { name: "Models" }));
     expect(screen.getByRole("heading", { name: "Models" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Models" })).toHaveAttribute("aria-current", "page");
 
-    await user.click(screen.getByRole("link", { name: "Chat" }));
-    expect(screen.getByRole("heading", { name: "Chat" })).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "Chat" })).toHaveAttribute("aria-current", "page");
+    await user.click(screen.getByRole("link", { name: "Node" }));
+    expect(screen.getByRole("heading", { name: "Node" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Node" })).toHaveAttribute("aria-current", "page");
 
     await user.click(screen.getByRole("link", { name: "Settings" }));
     expect(screen.getByRole("heading", { name: "Settings" })).toBeInTheDocument();
@@ -96,16 +109,15 @@ describe("App", () => {
     expect(await screen.findByRole("status")).toHaveTextContent("Deleted 2 conversations");
   });
 
-  it("groups Node and Models as primary controls while keeping Chat and Settings at the rail bottom", async () => {
+  it("keeps Chat, Models, and Node primary while Settings remains in the footer", async () => {
     render(<App services={services()} />);
-    await screen.findByText("Node ready — no model loaded");
+    await screen.findByRole("link", { name: "Node online. No active model" });
 
-    const primary = screen.getByRole("group", { name: "Node control" });
-    const secondary = screen.getByRole("group", { name: "Operational tools" });
+    const primary = screen.getByRole("navigation", { name: "Primary navigation" });
+    const secondary = screen.getByRole("navigation", { name: "Application settings" });
+    expect(primary).toContainElement(screen.getByRole("link", { name: "Chat" }));
     expect(primary).toContainElement(screen.getByRole("link", { name: "Node" }));
     expect(primary).toContainElement(screen.getByRole("link", { name: "Models" }));
-    expect(primary).not.toContainElement(screen.getByRole("link", { name: "Chat" }));
-    expect(secondary).toContainElement(screen.getByRole("link", { name: "Chat" }));
     expect(secondary).toContainElement(screen.getByRole("link", { name: "Settings" }));
   });
 
@@ -122,11 +134,11 @@ describe("App", () => {
     api.getMessageContent = vi.fn();
     const removeListener = vi.spyOn(window, "removeEventListener");
     const view = render(<App services={api} />);
-    await user.click(await screen.findByRole("link", { name: "Chat" }));
+    await screen.findByRole("link", { name: "Node online. No active model" });
 
     const globalRail = screen.getByRole("complementary", { name: "Primary" });
     expect(within(globalRail).getByRole("navigation", { name: "Chat conversations" })).toBeVisible();
-    expect(within(globalRail).getByRole("button", { name: "Open Runtime notes" })).toBeVisible();
+    expect(await within(globalRail).findByRole("button", { name: "Open Runtime notes" })).toBeVisible();
     expect(
       within(screen.getByRole("main")).queryByRole("navigation", { name: "Chat conversations" }),
     ).not.toBeInTheDocument();
@@ -134,6 +146,8 @@ describe("App", () => {
     expect(within(globalRail).getByRole("link", { name: "Settings" })).toBeVisible();
 
     const separator = screen.getByRole("separator", { name: "Resize navigation and conversation rail" });
+    const shell = screen.getByTestId("app-shell");
+    expect(shell.style.getPropertyValue("--loxa-sidebar-width")).toBe("280px");
     expect(separator).toHaveAttribute("aria-valuemin", "220");
     expect(separator).toHaveAttribute("aria-valuemax", "420");
     fireEvent.keyDown(separator, { key: "End" });
@@ -144,14 +158,38 @@ describe("App", () => {
     expect(separator).toHaveAttribute("aria-valuenow", "220");
     fireEvent.keyDown(separator, { key: "ArrowLeft" });
     expect(separator).toHaveAttribute("aria-valuenow", "220");
+    fireEvent.doubleClick(separator);
+    expect(separator).toHaveAttribute("aria-valuenow", "280");
+    const setPointerCapture = vi.fn();
+    const releasePointerCapture = vi.fn();
+    Object.assign(separator, { setPointerCapture, releasePointerCapture, hasPointerCapture: () => true });
     fireEvent.pointerDown(separator, { pointerId: 7, button: 0, clientX: 220 });
+    expect(setPointerCapture).toHaveBeenCalledWith(7);
+    fireEvent.pointerMove(window, { pointerId: 8, clientX: 700 });
+    expect(separator).toHaveAttribute("aria-valuenow", "280");
     fireEvent.pointerMove(window, { pointerId: 7, clientX: 700 });
     expect(separator).toHaveAttribute("aria-valuenow", "420");
     fireEvent.pointerMove(window, { pointerId: 7, clientX: -200 });
     expect(separator).toHaveAttribute("aria-valuenow", "220");
-    fireEvent.pointerUp(window, { pointerId: 7 });
+    fireEvent.pointerCancel(window, { pointerId: 7 });
+    expect(releasePointerCapture).toHaveBeenCalledWith(7);
+
+    await user.click(screen.getByRole("button", { name: "Collapse sidebar" }));
+    expect(shell.style.getPropertyValue("--loxa-sidebar-width")).toBe("56px");
+    expect(
+      screen.queryByRole("separator", { name: "Resize navigation and conversation rail" }),
+    ).not.toBeInTheDocument();
+    for (const name of ["Expand sidebar", "Chat", "Models", "Node", "Settings", "Node online. No active model"]) {
+      expect(screen.getByRole(name === "Expand sidebar" ? "button" : "link", { name })).toBeVisible();
+    }
+    expect(document.querySelectorAll(".app-sidebar svg:not([aria-hidden='true'])")).toHaveLength(0);
 
     view.unmount();
+    render(<App services={api} />);
+    expect(screen.getByTestId("app-shell").style.getPropertyValue("--loxa-sidebar-width")).toBe("56px");
+    await user.click(screen.getByRole("button", { name: "Expand sidebar" }));
+    expect(screen.getByTestId("app-shell").style.getPropertyValue("--loxa-sidebar-width")).toBe("220px");
+
     expect(removeListener).toHaveBeenCalledWith("pointermove", expect.any(Function));
     expect(removeListener).toHaveBeenCalledWith("pointerup", expect.any(Function));
     expect(removeListener).toHaveBeenCalledWith("pointercancel", expect.any(Function));
@@ -189,6 +227,7 @@ describe("App", () => {
   });
 
   it("settles global model truth from a terminal snapshot after the initiating route unmounts", async () => {
+    useWorkspaceStore.setState({ activeRoute: "node" });
     const api = services();
     const controlCallbacks: ControlStreamCallbacks[] = [];
     api.getStatus = vi
@@ -500,6 +539,7 @@ describe("App", () => {
   });
 
   it("settles from the local Chat terminal when the global stream initially cannot connect", async () => {
+    useWorkspaceStore.setState({ activeRoute: "node" });
     const api = services();
     api.getStatus = vi
       .fn()
@@ -570,6 +610,7 @@ describe("App", () => {
   });
 
   it("reconnects the session stream and settles after the initiating route unmounts", async () => {
+    useWorkspaceStore.setState({ activeRoute: "node" });
     const api = services();
     const handles: Array<{ callbacks: ControlStreamCallbacks; dispose: ReturnType<typeof vi.fn> }> = [];
     const proofSignals: AbortSignal[] = [];
@@ -697,14 +738,14 @@ describe("App", () => {
   it("keeps every route inside the same shell-owned page frame", async () => {
     const user = userEvent.setup();
     const { container } = render(<App services={services()} />);
-    await screen.findByText("Node ready — no model loaded");
+    await screen.findByRole("link", { name: "Node online. No active model" });
 
     const canvas = container.querySelector(".workspace-canvas");
     const frame = container.querySelector(".workspace-frame");
     expect(canvas).toContainElement(frame as HTMLElement);
-    expect(frame).toContainElement(screen.getByRole("heading", { name: "Node" }));
+    expect(frame).toContainElement(screen.getByRole("heading", { name: "Chat" }));
 
-    for (const route of ["Models", "Chat", "Settings"] as const) {
+    for (const route of ["Models", "Node", "Settings"] as const) {
       await user.click(screen.getByRole("link", { name: route }));
       expect(frame).toContainElement(screen.getByRole("heading", { name: route }));
     }
@@ -731,16 +772,18 @@ describe("App", () => {
   it("has a logical keyboard focus order and no unsupported controls", async () => {
     const user = userEvent.setup();
     render(<App services={services()} />);
-    await screen.findByText("Node ready — no model loaded");
+    await screen.findByRole("link", { name: "Node online. No active model" });
 
     await user.tab();
-    expect(screen.getByRole("link", { name: "Node" })).toHaveFocus();
+    expect(screen.getByRole("button", { name: "Collapse sidebar" })).toHaveFocus();
+    await user.tab();
+    expect(screen.getByRole("link", { name: "Chat" })).toHaveFocus();
     await user.tab();
     expect(screen.getByRole("link", { name: "Models" })).toHaveFocus();
     await user.tab();
-    expect(screen.getByRole("link", { name: "Node online. No active model" })).toHaveFocus();
+    expect(screen.getByRole("link", { name: "Node" })).toHaveFocus();
     await user.tab();
-    expect(screen.getByRole("link", { name: "Chat" })).toHaveFocus();
+    expect(screen.getByRole("link", { name: "Node online. No active model" })).toHaveFocus();
     await user.tab();
     expect(screen.getByRole("link", { name: "Settings" })).toHaveFocus();
 
@@ -808,6 +851,7 @@ describe("App", () => {
     const user = userEvent.setup();
     render(<App services={api} />);
 
+    await user.click(screen.getByRole("link", { name: "Node" }));
     const stop = await screen.findByRole("button", { name: "Stop node" });
     await waitFor(() => expect(api.readControlToken).toHaveBeenCalled());
     vi.mocked(api.readControlToken).mockClear();
@@ -832,6 +876,7 @@ describe("App", () => {
   });
 
   it("passes read-only shared session facts to Settings without another bootstrap", async () => {
+    useWorkspaceStore.setState({ activeRoute: "node" });
     const api = services();
     api.getStatus = vi.fn().mockResolvedValue({
       node_id: "loxa-node-77",
@@ -843,7 +888,7 @@ describe("App", () => {
     });
     const user = userEvent.setup();
     render(<App services={api} />);
-    await screen.findByText("Ready");
+    await screen.findByRole("link", { name: "Node ready. Active model gemma-ready" });
     await user.click(screen.getByRole("link", { name: "Settings" }));
     expect(screen.getByRole("region", { name: "Local node/runtime" })).toHaveTextContent("loxa-node-77");
     expect(screen.getByText("gemma-ready")).toBeInTheDocument();
