@@ -31,6 +31,11 @@ function workflowStep(job: string, name: string) {
 }
 
 describe("Cargo workspace isolation", () => {
+  it("keeps generated Tauri schemas outside the formatting gate", () => {
+    const prettierIgnore = readFileSync(resolve(appRoot, ".prettierignore"), "utf8").split("\n");
+    expect(prettierIgnore).toContain("src-tauri/gen/schemas");
+  });
+
   it("enforces the complete desktop frontend gate in CI", () => {
     const manifest = JSON.parse(readFileSync(resolve(appRoot, "package.json"), "utf8"));
     expect(manifest.scripts).toMatchObject({
