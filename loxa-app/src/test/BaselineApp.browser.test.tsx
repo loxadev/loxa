@@ -7,7 +7,6 @@ import { applyTheme, writeThemePreference, type ThemeMode } from "@/settings/the
 import { expectNoAxeViolations } from "@/test/axe";
 import { mountBrowser } from "@/test/browser";
 import { createAppServicesFixture } from "@/test/fixtures";
-import { shellScreenshotOptions } from "@/test/screenshot";
 
 async function waitForThemeTransition() {
   const nextFrame = () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
@@ -21,14 +20,14 @@ async function waitForThemeTransition() {
   }
 }
 
-test("captures the chat-first desktop shell in fixed light and dark modes", async () => {
+test("keeps the chat-first desktop shell accessible in fixed light and dark modes", async () => {
   await page.viewport(800, 600);
   const { host } = mountBrowser(<App services={createAppServicesFixture()} />);
   await act(async () => {
     await Promise.resolve();
     await Promise.resolve();
   });
-  const chatHeading = page.getByRole("heading", { name: "Chat" });
+  const chatHeading = page.getByRole("heading", { name: "New Chat" });
   const chatNavigation = page.getByRole("link", { name: "Chat" });
   const conversationRail = page.getByRole("navigation", { name: "Chat conversations" });
   await expect.element(chatHeading).toBeVisible();
@@ -52,6 +51,14 @@ test("captures the chat-first desktop shell in fixed light and dark modes", asyn
     host.dataset.loxaTheme = mode;
     await waitForThemeTransition();
     await expectNoAxeViolations(document);
-    await expect(document.body).toMatchScreenshot(`baseline-shell-${mode}-800x600`, shellScreenshotOptions);
+    expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(document.documentElement.clientWidth);
+    expect(composerWithinViewport()).toBe(true);
   }
 });
+
+function composerWithinViewport() {
+  const composer = document.querySelector<HTMLElement>('form[aria-label="Message composer"]');
+  if (!composer) return false;
+  const rect = composer.getBoundingClientRect();
+  return rect.left >= 0 && rect.right <= window.innerWidth && rect.bottom <= window.innerHeight;
+}

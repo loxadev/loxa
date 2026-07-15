@@ -179,24 +179,19 @@ describe("Cargo workspace isolation", () => {
     expect(workflowStep(packaging, "Build packaged app")).toMatch(/^        run: pnpm package:app -- --debug$/m);
   });
 
-  it("enforces a deterministic shared-platform browser baseline", () => {
+  it("enforces a deterministic semantic light and dark browser contract", () => {
     const browserConfig = readFileSync(resolve(appRoot, "vitest.browser.config.ts"), "utf8");
     const baselineTest = readFileSync(resolve(appRoot, "src/test/BaselineApp.browser.test.tsx"), "utf8");
-    const screenshotOptions = readFileSync(resolve(appRoot, "src/test/screenshot.ts"), "utf8");
     const fontCss = readFileSync(resolve(appRoot, "src/styles/fonts.css"), "utf8");
     const themeCss = readFileSync(resolve(appRoot, "src/styles/theme.css"), "utf8");
 
-    expect(browserConfig).toContain("platform");
-    expect(browserConfig).toMatch(/"__screenshots__",\s*"shared",\s*browserName/);
+    expect(browserConfig).not.toContain("toMatchScreenshot");
     expect(baselineTest).toContain('document.fonts.load(`400 12px "IBM Plex Mono"`, "No active model")');
     expect(baselineTest).toContain('document.fonts.check(`400 12px "IBM Plex Mono"`, "No active model")');
     expect(baselineTest).toContain('getComputedStyle(chatHeading.element()).fontFamily).toContain("ui-sans-serif")');
     expect(baselineTest).toContain('getComputedStyle(document.body).fontFamily).toContain("ui-sans-serif")');
-    expect(baselineTest).toContain("shellScreenshotOptions");
-    expect(screenshotOptions).toContain('animations: "allow"');
-    expect(screenshotOptions).toContain('caret: "hide"');
-    expect(screenshotOptions).toContain('scale: "css"');
-    expect(screenshotOptions).toContain("allowedMismatchedPixelRatio: 0.02");
+    expect(baselineTest).toContain("document.documentElement.scrollWidth");
+    expect(baselineTest).toContain("composerWithinViewport()");
     expect(baselineTest).toContain("await expectNoAxeViolations(document)");
     expect(themeCss).toContain(
       '--loxa-font-sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',

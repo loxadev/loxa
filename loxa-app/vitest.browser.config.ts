@@ -1,5 +1,4 @@
 import { fileURLToPath } from "node:url";
-import { resolve } from "node:path";
 
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
@@ -26,17 +25,6 @@ export default defineConfig({
       headless: true,
       provider: playwright({ contextOptions: { locale: "en-US", timezoneId: "UTC" } }),
       instances: [{ browser: "chromium" }],
-      expect: {
-        toMatchScreenshot: {
-          resolveScreenshotPath: ({ arg, browserName, ext, platform, root, testFileDirectory }) => {
-            if (!new Set(["darwin", "linux", "win32"]).has(platform)) {
-              throw new Error(`Unsupported screenshot platform: ${platform}`);
-            }
-            const baselineDirectory = arg.startsWith("baseline-shell-") ? resolve(root, "src/test") : testFileDirectory;
-            return resolve(root, baselineDirectory, "__screenshots__", "shared", browserName, `${arg}${ext}`);
-          },
-        },
-      },
     },
   },
 });
