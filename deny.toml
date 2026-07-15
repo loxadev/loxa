@@ -1,6 +1,16 @@
 [advisories]
 yanked = "deny"
 
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
 [licenses]
 allow = [
   "Apache-2.0",

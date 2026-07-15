@@ -16,9 +16,38 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  repository-hygiene:
+    name: repository hygiene
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Reject generated or agent-context files
+        shell: bash
+        run: |
+          tracked="$({ git ls-files; } | awk '/(^|\/)(\.pnpm-store|\.superpowers|node_modules|target)(\/|$)/')"
+          if [[ -n "$tracked" ]]; then
+            echo "Generated or temporary paths must not be tracked:"
+            echo "$tracked"
+            exit 1
+          fi
+
+      - name: Check repository whitespace
+        shell: bash
+        run: git diff --check "$(git hash-object -t tree /dev/null)" HEAD
+
+      - name: Verify committed Rust lockfiles
+        run: |
+          cargo metadata --locked --no-deps --format-version 1 > /dev/null
+          cargo metadata --manifest-path loxa-app/src-tauri/Cargo.toml --locked --no-deps --format-version 1 > /dev/null
+
   fmt:
     name: cargo fmt
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -30,12 +59,18 @@ jobs:
         run: rustup toolchain install --profile minimal --no-self-update
 
       - name: Check formatting
-        run: cargo fmt --all --check
+        run: |
+          cargo fmt --all --check
+          cargo fmt --manifest-path loxa-app/src-tauri/Cargo.toml --all --check
 
   clippy:
-    name: cargo clippy
-    runs-on: ubuntu-latest
+    name: cargo clippy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2025]
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -49,7 +84,7 @@ jobs:
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: Run clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
   test:
     name: cargo test (${{ matrix.os }})
@@ -58,8 +93,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # macos-latest is arm64 on GitHub-hosted runners, matching the target Apple silicon machine.
-        os: [ubuntu-latest, macos-latest]
+        # macos-15 is arm64 on GitHub-hosted runners, matching the target Apple silicon machine.
+        os: [ubuntu-24.04, macos-15, windows-2025]
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -73,11 +108,11 @@ jobs:
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace --all-features --locked
 
   frontend:
     name: desktop frontend
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     defaults:
       run:
@@ -116,7 +151,7 @@ jobs:
 
   frontend-packaging:
     name: desktop package (macOS)
-    runs-on: macos-latest
+    runs-on: macos-15
     timeout-minutes: 30
     defaults:
       run:
@@ -144,6 +179,12 @@ jobs:
           workspaces: loxa-app/src-tauri
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+      - name: Prepare bundled node sidecar
+        run: pnpm prepare:sidecar
+      - name: Lint desktop Rust
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
+      - name: Test desktop Rust
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked
       - name: Packaging contract tests
         run: pnpm exec vitest run tests/workspace-isolation.test.ts
       - name: Build packaged app

@@ -3,14 +3,20 @@ name: Audit
 on:
   pull_request:
     paths:
+      - Cargo.toml
       - Cargo.lock
+      - "**/Cargo.toml"
+      - loxa-app/src-tauri/Cargo.lock
       - deny.toml
       - rust-toolchain.toml
       - .github/workflows/audit.yml
   push:
     branches: [main]
     paths:
+      - Cargo.toml
       - Cargo.lock
+      - "**/Cargo.toml"
+      - loxa-app/src-tauri/Cargo.lock
       - deny.toml
       - rust-toolchain.toml
       - .github/workflows/audit.yml
@@ -21,7 +27,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: audit-${{ github.ref }}
+  group: audit-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -30,7 +36,7 @@ env:
 jobs:
   cargo-deny:
     name: cargo deny
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -47,5 +53,8 @@ jobs:
           tool: cargo-deny
           fallback: none
 
-      - name: Check advisories and licenses
-        run: cargo deny check --warn unmaintained advisories licenses
+      - name: Check workspace dependencies
+        run: cargo deny --locked check --warn unmaintained
+
+      - name: Check desktop dependencies
+        run: cargo deny --manifest-path loxa-app/src-tauri/Cargo.toml --target aarch64-apple-darwin --locked check --warn unmaintained advisories bans sources
