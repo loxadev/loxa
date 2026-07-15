@@ -7,3 +7,4 @@ target/
 .claude/
 .superpowers/
 .worktrees/
+.pnpm-store/
