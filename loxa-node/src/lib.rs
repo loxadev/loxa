@@ -294,6 +294,21 @@ pub fn run_model(
     )
 }
 
+fn emit_engine_readiness_failed(
+    generation: u64,
+    backend_kind: &'static str,
+    result_class: &'static str,
+) {
+    tracing::warn!(
+        target: "loxa_core::engine",
+        event_code = "engine.readiness.failed",
+        component = "engine",
+        generation,
+        backend_kind,
+        result_class,
+    );
+}
+
 fn run_model_with_diagnostics_health(
     request: RunRequest<'_>,
     paths: &NodePaths,
@@ -636,13 +651,10 @@ fn run_model_with_diagnostics_health(
                 RuntimeBackendKind::LlamaCpp => "llama_cpp",
                 RuntimeBackendKind::PyMlxLm => "py_mlx_lm",
             };
-            tracing::warn!(
-                target: "loxa_core::engine",
-                event_code = "engine.readiness.failed",
-                component = "engine",
-                generation = state_identity.generation,
+            emit_engine_readiness_failed(
+                u64::from(state_identity.generation),
                 backend_kind,
-                result_class = "readiness_failed",
+                "readiness_failed",
             );
         }
         match startup {
@@ -2486,7 +2498,7 @@ mod lifecycle_api_tests {
         };
 
         let builder_error = NodeBuilder::new(
-            Some("missing-model"),
+            Some("ARBITRARY_ERROR_SENTINEL"),
             Some(0),
             RuntimeBackendKind::LlamaCpp,
             &paths,
@@ -2494,16 +2506,67 @@ mod lifecycle_api_tests {
         .build()
         .err()
         .expect("builder must reject an unknown model");
-        let facade_error = serve_node(
-            Some("missing-model"),
-            Some(0),
-            RuntimeBackendKind::LlamaCpp,
-            &paths,
-            &mut RecordingLifecycleSink::default(),
-        )
-        .expect_err("facade must reject an unknown model");
+        let capture = DiagnosticCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(capture.clone())
+            .finish();
+        let facade_error = tracing::subscriber::with_default(subscriber, || {
+            serve_node(
+                Some("ARBITRARY_ERROR_SENTINEL"),
+                Some(0),
+                RuntimeBackendKind::LlamaCpp,
+                &paths,
+                &mut RecordingLifecycleSink::default(),
+            )
+            .expect_err("facade must reject an unknown model")
+        });
 
         assert_eq!(facade_error.to_string(), builder_error.to_string());
+        assert!(facade_error
+            .to_string()
+            .contains("ARBITRARY_ERROR_SENTINEL"));
+        let diagnostics = capture.text();
+        assert_eq!(diagnostics.matches("node.starting").count(), 1);
+        assert_eq!(diagnostics.matches("node.start_failed").count(), 1);
+        assert!(
+            diagnostics.contains(" INFO loxa_node::lifecycle:"),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains(" WARN loxa_node::lifecycle:"),
+            "{diagnostics}"
+        );
+        assert_eq!(diagnostics.matches("component=\"node\"").count(), 2);
+        assert!(!diagnostics.contains("ARBITRARY_ERROR_SENTINEL"));
+    }
+
+    #[test]
+    fn readiness_failure_event_is_warn_with_the_approved_envelope() {
+        let capture = DiagnosticCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(capture.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            emit_engine_readiness_failed(7, "llama_cpp", "readiness_failed");
+        });
+
+        let diagnostics = capture.text();
+        assert_eq!(diagnostics.matches("engine.readiness.failed").count(), 1);
+        assert!(
+            diagnostics.contains(" WARN loxa_core::engine:"),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("component=\"engine\""),
+            "{diagnostics}"
+        );
+        assert!(diagnostics.contains("generation=7"), "{diagnostics}");
+        assert!(
+            diagnostics.contains("backend_kind=\"llama_cpp\""),
+            "{diagnostics}"
+        );
     }
 
     #[test]
@@ -2896,14 +2959,22 @@ mod lifecycle_api_tests {
         };
         let serve_paths = paths.clone();
         let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let capture = DiagnosticCapture::default();
+        let server_capture = capture.clone();
         let server = std::thread::spawn(move || {
-            serve_node(
-                None,
-                Some(0),
-                RuntimeBackendKind::LlamaCpp,
-                &serve_paths,
-                &mut ChannelLifecycleSink(event_tx),
-            )
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(server_capture)
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                serve_node(
+                    None,
+                    Some(0),
+                    RuntimeBackendKind::LlamaCpp,
+                    &serve_paths,
+                    &mut ChannelLifecycleSink(event_tx),
+                )
+            })
         });
         let LifecycleEvent::NodeListening { port, .. } = event_rx
             .recv_timeout(Duration::from_secs(2))
@@ -3042,6 +3113,30 @@ mod lifecycle_api_tests {
         assert_eq!(
             server.join().expect("join node").unwrap(),
             RunTermination::RequestedStop
+        );
+        let diagnostics = capture.text();
+        for code in [
+            "node.starting",
+            "node.listening",
+            "node.stopping",
+            "node.stopped",
+        ] {
+            assert_eq!(diagnostics.matches(code).count(), 1, "{diagnostics}");
+        }
+        assert_eq!(diagnostics.matches("shutdown.stage.completed").count(), 4);
+        assert_eq!(diagnostics.matches("shutdown.stage.failed").count(), 0);
+        assert!(
+            diagnostics.contains(" INFO loxa_node::lifecycle:"),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains(" INFO loxa_node::shutdown:"),
+            "{diagnostics}"
+        );
+        assert!(diagnostics.contains("component=\"node\""), "{diagnostics}");
+        assert!(
+            diagnostics.contains("component=\"shutdown\""),
+            "{diagnostics}"
         );
         TcpListener::bind(("127.0.0.1", port)).expect("gateway released port");
     }

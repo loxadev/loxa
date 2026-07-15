@@ -344,26 +344,16 @@ impl EngineLifecycleDriver for ProductionEngineDriver {
                 Ok(()) => return Ok(()),
                 Err(supervisor::SupervisorError::HealthTimeout) => {}
                 Err(error) => {
-                    tracing::warn!(
-                        target: "loxa_core::engine",
-                        event_code = "engine.readiness.failed",
-                        component = "engine",
-                        generation = session.correlation.generation,
-                        backend_kind = "llama_cpp",
-                        result_class = "readiness_failed",
+                    crate::emit_engine_readiness_failed(
+                        session.correlation.generation,
+                        "llama_cpp",
+                        "readiness_failed",
                     );
                     return Err(LifecycleError::ReadinessFailed(error.to_string()));
                 }
             }
         }
-        tracing::warn!(
-            target: "loxa_core::engine",
-            event_code = "engine.readiness.failed",
-            component = "engine",
-            generation = session.correlation.generation,
-            backend_kind = "llama_cpp",
-            result_class = "timeout",
-        );
+        crate::emit_engine_readiness_failed(session.correlation.generation, "llama_cpp", "timeout");
         Err(LifecycleError::ReadinessFailed(
             "engine readiness timed out".into(),
         ))

@@ -952,9 +952,14 @@ mod tests {
         fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
         fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
         fn event(&self, event: &Event<'_>) {
-            event.record(&mut FieldCapture(
-                &mut self.0.lock().expect("capture poisoned"),
-            ));
+            let mut output = self.0.lock().expect("capture poisoned");
+            output.push_str("target=");
+            output.push_str(event.metadata().target());
+            output.push('\n');
+            output.push_str("level=");
+            output.push_str(event.metadata().level().as_str());
+            output.push('\n');
+            event.record(&mut FieldCapture(&mut output));
         }
         fn enter(&self, _: &tracing::span::Id) {}
         fn exit(&self, _: &tracing::span::Id) {}
@@ -3029,8 +3034,11 @@ mod tests {
         });
 
         let output = output.lock().expect("capture poisoned");
+        assert_eq!(output.matches("engine.teardown.failed").count(), 1);
         assert!(output.contains("engine.teardown.failed"), "{output}");
         assert!(output.contains("result_class=unconfirmed"), "{output}");
+        assert!(output.contains("target=loxa_core::engine"), "{output}");
+        assert!(output.contains("level=WARN"), "{output}");
         assert!(!output.contains("SECRET_CHILD_OUTPUT"), "{output}");
         assert!(!output.contains("/private/SECRET_MODEL_PATH"), "{output}");
         assert!(!output.contains("--secret-command-argument"), "{output}");
@@ -3046,8 +3054,11 @@ mod tests {
         });
 
         let output = output.lock().expect("capture poisoned");
+        assert_eq!(output.matches("engine.teardown.confirmed").count(), 1);
         assert!(output.contains("engine.teardown.confirmed"), "{output}");
         assert!(output.contains("result_class=confirmed"), "{output}");
+        assert!(output.contains("target=loxa_core::engine"), "{output}");
+        assert!(output.contains("level=INFO"), "{output}");
         for forbidden in [
             "SECRET_CHILD_OUTPUT",
             "/private/SECRET_MODEL_PATH",

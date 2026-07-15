@@ -615,6 +615,51 @@ impl GatewayServer {
     }
 
     pub fn start_with_router(port: u16, state: GatewayState, app: Router) -> io::Result<Self> {
+        Self::start_with_router_and_spawner(
+            port,
+            state,
+            app,
+            |listener, app, receiver, server_state| {
+                thread::Builder::new()
+                    .name("loxa-gateway".into())
+                    .spawn(move || {
+                        let runtime = tokio::runtime::Runtime::new().map_err(io::Error::other)?;
+                        runtime.block_on(async move {
+                            let listener = tokio::net::TcpListener::from_std(listener)?;
+                            let _ = server_state;
+                            axum::serve(listener, app)
+                                .with_graceful_shutdown(async move {
+                                    let _ = receiver.await;
+                                })
+                                .await
+                                .map_err(io::Error::other)
+                        })
+                    })
+            },
+        )
+    }
+
+    fn start_with_router_and_spawner<F>(
+        port: u16,
+        state: GatewayState,
+        app: Router,
+        spawn: F,
+    ) -> io::Result<Self>
+    where
+        F: FnOnce(
+            std::net::TcpListener,
+            Router,
+            tokio::sync::oneshot::Receiver<()>,
+            GatewayState,
+        ) -> io::Result<thread::JoinHandle<io::Result<()>>>,
+    {
+        let started = std::time::Instant::now();
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))?;
+        listener.set_nonblocking(true)?;
+        let port = listener.local_addr()?.port();
+        let (shutdown, receiver) = tokio::sync::oneshot::channel();
+        let server_state = state.clone();
+        let thread = spawn(listener, app, receiver, server_state)?;
         tracing::info!(
             target: "loxa_core::gateway",
             event_code = "gateway.starting",
@@ -622,27 +667,6 @@ impl GatewayServer {
             runtime_identity = state.node_id.as_ref(),
             result_class = "started",
         );
-        let started = std::time::Instant::now();
-        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))?;
-        listener.set_nonblocking(true)?;
-        let port = listener.local_addr()?.port();
-        let (shutdown, receiver) = tokio::sync::oneshot::channel();
-        let server_state = state.clone();
-        let thread = thread::Builder::new()
-            .name("loxa-gateway".into())
-            .spawn(move || {
-                let runtime = tokio::runtime::Runtime::new().map_err(io::Error::other)?;
-                runtime.block_on(async move {
-                    let listener = tokio::net::TcpListener::from_std(listener)?;
-                    let _ = server_state;
-                    axum::serve(listener, app)
-                        .with_graceful_shutdown(async move {
-                            let _ = receiver.await;
-                        })
-                        .await
-                        .map_err(io::Error::other)
-                })
-            })?;
         tracing::info!(
             target: "loxa_core::gateway",
             event_code = "gateway.listening",
@@ -734,30 +758,34 @@ mod tests {
     use reqwest::Client;
     use serde_json::json;
     use serde_json::Value;
+    use std::collections::BTreeMap;
+    use std::io;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::thread;
     use tracing::field::{Field, Visit};
     use tracing::{Event, Metadata, Subscriber};
 
-    #[derive(Clone, Default)]
-    struct EventCapture(Arc<Mutex<String>>);
+    #[derive(Clone, Debug)]
+    struct CapturedEvent {
+        target: String,
+        level: tracing::Level,
+        fields: BTreeMap<String, String>,
+    }
 
-    struct FieldCapture<'a>(&'a mut String);
+    #[derive(Clone, Default)]
+    struct EventCapture(Arc<Mutex<Vec<CapturedEvent>>>);
+
+    struct FieldCapture<'a>(&'a mut BTreeMap<String, String>);
 
     impl Visit for FieldCapture<'_> {
         fn record_str(&mut self, field: &Field, value: &str) {
-            self.0.push_str(field.name());
-            self.0.push('=');
-            self.0.push_str(value);
-            self.0.push('\n');
+            self.0.insert(field.name().to_owned(), value.to_owned());
         }
 
         fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-            self.0.push_str(field.name());
-            self.0.push('=');
-            self.0.push_str(&format!("{value:?}"));
-            self.0.push('\n');
+            self.0.insert(field.name().to_owned(), format!("{value:?}"));
         }
     }
 
@@ -775,14 +803,28 @@ mod tests {
         fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
 
         fn event(&self, event: &Event<'_>) {
-            event.record(&mut FieldCapture(
-                &mut self.0.lock().expect("capture poisoned"),
-            ));
+            let mut fields = BTreeMap::new();
+            event.record(&mut FieldCapture(&mut fields));
+            self.0
+                .lock()
+                .expect("capture poisoned")
+                .push(CapturedEvent {
+                    target: event.metadata().target().to_owned(),
+                    level: *event.metadata().level(),
+                    fields,
+                });
         }
 
         fn enter(&self, _: &tracing::span::Id) {}
 
         fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    fn event_codes(events: &[CapturedEvent]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|event| event.fields.get("event_code").map(String::as_str))
+            .collect()
     }
 
     #[test]
@@ -796,14 +838,97 @@ mod tests {
         });
 
         let output = output.lock().expect("capture poisoned");
-        for code in [
-            "gateway.starting",
-            "gateway.listening",
-            "gateway.stop_requested",
-            "gateway.stopped",
-        ] {
-            assert!(output.contains(code), "missing {code}: {output}");
+        assert_eq!(
+            event_codes(&output),
+            [
+                "gateway.starting",
+                "gateway.listening",
+                "gateway.stop_requested",
+                "gateway.stopped",
+            ]
+        );
+        for event in output.iter() {
+            assert_eq!(event.target, "loxa_core::gateway");
+            assert_eq!(event.level, tracing::Level::INFO);
+            assert_eq!(
+                event.fields.get("component").map(String::as_str),
+                Some("gateway")
+            );
         }
+    }
+
+    #[test]
+    fn gateway_bind_failure_emits_no_start_or_listening_event() {
+        let occupied =
+            std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("occupy port");
+        let port = occupied.local_addr().expect("occupied address").port();
+        let capture = EventCapture::default();
+        let output = capture.0.clone();
+        tracing::subscriber::with_default(capture, || {
+            assert!(GatewayServer::start(port, GatewayState::new("runtime-test")).is_err());
+        });
+
+        let output = output.lock().expect("capture poisoned");
+        assert!(event_codes(&output).is_empty(), "{output:?}");
+    }
+
+    #[test]
+    fn gateway_thread_spawn_failure_emits_no_start_or_listening_event() {
+        let capture = EventCapture::default();
+        let output = capture.0.clone();
+        tracing::subscriber::with_default(capture, || {
+            let error = match GatewayServer::start_with_router_and_spawner(
+                0,
+                GatewayState::new("runtime-test"),
+                Router::new(),
+                |_, _, _, _| Err(io::Error::other("ARBITRARY_THREAD_SPAWN_ERROR")),
+            ) {
+                Ok(_) => panic!("thread spawn must fail"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("ARBITRARY_THREAD_SPAWN_ERROR"));
+        });
+
+        let output = output.lock().expect("capture poisoned");
+        assert!(event_codes(&output).is_empty(), "{output:?}");
+        assert!(!format!("{output:?}").contains("ARBITRARY_THREAD_SPAWN_ERROR"));
+    }
+
+    #[test]
+    fn gateway_join_failure_is_warn_after_owned_start_and_stop_request() {
+        let capture = EventCapture::default();
+        let output = capture.0.clone();
+        tracing::subscriber::with_default(capture, || {
+            let server = GatewayServer::start_with_router_and_spawner(
+                0,
+                GatewayState::new("runtime-test"),
+                Router::new(),
+                |_, _, _, _| {
+                    thread::Builder::new().spawn(|| panic!("ARBITRARY_GATEWAY_THREAD_PANIC"))
+                },
+            )
+            .expect("thread ownership acquired");
+            assert!(server.shutdown().is_err());
+        });
+
+        let output = output.lock().expect("capture poisoned");
+        assert_eq!(
+            event_codes(&output),
+            [
+                "gateway.starting",
+                "gateway.listening",
+                "gateway.stop_requested",
+                "gateway.join_failed",
+            ]
+        );
+        assert!(output[..3]
+            .iter()
+            .all(|event| event.level == tracing::Level::INFO));
+        assert_eq!(output[3].level, tracing::Level::WARN);
+        assert!(output
+            .iter()
+            .all(|event| event.target == "loxa_core::gateway"));
+        assert!(!format!("{output:?}").contains("ARBITRARY_GATEWAY_THREAD_PANIC"));
     }
     use std::task::{Context, Poll};
     use tokio::net::TcpListener;

@@ -1013,14 +1013,6 @@ where
     A: FnOnce(),
     D: FnOnce(),
 {
-    tracing::info!(
-        target: "loxa_core::engine",
-        event_code = "engine.spawn.started",
-        component = "engine",
-        generation = expected.generation,
-        backend_kind = backend_kind(spec),
-        result_class = "started",
-    );
     let result = spawn_starting_engine_with_hooks_inner(
         state_path,
         expected,
@@ -1079,9 +1071,22 @@ where
             prepared.spawn_raw_with_hooks(before_reservation_release, after_os_spawn)
         })? {
             SpawnStartingRunOutcome::Spawned { run, value: raw } => {
+                let spawned = raw.finish_with_hooks(
+                    || {
+                        tracing::info!(
+                            target: "loxa_core::engine",
+                            event_code = "engine.spawn.started",
+                            component = "engine",
+                            generation = expected.generation,
+                            backend_kind = backend_kind(spec),
+                            result_class = "started",
+                        );
+                    },
+                    after_log_drain_setup,
+                );
                 Ok(SpawnStartingRunOutcome::Spawned {
                     run,
-                    value: raw.finish_with_hook(after_log_drain_setup),
+                    value: spawned,
                 })
             }
             SpawnStartingRunOutcome::RequestedStop => Ok(SpawnStartingRunOutcome::RequestedStop),
@@ -1354,8 +1359,13 @@ impl RawEngineSpawn {
         self.raw.finish()
     }
 
-    fn finish_with_hook(self, after_log_drain_setup: impl FnOnce()) -> SpawnedServer {
+    fn finish_with_hooks(
+        self,
+        after_ownership_acquired: impl FnOnce(),
+        after_log_drain_setup: impl FnOnce(),
+    ) -> SpawnedServer {
         let mut spawned = self.finish();
+        after_ownership_acquired();
         let hook = std::panic::catch_unwind(std::panic::AssertUnwindSafe(after_log_drain_setup));
         if let Err(payload) = hook {
             let _ = teardown::teardown_managed_child_result(&mut spawned);
@@ -1621,6 +1631,7 @@ mod tests {
     use super::state::write_runtime_state;
     use super::*;
     use std::cell::Cell;
+    use std::collections::BTreeMap;
     #[cfg(unix)]
     use std::ffi::OsString;
     use std::fs;
@@ -1631,7 +1642,64 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Metadata, Subscriber};
+
+    #[derive(Clone, Debug)]
+    struct CapturedEvent {
+        target: String,
+        level: tracing::Level,
+        fields: BTreeMap<String, String>,
+    }
+
+    #[derive(Clone, Default)]
+    struct EventCapture(Arc<Mutex<Vec<CapturedEvent>>>);
+
+    struct FieldCapture<'a>(&'a mut BTreeMap<String, String>);
+
+    impl Visit for FieldCapture<'_> {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0.insert(field.name().to_owned(), value.to_owned());
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_owned(), format!("{value:?}"));
+        }
+    }
+
+    impl Subscriber for EventCapture {
+        fn enabled(&self, _: &Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &Event<'_>) {
+            let mut fields = BTreeMap::new();
+            event.record(&mut FieldCapture(&mut fields));
+            self.0
+                .lock()
+                .expect("capture poisoned")
+                .push(CapturedEvent {
+                    target: event.metadata().target().to_owned(),
+                    level: *event.metadata().level(),
+                    fields,
+                });
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    fn captured_event_codes(events: &[CapturedEvent]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|event| event.fields.get("event_code").map(String::as_str))
+            .collect()
+    }
 
     fn managed_run_for(server: &ManagedServer) -> ManagedRun {
         ManagedRun {
@@ -1671,6 +1739,206 @@ mod tests {
             child_process_start_time_unix_s: None,
             child_pgid: None,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn engine_spawn_events_begin_only_after_child_ownership() {
+        fn capture_spawn(
+            state_path: &Path,
+            run: &ManagedRun,
+            spec: &EngineLaunchSpec,
+            log_path: &Path,
+            reservation: LocalhostPortReservation,
+        ) -> (
+            Result<SpawnStartingRunOutcome<SpawnedServer>, SupervisorError>,
+            Vec<CapturedEvent>,
+        ) {
+            let capture = EventCapture::default();
+            let output = capture.0.clone();
+            let result = tracing::subscriber::with_default(capture, || {
+                spawn_starting_engine_with_health(
+                    state_path,
+                    &run.identity(),
+                    spec,
+                    log_path,
+                    reservation,
+                    &DiagnosticsHealth::new(),
+                )
+            });
+            let events = output.lock().expect("capture poisoned").clone();
+            (result, events)
+        }
+
+        let invalid_root = tempdir().expect("invalid-root tempdir");
+        let invalid_state = invalid_root.path().join("managed.json");
+        let invalid_run = childless_starting_run(invalid_root.path(), "invalid-log");
+        create_starting_run(&invalid_state, invalid_run.clone()).expect("seed invalid run");
+        let invalid_reservation = reserve_localhost_port(None).expect("reserve invalid port");
+        let invalid_spec = test_engine_launch_spec(
+            PathBuf::from("/bin/sh"),
+            vec![OsString::from("--secret-command-argument")],
+            invalid_reservation.port(),
+        );
+        let (invalid_result, invalid_events) = capture_spawn(
+            &invalid_state,
+            &invalid_run,
+            &invalid_spec,
+            Path::new("/dev/null/SECRET_MODEL_PATH.log"),
+            invalid_reservation,
+        );
+        assert!(invalid_result.is_err());
+        assert!(
+            captured_event_codes(&invalid_events).is_empty(),
+            "{invalid_events:?}"
+        );
+
+        let missing_state_root = tempdir().expect("missing-state tempdir");
+        let missing_state_run = childless_starting_run(missing_state_root.path(), "missing-state");
+        let missing_state_reservation = reserve_localhost_port(None).expect("reserve state port");
+        let missing_state_spec = test_engine_launch_spec(
+            PathBuf::from("/bin/sh"),
+            Vec::new(),
+            missing_state_reservation.port(),
+        );
+        let (missing_state_result, missing_state_events) = capture_spawn(
+            &missing_state_root.path().join("absent.json"),
+            &missing_state_run,
+            &missing_state_spec,
+            &missing_state_run.log_path,
+            missing_state_reservation,
+        );
+        assert!(missing_state_result.is_err());
+        assert!(
+            captured_event_codes(&missing_state_events).is_empty(),
+            "{missing_state_events:?}"
+        );
+
+        let lock_error_root = tempdir().expect("lock-error tempdir");
+        let lock_error_state = lock_error_root.path().join("managed.json");
+        let mut lock_error_run = childless_starting_run(lock_error_root.path(), "lock-error");
+        let lock_error_reservation = reserve_localhost_port(None).expect("reserve lock port");
+        lock_error_run.port = lock_error_reservation.port();
+        create_starting_run(&lock_error_state, lock_error_run.clone()).expect("seed lock run");
+        let lock_path = lock_error_root.path().join("managed.json.v2.lock");
+        fs::remove_file(&lock_path).expect("remove persistent lock file");
+        fs::create_dir(&lock_path).expect("replace lock file with directory");
+        let lock_error_spec =
+            test_engine_launch_spec(PathBuf::from("/bin/sh"), Vec::new(), lock_error_run.port);
+        let (lock_error_result, lock_error_events) = capture_spawn(
+            &lock_error_state,
+            &lock_error_run,
+            &lock_error_spec,
+            &lock_error_run.log_path,
+            lock_error_reservation,
+        );
+        assert!(lock_error_result.is_err());
+        assert!(
+            captured_event_codes(&lock_error_events).is_empty(),
+            "{lock_error_events:?}"
+        );
+
+        let stopped_root = tempdir().expect("stopped tempdir");
+        let stopped_state = stopped_root.path().join("managed.json");
+        let mut stopped_run = childless_starting_run(stopped_root.path(), "stopped");
+        let stopped_reservation = reserve_localhost_port(None).expect("reserve stopped port");
+        stopped_run.port = stopped_reservation.port();
+        create_starting_run(&stopped_state, stopped_run.clone()).expect("seed stopped run");
+        state::record_stop_request(&stopped_state, "all").expect("commit stop");
+        let stopped_spec =
+            test_engine_launch_spec(PathBuf::from("/bin/sh"), Vec::new(), stopped_run.port);
+        let (stopped_result, stopped_events) = capture_spawn(
+            &stopped_state,
+            &stopped_run,
+            &stopped_spec,
+            &stopped_run.log_path,
+            stopped_reservation,
+        );
+        assert!(matches!(
+            stopped_result,
+            Ok(SpawnStartingRunOutcome::RequestedStop)
+        ));
+        assert!(
+            captured_event_codes(&stopped_events).is_empty(),
+            "{stopped_events:?}"
+        );
+
+        let spawn_error_root = tempdir().expect("spawn-error tempdir");
+        let spawn_error_state = spawn_error_root.path().join("managed.json");
+        let mut spawn_error_run = childless_starting_run(spawn_error_root.path(), "spawn-error");
+        let spawn_error_reservation = reserve_localhost_port(None).expect("reserve spawn port");
+        spawn_error_run.port = spawn_error_reservation.port();
+        create_starting_run(&spawn_error_state, spawn_error_run.clone()).expect("seed spawn run");
+        let spawn_error_spec = test_engine_launch_spec(
+            spawn_error_root.path().join("SECRET_MISSING_COMMAND"),
+            vec![OsString::from("--secret-command-argument")],
+            spawn_error_run.port,
+        );
+        let (spawn_error_result, spawn_error_events) = capture_spawn(
+            &spawn_error_state,
+            &spawn_error_run,
+            &spawn_error_spec,
+            &spawn_error_run.log_path,
+            spawn_error_reservation,
+        );
+        assert!(spawn_error_result.is_err());
+        assert!(
+            captured_event_codes(&spawn_error_events).is_empty(),
+            "{spawn_error_events:?}"
+        );
+
+        let success_root = tempdir().expect("success tempdir");
+        let success_state = success_root.path().join("managed.json");
+        let mut success_run = childless_starting_run(success_root.path(), "success");
+        let success_reservation = reserve_localhost_port(None).expect("reserve success port");
+        success_run.port = success_reservation.port();
+        create_starting_run(&success_state, success_run.clone()).expect("seed success run");
+        let mut success_spec = test_engine_launch_spec(
+            PathBuf::from("/bin/sh"),
+            vec![
+                OsString::from("-c"),
+                OsString::from("printf SECRET_CHILD_STDOUT; printf SECRET_CHILD_STDERR >&2; trap 'exit 0' TERM; while :; do sleep 1; done"),
+            ],
+            success_run.port,
+        );
+        success_spec.runtime_model = "/private/SECRET_MODEL_PATH".to_owned();
+        let (success_result, success_events) = capture_spawn(
+            &success_state,
+            &success_run,
+            &success_spec,
+            &success_run.log_path,
+            success_reservation,
+        );
+        assert_eq!(
+            captured_event_codes(&success_events),
+            ["engine.spawn.started", "engine.spawn.succeeded"]
+        );
+        for event in &success_events {
+            assert_eq!(event.target, "loxa_core::engine");
+            assert_eq!(event.level, tracing::Level::INFO);
+            assert_eq!(
+                event.fields.get("component").map(String::as_str),
+                Some("engine")
+            );
+        }
+        let rendered = format!("{success_events:?}");
+        for forbidden in [
+            "SECRET_MODEL_PATH",
+            "SECRET_MISSING_COMMAND",
+            "--secret-command-argument",
+            "SECRET_CHILD_STDOUT",
+            "SECRET_CHILD_STDERR",
+        ] {
+            assert!(!rendered.contains(forbidden), "{rendered}");
+        }
+        let SpawnStartingRunOutcome::Spawned { mut value, .. } = success_result.expect("spawn")
+        else {
+            panic!("expected spawned child");
+        };
+        assert_eq!(
+            teardown_managed_child(&mut value, Duration::ZERO).expect("teardown child"),
+            TeardownConfirmation::Confirmed
+        );
     }
 
     #[test]
@@ -1956,39 +2224,63 @@ mod tests {
         create_starting_run(&state_path, run.clone()).expect("publish starting run");
         let spec = test_engine_launch_spec(program, vec![pid_path.as_os_str().to_owned()], port);
 
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = spawn_starting_engine_with_hooks(
-                &state_path,
-                &run.identity(),
-                &spec,
-                &run.log_path,
-                reservation,
-                || {},
-                || {},
-                || {},
-                || {
-                    let deadline = Instant::now() + Duration::from_secs(2);
-                    while fs::read_to_string(&pid_path)
-                        .ok()
-                        .and_then(|contents| contents.parse::<u32>().ok())
-                        .is_none()
-                        && Instant::now() < deadline
-                    {
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    assert!(
-                        fs::read_to_string(&pid_path)
+        let capture = EventCapture::default();
+        let captured = capture.0.clone();
+        let panic = tracing::subscriber::with_default(capture, || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = spawn_starting_engine_with_hooks(
+                    &state_path,
+                    &run.identity(),
+                    &spec,
+                    &run.log_path,
+                    reservation,
+                    || {},
+                    || {},
+                    || {},
+                    || {
+                        let deadline = Instant::now() + Duration::from_secs(2);
+                        while fs::read_to_string(&pid_path)
                             .ok()
                             .and_then(|contents| contents.parse::<u32>().ok())
-                            .is_some(),
-                        "spawned engine must publish its complete pid"
-                    );
-                    panic!("injected post-spawn initialization failure");
-                },
-            );
-        }));
+                            .is_none()
+                            && Instant::now() < deadline
+                        {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        assert!(
+                            fs::read_to_string(&pid_path)
+                                .ok()
+                                .and_then(|contents| contents.parse::<u32>().ok())
+                                .is_some(),
+                            "spawned engine must publish its complete pid"
+                        );
+                        panic!("ARBITRARY_POST_SPAWN_INITIALIZATION_FAILURE");
+                    },
+                );
+            }))
+        });
 
         assert!(panic.is_err());
+        let captured = captured.lock().expect("capture poisoned");
+        let codes = captured_event_codes(&captured);
+        assert_eq!(
+            codes
+                .iter()
+                .filter(|code| **code == "engine.spawn.started")
+                .count(),
+            1
+        );
+        assert_eq!(
+            codes
+                .iter()
+                .filter(|code| **code == "engine.spawn.succeeded")
+                .count(),
+            0
+        );
+        assert!(codes
+            .iter()
+            .any(|code| code.starts_with("engine.teardown.")));
+        assert!(!format!("{captured:?}").contains("ARBITRARY_POST_SPAWN_INITIALIZATION_FAILURE"));
         let pid = fs::read_to_string(&pid_path)
             .expect("read spawned pid")
             .parse::<u32>()
@@ -2943,6 +3235,55 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[test]
+    fn observed_exit_is_info_and_never_serializes_captured_log_tail() {
+        struct NotInterrupted;
+        impl InterruptStatus for NotInterrupted {
+            fn interrupted(&self) -> bool {
+                false
+            }
+        }
+
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let log_path = temp.path().join("engine.log");
+        fs::write(&log_path, "SECRET_CHILD_LOG_TAIL").expect("write child log tail");
+        let mut run = childless_starting_run(temp.path(), "observed-exit");
+        run.lifecycle = RunLifecycle::Running;
+        run.log_path = log_path.clone();
+        run.child_pid = Some(777);
+        run.child_process_start_time_unix_s = Some(999);
+        write_runtime_state(&state_path, std::slice::from_ref(&run)).expect("seed running state");
+        let capture = EventCapture::default();
+        let output = capture.0.clone();
+        let mut child = FakeChild::with_wait_results(vec![Some(1)]);
+
+        let _ = tracing::subscriber::with_default(capture, || {
+            handle_observed_child_exit(
+                &mut child,
+                &log_path,
+                &state_path,
+                &run.identity(),
+                &NotInterrupted,
+            )
+        });
+
+        let output = output.lock().expect("capture poisoned");
+        let exit = output
+            .iter()
+            .find(|event| {
+                event.fields.get("event_code").map(String::as_str) == Some("engine.exit.observed")
+            })
+            .expect("exit event");
+        assert_eq!(exit.target, "loxa_core::engine");
+        assert_eq!(exit.level, tracing::Level::INFO);
+        assert_eq!(
+            exit.fields.get("component").map(String::as_str),
+            Some("engine")
+        );
+        assert!(!format!("{output:?}").contains("SECRET_CHILD_LOG_TAIL"));
     }
 
     struct FakeChild {

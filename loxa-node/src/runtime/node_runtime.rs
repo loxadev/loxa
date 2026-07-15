@@ -10,6 +10,28 @@ use loxa_core::supervisor::ManagedRun;
 use std::io;
 use std::thread;
 
+fn emit_shutdown_stage(stage: &'static str, duration_ms: u64, error: Option<&io::Error>) {
+    if error.is_some() {
+        tracing::warn!(
+            target: "loxa_node::shutdown",
+            event_code = "shutdown.stage.failed",
+            component = "shutdown",
+            stage,
+            result_class = "join_failed",
+            duration_ms,
+        );
+    } else {
+        tracing::info!(
+            target: "loxa_node::shutdown",
+            event_code = "shutdown.stage.completed",
+            component = "shutdown",
+            stage,
+            result_class = "completed",
+            duration_ms,
+        );
+    }
+}
+
 #[must_use]
 pub(crate) struct NodeRuntimeParts {
     pub(crate) paths: NodePaths,
@@ -173,79 +195,41 @@ impl NodeRuntime {
             .take()
             .expect("runtime gateway state present")
             .withdraw();
-        tracing::info!(
-            target: "loxa_node::shutdown",
-            event_code = "shutdown.stage.completed",
-            component = "shutdown",
-            stage = "withdraw_routes",
-            result_class = "completed",
-            duration_ms = u64::try_from(shutdown_started.elapsed().as_millis())
-                .unwrap_or(u64::MAX),
+        emit_shutdown_stage(
+            "withdraw_routes",
+            u64::try_from(shutdown_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            None,
         );
         self.chat_routes_state
             .take()
             .expect("runtime chat routes state present")
             .shutdown_and_wait();
-        tracing::info!(
-            target: "loxa_node::shutdown",
-            event_code = "shutdown.stage.completed",
-            component = "shutdown",
-            stage = "chat_cancel_wait",
-            result_class = "completed",
-            duration_ms = u64::try_from(shutdown_started.elapsed().as_millis())
-                .unwrap_or(u64::MAX),
+        emit_shutdown_stage(
+            "chat_cancel_wait",
+            u64::try_from(shutdown_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            None,
         );
         let shutdown = self
             .gateway
             .take()
             .expect("runtime gateway present")
             .shutdown();
-        match &shutdown {
-            Ok(()) => tracing::info!(
-                target: "loxa_node::shutdown",
-                event_code = "shutdown.stage.completed",
-                component = "shutdown",
-                stage = "gateway_join",
-                result_class = "completed",
-                duration_ms = u64::try_from(shutdown_started.elapsed().as_millis())
-                    .unwrap_or(u64::MAX),
-            ),
-            Err(_) => tracing::warn!(
-                target: "loxa_node::shutdown",
-                event_code = "shutdown.stage.failed",
-                component = "shutdown",
-                stage = "gateway_join",
-                result_class = "join_failed",
-                duration_ms = u64::try_from(shutdown_started.elapsed().as_millis())
-                    .unwrap_or(u64::MAX),
-            ),
-        }
+        emit_shutdown_stage(
+            "gateway_join",
+            u64::try_from(shutdown_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            shutdown.as_ref().err(),
+        );
         let history_shutdown = self
             .history_worker
             .take()
             .expect("runtime history worker present")
             .stop_and_join()
             .map_err(io::Error::other);
-        match &history_shutdown {
-            Ok(()) => tracing::info!(
-                target: "loxa_node::shutdown",
-                event_code = "shutdown.stage.completed",
-                component = "shutdown",
-                stage = "history_join",
-                result_class = "completed",
-                duration_ms = u64::try_from(shutdown_started.elapsed().as_millis())
-                    .unwrap_or(u64::MAX),
-            ),
-            Err(_) => tracing::warn!(
-                target: "loxa_node::shutdown",
-                event_code = "shutdown.stage.failed",
-                component = "shutdown",
-                stage = "history_join",
-                result_class = "join_failed",
-                duration_ms = u64::try_from(shutdown_started.elapsed().as_millis())
-                    .unwrap_or(u64::MAX),
-            ),
-        }
+        emit_shutdown_stage(
+            "history_join",
+            u64::try_from(shutdown_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            history_shutdown.as_ref().err(),
+        );
         let result = match (outcome, shutdown, history_shutdown) {
             (Err(error), _, _) => Err(error),
             (Ok(_), Err(error), _) => Err(error),
@@ -308,5 +292,57 @@ impl Drop for NodeRuntime {
                     let _ = history_worker.stop_and_join();
                 }
             });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::emit_shutdown_stage;
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    struct CaptureWriter(Capture);
+
+    impl Write for CaptureWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0 .0.lock().expect("capture poisoned").extend(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for Capture {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            CaptureWriter(self.clone())
+        }
+    }
+
+    #[test]
+    fn failed_shutdown_stage_is_warn_and_does_not_serialize_error_display() {
+        let capture = Capture::default();
+        let output = capture.0.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(capture)
+            .finish();
+        let error = io::Error::other("ARBITRARY_SHUTDOWN_JOIN_ERROR");
+        tracing::subscriber::with_default(subscriber, || {
+            emit_shutdown_stage("gateway_join", 9, Some(&error));
+        });
+
+        let output = String::from_utf8(output.lock().expect("capture poisoned").clone())
+            .expect("UTF-8 diagnostics");
+        assert_eq!(output.matches("shutdown.stage.failed").count(), 1);
+        assert!(output.contains(" WARN loxa_node::shutdown:"), "{output}");
+        assert!(output.contains("component=\"shutdown\""), "{output}");
+        assert!(output.contains("stage=\"gateway_join\""), "{output}");
+        assert!(!output.contains("ARBITRARY_SHUTDOWN_JOIN_ERROR"));
     }
 }
