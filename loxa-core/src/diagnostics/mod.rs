@@ -4,6 +4,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::SystemTime;
 
+pub mod storage;
+pub use storage::{BoundedJsonlWriter, DiskSpace, StorageConfig, SystemDiskSpace};
+
 pub const MAX_DYNAMIC_FIELD_BYTES: usize = 256;
 pub const MAX_RECORD_BYTES: usize = 8 * 1024;
 pub const LOG_QUEUE_CAPACITY: usize = 1_024;
