@@ -249,10 +249,12 @@ impl InterruptStatus for SignalGuard {
 pub(crate) mod test_support {
     pub(crate) static SIGNAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub(crate) fn clear_ctrl_c_received() {
         super::clear_ctrl_c_received();
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub(crate) fn set_ctrl_c_received() {
         super::set_ctrl_c_received();
     }

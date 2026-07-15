@@ -1789,15 +1789,16 @@ fn unix_timestamp_now() -> u64 {
 #[cfg(test)]
 mod lifecycle_api_tests {
     use super::*;
-    use crate::daemon::signals::test_support::{
-        clear_ctrl_c_received, set_ctrl_c_received, SIGNAL_TEST_LOCK,
-    };
+    use crate::daemon::signals::test_support::SIGNAL_TEST_LOCK;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use crate::daemon::signals::test_support::{clear_ctrl_c_received, set_ctrl_c_received};
     use loxa_core::supervisor::{LogDrainingChild, ManagedChild};
     use std::cell::{Cell, RefCell};
     use std::fs;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::Arc;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     use std::sync::Mutex;
 
     use std::sync::atomic::{AtomicBool as TestAtomicBool, Ordering as TestOrdering};
