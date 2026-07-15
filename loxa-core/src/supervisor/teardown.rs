@@ -1,4 +1,4 @@
-#[cfg(debug_assertions)]
+#[cfg(feature = "composition-test-support")]
 use super::MAX_LOG_BYTES;
 use super::{BoundedLogWriter, SupervisorError};
 #[cfg(unix)]
@@ -8,7 +8,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
-#[cfg(debug_assertions)]
+#[cfg(feature = "composition-test-support")]
 use std::{fs::File, path::Path};
 
 #[cfg(unix)]
@@ -583,7 +583,7 @@ impl SpawnedServer {
     }
 
     #[doc(hidden)]
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "composition-test-support")]
     pub fn from_debug_child_for_composition_test(
         child: Child,
         log_path: &Path,

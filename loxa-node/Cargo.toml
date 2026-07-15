@@ -24,5 +24,6 @@ tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["fmt"] }
 
 [dev-dependencies]
+loxa-core = { path = "../loxa-core", features = ["composition-test-support"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
 tower = "0.5"

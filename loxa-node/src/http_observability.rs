@@ -127,9 +127,9 @@ fn apply_with_source<S: RequestIdSource>(router: Router, source: S) -> Router {
                         target: "loxa_node::http",
                         Level::INFO,
                         "http.request",
-                        request_id = %request_id.0,
-                        method = %request.method(),
-                        route = %route,
+                        request_id = request_id.0.as_str(),
+                        method = request.method().as_str(),
+                        route,
                         status = field::Empty,
                         latency_ms = field::Empty,
                         result_class = field::Empty,
@@ -151,6 +151,8 @@ fn apply_with_source<S: RequestIdSource>(router: Router, source: S) -> Router {
                             target: "loxa_node::http",
                             parent: span,
                             Level::INFO,
+                            event_code = "http.request.completed",
+                            component = "http",
                             status,
                             latency_ms,
                             result_class,
@@ -304,6 +306,8 @@ mod tests {
         assert_eq!(response_id, body_id);
         assert!(captured.contains(&response_id));
         assert!(captured.contains("/known/{id}"));
+        assert!(captured.contains("http.request.completed"));
+        assert!(captured.contains("component=\"http\""));
         for forbidden in [
             "Bearer hostile",
             "extension-hostile",

@@ -106,6 +106,15 @@ impl MonotonicCounter {
             });
     }
 
+    fn observe_total(&self, observed: u64) {
+        self.support();
+        let _ = self
+            .value
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                (observed > current).then_some(observed)
+            });
+    }
+
     fn snapshot(&self) -> Option<u64> {
         self.supported
             .load(Ordering::Relaxed)
@@ -166,6 +175,10 @@ impl DiagnosticsHealth {
         increment_queue_dropped,
         queue_dropped
     );
+
+    pub fn observe_queue_dropped_total(&self, observed: u64) {
+        self.inner.queue_dropped.observe_total(observed);
+    }
     counter_methods!(
         support_records_truncated_counter,
         increment_records_truncated,
@@ -295,6 +308,18 @@ mod tests {
         health.support_queue_drop_counter();
 
         assert_eq!(health.snapshot().queue_dropped, Some(0));
+    }
+
+    #[test]
+    fn observed_queue_drop_totals_auto_support_and_never_decrease() {
+        let health = DiagnosticsHealth::new();
+
+        health.observe_queue_dropped_total(7);
+        assert_eq!(health.snapshot().queue_dropped, Some(7));
+        health.observe_queue_dropped_total(3);
+        assert_eq!(health.snapshot().queue_dropped, Some(7));
+        health.observe_queue_dropped_total(11);
+        assert_eq!(health.snapshot().queue_dropped, Some(11));
     }
 
     #[test]

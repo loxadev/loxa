@@ -6,6 +6,10 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+composition-test-support = []
+
 [dependencies]
 axum = "0.8"
 futures-util = "0.3"
