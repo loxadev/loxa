@@ -1,11 +1,15 @@
 import { decodeOpenAIError } from "../node/contracts";
 import { SseDecodeError, SseDecoder } from "./sse";
+import { emptyTurnMetrics, type ChatTurnMetrics } from "./turnMetrics";
 
 const MAX_CHAT_RESPONSE_BYTES = 2 * 1024 * 1024;
 
 class ChatResponseTooLargeError extends Error {}
 
-export type StreamTerminal = { kind: "completed" } | { kind: "cancelled" } | { kind: "error"; message: string };
+export type StreamTerminal =
+  | { kind: "completed"; metrics: ChatTurnMetrics }
+  | { kind: "cancelled"; metrics: ChatTurnMetrics }
+  | { kind: "error"; message: string; metrics: ChatTurnMetrics };
 
 export type StreamCallbacks = {
   onDelta(text: string): void;
@@ -63,13 +67,15 @@ export function streamChat(
     return terminal;
   };
   const settle = (terminal: StreamTerminal): StreamTerminal =>
-    notifyTerminal(abortCause === null || abortCause === "timeout" ? terminal : { kind: "cancelled" });
+    notifyTerminal(
+      abortCause === null || abortCause === "timeout" ? terminal : { kind: "cancelled", metrics: emptyTurnMetrics() },
+    );
 
   let headerTimer: ReturnType<typeof setTimeout> | undefined = setTimeout(() => abortOnce("timeout"), headerTimeoutMs);
 
   const finished = (async (): Promise<StreamTerminal> => {
     if (abortCause !== null) {
-      return settle({ kind: "cancelled" });
+      return settle({ kind: "cancelled", metrics: emptyTurnMetrics() });
     }
     try {
       const response = await fetch(`${endpoint.replace(/\/$/, "")}/v1/chat/completions`, {
@@ -87,27 +93,33 @@ export function streamChat(
       }
       if (!response.ok) {
         if (abortCause !== null) {
-          return settle({ kind: "cancelled" });
+          return settle({ kind: "cancelled", metrics: emptyTurnMetrics() });
         }
         const message = await httpErrorMessage(response);
         if (abortCause !== null) {
-          return settle({ kind: "cancelled" });
+          return settle({ kind: "cancelled", metrics: emptyTurnMetrics() });
         }
         return settle({
           kind: "error",
           message,
+          metrics: emptyTurnMetrics(),
         });
       }
       const body = response.body;
       if (!body) {
         if (abortCause !== null) {
           return abortCause === "timeout"
-            ? settle({ kind: "error", message: "Timed out waiting for the Loxa node to begin responding." })
-            : settle({ kind: "cancelled" });
+            ? settle({
+                kind: "error",
+                message: "Timed out waiting for the Loxa node to begin responding.",
+                metrics: emptyTurnMetrics(),
+              })
+            : settle({ kind: "cancelled", metrics: emptyTurnMetrics() });
         }
         return settle({
           kind: "error",
           message: "The Loxa node returned a stream without a response body.",
+          metrics: emptyTurnMetrics(),
         });
       }
 
@@ -115,15 +127,19 @@ export function streamChat(
       if (abortCause !== null) {
         await cancelReader();
         return abortCause === "timeout"
-          ? settle({ kind: "error", message: "Timed out waiting for the Loxa node to begin responding." })
-          : settle({ kind: "cancelled" });
+          ? settle({
+              kind: "error",
+              message: "Timed out waiting for the Loxa node to begin responding.",
+              metrics: emptyTurnMetrics(),
+            })
+          : settle({ kind: "cancelled", metrics: emptyTurnMetrics() });
       }
       const decoder = new SseDecoder();
       let responseBytes = 0;
       while (true) {
         const result = await reader.read();
         if (abortCause !== null) {
-          return settle({ kind: "cancelled" });
+          return settle({ kind: "cancelled", metrics: emptyTurnMetrics() });
         }
         if (result.done) {
           for (const event of decoder.finish()) {
@@ -134,6 +150,7 @@ export function streamChat(
           return settle({
             kind: "error",
             message: "The chat stream ended before [DONE].",
+            metrics: emptyTurnMetrics(),
           });
         }
         responseBytes += result.value.byteLength;
@@ -150,10 +167,14 @@ export function streamChat(
       }
     } catch (error) {
       if (abortCause === "timeout") {
-        return settle({ kind: "error", message: "Timed out waiting for the Loxa node to begin responding." });
+        return settle({
+          kind: "error",
+          message: "Timed out waiting for the Loxa node to begin responding.",
+          metrics: emptyTurnMetrics(),
+        });
       }
       if (abortCause !== null || controller.signal.aborted) {
-        return settle({ kind: "cancelled" });
+        return settle({ kind: "cancelled", metrics: emptyTurnMetrics() });
       }
       await cancelReader();
       return settle({
@@ -166,6 +187,7 @@ export function streamChat(
               : reader
                 ? "The chat stream failed while reading."
                 : "Could not connect to the Loxa node.",
+        metrics: emptyTurnMetrics(),
       });
     } finally {
       if (headerTimer !== undefined) clearTimeout(headerTimer);
@@ -215,20 +237,20 @@ async function readBoundedBody(response: Response): Promise<string> {
 }
 
 function consumeEvent(data: string, callbacks: StreamCallbacks, isAborted: () => boolean): StreamTerminal | null {
-  if (isAborted()) return { kind: "cancelled" };
-  if (data.trim() === "[DONE]") return { kind: "completed" };
+  if (isAborted()) return { kind: "cancelled", metrics: emptyTurnMetrics() };
+  if (data.trim() === "[DONE]") return { kind: "completed", metrics: emptyTurnMetrics() };
   const payload = JSON.parse(data) as unknown;
   if (!isRecord(payload) || !Array.isArray(payload.choices)) {
     throw new SyntaxError("invalid OpenAI stream chunk");
   }
   for (const choice of payload.choices) {
-    if (isAborted()) return { kind: "cancelled" };
+    if (isAborted()) return { kind: "cancelled", metrics: emptyTurnMetrics() };
     if (!isRecord(choice) || !isRecord(choice.delta)) continue;
     const content = choice.delta.content;
     if (typeof content === "string" && content.length > 0) {
-      if (isAborted()) return { kind: "cancelled" };
+      if (isAborted()) return { kind: "cancelled", metrics: emptyTurnMetrics() };
       callbacks.onDelta(content);
-      if (isAborted()) return { kind: "cancelled" };
+      if (isAborted()) return { kind: "cancelled", metrics: emptyTurnMetrics() };
     }
   }
   return null;

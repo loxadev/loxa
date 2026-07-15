@@ -1,3 +1,6 @@
+import { SseDecodeError, SseDecoder } from "./sse";
+import { emptyTurnMetrics, type ChatTurnMetrics } from "./turnMetrics";
+
 export type HistoryClientErrorKind =
   "credential" | "endpoint" | "invalid-request" | "transport" | "timeout" | "aborted" | "http" | "invalid-response";
 
@@ -39,6 +42,7 @@ export type HistoryTurn = {
   engineName: string | null;
   engineVersion: string | null;
   errorCode: string | null;
+  metrics: ChatTurnMetrics;
   createdAtMs: number;
   updatedAtMs: number;
 };
@@ -53,7 +57,10 @@ export type MessageSummary = {
   createdAtMs: number;
   updatedAtMs: number;
 };
-export type PersistentTurnTerminal = { kind: "completed" } | { kind: "cancelled" } | { kind: "error"; message: string };
+export type PersistentTurnTerminal =
+  | { kind: "completed"; metrics: ChatTurnMetrics }
+  | { kind: "cancelled"; metrics: ChatTurnMetrics }
+  | { kind: "error"; message: string; metrics: ChatTurnMetrics };
 export type PersistentTurnCallbacks = {
   onStarted(turnId: string, omittedTurns: number): void;
   onDelta(content: string): void;
@@ -289,7 +296,7 @@ export function streamPersistentTurn(
     ).catch(() => undefined);
   };
   const finished = (async (): Promise<PersistentTurnTerminal> => {
-    if (disposed) return { kind: "cancelled" };
+    if (disposed) return { kind: "cancelled", metrics: emptyTurnMetrics() };
     try {
       const response = await fetch(historyUrl(endpoint, `/loxa/v1/chats/${chatId}/turns`), {
         method: "POST",
@@ -323,15 +330,16 @@ export function streamPersistentTurn(
         if (result.done) throw invalidResponse();
       }
     } catch (error) {
-      if (disposed || controller.signal.aborted) return { kind: "cancelled" };
+      if (disposed || controller.signal.aborted) return { kind: "cancelled", metrics: emptyTurnMetrics() };
       if (error instanceof HistoryClientError && error.kind === "http")
-        return notify({ kind: "error", message: error.message });
+        return notify({ kind: "error", message: error.message, metrics: emptyTurnMetrics() });
       return notify({
         kind: "error",
         message:
           error instanceof SseDecodeError
             ? "The Loxa node returned a malformed persistent chat stream."
             : "The persistent chat stream failed.",
+        metrics: emptyTurnMetrics(),
       });
     } finally {
       signal?.removeEventListener("abort", callerAbort);
@@ -575,7 +583,17 @@ function decodeTurnPage(value: unknown, chatId: string): TurnPage {
 }
 
 function decodeTurn(value: unknown, expectedChatId: string): HistoryTurn {
-  const keys = ["id", "chat_id", "ordinal", "state", "provenance", "error_code", "created_at_ms", "updated_at_ms"];
+  const keys = [
+    "id",
+    "chat_id",
+    "ordinal",
+    "state",
+    "provenance",
+    "error_code",
+    "metrics",
+    "created_at_ms",
+    "updated_at_ms",
+  ];
   if (
     !isRecord(value) ||
     !hasExactKeys(value, keys) ||
@@ -594,6 +612,7 @@ function decodeTurn(value: unknown, expectedChatId: string): HistoryTurn {
       value.error_code === null ||
       (typeof value.error_code === "string" && ERROR_CODE_PATTERN.test(value.error_code))
     ) ||
+    !isRecord(value.metrics) ||
     !isTimestamp(value.created_at_ms) ||
     !isTimestamp(value.updated_at_ms) ||
     value.updated_at_ms < value.created_at_ms
@@ -609,6 +628,7 @@ function decodeTurn(value: unknown, expectedChatId: string): HistoryTurn {
     engineName: value.provenance.engine_name,
     engineVersion: value.provenance.engine_version,
     errorCode: value.error_code,
+    metrics: decodeTurnMetrics(value.metrics),
     createdAtMs: value.created_at_ms,
     updatedAtMs: value.updated_at_ms,
   };
@@ -725,18 +745,20 @@ function decodeTurnEvent(
   if (event === "turn.completed" || event === "turn.cancelled" || event === "turn.failed") {
     if (
       currentTurnId === null ||
-      !hasExactKeys(value, ["turn_id", "state", "error_code"]) ||
+      !hasExactKeys(value, ["turn_id", "state", "error_code", "metrics"]) ||
       value.turn_id !== currentTurnId ||
       !(
         value.error_code === null ||
         (typeof value.error_code === "string" && ERROR_CODE_PATTERN.test(value.error_code))
-      )
+      ) ||
+      !isRecord(value.metrics)
     )
       throw invalidResponse();
+    const metrics = decodeTurnMetrics(value.metrics);
     if (event === "turn.completed" && value.state === "completed" && value.error_code === null)
-      return { kind: "terminal", terminal: { kind: "completed" } };
+      return { kind: "terminal", terminal: { kind: "completed", metrics } };
     if (event === "turn.cancelled" && value.state === "cancelled" && value.error_code === null)
-      return { kind: "terminal", terminal: { kind: "cancelled" } };
+      return { kind: "terminal", terminal: { kind: "cancelled", metrics } };
     if (event === "turn.failed" && value.state === "failed")
       return {
         kind: "terminal",
@@ -745,6 +767,7 @@ function decodeTurnEvent(
           message: value.error_code
             ? `Turn failed: ${value.error_code.replace(/_/g, " ")}.`
             : "The persistent turn failed.",
+          metrics,
         },
       };
   }
@@ -754,6 +777,29 @@ function decodeTurnEvent(
 function decodeClearResult(value: unknown): { deleted: number } {
   if (!isRecord(value) || !hasExactKeys(value, ["deleted"]) || !isTimestamp(value.deleted)) throw invalidResponse();
   return { deleted: value.deleted };
+}
+
+function decodeTurnMetrics(value: Record<string, unknown>): ChatTurnMetrics {
+  if (
+    !hasExactKeys(value, ["output_tokens", "total_duration_ms", "ttft_ms", "stop_reason"]) ||
+    !nullableSafeInteger(value.output_tokens) ||
+    !nullableSafeInteger(value.total_duration_ms) ||
+    !nullableSafeInteger(value.ttft_ms) ||
+    !nullableBoundedString(value.stop_reason, 128) ||
+    (value.ttft_ms !== null && value.total_duration_ms !== null && value.ttft_ms > value.total_duration_ms)
+  ) {
+    throw invalidResponse();
+  }
+  return {
+    outputTokens: value.output_tokens,
+    totalDurationMs: value.total_duration_ms,
+    ttftMs: value.ttft_ms,
+    stopReason: value.stop_reason,
+  };
+}
+
+function nullableSafeInteger(value: unknown): value is number | null {
+  return value === null || (Number.isSafeInteger(value) && (value as number) >= 0);
 }
 
 function nullableCursor(value: unknown): value is string | null {
@@ -796,4 +842,3 @@ function hasExactKeys(value: Record<string, unknown>, expected: readonly string[
   const sorted = [...expected].sort();
   return actual.length === sorted.length && actual.every((key, index) => key === sorted[index]);
 }
-import { SseDecodeError, SseDecoder } from "./sse";

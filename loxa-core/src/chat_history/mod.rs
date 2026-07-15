@@ -321,8 +321,55 @@ pub struct TurnRecord {
     pub state: TurnState,
     pub provenance: TurnProvenance,
     pub error_code: Option<String>,
+    pub metrics: TurnMetrics,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct TurnMetrics {
+    pub output_tokens: Option<u64>,
+    pub total_duration_ms: Option<u64>,
+    pub ttft_ms: Option<u64>,
+    pub stop_reason: Option<String>,
+}
+
+impl TurnMetrics {
+    pub fn new(
+        output_tokens: Option<u64>,
+        total_duration_ms: Option<u64>,
+        ttft_ms: Option<u64>,
+        stop_reason: Option<&str>,
+    ) -> Result<Self, HistoryError> {
+        if output_tokens.is_some_and(|value| value > i64::MAX as u64)
+            || total_duration_ms.is_some_and(|value| value > i64::MAX as u64)
+            || ttft_ms.is_some_and(|value| value > i64::MAX as u64)
+        {
+            return Err(HistoryError::InvalidMetadata);
+        }
+        if matches!((total_duration_ms, ttft_ms), (Some(total), Some(ttft)) if ttft > total) {
+            return Err(HistoryError::InvalidMetadata);
+        }
+        if let Some(value) = stop_reason {
+            validate_metadata(value, 128, true)?;
+        }
+        Ok(Self {
+            output_tokens,
+            total_duration_ms,
+            ttft_ms,
+            stop_reason: stop_reason.map(str::to_owned),
+        })
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), HistoryError> {
+        Self::new(
+            self.output_tokens,
+            self.total_duration_ms,
+            self.ttft_ms,
+            self.stop_reason.as_deref(),
+        )
+        .map(|_| ())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -537,5 +584,23 @@ mod tests {
         assert!(MessageContent::assistant("contains\0nul").is_err());
         assert!(MessageContent::user(&"a".repeat(USER_CONTENT_MAX_BYTES + 1)).is_err());
         assert!(MessageContent::assistant(&"a".repeat(ASSISTANT_CONTENT_MAX_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn turn_metrics_preserve_nullable_values_and_bound_stop_reason() {
+        let metrics = TurnMetrics::new(Some(42), Some(1_250), Some(85), Some("stop")).unwrap();
+        assert_eq!(metrics.output_tokens, Some(42));
+        assert_eq!(metrics.total_duration_ms, Some(1_250));
+        assert_eq!(metrics.ttft_ms, Some(85));
+        assert_eq!(metrics.stop_reason.as_deref(), Some("stop"));
+
+        assert_eq!(
+            TurnMetrics::default(),
+            TurnMetrics::new(None, None, None, None).unwrap()
+        );
+        assert!(TurnMetrics::new(None, None, None, Some("")).is_err());
+        assert!(TurnMetrics::new(None, None, None, Some("contains\0nul")).is_err());
+        assert!(TurnMetrics::new(None, None, None, Some(&"x".repeat(129))).is_err());
+        assert!(TurnMetrics::new(None, Some(10), Some(11), None).is_err());
     }
 }

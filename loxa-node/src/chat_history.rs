@@ -1,7 +1,7 @@
 use loxa_core::chat_history::{
     ChatCursor, ChatHistoryRepository, ChatId, ChatSummary, HistoryError, HistoryPage,
-    MessageContent, MessageId, MessagePage, MessageSummary, Title, TurnCursor, TurnId, TurnPage,
-    TurnProvenance, TurnRecord, TurnState,
+    MessageContent, MessageId, MessagePage, MessageSummary, Title, TurnCursor, TurnId, TurnMetrics,
+    TurnPage, TurnProvenance, TurnRecord, TurnState,
 };
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Sender, SyncSender, TrySendError};
@@ -70,6 +70,7 @@ struct TerminalCommand {
     state: TurnState,
     content: MessageContent,
     code: Option<String>,
+    metrics: TurnMetrics,
     at: i64,
     response: oneshot::Sender<Result<(), HistoryError>>,
 }
@@ -112,11 +113,12 @@ impl ChatHistory {
                 let _ = ready_tx.send(Ok(()));
                 loop {
                     while let Ok(command) = terminal_receiver.try_recv() {
-                        let _ = command.response.send(repository.finalize_turn(
+                        let _ = command.response.send(repository.finalize_turn_with_metrics(
                             &command.turn,
                             command.state,
                             command.content,
                             command.code.as_deref(),
+                            command.metrics,
                             command.at,
                         ));
                     }
@@ -165,13 +167,15 @@ impl ChatHistory {
                         }
                         Command::Stop => {
                             while let Ok(command) = terminal_receiver.try_recv() {
-                                let _ = command.response.send(repository.finalize_turn(
-                                    &command.turn,
-                                    command.state,
-                                    command.content,
-                                    command.code.as_deref(),
-                                    command.at,
-                                ));
+                                let _ =
+                                    command.response.send(repository.finalize_turn_with_metrics(
+                                        &command.turn,
+                                        command.state,
+                                        command.content,
+                                        command.code.as_deref(),
+                                        command.metrics,
+                                        command.at,
+                                    ));
                             }
                             break;
                         }
@@ -286,6 +290,7 @@ impl ChatHistory {
         state: TurnState,
         content: MessageContent,
         code: Option<String>,
+        metrics: TurnMetrics,
         at: i64,
     ) -> Result<(), ChatHistoryError> {
         let (response, receiver) = oneshot::channel();
@@ -295,6 +300,7 @@ impl ChatHistory {
                 state,
                 content,
                 code,
+                metrics,
                 at,
                 response,
             })

@@ -1,0 +1,20 @@
+.metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--loxa-space-2);
+  margin-top: var(--loxa-space-3);
+}
+
+.metric {
+  gap: var(--loxa-space-1);
+  font-variant-numeric: tabular-nums;
+}
+
+.metricIcon {
+  display: inline-flex;
+}
+
+.metricIcon svg {
+  width: 13px;
+  height: 13px;
+}

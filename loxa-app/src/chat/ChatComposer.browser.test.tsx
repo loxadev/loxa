@@ -4,7 +4,6 @@ import { expect, test } from "vitest";
 import { cdp, page } from "vitest/browser";
 
 import App from "@/App";
-import { DESKTOP_RUNTIME_UNAVAILABLE_MESSAGE } from "@/app/services";
 import { useWorkspaceStore } from "@/stores/workspace-store";
 import { mountBrowser } from "@/test/browser";
 import { createAppServicesFixture } from "@/test/fixtures";
@@ -44,8 +43,8 @@ test.each(["light", "dark"] as const)(
       await Promise.resolve();
       await Promise.resolve();
     });
-    await expect.element(page.getByRole("heading", { name: "Chat" })).toBeVisible();
-    await act(async () => page.getByRole("heading", { name: "Chat" }).hover());
+    await expect.element(page.getByRole("heading", { name: "New Chat" })).toBeVisible();
+    await act(async () => page.getByRole("heading", { name: "New Chat" }).hover());
 
     const composer = page.getByRole("form", { name: "Message composer" }).element();
     const attachment = page.getByRole("button", { name: "Attach document" }).element();
@@ -70,30 +69,34 @@ test.each(["light", "dark"] as const)(
       resolveColor(host, hostStyle.getPropertyValue("--loxa-background").trim()),
     );
     expect(composerStyle.borderRadius).toBe(hostStyle.getPropertyValue("--loxa-radius-lg").trim());
-    expect(supportReason).not.toBeNull();
-    await expect.element(supportReason!).toBeVisible();
-    expect(supportReason).toHaveTextContent(DESKTOP_RUNTIME_UNAVAILABLE_MESSAGE);
+    expect(supportReason).toBeNull();
     expect(attachmentReason).not.toBeNull();
     expect(attachmentReason).toHaveTextContent("Document input support cannot be checked until the node is connected.");
     await expect.element(attachmentReason!).not.toBeVisible();
     expect(attachment).toHaveAttribute("aria-disabled", "true");
     expect(attachment).toHaveAttribute("aria-describedby", "attachment-support-reason");
-    attachment.focus();
+    await act(async () => attachment.focus());
     await expect.element(attachmentReason!).toBeVisible();
-    attachment.blur();
+    await act(async () => attachment.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+    await expect.element(attachmentReason!).not.toBeVisible();
+    expect(document.activeElement).toBe(attachment);
+    await act(async () => attachment.blur());
     await expect.element(attachmentReason!).not.toBeVisible();
     await act(async () => page.getByRole("button", { name: "Attach document" }).hover());
     await expect.element(attachmentReason!).toBeVisible();
+    await act(async () => page.getByRole("tooltip").hover());
+    await expect.element(attachmentReason!).toBeVisible();
+    await act(async () => page.getByRole("heading", { name: "New Chat" }).hover());
+    await expect.element(attachmentReason!).not.toBeVisible();
     expect(composer).not.toHaveTextContent("Active: None");
     expect(document.querySelector("#model-control-help")).toBeNull();
-    const chatHeader = page.getByRole("heading", { name: "Chat" }).element().closest("header");
-    expect(chatHeader).not.toBeNull();
-    expect(chatHeader).toHaveTextContent("No active model");
+    const modelControl = page.getByRole("region", { name: "Chat model" }).element();
+    expect(modelControl).toHaveTextContent("No active model");
     const message = page.getByRole("textbox", { name: "Message" }).element();
     expect(getComputedStyle(message).backgroundColor).toBe("rgba(0, 0, 0, 0)");
     expect(message).toBeDisabled();
 
-    for (const control of [attachment, model, send]) {
+    for (const control of [attachment, send]) {
       const rect = control.getBoundingClientRect();
       expect(rect.width).toBeGreaterThanOrEqual(36);
       expect(rect.height).toBeGreaterThanOrEqual(44);
@@ -101,7 +104,7 @@ test.each(["light", "dark"] as const)(
       expect(rect.right).toBeLessThanOrEqual(composerRect.right);
     }
 
-    expect(model.getBoundingClientRect().top).toBe(attachment.getBoundingClientRect().top);
+    expect(composer).not.toContainElement(model);
     expect(send.getBoundingClientRect().top).toBe(attachment.getBoundingClientRect().top);
   },
 );

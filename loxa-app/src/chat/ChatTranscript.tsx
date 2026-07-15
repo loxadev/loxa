@@ -1,8 +1,11 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { Copy } from "lucide-react";
 
 import { MarkdownMessage } from "./MarkdownMessage";
 import mark from "../assets/brand/loxa-mark.svg?no-inline";
-import { Button } from "../components/ui/button";
+import { Button, IconButton } from "../components/ui/button";
+import { ResponseMetrics } from "./ResponseMetrics";
+import type { ChatTurnMetrics } from "./turnMetrics";
 import styles from "./ChatTranscript.module.css";
 
 export type ChatTurnStatus = "queued" | "streaming" | "completed" | "cancelled" | "failed";
@@ -14,6 +17,7 @@ export type ChatTurn = {
   response: string;
   status: ChatTurnStatus;
   error: string;
+  metrics?: ChatTurnMetrics | null;
 };
 
 export function ChatTranscript({
@@ -152,16 +156,6 @@ function AssistantResponse({ turn, copyText }: { turn: ChatTurn; copyText(text: 
           <p className={styles.messageLabel}>Loxa</p>
           <span className="technical-value">{turn.model}</span>
         </div>
-        <button
-          className={`${styles.copyResponseButton} quiet-button interactive-target`}
-          type="button"
-          aria-label="Copy response"
-          aria-describedby={copyPhase === "copied" || copyPhase === "failed" ? copyStatusId : undefined}
-          disabled={!responseComplete || copyPhase === "copying"}
-          onClick={() => void copy()}
-        >
-          {copyPhase === "copying" ? "Copying…" : "Copy response"}
-        </button>
       </div>
       <MarkdownMessage
         content={
@@ -171,20 +165,38 @@ function AssistantResponse({ turn, copyText }: { turn: ChatTurn; copyText(text: 
             : "No response was returned.")
         }
       />
+      <div className={styles.responseFooter}>
+        <ResponseMetrics metrics={turn.metrics} />
+        <IconButton
+          className={`${styles.copyResponseButton} interactive-target`}
+          variant="quiet"
+          label="Copy response"
+          helpId={copyPhase === "copied" || copyPhase === "failed" ? copyStatusId : undefined}
+          busy={copyPhase === "copying"}
+          disabled={!responseComplete}
+          onClick={() => void copy()}
+        >
+          <Copy />
+        </IconButton>
+      </div>
       {(copyPhase === "copied" || copyPhase === "failed") && (
         <p id={copyStatusId} className={styles.copyStatus} role="status" aria-label="Copy response status">
           {copyPhase === "copied" ? "Response copied" : "Copy failed"}
         </p>
       )}
-      <p className={`${styles.turnState} ${turn.status === "failed" ? styles.turnFailed : ""}`}>
-        {turnStateLabel(turn.status)}
-        {turn.error ? ` — ${turn.error}` : ""}
-      </p>
+      {turnStateLabel(turn.status) !== null && (
+        <p className={`${styles.turnState} ${turn.status === "failed" ? styles.turnFailed : ""}`}>
+          {turnStateLabel(turn.status)}
+          {turn.error ? ` — ${turn.error}` : ""}
+        </p>
+      )}
     </div>
   );
 }
 
-function turnStateLabel(status: ChatTurnStatus): string {
+function turnStateLabel(status: ChatTurnStatus): string | null {
+  if (status === "completed") return null;
+  if (status === "cancelled") return "Generation stopped";
   if (status === "failed") return "Turn failed";
   return `Turn ${status}`;
 }

@@ -1,0 +1,163 @@
+.control {
+  width: min(100%, 920px);
+  margin-inline: auto;
+  display: grid;
+  gap: var(--loxa-space-2);
+  padding: var(--loxa-space-3);
+  background: var(--loxa-secondary-surface);
+  border: 1px solid var(--loxa-control-border);
+  border-radius: var(--loxa-radius-lg);
+}
+
+.summary,
+.actions,
+.modelIdentity,
+.searchField {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+}
+
+.summary {
+  justify-content: space-between;
+  gap: var(--loxa-space-4);
+}
+
+.modelIdentity {
+  flex: 0 1 auto;
+  gap: var(--loxa-space-2);
+}
+
+.modelIdentity > svg,
+.searchField > svg {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  color: var(--loxa-muted-foreground);
+}
+
+.label,
+.activeModel,
+.status,
+.guidance {
+  margin: 0;
+}
+
+.label {
+  color: var(--loxa-muted-foreground);
+  font-size: var(--loxa-type-label-size);
+  font-weight: var(--loxa-type-label-weight);
+}
+
+.activeModel {
+  overflow: hidden;
+  font-family: var(--loxa-font-mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.statusCopy {
+  min-width: 0;
+  text-align: right;
+}
+
+.status,
+.guidance {
+  color: var(--loxa-muted-foreground);
+  font-size: var(--loxa-type-body-small-size);
+  line-height: var(--loxa-type-body-small-line-height);
+}
+
+.guidance {
+  overflow-wrap: anywhere;
+}
+
+.actions {
+  gap: var(--loxa-space-2);
+}
+
+.searchField {
+  position: relative;
+  flex: 1 1 260px;
+}
+
+.searchField > svg {
+  position: absolute;
+  left: var(--loxa-space-3);
+  z-index: 1;
+}
+
+.searchField input {
+  padding-left: calc(var(--loxa-space-3) + 22px);
+}
+
+.modelField {
+  flex: 1 1 260px;
+  min-width: 0;
+}
+
+.modelPicker {
+  width: 100%;
+  min-width: 0;
+  min-height: var(--loxa-component-minimum-interactive-target);
+  padding: 0 var(--loxa-space-3);
+  color: var(--loxa-foreground);
+  background: var(--loxa-background);
+  border: 1px solid var(--loxa-control-border);
+  border-radius: var(--loxa-radius-md);
+  font-family: var(--loxa-font-mono);
+  text-overflow: ellipsis;
+}
+
+.modelPicker:focus-visible {
+  outline: 2px solid var(--loxa-focus);
+  outline-offset: 2px;
+}
+
+.visuallyHidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+@media (max-width: 760px) {
+  .summary {
+    align-items: flex-start;
+  }
+
+  .actions {
+    flex-wrap: wrap;
+  }
+
+  .searchField,
+  .modelField {
+    flex-basis: 100%;
+  }
+}
+
+@media (prefers-contrast: more) {
+  .control,
+  .modelPicker {
+    border-width: 2px;
+  }
+}
+
+@media (forced-colors: active) {
+  .control,
+  .modelPicker {
+    border-color: ButtonText;
+    forced-color-adjust: auto;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .modelPicker {
+    transition-duration: var(--loxa-motion-fast);
+  }
+}

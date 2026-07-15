@@ -4,6 +4,38 @@ mod tests {
     use std::fs;
 
     #[test]
+    fn development_origin_accepts_only_one_canonical_ipv4_loopback_port() {
+        assert_eq!(
+            validated_dev_origin("http://127.0.0.1:1421").as_deref(),
+            Some("http://127.0.0.1:1421")
+        );
+        for rejected in [
+            "http://127.0.0.1:0",
+            "http://127.0.0.1:01421",
+            "http://127.0.0.1:1421/",
+            "http://localhost:1421",
+            "http://0.0.0.0:1421",
+            "https://127.0.0.1:1421",
+            "http://127.0.0.1:65536",
+            "http://127.0.0.1:1421.example.com",
+        ] {
+            assert_eq!(validated_dev_origin(rejected), None, "accepted {rejected}");
+        }
+        assert_eq!(
+            desktop_origins_for(Some("http://127.0.0.1:1421"), true),
+            ["tauri://localhost", "http://127.0.0.1:1421"]
+        );
+        assert_eq!(
+            desktop_origins_for(Some("http://127.0.0.1:1421"), false),
+            ["tauri://localhost", "http://127.0.0.1:1420"]
+        );
+        assert_eq!(
+            desktop_origins_for(Some("http://localhost:1421"), true),
+            ["tauri://localhost", "http://127.0.0.1:1420"]
+        );
+    }
+
+    #[test]
     fn token_is_created_once_private_and_never_disclosed_by_debug() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".loxa").join("control.token");
@@ -496,6 +528,39 @@ impl AuthPolicy {
         }
         Ok(())
     }
+}
+
+pub fn desktop_origins() -> Vec<String> {
+    desktop_origins_for(
+        std::env::var("LOXA_DEV_ORIGIN").ok().as_deref(),
+        cfg!(debug_assertions),
+    )
+}
+
+pub fn is_desktop_origin(origin: &str) -> bool {
+    desktop_origins().iter().any(|allowed| allowed == origin)
+}
+
+fn validated_dev_origin(value: &str) -> Option<String> {
+    let port = value
+        .strip_prefix("http://127.0.0.1:")?
+        .parse::<u16>()
+        .ok()?;
+    if port == 0 || value != format!("http://127.0.0.1:{port}") {
+        return None;
+    }
+    Some(value.to_owned())
+}
+
+fn desktop_origins_for(dev_origin: Option<&str>, development: bool) -> Vec<String> {
+    let browser_origin = if development {
+        dev_origin
+            .and_then(validated_dev_origin)
+            .unwrap_or_else(|| "http://127.0.0.1:1420".to_owned())
+    } else {
+        "http://127.0.0.1:1420".to_owned()
+    };
+    vec!["tauri://localhost".to_owned(), browser_origin]
 }
 
 fn encode_hex(bytes: &[u8]) -> String {

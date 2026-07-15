@@ -2121,6 +2121,7 @@ mod tests {
                 engine_version: None,
             },
             error_code: None,
+            metrics: loxa_core::control::client::TurnMetricsView::default(),
             created_at_ms: ordinal,
             updated_at_ms: ordinal,
         };

@@ -55,4 +55,15 @@ CREATE INDEX turns_by_chat ON turns(chat_id, ordinal);
 CREATE INDEX messages_by_turn ON messages(turn_id, role);
 "#,
     },
+    Migration {
+        version: 3,
+        name: "add_turn_metrics",
+        checksum: "f4e7822a4d6630baa5d41241f3038a5da3ae527234349111a14df8264716caf8",
+        sql: r#"
+ALTER TABLE turns ADD COLUMN output_tokens INTEGER CHECK(output_tokens IS NULL OR output_tokens >= 0);
+ALTER TABLE turns ADD COLUMN total_duration_ms INTEGER CHECK(total_duration_ms IS NULL OR total_duration_ms >= 0);
+ALTER TABLE turns ADD COLUMN ttft_ms INTEGER CHECK(ttft_ms IS NULL OR ttft_ms >= 0);
+ALTER TABLE turns ADD COLUMN stop_reason TEXT CHECK(stop_reason IS NULL OR (length(CAST(stop_reason AS BLOB)) BETWEEN 1 AND 128 AND instr(stop_reason, char(0)) = 0));
+"#,
+    },
 ];
