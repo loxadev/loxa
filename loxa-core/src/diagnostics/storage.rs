@@ -144,7 +144,7 @@ impl<D: DiskSpace> BoundedJsonlWriter<D> {
         health.support_rotation_failures_counter();
         health.support_retention_failures_counter();
         health.support_low_disk_suppressions_counter();
-        if let Err(error) = fs::create_dir_all(&config.daemon_root) {
+        if let Err(error) = ensure_daemon_root(&config.daemon_root) {
             storage_failure(&health);
             return Err(error);
         }
@@ -175,7 +175,10 @@ impl<D: DiskSpace> BoundedJsonlWriter<D> {
 
     fn open_next_segment(&mut self) -> io::Result<()> {
         if let Some(mut segment) = self.segment.take() {
-            segment.flush()?;
+            if let Err(error) = segment.flush() {
+                rotation_failure(&self.health);
+                return Err(error);
+            }
         }
         if !prune_segments(
             &self.incarnation_dir,
@@ -194,7 +197,10 @@ impl<D: DiskSpace> BoundedJsonlWriter<D> {
                     return Ok(());
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error),
+                Err(error) => {
+                    rotation_failure(&self.health);
+                    return Err(error);
+                }
             }
         }
     }
@@ -267,7 +273,6 @@ impl<D: DiskSpace> Write for BoundedJsonlWriter<D> {
             return Ok(buf.len());
         }
         if rotation_required && self.open_next_segment().is_err() {
-            self.health.increment_rotation_failures();
             self.enter_degraded(DegradedCause::Storage, self.clock.monotonic_seconds());
             return Ok(buf.len());
         }
@@ -279,8 +284,11 @@ impl<D: DiskSpace> Write for BoundedJsonlWriter<D> {
                 self.health.mark_available_at(self.clock.system_time());
             }
             Err(_) => {
-                let _ = segment.rollback(self.segment_bytes);
                 self.health.increment_storage_write_failures();
+                if segment.rollback(self.segment_bytes).is_err() {
+                    self.health.increment_storage_write_failures();
+                    self.segment = None;
+                }
                 self.enter_degraded(DegradedCause::Storage, self.clock.monotonic_seconds());
             }
         }
@@ -295,6 +303,18 @@ impl<D: DiskSpace> Write for BoundedJsonlWriter<D> {
             }
         }
         Ok(())
+    }
+}
+
+fn ensure_daemon_root(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "daemon log root is not a regular directory",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir(path),
+        Err(error) => Err(error),
     }
 }
 
@@ -561,6 +581,7 @@ mod tests {
     enum FailureMode {
         Write,
         PartialThenWrite,
+        PartialThenWriteAndRollback,
         Flush,
     }
 
@@ -568,20 +589,30 @@ mod tests {
         mode: FailureMode,
         writes: usize,
         rolled_back: Arc<AtomicU64>,
+        write_calls: Arc<AtomicU64>,
     }
 
     impl Write for FailingSegment {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.write_calls.fetch_add(1, Ordering::Relaxed);
             match self.mode {
                 FailureMode::Write => Err(std::io::Error::other("injected write failure")),
-                FailureMode::PartialThenWrite if self.writes == 0 => {
+                FailureMode::PartialThenWrite | FailureMode::PartialThenWriteAndRollback
+                    if self.writes == 0 =>
+                {
                     self.writes += 1;
                     Ok(buf.len().min(2))
                 }
+                FailureMode::PartialThenWrite | FailureMode::PartialThenWriteAndRollback
+                    if self.writes == 1 =>
+                {
+                    self.writes += 1;
+                    Err(std::io::Error::other("injected partial write failure"))
+                }
+                FailureMode::PartialThenWriteAndRollback | FailureMode::Flush => Ok(buf.len()),
                 FailureMode::PartialThenWrite => {
                     Err(std::io::Error::other("injected partial write failure"))
                 }
-                FailureMode::Flush => Ok(buf.len()),
             }
         }
 
@@ -596,7 +627,12 @@ mod tests {
     impl SegmentFile for FailingSegment {
         fn rollback(&mut self, _length: u64) -> std::io::Result<()> {
             self.rolled_back.fetch_add(1, Ordering::Relaxed);
-            Ok(())
+            match self.mode {
+                FailureMode::PartialThenWriteAndRollback => {
+                    Err(std::io::Error::other("injected rollback failure"))
+                }
+                _ => Ok(()),
+            }
         }
     }
 
@@ -829,28 +865,33 @@ mod tests {
         BoundedJsonlWriter<FakeDiskSpace>,
         DiagnosticsHealth,
         Arc<AtomicU64>,
+        Arc<AtomicU64>,
+        FakeClock,
     ) {
         let temp = TempDir::new().unwrap();
         let health = DiagnosticsHealth::new();
+        let clock = FakeClock::default();
         let mut writer = writer_with(
             &temp,
             FakeDiskSpace::available(),
-            FakeClock::default(),
+            clock.clone(),
             health.clone(),
         );
         writer.write_all(b"{\"event_code\":\"open\"}\n").unwrap();
         let rolled_back = Arc::new(AtomicU64::new(0));
+        let write_calls = Arc::new(AtomicU64::new(0));
         writer.replace_segment_for_test(Box::new(FailingSegment {
             mode,
             writes: 0,
             rolled_back: rolled_back.clone(),
+            write_calls: write_calls.clone(),
         }));
-        (temp, writer, health, rolled_back)
+        (temp, writer, health, rolled_back, write_calls, clock)
     }
 
     #[test]
     fn write_failure_is_consumed_and_degrades_storage() {
-        let (_temp, mut writer, health, _) = writer_with_failing_segment(FailureMode::Write);
+        let (_temp, mut writer, health, _, _, _) = writer_with_failing_segment(FailureMode::Write);
         let record = b"{\"event_code\":\"fail\"}\n";
 
         assert_eq!(writer.write(record).unwrap(), record.len());
@@ -863,7 +904,7 @@ mod tests {
 
     #[test]
     fn partial_write_is_rolled_back_and_consumed() {
-        let (_temp, mut writer, health, rolled_back) =
+        let (_temp, mut writer, health, rolled_back, _, _) =
             writer_with_failing_segment(FailureMode::PartialThenWrite);
         let record = b"{\"event_code\":\"partial\"}\n";
 
@@ -874,7 +915,7 @@ mod tests {
 
     #[test]
     fn flush_failure_is_consumed_and_degrades_storage() {
-        let (_temp, mut writer, health, _) = writer_with_failing_segment(FailureMode::Flush);
+        let (_temp, mut writer, health, _, _, _) = writer_with_failing_segment(FailureMode::Flush);
 
         assert!(writer.flush().is_ok());
         assert_eq!(health.snapshot().storage_write_failures, Some(1));
@@ -899,5 +940,69 @@ mod tests {
             health.snapshot().availability,
             crate::diagnostics::DiagnosticsAvailability::Degraded
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_symlinked_daemon_root_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::write(outside.path().join("sentinel"), b"keep").unwrap();
+        symlink(outside.path(), temp.path().join("daemon")).unwrap();
+        let config = StorageConfig::for_test(temp.path(), INCARNATION_3, 64, 4);
+        let health = DiagnosticsHealth::new();
+
+        let result = BoundedJsonlWriter::new(config, FakeDiskSpace::available(), health.clone());
+
+        assert!(result.is_err());
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 1);
+        assert_eq!(fs::read(outside.path().join("sentinel")).unwrap(), b"keep");
+        assert_eq!(health.snapshot().storage_write_failures, Some(1));
+        assert_eq!(
+            health.snapshot().availability,
+            crate::diagnostics::DiagnosticsAvailability::Degraded
+        );
+    }
+
+    #[test]
+    fn rollback_failure_abandons_the_corrupt_segment_before_recovery() {
+        let (_temp, mut writer, health, rolled_back, write_calls, clock) =
+            writer_with_failing_segment(FailureMode::PartialThenWriteAndRollback);
+        let record = b"{\"event_code\":\"partial\"}\n";
+
+        assert_eq!(writer.write(record).unwrap(), record.len());
+        assert_eq!(rolled_back.load(Ordering::Relaxed), 1);
+        assert_eq!(health.snapshot().storage_write_failures, Some(2));
+
+        clock.advance(Duration::from_secs(DEGRADED_RETRY_SECONDS));
+        assert_eq!(writer.write(record).unwrap(), record.len());
+        writer.flush().unwrap();
+
+        assert_eq!(write_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(recognized_segments(writer.incarnation_dir()).len(), 2);
+        assert_eq!(
+            health.snapshot().availability,
+            crate::diagnostics::DiagnosticsAvailability::Available
+        );
+    }
+
+    #[test]
+    fn one_pruning_failure_is_counted_once_by_rotation() {
+        let temp = TempDir::new().unwrap();
+        let health = DiagnosticsHealth::new();
+        let mut writer = writer_with(
+            &temp,
+            FakeDiskSpace::available(),
+            FakeClock::default(),
+            health.clone(),
+        );
+        fs::remove_dir(writer.incarnation_dir()).unwrap();
+        let record = b"{\"event_code\":\"safe\"}\n";
+
+        assert_eq!(writer.write(record).unwrap(), record.len());
+
+        assert_eq!(health.snapshot().rotation_failures, Some(1));
     }
 }
