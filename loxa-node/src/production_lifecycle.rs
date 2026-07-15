@@ -468,6 +468,7 @@ impl GatewayPublisher for ProductionGatewayPublisher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::process::{Command, Stdio};
 
     struct TestDir(PathBuf);

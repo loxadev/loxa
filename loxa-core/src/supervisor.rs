@@ -41,7 +41,7 @@ pub use state::{
 };
 use state::{record_stop_request, stable_run_is_present, StopRequestMatch};
 use teardown::prepare_managed_command;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use teardown::spawn_managed_command;
 pub use teardown::{
     teardown_managed_child, LogDrainingChild, ManagedChild, SpawnedServer, TeardownConfirmation,

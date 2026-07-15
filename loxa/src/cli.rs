@@ -1638,6 +1638,7 @@ mod tests {
         };
         let engine_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let mut run = starting_run_for_test(&paths.state_path, "migrated-live-owner");
+        run.log_path = PathBuf::from("managed.log");
         set_test_owner_to_current_process(&mut run);
         set_test_child_to_current_process(&mut run, &engine_listener);
         fs::create_dir_all(paths.state_path.parent().unwrap()).unwrap();
@@ -2332,13 +2333,19 @@ mod tests {
                 reason: "both qualified; attached candidate did not clear both thresholds".into(),
             },
         );
+        let evidence_path = outcome
+            .evidence_path
+            .as_ref()
+            .unwrap()
+            .display()
+            .to_string();
         let mut output = Vec::new();
         render_calibration_outcome(&outcome, &mut output).unwrap();
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("workload: tool-use-v1"));
         assert!(output.contains("verdict: no material winner"));
         assert!(output.contains("baseline retained: candidate A"));
-        assert!(output.contains("evidence: /tmp/calibration.json"));
+        assert!(output.contains(&format!("evidence: {evidence_path}")));
         assert!(!output.contains("best"));
     }
 
@@ -2387,6 +2394,12 @@ mod tests {
         ];
         for (evidence_verdict, verdict, expected) in cases {
             let outcome = calibration_outcome_for_test(evidence_verdict, verdict);
+            let evidence_path = outcome
+                .evidence_path
+                .as_ref()
+                .unwrap()
+                .display()
+                .to_string();
             let mut output = Vec::new();
             render_calibration_outcome(&outcome, &mut output).unwrap();
             let output = String::from_utf8(output).unwrap();
@@ -2397,7 +2410,7 @@ mod tests {
             assert!(output.contains("candidate A: passed"));
             assert!(output.contains("candidate B: passed"));
             assert!(output.contains("reason:"));
-            assert!(output.contains("evidence: /tmp/calibration.json"));
+            assert!(output.contains(&format!("evidence: {evidence_path}")));
         }
     }
 
@@ -2640,7 +2653,7 @@ mod tests {
                 verdict: evidence_verdict,
                 explanation_codes: vec![],
             },
-            evidence_path: Some(PathBuf::from("/tmp/calibration.json")),
+            evidence_path: Some(std::env::temp_dir().join("calibration.json")),
             verdict,
         }
     }

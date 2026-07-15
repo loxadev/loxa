@@ -139,7 +139,7 @@ describe("Cargo workspace isolation", () => {
     const ci = readFileSync(resolve(repositoryRoot, ".github/workflows/ci.yml"), "utf8");
     const frontend = yamlBlock(ci, "frontend", 2);
     expect(frontend).toMatch(/^    name: desktop frontend$/m);
-    expect(frontend).toMatch(/^    runs-on: ubuntu-latest$/m);
+    expect(frontend).toMatch(/^    runs-on: ubuntu-24\.04$/m);
     expect(frontend).toMatch(/^    timeout-minutes: 20$/m);
     expect(frontend).toMatch(/^        working-directory: loxa-app$/m);
 
@@ -169,7 +169,7 @@ describe("Cargo workspace isolation", () => {
 
     const packaging = yamlBlock(ci, "frontend-packaging", 2);
     expect(packaging).toMatch(/^    name: desktop package \(macOS\)$/m);
-    expect(packaging).toMatch(/^    runs-on: macos-latest$/m);
+    expect(packaging).toMatch(/^    runs-on: macos-15$/m);
     expect(packaging).toMatch(/^    timeout-minutes: 30$/m);
     expect(packaging).toMatch(/^        working-directory: loxa-app$/m);
     expect(workflowStep(packaging, "Install dependencies")).toMatch(/^        run: pnpm install --frozen-lockfile$/m);

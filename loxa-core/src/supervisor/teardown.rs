@@ -873,6 +873,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::supervisor::state::write_runtime_state;
     use crate::supervisor::{BoundedLogWriter, ManagedChild, TeardownConfirmation, MAX_LOG_BYTES};
     use std::cell::{Cell, RefCell};
@@ -2833,6 +2834,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn group_events(events: &RefCell<Vec<String>>) -> Vec<String> {
         events
             .borrow()
@@ -2873,11 +2875,13 @@ mod tests {
             }
         }
 
+        #[cfg(unix)]
         fn with_drain_states(mut self, states: Vec<bool>) -> Self {
             self.drain_states = RefCell::new(states.into());
             self
         }
 
+        #[cfg(unix)]
         fn with_drain_error(mut self) -> Self {
             self.drain_error = true;
             self

@@ -91,7 +91,7 @@ impl ChatHistoryRepository {
         Self::open_internal(path, || {})
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn open_with_boundary_hook(
         path: &Path,
         boundary_hook: impl FnOnce(),

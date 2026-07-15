@@ -227,6 +227,7 @@ mod tests {
     use std::ffi::{OsStr, OsString};
     use std::fs;
     use std::path::Path;
+    #[cfg(unix)]
     use std::time::Duration;
     use tempfile::TempDir;
 
