@@ -1877,7 +1877,9 @@ fn unix_timestamp_now() -> u64 {
 #[cfg(test)]
 mod lifecycle_api_tests {
     use super::*;
-    use crate::daemon::signals::{clear_ctrl_c_received, set_ctrl_c_received, SIGNAL_TEST_LOCK};
+    use crate::daemon::signals::test_support::{
+        clear_ctrl_c_received, set_ctrl_c_received, SIGNAL_TEST_LOCK,
+    };
     use loxa_core::supervisor::{LogDrainingChild, ManagedChild};
     use std::cell::{Cell, RefCell};
     use std::fs;
@@ -3637,6 +3639,7 @@ mod lifecycle_api_tests {
         use std::os::unix::fs::PermissionsExt;
 
         let _lock = MLX_ENV_LOCK.lock().expect("MLX environment lock");
+        let _signal_lock = SIGNAL_TEST_LOCK.lock().expect("signal test lock");
         let temp = TempDir::new("loxa-python-actual-restart");
         let bin_dir = temp.path().join("fake bin");
         let model_dir = temp.path().join("mlx model with spaces");

@@ -8,11 +8,11 @@ pub(crate) trait InterruptSource {
 
 static CTRL_C_RECEIVED: AtomicBool = AtomicBool::new(false);
 
-pub(crate) fn clear_ctrl_c_received() {
+fn clear_ctrl_c_received() {
     CTRL_C_RECEIVED.store(false, Ordering::SeqCst);
 }
 
-pub(crate) fn set_ctrl_c_received() {
+fn set_ctrl_c_received() {
     CTRL_C_RECEIVED.store(true, Ordering::SeqCst);
 }
 
@@ -246,10 +246,21 @@ impl InterruptStatus for SignalGuard {
 }
 
 #[cfg(test)]
-pub(crate) static SIGNAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) mod test_support {
+    pub(crate) static SIGNAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(crate) fn clear_ctrl_c_received() {
+        super::clear_ctrl_c_received();
+    }
+
+    pub(crate) fn set_ctrl_c_received() {
+        super::set_ctrl_c_received();
+    }
+}
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::SIGNAL_TEST_LOCK;
     use super::*;
     use std::sync::{Arc, Mutex};
 
