@@ -172,8 +172,21 @@ enum ChatsCommand {
 
 pub(crate) fn main() -> ExitCode {
     let cli = Cli::parse();
-
-    run(cli, io::stdout(), io::stderr())
+    let diagnostics = matches!(&cli.command, Command::Serve { .. }).then(|| {
+        let paths = NodePaths::detect();
+        install_daemon_diagnostics(&paths.logs_dir)
+    });
+    let exit_code = run(cli, io::stdout(), io::stderr());
+    if diagnostics.is_some() {
+        let result_class = if exit_code == ExitCode::SUCCESS {
+            "success"
+        } else {
+            "failed"
+        };
+        emit_final_shutdown_diagnostic(result_class);
+    }
+    drop(diagnostics);
+    exit_code
 }
 
 fn run<W: Write, E: Write>(cli: Cli, mut stdout: W, mut stderr: E) -> ExitCode {

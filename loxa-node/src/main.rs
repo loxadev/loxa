@@ -35,14 +35,30 @@ where
 
 fn run() -> Result<RunTermination, String> {
     let port = parse_port(std::env::args().skip(1))?;
-    loxa_node::serve_node(
+    let paths = NodePaths::detect();
+    let diagnostics = loxa_node::install_daemon_diagnostics(&paths.logs_dir);
+    let result = loxa_node::serve_node(
         None,
         port,
         RuntimeBackendKind::LlamaCpp,
-        &NodePaths::detect(),
+        &paths,
         &mut SilentEvents,
-    )
-    .map_err(|error| error.to_string())
+    );
+    let result_class = match &result {
+        Ok(RunTermination::RequestedStop) => "requested_stop",
+        Ok(RunTermination::Interrupted) => "interrupted",
+        Ok(RunTermination::Failed) => "failed",
+        Ok(RunTermination::RecoveryRequired) => "recovery_required",
+        Err(_) => "error",
+    };
+    tracing::info!(
+        target: "loxa_node::shutdown",
+        event_code = "shutdown.completed",
+        component = "shutdown",
+        result_class,
+    );
+    drop(diagnostics);
+    result.map_err(|error| error.to_string())
 }
 
 fn main() {

@@ -23,7 +23,9 @@ pub mod model_lifecycle;
 mod production_lifecycle;
 mod runtime;
 
-pub use bootstrap::NodePaths;
+pub use bootstrap::{
+    emit_final_shutdown_diagnostic, install_daemon_diagnostics, DiagnosticsBootstrap, NodePaths,
+};
 
 use bootstrap::NodeBuilder;
 use daemon::signals::{InterruptSource, SignalGuard};
