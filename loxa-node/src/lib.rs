@@ -984,6 +984,83 @@ fn cleanup_stable_node_runtime(
     }
 }
 
+struct StableRuntimeCleanup<'a> {
+    paths: &'a NodePaths,
+    run: Option<supervisor::ManagedRun>,
+    download_worker: Option<download_control::DownloadControlWorker>,
+}
+
+impl<'a> StableRuntimeCleanup<'a> {
+    fn new(
+        paths: &'a NodePaths,
+        run: supervisor::ManagedRun,
+        download_worker: download_control::DownloadControlWorker,
+    ) -> Self {
+        Self {
+            paths,
+            run: Some(run),
+            download_worker: Some(download_worker),
+        }
+    }
+
+    fn download_worker(&self) -> &download_control::DownloadControlWorker {
+        self.download_worker
+            .as_ref()
+            .expect("stable runtime download worker present")
+    }
+
+    fn finish(mut self, outcome: io::Result<RunTermination>) -> io::Result<RunTermination> {
+        let worker_cleanup = self
+            .download_worker
+            .take()
+            .expect("stable runtime download worker present")
+            .stop_and_join();
+        let cleanup = finish_unloaded_owner(
+            self.paths,
+            self.run
+                .as_ref()
+                .expect("stable runtime exact owner present"),
+        );
+        self.run.take();
+        match (outcome, worker_cleanup, cleanup) {
+            (Err(error), _, _) => Err(error),
+            (Ok(_), Err(error), _) => Err(error),
+            (Ok(_), Ok(()), Err(error)) => Err(error),
+            (Ok(outcome), Ok(()), Ok(())) => Ok(outcome),
+        }
+    }
+}
+
+impl Drop for StableRuntimeCleanup<'_> {
+    fn drop(&mut self) {
+        let worker_cleanup = self
+            .download_worker
+            .take()
+            .map(download_control::DownloadControlWorker::stop_and_join);
+        let owner_cleanup = self
+            .run
+            .take()
+            .map(|run| finish_unloaded_owner(self.paths, &run));
+        let cleanup_succeeded =
+            matches!(worker_cleanup, Some(Ok(()))) && matches!(owner_cleanup, Some(Ok(())));
+        #[cfg(test)]
+        if cleanup_succeeded {
+            STABLE_RUNTIME_PANIC_CLEANUPS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        #[cfg(not(test))]
+        let _ = cleanup_succeeded;
+    }
+}
+
+#[cfg(test)]
+static STABLE_RUNTIME_PANIC_CLEANUPS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn stable_runtime_panic_cleanup_count() -> usize {
+    STABLE_RUNTIME_PANIC_CLEANUPS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 #[cfg(test)]
 fn run_unloaded_actor(
     paths: &NodePaths,
@@ -1001,11 +1078,11 @@ fn run_stable_node_actor(
     startup_model: Option<&str>,
     mut events: Option<&mut dyn LifecycleEventSink>,
 ) -> io::Result<RunTermination> {
+    let cleanup = StableRuntimeCleanup::new(paths, run.clone(), download_worker);
     let signal_guard = match SignalGuard::install() {
         Ok(guard) => guard,
         Err(error) => {
-            let _ = download_worker.stop_and_join();
-            let _ = finish_unloaded_owner(paths, &run);
+            drop(cleanup);
             return Err(error);
         }
     };
@@ -1018,7 +1095,7 @@ fn run_stable_node_actor(
                 "startup model admission failed: {error:?}"
             )))),
             Ok(operation_id) => loop {
-                if download_worker.is_finished() {
+                if cleanup.download_worker().is_finished() {
                     break Some(Err(io::Error::other(
                         "model lifecycle actor worker terminated unexpectedly",
                     )));
@@ -1090,7 +1167,7 @@ fn run_stable_node_actor(
         startup
     } else {
         loop {
-            if download_worker.is_finished() {
+            if cleanup.download_worker().is_finished() {
                 break Err(io::Error::other(
                     "download actor worker terminated unexpectedly",
                 ));
@@ -1110,14 +1187,7 @@ fn run_stable_node_actor(
             std::thread::sleep(Duration::from_millis(25));
         }
     };
-    let worker_cleanup = download_worker.stop_and_join();
-    let cleanup = finish_unloaded_owner(paths, &run);
-    match (outcome, worker_cleanup, cleanup) {
-        (Err(error), _, _) => Err(error),
-        (Ok(_), Err(error), _) => Err(error),
-        (Ok(_), Ok(()), Err(error)) => Err(error),
-        (Ok(outcome), Ok(()), Ok(())) => Ok(outcome),
-    }
+    cleanup.finish(outcome)
 }
 
 fn current_same_owner_run(
@@ -2110,6 +2180,72 @@ mod lifecycle_api_tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn panicking_stable_lifecycle_sink_stops_worker_before_releasing_runtime() {
+        struct PanickingStableLifecycleSink {
+            emitted: usize,
+        }
+
+        impl LifecycleEventSink for PanickingStableLifecycleSink {
+            fn emit(&mut self, _: LifecycleEvent) -> io::Result<()> {
+                self.emitted += 1;
+                if self.emitted > 1 {
+                    panic!("injected stable lifecycle sink panic");
+                }
+                Ok(())
+            }
+        }
+
+        let _signal_lock = SIGNAL_TEST_LOCK.lock().expect("signal test lock");
+        let temp = TestDir::new("panic-stable-lifecycle-sink");
+        let paths = NodePaths {
+            models_dir: temp.0.join("models"),
+            state_path: temp.0.join("managed.json"),
+            logs_dir: temp.0.join("logs"),
+        };
+        std::fs::create_dir_all(&paths.models_dir).expect("create models directory");
+        let recipe = &REGISTRY[0];
+        std::fs::write(paths.models_dir.join(recipe.filename), b"invalid fixture")
+            .expect("write invalid startup fixture");
+        let runtime = build_node_runtime(
+            Some(recipe.id),
+            Some(0),
+            RuntimeBackendKind::LlamaCpp,
+            &paths,
+        )
+        .expect("construct production stable runtime graph");
+        let port = runtime.port();
+        let cleanup_before = stable_runtime_panic_cleanup_count();
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = runtime.run(&mut PanickingStableLifecycleSink { emitted: 0 });
+        }));
+
+        assert!(panic.is_err(), "sink panic must cross the runtime boundary");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let listener = TcpListener::bind(("127.0.0.1", port));
+            let owner_released = matches!(
+                managed_servers(&paths),
+                Ok(ManagedRunsSnapshot::Runs(ref runs)) if runs.is_empty()
+            );
+            let cleanup_completed = stable_runtime_panic_cleanup_count() == cleanup_before + 1;
+            if listener.is_ok() && owner_released && cleanup_completed {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "panic cleanup did not stop workers, release listener, and clear exact owner"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            stable_runtime_panic_cleanup_count(),
+            cleanup_before + 1,
+            "panic guard must clean the stable runtime exactly once"
+        );
     }
 
     #[test]
