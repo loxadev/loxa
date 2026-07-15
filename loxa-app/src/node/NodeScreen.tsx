@@ -3,27 +3,15 @@ import { TriangleAlert } from "lucide-react";
 
 import { Alert, AlertDescription, AlertTitle } from "../components/ui/alert";
 import { useNodeSession } from "./NodeSession";
-import type { NodeOwnership } from "./machine";
 import styles from "./NodeScreen.module.css";
 import { NodeTable } from "./NodeTable";
+import { presentNode } from "./presentation";
 
 export type { BootstrapApi, BootstrapSnapshot, StartNodeRequest } from "./NodeSession";
 
 export type NodeScreenServices = {
   copyText(text: string): Promise<void>;
 };
-
-const phaseLabels = {
-  checking: "Checking",
-  disconnected: "Disconnected",
-  starting: "Starting",
-  unloaded: "Node ready — no model loaded",
-  ready: "Ready",
-  reconciling: "Updating model status",
-  stopping: "Stopping",
-  "recovery-required": "Recovery required",
-  error: "Error",
-} as const;
 
 export function NodeScreen({
   services,
@@ -54,16 +42,7 @@ export function NodeScreen({
       </header>
       <p className={styles.intro}>{phaseSummary(session.phase)}</p>
       <NodeTable
-        nodeId={session.status?.node_id ?? "—"}
-        statusLabel={phaseLabels[session.phase]}
-        statusTone={statusTone(session.phase)}
-        health={session.status?.health ?? "Not connected"}
-        activeModel={session.status ? (session.status.runtime_model ?? "No model loaded") : "—"}
-        engineName={session.status?.engine?.name ?? "—"}
-        engineVersion={session.status?.engine?.version ?? "—"}
-        profile={session.status?.profile ?? "—"}
-        endpoint={session.endpoint}
-        ownership={ownershipLabel(session.ownership)}
+        {...presentNode(session)}
         actions={{
           copyEndpoint: (
             <button
@@ -111,7 +90,7 @@ export function NodeScreen({
   );
 }
 
-function phaseSummary(phase: keyof typeof phaseLabels) {
+function phaseSummary(phase: Parameters<typeof presentNode>[0]["phase"]) {
   if (phase === "unloaded") return "The private node is authenticated and ready for a verified model.";
   if (phase === "ready") return "The private node is authenticated and serving the active model.";
   if (phase === "reconciling") return "Refreshing authoritative node and model status.";
@@ -119,17 +98,4 @@ function phaseSummary(phase: keyof typeof phaseLabels) {
   if (phase === "stopping") return "Stopping the app-owned node safely.";
   if (phase === "recovery-required") return "Runtime recovery is required before model controls can continue.";
   return "The local node is not currently ready.";
-}
-
-function ownershipLabel(ownership: NodeOwnership) {
-  if (ownership === "owned") return "App-owned node";
-  if (ownership === "attached") return "Externally attached";
-  return "No node ownership";
-}
-
-function statusTone(phase: keyof typeof phaseLabels) {
-  if (phase === "error" || phase === "recovery-required") return "danger";
-  if (phase === "ready" || phase === "unloaded") return "success";
-  if (phase === "checking" || phase === "starting" || phase === "reconciling" || phase === "stopping") return "info";
-  return "neutral";
 }

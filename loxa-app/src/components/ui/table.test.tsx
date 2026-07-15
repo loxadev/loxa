@@ -33,7 +33,9 @@ describe("Table", () => {
 
     const table = screen.getByRole("table", { name: "Local node inventory" });
     expect(table.tagName).toBe("TABLE");
-    expect(container.querySelector("[data-slot='table-container']")).toContainElement(table);
+    const overflowContainer = container.querySelector("[data-slot='table-container']");
+    expect(overflowContainer).toContainElement(table);
+    expect(overflowContainer).toHaveAttribute("tabindex", "0");
     expect(within(table).getAllByRole("columnheader")).toHaveLength(2);
     expect(within(table).getAllByRole("row")).toHaveLength(2);
     expect(within(table).getByText("Local node").tagName).toBe("TD");

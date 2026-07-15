@@ -91,7 +91,14 @@ test("covers the annotated Nodes, Models, Settings overview, and Runtime routes 
   await expect.element(page.getByText(/theme and sidebar display preferences are saved on this Mac/i)).toBeVisible();
   await act(async () => page.getByRole("button", { name: /Runtime/ }).click());
   await expect.element(page.getByRole("heading", { name: "Runtime", exact: true })).toBeVisible();
+  const runtimeTable = page.getByRole("table", { name: "Local node inventory" });
+  await expect.element(runtimeTable).toBeVisible();
+  expect(runtimeTable.element().querySelectorAll("tbody tr")).toHaveLength(1);
+  expect(runtimeTable.element().querySelectorAll("th")).toHaveLength(5);
+  expect(runtimeTable.element()).not.toHaveTextContent("Actions");
+  expect(runtimeTable.element().querySelector("button, input, select, textarea")).toBeNull();
   await expect.element(page.getByText("http://127.0.0.1:8080")).toBeVisible();
+  await expect.element(page.getByRole("button", { name: "Back to Settings" })).toBeVisible();
 
   expectNoViewportOverflow();
   await settleVisuals();

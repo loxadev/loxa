@@ -1,4 +1,4 @@
-import { act, render, screen } from "@testing-library/react";
+import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -88,7 +88,16 @@ describe("SettingsScreen", () => {
 
     const heading = screen.getByRole("heading", { name: "Runtime", level: 1 });
     expect(heading).toHaveFocus();
-    expect(screen.getByRole("region", { name: "Local node/runtime" })).toBeVisible();
+    const local = screen.getByRole("region", { name: "Local node/runtime" });
+    expect(local).toBeVisible();
+    const table = within(local).getByRole("table", { name: "Local node inventory" });
+    expect(
+      within(table)
+        .getAllByRole("columnheader")
+        .map((cell) => cell.textContent),
+    ).toEqual(["Node", "Status", "Active model", "Endpoint", "Ownership"]);
+    expect(within(table).getAllByRole("row")).toHaveLength(2);
+    expect(within(table).getByText("Local node")).toBeVisible();
     for (const value of [
       runtime.endpoint,
       "Externally attached",
@@ -96,12 +105,16 @@ describe("SettingsScreen", () => {
       "llama.cpp",
       "b4321",
       "gemma-3-4b-it-q4",
+      "default",
     ]) {
       expect(screen.getByText(value)).toBeInTheDocument();
     }
+    expect(within(table).getByRole("status")).toHaveTextContent("Ready");
+    expect(within(table).getByRole("status")).toHaveAttribute("data-variant", "success");
+    expect(within(table).getByText(runtime.status.health)).toBeVisible();
     expect(screen.getByText("llama.cpp")).toHaveClass("technical-value");
-    const local = screen.getByRole("region", { name: "Local node/runtime" });
     expect(local.querySelectorAll("input, button, select, textarea")).toHaveLength(0);
+    expect(within(table).queryByRole("columnheader", { name: "Actions" })).not.toBeInTheDocument();
     expect(screen.queryByText(/start on login|provider|sampling|authentication|LAN|logs/i)).not.toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Back to Settings" }));
@@ -119,8 +132,12 @@ describe("SettingsScreen", () => {
         runtime={{ ...runtime, phase: "starting", ownership: "none", status: null }}
       />,
     );
-    expect(screen.getByText("Checking", { selector: "dd" })).toBeInTheDocument();
-    expect(screen.getAllByText("Unavailable", { selector: "dd" }).length).toBeGreaterThan(1);
+    const table = screen.getByRole("table", { name: "Local node inventory" });
+    expect(within(table).getByRole("status")).toHaveTextContent("Starting");
+    const row = within(table).getAllByRole("row")[1];
+    expect(within(row).getAllByText("—").length).toBeGreaterThan(1);
+    expect(row).not.toHaveTextContent("No model loaded");
+    expect(row).not.toHaveTextContent("Unavailable");
   });
 
   it("discloses plaintext local history and requires confirmation before clearing it", async () => {
