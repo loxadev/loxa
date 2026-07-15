@@ -20,11 +20,13 @@ pub mod download_control;
 mod engine_session;
 pub mod model_lifecycle;
 mod production_lifecycle;
+mod runtime;
 
 pub use bootstrap::NodePaths;
 
 use daemon::signals::{InterruptSource, SignalGuard};
 use engine_session::EngineSession;
+use runtime::{NodeRuntime, NodeRuntimeParts};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RunOutcome {
@@ -851,6 +853,15 @@ pub fn serve_node(
     paths: &NodePaths,
     events: &mut dyn LifecycleEventSink,
 ) -> io::Result<RunTermination> {
+    build_node_runtime(requested_model, port, engine, paths)?.run(events)
+}
+
+fn build_node_runtime(
+    requested_model: Option<&str>,
+    port: Option<u16>,
+    engine: RuntimeBackendKind,
+    paths: &NodePaths,
+) -> io::Result<NodeRuntime> {
     let startup_model = requested_startup_model(&paths.models_dir, requested_model, engine)
         .map_err(io::Error::other)?;
     let stable_llama_node = engine == RuntimeBackendKind::LlamaCpp;
@@ -942,78 +953,18 @@ pub fn serve_node(
             return Err(error);
         }
     };
-    let outcome = (|| {
-        if let Err(error) = events.emit(LifecycleEvent::NodeListening {
-            port: gateway.port(),
-            model_alias: "loxa".to_string(),
-        }) {
-            return match cleanup_stable_node_runtime(
-                paths,
-                unloaded_run.as_ref(),
-                &mut download_runtime,
-            ) {
-                Ok(()) => Err(error),
-                Err(cleanup) => Err(cleanup),
-            };
-        }
-        match startup_model {
-            Some(model_id) if stable_llama_node => run_stable_node_actor(
-                paths,
-                unloaded_run.expect("stable llama node owner claimed"),
-                Some(
-                    download_runtime
-                        .as_ref()
-                        .expect("stable llama node has model control")
-                        .0
-                        .clone(),
-                ),
-                download_runtime
-                    .take()
-                    .expect("stable llama node has model control")
-                    .1,
-                Some(model_id),
-                Some(events),
-            ),
-            Some(model_id) => run_model(
-                RunRequest {
-                    id: model_id,
-                    ctx: None,
-                    port: None,
-                    engine,
-                },
-                paths,
-                Some(&gateway_state),
-                events,
-            ),
-            None => run_stable_node_actor(
-                paths,
-                unloaded_run.expect("unloaded owner claimed"),
-                Some(
-                    download_runtime
-                        .as_ref()
-                        .expect("unloaded node has download control")
-                        .0
-                        .clone(),
-                ),
-                download_runtime
-                    .take()
-                    .expect("unloaded node has download control")
-                    .1,
-                None,
-                Some(events),
-            ),
-        }
-    })();
-    gateway_state.withdraw();
-    chat_routes_state.shutdown_and_wait();
-    let shutdown = gateway.shutdown();
-    let history_shutdown = history_worker.stop_and_join().map_err(io::Error::other);
-    match (outcome, shutdown, history_shutdown) {
-        (Err(error), _, _) => Err(error),
-        (Ok(_), Err(error), _) => Err(error),
-        (Ok(_), Ok(()), Err(error)) => Err(error),
-        (Ok(exit), Ok(()), Ok(())) => Ok(exit),
-    }
+    Ok(NodeRuntime::new(NodeRuntimeParts {
+        paths: paths.clone(),
+        startup_model: startup_model.map(str::to_owned),
+        engine,
+        stable_llama_node,
+        unloaded_run,
+        download_runtime,
+        gateway_state,
+        chat_routes_state,
+        gateway,
+        history_worker,
+    }))
 }
 
 fn cleanup_stable_node_runtime(
@@ -2127,6 +2078,38 @@ mod lifecycle_api_tests {
             ManagedRunsSnapshot::Runs(Vec::new()),
             "failed listening publication releases unloaded ownership"
         );
+    }
+
+    #[test]
+    fn dropping_unrun_runtime_eventually_releases_listener_and_exact_owner() {
+        let temp = TestDir::new("drop-unrun-runtime");
+        let paths = NodePaths {
+            models_dir: temp.0.join("models"),
+            state_path: temp.0.join("managed.json"),
+            logs_dir: temp.0.join("logs"),
+        };
+        let runtime = build_node_runtime(None, Some(0), RuntimeBackendKind::LlamaCpp, &paths)
+            .expect("construct production runtime graph");
+        let port = runtime.port();
+
+        drop(runtime);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let listener = TcpListener::bind(("127.0.0.1", port));
+            let owner_released = matches!(
+                managed_servers(&paths),
+                Ok(ManagedRunsSnapshot::Runs(ref runs)) if runs.is_empty()
+            );
+            if listener.is_ok() && owner_released {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "abandoned runtime did not release listener and exact owner"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]
