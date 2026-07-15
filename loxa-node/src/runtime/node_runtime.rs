@@ -88,9 +88,8 @@ impl NodeRuntime {
             Some(model_id) if self.stable_llama_node => {
                 let run = self
                     .unloaded_run
-                    .as_ref()
-                    .expect("stable llama node owner claimed")
-                    .clone();
+                    .take()
+                    .expect("stable llama node owner claimed");
                 let (download_control, download_worker) = self
                     .download_runtime
                     .take()
@@ -103,7 +102,6 @@ impl NodeRuntime {
                     Some(model_id),
                     Some(events),
                 );
-                self.unloaded_run.take();
                 outcome
             }
             Some(model_id) => crate::run_model(
@@ -122,11 +120,7 @@ impl NodeRuntime {
                 events,
             ),
             None => {
-                let run = self
-                    .unloaded_run
-                    .as_ref()
-                    .expect("unloaded owner claimed")
-                    .clone();
+                let run = self.unloaded_run.take().expect("unloaded owner claimed");
                 let (download_control, download_worker) = self
                     .download_runtime
                     .take()
@@ -139,7 +133,6 @@ impl NodeRuntime {
                     None,
                     Some(events),
                 );
-                self.unloaded_run.take();
                 outcome
             }
         }
