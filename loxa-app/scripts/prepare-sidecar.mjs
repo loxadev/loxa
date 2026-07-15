@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 const appRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repositoryRoot = resolve(appRoot, "..");
 const explicitTarget = process.env.LOXA_SIDECAR_TARGET;
+const development = process.argv.includes("--dev");
 let triple = explicitTarget;
 if (!triple) {
   const rustc = spawnSync("rustc", ["-vV"], { encoding: "utf8" });
@@ -20,15 +21,19 @@ if (process.argv.includes("--print-target")) {
   process.exit(0);
 }
 
-const build = spawnSync("cargo", ["build", "--locked", "--release", "--target", triple, "-p", "loxa-node"], {
-  cwd: repositoryRoot,
-  encoding: "utf8",
-  stdio: "inherit",
-});
+const build = spawnSync(
+  "cargo",
+  ["build", "--locked", ...(development ? [] : ["--release"]), "--target", triple, "-p", "loxa-node"],
+  {
+    cwd: repositoryRoot,
+    encoding: "utf8",
+    stdio: "inherit",
+  },
+);
 if (build.status !== 0) process.exit(build.status ?? 1);
 
 const extension = process.platform === "win32" ? ".exe" : "";
-const source = resolve(repositoryRoot, "target", triple, "release", `loxa-node${extension}`);
+const source = resolve(repositoryRoot, "target", triple, development ? "debug" : "release", `loxa-node${extension}`);
 const destination = resolve(appRoot, "src-tauri", "binaries", `loxa-node-${triple}${extension}`);
 mkdirSync(dirname(destination), { recursive: true });
 copyFileSync(source, destination);

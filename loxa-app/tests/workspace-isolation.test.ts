@@ -251,6 +251,23 @@ describe("Cargo workspace isolation", () => {
     expect(config.build.beforeDevCommand).toBe("pnpm prepare:sidecar && pnpm dev");
   });
 
+  it("selects one available loopback port for both Tauri and Vite development", () => {
+    const packageJson = JSON.parse(readFileSync(resolve(appRoot, "package.json"), "utf8")) as {
+      scripts: Record<string, string>;
+    };
+    const launcher = readFileSync(resolve(appRoot, "scripts/tauri.mjs"), "utf8");
+    const runtime = readFileSync(resolve(appRoot, "scripts/dev-runtime.mjs"), "utf8");
+    const sidecar = readFileSync(resolve(appRoot, "scripts/prepare-sidecar.mjs"), "utf8");
+
+    expect(packageJson.scripts.tauri).toBe("node scripts/tauri.mjs");
+    expect(launcher).toContain("LOXA_DEV_ORIGIN");
+    expect(launcher).toContain("startFrontend");
+    expect(runtime).toContain("http://127.0.0.1:");
+    expect(runtime).toContain("strictPort: false");
+    expect(runtime).not.toContain("0.0.0.0");
+    expect(sidecar).toContain('process.argv.includes("--dev")');
+  });
+
   it("keeps desktop diagnostics debug-only, structured, and non-persistent", () => {
     const manifest = readFileSync(resolve(appRoot, "src-tauri/Cargo.toml"), "utf8");
     const bootstrap = readFileSync(resolve(appRoot, "src-tauri/src/bootstrap.rs"), "utf8");
