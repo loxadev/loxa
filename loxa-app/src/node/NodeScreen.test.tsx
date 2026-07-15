@@ -6,6 +6,7 @@ import { resolve } from "node:path";
 
 import { NodeScreen, type NodeScreenServices } from "./NodeScreen";
 import { NodeSessionProvider, type BootstrapSnapshot, type NodeSessionServices, useNodeSession } from "./NodeSession";
+import { NodeTable } from "./NodeTable";
 
 const endpoint = "http://127.0.0.1:8080";
 const readyStatus = {
@@ -82,6 +83,31 @@ function ReconcileControl() {
 }
 
 describe("NodeScreen", () => {
+  it("omits the Actions column and cells when actions are absent", () => {
+    render(
+      <NodeTable
+        nodeId="node-7"
+        statusLabel="Ready"
+        statusTone="success"
+        health="ready"
+        activeModel="gemma-3-4b-it-q4"
+        engineName="llama.cpp"
+        engineVersion="b9999"
+        profile="default"
+        endpoint={endpoint}
+        ownership="App-owned node"
+      />,
+    );
+
+    const table = screen.getByRole("table", { name: "Local node inventory" });
+    expect(
+      within(table)
+        .getAllByRole("columnheader")
+        .map((cell) => cell.textContent),
+    ).toEqual(["Node", "Status", "Active model", "Endpoint", "Ownership"]);
+    expect(within(table).getAllByRole("cell")).toHaveLength(5);
+  });
+
   it("presents one truthful local node row without unsupported inventory controls", async () => {
     renderNode();
 

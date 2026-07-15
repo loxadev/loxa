@@ -135,59 +135,22 @@
   margin-bottom: var(--loxa-space-4);
 }
 
-.facts {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  margin: 0;
-  border-top: 1px solid var(--loxa-control-border);
-}
-
-.fact {
-  min-width: 0;
-  padding: var(--loxa-space-4) 0;
-  border-bottom: 1px solid var(--loxa-control-border);
-}
-
-.fact:nth-child(odd) {
-  padding-right: var(--loxa-space-6);
-}
-
-.fact:nth-child(even) {
-  padding-left: var(--loxa-space-6);
-  border-left: 1px solid var(--loxa-control-border);
-}
-
-.fact dd {
-  margin: 0;
-  overflow-wrap: anywhere;
-}
-
 @media (max-width: 760px) {
-  .themeOptions,
-  .facts {
+  .themeOptions {
     grid-template-columns: 1fr;
-  }
-
-  .fact:nth-child(n) {
-    padding: var(--loxa-space-4) 0;
-    border-left: 0;
   }
 }
 
 @media (prefers-contrast: more) {
   .themeOption,
-  .navigationRow,
-  .facts,
-  .fact {
+  .navigationRow {
     border-width: 2px;
   }
 }
 
 @media (forced-colors: active) {
   .themeOption,
-  .navigationRow,
-  .facts,
-  .fact {
+  .navigationRow {
     border-color: ButtonText;
     forced-color-adjust: auto;
   }

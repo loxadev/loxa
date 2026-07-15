@@ -23,7 +23,7 @@ export type NodeTableProps = {
   profile: string;
   endpoint: string;
   ownership: string;
-  actions: NodeTableActions;
+  actions?: NodeTableActions;
 };
 
 export function NodeTable({
@@ -49,7 +49,7 @@ export function NodeTable({
           <TableHead scope="col">Active model</TableHead>
           <TableHead scope="col">Endpoint</TableHead>
           <TableHead scope="col">Ownership</TableHead>
-          <TableHead scope="col">Actions</TableHead>
+          {actions && <TableHead scope="col">Actions</TableHead>}
         </TableRow>
       </TableHeader>
       <TableBody>
@@ -88,14 +88,16 @@ export function NodeTable({
           <TableCell>
             <span className={styles.primaryValue}>{ownership}</span>
           </TableCell>
-          <TableCell>
-            <div className={styles.actions}>
-              {actions.copyEndpoint}
-              {actions.model}
-              {actions.retry}
-              {actions.lifecycle}
-            </div>
-          </TableCell>
+          {actions && (
+            <TableCell>
+              <div className={styles.actions}>
+                {actions.copyEndpoint}
+                {actions.model}
+                {actions.retry}
+                {actions.lifecycle}
+              </div>
+            </TableCell>
+          )}
         </TableRow>
       </TableBody>
     </Table>
