@@ -1,12 +1,16 @@
 use axum::{
     body::Body,
     extract::MatchedPath,
-    http::{header::HeaderName, Request, Response},
+    http::{header::HeaderName, HeaderMap, Request, Response},
     middleware::{self, Next},
     Router,
 };
-use std::time::Duration;
+use std::{
+    fmt,
+    time::{Duration, Instant},
+};
 use tower_http::{
+    classify::{ClassifiedResponse, ClassifyEos, ClassifyResponse, MakeClassifier},
     request_id::{MakeRequestId, PropagateRequestIdLayer, RequestId, SetRequestIdLayer},
     trace::TraceLayer,
 };
@@ -100,6 +104,154 @@ fn result_class(status: axum::http::StatusCode) -> &'static str {
     }
 }
 
+fn emit_http_terminal(
+    span: &Span,
+    status: Option<u16>,
+    result_class: &'static str,
+    started: Instant,
+) {
+    if span.is_disabled() {
+        return;
+    }
+    let latency_ms = elapsed_milliseconds(started.elapsed());
+    if let Some(status) = status {
+        span.record("status", status);
+    }
+    span.record("latency_ms", latency_ms);
+    span.record("result_class", result_class);
+    let failed = matches!(
+        result_class,
+        "server_error" | "body_error" | "service_error"
+    );
+    match (failed, status) {
+        (true, Some(status)) => tracing::event!(
+            target: "loxa_node::http",
+            parent: span,
+            Level::WARN,
+            event_code = "http.request.failed",
+            component = "http",
+            status,
+            latency_ms,
+            result_class,
+        ),
+        (true, None) => tracing::event!(
+            target: "loxa_node::http",
+            parent: span,
+            Level::WARN,
+            event_code = "http.request.failed",
+            component = "http",
+            latency_ms,
+            result_class,
+        ),
+        (false, Some(status)) => tracing::event!(
+            target: "loxa_node::http",
+            parent: span,
+            Level::INFO,
+            event_code = "http.request.completed",
+            component = "http",
+            status,
+            latency_ms,
+            result_class,
+        ),
+        (false, None) => tracing::event!(
+            target: "loxa_node::http",
+            parent: span,
+            Level::INFO,
+            event_code = "http.request.completed",
+            component = "http",
+            latency_ms,
+            result_class,
+        ),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RequestLifecycleClassifier;
+
+#[derive(Clone)]
+struct ResponseClassifier {
+    started: Instant,
+}
+
+#[derive(Clone)]
+struct ResponseEosClassifier {
+    started: Instant,
+    status: u16,
+    result_class: &'static str,
+}
+
+struct HttpTerminal {
+    started: Instant,
+    status: Option<u16>,
+    result_class: &'static str,
+}
+
+// Dropping a body before another frame is polled provides no reliable signal
+// that distinguishes client cancellation from consumer teardown. In that case
+// diagnostics omit a terminal event instead of fabricating completion/failure.
+
+impl MakeClassifier for RequestLifecycleClassifier {
+    type Classifier = ResponseClassifier;
+    type FailureClass = HttpTerminal;
+    type ClassifyEos = ResponseEosClassifier;
+
+    fn make_classifier<B>(&self, _request: &Request<B>) -> Self::Classifier {
+        ResponseClassifier {
+            started: Instant::now(),
+        }
+    }
+}
+
+impl ClassifyResponse for ResponseClassifier {
+    type FailureClass = HttpTerminal;
+    type ClassifyEos = ResponseEosClassifier;
+
+    fn classify_response<B>(
+        self,
+        response: &axum::http::Response<B>,
+    ) -> ClassifiedResponse<Self::FailureClass, Self::ClassifyEos> {
+        ClassifiedResponse::RequiresEos(ResponseEosClassifier {
+            started: self.started,
+            status: response.status().as_u16(),
+            result_class: result_class(response.status()),
+        })
+    }
+
+    fn classify_error<E>(self, _error: &E) -> Self::FailureClass
+    where
+        E: fmt::Display + 'static,
+    {
+        HttpTerminal {
+            started: self.started,
+            status: None,
+            result_class: "service_error",
+        }
+    }
+}
+
+impl ClassifyEos for ResponseEosClassifier {
+    type FailureClass = HttpTerminal;
+
+    fn classify_eos(self, _trailers: Option<&HeaderMap>) -> Result<(), Self::FailureClass> {
+        Err(HttpTerminal {
+            started: self.started,
+            status: Some(self.status),
+            result_class: self.result_class,
+        })
+    }
+
+    fn classify_error<E>(self, _error: &E) -> Self::FailureClass
+    where
+        E: fmt::Display + 'static,
+    {
+        HttpTerminal {
+            started: self.started,
+            status: Some(self.status),
+            result_class: "body_error",
+        }
+    }
+}
+
 pub(crate) fn apply(router: Router) -> Router {
     apply_with_source(router, OsRequestIdSource)
 }
@@ -113,7 +265,7 @@ fn apply_with_source<S: RequestIdSource>(router: Router, source: S) -> Router {
         .layer(PropagateRequestIdLayer::new(REQUEST_ID_HEADER.clone()))
         .layer(middleware::from_fn(enforce_trusted_response_id))
         .layer(
-            TraceLayer::new_for_http()
+            TraceLayer::new(RequestLifecycleClassifier)
                 .make_span_with(|request: &Request<Body>| {
                     let Some(request_id) = request.extensions().get::<DiagnosticRequestId>() else {
                         return Span::none();
@@ -136,32 +288,19 @@ fn apply_with_source<S: RequestIdSource>(router: Router, source: S) -> Router {
                     )
                 })
                 .on_request(())
-                .on_response(
-                    |response: &Response<Body>, latency: Duration, span: &Span| {
-                        if span.is_disabled() {
-                            return;
-                        }
-                        let status = response.status().as_u16();
-                        let latency_ms = elapsed_milliseconds(latency);
-                        let result_class = result_class(response.status());
-                        span.record("status", status);
-                        span.record("latency_ms", latency_ms);
-                        span.record("result_class", result_class);
-                        tracing::event!(
-                            target: "loxa_node::http",
-                            parent: span,
-                            Level::INFO,
-                            event_code = "http.request.completed",
-                            component = "http",
-                            status,
-                            latency_ms,
-                            result_class,
-                        );
-                    },
-                )
+                .on_response(())
                 .on_body_chunk(())
                 .on_eos(())
-                .on_failure(()),
+                .on_failure(
+                    |terminal: HttpTerminal, _last_frame_latency: Duration, span: &Span| {
+                        emit_http_terminal(
+                            span,
+                            terminal.status,
+                            terminal.result_class,
+                            terminal.started,
+                        );
+                    },
+                ),
         )
         .layer(middleware::map_request(attach_diagnostic_request_id))
         .layer(SetRequestIdLayer::new(
@@ -174,20 +313,21 @@ fn apply_with_source<S: RequestIdSource>(router: Router, source: S) -> Router {
 #[cfg(test)]
 mod tests {
     use axum::{
-        body::{to_bytes, Body},
+        body::{to_bytes, Body, Bytes},
         extract::{Extension, State},
-        http::{header, HeaderMap, Request, StatusCode},
+        http::{header, HeaderMap, Request, Response, StatusCode},
         response::{sse::Event, IntoResponse, Sse},
         routing::{get, post},
         Json, Router,
     };
-    use futures_util::stream;
+    use futures_util::{stream, StreamExt};
     use loxa_core::gateway::{EngineTarget, GatewayState, GenerationOutput};
     use serde_json::{json, Value};
     use std::{
         convert::Infallible,
         io::{self, Write},
         sync::{Arc, Mutex},
+        time::Duration,
     };
     use tower::ServiceExt;
     use tracing::instrument::WithSubscriber;
@@ -288,17 +428,18 @@ mod tests {
             .extensions_mut()
             .insert(DiagnosticRequestId("diagnostic-hostile".to_owned()));
 
-        let response = app()
-            .oneshot(request)
-            .with_subscriber(capture.subscriber())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let response_id = response.headers()["x-request-id"]
-            .to_str()
-            .unwrap()
-            .to_owned();
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let (response_id, body) = async {
+            let response = app().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let response_id = response.headers()["x-request-id"]
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            (response_id, body)
+        }
+        .with_subscriber(capture.subscriber())
+        .await;
         let body_id = std::str::from_utf8(&body).unwrap();
         let captured = capture.text();
 
@@ -420,6 +561,161 @@ mod tests {
             body.as_ref(),
             b"event: first\ndata: one\n\nevent: second\ndata: two\n\n"
         );
+    }
+
+    #[tokio::test]
+    async fn streaming_request_completes_once_only_after_true_end_of_stream() {
+        let capture = Capture::default();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let released = Arc::new(Mutex::new(Some(released)));
+        let gated = Router::new().route(
+            "/gated-events",
+            get({
+                let released = Arc::clone(&released);
+                move || {
+                    let released = released
+                        .lock()
+                        .expect("release receiver poisoned")
+                        .take()
+                        .expect("gated route called once");
+                    async move {
+                        let first = stream::once(async {
+                            Ok::<_, Infallible>(Event::default().event("first").data("one"))
+                        });
+                        let second = stream::once(async move {
+                            released.await.expect("test releases stream");
+                            Ok::<_, Infallible>(Event::default().event("second").data("two"))
+                        });
+                        Sse::new(first.chain(second))
+                    }
+                }
+            }),
+        );
+
+        async {
+            let response = apply(gated)
+                .oneshot(
+                    Request::builder()
+                        .uri("/gated-events")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                capture.text().matches("http.request.completed").count(),
+                0,
+                "response headers are not stream completion"
+            );
+
+            let mut body = response.into_body().into_data_stream();
+            let first = body.next().await.unwrap().unwrap();
+            assert_eq!(first.as_ref(), b"event: first\ndata: one\n\n");
+            assert_eq!(capture.text().matches("http.request.completed").count(), 0);
+
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            release.send(()).unwrap();
+            let second = body.next().await.unwrap().unwrap();
+            assert_eq!(second.as_ref(), b"event: second\ndata: two\n\n");
+            assert!(body.next().await.is_none());
+        }
+        .with_subscriber(capture.subscriber())
+        .await;
+        let captured = capture.text();
+        assert_eq!(captured.matches("http.request.completed").count(), 1);
+        assert_eq!(captured.matches("http.request.failed").count(), 0);
+        let terminal = captured
+            .lines()
+            .find(|line| line.contains("http.request.completed"))
+            .unwrap();
+        let latency_ms = terminal
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("latency_ms="))
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        assert!(
+            latency_ms >= 20,
+            "latency omitted stream lifetime: {terminal}"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_error_emits_one_warn_failure_instead_of_info_completion() {
+        let capture = Capture::default();
+        async {
+            let response = apply(Router::new().route(
+                "/failure",
+                get(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "safe failure") }),
+            ))
+            .oneshot(
+                Request::builder()
+                    .uri("/failure")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        }
+        .with_subscriber(capture.subscriber())
+        .await;
+
+        let captured = capture.text();
+        let failure = captured
+            .lines()
+            .find(|line| line.contains("http.request.failed"))
+            .expect("server failure diagnostic");
+        assert!(failure.contains("loxa_node::http"), "{failure}");
+        assert!(failure.contains(" WARN "), "{failure}");
+        assert!(failure.contains("status=500"), "{failure}");
+        assert!(
+            failure.contains("result_class=\"server_error\""),
+            "{failure}"
+        );
+        assert_eq!(captured.matches("http.request.failed").count(), 1);
+        assert_eq!(captured.matches("http.request.completed").count(), 0);
+    }
+
+    #[tokio::test]
+    async fn response_body_error_emits_one_safe_warn_failure() {
+        let capture = Capture::default();
+        async {
+            let response = apply(Router::new().route(
+                "/body-failure",
+                get(|| async {
+                    Response::new(Body::from_stream(stream::iter([
+                        Ok::<_, io::Error>(Bytes::from_static(b"first")),
+                        Err(io::Error::other("SECRET_BODY_ERROR")),
+                    ])))
+                }),
+            ))
+            .oneshot(
+                Request::builder()
+                    .uri("/body-failure")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            let mut body = response.into_body().into_data_stream();
+            assert_eq!(body.next().await.unwrap().unwrap().as_ref(), b"first");
+            assert!(body.next().await.unwrap().is_err());
+        }
+        .with_subscriber(capture.subscriber())
+        .await;
+
+        let captured = capture.text();
+        let failure = captured
+            .lines()
+            .find(|line| line.contains("http.request.failed"))
+            .expect("body failure diagnostic");
+        assert!(failure.contains(" WARN "), "{failure}");
+        assert!(failure.contains("result_class=\"body_error\""), "{failure}");
+        assert_eq!(captured.matches("http.request.failed").count(), 1);
+        assert_eq!(captured.matches("http.request.completed").count(), 0);
+        assert!(!captured.contains("SECRET_BODY_ERROR"));
     }
 
     async fn proxy(

@@ -841,6 +841,61 @@ async fn send_downstream(
     }
 }
 
+fn emit_turn_started(chat_id: &str, turn_id: &str, request_id: Option<&str>) {
+    if let Some(request_id) = request_id {
+        tracing::info!(
+            target: "loxa_node::chat",
+            event_code = "chat.turn.started",
+            component = "chat",
+            chat_id,
+            turn_id,
+            request_id,
+            state = "streaming",
+        );
+    } else {
+        tracing::info!(
+            target: "loxa_node::chat",
+            event_code = "chat.turn.started",
+            component = "chat",
+            chat_id,
+            turn_id,
+            state = "streaming",
+        );
+    }
+}
+
+fn emit_turn_terminal(
+    chat_id: &str,
+    turn_id: &str,
+    request_id: Option<&str>,
+    result: &'static str,
+) {
+    if let Some(request_id) = request_id {
+        tracing::info!(
+            target: "loxa_node::chat",
+            event_code = "chat.turn.terminal",
+            component = "chat",
+            chat_id,
+            turn_id,
+            request_id,
+            state = result,
+            status = result,
+            result_class = result,
+        );
+    } else {
+        tracing::info!(
+            target: "loxa_node::chat",
+            event_code = "chat.turn.terminal",
+            component = "chat",
+            chat_id,
+            turn_id,
+            state = result,
+            status = result,
+            result_class = result,
+        );
+    }
+}
+
 async fn persistent_turn(
     State(state): State<ChatRoutesState>,
     request_id: Option<Extension<crate::http_observability::DiagnosticRequestId>>,
@@ -948,14 +1003,10 @@ async fn persistent_turn(
         }
     }
     let diagnostic_request_id = request_id.map(|Extension(value)| value.0);
-    tracing::info!(
-        target: "loxa_node::chat",
-        event_code = "chat.turn.started",
-        component = "chat",
-        chat_id = chat.as_str(),
-        turn_id = turn_id.as_str(),
-        request_id = diagnostic_request_id.as_deref().unwrap_or("unsupported"),
-        state = "streaming",
+    emit_turn_started(
+        chat.as_str(),
+        turn_id.as_str(),
+        diagnostic_request_id.as_deref(),
     );
     let (sender, receiver) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(32);
     let task_state = state.clone();
@@ -1125,16 +1176,11 @@ async fn persistent_turn(
                 TurnState::Cancelled => "cancelled",
                 _ => "failed",
             };
-            tracing::info!(
-                target: "loxa_node::chat",
-                event_code = "chat.turn.terminal",
-                component = "chat",
-                chat_id = chat.as_str(),
-                turn_id = turn_id.as_str(),
-                request_id = diagnostic_request_id.as_deref().unwrap_or("unsupported"),
-                state = diagnostic_result,
-                status = diagnostic_result,
-                result_class = diagnostic_result,
+            emit_turn_terminal(
+                chat.as_str(),
+                turn_id.as_str(),
+                diagnostic_request_id.as_deref(),
+                diagnostic_result,
             );
         }
         if receiver_alive {
@@ -1725,7 +1771,7 @@ mod tests {
                 worker: None,
                 root: root.clone(),
             };
-            for (engine_body, prompt, expected_state) in [
+            for (index, (engine_body, prompt, expected_state)) in [
                 (
                     "data: {\"choices\":[{\"delta\":{\"content\":\"SECRET_RESPONSE_TOKEN\"}}]}\n\ndata: [DONE]\n\n",
                     "SECRET_PROMPT_TOKEN /private/owner/chat",
@@ -1736,10 +1782,13 @@ mod tests {
                     "failure prompt",
                     TurnState::Failed,
                 ),
-            ] {
+            ]
+            .into_iter()
+            .enumerate()
+            {
                 publish_fake_engine(&fixture, engine_body).await;
                 let chat = history.create_chat(1).await.unwrap();
-                let request = axum::http::Request::builder()
+                let mut request = axum::http::Request::builder()
                     .method(Method::POST)
                     .uri(format!("/loxa/v1/chats/{}/turns", chat.id))
                     .header(header::AUTHORIZATION, &bearer)
@@ -1748,6 +1797,13 @@ mod tests {
                         json!({"model":"loxa","content":prompt}).to_string(),
                     ))
                     .unwrap();
+                if index == 0 {
+                    request.extensions_mut().insert(
+                        crate::http_observability::DiagnosticRequestId(
+                            "present-correlation".to_owned(),
+                        ),
+                    );
+                }
                 let response = router(state.clone()).oneshot(request).await.unwrap();
                 assert_eq!(response.status(), StatusCode::OK);
                 let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
@@ -1812,13 +1868,19 @@ mod tests {
             .collect();
         assert_eq!(diagnostic.len(), 6, "{diagnostic:?}");
         assert_eq!(diagnostic[0].fields["event_code"], "chat.turn.started");
+        assert_eq!(diagnostic[0].fields["request_id"], "present-correlation");
         assert_eq!(diagnostic[1].fields["event_code"], "chat.turn.terminal");
+        assert_eq!(diagnostic[1].fields["request_id"], "present-correlation");
         assert_eq!(diagnostic[1].fields["result_class"], "completed");
         assert_eq!(diagnostic[2].fields["event_code"], "chat.turn.started");
+        assert!(!diagnostic[2].fields.contains_key("request_id"));
         assert_eq!(diagnostic[3].fields["event_code"], "chat.turn.terminal");
+        assert!(!diagnostic[3].fields.contains_key("request_id"));
         assert_eq!(diagnostic[3].fields["result_class"], "failed");
         assert_eq!(diagnostic[4].fields["event_code"], "chat.turn.started");
+        assert!(!diagnostic[4].fields.contains_key("request_id"));
         assert_eq!(diagnostic[5].fields["event_code"], "chat.turn.terminal");
+        assert!(!diagnostic[5].fields.contains_key("request_id"));
         assert_eq!(diagnostic[5].fields["result_class"], "cancelled");
         assert!(diagnostic.iter().all(|event| {
             event.target == "loxa_node::chat" && event.level == tracing::Level::INFO
