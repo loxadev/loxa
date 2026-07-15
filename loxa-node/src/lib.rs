@@ -1,4 +1,3 @@
-use loxa_core::download;
 use loxa_core::engine::{py_mlx_lm, EngineLaunchSpec, ReadinessStrategy, RuntimeBackendKind};
 use loxa_core::registry::{self, ModelEntry, REGISTRY};
 use loxa_core::supervisor::{
@@ -13,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub mod actor;
+mod bootstrap;
 pub mod chat_history;
 pub mod chat_routes;
 pub mod control_router;
@@ -21,50 +21,9 @@ mod engine_session;
 pub mod model_lifecycle;
 mod production_lifecycle;
 
+pub use bootstrap::NodePaths;
+
 use engine_session::EngineSession;
-
-#[derive(Clone, Debug)]
-pub struct NodePaths {
-    pub models_dir: PathBuf,
-    pub state_path: PathBuf,
-    pub logs_dir: PathBuf,
-}
-
-impl NodePaths {
-    pub fn detect() -> Self {
-        Self {
-            models_dir: download::model_dir(),
-            state_path: supervisor::runtime_state_path(),
-            logs_dir: supervisor::runtime_logs_dir(),
-        }
-    }
-
-    fn log_path(&self, id: &str, port: u16, started_at_unix_s: u64) -> PathBuf {
-        self.logs_dir
-            .join(format!("{id}-{port}-{started_at_unix_s}.log"))
-    }
-
-    fn loxa_dir(&self) -> io::Result<&Path> {
-        let state_dir = self
-            .state_path
-            .parent()
-            .ok_or_else(|| io::Error::other("runtime state path has no parent directory"))?;
-        if state_dir.file_name().is_some_and(|name| name == "run") {
-            state_dir
-                .parent()
-                .ok_or_else(|| io::Error::other("runtime run path has no Loxa directory"))
-        } else {
-            Ok(state_dir)
-        }
-    }
-
-    fn history_path(&self) -> io::Result<PathBuf> {
-        Ok(self
-            .loxa_dir()?
-            .join("history")
-            .join("chat-history.sqlite3"))
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RunOutcome {
@@ -2683,21 +2642,6 @@ mod lifecycle_api_tests {
         assert_eq!(
             requested_startup_model(&temp, None, RuntimeBackendKind::PyMlxLm),
             Ok(None)
-        );
-    }
-
-    #[test]
-    fn node_paths_place_history_in_a_dedicated_private_subdirectory() {
-        let temp = TestDir::new("history-path");
-        let paths = NodePaths {
-            models_dir: temp.0.join("models"),
-            state_path: temp.0.join("run").join("managed.json"),
-            logs_dir: temp.0.join("run").join("logs"),
-        };
-
-        assert_eq!(
-            paths.history_path().unwrap(),
-            temp.0.join("history").join("chat-history.sqlite3")
         );
     }
 
