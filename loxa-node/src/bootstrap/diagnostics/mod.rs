@@ -2,19 +2,25 @@ mod delivery;
 mod encoder;
 
 use self::delivery::{
-    drop_guard_with_deadline, non_blocking_writer_with_health, wait_for_queue_drain, QueueProgress,
-    ShutdownGuard, StorageReporter, DIAGNOSTICS_SHUTDOWN_BOUND, QUEUE_DRAIN_DEADLINE,
-    WORKER_GUARD_DEADLINE,
+    drop_guard_with_deadline, non_blocking_writer_with_health, wait_for_queue_drain,
+    write_bypass_warning, QueueProgress, ShutdownGuard, StorageReporter,
+    DIAGNOSTICS_SHUTDOWN_BOUND, FILE_LOGGING_UNAVAILABLE_WARNING, QUEUE_DRAIN_DEADLINE,
+    SUBSCRIBER_UNAVAILABLE_WARNING, WORKER_GUARD_DEADLINE,
 };
 #[cfg(test)]
 use self::delivery::{
-    non_blocking_writer_with_reporter, DropWarningClock, DropWarningReporter, DropWarningSink,
+    non_blocking_writer_with_reporter, write_bypass_warning_to, BypassWarningSink,
+    DropWarningClock, DropWarningReporter, SHUTDOWN_HELPER_UNAVAILABLE_WARNING,
+    STORAGE_DEGRADED_WARNING, STORAGE_RECOVERED_WARNING,
 };
 #[cfg(test)]
 use self::encoder::debug_filter;
 #[cfg(all(test, debug_assertions))]
 use self::encoder::release_filter;
-use self::encoder::{executable_filter, SafeHumanFormatter, SafeJsonFields, SafeJsonFormatter};
+use self::encoder::{
+    executable_filter, mirrored_stderr_formatters, stderr_only_formatters, SafeJsonFields,
+    SafeJsonFormatter,
+};
 use loxa_core::diagnostics::{
     storage::prepare_logs_dir, BoundedJsonlWriter, DiagnosticsHealth, DiagnosticsHealthSnapshot,
     StorageConfig, SystemDiskSpace, LOG_QUEUE_CAPACITY,
@@ -72,9 +78,10 @@ pub fn install_daemon_diagnostics(logs_dir: &Path) -> DiagnosticsBootstrap {
     let (guard, queue_progress) = match file_sink {
         Ok(file_sink) => {
             health.support_queue_drop_counter();
+            let (stderr_fields, stderr_formatter) = mirrored_stderr_formatters(health.clone());
             let stderr_layer = tracing_subscriber::fmt::layer()
-                .fmt_fields(SafeJsonFields::uncounted(health.clone()))
-                .event_format(SafeHumanFormatter::uncounted(health.clone()))
+                .fmt_fields(stderr_fields)
+                .event_format(stderr_formatter)
                 .with_ansi(false)
                 .with_writer(io::stderr)
                 .with_filter(executable_filter());
@@ -91,23 +98,24 @@ pub fn install_daemon_diagnostics(logs_dir: &Path) -> DiagnosticsBootstrap {
                 .with(stderr_layer)
                 .with(file_layer);
             if tracing::subscriber::set_global_default(subscriber).is_err() {
-                eprintln!("loxa diagnostics: subscriber unavailable; continuing best effort");
+                write_bypass_warning(SUBSCRIBER_UNAVAILABLE_WARNING);
                 health.mark_unavailable();
             }
             (Some(guard), Some(progress))
         }
         Err(_) => {
-            eprintln!("loxa diagnostics: file logging unavailable; continuing with stderr");
+            write_bypass_warning(FILE_LOGGING_UNAVAILABLE_WARNING);
             health.mark_unavailable();
+            let (stderr_fields, stderr_formatter) = stderr_only_formatters(health.clone());
             let stderr_layer = tracing_subscriber::fmt::layer()
-                .fmt_fields(SafeJsonFields::uncounted(health.clone()))
-                .event_format(SafeHumanFormatter::new(health.clone()))
+                .fmt_fields(stderr_fields)
+                .event_format(stderr_formatter)
                 .with_ansi(false)
                 .with_writer(io::stderr)
                 .with_filter(executable_filter());
             let subscriber = tracing_subscriber::registry().with(stderr_layer);
             if tracing::subscriber::set_global_default(subscriber).is_err() {
-                eprintln!("loxa diagnostics: subscriber unavailable; continuing best effort");
+                write_bypass_warning(SUBSCRIBER_UNAVAILABLE_WARNING);
             }
             (None, None)
         }

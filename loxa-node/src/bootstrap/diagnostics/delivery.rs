@@ -13,13 +13,23 @@ pub(super) const WORKER_GUARD_DEADLINE: Duration = Duration::from_millis(350);
 pub(super) const DIAGNOSTICS_SHUTDOWN_BOUND: Duration = Duration::from_millis(800);
 const QUEUE_PROGRESS_POLL: Duration = Duration::from_millis(2);
 const DROP_WARNING_INTERVAL: Duration = Duration::from_secs(30);
+pub(super) const FILE_LOGGING_UNAVAILABLE_WARNING: &str =
+    "loxa diagnostics: diagnostics.file_unavailable; continuing with stderr";
+pub(super) const SUBSCRIBER_UNAVAILABLE_WARNING: &str =
+    "loxa diagnostics: diagnostics.subscriber_unavailable; continuing best effort";
+pub(super) const STORAGE_DEGRADED_WARNING: &str =
+    "loxa diagnostics: diagnostics.storage_degraded; continuing with stderr";
+pub(super) const STORAGE_RECOVERED_WARNING: &str =
+    "loxa diagnostics: diagnostics.storage_recovered";
+pub(super) const SHUTDOWN_HELPER_UNAVAILABLE_WARNING: &str =
+    "loxa diagnostics: diagnostics.shutdown_helper_unavailable; detaching file logging";
 
 pub(super) trait DropWarningClock: Send + Sync + 'static {
     fn elapsed(&self) -> Duration;
 }
 
-pub(super) trait DropWarningSink: Send + Sync + 'static {
-    fn write_warning(&self, warning: &str);
+pub(super) trait BypassWarningSink: Send + Sync + 'static {
+    fn write_warning(&self, warning: &str) -> io::Result<()>;
 }
 
 struct MonotonicClock(Instant);
@@ -32,10 +42,18 @@ impl DropWarningClock for MonotonicClock {
 
 struct StderrWarningSink;
 
-impl DropWarningSink for StderrWarningSink {
-    fn write_warning(&self, warning: &str) {
-        let _ = writeln!(io::stderr().lock(), "{warning}");
+impl BypassWarningSink for StderrWarningSink {
+    fn write_warning(&self, warning: &str) -> io::Result<()> {
+        writeln!(io::stderr().lock(), "{warning}")
     }
+}
+
+pub(super) fn write_bypass_warning(warning: &str) {
+    write_bypass_warning_to(&StderrWarningSink, warning);
+}
+
+pub(super) fn write_bypass_warning_to<S: BypassWarningSink + ?Sized>(sink: &S, warning: &str) {
+    let _ = sink.write_warning(warning);
 }
 
 struct DropWarningState {
@@ -45,7 +63,7 @@ struct DropWarningState {
 
 pub(super) struct DropWarningReporter {
     clock: Arc<dyn DropWarningClock>,
-    sink: Arc<dyn DropWarningSink>,
+    sink: Arc<dyn BypassWarningSink>,
     interval: Duration,
     state: Mutex<DropWarningState>,
 }
@@ -66,7 +84,7 @@ impl DropWarningReporter {
     #[cfg(test)]
     pub(super) fn new_for_test(
         clock: impl DropWarningClock,
-        sink: impl DropWarningSink,
+        sink: impl BypassWarningSink,
         interval: Duration,
     ) -> Self {
         Self {
@@ -98,7 +116,7 @@ impl DropWarningReporter {
         }
         let warning =
             format!("loxa diagnostics: diagnostics.queue_dropped delta={delta} total={total}");
-        self.sink.write_warning(&warning);
+        write_bypass_warning_to(self.sink.as_ref(), &warning);
         state.reported_total = total;
         state.last_warning_at = Some(now);
     }
@@ -335,6 +353,7 @@ pub(super) fn non_blocking_writer_with_reporter<W: Write + Send + 'static>(
 pub(super) struct StorageReporter<W> {
     inner: W,
     health: DiagnosticsHealth,
+    warning_sink: Arc<dyn BypassWarningSink>,
     degraded_episode: bool,
 }
 
@@ -343,6 +362,21 @@ impl<W> StorageReporter<W> {
         Self {
             inner,
             health,
+            warning_sink: Arc::new(StderrWarningSink),
+            degraded_episode: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn new_for_test(
+        inner: W,
+        health: DiagnosticsHealth,
+        warning_sink: impl BypassWarningSink,
+    ) -> Self {
+        Self {
+            inner,
+            health,
+            warning_sink: Arc::new(warning_sink),
             degraded_episode: false,
         }
     }
@@ -350,11 +384,11 @@ impl<W> StorageReporter<W> {
     fn report_transition(&mut self) {
         match self.health.snapshot().availability {
             DiagnosticsAvailability::Degraded if !self.degraded_episode => {
-                eprintln!("loxa diagnostics: diagnostics.storage_degraded; continuing with stderr");
+                write_bypass_warning_to(self.warning_sink.as_ref(), STORAGE_DEGRADED_WARNING);
                 self.degraded_episode = true;
             }
             DiagnosticsAvailability::Available if self.degraded_episode => {
-                eprintln!("loxa diagnostics: diagnostics.storage_recovered");
+                write_bypass_warning_to(self.warning_sink.as_ref(), STORAGE_RECOVERED_WARNING);
                 self.degraded_episode = false;
             }
             _ => {}
@@ -412,7 +446,7 @@ pub(super) fn drop_guard_with_deadline(guard: ShutdownGuard, deadline: Duration)
             drop(handle);
         }
         Err(_) => {
-            eprintln!("loxa diagnostics: shutdown helper unavailable; detaching file logging");
+            write_bypass_warning(SHUTDOWN_HELPER_UNAVAILABLE_WARNING);
             std::mem::forget(shared_guard);
         }
     }

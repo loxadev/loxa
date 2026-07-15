@@ -106,9 +106,10 @@ fn capture_human_events(
     health: DiagnosticsHealth,
 ) -> Capture {
     let capture = Capture::default();
+    let (fields, formatter) = stderr_only_formatters(health);
     let layer = tracing_subscriber::fmt::layer()
-        .fmt_fields(SafeJsonFields::uncounted(health.clone()))
-        .event_format(SafeHumanFormatter::new(health))
+        .fmt_fields(fields)
+        .event_format(formatter)
         .with_ansi(false)
         .with_writer(capture.clone())
         .with_filter(filter);
@@ -705,12 +706,13 @@ impl DropWarningClock for TestClock {
 #[derive(Clone, Default)]
 struct WarningCapture(Arc<Mutex<Vec<String>>>);
 
-impl DropWarningSink for WarningCapture {
-    fn write_warning(&self, warning: &str) {
+impl BypassWarningSink for WarningCapture {
+    fn write_warning(&self, warning: &str) -> io::Result<()> {
         self.0
             .lock()
             .expect("warning capture poisoned")
             .push(warning.to_owned());
+        Ok(())
     }
 }
 
@@ -781,6 +783,115 @@ fn real_queue_drops_emit_rate_limited_bypass_warnings_and_final_delta() {
     ready.notify_all();
     drop(writer);
     drop(guard);
+}
+
+#[derive(Clone, Default)]
+struct FailingWarningSink(WarningCapture);
+
+impl BypassWarningSink for FailingWarningSink {
+    fn write_warning(&self, warning: &str) -> io::Result<()> {
+        self.0.write_warning(warning)?;
+        Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "injected closed stderr",
+        ))
+    }
+}
+
+#[test]
+fn every_bypass_warning_class_ignores_closed_stderr() {
+    let sink = FailingWarningSink::default();
+    for warning in [
+        FILE_LOGGING_UNAVAILABLE_WARNING,
+        SUBSCRIBER_UNAVAILABLE_WARNING,
+        STORAGE_DEGRADED_WARNING,
+        STORAGE_RECOVERED_WARNING,
+        SHUTDOWN_HELPER_UNAVAILABLE_WARNING,
+    ] {
+        write_bypass_warning_to(&sink, warning);
+    }
+
+    let warnings = sink.0.warnings();
+    assert_eq!(warnings.len(), 5);
+    assert!(warnings.iter().all(|warning| warning.len() < 160));
+    assert!(warnings[0].contains("diagnostics.file_unavailable"));
+    assert!(warnings[1].contains("diagnostics.subscriber_unavailable"));
+    assert!(warnings[2].contains("diagnostics.storage_degraded"));
+    assert!(warnings[3].contains("diagnostics.storage_recovered"));
+    assert!(warnings[4].contains("diagnostics.shutdown_helper_unavailable"));
+}
+
+#[test]
+fn storage_transition_bypass_uses_the_fallible_warning_sink() {
+    let health = DiagnosticsHealth::new();
+    let sink = FailingWarningSink::default();
+    let mut reporter = StorageReporter::new_for_test(io::sink(), health.clone(), sink.clone());
+
+    health.mark_degraded();
+    reporter.write_all(b"degraded\n").unwrap();
+    health.mark_available_at(std::time::SystemTime::UNIX_EPOCH);
+    reporter.flush().unwrap();
+
+    assert_eq!(
+        sink.0.warnings(),
+        vec![
+            STORAGE_DEGRADED_WARNING.to_owned(),
+            STORAGE_RECOVERED_WARNING.to_owned(),
+        ]
+    );
+}
+
+#[test]
+fn stderr_only_rejected_record_increments_health_exactly_once() {
+    let health = DiagnosticsHealth::new();
+    let capture = capture_human_events(
+        debug_filter(),
+        || {
+            tracing::event!(
+                target: "loxa_node::test",
+                Level::INFO,
+                event_code = "operation.terminal",
+                component = "operation",
+                authorization = "Bearer COUNT_SECRET",
+            );
+        },
+        health.clone(),
+    );
+
+    assert_eq!(
+        capture.text(),
+        "WARN diagnostics.field_rejected component=diagnostics\n"
+    );
+    assert_eq!(health.snapshot().forbidden_field_rejections, Some(1));
+}
+
+#[test]
+fn stderr_only_rejected_span_increments_health_exactly_once() {
+    let health = DiagnosticsHealth::new();
+    let capture = capture_human_events(
+        debug_filter(),
+        || {
+            let span = tracing::info_span!(
+                target: "loxa_node::test",
+                "operation",
+                authorization = "Bearer SPAN_COUNT_SECRET",
+            );
+            let _entered = span.enter();
+            tracing::event!(
+                target: "loxa_node::test",
+                Level::INFO,
+                event_code = "operation.terminal",
+                component = "operation",
+            );
+        },
+        health.clone(),
+    );
+
+    assert_eq!(
+        capture.text(),
+        "WARN diagnostics.field_rejected component=diagnostics\n"
+    );
+    assert_eq!(health.snapshot().forbidden_field_rejections, Some(1));
 }
 
 #[test]

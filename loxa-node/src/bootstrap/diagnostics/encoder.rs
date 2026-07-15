@@ -358,7 +358,7 @@ pub(super) struct SafeHumanFormatter {
 }
 
 impl SafeHumanFormatter {
-    pub(super) fn new(health: DiagnosticsHealth) -> Self {
+    fn new(health: DiagnosticsHealth) -> Self {
         health.support_records_truncated_counter();
         health.support_forbidden_field_rejections_counter();
         Self {
@@ -367,12 +367,30 @@ impl SafeHumanFormatter {
         }
     }
 
-    pub(super) fn uncounted(health: DiagnosticsHealth) -> Self {
+    fn uncounted(health: DiagnosticsHealth) -> Self {
         Self {
             health,
             count_health: false,
         }
     }
+}
+
+pub(super) fn stderr_only_formatters(
+    health: DiagnosticsHealth,
+) -> (SafeJsonFields, SafeHumanFormatter) {
+    (
+        SafeJsonFields::uncounted(health.clone()),
+        SafeHumanFormatter::new(health),
+    )
+}
+
+pub(super) fn mirrored_stderr_formatters(
+    health: DiagnosticsHealth,
+) -> (SafeJsonFields, SafeHumanFormatter) {
+    (
+        SafeJsonFields::uncounted(health.clone()),
+        SafeHumanFormatter::uncounted(health),
+    )
 }
 
 impl<S> FormatEvent<S, SafeJsonFields> for SafeHumanFormatter
