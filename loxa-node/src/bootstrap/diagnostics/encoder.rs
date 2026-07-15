@@ -12,54 +12,41 @@ use tracing_subscriber::registry::LookupSpan;
 const REJECTED_FIELD_MARKER: &str = "__loxa_rejected_field";
 const FALLBACK_REJECTED_CODE: &str = "diagnostics.field_rejected";
 const FALLBACK_TRUNCATED_CODE: &str = "diagnostics.record_truncated";
-const APPROVED_EVENT_CODES: &[&str] = &[
-    "node.starting",
-    "node.listening",
-    "node.stopping",
-    "node.stopped",
-    "node.start_failed",
-    "http.request.completed",
-    "http.request.failed",
-    "gateway.starting",
-    "gateway.listening",
-    "gateway.stop_requested",
-    "gateway.stopped",
-    "gateway.join_failed",
-    "engine.spawn.started",
-    "engine.spawn.succeeded",
-    "engine.readiness.failed",
-    "engine.exit.observed",
-    "engine.teardown.confirmed",
-    "engine.teardown.failed",
-    "operation.started",
-    "operation.terminal",
-    "download.started",
-    "download.terminal",
-    "chat.turn.started",
-    "chat.turn.terminal",
-    "chat.turn.cancel_requested",
-    "diagnostics.queue_dropped",
-    "diagnostics.storage_degraded",
-    "diagnostics.storage_recovered",
-    "diagnostics.record_truncated",
-    "diagnostics.field_rejected",
-    "shutdown.requested",
-    "shutdown.stage.completed",
-    "shutdown.stage.failed",
-    "shutdown.completed",
-];
-
-const APPROVED_COMPONENTS: &[&str] = &[
-    "node",
-    "http",
-    "gateway",
-    "engine",
-    "supervisor",
-    "operation",
-    "download",
-    "chat",
-    "diagnostics",
-    "shutdown",
+const APPROVED_EVENT_ENVELOPES: &[(&str, &str)] = &[
+    ("node.starting", "node"),
+    ("node.listening", "node"),
+    ("node.stopping", "node"),
+    ("node.stopped", "node"),
+    ("node.start_failed", "node"),
+    ("http.request.completed", "http"),
+    ("http.request.failed", "http"),
+    ("gateway.starting", "gateway"),
+    ("gateway.listening", "gateway"),
+    ("gateway.stop_requested", "gateway"),
+    ("gateway.stopped", "gateway"),
+    ("gateway.join_failed", "gateway"),
+    ("engine.spawn.started", "engine"),
+    ("engine.spawn.succeeded", "engine"),
+    ("engine.readiness.failed", "engine"),
+    ("engine.exit.observed", "engine"),
+    ("engine.teardown.confirmed", "engine"),
+    ("engine.teardown.failed", "engine"),
+    ("operation.started", "operation"),
+    ("operation.terminal", "operation"),
+    ("download.started", "download"),
+    ("download.terminal", "download"),
+    ("chat.turn.started", "chat"),
+    ("chat.turn.terminal", "chat"),
+    ("chat.turn.cancel_requested", "chat"),
+    ("diagnostics.queue_dropped", "diagnostics"),
+    ("diagnostics.storage_degraded", "diagnostics"),
+    ("diagnostics.storage_recovered", "diagnostics"),
+    ("diagnostics.record_truncated", "diagnostics"),
+    ("diagnostics.field_rejected", "diagnostics"),
+    ("shutdown.requested", "shutdown"),
+    ("shutdown.stage.completed", "shutdown"),
+    ("shutdown.stage.failed", "shutdown"),
+    ("shutdown.completed", "shutdown"),
 ];
 
 const ALLOWED_FIELDS: &[&str] = &[
@@ -378,14 +365,13 @@ fn current_timestamp() -> Result<String, fmt::Error> {
 }
 
 fn approved_event_envelope(fields: &Map<String, Value>) -> bool {
-    fields
-        .get("event_code")
-        .and_then(Value::as_str)
-        .is_some_and(|value| APPROVED_EVENT_CODES.contains(&value))
-        && fields
-            .get("component")
-            .and_then(Value::as_str)
-            .is_some_and(|value| APPROVED_COMPONENTS.contains(&value))
+    let Some(event_code) = fields.get("event_code").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(component) = fields.get("component").and_then(Value::as_str) else {
+        return false;
+    };
+    APPROVED_EVENT_ENVELOPES.contains(&(event_code, component))
 }
 
 fn safe_span_correlation(fields: &Map<String, Value>) -> Map<String, Value> {

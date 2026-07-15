@@ -3,7 +3,7 @@ use loxa_core::diagnostics::{DiagnosticsHealth, MAX_DYNAMIC_FIELD_BYTES, MAX_REC
 use serde_json::Value;
 use std::fmt;
 use std::io::{self, Write};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{mpsc, Arc, Barrier, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use tracing::Level;
 use tracing_subscriber::filter::Targets;
@@ -317,17 +317,78 @@ fn missing_or_unapproved_event_envelopes_use_static_fallbacks() {
                 event_code = "attacker.dynamic", component = "operation");
             tracing::event!(target: "loxa_node::test", Level::INFO,
                 event_code = "operation.terminal", component = "attacker");
+            tracing::event!(target: "loxa_node::test", Level::INFO,
+                event_code = "http.request.completed", component = "engine");
         },
         DiagnosticsHealth::new(),
     );
 
     let text = capture.text();
-    assert_eq!(text.lines().count(), 4);
+    assert_eq!(text.lines().count(), 5);
     assert!(!text.contains("attacker.dynamic"));
     assert!(!text.contains("\"component\":\"attacker\""));
+    assert!(!text.contains("\"component\":\"engine\""));
     assert!(text
         .lines()
         .all(|line| line.contains("diagnostics.field_rejected")));
+}
+
+#[test]
+fn every_planned_event_code_component_pair_is_accepted() {
+    let approved = [
+        ("node.starting", "node"),
+        ("node.listening", "node"),
+        ("node.stopping", "node"),
+        ("node.stopped", "node"),
+        ("node.start_failed", "node"),
+        ("http.request.completed", "http"),
+        ("http.request.failed", "http"),
+        ("gateway.starting", "gateway"),
+        ("gateway.listening", "gateway"),
+        ("gateway.stop_requested", "gateway"),
+        ("gateway.stopped", "gateway"),
+        ("gateway.join_failed", "gateway"),
+        ("engine.spawn.started", "engine"),
+        ("engine.spawn.succeeded", "engine"),
+        ("engine.readiness.failed", "engine"),
+        ("engine.exit.observed", "engine"),
+        ("engine.teardown.confirmed", "engine"),
+        ("engine.teardown.failed", "engine"),
+        ("operation.started", "operation"),
+        ("operation.terminal", "operation"),
+        ("download.started", "download"),
+        ("download.terminal", "download"),
+        ("chat.turn.started", "chat"),
+        ("chat.turn.terminal", "chat"),
+        ("chat.turn.cancel_requested", "chat"),
+        ("diagnostics.queue_dropped", "diagnostics"),
+        ("diagnostics.storage_degraded", "diagnostics"),
+        ("diagnostics.storage_recovered", "diagnostics"),
+        ("diagnostics.record_truncated", "diagnostics"),
+        ("diagnostics.field_rejected", "diagnostics"),
+        ("shutdown.requested", "shutdown"),
+        ("shutdown.stage.completed", "shutdown"),
+        ("shutdown.stage.failed", "shutdown"),
+        ("shutdown.completed", "shutdown"),
+    ];
+    let approved_count = approved.len();
+    let capture = capture_events(
+        debug_filter(),
+        || {
+            for &(event_code, component) in &approved {
+                tracing::event!(target: "loxa_node::test", Level::INFO, event_code, component);
+            }
+        },
+        DiagnosticsHealth::new(),
+    );
+
+    let text = capture.text();
+    assert_eq!(text.lines().count(), approved_count);
+    for (line, (event_code, component)) in text.lines().zip(approved) {
+        let record: Value = serde_json::from_str(line).expect("valid approved record");
+        assert_eq!(record["event_code"], event_code);
+        assert_eq!(record["component"], component);
+    }
 }
 
 #[test]
@@ -554,6 +615,57 @@ fn dropping_guard_flushes_the_final_formatted_record() {
     drop(bootstrap);
     assert!(started.elapsed() <= DIAGNOSTICS_SHUTDOWN_BOUND);
     assert!(capture.text().contains("shutdown.completed"));
+}
+
+#[test]
+fn shutdown_waits_for_a_previously_open_admission_before_declaring_drain() {
+    let capture = Capture::default();
+    let health = DiagnosticsHealth::new();
+    let (writer, worker_guard, progress) =
+        non_blocking_writer_with_health(CaptureWriter(capture.clone()), 16, health.clone());
+    let admission_reached = Arc::new(Barrier::new(2));
+    let admission_release = Arc::new(Barrier::new(2));
+    progress.pause_admission_for_test(
+        Arc::clone(&admission_reached),
+        Arc::clone(&admission_release),
+    );
+
+    let producer = std::thread::spawn(move || {
+        let mut writer = writer;
+        writer.write_all(b"admitted-before-close\n").unwrap();
+    });
+    admission_reached.wait();
+
+    let (guard_started, guard_observed) = mpsc::sync_channel(1);
+    let bootstrap = DiagnosticsBootstrap {
+        guard: Some(ShutdownGuard::test_action(move || {
+            let _ = guard_started.send(());
+            drop(worker_guard);
+        })),
+        health,
+        queue_progress: Some(progress),
+    };
+    let shutdown_started = Instant::now();
+    let shutdown = std::thread::spawn(move || drop(bootstrap));
+
+    let guard_started_before_admission_completed = guard_observed
+        .recv_timeout(Duration::from_millis(50))
+        .is_ok();
+    admission_release.wait();
+    producer.join().expect("producer joins");
+    if !guard_started_before_admission_completed {
+        guard_observed
+            .recv_timeout(DIAGNOSTICS_SHUTDOWN_BOUND)
+            .expect("guard starts after admitted write is processed");
+    }
+    shutdown.join().expect("shutdown joins");
+
+    assert!(shutdown_started.elapsed() <= DIAGNOSTICS_SHUTDOWN_BOUND);
+    assert!(capture.text().contains("admitted-before-close"));
+    assert!(
+        !guard_started_before_admission_completed,
+        "shutdown declared the queue drained while an open admission was unaccounted"
+    );
 }
 
 struct StalledWriter {

@@ -1,6 +1,8 @@
 use loxa_core::diagnostics::{DiagnosticsAvailability, DiagnosticsHealth};
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::Barrier;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing_appender::non_blocking::{ErrorCounter, NonBlocking, NonBlockingBuilder, WorkerGuard};
@@ -20,7 +22,9 @@ pub(super) struct QueueProgress {
     counters: Arc<QueueCounters>,
     errors: ErrorCounter,
     health: DiagnosticsHealth,
-    accepting: AtomicBool,
+    admission_open: Mutex<bool>,
+    #[cfg(test)]
+    admission_pause: Mutex<Option<(Arc<Barrier>, Arc<Barrier>)>>,
 }
 
 impl QueueProgress {
@@ -34,12 +38,32 @@ impl QueueProgress {
     }
 
     pub(super) fn begin_shutdown(&self) {
-        self.accepting.store(false, Ordering::Release);
+        *self
+            .admission_open
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
         self.observe_drops();
     }
 
-    fn is_accepting(&self) -> bool {
-        self.accepting.load(Ordering::Acquire)
+    #[cfg(test)]
+    pub(super) fn pause_admission_for_test(&self, reached: Arc<Barrier>, release: Arc<Barrier>) {
+        *self
+            .admission_pause
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((reached, release));
+    }
+
+    #[cfg(test)]
+    fn pause_after_open_for_test(&self) {
+        let pause = self
+            .admission_pause
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some((reached, release)) = pause {
+            reached.wait();
+            release.wait();
+        }
     }
 
     fn is_drained(&self) -> bool {
@@ -59,13 +83,29 @@ pub(super) struct QueueWriter {
 
 impl Write for QueueWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if !self.progress.is_accepting() {
+        // Closing admission and accounting accepted writes share this critical section. The
+        // queue write itself stays outside it so runtime producers never hold the lock over I/O.
+        let admitted = {
+            let admission_open = self
+                .progress
+                .admission_open
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !*admission_open {
+                false
+            } else {
+                #[cfg(test)]
+                self.progress.pause_after_open_for_test();
+                self.progress
+                    .counters
+                    .submitted
+                    .fetch_add(1, Ordering::Release);
+                true
+            }
+        };
+        if !admitted {
             return Ok(bytes.len());
         }
-        self.progress
-            .counters
-            .submitted
-            .fetch_add(1, Ordering::Release);
         let result = self.inner.write(bytes);
         self.progress.observe_drops();
         result
@@ -112,6 +152,13 @@ impl ShutdownGuard {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn test_action(action: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            action: Some(Box::new(action)),
+        }
+    }
+
     fn run(mut self) {
         if let Some(action) = self.action.take() {
             action();
@@ -137,7 +184,9 @@ pub(super) fn non_blocking_writer_with_health<W: Write + Send + 'static>(
         counters,
         errors,
         health,
-        accepting: AtomicBool::new(true),
+        admission_open: Mutex::new(true),
+        #[cfg(test)]
+        admission_pause: Mutex::new(None),
     });
     progress.observe_drops();
     (
