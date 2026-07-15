@@ -94,15 +94,14 @@ impl NodeRuntime {
                     .download_runtime
                     .take()
                     .expect("stable llama node has model control");
-                let outcome = crate::run_stable_node_actor(
+                crate::run_stable_node_actor(
                     paths,
                     run,
                     Some(download_control),
                     download_worker,
                     Some(model_id),
                     Some(events),
-                );
-                outcome
+                )
             }
             Some(model_id) => crate::run_model(
                 RunRequest {
@@ -125,15 +124,14 @@ impl NodeRuntime {
                     .download_runtime
                     .take()
                     .expect("unloaded node has download control");
-                let outcome = crate::run_stable_node_actor(
+                crate::run_stable_node_actor(
                     paths,
                     run,
                     Some(download_control),
                     download_worker,
                     None,
                     Some(events),
-                );
-                outcome
+                )
             }
         }
     }
