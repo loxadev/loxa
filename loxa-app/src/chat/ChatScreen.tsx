@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { SquareSplitHorizontal, X } from "lucide-react";
 
 import type {
   getCapabilities as defaultGetCapabilities,
@@ -11,6 +12,7 @@ import type { ModelInventoryEntry, NodeControlStatus } from "../control/contract
 import type { ControlStreamHandle, streamControlEvents as defaultStreamControlEvents } from "../control/events";
 import type { getModels as defaultGetModels, getStatus as defaultGetStatus } from "../node/client";
 import type { NodeSessionPhase } from "../node/NodeSession";
+import { IconButton } from "../components/ui/button";
 import { ChatComposer } from "./ChatComposer";
 import { ChatModelControl } from "./ChatModelControl";
 import type { ConversationHistoryController } from "./conversationHistory";
@@ -85,6 +87,7 @@ export function ChatScreen({
   conversationTitle = "New Chat",
   onInteractionLockChange,
   onNavigateModels,
+  headerEndActions,
 }: {
   services: ChatScreenServices;
   endpoint: string;
@@ -95,6 +98,7 @@ export function ChatScreen({
   conversationTitle?: string;
   onInteractionLockChange?: (locked: boolean) => void;
   onNavigateModels?: () => void;
+  headerEndActions?: ReactNode;
 }) {
   const availabilityPhase = nodeAvailability?.phase;
   const availabilityProven = nodeAvailability?.proven;
@@ -109,6 +113,8 @@ export function ChatScreen({
   const [controlBusy, setControlBusy] = useState(false);
   const [controlStreamState, setControlStreamState] = useState<ControlStreamState>("live");
   const [input, setInput] = useState("");
+  const [secondaryInput, setSecondaryInput] = useState("");
+  const [splitOpen, setSplitOpen] = useState(false);
   const [turns, setTurns] = useState<ChatTurn[]>([]);
   const [restoreError, setRestoreError] = useState("");
   const [omittedTurns, setOmittedTurns] = useState(0);
@@ -129,6 +135,7 @@ export function ChatScreen({
   const persistentHandle = useRef<PersistentTurnHandle | null>(null);
   const persistentController = useRef<AbortController | null>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const secondaryInputRef = useRef<HTMLTextAreaElement>(null);
   const focusAfterTerminal = useRef(false);
   const stopRequested = useRef(false);
   const lifecycleController = useRef<AbortController | null>(null);
@@ -915,6 +922,7 @@ export function ChatScreen({
                 : activeModel === null && connection === "ready"
                   ? "No active runtime model is available for chat."
                   : "";
+  const modelGuidance = chatSupportReason === statusLabel ? "" : chatSupportReason;
   const emptyMessage = emptyChatMessage(
     connection,
     chatCapability,
@@ -931,47 +939,92 @@ export function ChatScreen({
     controlStreamState === "live" &&
     modelOperation === "idle" &&
     !controlBusy;
+  const transcriptEmptyMessage =
+    connection === "ready" && chatCapability === "supported"
+      ? emptyMessage
+      : "Start a local conversation when the node is ready.";
 
   return (
     <section className={styles.screen} aria-labelledby="chat-heading">
-      <header className={styles.header}>
-        <h1 id="chat-heading">{conversationTitle.trim() || "New Chat"}</h1>
-      </header>
+      <div className={splitOpen ? `${styles.panes} ${styles.panesSplit}` : styles.panes}>
+        <div className={styles.chatMain}>
+          <ChatModelControl
+            title={conversationTitle}
+            headerActions={
+              <IconButton
+                variant="quiet"
+                label={splitOpen ? "Close split chat preview" : "Preview split chat side by side"}
+                onClick={() => setSplitOpen((current) => !current)}
+              >
+                <SquareSplitHorizontal />
+              </IconButton>
+            }
+            endActions={headerEndActions}
+            activeModel={activeModel}
+            selectedModel={selectedModel}
+            eligibleModels={eligibleModels}
+            status={statusLabel}
+            guidance={modelGuidance}
+            modelBusy={controlBusy}
+            modelOperation={modelOperation}
+            modelControlsAvailable={modelControlsAvailable}
+            responseInProgress={responseInProgress}
+            canBrowseModels={canBrowseModels}
+            onSelectedModel={setSelectedModel}
+            onSwitchModel={() => void switchModel()}
+            onBrowseModels={onNavigateModels}
+          />
+          <div className={styles.contextNotice}>
+            {restoreError ||
+              (omittedTurns > 0
+                ? `${omittedTurns} earlier ${omittedTurns === 1 ? "turn was" : "turns were"} omitted from the model context.`
+                : "")}
+          </div>
+          <ChatTranscript turns={turns} emptyMessage={transcriptEmptyMessage} copyText={services.copyText} />
 
-      <div className={styles.chatMain}>
-        <ChatModelControl
-          activeModel={activeModel}
-          selectedModel={selectedModel}
-          eligibleModels={eligibleModels}
-          status={statusLabel}
-          guidance={chatSupportReason}
-          modelBusy={controlBusy}
-          modelOperation={modelOperation}
-          modelControlsAvailable={modelControlsAvailable}
-          responseInProgress={responseInProgress}
-          canBrowseModels={canBrowseModels}
-          onSelectedModel={setSelectedModel}
-          onSwitchModel={() => void switchModel()}
-          onBrowseModels={onNavigateModels}
-        />
-        <div className={styles.contextNotice}>
-          {restoreError ||
-            (omittedTurns > 0
-              ? `${omittedTurns} earlier ${omittedTurns === 1 ? "turn was" : "turns were"} omitted from the model context.`
-              : "")}
+          <ChatComposer
+            input={input}
+            inputRef={inputRef}
+            canCompose={canCompose}
+            responseInProgress={responseInProgress}
+            attachmentReason={attachmentReason}
+            toolsReason="Tool use will be available when the active model publishes a supported tool capability."
+            contextUsage={null}
+            onInput={setInput}
+            onSend={send}
+            onStop={stop}
+          />
         </div>
-        <ChatTranscript turns={turns} emptyMessage={emptyMessage} copyText={services.copyText} />
-
-        <ChatComposer
-          input={input}
-          inputRef={inputRef}
-          canCompose={canCompose}
-          responseInProgress={responseInProgress}
-          attachmentReason={attachmentReason}
-          onInput={setInput}
-          onSend={send}
-          onStop={stop}
-        />
+        {splitOpen && (
+          <section className={styles.secondaryPane} aria-label="Second chat">
+            <header className={styles.secondaryHeader}>
+              <span>Second chat preview</span>
+              <IconButton variant="quiet" label="Close second chat preview" onClick={() => setSplitOpen(false)}>
+                <X />
+              </IconButton>
+            </header>
+            <ChatTranscript
+              turns={[]}
+              emptyMessage="Independent split requests require pane-scoped backend conversation and request identifiers."
+              copyText={services.copyText}
+            />
+            <ChatComposer
+              idPrefix="secondary-chat"
+              label="Second chat composer"
+              placeholder="Second chat is awaiting backend pane support"
+              input={secondaryInput}
+              inputRef={secondaryInputRef}
+              canCompose={false}
+              responseInProgress={false}
+              attachmentReason="Second-pane document input is unavailable until the backend supports pane-scoped requests."
+              toolsReason="Second-pane tools require backend pane-scoped requests."
+              contextUsage={null}
+              onInput={setSecondaryInput}
+              onSend={() => undefined}
+              onStop={() => undefined}
+            />
+          </section>
+        )}
       </div>
     </section>
   );

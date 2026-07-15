@@ -1,5 +1,5 @@
 import type { KeyboardEvent, RefObject } from "react";
-import { Paperclip, Send, Square } from "lucide-react";
+import { Paperclip, SendHorizontal, Square, Wrench } from "lucide-react";
 
 import { Button, IconButton } from "../components/ui/button";
 import { Tooltip } from "../components/ui/tooltip";
@@ -11,6 +11,11 @@ type ChatComposerProps = {
   canCompose: boolean;
   responseInProgress: boolean;
   attachmentReason: string;
+  toolsReason?: string;
+  contextUsage?: number | null;
+  idPrefix?: string;
+  label?: string;
+  placeholder?: string;
   onInput(value: string): void;
   onSend(): void;
   onStop(): void;
@@ -22,10 +27,18 @@ export function ChatComposer({
   canCompose,
   responseInProgress,
   attachmentReason,
+  toolsReason = "Tool use is not available for this model.",
+  contextUsage = null,
+  idPrefix = "",
+  label = "Message composer",
+  placeholder = "Message the active local model",
   onInput,
   onSend,
   onStop,
 }: ChatComposerProps) {
+  const messageId = idPrefix ? `${idPrefix}-message` : "message";
+  const attachmentHelpId = idPrefix ? `${idPrefix}-attachment-support-reason` : "attachment-support-reason";
+  const toolsHelpId = idPrefix ? `${idPrefix}-tools-support-reason` : "tools-support-reason";
   const submit = () => {
     if (responseInProgress) onStop();
     else onSend();
@@ -40,47 +53,65 @@ export function ChatComposer({
       className={styles.attachmentButton}
       variant="quiet"
       label="Attach document"
-      helpId={attachmentReason ? "attachment-support-reason" : undefined}
+      helpId={attachmentReason ? attachmentHelpId : undefined}
       aria-disabled="true"
       onClick={(event) => event.preventDefault()}
     >
       <Paperclip />
     </IconButton>
   );
+  const toolsButton = (
+    <IconButton
+      className={styles.toolButton}
+      variant="quiet"
+      label="Tools"
+      helpId={toolsHelpId}
+      aria-disabled="true"
+      onClick={(event) => event.preventDefault()}
+    >
+      <Wrench />
+    </IconButton>
+  );
 
   return (
     <form
       className={styles.composer}
-      aria-label="Message composer"
+      aria-label={label}
       onSubmit={(event) => {
         event.preventDefault();
         submit();
       }}
     >
-      <label className={styles.messageLabel} htmlFor="message">
+      <label className={styles.messageLabel} htmlFor={messageId}>
         Message
       </label>
       <textarea
         ref={inputRef}
-        id="message"
+        id={messageId}
         className={styles.messageInput}
         rows={3}
         value={input}
         onChange={(event) => onInput(event.target.value)}
         onKeyDown={keyDown}
         disabled={!canCompose}
-        placeholder="Message the active local model"
+        placeholder={placeholder}
       />
 
       <div className={styles.composerFooter}>
         <div className={styles.composerTools}>
           {attachmentReason ? (
-            <Tooltip id="attachment-support-reason" side="top" content={attachmentReason}>
+            <Tooltip id={attachmentHelpId} side="top" content={attachmentReason}>
               {attachmentButton}
             </Tooltip>
           ) : (
             attachmentButton
           )}
+          <Tooltip id={toolsHelpId} side="top" content={toolsReason}>
+            {toolsButton}
+          </Tooltip>
+          <span className={styles.contextUsage} aria-label="Context usage">
+            {contextUsage === null ? "Context unavailable" : `${Math.round(contextUsage)}% context`}
+          </span>
         </div>
 
         {responseInProgress ? (
@@ -94,14 +125,15 @@ export function ChatComposer({
             <Square aria-hidden="true" /> Stop<span className={styles.visuallyHidden}> response</span>
           </Button>
         ) : (
-          <Button
+          <IconButton
             className={styles.primaryControl}
+            variant="primary"
+            label="Send message"
             type="submit"
-            aria-label="Send message"
             disabled={!canCompose || !input.trim()}
           >
-            <Send aria-hidden="true" /> Send<span className={styles.visuallyHidden}> message</span>
-          </Button>
+            <SendHorizontal />
+          </IconButton>
         )}
       </div>
     </form>

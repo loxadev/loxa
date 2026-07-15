@@ -1,4 +1,6 @@
 import type { ModelInventoryEntry, NodeSnapshot, OperationView } from "../control/contracts";
+import { Button } from "../components/ui/button";
+import { TableCell, TableRow } from "../components/ui/table";
 import { artifactLabel, formatBytes, operationLabel } from "./modelRowLabels";
 import styles from "./ModelsScreen.module.css";
 
@@ -8,8 +10,10 @@ export function ModelRow({
   unloadOperation,
   pending,
   active,
+  selected,
   node,
   mutationBusy,
+  onSelect,
   onDownload,
   onLoad,
   onUnload,
@@ -20,8 +24,10 @@ export function ModelRow({
   unloadOperation?: OperationView;
   pending: boolean;
   active: boolean;
+  selected: boolean;
   node: NodeSnapshot | null;
   mutationBusy: boolean;
+  onSelect(): void;
   onDownload(): void;
   onLoad(): void;
   onUnload(): void;
@@ -48,26 +54,19 @@ export function ModelRow({
         : `Download ${entry.id}`;
 
   return (
-    <article className={styles.row} aria-labelledby={headingId}>
-      <div className={styles.main}>
-        <div className={styles.headingLine}>
-          <h2 id={headingId}>{entry.id}</h2>
-          {active && <span className={`${styles.chip} ${styles.activeChip}`}>Active</span>}
-          <span className={styles.chip}>{status}</span>
-        </div>
-        <p className={styles.metadata}>
-          <span>{entry.params}</span>
-          <span>{entry.quant}</span>
-          <span>{formatBytes(entry.sizeBytes)}</span>
-          <span>{entry.license}</span>
-          <span>{entry.engine.engine}</span>
-        </p>
-        <p className={`technical-value ${styles.repository}`}>
-          {entry.repo}@{entry.revision}
-        </p>
-        <p id={reasonId} className={actionable ? styles.reason : `${styles.reason} ${styles.reasonBlocking}`}>
-          {entry.compatibility.reason} {entry.engine.reason}
-        </p>
+    <TableRow className={selected ? `${styles.modelRow} ${styles.selectedRow}` : styles.modelRow}>
+      <TableCell>
+        <button type="button" className={styles.modelIdentity} onClick={onSelect} aria-pressed={selected}>
+          <span className={styles.modelMonogram} aria-hidden="true">
+            {entry.id.slice(0, 2).toUpperCase()}
+          </span>
+          <span className={styles.modelCopy}>
+            <span id={headingId} role="heading" aria-level={2} className={styles.modelName}>
+              {entry.id}
+            </span>
+            <span className="technical-value">{entry.repo}</span>
+          </span>
+        </button>
         {displayedOperation?.progress && (
           <div className={styles.progress}>
             {displayedOperation.progress.totalBytes === null ? (
@@ -91,35 +90,44 @@ export function ModelRow({
         {displayedOperation && !inProgress && (
           <p className={styles.operationHistory}>Last operation: {operationLabel(displayedOperation)}</p>
         )}
-      </div>
-      <div className={styles.actions}>
+      </TableCell>
+      <TableCell className="technical-value">
+        {entry.params} · {entry.quant}
+      </TableCell>
+      <TableCell className="technical-value">{formatBytes(entry.sizeBytes)}</TableCell>
+      <TableCell>
+        <div className={styles.stateStack}>
+          {active && <span className={`${styles.stateBadge} ${styles.activeChip}`}>Active</span>}
+          <span className={styles.stateBadge}>{status}</span>
+        </div>
+        <span id={reasonId} className="visually-hidden">
+          {entry.compatibility.reason} {entry.engine.reason}
+        </span>
+      </TableCell>
+      <TableCell className={styles.rowActions}>
         {inProgress && displayedOperation?.kind === "download" ? (
-          <button
-            className="secondary-button interactive-target"
-            type="button"
+          <Button
+            variant="secondary"
             disabled={pending}
             onClick={() => onCancel(displayedOperation)}
             aria-label={`Cancel ${displayedOperation.kind} ${entry.id}`}
           >
             Cancel
-          </button>
+          </Button>
         ) : inProgress && displayedOperation ? (
           <span className={styles.actionLabel}>{operationLabel(displayedOperation)}</span>
         ) : showDownload ? (
-          <button
-            className="primary-button interactive-target"
-            type="button"
+          <Button
             disabled={!actionable || pending || mutationBusy}
             aria-describedby={reasonId}
             aria-label={actionLabel}
             onClick={onDownload}
           >
             {entry.artifact.kind === "partial" ? "Resume" : entry.artifact.kind === "invalid" ? "Repair" : "Download"}
-          </button>
+          </Button>
         ) : entry.artifact.kind === "downloaded" && actionable && node?.status !== "recovery_required" ? (
-          <button
-            className={active ? "secondary-button interactive-target" : "primary-button interactive-target"}
-            type="button"
+          <Button
+            variant={active ? "secondary" : "primary"}
             disabled={pending || mutationBusy}
             onClick={active ? onUnload : onLoad}
             aria-label={
@@ -127,13 +135,13 @@ export function ModelRow({
             }
           >
             {active ? "Unload" : node?.activeModelId ? "Switch" : "Load"}
-          </button>
+          </Button>
         ) : (
           <span className={styles.actionLabel}>
             {entry.artifact.kind === "downloaded" ? "Unavailable to load" : "Awaiting verification"}
           </span>
         )}
-      </div>
-    </article>
+      </TableCell>
+    </TableRow>
   );
 }

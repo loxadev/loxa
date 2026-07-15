@@ -2,6 +2,9 @@ import { beforeEach, describe, expect, it } from "vitest";
 import type { StateStorage } from "zustand/middleware";
 
 import {
+  ACTIVITY_RAIL_WIDTH,
+  MAX_CONVERSATION_RAIL_WIDTH,
+  MIN_CONVERSATION_RAIL_WIDTH,
   COLLAPSED_SIDEBAR_WIDTH,
   DEFAULT_EXPANDED_SIDEBAR_WIDTH,
   MAX_EXPANDED_SIDEBAR_WIDTH,
@@ -47,6 +50,22 @@ describe("workspace store", () => {
     storage = new MemoryStorage();
   });
 
+  it("keeps the activity rail fixed while conversation width stays within desktop bounds", () => {
+    const store = createWorkspaceStore(storage);
+
+    expect(ACTIVITY_RAIL_WIDTH).toBe(48);
+    expect(MIN_CONVERSATION_RAIL_WIDTH).toBe(240);
+    expect(MAX_CONVERSATION_RAIL_WIDTH).toBe(400);
+
+    store.getState().setExpandedSidebarWidth(100);
+    expect(store.getState().expandedSidebarWidth).toBe(240);
+    store.getState().setExpandedSidebarWidth(999);
+    expect(store.getState().expandedSidebarWidth).toBe(400);
+
+    store.getState().setSidebarCollapsed(true);
+    expect(store.getState().expandedSidebarWidth).toBe(400);
+  });
+
   it("starts on chat with the exact sidebar constants", () => {
     const store = createWorkspaceStore(storage);
 
@@ -56,9 +75,9 @@ describe("workspace store", () => {
     expect(selectExpandedSidebarWidth(store.getState())).toBe(280);
     expect(selectEffectiveSidebarWidth(store.getState())).toBe(280);
     expect(DEFAULT_EXPANDED_SIDEBAR_WIDTH).toBe(280);
-    expect(MIN_EXPANDED_SIDEBAR_WIDTH).toBe(220);
-    expect(MAX_EXPANDED_SIDEBAR_WIDTH).toBe(420);
-    expect(COLLAPSED_SIDEBAR_WIDTH).toBe(56);
+    expect(MIN_EXPANDED_SIDEBAR_WIDTH).toBe(240);
+    expect(MAX_EXPANDED_SIDEBAR_WIDTH).toBe(400);
+    expect(COLLAPSED_SIDEBAR_WIDTH).toBe(48);
     expect(SIDEBAR_KEYBOARD_STEP).toBe(20);
   });
 
@@ -91,15 +110,15 @@ describe("workspace store", () => {
     const setWidth = selectSetExpandedSidebarWidth(store.getState());
 
     setWidth(100);
-    expect(selectExpandedSidebarWidth(store.getState())).toBe(220);
+    expect(selectExpandedSidebarWidth(store.getState())).toBe(240);
     setWidth(280);
     expect(selectExpandedSidebarWidth(store.getState())).toBe(280);
     setWidth(999);
-    expect(selectExpandedSidebarWidth(store.getState())).toBe(420);
+    expect(selectExpandedSidebarWidth(store.getState())).toBe(400);
 
     store.getState().setSidebarCollapsed(true);
-    expect(selectExpandedSidebarWidth(store.getState())).toBe(420);
-    expect(selectEffectiveSidebarWidth(store.getState())).toBe(56);
+    expect(selectExpandedSidebarWidth(store.getState())).toBe(400);
+    expect(selectEffectiveSidebarWidth(store.getState())).toBe(48);
   });
 
   it("collapses and expands without losing the last useful width", () => {
@@ -107,7 +126,7 @@ describe("workspace store", () => {
 
     store.getState().setExpandedSidebarWidth(340);
     selectToggleSidebar(store.getState())();
-    expect(selectEffectiveSidebarWidth(store.getState())).toBe(56);
+    expect(selectEffectiveSidebarWidth(store.getState())).toBe(48);
     store.getState().setExpandedSidebarWidth(380);
     expect(selectExpandedSidebarWidth(store.getState())).toBe(380);
     selectToggleSidebar(store.getState())();
@@ -150,7 +169,7 @@ describe("workspace store", () => {
     expect(selectActiveSettingsPage(store.getState())).toBe("overview");
     expect(selectSidebarCollapsed(store.getState())).toBe(true);
     expect(selectExpandedSidebarWidth(store.getState())).toBe(320);
-    expect(selectEffectiveSidebarWidth(store.getState())).toBe(56);
+    expect(selectEffectiveSidebarWidth(store.getState())).toBe(48);
   });
 
   it.each([
@@ -160,8 +179,8 @@ describe("workspace store", () => {
     ["stale version", persistedEnvelope({ sidebarCollapsed: true, expandedSidebarWidth: 300 }, 0)],
     ["invalid boolean", persistedEnvelope({ sidebarCollapsed: "yes", expandedSidebarWidth: 300 })],
     ["non-finite width", '{"state":{"sidebarCollapsed":true,"expandedSidebarWidth":1e999},"version":1}'],
-    ["too-small width", persistedEnvelope({ sidebarCollapsed: true, expandedSidebarWidth: 219 })],
-    ["too-large width", persistedEnvelope({ sidebarCollapsed: true, expandedSidebarWidth: 421 })],
+    ["too-small width", persistedEnvelope({ sidebarCollapsed: true, expandedSidebarWidth: 239 })],
+    ["too-large width", persistedEnvelope({ sidebarCollapsed: true, expandedSidebarWidth: 401 })],
   ])("falls back safely for %s", (_label, value) => {
     storage.values.set(WORKSPACE_STORAGE_KEY, value);
 

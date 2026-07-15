@@ -79,6 +79,91 @@ function setup() {
 }
 
 describe("ModelsScreen", () => {
+  it("presents installed models as a searchable master-detail workspace", async () => {
+    const { api } = setup();
+    render(<ModelsScreen endpoint="http://127.0.0.1:8080" services={api} />);
+
+    expect(await screen.findByRole("tab", { name: "Installed" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tab", { name: "Discover" })).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Installed models" })).toBeInTheDocument();
+    expect(screen.getByRole("complementary", { name: "Model details" })).toHaveTextContent("model-ready");
+    expect(screen.getByLabelText("Parameters: 4B")).toHaveTextContent("4B");
+    expect(screen.getByLabelText("Quantization: Q4_K_M")).toHaveTextContent("Q4_K_M");
+    expect(screen.getByLabelText("Engine: llama-cpp")).toHaveTextContent("llama-cpp");
+    expect(screen.getByLabelText("License: Apache-2.0")).toHaveTextContent("Apache-2.0");
+  });
+
+  it("supports roving keyboard focus and automatic activation across workspace tabs", async () => {
+    const user = userEvent.setup();
+    const { api } = setup();
+    render(<ModelsScreen endpoint="http://127.0.0.1:8080" services={api} />);
+
+    const installed = await screen.findByRole("tab", { name: "Installed" });
+    const discover = screen.getByRole("tab", { name: "Discover" });
+    expect(installed).toHaveAttribute("tabindex", "0");
+    expect(discover).toHaveAttribute("tabindex", "-1");
+
+    installed.focus();
+    await user.keyboard("{ArrowRight}");
+    expect(discover).toHaveFocus();
+    expect(discover).toHaveAttribute("aria-selected", "true");
+    expect(installed).toHaveAttribute("tabindex", "-1");
+
+    await user.keyboard("{Home}");
+    expect(installed).toHaveFocus();
+    expect(installed).toHaveAttribute("aria-selected", "true");
+
+    await user.keyboard("{End}");
+    expect(discover).toHaveFocus();
+    await user.keyboard("{ArrowRight}");
+    expect(installed).toHaveFocus();
+    await user.keyboard("{ArrowLeft}");
+    expect(discover).toHaveFocus();
+  });
+
+  it("keeps discovery truthful when no catalog source is connected", async () => {
+    const user = userEvent.setup();
+    const { api } = setup();
+    render(<ModelsScreen endpoint="http://127.0.0.1:8080" services={api} />);
+
+    await user.click(await screen.findByRole("tab", { name: "Discover" }));
+    expect(screen.getByRole("tab", { name: "Discover" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("heading", { name: "Model catalog unavailable" })).toBeInTheDocument();
+    expect(screen.getByText(/No catalog source is connected/i)).toBeInTheDocument();
+    expect(screen.queryByText("Llama 3.2 3B")).not.toBeInTheDocument();
+  });
+
+  it("renders optional catalog data and delegates downloads to authoritative inventory", async () => {
+    const user = userEvent.setup();
+    const { api } = setup();
+    render(
+      <ModelsScreen
+        endpoint="http://127.0.0.1:8080"
+        services={api}
+        catalogModels={[
+          {
+            modelId: "model-ready",
+            title: "Aurora 4B",
+            publisher: "Acme AI",
+            summary: "Compact instruction model for local work.",
+            tags: ["Text", "4B"],
+          },
+        ]}
+      />,
+    );
+
+    await user.click(await screen.findByRole("tab", { name: "Discover" }));
+    expect(screen.getByRole("searchbox", { name: "Search catalog" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Aurora 4B" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Download Aurora 4B" }));
+    expect(api.downloadModel).toHaveBeenCalledWith(
+      "http://127.0.0.1:8080",
+      token,
+      "model-ready",
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+  });
+
   it("distinguishes a completed empty known registry from loading", async () => {
     const { api } = setup();
     vi.mocked(api.getInventory).mockResolvedValue([]);
@@ -91,11 +176,18 @@ describe("ModelsScreen", () => {
     const css = readFileSync(resolve(process.cwd(), "src/models/ModelsScreen.module.css"), "utf8");
     expect(css).toContain("var(--loxa-component-minimum-interactive-target)");
     expect(css).toContain("overflow-wrap: anywhere");
-    expect(css).toContain("@media (max-width:");
+    expect(css).toContain("container-type: inline-size");
+    expect(css).toContain("container-name: models-workspace");
+    expect(css).toContain("@container models-workspace (max-width: 760px)");
+    expect(css).toMatch(
+      /@container models-workspace \(max-width: 760px\)[\s\S]*?\.workspaceGrid\s*{[\s\S]*?grid-template-columns:\s*1fr/,
+    );
+    expect(css).toContain("@media (max-width: 760px)");
     expect(css).toContain("@media (prefers-contrast: more)");
     expect(css).toContain("@media (forced-colors: active)");
     expect(css).toContain("@media (prefers-reduced-motion: reduce)");
     expect(css).not.toMatch(/#[0-9a-f]{3,8}\b/i);
+    expect(css).not.toContain("var(--loxa-space-5)");
   });
 
   it("filters verified recipes locally across recipe metadata without refetching", async () => {

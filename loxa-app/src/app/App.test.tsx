@@ -59,6 +59,16 @@ function services(): AppServices {
   };
 }
 
+async function chooseChatModel(
+  user: ReturnType<typeof userEvent.setup>,
+  modelId: string,
+  action: "Load" | "Switch to",
+) {
+  await user.click(await screen.findByRole("button", { name: "Choose model" }));
+  await user.click(await screen.findByRole("option", { name: modelId }));
+  await user.click(screen.getByRole("button", { name: `${action} ${modelId}` }));
+}
+
 describe("App", () => {
   beforeEach(() => {
     window.localStorage.clear();
@@ -119,7 +129,7 @@ describe("App", () => {
     vi.mocked(api.getInventory).mockResolvedValue([]);
 
     render(<App services={api} />);
-    await user.click(await screen.findByRole("button", { name: "Browse models" }));
+    await user.click(await screen.findByRole("button", { name: "Open Models" }));
 
     expect(screen.getByRole("heading", { name: "Models" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Models" })).toHaveAttribute("aria-current", "page");
@@ -209,6 +219,56 @@ describe("App", () => {
     expect(secondary).toContainElement(screen.getByRole("link", { name: "Settings" }));
   });
 
+  it("closes the observability inspector when the workspace becomes compact", async () => {
+    const user = userEvent.setup();
+    const compactListeners = new Set<(event: MediaQueryListEvent) => void>();
+    let compact = false;
+    const compactQuery = "(max-width: 760px)";
+    const matchMedia = vi.fn((query: string) => {
+      const listeners = query === compactQuery ? compactListeners : new Set<(event: MediaQueryListEvent) => void>();
+      return {
+        matches: query === compactQuery ? compact : false,
+        media: query,
+        onchange: null,
+        addEventListener: (_type: string, listener: EventListenerOrEventListenerObject) =>
+          listeners.add(listener as (event: MediaQueryListEvent) => void),
+        removeEventListener: (_type: string, listener: EventListenerOrEventListenerObject) =>
+          listeners.delete(listener as (event: MediaQueryListEvent) => void),
+        addListener: () => undefined,
+        removeListener: () => undefined,
+        dispatchEvent: () => true,
+      } as MediaQueryList;
+    });
+    vi.stubGlobal("matchMedia", matchMedia);
+
+    render(<App services={services()} />);
+    const trigger = await screen.findByRole("button", { name: "Node online" });
+    await user.click(trigger);
+    expect(trigger).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("complementary", { name: "Health and observability inspector" })).toBeInTheDocument();
+
+    compact = true;
+    act(() => {
+      compactListeners.forEach((listener) => listener({ matches: true, media: compactQuery } as MediaQueryListEvent));
+    });
+
+    await waitFor(() => expect(trigger).toHaveAttribute("aria-expanded", "false"));
+    expect(screen.queryByRole("complementary", { name: "Health and observability inspector" })).not.toBeInTheDocument();
+    vi.unstubAllGlobals();
+  });
+
+  it("returns focus to the health trigger after closing observability", async () => {
+    const user = userEvent.setup();
+    render(<App services={services()} />);
+    const trigger = await screen.findByRole("button", { name: "Node online" });
+    await user.click(trigger);
+
+    await user.click(screen.getByRole("button", { name: "Close observability" }));
+
+    expect(trigger).toHaveFocus();
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
+  });
+
   it("places Chat history in the global resizable rail and keeps route navigation", async () => {
     const user = userEvent.setup();
     const api = services();
@@ -250,65 +310,55 @@ describe("App", () => {
     }
     expect(api.listChats).toHaveBeenCalledTimes(1);
 
-    const separator = screen.getByRole("separator", { name: "Resize navigation and conversation rail" });
+    const separator = screen.getByRole("separator", { name: "Resize conversation rail" });
     const shell = screen.getByTestId("app-shell");
-    expect(shell.style.getPropertyValue("--loxa-sidebar-width")).toBe("280px");
-    expect(separator).toHaveAttribute("aria-valuemin", "220");
-    expect(separator).toHaveAttribute("aria-valuemax", "420");
+    expect(shell.style.getPropertyValue("--loxa-sidebar-width")).toBe("328px");
+    expect(separator).toHaveAttribute("aria-valuemin", "240");
+    expect(separator).toHaveAttribute("aria-valuemax", "400");
     fireEvent.keyDown(separator, { key: "End" });
-    expect(separator).toHaveAttribute("aria-valuenow", "420");
+    expect(separator).toHaveAttribute("aria-valuenow", "400");
     fireEvent.keyDown(separator, { key: "ArrowRight" });
-    expect(separator).toHaveAttribute("aria-valuenow", "420");
+    expect(separator).toHaveAttribute("aria-valuenow", "400");
     fireEvent.keyDown(separator, { key: "Home" });
-    expect(separator).toHaveAttribute("aria-valuenow", "220");
+    expect(separator).toHaveAttribute("aria-valuenow", "240");
     fireEvent.keyDown(separator, { key: "ArrowLeft" });
-    expect(separator).toHaveAttribute("aria-valuenow", "220");
+    expect(separator).toHaveAttribute("aria-valuenow", "240");
     fireEvent.doubleClick(separator);
-    expect(shell.style.getPropertyValue("--loxa-sidebar-width")).toBe("56px");
-    expect(separator).toHaveAttribute("aria-valuetext", "Collapsed");
-    await user.click(screen.getByRole("button", { name: "Expand sidebar" }));
-    expect(shell.style.getPropertyValue("--loxa-sidebar-width")).toBe("220px");
+    expect(shell.style.getPropertyValue("--loxa-sidebar-width")).toBe("328px");
+    expect(separator).toHaveAttribute("aria-valuenow", "280");
     const setPointerCapture = vi.fn();
     const releasePointerCapture = vi.fn();
     Object.assign(separator, { setPointerCapture, releasePointerCapture, hasPointerCapture: () => true });
-    fireEvent.pointerDown(separator, { pointerId: 7, button: 0, clientX: 220 });
+    fireEvent.pointerDown(separator, { pointerId: 7, button: 0, clientX: 328 });
     expect(setPointerCapture).toHaveBeenCalledWith(7);
     fireEvent.pointerMove(window, { pointerId: 8, clientX: 700 });
-    expect(separator).toHaveAttribute("aria-valuenow", "220");
+    expect(separator).toHaveAttribute("aria-valuenow", "280");
     fireEvent.pointerMove(window, { pointerId: 7, clientX: 700 });
-    expect(separator).toHaveAttribute("aria-valuenow", "420");
+    expect(separator).toHaveAttribute("aria-valuenow", "400");
     fireEvent.pointerMove(window, { pointerId: 7, clientX: -200 });
-    expect(shell.style.getPropertyValue("--loxa-sidebar-width")).toBe("56px");
-    expect(separator).toHaveAttribute("aria-valuetext", "Collapsed");
+    expect(separator).toHaveAttribute("aria-valuenow", "240");
+    expect(useWorkspaceStore.getState().sidebarCollapsed).toBe(false);
     fireEvent.pointerCancel(window, { pointerId: 7 });
     expect(releasePointerCapture).toHaveBeenCalledWith(7);
 
-    expect(shell.style.getPropertyValue("--loxa-sidebar-width")).toBe("56px");
-    const collapsedSeparator = screen.getByRole("separator", {
-      name: "Resize navigation and conversation rail",
-    });
-    expect(collapsedSeparator).toHaveAttribute("aria-valuetext", "Collapsed");
-    for (const name of ["Expand sidebar", "Chat", "Models", "Node", "Settings", "Node online. No active model"]) {
-      expect(screen.getByRole(name === "Expand sidebar" ? "button" : "link", { name })).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Hide conversations" }));
+    expect(shell.style.getPropertyValue("--loxa-sidebar-width")).toBe("48px");
+    expect(screen.queryByRole("separator", { name: "Resize conversation rail" })).not.toBeInTheDocument();
+    for (const name of ["Chat", "Models", "Node", "Settings", "Node online. No active model"]) {
+      expect(screen.getByRole("link", { name })).toBeVisible();
     }
+    expect(screen.getByRole("button", { name: "Show conversations" })).toBeVisible();
     expect(document.querySelectorAll(".app-sidebar svg:not([aria-hidden='true'])")).toHaveLength(0);
 
-    fireEvent.pointerDown(collapsedSeparator, { pointerId: 9, button: 0, clientX: 56 });
-    fireEvent.pointerMove(window, { pointerId: 9, clientX: 120 });
-    expect(shell.style.getPropertyValue("--loxa-sidebar-width")).toBe("420px");
-    fireEvent.pointerUp(window, { pointerId: 9 });
-
-    await user.click(screen.getByRole("button", { name: "Collapse sidebar" }));
-    fireEvent.doubleClick(screen.getByRole("separator", { name: "Resize navigation and conversation rail" }));
-    expect(shell.style.getPropertyValue("--loxa-sidebar-width")).toBe("420px");
-
-    await user.click(screen.getByRole("button", { name: "Collapse sidebar" }));
+    await user.click(screen.getByRole("button", { name: "Show conversations" }));
+    expect(shell.style.getPropertyValue("--loxa-sidebar-width")).toBe("288px");
+    await user.click(screen.getByRole("button", { name: "Hide conversations" }));
 
     view.unmount();
     render(<App services={api} />);
-    expect(screen.getByTestId("app-shell").style.getPropertyValue("--loxa-sidebar-width")).toBe("56px");
-    await user.click(screen.getByRole("button", { name: "Expand sidebar" }));
-    expect(screen.getByTestId("app-shell").style.getPropertyValue("--loxa-sidebar-width")).toBe("420px");
+    expect(screen.getByTestId("app-shell").style.getPropertyValue("--loxa-sidebar-width")).toBe("48px");
+    await user.click(screen.getByRole("button", { name: "Show conversations" }));
+    expect(screen.getByTestId("app-shell").style.getPropertyValue("--loxa-sidebar-width")).toBe("288px");
 
     expect(removeListener).toHaveBeenCalledWith("pointermove", expect.any(Function));
     expect(removeListener).toHaveBeenCalledWith("pointerup", expect.any(Function));
@@ -651,7 +701,7 @@ describe("App", () => {
     render(<App services={api} />);
 
     await user.click(await screen.findByRole("link", { name: "Chat" }));
-    await user.click(await screen.findByRole("button", { name: "Load gemma-ready" }));
+    await chooseChatModel(user, "gemma-ready", "Load");
     act(() =>
       controlCallbacks.forEach((callbacks) =>
         callbacks.onEvent({
@@ -743,8 +793,7 @@ describe("App", () => {
     render(<App services={api} />);
 
     await user.click(await screen.findByRole("link", { name: "Chat" }));
-    await user.selectOptions(await screen.findByRole("combobox", { name: "Choose model" }), "gemma-ready");
-    await user.click(screen.getByRole("button", { name: "Switch to gemma-ready" }));
+    await chooseChatModel(user, "gemma-ready", "Switch to");
     await waitFor(() => expect(api.getOperation).toHaveBeenCalledTimes(1));
 
     act(() =>
@@ -861,7 +910,7 @@ describe("App", () => {
     await waitFor(() => expect(api.readControlToken).toHaveBeenCalledTimes(1));
     expect(api.createControlEventStream).not.toHaveBeenCalled();
     await user.click(screen.getByRole("link", { name: "Chat" }));
-    await user.click(await screen.findByRole("button", { name: "Load gemma-ready" }));
+    await chooseChatModel(user, "gemma-ready", "Load");
 
     expect(await screen.findByRole("link", { name: "Node ready. Active model gemma-ready" })).toBeVisible();
     await waitFor(() => expect(screen.getByLabelText("Message")).toBeEnabled());
@@ -1022,11 +1071,13 @@ describe("App", () => {
     expect(screen.getByRole("log", { name: "Conversation" })).toBeVisible();
     expect(screen.getByRole("form", { name: "Message composer" })).toBeVisible();
     expect(screen.getByLabelText("Message")).toBeDisabled();
-    expect(screen.getByRole("combobox", { name: "Choose model" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Choose model" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Attach document" })).toHaveAttribute("aria-disabled", "true");
-    expect(screen.getByRole("tooltip")).toHaveTextContent(
-      /document input support cannot be checked until the node is connected/i,
-    );
+    expect(
+      screen.getByRole("tooltip", {
+        name: /document input support cannot be checked until the node is connected/i,
+      }),
+    ).toBeInTheDocument();
     expect(api.getStatus).not.toHaveBeenCalled();
     expect(api.readControlToken).not.toHaveBeenCalled();
   });
@@ -1037,8 +1088,6 @@ describe("App", () => {
     await screen.findByRole("link", { name: "Node online. No active model" });
 
     await user.tab();
-    expect(screen.getByRole("button", { name: "Collapse sidebar" })).toHaveFocus();
-    await user.tab();
     expect(screen.getByRole("link", { name: "Chat" })).toHaveFocus();
     await user.tab();
     expect(screen.getByRole("link", { name: "Models" })).toHaveFocus();
@@ -1048,7 +1097,6 @@ describe("App", () => {
     expect(screen.getByRole("link", { name: "Node online. No active model" })).toHaveFocus();
     await user.tab();
     expect(screen.getByRole("link", { name: "Settings" })).toHaveFocus();
-
     expect(screen.queryByRole("button", { name: /load|unload|switch|download/i })).not.toBeInTheDocument();
   });
 

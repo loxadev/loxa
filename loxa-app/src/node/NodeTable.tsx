@@ -12,7 +12,10 @@ export type NodeTableActions = {
   lifecycle?: ReactNode;
 };
 
-export type NodeTableProps = {
+export type NodeTableRow = {
+  rowId: string;
+  name: string;
+  kind: string;
   nodeId: string;
   statusLabel: string;
   statusTone: StatusBadgeProps["tone"];
@@ -25,19 +28,19 @@ export type NodeTableProps = {
   actions?: NodeTableActions;
 };
 
-export function NodeTable({
-  nodeId,
-  statusLabel,
-  statusTone,
-  activeModel,
-  engineName,
-  engineVersion,
-  profile,
-  endpoint,
-  ownership,
-  actions,
-}: NodeTableProps) {
-  const hasActions = actions ? Children.toArray(Object.values(actions)).length > 0 : false;
+type NodeTableCollectionProps = {
+  rows: readonly NodeTableRow[];
+  selectedRowId?: string;
+  onSelectRow?(rowId: string): void;
+};
+
+export type NodeTableProps = NodeTableRow | NodeTableCollectionProps;
+
+export function NodeTable(props: NodeTableProps) {
+  const rows = "rows" in props ? props.rows : [props];
+  const selectedRowId = "rows" in props ? props.selectedRowId : undefined;
+  const onSelectRow = "rows" in props ? props.onSelectRow : undefined;
+  const hasActions = rows.some((row) => hasRenderableActions(row.actions));
 
   return (
     <Table className={styles.table}>
@@ -56,45 +59,78 @@ export function NodeTable({
         </TableRow>
       </TableHeader>
       <TableBody>
-        <TableRow className={styles.nodeRow}>
-          <TableCell>
-            <strong className={styles.primaryValue}>Local node</strong>
-            <span className={`${styles.detail} technical-value`}>{nodeId}</span>
-          </TableCell>
-          <TableCell>
-            <StatusBadge tone={statusTone}>{statusLabel}</StatusBadge>
-          </TableCell>
-          <TableCell>
-            <span className={`${styles.primaryValue} technical-value`}>{activeModel}</span>
-          </TableCell>
-          <TableCell>
-            <span className="technical-value">{engineName}</span>
-          </TableCell>
-          <TableCell>
-            <span className="technical-value">{engineVersion}</span>
-          </TableCell>
-          <TableCell>
-            <span className="technical-value">{profile}</span>
-          </TableCell>
-          <TableCell>
-            <span className={`${styles.endpoint} technical-value`}>{endpoint}</span>
-          </TableCell>
-          <TableCell>
-            <span className={styles.primaryValue}>{ownership}</span>
-          </TableCell>
-          {hasActions && actions && (
-            <TableCell>
-              <div className={styles.actions}>
-                {actions.copyEndpoint}
-                {actions.model}
-                {actions.start}
-                {actions.retry}
-                {actions.lifecycle}
-              </div>
-            </TableCell>
-          )}
-        </TableRow>
+        {rows.map((row) => {
+          const selected = selectedRowId === row.rowId;
+          return (
+            <TableRow
+              aria-selected={onSelectRow ? selected : undefined}
+              className={styles.nodeRow}
+              data-selected={onSelectRow && selected ? true : undefined}
+              key={row.rowId}
+            >
+              <TableCell>
+                {onSelectRow ? (
+                  <button
+                    className={styles.rowSelector}
+                    type="button"
+                    aria-label={`Select ${row.name}`}
+                    aria-pressed={selected}
+                    onClick={() => onSelectRow(row.rowId)}
+                  >
+                    <strong className={styles.primaryValue}>{row.name}</strong>
+                    <span className={styles.detail}>{row.kind}</span>
+                    <span className={`${styles.detail} technical-value`}>{row.nodeId}</span>
+                  </button>
+                ) : (
+                  <>
+                    <strong className={styles.primaryValue}>{row.name}</strong>
+                    <span className={styles.detail}>{row.kind}</span>
+                    <span className={`${styles.detail} technical-value`}>{row.nodeId}</span>
+                  </>
+                )}
+              </TableCell>
+              <TableCell>
+                <StatusBadge tone={row.statusTone}>{row.statusLabel}</StatusBadge>
+              </TableCell>
+              <TableCell>
+                <span className={`${styles.primaryValue} technical-value`}>{row.activeModel}</span>
+              </TableCell>
+              <TableCell>
+                <span className="technical-value">{row.engineName}</span>
+              </TableCell>
+              <TableCell>
+                <span className="technical-value">{row.engineVersion}</span>
+              </TableCell>
+              <TableCell>
+                <span className="technical-value">{row.profile}</span>
+              </TableCell>
+              <TableCell>
+                <span className={`${styles.endpoint} technical-value`}>{row.endpoint}</span>
+              </TableCell>
+              <TableCell>
+                <span className={styles.primaryValue}>{row.ownership}</span>
+              </TableCell>
+              {hasActions && (
+                <TableCell>
+                  {hasRenderableActions(row.actions) && row.actions ? (
+                    <div className={styles.actions}>
+                      {row.actions.copyEndpoint}
+                      {row.actions.model}
+                      {row.actions.start}
+                      {row.actions.retry}
+                      {row.actions.lifecycle}
+                    </div>
+                  ) : null}
+                </TableCell>
+              )}
+            </TableRow>
+          );
+        })}
       </TableBody>
     </Table>
   );
+}
+
+function hasRenderableActions(actions?: NodeTableActions) {
+  return actions ? Children.toArray(Object.values(actions)).length > 0 : false;
 }

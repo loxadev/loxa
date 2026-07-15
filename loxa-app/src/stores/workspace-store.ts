@@ -1,10 +1,19 @@
 import { create } from "zustand";
 import { createJSONStorage, persist, type StateStorage } from "zustand/middleware";
 
-export const DEFAULT_EXPANDED_SIDEBAR_WIDTH = 280;
-export const MIN_EXPANDED_SIDEBAR_WIDTH = 220;
-export const MAX_EXPANDED_SIDEBAR_WIDTH = 420;
-export const COLLAPSED_SIDEBAR_WIDTH = 56;
+export const ACTIVITY_RAIL_WIDTH = 48;
+export const DEFAULT_CONVERSATION_RAIL_WIDTH = 280;
+export const MIN_CONVERSATION_RAIL_WIDTH = 240;
+export const MAX_CONVERSATION_RAIL_WIDTH = 400;
+
+/** @deprecated Prefer the conversation rail constants for new shell code. */
+export const DEFAULT_EXPANDED_SIDEBAR_WIDTH = DEFAULT_CONVERSATION_RAIL_WIDTH;
+/** @deprecated Prefer the conversation rail constants for new shell code. */
+export const MIN_EXPANDED_SIDEBAR_WIDTH = MIN_CONVERSATION_RAIL_WIDTH;
+/** @deprecated Prefer the conversation rail constants for new shell code. */
+export const MAX_EXPANDED_SIDEBAR_WIDTH = MAX_CONVERSATION_RAIL_WIDTH;
+/** @deprecated The fixed activity rail remains visible when conversations collapse. */
+export const COLLAPSED_SIDEBAR_WIDTH = ACTIVITY_RAIL_WIDTH;
 export const SIDEBAR_KEYBOARD_STEP = 20;
 
 export const WORKSPACE_STORAGE_KEY = "loxa-workspace";
@@ -145,6 +154,8 @@ export const selectSidebarCollapsed = (state: WorkspaceState) => state.sidebarCo
 export const selectExpandedSidebarWidth = (state: WorkspaceState) => state.expandedSidebarWidth;
 export const selectEffectiveSidebarWidth = (state: WorkspaceState) =>
   state.sidebarCollapsed ? COLLAPSED_SIDEBAR_WIDTH : state.expandedSidebarWidth;
+export const selectConversationRailWidth = (state: WorkspaceState) => state.expandedSidebarWidth;
+export const selectConversationRailCollapsed = (state: WorkspaceState) => state.sidebarCollapsed;
 
 export const selectSetActiveRoute = (state: WorkspaceState) => state.setActiveRoute;
 export const selectSetActiveSettingsPage = (state: WorkspaceState) => state.setActiveSettingsPage;

@@ -40,6 +40,25 @@
   color: var(--loxa-foreground);
 }
 
+.nodeRow td:first-child {
+  min-width: 10rem;
+}
+
+.nodeRow[data-selected] {
+  background: var(--loxa-secondary-surface);
+}
+
+.rowSelector {
+  width: 100%;
+  min-width: var(--loxa-component-minimum-interactive-target);
+  min-height: var(--loxa-component-minimum-interactive-target);
+  padding: 0;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  text-align: left;
+}
+
 .detail {
   margin-top: var(--loxa-space-1);
   color: var(--loxa-muted-foreground);

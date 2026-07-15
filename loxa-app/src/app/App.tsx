@@ -1,10 +1,11 @@
-import { useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { ChatScreen, type ChatScreenServices } from "../chat/ChatScreen";
 import { ConversationList } from "../chat/ConversationList";
 import type { ConversationHistoryController, ConversationHistoryServices } from "../chat/conversationHistory";
 import { useConversationHistory } from "../chat/useConversationHistory";
 import { ModelsScreen, type ModelsScreenServices } from "../models/ModelsScreen";
+import { ObservabilityInspector } from "../observability/ObservabilityInspector";
 import { NodeScreen, type NodeScreenServices } from "../node/NodeScreen";
 import { NodeSessionProvider, useNodeSession, type NodeSessionServices } from "../node/NodeSession";
 import { SettingsScreen } from "../settings/SettingsScreen";
@@ -12,6 +13,7 @@ import { useThemePreference } from "../settings/theme";
 import { selectActiveRoute, selectSetActiveRoute, useWorkspaceStore } from "../stores/workspace-store";
 import mark from "../assets/brand/loxa-mark.svg?no-inline";
 import { AppShell } from "./AppShell";
+import { WorkspaceHealthTrigger, WorkspaceToolbar } from "./WorkspaceToolbar";
 import { appServices, DEFAULT_ENDPOINT } from "./services";
 
 export type AppServices = NodeSessionServices &
@@ -66,6 +68,23 @@ function WorkspaceContents({
   const setRoute = useWorkspaceStore(selectSetActiveRoute);
   const [theme, setTheme] = useThemePreference();
   const [chatInteractionLocked, setChatInteractionLocked] = useState(false);
+  const [inspectorOpen, setInspectorOpen] = useState(false);
+  const healthTrigger = useRef<HTMLButtonElement>(null);
+  const closeInspector = () => {
+    setInspectorOpen(false);
+    healthTrigger.current?.focus();
+  };
+
+  useEffect(() => {
+    if (typeof window.matchMedia !== "function") return;
+    const compactWorkspace = window.matchMedia("(max-width: 760px)");
+    const closeForCompactWorkspace = ({ matches }: Pick<MediaQueryListEvent, "matches">) => {
+      if (matches) setInspectorOpen(false);
+    };
+    closeForCompactWorkspace(compactWorkspace);
+    compactWorkspace.addEventListener("change", closeForCompactWorkspace);
+    return () => compactWorkspace.removeEventListener("change", closeForCompactWorkspace);
+  }, []);
   const session = useNodeSession();
   const health = globalHealthLabel(session.phase);
   const model =
@@ -74,6 +93,12 @@ function WorkspaceContents({
       : session.phase === "unloaded"
         ? "No active model"
         : "Model status unavailable";
+  const observabilityModel =
+    session.phase === "ready" && session.status?.runtime_model
+      ? session.status.runtime_model
+      : session.phase === "unloaded"
+        ? "No model loaded"
+        : "Unavailable";
   const conversationTitle = history?.conversations.find(({ id }) => id === history.selectedChatId)?.title ?? "New Chat";
 
   return (
@@ -81,6 +106,22 @@ function WorkspaceContents({
       brandMark={mark}
       runtimeHealth={health}
       runtimeModel={model}
+      workspaceHeader={
+        route === "chat" ? undefined : (
+          <WorkspaceToolbar
+            route={route}
+            health={health}
+            inspectorOpen={inspectorOpen}
+            onToggleInspector={() => setInspectorOpen((current) => !current)}
+            triggerRef={healthTrigger}
+          />
+        )
+      }
+      inspector={
+        inspectorOpen ? (
+          <ObservabilityInspector health={health} model={observabilityModel} onClose={closeInspector} />
+        ) : undefined
+      }
       conversationRail={
         history ? (
           <GlobalConversationRail
@@ -113,6 +154,14 @@ function WorkspaceContents({
           conversationTitle={conversationTitle}
           onInteractionLockChange={setChatInteractionLocked}
           onNavigateModels={() => setRoute("models")}
+          headerEndActions={
+            <WorkspaceHealthTrigger
+              health={health}
+              inspectorOpen={inspectorOpen}
+              onToggleInspector={() => setInspectorOpen((current) => !current)}
+              triggerRef={healthTrigger}
+            />
+          }
         />
       ) : (
         <SettingsScreen

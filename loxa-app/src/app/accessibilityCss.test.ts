@@ -40,7 +40,7 @@ describe("integrated accessibility CSS contract", () => {
 
   it("owns one responsive canvas and page frame for every route", () => {
     expect(globalCss).toMatch(/\.workspace-canvas\s*\{[^}]*background:\s*var\(--loxa-background\)/s);
-    expect(globalCss).toMatch(/\.workspace-frame\s*\{[^}]*width:\s*min\(100%,\s*1200px\)/s);
+    expect(globalCss).toMatch(/\.workspace-frame\s*\{[^}]*width:\s*100%[^}]*max-width:\s*1200px[^}]*min-width:\s*0/s);
     expect(globalCss).toMatch(/\.workspace-frame\s*\{[^}]*margin-inline:\s*auto/s);
     expect(responsiveCanvasErrors(globalCss)).toEqual([]);
   });
@@ -139,7 +139,6 @@ describe("integrated accessibility CSS contract", () => {
       "SidebarHeader.tsx",
       "SidebarNavigation.tsx",
       "SidebarRuntimeStatus.tsx",
-      "SidebarResizeHandle.tsx",
     ]) {
       const source = readFileSync(`${root}/src/app/${file}`, "utf8");
       expect(source, file).not.toMatch(/\b(?:services|endpoint|ownership|token|credential|session)\b/i);

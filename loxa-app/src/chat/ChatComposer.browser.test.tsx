@@ -48,10 +48,10 @@ test.each(["light", "dark"] as const)(
 
     const composer = page.getByRole("form", { name: "Message composer" }).element();
     const attachment = page.getByRole("button", { name: "Attach document" }).element();
-    const model = page.getByRole("combobox", { name: "Choose model" }).element();
+    const model = page.getByRole("button", { name: "Choose model" }).element();
     const send = page.getByRole("button", { name: "Send message" }).element();
     const supportReason = document.querySelector<HTMLElement>("#chat-support-reason");
-    const attachmentReason = document.querySelector<HTMLElement>('[role="tooltip"]');
+    const attachmentReason = document.querySelector<HTMLElement>("#attachment-support-reason");
     const composerRect = composer.getBoundingClientRect();
     const composerStyle = getComputedStyle(composer);
     const hostStyle = getComputedStyle(host);
@@ -84,14 +84,15 @@ test.each(["light", "dark"] as const)(
     await expect.element(attachmentReason!).not.toBeVisible();
     await act(async () => page.getByRole("button", { name: "Attach document" }).hover());
     await expect.element(attachmentReason!).toBeVisible();
-    await act(async () => page.getByRole("tooltip").hover());
+    await act(async () => page.getByRole("tooltip", { name: attachmentReason!.textContent ?? "" }).hover());
     await expect.element(attachmentReason!).toBeVisible();
     await act(async () => page.getByRole("heading", { name: "New Chat" }).hover());
     await expect.element(attachmentReason!).not.toBeVisible();
     expect(composer).not.toHaveTextContent("Active: None");
     expect(document.querySelector("#model-control-help")).toBeNull();
     const modelControl = page.getByRole("region", { name: "Chat model" }).element();
-    expect(modelControl).toHaveTextContent("No active model");
+    expect(modelControl).toHaveTextContent("Choose a model to load");
+    expect(modelControl).toHaveTextContent("Active model: None");
     const message = page.getByRole("textbox", { name: "Message" }).element();
     expect(getComputedStyle(message).backgroundColor).toBe("rgba(0, 0, 0, 0)");
     expect(message).toBeDisabled();
