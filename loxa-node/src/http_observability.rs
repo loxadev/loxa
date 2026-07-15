@@ -2,7 +2,8 @@ use axum::{
     body::Body,
     extract::MatchedPath,
     http::{header::HeaderName, Request, Response},
-    middleware, Router,
+    middleware::{self, Next},
+    Router,
 };
 use std::time::Duration;
 use tower_http::{
@@ -16,13 +17,26 @@ const REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("x-request-id");
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DiagnosticRequestId(pub(crate) String);
 
-#[derive(Clone, Copy, Debug, Default)]
-struct RandomRequestId;
+trait RequestIdSource: Clone + Send + Sync + 'static {
+    fn fill(&mut self, bytes: &mut [u8; 16]) -> Result<(), ()>;
+}
 
-impl MakeRequestId for RandomRequestId {
+#[derive(Clone, Copy, Debug, Default)]
+struct OsRequestIdSource;
+
+impl RequestIdSource for OsRequestIdSource {
+    fn fill(&mut self, bytes: &mut [u8; 16]) -> Result<(), ()> {
+        getrandom::fill(bytes).map_err(|_| ())
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RandomRequestId<S>(S);
+
+impl<S: RequestIdSource> MakeRequestId for RandomRequestId<S> {
     fn make_request_id<B>(&mut self, _request: &Request<B>) -> Option<RequestId> {
         let mut random = [0_u8; 16];
-        getrandom::fill(&mut random).expect("operating-system randomness unavailable");
+        self.0.fill(&mut random).ok()?;
         let mut encoded = [0_u8; 32];
         const LOWER_HEX: &[u8; 16] = b"0123456789abcdef";
         for (index, byte) in random.into_iter().enumerate() {
@@ -45,22 +59,30 @@ async fn discard_untrusted_request_id(mut request: Request<Body>) -> Request<Bod
 }
 
 async fn attach_diagnostic_request_id(mut request: Request<Body>) -> Request<Body> {
-    let trusted = request
-        .extensions()
-        .get::<RequestId>()
-        .expect("request ID layer runs before diagnostic extension layer")
-        .header_value()
-        .to_str()
-        .expect("generated request ID is ASCII")
-        .to_owned();
-    request
-        .extensions_mut()
-        .insert(DiagnosticRequestId(trusted));
+    if let Some(trusted) = request.extensions().get::<RequestId>() {
+        let trusted = trusted
+            .header_value()
+            .to_str()
+            .expect("generated request ID is ASCII")
+            .to_owned();
+        request
+            .extensions_mut()
+            .insert(DiagnosticRequestId(trusted));
+    }
     request
 }
 
-async fn discard_route_request_id(mut response: Response<Body>) -> Response<Body> {
-    response.headers_mut().remove(&REQUEST_ID_HEADER);
+async fn enforce_trusted_response_id(request: Request<Body>, next: Next) -> Response<Body> {
+    let trusted = request
+        .extensions()
+        .get::<RequestId>()
+        .map(|request_id| request_id.header_value().clone());
+    let mut response = next.run(request).await;
+    if let Some(trusted) = trusted {
+        response
+            .headers_mut()
+            .insert(REQUEST_ID_HEADER.clone(), trusted);
+    }
     response
 }
 
@@ -79,21 +101,23 @@ fn result_class(status: axum::http::StatusCode) -> &'static str {
 }
 
 pub(crate) fn apply(router: Router) -> Router {
+    apply_with_source(router, OsRequestIdSource)
+}
+
+fn apply_with_source<S: RequestIdSource>(router: Router, source: S) -> Router {
     // Request order is intentionally the reverse of these calls:
     // discard untrusted context -> generate -> attach -> trace -> propagate.
-    // On the response path, the innermost mapper removes any route-local value
-    // before propagation writes the trusted generated ID.
+    // On the response path, the request-aware middleware overwrites a
+    // route-local value only when generation produced a trusted ID.
     router
-        .layer(middleware::map_response(discard_route_request_id))
         .layer(PropagateRequestIdLayer::new(REQUEST_ID_HEADER.clone()))
+        .layer(middleware::from_fn(enforce_trusted_response_id))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(|request: &Request<Body>| {
-                    let request_id = &request
-                        .extensions()
-                        .get::<DiagnosticRequestId>()
-                        .expect("diagnostic extension layer runs before trace layer")
-                        .0;
+                    let Some(request_id) = request.extensions().get::<DiagnosticRequestId>() else {
+                        return Span::none();
+                    };
                     let route = request
                         .extensions()
                         .get::<MatchedPath>()
@@ -103,7 +127,7 @@ pub(crate) fn apply(router: Router) -> Router {
                         target: "loxa_node::http",
                         Level::INFO,
                         "http.request",
-                        request_id = %request_id,
+                        request_id = %request_id.0,
                         method = %request.method(),
                         route = %route,
                         status = field::Empty,
@@ -114,6 +138,9 @@ pub(crate) fn apply(router: Router) -> Router {
                 .on_request(())
                 .on_response(
                     |response: &Response<Body>, latency: Duration, span: &Span| {
+                        if span.is_disabled() {
+                            return;
+                        }
                         let status = response.status().as_u16();
                         let latency_ms = elapsed_milliseconds(latency);
                         let result_class = result_class(response.status());
@@ -137,7 +164,7 @@ pub(crate) fn apply(router: Router) -> Router {
         .layer(middleware::map_request(attach_diagnostic_request_id))
         .layer(SetRequestIdLayer::new(
             REQUEST_ID_HEADER.clone(),
-            RandomRequestId,
+            RandomRequestId(source),
         ))
         .layer(middleware::map_request(discard_untrusted_request_id))
 }
@@ -164,7 +191,16 @@ mod tests {
     use tracing::instrument::WithSubscriber;
     use tracing_subscriber::fmt::format::FmtSpan;
 
-    use super::{apply, DiagnosticRequestId};
+    use super::{apply, apply_with_source, DiagnosticRequestId, RequestIdSource};
+
+    #[derive(Clone, Copy, Debug)]
+    struct FailingRequestIdSource;
+
+    impl RequestIdSource for FailingRequestIdSource {
+        fn fill(&mut self, _bytes: &mut [u8; 16]) -> Result<(), ()> {
+            Err(())
+        }
+    }
 
     #[derive(Clone, Default)]
     struct Capture(Arc<Mutex<Vec<u8>>>);
@@ -295,6 +331,53 @@ mod tests {
         assert!(is_request_id(
             response.headers()["x-request-id"].to_str().unwrap()
         ));
+    }
+
+    fn failure_contract_router() -> Router {
+        Router::new().route(
+            "/generation-failure",
+            get(|| async {
+                (
+                    StatusCode::IM_A_TEAPOT,
+                    [("x-route-contract", "unchanged")],
+                    "exact route body",
+                )
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn request_id_generation_failure_preserves_the_route_response_without_correlation() {
+        let baseline = failure_contract_router()
+            .oneshot(
+                Request::builder()
+                    .uri("/generation-failure")
+                    .header("x-request-id", "HOSTILE_INBOUND_ID")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let observed = apply_with_source(failure_contract_router(), FailingRequestIdSource)
+            .oneshot(
+                Request::builder()
+                    .uri("/generation-failure")
+                    .header("x-request-id", "HOSTILE_INBOUND_ID")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let (baseline_parts, baseline_body) = baseline.into_parts();
+        let (observed_parts, observed_body) = observed.into_parts();
+        assert_eq!(observed_parts.status, baseline_parts.status);
+        assert_eq!(observed_parts.headers, baseline_parts.headers);
+        assert!(!observed_parts.headers.contains_key("x-request-id"));
+        assert_eq!(
+            to_bytes(observed_body, usize::MAX).await.unwrap(),
+            to_bytes(baseline_body, usize::MAX).await.unwrap()
+        );
     }
 
     #[tokio::test]
