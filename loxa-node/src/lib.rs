@@ -24,9 +24,9 @@ mod runtime;
 
 pub use bootstrap::NodePaths;
 
+use bootstrap::NodeBuilder;
 use daemon::signals::{InterruptSource, SignalGuard};
 use engine_session::EngineSession;
-use runtime::{NodeRuntime, NodeRuntimeParts};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RunOutcome {
@@ -853,118 +853,9 @@ pub fn serve_node(
     paths: &NodePaths,
     events: &mut dyn LifecycleEventSink,
 ) -> io::Result<RunTermination> {
-    build_node_runtime(requested_model, port, engine, paths)?.run(events)
-}
-
-fn build_node_runtime(
-    requested_model: Option<&str>,
-    port: Option<u16>,
-    engine: RuntimeBackendKind,
-    paths: &NodePaths,
-) -> io::Result<NodeRuntime> {
-    let startup_model = requested_startup_model(&paths.models_dir, requested_model, engine)
-        .map_err(io::Error::other)?;
-    let stable_llama_node = engine == RuntimeBackendKind::LlamaCpp;
-    let (gateway_port, unloaded_run) = if uses_stable_node_host(startup_model, engine) {
-        let reservation =
-            supervisor::reserve_localhost_port(Some(port.unwrap_or(DEFAULT_GATEWAY_PORT)))
-                .map_err(supervisor_error_to_io)?;
-        let gateway_port = reservation.port();
-        let run = claim_unloaded_owner(paths, gateway_port)?;
-        drop(reservation);
-        (gateway_port, Some(run))
-    } else {
-        (port.unwrap_or(DEFAULT_GATEWAY_PORT), None)
-    };
-    let node_id = format!("loxa-node-{}", std::process::id());
-    let gateway_state = loxa_core::gateway::GatewayState::new(node_id);
-    let mut download_runtime = unloaded_run.as_ref().map(|run| {
-        if engine == RuntimeBackendKind::LlamaCpp {
-            let owner = model_lifecycle::StableNodeOwner {
-                run_id: run.run_id.clone(),
-                pid: run.owner_pid,
-                process_start_time_unix_s: run.owner_process_start_time_unix_s,
-                gateway_port,
-            };
-            let lifecycle = model_lifecycle::ModelLifecycle::new(
-                owner,
-                production_lifecycle::ProductionEngineDriver::new(
-                    paths.state_path.clone(),
-                    paths.logs_dir.clone(),
-                    gateway_port,
-                ),
-                production_lifecycle::ProductionGatewayPublisher(gateway_state.clone()),
-            );
-            download_control::DownloadControl::spawn_with_lifecycle(
-                paths.models_dir.clone(),
-                lifecycle,
-            )
-        } else {
-            download_control::DownloadControl::spawn(paths.models_dir.clone())
-        }
-    });
-    let loxa_dir = paths.loxa_dir()?;
-    let token_path = loxa_dir.join("control.token");
-    let token = match loxa_core::control::auth::ControlToken::load_or_create(&token_path) {
-        Ok(token) => token,
-        Err(error) => {
-            let _ =
-                cleanup_stable_node_runtime(paths, unloaded_run.as_ref(), &mut download_runtime);
-            return Err(error);
-        }
-    };
-    let history_path = paths.history_path()?;
-    let (history, history_worker) = match chat_history::ChatHistory::spawn(history_path) {
-        Ok(history) => history,
-        Err(error) => {
-            let _ =
-                cleanup_stable_node_runtime(paths, unloaded_run.as_ref(), &mut download_runtime);
-            return Err(io::Error::other(error));
-        }
-    };
-    let chat_routes_state =
-        chat_routes::ChatRoutesState::new(token.clone(), history, gateway_state.clone());
-    let router = loxa_core::gateway::router(gateway_state.clone())
-        .merge(chat_routes::router(chat_routes_state.clone()));
-    let gateway_router = if let Some(run) = &unloaded_run {
-        router.merge(control_router::router(control_router::ControlState::new(
-            token,
-            format!("loxa-node-{}", std::process::id()),
-            run.run_id.clone(),
-            download_runtime
-                .as_ref()
-                .expect("unloaded node has download control")
-                .0
-                .clone(),
-        )))
-    } else {
-        router
-    };
-    let gateway = match loxa_core::gateway::GatewayServer::start_with_router(
-        gateway_port,
-        gateway_state.clone(),
-        gateway_router,
-    ) {
-        Ok(gateway) => gateway,
-        Err(error) => {
-            let _ = history_worker.stop_and_join();
-            let _ =
-                cleanup_stable_node_runtime(paths, unloaded_run.as_ref(), &mut download_runtime);
-            return Err(error);
-        }
-    };
-    Ok(NodeRuntime::new(NodeRuntimeParts {
-        paths: paths.clone(),
-        startup_model: startup_model.map(str::to_owned),
-        engine,
-        stable_llama_node,
-        unloaded_run,
-        download_runtime,
-        gateway_state,
-        chat_routes_state,
-        gateway,
-        history_worker,
-    }))
+    NodeBuilder::new(requested_model, port, engine, paths)
+        .build()?
+        .run(events)
 }
 
 fn cleanup_stable_node_runtime(
@@ -2158,7 +2049,8 @@ mod lifecycle_api_tests {
             state_path: temp.0.join("managed.json"),
             logs_dir: temp.0.join("logs"),
         };
-        let runtime = build_node_runtime(None, Some(0), RuntimeBackendKind::LlamaCpp, &paths)
+        let runtime = NodeBuilder::new(None, Some(0), RuntimeBackendKind::LlamaCpp, &paths)
+            .build()
             .expect("construct production runtime graph");
         let port = runtime.port();
 
@@ -2209,12 +2101,13 @@ mod lifecycle_api_tests {
         let recipe = &REGISTRY[0];
         std::fs::write(paths.models_dir.join(recipe.filename), b"invalid fixture")
             .expect("write invalid startup fixture");
-        let runtime = build_node_runtime(
+        let runtime = NodeBuilder::new(
             Some(recipe.id),
             Some(0),
             RuntimeBackendKind::LlamaCpp,
             &paths,
         )
+        .build()
         .expect("construct production stable runtime graph");
         let port = runtime.port();
         let cleanup_before = stable_runtime_panic_cleanup_count();
@@ -2440,6 +2333,116 @@ mod lifecycle_api_tests {
         );
         assert!(!error.to_string().contains("loxa pull"));
         let _ = std::fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn serve_node_facade_matches_builder_selection_errors() {
+        let temp = TestDir::new("builder-selection-errors");
+        let paths = NodePaths {
+            models_dir: temp.0.join("models"),
+            state_path: temp.0.join("managed.json"),
+            logs_dir: temp.0.join("logs"),
+        };
+
+        let builder_error = NodeBuilder::new(
+            Some("missing-model"),
+            Some(0),
+            RuntimeBackendKind::LlamaCpp,
+            &paths,
+        )
+        .build()
+        .err()
+        .expect("builder must reject an unknown model");
+        let facade_error = serve_node(
+            Some("missing-model"),
+            Some(0),
+            RuntimeBackendKind::LlamaCpp,
+            &paths,
+            &mut RecordingLifecycleSink::default(),
+        )
+        .expect_err("facade must reject an unknown model");
+
+        assert_eq!(facade_error.to_string(), builder_error.to_string());
+    }
+
+    #[test]
+    fn builder_failure_releases_exact_unloaded_owner() {
+        let temp = TestDir::new("builder-failure-cleanup");
+        let paths = NodePaths {
+            models_dir: temp.0.join("models"),
+            state_path: temp.0.join("managed.json"),
+            logs_dir: temp.0.join("logs"),
+        };
+        std::fs::create_dir(temp.0.join("control.token"))
+            .expect("block token creation with a directory");
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("reserve test port");
+        let port = listener.local_addr().expect("test address").port();
+        drop(listener);
+
+        NodeBuilder::new(None, Some(port), RuntimeBackendKind::LlamaCpp, &paths)
+            .build()
+            .err()
+            .expect("token creation must fail");
+
+        assert_eq!(
+            managed_servers(&paths).expect("inspect managed runs"),
+            ManagedRunsSnapshot::Runs(Vec::new())
+        );
+        TcpListener::bind(("127.0.0.1", port)).expect("failed build released reserved port");
+    }
+
+    #[test]
+    fn builder_starts_control_before_startup_model_work() {
+        let temp = TestDir::new("builder-control-before-model");
+        let paths = NodePaths {
+            models_dir: temp.0.join("models"),
+            state_path: temp.0.join("managed.json"),
+            logs_dir: temp.0.join("logs"),
+        };
+        std::fs::create_dir_all(&paths.models_dir).expect("create models directory");
+        let recipe = &REGISTRY[0];
+        std::fs::write(paths.models_dir.join(recipe.filename), b"invalid fixture")
+            .expect("write invalid startup fixture");
+
+        let runtime = NodeBuilder::new(
+            Some(recipe.id),
+            Some(0),
+            RuntimeBackendKind::LlamaCpp,
+            &paths,
+        )
+        .build()
+        .expect("build runtime before startup model work");
+        let port = runtime.port();
+        let token = loxa_core::control::auth::ControlToken::load(&temp.0.join("control.token"))
+            .expect("load control token");
+        let models = http_request(
+            port,
+            &format!(
+                "GET /loxa/v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {}\r\nOrigin: tauri://localhost\r\nConnection: close\r\n\r\n",
+                token.expose_for_authorization()
+            ),
+        );
+
+        assert!(models.starts_with("HTTP/1.1 200"), "{models}");
+        assert!(models.contains(recipe.id), "{models}");
+        drop(runtime);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let listener = TcpListener::bind(("127.0.0.1", port));
+            let owner_released = matches!(
+                managed_servers(&paths),
+                Ok(ManagedRunsSnapshot::Runs(ref runs)) if runs.is_empty()
+            );
+            if listener.is_ok() && owner_released {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "builder runtime cleanup did not release listener and exact owner"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]
