@@ -5,6 +5,7 @@ use crate::{
     model_lifecycle, production_lifecycle, requested_startup_model, supervisor_error_to_io,
     uses_stable_node_host, DEFAULT_GATEWAY_PORT,
 };
+use loxa_core::diagnostics::DiagnosticsHealth;
 use loxa_core::engine::RuntimeBackendKind;
 use loxa_core::supervisor;
 use std::io;
@@ -14,9 +15,11 @@ pub(crate) struct NodeBuilder<'a> {
     port: Option<u16>,
     engine: RuntimeBackendKind,
     paths: &'a NodePaths,
+    diagnostics_health: DiagnosticsHealth,
 }
 
 impl<'a> NodeBuilder<'a> {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new(
         requested_model: Option<&'a str>,
         port: Option<u16>,
@@ -28,6 +31,23 @@ impl<'a> NodeBuilder<'a> {
             port,
             engine,
             paths,
+            diagnostics_health: DiagnosticsHealth::new(),
+        }
+    }
+
+    pub(crate) fn with_diagnostics_health(
+        requested_model: Option<&'a str>,
+        port: Option<u16>,
+        engine: RuntimeBackendKind,
+        paths: &'a NodePaths,
+        diagnostics_health: DiagnosticsHealth,
+    ) -> Self {
+        Self {
+            requested_model,
+            port,
+            engine,
+            paths,
+            diagnostics_health,
         }
     }
 
@@ -48,7 +68,7 @@ impl<'a> NodeBuilder<'a> {
             (self.port.unwrap_or(DEFAULT_GATEWAY_PORT), None)
         };
         let node_id = format!("loxa-node-{}", std::process::id());
-        let gateway_state = loxa_core::gateway::GatewayState::new(node_id);
+        let gateway_state = loxa_core::gateway::GatewayState::new(node_id.clone());
         let mut download_runtime = unloaded_run.as_ref().map(|run| {
             if self.engine == RuntimeBackendKind::LlamaCpp {
                 let owner = model_lifecycle::StableNodeOwner {
@@ -63,7 +83,8 @@ impl<'a> NodeBuilder<'a> {
                         self.paths.state_path.clone(),
                         self.paths.logs_dir.clone(),
                         gateway_port,
-                    ),
+                    )
+                    .with_diagnostics_health(self.diagnostics_health.clone()),
                     production_lifecycle::ProductionGatewayPublisher(gateway_state.clone()),
                 );
                 download_control::DownloadControl::spawn_with_lifecycle(
@@ -165,6 +186,8 @@ impl<'a> NodeBuilder<'a> {
             chat_routes_state,
             gateway,
             history_worker,
+            diagnostics_health: self.diagnostics_health,
+            runtime_identity: node_id,
         }))
     }
 }

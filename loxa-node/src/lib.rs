@@ -285,6 +285,22 @@ pub fn run_model(
     gateway: Option<&loxa_core::gateway::GatewayState>,
     events: &mut dyn LifecycleEventSink,
 ) -> io::Result<RunTermination> {
+    run_model_with_diagnostics_health(
+        request,
+        paths,
+        gateway,
+        events,
+        &loxa_core::diagnostics::DiagnosticsHealth::new(),
+    )
+}
+
+fn run_model_with_diagnostics_health(
+    request: RunRequest<'_>,
+    paths: &NodePaths,
+    gateway: Option<&loxa_core::gateway::GatewayState>,
+    events: &mut dyn LifecycleEventSink,
+    diagnostics_health: &loxa_core::diagnostics::DiagnosticsHealth,
+) -> io::Result<RunTermination> {
     let RunRequest {
         id,
         ctx,
@@ -436,12 +452,13 @@ pub fn run_model(
                 };
             }
         };
-        let spawn = supervisor::spawn_starting_engine(
+        let spawn = supervisor::spawn_starting_engine_with_health(
             &paths.state_path,
             &starting_run.identity(),
             &spec,
             &log_path,
             reservation,
+            diagnostics_health,
         );
         let (starting_run, mut child) = match spawn {
             Ok(supervisor::SpawnStartingRunOutcome::Spawned { run, value }) => (run, value),
@@ -614,6 +631,20 @@ pub fn run_model(
                 error,
             ),
         };
+        if startup.is_err() {
+            let backend_kind = match backend.kind {
+                RuntimeBackendKind::LlamaCpp => "llama_cpp",
+                RuntimeBackendKind::PyMlxLm => "py_mlx_lm",
+            };
+            tracing::warn!(
+                target: "loxa_core::engine",
+                event_code = "engine.readiness.failed",
+                component = "engine",
+                generation = state_identity.generation,
+                backend_kind,
+                result_class = "readiness_failed",
+            );
+        }
         match startup {
             Ok(StartupWaitOutcome::Ready) => {
                 let ready_server = session.server().clone();
@@ -856,9 +887,53 @@ pub fn serve_node(
     paths: &NodePaths,
     events: &mut dyn LifecycleEventSink,
 ) -> io::Result<RunTermination> {
-    NodeBuilder::new(requested_model, port, engine, paths)
-        .build()?
-        .run(events)
+    serve_node_with_diagnostics_health(
+        requested_model,
+        port,
+        engine,
+        paths,
+        events,
+        loxa_core::diagnostics::DiagnosticsHealth::new(),
+    )
+}
+
+pub fn serve_node_with_diagnostics_health(
+    requested_model: Option<&str>,
+    port: Option<u16>,
+    engine: RuntimeBackendKind,
+    paths: &NodePaths,
+    events: &mut dyn LifecycleEventSink,
+    diagnostics_health: loxa_core::diagnostics::DiagnosticsHealth,
+) -> io::Result<RunTermination> {
+    let runtime_identity = format!("loxa-node-{}", std::process::id());
+    tracing::info!(
+        target: "loxa_node::lifecycle",
+        event_code = "node.starting",
+        component = "node",
+        runtime_identity = runtime_identity.as_str(),
+        result_class = "starting",
+    );
+    let runtime = NodeBuilder::with_diagnostics_health(
+        requested_model,
+        port,
+        engine,
+        paths,
+        diagnostics_health,
+    )
+    .build();
+    match runtime {
+        Ok(runtime) => runtime.run(events),
+        Err(error) => {
+            tracing::warn!(
+                target: "loxa_node::lifecycle",
+                event_code = "node.start_failed",
+                component = "node",
+                runtime_identity = runtime_identity.as_str(),
+                result_class = "build_failed",
+            );
+            Err(error)
+        }
+    }
 }
 
 fn cleanup_stable_node_runtime(
@@ -1800,14 +1875,44 @@ mod lifecycle_api_tests {
     use std::fs;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::sync::Arc;
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
 
     use std::sync::atomic::{AtomicBool as TestAtomicBool, Ordering as TestOrdering};
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     static MLX_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[derive(Clone, Default)]
+    struct DiagnosticCapture(Arc<Mutex<Vec<u8>>>);
+
+    struct DiagnosticWriter(DiagnosticCapture);
+
+    impl Write for DiagnosticWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0 .0.lock().expect("capture poisoned").extend(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for DiagnosticCapture {
+        type Writer = DiagnosticWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            DiagnosticWriter(self.clone())
+        }
+    }
+
+    impl DiagnosticCapture {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().expect("capture poisoned").clone())
+                .expect("diagnostics are UTF-8")
+        }
+    }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     struct TestEnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
@@ -2018,7 +2123,7 @@ mod lifecycle_api_tests {
 
     #[test]
     fn node_listening_sink_failure_joins_gateway_before_returning() {
-        let temp = TestDir::new("listening-sink-failure");
+        let temp = TestDir::new("SECRET_MODEL_PATH-listening-sink-failure");
         let paths = NodePaths {
             models_dir: temp.0.join("models"),
             state_path: temp.0.join("managed.json"),
@@ -2026,14 +2131,21 @@ mod lifecycle_api_tests {
         };
         let mut sink = FailingFirstLifecycleSink::default();
 
-        let error = serve_node(
-            None,
-            Some(0),
-            RuntimeBackendKind::LlamaCpp,
-            &paths,
-            &mut sink,
-        )
-        .expect_err("first event failure must escape");
+        let capture = DiagnosticCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(capture.clone())
+            .finish();
+        let error = tracing::subscriber::with_default(subscriber, || {
+            serve_node(
+                None,
+                Some(0),
+                RuntimeBackendKind::LlamaCpp,
+                &paths,
+                &mut sink,
+            )
+            .expect_err("first event failure must escape")
+        });
 
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
         let port = sink.listening_port.expect("listening payload captured");
@@ -2043,6 +2155,31 @@ mod lifecycle_api_tests {
             ManagedRunsSnapshot::Runs(Vec::new()),
             "failed listening publication releases unloaded ownership"
         );
+        let diagnostics = capture.text();
+        let ordered = [
+            "shutdown.requested",
+            "withdraw_routes",
+            "chat_cancel_wait",
+            "gateway_join",
+            "history_join",
+            "node.stopped",
+        ];
+        let mut previous = 0;
+        for expected in ordered {
+            let position = diagnostics[previous..]
+                .find(expected)
+                .map(|position| previous + position)
+                .unwrap_or_else(|| panic!("missing {expected}: {diagnostics}"));
+            previous = position + expected.len();
+        }
+        for forbidden in [
+            "SECRET_MODEL_PATH",
+            "--secret-command-argument",
+            "SECRET_CHILD_OUTPUT",
+            "ARBITRARY_ERROR_SENTINEL",
+        ] {
+            assert!(!diagnostics.contains(forbidden), "{diagnostics}");
+        }
     }
 
     #[test]

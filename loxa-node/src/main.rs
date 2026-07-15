@@ -37,12 +37,13 @@ fn run() -> Result<RunTermination, String> {
     let port = parse_port(std::env::args().skip(1))?;
     let paths = NodePaths::detect();
     let diagnostics = loxa_node::install_daemon_diagnostics(&paths.logs_dir);
-    let result = loxa_node::serve_node(
+    let result = loxa_node::serve_node_with_diagnostics_health(
         None,
         port,
         RuntimeBackendKind::LlamaCpp,
         &paths,
         &mut SilentEvents,
+        diagnostics.health(),
     );
     let result_class = match &result {
         Ok(RunTermination::RequestedStop) => "requested_stop",

@@ -172,11 +172,16 @@ enum ChatsCommand {
 
 pub(crate) fn main() -> ExitCode {
     let cli = Cli::parse();
-    let diagnostics = matches!(&cli.command, Command::Serve { .. }).then(|| {
-        let paths = NodePaths::detect();
-        install_daemon_diagnostics(&paths.logs_dir)
-    });
-    let exit_code = run(cli, io::stdout(), io::stderr());
+    let paths = NodePaths::detect();
+    let diagnostics = matches!(&cli.command, Command::Serve { .. })
+        .then(|| install_daemon_diagnostics(&paths.logs_dir));
+    let exit_code = run_with_paths_and_diagnostics_health(
+        cli,
+        &paths,
+        &mut io::stdout(),
+        &mut io::stderr(),
+        diagnostics.as_ref().map(|bootstrap| bootstrap.health()),
+    );
     if diagnostics.is_some() {
         let result_class = if exit_code == ExitCode::SUCCESS {
             "success"
@@ -189,16 +194,28 @@ pub(crate) fn main() -> ExitCode {
     exit_code
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn run<W: Write, E: Write>(cli: Cli, mut stdout: W, mut stderr: E) -> ExitCode {
     let paths = NodePaths::detect();
     run_with_paths(cli, &paths, &mut stdout, &mut stderr)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn run_with_paths<W: Write, E: Write>(
     cli: Cli,
     paths: &NodePaths,
     mut stdout: W,
     mut stderr: E,
+) -> ExitCode {
+    run_with_paths_and_diagnostics_health(cli, paths, &mut stdout, &mut stderr, None)
+}
+
+fn run_with_paths_and_diagnostics_health<W: Write, E: Write>(
+    cli: Cli,
+    paths: &NodePaths,
+    mut stdout: W,
+    mut stderr: E,
+    diagnostics_health: Option<loxa_core::diagnostics::DiagnosticsHealth>,
 ) -> ExitCode {
     if let Err(error) = validate_cli_contract(&cli) {
         return finish_cli_result(Err(error), &mut stderr);
@@ -269,6 +286,7 @@ fn run_with_paths<W: Write, E: Write>(
                 paths,
                 &mut stdout,
                 &mut stderr,
+                diagnostics_health.as_ref(),
             ),
             Command::Ps => render_managed_servers(managed_servers(paths), &mut stdout),
             Command::Stop { target } => render_stop_outcome(
@@ -924,10 +942,19 @@ fn serve_node_cli<W: Write, E: Write>(
     paths: &NodePaths,
     stdout: &mut W,
     stderr: &mut E,
+    diagnostics_health: Option<&loxa_core::diagnostics::DiagnosticsHealth>,
 ) -> io::Result<ExitCode> {
     validate_cli_serve_request(requested_model, engine, paths)?;
     let mut events = CliLifecycleSink { stdout, stderr };
-    serve_node(requested_model, port, engine, paths, &mut events).map(exit_code_for_termination)
+    loxa_node::serve_node_with_diagnostics_health(
+        requested_model,
+        port,
+        engine,
+        paths,
+        &mut events,
+        diagnostics_health.cloned().unwrap_or_default(),
+    )
+    .map(exit_code_for_termination)
 }
 
 fn validate_cli_serve_request(

@@ -924,6 +924,14 @@ where
     C: ManagedChild + LogDrainingChild,
     I: InterruptStatus,
 {
+    tracing::info!(
+        target: "loxa_core::engine",
+        event_code = "engine.exit.observed",
+        component = "engine",
+        generation = state_identity.generation,
+        exit_class = "observed",
+        result_class = "terminal",
+    );
     lifecycle::decide_observed_child_exit_with_diagnostics(
         state_path,
         state_identity,
@@ -947,12 +955,31 @@ pub fn spawn_starting_engine(
     log_path: &Path,
     reservation: LocalhostPortReservation,
 ) -> Result<SpawnStartingRunOutcome<SpawnedServer>, SupervisorError> {
-    spawn_starting_engine_with_hooks(
+    spawn_starting_engine_with_health(
         state_path,
         expected,
         spec,
         log_path,
         reservation,
+        &DiagnosticsHealth::new(),
+    )
+}
+
+pub fn spawn_starting_engine_with_health(
+    state_path: &Path,
+    expected: &ManagedRunIdentity,
+    spec: &EngineLaunchSpec,
+    log_path: &Path,
+    reservation: LocalhostPortReservation,
+    health: &DiagnosticsHealth,
+) -> Result<SpawnStartingRunOutcome<SpawnedServer>, SupervisorError> {
+    spawn_starting_engine_with_health_and_hooks(
+        state_path,
+        expected,
+        spec,
+        log_path,
+        reservation,
+        health,
         || {},
         || {},
         || {},
@@ -960,24 +987,73 @@ pub fn spawn_starting_engine(
     )
 }
 
-pub fn spawn_starting_llama_server(
-    state_path: &Path,
-    expected: &ManagedRunIdentity,
-    spec: &ServerSpec<'_>,
-    log_path: &Path,
-    reservation: LocalhostPortReservation,
-) -> Result<SpawnStartingRunOutcome<SpawnedServer>, SupervisorError> {
-    let launch = llama_engine_launch_spec(spec);
-    spawn_starting_engine(state_path, expected, &launch, log_path, reservation)
+fn backend_kind(spec: &EngineLaunchSpec) -> &'static str {
+    match spec.readiness {
+        ReadinessStrategy::LlamaModelAlias { .. } => "llama_cpp",
+        ReadinessStrategy::ChatCompletionProbe { .. } => "py_mlx_lm",
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn spawn_starting_engine_with_hooks<L, B, A, D>(
+fn spawn_starting_engine_with_health_and_hooks<L, B, A, D>(
     state_path: &Path,
     expected: &ManagedRunIdentity,
     spec: &EngineLaunchSpec,
     log_path: &Path,
     reservation: LocalhostPortReservation,
+    health: &DiagnosticsHealth,
+    before_log_open: L,
+    before_reservation_release: B,
+    after_os_spawn: A,
+    after_log_drain_setup: D,
+) -> Result<SpawnStartingRunOutcome<SpawnedServer>, SupervisorError>
+where
+    L: FnOnce(),
+    B: FnOnce(),
+    A: FnOnce(),
+    D: FnOnce(),
+{
+    tracing::info!(
+        target: "loxa_core::engine",
+        event_code = "engine.spawn.started",
+        component = "engine",
+        generation = expected.generation,
+        backend_kind = backend_kind(spec),
+        result_class = "started",
+    );
+    let result = spawn_starting_engine_with_hooks_inner(
+        state_path,
+        expected,
+        spec,
+        log_path,
+        reservation,
+        health,
+        before_log_open,
+        before_reservation_release,
+        after_os_spawn,
+        after_log_drain_setup,
+    );
+    if matches!(result, Ok(SpawnStartingRunOutcome::Spawned { .. })) {
+        tracing::info!(
+            target: "loxa_core::engine",
+            event_code = "engine.spawn.succeeded",
+            component = "engine",
+            generation = expected.generation,
+            backend_kind = backend_kind(spec),
+            result_class = "spawned",
+        );
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_starting_engine_with_hooks_inner<L, B, A, D>(
+    state_path: &Path,
+    expected: &ManagedRunIdentity,
+    spec: &EngineLaunchSpec,
+    log_path: &Path,
+    reservation: LocalhostPortReservation,
+    health: &DiagnosticsHealth,
     before_log_open: L,
     before_reservation_release: B,
     after_os_spawn: A,
@@ -996,7 +1072,7 @@ where
         ))
     })?;
     with_child_log_root_coordination(logs_dir, || {
-        prune_child_logs_at_owned_spawn(state_path, expected, log_path);
+        prune_child_logs_at_owned_spawn(state_path, expected, log_path, health);
         let prepared =
             prepare_engine_spawn_with_hook(spec, log_path, reservation, before_log_open)?;
         match lifecycle::spawn_starting_run_with(state_path, expected, || {
@@ -1011,6 +1087,50 @@ where
             SpawnStartingRunOutcome::RequestedStop => Ok(SpawnStartingRunOutcome::RequestedStop),
         }
     })
+}
+
+pub fn spawn_starting_llama_server(
+    state_path: &Path,
+    expected: &ManagedRunIdentity,
+    spec: &ServerSpec<'_>,
+    log_path: &Path,
+    reservation: LocalhostPortReservation,
+) -> Result<SpawnStartingRunOutcome<SpawnedServer>, SupervisorError> {
+    let launch = llama_engine_launch_spec(spec);
+    spawn_starting_engine(state_path, expected, &launch, log_path, reservation)
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
+fn spawn_starting_engine_with_hooks<L, B, A, D>(
+    state_path: &Path,
+    expected: &ManagedRunIdentity,
+    spec: &EngineLaunchSpec,
+    log_path: &Path,
+    reservation: LocalhostPortReservation,
+    before_log_open: L,
+    before_reservation_release: B,
+    after_os_spawn: A,
+    after_log_drain_setup: D,
+) -> Result<SpawnStartingRunOutcome<SpawnedServer>, SupervisorError>
+where
+    L: FnOnce(),
+    B: FnOnce(),
+    A: FnOnce(),
+    D: FnOnce(),
+{
+    spawn_starting_engine_with_health_and_hooks(
+        state_path,
+        expected,
+        spec,
+        log_path,
+        reservation,
+        &DiagnosticsHealth::new(),
+        before_log_open,
+        before_reservation_release,
+        after_os_spawn,
+        after_log_drain_setup,
+    )
 }
 
 fn with_child_log_root_coordination<T>(
@@ -1098,6 +1218,7 @@ fn prune_child_logs_at_owned_spawn(
     state_path: &Path,
     expected: &ManagedRunIdentity,
     log_path: &Path,
+    health: &DiagnosticsHealth,
 ) {
     let Ok(current) = current_runtime_state_run(state_path, expected) else {
         return;
@@ -1114,8 +1235,7 @@ fn prune_child_logs_at_owned_spawn(
     };
 
     let active = HashSet::from([current.log_path]);
-    let health = DiagnosticsHealth::new();
-    let _ = prune_inactive_child_logs(logs_dir, &active, RETAIN_INACTIVE_CHILD_LOGS, &health);
+    let _ = prune_inactive_child_logs(logs_dir, &active, RETAIN_INACTIVE_CHILD_LOGS, health);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1551,6 +1671,22 @@ mod tests {
             child_process_start_time_unix_s: None,
             child_pgid: None,
         }
+    }
+
+    #[test]
+    fn owned_spawn_retention_updates_the_supplied_process_health() {
+        let temp = tempdir().expect("tempdir");
+        let logs_dir = temp.path().join("logs");
+        fs::create_dir(&logs_dir).expect("create logs");
+        let state_path = temp.path().join("runtime.json");
+        let mut run = childless_starting_run(&logs_dir, "shared-health");
+        run.log_path = logs_dir.join("shared-health-9000-1.log");
+        write_runtime_state(&state_path, std::slice::from_ref(&run)).expect("seed run");
+        let health = DiagnosticsHealth::new();
+
+        prune_child_logs_at_owned_spawn(&state_path, &run.identity(), &run.log_path, &health);
+
+        assert_eq!(health.snapshot().retention_failures, Some(0));
     }
 
     #[test]

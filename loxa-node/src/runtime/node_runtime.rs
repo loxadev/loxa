@@ -3,6 +3,7 @@ use crate::chat_history::ChatHistoryWorker;
 use crate::chat_routes::ChatRoutesState;
 use crate::download_control::{DownloadControl, DownloadControlWorker};
 use crate::{LifecycleEvent, LifecycleEventSink, RunRequest, RunTermination};
+use loxa_core::diagnostics::DiagnosticsHealth;
 use loxa_core::engine::RuntimeBackendKind;
 use loxa_core::gateway::{GatewayServer, GatewayState};
 use loxa_core::supervisor::ManagedRun;
@@ -21,6 +22,8 @@ pub(crate) struct NodeRuntimeParts {
     pub(crate) chat_routes_state: ChatRoutesState,
     pub(crate) gateway: GatewayServer,
     pub(crate) history_worker: ChatHistoryWorker,
+    pub(crate) diagnostics_health: DiagnosticsHealth,
+    pub(crate) runtime_identity: String,
 }
 
 #[must_use]
@@ -35,6 +38,8 @@ pub(crate) struct NodeRuntime {
     chat_routes_state: Option<ChatRoutesState>,
     gateway: Option<GatewayServer>,
     history_worker: Option<ChatHistoryWorker>,
+    diagnostics_health: DiagnosticsHealth,
+    runtime_identity: String,
 }
 
 impl NodeRuntime {
@@ -50,6 +55,8 @@ impl NodeRuntime {
             chat_routes_state: Some(parts.chat_routes_state),
             gateway: Some(parts.gateway),
             history_worker: Some(parts.history_worker),
+            diagnostics_health: parts.diagnostics_health,
+            runtime_identity: parts.runtime_identity,
         }
     }
 
@@ -76,6 +83,13 @@ impl NodeRuntime {
                 Err(cleanup) => Err(cleanup),
             }
         } else {
+            tracing::info!(
+                target: "loxa_node::lifecycle",
+                event_code = "node.listening",
+                component = "node",
+                runtime_identity = self.runtime_identity.as_str(),
+                result_class = "listening",
+            );
             self.run_lifecycle(events)
         };
 
@@ -103,7 +117,7 @@ impl NodeRuntime {
                     Some(events),
                 )
             }
-            Some(model_id) => crate::run_model(
+            Some(model_id) => crate::run_model_with_diagnostics_health(
                 RunRequest {
                     id: model_id,
                     ctx: None,
@@ -117,6 +131,7 @@ impl NodeRuntime {
                         .expect("runtime gateway state present"),
                 ),
                 events,
+                &self.diagnostics_health,
             ),
             None => {
                 let run = self.unloaded_run.take().expect("unloaded owner claimed");
@@ -140,31 +155,114 @@ impl NodeRuntime {
         &mut self,
         outcome: io::Result<RunTermination>,
     ) -> io::Result<RunTermination> {
+        let shutdown_started = std::time::Instant::now();
+        tracing::info!(
+            target: "loxa_node::shutdown",
+            event_code = "shutdown.requested",
+            component = "shutdown",
+            result_class = "requested",
+        );
+        tracing::info!(
+            target: "loxa_node::lifecycle",
+            event_code = "node.stopping",
+            component = "node",
+            runtime_identity = self.runtime_identity.as_str(),
+            result_class = "stopping",
+        );
         self.gateway_state
             .take()
             .expect("runtime gateway state present")
             .withdraw();
+        tracing::info!(
+            target: "loxa_node::shutdown",
+            event_code = "shutdown.stage.completed",
+            component = "shutdown",
+            stage = "withdraw_routes",
+            result_class = "completed",
+            duration_ms = u64::try_from(shutdown_started.elapsed().as_millis())
+                .unwrap_or(u64::MAX),
+        );
         self.chat_routes_state
             .take()
             .expect("runtime chat routes state present")
             .shutdown_and_wait();
+        tracing::info!(
+            target: "loxa_node::shutdown",
+            event_code = "shutdown.stage.completed",
+            component = "shutdown",
+            stage = "chat_cancel_wait",
+            result_class = "completed",
+            duration_ms = u64::try_from(shutdown_started.elapsed().as_millis())
+                .unwrap_or(u64::MAX),
+        );
         let shutdown = self
             .gateway
             .take()
             .expect("runtime gateway present")
             .shutdown();
+        match &shutdown {
+            Ok(()) => tracing::info!(
+                target: "loxa_node::shutdown",
+                event_code = "shutdown.stage.completed",
+                component = "shutdown",
+                stage = "gateway_join",
+                result_class = "completed",
+                duration_ms = u64::try_from(shutdown_started.elapsed().as_millis())
+                    .unwrap_or(u64::MAX),
+            ),
+            Err(_) => tracing::warn!(
+                target: "loxa_node::shutdown",
+                event_code = "shutdown.stage.failed",
+                component = "shutdown",
+                stage = "gateway_join",
+                result_class = "join_failed",
+                duration_ms = u64::try_from(shutdown_started.elapsed().as_millis())
+                    .unwrap_or(u64::MAX),
+            ),
+        }
         let history_shutdown = self
             .history_worker
             .take()
             .expect("runtime history worker present")
             .stop_and_join()
             .map_err(io::Error::other);
-        match (outcome, shutdown, history_shutdown) {
+        match &history_shutdown {
+            Ok(()) => tracing::info!(
+                target: "loxa_node::shutdown",
+                event_code = "shutdown.stage.completed",
+                component = "shutdown",
+                stage = "history_join",
+                result_class = "completed",
+                duration_ms = u64::try_from(shutdown_started.elapsed().as_millis())
+                    .unwrap_or(u64::MAX),
+            ),
+            Err(_) => tracing::warn!(
+                target: "loxa_node::shutdown",
+                event_code = "shutdown.stage.failed",
+                component = "shutdown",
+                stage = "history_join",
+                result_class = "join_failed",
+                duration_ms = u64::try_from(shutdown_started.elapsed().as_millis())
+                    .unwrap_or(u64::MAX),
+            ),
+        }
+        let result = match (outcome, shutdown, history_shutdown) {
             (Err(error), _, _) => Err(error),
             (Ok(_), Err(error), _) => Err(error),
             (Ok(_), Ok(()), Err(error)) => Err(error),
             (Ok(exit), Ok(()), Ok(())) => Ok(exit),
-        }
+        };
+        let result_class = if result.is_ok() { "stopped" } else { "failed" };
+        tracing::info!(
+            target: "loxa_node::lifecycle",
+            event_code = "node.stopped",
+            component = "node",
+            runtime_identity = self.runtime_identity.as_str(),
+            result_class,
+            duration_ms = u64::try_from(shutdown_started.elapsed().as_millis())
+                .unwrap_or(u64::MAX),
+        );
+        result
     }
 }
 

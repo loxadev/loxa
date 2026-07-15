@@ -615,6 +615,14 @@ impl GatewayServer {
     }
 
     pub fn start_with_router(port: u16, state: GatewayState, app: Router) -> io::Result<Self> {
+        tracing::info!(
+            target: "loxa_core::gateway",
+            event_code = "gateway.starting",
+            component = "gateway",
+            runtime_identity = state.node_id.as_ref(),
+            result_class = "started",
+        );
+        let started = std::time::Instant::now();
         let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))?;
         listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();
@@ -635,6 +643,14 @@ impl GatewayServer {
                         .map_err(io::Error::other)
                 })
             })?;
+        tracing::info!(
+            target: "loxa_core::gateway",
+            event_code = "gateway.listening",
+            component = "gateway",
+            runtime_identity = state.node_id.as_ref(),
+            result_class = "listening",
+            duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        );
         Ok(Self {
             port,
             shutdown: Some(shutdown),
@@ -648,13 +664,46 @@ impl GatewayServer {
     }
 
     pub fn shutdown(mut self) -> io::Result<()> {
+        let started = std::time::Instant::now();
+        tracing::info!(
+            target: "loxa_core::gateway",
+            event_code = "gateway.stop_requested",
+            component = "gateway",
+            runtime_identity = self.state.node_id.as_ref(),
+            result_class = "requested",
+        );
         self.state.cancel_requests();
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
-        match self.thread.take().expect("gateway thread present").join() {
+        let result = match self.thread.take().expect("gateway thread present").join() {
             Ok(result) => result,
             Err(_) => Err(io::Error::other("gateway thread panicked")),
+        };
+        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        match result {
+            Ok(()) => {
+                tracing::info!(
+                    target: "loxa_core::gateway",
+                    event_code = "gateway.stopped",
+                    component = "gateway",
+                    runtime_identity = self.state.node_id.as_ref(),
+                    result_class = "stopped",
+                    duration_ms,
+                );
+                Ok(())
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "loxa_core::gateway",
+                    event_code = "gateway.join_failed",
+                    component = "gateway",
+                    runtime_identity = self.state.node_id.as_ref(),
+                    result_class = "join_failed",
+                    duration_ms,
+                );
+                Err(error)
+            }
         }
     }
 }
@@ -688,6 +737,74 @@ mod tests {
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Metadata, Subscriber};
+
+    #[derive(Clone, Default)]
+    struct EventCapture(Arc<Mutex<String>>);
+
+    struct FieldCapture<'a>(&'a mut String);
+
+    impl Visit for FieldCapture<'_> {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0.push_str(field.name());
+            self.0.push('=');
+            self.0.push_str(value);
+            self.0.push('\n');
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0.push_str(field.name());
+            self.0.push('=');
+            self.0.push_str(&format!("{value:?}"));
+            self.0.push('\n');
+        }
+    }
+
+    impl Subscriber for EventCapture {
+        fn enabled(&self, _: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            event.record(&mut FieldCapture(
+                &mut self.0.lock().expect("capture poisoned"),
+            ));
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn gateway_start_and_shutdown_emit_static_lifecycle_events() {
+        let capture = EventCapture::default();
+        let output = capture.0.clone();
+        tracing::subscriber::with_default(capture, || {
+            let server =
+                GatewayServer::start(0, GatewayState::new("runtime-test")).expect("start gateway");
+            server.shutdown().expect("shutdown gateway");
+        });
+
+        let output = output.lock().expect("capture poisoned");
+        for code in [
+            "gateway.starting",
+            "gateway.listening",
+            "gateway.stop_requested",
+            "gateway.stopped",
+        ] {
+            assert!(output.contains(code), "missing {code}: {output}");
+        }
+    }
     use std::task::{Context, Poll};
     use tokio::net::TcpListener;
     use tokio::sync::Notify;

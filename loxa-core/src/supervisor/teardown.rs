@@ -105,24 +105,48 @@ where
     C: ManagedChild + LogDrainingChild,
 {
     let started = std::time::Instant::now();
-    #[cfg(unix)]
-    {
-        teardown_managed_child_with(
-            child,
-            &mut UnixProcessGroupControl,
-            TeardownTiming::production(),
-            || started.elapsed(),
-            thread::sleep,
-        )
-    }
-    #[cfg(not(unix))]
-    {
-        teardown_direct_child_with(
-            child,
-            TeardownTiming::production(),
-            || started.elapsed(),
-            thread::sleep,
-        )
+    let result = {
+        #[cfg(unix)]
+        {
+            teardown_managed_child_with(
+                child,
+                &mut UnixProcessGroupControl,
+                TeardownTiming::production(),
+                || started.elapsed(),
+                thread::sleep,
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            teardown_direct_child_with(
+                child,
+                TeardownTiming::production(),
+                || started.elapsed(),
+                thread::sleep,
+            )
+        }
+    };
+    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    emit_teardown_diagnostic(result.confirmation, duration_ms);
+    result
+}
+
+fn emit_teardown_diagnostic(confirmation: TeardownConfirmation, duration_ms: u64) {
+    match confirmation {
+        TeardownConfirmation::Confirmed => tracing::info!(
+            target: "loxa_core::engine",
+            event_code = "engine.teardown.confirmed",
+            component = "engine",
+            result_class = "confirmed",
+            duration_ms,
+        ),
+        TeardownConfirmation::Unconfirmed => tracing::warn!(
+            target: "loxa_core::engine",
+            event_code = "engine.teardown.failed",
+            component = "engine",
+            result_class = "unconfirmed",
+            duration_ms,
+        ),
     }
 }
 
@@ -894,6 +918,47 @@ mod tests {
     #[cfg(unix)]
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::tempdir;
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Metadata, Subscriber};
+
+    #[derive(Clone, Default)]
+    struct EventCapture(Arc<Mutex<String>>);
+
+    struct FieldCapture<'a>(&'a mut String);
+
+    impl Visit for FieldCapture<'_> {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0.push_str(field.name());
+            self.0.push('=');
+            self.0.push_str(value);
+            self.0.push('\n');
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0.push_str(field.name());
+            self.0.push('=');
+            self.0.push_str(&format!("{value:?}"));
+            self.0.push('\n');
+        }
+    }
+
+    impl Subscriber for EventCapture {
+        fn enabled(&self, _: &Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &Event<'_>) {
+            event.record(&mut FieldCapture(
+                &mut self.0.lock().expect("capture poisoned"),
+            ));
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
 
     #[cfg(unix)]
     #[test]
@@ -2949,6 +3014,47 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+    }
+
+    #[test]
+    fn unconfirmed_teardown_emits_closed_classification_without_child_output() {
+        let events = RefCell::new(Vec::new());
+        let mut child = KernelFakeChild::new(&events, None, vec![Ok(Some(0))]);
+        let capture = EventCapture::default();
+        let output = capture.0.clone();
+        tracing::subscriber::with_default(capture, || {
+            let result = teardown_managed_child_result(&mut child);
+            assert_eq!(result.confirmation, TeardownConfirmation::Unconfirmed);
+        });
+
+        let output = output.lock().expect("capture poisoned");
+        assert!(output.contains("engine.teardown.failed"), "{output}");
+        assert!(output.contains("result_class=unconfirmed"), "{output}");
+        assert!(!output.contains("SECRET_CHILD_OUTPUT"), "{output}");
+        assert!(!output.contains("/private/SECRET_MODEL_PATH"), "{output}");
+        assert!(!output.contains("--secret-command-argument"), "{output}");
+        assert!(!output.contains("ARBITRARY_ERROR_SENTINEL"), "{output}");
+    }
+
+    #[test]
+    fn confirmed_teardown_emits_closed_classification_without_child_output() {
+        let capture = EventCapture::default();
+        let output = capture.0.clone();
+        tracing::subscriber::with_default(capture, || {
+            emit_teardown_diagnostic(TeardownConfirmation::Confirmed, 7);
+        });
+
+        let output = output.lock().expect("capture poisoned");
+        assert!(output.contains("engine.teardown.confirmed"), "{output}");
+        assert!(output.contains("result_class=confirmed"), "{output}");
+        for forbidden in [
+            "SECRET_CHILD_OUTPUT",
+            "/private/SECRET_MODEL_PATH",
+            "--secret-command-argument",
+            "ARBITRARY_ERROR_SENTINEL",
+        ] {
+            assert!(!output.contains(forbidden), "{output}");
         }
     }
 

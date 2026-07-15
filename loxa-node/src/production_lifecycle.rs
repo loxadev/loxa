@@ -3,6 +3,7 @@ use crate::model_lifecycle::{
     EngineLifecycleDriver, ExactSessionStatus, GatewayPublisher, LaunchPlan, LifecycleError,
     LifecycleSignals, SessionCorrelation, StableNodeOwner, StartedSession,
 };
+use loxa_core::diagnostics::DiagnosticsHealth;
 use loxa_core::engine::{EngineLaunchSpec, ReadinessStrategy};
 use loxa_core::gateway::{EngineTarget, GatewayState};
 use loxa_core::supervisor::{self, ManagedChild, ManagedServer, RunLifecycle};
@@ -14,6 +15,7 @@ pub(crate) struct ProductionEngineDriver {
     state_path: PathBuf,
     logs_dir: PathBuf,
     gateway_port: u16,
+    diagnostics_health: DiagnosticsHealth,
 }
 
 impl ProductionEngineDriver {
@@ -22,7 +24,13 @@ impl ProductionEngineDriver {
             state_path,
             logs_dir,
             gateway_port,
+            diagnostics_health: DiagnosticsHealth::new(),
         }
+    }
+
+    pub(crate) fn with_diagnostics_health(mut self, health: DiagnosticsHealth) -> Self {
+        self.diagnostics_health = health;
+        self
     }
 
     fn public_error(error: impl std::fmt::Display) -> LifecycleError {
@@ -215,12 +223,13 @@ impl EngineLifecycleDriver for ProductionEngineDriver {
                 expected_alias: alias.clone(),
             },
         };
-        let spawn = match supervisor::spawn_starting_engine(
+        let spawn = match supervisor::spawn_starting_engine_with_health(
             &self.state_path,
             &starting.identity(),
             &spec,
             &log_path,
             reservation,
+            &self.diagnostics_health,
         ) {
             Ok(spawn) => spawn,
             Err(error) => {
@@ -334,9 +343,27 @@ impl EngineLifecycleDriver for ProductionEngineDriver {
             ) {
                 Ok(()) => return Ok(()),
                 Err(supervisor::SupervisorError::HealthTimeout) => {}
-                Err(error) => return Err(LifecycleError::ReadinessFailed(error.to_string())),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "loxa_core::engine",
+                        event_code = "engine.readiness.failed",
+                        component = "engine",
+                        generation = session.correlation.generation,
+                        backend_kind = "llama_cpp",
+                        result_class = "readiness_failed",
+                    );
+                    return Err(LifecycleError::ReadinessFailed(error.to_string()));
+                }
             }
         }
+        tracing::warn!(
+            target: "loxa_core::engine",
+            event_code = "engine.readiness.failed",
+            component = "engine",
+            generation = session.correlation.generation,
+            backend_kind = "llama_cpp",
+            result_class = "timeout",
+        );
         Err(LifecycleError::ReadinessFailed(
             "engine readiness timed out".into(),
         ))
@@ -375,6 +402,14 @@ impl EngineLifecycleDriver for ProductionEngineDriver {
             .try_wait()
             .map(|status| {
                 if status.is_some() {
+                    tracing::info!(
+                        target: "loxa_core::engine",
+                        event_code = "engine.exit.observed",
+                        component = "engine",
+                        generation = session.correlation.generation,
+                        exit_class = "observed",
+                        result_class = "terminal",
+                    );
                     ExactSessionStatus::Exited
                 } else {
                     ExactSessionStatus::Running
