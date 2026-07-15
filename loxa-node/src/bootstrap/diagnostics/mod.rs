@@ -12,10 +12,9 @@ use self::encoder::debug_filter;
 use self::encoder::release_filter;
 use self::encoder::{executable_filter, SafeJsonFields, SafeJsonFormatter};
 use loxa_core::diagnostics::{
-    BoundedJsonlWriter, DiagnosticsHealth, DiagnosticsHealthSnapshot, StorageConfig,
-    SystemDiskSpace, LOG_QUEUE_CAPACITY,
+    storage::prepare_logs_dir, BoundedJsonlWriter, DiagnosticsHealth, DiagnosticsHealthSnapshot,
+    StorageConfig, SystemDiskSpace, LOG_QUEUE_CAPACITY,
 };
-use std::fs;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
@@ -62,13 +61,7 @@ impl Drop for DiagnosticsBootstrap {
 pub fn install_daemon_diagnostics(logs_dir: &Path) -> DiagnosticsBootstrap {
     let health = DiagnosticsHealth::new();
 
-    let file_sink = fs::create_dir_all(logs_dir).and_then(|()| {
-        BoundedJsonlWriter::new(
-            StorageConfig::for_logs_dir(logs_dir),
-            SystemDiskSpace,
-            health.clone(),
-        )
-    });
+    let file_sink = open_file_sink(logs_dir, health.clone());
 
     let (guard, queue_progress) = match file_sink {
         Ok(file_sink) => {
@@ -119,6 +112,28 @@ pub fn install_daemon_diagnostics(logs_dir: &Path) -> DiagnosticsBootstrap {
         health,
         queue_progress,
     }
+}
+
+fn open_file_sink(
+    logs_dir: &Path,
+    health: DiagnosticsHealth,
+) -> io::Result<BoundedJsonlWriter<SystemDiskSpace>> {
+    let result = match prepare_logs_dir(logs_dir) {
+        Ok(()) => BoundedJsonlWriter::new(
+            StorageConfig::for_logs_dir(logs_dir),
+            SystemDiskSpace,
+            health.clone(),
+        ),
+        Err(error) => {
+            health.support_storage_write_failures_counter();
+            health.increment_storage_write_failures();
+            Err(error)
+        }
+    };
+    if result.is_err() {
+        health.mark_unavailable();
+    }
+    result
 }
 
 pub fn emit_final_shutdown_diagnostic(result_class: &'static str) {

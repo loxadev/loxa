@@ -11,6 +11,40 @@ use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::Layer;
 
+#[cfg(unix)]
+#[test]
+fn rejects_symlinked_logs_root_before_bootstrap_storage_creation() {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+    let root = std::env::temp_dir().join(format!(
+        "loxa-bootstrap-diagnostics-symlink-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let outside = root.join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("sentinel"), b"keep").unwrap();
+    let logs_link = root.join("logs");
+    symlink(&outside, &logs_link).unwrap();
+    let health = DiagnosticsHealth::new();
+
+    let result = open_file_sink(&logs_link, health.clone());
+
+    assert!(result.is_err());
+    assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
+    assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"keep");
+    assert_eq!(health.snapshot().storage_write_failures, Some(1));
+    assert_eq!(
+        health.snapshot().availability,
+        loxa_core::diagnostics::DiagnosticsAvailability::Unavailable
+    );
+    fs::remove_file(logs_link).unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[derive(Clone, Default)]
 struct Capture {
     writes: Arc<Mutex<Vec<Vec<u8>>>>,

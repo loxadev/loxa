@@ -4,7 +4,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::{DiskRefreshKind, Disks};
 
 pub const SEGMENT_BYTES: u64 = 1024 * 1024;
@@ -13,6 +14,10 @@ pub const INCARNATIONS_TO_KEEP: usize = 2;
 pub const MIN_FREE_DISK_BYTES: u64 = 64 * 1024 * 1024;
 const DISK_CHECK_INTERVAL_SECONDS: u64 = 1;
 const DEGRADED_RETRY_SECONDS: u64 = 30;
+const STARTUP_LOCK_FILE: &str = ".startup.lock";
+const OWNERSHIP_LOCK_FILE: &str = ".owner.lock";
+const STARTUP_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const STARTUP_LOCK_INTERVAL: Duration = Duration::from_millis(10);
 
 pub trait DiskSpace: Clone + Send + Sync + 'static {
     fn available_bytes(&self, path: &Path) -> io::Result<u64>;
@@ -121,6 +126,7 @@ pub struct BoundedJsonlWriter<D: DiskSpace> {
     last_disk_check: Option<u64>,
     degraded_until: Option<u64>,
     degraded_cause: Option<DegradedCause>,
+    _ownership_lock: File,
 }
 
 #[derive(Clone, Copy)]
@@ -144,16 +150,38 @@ impl<D: DiskSpace> BoundedJsonlWriter<D> {
         health.support_rotation_failures_counter();
         health.support_retention_failures_counter();
         health.support_low_disk_suppressions_counter();
+        let logs_dir = config.daemon_root.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "daemon log root has no parent")
+        })?;
+        if let Err(error) = prepare_logs_dir(logs_dir) {
+            storage_failure(&health);
+            return Err(error);
+        }
         if let Err(error) = ensure_daemon_root(&config.daemon_root) {
             storage_failure(&health);
             return Err(error);
         }
-        prune_incarnations(&config.daemon_root, &config.incarnation, &health);
+        let _startup_lock = match acquire_startup_lock(&config.daemon_root) {
+            Ok(lock) => lock,
+            Err(error) => {
+                storage_failure(&health);
+                return Err(error);
+            }
+        };
         let incarnation_dir = config.daemon_root.join(&config.incarnation);
         if let Err(error) = fs::create_dir(&incarnation_dir) {
             storage_failure(&health);
             return Err(error);
         }
+        let ownership_lock = match acquire_ownership_lock(&incarnation_dir) {
+            Ok(lock) => lock,
+            Err(error) => {
+                storage_failure(&health);
+                let _ = fs::remove_dir(&incarnation_dir);
+                return Err(error);
+            }
+        };
+        prune_incarnations(&config.daemon_root, &config.incarnation, &health);
         Ok(Self {
             config,
             disk,
@@ -166,6 +194,7 @@ impl<D: DiskSpace> BoundedJsonlWriter<D> {
             last_disk_check: None,
             degraded_until: None,
             degraded_cause: None,
+            _ownership_lock: ownership_lock,
         })
     }
 
@@ -257,6 +286,29 @@ impl<D: DiskSpace> BoundedJsonlWriter<D> {
     }
 }
 
+pub fn prepare_logs_dir(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "diagnostic log root is not a regular directory",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(path)?;
+            let metadata = fs::symlink_metadata(path)?;
+            if metadata.file_type().is_dir() {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "diagnostic log root is not a regular directory",
+                ))
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
 impl<D: DiskSpace> Write for BoundedJsonlWriter<D> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if buf.is_empty() {
@@ -318,6 +370,74 @@ fn ensure_daemon_root(path: &Path) -> io::Result<()> {
     }
 }
 
+fn acquire_startup_lock(root: &Path) -> io::Result<File> {
+    let file = open_regular_lock_file(&root.join(STARTUP_LOCK_FILE), true)?;
+    let started = Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(fs::TryLockError::WouldBlock) if started.elapsed() < STARTUP_LOCK_TIMEOUT => {
+                thread::sleep(STARTUP_LOCK_INTERVAL);
+            }
+            Err(fs::TryLockError::WouldBlock) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "timed out waiting for diagnostic startup coordination",
+                ));
+            }
+            Err(fs::TryLockError::Error(error)) => return Err(error),
+        }
+    }
+}
+
+fn acquire_ownership_lock(incarnation_dir: &Path) -> io::Result<File> {
+    let file = open_regular_lock_file(&incarnation_dir.join(OWNERSHIP_LOCK_FILE), true)?;
+    file.try_lock().map_err(|error| match error {
+        fs::TryLockError::WouldBlock => io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "diagnostic incarnation ownership is already held",
+        ),
+        fs::TryLockError::Error(error) => error,
+    })?;
+    Ok(file)
+}
+
+fn open_regular_lock_file(path: &Path, create: bool) -> io::Result<File> {
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if !metadata.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "diagnostic lock entry is not a regular file",
+            ));
+        }
+    }
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create(create)
+        .truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "diagnostic lock entry is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
 fn new_incarnation_key() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -365,7 +485,8 @@ fn prune_incarnations(root: &Path, current: &str, health: &DiagnosticsHealth) {
         retention_failure(health);
         return;
     };
-    let mut recognized = Vec::new();
+    let mut active_count = 0_usize;
+    let mut inactive = Vec::new();
     for entry in entries {
         let Ok(entry) = entry else {
             retention_failure(health);
@@ -380,27 +501,81 @@ fn prune_incarnations(root: &Path, current: &str, health: &DiagnosticsHealth) {
             retention_failure(health);
             continue;
         };
+        if name == STARTUP_LOCK_FILE {
+            continue;
+        }
         if is_incarnation_name(name) && metadata.file_type().is_dir() && name != current {
-            recognized.push((name.to_owned(), entry.path()));
+            match incarnation_state(&entry.path(), health) {
+                IncarnationState::Active => active_count = active_count.saturating_add(1),
+                IncarnationState::Inactive(owner_lock) => {
+                    inactive.push((name.to_owned(), entry.path(), owner_lock));
+                }
+                IncarnationState::Unsafe => {}
+            }
+        } else if name == current && metadata.file_type().is_dir() {
+            continue;
         } else {
             retention_failure(health);
         }
     }
-    recognized.sort_by(|left, right| right.0.cmp(&left.0));
-    for (_, path) in recognized
-        .into_iter()
-        .skip(INCARNATIONS_TO_KEEP.saturating_sub(1))
-    {
-        remove_recognized_incarnation(&path, health);
+    inactive.sort_by(|left, right| right.0.cmp(&left.0));
+    let inactive_to_keep = INCARNATIONS_TO_KEEP
+        .saturating_sub(1)
+        .saturating_sub(active_count);
+    for (_, path, owner_lock) in inactive.into_iter().skip(inactive_to_keep) {
+        remove_recognized_incarnation(&path, owner_lock, health);
     }
 }
 
-fn remove_recognized_incarnation(path: &Path, health: &DiagnosticsHealth) {
+enum IncarnationState {
+    Active,
+    Inactive(Option<File>),
+    Unsafe,
+}
+
+fn incarnation_state(path: &Path, health: &DiagnosticsHealth) -> IncarnationState {
+    let lock_path = path.join(OWNERSHIP_LOCK_FILE);
+    match fs::symlink_metadata(&lock_path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => IncarnationState::Inactive(None),
+        Err(_) => {
+            retention_failure(health);
+            IncarnationState::Unsafe
+        }
+        Ok(metadata) if metadata.file_type().is_file() => {
+            let file = match open_regular_lock_file(&lock_path, false) {
+                Ok(file) => file,
+                Err(_) => {
+                    retention_failure(health);
+                    return IncarnationState::Unsafe;
+                }
+            };
+            match file.try_lock() {
+                Ok(()) => IncarnationState::Inactive(Some(file)),
+                Err(fs::TryLockError::WouldBlock) => IncarnationState::Active,
+                Err(fs::TryLockError::Error(_)) => {
+                    retention_failure(health);
+                    IncarnationState::Unsafe
+                }
+            }
+        }
+        Ok(_) => {
+            retention_failure(health);
+            IncarnationState::Unsafe
+        }
+    }
+}
+
+fn remove_recognized_incarnation(
+    path: &Path,
+    owner_lock: Option<File>,
+    health: &DiagnosticsHealth,
+) {
     let Ok(entries) = fs::read_dir(path) else {
         retention_failure(health);
         return;
     };
     let mut safe = true;
+    let mut has_owner_lock = false;
     for entry in entries {
         let Ok(entry) = entry else {
             retention_failure(health);
@@ -409,7 +584,13 @@ fn remove_recognized_incarnation(path: &Path, health: &DiagnosticsHealth) {
         };
         let name = entry.file_name();
         let metadata = fs::symlink_metadata(entry.path());
-        if name.to_str().is_some_and(is_segment_name)
+        if name == OWNERSHIP_LOCK_FILE
+            && metadata
+                .as_ref()
+                .is_ok_and(|metadata| metadata.file_type().is_file())
+        {
+            has_owner_lock = true;
+        } else if name.to_str().is_some_and(is_segment_name)
             && metadata
                 .as_ref()
                 .is_ok_and(|metadata| metadata.file_type().is_file())
@@ -422,6 +603,11 @@ fn remove_recognized_incarnation(path: &Path, health: &DiagnosticsHealth) {
             retention_failure(health);
             safe = false;
         }
+    }
+    drop(owner_lock);
+    if safe && has_owner_lock && fs::remove_file(path.join(OWNERSHIP_LOCK_FILE)).is_err() {
+        retention_failure(health);
+        safe = false;
     }
     if safe && fs::remove_dir(path).is_err() {
         retention_failure(health);
@@ -443,6 +629,13 @@ fn prune_segments(path: &Path, keep: usize, health: &DiagnosticsHealth) -> bool 
         };
         let name = entry.file_name();
         let metadata = fs::symlink_metadata(entry.path());
+        if name == OWNERSHIP_LOCK_FILE
+            && metadata
+                .as_ref()
+                .is_ok_and(|metadata| metadata.file_type().is_file())
+        {
+            continue;
+        }
         if name.to_str().is_some_and(is_segment_name)
             && metadata
                 .as_ref()
@@ -500,6 +693,7 @@ mod tests {
     const INCARNATION_1: &str = "incarnation-00000000000000000001-0000000001-0000000000000001";
     const INCARNATION_2: &str = "incarnation-00000000000000000002-0000000001-0000000000000002";
     const INCARNATION_3: &str = "incarnation-00000000000000000003-0000000001-0000000000000003";
+    const INCARNATION_4: &str = "incarnation-00000000000000000004-0000000001-0000000000000004";
 
     #[derive(Clone)]
     struct FakeDiskSpace {
@@ -717,6 +911,64 @@ mod tests {
         assert!(daemon.join(INCARNATION_2).exists());
         assert!(daemon.join("incarnation-not-valid").exists());
         assert_eq!(writer.incarnation_dir(), daemon.join(INCARNATION_3));
+    }
+
+    #[test]
+    fn competing_startups_preserve_live_incarnations_and_prune_them_after_release() {
+        let temp = TempDir::new().unwrap();
+        let daemon = temp.path().join("daemon");
+        let stale = "incarnation-00000000000000000000-0000000001-0000000000000000";
+        fs::create_dir_all(daemon.join(stale)).unwrap();
+
+        let config = StorageConfig::for_test(temp.path(), INCARNATION_1, 32, 4);
+        let mut first =
+            BoundedJsonlWriter::new(config, FakeDiskSpace::available(), DiagnosticsHealth::new())
+                .unwrap();
+        first.write_all(b"{\"event_code\":\"a\"}\n").unwrap();
+
+        let config = StorageConfig::for_test(temp.path(), INCARNATION_2, 32, 4);
+        let _second =
+            BoundedJsonlWriter::new(config, FakeDiskSpace::available(), DiagnosticsHealth::new())
+                .unwrap();
+        let config = StorageConfig::for_test(temp.path(), INCARNATION_3, 32, 4);
+        let _third =
+            BoundedJsonlWriter::new(config, FakeDiskSpace::available(), DiagnosticsHealth::new())
+                .unwrap();
+
+        assert!(
+            !daemon.join(stale).exists(),
+            "inactive stale entry is pruned"
+        );
+        assert!(
+            daemon.join(INCARNATION_1).exists(),
+            "live first writer remains"
+        );
+        assert!(
+            daemon.join(INCARNATION_2).exists(),
+            "live second writer remains"
+        );
+        first.write_all(b"{\"event_code\":\"b\"}\n").unwrap();
+        first.flush().unwrap();
+        assert_eq!(recognized_segments(first.incarnation_dir()).len(), 2);
+
+        drop(first);
+        let config = StorageConfig::for_test(temp.path(), INCARNATION_4, 32, 4);
+        let _fourth =
+            BoundedJsonlWriter::new(config, FakeDiskSpace::available(), DiagnosticsHealth::new())
+                .unwrap();
+
+        assert!(
+            !daemon.join(INCARNATION_1).exists(),
+            "released incarnation becomes eligible for pruning"
+        );
+        assert!(
+            daemon.join(INCARNATION_2).exists(),
+            "still-live writer remains"
+        );
+        assert!(
+            daemon.join(INCARNATION_3).exists(),
+            "still-live writer remains"
+        );
     }
 
     #[cfg(unix)]
@@ -942,6 +1194,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rejects_a_non_directory_logs_root_without_modifying_it() {
+        let temp = TempDir::new().unwrap();
+        let logs_file = temp.path().join("logs");
+        fs::write(&logs_file, b"keep").unwrap();
+        let config = StorageConfig::for_test(&logs_file, INCARNATION_3, 64, 4);
+        let health = DiagnosticsHealth::new();
+
+        let result = BoundedJsonlWriter::new(config, FakeDiskSpace::available(), health.clone());
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(&logs_file).unwrap(), b"keep");
+        assert_eq!(health.snapshot().storage_write_failures, Some(1));
+        assert_eq!(
+            health.snapshot().availability,
+            crate::diagnostics::DiagnosticsAvailability::Degraded
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn rejects_a_symlinked_daemon_root_without_touching_its_target() {
@@ -960,6 +1231,63 @@ mod tests {
         assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 1);
         assert_eq!(fs::read(outside.path().join("sentinel")).unwrap(), b"keep");
         assert_eq!(health.snapshot().storage_write_failures, Some(1));
+        assert_eq!(
+            health.snapshot().availability,
+            crate::diagnostics::DiagnosticsAvailability::Degraded
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_symlinked_logs_root_before_creating_daemon_entries() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::write(outside.path().join("sentinel"), b"keep").unwrap();
+        let logs_link = temp.path().join("logs");
+        symlink(outside.path(), &logs_link).unwrap();
+        let config = StorageConfig::for_test(&logs_link, INCARNATION_3, 64, 4);
+        let health = DiagnosticsHealth::new();
+
+        let result = BoundedJsonlWriter::new(config, FakeDiskSpace::available(), health.clone());
+
+        assert!(result.is_err());
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 1);
+        assert_eq!(fs::read(outside.path().join("sentinel")).unwrap(), b"keep");
+        assert_eq!(health.snapshot().storage_write_failures, Some(1));
+        assert_eq!(
+            health.snapshot().availability,
+            crate::diagnostics::DiagnosticsAvailability::Degraded
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skips_an_incarnation_with_a_symlinked_owner_lock_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let daemon = temp.path().join("daemon");
+        let stale = daemon.join(INCARNATION_1);
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(outside.path().join("sentinel"), b"keep").unwrap();
+        symlink(
+            outside.path().join("sentinel"),
+            stale.join(OWNERSHIP_LOCK_FILE),
+        )
+        .unwrap();
+        let health = DiagnosticsHealth::new();
+        let config = StorageConfig::for_test(temp.path(), INCARNATION_3, 64, 4);
+
+        let _writer =
+            BoundedJsonlWriter::new(config, FakeDiskSpace::available(), health.clone()).unwrap();
+
+        assert!(stale.exists());
+        assert!(stale.join(OWNERSHIP_LOCK_FILE).symlink_metadata().is_ok());
+        assert_eq!(fs::read(outside.path().join("sentinel")).unwrap(), b"keep");
+        assert_eq!(health.snapshot().retention_failures, Some(1));
         assert_eq!(
             health.snapshot().availability,
             crate::diagnostics::DiagnosticsAvailability::Degraded
@@ -992,16 +1320,13 @@ mod tests {
     fn one_pruning_failure_is_counted_once_by_rotation() {
         let temp = TempDir::new().unwrap();
         let health = DiagnosticsHealth::new();
-        let mut writer = writer_with(
-            &temp,
-            FakeDiskSpace::available(),
-            FakeClock::default(),
-            health.clone(),
-        );
-        fs::remove_dir(writer.incarnation_dir()).unwrap();
-        let record = b"{\"event_code\":\"safe\"}\n";
+        health.support_rotation_failures_counter();
 
-        assert_eq!(writer.write(record).unwrap(), record.len());
+        assert!(!prune_segments(
+            &temp.path().join("missing-incarnation"),
+            3,
+            &health
+        ));
 
         assert_eq!(health.snapshot().rotation_failures, Some(1));
     }
