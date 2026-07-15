@@ -109,8 +109,9 @@ describe("SettingsScreen", () => {
     ]) {
       expect(screen.getByText(value)).toBeInTheDocument();
     }
-    expect(within(table).getByRole("status")).toHaveTextContent("Ready");
-    expect(within(table).getByRole("status")).toHaveAttribute("data-variant", "success");
+    const badge = within(table).getByText("Ready", { selector: '[data-slot="status-badge"]' });
+    expect(badge).toHaveAttribute("data-variant", "success");
+    expect(badge).not.toHaveAttribute("aria-live");
     expect(within(table).getByText(runtime.status.health)).toBeVisible();
     expect(screen.getByText("llama.cpp")).toHaveClass("technical-value");
     expect(local.querySelectorAll("input, button, select, textarea")).toHaveLength(0);
@@ -133,7 +134,7 @@ describe("SettingsScreen", () => {
       />,
     );
     const table = screen.getByRole("table", { name: "Local node inventory" });
-    expect(within(table).getByRole("status")).toHaveTextContent("Starting");
+    expect(within(table).getByText("Starting", { selector: '[data-slot="status-badge"]' })).toBeVisible();
     const row = within(table).getAllByRole("row")[1];
     expect(within(row).getAllByText("—").length).toBeGreaterThan(1);
     expect(row).not.toHaveTextContent("No model loaded");

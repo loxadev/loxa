@@ -73,6 +73,14 @@ function expectActiveModelUnavailable() {
   expect(cell).not.toHaveTextContent("No model loaded");
 }
 
+function statusBadge(label: string) {
+  return screen.getByText(label, { selector: '[data-slot="status-badge"]' });
+}
+
+function findStatusBadge(label: string) {
+  return screen.findByText(label, { selector: '[data-slot="status-badge"]' });
+}
+
 function ReconcileControl() {
   const session = useNodeSession();
   return (
@@ -106,6 +114,49 @@ describe("NodeScreen", () => {
         .map((cell) => cell.textContent),
     ).toEqual(["Node", "Status", "Active model", "Endpoint", "Ownership"]);
     expect(within(table).getAllByRole("cell")).toHaveLength(5);
+  });
+
+  it("omits the Actions column when every provided action slot is empty", () => {
+    render(
+      <NodeTable
+        nodeId="node-7"
+        statusLabel="Ready"
+        statusTone="success"
+        health="ready"
+        activeModel="gemma-3-4b-it-q4"
+        engineName="llama.cpp"
+        engineVersion="b9999"
+        profile="default"
+        endpoint={endpoint}
+        ownership="App-owned node"
+        actions={{ copyEndpoint: null, model: undefined, retry: null, lifecycle: undefined }}
+      />,
+    );
+
+    const table = screen.getByRole("table", { name: "Local node inventory" });
+    expect(within(table).queryByRole("columnheader", { name: "Actions" })).not.toBeInTheDocument();
+    expect(within(table).getAllByRole("cell")).toHaveLength(5);
+  });
+
+  it("keeps the status badge visual-only", () => {
+    render(
+      <NodeTable
+        nodeId="node-7"
+        statusLabel="Ready"
+        statusTone="success"
+        health="ready"
+        activeModel="gemma-3-4b-it-q4"
+        engineName="llama.cpp"
+        engineVersion="b9999"
+        profile="default"
+        endpoint={endpoint}
+        ownership="App-owned node"
+      />,
+    );
+
+    const badge = screen.getByText("Ready", { selector: '[data-slot="status-badge"]' });
+    expect(badge).not.toHaveAttribute("role");
+    expect(badge).not.toHaveAttribute("aria-live");
   });
 
   it("presents one truthful local node row without unsupported inventory controls", async () => {
@@ -151,7 +202,7 @@ describe("NodeScreen", () => {
         bootstrap: { ...services().bootstrap, start: vi.fn(() => pending) },
       }),
     );
-    expect(await screen.findByRole("status")).toHaveTextContent("Starting");
+    expect(await findStatusBadge("Starting")).toBeVisible();
     expectActiveModelUnavailable();
     expect(screen.queryByRole("button", { name: "Browse verified models" })).not.toBeInTheDocument();
     first.unmount();
@@ -164,7 +215,7 @@ describe("NodeScreen", () => {
         },
       }),
     );
-    const status = await screen.findByRole("status");
+    const status = await findStatusBadge("Recovery required");
     expect(status).toHaveTextContent("Recovery required");
     expect(status).not.toHaveTextContent("unsafe child exit");
     expect(status).toHaveAttribute("data-variant", "danger");
@@ -189,7 +240,7 @@ describe("NodeScreen", () => {
     expect(await screen.findByText("Node ready — no model loaded")).toBeVisible();
     await user.click(screen.getByRole("button", { name: "Invalidate model truth" }));
 
-    expect(screen.getByRole("status")).toHaveTextContent("Updating model status");
+    expect(statusBadge("Updating model status")).toBeVisible();
     expectActiveModelUnavailable();
     expect(screen.queryByRole("button", { name: "Browse verified models" })).not.toBeInTheDocument();
   });
@@ -204,7 +255,7 @@ describe("NodeScreen", () => {
         getStatus: vi.fn().mockResolvedValue(readyStatus),
       }),
     );
-    expect(await screen.findByRole("status")).toHaveTextContent("Ready");
+    expect(await findStatusBadge("Ready")).toBeVisible();
     expect(screen.getByText("Externally attached")).toBeInTheDocument();
     for (const value of [endpoint, "node-7", "llama.cpp", "b9999", "gemma-3-4b-it-q4", "default"]) {
       expect(screen.getByText(value)).toHaveClass("technical-value");
@@ -218,7 +269,7 @@ describe("NodeScreen", () => {
     await screen.findByText("Node ready — no model loaded");
     await user.click(screen.getByRole("button", { name: "Stop node" }));
     expect(api.bootstrap.stop).toHaveBeenCalledTimes(1);
-    expect(await screen.findByRole("status")).toHaveTextContent("Disconnected");
+    expect(await findStatusBadge("Disconnected")).toBeVisible();
     expectActiveModelUnavailable();
     expect(screen.queryByRole("button", { name: "Browse verified models" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Retry node startup" })).toBeEnabled();
@@ -226,7 +277,7 @@ describe("NodeScreen", () => {
 
   it("keeps safe owned-child recovery available when the public probe fails", async () => {
     renderNode(services({ getStatus: vi.fn().mockRejectedValue(new Error("Public status unavailable.")) }));
-    const status = await screen.findByRole("status");
+    const status = await findStatusBadge("Error");
     expect(status).toHaveTextContent("Error");
     expect(status).not.toHaveTextContent("Public status unavailable.");
     expect(status).toHaveAttribute("data-variant", "danger");

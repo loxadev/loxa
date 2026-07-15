@@ -1,7 +1,6 @@
 import type { ReactNode } from "react";
 
-import type { StatusBadgeProps } from "../components/loxa/status-badge";
-import { Badge } from "../components/ui/badge";
+import { StatusBadge, type StatusBadgeProps } from "../components/loxa/status-badge";
 import { Table, TableBody, TableCaption, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
 import styles from "./NodeTable.module.css";
 
@@ -39,6 +38,8 @@ export function NodeTable({
   ownership,
   actions,
 }: NodeTableProps) {
+  const hasActions = actions ? Object.values(actions).some((action) => action != null) : false;
+
   return (
     <Table className={styles.table}>
       <TableCaption className="visually-hidden">Local node inventory</TableCaption>
@@ -49,7 +50,7 @@ export function NodeTable({
           <TableHead scope="col">Active model</TableHead>
           <TableHead scope="col">Endpoint</TableHead>
           <TableHead scope="col">Ownership</TableHead>
-          {actions && <TableHead scope="col">Actions</TableHead>}
+          {hasActions && <TableHead scope="col">Actions</TableHead>}
         </TableRow>
       </TableHeader>
       <TableBody>
@@ -59,15 +60,7 @@ export function NodeTable({
             <span className={`${styles.detail} technical-value`}>{nodeId}</span>
           </TableCell>
           <TableCell>
-            <Badge
-              data-slot="status-badge"
-              data-variant={statusTone}
-              variant={statusTone}
-              role="status"
-              aria-live="polite"
-            >
-              {statusLabel}
-            </Badge>
+            <StatusBadge tone={statusTone}>{statusLabel}</StatusBadge>
             <span className={`${styles.detail} technical-value`}>{health}</span>
           </TableCell>
           <TableCell>
@@ -88,7 +81,7 @@ export function NodeTable({
           <TableCell>
             <span className={styles.primaryValue}>{ownership}</span>
           </TableCell>
-          {actions && (
+          {hasActions && actions && (
             <TableCell>
               <div className={styles.actions}>
                 {actions.copyEndpoint}
