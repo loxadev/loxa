@@ -179,6 +179,18 @@ describe("Cargo workspace isolation", () => {
     expect(workflowStep(packaging, "Build packaged app")).toMatch(/^        run: pnpm package:app -- --debug$/m);
   });
 
+  it("runs latest GitHub runner images as a scheduled compatibility canary", () => {
+    const nightly = readFileSync(resolve(repositoryRoot, ".github/workflows/nightly.yml"), "utf8");
+
+    expect(nightly).toMatch(/^name: Nightly Runner Canary$/m);
+    expect(nightly).toMatch(/^  schedule:$/m);
+    expect(nightly).toMatch(/^    - cron: "0 3 \* \* \*"$/m);
+    expect(nightly).toMatch(/^  workflow_dispatch:$/m);
+    expect(nightly).toMatch(/^        os: \[ubuntu-latest, macos-latest, windows-latest\]$/m);
+    expect(nightly).toMatch(/^    runs-on: ubuntu-latest$/m);
+    expect(nightly).toMatch(/^    runs-on: macos-latest$/m);
+  });
+
   it("enforces a deterministic semantic light and dark browser contract", () => {
     const browserConfig = readFileSync(resolve(appRoot, "vitest.browser.config.ts"), "utf8");
     const baselineTest = readFileSync(resolve(appRoot, "src/test/BaselineApp.browser.test.tsx"), "utf8");
