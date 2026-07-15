@@ -24,7 +24,7 @@
     "test:browser": "vitest run --config vitest.browser.config.ts",
     "test:unit": "vitest run",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.node.json",
-    "tauri": "tauri"
+    "tauri": "node scripts/tauri.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.1",
