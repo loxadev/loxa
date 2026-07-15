@@ -4,6 +4,7 @@ pub mod calibration;
 pub mod chat_history;
 pub mod control;
 pub mod detect;
+pub mod diagnostics;
 pub mod download;
 pub mod engine;
 pub mod evidence;
