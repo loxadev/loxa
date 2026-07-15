@@ -66,6 +66,12 @@ export function NodeScreen({
                 Retry node startup
               </button>
             ) : undefined,
+          start:
+            session.phase === "stopped" ? (
+              <button className="primary-button interactive-target" type="button" onClick={() => void session.retry()}>
+                Start node
+              </button>
+            ) : undefined,
           lifecycle:
             session.ownership === "owned" && !["checking", "starting", "stopping"].includes(session.phase) ? (
               <button className="secondary-button interactive-target" type="button" onClick={() => void session.stop()}>
@@ -96,6 +102,7 @@ function phaseSummary(phase: Parameters<typeof presentNode>[0]["phase"]) {
   if (phase === "reconciling") return "Refreshing authoritative node and model status.";
   if (phase === "checking" || phase === "starting") return "Proving local node identity.";
   if (phase === "stopping") return "Stopping the app-owned node safely.";
+  if (phase === "stopped") return "The local node is stopped.";
   if (phase === "recovery-required") return "Runtime recovery is required before model controls can continue.";
   return "The local node is not currently ready.";
 }

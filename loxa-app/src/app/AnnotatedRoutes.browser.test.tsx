@@ -95,7 +95,7 @@ test("covers the annotated Nodes, Models, Settings overview, and Runtime routes 
   const runtimeTable = page.getByRole("table", { name: "Local node inventory" });
   await expect.element(runtimeTable).toBeVisible();
   expect(runtimeTable.element().querySelectorAll("tbody tr")).toHaveLength(1);
-  expect(runtimeTable.element().querySelectorAll("th")).toHaveLength(5);
+  expect(runtimeTable.element().querySelectorAll("th")).toHaveLength(8);
   expect(runtimeTable.element()).not.toHaveTextContent("Actions");
   expect(runtimeTable.element().querySelector("button, input, select, textarea")).toBeNull();
   await vi.waitFor(() => expect(runtimeTable.element().parentElement).toHaveAttribute("tabindex", "0"));
@@ -137,7 +137,7 @@ test("keeps neutral production runtime copy across Nodes, Models, and Chat surfa
   const chatRegion = page.getByRole("region", { name: "Chat" });
   expect(chatRegion.getByRole("status").element()).toHaveTextContent(neutralMessage);
   expect(page.getByRole("log", { name: "Conversation" }).element()).toHaveTextContent(neutralMessage);
-  expect(page.getByRole("form", { name: "Message composer" }).element()).toHaveTextContent(neutralMessage);
+  expect(page.getByRole("form", { name: "Message composer" }).element()).not.toHaveTextContent(neutralMessage);
   expect(document.body).not.toHaveTextContent("browser preview");
 });
 

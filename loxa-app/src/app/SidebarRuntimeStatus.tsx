@@ -1,13 +1,16 @@
 import { selectSetActiveRoute, useWorkspaceStore } from "../stores/workspace-store";
+import { Tooltip } from "../components/ui/tooltip";
 
 export function SidebarRuntimeStatus({ health, model }: { health: string; model: string }) {
   const setRoute = useWorkspaceStore(selectSetActiveRoute);
+  const collapsed = useWorkspaceStore((state) => state.sidebarCollapsed);
+  const label = `${health}. ${model}`;
 
-  return (
+  const status = (
     <a
       className="global-node-status interactive-target"
       href="#node"
-      aria-label={`${health}. ${model}`}
+      aria-label={label}
       aria-live="polite"
       onClick={(event) => {
         event.preventDefault();
@@ -21,4 +24,6 @@ export function SidebarRuntimeStatus({ health, model }: { health: string; model:
       </span>
     </a>
   );
+
+  return collapsed ? <Tooltip content={label}>{status}</Tooltip> : status;
 }

@@ -1,6 +1,6 @@
 import { act } from "react";
 import { expect, test } from "vitest";
-import { page } from "vitest/browser";
+import { page, userEvent } from "vitest/browser";
 
 import App from "@/App";
 import { applyTheme } from "@/settings/theme";
@@ -57,7 +57,11 @@ test("keeps expanded and collapsed shell geometry accessible at 800 by 600", asy
     await page.getByRole("button", { name: "Collapse sidebar" }).click();
   });
   expect(sidebar?.getBoundingClientRect().width).toBe(56);
-  expect(document.querySelector('[role="separator"]')).toBeNull();
+  const collapsedDivider = document.querySelector<HTMLElement>('[role="separator"]');
+  expect(collapsedDivider).not.toBeNull();
+  expect(collapsedDivider!.getBoundingClientRect().left).toBeGreaterThanOrEqual(
+    sidebar!.getBoundingClientRect().right - 4,
+  );
   expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(document.documentElement.clientWidth);
   await expectNoAxeViolations(document);
 });
@@ -101,11 +105,98 @@ test("shows keyboard focus on collapsed navigation without horizontal overflow",
 
   const chatLink = document.querySelector<HTMLAnchorElement>('a[href="#chat"]');
   expect(chatLink).not.toBeNull();
-  chatLink?.focus();
+  await act(async () => chatLink?.focus());
   const focusStyle = getComputedStyle(chatLink!);
   expect(focusStyle.outlineStyle).toBe("solid");
   expect(focusStyle.outlineWidth).toBe("2px");
   expect(document.body.scrollWidth).toBeLessThanOrEqual(document.body.clientWidth);
+});
+
+test("uses the divider to collapse, expand, and toggle with pointer gestures", async () => {
+  await page.viewport(800, 600);
+  useWorkspaceStore.setState({ activeRoute: "chat", sidebarCollapsed: false, expandedSidebarWidth: 280 });
+  mountBrowser(<App services={createAppServicesFixture()} />);
+  await settleShell();
+
+  const divider = page.getByRole("separator", { name: "Resize navigation and conversation rail" });
+  const element = divider.element();
+  await act(async () => {
+    element.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, pointerId: 1, button: 0, clientX: 280 }));
+    window.dispatchEvent(new PointerEvent("pointermove", { bubbles: true, pointerId: 1, clientX: 220 }));
+    window.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, pointerId: 1, clientX: 220 }));
+  });
+  expect(useWorkspaceStore.getState().sidebarCollapsed).toBe(true);
+
+  await act(async () => {
+    element.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, pointerId: 2, button: 0, clientX: 56 }));
+    window.dispatchEvent(new PointerEvent("pointermove", { bubbles: true, pointerId: 2, clientX: 116 }));
+    window.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, pointerId: 2, clientX: 116 }));
+  });
+  expect(useWorkspaceStore.getState().sidebarCollapsed).toBe(false);
+
+  await act(async () => element.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })));
+  expect(useWorkspaceStore.getState().sidebarCollapsed).toBe(true);
+});
+
+test("shows tooltips for important icon-only controls only while collapsed", async () => {
+  await page.viewport(800, 600);
+  useWorkspaceStore.setState({ activeRoute: "chat", sidebarCollapsed: true, expandedSidebarWidth: 280 });
+  mountBrowser(<App services={createAppServicesFixture()} />);
+  await settleShell();
+
+  await act(async () => page.getByRole("link", { name: "Models" }).hover());
+  await expect.element(page.getByRole("tooltip", { name: "Models" })).toBeVisible();
+
+  await act(async () => page.getByRole("button", { name: "Expand sidebar" }).element().focus());
+  await expect.element(page.getByRole("tooltip", { name: "Expand sidebar" })).toBeVisible();
+
+  await act(async () => page.getByRole("button", { name: "Expand sidebar" }).click());
+  await expect.element(page.getByRole("button", { name: "Collapse sidebar" })).toBeVisible();
+  expect(document.querySelectorAll(".app-sidebar .tooltip-content")).toHaveLength(0);
+});
+
+test("keeps a collapsed-sidebar tooltip visible while the pointer moves onto it", async () => {
+  await page.viewport(800, 600);
+  useWorkspaceStore.setState({ activeRoute: "chat", sidebarCollapsed: true, expandedSidebarWidth: 280 });
+  mountBrowser(<App services={createAppServicesFixture()} />);
+  await settleShell();
+
+  await act(async () => page.getByRole("link", { name: "Models" }).hover());
+  const tooltip = page.getByRole("tooltip", { name: "Models" });
+  await expect.element(tooltip).toBeVisible();
+  expect(getComputedStyle(tooltip.element()).pointerEvents).toBe("auto");
+
+  await act(async () => tooltip.hover());
+  await expect.element(tooltip).toBeVisible();
+
+  const tooltipElement = tooltip.element();
+  await act(async () => page.getByRole("heading", { name: "New Chat" }).hover());
+  await expect.element(tooltipElement).not.toBeVisible();
+  await act(async () => page.getByRole("link", { name: "Models" }).hover());
+  await expect.element(tooltip).toBeVisible();
+});
+
+test("dismisses a focused collapsed-sidebar tooltip with Escape until focus returns", async () => {
+  await page.viewport(800, 600);
+  useWorkspaceStore.setState({ activeRoute: "chat", sidebarCollapsed: true, expandedSidebarWidth: 280 });
+  mountBrowser(<App services={createAppServicesFixture()} />);
+  await settleShell();
+
+  const toggle = page.getByRole("button", { name: "Expand sidebar" });
+  await act(async () => toggle.element().focus());
+  const tooltip = page.getByRole("tooltip", { name: "Expand sidebar" });
+  await expect.element(tooltip).toBeVisible();
+  const tooltipElement = tooltip.element();
+
+  await act(async () => userEvent.keyboard("{Escape}"));
+  await expect.element(tooltipElement).not.toBeVisible();
+  await expect.element(toggle).toHaveFocus();
+
+  await act(async () => {
+    toggle.element().blur();
+    toggle.element().focus();
+  });
+  await expect.element(tooltip).toBeVisible();
 });
 
 test("renders the dark shell brand and new-chat foreground with visible contrast", async () => {
