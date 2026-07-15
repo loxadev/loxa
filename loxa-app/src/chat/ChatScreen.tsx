@@ -12,11 +12,13 @@ import type { ControlStreamHandle, streamControlEvents as defaultStreamControlEv
 import type { getModels as defaultGetModels, getStatus as defaultGetStatus } from "../node/client";
 import type { NodeSessionPhase } from "../node/NodeSession";
 import { ChatComposer } from "./ChatComposer";
+import { ChatModelControl } from "./ChatModelControl";
 import type { ConversationHistoryController } from "./conversationHistory";
 import type { ChatSummary, PersistentTurnCallbacks, PersistentTurnHandle } from "./historyClient";
 import styles from "./ChatScreen.module.css";
 import { ChatTranscript, type ChatTurn } from "./ChatTranscript";
 import type { StreamCallbacks, StreamHandle, StreamTerminal } from "./streamChat";
+import { emptyTurnMetrics } from "./turnMetrics";
 
 export type ChatScreenServices = {
   getStatus: typeof defaultGetStatus;
@@ -80,6 +82,7 @@ export function ChatScreen({
   onModelMutationStart,
   onModelMutationSettled,
   history,
+  conversationTitle = "New Chat",
   onInteractionLockChange,
   onNavigateModels,
 }: {
@@ -89,6 +92,7 @@ export function ChatScreen({
   onModelMutationStart?: (operationId?: string) => void;
   onModelMutationSettled?: (operationId: string) => void | Promise<void>;
   history?: ChatScreenHistory | null;
+  conversationTitle?: string;
   onInteractionLockChange?: (locked: boolean) => void;
   onNavigateModels?: () => void;
 }) {
@@ -98,6 +102,7 @@ export function ChatScreen({
   const [connection, setConnection] = useState<ConnectionState>("checking");
   const [requestModel, setRequestModel] = useState<string | null>(null);
   const [activeModel, setActiveModel] = useState<string | null>(null);
+  const [authoritativeNodeStatus, setAuthoritativeNodeStatus] = useState<NodeControlStatus | null>(null);
   const [selectedModel, setSelectedModel] = useState("");
   const [eligibleModels, setEligibleModels] = useState<ModelInventoryEntry[]>([]);
   const [modelOperation, setModelOperation] = useState<"idle" | "switching">("idle");
@@ -165,6 +170,7 @@ export function ChatScreen({
         turn.id === turnId
           ? terminalTurn(bufferedResponse === null ? turn : { ...turn, response: bufferedResponse }, {
               kind: "cancelled",
+              metrics: emptyTurnMetrics(),
             })
           : turn,
       ),
@@ -238,6 +244,7 @@ export function ChatScreen({
               response,
               status: turn.state,
               error: turn.errorCode ? turn.errorCode.replace(/_/g, " ") : "",
+              metrics: turn.metrics,
             });
           }
           const next = page.nextAfter ?? undefined;
@@ -291,6 +298,7 @@ export function ChatScreen({
       setConnectionError(availabilityBlockedReason);
       setRequestModel(null);
       setActiveModel(null);
+      setAuthoritativeNodeStatus(null);
       setSelectedModel("");
       setEligibleModels([]);
       setControlBusy(false);
@@ -309,6 +317,7 @@ export function ChatScreen({
     setConnectionError("");
     setRequestModel(null);
     setActiveModel(null);
+    setAuthoritativeNodeStatus(null);
     setSelectedModel("");
     setEligibleModels([]);
     setControlBusy(false);
@@ -358,6 +367,7 @@ export function ChatScreen({
         (entry) => entry.artifact.kind === "downloaded" && entry.compatibility.compatible && entry.engine.eligible,
       );
       setEligibleModels(eligible);
+      setAuthoritativeNodeStatus(controlNode.status);
       setActiveModel(controlNode.activeModelId);
       setSelectedModel(controlNode.activeModelId ?? eligible[0]?.id ?? "");
       setControlBusy(controlNode.operationId !== null);
@@ -381,6 +391,7 @@ export function ChatScreen({
             (entry) => entry.artifact.kind === "downloaded" && entry.compatibility.compatible && entry.engine.eligible,
           );
           setEligibleModels(eligibleNext);
+          setAuthoritativeNodeStatus(node.status);
           if (node.status === "ready" && node.activeModelId !== null) {
             setActiveModel(node.activeModelId);
             setSelectedModel(node.activeModelId);
@@ -447,6 +458,7 @@ export function ChatScreen({
                         entry.artifact.kind === "downloaded" && entry.compatibility.compatible && entry.engine.eligible,
                     );
                     setEligibleModels(eligibleNext);
+                    setAuthoritativeNodeStatus(node.status);
                     setControlBusy(
                       node.operationId !== null ||
                         [...operations.current.values()].some(
@@ -553,6 +565,8 @@ export function ChatScreen({
 
   const latestTurn = turns[turns.length - 1];
   const responseInProgress = latestTurn?.status === "queued" || latestTurn?.status === "streaming";
+  const modelControlsAvailable =
+    !availabilityBlocked && (authoritativeNodeStatus === "ready" || authoritativeNodeStatus === "unloaded");
   const canCompose =
     connection === "ready" &&
     chatCapability === "supported" &&
@@ -765,7 +779,14 @@ export function ChatScreen({
   };
 
   const switchModel = async () => {
-    if (!selectedModel || selectedModel === activeModel || modelOperation !== "idle" || controlBusy) return;
+    if (
+      !modelControlsAvailable ||
+      !selectedModel ||
+      selectedModel === activeModel ||
+      modelOperation !== "idle" ||
+      controlBusy
+    )
+      return;
     const controller = new AbortController();
     lifecycleController.current = controller;
     const close = () => controller.abort();
@@ -802,6 +823,7 @@ export function ChatScreen({
       ]);
       if (version !== truthVersion.current) return;
       publishReconciledBusy = true;
+      setAuthoritativeNodeStatus(node.status);
       if (node.status !== "ready" || node.activeModelId !== selectedModel)
         throw new Error("The node did not confirm the selected model as ready.");
       const reconciledRequestModel = models.data.find(({ id }) => id === "loxa")?.id ?? models.data[0]?.id ?? null;
@@ -839,6 +861,7 @@ export function ChatScreen({
                 entry.artifact.kind === "downloaded" && entry.compatibility.compatible && entry.engine.eligible,
             );
             setEligibleModels(eligible);
+            setAuthoritativeNodeStatus(node.status);
             if (node.status === "ready" && node.activeModelId !== null) {
               setActiveModel(node.activeModelId);
             } else {
@@ -912,47 +935,40 @@ export function ChatScreen({
   return (
     <section className={styles.screen} aria-labelledby="chat-heading">
       <header className={styles.header}>
-        <h1 id="chat-heading">Chat</h1>
-        <div className={styles.headerStatus}>
-          <p className={styles.liveStatus} role="status" aria-live="polite" aria-atomic="true">
-            {statusLabel}
-          </p>
-          <p className={styles.activeModelStatus}>
-            {activeModel === null ? "No active model" : `Active model: ${activeModel}`}
-          </p>
-        </div>
+        <h1 id="chat-heading">{conversationTitle.trim() || "New Chat"}</h1>
       </header>
 
       <div className={styles.chatMain}>
+        <ChatModelControl
+          activeModel={activeModel}
+          selectedModel={selectedModel}
+          eligibleModels={eligibleModels}
+          status={statusLabel}
+          guidance={chatSupportReason}
+          modelBusy={controlBusy}
+          modelOperation={modelOperation}
+          modelControlsAvailable={modelControlsAvailable}
+          responseInProgress={responseInProgress}
+          canBrowseModels={canBrowseModels}
+          onSelectedModel={setSelectedModel}
+          onSwitchModel={() => void switchModel()}
+          onBrowseModels={onNavigateModels}
+        />
         <div className={styles.contextNotice}>
           {restoreError ||
             (omittedTurns > 0
               ? `${omittedTurns} earlier ${omittedTurns === 1 ? "turn was" : "turns were"} omitted from the model context.`
               : "")}
         </div>
-        <ChatTranscript
-          turns={turns}
-          emptyMessage={emptyMessage}
-          copyText={services.copyText}
-          onBrowseModels={canBrowseModels ? onNavigateModels : undefined}
-        />
+        <ChatTranscript turns={turns} emptyMessage={emptyMessage} copyText={services.copyText} />
 
         <ChatComposer
           input={input}
           inputRef={inputRef}
           canCompose={canCompose}
           responseInProgress={responseInProgress}
-          supportReason={chatSupportReason}
           attachmentReason={attachmentReason}
-          activeModel={activeModel}
-          selectedModel={selectedModel}
-          eligibleModels={eligibleModels}
-          modelBusy={controlBusy}
-          modelOperation={modelOperation}
-          modelControlsAvailable={!availabilityBlocked}
           onInput={setInput}
-          onSelectedModel={setSelectedModel}
-          onSwitchModel={() => void switchModel()}
           onSend={send}
           onStop={stop}
         />
@@ -972,8 +988,9 @@ function nodeSessionUnavailableReason(availability: ChatNodeAvailability): strin
 }
 
 function terminalTurn(turn: ChatTurn, terminal: StreamTerminal): ChatTurn {
-  if (terminal.kind === "error") return { ...turn, status: "failed", error: terminal.message };
-  return { ...turn, status: terminal.kind, error: "" };
+  if (terminal.kind === "error")
+    return { ...turn, status: "failed", error: terminal.message, metrics: terminal.metrics };
+  return { ...turn, status: terminal.kind, error: "", metrics: terminal.metrics };
 }
 
 function connectionLabel(
@@ -994,7 +1011,9 @@ function connectionLabel(
   if (operation === "switching") return "Loading selected model";
   if (controlBusy) return "Model operation in progress";
   if (latest?.status === "failed") return latest.error;
-  if (latest) return latest.status[0].toUpperCase() + latest.status.slice(1);
+  if (latest?.status === "queued" || latest?.status === "streaming") {
+    return latest.status[0].toUpperCase() + latest.status.slice(1);
+  }
   return "Ready";
 }
 

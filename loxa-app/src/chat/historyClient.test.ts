@@ -18,6 +18,7 @@ const token = "ab".repeat(32);
 const chatId = "0123456789abcdef0123456789abcdef";
 const turnId = "1123456789abcdef0123456789abcdef";
 const chat = { id: chatId, title: "Node health", created_at_ms: 10, updated_at_ms: 11 };
+const wireMetrics = { output_tokens: 8, total_duration_ms: 1_000, ttft_ms: 200, stop_reason: "stop" };
 
 describe("history client", () => {
   it("lists chats using bounded opaque pagination and keeps content out of URLs", async () => {
@@ -81,6 +82,7 @@ describe("history client", () => {
             state: "completed",
             provenance: { model_alias: "loxa", recipe_id: "gemma", engine_name: "llama.cpp", engine_version: null },
             error_code: null,
+            metrics: wireMetrics,
             created_at_ms: 20,
             updated_at_ms: 22,
           },
@@ -95,6 +97,7 @@ describe("history client", () => {
           id: turnId,
           state: "completed",
           recipeId: "gemma",
+          metrics: { outputTokens: 8, totalDurationMs: 1_000, ttftMs: 200, stopReason: "stop" },
         }),
       ],
       nextAfter: null,
@@ -174,7 +177,7 @@ describe("history client", () => {
         expect(init).toEqual(expect.objectContaining({ method: "POST", body: "" }));
         streamController.enqueue(
           encoder.encode(
-            `event: turn.cancelled\ndata: ${JSON.stringify({ turn_id: turnId, state: "cancelled", error_code: null })}\n\n`,
+            `event: turn.cancelled\ndata: ${JSON.stringify({ turn_id: turnId, state: "cancelled", error_code: null, metrics: wireMetrics })}\n\n`,
           ),
         );
         streamController.close();
@@ -197,10 +200,16 @@ describe("history client", () => {
     );
     await vi.waitFor(() => expect(onStarted).toHaveBeenCalledWith(turnId, 3));
     handle.cancel();
-    await expect(handle.finished).resolves.toEqual({ kind: "cancelled" });
+    await expect(handle.finished).resolves.toEqual({
+      kind: "cancelled",
+      metrics: { outputTokens: 8, totalDurationMs: 1_000, ttftMs: 200, stopReason: "stop" },
+    });
     expect(onStarted).toHaveBeenCalledWith(turnId, 3);
     expect(onDelta).toHaveBeenCalledWith("hello");
-    expect(onTerminal).toHaveBeenCalledWith({ kind: "cancelled" });
+    expect(onTerminal).toHaveBeenCalledWith({
+      kind: "cancelled",
+      metrics: { outputTokens: 8, totalDurationMs: 1_000, ttftMs: 200, stopReason: "stop" },
+    });
     expect(fetch.mock.calls[0]).toEqual([
       `${endpoint}/loxa/v1/chats/${chatId}/turns`,
       expect.objectContaining({ method: "POST", body: JSON.stringify({ content: "hello", model: "loxa" }) }),
@@ -338,6 +347,7 @@ describe("history client", () => {
           state: "completed",
           provenance: { model_alias: "loxa", recipe_id: "gemma", engine_name: null, engine_version: null },
           error_code: null,
+          metrics: wireMetrics,
           created_at_ms: 20,
           updated_at_ms: 22,
         },
@@ -348,6 +358,7 @@ describe("history client", () => {
           state: "completed",
           provenance: { model_alias: "loxa", recipe_id: "gemma", engine_name: null, engine_version: null },
           error_code: null,
+          metrics: wireMetrics,
           created_at_ms: 23,
           updated_at_ms: 24,
         },
@@ -390,6 +401,24 @@ describe("history client", () => {
         turn.state = "done";
       },
     ],
+    [
+      "contradictory metrics",
+      (turn: Record<string, unknown>) => {
+        turn.metrics = { ...wireMetrics, ttft_ms: 1_001 };
+      },
+    ],
+    [
+      "unsafe metric integer",
+      (turn: Record<string, unknown>) => {
+        turn.metrics = { ...wireMetrics, output_tokens: Number.MAX_SAFE_INTEGER + 1 };
+      },
+    ],
+    [
+      "extra metric field",
+      (turn: Record<string, unknown>) => {
+        turn.metrics = { ...wireMetrics, estimated: true };
+      },
+    ],
   ])("strictly rejects turn DTO %s", async (_case, mutate) => {
     const turn: Record<string, unknown> = {
       id: turnId,
@@ -398,6 +427,7 @@ describe("history client", () => {
       state: "completed",
       provenance: { model_alias: "loxa", recipe_id: "gemma", engine_name: null, engine_version: null },
       error_code: null,
+      metrics: wireMetrics,
       created_at_ms: 20,
       updated_at_ms: 22,
     };

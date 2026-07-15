@@ -6,8 +6,8 @@ use super::ASSISTANT_CONTENT_MAX_BYTES;
 use super::{
     valid_timestamp_pair, validate_error_code, ChatCursor, ChatId, ChatSummary, HistoryError,
     MessageContent, MessageId, MessageRecord, MessageRole, MessageSegment, MessageSummary, Title,
-    TurnCursor, TurnId, TurnProvenance, TurnRecord, TurnState, MAX_SERIALIZED_MESSAGE_PAGE_BYTES,
-    RESPONSE_SEGMENT_MAX_BYTES,
+    TurnCursor, TurnId, TurnMetrics, TurnProvenance, TurnRecord, TurnState,
+    MAX_SERIALIZED_MESSAGE_PAGE_BYTES, RESPONSE_SEGMENT_MAX_BYTES,
 };
 use rusqlite::{
     config::DbConfig, limits::Limit, Connection, Error as SqlError, ErrorCode, OpenFlags,
@@ -304,7 +304,7 @@ impl ChatHistoryRepository {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT id, chat_id, ordinal, state, model_alias, recipe_id, engine_name, engine_version, error_code, created_at_ms, updated_at_ms FROM turns WHERE chat_id = ?1 AND ordinal > ?2 ORDER BY ordinal ASC LIMIT ?3",
+                "SELECT id, chat_id, ordinal, state, model_alias, recipe_id, engine_name, engine_version, error_code, output_tokens, total_duration_ms, ttft_ms, stop_reason, created_at_ms, updated_at_ms FROM turns WHERE chat_id = ?1 AND ordinal > ?2 ORDER BY ordinal ASC LIMIT ?3",
             )
             .map_err(map_sql_error)?;
         let rows = statement
@@ -319,8 +319,12 @@ impl ChatHistoryRepository {
                     row.get::<_, Option<String>>(6)?,
                     row.get::<_, Option<String>>(7)?,
                     row.get::<_, Option<String>>(8)?,
-                    row.get::<_, i64>(9)?,
-                    row.get::<_, i64>(10)?,
+                    row.get::<_, Option<i64>>(9)?,
+                    row.get::<_, Option<i64>>(10)?,
+                    row.get::<_, Option<i64>>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                    row.get::<_, i64>(13)?,
+                    row.get::<_, i64>(14)?,
                 ))
             })
             .map_err(map_sql_error)?;
@@ -477,6 +481,7 @@ impl ChatHistoryRepository {
             state: TurnState::Queued,
             provenance,
             error_code: None,
+            metrics: TurnMetrics::default(),
             created_at_ms,
             updated_at_ms: created_at_ms,
         })
@@ -490,6 +495,25 @@ impl ChatHistoryRepository {
         error_code: Option<&str>,
         updated_at_ms: i64,
     ) -> Result<(), HistoryError> {
+        self.finalize_turn_with_metrics(
+            turn_id,
+            state,
+            assistant_content,
+            error_code,
+            TurnMetrics::default(),
+            updated_at_ms,
+        )
+    }
+
+    pub fn finalize_turn_with_metrics(
+        &mut self,
+        turn_id: &TurnId,
+        state: TurnState,
+        assistant_content: MessageContent,
+        error_code: Option<&str>,
+        metrics: TurnMetrics,
+        updated_at_ms: i64,
+    ) -> Result<(), HistoryError> {
         if !matches!(
             state,
             TurnState::Completed | TurnState::Cancelled | TurnState::Failed
@@ -497,6 +521,7 @@ impl ChatHistoryRepository {
             return Err(HistoryError::InvalidTurnState);
         }
         validate_error_code(error_code)?;
+        metrics.validate()?;
         if (state == TurnState::Failed) != error_code.is_some() {
             return Err(HistoryError::InvalidMetadata);
         }
@@ -524,8 +549,17 @@ impl ChatHistoryRepository {
         }
         let updated = transaction
             .execute(
-                "UPDATE turns SET state = ?1, error_code = ?2, updated_at_ms = ?3 WHERE id = ?4 AND state IN ('queued', 'streaming')",
-                (state.as_str(), error_code, updated_at_ms, turn_id.as_str()),
+                "UPDATE turns SET state = ?1, error_code = ?2, output_tokens = ?3, total_duration_ms = ?4, ttft_ms = ?5, stop_reason = ?6, updated_at_ms = ?7 WHERE id = ?8 AND state IN ('queued', 'streaming')",
+                (
+                    state.as_str(),
+                    error_code,
+                    metrics.output_tokens.map(|value| value as i64),
+                    metrics.total_duration_ms.map(|value| value as i64),
+                    metrics.ttft_ms.map(|value| value as i64),
+                    metrics.stop_reason.as_deref(),
+                    updated_at_ms,
+                    turn_id.as_str(),
+                ),
             )
             .map_err(map_sql_error)?;
         if updated != 1 {
@@ -623,7 +657,7 @@ impl ChatHistoryRepository {
         let raw = self
             .connection
             .query_row(
-                "SELECT id, chat_id, ordinal, state, model_alias, recipe_id, engine_name, engine_version, error_code, created_at_ms, updated_at_ms FROM turns WHERE id = ?1",
+                "SELECT id, chat_id, ordinal, state, model_alias, recipe_id, engine_name, engine_version, error_code, output_tokens, total_duration_ms, ttft_ms, stop_reason, created_at_ms, updated_at_ms FROM turns WHERE id = ?1",
                 [id.as_str()],
                 |row| {
                     Ok((
@@ -636,8 +670,12 @@ impl ChatHistoryRepository {
                         row.get::<_, Option<String>>(6)?,
                         row.get::<_, Option<String>>(7)?,
                         row.get::<_, Option<String>>(8)?,
-                        row.get::<_, i64>(9)?,
-                        row.get::<_, i64>(10)?,
+                        row.get::<_, Option<i64>>(9)?,
+                        row.get::<_, Option<i64>>(10)?,
+                        row.get::<_, Option<i64>>(11)?,
+                        row.get::<_, Option<String>>(12)?,
+                        row.get::<_, i64>(13)?,
+                        row.get::<_, i64>(14)?,
                     ))
                 },
             )
@@ -827,17 +865,34 @@ type TurnRaw = (
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
     i64,
     i64,
 );
 
 fn turn_from_raw(raw: TurnRaw) -> Result<TurnRecord, HistoryError> {
-    if raw.2 < 0 || !valid_timestamp_pair(raw.9, raw.10) || raw.4 != "loxa" {
+    if raw.2 < 0 || !valid_timestamp_pair(raw.13, raw.14) || raw.4 != "loxa" {
         return Err(HistoryError::CorruptDatabase);
     }
     let provenance = TurnProvenance::new(&raw.5, raw.6.as_deref(), raw.7.as_deref())
         .map_err(|_| HistoryError::CorruptDatabase)?;
     validate_error_code(raw.8.as_deref()).map_err(|_| HistoryError::CorruptDatabase)?;
+    let metrics = TurnMetrics::new(
+        raw.9
+            .map(|value| u64::try_from(value).map_err(|_| HistoryError::CorruptDatabase))
+            .transpose()?,
+        raw.10
+            .map(|value| u64::try_from(value).map_err(|_| HistoryError::CorruptDatabase))
+            .transpose()?,
+        raw.11
+            .map(|value| u64::try_from(value).map_err(|_| HistoryError::CorruptDatabase))
+            .transpose()?,
+        raw.12.as_deref(),
+    )
+    .map_err(|_| HistoryError::CorruptDatabase)?;
     Ok(TurnRecord {
         id: TurnId::parse(&raw.0).map_err(|_| HistoryError::CorruptDatabase)?,
         chat_id: ChatId::parse(&raw.1).map_err(|_| HistoryError::CorruptDatabase)?,
@@ -845,8 +900,9 @@ fn turn_from_raw(raw: TurnRaw) -> Result<TurnRecord, HistoryError> {
         state: TurnState::from_db(&raw.3).map_err(|_| HistoryError::CorruptDatabase)?,
         provenance,
         error_code: raw.8,
-        created_at_ms: raw.9,
-        updated_at_ms: raw.10,
+        metrics,
+        created_at_ms: raw.13,
+        updated_at_ms: raw.14,
     })
 }
 
@@ -1409,7 +1465,7 @@ mod tests {
 
         let repository = ChatHistoryRepository::open(&path).unwrap();
 
-        assert_eq!(repository.schema_version().unwrap(), 2);
+        assert_eq!(repository.schema_version().unwrap(), 3);
         assert!(repository.sqlite_version().starts_with("3.53.2"));
         assert_eq!(repository.journal_mode().unwrap(), "wal");
         assert_eq!(repository.pragma_i64("foreign_keys").unwrap(), 1);
@@ -1485,6 +1541,39 @@ mod tests {
         assert_eq!(
             repository.get_chat(&chat.id).unwrap().title.as_str(),
             "Explain node health states"
+        );
+    }
+
+    #[test]
+    fn finalized_turn_metrics_round_trip_through_get_and_list() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut repository = ChatHistoryRepository::open(&history_path(&directory)).unwrap();
+        let chat = repository.create_chat(1_000).unwrap();
+        let turn = repository
+            .begin_turn(
+                &chat.id,
+                MessageContent::user("metrics please").unwrap(),
+                TurnProvenance::new("recipe", Some("engine"), Some("1")).unwrap(),
+                1_010,
+            )
+            .unwrap();
+        let metrics = TurnMetrics::new(Some(17), Some(950), Some(75), Some("stop")).unwrap();
+
+        repository
+            .finalize_turn_with_metrics(
+                &turn.id,
+                TurnState::Completed,
+                MessageContent::assistant("done").unwrap(),
+                None,
+                metrics.clone(),
+                1_020,
+            )
+            .unwrap();
+
+        assert_eq!(repository.get_turn(&turn.id).unwrap().metrics, metrics);
+        assert_eq!(
+            repository.list_turns(&chat.id, 30, None).unwrap().turns[0].metrics,
+            metrics
         );
     }
 
@@ -1777,7 +1866,7 @@ mod tests {
         drop(connection);
 
         let repository = ChatHistoryRepository::open(&path).unwrap();
-        assert_eq!(repository.schema_version().unwrap(), 2);
+        assert_eq!(repository.schema_version().unwrap(), 3);
         assert_eq!(
             repository
                 .get_chat(&ChatId::parse(id).unwrap())
@@ -1795,6 +1884,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(index_count, 1);
+        let metric_columns: i64 = repository
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('turns') WHERE name IN ('output_tokens', 'total_duration_ms', 'ttft_ms', 'stop_reason')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(metric_columns, 4);
     }
 
     #[test]

@@ -32,6 +32,7 @@ pub struct ChatPageView {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct TurnProvenanceView {
     pub model_alias: String,
     pub recipe_id: String,
@@ -40,6 +41,7 @@ pub struct TurnProvenanceView {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct TurnView {
     pub id: String,
     pub chat_id: String,
@@ -47,11 +49,13 @@ pub struct TurnView {
     pub state: String,
     pub provenance: TurnProvenanceView,
     pub error_code: Option<String>,
+    pub metrics: TurnMetricsView,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct TurnPageView {
     pub turns: Vec<TurnView>,
     pub next_after: Option<String>,
@@ -107,7 +111,38 @@ pub enum TurnStreamEvent {
         turn_id: String,
         state: String,
         error_code: Option<String>,
+        metrics: TurnMetricsView,
     },
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TurnMetricsView {
+    pub output_tokens: Option<u64>,
+    pub total_duration_ms: Option<u64>,
+    pub ttft_ms: Option<u64>,
+    pub stop_reason: Option<String>,
+}
+
+impl TurnMetricsView {
+    fn is_valid(&self) -> bool {
+        if [self.output_tokens, self.total_duration_ms, self.ttft_ms]
+            .into_iter()
+            .flatten()
+            .any(|value| value > i64::MAX as u64)
+        {
+            return false;
+        }
+        if matches!(
+            (self.total_duration_ms, self.ttft_ms),
+            (Some(total), Some(ttft)) if ttft > total
+        ) {
+            return false;
+        }
+        self.stop_reason.as_deref().is_none_or(|reason| {
+            !reason.trim().is_empty() && reason.len() <= 128 && !reason.contains('\0')
+        })
+    }
 }
 
 struct TurnStreamState<'a> {
@@ -179,10 +214,12 @@ struct DeltaEvent {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TerminalEvent {
     turn_id: String,
     state: String,
     error_code: Option<String>,
+    metrics: TurnMetricsView,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -356,7 +393,11 @@ impl LiveControlClient {
             path.push_str("&after=");
             path.push_str(after);
         }
-        self.json_get(&path)
+        let page: TurnPageView = self.json_get(&path)?;
+        if page.turns.iter().any(|turn| !turn.metrics.is_valid()) {
+            return Err(ClientError::Transport("invalid turn metrics".into()));
+        }
+        Ok(page)
     }
 
     pub fn message_summaries(
@@ -991,14 +1032,34 @@ fn parse_turn_event(name: &str, data: &str) -> Result<TurnStreamEvent, ClientErr
                     "terminal event state mismatch".into(),
                 ));
             }
+            if !value.metrics.is_valid() {
+                return Err(ClientError::Transport("invalid terminal metrics".into()));
+            }
+            let valid_error = match value.state.as_str() {
+                "completed" | "cancelled" => value.error_code.is_none(),
+                "failed" => value.error_code.as_deref().is_some_and(valid_error_code),
+                _ => false,
+            };
+            if !valid_error {
+                return Err(ClientError::Transport("invalid terminal error code".into()));
+            }
             Ok(TurnStreamEvent::Terminal {
                 turn_id: value.turn_id,
                 state: value.state,
                 error_code: value.error_code,
+                metrics: value.metrics,
             })
         }
         _ => Err(ClientError::Transport("unknown turn stream event".into())),
     }
+}
+
+fn valid_error_code(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
 fn read_response(stream: &mut TcpStream, max_body: usize) -> std::io::Result<HttpResponse> {
@@ -1349,7 +1410,7 @@ mod tests {
         let turn_id = "11111111111111111111111111111111";
         let message_id = "22222222222222222222222222222222";
         let turns = format!(
-            r#"{{"turns":[{{"id":"{turn_id}","chat_id":"{id}","ordinal":1,"state":"completed","provenance":{{"model_alias":"loxa","recipe_id":"recipe","engine_name":null,"engine_version":null}},"error_code":null,"created_at_ms":1,"updated_at_ms":2}}],"next_after":null}}"#
+            r#"{{"turns":[{{"id":"{turn_id}","chat_id":"{id}","ordinal":1,"state":"completed","provenance":{{"model_alias":"loxa","recipe_id":"recipe","engine_name":null,"engine_version":null}},"error_code":null,"metrics":{{"output_tokens":17,"total_duration_ms":950,"ttft_ms":75,"stop_reason":"stop"}},"created_at_ms":1,"updated_at_ms":2}}],"next_after":null}}"#
         );
         let summaries = format!(
             r#"{{"messages":[{{"id":"{message_id}","turn_id":"{turn_id}","role":"assistant","content_bytes":5,"created_at_ms":1,"updated_at_ms":2}}]}}"#
@@ -1379,7 +1440,9 @@ mod tests {
         assert_eq!(client.create_chat().unwrap().title, "New chat");
         assert_eq!(client.chats(30, None).unwrap().chats.len(), 1);
         assert_eq!(client.chat(id).unwrap().title, "New chat");
-        assert_eq!(client.turns(id, 30, None).unwrap().turns.len(), 1);
+        let turns = client.turns(id, 30, None).unwrap();
+        assert_eq!(turns.turns.len(), 1);
+        assert_eq!(turns.turns[0].metrics.output_tokens, Some(17));
         assert_eq!(
             client
                 .message_summaries(id, turn_id)
@@ -1451,7 +1514,7 @@ mod tests {
                 let authenticated = read_request(&mut socket);
                 assert!(authenticated.starts_with(&format!("POST /loxa/v1/chats/{id}/turns ")));
                 let events = format!(
-                    "event: turn.started\ndata: {{\"chat_id\":\"{id}\",\"turn_id\":\"{turn_id}\",\"state\":\"streaming\",\"omitted_turns\":0}}\n\nevent: turn.delta\ndata: {{\"turn_id\":\"{turn_id}\",\"content\":\"hello\"}}\n\nevent: turn.completed\ndata: {{\"turn_id\":\"{turn_id}\",\"state\":\"completed\",\"error_code\":null}}\n\n"
+                    "event: turn.started\ndata: {{\"chat_id\":\"{id}\",\"turn_id\":\"{turn_id}\",\"state\":\"streaming\",\"omitted_turns\":0}}\n\nevent: turn.delta\ndata: {{\"turn_id\":\"{turn_id}\",\"content\":\"hello\"}}\n\nevent: turn.completed\ndata: {{\"turn_id\":\"{turn_id}\",\"state\":\"completed\",\"error_code\":null,\"metrics\":{{\"output_tokens\":17,\"total_duration_ms\":950,\"ttft_ms\":75,\"stop_reason\":\"stop\"}}}}\n\n"
                 );
                 write!(
                     socket,
@@ -1485,6 +1548,11 @@ mod tests {
         assert!(
             matches!(terminal, TurnStreamEvent::Terminal { ref state, .. } if state == "completed")
         );
+        let TurnStreamEvent::Terminal { metrics, .. } = terminal else {
+            unreachable!();
+        };
+        assert_eq!(metrics.output_tokens, Some(17));
+        assert_eq!(metrics.stop_reason.as_deref(), Some("stop"));
     }
 
     #[test]
@@ -1519,6 +1587,7 @@ mod tests {
                 turn_id: other.into(),
                 state: "completed".into(),
                 error_code: None,
+                metrics: TurnMetricsView::default(),
             })
             .is_err());
 
@@ -1530,6 +1599,74 @@ mod tests {
                 omitted_turns: 0,
             })
             .is_err());
+    }
+
+    #[test]
+    fn terminal_metrics_reject_contradictory_or_unbounded_values() {
+        let turn = "11111111111111111111111111111111";
+        let contradictory = format!(
+            r#"{{"turn_id":"{turn}","state":"completed","error_code":null,"metrics":{{"output_tokens":1,"total_duration_ms":10,"ttft_ms":11,"stop_reason":"stop"}}}}"#
+        );
+        assert!(parse_turn_event("turn.completed", &contradictory).is_err());
+
+        let unbounded = format!(
+            r#"{{"turn_id":"{turn}","state":"completed","error_code":null,"metrics":{{"output_tokens":null,"total_duration_ms":null,"ttft_ms":null,"stop_reason":"{}"}}}}"#,
+            "x".repeat(129)
+        );
+        assert!(parse_turn_event("turn.completed", &unbounded).is_err());
+
+        let oversized = format!(
+            r#"{{"turn_id":"{turn}","state":"completed","error_code":null,"metrics":{{"output_tokens":{},"total_duration_ms":null,"ttft_ms":null,"stop_reason":null}}}}"#,
+            i64::MAX as u64 + 1
+        );
+        assert!(parse_turn_event("turn.completed", &oversized).is_err());
+
+        let unknown = format!(
+            r#"{{"turn_id":"{turn}","state":"completed","error_code":null,"metrics":{{"output_tokens":null,"total_duration_ms":null,"ttft_ms":null,"stop_reason":null}},"extra":true}}"#
+        );
+        assert!(parse_turn_event("turn.completed", &unknown).is_err());
+
+        let completed_error = format!(
+            r#"{{"turn_id":"{turn}","state":"completed","error_code":"generation_failed","metrics":{{"output_tokens":null,"total_duration_ms":null,"ttft_ms":null,"stop_reason":null}}}}"#
+        );
+        assert!(parse_turn_event("turn.completed", &completed_error).is_err());
+        let failed_without_error = format!(
+            r#"{{"turn_id":"{turn}","state":"failed","error_code":null,"metrics":{{"output_tokens":null,"total_duration_ms":null,"ttft_ms":null,"stop_reason":null}}}}"#
+        );
+        assert!(parse_turn_event("turn.failed", &failed_without_error).is_err());
+        let failed_with_invalid_error = format!(
+            r#"{{"turn_id":"{turn}","state":"failed","error_code":"Invalid Error","metrics":{{"output_tokens":null,"total_duration_ms":null,"ttft_ms":null,"stop_reason":null}}}}"#
+        );
+        assert!(parse_turn_event("turn.failed", &failed_with_invalid_error).is_err());
+    }
+
+    #[test]
+    fn turn_list_dtos_reject_unknown_fields() {
+        let turn = "11111111111111111111111111111111";
+        let chat = "0123456789abcdef0123456789abcdef";
+        let page = |turn_extra: &str, provenance_extra: &str, page_extra: &str| {
+            format!(
+                r#"{{"turns":[{{"id":"{turn}","chat_id":"{chat}","ordinal":0,"state":"completed","provenance":{{"model_alias":"loxa","recipe_id":"recipe","engine_name":null,"engine_version":null{provenance_extra}}},"error_code":null,"metrics":{{"output_tokens":null,"total_duration_ms":null,"ttft_ms":null,"stop_reason":null}},"created_at_ms":1,"updated_at_ms":2{turn_extra}}}],"next_after":null{page_extra}}}"#
+            )
+        };
+        assert!(serde_json::from_str::<TurnPageView>(&page(",\"extra\":true", "", "")).is_err());
+        assert!(serde_json::from_str::<TurnPageView>(&page("", ",\"extra\":true", "")).is_err());
+        assert!(serde_json::from_str::<TurnPageView>(&page("", "", ",\"extra\":true")).is_err());
+    }
+
+    #[test]
+    fn turns_rejects_contradictory_metrics_after_decoding() {
+        let (_dir, token) = token();
+        let chat = "0123456789abcdef0123456789abcdef";
+        let turn = "11111111111111111111111111111111";
+        let page = format!(
+            r#"{{"turns":[{{"id":"{turn}","chat_id":"{chat}","ordinal":0,"state":"completed","provenance":{{"model_alias":"loxa","recipe_id":"recipe","engine_name":null,"engine_version":null}},"error_code":null,"metrics":{{"output_tokens":1,"total_duration_ms":10,"ttft_ms":11,"stop_reason":"stop"}},"created_at_ms":1,"updated_at_ms":2}}],"next_after":null}}"#
+        );
+        let (address, _seen, worker) = serve(token.clone(), vec!["__PROOF__".into(), page]);
+        let client =
+            LiveControlClient::connect(address, token, "runtime", Duration::from_secs(1)).unwrap();
+        assert!(client.turns(chat, 30, None).is_err());
+        worker.join().unwrap();
     }
 
     #[test]

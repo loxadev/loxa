@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { streamChat, type StreamCallbacks, type StreamTerminal } from "./streamChat";
 
+const emptyMetrics = { outputTokens: null, totalDurationMs: null, ttftMs: null, stopReason: null };
 const encoder = new TextEncoder();
 const chunk = (text: string) => encoder.encode(text);
 const delta = (text: string) => `data: ${JSON.stringify({ choices: [{ delta: { content: text } }] })}\n\n`;
@@ -50,7 +51,11 @@ describe("streamChat", () => {
 
     const result = await streamChat("http://node", {}, observed.value, undefined, fetch, 1).finished;
 
-    expect(result).toEqual({ kind: "error", message: "Timed out waiting for the Loxa node to begin responding." });
+    expect(result).toEqual({
+      kind: "error",
+      message: "Timed out waiting for the Loxa node to begin responding.",
+      metrics: emptyMetrics,
+    });
     expect(requestSignal?.aborted).toBe(true);
     expect(observed.terminals).toEqual([result]);
   });
@@ -74,8 +79,8 @@ describe("streamChat", () => {
       },
     } as Response);
 
-    await expect(handle.finished).resolves.toEqual({ kind: "cancelled" });
-    expect(observed.terminals).toEqual([{ kind: "cancelled" }]);
+    await expect(handle.finished).resolves.toEqual({ kind: "cancelled", metrics: emptyMetrics });
+    expect(observed.terminals).toEqual([{ kind: "cancelled", metrics: emptyMetrics }]);
   });
   it("posts the stable streaming request and emits deltas then one completion", async () => {
     const seen: { url?: string; init?: RequestInit } = {};
@@ -94,9 +99,9 @@ describe("streamChat", () => {
       fetch,
     );
 
-    await expect(handle.finished).resolves.toEqual({ kind: "completed" });
+    await expect(handle.finished).resolves.toEqual({ kind: "completed", metrics: emptyMetrics });
     expect(observed.deltas).toEqual(["hel", "lo"]);
-    expect(observed.terminals).toEqual([{ kind: "completed" }]);
+    expect(observed.terminals).toEqual([{ kind: "completed", metrics: emptyMetrics }]);
     expect(seen.url).toBe("http://127.0.0.1:31000/v1/chat/completions");
     expect(JSON.parse(String(seen.init?.body))).toMatchObject({ model: "loxa", stream: true });
   });
@@ -109,7 +114,7 @@ describe("streamChat", () => {
     await streamChat("http://node", {}, observed.value, undefined, fetch).finished;
 
     expect(observed.deltas).toEqual(["🙂 café"]);
-    expect(observed.terminals).toEqual([{ kind: "completed" }]);
+    expect(observed.terminals).toEqual([{ kind: "completed", metrics: emptyMetrics }]);
   });
 
   it("ignores comments and empty OpenAI deltas", async () => {
@@ -124,7 +129,7 @@ describe("streamChat", () => {
 
     await streamChat("http://node", {}, observed.value, undefined, fetch).finished;
     expect(observed.deltas).toEqual([]);
-    expect(observed.terminals).toEqual([{ kind: "completed" }]);
+    expect(observed.terminals).toEqual([{ kind: "completed", metrics: emptyMetrics }]);
   });
 
   it.each([
@@ -155,7 +160,7 @@ describe("streamChat", () => {
 
     await streamChat("http://node", {}, observed.value, undefined, fetch).finished;
     expect(observed.deltas).toEqual(["before"]);
-    expect(observed.terminals).toEqual([{ kind: "completed" }]);
+    expect(observed.terminals).toEqual([{ kind: "completed", metrics: emptyMetrics }]);
     expect(cancel).toHaveBeenCalledOnce();
   });
 
@@ -181,11 +186,12 @@ describe("streamChat", () => {
 
     await expect(streamChat("http://node", {}, observed.value, undefined, fetch).finished).resolves.toEqual({
       kind: "completed",
+      metrics: emptyMetrics,
     });
     expect(reader.read).toHaveBeenCalledOnce();
     expect(cancel).toHaveBeenCalledOnce();
     expect(reader.releaseLock).toHaveBeenCalledOnce();
-    expect(observed.terminals).toEqual([{ kind: "completed" }]);
+    expect(observed.terminals).toEqual([{ kind: "completed", metrics: emptyMetrics }]);
   });
 
   it("stops callbacks immediately when onDelta disposes a multi-choice event", async () => {
@@ -210,7 +216,7 @@ describe("streamChat", () => {
       fetch,
     );
 
-    await expect(handle.finished).resolves.toEqual({ kind: "cancelled" });
+    await expect(handle.finished).resolves.toEqual({ kind: "cancelled", metrics: emptyMetrics });
     expect(deltas).toEqual(["first"]);
     expect(terminals).toEqual([]);
     expect(cancel).toHaveBeenCalledOnce();
@@ -254,7 +260,7 @@ describe("streamChat", () => {
     );
 
     const result = await streamChat("http://node", {}, observed.value, undefined, fetch).finished;
-    expect(result).toEqual({ kind: "error", message: "engine unavailable" });
+    expect(result).toEqual({ kind: "error", message: "engine unavailable", metrics: emptyMetrics });
     expect(observed.terminals).toEqual([result]);
   });
 
@@ -264,6 +270,7 @@ describe("streamChat", () => {
     await expect(streamChat("http://node", {}, observed.value, undefined, fetch).finished).resolves.toEqual({
       kind: "error",
       message: "The Loxa node returned HTTP 502.",
+      metrics: emptyMetrics,
     });
   });
 
@@ -275,7 +282,11 @@ describe("streamChat", () => {
 
     const result = await streamChat("http://node", {}, observed.value, undefined, fetch).finished;
 
-    expect(result).toEqual({ kind: "error", message: "The Loxa node returned a chat response larger than 2 MiB." });
+    expect(result).toEqual({
+      kind: "error",
+      message: "The Loxa node returned a chat response larger than 2 MiB.",
+      metrics: emptyMetrics,
+    });
     expect(observed.terminals).toEqual([result]);
     expect(cancel).toHaveBeenCalledOnce();
   });
@@ -290,7 +301,7 @@ describe("streamChat", () => {
 
     const result = await streamChat("http://node", {}, observed.value, undefined, fetch).finished;
 
-    expect(result).toEqual({ kind: "error", message: "The Loxa node returned HTTP 500." });
+    expect(result).toEqual({ kind: "error", message: "The Loxa node returned HTTP 500.", metrics: emptyMetrics });
     expect(cancel).toHaveBeenCalledOnce();
   });
 
@@ -312,7 +323,11 @@ describe("streamChat", () => {
     const observed = callbacks();
 
     const result = await streamChat("http://node", {}, observed.value, undefined, fetch).finished;
-    expect(result).toEqual({ kind: "error", message: "The chat stream failed while reading." });
+    expect(result).toEqual({
+      kind: "error",
+      message: "The chat stream failed while reading.",
+      metrics: emptyMetrics,
+    });
     expect(observed.terminals).toEqual([result]);
     expect(releaseLock).toHaveBeenCalledOnce();
   });
@@ -341,9 +356,9 @@ describe("streamChat", () => {
     caller.abort();
     releaseRead();
 
-    await expect(handle.finished).resolves.toEqual({ kind: "cancelled" });
+    await expect(handle.finished).resolves.toEqual({ kind: "cancelled", metrics: emptyMetrics });
     expect(cancel).toHaveBeenCalledOnce();
-    expect(observed.terminals).toEqual([{ kind: "cancelled" }]);
+    expect(observed.terminals).toEqual([{ kind: "cancelled", metrics: emptyMetrics }]);
   });
 
   it("dispose aborts downstream work and suppresses all later callbacks", async () => {
@@ -369,7 +384,7 @@ describe("streamChat", () => {
     handle.dispose();
     releaseRead();
 
-    await expect(handle.finished).resolves.toEqual({ kind: "cancelled" });
+    await expect(handle.finished).resolves.toEqual({ kind: "cancelled", metrics: emptyMetrics });
     expect(cancel).toHaveBeenCalledOnce();
     expect(reader.releaseLock).toHaveBeenCalledOnce();
     expect(observed.deltas).toEqual([]);
@@ -392,7 +407,7 @@ describe("streamChat", () => {
     handle.dispose();
     resolveFetch({ ok: true, status: 200, body: { getReader: () => reader } } as unknown as Response);
 
-    await expect(handle.finished).resolves.toEqual({ kind: "cancelled" });
+    await expect(handle.finished).resolves.toEqual({ kind: "cancelled", metrics: emptyMetrics });
     expect(reader.read).not.toHaveBeenCalled();
     expect(cancel).toHaveBeenCalledOnce();
     expect(reader.releaseLock).toHaveBeenCalledOnce();
@@ -415,8 +430,8 @@ describe("streamChat", () => {
     caller.abort();
     handle.dispose();
 
-    await expect(handle.finished).resolves.toEqual({ kind: "cancelled" });
-    expect(observed.terminals).toEqual([{ kind: "cancelled" }]);
+    await expect(handle.finished).resolves.toEqual({ kind: "cancelled", metrics: emptyMetrics });
+    expect(observed.terminals).toEqual([{ kind: "cancelled", metrics: emptyMetrics }]);
   });
 
   it("handles an already-aborted caller without fetching", async () => {
@@ -427,8 +442,9 @@ describe("streamChat", () => {
 
     await expect(streamChat("http://node", {}, observed.value, caller.signal, fetch).finished).resolves.toEqual({
       kind: "cancelled",
+      metrics: emptyMetrics,
     });
     expect(fetch).not.toHaveBeenCalled();
-    expect(observed.terminals).toEqual([{ kind: "cancelled" }]);
+    expect(observed.terminals).toEqual([{ kind: "cancelled", metrics: emptyMetrics }]);
   });
 });

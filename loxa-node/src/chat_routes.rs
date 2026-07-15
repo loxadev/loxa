@@ -11,9 +11,10 @@ use futures_util::StreamExt;
 use loxa_core::{
     chat_history::{
         ChatCursor, ChatId, HistoryError, MessageContent, MessageId, MessageRole, Title,
-        TurnCursor, TurnId, TurnProvenance, TurnState, LIST_DEFAULT_LIMIT, LIST_MAX_LIMIT,
+        TurnCursor, TurnId, TurnMetrics, TurnProvenance, TurnState, LIST_DEFAULT_LIMIT,
+        LIST_MAX_LIMIT,
     },
-    control::auth::{AuthPolicy, ControlToken},
+    control::auth::{desktop_origins, is_desktop_origin, AuthPolicy, ControlToken},
     gateway::{GatewayState, GenerationOutput},
 };
 use serde::Deserialize;
@@ -62,10 +63,7 @@ pub struct ChatRoutesState {
 impl ChatRoutesState {
     pub fn new(token: ControlToken, history: ChatHistory, gateway: GatewayState) -> Self {
         Self {
-            policy: Arc::new(AuthPolicy::new(
-                token,
-                ["tauri://localhost", "http://127.0.0.1:1420"],
-            )),
+            policy: Arc::new(AuthPolicy::new(token, desktop_origins())),
             history,
             gateway,
             active: Arc::new(ActiveTurnRegistry::default()),
@@ -93,7 +91,7 @@ fn request_origin(headers: &HeaderMap) -> Result<Option<String>, StatusCode> {
         return Ok(None);
     };
     let origin = value.to_str().map_err(|_| StatusCode::FORBIDDEN)?;
-    if matches!(origin, "tauri://localhost" | "http://127.0.0.1:1420") {
+    if is_desktop_origin(origin) {
         Ok(Some(origin.to_owned()))
     } else {
         Err(StatusCode::FORBIDDEN)
@@ -602,7 +600,11 @@ fn sse_event(name: &str, value: serde_json::Value) -> Bytes {
 
 #[derive(Debug, PartialEq, Eq)]
 enum UpstreamEvent {
-    Delta(Option<String>),
+    Chunk {
+        delta: Option<String>,
+        finish_reason: Option<String>,
+        output_tokens: Option<u64>,
+    },
     Done,
     Ignored,
 }
@@ -634,12 +636,60 @@ fn parse_upstream_event(bytes: &[u8]) -> Result<UpstreamEvent, UpstreamSseError>
     }
     let value: serde_json::Value =
         serde_json::from_str(payload).map_err(|_| UpstreamSseError::Malformed)?;
-    let delta = match value.pointer("/choices/0/delta/content") {
+    let root = value.as_object().ok_or(UpstreamSseError::Malformed)?;
+    let choices = root
+        .get("choices")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(UpstreamSseError::Malformed)?;
+    if choices.len() > 1 {
+        return Err(UpstreamSseError::Malformed);
+    }
+    let choice = choices
+        .first()
+        .map(|choice| choice.as_object().ok_or(UpstreamSseError::Malformed))
+        .transpose()?;
+    let delta = match choice.and_then(|choice| choice.get("delta")) {
         None | Some(serde_json::Value::Null) => None,
-        Some(serde_json::Value::String(content)) => Some(content.clone()),
+        Some(serde_json::Value::Object(delta)) => match delta.get("content") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(content)) => Some(content.clone()),
+            Some(_) => return Err(UpstreamSseError::Malformed),
+        },
         Some(_) => return Err(UpstreamSseError::Malformed),
     };
-    Ok(UpstreamEvent::Delta(delta))
+    let finish_reason = match choice.and_then(|choice| choice.get("finish_reason")) {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(reason))
+            if !reason.trim().is_empty() && reason.len() <= 128 && !reason.contains('\0') =>
+        {
+            Some(reason.clone())
+        }
+        Some(_) => return Err(UpstreamSseError::Malformed),
+    };
+    let output_tokens = match root.get("usage") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Object(usage)) => {
+            match usage
+                .get("completion_tokens")
+                .and_then(serde_json::Value::as_u64)
+            {
+                Some(tokens) if tokens <= i64::MAX as u64 => Some(tokens),
+                _ => return Err(UpstreamSseError::Malformed),
+            }
+        }
+        Some(_) => return Err(UpstreamSseError::Malformed),
+    };
+    Ok(UpstreamEvent::Chunk {
+        delta,
+        finish_reason,
+        output_tokens,
+    })
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis())
+        .unwrap_or(u64::MAX)
+        .min(i64::MAX as u64)
 }
 
 #[derive(Clone, Debug)]
@@ -841,10 +891,12 @@ async fn persistent_turn(
                 return error_response(error, origin.as_deref());
             }
         };
-    let prepared = match state
-        .gateway
-        .prepare_generation(json!({"model":"loxa","stream":true,"messages":messages}))
-    {
+    let prepared = match state.gateway.prepare_generation(json!({
+        "model":"loxa",
+        "stream":true,
+        "stream_options":{"include_usage":true},
+        "messages":messages
+    })) {
         Ok(value) => value,
         Err(_) => {
             release_starting(&state, &chat);
@@ -907,7 +959,12 @@ async fn persistent_turn(
         let mut error_code: Option<String>;
         let mut last_checkpoint = Instant::now();
         let mut checkpoint_bytes = 0usize;
+        let mut dispatch_started = None;
+        let mut ttft_ms = None;
+        let mut output_tokens = None;
+        let mut stop_reason = None;
         if receiver_alive {
+            dispatch_started = Some(Instant::now());
             match tokio::select! { value = prepared.execute() => Some(value), _ = cancelled.changed() => None }
             {
                 Some(Ok(GenerationOutput::Stream(mut stream))) => {
@@ -922,14 +979,40 @@ async fn persistent_turn(
                                     saw_done = true;
                                     break;
                                 }
-                                Ok(UpstreamEvent::Delta(None)) => continue,
                                 Ok(UpstreamEvent::Ignored) => continue,
                                 Err(UpstreamSseError::Malformed) => {
                                     terminal = TurnState::Failed;
                                     error_code = Some("malformed_upstream_event".into());
                                     break;
                                 }
-                                Ok(UpstreamEvent::Delta(Some(delta))) => {
+                                Ok(UpstreamEvent::Chunk {
+                                    delta,
+                                    finish_reason,
+                                    output_tokens: chunk_output_tokens,
+                                }) => {
+                                    if let Some(value) = finish_reason {
+                                        if stop_reason.as_ref().is_some_and(|known| known != &value)
+                                        {
+                                            terminal = TurnState::Failed;
+                                            error_code =
+                                                Some("conflicting_upstream_metrics".into());
+                                            break;
+                                        }
+                                        stop_reason = Some(value);
+                                    }
+                                    if let Some(value) = chunk_output_tokens {
+                                        if output_tokens.is_some_and(|known| known != value) {
+                                            terminal = TurnState::Failed;
+                                            error_code =
+                                                Some("conflicting_upstream_metrics".into());
+                                            break;
+                                        }
+                                        output_tokens = Some(value);
+                                    }
+                                    let Some(delta) = delta else { continue };
+                                    if !delta.is_empty() && ttft_ms.is_none() {
+                                        ttft_ms = dispatch_started.map(elapsed_ms);
+                                    }
                                     if assistant.len().saturating_add(delta.len())
                                         > loxa_core::chat_history::ASSISTANT_CONTENT_MAX_BYTES
                                     {
@@ -1007,6 +1090,13 @@ async fn persistent_turn(
         }
         let content = MessageContent::assistant(&assistant)
             .unwrap_or_else(|_| MessageContent::assistant("").expect("empty assistant content"));
+        let metrics = TurnMetrics::new(
+            output_tokens,
+            dispatch_started.map(elapsed_ms),
+            ttft_ms,
+            stop_reason.as_deref(),
+        )
+        .expect("bounded upstream metrics and monotonic local timings");
         let persisted = task_state
             .history
             .finalize(
@@ -1014,6 +1104,7 @@ async fn persistent_turn(
                 terminal,
                 content,
                 error_code.clone(),
+                metrics.clone(),
                 unix_time_ms(),
             )
             .await;
@@ -1032,7 +1123,7 @@ async fn persistent_turn(
                 &mut cancelled,
                 sse_event(
                     event,
-                    json!({"turn_id":turn_id,"state":state_name,"error_code":code}),
+                    json!({"turn_id":turn_id,"state":state_name,"error_code":code,"metrics":metrics}),
                 ),
             )
             .await;
@@ -1379,7 +1470,21 @@ mod tests {
         );
         assert_eq!(
             parse_upstream_event(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"),
-            Ok(UpstreamEvent::Delta(Some("hi".into())))
+            Ok(UpstreamEvent::Chunk {
+                delta: Some("hi".into()),
+                finish_reason: None,
+                output_tokens: None,
+            })
+        );
+        assert_eq!(
+            parse_upstream_event(
+                b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"completion_tokens\":17}}\n\n"
+            ),
+            Ok(UpstreamEvent::Chunk {
+                delta: None,
+                finish_reason: Some("stop".into()),
+                output_tokens: Some(17),
+            })
         );
         assert_eq!(
             parse_upstream_event(b"data: not-json\n\n"),
@@ -1393,6 +1498,123 @@ mod tests {
             parse_upstream_event(b": keepalive\n\n"),
             Ok(UpstreamEvent::Ignored)
         );
+
+        for malformed in [
+            b"data: {\"choices\":[42]}\n\n".as_slice(),
+            b"data: {\"choices\":[{\"delta\":42}]}\n\n".as_slice(),
+            b"data: {\"choices\":[],\"usage\":42}\n\n".as_slice(),
+            b"data: {\"choices\":[],\"usage\":{}}\n\n".as_slice(),
+            b"data: {\"choices\":[],\"usage\":{\"completion_tokens\":\"17\"}}\n\n".as_slice(),
+            b"data: {\"choices\":[],\"usage\":{\"completion_tokens\":null}}\n\n".as_slice(),
+        ] {
+            assert_eq!(
+                parse_upstream_event(malformed),
+                Err(UpstreamSseError::Malformed)
+            );
+        }
+        assert_eq!(
+            parse_upstream_event(b"data: {\"choices\":[],\"usage\":null}\n\n"),
+            Ok(UpstreamEvent::Chunk {
+                delta: None,
+                finish_reason: None,
+                output_tokens: None,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_turn_emits_and_persists_exact_optional_metrics() {
+        let fixture = route_fixture();
+        publish_fake_engine(
+            &fixture,
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"completion_tokens\":17}}\n\ndata: [DONE]\n\n",
+        )
+        .await;
+        let chat = fixture.history.create_chat(1).await.unwrap();
+        let response = reqwest::Client::new()
+            .post(format!("{}/loxa/v1/chats/{}/turns", fixture.base, chat.id))
+            .header(header::AUTHORIZATION, &fixture.bearer)
+            .json(&json!({"model":"loxa","content":"hello"}))
+            .send()
+            .await
+            .unwrap();
+        let body = response.text().await.unwrap();
+        let terminal = body
+            .split("\n\n")
+            .find(|event| event.starts_with("event: turn.completed"))
+            .unwrap();
+        let data: serde_json::Value = serde_json::from_str(
+            terminal
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(data["metrics"]["output_tokens"], 17);
+        assert_eq!(data["metrics"]["stop_reason"], "stop");
+        assert!(data["metrics"]["ttft_ms"].is_u64());
+        assert!(data["metrics"]["total_duration_ms"].is_u64());
+
+        let stored = fixture
+            .history
+            .list_turns(chat.id, LIST_DEFAULT_LIMIT, None)
+            .await
+            .unwrap()
+            .turns
+            .pop()
+            .unwrap();
+        assert_eq!(stored.metrics.output_tokens, Some(17));
+        assert_eq!(stored.metrics.stop_reason.as_deref(), Some("stop"));
+        assert!(stored.metrics.ttft_ms.is_some());
+        assert!(stored.metrics.total_duration_ms.is_some());
+        fixture.shutdown();
+    }
+
+    #[tokio::test]
+    async fn persistent_turn_requests_streamed_usage_from_the_engine() {
+        let fixture = route_fixture();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        let request_tx = Arc::new(Mutex::new(Some(request_tx)));
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(request): Json<serde_json::Value>| {
+                let request_tx = request_tx.clone();
+                async move {
+                    if let Some(sender) = request_tx.lock().unwrap().take() {
+                        let _ = sender.send(request);
+                    }
+                    let mut response = Response::new(Body::from("data: [DONE]\n\n"));
+                    response.headers_mut().insert(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("text/event-stream"),
+                    );
+                    response
+                }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        fixture.gateway.publish(loxa_core::gateway::EngineTarget {
+            base_url: format!("http://{address}"),
+            backend_alias: "backend".into(),
+            engine: "test".into(),
+            engine_version: "1".into(),
+            model_id: "recipe".into(),
+            profile: "test".into(),
+        });
+        let chat = fixture.history.create_chat(1).await.unwrap();
+        let response = reqwest::Client::new()
+            .post(format!("{}/loxa/v1/chats/{}/turns", fixture.base, chat.id))
+            .header(header::AUTHORIZATION, &fixture.bearer)
+            .json(&json!({"model":"loxa","content":"hello"}))
+            .send()
+            .await
+            .unwrap();
+        let _ = response.text().await.unwrap();
+        let request = request_rx.await.unwrap();
+        assert_eq!(request["stream_options"]["include_usage"], true);
+        fixture.shutdown();
     }
 
     #[test]
@@ -1491,6 +1713,7 @@ mod tests {
                 ref turn_id,
                 ref state,
                 error_code: None,
+                ..
             } if turn_id == &started_turn && state == "cancelled"
         ));
         let stored = fixture
@@ -1524,6 +1747,7 @@ mod tests {
                 TurnState::Completed,
                 MessageContent::assistant("kept answer").unwrap(),
                 None,
+                TurnMetrics::default(),
                 3,
             )
             .await
@@ -1543,6 +1767,7 @@ mod tests {
                 TurnState::Cancelled,
                 MessageContent::assistant("excluded answer").unwrap(),
                 None,
+                TurnMetrics::default(),
                 5,
             )
             .await
@@ -1653,6 +1878,7 @@ mod tests {
                 TurnState::Completed,
                 MessageContent::assistant("world").unwrap(),
                 None,
+                TurnMetrics::default(),
                 4,
             )
             .await
@@ -1764,6 +1990,7 @@ mod tests {
                     TurnState::Cancelled,
                     MessageContent::assistant("").unwrap(),
                     None,
+                    TurnMetrics::default(),
                     3,
                 )
                 .await

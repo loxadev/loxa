@@ -6,7 +6,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, options, post};
 use axum::{Json, Router};
-use loxa_core::control::auth::{AuthPolicy, ControlToken};
+use loxa_core::control::auth::{desktop_origins, is_desktop_origin, AuthPolicy, ControlToken};
 use loxa_core::control::contracts::{
     CapabilitiesSnapshot, ControlErrorBody, ModelRequest, NodeIdentityChallenge,
     NodeIdentityProofResponse, NodeSnapshot, NodeStatus, OperationAccepted,
@@ -34,10 +34,7 @@ impl ControlState {
         runtime_identity: String,
         downloads: DownloadControl,
     ) -> Self {
-        let policy = AuthPolicy::new(
-            token.clone(),
-            ["tauri://localhost", "http://127.0.0.1:1420"],
-        );
+        let policy = AuthPolicy::new(token.clone(), desktop_origins());
         Self {
             token,
             policy: Arc::new(policy),
@@ -64,7 +61,7 @@ fn request_origin(headers: &HeaderMap) -> Result<Option<String>, StatusCode> {
         return Ok(None);
     };
     let origin = value.to_str().map_err(|_| StatusCode::FORBIDDEN)?;
-    if matches!(origin, "tauri://localhost" | "http://127.0.0.1:1420") {
+    if is_desktop_origin(origin) {
         Ok(Some(origin.to_owned()))
     } else {
         Err(StatusCode::FORBIDDEN)

@@ -74,6 +74,7 @@ function WorkspaceContents({
       : session.phase === "unloaded"
         ? "No active model"
         : "Model status unavailable";
+  const conversationTitle = history?.conversations.find(({ id }) => id === history.selectedChatId)?.title ?? "New Chat";
 
   return (
     <AppShell
@@ -109,6 +110,7 @@ function WorkspaceContents({
           onModelMutationStart={session.invalidateModelTruth}
           onModelMutationSettled={session.settleModelMutation}
           history={history}
+          conversationTitle={conversationTitle}
           onInteractionLockChange={setChatInteractionLocked}
           onNavigateModels={() => setRoute("models")}
         />

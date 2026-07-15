@@ -224,6 +224,14 @@
   line-height: var(--loxa-type-body-small-line-height);
 }
 
+.responseFooter {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: var(--loxa-space-3);
+  margin-top: var(--loxa-space-1);
+}
+
 .markdownFallback {
   margin: 0;
   color: var(--loxa-muted-foreground);

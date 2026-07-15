@@ -15,6 +15,8 @@ use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::thread;
 
+use crate::control::auth::is_desktop_origin;
+
 pub const MODEL_ALIAS: &str = "loxa";
 const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
 
@@ -213,14 +215,12 @@ struct Model {
     owned_by: &'static str,
 }
 
-const DESKTOP_ORIGINS: [&str; 2] = ["tauri://localhost", "http://127.0.0.1:1420"];
-
 fn request_origin(headers: &HeaderMap) -> Result<Option<String>, StatusCode> {
     let Some(value) = headers.get(header::ORIGIN) else {
         return Ok(None);
     };
     let origin = value.to_str().map_err(|_| StatusCode::FORBIDDEN)?;
-    if DESKTOP_ORIGINS.contains(&origin) {
+    if is_desktop_origin(origin) {
         Ok(Some(origin.to_owned()))
     } else {
         Err(StatusCode::FORBIDDEN)

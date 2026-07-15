@@ -74,7 +74,7 @@ describe("App", () => {
     const user = userEvent.setup();
     render(<App services={services()} />);
 
-    expect(await screen.findByRole("heading", { name: "Chat" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "New Chat" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Chat" })).toHaveAttribute("aria-current", "page");
     expect(screen.queryByRole("navigation", { name: "Chat conversations" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "New chat" })).not.toBeInTheDocument();
@@ -264,36 +264,51 @@ describe("App", () => {
     fireEvent.keyDown(separator, { key: "ArrowLeft" });
     expect(separator).toHaveAttribute("aria-valuenow", "220");
     fireEvent.doubleClick(separator);
-    expect(separator).toHaveAttribute("aria-valuenow", "280");
+    expect(shell.style.getPropertyValue("--loxa-sidebar-width")).toBe("56px");
+    expect(separator).toHaveAttribute("aria-valuetext", "Collapsed");
+    await user.click(screen.getByRole("button", { name: "Expand sidebar" }));
+    expect(shell.style.getPropertyValue("--loxa-sidebar-width")).toBe("220px");
     const setPointerCapture = vi.fn();
     const releasePointerCapture = vi.fn();
     Object.assign(separator, { setPointerCapture, releasePointerCapture, hasPointerCapture: () => true });
     fireEvent.pointerDown(separator, { pointerId: 7, button: 0, clientX: 220 });
     expect(setPointerCapture).toHaveBeenCalledWith(7);
     fireEvent.pointerMove(window, { pointerId: 8, clientX: 700 });
-    expect(separator).toHaveAttribute("aria-valuenow", "280");
+    expect(separator).toHaveAttribute("aria-valuenow", "220");
     fireEvent.pointerMove(window, { pointerId: 7, clientX: 700 });
     expect(separator).toHaveAttribute("aria-valuenow", "420");
     fireEvent.pointerMove(window, { pointerId: 7, clientX: -200 });
-    expect(separator).toHaveAttribute("aria-valuenow", "220");
+    expect(shell.style.getPropertyValue("--loxa-sidebar-width")).toBe("56px");
+    expect(separator).toHaveAttribute("aria-valuetext", "Collapsed");
     fireEvent.pointerCancel(window, { pointerId: 7 });
     expect(releasePointerCapture).toHaveBeenCalledWith(7);
 
-    await user.click(screen.getByRole("button", { name: "Collapse sidebar" }));
     expect(shell.style.getPropertyValue("--loxa-sidebar-width")).toBe("56px");
-    expect(
-      screen.queryByRole("separator", { name: "Resize navigation and conversation rail" }),
-    ).not.toBeInTheDocument();
+    const collapsedSeparator = screen.getByRole("separator", {
+      name: "Resize navigation and conversation rail",
+    });
+    expect(collapsedSeparator).toHaveAttribute("aria-valuetext", "Collapsed");
     for (const name of ["Expand sidebar", "Chat", "Models", "Node", "Settings", "Node online. No active model"]) {
       expect(screen.getByRole(name === "Expand sidebar" ? "button" : "link", { name })).toBeVisible();
     }
     expect(document.querySelectorAll(".app-sidebar svg:not([aria-hidden='true'])")).toHaveLength(0);
 
+    fireEvent.pointerDown(collapsedSeparator, { pointerId: 9, button: 0, clientX: 56 });
+    fireEvent.pointerMove(window, { pointerId: 9, clientX: 120 });
+    expect(shell.style.getPropertyValue("--loxa-sidebar-width")).toBe("420px");
+    fireEvent.pointerUp(window, { pointerId: 9 });
+
+    await user.click(screen.getByRole("button", { name: "Collapse sidebar" }));
+    fireEvent.doubleClick(screen.getByRole("separator", { name: "Resize navigation and conversation rail" }));
+    expect(shell.style.getPropertyValue("--loxa-sidebar-width")).toBe("420px");
+
+    await user.click(screen.getByRole("button", { name: "Collapse sidebar" }));
+
     view.unmount();
     render(<App services={api} />);
     expect(screen.getByTestId("app-shell").style.getPropertyValue("--loxa-sidebar-width")).toBe("56px");
     await user.click(screen.getByRole("button", { name: "Expand sidebar" }));
-    expect(screen.getByTestId("app-shell").style.getPropertyValue("--loxa-sidebar-width")).toBe("220px");
+    expect(screen.getByTestId("app-shell").style.getPropertyValue("--loxa-sidebar-width")).toBe("420px");
 
     expect(removeListener).toHaveBeenCalledWith("pointermove", expect.any(Function));
     expect(removeListener).toHaveBeenCalledWith("pointerup", expect.any(Function));
@@ -350,7 +365,7 @@ describe("App", () => {
     render(<App services={api} />);
     await user.click(await screen.findByRole("button", { name: "Open Selected chat" }));
 
-    expect(await screen.findByRole("heading", { name: "Chat" })).toBeVisible();
+    expect(await screen.findByRole("heading", { name: "Selected chat" })).toBeVisible();
     expect(await screen.findByText("Restored once")).toBeVisible();
     expect(api.listTurns).toHaveBeenCalledTimes(1);
     await user.click(screen.getByRole("button", { name: "Open Selected chat" }));
@@ -430,7 +445,7 @@ describe("App", () => {
     render(<App services={api} />);
     await screen.findByText("No conversations yet.");
     await user.click(screen.getByRole("button", { name: "New chat" }));
-    expect(await screen.findByRole("heading", { name: "Chat" })).toBeVisible();
+    expect(await screen.findByRole("heading", { name: "Created truth" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Open Created truth" })).toHaveAttribute("aria-current", "page");
 
     await user.click(screen.getByRole("link", { name: "Models" }));
@@ -987,7 +1002,7 @@ describe("App", () => {
     const canvas = container.querySelector(".workspace-canvas");
     const frame = container.querySelector(".workspace-frame");
     expect(canvas).toContainElement(frame as HTMLElement);
-    expect(frame).toContainElement(screen.getByRole("heading", { name: "Chat" }));
+    expect(frame).toContainElement(screen.getByRole("heading", { name: "New Chat" }));
 
     for (const route of ["Models", "Node", "Settings"] as const) {
       await user.click(screen.getByRole("link", { name: route }));
