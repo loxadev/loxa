@@ -25,6 +25,8 @@ pub(super) struct QueueProgress {
     admission_open: Mutex<bool>,
     #[cfg(test)]
     admission_pause: Mutex<Option<(Arc<Barrier>, Arc<Barrier>)>>,
+    #[cfg(test)]
+    shutdown_attempt: Mutex<Option<mpsc::SyncSender<()>>>,
 }
 
 impl QueueProgress {
@@ -38,6 +40,15 @@ impl QueueProgress {
     }
 
     pub(super) fn begin_shutdown(&self) {
+        #[cfg(test)]
+        if let Some(attempt) = self
+            .shutdown_attempt
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            let _ = attempt.send(());
+        }
         *self
             .admission_open
             .lock()
@@ -51,6 +62,14 @@ impl QueueProgress {
             .admission_pause
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((reached, release));
+    }
+
+    #[cfg(test)]
+    pub(super) fn signal_shutdown_attempt_for_test(&self, attempt: mpsc::SyncSender<()>) {
+        *self
+            .shutdown_attempt
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(attempt);
     }
 
     #[cfg(test)]
@@ -187,6 +206,8 @@ pub(super) fn non_blocking_writer_with_health<W: Write + Send + 'static>(
         admission_open: Mutex::new(true),
         #[cfg(test)]
         admission_pause: Mutex::new(None),
+        #[cfg(test)]
+        shutdown_attempt: Mutex::new(None),
     });
     progress.observe_drops();
     (

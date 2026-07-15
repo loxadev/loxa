@@ -637,6 +637,8 @@ fn shutdown_waits_for_a_previously_open_admission_before_declaring_drain() {
     admission_reached.wait();
 
     let (guard_started, guard_observed) = mpsc::sync_channel(1);
+    let (shutdown_attempting_tx, shutdown_attempting_rx) = mpsc::sync_channel::<()>(1);
+    progress.signal_shutdown_attempt_for_test(shutdown_attempting_tx);
     let bootstrap = DiagnosticsBootstrap {
         guard: Some(ShutdownGuard::test_action(move || {
             let _ = guard_started.send(());
@@ -648,6 +650,9 @@ fn shutdown_waits_for_a_previously_open_admission_before_declaring_drain() {
     let shutdown_started = Instant::now();
     let shutdown = std::thread::spawn(move || drop(bootstrap));
 
+    shutdown_attempting_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("shutdown attempts to close queue admission");
     let guard_started_before_admission_completed = guard_observed
         .recv_timeout(Duration::from_millis(50))
         .is_ok();

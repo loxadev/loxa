@@ -1965,6 +1965,7 @@ mod tests {
         let second_log = logs_dir.join("second-model-9001-2.log");
         let (first_entered_tx, first_entered_rx) = mpsc::channel();
         let (release_first_tx, release_first_rx) = mpsc::channel();
+        let (second_attempting_tx, second_attempting_rx) = mpsc::channel();
         let (second_opened_tx, second_opened_rx) = mpsc::channel();
 
         let first_root = logs_dir.clone();
@@ -1992,6 +1993,9 @@ mod tests {
         let second_root = logs_dir.clone();
         let second_path = second_log.clone();
         let second = thread::spawn(move || {
+            second_attempting_tx
+                .send(())
+                .expect("signal second coordination attempt");
             with_child_log_root_coordination(&second_root, || {
                 prune_inactive_child_logs(
                     &second_root,
@@ -2005,6 +2009,9 @@ mod tests {
             })
         });
 
+        second_attempting_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second prune attempts coordination");
         assert!(
             second_opened_rx
                 .recv_timeout(Duration::from_millis(100))
