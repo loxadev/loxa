@@ -109,6 +109,7 @@ fn emit_http_terminal(
     status: Option<u16>,
     result_class: &'static str,
     started: Instant,
+    context: Option<&SafeRequestContext>,
 ) {
     let latency_ms = elapsed_milliseconds(started.elapsed());
     if let Some(status) = status {
@@ -120,6 +121,39 @@ fn emit_http_terminal(
         result_class,
         "server_error" | "body_error" | "service_error"
     );
+    if failed {
+        if let Some(context) = context {
+            if let Some(status) = status {
+                tracing::event!(
+                    target: "loxa_node::http",
+                    parent: span,
+                    Level::WARN,
+                    event_code = "http.request.failed",
+                    component = "http",
+                    request_id = context.request_id.as_str(),
+                    method = context.method.as_str(),
+                    route = context.route.as_str(),
+                    status,
+                    latency_ms,
+                    result_class,
+                );
+            } else {
+                tracing::event!(
+                    target: "loxa_node::http",
+                    parent: span,
+                    Level::WARN,
+                    event_code = "http.request.failed",
+                    component = "http",
+                    request_id = context.request_id.as_str(),
+                    method = context.method.as_str(),
+                    route = context.route.as_str(),
+                    latency_ms,
+                    result_class,
+                );
+            }
+            return;
+        }
+    }
     match (failed, status) {
         (true, Some(status)) => tracing::event!(
             target: "loxa_node::http",
@@ -166,8 +200,32 @@ fn emit_http_terminal(
 struct RequestLifecycleClassifier;
 
 #[derive(Clone)]
+struct SafeRequestContext {
+    request_id: String,
+    method: String,
+    route: String,
+}
+
+impl SafeRequestContext {
+    fn from_request<B>(request: &Request<B>) -> Option<Self> {
+        let request_id = request.extensions().get::<DiagnosticRequestId>()?;
+        let route = request
+            .extensions()
+            .get::<MatchedPath>()
+            .map(MatchedPath::as_str)
+            .unwrap_or("unmatched");
+        Some(Self {
+            request_id: request_id.0.clone(),
+            method: request.method().as_str().to_owned(),
+            route: route.to_owned(),
+        })
+    }
+}
+
+#[derive(Clone)]
 struct ResponseClassifier {
     started: Instant,
+    context: Option<SafeRequestContext>,
 }
 
 #[derive(Clone)]
@@ -175,12 +233,14 @@ struct ResponseEosClassifier {
     started: Instant,
     status: u16,
     result_class: &'static str,
+    context: Option<SafeRequestContext>,
 }
 
 struct HttpTerminal {
     started: Instant,
     status: Option<u16>,
     result_class: &'static str,
+    context: Option<SafeRequestContext>,
 }
 
 // Dropping a body before another frame is polled provides no reliable signal
@@ -192,9 +252,10 @@ impl MakeClassifier for RequestLifecycleClassifier {
     type FailureClass = HttpTerminal;
     type ClassifyEos = ResponseEosClassifier;
 
-    fn make_classifier<B>(&self, _request: &Request<B>) -> Self::Classifier {
+    fn make_classifier<B>(&self, request: &Request<B>) -> Self::Classifier {
         ResponseClassifier {
             started: Instant::now(),
+            context: SafeRequestContext::from_request(request),
         }
     }
 }
@@ -211,6 +272,7 @@ impl ClassifyResponse for ResponseClassifier {
             started: self.started,
             status: response.status().as_u16(),
             result_class: result_class(response.status()),
+            context: self.context,
         })
     }
 
@@ -222,6 +284,7 @@ impl ClassifyResponse for ResponseClassifier {
             started: self.started,
             status: None,
             result_class: "service_error",
+            context: self.context,
         }
     }
 }
@@ -234,6 +297,7 @@ impl ClassifyEos for ResponseEosClassifier {
             started: self.started,
             status: Some(self.status),
             result_class: self.result_class,
+            context: self.context,
         })
     }
 
@@ -245,6 +309,7 @@ impl ClassifyEos for ResponseEosClassifier {
             started: self.started,
             status: Some(self.status),
             result_class: "body_error",
+            context: self.context,
         }
     }
 }
@@ -295,6 +360,7 @@ fn apply_with_source<S: RequestIdSource>(router: Router, source: S) -> Router {
                             terminal.status,
                             terminal.result_class,
                             terminal.started,
+                            terminal.context.as_ref(),
                         );
                     },
                 ),
@@ -687,29 +753,42 @@ mod tests {
     #[tokio::test]
     async fn server_error_remains_visible_when_the_info_request_span_is_disabled() {
         let capture = Capture::default();
-        async {
+        let request_id = async {
             let response = apply(Router::new().route(
                 "/release-failure",
                 get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
             ))
             .oneshot(
                 Request::builder()
-                    .uri("/release-failure")
-                    .body(Body::empty())
+                    .uri("/release-failure?token=SECRET_QUERY")
+                    .header(header::AUTHORIZATION, "Bearer SECRET_AUTH")
+                    .body(Body::from("SECRET_BODY"))
                     .unwrap(),
             )
             .await
             .unwrap();
+            let request_id = response.headers()["x-request-id"]
+                .to_str()
+                .unwrap()
+                .to_owned();
             let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            request_id
         }
         .with_subscriber(capture.warn_subscriber())
         .await;
 
         let captured = capture.text();
+        assert!(is_request_id(&request_id));
         assert_eq!(captured.matches("http.request.failed").count(), 1);
         assert!(captured.contains(" WARN "));
+        assert!(captured.contains(&format!("request_id=\"{request_id}\"")));
+        assert!(captured.contains("method=\"GET\""));
+        assert!(captured.contains("route=\"/release-failure\""));
         assert!(captured.contains("status=500"));
         assert!(captured.contains("result_class=\"server_error\""));
+        for forbidden in ["SECRET_QUERY", "SECRET_AUTH", "SECRET_BODY"] {
+            assert!(!captured.contains(forbidden), "captured {forbidden}");
+        }
     }
 
     #[tokio::test]
@@ -741,7 +820,7 @@ mod tests {
     #[tokio::test]
     async fn response_body_error_emits_one_safe_warn_failure_with_info_span_disabled() {
         let capture = Capture::default();
-        async {
+        let request_id = async {
             let response = apply(Router::new().route(
                 "/body-failure",
                 get(|| async {
@@ -759,9 +838,14 @@ mod tests {
             )
             .await
             .unwrap();
+            let request_id = response.headers()["x-request-id"]
+                .to_str()
+                .unwrap()
+                .to_owned();
             let mut body = response.into_body().into_data_stream();
             assert_eq!(body.next().await.unwrap().unwrap().as_ref(), b"first");
             assert!(body.next().await.unwrap().is_err());
+            request_id
         }
         .with_subscriber(capture.warn_subscriber())
         .await;
@@ -771,7 +855,11 @@ mod tests {
             .lines()
             .find(|line| line.contains("http.request.failed"))
             .expect("body failure diagnostic");
+        assert!(is_request_id(&request_id));
         assert!(failure.contains(" WARN "), "{failure}");
+        assert!(failure.contains(&format!("request_id=\"{request_id}\"")));
+        assert!(failure.contains("method=\"GET\""), "{failure}");
+        assert!(failure.contains("route=\"/body-failure\""), "{failure}");
         assert!(failure.contains("result_class=\"body_error\""), "{failure}");
         assert_eq!(captured.matches("http.request.failed").count(), 1);
         assert_eq!(captured.matches("http.request.completed").count(), 0);
