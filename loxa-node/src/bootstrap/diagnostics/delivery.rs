@@ -34,7 +34,7 @@ struct StderrWarningSink;
 
 impl DropWarningSink for StderrWarningSink {
     fn write_warning(&self, warning: &str) {
-        eprintln!("{warning}");
+        let _ = writeln!(io::stderr().lock(), "{warning}");
     }
 }
 
