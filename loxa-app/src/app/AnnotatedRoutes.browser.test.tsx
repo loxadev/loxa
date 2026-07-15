@@ -97,6 +97,7 @@ test("covers the annotated Nodes, Models, Settings overview, and Runtime routes 
   expect(runtimeTable.element().querySelectorAll("th")).toHaveLength(5);
   expect(runtimeTable.element()).not.toHaveTextContent("Actions");
   expect(runtimeTable.element().querySelector("button, input, select, textarea")).toBeNull();
+  await vi.waitFor(() => expect(runtimeTable.element().parentElement).toHaveAttribute("tabindex", "0"));
   await expect.element(page.getByText("http://127.0.0.1:8080")).toBeVisible();
   await expect.element(page.getByRole("button", { name: "Back to Settings" })).toBeVisible();
 

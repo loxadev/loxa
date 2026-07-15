@@ -3,8 +3,35 @@ import * as React from "react";
 import { cn } from "../../lib/utils";
 
 function Table({ className, ...props }: React.ComponentProps<"table">) {
+  const containerRef = React.useRef<HTMLDivElement>(null);
+  const [overflowing, setOverflowing] = React.useState(false);
+
+  React.useLayoutEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    const updateOverflow = () => setOverflowing(container.scrollWidth > container.clientWidth);
+    updateOverflow();
+
+    if (typeof ResizeObserver === "undefined") {
+      window.addEventListener("resize", updateOverflow);
+      return () => window.removeEventListener("resize", updateOverflow);
+    }
+
+    const observer = new ResizeObserver(updateOverflow);
+    observer.observe(container);
+    const table = container.querySelector("table");
+    if (table) observer.observe(table);
+    return () => observer.disconnect();
+  }, []);
+
   return (
-    <div data-slot="table-container" className="relative w-full overflow-x-auto" tabIndex={0}>
+    <div
+      ref={containerRef}
+      data-slot="table-container"
+      className="relative w-full overflow-x-auto"
+      tabIndex={overflowing ? 0 : undefined}
+    >
       <table data-slot="table" className={cn("w-full caption-bottom text-sm", className)} {...props} />
     </div>
   );

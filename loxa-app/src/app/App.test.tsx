@@ -1151,4 +1151,20 @@ describe("App", () => {
     await waitFor(() => expect(api.readControlToken).toHaveBeenCalledTimes(1));
     expect(api.createControlEventStream).toHaveBeenCalledTimes(1);
   });
+
+  it("keeps the sidebar as the only live-region owner on Runtime during a session transition", async () => {
+    const api = services();
+    api.bootstrap.start = vi.fn(() => new Promise<BootstrapSnapshot>(() => undefined));
+    const user = userEvent.setup();
+    render(<App services={api} />);
+
+    await user.click(screen.getByRole("link", { name: "Settings" }));
+    await user.click(screen.getByRole("button", { name: /Runtime/ }));
+
+    const table = screen.getByRole("table", { name: "Local node inventory" });
+    expect(within(table).getByText("Starting", { selector: '[data-slot="status-badge"]' })).toBeVisible();
+    const liveRegions = document.querySelectorAll('[aria-live="polite"]');
+    expect(liveRegions).toHaveLength(1);
+    expect(liveRegions[0]).toBe(screen.getByRole("link", { name: "Starting node. Model status unavailable" }));
+  });
 });
