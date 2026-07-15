@@ -110,9 +110,6 @@ fn emit_http_terminal(
     result_class: &'static str,
     started: Instant,
 ) {
-    if span.is_disabled() {
-        return;
-    }
     let latency_ms = elapsed_milliseconds(started.elapsed());
     if let Some(status) = status {
         span.record("status", status);
@@ -375,6 +372,15 @@ mod tests {
         fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync {
             tracing_subscriber::fmt()
                 .with_ansi(false)
+                .with_span_events(FmtSpan::FULL)
+                .with_writer(self.clone())
+                .finish()
+        }
+
+        fn warn_subscriber(&self) -> impl tracing::Subscriber + Send + Sync {
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
                 .with_span_events(FmtSpan::FULL)
                 .with_writer(self.clone())
                 .finish()
@@ -679,7 +685,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_body_error_emits_one_safe_warn_failure() {
+    async fn server_error_remains_visible_when_the_info_request_span_is_disabled() {
+        let capture = Capture::default();
+        async {
+            let response = apply(Router::new().route(
+                "/release-failure",
+                get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+            ))
+            .oneshot(
+                Request::builder()
+                    .uri("/release-failure")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        }
+        .with_subscriber(capture.warn_subscriber())
+        .await;
+
+        let captured = capture.text();
+        assert_eq!(captured.matches("http.request.failed").count(), 1);
+        assert!(captured.contains(" WARN "));
+        assert!(captured.contains("status=500"));
+        assert!(captured.contains("result_class=\"server_error\""));
+    }
+
+    #[tokio::test]
+    async fn dropping_an_unfinished_stream_does_not_fabricate_a_terminal_event() {
+        let capture = Capture::default();
+        async {
+            let response = apply(Router::new().route(
+                "/dropped-stream",
+                get(|| async { Sse::new(stream::pending::<Result<Event, Infallible>>()) }),
+            ))
+            .oneshot(
+                Request::builder()
+                    .uri("/dropped-stream")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            drop(response);
+        }
+        .with_subscriber(capture.subscriber())
+        .await;
+
+        let captured = capture.text();
+        assert!(!captured.contains("http.request.completed"));
+        assert!(!captured.contains("http.request.failed"));
+    }
+
+    #[tokio::test]
+    async fn response_body_error_emits_one_safe_warn_failure_with_info_span_disabled() {
         let capture = Capture::default();
         async {
             let response = apply(Router::new().route(
@@ -703,7 +763,7 @@ mod tests {
             assert_eq!(body.next().await.unwrap().unwrap().as_ref(), b"first");
             assert!(body.next().await.unwrap().is_err());
         }
-        .with_subscriber(capture.subscriber())
+        .with_subscriber(capture.warn_subscriber())
         .await;
 
         let captured = capture.text();
