@@ -271,13 +271,6 @@ impl SafeJsonFormatter {
             count_health: true,
         }
     }
-
-    pub(super) fn uncounted(health: DiagnosticsHealth) -> Self {
-        Self {
-            health,
-            count_health: false,
-        }
-    }
 }
 
 impl<S> FormatEvent<S, SafeJsonFields> for SafeJsonFormatter
@@ -355,6 +348,95 @@ where
 
         debug_assert!(record.len() <= MAX_RECORD_BYTES);
         writer.write_str(&record)
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct SafeHumanFormatter {
+    health: DiagnosticsHealth,
+    count_health: bool,
+}
+
+impl SafeHumanFormatter {
+    pub(super) fn new(health: DiagnosticsHealth) -> Self {
+        health.support_records_truncated_counter();
+        health.support_forbidden_field_rejections_counter();
+        Self {
+            health,
+            count_health: true,
+        }
+    }
+
+    pub(super) fn uncounted(health: DiagnosticsHealth) -> Self {
+        Self {
+            health,
+            count_health: false,
+        }
+    }
+}
+
+impl<S> FormatEvent<S, SafeJsonFields> for SafeHumanFormatter
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, SafeJsonFields>,
+        mut writer: Writer<'_>,
+        event: &Event<'_>,
+    ) -> fmt::Result {
+        let mut fields = Map::new();
+        let mut span_rejected = false;
+        if let Some(scope) = ctx.event_scope() {
+            for span in scope.from_root() {
+                let extensions = span.extensions();
+                let Some(formatted) = extensions.get::<FormattedFields<SafeJsonFields>>() else {
+                    continue;
+                };
+                let span_fields: Map<String, Value> =
+                    serde_json::from_str(&formatted.fields).unwrap_or_default();
+                if span_fields.contains_key(REJECTED_FIELD_MARKER) {
+                    span_rejected = true;
+                    fields.clear();
+                    break;
+                }
+                fields.extend(span_fields);
+            }
+        }
+
+        let mut visitor = SafeFieldVisitor::default();
+        event.record(&mut visitor);
+        let envelope_rejected = !approved_event_envelope(&visitor.values);
+        if (span_rejected || visitor.rejected || envelope_rejected) && self.count_health {
+            self.health.increment_forbidden_field_rejections();
+        }
+        if span_rejected || visitor.rejected || envelope_rejected {
+            return writer.write_str("WARN diagnostics.field_rejected component=diagnostics\n");
+        }
+
+        fields.extend(visitor.values);
+        let event_code = fields
+            .remove("event_code")
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .ok_or(fmt::Error)?;
+        let mut line = format!("{} {event_code}", event.metadata().level());
+        for (name, value) in fields {
+            line.push(' ');
+            line.push_str(&name);
+            line.push('=');
+            match value {
+                Value::String(value) => line.push_str(&value),
+                other => line.push_str(&other.to_string()),
+            }
+        }
+        line.push('\n');
+        if line.len() > MAX_RECORD_BYTES {
+            if self.count_health {
+                self.health.increment_records_truncated();
+            }
+            line = "WARN diagnostics.record_truncated component=diagnostics\n".to_owned();
+        }
+        writer.write_str(&line)
     }
 }
 

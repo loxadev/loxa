@@ -12,6 +12,98 @@ pub(super) const QUEUE_DRAIN_DEADLINE: Duration = Duration::from_millis(350);
 pub(super) const WORKER_GUARD_DEADLINE: Duration = Duration::from_millis(350);
 pub(super) const DIAGNOSTICS_SHUTDOWN_BOUND: Duration = Duration::from_millis(800);
 const QUEUE_PROGRESS_POLL: Duration = Duration::from_millis(2);
+const DROP_WARNING_INTERVAL: Duration = Duration::from_secs(30);
+
+pub(super) trait DropWarningClock: Send + Sync + 'static {
+    fn elapsed(&self) -> Duration;
+}
+
+pub(super) trait DropWarningSink: Send + Sync + 'static {
+    fn write_warning(&self, warning: &str);
+}
+
+struct MonotonicClock(Instant);
+
+impl DropWarningClock for MonotonicClock {
+    fn elapsed(&self) -> Duration {
+        self.0.elapsed()
+    }
+}
+
+struct StderrWarningSink;
+
+impl DropWarningSink for StderrWarningSink {
+    fn write_warning(&self, warning: &str) {
+        eprintln!("{warning}");
+    }
+}
+
+struct DropWarningState {
+    reported_total: u64,
+    last_warning_at: Option<Duration>,
+}
+
+pub(super) struct DropWarningReporter {
+    clock: Arc<dyn DropWarningClock>,
+    sink: Arc<dyn DropWarningSink>,
+    interval: Duration,
+    state: Mutex<DropWarningState>,
+}
+
+impl DropWarningReporter {
+    fn stderr() -> Self {
+        Self {
+            clock: Arc::new(MonotonicClock(Instant::now())),
+            sink: Arc::new(StderrWarningSink),
+            interval: DROP_WARNING_INTERVAL,
+            state: Mutex::new(DropWarningState {
+                reported_total: 0,
+                last_warning_at: None,
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn new_for_test(
+        clock: impl DropWarningClock,
+        sink: impl DropWarningSink,
+        interval: Duration,
+    ) -> Self {
+        Self {
+            clock: Arc::new(clock),
+            sink: Arc::new(sink),
+            interval,
+            state: Mutex::new(DropWarningState {
+                reported_total: 0,
+                last_warning_at: None,
+            }),
+        }
+    }
+
+    fn observe(&self, total: u64, force: bool) {
+        let now = self.clock.elapsed();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let delta = total.saturating_sub(state.reported_total);
+        if delta == 0 {
+            return;
+        }
+        let interval_elapsed = state
+            .last_warning_at
+            .is_none_or(|last| now.saturating_sub(last) >= self.interval);
+        if !force && !interval_elapsed {
+            return;
+        }
+        let warning =
+            format!("loxa diagnostics: diagnostics.queue_dropped delta={delta} total={total}");
+        self.sink.write_warning(&warning);
+        state.reported_total = total;
+        state.last_warning_at = Some(now);
+    }
+}
+
 #[derive(Default)]
 struct QueueCounters {
     submitted: AtomicU64,
@@ -22,6 +114,7 @@ pub(super) struct QueueProgress {
     counters: Arc<QueueCounters>,
     errors: ErrorCounter,
     health: DiagnosticsHealth,
+    drop_reporter: DropWarningReporter,
     admission_open: Mutex<bool>,
     #[cfg(test)]
     admission_pause: Mutex<Option<(Arc<Barrier>, Arc<Barrier>)>>,
@@ -35,8 +128,9 @@ impl QueueProgress {
     }
 
     pub(super) fn observe_drops(&self) {
-        self.health
-            .observe_queue_dropped_total(self.dropped_total());
+        let total = self.dropped_total();
+        self.health.observe_queue_dropped_total(total);
+        self.drop_reporter.observe(total, false);
     }
 
     pub(super) fn begin_shutdown(&self) {
@@ -53,7 +147,9 @@ impl QueueProgress {
             .admission_open
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
-        self.observe_drops();
+        let total = self.dropped_total();
+        self.health.observe_queue_dropped_total(total);
+        self.drop_reporter.observe(total, true);
     }
 
     #[cfg(test)]
@@ -190,6 +286,15 @@ pub(super) fn non_blocking_writer_with_health<W: Write + Send + 'static>(
     capacity: usize,
     health: DiagnosticsHealth,
 ) -> (QueueWriter, ShutdownGuard, Arc<QueueProgress>) {
+    non_blocking_writer_with_reporter(writer, capacity, health, DropWarningReporter::stderr())
+}
+
+pub(super) fn non_blocking_writer_with_reporter<W: Write + Send + 'static>(
+    writer: W,
+    capacity: usize,
+    health: DiagnosticsHealth,
+    drop_reporter: DropWarningReporter,
+) -> (QueueWriter, ShutdownGuard, Arc<QueueProgress>) {
     let counters = Arc::new(QueueCounters::default());
     let (writer, guard) = NonBlockingBuilder::default()
         .buffered_lines_limit(capacity)
@@ -203,6 +308,7 @@ pub(super) fn non_blocking_writer_with_health<W: Write + Send + 'static>(
         counters,
         errors,
         health,
+        drop_reporter,
         admission_open: Mutex::new(true),
         #[cfg(test)]
         admission_pause: Mutex::new(None),
@@ -238,11 +344,11 @@ impl<W> StorageReporter<W> {
     fn report_transition(&mut self) {
         match self.health.snapshot().availability {
             DiagnosticsAvailability::Degraded if !self.degraded_episode => {
-                eprintln!("loxa diagnostics: file logging degraded; continuing with stderr");
+                eprintln!("loxa diagnostics: diagnostics.storage_degraded; continuing with stderr");
                 self.degraded_episode = true;
             }
             DiagnosticsAvailability::Available if self.degraded_episode => {
-                eprintln!("loxa diagnostics: file logging recovered");
+                eprintln!("loxa diagnostics: diagnostics.storage_recovered");
                 self.degraded_episode = false;
             }
             _ => {}

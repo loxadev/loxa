@@ -3,6 +3,7 @@ use loxa_core::diagnostics::{DiagnosticsHealth, MAX_DYNAMIC_FIELD_BYTES, MAX_REC
 use serde_json::Value;
 use std::fmt;
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Barrier, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use tracing::Level;
@@ -99,6 +100,22 @@ fn capture_events(filter: Targets, emit: impl FnOnce(), health: DiagnosticsHealt
     capture
 }
 
+fn capture_human_events(
+    filter: Targets,
+    emit: impl FnOnce(),
+    health: DiagnosticsHealth,
+) -> Capture {
+    let capture = Capture::default();
+    let layer = tracing_subscriber::fmt::layer()
+        .fmt_fields(SafeJsonFields::uncounted(health.clone()))
+        .event_format(SafeHumanFormatter::new(health))
+        .with_ansi(false)
+        .with_writer(capture.clone())
+        .with_filter(filter);
+    tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), emit);
+    capture
+}
+
 fn parse_single_record(capture: &Capture) -> Value {
     let text = capture.text();
     assert!(text.ends_with('\n'));
@@ -137,6 +154,55 @@ fn encodes_stable_fields_as_one_complete_jsonl_write() {
     assert!(record["timestamp"]
         .as_str()
         .is_some_and(|value| value.ends_with('Z')));
+}
+
+#[test]
+fn debug_stderr_is_safe_human_readable_text() {
+    let capture = capture_human_events(
+        debug_filter(),
+        || {
+            tracing::event!(
+                target: "loxa_node::test",
+                Level::INFO,
+                event_code = "node.listening",
+                component = "node",
+                model_id = "public-model",
+                status = 200_u64,
+            );
+        },
+        DiagnosticsHealth::new(),
+    );
+
+    let text = capture.text();
+    assert!(text.starts_with("INFO node.listening"), "{text}");
+    assert!(text.contains("component=node"), "{text}");
+    assert!(text.contains("model_id=public-model"), "{text}");
+    assert!(text.contains("status=200"), "{text}");
+    assert!(!text.trim_start().starts_with('{'), "{text}");
+}
+
+#[test]
+fn debug_stderr_rejects_malicious_fields_without_rendering_secrets() {
+    let capture = capture_human_events(
+        debug_filter(),
+        || {
+            tracing::event!(
+                target: "loxa_node::test",
+                Level::INFO,
+                event_code = "operation.terminal",
+                component = "operation",
+                authorization = "Bearer HUMAN_STDERR_SECRET",
+            );
+        },
+        DiagnosticsHealth::new(),
+    );
+
+    let text = capture.text();
+    assert_eq!(
+        text,
+        "WARN diagnostics.field_rejected component=diagnostics\n"
+    );
+    assert!(!text.contains("HUMAN_STDERR_SECRET"));
 }
 
 #[test]
@@ -616,6 +682,103 @@ fn lossy_queue_counts_drops_without_blocking_producers() {
     drop(writer);
     drop(bootstrap);
     assert_eq!(shared_queue_dropped, Some(progress.dropped_total()));
+}
+
+#[derive(Clone, Default)]
+struct TestClock(Arc<AtomicU64>);
+
+impl TestClock {
+    fn advance(&self, duration: Duration) {
+        self.0.fetch_add(
+            u64::try_from(duration.as_millis()).unwrap(),
+            Ordering::Release,
+        );
+    }
+}
+
+impl DropWarningClock for TestClock {
+    fn elapsed(&self) -> Duration {
+        Duration::from_millis(self.0.load(Ordering::Acquire))
+    }
+}
+
+#[derive(Clone, Default)]
+struct WarningCapture(Arc<Mutex<Vec<String>>>);
+
+impl DropWarningSink for WarningCapture {
+    fn write_warning(&self, warning: &str) {
+        self.0
+            .lock()
+            .expect("warning capture poisoned")
+            .push(warning.to_owned());
+    }
+}
+
+impl WarningCapture {
+    fn warnings(&self) -> Vec<String> {
+        self.0.lock().expect("warning capture poisoned").clone()
+    }
+}
+
+#[test]
+fn real_queue_drops_emit_rate_limited_bypass_warnings_and_final_delta() {
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let health = DiagnosticsHealth::new();
+    let clock = TestClock::default();
+    let warnings = WarningCapture::default();
+    let reporter =
+        DropWarningReporter::new_for_test(clock.clone(), warnings.clone(), Duration::from_secs(1));
+    let (mut writer, guard, progress) = non_blocking_writer_with_reporter(
+        SlowWriter {
+            gate: Arc::clone(&gate),
+        },
+        1,
+        health,
+        reporter,
+    );
+
+    for _ in 0..100 {
+        writer.write_all(b"first-wave\n").unwrap();
+    }
+    let first = warnings.warnings();
+    assert_eq!(first.len(), 1, "{first:?}");
+    let counts = first[0]
+        .strip_prefix("loxa diagnostics: diagnostics.queue_dropped delta=")
+        .and_then(|counts| counts.split_once(" total="))
+        .map(|(delta, total)| (delta.parse::<u64>().unwrap(), total.parse::<u64>().unwrap()))
+        .expect("stable numeric queue-drop warning");
+    assert!(counts.0 > 0);
+    assert!(counts.1 >= counts.0);
+    assert!(first[0].len() < 128);
+
+    for _ in 0..100 {
+        writer.write_all(b"rate-limited-wave\n").unwrap();
+    }
+    assert_eq!(warnings.warnings().len(), 1);
+
+    clock.advance(Duration::from_secs(1));
+    progress.observe_drops();
+    let periodic = warnings.warnings();
+    assert_eq!(periodic.len(), 2, "{periodic:?}");
+    assert!(periodic[1].contains("delta="));
+
+    for _ in 0..100 {
+        writer.write_all(b"final-wave\n").unwrap();
+    }
+    let before_shutdown = warnings.warnings().len();
+    progress.begin_shutdown();
+    let final_warnings = warnings.warnings();
+    assert_eq!(
+        final_warnings.len(),
+        before_shutdown + 1,
+        "{final_warnings:?}"
+    );
+
+    let (lock, ready) = &*gate;
+    *lock.lock().expect("gate poisoned") = true;
+    ready.notify_all();
+    drop(writer);
+    drop(guard);
 }
 
 #[test]

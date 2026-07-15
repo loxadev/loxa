@@ -7,10 +7,14 @@ use self::delivery::{
     WORKER_GUARD_DEADLINE,
 };
 #[cfg(test)]
+use self::delivery::{
+    non_blocking_writer_with_reporter, DropWarningClock, DropWarningReporter, DropWarningSink,
+};
+#[cfg(test)]
 use self::encoder::debug_filter;
 #[cfg(all(test, debug_assertions))]
 use self::encoder::release_filter;
-use self::encoder::{executable_filter, SafeJsonFields, SafeJsonFormatter};
+use self::encoder::{executable_filter, SafeHumanFormatter, SafeJsonFields, SafeJsonFormatter};
 use loxa_core::diagnostics::{
     storage::prepare_logs_dir, BoundedJsonlWriter, DiagnosticsHealth, DiagnosticsHealthSnapshot,
     StorageConfig, SystemDiskSpace, LOG_QUEUE_CAPACITY,
@@ -68,7 +72,7 @@ pub fn install_daemon_diagnostics(logs_dir: &Path) -> DiagnosticsBootstrap {
             health.support_queue_drop_counter();
             let stderr_layer = tracing_subscriber::fmt::layer()
                 .fmt_fields(SafeJsonFields::uncounted(health.clone()))
-                .event_format(SafeJsonFormatter::uncounted(health.clone()))
+                .event_format(SafeHumanFormatter::uncounted(health.clone()))
                 .with_ansi(false)
                 .with_writer(io::stderr)
                 .with_filter(executable_filter());
@@ -94,8 +98,8 @@ pub fn install_daemon_diagnostics(logs_dir: &Path) -> DiagnosticsBootstrap {
             eprintln!("loxa diagnostics: file logging unavailable; continuing with stderr");
             health.mark_unavailable();
             let stderr_layer = tracing_subscriber::fmt::layer()
-                .fmt_fields(SafeJsonFields::new(health.clone()))
-                .event_format(SafeJsonFormatter::new(health.clone()))
+                .fmt_fields(SafeJsonFields::uncounted(health.clone()))
+                .event_format(SafeHumanFormatter::new(health.clone()))
                 .with_ansi(false)
                 .with_writer(io::stderr)
                 .with_filter(executable_filter());
