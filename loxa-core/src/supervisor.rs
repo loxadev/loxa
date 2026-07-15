@@ -70,6 +70,13 @@ pub const STOP_OWNER_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 pub const LOG_TAIL_BYTES: usize = 8 * 1024;
 pub const MAX_LOG_BYTES: usize = 1024 * 1024;
 const RETAIN_INACTIVE_CHILD_LOGS: usize = 7;
+const CHILD_LOG_ROOT_LOCK_FILE: &str = ".child-output.v1.lock";
+const CHILD_LOG_ROOT_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const CHILD_LOG_ROOT_LOCK_INTERVAL: Duration = Duration::from_millis(25);
+
+struct ChildLogRootLock {
+    _file: File,
+}
 
 pub struct ServerSpec<'a> {
     pub entry: &'a ModelEntry,
@@ -982,18 +989,108 @@ where
     A: FnOnce(),
     D: FnOnce(),
 {
-    prune_child_logs_at_owned_spawn(state_path, expected, log_path);
-    let prepared = prepare_engine_spawn_with_hook(spec, log_path, reservation, before_log_open)?;
-    match lifecycle::spawn_starting_run_with(state_path, expected, || {
-        prepared.spawn_raw_with_hooks(before_reservation_release, after_os_spawn)
-    })? {
-        SpawnStartingRunOutcome::Spawned { run, value: raw } => {
-            Ok(SpawnStartingRunOutcome::Spawned {
-                run,
-                value: raw.finish_with_hook(after_log_drain_setup),
-            })
+    let logs_dir = log_path.parent().ok_or_else(|| {
+        SupervisorError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "child log path has no parent",
+        ))
+    })?;
+    with_child_log_root_coordination(logs_dir, || {
+        prune_child_logs_at_owned_spawn(state_path, expected, log_path);
+        let prepared =
+            prepare_engine_spawn_with_hook(spec, log_path, reservation, before_log_open)?;
+        match lifecycle::spawn_starting_run_with(state_path, expected, || {
+            prepared.spawn_raw_with_hooks(before_reservation_release, after_os_spawn)
+        })? {
+            SpawnStartingRunOutcome::Spawned { run, value: raw } => {
+                Ok(SpawnStartingRunOutcome::Spawned {
+                    run,
+                    value: raw.finish_with_hook(after_log_drain_setup),
+                })
+            }
+            SpawnStartingRunOutcome::RequestedStop => Ok(SpawnStartingRunOutcome::RequestedStop),
         }
-        SpawnStartingRunOutcome::RequestedStop => Ok(SpawnStartingRunOutcome::RequestedStop),
+    })
+}
+
+fn with_child_log_root_coordination<T>(
+    logs_dir: &Path,
+    action: impl FnOnce() -> Result<T, SupervisorError>,
+) -> Result<T, SupervisorError> {
+    // This per-root advisory lock is shared by threads and cooperating Loxa
+    // processes. Keep its order before the shorter runtime-state lock: the
+    // spawn transaction below remains the only owner of that established lock.
+    let _lock = ChildLogRootLock::acquire(logs_dir)?;
+    action()
+}
+
+impl ChildLogRootLock {
+    fn acquire(logs_dir: &Path) -> Result<Self, SupervisorError> {
+        match fs::symlink_metadata(logs_dir) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(SupervisorError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "child log root must be a regular directory",
+                )))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir_all(logs_dir)?;
+                let metadata = fs::symlink_metadata(logs_dir)?;
+                if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                    return Err(SupervisorError::Io(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "child log root must be a regular directory",
+                    )));
+                }
+            }
+            Err(error) => return Err(SupervisorError::Io(error)),
+        }
+
+        let canonical_root = logs_dir.canonicalize()?;
+        let lock_path = canonical_root.join(CHILD_LOG_ROOT_LOCK_FILE);
+        if let Ok(metadata) = fs::symlink_metadata(&lock_path) {
+            if !metadata.file_type().is_file() {
+                return Err(SupervisorError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "child log coordination entry must be a regular file",
+                )));
+            }
+        }
+
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options.open(&lock_path)?;
+        if !file.metadata()?.file_type().is_file() {
+            return Err(SupervisorError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "child log coordination entry must be a regular file",
+            )));
+        }
+
+        let started = Instant::now();
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(fs::TryLockError::WouldBlock) => {
+                    if started.elapsed() >= CHILD_LOG_ROOT_LOCK_TIMEOUT {
+                        return Err(SupervisorError::Io(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "timed out waiting for child log root coordination",
+                        )));
+                    }
+                    thread::sleep(CHILD_LOG_ROOT_LOCK_INTERVAL);
+                }
+                Err(fs::TryLockError::Error(error)) => {
+                    return Err(SupervisorError::Io(error));
+                }
+            }
+        }
     }
 }
 
@@ -1413,6 +1510,7 @@ mod tests {
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::mpsc;
     use tempfile::tempdir;
 
     fn managed_run_for(server: &ManagedServer) -> ManagedRun {
@@ -1453,6 +1551,70 @@ mod tests {
             child_process_start_time_unix_s: None,
             child_pgid: None,
         }
+    }
+
+    #[test]
+    fn child_log_coordination_keeps_each_prune_open_active_set_current() {
+        let temp = tempdir().expect("tempdir");
+        let logs_dir = temp.path().to_path_buf();
+        let first_log = logs_dir.join("first-model-9000-1.log");
+        let second_log = logs_dir.join("second-model-9001-2.log");
+        let (first_entered_tx, first_entered_rx) = mpsc::channel();
+        let (release_first_tx, release_first_rx) = mpsc::channel();
+        let (second_opened_tx, second_opened_rx) = mpsc::channel();
+
+        let first_root = logs_dir.clone();
+        let first_path = first_log.clone();
+        let first = thread::spawn(move || {
+            with_child_log_root_coordination(&first_root, || {
+                prune_inactive_child_logs(
+                    &first_root,
+                    &HashSet::from([first_path.clone()]),
+                    0,
+                    &DiagnosticsHealth::new(),
+                )?;
+                fs::write(&first_path, "first")?;
+                first_entered_tx.send(()).expect("signal first open");
+                release_first_rx.recv().expect("release first open");
+                assert!(
+                    first_path.exists(),
+                    "the second stale prune must not overlap the first open"
+                );
+                Ok(())
+            })
+        });
+
+        first_entered_rx.recv().expect("first entered");
+        let second_root = logs_dir.clone();
+        let second_path = second_log.clone();
+        let second = thread::spawn(move || {
+            with_child_log_root_coordination(&second_root, || {
+                prune_inactive_child_logs(
+                    &second_root,
+                    &HashSet::from([second_path.clone()]),
+                    0,
+                    &DiagnosticsHealth::new(),
+                )?;
+                fs::write(&second_path, "second")?;
+                second_opened_tx.send(()).expect("signal second open");
+                Ok(())
+            })
+        });
+
+        assert!(
+            second_opened_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "the second prune/open must wait for the first critical section"
+        );
+        release_first_tx.send(()).expect("release first");
+        first.join().expect("join first").expect("first succeeds");
+        second_opened_rx.recv().expect("second opened");
+        second
+            .join()
+            .expect("join second")
+            .expect("second succeeds");
+        assert!(second_log.exists());
     }
 
     #[cfg(unix)]
