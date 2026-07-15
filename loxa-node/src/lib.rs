@@ -18,6 +18,7 @@ pub mod control_router;
 mod daemon;
 pub mod download_control;
 mod engine_session;
+mod http_observability;
 pub mod model_lifecycle;
 mod production_lifecycle;
 mod runtime;

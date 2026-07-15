@@ -137,6 +137,7 @@ impl<'a> NodeBuilder<'a> {
         } else {
             router
         };
+        let gateway_router = crate::http_observability::apply(gateway_router);
         let gateway = match loxa_core::gateway::GatewayServer::start_with_router(
             gateway_port,
             gateway_state.clone(),
