@@ -168,6 +168,20 @@ impl<D: DiskSpace> BoundedJsonlWriter<D> {
                 return Err(error);
             }
         };
+        match active_incarnation_exists(&config.daemon_root, &health) {
+            Ok(false) => {}
+            Ok(true) => {
+                storage_failure(&health);
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "an active daemon diagnostic incarnation already owns the file sink",
+                ));
+            }
+            Err(error) => {
+                storage_failure(&health);
+                return Err(error);
+            }
+        }
         let incarnation_dir = config.daemon_root.join(&config.incarnation);
         if let Err(error) = fs::create_dir(&incarnation_dir) {
             storage_failure(&health);
@@ -525,6 +539,34 @@ fn prune_incarnations(root: &Path, current: &str, health: &DiagnosticsHealth) {
     for (_, path, owner_lock) in inactive.into_iter().skip(inactive_to_keep) {
         remove_recognized_incarnation(&path, owner_lock, health);
     }
+}
+
+fn active_incarnation_exists(root: &Path, health: &DiagnosticsHealth) -> io::Result<bool> {
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !is_incarnation_name(name) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if !metadata.file_type().is_dir() {
+            continue;
+        }
+        match incarnation_state(&entry.path(), health) {
+            IncarnationState::Active => return Ok(true),
+            IncarnationState::Inactive(_) => {}
+            IncarnationState::Unsafe => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unable to prove diagnostic incarnation ownership is inactive",
+                ));
+            }
+        }
+    }
+    Ok(false)
 }
 
 enum IncarnationState {
@@ -914,7 +956,7 @@ mod tests {
     }
 
     #[test]
-    fn competing_startups_preserve_live_incarnations_and_prune_them_after_release() {
+    fn competing_startups_decline_while_the_active_incarnation_can_keep_rotating() {
         let temp = TempDir::new().unwrap();
         let daemon = temp.path().join("daemon");
         let stale = "incarnation-00000000000000000000-0000000001-0000000000000000";
@@ -927,26 +969,21 @@ mod tests {
         first.write_all(b"{\"event_code\":\"a\"}\n").unwrap();
 
         let config = StorageConfig::for_test(temp.path(), INCARNATION_2, 32, 4);
-        let _second =
-            BoundedJsonlWriter::new(config, FakeDiskSpace::available(), DiagnosticsHealth::new())
-                .unwrap();
+        let second =
+            BoundedJsonlWriter::new(config, FakeDiskSpace::available(), DiagnosticsHealth::new());
         let config = StorageConfig::for_test(temp.path(), INCARNATION_3, 32, 4);
-        let _third =
-            BoundedJsonlWriter::new(config, FakeDiskSpace::available(), DiagnosticsHealth::new())
-                .unwrap();
+        let third =
+            BoundedJsonlWriter::new(config, FakeDiskSpace::available(), DiagnosticsHealth::new());
 
-        assert!(
-            !daemon.join(stale).exists(),
-            "inactive stale entry is pruned"
-        );
+        assert!(second.is_err());
+        assert!(third.is_err());
         assert!(
             daemon.join(INCARNATION_1).exists(),
             "live first writer remains"
         );
-        assert!(
-            daemon.join(INCARNATION_2).exists(),
-            "live second writer remains"
-        );
+        assert!(!daemon.join(INCARNATION_2).exists());
+        assert!(!daemon.join(INCARNATION_3).exists());
+        assert!(daemon.join(stale).exists(), "previous remains while active");
         first.write_all(b"{\"event_code\":\"b\"}\n").unwrap();
         first.flush().unwrap();
         assert_eq!(recognized_segments(first.incarnation_dir()).len(), 2);
@@ -958,17 +995,80 @@ mod tests {
                 .unwrap();
 
         assert!(
-            !daemon.join(INCARNATION_1).exists(),
-            "released incarnation becomes eligible for pruning"
+            daemon.join(INCARNATION_1).exists(),
+            "released active incarnation becomes the retained previous"
         );
-        assert!(
-            daemon.join(INCARNATION_2).exists(),
-            "still-live writer remains"
+        assert!(!daemon.join(stale).exists(), "older stale entry is pruned");
+        assert!(daemon.join(INCARNATION_4).exists());
+    }
+
+    #[test]
+    fn cross_process_owner_lock_declines_a_competing_file_sink() {
+        const CHILD_ROOT: &str = "LOXA_DIAGNOSTICS_LOCK_TEST_ROOT";
+        const CHILD_MODE: &str = "LOXA_DIAGNOSTICS_LOCK_TEST_CHILD";
+
+        if std::env::var_os(CHILD_MODE).is_some() {
+            let root = PathBuf::from(std::env::var_os(CHILD_ROOT).unwrap());
+            let config = StorageConfig::for_test(&root, INCARNATION_1, 32, 4);
+            let mut writer = BoundedJsonlWriter::new(
+                config,
+                FakeDiskSpace::available(),
+                DiagnosticsHealth::new(),
+            )
+            .unwrap();
+            writer.write_all(b"{\"event_code\":\"a\"}\n").unwrap();
+            writer.write_all(b"{\"event_code\":\"b\"}\n").unwrap();
+            writer.flush().unwrap();
+            fs::write(root.join("child-ready"), b"ready").unwrap();
+            let release = root.join("child-release");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !release.exists() {
+                assert!(Instant::now() < deadline, "parent did not release child");
+                thread::sleep(Duration::from_millis(10));
+            }
+            return;
+        }
+
+        let temp = TempDir::new().unwrap();
+        let current_exe = std::env::current_exe().unwrap();
+        let mut child = std::process::Command::new(current_exe)
+            .arg("--exact")
+            .arg("diagnostics::storage::tests::cross_process_owner_lock_declines_a_competing_file_sink")
+            .arg("--nocapture")
+            .env(CHILD_ROOT, temp.path())
+            .env(CHILD_MODE, "1")
+            .spawn()
+            .unwrap();
+        let ready = temp.path().join("child-ready");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "child did not acquire owner lock"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let config = StorageConfig::for_test(temp.path(), INCARNATION_2, 32, 4);
+        let contender =
+            BoundedJsonlWriter::new(config, FakeDiskSpace::available(), DiagnosticsHealth::new());
+
+        assert!(contender.is_err());
+        assert!(!temp.path().join("daemon").join(INCARNATION_2).exists());
+        assert_eq!(
+            recognized_segments(&temp.path().join("daemon").join(INCARNATION_1)).len(),
+            2
         );
-        assert!(
-            daemon.join(INCARNATION_3).exists(),
-            "still-live writer remains"
-        );
+
+        fs::write(temp.path().join("child-release"), b"release").unwrap();
+        assert!(child.wait().unwrap().success());
+        let config = StorageConfig::for_test(temp.path(), INCARNATION_2, 32, 4);
+        let writer =
+            BoundedJsonlWriter::new(config, FakeDiskSpace::available(), DiagnosticsHealth::new())
+                .unwrap();
+        assert!(writer.incarnation_dir().exists());
+        assert!(temp.path().join("daemon").join(INCARNATION_1).exists());
+        drop(writer);
     }
 
     #[cfg(unix)]
@@ -1281,13 +1381,15 @@ mod tests {
         let health = DiagnosticsHealth::new();
         let config = StorageConfig::for_test(temp.path(), INCARNATION_3, 64, 4);
 
-        let _writer =
-            BoundedJsonlWriter::new(config, FakeDiskSpace::available(), health.clone()).unwrap();
+        let result = BoundedJsonlWriter::new(config, FakeDiskSpace::available(), health.clone());
 
+        assert!(result.is_err());
         assert!(stale.exists());
         assert!(stale.join(OWNERSHIP_LOCK_FILE).symlink_metadata().is_ok());
+        assert!(!daemon.join(INCARNATION_3).exists());
         assert_eq!(fs::read(outside.path().join("sentinel")).unwrap(), b"keep");
         assert_eq!(health.snapshot().retention_failures, Some(1));
+        assert_eq!(health.snapshot().storage_write_failures, Some(1));
         assert_eq!(
             health.snapshot().availability,
             crate::diagnostics::DiagnosticsAvailability::Degraded
