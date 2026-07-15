@@ -3015,6 +3015,10 @@ mod lifecycle_api_tests {
         );
         assert!(status.starts_with("HTTP/1.1 200"), "{status}");
         assert!(status.contains("\"health\":\"unavailable\""), "{status}");
+        assert!(status.contains("\"model\":\"loxa\""), "{status}");
+        assert!(status.contains("\"engine\":null"), "{status}");
+        assert!(status.contains("\"runtime_model\":null"), "{status}");
+        assert!(status.contains("\"profile\":null"), "{status}");
         let nonce = "01".repeat(32);
         let proof = http_request(
             port,
