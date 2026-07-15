@@ -150,6 +150,17 @@ function history(selection: ChatScreenHistory["selection"]): ChatScreenHistory {
   };
 }
 
+async function openModelPicker(user: ReturnType<typeof userEvent.setup>) {
+  const trigger = await screen.findByRole("button", { name: "Choose model" });
+  if (trigger.getAttribute("aria-expanded") !== "true") await user.click(trigger);
+  return trigger;
+}
+
+async function selectModel(user: ReturnType<typeof userEvent.setup>, modelId: string) {
+  await openModelPicker(user);
+  await user.click(screen.getByRole("option", { name: modelId }));
+}
+
 describe("ChatScreen", () => {
   it("uses New Chat by default and accepts the selected conversation title", async () => {
     const setup = services();
@@ -167,21 +178,37 @@ describe("ChatScreen", () => {
     expect(screen.getByRole("heading", { name: "Understanding Y Combinator" })).toBeInTheDocument();
   });
 
+  it("opens and closes an explicit side-by-side chat split with the horizontal split icon", async () => {
+    const user = userEvent.setup();
+    const setup = services();
+    render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
+
+    const split = await screen.findByRole("button", { name: "Preview split chat side by side" });
+    expect(split.querySelector(".lucide-square-split-horizontal")).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Second chat" })).not.toBeInTheDocument();
+
+    await user.click(split);
+    expect(screen.getByRole("region", { name: "Second chat" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Close split chat preview" }));
+    expect(screen.queryByRole("region", { name: "Second chat" })).not.toBeInTheDocument();
+  });
+
   it("filters downloaded models in the top control and offers the catalog when none match", async () => {
     const user = userEvent.setup();
     const setup = services();
     const onNavigateModels = vi.fn();
     render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" onNavigateModels={onNavigateModels} />);
 
+    await openModelPicker(user);
     const search = await screen.findByRole("searchbox", { name: "Search downloaded models" });
-    const picker = screen.getByRole("combobox", { name: "Choose model" });
+    const picker = screen.getByRole("button", { name: "Choose model" });
     const composer = screen.getByRole("form", { name: "Message composer" });
     expect(composer).not.toContainElement(search);
     expect(composer).not.toContainElement(picker);
 
     await user.type(search, "other");
-    expect(within(picker).getByRole("option", { name: "other" })).toBeInTheDocument();
-    expect(within(picker).queryByRole("option", { name: "gemma" })).not.toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "other" })).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "gemma" })).not.toBeInTheDocument();
 
     await user.clear(search);
     await user.type(search, "missing");
@@ -195,13 +222,14 @@ describe("ChatScreen", () => {
     const setup = services();
     render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
 
+    await openModelPicker(user);
     const search = await screen.findByRole("searchbox", { name: "Search downloaded models" });
-    const picker = screen.getByRole("combobox", { name: "Choose model" });
-    expect(picker).toHaveValue("gemma");
+    const picker = screen.getByRole("button", { name: "Choose model" });
+    expect(picker).toHaveTextContent("gemma");
 
     await user.type(search, "other");
 
-    expect(picker).toHaveValue("other");
+    await user.click(screen.getByRole("option", { name: "other" }));
     expect(screen.getByRole("button", { name: "Switch to other" })).toBeEnabled();
   });
 
@@ -212,7 +240,7 @@ describe("ChatScreen", () => {
     const composer = screen.getByRole("form", { name: "Message composer" });
     await screen.findByRole("status");
     expect(composer.querySelector("#chat-support-reason")).toBeNull();
-    expect(within(composer).queryByRole("combobox", { name: "Choose model" })).not.toBeInTheDocument();
+    expect(within(composer).queryByRole("button", { name: "Choose model" })).not.toBeInTheDocument();
   });
 
   it("offers Models only after authoritative unloaded truth and invokes navigation", async () => {
@@ -229,7 +257,7 @@ describe("ChatScreen", () => {
 
     render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" onNavigateModels={onNavigateModels} />);
 
-    const browse = await screen.findByRole("button", { name: "Browse models" });
+    const browse = await screen.findByRole("button", { name: "Open Models" });
     await user.click(browse);
     expect(onNavigateModels).toHaveBeenCalledOnce();
   });
@@ -285,7 +313,7 @@ describe("ChatScreen", () => {
     await user.type(message, "Explain this");
     const send = screen.getByRole("button", { name: "Send message" });
     expect(send).toHaveAttribute("data-slot", "button");
-    expect(send.querySelector("svg.lucide-send")).not.toBeNull();
+    expect(send.querySelector("svg.lucide-send-horizontal")).not.toBeNull();
     await user.click(send);
 
     const stop = screen.getByRole("button", { name: "Stop response" });
@@ -297,7 +325,8 @@ describe("ChatScreen", () => {
     const setup = services(false);
     render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
     const attachment = screen.getByRole("button", { name: "Attach document" });
-    const tooltip = screen.getByRole("tooltip");
+    const tooltip = document.querySelector<HTMLElement>("#attachment-support-reason");
+    expect(tooltip).not.toBeNull();
 
     attachment.focus();
     await waitFor(() => expect(tooltip).toHaveAttribute("data-open", "true"));
@@ -629,7 +658,7 @@ describe("ChatScreen", () => {
     expect(screen.getByRole("form", { name: "Message composer" })).toBeVisible();
     expect(screen.getAllByText(new RegExp(reason, "i"))).not.toHaveLength(0);
     expect(screen.getByLabelText("Message")).toBeDisabled();
-    expect(screen.getByRole("combobox", { name: "Choose model" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Choose model" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Attach document" })).toHaveAttribute("aria-disabled", "true");
     expect(setup.api.getStatus).not.toHaveBeenCalled();
@@ -648,7 +677,7 @@ describe("ChatScreen", () => {
 
     expect(await screen.findByRole("status")).toHaveTextContent(/refreshing authoritative model status/i);
     expect(screen.getByLabelText("Message")).toBeDisabled();
-    expect(screen.getByRole("combobox", { name: "Choose model" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Choose model" })).toBeDisabled();
     expect(setup.api.getStatus).not.toHaveBeenCalled();
     expect(setup.api.readControlToken).not.toHaveBeenCalled();
   });
@@ -675,7 +704,7 @@ describe("ChatScreen", () => {
     await vi.waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Ready"));
     expect(screen.getByRole("status")).not.toHaveTextContent("cold-start failed");
     expect(screen.getByLabelText("Message")).toBeEnabled();
-    expect(screen.getByRole("combobox", { name: "Choose model" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Choose model" })).toBeEnabled();
   });
 
   it("sends on Enter, preserves Shift+Enter newlines, and ignores Enter during composition", async () => {
@@ -834,7 +863,7 @@ describe("ChatScreen", () => {
     expect(css).toMatch(/\.chatMain\s*\{[^}]*grid-template-rows:\s*auto auto minmax\(0, 1fr\) auto/s);
     expect(css).toMatch(/\.header h1\s*\{[^}]*min-width:\s*0[^}]*text-overflow:\s*ellipsis[^}]*white-space:\s*nowrap/s);
     expect(css).not.toMatch(/\.chatWorkspace\s*\{/);
-    expect(css).toMatch(/@media \(max-width:[\s\S]*?\.chatMain\s*\{[^}]*overflow:\s*hidden/s);
+    expect(css).toMatch(/@container chat-screen \(max-width:[\s\S]*?\.chatMain\s*\{[^}]*overflow:\s*hidden/s);
     expect(css).toMatch(/overflow-y:\s*auto/);
     expect(css).toContain("var(--loxa-component-minimum-interactive-target)");
     expect(css).toContain(":focus-visible");
@@ -850,7 +879,7 @@ describe("ChatScreen", () => {
   it("keeps model-operation blocking visible instead of reporting Ready", async () => {
     const setup = services();
     render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
-    await screen.findByRole("combobox", { name: "Choose model" });
+    await screen.findByRole("button", { name: "Choose model" });
 
     act(() =>
       setup.controlCallbacks()?.onSnapshot({
@@ -875,14 +904,14 @@ describe("ChatScreen", () => {
     expect(screen.getByRole("status")).toHaveTextContent(/model operation in progress/i);
     expect(screen.getByRole("status")).not.toHaveTextContent("Ready");
     expect(screen.getByLabelText("Message")).toBeDisabled();
-    expect(screen.getByRole("combobox", { name: "Choose model" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Choose model" })).toBeDisabled();
     expect(screen.getAllByText(/model operation in progress/i)).not.toHaveLength(0);
   });
 
   it("reconnects from the terminal cursor and restores controls after a fresh snapshot", async () => {
     const setup = services();
     render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
-    await screen.findByRole("combobox", { name: "Choose model" });
+    await screen.findByRole("button", { name: "Choose model" });
 
     act(() =>
       setup.controlCallbackHistory[0].onTerminal({
@@ -905,7 +934,7 @@ describe("ChatScreen", () => {
 
     act(() => setup.controlCallbackHistory[1].onSnapshot({ cursor: 7, cursorGap: false, operations: [], events: [] }));
     expect(screen.getByLabelText("Message")).toBeEnabled();
-    expect(screen.getByRole("combobox", { name: "Choose model" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Choose model" })).toBeEnabled();
   });
 
   it("auto-scrolls near the bottom but preserves a reader's scroll-away position", () => {
@@ -942,7 +971,7 @@ describe("ChatScreen", () => {
     const user = userEvent.setup();
     const setup = services();
     render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
-    await screen.findByRole("combobox", { name: "Choose model" });
+    await screen.findByRole("button", { name: "Choose model" });
     await user.type(screen.getByLabelText("Message"), "Hello");
     await user.click(screen.getByRole("button", { name: "Send message" }));
     expect(setup.api.createChatStream).toHaveBeenCalledWith(
@@ -955,8 +984,8 @@ describe("ChatScreen", () => {
     setup.callbacks()?.onDelta("lo");
     await vi.waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Streaming"));
     expect(screen.getAllByText("Hello")).not.toHaveLength(0);
-    expect(screen.getByRole("combobox", { name: "Choose model" })).toHaveValue("gemma");
-    expect(screen.getByRole("combobox", { name: "Choose model" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Choose model" })).toHaveTextContent("gemma");
+    expect(screen.getByRole("button", { name: "Choose model" })).toBeDisabled();
   });
 
   it("coalesces streamed display updates to one animation frame and flushes before terminal", async () => {
@@ -971,7 +1000,7 @@ describe("ChatScreen", () => {
     vi.stubGlobal("cancelAnimationFrame", cancel);
     const setup = services();
     render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
-    await screen.findByRole("combobox", { name: "Choose model" });
+    await screen.findByRole("button", { name: "Choose model" });
     await user.type(screen.getByLabelText("Message"), "Hello");
     await user.click(screen.getByRole("button", { name: "Send message" }));
 
@@ -998,7 +1027,7 @@ describe("ChatScreen", () => {
     const user = userEvent.setup();
     const setup = services();
     render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
-    await screen.findByRole("combobox", { name: "Choose model" });
+    await screen.findByRole("button", { name: "Choose model" });
     await user.type(screen.getByLabelText("Message"), "Hello");
     await user.click(screen.getByRole("button", { name: "Send message" }));
     act(() => setup.callbacks()?.onDelta("Partial"));
@@ -1020,7 +1049,7 @@ describe("ChatScreen", () => {
     vi.stubGlobal("cancelAnimationFrame", cancel);
     const setup = services();
     const view = render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
-    await screen.findByRole("combobox", { name: "Choose model" });
+    await screen.findByRole("button", { name: "Choose model" });
     await user.type(screen.getByLabelText("Message"), "Hello");
     await user.click(screen.getByRole("button", { name: "Send message" }));
     act(() => setup.callbacks()?.onDelta("pending"));
@@ -1039,8 +1068,7 @@ describe("ChatScreen", () => {
       .mockResolvedValueOnce({ status: "ready", activeModelId: "gemma", operationId: null, error: null })
       .mockResolvedValueOnce({ status: "ready", activeModelId: "other", operationId: null, error: null });
     render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
-    const picker = await screen.findByRole("combobox", { name: "Choose model" });
-    await user.selectOptions(picker, "other");
+    await selectModel(user, "other");
     expect(screen.getByText("Active model: gemma")).toBeInTheDocument();
     expect(setup.api.loadModel).not.toHaveBeenCalled();
     await user.click(screen.getByRole("button", { name: "Switch to other" }));
@@ -1084,8 +1112,7 @@ describe("ChatScreen", () => {
     }
     render(<Harness />);
 
-    const picker = await screen.findByRole("combobox", { name: "Choose model" });
-    await user.selectOptions(picker, "other");
+    await selectModel(user, "other");
     await user.click(screen.getByRole("button", { name: "Switch to other" }));
 
     await vi.waitFor(() => expect(setup.api.getOperation).toHaveBeenCalled());
@@ -1121,7 +1148,7 @@ describe("ChatScreen", () => {
       />,
     );
 
-    await user.selectOptions(await screen.findByRole("combobox", { name: "Choose model" }), "other");
+    await selectModel(user, "other");
     await user.click(screen.getByRole("button", { name: "Switch to other" }));
     expect(onModelMutationStart).toHaveBeenCalledWith("op-load");
     await vi.waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("operation read unavailable"));
@@ -1158,7 +1185,7 @@ describe("ChatScreen", () => {
         onModelMutationSettled={onModelMutationSettled}
       />,
     );
-    await screen.findByRole("combobox", { name: "Choose model" });
+    await screen.findByRole("button", { name: "Choose model" });
 
     act(() =>
       setup.controlCallbacks()?.onSnapshot({
@@ -1225,6 +1252,7 @@ describe("ChatScreen", () => {
     expect(await screen.findByRole("status")).toHaveTextContent("No model is loaded");
     expect(screen.getByRole("status")).not.toHaveTextContent("Disconnected");
     expect(screen.getByLabelText("Message")).toBeDisabled();
+    await openModelPicker(user);
     await user.click(screen.getByRole("button", { name: "Load gemma" }));
     expect(await screen.findByRole("status")).toHaveTextContent("Ready");
     expect(screen.getByLabelText("Message")).toBeEnabled();
@@ -1272,6 +1300,7 @@ describe("ChatScreen", () => {
     expect(await screen.findByText("Earlier answer")).toBeVisible();
     expect(screen.getByLabelText("Message")).toBeDisabled();
 
+    await openModelPicker(user);
     await user.click(screen.getByRole("button", { name: "Load gemma" }));
 
     await waitFor(() => expect(setup.api.getModels).toHaveBeenCalledTimes(2));
@@ -1293,7 +1322,7 @@ describe("ChatScreen", () => {
       updatedAtUnixMs: 2,
     });
     render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
-    await user.selectOptions(await screen.findByRole("combobox", { name: "Choose model" }), "other");
+    await selectModel(user, "other");
     await user.click(screen.getByRole("button", { name: "Switch to other" }));
     expect(await screen.findByRole("status")).toHaveTextContent("readiness failed");
     expect(screen.getByText("Active model: gemma")).toBeInTheDocument();
@@ -1328,8 +1357,7 @@ describe("ChatScreen", () => {
           ReturnType<ChatScreenServices["getModels"]>
         >);
       render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
-      const picker = await screen.findByRole("combobox", { name: "Choose model" });
-      await user.selectOptions(picker, "other");
+      await selectModel(user, "other");
       await user.click(screen.getByRole("button", { name: "Switch to other" }));
 
       await waitFor(() => expect(setup.api.getModels).toHaveBeenCalledTimes(2));
@@ -1346,7 +1374,7 @@ describe("ChatScreen", () => {
       error: null,
     });
     render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
-    expect(await screen.findByRole("combobox", { name: "Choose model" })).toBeDisabled();
+    expect(await screen.findByRole("button", { name: "Choose model" })).toBeDisabled();
     expect(screen.getByLabelText("Message")).toBeDisabled();
     expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
     expect(setup.api.loadModel).not.toHaveBeenCalled();
@@ -1357,8 +1385,8 @@ describe("ChatScreen", () => {
     const setup = services();
     vi.mocked(setup.api.loadModel).mockRejectedValue(new Error("operation conflict"));
     render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
-    const picker = await screen.findByRole("combobox", { name: "Choose model" });
-    await user.selectOptions(picker, "other");
+    const picker = await screen.findByRole("button", { name: "Choose model" });
+    await selectModel(user, "other");
     await user.click(screen.getByRole("button", { name: "Switch to other" }));
     expect(await screen.findByRole("status")).toHaveTextContent("operation conflict");
     expect(picker).toBeEnabled();
@@ -1368,7 +1396,7 @@ describe("ChatScreen", () => {
   it("ignores an older lifecycle refresh that resolves after newer terminal truth", async () => {
     const setup = services();
     render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
-    await screen.findByRole("combobox", { name: "Choose model" });
+    await screen.findByRole("button", { name: "Choose model" });
     let resolveOlder!: (value: Awaited<ReturnType<ChatScreenServices["getControlNode"]>>) => void;
     vi.mocked(setup.api.getControlNode)
       .mockImplementationOnce(
@@ -1402,7 +1430,7 @@ describe("ChatScreen", () => {
   it("keeps chat blocked until terminal lifecycle truth finishes reconciling", async () => {
     const setup = services();
     render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
-    await screen.findByRole("combobox", { name: "Choose model" });
+    await screen.findByRole("button", { name: "Choose model" });
     let resolveNode!: (value: Awaited<ReturnType<ChatScreenServices["getControlNode"]>>) => void;
     vi.mocked(setup.api.getControlNode).mockImplementationOnce(
       () =>
@@ -1463,7 +1491,7 @@ describe("ChatScreen", () => {
       });
       render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
 
-      const picker = await screen.findByRole("combobox", { name: "Choose model" });
+      const picker = await screen.findByRole("button", { name: "Choose model" });
       expect(picker).toBeDisabled();
       const load = screen.queryByRole("button", { name: /^(Load|Switch to) / });
       if (load) {
@@ -1493,7 +1521,7 @@ describe("ChatScreen", () => {
       });
       render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
 
-      const picker = await screen.findByRole("combobox", { name: "Choose model" });
+      const picker = await screen.findByRole("button", { name: "Choose model" });
       expect(picker).toBeDisabled();
       await act(async () =>
         resolveStatus({
@@ -1523,7 +1551,8 @@ describe("ChatScreen", () => {
     });
     render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
 
-    await user.click(await screen.findByRole("button", { name: "Load gemma" }));
+    await openModelPicker(user);
+    await user.click(screen.getByRole("button", { name: "Load gemma" }));
 
     await waitFor(() => expect(setup.api.loadModel).toHaveBeenCalledOnce());
   });
@@ -1542,8 +1571,8 @@ describe("ChatScreen", () => {
       updatedAtUnixMs: 2,
     });
     render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
-    const picker = await screen.findByRole("combobox", { name: "Choose model" });
-    await user.selectOptions(picker, "other");
+    const picker = await screen.findByRole("button", { name: "Choose model" });
+    await selectModel(user, "other");
     await user.click(screen.getByRole("button", { name: "Switch to other" }));
     await vi.waitFor(() => expect(setup.api.getOperation).toHaveBeenCalled());
     const signal = vi.mocked(setup.api.getOperation).mock.calls[0][3]?.signal;
@@ -1572,7 +1601,7 @@ describe("ChatScreen", () => {
     const user = userEvent.setup();
     const setup = services();
     render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
-    await screen.findByRole("combobox", { name: "Choose model" });
+    await screen.findByRole("button", { name: "Choose model" });
     await user.type(screen.getByLabelText("Message"), "Hello");
     await user.click(screen.getByRole("button", { name: "Send message" }));
     setup.callbacks()?.onTerminal(terminal);
@@ -1584,7 +1613,7 @@ describe("ChatScreen", () => {
     const user = userEvent.setup();
     const setup = services();
     render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
-    await screen.findByRole("combobox", { name: "Choose model" });
+    await screen.findByRole("button", { name: "Choose model" });
     await user.type(screen.getByLabelText("Message"), "First");
     await user.click(screen.getByRole("button", { name: "Send message" }));
     setup.callbackHistory[0].onDelta("Partial answer");
@@ -1624,7 +1653,7 @@ describe("ChatScreen", () => {
     const user = userEvent.setup();
     const setup = services();
     const view = render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
-    await screen.findByRole("combobox", { name: "Choose model" });
+    await screen.findByRole("button", { name: "Choose model" });
     await user.type(screen.getByLabelText("Message"), "Hello");
     await user.click(screen.getByRole("button", { name: "Send message" }));
     await user.click(screen.getByRole("button", { name: "Stop response" }));
@@ -1637,7 +1666,7 @@ describe("ChatScreen", () => {
     const user = userEvent.setup();
     const setup = services();
     const view = render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
-    await screen.findByRole("combobox", { name: "Choose model" });
+    await screen.findByRole("button", { name: "Choose model" });
     await user.type(screen.getByLabelText("Message"), "Hello");
     await user.click(screen.getByRole("button", { name: "Send message" }));
 
@@ -1655,7 +1684,9 @@ describe("ChatScreen", () => {
     expect(attachment).not.toBeDisabled();
     expect(attachment).toHaveAttribute("aria-disabled", "true");
     expect(attachment).toHaveAttribute("aria-describedby", "attachment-support-reason");
-    expect(screen.getByRole("tooltip")).toHaveTextContent("Document input is not supported by this model and backend.");
+    expect(document.querySelector("#attachment-support-reason")).toHaveTextContent(
+      "Document input is not supported by this model and backend.",
+    );
     expect(setup.api.getCapabilities).toHaveBeenCalledWith(
       "http://127.0.0.1:8080",
       "ab".repeat(32),
@@ -1677,7 +1708,7 @@ describe("ChatScreen", () => {
     await waitFor(() => expect(setup.api.getCapabilities).toHaveBeenCalled());
     await waitFor(() => {
       expect(screen.getByRole("button", { name: "Attach document" })).not.toHaveAttribute("aria-describedby");
-      expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
+      expect(document.querySelector("#attachment-support-reason")).not.toBeInTheDocument();
     });
   });
 
@@ -1685,10 +1716,10 @@ describe("ChatScreen", () => {
     const setup = services();
     render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
 
-    const picker = await screen.findByRole("combobox", { name: "Choose model" });
+    const picker = await screen.findByRole("button", { name: "Choose model" });
     const modelControl = screen.getByRole("region", { name: "Chat model" });
     const composer = screen.getByRole("form", { name: "Message composer" });
-    expect(within(modelControl).getByText("Active model: gemma")).toBeVisible();
+    expect(within(modelControl).getByText("Active model: gemma")).toBeInTheDocument();
     expect(within(composer).queryByText("Active model: gemma")).not.toBeInTheDocument();
     expect(picker).toHaveAccessibleName("Choose model");
     expect(screen.queryByText(/Active:\s*gemma/)).not.toBeInTheDocument();

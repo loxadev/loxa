@@ -91,9 +91,75 @@ function ReconcileControl() {
 }
 
 describe("NodeScreen", () => {
+  it("renders a row-oriented inventory without changing the scalar screen truth", () => {
+    const first = {
+      rowId: "local-node",
+      name: "Local node",
+      kind: "Local",
+      nodeId: "node-7",
+      statusLabel: "Ready",
+      statusTone: "success" as const,
+      activeModel: "gemma-3-4b-it-q4",
+      engineName: "llama.cpp",
+      engineVersion: "b9999",
+      profile: "default",
+      endpoint,
+      ownership: "App-owned node",
+    };
+    render(
+      <NodeTable
+        rows={[
+          first,
+          { ...first, nodeId: "node-8", endpoint: "http://127.0.0.1:8081", ownership: "Externally attached" },
+        ]}
+      />,
+    );
+
+    const table = screen.getByRole("table", { name: "Local node inventory" });
+    expect(within(table).getAllByRole("row")).toHaveLength(3);
+    expect(within(table).getByText("node-8")).toBeVisible();
+  });
+
+  it("selects inventory rows through a named keyboard-operable control", async () => {
+    const user = userEvent.setup();
+    const onSelectRow = vi.fn();
+    const first = {
+      rowId: "local-node",
+      name: "Local node",
+      kind: "Local",
+      nodeId: "node-7",
+      statusLabel: "Ready",
+      statusTone: "success" as const,
+      activeModel: "gemma-3-4b-it-q4",
+      engineName: "llama.cpp",
+      engineVersion: "b9999",
+      profile: "default",
+      endpoint,
+      ownership: "App-owned node",
+    };
+    render(
+      <NodeTable
+        rows={[first, { ...first, rowId: "future-node", name: "Future node", nodeId: "node-8" }]}
+        selectedRowId="local-node"
+        onSelectRow={onSelectRow}
+      />,
+    );
+
+    const local = screen.getByRole("button", { name: "Select Local node" });
+    const future = screen.getByRole("button", { name: "Select Future node" });
+    expect(local).toHaveAttribute("aria-pressed", "true");
+    expect(future).toHaveAttribute("aria-pressed", "false");
+    future.focus();
+    await user.keyboard("{Enter}");
+    expect(onSelectRow).toHaveBeenCalledWith("future-node");
+  });
+
   it("omits the Actions column and cells when actions are absent", () => {
     render(
       <NodeTable
+        rowId="local-node"
+        name="Local node"
+        kind="Local"
         nodeId="node-7"
         statusLabel="Ready"
         statusTone="success"
@@ -118,6 +184,9 @@ describe("NodeScreen", () => {
   it("omits the Actions column when every provided action slot is empty", () => {
     render(
       <NodeTable
+        rowId="local-node"
+        name="Local node"
+        kind="Local"
         nodeId="node-7"
         statusLabel="Ready"
         statusTone="success"
@@ -139,6 +208,9 @@ describe("NodeScreen", () => {
   it("omits the Actions column when every action slot is false", () => {
     render(
       <NodeTable
+        rowId="local-node"
+        name="Local node"
+        kind="Local"
         nodeId="node-7"
         statusLabel="Ready"
         statusTone="success"
@@ -160,6 +232,9 @@ describe("NodeScreen", () => {
   it("omits the Actions column when action slots contain only empty arrays", () => {
     render(
       <NodeTable
+        rowId="local-node"
+        name="Local node"
+        kind="Local"
         nodeId="node-7"
         statusLabel="Ready"
         statusTone="success"
@@ -181,6 +256,9 @@ describe("NodeScreen", () => {
   it("shows the Actions column when mixed action slots include a renderable child", () => {
     render(
       <NodeTable
+        rowId="local-node"
+        name="Local node"
+        kind="Local"
         nodeId="node-7"
         statusLabel="Ready"
         statusTone="success"
@@ -208,6 +286,9 @@ describe("NodeScreen", () => {
   it("keeps the status badge visual-only", () => {
     render(
       <NodeTable
+        rowId="local-node"
+        name="Local node"
+        kind="Local"
         nodeId="node-7"
         statusLabel="Ready"
         statusTone="success"
@@ -247,6 +328,34 @@ describe("NodeScreen", () => {
     expect(within(localNode).getByText("App-owned node")).toBeVisible();
     expect(screen.queryByRole("combobox")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /add node/i })).not.toBeInTheDocument();
+  });
+
+  it("renders a selected-node runtime summary from authoritative node fields", async () => {
+    renderNode(
+      services({
+        getStatus: vi.fn().mockResolvedValue(readyStatus),
+      }),
+    );
+
+    const summary = await screen.findByRole("region", { name: "Selected node runtime" });
+    expect(within(summary).getByRole("heading", { name: "Local node runtime" })).toBeVisible();
+    for (const value of ["node-7", endpoint, "gemma-3-4b-it-q4", "llama.cpp", "b9999", "default"]) {
+      expect(within(summary).getByText(value)).toBeVisible();
+    }
+  });
+
+  it("shows truthful unavailable runtime values and an unsupported developer-log state", async () => {
+    renderNode();
+
+    const summary = await screen.findByRole("region", { name: "Selected node runtime" });
+    expect(within(summary).getByText("No model loaded")).toBeVisible();
+    expect(within(summary).getAllByText("Unavailable")).toHaveLength(3);
+
+    const logs = screen.getByRole("region", { name: "Developer logs unavailable" });
+    expect(
+      within(logs).getByText("Developer logs are unavailable because this backend does not expose a log source."),
+    ).toBeVisible();
+    expect(logs).not.toHaveTextContent(/tok\/s|latency|memory|gpu/i);
   });
 
   it("automatically ensures the node and renders unloaded as a successful state", async () => {
@@ -324,7 +433,7 @@ describe("NodeScreen", () => {
     expect(await findStatusBadge("Ready")).toBeVisible();
     expect(screen.getByText("Externally attached")).toBeInTheDocument();
     for (const value of [endpoint, "node-7", "llama.cpp", "b9999", "gemma-3-4b-it-q4", "default"]) {
-      expect(screen.getByText(value)).toHaveClass("technical-value");
+      expect(screen.getAllByText(value).every((element) => element.classList.contains("technical-value"))).toBe(true);
     }
     expect(screen.queryByRole("button", { name: "Stop node" })).not.toBeInTheDocument();
   });
@@ -340,6 +449,7 @@ describe("NodeScreen", () => {
     expect(screen.queryByRole("button", { name: "Browse verified models" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Retry node startup" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Start node" })).toBeEnabled();
+    expect(screen.queryByText("Error", { selector: '[data-slot="status-badge"]' })).not.toBeInTheDocument();
   });
 
   it("keeps safe owned-child recovery available when the public probe fails", async () => {
@@ -401,8 +511,7 @@ describe("NodeScreen", () => {
     const modules = [
       "src/node/NodeScreen.module.css",
       "src/node/NodeTable.module.css",
-      "src/models/ModelsScreen.module.css",
-      "src/settings/SettingsScreen.module.css",
+      "src/node/NodeRuntimePanels.module.css",
     ];
     const undefinedReferences = modules.flatMap((file) => {
       const css = readFileSync(resolve(process.cwd(), file), "utf8");

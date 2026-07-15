@@ -133,10 +133,13 @@ test("keeps neutral production runtime copy across Nodes, Models, and Chat surfa
   expect(document.body).not.toHaveTextContent("browser preview");
 
   await act(async () => page.getByRole("link", { name: "Chat", exact: true }).click());
-  await expect.element(page.getByRole("heading", { name: "Chat" })).toBeVisible();
+  await expect.element(page.getByRole("heading", { name: "New Chat" })).toBeVisible();
   const chatRegion = page.getByRole("region", { name: "Chat" });
   expect(chatRegion.getByRole("status").element()).toHaveTextContent(neutralMessage);
-  expect(page.getByRole("log", { name: "Conversation" }).element()).toHaveTextContent(neutralMessage);
+  expect(page.getByRole("log", { name: "Conversation" }).element()).toHaveTextContent(
+    "Start a local conversation when the node is ready.",
+  );
+  expect(page.getByRole("log", { name: "Conversation" }).element()).not.toHaveTextContent(neutralMessage);
   expect(page.getByRole("form", { name: "Message composer" }).element()).not.toHaveTextContent(neutralMessage);
   expect(document.body).not.toHaveTextContent("browser preview");
 });

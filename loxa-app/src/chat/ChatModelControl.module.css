@@ -1,117 +1,207 @@
 .control {
-  width: min(100%, 920px);
-  margin-inline: auto;
+  position: relative;
+  z-index: 10;
+  width: 100%;
+}
+
+.triggerRow {
+  min-height: 44px;
   display: grid;
-  gap: var(--loxa-space-2);
-  padding: var(--loxa-space-3);
-  background: var(--loxa-secondary-surface);
-  border: 1px solid var(--loxa-control-border);
-  border-radius: var(--loxa-radius-lg);
-}
-
-.summary,
-.actions,
-.modelIdentity,
-.searchField {
-  min-width: 0;
-  display: flex;
+  grid-template-columns: minmax(0, 1fr) minmax(240px, 420px) minmax(0, 1fr);
   align-items: center;
+  gap: var(--loxa-space-3);
+  padding: 0 var(--loxa-space-3);
+  border-bottom: 1px solid var(--loxa-control-border);
 }
 
-.summary {
-  justify-content: space-between;
-  gap: var(--loxa-space-4);
-}
-
-.modelIdentity {
-  flex: 0 1 auto;
-  gap: var(--loxa-space-2);
-}
-
-.modelIdentity > svg,
-.searchField > svg {
-  width: 16px;
-  height: 16px;
-  flex: 0 0 auto;
-  color: var(--loxa-muted-foreground);
-}
-
-.label,
-.activeModel,
-.status,
-.guidance {
+.title {
   margin: 0;
-}
-
-.label {
-  color: var(--loxa-muted-foreground);
-  font-size: var(--loxa-type-label-size);
-  font-weight: var(--loxa-type-label-weight);
-}
-
-.activeModel {
   overflow: hidden;
-  font-family: var(--loxa-font-mono);
+  font-weight: 600;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.statusCopy {
+.titleGroup {
   min-width: 0;
-  text-align: right;
+  display: flex;
+  align-items: center;
+  gap: var(--loxa-space-1);
 }
 
-.status,
-.guidance {
-  color: var(--loxa-muted-foreground);
-  font-size: var(--loxa-type-body-small-size);
-  line-height: var(--loxa-type-body-small-line-height);
+.endActions {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
 }
 
-.guidance {
-  overflow-wrap: anywhere;
-}
-
-.actions {
+.modelTrigger {
+  min-width: 0;
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   gap: var(--loxa-space-2);
+  padding: 0 var(--loxa-space-3);
+  color: var(--loxa-muted-foreground);
+  background: var(--loxa-secondary-surface);
+  border: 1px solid var(--loxa-control-border);
+  border-radius: var(--loxa-radius-md);
+}
+
+.modelTrigger:hover,
+.modelTrigger[aria-expanded="true"] {
+  color: var(--loxa-foreground);
+  background: var(--loxa-secondary-surface);
+}
+
+.modelTrigger > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.modelTrigger svg {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 15px;
+}
+
+.modelTrigger kbd {
+  color: var(--loxa-muted-foreground);
+  font: inherit;
+  font-family: var(--loxa-font-mono);
+}
+
+.notice {
+  width: min(calc(100% - 32px), 760px);
+  min-height: 34px;
+  margin: var(--loxa-space-2) auto 0;
+  display: flex;
+  align-items: center;
+  gap: var(--loxa-space-2);
+  padding: var(--loxa-space-2) var(--loxa-space-3);
+  color: var(--loxa-muted-foreground);
+  background: var(--loxa-danger-status-surface);
+  border: 1px solid var(--loxa-danger-status-border);
+  border-radius: var(--loxa-radius-md);
+  font-size: var(--loxa-type-body-small-size);
+}
+
+.guidance {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.notice button {
+  margin-left: auto;
+  flex: 0 0 auto;
+  color: var(--loxa-foreground);
+  font-weight: 600;
+}
+
+.picker {
+  position: absolute;
+  top: 48px;
+  left: 50%;
+  width: min(calc(100% - 32px), 680px);
+  max-height: min(560px, calc(100vh - 80px));
+  overflow: auto;
+  transform: translateX(-50%);
+  padding: var(--loxa-space-3);
+  color: var(--loxa-foreground);
+  background: var(--loxa-background);
+  border: 1px solid var(--loxa-control-border);
+  border-radius: var(--loxa-radius-lg);
+  box-shadow: 0 16px 42px rgb(0 0 0 / 28%);
 }
 
 .searchField {
   position: relative;
-  flex: 1 1 260px;
+  display: flex;
+  align-items: center;
 }
 
 .searchField > svg {
   position: absolute;
   left: var(--loxa-space-3);
   z-index: 1;
+  width: 15px;
+  height: 15px;
+  color: var(--loxa-muted-foreground);
 }
 
 .searchField input {
-  padding-left: calc(var(--loxa-space-3) + 22px);
+  padding-left: var(--loxa-space-8);
 }
 
-.modelField {
-  flex: 1 1 260px;
-  min-width: 0;
+.pickerHeading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--loxa-space-3) var(--loxa-space-2) var(--loxa-space-2);
+  color: var(--loxa-muted-foreground);
+  font-size: var(--loxa-type-label-size);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
 }
 
-.modelPicker {
-  width: 100%;
-  min-width: 0;
-  min-height: var(--loxa-component-minimum-interactive-target);
-  padding: 0 var(--loxa-space-3);
-  color: var(--loxa-foreground);
-  background: var(--loxa-background);
-  border: 1px solid var(--loxa-control-border);
-  border-radius: var(--loxa-radius-md);
+.pickerHeading svg {
+  width: 14px;
+  height: 14px;
+}
+
+.modelList {
+  display: grid;
+  gap: 2px;
+}
+
+.modelOption {
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--loxa-space-4);
+  padding: var(--loxa-space-2) var(--loxa-space-3);
+  border-radius: var(--loxa-radius-sm);
+  text-align: left;
+}
+
+.modelOption:hover,
+.modelOption[aria-selected="true"] {
+  color: var(--loxa-selected-foreground);
+  background: var(--loxa-selected-surface);
+}
+
+.modelOption[aria-selected="true"] .modelMeta {
+  color: var(--loxa-selected-foreground);
+}
+
+.modelMeta {
+  color: var(--loxa-muted-foreground);
   font-family: var(--loxa-font-mono);
-  text-overflow: ellipsis;
+  font-size: var(--loxa-type-code-compact-size);
 }
 
-.modelPicker:focus-visible {
-  outline: 2px solid var(--loxa-focus);
-  outline-offset: 2px;
+.noResults {
+  padding: var(--loxa-space-6) var(--loxa-space-2);
+  color: var(--loxa-muted-foreground);
+  text-align: center;
+}
+
+.pickerFooter {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--loxa-space-2);
+  margin-top: var(--loxa-space-3);
+  padding-top: var(--loxa-space-3);
+  border-top: 1px solid var(--loxa-control-border);
 }
 
 .visuallyHidden {
@@ -126,38 +216,58 @@
   border: 0;
 }
 
-@media (max-width: 760px) {
-  .summary {
-    align-items: flex-start;
+@container chat-screen (max-width: 640px) {
+  .triggerRow {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-rows: auto auto;
+    padding-block: var(--loxa-space-1);
   }
 
-  .actions {
-    flex-wrap: wrap;
+  .titleGroup {
+    grid-column: 1;
+    grid-row: 1;
   }
 
-  .searchField,
-  .modelField {
-    flex-basis: 100%;
+  .modelTrigger {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    width: 100%;
+  }
+
+  .endActions {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  .modelTrigger kbd {
+    display: none;
+  }
+
+  .guidance {
+    display: none;
   }
 }
 
 @media (prefers-contrast: more) {
-  .control,
-  .modelPicker {
+  .modelTrigger,
+  .notice,
+  .picker {
     border-width: 2px;
   }
 }
 
 @media (forced-colors: active) {
-  .control,
-  .modelPicker {
+  .modelTrigger,
+  .notice,
+  .picker {
     border-color: ButtonText;
     forced-color-adjust: auto;
   }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .modelPicker {
-    transition-duration: var(--loxa-motion-fast);
+  .control,
+  .control * {
+    transition-duration: 0.01ms;
   }
 }

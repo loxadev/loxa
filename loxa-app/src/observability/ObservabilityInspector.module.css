@@ -1,0 +1,60 @@
+.inspector {
+  min-height: 0;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--loxa-surface);
+}
+
+.header {
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 var(--loxa-space-3);
+  border-bottom: 1px solid var(--loxa-control-border);
+}
+
+.header h2,
+.section h3 {
+  margin: 0;
+  font-size: var(--loxa-type-body-size);
+}
+
+.section {
+  display: grid;
+  gap: var(--loxa-space-3);
+  padding: var(--loxa-space-4);
+  border-bottom: 1px solid var(--loxa-control-border);
+}
+
+.fact {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--loxa-space-2);
+  color: var(--loxa-muted-foreground);
+  font-size: var(--loxa-type-body-small-size);
+}
+
+.fact strong {
+  max-width: 132px;
+  overflow: hidden;
+  color: var(--loxa-foreground);
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.factIcon,
+.factIcon svg {
+  width: 15px;
+  height: 15px;
+}
+
+.explanation {
+  margin: 0;
+  color: var(--loxa-muted-foreground);
+  font-size: var(--loxa-type-body-small-size);
+  line-height: var(--loxa-type-body-small-line-height);
+}

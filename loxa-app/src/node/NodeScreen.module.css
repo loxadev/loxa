@@ -23,9 +23,20 @@
   height: 1.25rem;
 }
 
+.runtimePanels {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(18rem, 0.6fr);
+  gap: var(--loxa-space-4);
+  margin-top: var(--loxa-space-6);
+}
+
 @media (max-width: 760px) {
   .intro {
     margin-bottom: var(--loxa-space-4);
+  }
+
+  .runtimePanels {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 

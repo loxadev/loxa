@@ -1,9 +1,11 @@
 import { useState } from "react";
-import { TriangleAlert } from "lucide-react";
+import { Boxes, Copy, Play, RotateCcw, Square, TriangleAlert } from "lucide-react";
 
 import { Alert, AlertDescription, AlertTitle } from "../components/ui/alert";
+import { Button } from "../components/ui/button";
 import { useNodeSession } from "./NodeSession";
 import styles from "./NodeScreen.module.css";
+import { DeveloperLogPanel, NodeRuntimeSummary } from "./NodeRuntimePanels";
 import { NodeTable } from "./NodeTable";
 import { presentNode } from "./presentation";
 
@@ -22,6 +24,10 @@ export function NodeScreen({
 }) {
   const session = useNodeSession();
   const [announcement, setAnnouncement] = useState("");
+  const [selectedRowId, setSelectedRowId] = useState("local-node");
+  const node = presentNode(session);
+  const rows = [node];
+  const selectedNode = rows.find((row) => row.rowId === selectedRowId) ?? rows[0];
 
   const copyEndpoint = async () => {
     try {
@@ -42,43 +48,54 @@ export function NodeScreen({
       </header>
       <p className={styles.intro}>{phaseSummary(session.phase)}</p>
       <NodeTable
-        {...presentNode(session)}
-        actions={{
-          copyEndpoint: (
-            <button
-              className="quiet-button interactive-target"
-              type="button"
-              aria-label="Copy endpoint"
-              onClick={() => void copyEndpoint()}
-            >
-              Copy
-            </button>
-          ),
-          model:
-            session.phase === "unloaded" ? (
-              <button className="primary-button interactive-target" type="button" onClick={onNavigateModels}>
-                Browse verified models
-              </button>
-            ) : undefined,
-          retry:
-            session.phase === "error" || session.phase === "disconnected" ? (
-              <button className="primary-button interactive-target" type="button" onClick={() => void session.retry()}>
-                Retry node startup
-              </button>
-            ) : undefined,
-          start:
-            session.phase === "stopped" ? (
-              <button className="primary-button interactive-target" type="button" onClick={() => void session.retry()}>
-                Start node
-              </button>
-            ) : undefined,
-          lifecycle:
-            session.ownership === "owned" && !["checking", "starting", "stopping"].includes(session.phase) ? (
-              <button className="secondary-button interactive-target" type="button" onClick={() => void session.stop()}>
-                Stop node
-              </button>
-            ) : undefined,
-        }}
+        rows={[
+          {
+            ...node,
+            actions: {
+              copyEndpoint: (
+                <Button
+                  className="interactive-target"
+                  variant="quiet"
+                  aria-label="Copy endpoint"
+                  onClick={() => void copyEndpoint()}
+                >
+                  <Copy aria-hidden="true" />
+                  Copy
+                </Button>
+              ),
+              model:
+                session.phase === "unloaded" ? (
+                  <Button className="interactive-target" onClick={onNavigateModels}>
+                    <Boxes aria-hidden="true" />
+                    Browse verified models
+                  </Button>
+                ) : undefined,
+              retry:
+                session.phase === "error" || session.phase === "disconnected" ? (
+                  <Button className="interactive-target" onClick={() => void session.retry()}>
+                    <RotateCcw aria-hidden="true" />
+                    Retry node startup
+                  </Button>
+                ) : undefined,
+              start:
+                session.phase === "stopped" ? (
+                  <Button className="interactive-target" onClick={() => void session.retry()}>
+                    <Play aria-hidden="true" />
+                    Start node
+                  </Button>
+                ) : undefined,
+              lifecycle:
+                session.ownership === "owned" && !["checking", "starting", "stopping"].includes(session.phase) ? (
+                  <Button className="interactive-target" variant="secondary" onClick={() => void session.stop()}>
+                    <Square aria-hidden="true" />
+                    Stop node
+                  </Button>
+                ) : undefined,
+            },
+          },
+        ]}
+        selectedRowId={selectedNode.rowId}
+        onSelectRow={setSelectedRowId}
       />
       {session.error && (
         <Alert className={styles.errorAlert} variant="danger">
@@ -89,6 +106,10 @@ export function NodeScreen({
           </div>
         </Alert>
       )}
+      <div className={styles.runtimePanels}>
+        <NodeRuntimeSummary node={selectedNode} />
+        <DeveloperLogPanel />
+      </div>
       <p className="visually-hidden" aria-live="polite">
         {announcement}
       </p>

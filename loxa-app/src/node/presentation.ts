@@ -4,6 +4,9 @@ import type { NodeSessionPhase } from "./NodeSession";
 import type { NodeOwnership } from "./machine";
 
 export type NodePresentation = {
+  rowId: "local-node";
+  name: "Local node";
+  kind: "Local";
   nodeId: string;
   statusLabel: string;
   statusTone: StatusBadgeProps["tone"];
@@ -27,6 +30,9 @@ export function presentNode({
   status: NodeStatus | null;
 }): NodePresentation {
   return {
+    rowId: "local-node",
+    name: "Local node",
+    kind: "Local",
     nodeId: status?.node_id ?? "—",
     statusLabel: phaseLabel(phase),
     statusTone: phaseTone(phase),

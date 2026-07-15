@@ -67,9 +67,18 @@
 }
 
 .attachmentButton,
+.toolButton,
 .primaryControl {
   flex: 0 0 auto;
   min-height: var(--loxa-component-minimum-interactive-target);
+}
+
+.contextUsage {
+  margin-left: auto;
+  align-self: center;
+  color: var(--loxa-muted-foreground);
+  font-family: var(--loxa-font-mono);
+  font-size: var(--loxa-type-code-compact-size);
 }
 
 @media (max-width: 760px) {

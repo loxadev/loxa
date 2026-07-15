@@ -23,7 +23,6 @@ const primaryItems: Array<{ route: WorkspaceRoute; label: string; Icon: Icon }> 
 
 export function SidebarNavigation({ footer = false }: { footer?: boolean }) {
   const route = useWorkspaceStore(selectActiveRoute);
-  const collapsed = useWorkspaceStore((state) => state.sidebarCollapsed);
   const setRoute = useWorkspaceStore(selectSetActiveRoute);
   const setSettingsPage = useWorkspaceStore(selectSetActiveSettingsPage);
   const items = footer ? [{ route: "settings" as const, label: "Settings", Icon: Settings }] : primaryItems;
@@ -49,12 +48,10 @@ export function SidebarNavigation({ footer = false }: { footer?: boolean }) {
             <span className="sidebar-text">{label}</span>
           </a>
         );
-        return collapsed ? (
+        return (
           <Tooltip key={itemRoute} content={label}>
             {link}
           </Tooltip>
-        ) : (
-          link
         );
       })}
     </nav>

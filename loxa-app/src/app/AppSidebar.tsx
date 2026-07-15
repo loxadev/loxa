@@ -1,17 +1,19 @@
-import { useEffect, useRef, type KeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
+import { PanelLeftClose, PanelLeftOpen } from "lucide-react";
+import type { ReactNode } from "react";
 
+import { IconButton } from "../components/ui/button";
+import { Tooltip } from "../components/ui/tooltip";
 import {
-  MAX_EXPANDED_SIDEBAR_WIDTH,
-  MIN_EXPANDED_SIDEBAR_WIDTH,
-  SIDEBAR_KEYBOARD_STEP,
+  DEFAULT_CONVERSATION_RAIL_WIDTH,
+  MAX_CONVERSATION_RAIL_WIDTH,
+  MIN_CONVERSATION_RAIL_WIDTH,
   selectExpandedSidebarWidth,
-  selectResizeSidebarBy,
   selectSetExpandedSidebarWidth,
-  selectSetSidebarCollapsed,
-  selectSidebarCollapsed,
   selectToggleSidebar,
+  selectSidebarCollapsed,
   useWorkspaceStore,
 } from "../stores/workspace-store";
+import { ResizablePanel } from "./shell/ResizablePanel";
 import { SidebarHeader } from "./SidebarHeader";
 import { SidebarNavigation } from "./SidebarNavigation";
 import { SidebarRuntimeStatus } from "./SidebarRuntimeStatus";
@@ -25,119 +27,54 @@ type AppSidebarProps = {
 
 export function AppSidebar({ brandMark, conversationRail, runtimeHealth, runtimeModel }: AppSidebarProps) {
   const collapsed = useWorkspaceStore(selectSidebarCollapsed);
+  const width = useWorkspaceStore(selectExpandedSidebarWidth);
+  const setWidth = useWorkspaceStore(selectSetExpandedSidebarWidth);
+  const toggle = useWorkspaceStore(selectToggleSidebar);
+  const toggleLabel = collapsed ? "Show conversations" : "Hide conversations";
 
   return (
     <aside className="app-sidebar" aria-label="Primary" data-collapsed={collapsed || undefined}>
-      <SidebarHeader brandMark={brandMark} />
-      <SidebarNavigation />
-      {conversationRail ? (
-        <div className="conversation-rail-slot" hidden={collapsed}>
-          {conversationRail}
-        </div>
-      ) : (
-        <div className="sidebar-spacer" />
-      )}
-      <div className="sidebar-footer">
-        <SidebarRuntimeStatus health={runtimeHealth} model={runtimeModel} />
+      <div className="activity-rail">
+        <SidebarHeader brandMark={brandMark} />
+        <SidebarNavigation />
+        <div className="activity-rail-spacer" />
+        {collapsed ? (
+          <SidebarRuntimeStatus health={runtimeHealth} model={runtimeModel} />
+        ) : (
+          <Tooltip content={`${runtimeHealth}. ${runtimeModel}`}>
+            <SidebarRuntimeStatus health={runtimeHealth} model={runtimeModel} />
+          </Tooltip>
+        )}
+        {conversationRail && collapsed ? (
+          <Tooltip content={toggleLabel}>
+            <IconButton className="conversation-toggle" variant="quiet" label={toggleLabel} onClick={toggle}>
+              {collapsed ? <PanelLeftOpen aria-hidden="true" /> : <PanelLeftClose aria-hidden="true" />}
+            </IconButton>
+          </Tooltip>
+        ) : null}
         <SidebarNavigation footer />
       </div>
-      <SidebarDivider />
+
+      {conversationRail && !collapsed ? (
+        <ResizablePanel
+          ariaLabel="Resize conversation rail"
+          className="conversation-panel"
+          defaultWidth={DEFAULT_CONVERSATION_RAIL_WIDTH}
+          minWidth={MIN_CONVERSATION_RAIL_WIDTH}
+          maxWidth={MAX_CONVERSATION_RAIL_WIDTH}
+          onResize={setWidth}
+          side="left"
+          width={width}
+        >
+          <div className="conversation-panel-header">
+            <span>Chats</span>
+            <IconButton variant="quiet" label="Hide conversations" onClick={toggle}>
+              <PanelLeftClose aria-hidden="true" />
+            </IconButton>
+          </div>
+          <div className="conversation-rail-slot">{conversationRail}</div>
+        </ResizablePanel>
+      ) : null}
     </aside>
-  );
-}
-
-const SIDEBAR_COLLAPSE_THRESHOLD = 48;
-
-function SidebarDivider() {
-  const collapsed = useWorkspaceStore(selectSidebarCollapsed);
-  const width = useWorkspaceStore(selectExpandedSidebarWidth);
-  const setCollapsed = useWorkspaceStore(selectSetSidebarCollapsed);
-  const toggle = useWorkspaceStore(selectToggleSidebar);
-  const setWidth = useWorkspaceStore(selectSetExpandedSidebarWidth);
-  const resizeBy = useWorkspaceStore(selectResizeSidebarBy);
-  const handle = useRef<HTMLDivElement | null>(null);
-  const pointerDrag = useRef<{
-    pointerId: number;
-    startX: number;
-    startWidth: number;
-    startedCollapsed: boolean;
-  } | null>(null);
-
-  useEffect(() => {
-    const element = handle.current;
-    const move = (event: PointerEvent) => {
-      const active = pointerDrag.current;
-      if (!active || event.pointerId !== active.pointerId) return;
-      const delta = event.clientX - active.startX;
-      if (active.startedCollapsed) {
-        if (delta >= SIDEBAR_COLLAPSE_THRESHOLD) setCollapsed(false);
-      } else if (delta <= -SIDEBAR_COLLAPSE_THRESHOLD) {
-        setCollapsed(true);
-      } else {
-        setWidth(active.startWidth + delta);
-      }
-    };
-    const finish = (event: PointerEvent) => {
-      const active = pointerDrag.current;
-      if (!active || event.pointerId !== active.pointerId) return;
-      if (element?.hasPointerCapture?.(active.pointerId)) element.releasePointerCapture(active.pointerId);
-      pointerDrag.current = null;
-    };
-    window.addEventListener("pointermove", move);
-    window.addEventListener("pointerup", finish);
-    window.addEventListener("pointercancel", finish);
-    return () => {
-      window.removeEventListener("pointermove", move);
-      window.removeEventListener("pointerup", finish);
-      window.removeEventListener("pointercancel", finish);
-    };
-  }, [setCollapsed, setWidth]);
-
-  const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
-    if (event.key === "Enter" || event.key === " ") toggle();
-    else if (event.key === "ArrowLeft") {
-      if (!collapsed) resizeBy(-SIDEBAR_KEYBOARD_STEP);
-    } else if (event.key === "ArrowRight") {
-      if (collapsed) setCollapsed(false);
-      else resizeBy(SIDEBAR_KEYBOARD_STEP);
-    } else if (event.key === "Home") setWidth(MIN_EXPANDED_SIDEBAR_WIDTH);
-    else if (event.key === "End") setWidth(MAX_EXPANDED_SIDEBAR_WIDTH);
-    else return;
-    event.preventDefault();
-  };
-
-  const onPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
-    if (event.button !== 0) return;
-    pointerDrag.current = {
-      pointerId: event.pointerId,
-      startX: event.clientX,
-      startWidth: width,
-      startedCollapsed: collapsed,
-    };
-    try {
-      event.currentTarget.setPointerCapture?.(event.pointerId);
-    } catch {
-      // Synthetic pointer events do not always register as active native pointers.
-    }
-    event.preventDefault();
-  };
-
-  return (
-    <div
-      ref={handle}
-      className="sidebar-resize-handle"
-      role="separator"
-      aria-label="Resize navigation and conversation rail"
-      aria-orientation="vertical"
-      aria-valuemin={MIN_EXPANDED_SIDEBAR_WIDTH}
-      aria-valuemax={MAX_EXPANDED_SIDEBAR_WIDTH}
-      aria-valuenow={width}
-      aria-valuetext={collapsed ? "Collapsed" : `${width} pixels`}
-      data-collapsed={collapsed || undefined}
-      tabIndex={0}
-      onKeyDown={onKeyDown}
-      onPointerDown={onPointerDown}
-      onDoubleClick={toggle}
-    />
   );
 }
