@@ -1,5 +1,5 @@
 .table {
-  min-width: 740px;
+  min-width: 1080px;
   border-collapse: collapse;
   border-top: 1px solid var(--loxa-control-border);
 }
@@ -65,7 +65,7 @@
 
 @media (max-width: 760px) {
   .table {
-    min-width: 680px;
+    min-width: 980px;
   }
 
   .headerRow th,

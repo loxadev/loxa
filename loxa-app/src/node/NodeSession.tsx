@@ -37,6 +37,7 @@ export type NodeSessionPhase =
   | "ready"
   | "reconciling"
   | "stopping"
+  | "stopped"
   | "disconnected"
   | "error"
   | "recovery-required";
@@ -377,7 +378,7 @@ export function NodeSessionProvider({
       if (run !== bootstrapRun.current) return;
       if (snapshot.error) throw new Error(snapshot.error);
       setState({
-        phase: "disconnected",
+        phase: "stopped",
         ownership: snapshot.ownership,
         endpoint: snapshot.endpoint,
         status: null,

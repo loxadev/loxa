@@ -51,7 +51,7 @@ a {
   flex-direction: column;
   min-height: 0;
   padding: var(--loxa-space-2);
-  overflow: hidden;
+  overflow: visible;
   background: var(--loxa-surface);
   border-right: 1px solid var(--loxa-control-border);
 }
@@ -116,6 +116,67 @@ a {
   height: 100%;
   cursor: col-resize;
   touch-action: none;
+}
+
+.sidebar-resize-handle[data-collapsed] {
+  right: calc((var(--loxa-component-minimum-interactive-target) * -1) + 3px);
+  cursor: e-resize;
+}
+
+.tooltip-anchor {
+  position: relative;
+  display: block;
+  min-width: 0;
+}
+
+.tooltip-content {
+  position: absolute;
+  z-index: 10;
+  padding: var(--loxa-space-1) var(--loxa-space-2);
+  color: var(--loxa-foreground);
+  white-space: nowrap;
+  pointer-events: auto;
+  visibility: hidden;
+  background: var(--loxa-surface);
+  border: 1px solid var(--loxa-control-border);
+  border-radius: var(--loxa-radius-sm);
+  opacity: 0;
+}
+
+.tooltip-content[data-side="right"] {
+  top: 50%;
+  left: calc(100% + var(--loxa-space-2));
+  transform: translateY(-50%);
+}
+
+.tooltip-content[data-side="top"] {
+  bottom: calc(100% + var(--loxa-space-2));
+  left: 50%;
+  transform: translateX(-50%);
+}
+
+.tooltip-content::before {
+  position: absolute;
+  content: "";
+}
+
+.tooltip-content[data-side="right"]::before {
+  top: 0;
+  right: 100%;
+  width: var(--loxa-space-2);
+  height: 100%;
+}
+
+.tooltip-content[data-side="top"]::before {
+  top: 100%;
+  left: 0;
+  width: 100%;
+  height: var(--loxa-space-2);
+}
+
+.tooltip-content[data-open="true"] {
+  visibility: visible;
+  opacity: 1;
 }
 
 .sidebar-resize-handle::after {

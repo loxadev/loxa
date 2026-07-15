@@ -95,7 +95,7 @@ describe("SettingsScreen", () => {
       within(table)
         .getAllByRole("columnheader")
         .map((cell) => cell.textContent),
-    ).toEqual(["Node", "Status", "Active model", "Endpoint", "Ownership"]);
+    ).toEqual(["Node", "Status", "Active model", "Engine", "Version", "Profile", "Endpoint", "Ownership"]);
     expect(within(table).getAllByRole("row")).toHaveLength(2);
     expect(within(table).getByText("Local node")).toBeVisible();
     for (const value of [
@@ -112,7 +112,7 @@ describe("SettingsScreen", () => {
     const badge = within(table).getByText("Ready", { selector: '[data-slot="status-badge"]' });
     expect(badge).toHaveAttribute("data-variant", "success");
     expect(badge).not.toHaveAttribute("aria-live");
-    expect(within(table).getByText(runtime.status.health)).toBeVisible();
+    expect(within(table).queryByText(runtime.status.health)).not.toBeInTheDocument();
     expect(screen.getByText("llama.cpp")).toHaveClass("technical-value");
     expect(local.querySelectorAll("input, button, select, textarea")).toHaveLength(0);
     expect(within(table).queryByRole("columnheader", { name: "Actions" })).not.toBeInTheDocument();

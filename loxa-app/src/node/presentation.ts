@@ -7,7 +7,6 @@ export type NodePresentation = {
   nodeId: string;
   statusLabel: string;
   statusTone: StatusBadgeProps["tone"];
-  health: string;
   activeModel: string;
   engineName: string;
   engineVersion: string;
@@ -31,7 +30,6 @@ export function presentNode({
     nodeId: status?.node_id ?? "—",
     statusLabel: phaseLabel(phase),
     statusTone: phaseTone(phase),
-    health: status?.health ?? "—",
     activeModel: status ? (status.runtime_model ?? "No model loaded") : "—",
     engineName: status?.engine?.name ?? "—",
     engineVersion: status?.engine?.version ?? "—",
@@ -50,6 +48,7 @@ function phaseLabel(phase: NodeSessionPhase) {
     ready: "Ready",
     reconciling: "Updating model status",
     stopping: "Stopping",
+    stopped: "Stopped",
     "recovery-required": "Recovery required",
     error: "Error",
   };

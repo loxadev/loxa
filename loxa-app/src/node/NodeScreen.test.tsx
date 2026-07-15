@@ -97,7 +97,6 @@ describe("NodeScreen", () => {
         nodeId="node-7"
         statusLabel="Ready"
         statusTone="success"
-        health="ready"
         activeModel="gemma-3-4b-it-q4"
         engineName="llama.cpp"
         engineVersion="b9999"
@@ -112,8 +111,8 @@ describe("NodeScreen", () => {
       within(table)
         .getAllByRole("columnheader")
         .map((cell) => cell.textContent),
-    ).toEqual(["Node", "Status", "Active model", "Endpoint", "Ownership"]);
-    expect(within(table).getAllByRole("cell")).toHaveLength(5);
+    ).toEqual(["Node", "Status", "Active model", "Engine", "Version", "Profile", "Endpoint", "Ownership"]);
+    expect(within(table).getAllByRole("cell")).toHaveLength(8);
   });
 
   it("omits the Actions column when every provided action slot is empty", () => {
@@ -122,7 +121,6 @@ describe("NodeScreen", () => {
         nodeId="node-7"
         statusLabel="Ready"
         statusTone="success"
-        health="ready"
         activeModel="gemma-3-4b-it-q4"
         engineName="llama.cpp"
         engineVersion="b9999"
@@ -135,7 +133,7 @@ describe("NodeScreen", () => {
 
     const table = screen.getByRole("table", { name: "Local node inventory" });
     expect(within(table).queryByRole("columnheader", { name: "Actions" })).not.toBeInTheDocument();
-    expect(within(table).getAllByRole("cell")).toHaveLength(5);
+    expect(within(table).getAllByRole("cell")).toHaveLength(8);
   });
 
   it("omits the Actions column when every action slot is false", () => {
@@ -144,7 +142,6 @@ describe("NodeScreen", () => {
         nodeId="node-7"
         statusLabel="Ready"
         statusTone="success"
-        health="ready"
         activeModel="gemma-3-4b-it-q4"
         engineName="llama.cpp"
         engineVersion="b9999"
@@ -157,7 +154,7 @@ describe("NodeScreen", () => {
 
     const table = screen.getByRole("table", { name: "Local node inventory" });
     expect(within(table).queryByRole("columnheader", { name: "Actions" })).not.toBeInTheDocument();
-    expect(within(table).getAllByRole("cell")).toHaveLength(5);
+    expect(within(table).getAllByRole("cell")).toHaveLength(8);
   });
 
   it("omits the Actions column when action slots contain only empty arrays", () => {
@@ -166,7 +163,6 @@ describe("NodeScreen", () => {
         nodeId="node-7"
         statusLabel="Ready"
         statusTone="success"
-        health="ready"
         activeModel="gemma-3-4b-it-q4"
         engineName="llama.cpp"
         engineVersion="b9999"
@@ -179,7 +175,7 @@ describe("NodeScreen", () => {
 
     const table = screen.getByRole("table", { name: "Local node inventory" });
     expect(within(table).queryByRole("columnheader", { name: "Actions" })).not.toBeInTheDocument();
-    expect(within(table).getAllByRole("cell")).toHaveLength(5);
+    expect(within(table).getAllByRole("cell")).toHaveLength(8);
   });
 
   it("shows the Actions column when mixed action slots include a renderable child", () => {
@@ -188,7 +184,6 @@ describe("NodeScreen", () => {
         nodeId="node-7"
         statusLabel="Ready"
         statusTone="success"
-        health="ready"
         activeModel="gemma-3-4b-it-q4"
         engineName="llama.cpp"
         engineVersion="b9999"
@@ -207,7 +202,7 @@ describe("NodeScreen", () => {
     const table = screen.getByRole("table", { name: "Local node inventory" });
     expect(within(table).getByRole("columnheader", { name: "Actions" })).toBeVisible();
     expect(within(table).getByRole("button", { name: "Copy" })).toBeVisible();
-    expect(within(table).getAllByRole("cell")).toHaveLength(6);
+    expect(within(table).getAllByRole("cell")).toHaveLength(9);
   });
 
   it("keeps the status badge visual-only", () => {
@@ -216,7 +211,6 @@ describe("NodeScreen", () => {
         nodeId="node-7"
         statusLabel="Ready"
         statusTone="success"
-        health="ready"
         activeModel="gemma-3-4b-it-q4"
         engineName="llama.cpp"
         engineVersion="b9999"
@@ -240,14 +234,14 @@ describe("NodeScreen", () => {
       within(table)
         .getAllByRole("columnheader")
         .map((cell) => cell.textContent),
-    ).toEqual(["Node", "Status", "Active model", "Endpoint", "Ownership", "Actions"]);
+    ).toEqual(["Node", "Status", "Active model", "Engine", "Version", "Profile", "Endpoint", "Ownership", "Actions"]);
     const rows = within(table).getAllByRole("row");
     expect(rows).toHaveLength(2);
     const localNode = rows[1];
     expect(within(localNode).getByText("Local node")).toBeVisible();
     expect(within(localNode).getByText("node-7")).toBeVisible();
     expect(within(localNode).getByText("Node ready — no model loaded")).toBeVisible();
-    expect(within(localNode).getByText("unavailable")).toBeVisible();
+    expect(within(localNode).queryByText("unavailable")).not.toBeInTheDocument();
     expect(within(localNode).getByText("No model loaded")).toBeVisible();
     expect(within(localNode).getByText(endpoint)).toBeVisible();
     expect(within(localNode).getByText("App-owned node")).toBeVisible();
@@ -341,10 +335,11 @@ describe("NodeScreen", () => {
     await screen.findByText("Node ready — no model loaded");
     await user.click(screen.getByRole("button", { name: "Stop node" }));
     expect(api.bootstrap.stop).toHaveBeenCalledTimes(1);
-    expect(await findStatusBadge("Disconnected")).toBeVisible();
+    expect(await findStatusBadge("Stopped")).toBeVisible();
     expectActiveModelUnavailable();
     expect(screen.queryByRole("button", { name: "Browse verified models" })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Retry node startup" })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: "Retry node startup" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Start node" })).toBeEnabled();
   });
 
   it("keeps safe owned-child recovery available when the public probe fails", async () => {

@@ -213,6 +213,7 @@ describe("NodeSessionProvider", () => {
     expect(await screen.findByText("unloaded")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Stop" }));
     await waitFor(() => expect(owned.bootstrap.stop).toHaveBeenCalledTimes(1));
+    expect(screen.getByLabelText("phase")).toHaveTextContent("stopped");
     expect(screen.getByLabelText("ownership")).toHaveTextContent("none");
     view.unmount();
 
@@ -235,7 +236,7 @@ describe("NodeSessionProvider", () => {
     expect(attached.bootstrap.stop).not.toHaveBeenCalled();
   });
 
-  it("publishes disconnected when stop races a late lifecycle terminal without probing again", async () => {
+  it("publishes stopped when stop races a late lifecycle terminal without probing again", async () => {
     let callbacks!: ControlStreamCallbacks;
     let resolveStop!: (value: BootstrapSnapshot) => void;
     const dispose = vi.fn();
@@ -280,7 +281,7 @@ describe("NodeSessionProvider", () => {
 
     expect(api.getStatus).toHaveBeenCalledTimes(1);
     act(() => resolveStop(snapshot({ ownership: "none", childRunning: false })));
-    expect(await screen.findByText("disconnected")).toBeInTheDocument();
+    expect(await screen.findByText("stopped")).toBeInTheDocument();
     expect(api.getStatus).toHaveBeenCalledTimes(1);
     expect(dispose).toHaveBeenCalledTimes(1);
   });
@@ -470,7 +471,7 @@ describe("NodeSessionProvider", () => {
     act(() => callbacks.onEvent(terminal));
     await waitFor(() => expect(api.getStatus).toHaveBeenCalledTimes(2));
     await user.click(screen.getByRole("button", { name: "Stop" }));
-    expect(await screen.findByText("disconnected")).toBeInTheDocument();
+    expect(await screen.findByText("stopped")).toBeInTheDocument();
     const previousCallbacks = callbacks;
     await user.click(screen.getByRole("button", { name: "Retry" }));
     expect(await screen.findByText("ready")).toBeInTheDocument();
@@ -525,7 +526,7 @@ describe("NodeSessionProvider", () => {
     await waitFor(() => expect(readControlToken).toHaveBeenCalledTimes(1));
 
     await user.click(screen.getByRole("button", { name: "Stop" }));
-    expect(await screen.findByText("disconnected")).toBeInTheDocument();
+    expect(await screen.findByText("stopped")).toBeInTheDocument();
     await new Promise((resolve) => setTimeout(resolve, 300));
     expect(readControlToken).toHaveBeenCalledTimes(1);
   });
