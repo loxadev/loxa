@@ -186,7 +186,7 @@ describe("Cargo workspace isolation", () => {
     expect(nightly).toMatch(/^  schedule:$/m);
     expect(nightly).toMatch(/^    - cron: "0 3 \* \* \*"$/m);
     expect(nightly).toMatch(/^  workflow_dispatch:$/m);
-    expect(nightly).toMatch(/^        os: \[ubuntu-latest, macos-latest, windows-latest\]$/m);
+    expect(nightly).toMatch(/^        os: \[ubuntu-latest, macos-latest\]$/m);
     expect(nightly).toMatch(/^    runs-on: ubuntu-latest$/m);
     expect(nightly).toMatch(/^    runs-on: macos-latest$/m);
   });
