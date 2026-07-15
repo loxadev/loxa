@@ -1,7 +1,7 @@
 use crate::chat_history::{unix_time_ms, ChatHistory, ChatHistoryError};
 use axum::{
     body::{Body, Bytes},
-    extract::{rejection::BytesRejection, DefaultBodyLimit, Path, Query, State},
+    extract::{rejection::BytesRejection, DefaultBodyLimit, Extension, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -843,6 +843,7 @@ async fn send_downstream(
 
 async fn persistent_turn(
     State(state): State<ChatRoutesState>,
+    request_id: Option<Extension<crate::http_observability::DiagnosticRequestId>>,
     headers: HeaderMap,
     Path(chat): Path<String>,
     body: Result<Bytes, BytesRejection>,
@@ -946,6 +947,16 @@ async fn persistent_turn(
             cancel.send_replace(true);
         }
     }
+    let diagnostic_request_id = request_id.map(|Extension(value)| value.0);
+    tracing::info!(
+        target: "loxa_node::chat",
+        event_code = "chat.turn.started",
+        component = "chat",
+        chat_id = chat.as_str(),
+        turn_id = turn_id.as_str(),
+        request_id = diagnostic_request_id.as_deref().unwrap_or("unsupported"),
+        state = "streaming",
+    );
     let (sender, receiver) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(32);
     let task_state = state.clone();
     tokio::spawn(async move {
@@ -1108,6 +1119,26 @@ async fn persistent_turn(
                 unix_time_ms(),
             )
             .await;
+        let diagnostic_result = if persisted.is_err() {
+            "failed"
+        } else {
+            match terminal {
+                TurnState::Completed => "completed",
+                TurnState::Cancelled => "cancelled",
+                _ => "failed",
+            }
+        };
+        tracing::info!(
+            target: "loxa_node::chat",
+            event_code = "chat.turn.terminal",
+            component = "chat",
+            chat_id = chat.as_str(),
+            turn_id = turn_id.as_str(),
+            request_id = diagnostic_request_id.as_deref().unwrap_or("unsupported"),
+            state = diagnostic_result,
+            status = diagnostic_result,
+            result_class = diagnostic_result,
+        );
         if receiver_alive {
             let (event, state_name, code) = if persisted.is_err() {
                 ("turn.failed", "failed", Some("history_write_failed"))
@@ -1197,6 +1228,15 @@ async fn cancel_turn(
         );
     };
     cancel.send_replace(true);
+    tracing::info!(
+        target: "loxa_node::chat",
+        event_code = "chat.turn.cancel_requested",
+        component = "chat",
+        chat_id = chat.as_str(),
+        turn_id = turn.as_str(),
+        state = "cancel_requested",
+        result_class = "accepted",
+    );
     cors(
         (
             StatusCode::ACCEPTED,
@@ -1320,9 +1360,67 @@ pub fn router(state: ChatRoutesState) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::to_bytes;
     use axum::http::Method;
+    use std::collections::BTreeMap;
+    use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tower::ServiceExt;
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Metadata, Subscriber};
+
+    #[derive(Clone, Debug)]
+    struct CapturedEvent {
+        target: String,
+        level: tracing::Level,
+        fields: BTreeMap<String, String>,
+    }
+
+    #[derive(Clone, Default)]
+    struct EventCapture(Arc<Mutex<Vec<CapturedEvent>>>);
+
+    struct FieldCapture<'a>(&'a mut BTreeMap<String, String>);
+
+    impl Visit for FieldCapture<'_> {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0.insert(field.name().to_owned(), value.to_owned());
+        }
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_owned(), format!("{value:?}"));
+        }
+    }
+
+    impl Subscriber for EventCapture {
+        fn register_callsite(
+            &self,
+            _: &'static Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::always()
+        }
+        fn enabled(&self, _: &Metadata<'_>) -> bool {
+            true
+        }
+        fn max_level_hint(&self) -> Option<tracing::metadata::LevelFilter> {
+            Some(tracing::metadata::LevelFilter::TRACE)
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &Event<'_>) {
+            let mut fields = BTreeMap::new();
+            event.record(&mut FieldCapture(&mut fields));
+            self.0.lock().unwrap().push(CapturedEvent {
+                target: event.metadata().target().to_owned(),
+                level: *event.metadata().level(),
+                fields,
+            });
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1568,6 +1666,206 @@ mod tests {
         assert!(stored.metrics.ttft_ms.is_some());
         assert!(stored.metrics.total_duration_ms.is_some());
         fixture.shutdown();
+    }
+
+    #[test]
+    fn persistent_chat_diagnostics_emit_only_admission_and_post_persistence_terminal() {
+        const ISOLATED: &str = "LOXA_CHAT_TERMINAL_DIAGNOSTICS_TEST_CHILD";
+        if std::env::var_os(ISOLATED).is_none() {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "chat_routes::tests::persistent_chat_diagnostics_emit_only_admission_and_post_persistence_terminal",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let capture = EventCapture::default();
+        let output = Arc::clone(&capture.0);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tracing::subscriber::with_default(capture, || {
+            runtime.block_on(async {
+            let path = temp_history_path();
+            let root = path.parent().unwrap().to_owned();
+            let token = ControlToken::load_or_create(&root.join("control.token")).unwrap();
+            let bearer = format!("Bearer {}", token.expose_for_authorization());
+            let (history, worker) = ChatHistory::spawn(path).unwrap();
+            let gateway = GatewayState::new("chat-diagnostic-test");
+            let state = ChatRoutesState::new(token, history.clone(), gateway.clone());
+            let fixture = RouteFixture {
+                base: String::new(),
+                bearer: bearer.clone(),
+                history: history.clone(),
+                gateway,
+                state: state.clone(),
+                server: None,
+                worker: None,
+                root: root.clone(),
+            };
+            for (engine_body, prompt, expected_state) in [
+                (
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"SECRET_RESPONSE_TOKEN\"}}]}\n\ndata: [DONE]\n\n",
+                    "SECRET_PROMPT_TOKEN /private/owner/chat",
+                    TurnState::Completed,
+                ),
+                (
+                    "data: SECRET_RAW_ERROR /private/owner/upstream\n\n",
+                    "failure prompt",
+                    TurnState::Failed,
+                ),
+            ] {
+                publish_fake_engine(&fixture, engine_body).await;
+                let chat = history.create_chat(1).await.unwrap();
+                let request = axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/loxa/v1/chats/{}/turns", chat.id))
+                    .header(header::AUTHORIZATION, &bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"model":"loxa","content":prompt}).to_string(),
+                    ))
+                    .unwrap();
+                let response = router(state.clone()).oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                let stored = history
+                    .list_turns(chat.id, LIST_DEFAULT_LIMIT, None)
+                    .await
+                    .unwrap()
+                    .turns
+                    .pop()
+                    .unwrap();
+                assert_eq!(stored.state, expected_state);
+            }
+            state.shutdown_and_wait();
+            worker.stop_and_join().unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+        })
+        });
+        let events = output.lock().unwrap();
+        let diagnostic: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event
+                    .fields
+                    .get("event_code")
+                    .is_some_and(|code| code.starts_with("chat.turn."))
+            })
+            .collect();
+        assert_eq!(diagnostic.len(), 4, "{diagnostic:?}");
+        assert_eq!(diagnostic[0].fields["event_code"], "chat.turn.started");
+        assert_eq!(diagnostic[1].fields["event_code"], "chat.turn.terminal");
+        assert_eq!(diagnostic[1].fields["result_class"], "completed");
+        assert_eq!(diagnostic[2].fields["event_code"], "chat.turn.started");
+        assert_eq!(diagnostic[3].fields["event_code"], "chat.turn.terminal");
+        assert_eq!(diagnostic[3].fields["result_class"], "failed");
+        assert!(diagnostic.iter().all(|event| {
+            event.target == "loxa_node::chat" && event.level == tracing::Level::INFO
+        }));
+        let rendered = format!("{diagnostic:?}");
+        for forbidden in [
+            "SECRET_PROMPT_TOKEN",
+            "SECRET_RESPONSE_TOKEN",
+            "SECRET_RAW_ERROR",
+            "/private/owner/chat",
+            "/private/owner/upstream",
+            "turn.delta",
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "leaked {forbidden}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepted_chat_cancellation_emits_one_safe_request_diagnostic() {
+        const ISOLATED: &str = "LOXA_CHAT_CANCEL_DIAGNOSTICS_TEST_CHILD";
+        if std::env::var_os(ISOLATED).is_none() {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "chat_routes::tests::accepted_chat_cancellation_emits_one_safe_request_diagnostic",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let capture = EventCapture::default();
+        let output = Arc::clone(&capture.0);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tracing::subscriber::with_default(capture, || {
+            runtime.block_on(async {
+                let path = temp_history_path();
+                let root = path.parent().unwrap().to_owned();
+                let token = ControlToken::load_or_create(&root.join("control.token")).unwrap();
+                let bearer = format!("Bearer {}", token.expose_for_authorization());
+                let (history, worker) = ChatHistory::spawn(path).unwrap();
+                let state = ChatRoutesState::new(
+                    token,
+                    history.clone(),
+                    GatewayState::new("chat-cancel-diagnostic-test"),
+                );
+                let chat = history.create_chat(1).await.unwrap();
+                let turn = history
+                    .begin_turn(
+                        chat.id.clone(),
+                        MessageContent::user("SECRET_PROMPT_TOKEN").unwrap(),
+                        TurnProvenance::new("recipe", Some("engine"), Some("1")).unwrap(),
+                        2,
+                    )
+                    .await
+                    .unwrap();
+                let (cancel, _cancelled) = tokio::sync::watch::channel(false);
+                state.active.state.lock().unwrap().running.insert(
+                    chat.id.to_string(),
+                    ActiveTurn {
+                        turn_id: turn.id.clone(),
+                        cancel,
+                    },
+                );
+                let request = axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/loxa/v1/chats/{}/turns/{}/cancel",
+                        chat.id, turn.id
+                    ))
+                    .header(header::AUTHORIZATION, bearer)
+                    .body(Body::empty())
+                    .unwrap();
+                let response = router(state.clone()).oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::ACCEPTED);
+                state.active.state.lock().unwrap().running.clear();
+                worker.stop_and_join().unwrap();
+                std::fs::remove_dir_all(root).unwrap();
+            })
+        });
+        let events = output.lock().unwrap();
+        let diagnostic: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event.fields.get("event_code").map(String::as_str)
+                    == Some("chat.turn.cancel_requested")
+            })
+            .collect();
+        assert_eq!(diagnostic.len(), 1, "{diagnostic:?}");
+        assert_eq!(diagnostic[0].target, "loxa_node::chat");
+        assert_eq!(diagnostic[0].level, tracing::Level::INFO);
+        assert_eq!(diagnostic[0].fields["result_class"], "accepted");
+        assert!(!format!("{diagnostic:?}").contains("SECRET_PROMPT_TOKEN"));
     }
 
     #[tokio::test]

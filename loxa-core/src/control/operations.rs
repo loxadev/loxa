@@ -1,6 +1,53 @@
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+    use std::process::Command;
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Metadata, Subscriber};
+
+    #[derive(Clone, Default)]
+    struct EventCapture(Arc<Mutex<Vec<BTreeMap<String, String>>>>);
+
+    struct FieldCapture<'a>(&'a mut BTreeMap<String, String>);
+
+    impl Visit for FieldCapture<'_> {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0.insert(field.name().to_owned(), value.to_owned());
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_owned(), format!("{value:?}"));
+        }
+    }
+
+    impl Subscriber for EventCapture {
+        fn register_callsite(
+            &self,
+            _: &'static Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::always()
+        }
+        fn enabled(&self, _: &Metadata<'_>) -> bool {
+            true
+        }
+        fn max_level_hint(&self) -> Option<tracing::metadata::LevelFilter> {
+            Some(tracing::metadata::LevelFilter::TRACE)
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &Event<'_>) {
+            let mut fields = BTreeMap::new();
+            event.record(&mut FieldCapture(&mut fields));
+            self.0.lock().unwrap().push(fields);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
 
     #[test]
     fn operations_enforce_legal_transitions_and_safe_cancellation() {
@@ -25,6 +72,58 @@ mod tests {
                 .unwrap_err(),
             OperationError::CancellationNotSafe
         );
+    }
+
+    #[test]
+    fn operation_diagnostics_emit_once_at_committed_start_and_terminal_boundaries() {
+        const ISOLATED: &str = "LOXA_OPERATION_DIAGNOSTICS_TEST_CHILD";
+        if std::env::var_os(ISOLATED).is_none() {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "control::operations::tests::operation_diagnostics_emit_once_at_committed_start_and_terminal_boundaries",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let capture = EventCapture::default();
+        let output = Arc::clone(&capture.0);
+        tracing::subscriber::with_default(capture, || {
+            let mut store = OperationStore::new(3);
+            let id = store.enqueue(
+                OperationKind::Download,
+                Some("safe-model-SECRET_HF_TOKEN".into()),
+                10,
+            );
+            store.start(&id, 11).unwrap();
+            for completed in 1..=32 {
+                store
+                    .progress(&id, completed, Some(32), 11 + completed)
+                    .unwrap();
+            }
+            store
+                .fail(&id, "SECRET_RAW_ERROR /private/owner/model", 50)
+                .unwrap();
+        });
+        let events = output.lock().unwrap();
+        let diagnostic: Vec<_> = events
+            .iter()
+            .filter(|fields| fields.contains_key("event_code"))
+            .collect();
+        assert_eq!(diagnostic.len(), 2, "{diagnostic:?}");
+        assert_eq!(diagnostic[0]["event_code"], "operation.started");
+        assert_eq!(diagnostic[1]["event_code"], "operation.terminal");
+        assert_eq!(diagnostic[0]["operation_id"], "op-1");
+        assert_eq!(diagnostic[1]["result_class"], "failed");
+        let rendered = format!("{diagnostic:?}");
+        assert!(!rendered.contains("SECRET_RAW_ERROR"));
+        assert!(!rendered.contains("SECRET_HF_TOKEN"));
+        assert!(!rendered.contains("/private/owner/model"));
+        assert!(!rendered.contains("download.progress"));
     }
 
     #[test]
@@ -371,8 +470,31 @@ impl OperationStore {
         operation.status = next;
         operation.error = error;
         operation.updated_at_unix_ms = now;
+        let operation_id = operation.id.clone();
+        let state = operation_kind_name(operation.kind);
         self.publish(id);
         self.trim();
+        match next {
+            OperationStatus::Running => tracing::info!(
+                target: "loxa_core::operation",
+                event_code = "operation.started",
+                component = "operation",
+                operation_id,
+                state,
+            ),
+            OperationStatus::Succeeded | OperationStatus::Failed | OperationStatus::Cancelled => {
+                tracing::info!(
+                    target: "loxa_core::operation",
+                    event_code = "operation.terminal",
+                    component = "operation",
+                    operation_id,
+                    state,
+                    status = operation_status_name(next),
+                    result_class = operation_status_name(next),
+                );
+            }
+            OperationStatus::Queued => {}
+        }
         Ok(())
     }
     fn find_mut(&mut self, id: &str) -> Result<&mut OperationView, OperationError> {
@@ -417,6 +539,24 @@ impl OperationStore {
             };
             self.operations.remove(index);
         }
+    }
+}
+
+fn operation_kind_name(kind: OperationKind) -> &'static str {
+    match kind {
+        OperationKind::Download => "download",
+        OperationKind::Load => "load",
+        OperationKind::Unload => "unload",
+    }
+}
+
+fn operation_status_name(status: OperationStatus) -> &'static str {
+    match status {
+        OperationStatus::Queued => "queued",
+        OperationStatus::Running => "running",
+        OperationStatus::Succeeded => "succeeded",
+        OperationStatus::Failed => "failed",
+        OperationStatus::Cancelled => "cancelled",
     }
 }
 

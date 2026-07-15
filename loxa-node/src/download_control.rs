@@ -818,6 +818,14 @@ impl MutationExecutor for DownloadExecutor {
                 .fail(id, "unknown registry model", now_ms());
             return;
         };
+        tracing::info!(
+            target: "loxa_core::download",
+            event_code = "download.started",
+            component = "download",
+            operation_id = id,
+            recipe_id = recipe.id,
+            state = "download",
+        );
         let mut observer = OperationObserver {
             id,
             cancellation,
@@ -842,42 +850,48 @@ impl MutationExecutor for DownloadExecutor {
             .get(id)
             .is_some_and(|view| view.status == OperationStatus::Cancelled)
         {
+            emit_download_terminal(id, model_id, "cancelled");
             return;
         }
-        match result {
+        let terminal_result = match result {
             Ok(()) => match verification.expect("successful download was verified") {
                 Ok(evidence)
                     if evidence.matches
                         && evidence.size_bytes == recipe.size_bytes
                         && evidence.expected_sha256 == recipe.sha256 =>
                 {
-                    let _ = operations.succeed(id, now_ms());
+                    operations.succeed(id, now_ms()).map(|()| "succeeded")
                 }
-                Ok(_) => {
-                    let _ = operations.fail(
+                Ok(_) => operations
+                    .fail(
                         id,
                         "downloaded artifact failed checksum verification",
                         now_ms(),
-                    );
-                }
-                Err(_) if cancellation.is_cancelled() => {
-                    let _ = operations.cancel(id, CancellationSafety::Safe, now_ms());
-                }
+                    )
+                    .map(|()| "failed"),
+                Err(_) if cancellation.is_cancelled() => operations
+                    .cancel(id, CancellationSafety::Safe, now_ms())
+                    .map(|_| "cancelled"),
                 Err(_) => {
                     self.verifier.invalidate(&self.models_dir, recipe);
-                    let _ = operations.fail(
-                        id,
-                        "downloaded artifact could not be verified safely",
-                        now_ms(),
-                    );
+                    operations
+                        .fail(
+                            id,
+                            "downloaded artifact could not be verified safely",
+                            now_ms(),
+                        )
+                        .map(|()| "failed")
                 }
             },
-            Err(DownloadError::Cancelled) => {
-                let _ = operations.cancel(id, CancellationSafety::Safe, now_ms());
-            }
-            Err(error) => {
-                let _ = operations.fail(id, public_download_error(&error), now_ms());
-            }
+            Err(DownloadError::Cancelled) => operations
+                .cancel(id, CancellationSafety::Safe, now_ms())
+                .map(|_| "cancelled"),
+            Err(error) => operations
+                .fail(id, public_download_error(&error), now_ms())
+                .map(|()| "failed"),
+        };
+        if let Ok(result_class) = terminal_result {
+            emit_download_terminal(id, model_id, result_class);
         }
     }
 
@@ -898,6 +912,19 @@ impl MutationExecutor for DownloadExecutor {
             .as_ref()
             .map(|_| crate::actor::IDLE_TICK_INTERVAL)
     }
+}
+
+fn emit_download_terminal(operation_id: &str, recipe_id: &str, result_class: &'static str) {
+    tracing::info!(
+        target: "loxa_core::download",
+        event_code = "download.terminal",
+        component = "download",
+        operation_id,
+        recipe_id,
+        state = "download",
+        status = result_class,
+        result_class,
+    );
 }
 
 fn public_lifecycle_error(error: &LifecycleError) -> &'static str {
@@ -987,8 +1014,64 @@ mod tests {
     use super::*;
     use loxa_core::model_inventory::{ArtifactState, VerificationCache, VerifiedArtifact};
     use loxa_core::registry::{self, ModelEntry};
+    use std::collections::BTreeMap;
+    use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Metadata, Subscriber};
+
+    #[derive(Clone, Debug)]
+    struct CapturedEvent {
+        target: String,
+        level: tracing::Level,
+        fields: BTreeMap<String, String>,
+    }
+
+    #[derive(Clone, Default)]
+    struct EventCapture(Arc<Mutex<Vec<CapturedEvent>>>);
+
+    struct FieldCapture<'a>(&'a mut BTreeMap<String, String>);
+
+    impl Visit for FieldCapture<'_> {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0.insert(field.name().to_owned(), value.to_owned());
+        }
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_owned(), format!("{value:?}"));
+        }
+    }
+
+    impl Subscriber for EventCapture {
+        fn register_callsite(
+            &self,
+            _: &'static Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::always()
+        }
+        fn enabled(&self, _: &Metadata<'_>) -> bool {
+            true
+        }
+        fn max_level_hint(&self) -> Option<tracing::metadata::LevelFilter> {
+            Some(tracing::metadata::LevelFilter::TRACE)
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &Event<'_>) {
+            let mut fields = BTreeMap::new();
+            event.record(&mut FieldCapture(&mut fields));
+            self.0.lock().unwrap().push(CapturedEvent {
+                target: event.metadata().target().to_owned(),
+                level: *event.metadata().level(),
+                fields,
+            });
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
 
     struct NoopLifecycleDriver;
     impl EngineLifecycleDriver for NoopLifecycleDriver {
@@ -1303,6 +1386,67 @@ mod tests {
         );
         let view = operations.lock().unwrap().get(&id).unwrap();
         view
+    }
+
+    #[test]
+    fn download_diagnostics_are_exact_bounded_and_do_not_copy_progress_or_errors() {
+        const ISOLATED: &str = "LOXA_DOWNLOAD_DIAGNOSTICS_TEST_CHILD";
+        if std::env::var_os(ISOLATED).is_none() {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "download_control::tests::download_diagnostics_are_exact_bounded_and_do_not_copy_progress_or_errors",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        for (result, expected) in [
+            (Ok(()), "succeeded"),
+            (Err(DownloadError::Cancelled), "cancelled"),
+            (
+                Err(DownloadError::Http(
+                    "SECRET_HF_TOKEN /private/owner/model raw transport error".into(),
+                )),
+                "failed",
+            ),
+        ] {
+            let capture = EventCapture::default();
+            let output = Arc::clone(&capture.0);
+            let view = tracing::subscriber::with_default(capture, || execute_fake(result));
+            let status = match view.status {
+                OperationStatus::Succeeded => "succeeded",
+                OperationStatus::Failed => "failed",
+                OperationStatus::Cancelled => "cancelled",
+                other => panic!("unexpected terminal status: {other:?}"),
+            };
+            assert_eq!(status, expected);
+            let events = output.lock().unwrap();
+            let diagnostic: Vec<_> = events
+                .iter()
+                .filter(|event| {
+                    event
+                        .fields
+                        .get("event_code")
+                        .is_some_and(|code| code.starts_with("download."))
+                })
+                .collect();
+            assert_eq!(diagnostic.len(), 2, "{diagnostic:?}");
+            assert_eq!(diagnostic[0].fields["event_code"], "download.started");
+            assert_eq!(diagnostic[1].fields["event_code"], "download.terminal");
+            assert_eq!(diagnostic[1].fields["result_class"], expected);
+            assert!(diagnostic.iter().all(|event| {
+                event.target == "loxa_core::download" && event.level == tracing::Level::INFO
+            }));
+            let rendered = format!("{diagnostic:?}");
+            assert!(!rendered.contains("SECRET_HF_TOKEN"));
+            assert!(!rendered.contains("/private/owner/model"));
+            assert!(!rendered.contains("raw transport error"));
+            assert!(!rendered.contains("download.progress"));
+        }
     }
 
     #[test]
