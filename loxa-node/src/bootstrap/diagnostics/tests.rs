@@ -773,6 +773,8 @@ fn real_queue_drops_emit_rate_limited_bypass_warnings_and_final_delta() {
         before_shutdown + 1,
         "{final_warnings:?}"
     );
+    progress.finalize_drops();
+    assert_eq!(warnings.warnings(), final_warnings);
 
     let (lock, ready) = &*gate;
     *lock.lock().expect("gate poisoned") = true;

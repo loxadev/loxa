@@ -56,9 +56,11 @@ impl Drop for DiagnosticsBootstrap {
         };
         progress.begin_shutdown();
         if !wait_for_queue_drain(progress, QUEUE_DRAIN_DEADLINE) {
+            progress.finalize_drops();
             std::mem::forget(guard);
             return;
         }
+        progress.finalize_drops();
         drop_guard_with_deadline(guard, WORKER_GUARD_DEADLINE);
     }
 }

@@ -152,6 +152,12 @@ impl QueueProgress {
         self.drop_reporter.observe(total, true);
     }
 
+    pub(super) fn finalize_drops(&self) {
+        let total = self.dropped_total();
+        self.health.observe_queue_dropped_total(total);
+        self.drop_reporter.observe(total, true);
+    }
+
     #[cfg(test)]
     pub(super) fn pause_admission_for_test(&self, reached: Arc<Barrier>, release: Arc<Barrier>) {
         *self
