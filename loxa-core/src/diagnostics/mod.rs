@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::SystemTime;
 
+pub mod child_retention;
 pub mod storage;
 pub use storage::{BoundedJsonlWriter, DiskSpace, StorageConfig, SystemDiskSpace};
 

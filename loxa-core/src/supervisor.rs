@@ -1,6 +1,8 @@
+use crate::diagnostics::{child_retention::prune_inactive_child_logs, DiagnosticsHealth};
 use crate::engine::{EngineLaunchSpec, ReadinessStrategy};
 use crate::registry::{self, ModelEntry};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::env;
 use std::error::Error;
 use std::fmt;
@@ -67,6 +69,7 @@ pub const FORCE_KILL_CONFIRMATION_PERIOD: Duration = Duration::from_secs(5);
 pub const STOP_OWNER_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 pub const LOG_TAIL_BYTES: usize = 8 * 1024;
 pub const MAX_LOG_BYTES: usize = 1024 * 1024;
+const RETAIN_INACTIVE_CHILD_LOGS: usize = 7;
 
 pub struct ServerSpec<'a> {
     pub entry: &'a ModelEntry,
@@ -979,6 +982,7 @@ where
     A: FnOnce(),
     D: FnOnce(),
 {
+    prune_child_logs_at_owned_spawn(state_path, expected, log_path);
     let prepared = prepare_engine_spawn_with_hook(spec, log_path, reservation, before_log_open)?;
     match lifecycle::spawn_starting_run_with(state_path, expected, || {
         prepared.spawn_raw_with_hooks(before_reservation_release, after_os_spawn)
@@ -991,6 +995,30 @@ where
         }
         SpawnStartingRunOutcome::RequestedStop => Ok(SpawnStartingRunOutcome::RequestedStop),
     }
+}
+
+fn prune_child_logs_at_owned_spawn(
+    state_path: &Path,
+    expected: &ManagedRunIdentity,
+    log_path: &Path,
+) {
+    let Ok(current) = current_runtime_state_run(state_path, expected) else {
+        return;
+    };
+    if current.log_path != log_path
+        || current.child_pid.is_some()
+        || current.child_process_start_time_unix_s.is_some()
+        || current.child_pgid.is_some()
+    {
+        return;
+    }
+    let Some(logs_dir) = log_path.parent() else {
+        return;
+    };
+
+    let active = HashSet::from([current.log_path]);
+    let health = DiagnosticsHealth::new();
+    let _ = prune_inactive_child_logs(logs_dir, &active, RETAIN_INACTIVE_CHILD_LOGS, &health);
 }
 
 #[allow(clippy::too_many_arguments)]
