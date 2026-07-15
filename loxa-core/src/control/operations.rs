@@ -49,6 +49,31 @@ mod tests {
         fn exit(&self, _: &tracing::span::Id) {}
     }
 
+    fn run_isolated_capture_test(test_name: &str, marker: &str) -> bool {
+        let arguments: Vec<_> = std::env::args().collect();
+        let exact_child = std::env::var_os(marker).as_deref()
+            == Some(std::ffi::OsStr::new("child"))
+            && arguments.iter().any(|argument| argument == "--exact")
+            && arguments.iter().any(|argument| argument == test_name);
+        if exact_child {
+            return false;
+        }
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env(marker, "child")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success()
+                && stdout.contains("running 1 test")
+                && stdout.contains("1 passed; 0 failed"),
+            "isolated test did not run exactly once\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        true
+    }
+
     #[test]
     fn operations_enforce_legal_transitions_and_safe_cancellation() {
         let mut store = OperationStore::new(3);
@@ -77,48 +102,55 @@ mod tests {
     #[test]
     fn operation_diagnostics_emit_once_at_committed_start_and_terminal_boundaries() {
         const ISOLATED: &str = "LOXA_OPERATION_DIAGNOSTICS_TEST_CHILD";
-        if std::env::var_os(ISOLATED).is_none() {
-            let status = Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "control::operations::tests::operation_diagnostics_emit_once_at_committed_start_and_terminal_boundaries",
-                    "--nocapture",
-                ])
-                .env(ISOLATED, "1")
-                .status()
-                .unwrap();
-            assert!(status.success());
+        if run_isolated_capture_test(
+            "control::operations::tests::operation_diagnostics_emit_once_at_committed_start_and_terminal_boundaries",
+            ISOLATED,
+        ) {
             return;
         }
         let capture = EventCapture::default();
         let output = Arc::clone(&capture.0);
         tracing::subscriber::with_default(capture, || {
-            let mut store = OperationStore::new(3);
-            let id = store.enqueue(
-                OperationKind::Download,
-                Some("safe-model-SECRET_HF_TOKEN".into()),
-                10,
-            );
-            store.start(&id, 11).unwrap();
-            for completed in 1..=32 {
-                store
-                    .progress(&id, completed, Some(32), 11 + completed)
-                    .unwrap();
+            for outcome in ["succeeded", "cancelled", "failed"] {
+                let mut store = OperationStore::new(3);
+                let id = store.enqueue(
+                    OperationKind::Download,
+                    Some("safe-model-SECRET_HF_TOKEN".into()),
+                    10,
+                );
+                store.start(&id, 11).unwrap();
+                for completed in 1..=32 {
+                    store
+                        .progress(&id, completed, Some(32), 11 + completed)
+                        .unwrap();
+                }
+                match outcome {
+                    "succeeded" => store.succeed(&id, 50).unwrap(),
+                    "cancelled" => {
+                        store.cancel(&id, CancellationSafety::Safe, 50).unwrap();
+                    }
+                    "failed" => store
+                        .fail(&id, "SECRET_RAW_ERROR /private/owner/model", 50)
+                        .unwrap(),
+                    _ => unreachable!(),
+                }
             }
-            store
-                .fail(&id, "SECRET_RAW_ERROR /private/owner/model", 50)
-                .unwrap();
         });
         let events = output.lock().unwrap();
         let diagnostic: Vec<_> = events
             .iter()
             .filter(|fields| fields.contains_key("event_code"))
             .collect();
-        assert_eq!(diagnostic.len(), 2, "{diagnostic:?}");
-        assert_eq!(diagnostic[0]["event_code"], "operation.started");
-        assert_eq!(diagnostic[1]["event_code"], "operation.terminal");
-        assert_eq!(diagnostic[0]["operation_id"], "op-1");
-        assert_eq!(diagnostic[1]["result_class"], "failed");
+        assert_eq!(diagnostic.len(), 6, "{diagnostic:?}");
+        for (pair, outcome) in diagnostic
+            .chunks_exact(2)
+            .zip(["succeeded", "cancelled", "failed"])
+        {
+            assert_eq!(pair[0]["event_code"], "operation.started");
+            assert_eq!(pair[1]["event_code"], "operation.terminal");
+            assert_eq!(pair[0]["operation_id"], "op-1");
+            assert_eq!(pair[1]["result_class"], outcome);
+        }
         let rendered = format!("{diagnostic:?}");
         assert!(!rendered.contains("SECRET_RAW_ERROR"));
         assert!(!rendered.contains("SECRET_HF_TOKEN"));

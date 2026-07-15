@@ -1119,26 +1119,24 @@ async fn persistent_turn(
                 unix_time_ms(),
             )
             .await;
-        let diagnostic_result = if persisted.is_err() {
-            "failed"
-        } else {
-            match terminal {
+        if persisted.is_ok() {
+            let diagnostic_result = match terminal {
                 TurnState::Completed => "completed",
                 TurnState::Cancelled => "cancelled",
                 _ => "failed",
-            }
-        };
-        tracing::info!(
-            target: "loxa_node::chat",
-            event_code = "chat.turn.terminal",
-            component = "chat",
-            chat_id = chat.as_str(),
-            turn_id = turn_id.as_str(),
-            request_id = diagnostic_request_id.as_deref().unwrap_or("unsupported"),
-            state = diagnostic_result,
-            status = diagnostic_result,
-            result_class = diagnostic_result,
-        );
+            };
+            tracing::info!(
+                target: "loxa_node::chat",
+                event_code = "chat.turn.terminal",
+                component = "chat",
+                chat_id = chat.as_str(),
+                turn_id = turn_id.as_str(),
+                request_id = diagnostic_request_id.as_deref().unwrap_or("unsupported"),
+                state = diagnostic_result,
+                status = diagnostic_result,
+                result_class = diagnostic_result,
+            );
+        }
         if receiver_alive {
             let (event, state_name, code) = if persisted.is_err() {
                 ("turn.failed", "failed", Some("history_write_failed"))
@@ -1422,6 +1420,31 @@ mod tests {
         fn exit(&self, _: &tracing::span::Id) {}
     }
 
+    fn run_isolated_capture_test(test_name: &str, marker: &str) -> bool {
+        let arguments: Vec<_> = std::env::args().collect();
+        let exact_child = std::env::var_os(marker).as_deref()
+            == Some(std::ffi::OsStr::new("child"))
+            && arguments.iter().any(|argument| argument == "--exact")
+            && arguments.iter().any(|argument| argument == test_name);
+        if exact_child {
+            return false;
+        }
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env(marker, "child")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success()
+                && stdout.contains("running 1 test")
+                && stdout.contains("1 passed; 0 failed"),
+            "isolated test did not run exactly once\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        true
+    }
+
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn temp_history_path() -> std::path::PathBuf {
@@ -1671,17 +1694,10 @@ mod tests {
     #[test]
     fn persistent_chat_diagnostics_emit_only_admission_and_post_persistence_terminal() {
         const ISOLATED: &str = "LOXA_CHAT_TERMINAL_DIAGNOSTICS_TEST_CHILD";
-        if std::env::var_os(ISOLATED).is_none() {
-            let status = Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "chat_routes::tests::persistent_chat_diagnostics_emit_only_admission_and_post_persistence_terminal",
-                    "--nocapture",
-                ])
-                .env(ISOLATED, "1")
-                .status()
-                .unwrap();
-            assert!(status.success());
+        if run_isolated_capture_test(
+            "chat_routes::tests::persistent_chat_diagnostics_emit_only_admission_and_post_persistence_terminal",
+            ISOLATED,
+        ) {
             return;
         }
         let capture = EventCapture::default();
@@ -1744,6 +1760,41 @@ mod tests {
                     .unwrap();
                 assert_eq!(stored.state, expected_state);
             }
+            publish_stalled_engine(&fixture).await;
+            let cancelled_chat = history.create_chat(2).await.unwrap();
+            let request = axum::http::Request::builder()
+                .method(Method::POST)
+                .uri(format!(
+                    "/loxa/v1/chats/{}/turns",
+                    cancelled_chat.id
+                ))
+                .header(header::AUTHORIZATION, &bearer)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"model":"loxa","content":"cancelled prompt"}).to_string(),
+                ))
+                .unwrap();
+            let response = router(state.clone()).oneshot(request).await.unwrap();
+            let cancel = state
+                .active
+                .state
+                .lock()
+                .unwrap()
+                .running
+                .get(cancelled_chat.id.as_str())
+                .unwrap()
+                .cancel
+                .clone();
+            cancel.send_replace(true);
+            let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let stored = history
+                .list_turns(cancelled_chat.id, LIST_DEFAULT_LIMIT, None)
+                .await
+                .unwrap()
+                .turns
+                .pop()
+                .unwrap();
+            assert_eq!(stored.state, TurnState::Cancelled);
             state.shutdown_and_wait();
             worker.stop_and_join().unwrap();
             std::fs::remove_dir_all(root).unwrap();
@@ -1759,13 +1810,16 @@ mod tests {
                     .is_some_and(|code| code.starts_with("chat.turn."))
             })
             .collect();
-        assert_eq!(diagnostic.len(), 4, "{diagnostic:?}");
+        assert_eq!(diagnostic.len(), 6, "{diagnostic:?}");
         assert_eq!(diagnostic[0].fields["event_code"], "chat.turn.started");
         assert_eq!(diagnostic[1].fields["event_code"], "chat.turn.terminal");
         assert_eq!(diagnostic[1].fields["result_class"], "completed");
         assert_eq!(diagnostic[2].fields["event_code"], "chat.turn.started");
         assert_eq!(diagnostic[3].fields["event_code"], "chat.turn.terminal");
         assert_eq!(diagnostic[3].fields["result_class"], "failed");
+        assert_eq!(diagnostic[4].fields["event_code"], "chat.turn.started");
+        assert_eq!(diagnostic[5].fields["event_code"], "chat.turn.terminal");
+        assert_eq!(diagnostic[5].fields["result_class"], "cancelled");
         assert!(diagnostic.iter().all(|event| {
             event.target == "loxa_node::chat" && event.level == tracing::Level::INFO
         }));
@@ -1788,17 +1842,10 @@ mod tests {
     #[test]
     fn accepted_chat_cancellation_emits_one_safe_request_diagnostic() {
         const ISOLATED: &str = "LOXA_CHAT_CANCEL_DIAGNOSTICS_TEST_CHILD";
-        if std::env::var_os(ISOLATED).is_none() {
-            let status = Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "chat_routes::tests::accepted_chat_cancellation_emits_one_safe_request_diagnostic",
-                    "--nocapture",
-                ])
-                .env(ISOLATED, "1")
-                .status()
-                .unwrap();
-            assert!(status.success());
+        if run_isolated_capture_test(
+            "chat_routes::tests::accepted_chat_cancellation_emits_one_safe_request_diagnostic",
+            ISOLATED,
+        ) {
             return;
         }
         let capture = EventCapture::default();
@@ -1865,6 +1912,86 @@ mod tests {
         assert_eq!(diagnostic[0].target, "loxa_node::chat");
         assert_eq!(diagnostic[0].level, tracing::Level::INFO);
         assert_eq!(diagnostic[0].fields["result_class"], "accepted");
+        assert!(!format!("{diagnostic:?}").contains("SECRET_PROMPT_TOKEN"));
+    }
+
+    #[test]
+    fn failed_chat_persistence_emits_no_terminal_diagnostic() {
+        const ISOLATED: &str = "LOXA_CHAT_PERSISTENCE_DIAGNOSTICS_TEST_CHILD";
+        if run_isolated_capture_test(
+            "chat_routes::tests::failed_chat_persistence_emits_no_terminal_diagnostic",
+            ISOLATED,
+        ) {
+            return;
+        }
+        let capture = EventCapture::default();
+        let output = Arc::clone(&capture.0);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tracing::subscriber::with_default(capture, || {
+            runtime.block_on(async {
+                let path = temp_history_path();
+                let root = path.parent().unwrap().to_owned();
+                let token = ControlToken::load_or_create(&root.join("control.token")).unwrap();
+                let bearer = format!("Bearer {}", token.expose_for_authorization());
+                let (history, worker) = ChatHistory::spawn(path).unwrap();
+                let gateway = GatewayState::new("chat-persistence-diagnostic-test");
+                let state = ChatRoutesState::new(token, history.clone(), gateway.clone());
+                let fixture = RouteFixture {
+                    base: String::new(),
+                    bearer: bearer.clone(),
+                    history: history.clone(),
+                    gateway,
+                    state: state.clone(),
+                    server: None,
+                    worker: None,
+                    root: root.clone(),
+                };
+                publish_stalled_engine(&fixture).await;
+                let chat = history.create_chat(1).await.unwrap();
+                let request = axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/loxa/v1/chats/{}/turns", chat.id))
+                    .header(header::AUTHORIZATION, bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"model":"loxa","content":"SECRET_PROMPT_TOKEN"}).to_string(),
+                    ))
+                    .unwrap();
+                let response = router(state.clone()).oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                history.fail_next_finalize_for_test().await.unwrap();
+                let (turn_id, cancel) = {
+                    let active = state.active.state.lock().unwrap();
+                    let active = active.running.get(chat.id.as_str()).unwrap();
+                    (active.turn_id.clone(), active.cancel.clone())
+                };
+                cancel.send_replace(true);
+                let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                assert!(String::from_utf8_lossy(&body).contains("history_write_failed"));
+                assert_eq!(
+                    history.get_turn(turn_id).await.unwrap().state,
+                    TurnState::Queued
+                );
+                state.shutdown_and_wait();
+                worker.stop_and_join().unwrap();
+                std::fs::remove_dir_all(root).unwrap();
+            })
+        });
+        let events = output.lock().unwrap();
+        let diagnostic: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event
+                    .fields
+                    .get("event_code")
+                    .is_some_and(|code| code.starts_with("chat.turn."))
+            })
+            .collect();
+        assert_eq!(diagnostic.len(), 1, "{diagnostic:?}");
+        assert_eq!(diagnostic[0].fields["event_code"], "chat.turn.started");
         assert!(!format!("{diagnostic:?}").contains("SECRET_PROMPT_TOKEN"));
     }
 

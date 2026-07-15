@@ -1073,6 +1073,31 @@ mod tests {
         fn exit(&self, _: &tracing::span::Id) {}
     }
 
+    fn run_isolated_capture_test(test_name: &str, marker: &str) -> bool {
+        let arguments: Vec<_> = std::env::args().collect();
+        let exact_child = std::env::var_os(marker).as_deref()
+            == Some(std::ffi::OsStr::new("child"))
+            && arguments.iter().any(|argument| argument == "--exact")
+            && arguments.iter().any(|argument| argument == test_name);
+        if exact_child {
+            return false;
+        }
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env(marker, "child")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success()
+                && stdout.contains("running 1 test")
+                && stdout.contains("1 passed; 0 failed"),
+            "isolated test did not run exactly once\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        true
+    }
+
     struct NoopLifecycleDriver;
     impl EngineLifecycleDriver for NoopLifecycleDriver {
         type Session = ();
@@ -1391,17 +1416,10 @@ mod tests {
     #[test]
     fn download_diagnostics_are_exact_bounded_and_do_not_copy_progress_or_errors() {
         const ISOLATED: &str = "LOXA_DOWNLOAD_DIAGNOSTICS_TEST_CHILD";
-        if std::env::var_os(ISOLATED).is_none() {
-            let status = Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "download_control::tests::download_diagnostics_are_exact_bounded_and_do_not_copy_progress_or_errors",
-                    "--nocapture",
-                ])
-                .env(ISOLATED, "1")
-                .status()
-                .unwrap();
-            assert!(status.success());
+        if run_isolated_capture_test(
+            "download_control::tests::download_diagnostics_are_exact_bounded_and_do_not_copy_progress_or_errors",
+            ISOLATED,
+        ) {
             return;
         }
         for (result, expected) in [

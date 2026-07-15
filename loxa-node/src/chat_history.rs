@@ -62,6 +62,8 @@ enum Command {
         i64,
         oneshot::Sender<Result<(), HistoryError>>,
     ),
+    #[cfg(test)]
+    FailNextFinalize(oneshot::Sender<()>),
     Stop,
 }
 
@@ -111,8 +113,15 @@ impl ChatHistory {
                     return Err(error);
                 }
                 let _ = ready_tx.send(Ok(()));
+                #[cfg(test)]
+                let mut fail_next_finalize = false;
                 loop {
                     while let Ok(command) = terminal_receiver.try_recv() {
+                        #[cfg(test)]
+                        if std::mem::take(&mut fail_next_finalize) {
+                            let _ = command.response.send(Err(HistoryError::Database));
+                            continue;
+                        }
                         let _ = command.response.send(repository.finalize_turn_with_metrics(
                             &command.turn,
                             command.state,
@@ -165,8 +174,18 @@ impl ChatHistory {
                         Command::Checkpoint(turn, content, at, tx) => {
                             let _ = tx.send(repository.checkpoint_assistant(&turn, content, at));
                         }
+                        #[cfg(test)]
+                        Command::FailNextFinalize(tx) => {
+                            fail_next_finalize = true;
+                            let _ = tx.send(());
+                        }
                         Command::Stop => {
                             while let Ok(command) = terminal_receiver.try_recv() {
+                                #[cfg(test)]
+                                if std::mem::take(&mut fail_next_finalize) {
+                                    let _ = command.response.send(Err(HistoryError::Database));
+                                    continue;
+                                }
                                 let _ =
                                     command.response.send(repository.finalize_turn_with_metrics(
                                         &command.turn,
@@ -309,6 +328,18 @@ impl ChatHistory {
             .await
             .map_err(|_| ChatHistoryError::Stopped)?
             .map_err(ChatHistoryError::Repository)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn fail_next_finalize_for_test(&self) -> Result<(), ChatHistoryError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .try_send(Command::FailNextFinalize(response))
+            .map_err(|error| match error {
+                TrySendError::Full(_) => ChatHistoryError::Busy,
+                TrySendError::Disconnected(_) => ChatHistoryError::Stopped,
+            })?;
+        receiver.await.map_err(|_| ChatHistoryError::Stopped)
     }
 }
 
