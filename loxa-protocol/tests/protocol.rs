@@ -116,7 +116,7 @@ fn error_codes_and_body_shape_are_exact() {
     }
     assert!(serde_json::from_str::<ControlErrorCode>("\"other\"").is_err());
     let body = ControlErrorBody {
-        code: ControlErrorCode::OperationConflict.to_string(),
+        code: ControlErrorCode::OperationConflict,
         message: "busy".into(),
     };
     assert_eq!(
@@ -125,6 +125,10 @@ fn error_codes_and_body_shape_are_exact() {
     );
     assert!(serde_json::from_str::<ControlErrorBody>(
         r#"{"code":"operation_conflict","message":"busy","extra":true}"#
+    )
+    .is_err());
+    assert!(serde_json::from_str::<ControlErrorBody>(
+        r#"{"code":"not_a_real_code","message":"busy"}"#
     )
     .is_err());
 }

@@ -133,6 +133,6 @@ impl fmt::Display for ControlErrorCode {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ControlErrorBody {
-    pub code: String,
+    pub code: ControlErrorCode,
     pub message: String,
 }
