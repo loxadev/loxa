@@ -1,8 +1,9 @@
-#![cfg(unix)]
+#![cfg(any(target_os = "macos", target_os = "linux"))]
 
 use super::unix::{
-    cleanup_diagnostic_observed, inject_boundary_hook, inject_fault, inject_repeated_fault,
-    inject_stat_override, BoundaryPoint, FaultPoint, StatOverride, StatTarget,
+    active_temporary_lock_available, cleanup_diagnostic_observed, inject_boundary_hook,
+    inject_fault, inject_repeated_fault, validate_metadata_policy, BoundaryPoint, FaultPoint,
+    MetadataPolicy,
 };
 use super::{open_or_create, IdentityErrorClass};
 use loxa_protocol::NodeId;
@@ -77,6 +78,13 @@ fn temporary_paths(root: &TestRoot) -> Vec<PathBuf> {
                 .starts_with(b".node.json.tmp-")
         })
         .collect()
+}
+
+fn recognized_temporary(root: &TestRoot, token: u128) -> PathBuf {
+    root.identity().join(format!(
+        ".node.json.tmp-{}-{token:032x}",
+        std::process::id()
+    ))
 }
 
 #[test]
@@ -177,6 +185,7 @@ fn schema_and_canonical_failures_have_stable_sanitized_classes() {
         assert_eq!(error.class(), *expected);
         assert_eq!(error.to_string(), expected.as_str());
         assert!(!error.to_string().contains(root.path().to_str().unwrap()));
+        assert!(std::error::Error::source(&error).is_none());
     }
 }
 
@@ -245,38 +254,77 @@ fn unsafe_record_types_and_file_as_directory_fail_closed() {
 }
 
 #[test]
-fn captured_stat_rejects_wrong_owner_and_device_evidence() {
-    assert_eq!(
-        fs::metadata("/dev/null").unwrap().mode() & u32::from(libc::S_IFMT),
-        u32::from(libc::S_IFCHR)
-    );
-    for (target, stat_override, expected) in [
-        (
-            StatTarget::Root,
-            StatOverride::WrongOwner,
-            IdentityErrorClass::UnsafeRoot,
-        ),
-        (
-            StatTarget::IdentityDirectory,
-            StatOverride::WrongOwner,
-            IdentityErrorClass::UnsafeDirectory,
-        ),
-        (
-            StatTarget::PrimaryRecord,
-            StatOverride::WrongOwner,
-            IdentityErrorClass::UnsafeRecord,
-        ),
-        (
-            StatTarget::PrimaryRecord,
-            StatOverride::Device,
-            IdentityErrorClass::UnsafeRecord,
-        ),
-    ] {
-        let root = TestRoot::new();
-        let _ = open_or_create(root.path()).unwrap();
-        inject_stat_override(target, stat_override);
-        assert_eq!(open_or_create(root.path()).unwrap_err().class(), expected);
+fn real_descriptor_metadata_policy_rejects_wrong_owner_and_device() {
+    use std::fs::File;
+    use std::os::fd::AsRawFd;
+
+    fn captured(file: &File) -> libc::stat {
+        let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+        assert_eq!(
+            unsafe { libc::fstat(file.as_raw_fd(), metadata.as_mut_ptr()) },
+            0
+        );
+        unsafe { metadata.assume_init() }
     }
+
+    let root = TestRoot::new();
+    let id = open_or_create(root.path()).unwrap();
+    let record = File::open(root.primary()).unwrap();
+    let record_stat = captured(&record);
+    assert!(validate_metadata_policy(
+        &record_stat,
+        MetadataPolicy::Record { links: 1 },
+        unsafe { libc::geteuid() },
+    ));
+    assert!(!validate_metadata_policy(
+        &record_stat,
+        MetadataPolicy::Record { links: 1 },
+        unsafe { libc::geteuid() }.wrapping_add(1),
+    ));
+
+    let device = File::open("/dev/null").unwrap();
+    let device_stat = captured(&device);
+    assert_eq!(device_stat.st_mode & libc::S_IFMT, libc::S_IFCHR);
+    assert!(!validate_metadata_policy(
+        &device_stat,
+        MetadataPolicy::Record { links: 1 },
+        device_stat.st_uid,
+    ));
+    assert_eq!(fs::read(root.primary()).unwrap(), canonical(id));
+}
+
+#[test]
+fn post_read_chmod_and_hardlink_changes_fail_closed_before_parsing() {
+    for change in ["chmod", "hardlink"] {
+        let root = TestRoot::new();
+        let id = open_or_create(root.path()).unwrap();
+        let primary = root.primary();
+        let extra = root.identity().join("post-read-extra-link");
+        inject_boundary_hook(BoundaryPoint::RecordReadComplete, move || match change {
+            "chmod" => fs::set_permissions(&primary, fs::Permissions::from_mode(0o644)).unwrap(),
+            "hardlink" => fs::hard_link(&primary, &extra).unwrap(),
+            _ => unreachable!(),
+        });
+
+        assert_eq!(
+            open_or_create(root.path()).unwrap_err().class(),
+            IdentityErrorClass::UnsafeRecord,
+            "{change}"
+        );
+        assert_eq!(fs::read(root.primary()).unwrap(), canonical(id));
+    }
+}
+
+#[test]
+fn open_failure_classifies_available_unsafe_path_evidence_before_io() {
+    let root = TestRoot::new();
+    let id = open_or_create(root.path()).unwrap();
+    fs::set_permissions(root.primary(), fs::Permissions::from_mode(0o000)).unwrap();
+    assert_eq!(
+        open_or_create(root.path()).unwrap_err().class(),
+        IdentityErrorClass::UnsafeRecord
+    );
+    assert_eq!(fs::read(root.backup()).unwrap(), canonical(id));
 }
 
 #[test]
@@ -308,10 +356,9 @@ fn io_precedes_unsupported_schema_and_corrupt_observations() {
         write_record(&root.primary(), &canonical(NodeId::new_v4()));
         write_record(&root.backup(), backup);
         inject_fault(FaultPoint::PrimaryRead);
-        assert_eq!(
-            open_or_create(root.path()).unwrap_err().class(),
-            IdentityErrorClass::Io
-        );
+        let error = open_or_create(root.path()).unwrap_err();
+        assert_eq!(error.class(), IdentityErrorClass::Io);
+        assert!(std::error::Error::source(&error).is_none());
     }
 }
 
@@ -524,9 +571,7 @@ fn unrecognized_hard_link_is_rejected_without_removal() {
 fn recognized_post_link_crash_is_recovered_exactly() {
     let root = TestRoot::new();
     let id = open_or_create(root.path()).unwrap();
-    let temporary = root
-        .identity()
-        .join(format!(".node.json.tmp-{}-recovery", std::process::id()));
+    let temporary = recognized_temporary(&root, 1);
     fs::hard_link(root.primary(), &temporary).unwrap();
 
     assert_eq!(open_or_create(root.path()).unwrap(), id);
@@ -535,16 +580,30 @@ fn recognized_post_link_crash_is_recovered_exactly() {
 }
 
 #[test]
+fn noncanonical_two_link_record_is_not_mutated_during_recovery() {
+    let root = TestRoot::new();
+    fs::create_dir(root.identity()).unwrap();
+    fs::set_permissions(root.identity(), fs::Permissions::from_mode(0o700)).unwrap();
+    write_record(&root.primary(), b"{not-canonical}\n");
+    let temporary = recognized_temporary(&root, 2);
+    fs::hard_link(root.primary(), &temporary).unwrap();
+
+    assert_eq!(
+        open_or_create(root.path()).unwrap_err().class(),
+        IdentityErrorClass::UnsafeRecord
+    );
+    assert!(temporary.exists());
+    assert_eq!(fs::metadata(root.primary()).unwrap().nlink(), 2);
+}
+
+#[test]
 fn interrupted_publication_rejects_multiple_or_extra_links_without_mutation() {
     for recognized_second_link in [true, false] {
         let root = TestRoot::new();
         let id = open_or_create(root.path()).unwrap();
-        let first = root
-            .identity()
-            .join(format!(".node.json.tmp-{}-first", std::process::id()));
+        let first = recognized_temporary(&root, 3);
         let second = if recognized_second_link {
-            root.identity()
-                .join(format!(".node.json.tmp-{}-second", std::process::id()))
+            recognized_temporary(&root, 4)
         } else {
             root.identity().join("unexpected-extra-link")
         };
@@ -565,9 +624,7 @@ fn interrupted_publication_rejects_multiple_or_extra_links_without_mutation() {
 fn interrupted_publication_rejects_temp_name_swap() {
     let root = TestRoot::new();
     let id = open_or_create(root.path()).unwrap();
-    let temporary = root
-        .identity()
-        .join(format!(".node.json.tmp-{}-swap", std::process::id()));
+    let temporary = recognized_temporary(&root, 5);
     fs::hard_link(root.primary(), &temporary).unwrap();
     let swapped_path = temporary.clone();
     inject_boundary_hook(BoundaryPoint::RecoveryUnlink, move || {
@@ -588,9 +645,7 @@ fn interrupted_publication_rejects_temp_name_swap() {
 fn interrupted_publication_sync_failure_has_exact_recoverable_state() {
     let root = TestRoot::new();
     let id = open_or_create(root.path()).unwrap();
-    let temporary = root
-        .identity()
-        .join(format!(".node.json.tmp-{}-sync", std::process::id()));
+    let temporary = recognized_temporary(&root, 6);
     fs::hard_link(root.primary(), &temporary).unwrap();
     inject_fault(FaultPoint::RecoverySync);
 
@@ -608,12 +663,8 @@ fn interrupted_publication_sync_failure_has_exact_recoverable_state() {
 fn unsafe_unrelated_recognized_temp_blocks_two_link_recovery() {
     let root = TestRoot::new();
     let id = open_or_create(root.path()).unwrap();
-    let matching = root
-        .identity()
-        .join(format!(".node.json.tmp-{}-matching", std::process::id()));
-    let unsafe_temp = root
-        .identity()
-        .join(format!(".node.json.tmp-{}-bad-mode", std::process::id()));
+    let matching = recognized_temporary(&root, 7);
+    let unsafe_temp = recognized_temporary(&root, 8);
     fs::hard_link(root.primary(), &matching).unwrap();
     write_record(&unsafe_temp, b"different");
     fs::set_permissions(&unsafe_temp, fs::Permissions::from_mode(0o644)).unwrap();
@@ -632,13 +683,8 @@ fn unsafe_unrelated_recognized_temp_blocks_two_link_recovery() {
 fn recoverable_two_link_allows_safe_unrelated_temp_cleanup() {
     let root = TestRoot::new();
     let id = open_or_create(root.path()).unwrap();
-    let matching = root.identity().join(format!(
-        ".node.json.tmp-{}-matching-safe",
-        std::process::id()
-    ));
-    let unrelated = root
-        .identity()
-        .join(format!(".node.json.tmp-{}-unrelated", std::process::id()));
+    let matching = recognized_temporary(&root, 9);
+    let unrelated = recognized_temporary(&root, 10);
     fs::hard_link(root.primary(), &matching).unwrap();
     write_record(&unrelated, b"different inode and bytes");
 
@@ -650,20 +696,29 @@ fn recoverable_two_link_allows_safe_unrelated_temp_cleanup() {
 }
 
 #[test]
-fn captured_stat_rejects_wrong_owner_temporary_evidence() {
+fn malformed_temp_prefix_names_are_preserved() {
     let root = TestRoot::new();
     let id = open_or_create(root.path()).unwrap();
-    let stale = root
-        .identity()
-        .join(format!(".node.json.tmp-{}-owner", std::process::id()));
-    write_record(&stale, &canonical(id));
-    inject_stat_override(StatTarget::TemporaryRecord, StatOverride::WrongOwner);
+    let malformed = [
+        ".node.json.tmp-no-pid-00000000000000000000000000000000".to_owned(),
+        format!(".node.json.tmp-{}-abc", std::process::id()),
+        format!(
+            ".node.json.tmp-{}-0000000000000000000000000000000G",
+            std::process::id()
+        ),
+        format!(
+            ".node.json.tmp-{}-000000000000000000000000000000000",
+            std::process::id()
+        ),
+    ];
+    for name in &malformed {
+        write_record(&root.identity().join(name), &canonical(id));
+    }
 
-    assert_eq!(
-        open_or_create(root.path()).unwrap_err().class(),
-        IdentityErrorClass::UnsafeRecord
-    );
-    assert!(stale.exists());
+    assert_eq!(open_or_create(root.path()).unwrap(), id);
+    assert!(malformed
+        .iter()
+        .all(|name| root.identity().join(name).exists()));
     assert_eq!(fs::read(root.primary()).unwrap(), canonical(id));
 }
 
@@ -693,9 +748,7 @@ fn external_restore_of_both_or_either_copy_preserves_identity() {
 fn stale_recognized_temp_is_cleaned_but_unrecognized_entry_is_preserved() {
     let root = TestRoot::new();
     let id = open_or_create(root.path()).unwrap();
-    let stale = root
-        .identity()
-        .join(format!(".node.json.tmp-{}-stale", std::process::id()));
+    let stale = recognized_temporary(&root, 11);
     write_record(&stale, &canonical(id));
     let unrecognized = root.identity().join("keep-me");
     write_record(&unrecognized, b"private data");
@@ -710,9 +763,7 @@ fn stale_recognized_temp_is_cleaned_but_unrecognized_entry_is_preserved() {
 fn unsafe_recognized_temp_fails_closed() {
     let root = TestRoot::new();
     let id = open_or_create(root.path()).unwrap();
-    let unsafe_temp = root
-        .identity()
-        .join(format!(".node.json.tmp-{}-unsafe", std::process::id()));
+    let unsafe_temp = recognized_temporary(&root, 12);
     symlink(root.primary(), &unsafe_temp).unwrap();
 
     assert_eq!(
@@ -768,15 +819,46 @@ fn durability_faults_return_stable_classes_and_never_overwrite_committed_identit
 fn stale_cleanup_failure_is_nonfatal_and_emits_only_static_signal() {
     let root = TestRoot::new();
     let id = open_or_create(root.path()).unwrap();
-    let stale = root
-        .identity()
-        .join(format!(".node.json.tmp-{}-cleanup", std::process::id()));
+    let stale = recognized_temporary(&root, 13);
     write_record(&stale, &canonical(id));
     inject_fault(FaultPoint::Cleanup);
 
     assert_eq!(open_or_create(root.path()).unwrap(), id);
     assert!(stale.exists());
     assert!(cleanup_diagnostic_observed());
+}
+
+#[test]
+fn generated_temp_names_have_random_fixed_lowercase_hex_tokens_and_io_holds_no_global_lock() {
+    let root = TestRoot::new();
+    inject_boundary_hook(BoundaryPoint::TemporaryReserved, || {
+        assert!(active_temporary_lock_available());
+        inject_fault(FaultPoint::FileWrite);
+    });
+    assert_eq!(
+        open_or_create(root.path()).unwrap_err().class(),
+        IdentityErrorClass::Io
+    );
+    let first = temporary_paths(&root);
+    assert_eq!(first.len(), 1);
+    let first_name = first[0].file_name().unwrap().to_str().unwrap().to_owned();
+    let suffix = first_name
+        .strip_prefix(&format!(".node.json.tmp-{}-", std::process::id()))
+        .unwrap();
+    assert_eq!(suffix.len(), 32);
+    assert!(suffix
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+
+    fs::remove_file(&first[0]).unwrap();
+    inject_fault(FaultPoint::FileWrite);
+    assert_eq!(
+        open_or_create(root.path()).unwrap_err().class(),
+        IdentityErrorClass::Io
+    );
+    let second = temporary_paths(&root);
+    assert_eq!(second.len(), 1);
+    assert_ne!(first_name, second[0].file_name().unwrap().to_str().unwrap());
 }
 
 #[test]
@@ -841,6 +923,18 @@ fn cross_process_identity_helper() {
     let Some(path) = std::env::var_os("LOXA_IDENTITY_CROSS_PROCESS_ROOT") else {
         return;
     };
+    let index = std::env::var("LOXA_IDENTITY_CROSS_PROCESS_INDEX").unwrap();
+    let barrier = Path::new(&path).join("process-barrier");
+    fs::create_dir_all(&barrier).unwrap();
+    fs::write(barrier.join(format!("ready-{index}")), b"ready").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !barrier.join("go").exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "barrier release timed out"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
     let id = open_or_create(Path::new(&path)).unwrap();
     println!("CROSS_PROCESS_ID={id}");
 }
@@ -852,7 +946,7 @@ fn cross_process_creators_return_one_validated_winner() {
     let root = TestRoot::new();
     let executable = std::env::current_exe().unwrap();
     let mut children: Vec<_> = (0..8)
-        .map(|_| {
+        .map(|index| {
             Command::new(&executable)
                 .args([
                     "identity::tests::cross_process_identity_helper",
@@ -861,12 +955,27 @@ fn cross_process_creators_return_one_validated_winner() {
                     "--test-threads=1",
                 ])
                 .env("LOXA_IDENTITY_CROSS_PROCESS_ROOT", root.path())
+                .env("LOXA_IDENTITY_CROSS_PROCESS_INDEX", index.to_string())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
                 .unwrap()
         })
         .collect();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let barrier = root.path().join("process-barrier");
+    while (0..8)
+        .filter(|index| barrier.join(format!("ready-{index}")).exists())
+        .count()
+        != 8
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "children did not overlap"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    fs::write(barrier.join("go"), b"go").unwrap();
     let outputs: Vec<_> = children
         .drain(..)
         .map(|child| child.wait_with_output().unwrap())
