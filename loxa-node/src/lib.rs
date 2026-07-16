@@ -3098,6 +3098,87 @@ mod lifecycle_api_tests {
         assert!(!diagnostics.contains("ARBITRARY_ERROR_SENTINEL"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn builder_and_startup_preserve_corrupt_identity_class_with_sanitized_diagnostics() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TestDir::new("builder-corrupt-identity");
+        let paths = NodePaths {
+            models_dir: temp.0.join("models"),
+            state_path: temp.0.join("managed.json"),
+            logs_dir: temp.0.join("logs"),
+        };
+        let identity_dir = temp.0.join("identity");
+        fs::create_dir(&identity_dir).expect("create identity directory");
+        fs::set_permissions(&identity_dir, fs::Permissions::from_mode(0o700))
+            .expect("secure identity directory");
+        let primary = identity_dir.join("node.json");
+        fs::write(&primary, b"{not-json}\n").expect("write corrupt identity record");
+        fs::set_permissions(&primary, fs::Permissions::from_mode(0o600))
+            .expect("secure identity record");
+
+        let builder_listener = TcpListener::bind(("127.0.0.1", 0)).expect("select builder port");
+        let builder_port = builder_listener.local_addr().unwrap().port();
+        drop(builder_listener);
+        let builder_error = NodeBuilder::new(
+            None,
+            Some(builder_port),
+            RuntimeBackendKind::LlamaCpp,
+            &paths,
+        )
+        .build()
+        .err()
+        .expect("builder must reject corrupt identity");
+        assert_eq!(
+            builder_error.to_string(),
+            "node identity failed: identity_corrupt"
+        );
+
+        let capture = DiagnosticCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(capture.clone())
+            .finish();
+        let startup_listener = TcpListener::bind(("127.0.0.1", 0)).expect("select startup port");
+        let startup_port = startup_listener.local_addr().unwrap().port();
+        drop(startup_listener);
+        let startup_error = tracing::subscriber::with_default(subscriber, || {
+            serve_node(
+                None,
+                Some(startup_port),
+                RuntimeBackendKind::LlamaCpp,
+                &paths,
+                &mut RecordingLifecycleSink::default(),
+            )
+            .expect_err("startup must reject corrupt identity")
+        });
+        assert_eq!(startup_error.to_string(), builder_error.to_string());
+
+        let diagnostic = capture.text();
+        assert!(
+            diagnostic.contains("node.identity_open_failed"),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("trigger_class=\"identity_corrupt\""),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("cleanup_class=\"owner_cleanup_completed\""),
+            "{diagnostic}"
+        );
+        assert!(
+            !diagnostic.contains(temp.0.to_str().unwrap()),
+            "{diagnostic}"
+        );
+        assert!(!diagnostic.contains("os error"), "{diagnostic}");
+        assert_eq!(
+            managed_servers(&paths).expect("inspect owner cleanup"),
+            ManagedRunsSnapshot::Runs(Vec::new())
+        );
+    }
+
     #[test]
     fn readiness_failure_event_is_warn_with_the_approved_envelope() {
         let capture = DiagnosticCapture::default();

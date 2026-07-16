@@ -1327,7 +1327,8 @@ fn emit_cleanup_diagnostic() {
     CLEANUP_DIAGNOSTIC.with(|observed| observed.set(true));
     tracing::warn!(
         event_code = "identity_temp_cleanup_failed",
-        result = "identity_temp_cleanup_failed",
+        component = "identity",
+        result_class = "cleanup_failed",
         "identity temporary cleanup failed"
     );
 }

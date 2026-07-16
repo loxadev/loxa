@@ -18,6 +18,8 @@ const APPROVED_EVENT_ENVELOPES: &[(&str, &str)] = &[
     ("node.stopping", "node"),
     ("node.stopped", "node"),
     ("node.start_failed", "node"),
+    ("node.identity_open_failed", "node"),
+    ("identity_temp_cleanup_failed", "identity"),
     ("http.request.completed", "http"),
     ("http.request.failed", "http"),
     ("gateway.starting", "gateway"),
@@ -54,6 +56,7 @@ const ALLOWED_FIELDS: &[&str] = &[
     "chat_id",
     "component",
     "count",
+    "cleanup_class",
     "duration_ms",
     "event_code",
     "exit_class",
@@ -69,11 +72,11 @@ const ALLOWED_FIELDS: &[&str] = &[
     "request_id",
     "result_class",
     "route",
-    "runtime_identity",
     "stage",
     "state",
     "status",
     "turn_id",
+    "trigger_class",
 ];
 
 const FORBIDDEN_FIELD_PARTS: &[&str] = &[
