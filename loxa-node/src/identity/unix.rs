@@ -97,18 +97,20 @@ pub(super) enum BoundaryPoint {
     DirectoryRevalidate,
     RecoveryUnlink,
     PublicationUnlink,
+    RecoveryPostSync,
+    ConcurrentRecoveryPostSync,
     RecordReadComplete,
     TemporaryReserved,
 }
 
 #[cfg(test)]
-type BoundaryHook = Option<(BoundaryPoint, Box<dyn FnOnce()>)>;
+type BoundaryHooks = Vec<(BoundaryPoint, Box<dyn FnOnce()>)>;
 
 #[cfg(test)]
 thread_local! {
     static FAULT: RefCell<Option<(FaultPoint, usize)>> = const { RefCell::new(None) };
     static CLEANUP_DIAGNOSTIC: Cell<bool> = const { Cell::new(false) };
-    static BOUNDARY_HOOK: RefCell<BoundaryHook> = RefCell::new(None);
+    static BOUNDARY_HOOKS: RefCell<BoundaryHooks> = RefCell::new(Vec::new());
 }
 
 #[cfg(test)]
@@ -125,18 +127,18 @@ pub(super) fn inject_repeated_fault(point: FaultPoint, count: usize) {
 
 #[cfg(test)]
 pub(super) fn inject_boundary_hook(point: BoundaryPoint, hook: impl FnOnce() + 'static) {
-    BOUNDARY_HOOK.with(|state| *state.borrow_mut() = Some((point, Box::new(hook))));
+    BOUNDARY_HOOKS.with(|state| state.borrow_mut().push((point, Box::new(hook))));
 }
 
 #[cfg(test)]
 fn run_boundary_hook(point: BoundaryPoint) {
-    BOUNDARY_HOOK.with(|state| {
+    BOUNDARY_HOOKS.with(|state| {
         let hook = {
             let mut state = state.borrow_mut();
-            match state.as_ref().map(|(configured, _)| *configured) {
-                Some(configured) if configured == point => state.take().map(|(_, hook)| hook),
-                _ => None,
-            }
+            state
+                .iter()
+                .position(|(configured, _)| *configured == point)
+                .map(|position| state.remove(position).1)
         };
         if let Some(hook) = hook {
             hook();
@@ -835,6 +837,9 @@ impl IdentityDirectoryOwner<'_> {
         }
         fsync_fd(self.directory.as_raw_fd(), IdentityErrorClass::Durability)?;
         self.validate_committed_after_sync(committed_name, committed, committed_bytes)?;
+        #[cfg(test)]
+        run_boundary_hook(BoundaryPoint::RecoveryPostSync);
+        self.revalidate()?;
         Ok(Recovery::Recovered)
     }
 
@@ -872,6 +877,9 @@ impl IdentityDirectoryOwner<'_> {
         }
         fsync_fd(self.directory.as_raw_fd(), IdentityErrorClass::Durability)?;
         self.validate_committed_after_sync(committed_name, committed, committed_bytes)?;
+        #[cfg(test)]
+        run_boundary_hook(BoundaryPoint::ConcurrentRecoveryPostSync);
+        self.revalidate()?;
         Ok(Recovery::Recovered)
     }
 
