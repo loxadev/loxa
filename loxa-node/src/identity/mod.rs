@@ -39,7 +39,6 @@ impl IdentityErrorClass {
     }
 }
 
-#[derive(Debug)]
 pub(crate) struct IdentityError {
     class: IdentityErrorClass,
     _source: Option<io::Error>,
@@ -69,6 +68,12 @@ impl IdentityError {
 impl fmt::Display for IdentityError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.class.as_str())
+    }
+}
+
+impl fmt::Debug for IdentityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "IdentityError({})", self.class.as_str())
     }
 }
 

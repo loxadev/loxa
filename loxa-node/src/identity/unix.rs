@@ -96,6 +96,7 @@ pub(super) enum BoundaryPoint {
     RootRevalidate,
     DirectoryRevalidate,
     RecoveryUnlink,
+    PublicationUnlink,
     RecordReadComplete,
     TemporaryReserved,
 }
@@ -673,6 +674,7 @@ impl IdentityDirectoryOwner<'_> {
             return Err(injected_error(IdentityErrorClass::Durability));
         }
         fsync_fd(self.directory.as_raw_fd(), IdentityErrorClass::Durability)?;
+        self.validate_committed_after_sync(cstr(destination), &temporary.descriptor, bytes)?;
         self.root.revalidate()?;
         self.revalidate()?;
         Ok(Publication::Published)
@@ -728,6 +730,23 @@ impl IdentityDirectoryOwner<'_> {
                 return Err(IdentityError::classified(IdentityErrorClass::UnsafeRecord));
             }
             if same_file(&metadata, committed_metadata) {
+                if metadata.st_nlink == 1 {
+                    match fstatat_nofollow(self.directory.as_raw_fd(), &name) {
+                        Err(source) if source.raw_os_error() == Some(libc::ENOENT) => {
+                            return self.finish_concurrent_recovery(
+                                committed_name,
+                                committed,
+                                committed_bytes,
+                            );
+                        }
+                        Err(source) if source.raw_os_error() == Some(libc::ELOOP) => {}
+                        Err(source) => {
+                            return Err(IdentityError::with_source(IdentityErrorClass::Io, source));
+                        }
+                        Ok(_) => {}
+                    }
+                    return Err(IdentityError::classified(IdentityErrorClass::UnsafeRecord));
+                }
                 let bytes = read_bounded(descriptor.as_raw_fd())
                     .map_err(|source| IdentityError::with_source(IdentityErrorClass::Io, source))?;
                 if metadata.st_nlink != 2 || bytes != committed_bytes {
@@ -737,7 +756,7 @@ impl IdentityDirectoryOwner<'_> {
             }
         }
         if matching.is_empty() {
-            return self.finish_concurrent_recovery(committed_name, committed);
+            return self.finish_concurrent_recovery(committed_name, committed, committed_bytes);
         }
         if matching.len() != 1 {
             return Err(IdentityError::classified(IdentityErrorClass::UnsafeRecord));
@@ -749,7 +768,7 @@ impl IdentityDirectoryOwner<'_> {
         let path_metadata = match fstatat_nofollow(self.directory.as_raw_fd(), &name) {
             Ok(metadata) => metadata,
             Err(source) if source.raw_os_error() == Some(libc::ENOENT) => {
-                return self.finish_concurrent_recovery(committed_name, committed);
+                return self.finish_concurrent_recovery(committed_name, committed, committed_bytes);
             }
             Err(source) if source.raw_os_error() == Some(libc::ELOOP) => {
                 return Err(IdentityError::classified(IdentityErrorClass::UnsafeRecord));
@@ -763,7 +782,11 @@ impl IdentityDirectoryOwner<'_> {
         if descriptor_metadata.st_nlink == 1 {
             match fstatat_nofollow(self.directory.as_raw_fd(), &name) {
                 Err(source) if source.raw_os_error() == Some(libc::ENOENT) => {
-                    return self.finish_concurrent_recovery(committed_name, committed);
+                    return self.finish_concurrent_recovery(
+                        committed_name,
+                        committed,
+                        committed_bytes,
+                    );
                 }
                 Err(source) if source.raw_os_error() == Some(libc::ELOOP) => {
                     return Err(IdentityError::classified(IdentityErrorClass::UnsafeRecord));
@@ -776,6 +799,8 @@ impl IdentityDirectoryOwner<'_> {
                 }
             }
         }
+        let committed_path_metadata = fstatat_nofollow(self.directory.as_raw_fd(), committed_name)
+            .map_err(|source| revalidation_error(source, IdentityErrorClass::UnsafeRecord))?;
         if !validate_metadata_policy(
             &path_metadata,
             MetadataPolicy::Record { links: 2 },
@@ -784,15 +809,20 @@ impl IdentityDirectoryOwner<'_> {
             &descriptor_metadata,
             MetadataPolicy::Record { links: 2 },
             self.root.uid,
+        ) || !validate_metadata_policy(
+            &committed_path_metadata,
+            MetadataPolicy::Record { links: 2 },
+            self.root.uid,
         ) || !same_file(&metadata, &path_metadata)
             || !same_file(&metadata, &descriptor_metadata)
+            || !same_file(&metadata, &committed_path_metadata)
         {
             return Err(IdentityError::classified(IdentityErrorClass::UnsafeRecord));
         }
         if unsafe { libc::unlinkat(self.directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
             let source = io::Error::last_os_error();
             if source.raw_os_error() == Some(libc::ENOENT) {
-                return self.finish_concurrent_recovery(committed_name, committed);
+                return self.finish_concurrent_recovery(committed_name, committed, committed_bytes);
             }
             return Err(IdentityError::with_source(
                 IdentityErrorClass::Durability,
@@ -804,6 +834,7 @@ impl IdentityDirectoryOwner<'_> {
             return Err(injected_error(IdentityErrorClass::Durability));
         }
         fsync_fd(self.directory.as_raw_fd(), IdentityErrorClass::Durability)?;
+        self.validate_committed_after_sync(committed_name, committed, committed_bytes)?;
         Ok(Recovery::Recovered)
     }
 
@@ -811,6 +842,7 @@ impl IdentityDirectoryOwner<'_> {
         &self,
         committed_name: &std::ffi::CStr,
         committed: &OwnedFd,
+        committed_bytes: &[u8],
     ) -> Result<Recovery, IdentityError> {
         let descriptor_metadata = fstat(committed.as_raw_fd())
             .map_err(|source| IdentityError::with_source(IdentityErrorClass::Io, source))?;
@@ -839,6 +871,7 @@ impl IdentityDirectoryOwner<'_> {
             return Err(IdentityError::classified(IdentityErrorClass::UnsafeRecord));
         }
         fsync_fd(self.directory.as_raw_fd(), IdentityErrorClass::Durability)?;
+        self.validate_committed_after_sync(committed_name, committed, committed_bytes)?;
         Ok(Recovery::Recovered)
     }
 
@@ -1074,15 +1107,30 @@ impl IdentityDirectoryOwner<'_> {
         destination: &'static [u8],
         temporary: &TemporaryRecord,
     ) -> Result<(), IdentityError> {
+        #[cfg(test)]
+        run_boundary_hook(BoundaryPoint::PublicationUnlink);
         let descriptor = fstat(temporary.descriptor.as_raw_fd())
             .map_err(|source| IdentityError::with_source(IdentityErrorClass::Io, source))?;
         match fstatat_nofollow(self.directory.as_raw_fd(), &temporary.name) {
             Ok(path) => {
-                if !same_file(&descriptor, &path)
-                    || file_type(&descriptor) != libc::S_IFREG
-                    || descriptor.st_uid != self.root.uid
-                    || descriptor.st_mode & 0o777 != 0o600
-                    || descriptor.st_nlink != 2
+                let committed = fstatat_nofollow(self.directory.as_raw_fd(), cstr(destination))
+                    .map_err(|source| {
+                        revalidation_error(source, IdentityErrorClass::UnsafeRecord)
+                    })?;
+                if !validate_metadata_policy(
+                    &descriptor,
+                    MetadataPolicy::Record { links: 2 },
+                    self.root.uid,
+                ) || !validate_metadata_policy(
+                    &path,
+                    MetadataPolicy::Record { links: 2 },
+                    self.root.uid,
+                ) || !validate_metadata_policy(
+                    &committed,
+                    MetadataPolicy::Record { links: 2 },
+                    self.root.uid,
+                ) || !same_file(&descriptor, &path)
+                    || !same_file(&descriptor, &committed)
                 {
                     return Err(IdentityError::classified(IdentityErrorClass::UnsafeRecord));
                 }
@@ -1121,6 +1169,52 @@ impl IdentityDirectoryOwner<'_> {
             || descriptor.st_uid != self.root.uid
             || descriptor.st_mode & 0o777 != 0o600
             || descriptor.st_nlink != links
+        {
+            return Err(IdentityError::classified(IdentityErrorClass::UnsafeRecord));
+        }
+        Ok(())
+    }
+
+    fn validate_committed_after_sync(
+        &self,
+        name: &std::ffi::CStr,
+        retained: &OwnedFd,
+        expected_bytes: &[u8],
+    ) -> Result<(), IdentityError> {
+        let reopened = open_owned_raw(
+            self.directory.as_raw_fd(),
+            name,
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+        .map_err(|source| revalidation_error(source, IdentityErrorClass::UnsafeRecord))?;
+        let retained_metadata = fstat(retained.as_raw_fd())
+            .map_err(|source| IdentityError::with_source(IdentityErrorClass::Io, source))?;
+        let before = fstat(reopened.as_raw_fd())
+            .map_err(|source| IdentityError::with_source(IdentityErrorClass::Io, source))?;
+        let bytes = read_bounded(reopened.as_raw_fd())
+            .map_err(|source| IdentityError::with_source(IdentityErrorClass::Io, source))?;
+        let after = fstat(reopened.as_raw_fd())
+            .map_err(|source| IdentityError::with_source(IdentityErrorClass::Io, source))?;
+        let path = fstatat_nofollow(self.directory.as_raw_fd(), name)
+            .map_err(|source| revalidation_error(source, IdentityErrorClass::UnsafeRecord))?;
+        if !validate_metadata_policy(
+            &retained_metadata,
+            MetadataPolicy::Record { links: 1 },
+            self.root.uid,
+        ) || !validate_metadata_policy(
+            &before,
+            MetadataPolicy::Record { links: 1 },
+            self.root.uid,
+        ) || !validate_metadata_policy(
+            &after,
+            MetadataPolicy::Record { links: 1 },
+            self.root.uid,
+        ) || !validate_metadata_policy(&path, MetadataPolicy::Record { links: 1 }, self.root.uid)
+            || !same_file(&retained_metadata, &before)
+            || !same_file(&retained_metadata, &after)
+            || !same_file(&retained_metadata, &path)
+            || bytes != expected_bytes
+            || !matches!(parse_record(bytes), Observation::Valid(_))
         {
             return Err(IdentityError::classified(IdentityErrorClass::UnsafeRecord));
         }
