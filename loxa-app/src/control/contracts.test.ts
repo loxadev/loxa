@@ -5,6 +5,7 @@ import {
   decodeCapabilities,
   decodeControlEvent,
   decodeInventory,
+  decodeNodeIdentityProof,
   decodeNodeSnapshot,
   decodeOperation,
   decodeReconnectSnapshot,
@@ -40,6 +41,34 @@ const inventory = [
 ];
 
 describe("control contracts", () => {
+  it("accepts canonical UUID-shaped and older opaque v1 proof identities", () => {
+    const proof = (nodeId: string, runtimeIdentity: string) => ({
+      protocol_version: 1,
+      node_id: nodeId,
+      runtime_identity: runtimeIdentity,
+      status: "unloaded",
+      challenge_proof: "ab".repeat(32),
+    });
+
+    expect(
+      decodeNodeIdentityProof(proof("550e8400-e29b-41d4-a716-446655440000", "550e8400-e29b-41d4-a716-446655440001")),
+    ).toMatchObject({
+      nodeId: "550e8400-e29b-41d4-a716-446655440000",
+      runtimeIdentity: "550e8400-e29b-41d4-a716-446655440001",
+    });
+    expect(decodeNodeIdentityProof(proof("older-node", "pid-shaped-runtime"))).toMatchObject({
+      nodeId: "older-node",
+      runtimeIdentity: "pid-shaped-runtime",
+    });
+
+    expect(() => decodeNodeIdentityProof(proof("n".repeat(1025), "runtime"))).toThrow(ControlContractError);
+    expect(() => decodeNodeIdentityProof(proof("node", "r".repeat(1025)))).toThrow(ControlContractError);
+    expect(() => decodeNodeIdentityProof({ ...proof("node", "runtime"), extra: true })).toThrow(ControlContractError);
+    const missing = proof("node", "runtime") as Record<string, unknown>;
+    delete missing.runtime_identity;
+    expect(() => decodeNodeIdentityProof(missing)).toThrow(ControlContractError);
+  });
+
   it("decodes the closed node and capability snapshots", () => {
     expect(
       decodeNodeSnapshot({

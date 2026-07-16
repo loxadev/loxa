@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 const MAX_PROOF_BYTES: usize = 16 * 1024;
@@ -249,11 +250,54 @@ impl fmt::Display for ClientError {
 
 impl std::error::Error for ClientError {}
 
+pub struct ProvenControlPeer {
+    stream: TcpStream,
+    address: SocketAddr,
+    runtime_identity: String,
+    token: ControlToken,
+    timeout: Duration,
+}
+
+impl ProvenControlPeer {
+    pub fn prove(
+        address: SocketAddr,
+        token: ControlToken,
+        timeout: Duration,
+    ) -> Result<Self, ClientError> {
+        open_and_prove(address, token, None, timeout)
+    }
+
+    pub fn runtime_identity(&self) -> &str {
+        &self.runtime_identity
+    }
+
+    pub fn into_client(self) -> LiveControlClient {
+        LiveControlClient {
+            address: self.address,
+            runtime_identity: self.runtime_identity,
+            token: self.token,
+            timeout: self.timeout,
+            initial_stream: Mutex::new(Some(self.stream)),
+        }
+    }
+}
+
+impl fmt::Debug for ProvenControlPeer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProvenControlPeer")
+            .field("address", &self.address)
+            .field("runtime_identity", &self.runtime_identity)
+            .field("token", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
 pub struct LiveControlClient {
     address: SocketAddr,
     runtime_identity: String,
     token: ControlToken,
     timeout: Duration,
+    initial_stream: Mutex<Option<TcpStream>>,
 }
 
 impl fmt::Debug for LiveControlClient {
@@ -276,18 +320,8 @@ impl LiveControlClient {
         if !address.ip().is_loopback() || address.port() == 0 {
             return Err(ClientError::PeerProof);
         }
-        drop(open_and_prove(
-            address,
-            &token,
-            expected_runtime_identity,
-            timeout,
-        )?);
-        Ok(Self {
-            address,
-            runtime_identity: expected_runtime_identity.to_owned(),
-            token,
-            timeout,
-        })
+        open_and_prove(address, token, Some(expected_runtime_identity), timeout)
+            .map(ProvenControlPeer::into_client)
     }
 
     pub fn download(&self, model_id: &str) -> Result<String, ClientError> {
@@ -571,12 +605,21 @@ impl LiveControlClient {
         path: &str,
         body: &[u8],
     ) -> Result<TcpStream, ClientError> {
-        let mut stream = open_and_prove(
-            self.address,
-            &self.token,
-            &self.runtime_identity,
-            self.timeout,
-        )?;
+        let mut stream = self
+            .initial_stream
+            .lock()
+            .map_err(|_| ClientError::Transport("control connection state unavailable".into()))?
+            .take()
+            .map(Ok)
+            .unwrap_or_else(|| {
+                open_and_prove(
+                    self.address,
+                    self.token.clone(),
+                    Some(&self.runtime_identity),
+                    self.timeout,
+                )
+                .map(|proved| proved.stream)
+            })?;
         write!(
             stream,
             "{method} {path} HTTP/1.1\r\nHost: {}:{}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -639,10 +682,13 @@ fn validate_cursor(value: &str) -> Result<(), ClientError> {
 
 fn open_and_prove(
     address: SocketAddr,
-    token: &ControlToken,
-    expected_runtime_identity: &str,
+    token: ControlToken,
+    expected_runtime_identity: Option<&str>,
     timeout: Duration,
-) -> Result<TcpStream, ClientError> {
+) -> Result<ProvenControlPeer, ClientError> {
+    if !address.ip().is_loopback() || address.port() == 0 {
+        return Err(ClientError::PeerProof);
+    }
     let mut nonce = [0_u8; 32];
     getrandom::fill(&mut nonce).map_err(|_| ClientError::PeerProof)?;
     let nonce = encode_hex(&nonce);
@@ -675,7 +721,7 @@ fn open_and_prove(
     let value: NodeIdentityProofResponse =
         serde_json::from_slice(&response.body).map_err(|_| ClientError::PeerProof)?;
     if value.protocol_version != CONTROL_PROTOCOL_VERSION
-        || value.runtime_identity != expected_runtime_identity
+        || expected_runtime_identity.is_some_and(|expected| value.runtime_identity != expected)
         || matches!(
             value.status,
             crate::control::contracts::NodeStatus::RecoveryRequired
@@ -691,7 +737,13 @@ fn open_and_prove(
     {
         return Err(ClientError::PeerProof);
     }
-    Ok(stream)
+    Ok(ProvenControlPeer {
+        stream,
+        address,
+        runtime_identity: value.runtime_identity,
+        token,
+        timeout,
+    })
 }
 
 struct HttpResponse {
@@ -1167,7 +1219,8 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&seen);
         let worker = std::thread::spawn(move || {
-            for body in responses {
+            let skip_initial_marker = responses.len() > 1 && responses[0] == "__PROOF__";
+            for body in responses.into_iter().skip(usize::from(skip_initial_marker)) {
                 let (mut socket, _) = listener.accept().unwrap();
                 let request = read_request(&mut socket);
                 captured.lock().unwrap().push(request.clone());
@@ -1239,6 +1292,59 @@ mod tests {
     }
 
     #[test]
+    fn proved_peer_learns_opaque_identity_and_keeps_bearer_on_the_proved_socket() {
+        let (_dir, token) = token();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_token = token.clone();
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let proof_request = read_request(&mut socket);
+            assert!(!proof_request
+                .to_ascii_lowercase()
+                .contains("authorization:"));
+            let nonce = proof_request
+                .lines()
+                .find_map(|line| line.strip_prefix("X-Loxa-Challenge: "))
+                .unwrap();
+            let runtime_identity = "550e8400-e29b-41d4-a716-446655440001";
+            let proof = server_token
+                .node_identity_proof(
+                    nonce,
+                    "opaque-old-node",
+                    runtime_identity,
+                    NodeStatus::Ready,
+                )
+                .unwrap();
+            let body = format!(
+                r#"{{"protocol_version":1,"node_id":"opaque-old-node","runtime_identity":"{runtime_identity}","status":"ready","challenge_proof":"{proof}"}}"#
+            );
+            send_response(&mut socket, 200, &body, "keep-alive");
+
+            let authenticated = read_request(&mut socket);
+            assert!(authenticated.starts_with("POST /loxa/v1/models/load "));
+            assert!(authenticated
+                .to_ascii_lowercase()
+                .contains("authorization: bearer "));
+            send_response(&mut socket, 200, r#"{"operation_id":"op-1"}"#, "close");
+            listener.set_nonblocking(true).unwrap();
+            assert!(
+                listener.accept().is_err(),
+                "bearer opened a replacement socket"
+            );
+        });
+
+        let proved = ProvenControlPeer::prove(address, token, Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            proved.runtime_identity(),
+            "550e8400-e29b-41d4-a716-446655440001"
+        );
+        let client = proved.into_client();
+        assert_eq!(client.load("gemma-3-4b-it-q4").unwrap(), "op-1");
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn bearer_is_sent_only_after_nonce_bound_peer_proof() {
         let (_dir, token) = token();
         let accepted = r#"{"operation_id":"op-1"}"#.to_string();
@@ -1254,11 +1360,10 @@ mod tests {
         worker.join().unwrap();
         let requests = seen.lock().unwrap();
         assert!(!requests[0].to_ascii_lowercase().contains("authorization:"));
-        assert!(!requests[1].to_ascii_lowercase().contains("authorization:"));
-        assert!(requests[2]
+        assert!(requests[1]
             .to_ascii_lowercase()
             .contains("authorization: bearer "));
-        assert!(!requests[2].contains("X-Loxa-Challenge"));
+        assert!(!requests[1].contains("X-Loxa-Challenge"));
     }
 
     #[test]
@@ -1386,8 +1491,8 @@ mod tests {
         );
         worker.join().unwrap();
         let requests = seen.lock().unwrap();
-        assert_eq!(requests.len(), 5);
-        for (proof, authenticated) in [(1, 2), (3, 4)] {
+        assert_eq!(requests.len(), 4);
+        for (proof, authenticated) in [(0, 1), (2, 3)] {
             assert!(requests[proof].contains("X-Loxa-Challenge:"));
             assert!(!requests[proof]
                 .to_ascii_lowercase()
@@ -1396,6 +1501,76 @@ mod tests {
                 .to_ascii_lowercase()
                 .contains("authorization: bearer "));
         }
+    }
+
+    #[test]
+    fn later_reconnect_rejects_a_valid_replacement_proof_without_sending_bearer() {
+        let (_dir, token) = token();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_token = token.clone();
+        let worker = std::thread::spawn(move || {
+            let (mut initial, _) = listener.accept().unwrap();
+            let request = read_request(&mut initial);
+            let nonce = request
+                .lines()
+                .find_map(|line| line.strip_prefix("X-Loxa-Challenge: "))
+                .unwrap();
+            let proof = server_token
+                .node_identity_proof(nonce, "node", "original-instance", NodeStatus::Ready)
+                .unwrap();
+            send_response(
+                &mut initial,
+                200,
+                &format!(
+                    r#"{{"protocol_version":1,"node_id":"node","runtime_identity":"original-instance","status":"ready","challenge_proof":"{proof}"}}"#
+                ),
+                "keep-alive",
+            );
+            let authenticated = read_request(&mut initial);
+            assert!(authenticated
+                .to_ascii_lowercase()
+                .contains("authorization: bearer "));
+            send_response(
+                &mut initial,
+                200,
+                r#"{"id":"op","kind":"load","status":"running","model_id":"gemma-3-4b-it-q4","progress":null,"error":null,"created_at_unix_ms":1,"updated_at_unix_ms":2}"#,
+                "close",
+            );
+
+            let (mut replacement, _) = listener.accept().unwrap();
+            let request = read_request(&mut replacement);
+            let nonce = request
+                .lines()
+                .find_map(|line| line.strip_prefix("X-Loxa-Challenge: "))
+                .unwrap();
+            let proof = server_token
+                .node_identity_proof(nonce, "node", "replacement-instance", NodeStatus::Ready)
+                .unwrap();
+            send_response(
+                &mut replacement,
+                200,
+                &format!(
+                    r#"{{"protocol_version":1,"node_id":"node","runtime_identity":"replacement-instance","status":"ready","challenge_proof":"{proof}"}}"#
+                ),
+                "keep-alive",
+            );
+            replacement
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut byte = [0_u8; 1];
+            assert_eq!(replacement.read(&mut byte).unwrap(), 0);
+        });
+
+        let client = ProvenControlPeer::prove(address, token, Duration::from_secs(1))
+            .unwrap()
+            .into_client();
+        assert_eq!(
+            client.operation("op").unwrap().status,
+            OperationStatus::Running
+        );
+        assert_eq!(client.operation("op"), Err(ClientError::PeerProof));
+        worker.join().unwrap();
     }
 
     #[test]
@@ -1502,14 +1677,10 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server_token = token.clone();
         let worker = std::thread::spawn(move || {
-            for connection_index in 0..2 {
+            for _ in 0..1 {
                 let (mut socket, _) = listener.accept().unwrap();
                 let proof_request = read_request(&mut socket);
                 let proof = proof_body(&server_token, &proof_request);
-                if connection_index == 0 {
-                    send_response(&mut socket, 200, &proof, "close");
-                    continue;
-                }
                 send_response(&mut socket, 200, &proof, "keep-alive");
                 let authenticated = read_request(&mut socket);
                 assert!(authenticated.starts_with(&format!("POST /loxa/v1/chats/{id}/turns ")));
@@ -1679,17 +1850,13 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server_token = token.clone();
         let worker = std::thread::spawn(move || {
-            for connection_index in 0..3 {
+            for connection_index in 0..2 {
                 let (mut socket, _) = listener.accept().unwrap();
                 let proof_request = read_request(&mut socket);
                 let proof = proof_body(&server_token, &proof_request);
-                if connection_index == 0 {
-                    send_response(&mut socket, 200, &proof, "close");
-                    continue;
-                }
                 send_response(&mut socket, 200, &proof, "keep-alive");
                 let authenticated = read_request(&mut socket);
-                if connection_index == 1 {
+                if connection_index == 0 {
                     assert!(
                         authenticated.starts_with(&format!("POST /loxa/v1/chats/{chat}/turns "))
                     );
@@ -1733,17 +1900,13 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server_token = token.clone();
         let worker = std::thread::spawn(move || {
-            for connection_index in 0..3 {
+            for connection_index in 0..2 {
                 let (mut socket, _) = listener.accept().unwrap();
                 let proof_request = read_request(&mut socket);
                 let proof = proof_body(&server_token, &proof_request);
-                if connection_index == 0 {
-                    send_response(&mut socket, 200, &proof, "close");
-                    continue;
-                }
                 send_response(&mut socket, 200, &proof, "keep-alive");
                 let authenticated = read_request(&mut socket);
-                if connection_index == 1 {
+                if connection_index == 0 {
                     let event = format!(
                         "event: turn.started\ndata: {{\"chat_id\":\"{chat}\",\"turn_id\":\"{turn}\",\"state\":\"streaming\",\"omitted_turns\":0}}\n\n"
                     );
@@ -1786,15 +1949,6 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server_token = token.clone();
         let worker = std::thread::spawn(move || {
-            let (mut initial, _) = listener.accept().unwrap();
-            let request = read_request(&mut initial);
-            send_response(
-                &mut initial,
-                200,
-                &proof_body(&server_token, &request),
-                "close",
-            );
-
             let (mut quiet_stream, _) = listener.accept().unwrap();
             let request = read_request(&mut quiet_stream);
             send_response(

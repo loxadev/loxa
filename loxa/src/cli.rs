@@ -7,7 +7,8 @@ use crate::model_commands::{print_list, pull_model, remove_model, write_unknown_
 use clap::Parser;
 use loxa_core::control::auth::ControlToken;
 use loxa_core::control::client::{
-    ChatView, LiveControlClient, MessagePageView, MessageSummaryView, TurnStreamEvent, TurnView,
+    ChatView, LiveControlClient, MessagePageView, MessageSummaryView, ProvenControlPeer,
+    TurnStreamEvent, TurnView,
 };
 use loxa_core::detect::{DetectedTool, LocalToolsReport};
 use loxa_core::engine::RuntimeBackendKind;
@@ -808,21 +809,29 @@ fn live_control(paths: &NodePaths) -> io::Result<Option<LiveControlClient>> {
         state_dir
     };
     let token = ControlToken::load(&loxa_dir.join("control.token"))?;
-    let client =
-        LiveControlClient::connect(address, token, &run.run_id, Duration::from_millis(750))
-            .map_err(io::Error::other)?;
+    let proved = ProvenControlPeer::prove(address, token, Duration::from_millis(750))
+        .map_err(io::Error::other)?;
     match supervisor::read_runtime_state(&paths.state_path).map_err(supervisor_error_to_io)? {
         RuntimeStateRead::Loaded(current)
             if current.len() == 1
-                && current[0].identity() == run.identity()
-                && current[0].control_port == run.control_port => {}
+                && current[0] == run
+                && acceptable_live_control_run(&current[0]) => {}
         _ => {
             return Err(io::Error::other(
                 "managed node state changed during peer proof; retry the command",
             ))
         }
     }
-    Ok(Some(client))
+    Ok(Some(proved.into_client()))
+}
+
+fn acceptable_live_control_run(run: &supervisor::ManagedRun) -> bool {
+    let inspection = supervisor::inspect_managed_run(run);
+    inspection.owner_status == supervisor::OwnerIdentityStatus::Live
+        && matches!(
+            inspection.status,
+            supervisor::ManagedRunStatus::Unloaded | supervisor::ManagedRunStatus::Running
+        )
 }
 
 fn live_control_address(run: &supervisor::ManagedRun) -> io::Result<SocketAddr> {
@@ -1728,7 +1737,7 @@ mod tests {
     }
 
     #[test]
-    fn live_control_proves_the_persisted_custom_node_endpoint_after_engine_attachment() {
+    fn live_control_learns_opaque_instance_and_keeps_first_bearer_on_the_proved_socket() {
         use loxa_core::control::contracts::NodeStatus;
         #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
@@ -1749,7 +1758,8 @@ mod tests {
         set_test_owner_to_current_process(&mut run);
         run.control_port = Some(control_port);
         set_test_child_to_current_process(&mut run, &engine_listener);
-        let runtime_identity = run.run_id.clone();
+        let runtime_identity = "550e8400-e29b-41d4-a716-446655440001".to_string();
+        assert_ne!(runtime_identity, run.run_id);
         persist_test_run(&paths.state_path, run.clone());
 
         let server_token = token.clone();
@@ -1775,14 +1785,36 @@ mod tests {
             );
             write!(
                 socket,
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
                 body.len(),
                 body
             )
             .unwrap();
+
+            let mut authenticated_request = Vec::new();
+            while !authenticated_request.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).unwrap();
+                authenticated_request.push(byte[0]);
+            }
+            let request = String::from_utf8(authenticated_request).unwrap();
+            assert!(request.starts_with("GET /loxa/v1/models "));
+            assert!(request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer "));
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]"
+            )
+            .unwrap();
+            control_listener.set_nonblocking(true).unwrap();
+            assert!(
+                control_listener.accept().is_err(),
+                "first bearer opened a replacement socket"
+            );
         });
 
-        assert!(live_control(&paths).unwrap().is_some());
+        let client = live_control(&paths).unwrap().unwrap();
+        assert!(client.models().unwrap().is_empty());
         proof_server.join().unwrap();
         let RuntimeStateRead::Loaded(stored) =
             supervisor::read_runtime_state(&paths.state_path).unwrap()
@@ -1792,6 +1824,87 @@ mod tests {
         assert_eq!(stored[0].control_port, Some(control_port));
         assert_eq!(stored[0].port, engine_listener.local_addr().unwrap().port());
         assert_ne!(stored[0].control_port, Some(stored[0].port));
+    }
+
+    #[test]
+    fn live_control_drops_proved_socket_when_full_managed_state_changes_before_recheck() {
+        use loxa_core::control::contracts::NodeStatus;
+        use std::sync::mpsc;
+
+        let temp = TempDir::new("live-control-state-race");
+        let paths = NodePaths {
+            models_dir: temp.path().join("models"),
+            state_path: temp.path().join("run").join("managed.json"),
+            logs_dir: temp.path().join("logs"),
+        };
+        let token = ControlToken::load_or_create(&temp.path().join("control.token")).unwrap();
+        let control_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut run = starting_run_for_test(&paths.state_path, "state-race-owner");
+        set_test_owner_to_current_process(&mut run);
+        run.control_port = Some(control_listener.local_addr().unwrap().port());
+        run.lifecycle = supervisor::RunLifecycle::Unloaded;
+        run.child_pid = None;
+        run.child_process_start_time_unix_s = None;
+        persist_test_run(&paths.state_path, run.clone());
+
+        let state_path = paths.state_path.clone();
+        let server_token = token.clone();
+        let (request_tx, request_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = control_listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            let request = String::from_utf8(request).unwrap();
+            let nonce = request
+                .lines()
+                .find_map(|line| line.strip_prefix("X-Loxa-Challenge: "))
+                .unwrap();
+            let proof = server_token
+                .node_identity_proof(
+                    nonce,
+                    "opaque-node",
+                    "opaque-instance",
+                    NodeStatus::Unloaded,
+                )
+                .unwrap();
+            let body = format!(
+                r#"{{"protocol_version":1,"node_id":"opaque-node","runtime_identity":"opaque-instance","status":"unloaded","challenge_proof":"{proof}"}}"#
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(&response.as_bytes()[..response.len() - 1])
+                .unwrap();
+
+            let mut replacement = run;
+            replacement.generation_alias = "changed-after-proof".into();
+            assert!(supervisor::update_runtime_state_run(
+                &state_path,
+                &replacement.identity(),
+                replacement,
+            )
+            .unwrap());
+            socket
+                .write_all(&response.as_bytes()[response.len() - 1..])
+                .unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            request_tx.send(socket.read(&mut byte).unwrap()).unwrap();
+        });
+
+        let error = live_control(&paths).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("state changed during peer proof"));
+        assert_eq!(request_rx.recv_timeout(Duration::from_secs(2)).unwrap(), 0);
+        worker.join().unwrap();
     }
 
     fn persist_test_run(state_path: &Path, run: supervisor::ManagedRun) {
