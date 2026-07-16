@@ -10,6 +10,19 @@ use loxa_core::supervisor;
 use loxa_protocol::NodeInstanceId;
 use std::io;
 
+fn resolve_build_failure(
+    trigger: io::Error,
+    owner_cleanup: io::Result<()>,
+    worker_cleanup: io::Result<()>,
+    history_cleanup: io::Result<()>,
+) -> io::Error {
+    owner_cleanup
+        .err()
+        .or_else(|| history_cleanup.err())
+        .or_else(|| worker_cleanup.err())
+        .unwrap_or(trigger)
+}
+
 fn finish_failed_build(
     trigger: io::Error,
     owner_guard: NodeOwnerGuard,
@@ -17,16 +30,35 @@ fn finish_failed_build(
         download_control::DownloadControl,
         download_control::DownloadControlWorker,
     )>,
+    history_worker: Option<chat_history::ChatHistoryWorker>,
 ) -> io::Error {
     let worker_cleanup = runtime
         .take()
         .map(|(_, worker)| worker.stop_and_join())
-        .transpose();
+        .transpose()
+        .map(|_| ())
+        .map_err(io::Error::other);
+    let history_cleanup = history_worker
+        .map(chat_history::ChatHistoryWorker::stop_and_join)
+        .transpose()
+        .map(|_| ())
+        .map_err(io::Error::other);
     let owner_cleanup = owner_guard.finish();
-    owner_cleanup
-        .err()
-        .or_else(|| worker_cleanup.err())
-        .unwrap_or(trigger)
+    resolve_build_failure(trigger, owner_cleanup, worker_cleanup, history_cleanup)
+}
+
+#[cfg(test)]
+static DOWNLOAD_WORKER_SPAWN_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn reset_download_worker_spawn_count() {
+    DOWNLOAD_WORKER_SPAWN_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn download_worker_spawn_count() -> usize {
+    DOWNLOAD_WORKER_SPAWN_COUNT.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 pub(crate) struct NodeBuilder<'a> {
@@ -99,8 +131,45 @@ impl<'a> NodeBuilder<'a> {
             }
         };
         let node_instance_id = NodeInstanceId::new_v4();
+        let mut download_runtime = None;
+        let token_path = loxa_dir.join("control.token");
+        let token = match loxa_core::control::auth::ControlToken::load_or_create(&token_path) {
+            Ok(token) => token,
+            Err(error) => {
+                return Err(finish_failed_build(
+                    error,
+                    owner_guard,
+                    &mut download_runtime,
+                    None,
+                ))
+            }
+        };
+        let history_path = match self.paths.history_path() {
+            Ok(history_path) => history_path,
+            Err(error) => {
+                return Err(finish_failed_build(
+                    error,
+                    owner_guard,
+                    &mut download_runtime,
+                    None,
+                ))
+            }
+        };
+        let (history, history_worker) = match chat_history::ChatHistory::spawn(history_path) {
+            Ok(history) => history,
+            Err(error) => {
+                return Err(finish_failed_build(
+                    io::Error::other(error),
+                    owner_guard,
+                    &mut download_runtime,
+                    None,
+                ))
+            }
+        };
         let gateway_state = loxa_core::gateway::GatewayState::new(node_id, node_instance_id);
-        let mut download_runtime = Some({
+        #[cfg(test)]
+        DOWNLOAD_WORKER_SPAWN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        download_runtime = Some({
             let run = &unloaded_run;
             if self.engine == RuntimeBackendKind::LlamaCpp {
                 let owner = model_lifecycle::StableNodeOwner {
@@ -127,37 +196,6 @@ impl<'a> NodeBuilder<'a> {
                 download_control::DownloadControl::spawn(self.paths.models_dir.clone())
             }
         });
-        let token_path = loxa_dir.join("control.token");
-        let token = match loxa_core::control::auth::ControlToken::load_or_create(&token_path) {
-            Ok(token) => token,
-            Err(error) => {
-                return Err(finish_failed_build(
-                    error,
-                    owner_guard,
-                    &mut download_runtime,
-                ))
-            }
-        };
-        let history_path = match self.paths.history_path() {
-            Ok(history_path) => history_path,
-            Err(error) => {
-                return Err(finish_failed_build(
-                    error,
-                    owner_guard,
-                    &mut download_runtime,
-                ))
-            }
-        };
-        let (history, history_worker) = match chat_history::ChatHistory::spawn(history_path) {
-            Ok(history) => history,
-            Err(error) => {
-                return Err(finish_failed_build(
-                    io::Error::other(error),
-                    owner_guard,
-                    &mut download_runtime,
-                ))
-            }
-        };
         let chat_routes_state =
             chat_routes::ChatRoutesState::new(token.clone(), history, gateway_state.clone());
         let router = loxa_core::gateway::router(gateway_state.clone())
@@ -181,11 +219,11 @@ impl<'a> NodeBuilder<'a> {
         ) {
             Ok(gateway) => gateway,
             Err(error) => {
-                let _ = history_worker.stop_and_join();
                 return Err(finish_failed_build(
                     error,
                     owner_guard,
                     &mut download_runtime,
+                    Some(history_worker),
                 ));
             }
         };
@@ -205,5 +243,23 @@ impl<'a> NodeBuilder<'a> {
             node_id,
             node_instance_id,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_build_failure;
+    use std::io;
+
+    #[test]
+    fn history_join_failure_outranks_gateway_bind_failure() {
+        let error = resolve_build_failure(
+            io::Error::other("gateway bind failure"),
+            Ok(()),
+            Ok(()),
+            Err(io::Error::other("history join failure")),
+        );
+
+        assert_eq!(error.to_string(), "history join failure");
     }
 }

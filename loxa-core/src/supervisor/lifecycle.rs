@@ -302,6 +302,38 @@ pub fn finish_childless_runtime_state_run(
     Ok(outcome)
 }
 
+pub fn finish_exact_unloaded_owner(
+    path: &Path,
+    expected_baseline: &ManagedRun,
+) -> Result<ChildlessFinishOutcome, SupervisorError> {
+    validate_unloaded_owner_baseline(expected_baseline)?;
+    let _lock = state::acquire_runtime_state_lock_for_mutation(
+        path,
+        state::RUNTIME_STATE_LOCK_TIMEOUT,
+        state::RUNTIME_STATE_LOCK_POLL_INTERVAL,
+    )?;
+    let runs = state::runtime_state_runs_for_mutation(path)?;
+    let [current] = runs.as_slice() else {
+        return Err(SupervisorError::RunStateConflict(format!(
+            "unloaded managed owner {} is not the singular current owner",
+            expected_baseline.run_id
+        )));
+    };
+    if !managed_runs_match_except_monotonic_stop(current, expected_baseline) {
+        return Err(SupervisorError::RunStateConflict(format!(
+            "unloaded managed owner {} no longer matches its full baseline",
+            expected_baseline.run_id
+        )));
+    }
+    let outcome = if current.stop_requested {
+        ChildlessFinishOutcome::RequestedStop
+    } else {
+        ChildlessFinishOutcome::Finished
+    };
+    state::write_runtime_state(path, &[])?;
+    Ok(outcome)
+}
+
 pub fn finish_owner_teardown_with<T>(
     path: &Path,
     expected: &ManagedRunIdentity,
@@ -572,6 +604,59 @@ mod tests {
             child_pid: None,
             child_process_start_time_unix_s: None,
             child_pgid: None,
+        }
+    }
+
+    #[test]
+    fn exact_unloaded_finish_allows_only_monotonic_stop_and_removes_under_one_lock() {
+        for stopped in [false, true] {
+            let temp = tempdir().expect("tempdir");
+            let state_path = temp.path().join("managed.json");
+            let baseline = unloaded_owner(temp.path(), "exact-finish");
+            write_runtime_state(&state_path, std::slice::from_ref(&baseline)).expect("seed owner");
+            if stopped {
+                record_stop_request(&state_path, "all").expect("request stop");
+            }
+
+            let outcome = finish_exact_unloaded_owner(&state_path, &baseline)
+                .expect("finish exact unloaded owner");
+
+            assert_eq!(
+                outcome,
+                if stopped {
+                    ChildlessFinishOutcome::RequestedStop
+                } else {
+                    ChildlessFinishOutcome::Finished
+                }
+            );
+            assert_eq!(
+                read_runtime_state(&state_path).expect("read finished owner"),
+                RuntimeStateRead::Loaded(Vec::new())
+            );
+        }
+    }
+
+    #[test]
+    fn exact_unloaded_finish_preserves_prepared_and_recovery_shapes_with_same_identity() {
+        for lifecycle in [RunLifecycle::Starting, RunLifecycle::RecoveryRequired] {
+            let temp = tempdir().expect("tempdir");
+            let state_path = temp.path().join("managed.json");
+            let baseline = unloaded_owner(temp.path(), "shape-conflict");
+            let mut conflicting = baseline.clone();
+            conflicting.model_id = Some("mlx/model".to_string());
+            conflicting.lifecycle = lifecycle;
+            conflicting.port = 9_001;
+            write_runtime_state(&state_path, std::slice::from_ref(&conflicting))
+                .expect("seed conflicting owner");
+
+            let error = finish_exact_unloaded_owner(&state_path, &baseline)
+                .expect_err("non-baseline shape must fail closed");
+
+            assert!(matches!(error, SupervisorError::RunStateConflict(_)));
+            assert_eq!(
+                read_runtime_state(&state_path).expect("read preserved owner"),
+                RuntimeStateRead::Loaded(vec![conflicting])
+            );
         }
     }
 

@@ -2,7 +2,10 @@ use crate::bootstrap::NodePaths;
 use crate::chat_history::ChatHistoryWorker;
 use crate::chat_routes::ChatRoutesState;
 use crate::download_control::{DownloadControl, DownloadControlWorker};
-use crate::{LifecycleEvent, LifecycleEventSink, RunRequest, RunTermination};
+use crate::{
+    LifecycleEvent, LifecycleEventSink, PreparedPythonOwnerDisposition, PreparedPythonRunResult,
+    RunRequest, RunTermination,
+};
 use loxa_core::diagnostics::DiagnosticsHealth;
 use loxa_core::engine::RuntimeBackendKind;
 use loxa_core::gateway::{GatewayServer, GatewayState};
@@ -33,6 +36,10 @@ impl NodeOwnerGuard {
         self.baseline.as_ref().expect("node owner guard armed")
     }
 
+    pub(crate) fn disarm(mut self) {
+        self.baseline.take();
+    }
+
     pub(crate) fn finish(mut self) -> io::Result<()> {
         let baseline = self.baseline.as_ref().expect("node owner guard armed");
         crate::finish_unloaded_owner(&self.paths, baseline)?;
@@ -46,27 +53,25 @@ impl Drop for NodeOwnerGuard {
         let Some(baseline) = self.baseline.take() else {
             return;
         };
-        let Ok(loxa_core::supervisor::RuntimeStateRead::Loaded(runs)) =
-            loxa_core::supervisor::read_runtime_state(&self.paths.state_path)
-        else {
-            return;
-        };
-        if runs.as_slice() != [baseline.clone()] || baseline.stop_requested {
-            return;
-        }
-        let _ = loxa_core::supervisor::finish_childless_runtime_state_run(
-            &self.paths.state_path,
-            &baseline.identity(),
-        );
+        let _ =
+            loxa_core::supervisor::finish_exact_unloaded_owner(&self.paths.state_path, &baseline);
     }
 }
 
-fn emit_shutdown_stage(stage: &'static str, duration_ms: u64, error: Option<&io::Error>) {
+fn emit_shutdown_stage(
+    stage: &'static str,
+    duration_ms: u64,
+    node_id: NodeId,
+    node_instance_id: NodeInstanceId,
+    error: Option<&io::Error>,
+) {
     if error.is_some() {
         tracing::warn!(
             target: "loxa_node::shutdown",
             event_code = "shutdown.stage.failed",
             component = "shutdown",
+            node_id = node_id.to_string().as_str(),
+            node_instance_id = node_instance_id.to_string().as_str(),
             stage,
             result_class = "join_failed",
             duration_ms,
@@ -76,6 +81,8 @@ fn emit_shutdown_stage(stage: &'static str, duration_ms: u64, error: Option<&io:
             target: "loxa_node::shutdown",
             event_code = "shutdown.stage.completed",
             component = "shutdown",
+            node_id = node_id.to_string().as_str(),
+            node_instance_id = node_instance_id.to_string().as_str(),
             stage,
             result_class = "completed",
             duration_ms,
@@ -93,6 +100,26 @@ fn resolve_shutdown_outcome(
         (_, Ok(()), Err(error)) => Err(error),
         (Err(error), Ok(()), Ok(())) => Err(error),
         (Ok(exit), Ok(()), Ok(())) => Ok(exit),
+    }
+}
+
+fn resolve_prepared_python_owner(
+    result: PreparedPythonRunResult,
+    guard: NodeOwnerGuard,
+) -> io::Result<RunTermination> {
+    match result.owner {
+        PreparedPythonOwnerDisposition::Restored(_) => {
+            guard.finish()?;
+            result.outcome
+        }
+        PreparedPythonOwnerDisposition::ConsumedByRequestedStop => {
+            guard.disarm();
+            result.outcome
+        }
+        PreparedPythonOwnerDisposition::RecoveryRequired => {
+            guard.disarm();
+            Err(io::Error::other("prepared Python owner requires recovery"))
+        }
     }
 }
 
@@ -212,26 +239,34 @@ impl NodeRuntime {
                     Some(events),
                 )
             }
-            Some(model_id) => crate::run_prepared_python_model_with_diagnostics_health(
-                RunRequest {
-                    id: model_id,
-                    ctx: None,
-                    port: None,
-                    engine: self.engine,
-                },
-                paths,
-                self.owner_guard
-                    .as_ref()
-                    .expect("prepared Python node owner guarded")
-                    .baseline(),
-                Some(
-                    self.gateway_state
+            Some(model_id) => {
+                let result = crate::run_prepared_python_model_with_diagnostics_health(
+                    RunRequest {
+                        id: model_id,
+                        ctx: None,
+                        port: None,
+                        engine: self.engine,
+                    },
+                    paths,
+                    self.owner_guard
                         .as_ref()
-                        .expect("runtime gateway state present"),
-                ),
-                events,
-                &self.diagnostics_health,
-            ),
+                        .expect("prepared Python node owner guarded")
+                        .baseline(),
+                    Some(
+                        self.gateway_state
+                            .as_ref()
+                            .expect("runtime gateway state present"),
+                    ),
+                    events,
+                    &self.diagnostics_health,
+                );
+                resolve_prepared_python_owner(
+                    result,
+                    self.owner_guard
+                        .take()
+                        .expect("prepared Python node owner guarded"),
+                )
+            }
             None => {
                 self.unloaded_run.take();
                 let run = self
@@ -264,6 +299,8 @@ impl NodeRuntime {
             target: "loxa_node::shutdown",
             event_code = "shutdown.requested",
             component = "shutdown",
+            node_id = self.node_id.to_string().as_str(),
+            node_instance_id = self.node_instance_id.to_string().as_str(),
             result_class = "requested",
         );
         tracing::info!(
@@ -281,6 +318,8 @@ impl NodeRuntime {
         emit_shutdown_stage(
             "withdraw_routes",
             u64::try_from(shutdown_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            self.node_id,
+            self.node_instance_id,
             None,
         );
         self.chat_routes_state
@@ -290,6 +329,8 @@ impl NodeRuntime {
         emit_shutdown_stage(
             "chat_cancel_wait",
             u64::try_from(shutdown_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            self.node_id,
+            self.node_instance_id,
             None,
         );
         let shutdown = self
@@ -300,6 +341,8 @@ impl NodeRuntime {
         emit_shutdown_stage(
             "gateway_join",
             u64::try_from(shutdown_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            self.node_id,
+            self.node_instance_id,
             shutdown.as_ref().err(),
         );
         let history_shutdown = self
@@ -311,6 +354,8 @@ impl NodeRuntime {
         emit_shutdown_stage(
             "history_join",
             u64::try_from(shutdown_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            self.node_id,
+            self.node_instance_id,
             history_shutdown.as_ref().err(),
         );
         let result = resolve_shutdown_outcome(outcome, shutdown, history_shutdown);
@@ -378,9 +423,16 @@ impl Drop for NodeRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::{emit_shutdown_stage, resolve_shutdown_outcome, NodeOwnerGuard};
+    use super::{
+        emit_shutdown_stage, resolve_prepared_python_owner, resolve_shutdown_outcome,
+        NodeOwnerGuard,
+    };
     use crate::NodePaths;
-    use crate::{claim_unloaded_owner, managed_servers, ManagedRunsSnapshot};
+    use crate::{
+        claim_unloaded_owner, managed_servers, ManagedRunsSnapshot, PreparedPythonOwnerDisposition,
+        PreparedPythonRunResult, RunTermination,
+    };
+    use loxa_core::supervisor::ManagedRun;
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex};
     use tracing_subscriber::fmt::MakeWriter;
@@ -422,6 +474,102 @@ mod tests {
         assert_eq!(result.to_string(), "gateway join uncertainty");
     }
 
+    #[test]
+    fn prepared_owner_result_explicitly_finishes_restored_owner() {
+        let (paths, baseline) = guarded_owner("prepared-restored", 19_761);
+        let result = resolve_prepared_python_owner(
+            PreparedPythonRunResult {
+                outcome: Ok(RunTermination::Interrupted),
+                owner: PreparedPythonOwnerDisposition::Restored(baseline.clone()),
+            },
+            NodeOwnerGuard::new(paths.clone(), baseline),
+        )
+        .expect("restored owner finishes explicitly");
+
+        assert_eq!(result, RunTermination::Interrupted);
+        assert_eq!(
+            managed_servers(&paths).unwrap(),
+            ManagedRunsSnapshot::Runs(Vec::new())
+        );
+        std::fs::remove_dir_all(paths.state_path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn prepared_owner_result_disarms_consumed_stop_without_redeleting() {
+        let (paths, baseline) = guarded_owner("prepared-stopped", 19_762);
+        let mut stopped = baseline.clone();
+        stopped.stop_requested = true;
+        loxa_core::supervisor::update_runtime_state_run(
+            &paths.state_path,
+            &baseline.identity(),
+            stopped,
+        )
+        .unwrap();
+        loxa_core::supervisor::finish_exact_unloaded_owner(&paths.state_path, &baseline).unwrap();
+
+        let result = resolve_prepared_python_owner(
+            PreparedPythonRunResult {
+                outcome: Ok(RunTermination::RequestedStop),
+                owner: PreparedPythonOwnerDisposition::ConsumedByRequestedStop,
+            },
+            NodeOwnerGuard::new(paths.clone(), baseline),
+        )
+        .expect("consumed stop remains terminal");
+
+        assert_eq!(result, RunTermination::RequestedStop);
+        assert_eq!(
+            managed_servers(&paths).unwrap(),
+            ManagedRunsSnapshot::Runs(Vec::new())
+        );
+        std::fs::remove_dir_all(paths.state_path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn prepared_owner_result_preserves_recovery_and_outranks_trigger() {
+        let (paths, baseline) = guarded_owner("prepared-recovery", 19_763);
+        let mut recovery = baseline.clone();
+        recovery.model_id = Some("mlx/model".to_string());
+        recovery.lifecycle = loxa_core::supervisor::RunLifecycle::RecoveryRequired;
+        loxa_core::supervisor::update_runtime_state_run(
+            &paths.state_path,
+            &baseline.identity(),
+            recovery.clone(),
+        )
+        .unwrap();
+
+        let error = resolve_prepared_python_owner(
+            PreparedPythonRunResult {
+                outcome: Err(io::Error::other("triggering runtime error")),
+                owner: PreparedPythonOwnerDisposition::RecoveryRequired,
+            },
+            NodeOwnerGuard::new(paths.clone(), baseline),
+        )
+        .expect_err("recovery uncertainty must win");
+
+        assert_eq!(error.to_string(), "prepared Python owner requires recovery");
+        assert_eq!(
+            loxa_core::supervisor::read_runtime_state(&paths.state_path).unwrap(),
+            loxa_core::supervisor::RuntimeStateRead::Loaded(vec![recovery])
+        );
+        std::fs::remove_dir_all(paths.state_path.parent().unwrap()).unwrap();
+    }
+
+    fn guarded_owner(label: &str, port: u16) -> (NodePaths, ManagedRun) {
+        let root = std::env::temp_dir().join(format!(
+            "loxa-node-{label}-{}-{}",
+            std::process::id(),
+            loxa_protocol::NodeInstanceId::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = NodePaths {
+            models_dir: root.join("models"),
+            state_path: root.join("managed.json"),
+            logs_dir: root.join("logs"),
+        };
+        let baseline = claim_unloaded_owner(&paths, port).unwrap();
+        (paths, baseline)
+    }
+
     #[derive(Clone, Default)]
     struct Capture(Arc<Mutex<Vec<u8>>>);
 
@@ -454,7 +602,13 @@ mod tests {
             .finish();
         let error = io::Error::other("ARBITRARY_SHUTDOWN_JOIN_ERROR");
         tracing::subscriber::with_default(subscriber, || {
-            emit_shutdown_stage("gateway_join", 9, Some(&error));
+            emit_shutdown_stage(
+                "gateway_join",
+                9,
+                loxa_protocol::NodeId::new_v4(),
+                loxa_protocol::NodeInstanceId::new_v4(),
+                Some(&error),
+            );
         });
 
         let output = String::from_utf8(output.lock().expect("capture poisoned").clone())
