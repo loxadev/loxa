@@ -316,6 +316,30 @@ fn post_read_chmod_and_hardlink_changes_fail_closed_before_parsing() {
 }
 
 #[test]
+fn normal_publication_rejects_committed_name_swap_before_unlink() {
+    let root = TestRoot::new();
+    let committed = root.primary();
+    let displaced = root.identity().join("displaced-primary");
+    let displaced_for_hook = displaced.clone();
+    let replacement = canonical(NodeId::new_v4());
+    inject_boundary_hook(BoundaryPoint::PublicationUnlink, move || {
+        fs::rename(&committed, &displaced_for_hook).unwrap();
+        write_record(&committed, &replacement);
+    });
+
+    assert_eq!(
+        open_or_create(root.path()).unwrap_err().class(),
+        IdentityErrorClass::UnsafeRecord
+    );
+    assert_eq!(fs::metadata(&displaced).unwrap().nlink(), 2);
+    assert_eq!(temporary_paths(&root).len(), 1);
+    assert_ne!(
+        fs::metadata(root.primary()).unwrap().ino(),
+        fs::metadata(&displaced).unwrap().ino()
+    );
+}
+
+#[test]
 fn open_failure_classifies_available_unsafe_path_evidence_before_io() {
     let root = TestRoot::new();
     let id = open_or_create(root.path()).unwrap();
@@ -360,6 +384,19 @@ fn io_precedes_unsupported_schema_and_corrupt_observations() {
         assert_eq!(error.class(), IdentityErrorClass::Io);
         assert!(std::error::Error::source(&error).is_none());
     }
+}
+
+#[test]
+fn io_backed_error_debug_is_class_only_and_sanitized() {
+    let root = TestRoot::new();
+    let _ = open_or_create(root.path()).unwrap();
+    inject_fault(FaultPoint::PrimaryRead);
+
+    let error = open_or_create(root.path()).unwrap_err();
+    let debug = format!("{error:?}");
+    assert_eq!(debug, "IdentityError(identity_io)");
+    assert!(!debug.contains("injected identity read fault"));
+    assert!(!debug.contains(root.path().to_str().unwrap()));
 }
 
 #[test]
@@ -639,6 +676,34 @@ fn interrupted_publication_rejects_temp_name_swap() {
     assert_eq!(fs::read(root.primary()).unwrap(), canonical(id));
     assert_eq!(fs::metadata(root.primary()).unwrap().nlink(), 1);
     assert_eq!(fs::read(&temporary).unwrap(), b"swapped");
+}
+
+#[test]
+fn interrupted_publication_rejects_committed_name_swap_before_unlink() {
+    let root = TestRoot::new();
+    let id = open_or_create(root.path()).unwrap();
+    let temporary = recognized_temporary(&root, 14);
+    fs::hard_link(root.primary(), &temporary).unwrap();
+    let committed = root.primary();
+    let displaced = root.identity().join("displaced-recovery-primary");
+    let displaced_for_hook = displaced.clone();
+    let replacement = canonical(NodeId::new_v4());
+    inject_boundary_hook(BoundaryPoint::RecoveryUnlink, move || {
+        fs::rename(&committed, &displaced_for_hook).unwrap();
+        write_record(&committed, &replacement);
+    });
+
+    assert_eq!(
+        open_or_create(root.path()).unwrap_err().class(),
+        IdentityErrorClass::UnsafeRecord
+    );
+    assert!(temporary.exists());
+    assert_eq!(fs::metadata(&displaced).unwrap().nlink(), 2);
+    assert_eq!(fs::read(&displaced).unwrap(), canonical(id));
+    assert_ne!(
+        fs::metadata(root.primary()).unwrap().ino(),
+        fs::metadata(&displaced).unwrap().ino()
+    );
 }
 
 #[test]
