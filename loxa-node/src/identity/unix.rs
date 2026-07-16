@@ -43,18 +43,78 @@ pub(super) enum FaultPoint {
     DirectorySync,
     Reopen,
     Cleanup,
+    PrimaryRead,
+    BackupRead,
+    DestinationContention,
+    RecoverySync,
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BoundaryPoint {
+    RootRevalidate,
+    DirectoryRevalidate,
+    RecoveryUnlink,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum StatTarget {
+    Root,
+    IdentityDirectory,
+    PrimaryRecord,
+    TemporaryRecord,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum StatOverride {
+    WrongOwner,
+    Device,
+}
+
+#[cfg(test)]
+type BoundaryHook = Option<(BoundaryPoint, Box<dyn FnOnce()>)>;
+
+#[cfg(test)]
 thread_local! {
-    static FAULT: RefCell<Option<FaultPoint>> = const { RefCell::new(None) };
+    static FAULT: RefCell<Option<(FaultPoint, usize)>> = const { RefCell::new(None) };
     static CLEANUP_DIAGNOSTIC: Cell<bool> = const { Cell::new(false) };
+    static STAT_OVERRIDE: RefCell<Option<(StatTarget, StatOverride)>> = const { RefCell::new(None) };
+    static BOUNDARY_HOOK: RefCell<BoundaryHook> = RefCell::new(None);
 }
 
 #[cfg(test)]
 pub(super) fn inject_fault(point: FaultPoint) {
-    FAULT.with(|fault| *fault.borrow_mut() = Some(point));
+    inject_repeated_fault(point, 1);
     CLEANUP_DIAGNOSTIC.with(|observed| observed.set(false));
+}
+
+#[cfg(test)]
+pub(super) fn inject_repeated_fault(point: FaultPoint, count: usize) {
+    assert!(count > 0);
+    FAULT.with(|fault| *fault.borrow_mut() = Some((point, count)));
+}
+
+#[cfg(test)]
+pub(super) fn inject_boundary_hook(point: BoundaryPoint, hook: impl FnOnce() + 'static) {
+    BOUNDARY_HOOK.with(|state| *state.borrow_mut() = Some((point, Box::new(hook))));
+}
+
+#[cfg(test)]
+fn run_boundary_hook(point: BoundaryPoint) {
+    BOUNDARY_HOOK.with(|state| {
+        let hook = {
+            let mut state = state.borrow_mut();
+            match state.as_ref().map(|(configured, _)| *configured) {
+                Some(configured) if configured == point => state.take().map(|(_, hook)| hook),
+                _ => None,
+            }
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
+    });
 }
 
 #[cfg(test)]
@@ -63,14 +123,43 @@ pub(super) fn cleanup_diagnostic_observed() -> bool {
 }
 
 #[cfg(test)]
+pub(super) fn inject_stat_override(target: StatTarget, stat_override: StatOverride) {
+    STAT_OVERRIDE.with(|state| *state.borrow_mut() = Some((target, stat_override)));
+}
+
+#[cfg(test)]
+fn apply_stat_override(target: StatTarget, metadata: &mut libc::stat) {
+    STAT_OVERRIDE.with(|state| {
+        let mut state = state.borrow_mut();
+        let Some((configured_target, stat_override)) = *state else {
+            return;
+        };
+        if configured_target != target {
+            return;
+        }
+        *state = None;
+        match stat_override {
+            StatOverride::WrongOwner => metadata.st_uid = metadata.st_uid.wrapping_add(1),
+            StatOverride::Device => {
+                metadata.st_mode = (metadata.st_mode & !libc::S_IFMT) | libc::S_IFCHR;
+            }
+        }
+    });
+}
+
+#[cfg(test)]
 fn fault(point: FaultPoint) -> bool {
     FAULT.with(|fault| {
         let mut fault = fault.borrow_mut();
-        if fault.as_ref() == Some(&point) {
-            *fault = None;
-            true
-        } else {
-            false
+        match fault.as_mut() {
+            Some((configured, remaining)) if *configured == point => {
+                *remaining -= 1;
+                if *remaining == 0 {
+                    *fault = None;
+                }
+                true
+            }
+            _ => false,
         }
     })
 }
@@ -119,6 +208,17 @@ enum Publication {
     Contended,
 }
 
+enum Recovery {
+    Recovered,
+    Changing,
+}
+
+enum ActiveLink {
+    Present,
+    Absent,
+    Changing,
+}
+
 pub(super) fn open_or_create(loxa_root: &Path) -> Result<NodeId, IdentityError> {
     let root = RootOwner::open(loxa_root)?;
     let identity = root.open_identity_directory()?;
@@ -128,8 +228,8 @@ pub(super) fn open_or_create(loxa_root: &Path) -> Result<NodeId, IdentityError> 
         if pass > 0 && fault(FaultPoint::Reopen) {
             return Err(injected_error(IdentityErrorClass::Io));
         }
-        let primary = identity.observe(PRIMARY)?;
-        let backup = identity.observe(BACKUP)?;
+        let primary = identity.observe_stable(PRIMARY)?;
+        let backup = identity.observe_stable(BACKUP)?;
 
         match classify_pair(primary, backup)? {
             Matrix::Retry => {
@@ -181,8 +281,8 @@ pub(super) fn open_or_create(loxa_root: &Path) -> Result<NodeId, IdentityError> 
         if fault(FaultPoint::Reopen) {
             return Err(injected_error(IdentityErrorClass::Io));
         }
-        let primary = identity.observe(PRIMARY)?;
-        let backup = identity.observe(BACKUP)?;
+        let primary = identity.observe_stable(PRIMARY)?;
+        let backup = identity.observe_stable(BACKUP)?;
         if let Matrix::Open(node_id) = classify_pair(primary, backup)? {
             identity.cleanup_stale_temporaries()?;
             return Ok(node_id);
@@ -285,6 +385,10 @@ impl RootOwner {
         )?;
         let metadata = fstat(root.as_raw_fd())
             .map_err(|source| IdentityError::with_source(IdentityErrorClass::Io, source))?;
+        #[cfg(test)]
+        let mut metadata = metadata;
+        #[cfg(test)]
+        apply_stat_override(StatTarget::Root, &mut metadata);
         let uid = unsafe { libc::geteuid() };
         if file_type(&metadata) != libc::S_IFDIR
             || metadata.st_uid != uid
@@ -305,6 +409,8 @@ impl RootOwner {
     }
 
     fn revalidate(&self) -> Result<(), IdentityError> {
+        #[cfg(test)]
+        run_boundary_hook(BoundaryPoint::RootRevalidate);
         let metadata = fstatat_nofollow(self.parent.as_raw_fd(), &self.root_name)
             .map_err(|_| IdentityError::classified(IdentityErrorClass::UnsafeRoot))?;
         if file_type(&metadata) != libc::S_IFDIR
@@ -352,6 +458,10 @@ impl RootOwner {
         )?;
         let metadata = fstat(directory.as_raw_fd())
             .map_err(|source| IdentityError::with_source(IdentityErrorClass::Io, source))?;
+        #[cfg(test)]
+        let mut metadata = metadata;
+        #[cfg(test)]
+        apply_stat_override(StatTarget::IdentityDirectory, &mut metadata);
         if file_type(&metadata) != libc::S_IFDIR
             || metadata.st_uid != self.uid
             || metadata.st_mode & 0o777 != 0o700
@@ -372,8 +482,21 @@ impl RootOwner {
 }
 
 impl IdentityDirectoryOwner<'_> {
+    fn observe_stable(&self, name: &[u8]) -> Result<Observation, IdentityError> {
+        for _ in 0..10_000 {
+            let observation = self.observe(name)?;
+            if !matches!(observation, Observation::Changing) {
+                return Ok(observation);
+            }
+            std::thread::yield_now();
+        }
+        Ok(Observation::Changing)
+    }
+
     fn revalidate(&self) -> Result<(), IdentityError> {
         self.root.revalidate()?;
+        #[cfg(test)]
+        run_boundary_hook(BoundaryPoint::DirectoryRevalidate);
         let metadata = fstatat_nofollow(self.root.root.as_raw_fd(), cstr(IDENTITY_DIRECTORY))
             .map_err(|_| IdentityError::classified(IdentityErrorClass::UnsafeDirectory))?;
         if file_type(&metadata) != libc::S_IFDIR
@@ -403,12 +526,25 @@ impl IdentityDirectoryOwner<'_> {
             Err(source) if source.raw_os_error() == Some(libc::ELOOP) => {
                 return Ok(Observation::Unsafe);
             }
-            Err(source) => return Ok(Observation::Io(source)),
+            Err(source) => {
+                if let Ok(metadata) = fstatat_nofollow(self.directory.as_raw_fd(), name) {
+                    if file_type(&metadata) != libc::S_IFREG {
+                        return Ok(Observation::Unsafe);
+                    }
+                }
+                return Ok(Observation::Io(source));
+            }
         };
         let before = match fstat(descriptor.as_raw_fd()) {
             Ok(metadata) => metadata,
             Err(source) => return Ok(Observation::Io(source)),
         };
+        #[cfg(test)]
+        let mut before = before;
+        #[cfg(test)]
+        if name.to_bytes_with_nul() == PRIMARY {
+            apply_stat_override(StatTarget::PrimaryRecord, &mut before);
+        }
         if file_type(&before) != libc::S_IFREG
             || before.st_uid != self.root.uid
             || before.st_mode & 0o777 != 0o600
@@ -416,27 +552,41 @@ impl IdentityDirectoryOwner<'_> {
             return Ok(Observation::Unsafe);
         }
         if before.st_nlink == 2 {
-            if self.has_active_link(&before)? {
-                for _ in 0..64 {
-                    std::thread::yield_now();
-                    let metadata = fstat(descriptor.as_raw_fd()).map_err(|source| {
-                        IdentityError::with_source(IdentityErrorClass::Io, source)
-                    })?;
-                    if metadata.st_nlink == 1 {
-                        return self.observe(name.to_bytes_with_nul());
+            match self.has_active_link(&before)? {
+                ActiveLink::Present => {
+                    for _ in 0..10_000 {
+                        std::thread::yield_now();
+                        let metadata = fstat(descriptor.as_raw_fd()).map_err(|source| {
+                            IdentityError::with_source(IdentityErrorClass::Io, source)
+                        })?;
+                        if metadata.st_nlink == 1 {
+                            return self.observe(name.to_bytes_with_nul());
+                        }
                     }
+                    return Ok(Observation::Changing);
                 }
-                return Ok(Observation::Changing);
+                ActiveLink::Changing => return Ok(Observation::Changing),
+                ActiveLink::Absent => {}
             }
             let bytes = match read_bounded(descriptor.as_raw_fd()) {
                 Ok(bytes) => bytes,
                 Err(source) => return Ok(Observation::Io(source)),
             };
-            self.recover_interrupted_publication(name, &descriptor, &before, &bytes)?;
-            return self.observe(name.to_bytes_with_nul());
+            return match self.recover_interrupted_publication(name, &descriptor, &before, &bytes)? {
+                Recovery::Recovered => self.observe(name.to_bytes_with_nul()),
+                Recovery::Changing => Ok(Observation::Changing),
+            };
         }
         if before.st_nlink != 1 {
             return Ok(Observation::Unsafe);
+        }
+        #[cfg(test)]
+        if (name.to_bytes_with_nul() == PRIMARY && fault(FaultPoint::PrimaryRead))
+            || (name.to_bytes_with_nul() == BACKUP && fault(FaultPoint::BackupRead))
+        {
+            return Ok(Observation::Io(io::Error::other(
+                "injected identity read fault",
+            )));
         }
         let bytes = match read_bounded(descriptor.as_raw_fd()) {
             Ok(bytes) => bytes,
@@ -499,6 +649,11 @@ impl IdentityDirectoryOwner<'_> {
         if fault(FaultPoint::Publish) {
             return Err(injected_error(IdentityErrorClass::Io));
         }
+        #[cfg(test)]
+        if fault(FaultPoint::DestinationContention) {
+            self.remove_current_temporary(&temporary)?;
+            return Ok(Publication::Contended);
+        }
         let result = unsafe {
             libc::linkat(
                 self.directory.as_raw_fd(),
@@ -526,7 +681,7 @@ impl IdentityDirectoryOwner<'_> {
         if fault(FaultPoint::Unlink) {
             return Err(injected_error(IdentityErrorClass::Durability));
         }
-        self.remove_linked_temporary(&temporary)?;
+        self.remove_linked_temporary(destination, &temporary)?;
         #[cfg(test)]
         if fault(FaultPoint::DirectorySync) {
             return Err(injected_error(IdentityErrorClass::Durability));
@@ -539,21 +694,32 @@ impl IdentityDirectoryOwner<'_> {
 
     fn recover_interrupted_publication(
         &self,
-        _committed_name: &std::ffi::CStr,
-        _committed: &OwnedFd,
+        committed_name: &std::ffi::CStr,
+        committed: &OwnedFd,
         committed_metadata: &libc::stat,
         committed_bytes: &[u8],
-    ) -> Result<(), IdentityError> {
+    ) -> Result<Recovery, IdentityError> {
         let mut matching = Vec::new();
         for name in self.recognized_temporary_names()? {
-            let descriptor = open_owned_raw(
+            let descriptor = match open_owned_raw(
                 self.directory.as_raw_fd(),
                 &name,
                 libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
-            )
-            .map_err(|_| IdentityError::classified(IdentityErrorClass::UnsafeRecord))?;
+            ) {
+                Ok(descriptor) => descriptor,
+                Err(source) if source.raw_os_error() == Some(libc::ENOENT) => {
+                    return Ok(Recovery::Changing);
+                }
+                Err(_) => {
+                    return Err(IdentityError::classified(IdentityErrorClass::UnsafeRecord));
+                }
+            };
             let metadata = fstat(descriptor.as_raw_fd())
                 .map_err(|source| IdentityError::with_source(IdentityErrorClass::Io, source))?;
+            #[cfg(test)]
+            let mut metadata = metadata;
+            #[cfg(test)]
+            apply_stat_override(StatTarget::TemporaryRecord, &mut metadata);
             if file_type(&metadata) != libc::S_IFREG
                 || metadata.st_uid != self.root.uid
                 || metadata.st_mode & 0o777 != 0o600
@@ -569,13 +735,23 @@ impl IdentityDirectoryOwner<'_> {
                 matching.push((name, descriptor, metadata));
             }
         }
+        if matching.is_empty() {
+            return self.finish_concurrent_recovery(committed_name, committed);
+        }
         if matching.len() != 1 {
             return Err(IdentityError::classified(IdentityErrorClass::UnsafeRecord));
         }
         let (name, descriptor, metadata) = matching.pop().expect("one matching temporary");
         self.revalidate()?;
-        let path_metadata = fstatat_nofollow(self.directory.as_raw_fd(), &name)
-            .map_err(|_| IdentityError::classified(IdentityErrorClass::UnsafeRecord))?;
+        #[cfg(test)]
+        run_boundary_hook(BoundaryPoint::RecoveryUnlink);
+        let path_metadata = match fstatat_nofollow(self.directory.as_raw_fd(), &name) {
+            Ok(metadata) => metadata,
+            Err(source) if source.raw_os_error() == Some(libc::ENOENT) => {
+                return self.finish_concurrent_recovery(committed_name, committed);
+            }
+            Err(_) => return Err(IdentityError::classified(IdentityErrorClass::UnsafeRecord)),
+        };
         let descriptor_metadata = fstat(descriptor.as_raw_fd())
             .map_err(|source| IdentityError::with_source(IdentityErrorClass::Io, source))?;
         if !same_file(&metadata, &path_metadata)
@@ -584,29 +760,83 @@ impl IdentityDirectoryOwner<'_> {
         {
             return Err(IdentityError::classified(IdentityErrorClass::UnsafeRecord));
         }
-        unlinkat(self.directory.as_raw_fd(), &name)?;
+        if unsafe { libc::unlinkat(self.directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+            let source = io::Error::last_os_error();
+            if source.raw_os_error() == Some(libc::ENOENT) {
+                return self.finish_concurrent_recovery(committed_name, committed);
+            }
+            return Err(IdentityError::with_source(
+                IdentityErrorClass::Durability,
+                source,
+            ));
+        }
+        #[cfg(test)]
+        if fault(FaultPoint::RecoverySync) {
+            return Err(injected_error(IdentityErrorClass::Durability));
+        }
         fsync_fd(self.directory.as_raw_fd(), IdentityErrorClass::Durability)?;
-        Ok(())
+        Ok(Recovery::Recovered)
     }
 
-    fn has_active_link(&self, committed: &libc::stat) -> Result<bool, IdentityError> {
+    fn finish_concurrent_recovery(
+        &self,
+        committed_name: &std::ffi::CStr,
+        committed: &OwnedFd,
+    ) -> Result<Recovery, IdentityError> {
+        let descriptor_metadata = fstat(committed.as_raw_fd())
+            .map_err(|source| IdentityError::with_source(IdentityErrorClass::Io, source))?;
+        let path_metadata = fstatat_nofollow(self.directory.as_raw_fd(), committed_name)
+            .map_err(|_| IdentityError::classified(IdentityErrorClass::UnsafeRecord))?;
+        if !same_file(&descriptor_metadata, &path_metadata)
+            || descriptor_metadata.st_nlink != 1
+            || file_type(&descriptor_metadata) != libc::S_IFREG
+            || descriptor_metadata.st_uid != self.root.uid
+            || descriptor_metadata.st_mode & 0o777 != 0o600
+        {
+            return Err(IdentityError::classified(IdentityErrorClass::UnsafeRecord));
+        }
+        fsync_fd(self.directory.as_raw_fd(), IdentityErrorClass::Durability)?;
+        Ok(Recovery::Recovered)
+    }
+
+    fn has_active_link(&self, committed: &libc::stat) -> Result<ActiveLink, IdentityError> {
         for name in self.recognized_temporary_names()? {
             if !temporary_is_active(self.device, self.inode, &name) {
                 continue;
             }
-            let metadata = fstatat_nofollow(self.directory.as_raw_fd(), &name)
-                .map_err(|_| IdentityError::classified(IdentityErrorClass::UnsafeRecord))?;
+            let metadata = match fstatat_nofollow(self.directory.as_raw_fd(), &name) {
+                Ok(metadata) => metadata,
+                Err(source) if source.raw_os_error() == Some(libc::ENOENT) => {
+                    return Ok(ActiveLink::Changing);
+                }
+                Err(_) => {
+                    return Err(IdentityError::classified(IdentityErrorClass::UnsafeRecord));
+                }
+            };
             if same_file(committed, &metadata) {
-                return Ok(true);
+                return Ok(ActiveLink::Present);
             }
         }
-        Ok(false)
+        Ok(ActiveLink::Absent)
     }
 
     fn cleanup_stale_temporaries(&self) -> Result<(), IdentityError> {
+        if !ACTIVE_TEMPORARIES
+            .lock()
+            .expect("active identity temporary lock")
+            .iter()
+            .all(|active| {
+                active.directory_device != self.device || active.directory_inode != self.inode
+            })
+        {
+            return Ok(());
+        }
         let mut removed = false;
         for name in self.recognized_temporary_names()? {
             if temporary_is_active(self.device, self.inode, &name) {
+                continue;
+            }
+            if temporary_belongs_to_live_other_process(&name) {
                 continue;
             }
             let descriptor = open_owned_raw(
@@ -617,6 +847,10 @@ impl IdentityDirectoryOwner<'_> {
             .map_err(|_| IdentityError::classified(IdentityErrorClass::UnsafeRecord))?;
             let metadata = fstat(descriptor.as_raw_fd())
                 .map_err(|source| IdentityError::with_source(IdentityErrorClass::Io, source))?;
+            #[cfg(test)]
+            let mut metadata = metadata;
+            #[cfg(test)]
+            apply_stat_override(StatTarget::TemporaryRecord, &mut metadata);
             if file_type(&metadata) != libc::S_IFREG
                 || metadata.st_uid != self.root.uid
                 || metadata.st_mode & 0o777 != 0o600
@@ -689,6 +923,9 @@ impl IdentityDirectoryOwner<'_> {
     }
 
     fn create_temporary(&self) -> Result<TemporaryRecord, IdentityError> {
+        let mut active_temporaries = ACTIVE_TEMPORARIES
+            .lock()
+            .expect("active identity temporary lock");
         for _ in 0..64 {
             let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
             let name = CString::new(format!(
@@ -716,10 +953,7 @@ impl IdentityDirectoryOwner<'_> {
                         directory_inode: self.inode,
                         name: name.as_bytes().to_vec(),
                     };
-                    ACTIVE_TEMPORARIES
-                        .lock()
-                        .expect("active identity temporary lock")
-                        .insert(active.clone());
+                    active_temporaries.insert(active.clone());
                     return Ok(TemporaryRecord {
                         name,
                         descriptor,
@@ -743,9 +977,40 @@ impl IdentityDirectoryOwner<'_> {
         fsync_fd(self.directory.as_raw_fd(), IdentityErrorClass::Durability)
     }
 
-    fn remove_linked_temporary(&self, temporary: &TemporaryRecord) -> Result<(), IdentityError> {
-        self.revalidate_temporary(temporary, 2)?;
-        unlinkat(self.directory.as_raw_fd(), &temporary.name)
+    fn remove_linked_temporary(
+        &self,
+        destination: &'static [u8],
+        temporary: &TemporaryRecord,
+    ) -> Result<(), IdentityError> {
+        let descriptor = fstat(temporary.descriptor.as_raw_fd())
+            .map_err(|source| IdentityError::with_source(IdentityErrorClass::Io, source))?;
+        match fstatat_nofollow(self.directory.as_raw_fd(), &temporary.name) {
+            Ok(path) => {
+                if !same_file(&descriptor, &path)
+                    || file_type(&descriptor) != libc::S_IFREG
+                    || descriptor.st_uid != self.root.uid
+                    || descriptor.st_mode & 0o777 != 0o600
+                    || descriptor.st_nlink != 2
+                {
+                    return Err(IdentityError::classified(IdentityErrorClass::UnsafeRecord));
+                }
+                unlinkat(self.directory.as_raw_fd(), &temporary.name)
+            }
+            Err(source) if source.raw_os_error() == Some(libc::ENOENT) => {
+                let committed = fstatat_nofollow(self.directory.as_raw_fd(), cstr(destination))
+                    .map_err(|_| IdentityError::classified(IdentityErrorClass::UnsafeRecord))?;
+                if !same_file(&descriptor, &committed)
+                    || descriptor.st_nlink != 1
+                    || file_type(&descriptor) != libc::S_IFREG
+                    || descriptor.st_uid != self.root.uid
+                    || descriptor.st_mode & 0o777 != 0o600
+                {
+                    return Err(IdentityError::classified(IdentityErrorClass::UnsafeRecord));
+                }
+                Ok(())
+            }
+            Err(_) => Err(IdentityError::classified(IdentityErrorClass::UnsafeRecord)),
+        }
     }
 
     fn revalidate_temporary(
@@ -797,6 +1062,29 @@ fn temporary_is_active(
             directory_inode,
             name: name.to_bytes().to_vec(),
         })
+}
+
+fn temporary_belongs_to_live_other_process(name: &std::ffi::CStr) -> bool {
+    let bytes = name.to_bytes();
+    let Some(suffix) = bytes.strip_prefix(TEMP_PREFIX) else {
+        return false;
+    };
+    let Some(separator) = suffix.iter().position(|byte| *byte == b'-') else {
+        return false;
+    };
+    let Ok(pid_text) = std::str::from_utf8(&suffix[..separator]) else {
+        return false;
+    };
+    let Ok(pid) = pid_text.parse::<libc::pid_t>() else {
+        return false;
+    };
+    if pid == unsafe { libc::getpid() } {
+        return false;
+    }
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 struct DirectoryStream(*mut libc::DIR);
