@@ -725,6 +725,70 @@ fn interrupted_publication_sync_failure_has_exact_recoverable_state() {
 }
 
 #[test]
+fn normal_recovery_revalidates_identity_directory_after_sync() {
+    let root = TestRoot::new();
+    let id = open_or_create(root.path()).unwrap();
+    let temporary = recognized_temporary(&root, 15);
+    fs::hard_link(root.primary(), &temporary).unwrap();
+    let identity = root.identity();
+    let displaced = root.path().join("identity-after-recovery-sync");
+    let identity_for_hook = identity.clone();
+    let displaced_for_hook = displaced.clone();
+    inject_boundary_hook(BoundaryPoint::RecoveryPostSync, move || {
+        fs::rename(&identity_for_hook, &displaced_for_hook).unwrap();
+        fs::create_dir(&identity_for_hook).unwrap();
+        fs::set_permissions(&identity_for_hook, fs::Permissions::from_mode(0o700)).unwrap();
+    });
+
+    assert_eq!(
+        open_or_create(root.path()).unwrap_err().class(),
+        IdentityErrorClass::UnsafeDirectory
+    );
+    assert!(!temporary.exists());
+    assert_eq!(
+        fs::read(displaced.join("node.json")).unwrap(),
+        canonical(id)
+    );
+
+    fs::remove_dir(&identity).unwrap();
+    fs::rename(&displaced, &identity).unwrap();
+}
+
+#[test]
+fn concurrent_recovery_revalidates_root_after_sync() {
+    let root = TestRoot::new();
+    let id = open_or_create(root.path()).unwrap();
+    let temporary = recognized_temporary(&root, 16);
+    fs::hard_link(root.primary(), &temporary).unwrap();
+    let temporary_for_hook = temporary.clone();
+    inject_boundary_hook(BoundaryPoint::RecoveryUnlink, move || {
+        fs::remove_file(&temporary_for_hook).unwrap();
+    });
+    let root_path = root.path().to_owned();
+    let displaced = root.path().with_extension("after-concurrent-recovery-sync");
+    let root_for_hook = root_path.clone();
+    let displaced_for_hook = displaced.clone();
+    inject_boundary_hook(BoundaryPoint::ConcurrentRecoveryPostSync, move || {
+        fs::rename(&root_for_hook, &displaced_for_hook).unwrap();
+        fs::create_dir(&root_for_hook).unwrap();
+        fs::set_permissions(&root_for_hook, fs::Permissions::from_mode(0o700)).unwrap();
+    });
+
+    assert_eq!(
+        open_or_create(root.path()).unwrap_err().class(),
+        IdentityErrorClass::UnsafeRoot
+    );
+    assert!(!temporary.exists());
+    assert_eq!(
+        fs::read(displaced.join("identity/node.json")).unwrap(),
+        canonical(id)
+    );
+
+    fs::remove_dir(&root_path).unwrap();
+    fs::rename(&displaced, &root_path).unwrap();
+}
+
+#[test]
 fn unsafe_unrelated_recognized_temp_blocks_two_link_recovery() {
     let root = TestRoot::new();
     let id = open_or_create(root.path()).unwrap();
