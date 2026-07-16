@@ -928,6 +928,7 @@ dependencies = [
  "hmac",
  "indicatif",
  "libc",
+ "loxa-protocol",
  "reqwest 0.13.4",
  "rusqlite",
  "serde",
@@ -957,6 +958,15 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "loxa-protocol"
+version = "0.1.0-dev"
+dependencies = [
+ "serde",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]
