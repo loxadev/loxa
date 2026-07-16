@@ -69,6 +69,10 @@ impl LocalhostPortReservation {
         self.port
     }
 
+    pub fn into_listener(self) -> TcpListener {
+        self.listener
+    }
+
     pub(super) fn release_for(self, expected: u16) -> Result<(), SupervisorError> {
         if self.port != expected {
             return Err(SupervisorError::RunStateConflict(format!(
@@ -675,6 +679,21 @@ mod tests {
     use std::time::Duration;
 
     const EXPECTED_ALIAS: &str = "loxa-run-123-g0";
+
+    #[test]
+    fn reservation_handoff_keeps_the_exact_port_exclusive() {
+        let reservation = reserve_localhost_port(None).expect("reserve localhost port");
+        let port = reservation.port();
+        assert!(TcpListener::bind(("127.0.0.1", port)).is_err());
+
+        let listener = reservation.into_listener();
+
+        assert_eq!(
+            listener.local_addr().expect("listener address").port(),
+            port
+        );
+        assert!(TcpListener::bind(("127.0.0.1", port)).is_err());
+    }
 
     fn trace_contains_fallback_sequence(trace: &[String], status: u16) -> bool {
         let expected = [

@@ -639,6 +639,35 @@ impl GatewayServer {
         )
     }
 
+    pub fn start_with_router_on(
+        listener: std::net::TcpListener,
+        state: GatewayState,
+        app: Router,
+    ) -> io::Result<Self> {
+        Self::start_with_router_on_and_spawner(
+            listener,
+            state,
+            app,
+            |listener, app, receiver, server_state| {
+                thread::Builder::new()
+                    .name("loxa-gateway".into())
+                    .spawn(move || {
+                        let runtime = tokio::runtime::Runtime::new().map_err(io::Error::other)?;
+                        runtime.block_on(async move {
+                            let listener = tokio::net::TcpListener::from_std(listener)?;
+                            let _ = server_state;
+                            axum::serve(listener, app)
+                                .with_graceful_shutdown(async move {
+                                    let _ = receiver.await;
+                                })
+                                .await
+                                .map_err(io::Error::other)
+                        })
+                    })
+            },
+        )
+    }
+
     fn start_with_router_and_spawner<F>(
         port: u16,
         state: GatewayState,
@@ -653,8 +682,25 @@ impl GatewayServer {
             GatewayState,
         ) -> io::Result<thread::JoinHandle<io::Result<()>>>,
     {
-        let started = std::time::Instant::now();
         let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))?;
+        Self::start_with_router_on_and_spawner(listener, state, app, spawn)
+    }
+
+    fn start_with_router_on_and_spawner<F>(
+        listener: std::net::TcpListener,
+        state: GatewayState,
+        app: Router,
+        spawn: F,
+    ) -> io::Result<Self>
+    where
+        F: FnOnce(
+            std::net::TcpListener,
+            Router,
+            tokio::sync::oneshot::Receiver<()>,
+            GatewayState,
+        ) -> io::Result<thread::JoinHandle<io::Result<()>>>,
+    {
+        let started = std::time::Instant::now();
         listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();
         let (shutdown, receiver) = tokio::sync::oneshot::channel();
@@ -870,6 +916,28 @@ mod tests {
 
         let output = output.lock().expect("capture poisoned");
         assert!(event_codes(&output).is_empty(), "{output:?}");
+    }
+
+    #[test]
+    fn gateway_serves_on_the_exact_reserved_listener_without_rebinding() {
+        let reservation =
+            crate::supervisor::reserve_localhost_port(None).expect("reserve gateway listener");
+        let port = reservation.port();
+        assert!(std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_err());
+
+        let server = GatewayServer::start_with_router_on(
+            reservation.into_listener(),
+            GatewayState::new("runtime-test"),
+            Router::new().route("/reserved", axum::routing::get(|| async { "reserved" })),
+        )
+        .expect("start gateway on reservation");
+
+        assert_eq!(server.port(), port);
+        let response = reqwest::blocking::get(format!("http://127.0.0.1:{port}/reserved"))
+            .expect("request reserved gateway");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.text().expect("response body"), "reserved");
+        server.shutdown().expect("shutdown gateway");
     }
 
     #[test]
