@@ -632,15 +632,14 @@ pub(crate) fn run_prepared_python_model_with_diagnostics_health(
         diagnostics_health,
         RunOwnerPolicy::Prepared(PreparedPythonOwnerPolicy::new(baseline)),
     );
-    PreparedPythonRunResult {
-        outcome,
-        owner: classify_prepared_python_owner(&paths.state_path, baseline),
-    }
+    let owner = classify_prepared_python_owner(&paths.state_path, baseline, &outcome);
+    PreparedPythonRunResult { outcome, owner }
 }
 
 fn classify_prepared_python_owner(
     state_path: &Path,
     baseline: &supervisor::ManagedRun,
+    outcome: &io::Result<RunTermination>,
 ) -> PreparedPythonOwnerDisposition {
     let Ok(RuntimeStateRead::Loaded(runs)) = supervisor::read_runtime_state(state_path) else {
         return PreparedPythonOwnerDisposition::RecoveryRequired;
@@ -655,7 +654,11 @@ fn classify_prepared_python_owner(
         }
         return PreparedPythonOwnerDisposition::RecoveryRequired;
     };
-    PreparedPythonOwnerDisposition::ConsumedByRequestedStop
+    if matches!(outcome, Ok(RunTermination::RequestedStop)) {
+        PreparedPythonOwnerDisposition::ConsumedByRequestedStop
+    } else {
+        PreparedPythonOwnerDisposition::RecoveryRequired
+    }
 }
 
 fn run_model_with_owner_policy(
@@ -1336,9 +1339,16 @@ fn cleanup_stable_node_runtime(
 ) -> io::Result<()> {
     let worker = runtime.take().map(|(_, worker)| worker.stop_and_join());
     let owner = run.map(|run| finish_unloaded_owner(paths, run));
+    resolve_pre_listening_cleanup(worker, owner)
+}
+
+fn resolve_pre_listening_cleanup(
+    worker: Option<io::Result<()>>,
+    owner: Option<io::Result<()>>,
+) -> io::Result<()> {
     match (worker, owner) {
-        (Some(Err(error)), _) => Err(error),
         (_, Some(Err(error))) => Err(error),
+        (Some(Err(error)), _) => Err(error),
         _ => Ok(()),
     }
 }
@@ -3133,6 +3143,51 @@ mod lifecycle_api_tests {
         )
         .expect_err("owner uncertainty wins");
         assert_eq!(owner.to_string(), "exact owner recovery");
+    }
+
+    #[test]
+    fn pre_listening_rollback_prefers_owner_uncertainty_over_worker_failure() {
+        let error = resolve_pre_listening_cleanup(
+            Some(Err(io::Error::other("download worker join failure"))),
+            Some(Err(io::Error::other("exact owner recovery uncertainty"))),
+        )
+        .expect_err("owner uncertainty must win");
+
+        assert_eq!(error.to_string(), "exact owner recovery uncertainty");
+    }
+
+    #[test]
+    fn externally_missing_prepared_row_is_recovery_not_consumed_stop() {
+        let temp = TestDir::new("prepared-external-missing-row");
+        let paths = NodePaths {
+            models_dir: temp.0.join("models"),
+            state_path: temp.0.join("managed.json"),
+            logs_dir: temp.0.join("logs"),
+        };
+        let baseline = claim_unloaded_owner(&paths, 19_765).expect("claim prepared owner");
+        supervisor::finish_exact_unloaded_owner(&paths.state_path, &baseline)
+            .expect("externally remove exact row");
+        let mut events = RecordingLifecycleSink::default();
+
+        let result = run_prepared_python_model_with_diagnostics_health(
+            RunRequest {
+                id: "missing-python-model",
+                ctx: None,
+                port: None,
+                engine: RuntimeBackendKind::PyMlxLm,
+            },
+            &paths,
+            &baseline,
+            None,
+            &mut events,
+            &loxa_core::diagnostics::DiagnosticsHealth::new(),
+        );
+
+        assert!(result.outcome.is_err());
+        assert_eq!(
+            result.owner,
+            PreparedPythonOwnerDisposition::RecoveryRequired
+        );
     }
 
     #[test]

@@ -43,7 +43,7 @@ fn finish_failed_build(
         .transpose()
         .map(|_| ())
         .map_err(io::Error::other);
-    let owner_cleanup = owner_guard.finish();
+    let owner_cleanup = owner_guard.finish().map(|_| ());
     resolve_build_failure(trigger, owner_cleanup, worker_cleanup, history_cleanup)
 }
 
