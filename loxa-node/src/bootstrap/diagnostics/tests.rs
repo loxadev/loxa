@@ -442,6 +442,8 @@ fn every_planned_event_code_component_pair_is_accepted() {
         ("node.stopping", "node"),
         ("node.stopped", "node"),
         ("node.start_failed", "node"),
+        ("node.identity_open_failed", "node"),
+        ("identity_temp_cleanup_failed", "identity"),
         ("http.request.completed", "http"),
         ("http.request.failed", "http"),
         ("gateway.starting", "gateway"),
@@ -561,7 +563,8 @@ fn complete_records_never_exceed_the_shared_cap() {
                 target: "loxa_node::test",
                 Level::INFO,
                 event_code = large.as_str(), component = large.as_str(),
-                request_id = large.as_str(), runtime_identity = large.as_str(),
+                request_id = large.as_str(), node_id = large.as_str(),
+                node_instance_id = large.as_str(),
                 operation_id = large.as_str(), chat_id = large.as_str(), turn_id = large.as_str(),
                 model_id = large.as_str(), recipe_id = large.as_str(), route = large.as_str(),
                 method = large.as_str(), result_class = large.as_str(), backend_kind = large.as_str(),
@@ -572,6 +575,85 @@ fn complete_records_never_exceed_the_shared_cap() {
     );
 
     assert!(capture.text().len() <= MAX_RECORD_BYTES);
+}
+
+#[test]
+fn production_identity_failures_keep_only_static_classes_without_health_rejection() {
+    let health = DiagnosticsHealth::new();
+    let capture = capture_events(
+        release_filter(),
+        || {
+            tracing::event!(
+                target: "loxa_node::lifecycle",
+                Level::WARN,
+                event_code = "node.identity_open_failed",
+                component = "node",
+                result_class = "failed",
+                trigger_class = "identity_corrupt",
+                cleanup_class = "owner_cleanup_failed",
+            );
+            tracing::event!(
+                target: "loxa_node::identity::unix",
+                Level::WARN,
+                event_code = "identity_temp_cleanup_failed",
+                component = "identity",
+                result_class = "cleanup_failed",
+            );
+        },
+        health.clone(),
+    );
+
+    let records = capture
+        .text()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("valid production JSON"))
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0]["event_code"], "node.identity_open_failed");
+    assert_eq!(records[0]["component"], "node");
+    assert_eq!(records[0]["result_class"], "failed");
+    assert_eq!(records[0]["trigger_class"], "identity_corrupt");
+    assert_eq!(records[0]["cleanup_class"], "owner_cleanup_failed");
+    assert_eq!(records[1]["event_code"], "identity_temp_cleanup_failed");
+    assert_eq!(records[1]["component"], "identity");
+    assert_eq!(records[1]["result_class"], "cleanup_failed");
+    for record in &records {
+        assert!(record.as_object().unwrap().keys().all(|key| matches!(
+            key.as_str(),
+            "timestamp"
+                | "level"
+                | "target"
+                | "event_code"
+                | "component"
+                | "result_class"
+                | "trigger_class"
+                | "cleanup_class"
+        )));
+    }
+    assert_eq!(health.snapshot().forbidden_field_rejections, Some(0));
+}
+
+#[test]
+fn deprecated_runtime_identity_field_is_rejected() {
+    let health = DiagnosticsHealth::new();
+    let capture = capture_events(
+        release_filter(),
+        || {
+            tracing::event!(
+                target: "loxa_node::lifecycle",
+                Level::WARN,
+                event_code = "node.start_failed",
+                component = "node",
+                runtime_identity = "deprecated-instance",
+            );
+        },
+        health.clone(),
+    );
+
+    let record = parse_single_record(&capture);
+    assert_eq!(record["event_code"], "diagnostics.field_rejected");
+    assert!(record.get("runtime_identity").is_none());
+    assert_eq!(health.snapshot().forbidden_field_rejections, Some(1));
 }
 
 #[test]

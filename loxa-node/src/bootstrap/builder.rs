@@ -10,6 +10,48 @@ use loxa_core::supervisor;
 use loxa_protocol::NodeInstanceId;
 use std::io;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IdentityCleanupClass {
+    Completed,
+    OwnerCleanupFailed,
+}
+
+impl IdentityCleanupClass {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "owner_cleanup_completed",
+            Self::OwnerCleanupFailed => "owner_cleanup_failed",
+        }
+    }
+}
+
+fn identity_error_to_io(error: crate::identity::IdentityError) -> io::Error {
+    io::Error::other(format!("node identity failed: {}", error.class().as_str()))
+}
+
+fn resolve_identity_failure(
+    trigger: crate::identity::IdentityError,
+    owner_cleanup: io::Result<loxa_core::supervisor::ChildlessFinishOutcome>,
+) -> io::Error {
+    let trigger_class = trigger.class().as_str();
+    let (cleanup_class, result) = match owner_cleanup {
+        Ok(_) => (
+            IdentityCleanupClass::Completed,
+            identity_error_to_io(trigger),
+        ),
+        Err(cleanup) => (IdentityCleanupClass::OwnerCleanupFailed, cleanup),
+    };
+    tracing::warn!(
+        target: "loxa_node::lifecycle",
+        event_code = "node.identity_open_failed",
+        component = "node",
+        result_class = "failed",
+        trigger_class,
+        cleanup_class = cleanup_class.as_str(),
+    );
+    result
+}
+
 fn resolve_build_failure(
     trigger: io::Error,
     owner_cleanup: io::Result<()>,
@@ -119,15 +161,8 @@ impl<'a> NodeBuilder<'a> {
         };
         let node_id = match crate::identity::open_or_create(loxa_dir) {
             Ok(node_id) => node_id,
-            Err(_) => {
-                tracing::warn!(
-                    target: "loxa_node::lifecycle",
-                    event_code = "node.identity_open_failed",
-                    component = "node",
-                    result_class = "identity_unavailable",
-                );
-                let error = io::Error::other("node identity is unavailable");
-                return Err(owner_guard.finish().err().unwrap_or(error));
+            Err(error) => {
+                return Err(resolve_identity_failure(error, owner_guard.finish()));
             }
         };
         let node_instance_id = NodeInstanceId::new_v4();
@@ -248,8 +283,42 @@ impl<'a> NodeBuilder<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_build_failure;
-    use std::io;
+    use super::{identity_error_to_io, resolve_build_failure, resolve_identity_failure};
+    use crate::identity::{IdentityError, IdentityErrorClass};
+    use loxa_core::supervisor::ChildlessFinishOutcome;
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    struct CaptureWriter(Capture);
+
+    impl Write for CaptureWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0 .0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for Capture {
+        type Writer = CaptureWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CaptureWriter(self.clone())
+        }
+    }
+
+    impl Capture {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
 
     #[test]
     fn history_join_failure_outranks_gateway_bind_failure() {
@@ -261,5 +330,88 @@ mod tests {
         );
 
         assert_eq!(error.to_string(), "history join failure");
+    }
+
+    #[test]
+    fn identity_error_projection_preserves_stable_classes_without_source_details() {
+        let cases = [
+            (
+                IdentityErrorClass::UnsupportedPlatform,
+                "unsupported_platform",
+            ),
+            (IdentityErrorClass::Corrupt, "identity_corrupt"),
+            (IdentityErrorClass::UnsafeRoot, "unsafe_root"),
+            (IdentityErrorClass::UnsafeDirectory, "unsafe_directory"),
+            (IdentityErrorClass::UnsafeRecord, "unsafe_record"),
+            (
+                IdentityErrorClass::SchemaUnsupported,
+                "identity_schema_unsupported",
+            ),
+            (IdentityErrorClass::Conflict, "identity_conflict"),
+            (
+                IdentityErrorClass::ConcurrentChange,
+                "identity_concurrent_change",
+            ),
+            (IdentityErrorClass::Io, "identity_io"),
+            (IdentityErrorClass::Durability, "identity_durability"),
+        ];
+
+        for (class, expected) in cases {
+            let projected = identity_error_to_io(IdentityError::classified(class));
+            assert_eq!(
+                projected.to_string(),
+                format!("node identity failed: {expected}")
+            );
+            assert!(!projected.to_string().contains('/'));
+            assert!(!projected.to_string().contains("os error"));
+            assert!(!projected.to_string().contains("injected"));
+        }
+    }
+
+    #[test]
+    fn identity_cleanup_failure_outranks_trigger_without_collapsing_either_class() {
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(capture.clone())
+            .finish();
+        let error = tracing::subscriber::with_default(subscriber, || {
+            resolve_identity_failure(
+                IdentityError::classified(IdentityErrorClass::Corrupt),
+                Err(io::Error::other(
+                    "owner recovery required: ARBITRARY /private/path os error 13",
+                )),
+            )
+        });
+        assert_eq!(
+            error.to_string(),
+            "owner recovery required: ARBITRARY /private/path os error 13"
+        );
+        let diagnostic = capture.text();
+        assert!(
+            diagnostic.contains("event_code=\"node.identity_open_failed\""),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("trigger_class=\"identity_corrupt\""),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("cleanup_class=\"owner_cleanup_failed\""),
+            "{diagnostic}"
+        );
+        assert!(!diagnostic.contains("ARBITRARY"), "{diagnostic}");
+        assert!(!diagnostic.contains("/private/path"), "{diagnostic}");
+        assert!(!diagnostic.contains("os error"), "{diagnostic}");
+
+        let trigger = resolve_identity_failure(
+            IdentityError::classified(IdentityErrorClass::Durability),
+            Ok(ChildlessFinishOutcome::Finished),
+        );
+        assert_eq!(
+            trigger.to_string(),
+            "node identity failed: identity_durability"
+        );
     }
 }

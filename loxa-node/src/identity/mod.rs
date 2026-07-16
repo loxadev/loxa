@@ -9,7 +9,7 @@ mod non_unix;
 mod unix;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum IdentityErrorClass {
+pub(crate) enum IdentityErrorClass {
     UnsupportedPlatform,
     UnsafeRoot,
     UnsafeDirectory,
@@ -23,7 +23,7 @@ enum IdentityErrorClass {
 }
 
 impl IdentityErrorClass {
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::UnsupportedPlatform => "unsupported_platform",
             Self::UnsafeRoot => "unsafe_root",
@@ -45,7 +45,7 @@ pub(crate) struct IdentityError {
 }
 
 impl IdentityError {
-    fn classified(class: IdentityErrorClass) -> Self {
+    pub(crate) fn classified(class: IdentityErrorClass) -> Self {
         Self {
             class,
             _source: None,
@@ -59,8 +59,7 @@ impl IdentityError {
         }
     }
 
-    #[cfg(test)]
-    const fn class(&self) -> IdentityErrorClass {
+    pub(crate) const fn class(&self) -> IdentityErrorClass {
         self.class
     }
 }
