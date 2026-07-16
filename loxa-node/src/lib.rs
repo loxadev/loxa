@@ -19,6 +19,8 @@ mod daemon;
 pub mod download_control;
 mod engine_session;
 mod http_observability;
+#[allow(dead_code)]
+mod identity;
 pub mod model_lifecycle;
 mod production_lifecycle;
 mod runtime;
