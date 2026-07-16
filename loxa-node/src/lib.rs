@@ -66,6 +66,12 @@ pub(crate) enum PreparedPythonOwnerDisposition {
     RecoveryRequired,
 }
 
+#[derive(Debug)]
+pub(crate) struct PreparedPythonRunResult {
+    pub(crate) outcome: io::Result<RunTermination>,
+    pub(crate) owner: PreparedPythonOwnerDisposition,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct PreparedPythonOwnerPolicy<'a> {
     baseline: &'a supervisor::ManagedRun,
@@ -608,21 +614,48 @@ pub(crate) fn run_prepared_python_model_with_diagnostics_health(
     gateway: Option<&loxa_core::gateway::GatewayState>,
     events: &mut dyn LifecycleEventSink,
     diagnostics_health: &loxa_core::diagnostics::DiagnosticsHealth,
-) -> io::Result<RunTermination> {
+) -> PreparedPythonRunResult {
     if request.engine != RuntimeBackendKind::PyMlxLm {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "prepared node owner supports only the Python MLX backend",
-        ));
+        return PreparedPythonRunResult {
+            outcome: Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "prepared node owner supports only the Python MLX backend",
+            )),
+            owner: PreparedPythonOwnerDisposition::Restored(baseline.clone()),
+        };
     }
-    run_model_with_owner_policy(
+    let outcome = run_model_with_owner_policy(
         request,
         paths,
         gateway,
         events,
         diagnostics_health,
         RunOwnerPolicy::Prepared(PreparedPythonOwnerPolicy::new(baseline)),
-    )
+    );
+    PreparedPythonRunResult {
+        outcome,
+        owner: classify_prepared_python_owner(&paths.state_path, baseline),
+    }
+}
+
+fn classify_prepared_python_owner(
+    state_path: &Path,
+    baseline: &supervisor::ManagedRun,
+) -> PreparedPythonOwnerDisposition {
+    let Ok(RuntimeStateRead::Loaded(runs)) = supervisor::read_runtime_state(state_path) else {
+        return PreparedPythonOwnerDisposition::RecoveryRequired;
+    };
+    let [] = runs.as_slice() else {
+        if let [current] = runs.as_slice() {
+            let mut current = current.clone();
+            current.stop_requested = baseline.stop_requested;
+            if current == *baseline {
+                return PreparedPythonOwnerDisposition::Restored(baseline.clone());
+            }
+        }
+        return PreparedPythonOwnerDisposition::RecoveryRequired;
+    };
+    PreparedPythonOwnerDisposition::ConsumedByRequestedStop
 }
 
 fn run_model_with_owner_policy(
@@ -1316,6 +1349,19 @@ struct StableRuntimeCleanup<'a> {
     download_worker: Option<download_control::DownloadControlWorker>,
 }
 
+fn resolve_stable_runtime_cleanup(
+    outcome: io::Result<RunTermination>,
+    worker_cleanup: io::Result<()>,
+    owner_cleanup: io::Result<()>,
+) -> io::Result<RunTermination> {
+    match (outcome, worker_cleanup, owner_cleanup) {
+        (_, _, Err(error)) => Err(error),
+        (_, Err(error), Ok(())) => Err(error),
+        (Err(error), Ok(()), Ok(())) => Err(error),
+        (Ok(outcome), Ok(()), Ok(())) => Ok(outcome),
+    }
+}
+
 impl<'a> StableRuntimeCleanup<'a> {
     fn new(
         paths: &'a NodePaths,
@@ -1348,12 +1394,7 @@ impl<'a> StableRuntimeCleanup<'a> {
                 .expect("stable runtime exact owner present"),
         );
         self.run.take();
-        match (outcome, worker_cleanup, cleanup) {
-            (Err(error), _, _) => Err(error),
-            (Ok(_), Err(error), _) => Err(error),
-            (Ok(_), Ok(()), Err(error)) => Err(error),
-            (Ok(outcome), Ok(()), Ok(())) => Ok(outcome),
-        }
+        resolve_stable_runtime_cleanup(outcome, worker_cleanup, cleanup)
     }
 }
 
@@ -1407,10 +1448,7 @@ fn run_stable_node_actor(
     let cleanup = StableRuntimeCleanup::new(paths, run.clone(), download_worker);
     let signal_guard = match SignalGuard::install() {
         Ok(guard) => guard,
-        Err(error) => {
-            drop(cleanup);
-            return Err(error);
-        }
+        Err(error) => return cleanup.finish(Err(error)),
     };
     let startup = if let Some(model_id) = startup_model {
         let download_control = download_control
@@ -1539,25 +1577,7 @@ fn current_same_owner_run(
 }
 
 fn finish_unloaded_owner(paths: &NodePaths, run: &supervisor::ManagedRun) -> io::Result<()> {
-    let current = match supervisor::read_runtime_state(&paths.state_path)
-        .map_err(supervisor_error_to_io)?
-    {
-        supervisor::RuntimeStateRead::Loaded(runs) => runs.into_iter().next().ok_or_else(|| {
-            io::Error::other("stable node owner disappeared before final cleanup")
-        })?,
-        _ => return Err(io::Error::other("stable node owner state is unavailable")),
-    };
-    if current.run_id != run.run_id
-        || current.owner_pid != run.owner_pid
-        || current.owner_process_start_time_unix_s != run.owner_process_start_time_unix_s
-        || current.lifecycle != supervisor::RunLifecycle::Unloaded
-        || current.child_pid.is_some()
-    {
-        return Err(io::Error::other(
-            "stable node owner is not safely unloaded at final cleanup",
-        ));
-    }
-    supervisor::finish_childless_runtime_state_run(&paths.state_path, &current.identity())
+    supervisor::finish_exact_unloaded_owner(&paths.state_path, run)
         .map(|_| ())
         .map_err(supervisor_error_to_io)
 }
@@ -3097,6 +3117,25 @@ mod lifecycle_api_tests {
     }
 
     #[test]
+    fn stable_actor_cleanup_uncertainty_outranks_triggering_runtime_error() {
+        let worker = resolve_stable_runtime_cleanup(
+            Err(io::Error::other("trigger")),
+            Err(io::Error::other("worker join")),
+            Ok(()),
+        )
+        .expect_err("worker uncertainty wins");
+        assert_eq!(worker.to_string(), "worker join");
+
+        let owner = resolve_stable_runtime_cleanup(
+            Err(io::Error::other("trigger")),
+            Ok(()),
+            Err(io::Error::other("exact owner recovery")),
+        )
+        .expect_err("owner uncertainty wins");
+        assert_eq!(owner.to_string(), "exact owner recovery");
+    }
+
+    #[test]
     fn builder_failure_releases_exact_unloaded_owner() {
         let temp = TestDir::new("builder-failure-cleanup");
         let paths = NodePaths {
@@ -3120,6 +3159,43 @@ mod lifecycle_api_tests {
             ManagedRunsSnapshot::Runs(Vec::new())
         );
         TcpListener::bind(("127.0.0.1", port)).expect("failed build released reserved port");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_and_history_failures_spawn_no_download_or_model_actor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        crate::bootstrap::reset_download_worker_spawn_count();
+        let token_temp = TestDir::new("builder-token-before-workers");
+        let token_paths = NodePaths {
+            models_dir: token_temp.0.join("models"),
+            state_path: token_temp.0.join("managed.json"),
+            logs_dir: token_temp.0.join("logs"),
+        };
+        std::fs::create_dir(token_temp.0.join("control.token")).unwrap();
+        assert!(
+            NodeBuilder::new(None, Some(0), RuntimeBackendKind::LlamaCpp, &token_paths)
+                .build()
+                .is_err()
+        );
+        assert_eq!(crate::bootstrap::download_worker_spawn_count(), 0);
+
+        let history_temp = TestDir::new("builder-history-before-workers");
+        let history_dir = history_temp.0.join("history");
+        std::fs::create_dir(&history_dir).unwrap();
+        std::fs::set_permissions(&history_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let history_paths = NodePaths {
+            models_dir: history_temp.0.join("models"),
+            state_path: history_temp.0.join("run").join("managed.json"),
+            logs_dir: history_temp.0.join("run").join("logs"),
+        };
+        assert!(
+            NodeBuilder::new(None, Some(0), RuntimeBackendKind::LlamaCpp, &history_paths)
+                .build()
+                .is_err()
+        );
+        assert_eq!(crate::bootstrap::download_worker_spawn_count(), 0);
     }
 
     #[test]
@@ -3455,7 +3531,7 @@ mod lifecycle_api_tests {
     }
 
     #[test]
-    fn final_owner_cleanup_resolves_the_current_unloaded_generation() {
+    fn final_owner_cleanup_preserves_a_changed_unloaded_generation() {
         let temp = TestDir::new("advanced-unloaded-owner");
         let paths = NodePaths {
             models_dir: temp.0.join("models"),
@@ -3469,15 +3545,15 @@ mod lifecycle_api_tests {
         supervisor::update_runtime_state_run_committed(
             &paths.state_path,
             &original.identity(),
-            advanced,
+            advanced.clone(),
         )
         .unwrap()
         .expect("advance owner generation");
 
-        finish_unloaded_owner(&paths, &original).expect("finish current owner generation");
+        finish_unloaded_owner(&paths, &original).expect_err("changed generation must fail closed");
         assert_eq!(
-            managed_servers(&paths).unwrap(),
-            ManagedRunsSnapshot::Runs(Vec::new())
+            supervisor::read_runtime_state(&paths.state_path).unwrap(),
+            supervisor::RuntimeStateRead::Loaded(vec![advanced])
         );
     }
 
@@ -3521,7 +3597,7 @@ mod lifecycle_api_tests {
     }
 
     #[test]
-    fn unloaded_actor_monitor_accepts_same_owner_generation_advances() {
+    fn unloaded_actor_cleanup_preserves_changed_generation_and_outranks_stop() {
         let _signal_lock = SIGNAL_TEST_LOCK.lock().expect("signal test lock");
         let temp = TestDir::new("unloaded-generation-advance");
         let paths = NodePaths {
@@ -3538,26 +3614,33 @@ mod lifecycle_api_tests {
         let mut advanced = original.clone();
         advanced.generation = 2;
         advanced.generation_alias = format!("loxa-{}-g2", original.run_id);
+        advanced.stop_requested = true;
         supervisor::update_runtime_state_run_committed(
             &paths.state_path,
             &original.identity(),
-            advanced,
+            advanced.clone(),
         )
         .unwrap()
-        .expect("advance stable owner generation");
-        std::thread::sleep(Duration::from_millis(75));
+        .expect("advance and stop stable owner generation");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !actor.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "actor did not fail closed"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let error = actor
+            .join()
+            .unwrap()
+            .expect_err("changed baseline cleanup must outrank requested stop");
         assert!(
-            !actor.is_finished(),
-            "same-owner generation must not stop node"
+            error.to_string().contains("full baseline"),
+            "cleanup uncertainty must outrank monitor trigger: {error}"
         );
-
-        assert!(matches!(
-            stop_managed_servers(StopRequest { target: "all" }, &paths).unwrap(),
-            StopOutcome::Completed { .. }
-        ));
         assert_eq!(
-            actor.join().unwrap().unwrap(),
-            RunTermination::RequestedStop
+            supervisor::read_runtime_state(&paths.state_path).unwrap(),
+            supervisor::RuntimeStateRead::Loaded(vec![advanced])
         );
     }
 
@@ -3769,6 +3852,20 @@ mod lifecycle_api_tests {
         }
         assert_eq!(diagnostics.matches("shutdown.stage.completed").count(), 4);
         assert_eq!(diagnostics.matches("shutdown.stage.failed").count(), 0);
+        for line in diagnostics
+            .lines()
+            .filter(|line| line.contains("shutdown.requested") || line.contains("shutdown.stage."))
+        {
+            assert!(
+                line.contains(&format!("node_id=\"{diagnostic_node_id}\"")),
+                "shutdown diagnostic omitted node id: {line}"
+            );
+            assert!(
+                line.contains(&format!("node_instance_id=\"{diagnostic_instance_id}\"")),
+                "shutdown diagnostic omitted node instance id: {line}"
+            );
+            assert!(!line.contains("runtime_identity="), "{line}");
+        }
         assert!(
             diagnostics.contains(" INFO loxa_node::lifecycle:"),
             "{diagnostics}"
