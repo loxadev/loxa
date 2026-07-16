@@ -1,6 +1,6 @@
 use super::state::{self, ManagedRun, ManagedRunIdentity, RunLifecycle};
 use super::{SupervisorError, TeardownConfirmation};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ObservedChildExit {
@@ -44,8 +44,169 @@ pub enum ChildlessFinishOutcome {
     RequestedStop,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PrepareUnloadedOwnerOutcome {
+    Prepared(ManagedRun),
+    RequestedStop,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreparedOwnerCleanup {
+    Childless,
+    ConfirmedReaped,
+    Uncertain,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RestoreUnloadedOwnerOutcome {
+    Restored(ManagedRun),
+    RequestedStop,
+    RecoveryRequired,
+}
+
 pub trait InterruptStatus {
     fn interrupted(&self) -> bool;
+}
+
+pub fn prepare_unloaded_owner_for_model(
+    path: &Path,
+    expected_baseline: &ManagedRun,
+    model_id: String,
+    engine_port: u16,
+    log_path: PathBuf,
+) -> Result<PrepareUnloadedOwnerOutcome, SupervisorError> {
+    validate_unloaded_owner_baseline(expected_baseline)?;
+    let _lock = state::acquire_runtime_state_lock_for_mutation(
+        path,
+        state::RUNTIME_STATE_LOCK_TIMEOUT,
+        state::RUNTIME_STATE_LOCK_POLL_INTERVAL,
+    )?;
+    let mut runs = state::runtime_state_runs_for_mutation(path)?;
+    let Some(current) = runs.first() else {
+        return Err(SupervisorError::RunStateConflict(format!(
+            "unloaded managed owner {} is no longer present",
+            expected_baseline.run_id
+        )));
+    };
+    if !managed_runs_match_except_monotonic_stop(current, expected_baseline) {
+        return Err(SupervisorError::RunStateConflict(format!(
+            "unloaded managed owner {} no longer matches its full baseline",
+            expected_baseline.run_id
+        )));
+    }
+    if current.stop_requested {
+        return Ok(PrepareUnloadedOwnerOutcome::RequestedStop);
+    }
+
+    let mut prepared = current.clone();
+    prepared.model_id = Some(model_id);
+    prepared.lifecycle = RunLifecycle::Starting;
+    prepared.port = engine_port;
+    prepared.log_path = log_path;
+    runs[0] = prepared.clone();
+    state::write_runtime_state(path, &runs)?;
+    Ok(PrepareUnloadedOwnerOutcome::Prepared(prepared))
+}
+
+pub fn restore_unloaded_owner_after_prepared_run(
+    path: &Path,
+    expected_current: &ManagedRun,
+    expected_baseline: &ManagedRun,
+    cleanup: PreparedOwnerCleanup,
+) -> Result<RestoreUnloadedOwnerOutcome, SupervisorError> {
+    validate_unloaded_owner_baseline(expected_baseline)?;
+    validate_prepared_owner_pair(expected_current, expected_baseline)?;
+    let _lock = state::acquire_runtime_state_lock_for_mutation(
+        path,
+        state::RUNTIME_STATE_LOCK_TIMEOUT,
+        state::RUNTIME_STATE_LOCK_POLL_INTERVAL,
+    )?;
+    let mut runs = state::runtime_state_runs_for_mutation(path)?;
+    let Some(current) = runs.first() else {
+        return Ok(RestoreUnloadedOwnerOutcome::RecoveryRequired);
+    };
+    if !managed_runs_match_except_monotonic_stop(current, expected_current) {
+        return Ok(RestoreUnloadedOwnerOutcome::RecoveryRequired);
+    }
+
+    if cleanup == PreparedOwnerCleanup::Uncertain {
+        write_prepared_owner_recovery(path, &mut runs)?;
+        return Ok(RestoreUnloadedOwnerOutcome::RecoveryRequired);
+    }
+    if cleanup == PreparedOwnerCleanup::Childless
+        && (current.child_pid.is_some()
+            || current.child_process_start_time_unix_s.is_some()
+            || current.child_pgid.is_some())
+    {
+        write_prepared_owner_recovery(path, &mut runs)?;
+        return Ok(RestoreUnloadedOwnerOutcome::RecoveryRequired);
+    }
+    if current.stop_requested {
+        state::write_runtime_state(path, &[])?;
+        return Ok(RestoreUnloadedOwnerOutcome::RequestedStop);
+    }
+
+    runs[0] = expected_baseline.clone();
+    state::write_runtime_state(path, &runs)?;
+    Ok(RestoreUnloadedOwnerOutcome::Restored(
+        expected_baseline.clone(),
+    ))
+}
+
+fn validate_prepared_owner_pair(
+    current: &ManagedRun,
+    baseline: &ManagedRun,
+) -> Result<(), SupervisorError> {
+    let valid = current.schema_version == state::RUNTIME_STATE_SCHEMA_VERSION
+        && current.run_id == baseline.run_id
+        && current.model_id.is_some()
+        && current.owner_pid == baseline.owner_pid
+        && current.owner_process_start_time_unix_s == baseline.owner_process_start_time_unix_s
+        && current.control_port == baseline.control_port;
+    if valid {
+        Ok(())
+    } else {
+        Err(SupervisorError::RunStateConflict(format!(
+            "managed run {} does not belong to its unloaded owner baseline",
+            current.run_id
+        )))
+    }
+}
+
+fn write_prepared_owner_recovery(
+    path: &Path,
+    runs: &mut [ManagedRun],
+) -> Result<(), SupervisorError> {
+    runs[0].lifecycle = RunLifecycle::RecoveryRequired;
+    state::write_runtime_state(path, runs)
+}
+
+fn validate_unloaded_owner_baseline(baseline: &ManagedRun) -> Result<(), SupervisorError> {
+    let valid = baseline.schema_version == state::RUNTIME_STATE_SCHEMA_VERSION
+        && baseline.model_id.is_none()
+        && !baseline.stop_requested
+        && baseline.lifecycle == RunLifecycle::Unloaded
+        && baseline.generation == 0
+        && baseline.generation_alias == format!("loxa-{}-g0", baseline.run_id)
+        && baseline.control_port == Some(baseline.port)
+        && !baseline.log_path.as_os_str().is_empty()
+        && baseline.child_pid.is_none()
+        && baseline.child_process_start_time_unix_s.is_none()
+        && baseline.child_pgid.is_none();
+    if valid {
+        Ok(())
+    } else {
+        Err(SupervisorError::RunStateConflict(format!(
+            "managed run {} is not an exact unloaded owner baseline",
+            baseline.run_id
+        )))
+    }
+}
+
+fn managed_runs_match_except_monotonic_stop(current: &ManagedRun, expected: &ManagedRun) -> bool {
+    let mut current = current.clone();
+    current.stop_requested = expected.stop_requested;
+    current == *expected
 }
 
 pub(super) fn spawn_starting_run_with<T, F>(
@@ -386,6 +547,341 @@ mod tests {
             child_process_start_time_unix_s: None,
             child_pgid: None,
         }
+    }
+
+    fn unloaded_owner(root: &Path, run_id: &str) -> ManagedRun {
+        ManagedRun {
+            schema_version: RUNTIME_STATE_SCHEMA_VERSION,
+            run_id: run_id.to_string(),
+            model_id: None,
+            owner_pid: 42,
+            owner_process_start_time_unix_s: 456,
+            stop_requested: false,
+            lifecycle: RunLifecycle::Unloaded,
+            generation: 0,
+            generation_alias: format!("loxa-{run_id}-g0"),
+            control_port: Some(8_080),
+            port: 8_080,
+            log_path: root.join(format!("{run_id}-unloaded.log")),
+            child_pid: None,
+            child_process_start_time_unix_s: None,
+            child_pgid: None,
+        }
+    }
+
+    #[test]
+    fn prepared_unloaded_owner_commits_the_exact_starting_field_table() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let baseline = unloaded_owner(temp.path(), "prepared-owner");
+        write_runtime_state(&state_path, std::slice::from_ref(&baseline)).expect("seed owner");
+        let engine_log = temp.path().join("python-engine.log");
+
+        let outcome = prepare_unloaded_owner_for_model(
+            &state_path,
+            &baseline,
+            "mlx-community/model".to_string(),
+            9_001,
+            engine_log.clone(),
+        )
+        .expect("prepare unloaded owner");
+        let PrepareUnloadedOwnerOutcome::Prepared(prepared) = outcome else {
+            panic!("owner must be prepared");
+        };
+
+        assert_eq!(prepared.schema_version, baseline.schema_version);
+        assert_eq!(prepared.run_id, baseline.run_id);
+        assert_eq!(prepared.model_id.as_deref(), Some("mlx-community/model"));
+        assert_eq!(prepared.owner_pid, baseline.owner_pid);
+        assert_eq!(
+            prepared.owner_process_start_time_unix_s,
+            baseline.owner_process_start_time_unix_s
+        );
+        assert!(!prepared.stop_requested);
+        assert_eq!(prepared.lifecycle, RunLifecycle::Starting);
+        assert_eq!(prepared.generation, baseline.generation);
+        assert_eq!(prepared.generation_alias, baseline.generation_alias);
+        assert_eq!(prepared.control_port, baseline.control_port);
+        assert_eq!(prepared.port, 9_001);
+        assert_eq!(prepared.log_path, engine_log);
+        assert_eq!(prepared.child_pid, None);
+        assert_eq!(prepared.child_process_start_time_unix_s, None);
+        assert_eq!(prepared.child_pgid, None);
+        assert_eq!(
+            read_runtime_state(&state_path).expect("read prepared owner"),
+            RuntimeStateRead::Loaded(vec![prepared])
+        );
+    }
+
+    #[test]
+    fn preparation_rejects_full_baseline_mismatch_and_identity_cas_conflict() {
+        for identity_conflict in [false, true] {
+            let temp = tempdir().expect("tempdir");
+            let state_path = temp.path().join("managed.json");
+            let baseline = unloaded_owner(temp.path(), "prepared-conflict");
+            let mut current = baseline.clone();
+            if identity_conflict {
+                current.generation = 1;
+                current.generation_alias = "loxa-prepared-conflict-g1".to_string();
+            } else {
+                current.log_path = temp.path().join("different-unloaded.log");
+            }
+            write_runtime_state(&state_path, std::slice::from_ref(&current))
+                .expect("seed conflict");
+
+            let error = prepare_unloaded_owner_for_model(
+                &state_path,
+                &baseline,
+                "model".to_string(),
+                9_001,
+                temp.path().join("engine.log"),
+            )
+            .expect_err("mismatched owner must fail closed");
+
+            assert!(matches!(error, SupervisorError::RunStateConflict(_)));
+            assert_eq!(
+                read_runtime_state(&state_path).expect("read preserved conflict"),
+                RuntimeStateRead::Loaded(vec![current])
+            );
+        }
+    }
+
+    #[test]
+    fn preparation_observes_a_stop_race_without_clearing_or_removing_it() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let baseline = unloaded_owner(temp.path(), "stopped-before-prepare");
+        write_runtime_state(&state_path, std::slice::from_ref(&baseline)).expect("seed owner");
+        record_stop_request(&state_path, "all").expect("request stop");
+
+        let outcome = prepare_unloaded_owner_for_model(
+            &state_path,
+            &baseline,
+            "model".to_string(),
+            9_001,
+            temp.path().join("engine.log"),
+        )
+        .expect("observe stop");
+
+        assert!(matches!(
+            outcome,
+            PrepareUnloadedOwnerOutcome::RequestedStop
+        ));
+        let RuntimeStateRead::Loaded(runs) =
+            read_runtime_state(&state_path).expect("read stopped owner")
+        else {
+            panic!("stopped owner must remain present");
+        };
+        assert_eq!(runs.len(), 1);
+        assert!(runs[0].stop_requested);
+        assert_eq!(runs[0].lifecycle, RunLifecycle::Unloaded);
+    }
+
+    #[test]
+    fn prepared_owner_restores_exact_baseline_from_childless_or_confirmed_reaped_state() {
+        for cleanup in [
+            PreparedOwnerCleanup::Childless,
+            PreparedOwnerCleanup::ConfirmedReaped,
+        ] {
+            let temp = tempdir().expect("tempdir");
+            let state_path = temp.path().join("managed.json");
+            let baseline = unloaded_owner(temp.path(), "restored-owner");
+            write_runtime_state(&state_path, std::slice::from_ref(&baseline)).expect("seed owner");
+            let PrepareUnloadedOwnerOutcome::Prepared(mut prepared) =
+                prepare_unloaded_owner_for_model(
+                    &state_path,
+                    &baseline,
+                    "model".to_string(),
+                    9_001,
+                    temp.path().join("engine.log"),
+                )
+                .expect("prepare owner")
+            else {
+                panic!("owner must be prepared");
+            };
+            if cleanup == PreparedOwnerCleanup::ConfirmedReaped {
+                let expected = prepared.identity();
+                prepared.lifecycle = RunLifecycle::Running;
+                prepared.child_pid = Some(777);
+                prepared.child_process_start_time_unix_s = Some(111);
+                prepared.child_pgid = Some(777);
+                assert!(
+                    state::update_runtime_state_run(&state_path, &expected, prepared.clone())
+                        .expect("attach reaped child identity")
+                );
+            }
+
+            let outcome = restore_unloaded_owner_after_prepared_run(
+                &state_path,
+                &prepared,
+                &baseline,
+                cleanup,
+            )
+            .expect("restore owner");
+
+            assert_eq!(
+                outcome,
+                RestoreUnloadedOwnerOutcome::Restored(baseline.clone())
+            );
+            assert_eq!(
+                read_runtime_state(&state_path).expect("read restored owner"),
+                RuntimeStateRead::Loaded(vec![baseline])
+            );
+        }
+    }
+
+    #[test]
+    fn uncertain_prepared_cleanup_writes_recovery_and_requested_stop_removes_only_when_safe() {
+        for stop_requested in [false, true] {
+            let temp = tempdir().expect("tempdir");
+            let state_path = temp.path().join("managed.json");
+            let baseline = unloaded_owner(temp.path(), "terminal-owner");
+            write_runtime_state(&state_path, std::slice::from_ref(&baseline)).expect("seed owner");
+            let PrepareUnloadedOwnerOutcome::Prepared(mut prepared) =
+                prepare_unloaded_owner_for_model(
+                    &state_path,
+                    &baseline,
+                    "model".to_string(),
+                    9_001,
+                    temp.path().join("engine.log"),
+                )
+                .expect("prepare owner")
+            else {
+                panic!("owner must be prepared");
+            };
+            if stop_requested {
+                record_stop_request(&state_path, "all").expect("request stop");
+                prepared.stop_requested = true;
+            }
+
+            let outcome = restore_unloaded_owner_after_prepared_run(
+                &state_path,
+                &prepared,
+                &baseline,
+                if stop_requested {
+                    PreparedOwnerCleanup::Childless
+                } else {
+                    PreparedOwnerCleanup::Uncertain
+                },
+            )
+            .expect("terminal transition");
+
+            if stop_requested {
+                assert_eq!(outcome, RestoreUnloadedOwnerOutcome::RequestedStop);
+                assert_eq!(
+                    read_runtime_state(&state_path).expect("read removed stop"),
+                    RuntimeStateRead::Loaded(Vec::new())
+                );
+            } else {
+                assert_eq!(outcome, RestoreUnloadedOwnerOutcome::RecoveryRequired);
+                let RuntimeStateRead::Loaded(runs) =
+                    read_runtime_state(&state_path).expect("read recovery owner")
+                else {
+                    panic!("recovery owner must remain");
+                };
+                assert_eq!(runs.len(), 1);
+                assert_eq!(runs[0].lifecycle, RunLifecycle::RecoveryRequired);
+                assert_eq!(runs[0].run_id, prepared.run_id);
+                assert_eq!(runs[0].model_id, prepared.model_id);
+            }
+        }
+    }
+
+    #[test]
+    fn restoration_rejects_a_different_unloaded_owner_baseline() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let baseline = unloaded_owner(temp.path(), "owner-pair");
+        write_runtime_state(&state_path, std::slice::from_ref(&baseline)).expect("seed owner");
+        let PrepareUnloadedOwnerOutcome::Prepared(prepared) = prepare_unloaded_owner_for_model(
+            &state_path,
+            &baseline,
+            "model".to_string(),
+            9_001,
+            temp.path().join("engine.log"),
+        )
+        .expect("prepare owner") else {
+            panic!("owner must be prepared");
+        };
+        let mut wrong_baseline = baseline.clone();
+        wrong_baseline.owner_pid += 1;
+
+        let error = restore_unloaded_owner_after_prepared_run(
+            &state_path,
+            &prepared,
+            &wrong_baseline,
+            PreparedOwnerCleanup::Childless,
+        )
+        .expect_err("different baseline owner must fail closed");
+
+        assert!(matches!(error, SupervisorError::RunStateConflict(_)));
+        assert_eq!(
+            read_runtime_state(&state_path).expect("read preserved prepared owner"),
+            RuntimeStateRead::Loaded(vec![prepared])
+        );
+    }
+
+    #[test]
+    fn contradictory_childless_cleanup_evidence_persists_recovery_required() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let baseline = unloaded_owner(temp.path(), "childless-evidence");
+        write_runtime_state(&state_path, std::slice::from_ref(&baseline)).expect("seed owner");
+        let PrepareUnloadedOwnerOutcome::Prepared(mut attached) = prepare_unloaded_owner_for_model(
+            &state_path,
+            &baseline,
+            "model".to_string(),
+            9_001,
+            temp.path().join("engine.log"),
+        )
+        .expect("prepare owner") else {
+            panic!("owner must be prepared");
+        };
+        let starting_identity = attached.identity();
+        attached.lifecycle = RunLifecycle::Running;
+        attached.child_pid = Some(777);
+        attached.child_process_start_time_unix_s = Some(111);
+        attached.child_pgid = Some(777);
+        assert!(
+            state::update_runtime_state_run(&state_path, &starting_identity, attached.clone())
+                .expect("attach child")
+        );
+
+        let outcome = restore_unloaded_owner_after_prepared_run(
+            &state_path,
+            &attached,
+            &baseline,
+            PreparedOwnerCleanup::Childless,
+        )
+        .expect("record contradictory cleanup evidence");
+
+        assert_eq!(outcome, RestoreUnloadedOwnerOutcome::RecoveryRequired);
+        let RuntimeStateRead::Loaded(runs) =
+            read_runtime_state(&state_path).expect("read recovery state")
+        else {
+            panic!("recovery row must remain");
+        };
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].lifecycle, RunLifecycle::RecoveryRequired);
+        assert_eq!(runs[0].child_pid, attached.child_pid);
+    }
+
+    #[test]
+    fn standalone_childless_finish_semantics_remain_unchanged() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let run = childless_starting_run(temp.path(), "standalone-run");
+        create_starting_run(&state_path, run.clone()).expect("seed standalone run");
+
+        assert_eq!(
+            finish_childless_runtime_state_run(&state_path, &run.identity())
+                .expect("finish standalone run"),
+            ChildlessFinishOutcome::Finished
+        );
+        assert_eq!(
+            read_runtime_state(&state_path).expect("read finished standalone run"),
+            RuntimeStateRead::Loaded(Vec::new())
+        );
     }
 
     #[test]
