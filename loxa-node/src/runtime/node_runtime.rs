@@ -7,8 +7,59 @@ use loxa_core::diagnostics::DiagnosticsHealth;
 use loxa_core::engine::RuntimeBackendKind;
 use loxa_core::gateway::{GatewayServer, GatewayState};
 use loxa_core::supervisor::ManagedRun;
+use loxa_protocol::{NodeId, NodeInstanceId};
 use std::io;
 use std::thread;
+
+#[must_use]
+pub(crate) struct NodeOwnerGuard {
+    paths: NodePaths,
+    baseline: Option<ManagedRun>,
+}
+
+impl NodeOwnerGuard {
+    pub(crate) fn new(paths: NodePaths, baseline: ManagedRun) -> Self {
+        Self {
+            paths,
+            baseline: Some(baseline),
+        }
+    }
+
+    pub(crate) fn into_baseline(mut self) -> ManagedRun {
+        self.baseline.take().expect("node owner guard armed")
+    }
+
+    pub(crate) fn baseline(&self) -> &ManagedRun {
+        self.baseline.as_ref().expect("node owner guard armed")
+    }
+
+    pub(crate) fn finish(mut self) -> io::Result<()> {
+        let baseline = self.baseline.as_ref().expect("node owner guard armed");
+        crate::finish_unloaded_owner(&self.paths, baseline)?;
+        self.baseline.take();
+        Ok(())
+    }
+}
+
+impl Drop for NodeOwnerGuard {
+    fn drop(&mut self) {
+        let Some(baseline) = self.baseline.take() else {
+            return;
+        };
+        let Ok(loxa_core::supervisor::RuntimeStateRead::Loaded(runs)) =
+            loxa_core::supervisor::read_runtime_state(&self.paths.state_path)
+        else {
+            return;
+        };
+        if runs.as_slice() != [baseline.clone()] || baseline.stop_requested {
+            return;
+        }
+        let _ = loxa_core::supervisor::finish_childless_runtime_state_run(
+            &self.paths.state_path,
+            &baseline.identity(),
+        );
+    }
+}
 
 fn emit_shutdown_stage(stage: &'static str, duration_ms: u64, error: Option<&io::Error>) {
     if error.is_some() {
@@ -32,6 +83,19 @@ fn emit_shutdown_stage(stage: &'static str, duration_ms: u64, error: Option<&io:
     }
 }
 
+fn resolve_shutdown_outcome(
+    outcome: io::Result<RunTermination>,
+    gateway_shutdown: io::Result<()>,
+    history_shutdown: io::Result<()>,
+) -> io::Result<RunTermination> {
+    match (outcome, gateway_shutdown, history_shutdown) {
+        (_, Err(error), _) => Err(error),
+        (_, Ok(()), Err(error)) => Err(error),
+        (Err(error), Ok(()), Ok(())) => Err(error),
+        (Ok(exit), Ok(()), Ok(())) => Ok(exit),
+    }
+}
+
 #[must_use]
 pub(crate) struct NodeRuntimeParts {
     pub(crate) paths: NodePaths,
@@ -39,13 +103,15 @@ pub(crate) struct NodeRuntimeParts {
     pub(crate) engine: RuntimeBackendKind,
     pub(crate) stable_llama_node: bool,
     pub(crate) unloaded_run: Option<ManagedRun>,
+    pub(crate) owner_guard: NodeOwnerGuard,
     pub(crate) download_runtime: Option<(DownloadControl, DownloadControlWorker)>,
     pub(crate) gateway_state: GatewayState,
     pub(crate) chat_routes_state: ChatRoutesState,
     pub(crate) gateway: GatewayServer,
     pub(crate) history_worker: ChatHistoryWorker,
     pub(crate) diagnostics_health: DiagnosticsHealth,
-    pub(crate) runtime_identity: String,
+    pub(crate) node_id: NodeId,
+    pub(crate) node_instance_id: NodeInstanceId,
 }
 
 #[must_use]
@@ -55,13 +121,15 @@ pub(crate) struct NodeRuntime {
     engine: RuntimeBackendKind,
     stable_llama_node: bool,
     unloaded_run: Option<ManagedRun>,
+    owner_guard: Option<NodeOwnerGuard>,
     download_runtime: Option<(DownloadControl, DownloadControlWorker)>,
     gateway_state: Option<GatewayState>,
     chat_routes_state: Option<ChatRoutesState>,
     gateway: Option<GatewayServer>,
     history_worker: Option<ChatHistoryWorker>,
     diagnostics_health: DiagnosticsHealth,
-    runtime_identity: String,
+    node_id: NodeId,
+    node_instance_id: NodeInstanceId,
 }
 
 impl NodeRuntime {
@@ -72,13 +140,15 @@ impl NodeRuntime {
             engine: parts.engine,
             stable_llama_node: parts.stable_llama_node,
             unloaded_run: parts.unloaded_run,
+            owner_guard: Some(parts.owner_guard),
             download_runtime: parts.download_runtime,
             gateway_state: Some(parts.gateway_state),
             chat_routes_state: Some(parts.chat_routes_state),
             gateway: Some(parts.gateway),
             history_worker: Some(parts.history_worker),
             diagnostics_health: parts.diagnostics_health,
-            runtime_identity: parts.runtime_identity,
+            node_id: parts.node_id,
+            node_instance_id: parts.node_instance_id,
         }
     }
 
@@ -109,7 +179,8 @@ impl NodeRuntime {
                 target: "loxa_node::lifecycle",
                 event_code = "node.listening",
                 component = "node",
-                runtime_identity = self.runtime_identity.as_str(),
+                node_id = self.node_id.to_string().as_str(),
+                node_instance_id = self.node_instance_id.to_string().as_str(),
                 result_class = "listening",
             );
             self.run_lifecycle(events)
@@ -122,10 +193,12 @@ impl NodeRuntime {
         let paths = self.paths.as_ref().expect("runtime paths present");
         match self.startup_model.as_deref() {
             Some(model_id) if self.stable_llama_node => {
+                self.unloaded_run.take();
                 let run = self
-                    .unloaded_run
+                    .owner_guard
                     .take()
-                    .expect("stable llama node owner claimed");
+                    .expect("stable llama node owner guarded")
+                    .into_baseline();
                 let (download_control, download_worker) = self
                     .download_runtime
                     .take()
@@ -139,7 +212,7 @@ impl NodeRuntime {
                     Some(events),
                 )
             }
-            Some(model_id) => crate::run_model_with_diagnostics_health(
+            Some(model_id) => crate::run_prepared_python_model_with_diagnostics_health(
                 RunRequest {
                     id: model_id,
                     ctx: None,
@@ -147,6 +220,10 @@ impl NodeRuntime {
                     engine: self.engine,
                 },
                 paths,
+                self.owner_guard
+                    .as_ref()
+                    .expect("prepared Python node owner guarded")
+                    .baseline(),
                 Some(
                     self.gateway_state
                         .as_ref()
@@ -156,7 +233,12 @@ impl NodeRuntime {
                 &self.diagnostics_health,
             ),
             None => {
-                let run = self.unloaded_run.take().expect("unloaded owner claimed");
+                self.unloaded_run.take();
+                let run = self
+                    .owner_guard
+                    .take()
+                    .expect("unloaded node owner guarded")
+                    .into_baseline();
                 let (download_control, download_worker) = self
                     .download_runtime
                     .take()
@@ -188,7 +270,8 @@ impl NodeRuntime {
             target: "loxa_node::lifecycle",
             event_code = "node.stopping",
             component = "node",
-            runtime_identity = self.runtime_identity.as_str(),
+            node_id = self.node_id.to_string().as_str(),
+            node_instance_id = self.node_instance_id.to_string().as_str(),
             result_class = "stopping",
         );
         self.gateway_state
@@ -230,18 +313,14 @@ impl NodeRuntime {
             u64::try_from(shutdown_started.elapsed().as_millis()).unwrap_or(u64::MAX),
             history_shutdown.as_ref().err(),
         );
-        let result = match (outcome, shutdown, history_shutdown) {
-            (Err(error), _, _) => Err(error),
-            (Ok(_), Err(error), _) => Err(error),
-            (Ok(_), Ok(()), Err(error)) => Err(error),
-            (Ok(exit), Ok(()), Ok(())) => Ok(exit),
-        };
+        let result = resolve_shutdown_outcome(outcome, shutdown, history_shutdown);
         let result_class = if result.is_ok() { "stopped" } else { "failed" };
         tracing::info!(
             target: "loxa_node::lifecycle",
             event_code = "node.stopped",
             component = "node",
-            runtime_identity = self.runtime_identity.as_str(),
+            node_id = self.node_id.to_string().as_str(),
+            node_instance_id = self.node_instance_id.to_string().as_str(),
             result_class,
             duration_ms = u64::try_from(shutdown_started.elapsed().as_millis())
                 .unwrap_or(u64::MAX),
@@ -257,8 +336,9 @@ impl Drop for NodeRuntime {
         }
 
         let paths = self.paths.take();
+        let owner_guard = self.owner_guard.take();
         let unloaded_run = self.unloaded_run.take();
-        let mut download_runtime = self.download_runtime.take();
+        let download_runtime = self.download_runtime.take();
         let chat_routes_state = self.chat_routes_state.take();
         let gateway = self.gateway.take();
         let history_worker = self.history_worker.take();
@@ -268,6 +348,7 @@ impl Drop for NodeRuntime {
             && chat_routes_state.is_none()
             && gateway.is_none()
             && history_worker.is_none()
+            && owner_guard.is_none()
         {
             return;
         }
@@ -275,12 +356,9 @@ impl Drop for NodeRuntime {
         let _ = thread::Builder::new()
             .name("loxa-node-runtime-cleanup".to_string())
             .spawn(move || {
-                if let Some(paths) = paths.as_ref() {
-                    let _ = crate::cleanup_stable_node_runtime(
-                        paths,
-                        unloaded_run.as_ref(),
-                        &mut download_runtime,
-                    );
+                let _ = (paths, unloaded_run);
+                if let Some((_, download_worker)) = download_runtime {
+                    let _ = download_worker.stop_and_join();
                 }
                 if let Some(chat_routes_state) = chat_routes_state {
                     chat_routes_state.shutdown_and_wait();
@@ -291,16 +369,58 @@ impl Drop for NodeRuntime {
                 if let Some(history_worker) = history_worker {
                     let _ = history_worker.stop_and_join();
                 }
+                if let Some(owner_guard) = owner_guard {
+                    let _ = owner_guard.finish();
+                }
             });
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::emit_shutdown_stage;
+    use super::{emit_shutdown_stage, resolve_shutdown_outcome, NodeOwnerGuard};
+    use crate::NodePaths;
+    use crate::{claim_unloaded_owner, managed_servers, ManagedRunsSnapshot};
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex};
     use tracing_subscriber::fmt::MakeWriter;
+
+    #[test]
+    fn owner_guard_explicit_finish_removes_only_its_exact_unloaded_owner() {
+        let root = std::env::temp_dir().join(format!(
+            "loxa-node-owner-guard-{}-{}",
+            std::process::id(),
+            loxa_protocol::NodeInstanceId::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = NodePaths {
+            models_dir: root.join("models"),
+            state_path: root.join("managed.json"),
+            logs_dir: root.join("logs"),
+        };
+        let baseline = claim_unloaded_owner(&paths, 19_741).unwrap();
+        NodeOwnerGuard::new(paths.clone(), baseline)
+            .finish()
+            .unwrap();
+
+        assert_eq!(
+            managed_servers(&paths).unwrap(),
+            ManagedRunsSnapshot::Runs(Vec::new())
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cleanup_uncertainty_outranks_the_triggering_runtime_error() {
+        let result = resolve_shutdown_outcome(
+            Err(io::Error::other("triggering startup error")),
+            Err(io::Error::other("gateway join uncertainty")),
+            Ok(()),
+        )
+        .expect_err("cleanup uncertainty must win");
+
+        assert_eq!(result.to_string(), "gateway join uncertainty");
+    }
 
     #[derive(Clone, Default)]
     struct Capture(Arc<Mutex<Vec<u8>>>);

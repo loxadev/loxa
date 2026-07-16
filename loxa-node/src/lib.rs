@@ -59,6 +59,279 @@ enum OwnedReplacementPreparation<R, D> {
     Interrupted,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PreparedPythonOwnerDisposition {
+    Restored(supervisor::ManagedRun),
+    ConsumedByRequestedStop,
+    RecoveryRequired,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PreparedPythonOwnerPolicy<'a> {
+    baseline: &'a supervisor::ManagedRun,
+}
+
+impl<'a> PreparedPythonOwnerPolicy<'a> {
+    pub(crate) fn new(baseline: &'a supervisor::ManagedRun) -> Self {
+        Self { baseline }
+    }
+
+    fn finish_childless(
+        self,
+        state_path: &Path,
+        current: &supervisor::ManagedRun,
+    ) -> Result<PreparedPythonOwnerDisposition, SupervisorError> {
+        self.finish(
+            state_path,
+            current,
+            supervisor::PreparedOwnerCleanup::Childless,
+        )
+    }
+
+    fn finish(
+        self,
+        state_path: &Path,
+        current: &supervisor::ManagedRun,
+        cleanup: supervisor::PreparedOwnerCleanup,
+    ) -> Result<PreparedPythonOwnerDisposition, SupervisorError> {
+        match supervisor::restore_unloaded_owner_after_prepared_run(
+            state_path,
+            current,
+            self.baseline,
+            cleanup,
+        )? {
+            supervisor::RestoreUnloadedOwnerOutcome::Restored(run) => {
+                Ok(PreparedPythonOwnerDisposition::Restored(run))
+            }
+            supervisor::RestoreUnloadedOwnerOutcome::RequestedStop => {
+                Ok(PreparedPythonOwnerDisposition::ConsumedByRequestedStop)
+            }
+            supervisor::RestoreUnloadedOwnerOutcome::RecoveryRequired => {
+                Ok(PreparedPythonOwnerDisposition::RecoveryRequired)
+            }
+        }
+    }
+
+    fn cleanup_child<C>(
+        self,
+        child: &mut C,
+        state_path: &Path,
+        current: &supervisor::ManagedRun,
+    ) -> Result<PreparedPythonOwnerDisposition, SupervisorError>
+    where
+        C: ManagedChild + LogDrainingChild,
+    {
+        let confirmation =
+            supervisor::teardown_managed_child(child, supervisor::CTRL_C_GRACE_PERIOD)?;
+        self.finish(
+            state_path,
+            current,
+            match confirmation {
+                supervisor::TeardownConfirmation::Confirmed => {
+                    supervisor::PreparedOwnerCleanup::ConfirmedReaped
+                }
+                supervisor::TeardownConfirmation::Unconfirmed => {
+                    supervisor::PreparedOwnerCleanup::Uncertain
+                }
+            },
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RunOwnerPolicy<'a> {
+    Standalone,
+    Prepared(PreparedPythonOwnerPolicy<'a>),
+}
+
+impl RunOwnerPolicy<'_> {
+    fn handle_observed_exit<C, I>(
+        self,
+        child: &mut C,
+        log_path: &Path,
+        state_path: &Path,
+        state_identity: &supervisor::ManagedRunIdentity,
+        interrupt: &I,
+    ) -> Result<ObservedChildExit, SupervisorError>
+    where
+        C: ManagedChild + LogDrainingChild,
+        I: InterruptStatus,
+    {
+        match self {
+            Self::Standalone => supervisor::handle_observed_child_exit(
+                child,
+                log_path,
+                state_path,
+                state_identity,
+                interrupt,
+            ),
+            Self::Prepared(policy) => supervisor::handle_observed_child_exit_prepared(
+                child,
+                log_path,
+                state_path,
+                state_identity,
+                policy.baseline,
+                interrupt,
+            ),
+        }
+    }
+
+    fn current(
+        self,
+        state_path: &Path,
+        state_identity: &supervisor::ManagedRunIdentity,
+    ) -> Result<supervisor::ManagedRun, SupervisorError> {
+        supervisor::current_runtime_state_run(state_path, state_identity)
+    }
+
+    fn cleanup_by_identity<C>(
+        self,
+        child: &mut C,
+        state_path: &Path,
+        state_identity: &supervisor::ManagedRunIdentity,
+    ) -> Result<supervisor::PostSpawnCleanupOutcome, SupervisorError>
+    where
+        C: ManagedChild + LogDrainingChild,
+    {
+        match self {
+            Self::Standalone => {
+                supervisor::cleanup_post_spawn_failure(child, state_path, state_identity)
+            }
+            Self::Prepared(_) => match self.current(state_path, state_identity) {
+                Ok(current) => self.cleanup_child(child, state_path, &current),
+                Err(_) => Ok(supervisor::PostSpawnCleanupOutcome::RecoveryRequired),
+            },
+        }
+    }
+
+    fn teardown_by_identity<C>(
+        self,
+        child: &mut C,
+        state_path: &Path,
+        state_identity: &supervisor::ManagedRunIdentity,
+        decision: supervisor::OwnerTeardownDecision,
+    ) -> Result<supervisor::OwnerTerminalOutcome, SupervisorError>
+    where
+        C: ManagedChild + LogDrainingChild,
+    {
+        match self {
+            Self::Standalone => {
+                supervisor::teardown_owned_run(child, state_path, state_identity, decision)
+            }
+            Self::Prepared(_) => match self.current(state_path, state_identity) {
+                Ok(current) => self.teardown_child(child, state_path, &current, decision),
+                Err(_) => Ok(supervisor::OwnerTerminalOutcome::RecoveryRequired),
+            },
+        }
+    }
+
+    fn finish_childless(
+        self,
+        state_path: &Path,
+        current: &supervisor::ManagedRun,
+    ) -> Result<supervisor::ChildlessFinishOutcome, SupervisorError> {
+        match self {
+            Self::Standalone => {
+                supervisor::finish_childless_runtime_state_run(state_path, &current.identity())
+            }
+            Self::Prepared(policy) => match policy.finish_childless(state_path, current)? {
+                PreparedPythonOwnerDisposition::Restored(_) => {
+                    Ok(supervisor::ChildlessFinishOutcome::Finished)
+                }
+                PreparedPythonOwnerDisposition::ConsumedByRequestedStop => {
+                    Ok(supervisor::ChildlessFinishOutcome::RequestedStop)
+                }
+                PreparedPythonOwnerDisposition::RecoveryRequired => {
+                    Err(SupervisorError::RecoveryRequired(current.run_id.clone()))
+                }
+            },
+        }
+    }
+
+    fn cleanup_child<C>(
+        self,
+        child: &mut C,
+        state_path: &Path,
+        current: &supervisor::ManagedRun,
+    ) -> Result<supervisor::PostSpawnCleanupOutcome, SupervisorError>
+    where
+        C: ManagedChild + LogDrainingChild,
+    {
+        match self {
+            Self::Standalone => {
+                supervisor::cleanup_post_spawn_failure(child, state_path, &current.identity())
+            }
+            Self::Prepared(policy) => match policy.cleanup_child(child, state_path, current)? {
+                PreparedPythonOwnerDisposition::Restored(_) => {
+                    Ok(supervisor::PostSpawnCleanupOutcome::Cleaned)
+                }
+                PreparedPythonOwnerDisposition::ConsumedByRequestedStop => {
+                    Ok(supervisor::PostSpawnCleanupOutcome::RequestedStop)
+                }
+                PreparedPythonOwnerDisposition::RecoveryRequired => {
+                    Ok(supervisor::PostSpawnCleanupOutcome::RecoveryRequired)
+                }
+            },
+        }
+    }
+
+    fn attach_or_cleanup<C>(
+        self,
+        child: &mut C,
+        state_path: &Path,
+        run: supervisor::ManagedRun,
+        server: ManagedServer,
+    ) -> Result<supervisor::PersistManagedServerOutcome, SupervisorError>
+    where
+        C: ManagedChild + LogDrainingChild,
+    {
+        match self {
+            Self::Standalone => supervisor::persist_managed_server_or_cleanup(
+                child,
+                state_path,
+                run,
+                server,
+                supervisor::CTRL_C_GRACE_PERIOD,
+            ),
+            Self::Prepared(policy) => supervisor::persist_managed_server_or_cleanup_prepared(
+                child,
+                state_path,
+                run,
+                server,
+                policy.baseline,
+            ),
+        }
+    }
+
+    fn teardown_child<C>(
+        self,
+        child: &mut C,
+        state_path: &Path,
+        current: &supervisor::ManagedRun,
+        decision: supervisor::OwnerTeardownDecision,
+    ) -> Result<supervisor::OwnerTerminalOutcome, SupervisorError>
+    where
+        C: ManagedChild + LogDrainingChild,
+    {
+        match self {
+            Self::Standalone => {
+                supervisor::teardown_owned_run(child, state_path, &current.identity(), decision)
+            }
+            Self::Prepared(policy) => match policy.cleanup_child(child, state_path, current)? {
+                PreparedPythonOwnerDisposition::Restored(_) => {
+                    Ok(supervisor::OwnerTerminalOutcome::Interrupted)
+                }
+                PreparedPythonOwnerDisposition::ConsumedByRequestedStop => {
+                    Ok(supervisor::OwnerTerminalOutcome::RequestedStop)
+                }
+                PreparedPythonOwnerDisposition::RecoveryRequired => {
+                    Ok(supervisor::OwnerTerminalOutcome::RecoveryRequired)
+                }
+            },
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StartupPoll {
     Pending,
@@ -318,6 +591,48 @@ fn run_model_with_diagnostics_health(
     events: &mut dyn LifecycleEventSink,
     diagnostics_health: &loxa_core::diagnostics::DiagnosticsHealth,
 ) -> io::Result<RunTermination> {
+    run_model_with_owner_policy(
+        request,
+        paths,
+        gateway,
+        events,
+        diagnostics_health,
+        RunOwnerPolicy::Standalone,
+    )
+}
+
+pub(crate) fn run_prepared_python_model_with_diagnostics_health(
+    request: RunRequest<'_>,
+    paths: &NodePaths,
+    baseline: &supervisor::ManagedRun,
+    gateway: Option<&loxa_core::gateway::GatewayState>,
+    events: &mut dyn LifecycleEventSink,
+    diagnostics_health: &loxa_core::diagnostics::DiagnosticsHealth,
+) -> io::Result<RunTermination> {
+    if request.engine != RuntimeBackendKind::PyMlxLm {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "prepared node owner supports only the Python MLX backend",
+        ));
+    }
+    run_model_with_owner_policy(
+        request,
+        paths,
+        gateway,
+        events,
+        diagnostics_health,
+        RunOwnerPolicy::Prepared(PreparedPythonOwnerPolicy::new(baseline)),
+    )
+}
+
+fn run_model_with_owner_policy(
+    request: RunRequest<'_>,
+    paths: &NodePaths,
+    gateway: Option<&loxa_core::gateway::GatewayState>,
+    events: &mut dyn LifecycleEventSink,
+    diagnostics_health: &loxa_core::diagnostics::DiagnosticsHealth,
+    owner_policy: RunOwnerPolicy<'_>,
+) -> io::Result<RunTermination> {
     let RunRequest {
         id,
         ctx,
@@ -343,12 +658,25 @@ fn run_model_with_diagnostics_health(
     ensure_runtime_state_is_mutable(&paths.state_path)?;
 
     let signal_guard = SignalGuard::install()?;
-    let owner_pid = std::process::id();
-    let owner_process_start_time_unix_s = supervisor::process_start_time_with_retry(owner_pid)
-        .ok_or_else(|| {
-            supervisor_error_to_io(SupervisorError::ProcessIdentityUnavailable(owner_pid))
-        })?;
-    let run_id = format!("run-{owner_pid}-{owner_process_start_time_unix_s}");
+    let (owner_pid, owner_process_start_time_unix_s, run_id) = match owner_policy {
+        RunOwnerPolicy::Standalone => {
+            let owner_pid = std::process::id();
+            let owner_start =
+                supervisor::process_start_time_with_retry(owner_pid).ok_or_else(|| {
+                    supervisor_error_to_io(SupervisorError::ProcessIdentityUnavailable(owner_pid))
+                })?;
+            (
+                owner_pid,
+                owner_start,
+                format!("run-{owner_pid}-{owner_start}"),
+            )
+        }
+        RunOwnerPolicy::Prepared(policy) => (
+            policy.baseline.owner_pid,
+            policy.baseline.owner_process_start_time_unix_s,
+            policy.baseline.run_id.clone(),
+        ),
+    };
     let mut replacement_run: Option<supervisor::ManagedRun> = None;
 
     loop {
@@ -359,6 +687,7 @@ fn run_model_with_diagnostics_health(
                 let preparation = prepare_owned_replacement_run(
                     &paths.state_path,
                     run,
+                    owner_policy,
                     &signal_guard,
                     || resolve_runtime_backend(engine, id, &paths.models_dir),
                     || Ok(()),
@@ -411,28 +740,43 @@ fn run_model_with_diagnostics_health(
                     supervisor::reserve_localhost_port(port).map_err(supervisor_error_to_io)?;
                 let selected_port = reservation.port();
                 let log_path = paths.log_path(backend.log_key(), selected_port, started_at_unix_s);
-                (
-                    backend,
-                    supervisor::ManagedRun {
-                        schema_version: supervisor::RUNTIME_STATE_SCHEMA_VERSION,
-                        run_id: run_id.clone(),
-                        model_id: Some(id.to_string()),
-                        owner_pid,
-                        owner_process_start_time_unix_s,
-                        stop_requested: false,
-                        lifecycle: supervisor::RunLifecycle::Starting,
-                        generation: 0,
-                        generation_alias: format!("loxa-{run_id}-g0"),
-                        control_port: None,
-                        port: selected_port,
-                        log_path,
-                        child_pid: None,
-                        child_process_start_time_unix_s: None,
-                        child_pgid: None,
-                    },
-                    true,
-                    Some(reservation),
-                )
+                let standalone_starting = supervisor::ManagedRun {
+                    schema_version: supervisor::RUNTIME_STATE_SCHEMA_VERSION,
+                    run_id: run_id.clone(),
+                    model_id: Some(id.to_string()),
+                    owner_pid,
+                    owner_process_start_time_unix_s,
+                    stop_requested: false,
+                    lifecycle: supervisor::RunLifecycle::Starting,
+                    generation: 0,
+                    generation_alias: format!("loxa-{run_id}-g0"),
+                    control_port: None,
+                    port: selected_port,
+                    log_path,
+                    child_pid: None,
+                    child_process_start_time_unix_s: None,
+                    child_pgid: None,
+                };
+                let (starting, create) = match owner_policy {
+                    RunOwnerPolicy::Standalone => (standalone_starting, true),
+                    RunOwnerPolicy::Prepared(policy) => {
+                        match supervisor::prepare_unloaded_owner_for_model(
+                            &paths.state_path,
+                            policy.baseline,
+                            id.to_string(),
+                            selected_port,
+                            standalone_starting.log_path,
+                        )
+                        .map_err(supervisor_error_to_io)?
+                        {
+                            supervisor::PrepareUnloadedOwnerOutcome::Prepared(run) => (run, false),
+                            supervisor::PrepareUnloadedOwnerOutcome::RequestedStop => {
+                                return Ok(RunTermination::RequestedStop);
+                            }
+                        }
+                    }
+                };
+                (backend, starting, create, Some(reservation))
             };
         let log_path = starting_run.log_path.clone();
         let spec = backend.launch_spec(
@@ -454,11 +798,9 @@ fn run_model_with_diagnostics_health(
         let reservation = match reservation {
             Ok(reservation) => reservation,
             Err(error) => {
-                return match supervisor::finish_childless_runtime_state_run(
-                    &paths.state_path,
-                    &starting_run.identity(),
-                )
-                .map_err(supervisor_error_to_io)?
+                return match owner_policy
+                    .finish_childless(&paths.state_path, &starting_run)
+                    .map_err(supervisor_error_to_io)?
                 {
                     supervisor::ChildlessFinishOutcome::RequestedStop => {
                         Ok(RunTermination::RequestedStop)
@@ -483,11 +825,9 @@ fn run_model_with_diagnostics_health(
                 return Ok(RunTermination::RequestedStop);
             }
             Err(error) => {
-                return match supervisor::finish_childless_runtime_state_run(
-                    &paths.state_path,
-                    &starting_run.identity(),
-                )
-                .map_err(supervisor_error_to_io)?
+                return match owner_policy
+                    .finish_childless(&paths.state_path, &starting_run)
+                    .map_err(supervisor_error_to_io)?
                 {
                     supervisor::ChildlessFinishOutcome::RequestedStop => {
                         Ok(RunTermination::RequestedStop)
@@ -504,6 +844,8 @@ fn run_model_with_diagnostics_health(
             &paths.state_path,
             &starting_run.identity(),
             initialization_error,
+            owner_policy,
+            &starting_run,
         )
         .map_err(supervisor_error_to_io)?
         {
@@ -528,9 +870,14 @@ fn run_model_with_diagnostics_health(
         };
 
         if signal_guard.interrupted() {
-            let outcome =
-                finish_spawned_interrupt(&mut child, &paths.state_path, &starting_run.identity())
-                    .map_err(supervisor_error_to_io)?;
+            let outcome = finish_spawned_interrupt(
+                &mut child,
+                &paths.state_path,
+                &starting_run.identity(),
+                owner_policy,
+                &starting_run,
+            )
+            .map_err(supervisor_error_to_io)?;
             if outcome == supervisor::OwnerTerminalOutcome::RecoveryRequired {
                 return emit_recovery_required(events, &starting_run.run_id);
             }
@@ -538,14 +885,9 @@ fn run_model_with_diagnostics_health(
         }
 
         let starting_run_id = starting_run.run_id.clone();
-        let persist_outcome = supervisor::persist_managed_server_or_cleanup(
-            &mut child,
-            &paths.state_path,
-            starting_run,
-            server.clone(),
-            supervisor::CTRL_C_GRACE_PERIOD,
-        )
-        .map_err(supervisor_error_to_io)?;
+        let persist_outcome = owner_policy
+            .attach_or_cleanup(&mut child, &paths.state_path, starting_run, server.clone())
+            .map_err(supervisor_error_to_io)?;
         let run = match resolve_managed_attachment_typed(persist_outcome) {
             TypedManagedAttachmentBoundary::Attached(run) => run,
             TypedManagedAttachmentBoundary::Terminal(termination) => {
@@ -559,12 +901,9 @@ fn run_model_with_diagnostics_health(
         let observed_child_start = match server.process_start_time_unix_s {
             Some(start) => start,
             None => {
-                let cleanup = supervisor::cleanup_post_spawn_failure(
-                    &mut child,
-                    &paths.state_path,
-                    &run.identity(),
-                )
-                .map_err(supervisor_error_to_io)?;
+                let cleanup = owner_policy
+                    .cleanup_child(&mut child, &paths.state_path, &run)
+                    .map_err(supervisor_error_to_io)?;
                 if cleanup == supervisor::PostSpawnCleanupOutcome::RecoveryRequired {
                     return emit_recovery_required(events, &run.run_id);
                 }
@@ -573,8 +912,8 @@ fn run_model_with_diagnostics_health(
                 ));
             }
         };
-        let correlation_identity = run.identity();
         let correlation_run_id = run.run_id.clone();
+        let correlation_run = run.clone();
         let mut session = match EngineSession::new(
             child,
             run,
@@ -585,12 +924,9 @@ fn run_model_with_diagnostics_health(
         ) {
             Ok(session) => session,
             Err((mut child, error)) => {
-                let cleanup = supervisor::cleanup_post_spawn_failure(
-                    &mut child,
-                    &paths.state_path,
-                    &correlation_identity,
-                )
-                .map_err(supervisor_error_to_io)?;
+                let cleanup = owner_policy
+                    .cleanup_child(&mut child, &paths.state_path, &correlation_run)
+                    .map_err(supervisor_error_to_io)?;
                 if cleanup == supervisor::PostSpawnCleanupOutcome::RecoveryRequired {
                     return emit_recovery_required(events, &correlation_run_id);
                 }
@@ -599,9 +935,13 @@ fn run_model_with_diagnostics_health(
         };
         let state_identity = session.identity();
 
-        if let Some(outcome) =
-            observe_attached_stop(session.child_mut(), &paths.state_path, &state_identity)
-                .map_err(supervisor_error_to_io)?
+        if let Some(outcome) = observe_attached_stop_with_policy(
+            session.child_mut(),
+            &paths.state_path,
+            &state_identity,
+            owner_policy,
+        )
+        .map_err(supervisor_error_to_io)?
         {
             if outcome == supervisor::OwnerTerminalOutcome::RecoveryRequired {
                 return emit_recovery_required(events, &session.run().run_id);
@@ -623,12 +963,13 @@ fn run_model_with_diagnostics_health(
         };
         let engine_port = session.server().port;
         let startup = match readiness_worker {
-            Ok(mut readiness_worker) => wait_for_startup_owned(
+            Ok(mut readiness_worker) => wait_for_startup_owned_with_policy(
                 session.child_mut(),
                 &state_identity,
                 &paths.state_path,
                 &signal_guard,
                 readiness_worker.as_mut(),
+                owner_policy,
                 |child, timeout, interval| match supervisor::wait_for_engine_ready_or_exit(
                     child,
                     engine_port,
@@ -641,10 +982,11 @@ fn run_model_with_diagnostics_health(
                     Err(error) => Err(error),
                 },
             ),
-            Err(error) => finish_owned_startup_failure(
+            Err(error) => finish_owned_startup_failure_with_policy(
                 session.child_mut(),
                 &paths.state_path,
                 &state_identity,
+                owner_policy,
                 error,
             ),
         };
@@ -662,12 +1004,13 @@ fn run_model_with_diagnostics_health(
         match startup {
             Ok(StartupWaitOutcome::Ready) => {
                 let ready_server = session.server().clone();
-                match emit_run_ready_owned(
+                match emit_run_ready_owned_with_policy(
                     events,
                     &ready_server,
                     session.child_mut(),
                     &paths.state_path,
                     &state_identity,
+                    owner_policy,
                 )? {
                     ReadyOutputOutcome::Ready => {}
                     ReadyOutputOutcome::RequestedStop => return Ok(RunTermination::RequestedStop),
@@ -681,7 +1024,7 @@ fn run_model_with_diagnostics_health(
                 let session_model_id = session.server().id.clone();
                 let session_log_path = session.run().log_path.clone();
                 let session_process_label = session.process_label().to_owned();
-                match supervise_running_server(
+                match supervise_running_server_with_policy(
                     RunSession {
                         id: &session_model_id,
                         state_identity: &state_identity,
@@ -693,6 +1036,7 @@ fn run_model_with_diagnostics_health(
                     gateway,
                     &session_process_label,
                     events,
+                    owner_policy,
                 )? {
                     RunOutcome::RequestedStop => {
                         if let Some(gateway) = gateway {
@@ -738,14 +1082,15 @@ fn run_model_with_diagnostics_health(
             }) => {
                 let _ = (log_tail, diagnostics_error);
                 let session_log_path = session.run().log_path.clone();
-                match supervisor::handle_observed_child_exit(
-                    session.child_mut(),
-                    &session_log_path,
-                    &paths.state_path,
-                    &state_identity,
-                    &signal_guard,
-                )
-                .map_err(supervisor_error_to_io)?
+                match owner_policy
+                    .handle_observed_exit(
+                        session.child_mut(),
+                        &session_log_path,
+                        &paths.state_path,
+                        &state_identity,
+                        &signal_guard,
+                    )
+                    .map_err(supervisor_error_to_io)?
                 {
                     ObservedChildExit::RequestedStop => return Ok(RunTermination::RequestedStop),
                     ObservedChildExit::Interrupted => return Ok(RunTermination::Interrupted),
@@ -890,6 +1235,7 @@ fn requested_startup_model<'a>(
     }
 }
 
+#[cfg(test)]
 fn uses_stable_node_host(startup_model: Option<&str>, engine: RuntimeBackendKind) -> bool {
     startup_model.is_none() || engine == RuntimeBackendKind::LlamaCpp
 }
@@ -919,12 +1265,10 @@ pub fn serve_node_with_diagnostics_health(
     events: &mut dyn LifecycleEventSink,
     diagnostics_health: loxa_core::diagnostics::DiagnosticsHealth,
 ) -> io::Result<RunTermination> {
-    let runtime_identity = format!("loxa-node-{}", std::process::id());
     tracing::info!(
         target: "loxa_node::lifecycle",
         event_code = "node.starting",
         component = "node",
-        runtime_identity = runtime_identity.as_str(),
         result_class = "starting",
     );
     let runtime = NodeBuilder::with_diagnostics_health(
@@ -942,7 +1286,6 @@ pub fn serve_node_with_diagnostics_health(
                 target: "loxa_node::lifecycle",
                 event_code = "node.start_failed",
                 component = "node",
-                runtime_identity = runtime_identity.as_str(),
                 result_class = "build_failed",
             );
             Err(error)
@@ -1270,6 +1613,7 @@ fn resolve_managed_attachment_typed(
 fn prepare_owned_replacement_run<R, D, I, RF, DF>(
     state_path: &Path,
     run: supervisor::ManagedRun,
+    owner_policy: RunOwnerPolicy<'_>,
     interrupt: &I,
     resolve: RF,
     detect: DF,
@@ -1280,23 +1624,23 @@ where
     DF: FnOnce() -> Result<D, SupervisorError>,
 {
     if InterruptSource::interrupted(interrupt) {
-        return finish_owned_replacement_interrupt(state_path, &run);
+        return finish_owned_replacement_interrupt(state_path, &run, owner_policy);
     }
 
     let resolved = match resolve() {
         Ok(resolved) => resolved,
-        Err(error) => return finish_owned_replacement_error(state_path, &run, error),
+        Err(error) => return finish_owned_replacement_error(state_path, &run, owner_policy, error),
     };
     if InterruptSource::interrupted(interrupt) {
-        return finish_owned_replacement_interrupt(state_path, &run);
+        return finish_owned_replacement_interrupt(state_path, &run, owner_policy);
     }
 
     let detected = match detect() {
         Ok(detected) => detected,
-        Err(error) => return finish_owned_replacement_error(state_path, &run, error),
+        Err(error) => return finish_owned_replacement_error(state_path, &run, owner_policy, error),
     };
     if InterruptSource::interrupted(interrupt) {
-        return finish_owned_replacement_interrupt(state_path, &run);
+        return finish_owned_replacement_interrupt(state_path, &run, owner_policy);
     }
 
     Ok(OwnedReplacementPreparation::Prepared {
@@ -1309,8 +1653,9 @@ where
 fn finish_owned_replacement_interrupt<R, D>(
     state_path: &Path,
     run: &supervisor::ManagedRun,
+    owner_policy: RunOwnerPolicy<'_>,
 ) -> Result<OwnedReplacementPreparation<R, D>, SupervisorError> {
-    match supervisor::finish_childless_runtime_state_run(state_path, &run.identity())? {
+    match owner_policy.finish_childless(state_path, run)? {
         supervisor::ChildlessFinishOutcome::RequestedStop => {
             Ok(OwnedReplacementPreparation::RequestedStop)
         }
@@ -1323,9 +1668,10 @@ fn finish_owned_replacement_interrupt<R, D>(
 fn finish_owned_replacement_error<R, D>(
     state_path: &Path,
     run: &supervisor::ManagedRun,
+    owner_policy: RunOwnerPolicy<'_>,
     error: SupervisorError,
 ) -> Result<OwnedReplacementPreparation<R, D>, SupervisorError> {
-    match supervisor::finish_childless_runtime_state_run(state_path, &run.identity())? {
+    match owner_policy.finish_childless(state_path, run)? {
         supervisor::ChildlessFinishOutcome::RequestedStop => {
             Ok(OwnedReplacementPreparation::RequestedStop)
         }
@@ -1425,6 +1771,7 @@ pub fn stop_managed_servers(
     }
 }
 
+#[cfg(test)]
 fn observe_attached_stop<C>(
     child: &mut C,
     state_path: &Path,
@@ -1433,11 +1780,27 @@ fn observe_attached_stop<C>(
 where
     C: ManagedChild + LogDrainingChild,
 {
+    observe_attached_stop_with_policy(
+        child,
+        state_path,
+        state_identity,
+        RunOwnerPolicy::Standalone,
+    )
+}
+
+fn observe_attached_stop_with_policy<C>(
+    child: &mut C,
+    state_path: &Path,
+    state_identity: &supervisor::ManagedRunIdentity,
+    owner_policy: RunOwnerPolicy<'_>,
+) -> Result<Option<supervisor::OwnerTerminalOutcome>, SupervisorError>
+where
+    C: ManagedChild + LogDrainingChild,
+{
     let current = match supervisor::current_runtime_state_run(state_path, state_identity) {
         Ok(current) => current,
         Err(error) => {
-            return match supervisor::cleanup_post_spawn_failure(child, state_path, state_identity)?
-            {
+            return match owner_policy.cleanup_by_identity(child, state_path, state_identity)? {
                 supervisor::PostSpawnCleanupOutcome::Cleaned => Err(error),
                 supervisor::PostSpawnCleanupOutcome::RequestedStop => {
                     Ok(Some(supervisor::OwnerTerminalOutcome::RequestedStop))
@@ -1451,20 +1814,23 @@ where
     if !current.stop_requested {
         return Ok(None);
     }
-    supervisor::teardown_owned_run(
-        child,
-        state_path,
-        &current.identity(),
-        supervisor::OwnerTeardownDecision::RequestedStop,
-    )
-    .map(Some)
+    owner_policy
+        .teardown_child(
+            child,
+            state_path,
+            &current,
+            supervisor::OwnerTeardownDecision::RequestedStop,
+        )
+        .map(Some)
 }
 
 fn finish_spawn_initialization<C>(
     child: &mut C,
     state_path: &Path,
-    state_identity: &supervisor::ManagedRunIdentity,
+    _state_identity: &supervisor::ManagedRunIdentity,
     error: Option<SupervisorError>,
+    owner_policy: RunOwnerPolicy<'_>,
+    current: &supervisor::ManagedRun,
 ) -> Result<Option<supervisor::PostSpawnCleanupOutcome>, SupervisorError>
 where
     C: ManagedChild + LogDrainingChild,
@@ -1472,7 +1838,7 @@ where
     let Some(error) = error else {
         return Ok(None);
     };
-    match supervisor::cleanup_post_spawn_failure(child, state_path, state_identity)? {
+    match owner_policy.cleanup_child(child, state_path, current)? {
         supervisor::PostSpawnCleanupOutcome::Cleaned => Err(error),
         outcome @ (supervisor::PostSpawnCleanupOutcome::RequestedStop
         | supervisor::PostSpawnCleanupOutcome::RecoveryRequired) => Ok(Some(outcome)),
@@ -1483,24 +1849,53 @@ fn finish_spawned_interrupt<C>(
     child: &mut C,
     state_path: &Path,
     state_identity: &supervisor::ManagedRunIdentity,
+    owner_policy: RunOwnerPolicy<'_>,
+    current: &supervisor::ManagedRun,
 ) -> Result<supervisor::OwnerTerminalOutcome, SupervisorError>
 where
     C: ManagedChild + LogDrainingChild,
 {
-    supervisor::teardown_owned_run(
+    let _ = state_identity;
+    owner_policy.teardown_child(
         child,
         state_path,
-        state_identity,
+        current,
         supervisor::OwnerTeardownDecision::Interrupted,
     )
 }
 
+#[cfg(test)]
 fn wait_for_startup_owned<C, I, W>(
     child: &mut C,
     state_identity: &supervisor::ManagedRunIdentity,
     state_path: &Path,
     interrupt: &I,
+    readiness_worker: Option<&mut supervisor::ChatCompletionReadinessWorker>,
+    wait_step: W,
+) -> Result<StartupWaitOutcome, StartupWaitFailure>
+where
+    C: ManagedChild + LogDrainingChild,
+    I: InterruptSource,
+    W: FnMut(&mut C, Duration, Duration) -> Result<StartupPoll, SupervisorError>,
+{
+    wait_for_startup_owned_with_policy(
+        child,
+        state_identity,
+        state_path,
+        interrupt,
+        readiness_worker,
+        RunOwnerPolicy::Standalone,
+        wait_step,
+    )
+}
+
+fn wait_for_startup_owned_with_policy<C, I, W>(
+    child: &mut C,
+    state_identity: &supervisor::ManagedRunIdentity,
+    state_path: &Path,
+    interrupt: &I,
     mut readiness_worker: Option<&mut supervisor::ChatCompletionReadinessWorker>,
+    owner_policy: RunOwnerPolicy<'_>,
     mut wait_step: W,
 ) -> Result<StartupWaitOutcome, StartupWaitFailure>
 where
@@ -1513,31 +1908,34 @@ where
         let current = match supervisor::current_runtime_state_run(state_path, state_identity) {
             Ok(current) => current,
             Err(error) => {
-                return finish_owned_startup_failure_after_readiness(
+                return finish_owned_startup_failure_after_readiness_with_policy(
                     child,
                     state_path,
                     state_identity,
                     &mut readiness_worker,
+                    owner_policy,
                     error,
                 );
             }
         };
         if current.stop_requested {
-            return finish_owned_startup_transition_after_readiness(
+            return finish_owned_startup_transition_after_readiness_with_policy(
                 child,
                 state_path,
                 &current.identity(),
                 supervisor::OwnerTeardownDecision::RequestedStop,
                 &mut readiness_worker,
+                owner_policy,
             );
         }
         if InterruptSource::interrupted(interrupt) {
-            return finish_owned_startup_transition_after_readiness(
+            return finish_owned_startup_transition_after_readiness_with_policy(
                 child,
                 state_path,
                 state_identity,
                 supervisor::OwnerTeardownDecision::Interrupted,
                 &mut readiness_worker,
+                owner_policy,
             );
         }
 
@@ -1553,11 +1951,12 @@ where
             }
             Ok(None) => {}
             Err(error) => {
-                return finish_owned_startup_failure_after_readiness(
+                return finish_owned_startup_failure_after_readiness_with_policy(
                     child,
                     state_path,
                     state_identity,
                     &mut readiness_worker,
+                    owner_policy,
                     SupervisorError::Io(error),
                 );
             }
@@ -1565,11 +1964,12 @@ where
 
         let remaining = supervisor::HEALTH_TIMEOUT.saturating_sub(started.elapsed());
         if remaining.is_zero() {
-            return finish_owned_startup_failure_after_readiness(
+            return finish_owned_startup_failure_after_readiness_with_policy(
                 child,
                 state_path,
                 state_identity,
                 &mut readiness_worker,
+                owner_policy,
                 SupervisorError::HealthTimeout,
             );
         }
@@ -1587,27 +1987,35 @@ where
             Ok(StartupPoll::Pending) => {}
             Ok(StartupPoll::Ready) => {
                 if let Err(error) = cancel_startup_readiness(&mut readiness_worker) {
-                    return finish_owned_startup_failure(child, state_path, state_identity, error);
+                    return finish_owned_startup_failure_with_policy(
+                        child,
+                        state_path,
+                        state_identity,
+                        owner_policy,
+                        error,
+                    );
                 }
                 let current =
                     match supervisor::current_runtime_state_run(state_path, state_identity) {
                         Ok(current) => current,
                         Err(error) => {
-                            return finish_owned_startup_failure(
+                            return finish_owned_startup_failure_with_policy(
                                 child,
                                 state_path,
                                 state_identity,
+                                owner_policy,
                                 error,
                             );
                         }
                     };
                 if current.stop_requested {
-                    return finish_owned_startup_transition_after_readiness(
+                    return finish_owned_startup_transition_after_readiness_with_policy(
                         child,
                         state_path,
                         &current.identity(),
                         supervisor::OwnerTeardownDecision::RequestedStop,
                         &mut readiness_worker,
+                        owner_policy,
                     );
                 }
                 return Ok(StartupWaitOutcome::Ready);
@@ -1625,11 +2033,12 @@ where
                 });
             }
             Err(error) => {
-                return finish_owned_startup_failure_after_readiness(
+                return finish_owned_startup_failure_after_readiness_with_policy(
                     child,
                     state_path,
                     state_identity,
                     &mut readiness_worker,
+                    owner_policy,
                     error,
                 );
             }
@@ -1651,32 +2060,35 @@ fn cancel_startup_readiness(
     result
 }
 
-fn finish_owned_startup_failure_after_readiness<C>(
+fn finish_owned_startup_failure_after_readiness_with_policy<C>(
     child: &mut C,
     state_path: &Path,
     state_identity: &supervisor::ManagedRunIdentity,
     worker: &mut Option<&mut supervisor::ChatCompletionReadinessWorker>,
+    owner_policy: RunOwnerPolicy<'_>,
     error: SupervisorError,
 ) -> Result<StartupWaitOutcome, StartupWaitFailure>
 where
     C: ManagedChild + LogDrainingChild,
 {
     let error = cancel_startup_readiness(worker).err().unwrap_or(error);
-    finish_owned_startup_failure(child, state_path, state_identity, error)
+    finish_owned_startup_failure_with_policy(child, state_path, state_identity, owner_policy, error)
 }
 
-fn finish_owned_startup_transition_after_readiness<C>(
+fn finish_owned_startup_transition_after_readiness_with_policy<C>(
     child: &mut C,
     state_path: &Path,
     state_identity: &supervisor::ManagedRunIdentity,
     decision: supervisor::OwnerTeardownDecision,
     worker: &mut Option<&mut supervisor::ChatCompletionReadinessWorker>,
+    owner_policy: RunOwnerPolicy<'_>,
 ) -> Result<StartupWaitOutcome, StartupWaitFailure>
 where
     C: ManagedChild + LogDrainingChild,
 {
     let cancellation = cancel_startup_readiness(worker);
-    let outcome = supervisor::teardown_owned_run(child, state_path, state_identity, decision)
+    let outcome = owner_policy
+        .teardown_by_identity(child, state_path, state_identity, decision)
         .map_err(StartupWaitFailure::AfterTeardown)?;
     if let Err(error) = cancellation {
         return Err(StartupWaitFailure::AfterTeardown(error));
@@ -1684,16 +2096,18 @@ where
     map_owned_startup_transition(outcome)
 }
 
-fn finish_owned_startup_failure<C>(
+fn finish_owned_startup_failure_with_policy<C>(
     child: &mut C,
     state_path: &Path,
     state_identity: &supervisor::ManagedRunIdentity,
+    owner_policy: RunOwnerPolicy<'_>,
     error: SupervisorError,
 ) -> Result<StartupWaitOutcome, StartupWaitFailure>
 where
     C: ManagedChild + LogDrainingChild,
 {
-    match supervisor::cleanup_post_spawn_failure(child, state_path, state_identity)
+    match owner_policy
+        .cleanup_by_identity(child, state_path, state_identity)
         .map_err(StartupWaitFailure::AfterTeardown)?
     {
         supervisor::PostSpawnCleanupOutcome::Cleaned => {
@@ -1716,6 +2130,7 @@ fn map_owned_startup_transition(
     })
 }
 
+#[cfg(test)]
 fn supervise_running_server<C, I: InterruptSource + InterruptStatus>(
     session: RunSession<'_>,
     child: &mut C,
@@ -1727,10 +2142,37 @@ fn supervise_running_server<C, I: InterruptSource + InterruptStatus>(
 where
     C: ManagedChild + LogDrainingChild,
 {
+    supervise_running_server_with_policy(
+        session,
+        child,
+        interrupt,
+        gateway,
+        process_label,
+        events,
+        RunOwnerPolicy::Standalone,
+    )
+}
+
+fn supervise_running_server_with_policy<C, I: InterruptSource + InterruptStatus>(
+    session: RunSession<'_>,
+    child: &mut C,
+    interrupt: &I,
+    gateway: Option<&loxa_core::gateway::GatewayState>,
+    process_label: &str,
+    events: &mut dyn LifecycleEventSink,
+    owner_policy: RunOwnerPolicy<'_>,
+) -> io::Result<RunOutcome>
+where
+    C: ManagedChild + LogDrainingChild,
+{
     loop {
-        if let Some(outcome) =
-            observe_attached_stop(child, session.state_path, session.state_identity)
-                .map_err(supervisor_error_to_io)?
+        if let Some(outcome) = observe_attached_stop_with_policy(
+            child,
+            session.state_path,
+            session.state_identity,
+            owner_policy,
+        )
+        .map_err(supervisor_error_to_io)?
         {
             if let Some(gateway) = gateway {
                 gateway.withdraw();
@@ -1741,13 +2183,14 @@ where
             if let Some(gateway) = gateway {
                 gateway.withdraw();
             }
-            let outcome = supervisor::teardown_owned_run(
-                child,
-                session.state_path,
-                session.state_identity,
-                supervisor::OwnerTeardownDecision::Interrupted,
-            )
-            .map_err(supervisor_error_to_io)?;
+            let outcome = owner_policy
+                .teardown_by_identity(
+                    child,
+                    session.state_path,
+                    session.state_identity,
+                    supervisor::OwnerTeardownDecision::Interrupted,
+                )
+                .map_err(supervisor_error_to_io)?;
             return Ok(owner_terminal_to_run_outcome(outcome));
         }
         match child.try_wait() {
@@ -1756,12 +2199,9 @@ where
                 if let Some(gateway) = gateway {
                     gateway.withdraw();
                 }
-                return match supervisor::cleanup_post_spawn_failure(
-                    child,
-                    session.state_path,
-                    session.state_identity,
-                )
-                .map_err(supervisor_error_to_io)?
+                return match owner_policy
+                    .cleanup_by_identity(child, session.state_path, session.state_identity)
+                    .map_err(supervisor_error_to_io)?
                 {
                     supervisor::PostSpawnCleanupOutcome::Cleaned => Err(error),
                     supervisor::PostSpawnCleanupOutcome::RequestedStop => {
@@ -1776,14 +2216,15 @@ where
                 if let Some(gateway) = gateway {
                     gateway.withdraw();
                 }
-                match supervisor::handle_observed_child_exit(
-                    child,
-                    session.log_path,
-                    session.state_path,
-                    session.state_identity,
-                    interrupt,
-                )
-                .map_err(supervisor_error_to_io)?
+                match owner_policy
+                    .handle_observed_exit(
+                        child,
+                        session.log_path,
+                        session.state_path,
+                        session.state_identity,
+                        interrupt,
+                    )
+                    .map_err(supervisor_error_to_io)?
                 {
                     ObservedChildExit::RequestedStop => return Ok(RunOutcome::RequestedStop),
                     ObservedChildExit::Interrupted => return Ok(RunOutcome::Interrupted),
@@ -1818,6 +2259,7 @@ fn owner_terminal_to_run_outcome(outcome: supervisor::OwnerTerminalOutcome) -> R
     }
 }
 
+#[cfg(test)]
 fn emit_run_ready_owned<C>(
     events: &mut dyn LifecycleEventSink,
     server: &ManagedServer,
@@ -1828,12 +2270,34 @@ fn emit_run_ready_owned<C>(
 where
     C: ManagedChild + LogDrainingChild,
 {
+    emit_run_ready_owned_with_policy(
+        events,
+        server,
+        child,
+        state_path,
+        state_identity,
+        RunOwnerPolicy::Standalone,
+    )
+}
+
+fn emit_run_ready_owned_with_policy<C>(
+    events: &mut dyn LifecycleEventSink,
+    server: &ManagedServer,
+    child: &mut C,
+    state_path: &Path,
+    state_identity: &supervisor::ManagedRunIdentity,
+    owner_policy: RunOwnerPolicy<'_>,
+) -> io::Result<ReadyOutputOutcome>
+where
+    C: ManagedChild + LogDrainingChild,
+{
     let Err(output_error) = events.emit(LifecycleEvent::ModelReady {
         server: server.clone(),
     }) else {
         return Ok(ReadyOutputOutcome::Ready);
     };
-    match supervisor::cleanup_post_spawn_failure(child, state_path, state_identity)
+    match owner_policy
+        .cleanup_by_identity(child, state_path, state_identity)
         .map_err(supervisor_error_to_io)?
     {
         supervisor::PostSpawnCleanupOutcome::Cleaned => Err(output_error),
@@ -2016,6 +2480,32 @@ mod lifecycle_api_tests {
         let mut response = String::new();
         stream.read_to_string(&mut response).expect("read response");
         response
+    }
+
+    fn http_json(response: &str) -> serde_json::Value {
+        let (_, body) = response
+            .split_once("\r\n\r\n")
+            .expect("HTTP response has a body separator");
+        serde_json::from_str(body).expect("HTTP response body is JSON")
+    }
+
+    fn wait_for_runtime_cleanup(paths: &NodePaths, port: u16) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let listener = TcpListener::bind(("127.0.0.1", port));
+            let owner_released = matches!(
+                managed_servers(paths),
+                Ok(ManagedRunsSnapshot::Runs(ref runs)) if runs.is_empty()
+            );
+            if listener.is_ok() && owner_released {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "runtime cleanup did not release listener and exact owner"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     fn http_stream_prefix(port: u16, request: &str) -> String {
@@ -2572,6 +3062,9 @@ mod lifecycle_api_tests {
             "{diagnostics}"
         );
         assert_eq!(diagnostics.matches("component=\"node\"").count(), 2);
+        assert!(!diagnostics.contains("runtime_identity="));
+        assert!(!diagnostics.contains("node_id="));
+        assert!(!diagnostics.contains("node_instance_id="));
         assert!(!diagnostics.contains("ARBITRARY_ERROR_SENTINEL"));
     }
 
@@ -2681,6 +3174,63 @@ mod lifecycle_api_tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn node_id_is_stable_and_instance_identity_is_fresh_across_runtime_restart() {
+        let temp = TestDir::new("builder-identity-restart");
+        let paths = NodePaths {
+            models_dir: temp.0.join("models"),
+            state_path: temp.0.join("managed.json"),
+            logs_dir: temp.0.join("logs"),
+        };
+        let nonce = "01".repeat(32);
+
+        let observe = || {
+            let runtime = NodeBuilder::new(None, Some(0), RuntimeBackendKind::LlamaCpp, &paths)
+                .build()
+                .expect("build unloaded runtime");
+            let port = runtime.port();
+            let status = http_json(&http_request(
+                port,
+                "GET /loxa/status HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            ));
+            let proof = http_json(&http_request(
+                port,
+                &format!(
+                    "GET /loxa/v1/node HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Loxa-Challenge: {nonce}\r\nConnection: close\r\n\r\n"
+                ),
+            ));
+            assert_eq!(status["node_id"], proof["node_id"]);
+            assert_eq!(proof["protocol_version"], 1);
+            assert_eq!(proof["status"], "unloaded");
+            let token = loxa_core::control::auth::ControlToken::load(&temp.0.join("control.token"))
+                .expect("load control token");
+            assert!(token.verify_node_identity_proof(
+                &nonce,
+                proof["node_id"].as_str().expect("node id string"),
+                proof["runtime_identity"]
+                    .as_str()
+                    .expect("runtime identity string"),
+                loxa_core::control::contracts::NodeStatus::Unloaded,
+                proof["challenge_proof"].as_str().expect("proof string"),
+            ));
+            let observed = (
+                proof["node_id"].as_str().unwrap().to_owned(),
+                proof["runtime_identity"].as_str().unwrap().to_owned(),
+            );
+            drop(runtime);
+            wait_for_runtime_cleanup(&paths, port);
+            observed
+        };
+
+        let first = observe();
+        let second = observe();
+        assert_eq!(first.0, second.0, "durable NodeId must survive restart");
+        assert_ne!(
+            first.1, second.1,
+            "NodeInstanceId must be fresh for each successful start"
+        );
     }
 
     #[test]
@@ -2803,6 +3353,54 @@ mod lifecycle_api_tests {
         assert_eq!(
             managed_servers(&paths).unwrap(),
             ManagedRunsSnapshot::Runs(Vec::new())
+        );
+    }
+
+    #[test]
+    fn every_api_path_rejects_a_second_owner_before_identity_mutation() {
+        let temp = TestDir::new("all-path-second-owner");
+        let paths = NodePaths {
+            models_dir: temp.0.join("models"),
+            state_path: temp.0.join("managed.json"),
+            logs_dir: temp.0.join("logs"),
+        };
+        std::fs::create_dir_all(&paths.models_dir).unwrap();
+        let recipe = &REGISTRY[0];
+        std::fs::write(
+            paths.models_dir.join(recipe.filename),
+            b"validation fixture",
+        )
+        .unwrap();
+        let owner = claim_unloaded_owner(&paths, 19_742).expect("claim active owner");
+
+        for (requested, engine) in [
+            (None, RuntimeBackendKind::LlamaCpp),
+            (Some(recipe.id), RuntimeBackendKind::LlamaCpp),
+            (
+                Some("mlx-community/second-owner-fixture"),
+                RuntimeBackendKind::PyMlxLm,
+            ),
+        ] {
+            let error = NodeBuilder::new(requested, Some(0), engine, &paths)
+                .build()
+                .err()
+                .expect("active owner must reject second runtime");
+            assert!(!error.to_string().is_empty());
+            assert!(!temp.0.join("identity").exists());
+            assert!(!temp.0.join("control.token").exists());
+            assert!(!temp.0.join("history").exists());
+            let supervisor::RuntimeStateRead::Loaded(runs) =
+                supervisor::read_runtime_state(&paths.state_path).unwrap()
+            else {
+                panic!("active owner remains loaded");
+            };
+            assert_eq!(runs, vec![owner.clone()]);
+        }
+
+        assert_eq!(
+            supervisor::finish_childless_runtime_state_run(&paths.state_path, &owner.identity(),)
+                .unwrap(),
+            supervisor::ChildlessFinishOutcome::Finished
         );
     }
 
@@ -3084,6 +3682,18 @@ mod lifecycle_api_tests {
         let token = loxa_core::control::auth::ControlToken::load(&temp.0.join("control.token"))
             .expect("load control token");
         let bearer = token.expose_for_authorization();
+        let nonce = "01".repeat(32);
+        let identity_proof = http_json(&http_request(
+            port,
+            &format!(
+                "GET /loxa/v1/node HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Loxa-Challenge: {nonce}\r\nConnection: close\r\n\r\n"
+            ),
+        ));
+        let diagnostic_node_id = identity_proof["node_id"].as_str().unwrap().to_owned();
+        let diagnostic_instance_id = identity_proof["runtime_identity"]
+            .as_str()
+            .unwrap()
+            .to_owned();
         let authenticated_node = http_request(port, &format!("GET /loxa/v1/node HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {bearer}\r\nOrigin: tauri://localhost\r\nConnection: close\r\n\r\n"));
         assert!(
             authenticated_node.starts_with("HTTP/1.1 200"),
@@ -3168,6 +3778,9 @@ mod lifecycle_api_tests {
             "{diagnostics}"
         );
         assert!(diagnostics.contains("component=\"node\""), "{diagnostics}");
+        assert!(diagnostics.contains(&format!("node_id=\"{diagnostic_node_id}\"")));
+        assert!(diagnostics.contains(&format!("node_instance_id=\"{diagnostic_instance_id}\"")));
+        assert!(!diagnostics.contains("runtime_identity="));
         assert!(
             diagnostics.contains("component=\"shutdown\""),
             "{diagnostics}"
@@ -3393,6 +4006,7 @@ mod lifecycle_api_tests {
         let error = finish_owned_replacement_error::<(), ()>(
             &state_path,
             &run,
+            RunOwnerPolicy::Standalone,
             SupervisorError::NoFreePort,
         )
         .expect_err("cleanup conflict must replace the spawn error");
@@ -3417,6 +4031,7 @@ mod lifecycle_api_tests {
         let error = prepare_owned_replacement_run(
             &state_path,
             run,
+            RunOwnerPolicy::Standalone,
             &signal,
             || Err::<(), _>(SupervisorError::NoFreePort),
             || -> Result<(), SupervisorError> {
@@ -3445,6 +4060,7 @@ mod lifecycle_api_tests {
         let error = prepare_owned_replacement_run(
             &state_path,
             run,
+            RunOwnerPolicy::Standalone,
             &signal,
             || Ok("resolved"),
             || Err::<(), _>(SupervisorError::LlamaServerNotFound),
@@ -3471,6 +4087,7 @@ mod lifecycle_api_tests {
         let outcome = prepare_owned_replacement_run(
             &state_path,
             run,
+            RunOwnerPolicy::Standalone,
             &signal,
             || Ok("resolved"),
             || -> Result<(), SupervisorError> { panic!("detection must not run after interrupt") },
@@ -3497,6 +4114,7 @@ mod lifecycle_api_tests {
         let outcome = prepare_owned_replacement_run(
             &state_path,
             run,
+            RunOwnerPolicy::Standalone,
             &signal,
             || Ok("resolved"),
             || Ok("detected"),
@@ -3525,6 +4143,7 @@ mod lifecycle_api_tests {
         let outcome = prepare_owned_replacement_run(
             &state_path,
             run,
+            RunOwnerPolicy::Standalone,
             &signal,
             || {
                 request_stop_for_test(&state_path, &identity);
@@ -3571,6 +4190,7 @@ mod lifecycle_api_tests {
         let ordinary_error = finish_owned_replacement_error::<(), ()>(
             &ordinary_state_path,
             &ordinary_run,
+            RunOwnerPolicy::Standalone,
             reservation_error,
         )
         .expect_err("blocked replacement reservation must fail");
@@ -3605,6 +4225,7 @@ mod lifecycle_api_tests {
         let stopped_outcome = finish_owned_replacement_error::<(), ()>(
             &stopped_state_path,
             &stopped_run,
+            RunOwnerPolicy::Standalone,
             reservation_error,
         )
         .expect("durable stop must win over replacement reservation failure");
@@ -3687,8 +4308,14 @@ mod lifecycle_api_tests {
         supervisor::create_starting_run(&state_path, run.clone()).expect("create starting run");
         let mut child = FakeStartupChild::with_wait_results(vec![Some(0)]);
 
-        let outcome = finish_spawned_interrupt(&mut child, &state_path, &run.identity())
-            .expect("interrupt cleanup outcome");
+        let outcome = finish_spawned_interrupt(
+            &mut child,
+            &state_path,
+            &run.identity(),
+            RunOwnerPolicy::Standalone,
+            &run,
+        )
+        .expect("interrupt cleanup outcome");
 
         assert_eq!(outcome, supervisor::OwnerTerminalOutcome::RecoveryRequired);
         assert_eq!(
@@ -3721,6 +4348,8 @@ mod lifecycle_api_tests {
             Some(SupervisorError::Io(io::Error::other(
                 "injected drain initialization failure",
             ))),
+            RunOwnerPolicy::Standalone,
+            &run,
         )
         .expect("initialization cleanup outcome");
 
@@ -4665,6 +5294,7 @@ LOXA_MLX_RESTART_CHILD="1" \
         let terminal = finish_owned_replacement_error::<(), ()>(
             &state_path,
             &replacement,
+            RunOwnerPolicy::Standalone,
             SupervisorError::NoFreePort,
         )
         .expect("committed stop must win after the non-fatal event");
@@ -4838,6 +5468,7 @@ LOXA_MLX_RESTART_CHILD="1" \
         let error = finish_owned_replacement_error::<(), ()>(
             &state_path,
             &replacement,
+            RunOwnerPolicy::Standalone,
             SupervisorError::NoFreePort,
         )
         .expect_err("newer exact state must beat stale handoff");
@@ -4976,6 +5607,118 @@ LOXA_MLX_RESTART_CHILD="1" \
             supervisor::read_runtime_state(&state_path).expect("read removed generation one"),
             RuntimeStateRead::Loaded(Vec::new())
         );
+    }
+
+    #[test]
+    fn prepared_python_policy_restores_childless_owner_without_a_lease_gap() {
+        let temp = TempDir::new("loxa-prepared-python-childless");
+        let paths = NodePaths {
+            models_dir: temp.path().join("models"),
+            state_path: temp.path().join("managed.json"),
+            logs_dir: temp.path().join("logs"),
+        };
+        let baseline = claim_unloaded_owner(&paths, 19_751).expect("claim unloaded owner");
+        let supervisor::PrepareUnloadedOwnerOutcome::Prepared(prepared) =
+            supervisor::prepare_unloaded_owner_for_model(
+                &paths.state_path,
+                &baseline,
+                "mlx/model".to_string(),
+                19_752,
+                paths.logs_dir.join("engine.log"),
+            )
+            .expect("prepare Python owner")
+        else {
+            panic!("owner must prepare");
+        };
+        let policy = PreparedPythonOwnerPolicy::new(&baseline);
+
+        let disposition = policy
+            .finish_childless(&paths.state_path, &prepared)
+            .expect("restore childless owner");
+
+        assert_eq!(
+            disposition,
+            PreparedPythonOwnerDisposition::Restored(baseline.clone())
+        );
+        assert_eq!(
+            supervisor::read_runtime_state(&paths.state_path).expect("read restored owner"),
+            RuntimeStateRead::Loaded(vec![baseline])
+        );
+    }
+
+    #[test]
+    fn prepared_python_policy_consumes_a_concurrent_stop_instead_of_restoring() {
+        let temp = TempDir::new("loxa-prepared-python-stop");
+        let paths = NodePaths {
+            models_dir: temp.path().join("models"),
+            state_path: temp.path().join("managed.json"),
+            logs_dir: temp.path().join("logs"),
+        };
+        let baseline = claim_unloaded_owner(&paths, 19_753).expect("claim unloaded owner");
+        let supervisor::PrepareUnloadedOwnerOutcome::Prepared(prepared) =
+            supervisor::prepare_unloaded_owner_for_model(
+                &paths.state_path,
+                &baseline,
+                "mlx/model".to_string(),
+                19_754,
+                paths.logs_dir.join("engine.log"),
+            )
+            .expect("prepare Python owner")
+        else {
+            panic!("owner must prepare");
+        };
+        let stopped = request_stop_for_test(&paths.state_path, &prepared.identity());
+
+        let disposition = PreparedPythonOwnerPolicy::new(&baseline)
+            .finish_childless(&paths.state_path, &stopped)
+            .expect("consume prepared stop");
+
+        assert_eq!(
+            disposition,
+            PreparedPythonOwnerDisposition::ConsumedByRequestedStop
+        );
+        assert_eq!(
+            supervisor::read_runtime_state(&paths.state_path).expect("read consumed state"),
+            RuntimeStateRead::Loaded(Vec::new())
+        );
+    }
+
+    #[test]
+    fn prepared_python_missing_exact_row_requires_recovery_without_signalling_child() {
+        let temp = TempDir::new("loxa-prepared-python-missing-row");
+        let paths = NodePaths {
+            models_dir: temp.path().join("models"),
+            state_path: temp.path().join("managed.json"),
+            logs_dir: temp.path().join("logs"),
+        };
+        let baseline = claim_unloaded_owner(&paths, 19_755).expect("claim unloaded owner");
+        let supervisor::PrepareUnloadedOwnerOutcome::Prepared(prepared) =
+            supervisor::prepare_unloaded_owner_for_model(
+                &paths.state_path,
+                &baseline,
+                "mlx/model".to_string(),
+                19_756,
+                paths.logs_dir.join("engine.log"),
+            )
+            .expect("prepare Python owner")
+        else {
+            panic!("owner must prepare");
+        };
+        assert!(
+            supervisor::finish_runtime_state_run(&paths.state_path, &prepared.identity())
+                .expect("remove exact row")
+        );
+        let mut child = FakeStartupChild::with_wait_results(vec![Some(0)]);
+
+        let outcome = RunOwnerPolicy::Prepared(PreparedPythonOwnerPolicy::new(&baseline))
+            .cleanup_by_identity(&mut child, &paths.state_path, &prepared.identity())
+            .expect("missing row is typed recovery");
+
+        assert_eq!(
+            outcome,
+            supervisor::PostSpawnCleanupOutcome::RecoveryRequired
+        );
+        assert!(child.events.into_inner().is_empty());
     }
 
     #[test]

@@ -385,6 +385,7 @@ mod tests {
     };
     use futures_util::{stream, StreamExt};
     use loxa_core::gateway::{EngineTarget, GatewayState, GenerationOutput};
+    use loxa_protocol::{NodeId, NodeInstanceId};
     use serde_json::{json, Value};
     use std::{
         convert::Infallible,
@@ -902,7 +903,7 @@ mod tests {
         let upstream_task = tokio::spawn(async move {
             axum::serve(listener, upstream).await.unwrap();
         });
-        let gateway = GatewayState::new("correlation-test");
+        let gateway = GatewayState::new(NodeId::new_v4(), NodeInstanceId::new_v4());
         gateway.publish(EngineTarget {
             base_url: format!("http://{address}"),
             backend_alias: "engine-model".to_owned(),

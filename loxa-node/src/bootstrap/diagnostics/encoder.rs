@@ -61,6 +61,8 @@ const ALLOWED_FIELDS: &[&str] = &[
     "latency_ms",
     "method",
     "model_id",
+    "node_id",
+    "node_instance_id",
     "operation_id",
     "ready",
     "recipe_id",

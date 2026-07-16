@@ -842,6 +842,28 @@ where
     )
 }
 
+pub fn persist_managed_server_or_cleanup_prepared<C>(
+    child: &mut C,
+    state_path: &Path,
+    run: ManagedRun,
+    server: ManagedServer,
+    baseline: &ManagedRun,
+) -> Result<PersistManagedServerOutcome, SupervisorError>
+where
+    C: ManagedChild + LogDrainingChild,
+{
+    persist_managed_server_or_cleanup_with(
+        child,
+        state_path,
+        run,
+        server,
+        |child, path, expected| {
+            let current = current_runtime_state_run(path, expected)?;
+            cleanup_prepared_owner(child, path, &current, baseline)
+        },
+    )
+}
+
 fn persist_managed_server_or_cleanup_with<C, T>(
     child: &mut C,
     state_path: &Path,
@@ -901,6 +923,45 @@ where
     })
 }
 
+pub fn cleanup_post_spawn_failure_prepared<C>(
+    child: &mut C,
+    state_path: &Path,
+    current: &ManagedRun,
+    baseline: &ManagedRun,
+) -> Result<PostSpawnCleanupOutcome, SupervisorError>
+where
+    C: ManagedChild + LogDrainingChild,
+{
+    cleanup_prepared_owner(child, state_path, current, baseline)
+}
+
+fn cleanup_prepared_owner<C>(
+    child: &mut C,
+    state_path: &Path,
+    current: &ManagedRun,
+    baseline: &ManagedRun,
+) -> Result<PostSpawnCleanupOutcome, SupervisorError>
+where
+    C: ManagedChild + LogDrainingChild,
+{
+    let confirmation = teardown_managed_child(child, CTRL_C_GRACE_PERIOD)?;
+    match restore_unloaded_owner_after_prepared_run(
+        state_path,
+        current,
+        baseline,
+        match confirmation {
+            TeardownConfirmation::Confirmed => PreparedOwnerCleanup::ConfirmedReaped,
+            TeardownConfirmation::Unconfirmed => PreparedOwnerCleanup::Uncertain,
+        },
+    )? {
+        RestoreUnloadedOwnerOutcome::Restored(_) => Ok(PostSpawnCleanupOutcome::Cleaned),
+        RestoreUnloadedOwnerOutcome::RequestedStop => Ok(PostSpawnCleanupOutcome::RequestedStop),
+        RestoreUnloadedOwnerOutcome::RecoveryRequired => {
+            Ok(PostSpawnCleanupOutcome::RecoveryRequired)
+        }
+    }
+}
+
 pub fn teardown_owned_run<C>(
     child: &mut C,
     state_path: &Path,
@@ -941,6 +1002,45 @@ where
         || teardown::teardown_managed_child_result(child).confirmation,
         || read_log_tail(log_path, LOG_TAIL_BYTES),
     )
+}
+
+pub fn handle_observed_child_exit_prepared<C, I>(
+    child: &mut C,
+    log_path: &Path,
+    state_path: &Path,
+    state_identity: &ManagedRunIdentity,
+    baseline: &ManagedRun,
+    interrupt: &I,
+) -> Result<ObservedChildExit, SupervisorError>
+where
+    C: ManagedChild + LogDrainingChild,
+    I: InterruptStatus,
+{
+    let current = current_runtime_state_run(state_path, state_identity)?;
+    if current.generation == 0 && !current.stop_requested && !interrupt.interrupted() {
+        return handle_observed_child_exit(child, log_path, state_path, state_identity, interrupt);
+    }
+
+    let confirmation = teardown_managed_child(child, CTRL_C_GRACE_PERIOD)?;
+    let restored = restore_unloaded_owner_after_prepared_run(
+        state_path,
+        &current,
+        baseline,
+        match confirmation {
+            TeardownConfirmation::Confirmed => PreparedOwnerCleanup::ConfirmedReaped,
+            TeardownConfirmation::Unconfirmed => PreparedOwnerCleanup::Uncertain,
+        },
+    )?;
+    match restored {
+        RestoreUnloadedOwnerOutcome::RequestedStop => Ok(ObservedChildExit::RequestedStop),
+        RestoreUnloadedOwnerOutcome::RecoveryRequired => Ok(ObservedChildExit::RecoveryRequired),
+        RestoreUnloadedOwnerOutcome::Restored(_) if interrupt.interrupted() => {
+            Ok(ObservedChildExit::Interrupted)
+        }
+        RestoreUnloadedOwnerOutcome::Restored(_) => Ok(ObservedChildExit::Exhausted {
+            log_tail: read_log_tail(log_path, LOG_TAIL_BYTES)?,
+        }),
+    }
 }
 
 /// Spawns one validated childless managed engine generation through the complete boundary.
