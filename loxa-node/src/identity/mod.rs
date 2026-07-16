@@ -3,9 +3,9 @@ use std::fmt;
 use std::io;
 use std::path::Path;
 
-#[cfg(not(unix))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod non_unix;
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod unix;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,21 +42,21 @@ impl IdentityErrorClass {
 #[derive(Debug)]
 pub(crate) struct IdentityError {
     class: IdentityErrorClass,
-    source: Option<io::Error>,
+    _source: Option<io::Error>,
 }
 
 impl IdentityError {
-    const fn classified(class: IdentityErrorClass) -> Self {
+    fn classified(class: IdentityErrorClass) -> Self {
         Self {
             class,
-            source: None,
+            _source: None,
         }
     }
 
     fn with_source(class: IdentityErrorClass, source: io::Error) -> Self {
         Self {
             class,
-            source: Some(source),
+            _source: Some(source),
         }
     }
 
@@ -74,9 +74,7 @@ impl fmt::Display for IdentityError {
 
 impl std::error::Error for IdentityError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source
-            .as_ref()
-            .map(|source| source as &(dyn std::error::Error + 'static))
+        None
     }
 }
 
@@ -84,9 +82,9 @@ pub(crate) fn open_or_create(loxa_root: &Path) -> Result<NodeId, IdentityError> 
     platform::open_or_create(loxa_root)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 use non_unix as platform;
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use unix as platform;
 
 #[cfg(test)]
