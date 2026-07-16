@@ -2135,6 +2135,38 @@ mod lifecycle_api_tests {
 
     #[test]
     fn node_listening_sink_failure_joins_gateway_before_returning() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .env("LOXA_LISTENING_SINK_FAILURE_CHILD", "1")
+            .args([
+                "--exact",
+                "lifecycle_api_tests::node_listening_sink_failure_child",
+                "--nocapture",
+            ])
+            .output()
+            .expect("run isolated lifecycle diagnostic regression");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "isolated lifecycle regression failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(stdout.contains("running 1 test"), "{stdout}");
+        assert!(stdout.contains("1 passed; 0 failed"), "{stdout}");
+    }
+
+    #[test]
+    fn node_listening_sink_failure_child() {
+        let arguments: Vec<_> = std::env::args().collect();
+        let exact_child = std::env::var_os("LOXA_LISTENING_SINK_FAILURE_CHILD").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+            && arguments.iter().any(|argument| argument == "--exact")
+            && arguments.iter().any(|argument| {
+                argument == "lifecycle_api_tests::node_listening_sink_failure_child"
+            });
+        if !exact_child {
+            return;
+        }
+
         let temp = TestDir::new("SECRET_MODEL_PATH-listening-sink-failure");
         let paths = NodePaths {
             models_dir: temp.0.join("models"),
