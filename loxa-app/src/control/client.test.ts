@@ -41,8 +41,8 @@ describe("control client", () => {
       Response.json(
         {
           protocol_version: 1,
-          node_id: "node-1",
-          runtime_identity: "runtime-1",
+          node_id: "550e8400-e29b-41d4-a716-446655440000",
+          runtime_identity: "550e8400-e29b-41d4-a716-446655440001",
           status: "unloaded",
           challenge_proof: "02".repeat(32),
         },
@@ -51,7 +51,7 @@ describe("control client", () => {
     );
     await expect(getNodeIdentityProof("http://127.0.0.1:8080", nonce, { fetch })).resolves.toMatchObject({
       protocolVersion: 1,
-      nodeId: "node-1",
+      nodeId: "550e8400-e29b-41d4-a716-446655440000",
     });
     const headers = new Headers(fetch.mock.calls[0][1]?.headers);
     expect(headers.get("x-loxa-challenge")).toBe(nonce);

@@ -107,6 +107,10 @@ function nonEmpty(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
 }
 
+function boundedOpaqueIdentity(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && new TextEncoder().encode(value).byteLength <= 1024;
+}
+
 function decodeArtifact(value: unknown): ArtifactState {
   if (value === "not_downloaded" || value === "downloaded") {
     return { kind: value };
@@ -343,8 +347,8 @@ export function decodeNodeIdentityProof(value: unknown): NodeIdentityProof {
     !isRecord(value) ||
     !hasKeys(value, ["protocol_version", "node_id", "runtime_identity", "status", "challenge_proof"]) ||
     value.protocol_version !== 1 ||
-    !nonEmpty(value.node_id) ||
-    !nonEmpty(value.runtime_identity) ||
+    !boundedOpaqueIdentity(value.node_id) ||
+    !boundedOpaqueIdentity(value.runtime_identity) ||
     typeof value.challenge_proof !== "string" ||
     !/^[0-9a-f]{64}$/.test(value.challenge_proof)
   ) {

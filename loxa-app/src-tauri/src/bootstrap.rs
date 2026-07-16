@@ -1196,6 +1196,24 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_probe_accepts_uuid_shaped_identity_without_rejecting_opaque_v1_peers() {
+        for (node_id, runtime_identity) in [
+            (
+                "550e8400-e29b-41d4-a716-446655440000",
+                "550e8400-e29b-41d4-a716-446655440001",
+            ),
+            ("older-node", "pid-shaped-runtime"),
+        ] {
+            let (address, worker) = serve_identity_response(node_id, runtime_identity);
+            let peer = prove_compatible(address, Duration::from_secs(1), &test_token_path())
+                .expect("compatible v1 identity");
+            assert_eq!(peer.node_id, node_id);
+            assert_eq!(peer.runtime_identity, runtime_identity);
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
     fn narrow_control_token_read_requires_a_fresh_exact_peer_proof() {
         let credential_path = test_token_path();
         let mut disconnected = BootstrapState {
