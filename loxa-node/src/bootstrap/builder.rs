@@ -1,14 +1,33 @@
 use super::NodePaths;
-use crate::runtime::{NodeRuntime, NodeRuntimeParts};
+use crate::runtime::{NodeOwnerGuard, NodeRuntime, NodeRuntimeParts};
 use crate::{
-    chat_history, chat_routes, cleanup_stable_node_runtime, control_router, download_control,
-    model_lifecycle, production_lifecycle, requested_startup_model, supervisor_error_to_io,
-    uses_stable_node_host, DEFAULT_GATEWAY_PORT,
+    chat_history, chat_routes, control_router, download_control, model_lifecycle,
+    production_lifecycle, requested_startup_model, supervisor_error_to_io, DEFAULT_GATEWAY_PORT,
 };
 use loxa_core::diagnostics::DiagnosticsHealth;
 use loxa_core::engine::RuntimeBackendKind;
 use loxa_core::supervisor;
+use loxa_protocol::NodeInstanceId;
 use std::io;
+
+fn finish_failed_build(
+    trigger: io::Error,
+    owner_guard: NodeOwnerGuard,
+    runtime: &mut Option<(
+        download_control::DownloadControl,
+        download_control::DownloadControlWorker,
+    )>,
+) -> io::Error {
+    let worker_cleanup = runtime
+        .take()
+        .map(|(_, worker)| worker.stop_and_join())
+        .transpose();
+    let owner_cleanup = owner_guard.finish();
+    owner_cleanup
+        .err()
+        .or_else(|| worker_cleanup.err())
+        .unwrap_or(trigger)
+}
 
 pub(crate) struct NodeBuilder<'a> {
     requested_model: Option<&'a str>,
@@ -56,20 +75,33 @@ impl<'a> NodeBuilder<'a> {
             requested_startup_model(&self.paths.models_dir, self.requested_model, self.engine)
                 .map_err(io::Error::other)?;
         let stable_llama_node = self.engine == RuntimeBackendKind::LlamaCpp;
-        let (gateway_port, unloaded_run) = if uses_stable_node_host(startup_model, self.engine) {
-            let reservation =
-                supervisor::reserve_localhost_port(Some(self.port.unwrap_or(DEFAULT_GATEWAY_PORT)))
-                    .map_err(supervisor_error_to_io)?;
-            let gateway_port = reservation.port();
-            let run = crate::claim_unloaded_owner(self.paths, gateway_port)?;
-            drop(reservation);
-            (gateway_port, Some(run))
-        } else {
-            (self.port.unwrap_or(DEFAULT_GATEWAY_PORT), None)
+        let reservation =
+            supervisor::reserve_localhost_port(Some(self.port.unwrap_or(DEFAULT_GATEWAY_PORT)))
+                .map_err(supervisor_error_to_io)?;
+        let gateway_port = reservation.port();
+        let unloaded_run = crate::claim_unloaded_owner(self.paths, gateway_port)?;
+        let owner_guard = NodeOwnerGuard::new(self.paths.clone(), unloaded_run.clone());
+        let loxa_dir = match self.paths.loxa_dir() {
+            Ok(loxa_dir) => loxa_dir,
+            Err(error) => return Err(owner_guard.finish().err().unwrap_or(error)),
         };
-        let node_id = format!("loxa-node-{}", std::process::id());
-        let gateway_state = loxa_core::gateway::GatewayState::new(node_id.clone());
-        let mut download_runtime = unloaded_run.as_ref().map(|run| {
+        let node_id = match crate::identity::open_or_create(loxa_dir) {
+            Ok(node_id) => node_id,
+            Err(_) => {
+                tracing::warn!(
+                    target: "loxa_node::lifecycle",
+                    event_code = "node.identity_open_failed",
+                    component = "node",
+                    result_class = "identity_unavailable",
+                );
+                let error = io::Error::other("node identity is unavailable");
+                return Err(owner_guard.finish().err().unwrap_or(error));
+            }
+        };
+        let node_instance_id = NodeInstanceId::new_v4();
+        let gateway_state = loxa_core::gateway::GatewayState::new(node_id, node_instance_id);
+        let mut download_runtime = Some({
+            let run = &unloaded_run;
             if self.engine == RuntimeBackendKind::LlamaCpp {
                 let owner = model_lifecycle::StableNodeOwner {
                     run_id: run.run_id.clone(),
@@ -95,84 +127,66 @@ impl<'a> NodeBuilder<'a> {
                 download_control::DownloadControl::spawn(self.paths.models_dir.clone())
             }
         });
-        let loxa_dir = match self.paths.loxa_dir() {
-            Ok(loxa_dir) => loxa_dir,
-            Err(error) => {
-                let _ = cleanup_stable_node_runtime(
-                    self.paths,
-                    unloaded_run.as_ref(),
-                    &mut download_runtime,
-                );
-                return Err(error);
-            }
-        };
         let token_path = loxa_dir.join("control.token");
         let token = match loxa_core::control::auth::ControlToken::load_or_create(&token_path) {
             Ok(token) => token,
             Err(error) => {
-                let _ = cleanup_stable_node_runtime(
-                    self.paths,
-                    unloaded_run.as_ref(),
+                return Err(finish_failed_build(
+                    error,
+                    owner_guard,
                     &mut download_runtime,
-                );
-                return Err(error);
+                ))
             }
         };
         let history_path = match self.paths.history_path() {
             Ok(history_path) => history_path,
             Err(error) => {
-                let _ = cleanup_stable_node_runtime(
-                    self.paths,
-                    unloaded_run.as_ref(),
+                return Err(finish_failed_build(
+                    error,
+                    owner_guard,
                     &mut download_runtime,
-                );
-                return Err(error);
+                ))
             }
         };
         let (history, history_worker) = match chat_history::ChatHistory::spawn(history_path) {
             Ok(history) => history,
             Err(error) => {
-                let _ = cleanup_stable_node_runtime(
-                    self.paths,
-                    unloaded_run.as_ref(),
+                return Err(finish_failed_build(
+                    io::Error::other(error),
+                    owner_guard,
                     &mut download_runtime,
-                );
-                return Err(io::Error::other(error));
+                ))
             }
         };
         let chat_routes_state =
             chat_routes::ChatRoutesState::new(token.clone(), history, gateway_state.clone());
         let router = loxa_core::gateway::router(gateway_state.clone())
             .merge(chat_routes::router(chat_routes_state.clone()));
-        let gateway_router = if let Some(run) = &unloaded_run {
+        let gateway_router =
             router.merge(control_router::router(control_router::ControlState::new(
                 token,
-                format!("loxa-node-{}", std::process::id()),
-                run.run_id.clone(),
+                node_id,
+                node_instance_id,
                 download_runtime
                     .as_ref()
                     .expect("unloaded node has download control")
                     .0
                     .clone(),
-            )))
-        } else {
-            router
-        };
+            )));
         let gateway_router = crate::http_observability::apply(gateway_router);
-        let gateway = match loxa_core::gateway::GatewayServer::start_with_router(
-            gateway_port,
+        let gateway = match loxa_core::gateway::GatewayServer::start_with_router_on(
+            reservation.into_listener(),
             gateway_state.clone(),
             gateway_router,
         ) {
             Ok(gateway) => gateway,
             Err(error) => {
                 let _ = history_worker.stop_and_join();
-                let _ = cleanup_stable_node_runtime(
-                    self.paths,
-                    unloaded_run.as_ref(),
+                return Err(finish_failed_build(
+                    error,
+                    owner_guard,
                     &mut download_runtime,
-                );
-                return Err(error);
+                ));
             }
         };
         Ok(NodeRuntime::new(NodeRuntimeParts {
@@ -180,14 +194,16 @@ impl<'a> NodeBuilder<'a> {
             startup_model: startup_model.map(str::to_owned),
             engine: self.engine,
             stable_llama_node,
-            unloaded_run,
+            unloaded_run: Some(unloaded_run),
+            owner_guard,
             download_runtime,
             gateway_state,
             chat_routes_state,
             gateway,
             history_worker,
             diagnostics_health: self.diagnostics_health,
-            runtime_identity: node_id,
+            node_id,
+            node_instance_id,
         }))
     }
 }

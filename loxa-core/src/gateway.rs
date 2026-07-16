@@ -16,6 +16,7 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 
 use crate::control::auth::is_desktop_origin;
+use loxa_protocol::{NodeId, NodeInstanceId};
 
 pub const MODEL_ALIAS: &str = "loxa";
 const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
@@ -135,21 +136,31 @@ impl PreparedGeneration {
 
 #[derive(Clone)]
 pub struct GatewayState {
-    node_id: Arc<str>,
+    node_id: NodeId,
+    node_instance_id: NodeInstanceId,
     target: Arc<RwLock<Option<Arc<EngineTarget>>>>,
     client: reqwest::Client,
     cancellation: tokio::sync::watch::Sender<bool>,
 }
 
 impl GatewayState {
-    pub fn new(node_id: impl Into<String>) -> Self {
+    pub fn new(node_id: NodeId, node_instance_id: NodeInstanceId) -> Self {
         let (cancellation, _) = tokio::sync::watch::channel(false);
         Self {
-            node_id: Arc::from(node_id.into()),
+            node_id,
+            node_instance_id,
             target: Arc::new(RwLock::new(None)),
             client: reqwest::Client::new(),
             cancellation,
         }
+    }
+
+    pub fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+
+    pub fn node_instance_id(&self) -> NodeInstanceId {
+        self.node_instance_id
     }
 
     pub fn publish(&self, target: EngineTarget) {
@@ -317,7 +328,7 @@ async fn status(State(state): State<GatewayState>, headers: HeaderMap) -> Respon
     cors(
         Json(match target {
             Some(target) => json!({
-                "node_id": &*state.node_id,
+                "node_id": state.node_id,
                 "health": "ready",
                 "model": MODEL_ALIAS,
                 "engine": { "name": target.engine, "version": target.engine_version },
@@ -325,7 +336,7 @@ async fn status(State(state): State<GatewayState>, headers: HeaderMap) -> Respon
                 "profile": target.profile,
             }),
             None => json!({
-                "node_id": &*state.node_id,
+                "node_id": state.node_id,
                 "health": "unavailable",
                 "model": MODEL_ALIAS,
                 "engine": null,
@@ -717,18 +728,22 @@ impl GatewayServer {
         let (shutdown, receiver) = tokio::sync::oneshot::channel();
         let server_state = state.clone();
         let thread = spawn(listener, app, receiver, server_state)?;
+        let node_id = state.node_id.to_string();
+        let node_instance_id = state.node_instance_id.to_string();
         tracing::info!(
             target: "loxa_core::gateway",
             event_code = "gateway.starting",
             component = "gateway",
-            runtime_identity = state.node_id.as_ref(),
+            node_id = node_id.as_str(),
+            node_instance_id = node_instance_id.as_str(),
             result_class = "started",
         );
         tracing::info!(
             target: "loxa_core::gateway",
             event_code = "gateway.listening",
             component = "gateway",
-            runtime_identity = state.node_id.as_ref(),
+            node_id = node_id.as_str(),
+            node_instance_id = node_instance_id.as_str(),
             result_class = "listening",
             duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         );
@@ -746,11 +761,14 @@ impl GatewayServer {
 
     pub fn shutdown(mut self) -> io::Result<()> {
         let started = std::time::Instant::now();
+        let node_id = self.state.node_id.to_string();
+        let node_instance_id = self.state.node_instance_id.to_string();
         tracing::info!(
             target: "loxa_core::gateway",
             event_code = "gateway.stop_requested",
             component = "gateway",
-            runtime_identity = self.state.node_id.as_ref(),
+            node_id = node_id.as_str(),
+            node_instance_id = node_instance_id.as_str(),
             result_class = "requested",
         );
         self.state.cancel_requests();
@@ -768,7 +786,8 @@ impl GatewayServer {
                     target: "loxa_core::gateway",
                     event_code = "gateway.stopped",
                     component = "gateway",
-                    runtime_identity = self.state.node_id.as_ref(),
+                    node_id = node_id.as_str(),
+                    node_instance_id = node_instance_id.as_str(),
                     result_class = "stopped",
                     duration_ms,
                 );
@@ -779,7 +798,8 @@ impl GatewayServer {
                     target: "loxa_core::gateway",
                     event_code = "gateway.join_failed",
                     component = "gateway",
-                    runtime_identity = self.state.node_id.as_ref(),
+                    node_id = node_id.as_str(),
+                    node_instance_id = node_instance_id.as_str(),
                     result_class = "join_failed",
                     duration_ms,
                 );
@@ -804,7 +824,7 @@ mod tests {
         GenerationError, GenerationOutput, GenerationProvenance, GenerationStreamError,
         MAX_SSE_EVENT_BYTES,
     };
-    use axum::http::{header, Method, StatusCode};
+    use axum::http::{header, HeaderMap, Method, StatusCode};
     use axum::{
         body::{Body, Bytes},
         response::{IntoResponse, Response},
@@ -812,12 +832,36 @@ mod tests {
     use axum::{extract::State, routing::post, Json, Router};
     use futures_util::stream;
     use futures_util::StreamExt;
+    use loxa_protocol::{NodeId, NodeInstanceId};
     use reqwest::Client;
     use serde_json::json;
     use serde_json::Value;
     use std::collections::BTreeMap;
     use std::io;
     use std::pin::Pin;
+    use std::str::FromStr;
+
+    fn gateway_state() -> GatewayState {
+        GatewayState::new(NodeId::new_v4(), NodeInstanceId::new_v4())
+    }
+
+    #[tokio::test]
+    async fn status_projects_stable_node_id_and_retains_typed_instance_identity() {
+        let node_id = NodeId::from_str("123e4567-e89b-42d3-a456-426614174000").unwrap();
+        let instance_id = NodeInstanceId::from_str("123e4567-e89b-42d3-b456-426614174001").unwrap();
+        let state = GatewayState::new(node_id, instance_id);
+
+        assert_eq!(state.node_id(), node_id);
+        assert_eq!(state.node_instance_id(), instance_id);
+
+        let response = super::status(State(state), HeaderMap::new()).await;
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["node_id"], node_id.to_string());
+        assert!(payload.get("node_instance_id").is_none());
+    }
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -889,8 +933,7 @@ mod tests {
         let capture = EventCapture::default();
         let output = capture.0.clone();
         tracing::subscriber::with_default(capture, || {
-            let server =
-                GatewayServer::start(0, GatewayState::new("runtime-test")).expect("start gateway");
+            let server = GatewayServer::start(0, gateway_state()).expect("start gateway");
             server.shutdown().expect("shutdown gateway");
         });
 
@@ -922,7 +965,7 @@ mod tests {
         let capture = EventCapture::default();
         let output = capture.0.clone();
         tracing::subscriber::with_default(capture, || {
-            assert!(GatewayServer::start(port, GatewayState::new("runtime-test")).is_err());
+            assert!(GatewayServer::start(port, gateway_state()).is_err());
         });
 
         let output = output.lock().expect("capture poisoned");
@@ -938,7 +981,7 @@ mod tests {
 
         let server = GatewayServer::start_with_router_on(
             reservation.into_listener(),
-            GatewayState::new("runtime-test"),
+            gateway_state(),
             Router::new().route("/reserved", axum::routing::get(|| async { "reserved" })),
         )
         .expect("start gateway on reservation");
@@ -963,7 +1006,7 @@ mod tests {
                 capture,
                 || match GatewayServer::start_with_router_on(
                     listener,
-                    GatewayState::new("runtime-test"),
+                    gateway_state(),
                     Router::new(),
                 ) {
                     Ok(_) => panic!("wildcard listener must be rejected"),
@@ -986,7 +1029,7 @@ mod tests {
         tracing::subscriber::with_default(capture, || {
             let error = match GatewayServer::start_with_router_and_spawner(
                 0,
-                GatewayState::new("runtime-test"),
+                gateway_state(),
                 Router::new(),
                 |_, _, _, _| Err(io::Error::other("ARBITRARY_THREAD_SPAWN_ERROR")),
             ) {
@@ -1008,7 +1051,7 @@ mod tests {
         tracing::subscriber::with_default(capture, || {
             let server = GatewayServer::start_with_router_and_spawner(
                 0,
-                GatewayState::new("runtime-test"),
+                gateway_state(),
                 Router::new(),
                 |_, _, _, _| {
                     thread::Builder::new().spawn(|| panic!("ARBITRARY_GATEWAY_THREAD_PANIC"))
@@ -1050,7 +1093,7 @@ mod tests {
 
     #[tokio::test]
     async fn public_routes_allow_only_the_two_desktop_origins() {
-        let base = spawn_gateway(GatewayState::new("node-test")).await;
+        let base = spawn_gateway(gateway_state()).await;
         let client = Client::new();
 
         for origin in ["tauri://localhost", "http://127.0.0.1:1420"] {
@@ -1117,7 +1160,7 @@ mod tests {
 
     #[tokio::test]
     async fn public_preflights_are_route_specific_and_fail_closed() {
-        let base = spawn_gateway(GatewayState::new("node-test")).await;
+        let base = spawn_gateway(gateway_state()).await;
         let client = Client::new();
 
         for (path, method, allowed_methods, allowed_headers) in [
@@ -1203,7 +1246,7 @@ mod tests {
 
     #[tokio::test]
     async fn public_routes_preserve_originless_api_clients() {
-        let base = spawn_gateway(GatewayState::new("node-test")).await;
+        let base = spawn_gateway(gateway_state()).await;
         let response = Client::new()
             .get(format!("{base}/loxa/status"))
             .send()
@@ -1219,7 +1262,8 @@ mod tests {
 
     #[tokio::test]
     async fn models_and_status_are_stable() {
-        let state = GatewayState::new("node-test");
+        let node_id = NodeId::from_str("123e4567-e89b-42d3-a456-426614174000").unwrap();
+        let state = GatewayState::new(node_id, NodeInstanceId::new_v4());
         let base = spawn_gateway(state.clone()).await;
         let client = Client::new();
 
@@ -1244,7 +1288,7 @@ mod tests {
             .json()
             .await
             .unwrap();
-        assert_eq!(status["node_id"], "node-test");
+        assert_eq!(status["node_id"], node_id.to_string());
         assert_eq!(status["health"], "unavailable");
         assert_eq!(status["model"], "loxa");
 
@@ -1299,7 +1343,7 @@ mod tests {
     async fn non_stream_proxy_rewrites_and_normalizes_alias() {
         let seen = Arc::new(Mutex::new(None));
         let engine = spawn_fake_engine(seen.clone()).await;
-        let state = GatewayState::new("node-test");
+        let state = gateway_state();
         state.publish(EngineTarget {
             base_url: engine,
             backend_alias: "loxa-node-test-g0".into(),
@@ -1331,7 +1375,7 @@ mod tests {
     async fn internal_generation_service_holds_one_target_snapshot_and_normalizes_output() {
         let seen = Arc::new(Mutex::new(None));
         let engine = spawn_fake_engine(seen.clone()).await;
-        let state = GatewayState::new("node-test");
+        let state = gateway_state();
         state.publish(EngineTarget {
             base_url: engine,
             backend_alias: "loxa-node-test-g0".into(),
@@ -1400,7 +1444,7 @@ mod tests {
             .with_state(seen.clone());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let state = GatewayState::new("node-test");
+        let state = gateway_state();
         state.publish(EngineTarget {
             base_url: format!("http://{address}"),
             backend_alias: "default_model".into(),
@@ -1431,7 +1475,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_stream_errors_are_openai_shaped() {
-        let state = GatewayState::new("node-test");
+        let state = gateway_state();
         let base = spawn_gateway(state).await;
         let response = Client::new()
             .post(format!("{base}/v1/chat/completions"))
@@ -1449,7 +1493,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_model_and_transport_errors_are_openai_shaped() {
-        let state = GatewayState::new("node-test");
+        let state = gateway_state();
         let base = spawn_gateway(state.clone()).await;
         let invalid = Client::new()
             .post(format!("{base}/v1/chat/completions"))
@@ -1511,7 +1555,7 @@ mod tests {
             .await
             .unwrap()
         });
-        let state = GatewayState::new("node-test");
+        let state = gateway_state();
         state.publish(EngineTarget {
             base_url: format!("http://{address}"),
             backend_alias: "loxa-node-test-g0".into(),
@@ -1590,7 +1634,7 @@ mod tests {
             .with_state(gate.clone());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let state = GatewayState::new("node-test");
+        let state = gateway_state();
         state.publish(EngineTarget {
             base_url: format!("http://{address}"),
             backend_alias: "backend".into(),
@@ -1652,7 +1696,7 @@ mod tests {
             .with_state(seen.clone());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let state = GatewayState::new("node-test");
+        let state = gateway_state();
         state.publish(EngineTarget {
             base_url: format!("http://{address}"),
             backend_alias: "default_model".into(),
@@ -1699,7 +1743,7 @@ mod tests {
             .await
             .unwrap()
         });
-        let state = GatewayState::new("node-test");
+        let state = gateway_state();
         state.publish(EngineTarget {
             base_url: format!("http://{address}"),
             backend_alias: "loxa-node-test-g0".into(),
@@ -1758,7 +1802,7 @@ mod tests {
 
     #[test]
     fn target_snapshots_and_mixed_sse_boundaries_are_stable() {
-        let state = GatewayState::new("node-test");
+        let state = gateway_state();
         let target = |port| EngineTarget {
             base_url: format!("http://127.0.0.1:{port}"),
             backend_alias: format!("loxa-node-g{port}"),
@@ -1780,7 +1824,7 @@ mod tests {
 
     #[test]
     fn generation_preparation_distinguishes_unloaded_from_shutdown() {
-        let state = GatewayState::new("node-test");
+        let state = gateway_state();
         assert_eq!(
             state.prepare_generation(json!({"model": "loxa"})).err(),
             Some(GenerationError::EngineUnavailable)
@@ -1864,7 +1908,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_json_is_openai_shaped() {
-        let base = spawn_gateway(GatewayState::new("node-test")).await;
+        let base = spawn_gateway(gateway_state()).await;
         let response = Client::new()
             .post(format!("{base}/v1/chat/completions"))
             .header("content-type", "application/json")
@@ -1909,7 +1953,7 @@ mod tests {
             .await
             .unwrap()
         });
-        let state = GatewayState::new("node-test");
+        let state = gateway_state();
         state.publish(EngineTarget {
             base_url: format!("http://{address}"),
             backend_alias: "backend".into(),
@@ -1944,7 +1988,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_subscribed_after_shutdown_observes_cancellation() {
-        let state = GatewayState::new("node-test");
+        let state = gateway_state();
         state.cancel_requests();
         let mut output = Box::pin(normalize_sse(
             stream::pending::<Result<Bytes, reqwest::Error>>(),
@@ -1978,7 +2022,7 @@ mod tests {
             .await
             .unwrap()
         });
-        let state = GatewayState::new("node-test");
+        let state = gateway_state();
         state.publish(EngineTarget {
             base_url: format!("http://{address}"),
             backend_alias: "backend".into(),
@@ -2012,7 +2056,7 @@ mod tests {
             .await
             .unwrap()
         });
-        let state = GatewayState::new("node-test");
+        let state = gateway_state();
         state.publish(EngineTarget {
             base_url: format!("http://{address}"),
             backend_alias: "backend".into(),
@@ -2111,7 +2155,7 @@ mod tests {
             .route("/v1/chat/completions", post(http_drop_stream))
             .with_state(dropped.clone());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let state = GatewayState::new("node-test");
+        let state = gateway_state();
         state.publish(EngineTarget {
             base_url: format!("http://{address}"),
             backend_alias: "backend".into(),

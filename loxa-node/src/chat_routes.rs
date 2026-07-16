@@ -1406,6 +1406,7 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use axum::http::Method;
+    use loxa_protocol::{NodeId, NodeInstanceId};
     use std::collections::BTreeMap;
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1493,6 +1494,10 @@ mod tests {
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+    fn gateway_state() -> GatewayState {
+        GatewayState::new(NodeId::new_v4(), NodeInstanceId::new_v4())
+    }
+
     fn temp_history_path() -> std::path::PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1534,7 +1539,7 @@ mod tests {
         let token = ControlToken::load_or_create(&root.join("control.token")).unwrap();
         let bearer = format!("Bearer {}", token.expose_for_authorization());
         let (history, worker) = ChatHistory::spawn(history_path).unwrap();
-        let gateway = GatewayState::new("route-test");
+        let gateway = gateway_state();
         let state = ChatRoutesState::new(token, history.clone(), gateway.clone());
         let proof_token = ControlToken::load(&root.join("control.token")).unwrap();
         let proof_router = Router::new().route(
@@ -1759,7 +1764,7 @@ mod tests {
             let token = ControlToken::load_or_create(&root.join("control.token")).unwrap();
             let bearer = format!("Bearer {}", token.expose_for_authorization());
             let (history, worker) = ChatHistory::spawn(path).unwrap();
-            let gateway = GatewayState::new("chat-diagnostic-test");
+            let gateway = gateway_state();
             let state = ChatRoutesState::new(token, history.clone(), gateway.clone());
             let fixture = RouteFixture {
                 base: String::new(),
@@ -1923,11 +1928,7 @@ mod tests {
                 let token = ControlToken::load_or_create(&root.join("control.token")).unwrap();
                 let bearer = format!("Bearer {}", token.expose_for_authorization());
                 let (history, worker) = ChatHistory::spawn(path).unwrap();
-                let state = ChatRoutesState::new(
-                    token,
-                    history.clone(),
-                    GatewayState::new("chat-cancel-diagnostic-test"),
-                );
+                let state = ChatRoutesState::new(token, history.clone(), gateway_state());
                 let chat = history.create_chat(1).await.unwrap();
                 let turn = history
                     .begin_turn(
@@ -1999,7 +2000,7 @@ mod tests {
                 let token = ControlToken::load_or_create(&root.join("control.token")).unwrap();
                 let bearer = format!("Bearer {}", token.expose_for_authorization());
                 let (history, worker) = ChatHistory::spawn(path).unwrap();
-                let gateway = GatewayState::new("chat-persistence-diagnostic-test");
+                let gateway = gateway_state();
                 let state = ChatRoutesState::new(token, history.clone(), gateway.clone());
                 let fixture = RouteFixture {
                     base: String::new(),
@@ -2439,7 +2440,7 @@ mod tests {
         let root = path.parent().unwrap().to_owned();
         let token = ControlToken::load_or_create(&root.join("control.token")).unwrap();
         let (history, worker) = ChatHistory::spawn(path).unwrap();
-        let state = ChatRoutesState::new(token, history.clone(), GatewayState::new("test"));
+        let state = ChatRoutesState::new(token, history.clone(), gateway_state());
         let chat = history.create_chat(1).await.unwrap();
         let turn = history
             .begin_turn(

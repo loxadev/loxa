@@ -13,6 +13,7 @@ use loxa_core::control::contracts::{
     CONTROL_PROTOCOL_VERSION,
 };
 use loxa_core::model_inventory::current_available_memory_bytes;
+use loxa_protocol::{NodeId, NodeInstanceId};
 use serde::Deserialize;
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -22,24 +23,24 @@ use std::time::Duration;
 pub struct ControlState {
     token: ControlToken,
     policy: Arc<AuthPolicy>,
-    node_id: Arc<str>,
-    runtime_identity: Arc<str>,
+    node_id: NodeId,
+    node_instance_id: NodeInstanceId,
     downloads: DownloadControl,
 }
 
 impl ControlState {
     pub fn new(
         token: ControlToken,
-        node_id: String,
-        runtime_identity: String,
+        node_id: NodeId,
+        node_instance_id: NodeInstanceId,
         downloads: DownloadControl,
     ) -> Self {
         let policy = AuthPolicy::new(token.clone(), desktop_origins());
         Self {
             token,
             policy: Arc::new(policy),
-            node_id: node_id.into(),
-            runtime_identity: runtime_identity.into(),
+            node_id,
+            node_instance_id,
             downloads,
         }
     }
@@ -446,21 +447,22 @@ async fn node_proof(
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
     let status = node_status(&state);
-    let proof = match state.token.node_identity_proof(
-        &challenge.nonce,
-        &state.node_id,
-        &state.runtime_identity,
-        status,
-    ) {
-        Ok(proof) => proof,
-        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
-    };
+    let node_id = state.node_id.to_string();
+    let node_instance_id = state.node_instance_id.to_string();
+    let proof =
+        match state
+            .token
+            .node_identity_proof(&challenge.nonce, &node_id, &node_instance_id, status)
+        {
+            Ok(proof) => proof,
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        };
     cors(
         Json(
             NodeIdentityProofResponse::new(
                 CONTROL_PROTOCOL_VERSION,
-                state.node_id.to_string(),
-                state.runtime_identity.to_string(),
+                node_id,
+                node_instance_id,
                 status,
                 proof,
             )
@@ -586,6 +588,7 @@ mod tests {
     use loxa_core::model_inventory::VerificationCache;
     use loxa_core::registry::ModelEntry;
     use std::path::PathBuf;
+    use std::str::FromStr;
 
     struct RouterDriver;
     impl crate::model_lifecycle::EngineLifecycleDriver for RouterDriver {
@@ -656,6 +659,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_identity_projects_the_exact_v1_proof_fixture() {
+        let temp = TestDir::new("typed-v1-proof");
+        let token = ControlToken::load_or_create(&temp.0.join("control.token")).unwrap();
+        let node_id = NodeId::from_str("123e4567-e89b-42d3-a456-426614174000").unwrap();
+        let instance_id = NodeInstanceId::from_str("123e4567-e89b-42d3-b456-426614174001").unwrap();
+        let (downloads, worker) = DownloadControl::spawn(temp.0.join("models"));
+        let state = ControlState::new(token.clone(), node_id, instance_id, downloads);
+        let nonce = "01".repeat(32);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-loxa-challenge", HeaderValue::from_str(&nonce).unwrap());
+
+        let response = node_proof(State(state), headers, RawQuery(None)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let expected_proof = token
+            .node_identity_proof(
+                &nonce,
+                &node_id.to_string(),
+                &instance_id.to_string(),
+                NodeStatus::Unloaded,
+            )
+            .unwrap();
+        assert_eq!(
+            body.as_ref(),
+            format!(
+                "{{\"protocol_version\":1,\"node_id\":\"{node_id}\",\"runtime_identity\":\"{instance_id}\",\"status\":\"unloaded\",\"challenge_proof\":\"{expected_proof}\"}}"
+            )
+            .as_bytes()
+        );
+        worker.stop_and_join().unwrap();
+    }
+
+    #[tokio::test]
     async fn successful_download_publishes_shared_evidence_to_authorized_models_route() {
         let temp = TestDir::new("download-models-e2e");
         let models_dir = temp.0.join("models");
@@ -689,8 +727,8 @@ mod tests {
         let token = ControlToken::load_or_create(&temp.0.join("control.token")).unwrap();
         let state = ControlState::new(
             token.clone(),
-            "node-id".into(),
-            "runtime-id".into(),
+            NodeId::new_v4(),
+            NodeInstanceId::new_v4(),
             downloads,
         );
         let mut headers = HeaderMap::new();
@@ -733,8 +771,8 @@ mod tests {
         let token = ControlToken::load_or_create(&temp.0.join("control.token")).unwrap();
         let state = ControlState::new(
             token.clone(),
-            "node".into(),
-            "runtime".into(),
+            NodeId::new_v4(),
+            NodeInstanceId::new_v4(),
             downloads.clone(),
         );
         let mut unauthorized = HeaderMap::new();

@@ -575,6 +575,33 @@ fn complete_records_never_exceed_the_shared_cap() {
 }
 
 #[test]
+fn typed_node_identity_fields_are_allowlisted_scalars() {
+    let capture = capture_events(
+        debug_filter(),
+        || {
+            tracing::event!(
+                target: "loxa_node::test",
+                Level::INFO,
+                event_code = "node.listening",
+                component = "node",
+                node_id = "123e4567-e89b-42d3-a456-426614174000",
+                node_instance_id = "123e4567-e89b-42d3-b456-426614174001",
+                result_class = "listening",
+            );
+        },
+        DiagnosticsHealth::new(),
+    );
+
+    let record = parse_single_record(&capture);
+    assert_eq!(record["event_code"], "node.listening");
+    assert_eq!(record["node_id"], "123e4567-e89b-42d3-a456-426614174000");
+    assert_eq!(
+        record["node_instance_id"],
+        "123e4567-e89b-42d3-b456-426614174001"
+    );
+}
+
+#[test]
 fn debug_filter_accepts_loxa_debug_and_dependency_warnings_only() {
     let capture = capture_events(
         debug_filter(),
