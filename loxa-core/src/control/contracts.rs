@@ -3,6 +3,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn protocol_manifest_has_only_wire_dependencies() {
+        let manifest = include_str!("../../../loxa-protocol/Cargo.toml");
+        assert!(manifest.contains("serde"));
+        assert!(manifest.contains("uuid"));
+        for forbidden in [
+            "axum",
+            "tauri",
+            "clap",
+            "rusqlite",
+            "loxa-core",
+            "loxa-node",
+            "std::fs",
+            "std::process",
+        ] {
+            assert!(
+                !manifest.contains(forbidden),
+                "forbidden dependency {forbidden}"
+            );
+        }
+    }
+
+    #[test]
     fn known_model_requests_reject_unknown_or_blank_ids() {
         assert!(ModelRequest::known("gemma-3-4b-it-q4").is_ok());
         assert_eq!(
@@ -87,9 +109,11 @@ mod tests {
     }
 }
 use crate::registry;
+pub use loxa_protocol::v1::{
+    ControlErrorBody, ControlErrorCode, NodeIdentityProofResponse, NodeStatus,
+    CONTROL_PROTOCOL_VERSION,
+};
 use serde::{Deserialize, Serialize};
-
-pub const CONTROL_PROTOCOL_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ContractError {
@@ -189,17 +213,6 @@ pub struct CapabilitiesSnapshot {
     pub text_chat: bool,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NodeStatus {
-    Unloaded,
-    Loading,
-    Ready,
-    Unloading,
-    RecoveryRequired,
-    Error,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct NodeIdentityChallenge {
     pub nonce: String,
@@ -234,81 +247,6 @@ impl<'de> Deserialize<'de> for NodeIdentityChallenge {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct NodeIdentityProofResponse {
-    pub protocol_version: u32,
-    pub node_id: String,
-    pub runtime_identity: String,
-    pub status: NodeStatus,
-    pub challenge_proof: String,
-}
-
-impl NodeIdentityProofResponse {
-    pub fn new(
-        protocol_version: u32,
-        node_id: String,
-        runtime_identity: String,
-        status: NodeStatus,
-        challenge_proof: String,
-    ) -> Result<Self, ContractError> {
-        let identity_valid = |value: &str| !value.is_empty() && value.len() <= 1024;
-        let proof_valid = challenge_proof.len() == 64
-            && challenge_proof
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase());
-        if protocol_version != CONTROL_PROTOCOL_VERSION
-            || !identity_valid(&node_id)
-            || !identity_valid(&runtime_identity)
-            || !proof_valid
-        {
-            return Err(ContractError::InvalidProofResponse);
-        }
-        Ok(Self {
-            protocol_version,
-            node_id,
-            runtime_identity,
-            status,
-            challenge_proof,
-        })
-    }
-}
-
-impl<'de> Deserialize<'de> for NodeIdentityProofResponse {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct WireResponse {
-            protocol_version: u32,
-            node_id: String,
-            runtime_identity: String,
-            status: NodeStatus,
-            challenge_proof: String,
-        }
-        let wire = WireResponse::deserialize(deserializer)?;
-        Self::new(
-            wire.protocol_version,
-            wire.node_id,
-            wire.runtime_identity,
-            wire.status,
-            wire.challenge_proof,
-        )
-        .map_err(|_| serde::de::Error::custom("invalid node identity proof response"))
-    }
-}
-
-impl NodeStatus {
-    pub(crate) fn proof_discriminant(self) -> u8 {
-        match self {
-            Self::Unloaded => 0,
-            Self::Loading => 1,
-            Self::Ready => 2,
-            Self::Unloading => 3,
-            Self::RecoveryRequired => 4,
-            Self::Error => 5,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeSnapshot {
@@ -322,11 +260,4 @@ pub struct NodeSnapshot {
 #[serde(deny_unknown_fields)]
 pub struct OperationAccepted {
     pub operation_id: String,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ControlErrorBody {
-    pub code: String,
-    pub message: String,
 }
