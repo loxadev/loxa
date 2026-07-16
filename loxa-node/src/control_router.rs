@@ -8,7 +8,7 @@ use axum::routing::{get, options, post};
 use axum::{Json, Router};
 use loxa_core::control::auth::{desktop_origins, is_desktop_origin, AuthPolicy, ControlToken};
 use loxa_core::control::contracts::{
-    CapabilitiesSnapshot, ControlErrorBody, ModelRequest, NodeIdentityChallenge,
+    CapabilitiesSnapshot, ControlErrorBody, ControlErrorCode, ModelRequest, NodeIdentityChallenge,
     NodeIdentityProofResponse, NodeSnapshot, NodeStatus, OperationAccepted,
     CONTROL_PROTOCOL_VERSION,
 };
@@ -126,12 +126,17 @@ async fn post_preflight(headers: HeaderMap) -> Response {
     preflight(headers, "POST, OPTIONS").await
 }
 
-fn control_error(status: StatusCode, code: &str, message: &str, origin: Option<&str>) -> Response {
+fn control_error(
+    status: StatusCode,
+    code: ControlErrorCode,
+    message: &str,
+    origin: Option<&str>,
+) -> Response {
     cors(
         (
             status,
             Json(ControlErrorBody {
-                code: code.into(),
+                code,
                 message: message.into(),
             }),
         )
@@ -144,37 +149,37 @@ fn map_download_error(error: DownloadControlError, origin: Option<&str>) -> Resp
     match error {
         DownloadControlError::Conflict => control_error(
             StatusCode::CONFLICT,
-            "operation_conflict",
+            ControlErrorCode::OperationConflict,
             "a conflicting model operation is already active",
             origin,
         ),
         DownloadControlError::Missing => control_error(
             StatusCode::NOT_FOUND,
-            "operation_not_found",
+            ControlErrorCode::OperationNotFound,
             "operation or model was not found",
             origin,
         ),
         DownloadControlError::Terminal => control_error(
             StatusCode::CONFLICT,
-            "operation_terminal",
+            ControlErrorCode::OperationTerminal,
             "operation is already terminal",
             origin,
         ),
         DownloadControlError::Stopping => control_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            "node_stopping",
+            ControlErrorCode::NodeStopping,
             "node is stopping",
             origin,
         ),
         DownloadControlError::CancellationNotSafe => control_error(
             StatusCode::CONFLICT,
-            "cancellation_not_safe",
+            ControlErrorCode::CancellationNotSafe,
             "the model operation passed its safe cancellation point",
             origin,
         ),
         DownloadControlError::ModelUnavailable => control_error(
             StatusCode::CONFLICT,
-            "model_unavailable",
+            ControlErrorCode::ModelUnavailable,
             "the model must be downloaded, verified, compatible, and engine eligible",
             origin,
         ),
@@ -200,7 +205,7 @@ async fn start_download(
     {
         return control_error(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "unsupported_media_type",
+            ControlErrorCode::UnsupportedMediaType,
             "content type must be application/json",
             origin.as_deref(),
         );
@@ -210,7 +215,7 @@ async fn start_download(
         Err(_) => {
             return control_error(
                 StatusCode::BAD_REQUEST,
-                "unknown_model",
+                ControlErrorCode::UnknownModel,
                 "request must name a known registry model",
                 origin.as_deref(),
             )
@@ -248,7 +253,7 @@ async fn start_load(
     {
         return control_error(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "unsupported_media_type",
+            ControlErrorCode::UnsupportedMediaType,
             "content type must be application/json",
             origin.as_deref(),
         );
@@ -258,7 +263,7 @@ async fn start_load(
         Err(_) => {
             return control_error(
                 StatusCode::BAD_REQUEST,
-                "unknown_model",
+                ControlErrorCode::UnknownModel,
                 "request must name a known registry model",
                 origin.as_deref(),
             );

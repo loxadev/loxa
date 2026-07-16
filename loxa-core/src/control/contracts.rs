@@ -3,25 +3,72 @@ mod tests {
     use super::*;
 
     #[test]
-    fn protocol_manifest_has_only_wire_dependencies() {
-        let manifest = include_str!("../../../loxa-protocol/Cargo.toml");
-        assert!(manifest.contains("serde"));
-        assert!(manifest.contains("uuid"));
-        for forbidden in [
-            "axum",
-            "tauri",
-            "clap",
-            "rusqlite",
-            "loxa-core",
-            "loxa-node",
-            "std::fs",
-            "std::process",
-        ] {
+    fn protocol_metadata_has_only_wire_dependencies() {
+        let output = std::process::Command::new(env!("CARGO"))
+            .args(["metadata", "--format-version", "1", "--no-deps", "--locked"])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .expect("run cargo metadata");
+        assert!(output.status.success(), "cargo metadata failed");
+        let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let package = metadata["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|package| package["name"] == "loxa-protocol")
+            .expect("loxa-protocol package");
+        let dependencies = package["dependencies"].as_array().unwrap();
+
+        let mut normal_names = dependencies
+            .iter()
+            .filter(|dependency| dependency["kind"].is_null())
+            .map(|dependency| dependency["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        normal_names.sort_unstable();
+        assert_eq!(normal_names, ["serde", "uuid"]);
+
+        for dependency in dependencies {
             assert!(
-                !manifest.contains(forbidden),
-                "forbidden dependency {forbidden}"
+                dependency["path"].is_null(),
+                "path dependency: {dependency}"
             );
+            assert!(
+                dependency["rename"].is_null(),
+                "renamed dependency: {dependency}"
+            );
+            for forbidden in [
+                "axum",
+                "tauri",
+                "clap",
+                "rusqlite",
+                "loxa-core",
+                "loxa-node",
+            ] {
+                assert_ne!(dependency["name"], forbidden);
+                assert_ne!(dependency["rename"], forbidden);
+            }
         }
+
+        let serde = dependencies
+            .iter()
+            .find(|dependency| dependency["name"] == "serde")
+            .unwrap();
+        assert!(serde["source"]
+            .as_str()
+            .is_some_and(|source| source.starts_with("registry+")));
+        assert_eq!(serde["req"], "^1");
+        assert_eq!(serde["features"], serde_json::json!(["derive"]));
+
+        let uuid = dependencies
+            .iter()
+            .find(|dependency| dependency["name"] == "uuid")
+            .unwrap();
+        assert!(uuid["source"]
+            .as_str()
+            .is_some_and(|source| source.starts_with("registry+")));
+        assert_eq!(uuid["req"], "=1.23.5");
+        assert_eq!(uuid["uses_default_features"], false);
+        assert_eq!(uuid["features"], serde_json::json!(["std", "v4"]));
     }
 
     #[test]
