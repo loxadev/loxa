@@ -126,7 +126,10 @@ pub fn restore_unloaded_owner_after_prepared_run(
         return Ok(RestoreUnloadedOwnerOutcome::RecoveryRequired);
     };
     if !managed_runs_match_except_monotonic_stop(current, expected_current) {
-        return Ok(RestoreUnloadedOwnerOutcome::RecoveryRequired);
+        return Err(SupervisorError::RunStateConflict(format!(
+            "prepared managed owner {} no longer matches its expected state",
+            expected_current.run_id
+        )));
     }
 
     if cleanup == PreparedOwnerCleanup::Uncertain {
@@ -204,6 +207,9 @@ fn validate_unloaded_owner_baseline(baseline: &ManagedRun) -> Result<(), Supervi
 }
 
 fn managed_runs_match_except_monotonic_stop(current: &ManagedRun, expected: &ManagedRun) -> bool {
+    if expected.stop_requested && !current.stop_requested {
+        return false;
+    }
     let mut current = current.clone();
     current.stop_requested = expected.stop_requested;
     current == *expected
@@ -864,6 +870,40 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].lifecycle, RunLifecycle::RecoveryRequired);
         assert_eq!(runs[0].child_pid, attached.child_pid);
+    }
+
+    #[test]
+    fn restoration_rejects_expected_stop_that_disappeared_from_persisted_state() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let baseline = unloaded_owner(temp.path(), "stop-regression");
+        write_runtime_state(&state_path, std::slice::from_ref(&baseline)).expect("seed owner");
+        let PrepareUnloadedOwnerOutcome::Prepared(prepared) = prepare_unloaded_owner_for_model(
+            &state_path,
+            &baseline,
+            "model".to_string(),
+            9_001,
+            temp.path().join("engine.log"),
+        )
+        .expect("prepare owner") else {
+            panic!("owner must be prepared");
+        };
+        let mut expected_stopped = prepared.clone();
+        expected_stopped.stop_requested = true;
+
+        let error = restore_unloaded_owner_after_prepared_run(
+            &state_path,
+            &expected_stopped,
+            &baseline,
+            PreparedOwnerCleanup::Childless,
+        )
+        .expect_err("persisted stop must never move true to false");
+
+        assert!(matches!(error, SupervisorError::RunStateConflict(_)));
+        assert_eq!(
+            read_runtime_state(&state_path).expect("read preserved prepared state"),
+            RuntimeStateRead::Loaded(vec![prepared])
+        );
     }
 
     #[test]

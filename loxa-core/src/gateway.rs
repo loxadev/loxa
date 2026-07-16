@@ -701,8 +701,19 @@ impl GatewayServer {
         ) -> io::Result<thread::JoinHandle<io::Result<()>>>,
     {
         let started = std::time::Instant::now();
+        let address = listener.local_addr()?;
+        if !matches!(
+            address,
+            std::net::SocketAddr::V4(address)
+                if *address.ip() == std::net::Ipv4Addr::LOCALHOST
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "gateway listener must be bound to IPv4 localhost",
+            ));
+        }
         listener.set_nonblocking(true)?;
-        let port = listener.local_addr()?.port();
+        let port = address.port();
         let (shutdown, receiver) = tokio::sync::oneshot::channel();
         let server_state = state.clone();
         let thread = spawn(listener, app, receiver, server_state)?;
@@ -938,6 +949,34 @@ mod tests {
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         assert_eq!(response.text().expect("response body"), "reserved");
         server.shutdown().expect("shutdown gateway");
+    }
+
+    #[test]
+    fn gateway_rejects_a_wildcard_bound_listener_before_starting() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
+            .expect("bind wildcard listener");
+        let capture = EventCapture::default();
+        let output = capture.0.clone();
+
+        let error =
+            tracing::subscriber::with_default(
+                capture,
+                || match GatewayServer::start_with_router_on(
+                    listener,
+                    GatewayState::new("runtime-test"),
+                    Router::new(),
+                ) {
+                    Ok(_) => panic!("wildcard listener must be rejected"),
+                    Err(error) => error,
+                },
+            );
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "gateway listener must be bound to IPv4 localhost"
+        );
+        assert!(event_codes(&output.lock().expect("capture poisoned")).is_empty());
     }
 
     #[test]
