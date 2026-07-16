@@ -40,11 +40,13 @@ impl NodeOwnerGuard {
         self.baseline.take();
     }
 
-    pub(crate) fn finish(mut self) -> io::Result<()> {
+    pub(crate) fn finish(mut self) -> io::Result<loxa_core::supervisor::ChildlessFinishOutcome> {
         let baseline = self.baseline.as_ref().expect("node owner guard armed");
-        crate::finish_unloaded_owner(&self.paths, baseline)?;
+        let outcome =
+            loxa_core::supervisor::finish_exact_unloaded_owner(&self.paths.state_path, baseline)
+                .map_err(crate::supervisor_error_to_io)?;
         self.baseline.take();
-        Ok(())
+        Ok(outcome)
     }
 }
 
@@ -108,10 +110,12 @@ fn resolve_prepared_python_owner(
     guard: NodeOwnerGuard,
 ) -> io::Result<RunTermination> {
     match result.owner {
-        PreparedPythonOwnerDisposition::Restored(_) => {
-            guard.finish()?;
-            result.outcome
-        }
+        PreparedPythonOwnerDisposition::Restored(_) => match guard.finish()? {
+            loxa_core::supervisor::ChildlessFinishOutcome::Finished => result.outcome,
+            loxa_core::supervisor::ChildlessFinishOutcome::RequestedStop => {
+                Ok(RunTermination::RequestedStop)
+            }
+        },
         PreparedPythonOwnerDisposition::ConsumedByRequestedStop => {
             guard.disarm();
             result.outcome
@@ -487,6 +491,34 @@ mod tests {
         .expect("restored owner finishes explicitly");
 
         assert_eq!(result, RunTermination::Interrupted);
+        assert_eq!(
+            managed_servers(&paths).unwrap(),
+            ManagedRunsSnapshot::Runs(Vec::new())
+        );
+        std::fs::remove_dir_all(paths.state_path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn late_stop_after_restored_classification_overrides_runtime_outcome() {
+        let (paths, baseline) = guarded_owner("prepared-late-stop", 19_764);
+        let classified = PreparedPythonRunResult {
+            outcome: Ok(RunTermination::Interrupted),
+            owner: PreparedPythonOwnerDisposition::Restored(baseline.clone()),
+        };
+        let mut stopped = baseline.clone();
+        stopped.stop_requested = true;
+        loxa_core::supervisor::update_runtime_state_run(
+            &paths.state_path,
+            &baseline.identity(),
+            stopped,
+        )
+        .unwrap();
+
+        let result =
+            resolve_prepared_python_owner(classified, NodeOwnerGuard::new(paths.clone(), baseline))
+                .expect("late stop remains observable");
+
+        assert_eq!(result, RunTermination::RequestedStop);
         assert_eq!(
             managed_servers(&paths).unwrap(),
             ManagedRunsSnapshot::Runs(Vec::new())
