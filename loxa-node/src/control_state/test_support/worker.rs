@@ -6,7 +6,7 @@ use crate::control_state::worker::{
 };
 use crate::control_state::{ControlIdGenerator, ControlRepository};
 use loxa_protocol::v2::{
-    DecimalU64, EventId, OperationId, SlotId, StreamEpoch, V2OperationProgress,
+    DecimalU64, EventId, OperationId, SlotId, StreamEpoch, V2OperationProgress, V2OperationStatus,
 };
 use loxa_protocol::{NodeId, NodeInstanceId};
 use std::collections::HashSet;
@@ -412,6 +412,211 @@ fn reconnect_epoch_replacement_and_cursor_gap_are_fail_closed() {
     .unwrap();
     assert!(reconnect.stream.cursor_gap);
     assert!(reconnect.events.is_empty());
+    repository.close().unwrap();
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn subscription_snapshot_and_registration_have_no_lost_event_boundary() {
+    let (path, repository) = repository();
+    let (handle, worker) = spawn_from_repository_for_test(repository).unwrap();
+    let mut subscription = handle.subscribe(None, DecimalU64::new(10)).await.unwrap();
+    let snapshot_cursor = subscription.snapshot.stream.cursor;
+    let admission = handle.admit(download("after-subscribe")).await.unwrap();
+    let event = subscription.events.recv().await.unwrap();
+    assert_eq!(event.sequence, snapshot_cursor.checked_next().unwrap());
+    assert_eq!(event.sequence, admission.revision);
+    assert_eq!(event.operation_id, Some(admission.operation_id));
+    drop(subscription);
+    drop(handle);
+    worker.join_for_test();
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn slow_subscriber_disconnects_without_blocking_writer() {
+    let (path, repository) = repository();
+    let (handle, worker) = spawn_from_repository_for_test(repository).unwrap();
+    let admission = handle.admit(download("progressing")).await.unwrap();
+    let mut subscription = handle.subscribe(None, DecimalU64::new(10)).await.unwrap();
+    handle
+        .observe_required_async(Transition::Started {
+            operation_id: admission.operation_id,
+            progress: Some(V2OperationProgress {
+                completed_bytes: DecimalU64::new(0),
+                total_bytes: None,
+            }),
+        })
+        .await
+        .unwrap();
+    for index in 1..=128 {
+        handle
+            .observe_required_async(Transition::Progress {
+                operation_id: admission.operation_id,
+                progress: V2OperationProgress {
+                    completed_bytes: DecimalU64::new(index * 1_048_576),
+                    total_bytes: None,
+                },
+            })
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        handle
+            .read_snapshot()
+            .unwrap()
+            .operations
+            .iter()
+            .find(|operation| operation.operation_id == admission.operation_id)
+            .unwrap()
+            .status,
+        V2OperationStatus::Running
+    );
+    let mut delivered = 0;
+    while subscription.events.recv().await.is_some() {
+        delivered += 1;
+    }
+    assert_eq!(delivered, 128);
+    drop(handle);
+    worker.join_for_test();
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn poison_closes_subscribers_and_rejects_new_reads_and_streams() {
+    let (path, repository) = repository();
+    let (handle, worker) = spawn_from_repository_for_test(repository).unwrap();
+    let mut subscription = handle.subscribe(None, DecimalU64::new(10)).await.unwrap();
+    handle.admit_with_snapshot_failure_for_test(download("uncertain"));
+    assert!(subscription.events.recv().await.is_none());
+    assert_eq!(
+        handle.read_snapshot().unwrap_err(),
+        ControlStateError::DurableStateUnavailable
+    );
+    assert_eq!(
+        handle
+            .subscribe(None, DecimalU64::new(11))
+            .await
+            .unwrap_err(),
+        ControlStateError::DurableStateUnavailable
+    );
+    assert_eq!(
+        handle.reconnect(None, DecimalU64::new(11)).unwrap_err(),
+        ControlStateError::DurableStateUnavailable
+    );
+    drop(handle);
+    worker.join_for_test();
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn external_poison_wakes_subscription_while_writer_is_blocked() {
+    let (path, repository) = repository();
+    let (handle, worker) = spawn_from_repository_for_test(repository).unwrap();
+    let mut subscription = handle.subscribe(None, DecimalU64::new(10)).await.unwrap();
+    let release = handle.block_worker_for_test().await;
+    handle.poison_for_test();
+    assert!(subscription.events.recv().await.is_none());
+    release.wait();
+    drop(handle);
+    worker.join_for_test();
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn worker_snapshot_uncertainty_wakes_subscription_before_cleanup_unblocks() {
+    let (path, repository) = repository();
+    let (handle, worker) = spawn_from_repository_for_test(repository).unwrap();
+    let mut subscription = handle.subscribe(None, DecimalU64::new(10)).await.unwrap();
+    let release = handle
+        .trigger_snapshot_failure_and_block_cleanup_for_test(download("uncertain-and-stuck"))
+        .await;
+    assert!(subscription.events.recv().await.is_none());
+    release.wait();
+    drop(handle);
+    worker.join_for_test();
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn abandoned_subscription_churn_is_pruned_and_next_stream_stays_atomic() {
+    let (path, repository) = repository();
+    let (handle, worker) = spawn_from_repository_for_test(repository).unwrap();
+    for _ in 0..256 {
+        drop(handle.subscribe(None, DecimalU64::new(10)).await.unwrap());
+    }
+    assert!(handle.subscriber_count_for_test().await <= 1);
+    handle.cancel_subscribe_for_test().await;
+    assert_eq!(handle.subscriber_count_for_test().await, 0);
+
+    let mut subscription = handle.subscribe(None, DecimalU64::new(11)).await.unwrap();
+    let snapshot_cursor = subscription.snapshot.stream.cursor;
+    let admission = handle.admit(download("after-churn")).await.unwrap();
+    let event = subscription.events.recv().await.unwrap();
+    assert_eq!(event.sequence, snapshot_cursor.checked_next().unwrap());
+    assert_eq!(event.operation_id, Some(admission.operation_id));
+
+    drop(subscription);
+    drop(handle);
+    worker.join_for_test();
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn graceful_stop_acknowledges_and_joins_worker() {
+    let (path, repository) = repository();
+    let (handle, worker) = spawn_from_repository_for_test(repository).unwrap();
+    worker.shutdown().await.unwrap();
+    assert!(!handle.is_healthy());
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn worker_panic_is_classified_without_reporting_graceful_shutdown() {
+    let (path, repository) = repository();
+    let (handle, worker) = spawn_from_repository_for_test(repository).unwrap();
+    handle.panic_worker_for_test().await;
+    assert_eq!(
+        worker.shutdown().await.unwrap_err(),
+        ControlStateError::WorkerPanicked
+    );
+    assert!(!handle.is_healthy());
+    cleanup(&path);
+}
+
+#[tokio::test(start_paused = true)]
+async fn worker_stop_ack_and_join_share_one_absolute_deadline() {
+    let (path, repository) = repository();
+    let (handle, worker, barrier) = spawn_paused_from_repository_for_test(repository).unwrap();
+    let started = tokio::time::Instant::now();
+    let shutdown = tokio::spawn(worker.shutdown());
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(10)).await;
+    assert_eq!(
+        shutdown.await.unwrap().unwrap_err(),
+        ControlStateError::ShutdownDeadlineExceeded
+    );
+    assert_eq!(
+        tokio::time::Instant::now() - started,
+        Duration::from_secs(10)
+    );
+    assert!(!handle.is_healthy());
+    barrier.wait();
+    drop(handle);
+    cleanup(&path);
+}
+
+#[test]
+fn authoritative_snapshot_over_budget_is_an_error_not_a_truncation() {
+    let (path, repository) = repository();
+    let state = repository.committed_state().unwrap();
+    let base =
+        build_reconnect_snapshot(&state, None, DecimalU64::new(10), MAX_SNAPSHOT_BYTES).unwrap();
+    let smaller_than_base = serde_json::to_vec(&base).unwrap().len() - 1;
+    assert_eq!(
+        build_reconnect_snapshot(&state, None, DecimalU64::new(10), smaller_than_base).unwrap_err(),
+        ControlStateError::SnapshotTooLarge
+    );
     repository.close().unwrap();
     cleanup(&path);
 }
