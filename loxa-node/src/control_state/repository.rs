@@ -143,6 +143,7 @@ pub(crate) struct ControlRepository {
     slot_id: SlotId,
     stream_epoch: StreamEpoch,
     directory_guard: Option<fs::File>,
+    family_guard: Option<fs::File>,
     main_guard: Option<fs::File>,
     live_claim: Option<LiveDatabaseClaim>,
 }
@@ -150,9 +151,63 @@ pub(crate) struct ControlRepository {
 struct ValidatedConnection {
     connection: Option<Connection>,
     directory_guard: Option<fs::File>,
+    family_guard: Option<fs::File>,
     main_guard: Option<fs::File>,
     live_claim: Option<LiveDatabaseClaim>,
     identity: FileIdentity,
+}
+
+/// A validated SQLite image while its connection and exclusive ownership are live.
+///
+/// Every field that owns authority is optional because the consuming close path and
+/// `Drop` must move the authority into a fail-closed quarantine without moving fields
+/// directly out of a type that implements `Drop`.
+struct OpenValidatedImage {
+    path: Option<PathBuf>,
+    identity: FileIdentity,
+    connection: Option<Connection>,
+    directory_guard: Option<fs::File>,
+    family_guard: Option<fs::File>,
+    main_guard: Option<fs::File>,
+    live_claim: Option<LiveDatabaseClaim>,
+    summary: ValidationSummary,
+}
+
+/// A standalone, sidecar-free SQLite image whose inode remains reserved and guarded.
+struct ClosedImage {
+    path: Option<PathBuf>,
+    identity: FileIdentity,
+    directory_guard: Option<fs::File>,
+    family_guard: Option<fs::File>,
+    main_guard: Option<fs::File>,
+    reservation: Option<ClaimReservation>,
+    summary: ValidationSummary,
+}
+
+/// A destination whose existing image is quiesced or whose absence is bound to a
+/// retained parent-directory identity.
+enum QuiescedDestination {
+    Existing(ClosedImage),
+    Vacant(GuardedVacantDestination),
+}
+
+struct GuardedVacantDestination {
+    path: PathBuf,
+    canonical_parent: PathBuf,
+    directory_identity: FileIdentity,
+    directory_guard: fs::File,
+    family_guard: Option<fs::File>,
+}
+
+#[derive(Clone, Copy)]
+enum DestinationInstallExpectation {
+    Vacant,
+    Existing(FileIdentity),
+}
+
+struct AtomicInstallError {
+    error: RepositoryError,
+    renamed: bool,
 }
 
 impl std::ops::Deref for ValidatedConnection {
@@ -182,7 +237,9 @@ impl ValidatedConnection {
                 self.live_claim
                     .take()
                     .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?
-                    .release_after_proven_close()
+                    .release_after_proven_close()?;
+                drop(self.family_guard.take());
+                Ok(())
             }
             Err((connection, error)) => {
                 self.connection = Some(connection);
@@ -202,6 +259,7 @@ impl ValidatedConnection {
         Connection,
         fs::File,
         fs::File,
+        fs::File,
         LiveDatabaseClaim,
         FileIdentity,
     ) {
@@ -210,6 +268,7 @@ impl ValidatedConnection {
             self.directory_guard
                 .take()
                 .expect("directory guard retained"),
+            self.family_guard.take().expect("family guard retained"),
             self.main_guard.take().expect("main guard retained"),
             self.live_claim.take().expect("live claim retained"),
             self.identity,
@@ -229,10 +288,69 @@ impl Drop for ValidatedConnection {
     }
 }
 
+impl Drop for OpenValidatedImage {
+    fn drop(&mut self) {
+        if let Some(claim) = self.live_claim.take() {
+            let _ = retain_poisoned_owner(
+                self.connection.take(),
+                self.main_guard.take(),
+                self.directory_guard.take(),
+                self.family_guard.take(),
+                claim,
+                CloseUncertainty::ImplicitDrop,
+                RepositoryError::new(RepositoryErrorClass::Durability),
+            );
+        }
+    }
+}
+
+impl ClosedImage {
+    fn path(&self) -> Result<&Path, RepositoryError> {
+        self.path
+            .as_deref()
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))
+    }
+
+    fn release(mut self) -> Result<(), RepositoryError> {
+        drop(self.main_guard.take());
+        drop(self.directory_guard.take());
+        let release = self
+            .reservation
+            .take()
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?
+            .release_after_guards_closed();
+        if let Err(error) = release {
+            if let Some(guard) = self.family_guard.take() {
+                let _retained_until_exit: &'static mut fs::File = Box::leak(Box::new(guard));
+            }
+            return Err(error);
+        }
+        drop(self.family_guard.take());
+        Ok(())
+    }
+}
+
+impl Drop for ClosedImage {
+    fn drop(&mut self) {
+        drop(self.main_guard.take());
+        drop(self.directory_guard.take());
+        if let Some(reservation) = self.reservation.take() {
+            if reservation.release_after_guards_closed().is_err() {
+                if let Some(guard) = self.family_guard.take() {
+                    let _retained_until_exit: &'static mut fs::File = Box::leak(Box::new(guard));
+                }
+                return;
+            }
+        }
+        drop(self.family_guard.take());
+    }
+}
+
 fn retain_poisoned_owner(
     connection: Option<Connection>,
     main_guard: Option<fs::File>,
     directory_guard: Option<fs::File>,
+    family_guard: Option<fs::File>,
     mut claim: LiveDatabaseClaim,
     reason: CloseUncertainty,
     error: RepositoryError,
@@ -242,6 +360,7 @@ fn retain_poisoned_owner(
         connection,
         main_guard,
         directory_guard,
+        family_guard,
         claim,
     };
     let _retained_until_exit: &'static mut PoisonedDatabaseOwner = Box::leak(Box::new(owner));
@@ -252,6 +371,7 @@ fn retain_quarantined_owner(
     connection: Connection,
     main_guard: fs::File,
     directory_guard: fs::File,
+    family_guard: fs::File,
     reservation: ClaimReservation,
     error: RepositoryError,
 ) -> RepositoryError {
@@ -259,6 +379,63 @@ fn retain_quarantined_owner(
         connection,
         main_guard,
         directory_guard,
+        family_guard,
+        reservation,
+    };
+    let _retained_until_exit: &'static mut PoisonedReservationOwner = Box::leak(Box::new(owner));
+    error
+}
+
+fn quarantine_closed_image_until_exit(
+    image: &mut ClosedImage,
+    error: RepositoryError,
+) -> RepositoryError {
+    let Some(mut reservation) = image.reservation.take() else {
+        return error;
+    };
+    let _ = reservation.poison(CloseUncertainty::CheckpointOrClose);
+    let Some(main_guard) = image.main_guard.take() else {
+        return error;
+    };
+    let Some(directory_guard) = image.directory_guard.take() else {
+        return error;
+    };
+    let Some(family_guard) = image.family_guard.take() else {
+        return error;
+    };
+    let owner = PoisonedClosedImageOwner {
+        main_guard,
+        directory_guard,
+        family_guard,
+        reservation,
+    };
+    let _retained_until_exit: &'static mut PoisonedClosedImageOwner = Box::leak(Box::new(owner));
+    error
+}
+
+fn quarantine_closed_image_connection_until_exit(
+    image: &mut ClosedImage,
+    connection: Connection,
+    error: RepositoryError,
+) -> RepositoryError {
+    let Some(mut reservation) = image.reservation.take() else {
+        return error;
+    };
+    let _ = reservation.poison(CloseUncertainty::CheckpointOrClose);
+    let Some(main_guard) = image.main_guard.take() else {
+        return error;
+    };
+    let Some(directory_guard) = image.directory_guard.take() else {
+        return error;
+    };
+    let Some(family_guard) = image.family_guard.take() else {
+        return error;
+    };
+    let owner = PoisonedReservationOwner {
+        connection,
+        main_guard,
+        directory_guard,
+        family_guard,
         reservation,
     };
     let _retained_until_exit: &'static mut PoisonedReservationOwner = Box::leak(Box::new(owner));
@@ -277,6 +454,7 @@ fn quarantine_validated_connection(
         owner.connection.take(),
         owner.main_guard.take(),
         owner.directory_guard.take(),
+        owner.family_guard.take(),
         claim,
         reason,
         error,
@@ -299,6 +477,7 @@ struct PreparedStorage {
     identity: FileIdentity,
     directory_identity: FileIdentity,
     directory_guard: fs::File,
+    family_guard: fs::File,
     main_guard: fs::File,
     reservation: ClaimReservation,
 }
@@ -326,6 +505,35 @@ enum CloseEvent {
     DirectoryGuardClosed,
     ClaimReleased,
     Poisoned,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ImageCloseEvent {
+    CheckpointTruncated,
+    JournalModeDelete,
+    SqliteClosed,
+    SidecarsAbsent,
+    ReadOnlyValidated,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RestoreBoundary {
+    BeforeSourceCopy,
+    AfterSourceCopy,
+    SourceCheckpointTruncated,
+    SourceJournalModeDelete,
+    SourceSqliteClosed,
+    SourceSidecarsAbsent,
+    SourceReadOnlyValidated,
+    DestinationCheckpointTruncated,
+    DestinationJournalModeDelete,
+    DestinationSqliteClosed,
+    DestinationSidecarsAbsent,
+    DestinationReadOnlyValidated,
+    BeforeRename,
+    AfterRename,
+    AfterDirectorySync,
+    ReopenValidated,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -375,6 +583,7 @@ struct PoisonedDatabaseOwner {
     connection: Option<Connection>,
     main_guard: Option<fs::File>,
     directory_guard: Option<fs::File>,
+    family_guard: Option<fs::File>,
     claim: LiveDatabaseClaim,
 }
 
@@ -382,6 +591,14 @@ struct PoisonedReservationOwner {
     connection: Connection,
     main_guard: fs::File,
     directory_guard: fs::File,
+    family_guard: fs::File,
+    reservation: ClaimReservation,
+}
+
+struct PoisonedClosedImageOwner {
+    main_guard: fs::File,
+    directory_guard: fs::File,
+    family_guard: fs::File,
     reservation: ClaimReservation,
 }
 
@@ -391,6 +608,7 @@ static DATABASE_CLAIMS: OnceLock<Mutex<BTreeMap<FileIdentity, ClaimState>>> = On
 thread_local! {
     static FAIL_CLAIM_TRANSITIONS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
     static FAIL_NEXT_UNCOMMITTED_CLOSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_ATOMIC_INSTALL_POSTFLIGHT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -477,6 +695,38 @@ impl ClaimReservation {
             token: self.token,
         })
     }
+
+    fn release_after_guards_closed(mut self) -> Result<(), RepositoryError> {
+        let mut claims = claims()
+            .lock()
+            .map_err(|_| RepositoryError::new(RepositoryErrorClass::Durability))?;
+        match claims.get(&self.identity) {
+            Some(ClaimState::Quarantined { token }) if *token == self.token => {
+                claims.remove(&self.identity);
+                self.active = false;
+                Ok(())
+            }
+            _ => Err(RepositoryError::new(RepositoryErrorClass::Durability)),
+        }
+    }
+
+    fn poison(&mut self, reason: CloseUncertainty) -> Result<(), RepositoryError> {
+        let mut claims = claims()
+            .lock()
+            .map_err(|_| RepositoryError::new(RepositoryErrorClass::Durability))?;
+        match claims.get(&self.identity) {
+            Some(ClaimState::Quarantined { token }) if *token == self.token => {
+                claims.insert(self.identity, ClaimState::Poisoned { reason });
+                self.active = false;
+                Ok(())
+            }
+            Some(ClaimState::Poisoned { .. }) => {
+                self.active = false;
+                Ok(())
+            }
+            _ => Err(RepositoryError::new(RepositoryErrorClass::Durability)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -488,6 +738,16 @@ fn fail_next_claim_transition_for_test() {
 fn fail_next_uncommitted_close_and_two_claim_transitions_for_test() {
     FAIL_CLAIM_TRANSITIONS.with(|remaining| remaining.set(2));
     FAIL_NEXT_UNCOMMITTED_CLOSE.with(|fault| fault.set(true));
+}
+
+#[cfg(test)]
+fn fail_next_atomic_install_postflight_for_test() {
+    FAIL_ATOMIC_INSTALL_POSTFLIGHT.with(|fault| fault.set(true));
+}
+
+#[cfg(test)]
+fn atomic_install_postflight_fault_is_pending_for_test() -> bool {
+    FAIL_ATOMIC_INSTALL_POSTFLIGHT.with(std::cell::Cell::get)
 }
 
 impl Drop for ClaimReservation {
@@ -507,6 +767,23 @@ impl Drop for ClaimReservation {
 }
 
 impl LiveDatabaseClaim {
+    fn transition_to_quarantined(&mut self) -> Result<ClaimReservation, RepositoryError> {
+        let mut claims = claims()
+            .lock()
+            .map_err(|_| RepositoryError::new(RepositoryErrorClass::Durability))?;
+        match claims.get(&self.identity) {
+            Some(ClaimState::Live { token }) if *token == self.token => {
+                claims.insert(self.identity, ClaimState::Quarantined { token: self.token });
+                Ok(ClaimReservation {
+                    identity: self.identity,
+                    token: self.token,
+                    active: true,
+                })
+            }
+            _ => Err(RepositoryError::new(RepositoryErrorClass::Durability)),
+        }
+    }
+
     fn release_after_proven_close(self) -> Result<(), RepositoryError> {
         let mut claims = claims()
             .lock()
@@ -734,7 +1011,7 @@ impl ControlRepository {
                 };
             }
         };
-        let (connection, directory_guard, main_guard, live_claim, identity) =
+        let (connection, directory_guard, family_guard, main_guard, live_claim, identity) =
             opened.into_repository_parts();
         let repository = Self {
             connection: Some(connection),
@@ -744,6 +1021,7 @@ impl ControlRepository {
             slot_id: summary.slot_id,
             stream_epoch: summary.epoch,
             directory_guard: Some(directory_guard),
+            family_guard: Some(family_guard),
             main_guard: Some(main_guard),
             live_claim: Some(live_claim),
         };
@@ -766,6 +1044,7 @@ impl ControlRepository {
         &mut self,
         work: impl FnOnce(&Transaction<'_>) -> Result<T, RepositoryError>,
     ) -> Result<T, RepositoryError> {
+        self.validate_ownership()?;
         let transaction = self
             .connection
             .as_mut()
@@ -777,6 +1056,7 @@ impl ControlRepository {
     }
 
     pub(crate) fn validate_all(&self) -> Result<ValidationSummary, RepositoryError> {
+        self.validate_ownership()?;
         validate_connection(self.connection_ref()?, Some(self.expected_node_id))
     }
 
@@ -798,34 +1078,85 @@ impl ControlRepository {
 
     fn migration_rollback_proof(&self) -> Result<MigrationRollbackProof, RepositoryError> {
         let backup = self.migration_backup_path()?;
-        let summary = validate_database_file(&backup, Some(self.expected_node_id))?;
-        Ok(MigrationRollbackProof {
+        let image = close_into_image(open_validated_image(&backup, Some(self.expected_node_id))?)?;
+        let summary = image.summary.clone();
+        let digest = digest_file_handle(
+            image
+                .main_guard
+                .as_ref()
+                .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?,
+        )?;
+        let proof = MigrationRollbackProof {
             node_id: self.expected_node_id,
             slot_id: summary.slot_id,
             epoch: summary.epoch,
             revision: summary.revision,
             cursor: summary.cursor,
-            digest: digest_private_file(&backup)?,
-        })
+            digest,
+        };
+        image.release()?;
+        Ok(proof)
     }
 
     pub(crate) fn restore_offline(
         backup: &Path,
         destination: &Path,
     ) -> Result<RestoreSummary, RepositoryError> {
-        let source_summary = validate_database_file(backup, None)?;
-        let prepared_destination = prepare_destination_parent(destination)?;
-        validate_optional_private_file(destination, None)?;
-        ensure_auxiliary_files_absent(destination)?;
+        Self::restore_offline_after(backup, destination, |_| Ok(()))
+    }
+
+    fn restore_offline_after(
+        backup: &Path,
+        destination: &Path,
+        mut observe: impl FnMut(RestoreBoundary) -> Result<(), RepositoryError>,
+    ) -> Result<RestoreSummary, RepositoryError> {
+        ensure_auxiliary_files_absent(backup)?;
+        let backup_image = close_into_image(open_validated_image(backup, None)?)?;
+        let source_summary = backup_image.summary.clone();
         let temporary = unique_temporary_path(destination, "restore")?;
+        observe(RestoreBoundary::BeforeSourceCopy)?;
         let result = (|| {
-            copy_database(backup, &temporary)?;
-            rotate_lineage(&temporary, source_summary.node_id)?;
-            validate_database_file(&temporary, Some(source_summary.node_id))?;
-            sync_private_file(&temporary)?;
-            atomic_replace(&temporary, destination)?;
-            sync_directory(&prepared_destination)?;
-            let reopened = validate_database_file(destination, Some(source_summary.node_id))?;
+            copy_closed_image(&backup_image, &temporary)?;
+            observe(RestoreBoundary::AfterSourceCopy)?;
+            let source = rotate_lineage_after(&temporary, source_summary.node_id, |event| {
+                observe(match event {
+                    ImageCloseEvent::CheckpointTruncated => {
+                        RestoreBoundary::SourceCheckpointTruncated
+                    }
+                    ImageCloseEvent::JournalModeDelete => RestoreBoundary::SourceJournalModeDelete,
+                    ImageCloseEvent::SqliteClosed => RestoreBoundary::SourceSqliteClosed,
+                    ImageCloseEvent::SidecarsAbsent => RestoreBoundary::SourceSidecarsAbsent,
+                    ImageCloseEvent::ReadOnlyValidated => RestoreBoundary::SourceReadOnlyValidated,
+                })
+            })?;
+            source
+                .main_guard
+                .as_ref()
+                .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?
+                .sync_all()
+                .map_err(|_| RepositoryError::new(RepositoryErrorClass::Durability))?;
+            backup_image.release()?;
+            let quiesced_destination = quiesce_destination_after(destination, |event| {
+                observe(match event {
+                    ImageCloseEvent::CheckpointTruncated => {
+                        RestoreBoundary::DestinationCheckpointTruncated
+                    }
+                    ImageCloseEvent::JournalModeDelete => {
+                        RestoreBoundary::DestinationJournalModeDelete
+                    }
+                    ImageCloseEvent::SqliteClosed => RestoreBoundary::DestinationSqliteClosed,
+                    ImageCloseEvent::SidecarsAbsent => RestoreBoundary::DestinationSidecarsAbsent,
+                    ImageCloseEvent::ReadOnlyValidated => {
+                        RestoreBoundary::DestinationReadOnlyValidated
+                    }
+                })
+            })?;
+            let reopened = install_closed_image_after(
+                source,
+                quiesced_destination,
+                source_summary.node_id,
+                &mut observe,
+            )?;
             Ok(RestoreSummary {
                 epoch: reopened.epoch,
                 revision: reopened.revision,
@@ -833,10 +1164,7 @@ impl ControlRepository {
                 event_rows: reopened.event_rows,
             })
         })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        result
+        finish_with_temporary_cleanup(result, &temporary)
     }
 
     fn restore_verified_migration_backup(
@@ -844,39 +1172,108 @@ impl ControlRepository {
         destination: &Path,
         proof: &MigrationRollbackProof,
     ) -> Result<(), RepositoryError> {
+        Self::restore_verified_migration_backup_after(backup, destination, proof, |_| Ok(()))
+    }
+
+    fn rollback_failed_migration(
+        backup: &Path,
+        destination: &Path,
+        proof: &MigrationRollbackProof,
+        original_migration_error: RepositoryError,
+    ) -> RepositoryError {
+        match Self::restore_verified_migration_backup(backup, destination, proof) {
+            Ok(()) => original_migration_error,
+            Err(rollback_error) => rollback_error,
+        }
+    }
+
+    fn restore_verified_migration_backup_after(
+        backup: &Path,
+        destination: &Path,
+        proof: &MigrationRollbackProof,
+        mut observe: impl FnMut(RestoreBoundary) -> Result<(), RepositoryError>,
+    ) -> Result<(), RepositoryError> {
         if migration_backup_path(destination)? != backup {
             return Err(RepositoryError::new(RepositoryErrorClass::UnsafePath));
         }
-        let backup_summary = validate_database_file(backup, Some(proof.node_id))?;
+        ensure_auxiliary_files_absent(backup)?;
+        let backup_image = close_into_image(open_validated_image(backup, Some(proof.node_id))?)?;
+        let backup_summary = backup_image.summary.clone();
         if backup_summary.slot_id != proof.slot_id
             || backup_summary.epoch != proof.epoch
             || backup_summary.revision != proof.revision
             || backup_summary.cursor != proof.cursor
-            || digest_private_file(backup)? != proof.digest
+            || digest_file_handle(
+                backup_image
+                    .main_guard
+                    .as_ref()
+                    .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?,
+            )? != proof.digest
         {
             return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
         }
-        // The failed migration may have left an unreadable database, so the
-        // rollback proof is the exact retained sibling path plus a fully
-        // validated backup. Do not require the failed destination to parse.
-        validate_optional_private_file(destination, None)?;
-        ensure_auxiliary_files_absent(destination)?;
-        let parent = prepare_destination_parent(destination)?;
+        // Rollback is automatic only while both lineages remain fully
+        // interpretable. Corrupt or incomplete destination families require
+        // explicit operator archival outside the state directory.
         let temporary = unique_temporary_path(destination, "rollback")?;
+        observe(RestoreBoundary::BeforeSourceCopy)?;
         let result = (|| {
-            copy_database(backup, &temporary)?;
-            let copied = validate_database_file(&temporary, Some(proof.node_id))?;
+            copy_closed_image(&backup_image, &temporary)?;
+            observe(RestoreBoundary::AfterSourceCopy)?;
+            let copied_image = open_validated_image(&temporary, Some(proof.node_id))?;
+            let copied = copied_image.summary.clone();
             if copied.slot_id != proof.slot_id
                 || copied.epoch != proof.epoch
                 || copied.revision != proof.revision
                 || copied.cursor != proof.cursor
+                || digest_file_handle(
+                    copied_image
+                        .main_guard
+                        .as_ref()
+                        .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?,
+                )? != proof.digest
             {
                 return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
             }
-            sync_private_file(&temporary)?;
-            atomic_replace(&temporary, destination)?;
-            sync_directory(&parent)?;
-            let restored = validate_database_file(destination, Some(proof.node_id))?;
+            let source = close_into_image_traced(copied_image, |event| {
+                observe(match event {
+                    ImageCloseEvent::CheckpointTruncated => {
+                        RestoreBoundary::SourceCheckpointTruncated
+                    }
+                    ImageCloseEvent::JournalModeDelete => RestoreBoundary::SourceJournalModeDelete,
+                    ImageCloseEvent::SqliteClosed => RestoreBoundary::SourceSqliteClosed,
+                    ImageCloseEvent::SidecarsAbsent => RestoreBoundary::SourceSidecarsAbsent,
+                    ImageCloseEvent::ReadOnlyValidated => RestoreBoundary::SourceReadOnlyValidated,
+                })
+            })?;
+            source
+                .main_guard
+                .as_ref()
+                .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?
+                .sync_all()
+                .map_err(|_| RepositoryError::new(RepositoryErrorClass::Durability))?;
+            backup_image.release()?;
+            let quiesced_destination = quiesce_destination_after(destination, |event| {
+                observe(match event {
+                    ImageCloseEvent::CheckpointTruncated => {
+                        RestoreBoundary::DestinationCheckpointTruncated
+                    }
+                    ImageCloseEvent::JournalModeDelete => {
+                        RestoreBoundary::DestinationJournalModeDelete
+                    }
+                    ImageCloseEvent::SqliteClosed => RestoreBoundary::DestinationSqliteClosed,
+                    ImageCloseEvent::SidecarsAbsent => RestoreBoundary::DestinationSidecarsAbsent,
+                    ImageCloseEvent::ReadOnlyValidated => {
+                        RestoreBoundary::DestinationReadOnlyValidated
+                    }
+                })
+            })?;
+            let restored = install_closed_image_after(
+                source,
+                quiesced_destination,
+                proof.node_id,
+                &mut observe,
+            )?;
             if restored.slot_id != proof.slot_id
                 || restored.epoch != proof.epoch
                 || restored.revision != proof.revision
@@ -886,16 +1283,14 @@ impl ControlRepository {
             }
             Ok(())
         })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        result
+        finish_with_temporary_cleanup(result, &temporary)
     }
 
     fn checkpoint(&self) -> Result<(), RepositoryError> {
+        self.validate_ownership()?;
         let (busy, _log, _checkpointed): (i64, i64, i64) =
             self.connection_ref()?
-                .query_row("PRAGMA wal_checkpoint(FULL)", [], |row| {
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
                     Ok((row.get(0)?, row.get(1)?, row.get(2)?))
                 })?;
         if busy != 0 {
@@ -904,26 +1299,42 @@ impl ControlRepository {
         Ok(())
     }
 
+    fn validate_ownership(&self) -> Result<(), RepositoryError> {
+        validate_guarded_image(
+            &self.path,
+            self.identity,
+            self.directory_guard
+                .as_ref()
+                .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?,
+            self.family_guard
+                .as_ref()
+                .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?,
+            self.main_guard
+                .as_ref()
+                .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?,
+        )
+    }
+
     fn publish_migration_backup(&self) -> Result<PathBuf, RepositoryError> {
         let backup = self.migration_backup_path()?;
-        validate_optional_private_file(&backup, None)?;
         let temporary = unique_temporary_path(&backup, "backup")?;
         let result = (|| {
             backup_connection(self.connection_ref()?, &temporary)?;
-            validate_database_file(&temporary, Some(self.expected_node_id))?;
-            sync_private_file(&temporary)?;
-            atomic_replace(&temporary, &backup)?;
-            let parent = backup
-                .parent()
-                .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
-            sync_directory_path(parent)?;
-            validate_database_file(&backup, Some(self.expected_node_id))?;
+            let source = close_into_image(open_validated_image(
+                &temporary,
+                Some(self.expected_node_id),
+            )?)?;
+            source
+                .main_guard
+                .as_ref()
+                .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?
+                .sync_all()
+                .map_err(|_| RepositoryError::new(RepositoryErrorClass::Durability))?;
+            let destination = quiesce_destination_after(&backup, |_| Ok(()))?;
+            install_closed_image_after(source, destination, self.expected_node_id, |_| Ok(()))?;
             Ok(backup.clone())
         })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        result
+        finish_with_temporary_cleanup(result, &temporary)
     }
 
     fn connection_ref(&self) -> Result<&Connection, RepositoryError> {
@@ -995,6 +1406,7 @@ impl ControlRepository {
                     .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?
                     .release_after_proven_close()?;
                 observe(CloseEvent::ClaimReleased);
+                drop(self.family_guard.take());
                 Ok(())
             }
             Err((connection, error)) => {
@@ -1033,6 +1445,7 @@ fn quarantine_repository_until_exit(
         repository.connection.take(),
         repository.main_guard.take(),
         repository.directory_guard.take(),
+        repository.family_guard.take(),
         claim,
         reason,
         error,
@@ -1480,11 +1893,17 @@ fn valid_control_endpoint(value: &str) -> bool {
     })
 }
 
-fn rotate_lineage(path: &Path, node_id: NodeId) -> Result<(), RepositoryError> {
-    let prepared = prepare_existing_storage_path(path)?;
-    let mut connection = open_validated_connection_after(prepared, false, || {})?;
-    configure_for_offline_mutation(&connection)?;
-    let summary = validate_connection(&connection, Some(node_id))?;
+fn rotate_lineage_after(
+    path: &Path,
+    node_id: NodeId,
+    observe: impl FnMut(ImageCloseEvent) -> Result<(), RepositoryError>,
+) -> Result<ClosedImage, RepositoryError> {
+    let mut image = open_validated_image(path, Some(node_id))?;
+    let connection = image
+        .connection
+        .as_mut()
+        .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?;
+    let summary = image.summary.clone();
     let next_revision = summary
         .revision
         .checked_add(1)
@@ -1506,10 +1925,8 @@ fn rotate_lineage(path: &Path, node_id: NodeId) -> Result<(), RepositoryError> {
         ),
     )?;
     transaction.commit()?;
-    connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")?;
-    connection.close()?;
-    validate_database_file(path, Some(node_id))?;
-    Ok(())
+    image.summary = validate_connection(connection, Some(node_id))?;
+    close_into_image_traced(image, observe)
 }
 
 fn unloaded_slot_payload(node_id: NodeId, slot_id: SlotId) -> Result<String, RepositoryError> {
@@ -1638,11 +2055,607 @@ fn validate_database_file(
     Ok(summary)
 }
 
-fn copy_database(source: &Path, destination: &Path) -> Result<(), RepositoryError> {
-    let source_storage = prepare_existing_storage_path(source)?;
-    let source_connection = open_validated_connection_after(source_storage, true, || {})?;
-    backup_connection(&source_connection, destination)?;
-    source_connection.close()?;
+fn open_validated_image(
+    path: &Path,
+    expected_node_id: Option<NodeId>,
+) -> Result<OpenValidatedImage, RepositoryError> {
+    let prepared = prepare_existing_storage_path(path)?;
+    let canonical_path = prepared.canonical_path.clone();
+    let mut opened = open_validated_connection_after(prepared, false, || {})?;
+    configure_for_offline_mutation(&opened)?;
+    let summary = validate_connection(&opened, expected_node_id)?;
+    Ok(OpenValidatedImage {
+        path: Some(canonical_path),
+        identity: opened.identity,
+        connection: opened.connection.take(),
+        directory_guard: opened.directory_guard.take(),
+        family_guard: opened.family_guard.take(),
+        main_guard: opened.main_guard.take(),
+        live_claim: opened.live_claim.take(),
+        summary,
+    })
+}
+
+fn require_checkpoint_not_busy(
+    connection: &Connection,
+    pragma: &'static str,
+) -> Result<(), RepositoryError> {
+    let (busy, _log, _checkpointed): (i64, i64, i64) = connection.query_row(pragma, [], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+    })?;
+    if busy == 0 {
+        Ok(())
+    } else {
+        Err(RepositoryError::new(RepositoryErrorClass::Durability))
+    }
+}
+
+fn require_delete_journal_mode(connection: &Connection) -> Result<(), RepositoryError> {
+    let returned: String =
+        connection.query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))?;
+    if returned.eq_ignore_ascii_case("delete") {
+        Ok(())
+    } else {
+        Err(RepositoryError::new(RepositoryErrorClass::Durability))
+    }
+}
+
+fn validate_guarded_image(
+    path: &Path,
+    identity: FileIdentity,
+    directory_guard: &fs::File,
+    family_guard: &fs::File,
+    main_guard: &fs::File,
+) -> Result<(), RepositoryError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
+    let canonical_parent = fs::canonicalize(parent)
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
+    let directory_identity = file_identity(
+        &directory_guard
+            .metadata()
+            .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?,
+    )?;
+    validate_bound_directory_continuity(&canonical_parent, directory_identity, directory_guard)?;
+    validate_family_guard(path, family_guard)?;
+    let path_metadata = fs::symlink_metadata(path)
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
+    let guard_metadata = main_guard
+        .metadata()
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
+    validate_file_metadata(&path_metadata)?;
+    validate_file_metadata(&guard_metadata)?;
+    if file_identity(&path_metadata)? != identity || file_identity(&guard_metadata)? != identity {
+        return Err(RepositoryError::new(RepositoryErrorClass::UnsafePath));
+    }
+    Ok(())
+}
+
+fn close_into_image(image: OpenValidatedImage) -> Result<ClosedImage, RepositoryError> {
+    close_into_image_traced(image, |_| Ok(()))
+}
+
+fn close_into_image_traced(
+    mut image: OpenValidatedImage,
+    mut observe: impl FnMut(ImageCloseEvent) -> Result<(), RepositoryError>,
+) -> Result<ClosedImage, RepositoryError> {
+    let connection = image
+        .connection
+        .as_ref()
+        .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?;
+    require_checkpoint_not_busy(connection, "PRAGMA wal_checkpoint(TRUNCATE)")?;
+    observe(ImageCloseEvent::CheckpointTruncated)?;
+    require_delete_journal_mode(connection)?;
+    observe(ImageCloseEvent::JournalModeDelete)?;
+    let connection = image
+        .connection
+        .take()
+        .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?;
+    if let Err((connection, error)) = connection.close() {
+        image.connection = Some(connection);
+        return Err(retain_poisoned_owner(
+            image.connection.take(),
+            image.main_guard.take(),
+            image.directory_guard.take(),
+            image.family_guard.take(),
+            image
+                .live_claim
+                .take()
+                .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?,
+            CloseUncertainty::CheckpointOrClose,
+            map_sql_error(error),
+        ));
+    }
+    if let Err(error) = observe(ImageCloseEvent::SqliteClosed) {
+        return Err(retain_poisoned_owner(
+            image.connection.take(),
+            image.main_guard.take(),
+            image.directory_guard.take(),
+            image.family_guard.take(),
+            image
+                .live_claim
+                .take()
+                .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?,
+            CloseUncertainty::CheckpointOrClose,
+            error,
+        ));
+    }
+    let reservation = image
+        .live_claim
+        .as_mut()
+        .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?
+        .transition_to_quarantined()?;
+    let _former_live_claim = image.live_claim.take();
+    let mut closed = ClosedImage {
+        path: image.path.take(),
+        identity: image.identity,
+        directory_guard: image.directory_guard.take(),
+        family_guard: image.family_guard.take(),
+        main_guard: image.main_guard.take(),
+        reservation: Some(reservation),
+        summary: image.summary.clone(),
+    };
+    let path = closed.path()?.to_owned();
+    if let Err(error) = validate_guarded_image(
+        &path,
+        closed.identity,
+        closed
+            .directory_guard
+            .as_ref()
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?,
+        closed
+            .family_guard
+            .as_ref()
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?,
+        closed
+            .main_guard
+            .as_ref()
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?,
+    ) {
+        return Err(quarantine_closed_image_until_exit(&mut closed, error));
+    }
+    if let Err(error) = ensure_auxiliary_files_absent(&path) {
+        return Err(quarantine_closed_image_until_exit(&mut closed, error));
+    }
+    if let Err(error) = observe(ImageCloseEvent::SidecarsAbsent) {
+        return Err(quarantine_closed_image_until_exit(&mut closed, error));
+    }
+    validate_closed_image_read_only(&mut closed)?;
+    if let Err(error) = observe(ImageCloseEvent::ReadOnlyValidated) {
+        return Err(quarantine_closed_image_until_exit(&mut closed, error));
+    }
+    Ok(closed)
+}
+
+fn close_into_destination_traced(
+    image: OpenValidatedImage,
+    observe: impl FnMut(ImageCloseEvent) -> Result<(), RepositoryError>,
+) -> Result<QuiescedDestination, RepositoryError> {
+    close_into_image_traced(image, observe).map(QuiescedDestination::Existing)
+}
+
+fn quiesce_destination_after(
+    path: &Path,
+    observe: impl FnMut(ImageCloseEvent) -> Result<(), RepositoryError>,
+) -> Result<QuiescedDestination, RepositoryError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            ensure_auxiliary_files_absent(path)?;
+            close_into_destination_traced(open_validated_image(path, None)?, observe)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = prepare_destination_parent(path)?;
+            let directory_guard = open_secure_directory(&parent, false)?;
+            let canonical_parent = fs::canonicalize(&parent)
+                .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
+            let directory_identity = file_identity(
+                &directory_guard
+                    .metadata()
+                    .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?,
+            )?;
+            validate_bound_directory_continuity(
+                &canonical_parent,
+                directory_identity,
+                &directory_guard,
+            )?;
+            let family_guard = open_family_guard(path)?;
+            ensure_auxiliary_files_absent(path)?;
+            if fs::symlink_metadata(path).is_ok() {
+                return Err(RepositoryError::new(RepositoryErrorClass::UnsafePath));
+            }
+            Ok(QuiescedDestination::Vacant(GuardedVacantDestination {
+                path: path.to_owned(),
+                canonical_parent,
+                directory_identity,
+                directory_guard,
+                family_guard: Some(family_guard),
+            }))
+        }
+        Err(_) => Err(RepositoryError::new(RepositoryErrorClass::UnsafePath)),
+    }
+}
+
+fn validate_quiesced_destination(destination: &QuiescedDestination) -> Result<(), RepositoryError> {
+    match destination {
+        QuiescedDestination::Existing(image) => {
+            let path = image.path()?;
+            validate_guarded_image(
+                path,
+                image.identity,
+                image
+                    .directory_guard
+                    .as_ref()
+                    .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?,
+                image
+                    .family_guard
+                    .as_ref()
+                    .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?,
+                image
+                    .main_guard
+                    .as_ref()
+                    .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?,
+            )?;
+            ensure_auxiliary_files_absent(path)
+        }
+        QuiescedDestination::Vacant(vacant) => {
+            validate_bound_directory_continuity(
+                &vacant.canonical_parent,
+                vacant.directory_identity,
+                &vacant.directory_guard,
+            )?;
+            validate_family_guard(
+                &vacant.path,
+                vacant
+                    .family_guard
+                    .as_ref()
+                    .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?,
+            )?;
+            ensure_auxiliary_files_absent(&vacant.path)?;
+            match fs::symlink_metadata(&vacant.path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                _ => Err(RepositoryError::new(RepositoryErrorClass::UnsafePath)),
+            }
+        }
+    }
+}
+
+fn transfer_destination_family_guard_after_rename(
+    source: &mut ClosedImage,
+    destination: &mut QuiescedDestination,
+    source_path: &Path,
+) -> Result<(), RepositoryError> {
+    let destination_family_guard = match destination {
+        QuiescedDestination::Existing(image) => image.family_guard.take(),
+        QuiescedDestination::Vacant(vacant) => vacant.family_guard.take(),
+    }
+    .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?;
+    let source_family_guard = source
+        .family_guard
+        .replace(destination_family_guard)
+        .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?;
+    remove_guarded_family_lock(source_path, source_family_guard)
+}
+
+fn install_closed_image_after(
+    mut source: ClosedImage,
+    mut destination: QuiescedDestination,
+    expected_node_id: NodeId,
+    mut observe: impl FnMut(RestoreBoundary) -> Result<(), RepositoryError>,
+) -> Result<ValidationSummary, RepositoryError> {
+    let source_path = source.path()?.to_owned();
+    let destination_path = match &destination {
+        QuiescedDestination::Existing(image) => image.path()?.to_owned(),
+        QuiescedDestination::Vacant(vacant) => vacant.path.clone(),
+    };
+    let destination_expectation = match &destination {
+        QuiescedDestination::Existing(image) => {
+            DestinationInstallExpectation::Existing(image.identity)
+        }
+        QuiescedDestination::Vacant(_) => DestinationInstallExpectation::Vacant,
+    };
+    if source_path.parent() != destination_path.parent() {
+        return Err(RepositoryError::new(RepositoryErrorClass::UnsafePath));
+    }
+    validate_guarded_image(
+        &source_path,
+        source.identity,
+        source
+            .directory_guard
+            .as_ref()
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?,
+        source
+            .family_guard
+            .as_ref()
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?,
+        source
+            .main_guard
+            .as_ref()
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?,
+    )?;
+    ensure_auxiliary_files_absent(&source_path)?;
+    validate_quiesced_destination(&destination)?;
+
+    observe(RestoreBoundary::BeforeRename)?;
+    if let Err(failure) = atomic_install_closed_image(
+        &source_path,
+        source.identity,
+        &destination_path,
+        destination_expectation,
+    ) {
+        if !failure.renamed {
+            return Err(failure.error);
+        }
+        if let Err(transfer_error) = transfer_destination_family_guard_after_rename(
+            &mut source,
+            &mut destination,
+            &source_path,
+        ) {
+            return Err(quarantine_closed_image_until_exit(
+                &mut source,
+                transfer_error,
+            ));
+        }
+        return Err(quarantine_closed_image_until_exit(
+            &mut source,
+            failure.error,
+        ));
+    }
+
+    // The destination lock protects the logical database family across the
+    // pathname replacement. The source lock protected only the temporary
+    // pathname and must not be mistaken for destination authority afterward.
+    if let Err(error) =
+        transfer_destination_family_guard_after_rename(&mut source, &mut destination, &source_path)
+    {
+        return Err(quarantine_closed_image_until_exit(&mut source, error));
+    }
+    if let Err(error) = observe(RestoreBoundary::AfterRename) {
+        return Err(quarantine_closed_image_until_exit(&mut source, error));
+    }
+    let Some(parent) = destination_path.parent() else {
+        let error = RepositoryError::new(RepositoryErrorClass::UnsafePath);
+        return Err(quarantine_closed_image_until_exit(&mut source, error));
+    };
+    if let Err(error) = sync_directory_path(parent) {
+        return Err(quarantine_closed_image_until_exit(&mut source, error));
+    }
+    if let Err(error) = observe(RestoreBoundary::AfterDirectorySync) {
+        return Err(quarantine_closed_image_until_exit(&mut source, error));
+    }
+    let installed = match fs::symlink_metadata(&destination_path) {
+        Ok(metadata) => metadata,
+        Err(_) => {
+            let error = RepositoryError::new(RepositoryErrorClass::UnsafePath);
+            return Err(quarantine_closed_image_until_exit(&mut source, error));
+        }
+    };
+    let installed_identity = match file_identity(&installed) {
+        Ok(identity) => identity,
+        Err(error) => return Err(quarantine_closed_image_until_exit(&mut source, error)),
+    };
+    if installed_identity != source.identity {
+        let error = RepositoryError::new(RepositoryErrorClass::Durability);
+        return Err(quarantine_closed_image_until_exit(&mut source, error));
+    }
+    if let Err(error) = ensure_auxiliary_files_absent(&destination_path) {
+        return Err(quarantine_closed_image_until_exit(&mut source, error));
+    }
+
+    // The obsolete destination inode is now unreachable. Close its guard before
+    // releasing the token-checked reservation.
+    if let QuiescedDestination::Existing(image) = &mut destination {
+        drop(image.main_guard.take());
+        drop(image.directory_guard.take());
+        let Some(reservation) = image.reservation.take() else {
+            let error = RepositoryError::new(RepositoryErrorClass::Durability);
+            return Err(quarantine_closed_image_until_exit(&mut source, error));
+        };
+        let release = reservation.release_after_guards_closed();
+        if let Err(error) = release {
+            return Err(quarantine_closed_image_until_exit(&mut source, error));
+        }
+    }
+
+    let spec = match ConnectionOpenSpec::for_existing(destination_path.clone(), true) {
+        Ok(spec) => spec,
+        Err(error) => return Err(quarantine_closed_image_until_exit(&mut source, error)),
+    };
+    let connection =
+        match Connection::open_with_flags_and_vfs(&destination_path, spec.flags, spec.vfs) {
+            Ok(connection) => connection,
+            Err(error) => {
+                let error = map_sql_error(error);
+                return Err(quarantine_closed_image_until_exit(&mut source, error));
+            }
+        };
+    let connected_vfs = match connected_vfs_name(&connection) {
+        Ok(vfs) => vfs,
+        Err(error) => {
+            return Err(quarantine_closed_image_connection_until_exit(
+                &mut source,
+                connection,
+                error,
+            ));
+        }
+    };
+    if connected_vfs != spec.vfs {
+        let error = RepositoryError::new(RepositoryErrorClass::Database);
+        return Err(quarantine_closed_image_connection_until_exit(
+            &mut source,
+            connection,
+            error,
+        ));
+    }
+    if let Err(error) = connection.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true) {
+        let error = map_sql_error(error);
+        return Err(quarantine_closed_image_connection_until_exit(
+            &mut source,
+            connection,
+            error,
+        ));
+    }
+    if let Err(error) = connection.execute_batch("PRAGMA trusted_schema=OFF; PRAGMA mmap_size=0;") {
+        let error = map_sql_error(error);
+        return Err(quarantine_closed_image_connection_until_exit(
+            &mut source,
+            connection,
+            error,
+        ));
+    }
+    if let Err(error) = apply_limits(&connection) {
+        return Err(quarantine_closed_image_connection_until_exit(
+            &mut source,
+            connection,
+            error,
+        ));
+    }
+    let summary = match validate_connection(&connection, Some(expected_node_id)) {
+        Ok(summary) => summary,
+        Err(error) => {
+            return Err(quarantine_closed_image_connection_until_exit(
+                &mut source,
+                connection,
+                error,
+            ));
+        }
+    };
+    if let Err(error) = observe(RestoreBoundary::ReopenValidated) {
+        return Err(quarantine_closed_image_connection_until_exit(
+            &mut source,
+            connection,
+            error,
+        ));
+    }
+    let live_claim = match source
+        .reservation
+        .as_mut()
+        .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))
+        .and_then(ClaimReservation::transition_to_live)
+    {
+        Ok(claim) => claim,
+        Err(error) => {
+            return Err(quarantine_closed_image_connection_until_exit(
+                &mut source,
+                connection,
+                error,
+            ));
+        }
+    };
+    drop(source.reservation.take());
+    let reopened = ValidatedConnection {
+        connection: Some(connection),
+        directory_guard: source.directory_guard.take(),
+        family_guard: source.family_guard.take(),
+        main_guard: source.main_guard.take(),
+        live_claim: Some(live_claim),
+        identity: source.identity,
+    };
+    // The retained source guard now proves the installed destination pathname.
+    validate_guarded_image(
+        &destination_path,
+        reopened.identity,
+        reopened
+            .directory_guard
+            .as_ref()
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?,
+        reopened
+            .family_guard
+            .as_ref()
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?,
+        reopened
+            .main_guard
+            .as_ref()
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?,
+    )?;
+    reopened.close()?;
+    Ok(summary)
+}
+
+fn validate_closed_image_read_only(image: &mut ClosedImage) -> Result<(), RepositoryError> {
+    let path = image.path()?.to_owned();
+    if let Err(error) = validate_guarded_image(
+        &path,
+        image.identity,
+        image
+            .directory_guard
+            .as_ref()
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?,
+        image
+            .family_guard
+            .as_ref()
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?,
+        image
+            .main_guard
+            .as_ref()
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?,
+    ) {
+        return Err(quarantine_closed_image_until_exit(image, error));
+    }
+    if let Err(error) = ensure_auxiliary_files_absent(&path) {
+        return Err(quarantine_closed_image_until_exit(image, error));
+    }
+    let spec = match ConnectionOpenSpec::for_existing(path.clone(), true) {
+        Ok(spec) => spec,
+        Err(error) => return Err(quarantine_closed_image_until_exit(image, error)),
+    };
+    let connection = match Connection::open_with_flags_and_vfs(&path, spec.flags, spec.vfs) {
+        Ok(connection) => connection,
+        Err(error) => {
+            return Err(quarantine_closed_image_until_exit(
+                image,
+                map_sql_error(error),
+            ));
+        }
+    };
+    let validation = (|| {
+        if connected_vfs_name(&connection)? != spec.vfs {
+            return Err(RepositoryError::new(RepositoryErrorClass::Database));
+        }
+        connection.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
+        connection.execute_batch("PRAGMA trusted_schema=OFF; PRAGMA mmap_size=0;")?;
+        apply_limits(&connection)?;
+        validate_connection(&connection, Some(image.summary.node_id))
+    })();
+    match connection.close() {
+        Ok(()) => {}
+        Err((connection, error)) => {
+            return Err(quarantine_closed_image_connection_until_exit(
+                image,
+                connection,
+                map_sql_error(error),
+            ));
+        }
+    }
+    let summary = match validation {
+        Ok(summary) => summary,
+        Err(error) => return Err(quarantine_closed_image_until_exit(image, error)),
+    };
+    if let Err(error) = validate_guarded_image(
+        &path,
+        image.identity,
+        image
+            .directory_guard
+            .as_ref()
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?,
+        image
+            .family_guard
+            .as_ref()
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?,
+        image
+            .main_guard
+            .as_ref()
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?,
+    ) {
+        return Err(quarantine_closed_image_until_exit(image, error));
+    }
+    if let Err(error) = ensure_auxiliary_files_absent(&path) {
+        return Err(quarantine_closed_image_until_exit(image, error));
+    }
+    if summary != image.summary {
+        let error = RepositoryError::new(RepositoryErrorClass::Corrupt);
+        return Err(quarantine_closed_image_until_exit(image, error));
+    }
     Ok(())
 }
 
@@ -1721,6 +2734,7 @@ fn open_validated_connection_traced(
     let PreparedStorage {
         identity,
         directory_guard,
+        family_guard,
         main_guard,
         ..
     } = prepared;
@@ -1731,6 +2745,7 @@ fn open_validated_connection_traced(
     Ok(ValidatedConnection {
         connection: Some(connection),
         directory_guard: Some(directory_guard),
+        family_guard: Some(family_guard),
         main_guard: Some(main_guard),
         live_claim: Some(live_claim),
         identity,
@@ -1766,6 +2781,7 @@ fn dispose_uncommitted_open(
                     Some(connection),
                     Some(prepared.main_guard),
                     Some(prepared.directory_guard),
+                    Some(prepared.family_guard),
                     claim,
                     CloseUncertainty::CheckpointOrClose,
                     error,
@@ -1774,6 +2790,7 @@ fn dispose_uncommitted_open(
                     connection,
                     prepared.main_guard,
                     prepared.directory_guard,
+                    prepared.family_guard,
                     prepared.reservation,
                     error,
                 ),
@@ -1800,6 +2817,91 @@ fn auxiliary_path(path: &Path, suffix: &str) -> Result<PathBuf, RepositoryError>
     Ok(path.with_file_name(name))
 }
 
+fn family_lock_path(path: &Path) -> Result<PathBuf, RepositoryError> {
+    let mut name = path
+        .file_name()
+        .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::UnsafePath))?
+        .to_os_string();
+    name.push(".owner.lock");
+    Ok(path.with_file_name(name))
+}
+
+#[cfg(unix)]
+fn open_family_guard(path: &Path) -> Result<fs::File, RepositoryError> {
+    let lock_path = family_lock_path(path)?;
+    let (guard, created) = open_or_create_private_file(&lock_path)?;
+    validate_family_guard(path, &guard)?;
+    try_lock_family_guard(&guard)?;
+    validate_family_guard(path, &guard)?;
+    if created {
+        let parent = lock_path
+            .parent()
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
+        sync_directory_path(parent)?;
+    }
+    Ok(guard)
+}
+
+#[cfg(unix)]
+fn try_lock_family_guard(guard: &fs::File) -> Result<(), RepositoryError> {
+    use std::os::fd::AsRawFd;
+
+    let result = unsafe { libc::flock(guard.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(());
+    }
+    let raw = std::io::Error::last_os_error().raw_os_error();
+    Err(
+        if raw == Some(libc::EWOULDBLOCK) || raw == Some(libc::EAGAIN) {
+            RepositoryError::new(RepositoryErrorClass::AlreadyOwned)
+        } else {
+            RepositoryError::new(RepositoryErrorClass::Durability)
+        },
+    )
+}
+
+#[cfg(not(unix))]
+fn try_lock_family_guard(_guard: &fs::File) -> Result<(), RepositoryError> {
+    Err(RepositoryError::new(
+        RepositoryErrorClass::UnsupportedPlatform,
+    ))
+}
+
+#[cfg(not(unix))]
+fn open_family_guard(_path: &Path) -> Result<fs::File, RepositoryError> {
+    Err(RepositoryError::new(
+        RepositoryErrorClass::UnsupportedPlatform,
+    ))
+}
+
+fn validate_family_guard(path: &Path, guard: &fs::File) -> Result<(), RepositoryError> {
+    let lock_path = family_lock_path(path)?;
+    let path_metadata = fs::symlink_metadata(&lock_path)
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
+    let guard_metadata = guard
+        .metadata()
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
+    validate_file_metadata(&path_metadata)?;
+    validate_file_metadata(&guard_metadata)?;
+    if file_identity(&path_metadata)? != file_identity(&guard_metadata)? {
+        return Err(RepositoryError::new(RepositoryErrorClass::UnsafePath));
+    }
+    Ok(())
+}
+
+fn remove_guarded_family_lock(path: &Path, guard: fs::File) -> Result<(), RepositoryError> {
+    validate_family_guard(path, &guard)?;
+    let lock_path = family_lock_path(path)?;
+    fs::remove_file(&lock_path)
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::Durability))?;
+    let parent = lock_path
+        .parent()
+        .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?;
+    sync_directory_path(parent)?;
+    drop(guard);
+    Ok(())
+}
+
 fn unique_temporary_path(path: &Path, label: &str) -> Result<PathBuf, RepositoryError> {
     let mut name = path
         .file_name()
@@ -1807,6 +2909,115 @@ fn unique_temporary_path(path: &Path, label: &str) -> Result<PathBuf, Repository
         .to_os_string();
     name.push(format!(".{label}-{}.tmp", StreamEpoch::new_v4()));
     Ok(path.with_file_name(name))
+}
+
+fn finish_with_temporary_cleanup<T>(
+    result: Result<T, RepositoryError>,
+    temporary: &Path,
+) -> Result<T, RepositoryError> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(original) => match cleanup_unclaimed_temporary_family(temporary) {
+            Ok(()) => Err(original),
+            Err(cleanup) if cleanup.class() == RepositoryErrorClass::AlreadyOwned => {
+                // The caller's own quarantined temporary can still own the
+                // lock. Do not expose that internal path as a user-visible
+                // ownership conflict; cleanup uncertainty is durability.
+                Err(RepositoryError::new(RepositoryErrorClass::Durability))
+            }
+            Err(cleanup) => Err(cleanup),
+        },
+    }
+}
+
+fn cleanup_unclaimed_temporary_family(path: &Path) -> Result<(), RepositoryError> {
+    cleanup_unclaimed_temporary_family_after(path, || {})
+}
+
+fn cleanup_unclaimed_temporary_family_after(
+    path: &Path,
+    after_family_lock: impl FnOnce(),
+) -> Result<(), RepositoryError> {
+    let family_guard = open_family_guard(path)?;
+    after_family_lock();
+    ensure_auxiliary_files_absent(path).map_err(|_| {
+        // A temporary sidecar means an SQLite owner may still be uncertain.
+        RepositoryError::new(RepositoryErrorClass::Durability)
+    })?;
+    let file = match validate_optional_private_file(path, None) {
+        Ok(Some(file)) => file,
+        Ok(None) => return remove_guarded_family_lock(path, family_guard),
+        Err(_) => return Err(RepositoryError::new(RepositoryErrorClass::Durability)),
+    };
+    let identity = file_identity(
+        &file
+            .metadata()
+            .map_err(|_| RepositoryError::new(RepositoryErrorClass::Durability))?,
+    )?;
+    let claimed = claims()
+        .lock()
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::Durability))?
+        .contains_key(&identity);
+    drop(file);
+    if claimed {
+        return Err(RepositoryError::new(RepositoryErrorClass::Durability));
+    }
+    fs::remove_file(path).map_err(|_| RepositoryError::new(RepositoryErrorClass::Durability))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?;
+    sync_directory_path(parent)?;
+    remove_guarded_family_lock(path, family_guard)
+}
+
+fn recover_orphaned_temporary_families(path: &Path) -> Result<(), RepositoryError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
+    let base = path
+        .file_name()
+        .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::UnsafePath))?
+        .to_string_lossy();
+    let backup_base = migration_backup_path(path)?
+        .file_name()
+        .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::UnsafePath))?
+        .to_string_lossy()
+        .into_owned();
+    let prefixes = [
+        format!("{base}.restore-"),
+        format!("{base}.rollback-"),
+        format!("{backup_base}.backup-"),
+    ];
+    let mut temporaries = BTreeSet::new();
+    let entries =
+        fs::read_dir(parent).map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
+    for entry in entries {
+        let entry = entry.map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let main_name = name.strip_suffix(".owner.lock").unwrap_or(&name);
+        if main_name.ends_with(".tmp")
+            && prefixes.iter().any(|prefix| main_name.starts_with(prefix))
+        {
+            temporaries.insert(parent.join(main_name));
+        }
+    }
+    for temporary in temporaries {
+        match cleanup_unclaimed_temporary_family(&temporary) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.class(),
+                    RepositoryErrorClass::AlreadyOwned | RepositoryErrorClass::Durability
+                ) =>
+            {
+                // Active or sidecar-bearing recovery state is retained for
+                // operator/restart reconciliation. It is non-authoritative and
+                // must not block the separately locked destination family.
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 fn validate_auxiliary_files(path: &Path) -> Result<(), RepositoryError> {
@@ -1837,7 +3048,7 @@ fn validate_auxiliary_files_for_owner(
 }
 
 fn ensure_auxiliary_files_absent(path: &Path) -> Result<(), RepositoryError> {
-    for suffix in ["-wal", "-shm"] {
+    for suffix in ["-wal", "-journal", "-shm"] {
         if validate_optional_private_file(&auxiliary_path(path, suffix)?, None)?.is_some() {
             return Err(RepositoryError::new(RepositoryErrorClass::UnsafePath));
         }
@@ -1922,6 +3133,8 @@ fn prepare_storage_path_traced_with_preflight_after_directory_bound(
     )?;
     after_directory_bound(&canonical_parent);
     validate_bound_directory_continuity(&canonical_parent, directory_identity, &directory_guard)?;
+    let family_guard = open_family_guard(&canonical_path)?;
+    recover_orphaned_temporary_families(&canonical_path)?;
     validate_auxiliary_files(&canonical_path)?;
     validate_bound_directory_continuity(&canonical_parent, directory_identity, &directory_guard)?;
     let existing = match fs::symlink_metadata(&canonical_path) {
@@ -1977,6 +3190,7 @@ fn prepare_storage_path_traced_with_preflight_after_directory_bound(
         identity,
         directory_identity,
         directory_guard,
+        family_guard,
         main_guard,
         reservation,
     })
@@ -2001,6 +3215,8 @@ fn prepare_existing_storage_path(path: &Path) -> Result<PreparedStorage, Reposit
             .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?,
     )?;
     validate_bound_directory_continuity(&canonical_parent, directory_identity, &directory_guard)?;
+    let family_guard = open_family_guard(&canonical_path)?;
+    recover_orphaned_temporary_families(&canonical_path)?;
     validate_auxiliary_files(&canonical_path)?;
     validate_bound_directory_continuity(&canonical_parent, directory_identity, &directory_guard)?;
     let metadata = fs::symlink_metadata(&canonical_path)
@@ -2015,6 +3231,7 @@ fn prepare_existing_storage_path(path: &Path) -> Result<PreparedStorage, Reposit
         identity,
         directory_identity,
         directory_guard,
+        family_guard,
         main_guard,
         reservation,
     })
@@ -2079,6 +3296,7 @@ fn validate_prepared_storage_continuity(prepared: &PreparedStorage) -> Result<()
         prepared.directory_identity,
         &prepared.directory_guard,
     )?;
+    validate_family_guard(&prepared.canonical_path, &prepared.family_guard)?;
     let path_metadata = fs::symlink_metadata(&prepared.canonical_path)
         .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
     let guard_metadata = prepared
@@ -2337,8 +3555,17 @@ fn sync_private_file(path: &Path) -> Result<(), RepositoryError> {
 
 fn digest_private_file(path: &Path) -> Result<[u8; 32], RepositoryError> {
     use sha2::{Digest, Sha256};
-    let mut file = validate_optional_private_file(path, None)?
+    let file = validate_optional_private_file(path, None)?
         .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
+    digest_file_handle(&file)
+}
+
+fn digest_file_handle(file: &fs::File) -> Result<[u8; 32], RepositoryError> {
+    use sha2::{Digest, Sha256};
+
+    let mut file = file
+        .try_clone()
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::Durability))?;
     file.seek(SeekFrom::Start(0))
         .map_err(|_| RepositoryError::new(RepositoryErrorClass::Durability))?;
     let mut digest = Sha256::new();
@@ -2355,8 +3582,239 @@ fn digest_private_file(path: &Path) -> Result<[u8; 32], RepositoryError> {
     Ok(digest.finalize().into())
 }
 
+fn copy_closed_image(source: &ClosedImage, destination: &Path) -> Result<(), RepositoryError> {
+    let source_path = source.path()?;
+    validate_guarded_image(
+        source_path,
+        source.identity,
+        source
+            .directory_guard
+            .as_ref()
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?,
+        source
+            .family_guard
+            .as_ref()
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?,
+        source
+            .main_guard
+            .as_ref()
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?,
+    )?;
+    ensure_auxiliary_files_absent(source_path)?;
+    ensure_auxiliary_files_absent(destination)?;
+    if fs::symlink_metadata(destination).is_ok() {
+        return Err(RepositoryError::new(RepositoryErrorClass::UnsafePath));
+    }
+    let parent = destination
+        .parent()
+        .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
+    let directory_guard = open_secure_directory(parent, false)?;
+    let canonical_parent = fs::canonicalize(parent)
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
+    let directory_identity = file_identity(
+        &directory_guard
+            .metadata()
+            .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?,
+    )?;
+    validate_bound_directory_continuity(&canonical_parent, directory_identity, &directory_guard)?;
+    let mut input = source
+        .main_guard
+        .as_ref()
+        .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?
+        .try_clone()
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::Durability))?;
+    input
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::Durability))?;
+    let mut output = create_private_file(destination)?;
+    std::io::copy(&mut input, &mut output)
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::Durability))?;
+    output
+        .sync_all()
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::Durability))?;
+    directory_guard
+        .sync_all()
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::Durability))?;
+    validate_bound_directory_continuity(&canonical_parent, directory_identity, &directory_guard)?;
+    let copied = validate_optional_private_file(destination, None)?
+        .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
+    if digest_file_handle(&copied)?
+        != digest_file_handle(source.main_guard.as_ref().expect("source guard retained"))?
+    {
+        return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
+    }
+    ensure_auxiliary_files_absent(destination)
+}
+
 fn atomic_replace(source: &Path, destination: &Path) -> Result<(), RepositoryError> {
     atomic_replace_after(source, destination, || {})
+}
+
+fn atomic_install_closed_image(
+    source: &Path,
+    source_identity: FileIdentity,
+    destination: &Path,
+    expectation: DestinationInstallExpectation,
+) -> Result<(), AtomicInstallError> {
+    let preflight = (|| {
+        let source_file = validate_optional_private_file(source, None)?
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
+        if file_identity(
+            &source_file
+                .metadata()
+                .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?,
+        )? != source_identity
+        {
+            return Err(RepositoryError::new(RepositoryErrorClass::UnsafePath));
+        }
+        ensure_auxiliary_files_absent(source)?;
+        match expectation {
+            DestinationInstallExpectation::Vacant => {
+                if fs::symlink_metadata(destination).is_ok() {
+                    return Err(RepositoryError::new(RepositoryErrorClass::UnsafePath));
+                }
+            }
+            DestinationInstallExpectation::Existing(expected) => {
+                let destination_file = validate_optional_private_file(destination, None)?
+                    .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
+                if file_identity(
+                    &destination_file
+                        .metadata()
+                        .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?,
+                )? != expected
+                {
+                    return Err(RepositoryError::new(RepositoryErrorClass::UnsafePath));
+                }
+            }
+        }
+        ensure_auxiliary_files_absent(destination)
+    })();
+    if let Err(error) = preflight {
+        return Err(AtomicInstallError {
+            error,
+            renamed: false,
+        });
+    }
+
+    #[cfg(unix)]
+    let rename_result = (|| {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+
+        let source_parent = source
+            .parent()
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
+        if destination.parent() != Some(source_parent) {
+            return Err(RepositoryError::new(RepositoryErrorClass::UnsafePath));
+        }
+        let directory = open_secure_directory(source_parent, false)?;
+        let source_name = CString::new(
+            source
+                .file_name()
+                .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::UnsafePath))?
+                .as_bytes(),
+        )
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
+        let destination_name = CString::new(
+            destination
+                .file_name()
+                .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::UnsafePath))?
+                .as_bytes(),
+        )
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
+
+        // Vacant installation is kernel-enforced no-replace. Existing-image
+        // replacement is serialized by the retained private destination-family
+        // flock and checked by exact inode immediately before this syscall.
+        // A non-cooperating process with the same OS account can still rename
+        // account-owned files; that is the binding local-account compromise
+        // boundary, not a second supported Loxa owner.
+        #[cfg(target_os = "linux")]
+        let rc = unsafe {
+            libc::renameat2(
+                directory.as_raw_fd(),
+                source_name.as_ptr(),
+                directory.as_raw_fd(),
+                destination_name.as_ptr(),
+                if matches!(expectation, DestinationInstallExpectation::Vacant) {
+                    libc::RENAME_NOREPLACE
+                } else {
+                    0
+                },
+            )
+        };
+        #[cfg(target_os = "macos")]
+        let rc = if matches!(expectation, DestinationInstallExpectation::Vacant) {
+            let source_path = CString::new(source.as_os_str().as_bytes())
+                .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
+            let destination_path = CString::new(destination.as_os_str().as_bytes())
+                .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
+            unsafe {
+                libc::renamex_np(
+                    source_path.as_ptr(),
+                    destination_path.as_ptr(),
+                    libc::RENAME_EXCL,
+                )
+            }
+        } else {
+            unsafe {
+                libc::renameat(
+                    directory.as_raw_fd(),
+                    source_name.as_ptr(),
+                    directory.as_raw_fd(),
+                    destination_name.as_ptr(),
+                )
+            }
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            let error = std::io::Error::last_os_error();
+            Err(RepositoryError::new(
+                if matches!(error.kind(), std::io::ErrorKind::AlreadyExists) {
+                    RepositoryErrorClass::UnsafePath
+                } else {
+                    RepositoryErrorClass::Durability
+                },
+            ))
+        }
+    })();
+    #[cfg(not(unix))]
+    let rename_result: Result<(), RepositoryError> = Err(RepositoryError::new(
+        RepositoryErrorClass::UnsupportedPlatform,
+    ));
+    if let Err(error) = rename_result {
+        return Err(AtomicInstallError {
+            error,
+            renamed: false,
+        });
+    }
+
+    #[cfg(test)]
+    if FAIL_ATOMIC_INSTALL_POSTFLIGHT.with(|fault| fault.replace(false)) {
+        return Err(AtomicInstallError {
+            error: RepositoryError::new(RepositoryErrorClass::Durability),
+            renamed: true,
+        });
+    }
+
+    let postflight = (|| {
+        let installed = validate_optional_private_file(destination, None)?
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
+        if file_identity(
+            &installed
+                .metadata()
+                .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?,
+        )? != source_identity
+        {
+            return Err(RepositoryError::new(RepositoryErrorClass::Durability));
+        }
+        ensure_auxiliary_files_absent(destination)
+    })();
+    postflight.map_err(|error| AtomicInstallError {
+        error,
+        renamed: true,
+    })
 }
 
 fn atomic_replace_after(
@@ -2570,6 +4028,75 @@ mod tests {
         ControlRepository::open_or_create(path, node_id(), &mut CountingIds::fixed()).unwrap()
     }
 
+    fn file_digest(path: &Path) -> [u8; 32] {
+        super::digest_file_handle(&fs::File::open(path).unwrap()).unwrap()
+    }
+
+    fn logical_lineage(path: &Path) -> ([u8; 32], super::ValidationSummary) {
+        use rusqlite::types::ValueRef;
+        use sha2::{Digest, Sha256};
+
+        let image = super::open_validated_image(path, Some(node_id())).unwrap();
+        let summary = image.summary.clone();
+        let connection = image.connection.as_ref().unwrap();
+        let mut digest = Sha256::new();
+        for table in [
+            "loxa_schema_migrations",
+            "control_meta",
+            "node_state",
+            "slot_state",
+            "operations",
+            "events",
+        ] {
+            digest.update(table.as_bytes());
+            let sql = format!("SELECT * FROM {table} ORDER BY rowid");
+            let mut statement = connection.prepare(&sql).unwrap();
+            let column_count = statement.column_count();
+            let mut rows = statement.query([]).unwrap();
+            while let Some(row) = rows.next().unwrap() {
+                for column in 0..column_count {
+                    match row.get_ref(column).unwrap() {
+                        ValueRef::Null => digest.update([0]),
+                        ValueRef::Integer(value) => {
+                            digest.update([1]);
+                            digest.update(value.to_be_bytes());
+                        }
+                        ValueRef::Real(value) => {
+                            digest.update([2]);
+                            digest.update(value.to_bits().to_be_bytes());
+                        }
+                        ValueRef::Text(value) => {
+                            digest.update([3]);
+                            digest.update(value.len().to_be_bytes());
+                            digest.update(value);
+                        }
+                        ValueRef::Blob(value) => {
+                            digest.update([4]);
+                            digest.update(value.len().to_be_bytes());
+                            digest.update(value);
+                        }
+                    }
+                }
+            }
+        }
+        super::close_into_image(image).unwrap().release().unwrap();
+        (digest.finalize().into(), summary)
+    }
+
+    fn assert_no_temporary_restore_artifacts(directory: &Path) {
+        let artifacts: Vec<_> = fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| {
+                (name.contains(".restore-")
+                    || name.contains(".rollback-")
+                    || name.contains(".backup-"))
+                    && (name.contains(".tmp") || name.ends_with(".owner.lock"))
+            })
+            .collect();
+        assert!(artifacts.is_empty(), "temporary artifacts: {artifacts:?}");
+    }
+
     fn commit_revision_two(repository: &mut ControlRepository) {
         let payload =
             super::unloaded_slot_payload(node_id(), repository.slot_id()).expect("slot payload");
@@ -2639,6 +4166,276 @@ mod tests {
             .unwrap()
     }
 
+    struct RestoreFaultOutcome {
+        reached: bool,
+        exit_code: i32,
+        destination_summary: super::ValidationSummary,
+        destination_digest: [u8; 32],
+        old_destination_digest: [u8; 32],
+        backup_lineage_digest: [u8; 32],
+        backup_digest_unchanged: bool,
+        backup_summary: super::ValidationSummary,
+        destination_sidecars_absent: bool,
+        present_sidecars: Vec<&'static str>,
+        temporary_artifacts_absent: bool,
+        output: String,
+    }
+
+    fn restore_boundaries() -> [super::RestoreBoundary; 16] {
+        [
+            super::RestoreBoundary::BeforeSourceCopy,
+            super::RestoreBoundary::AfterSourceCopy,
+            super::RestoreBoundary::SourceCheckpointTruncated,
+            super::RestoreBoundary::SourceJournalModeDelete,
+            super::RestoreBoundary::SourceSqliteClosed,
+            super::RestoreBoundary::SourceSidecarsAbsent,
+            super::RestoreBoundary::SourceReadOnlyValidated,
+            super::RestoreBoundary::DestinationCheckpointTruncated,
+            super::RestoreBoundary::DestinationJournalModeDelete,
+            super::RestoreBoundary::DestinationSqliteClosed,
+            super::RestoreBoundary::DestinationSidecarsAbsent,
+            super::RestoreBoundary::DestinationReadOnlyValidated,
+            super::RestoreBoundary::BeforeRename,
+            super::RestoreBoundary::AfterRename,
+            super::RestoreBoundary::AfterDirectorySync,
+            super::RestoreBoundary::ReopenValidated,
+        ]
+    }
+
+    fn is_pre_rename(point: super::RestoreBoundary) -> bool {
+        !matches!(
+            point,
+            super::RestoreBoundary::AfterRename
+                | super::RestoreBoundary::AfterDirectorySync
+                | super::RestoreBoundary::ReopenValidated
+        )
+    }
+
+    fn assert_canonical_singleton(summary: &super::ValidationSummary) {
+        assert_eq!(summary.node_rows, 1);
+        assert_eq!(summary.slot_rows, 1);
+        assert_eq!(summary.slot_name, "default");
+        assert_eq!(summary.node_id, node_id());
+    }
+
+    fn assert_temporary_recovery_disposition(
+        outcome: &RestoreFaultOutcome,
+        point: super::RestoreBoundary,
+    ) {
+        assert!(
+            outcome.temporary_artifacts_absent
+                || point == super::RestoreBoundary::SourceCheckpointTruncated,
+            "unexpected retained temporary at {point:?}"
+        );
+    }
+
+    fn run_restore_fault_subprocess(point: super::RestoreBoundary) -> RestoreFaultOutcome {
+        run_restore_subprocess(point, "restore_crash")
+    }
+
+    fn run_restore_returned_failure_subprocess(
+        point: super::RestoreBoundary,
+    ) -> RestoreFaultOutcome {
+        run_restore_subprocess(point, "restore_failure")
+    }
+
+    fn run_restore_subprocess(
+        point: super::RestoreBoundary,
+        mode: &'static str,
+    ) -> RestoreFaultOutcome {
+        let source = TestDirectory::new(&format!("{mode}-source-{point:?}"));
+        let mut source_repository = create_repository(&source.database());
+        let payload = super::unloaded_slot_payload(node_id(), source_repository.slot_id()).unwrap();
+        source_repository
+            .transaction(|transaction| {
+                transaction.execute(
+                    "UPDATE control_meta SET revision = '41', cursor = '41' WHERE singleton = 1",
+                    [],
+                )?;
+                transaction.execute(
+                    "INSERT INTO events(event_id, stream_epoch, sequence, revision, event_kind, payload_json) VALUES('44444444-4444-4444-8444-444444444444', ?1, '41', '41', 'slot_changed', ?2)",
+                    [STREAM_EPOCH, &payload],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let backup = source_repository.backup_before_migration().unwrap();
+        source_repository.close().unwrap();
+        let (backup_lineage_digest, backup_summary) = logical_lineage(&backup);
+        let backup_digest_before = file_digest(&backup);
+
+        let destination = TestDirectory::new(&format!("{mode}-destination-{point:?}"));
+        let destination_path = destination.database();
+        create_repository(&destination_path).close().unwrap();
+        let (old_destination_digest, _) = logical_lineage(&destination_path);
+
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "control_state::repository::tests::repository_process_helper",
+                "--nocapture",
+            ])
+            .env("LOXA_REPOSITORY_HELPER", mode)
+            .env("LOXA_RESTORE_BACKUP", &backup)
+            .env("LOXA_RESTORE_DESTINATION", &destination_path)
+            .env("LOXA_RESTORE_BOUNDARY", format!("{point:?}"))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = wait_child_with_timeout(child, Duration::from_secs(15));
+        if mode == "restore_failure" {
+            ControlRepository::open_or_create(
+                &destination_path,
+                node_id(),
+                &mut CountingIds::default(),
+            )
+            .unwrap()
+            .close()
+            .unwrap();
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let present_sidecars: Vec<_> = ["-wal", "-journal", "-shm"]
+            .into_iter()
+            .filter(|suffix| {
+                super::auxiliary_path(&destination_path, suffix)
+                    .unwrap()
+                    .exists()
+            })
+            .collect();
+        let destination_sidecars_absent = present_sidecars.is_empty();
+        let (destination_digest, destination_summary) = logical_lineage(&destination_path);
+        let backup_digest_unchanged = file_digest(&backup) == backup_digest_before;
+        let temporary_artifacts_absent = fs::read_dir(&destination.0).unwrap().all(|entry| {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            !((name.contains(".restore-") || name.contains(".rollback-"))
+                && (name.contains(".tmp") || name.ends_with(".owner.lock")))
+        });
+        RestoreFaultOutcome {
+            reached: stdout.contains(&format!("RESTORE_REACHED:{point:?}")),
+            exit_code: output.status.code().unwrap_or(-1),
+            destination_summary,
+            destination_digest,
+            old_destination_digest,
+            backup_lineage_digest,
+            backup_digest_unchanged,
+            backup_summary,
+            destination_sidecars_absent,
+            present_sidecars,
+            temporary_artifacts_absent,
+            output: format!(
+                "stdout:\n{}\nstderr:\n{}",
+                stdout,
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        }
+    }
+
+    fn run_migration_rollback_fault_subprocess(
+        point: super::RestoreBoundary,
+    ) -> RestoreFaultOutcome {
+        run_migration_rollback_subprocess(point, "rollback_crash")
+    }
+
+    fn run_migration_rollback_returned_failure_subprocess(
+        point: super::RestoreBoundary,
+    ) -> RestoreFaultOutcome {
+        run_migration_rollback_subprocess(point, "rollback_failure")
+    }
+
+    fn run_migration_rollback_subprocess(
+        point: super::RestoreBoundary,
+        mode: &'static str,
+    ) -> RestoreFaultOutcome {
+        let directory = TestDirectory::new(&format!("{mode}-{point:?}"));
+        let destination_path = directory.database();
+        let repository = create_repository(&destination_path);
+        let backup = repository.backup_before_migration().unwrap();
+        repository.close().unwrap();
+        let (backup_lineage_digest, backup_summary) = logical_lineage(&backup);
+        let backup_digest_before = file_digest(&backup);
+        let mut failed = ControlRepository::open_or_create(
+            &destination_path,
+            node_id(),
+            &mut CountingIds::default(),
+        )
+        .unwrap();
+        failed
+            .transaction(|transaction| {
+                transaction.execute(
+                    "UPDATE control_meta SET revision = '9' WHERE singleton = 1",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        failed.close().unwrap();
+        let (old_destination_digest, _) = logical_lineage(&destination_path);
+
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "control_state::repository::tests::repository_process_helper",
+                "--nocapture",
+            ])
+            .env("LOXA_REPOSITORY_HELPER", mode)
+            .env("LOXA_RESTORE_BACKUP", &backup)
+            .env("LOXA_RESTORE_DESTINATION", &destination_path)
+            .env("LOXA_RESTORE_BOUNDARY", format!("{point:?}"))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = wait_child_with_timeout(child, Duration::from_secs(15));
+        if mode == "rollback_failure" {
+            ControlRepository::open_or_create(
+                &destination_path,
+                node_id(),
+                &mut CountingIds::default(),
+            )
+            .unwrap()
+            .close()
+            .unwrap();
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let present_sidecars: Vec<_> = ["-wal", "-journal", "-shm"]
+            .into_iter()
+            .filter(|suffix| {
+                super::auxiliary_path(&destination_path, suffix)
+                    .unwrap()
+                    .exists()
+            })
+            .collect();
+        let destination_sidecars_absent = present_sidecars.is_empty();
+        let (destination_digest, destination_summary) = logical_lineage(&destination_path);
+        let backup_digest_unchanged = file_digest(&backup) == backup_digest_before;
+        let temporary_artifacts_absent = fs::read_dir(&directory.0).unwrap().all(|entry| {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            !((name.contains(".restore-") || name.contains(".rollback-"))
+                && (name.contains(".tmp") || name.ends_with(".owner.lock")))
+        });
+        RestoreFaultOutcome {
+            reached: stdout.contains(&format!("RESTORE_REACHED:{point:?}")),
+            exit_code: output.status.code().unwrap_or(-1),
+            destination_summary,
+            destination_digest,
+            old_destination_digest,
+            backup_lineage_digest,
+            backup_digest_unchanged,
+            backup_summary,
+            destination_sidecars_absent,
+            present_sidecars,
+            temporary_artifacts_absent,
+            output: format!(
+                "stdout:\n{}\nstderr:\n{}",
+                stdout,
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        }
+    }
+
     fn wait_child_with_timeout(mut child: Child, timeout: Duration) -> std::process::Output {
         let deadline = Instant::now() + timeout;
         loop {
@@ -2662,9 +4459,10 @@ mod tests {
     #[ignore = "exact subprocess entrypoint"]
     fn repository_process_helper() {
         let mode = std::env::var("LOXA_REPOSITORY_HELPER").expect("helper mode");
-        let path = PathBuf::from(std::env::var_os("LOXA_REPOSITORY_PATH").expect("helper path"));
         match mode.as_str() {
             "probe" => {
+                let path =
+                    PathBuf::from(std::env::var_os("LOXA_REPOSITORY_PATH").expect("helper path"));
                 let outcome = ControlRepository::open_or_create(
                     &path,
                     node_id(),
@@ -2684,13 +4482,20 @@ mod tests {
                         repository.close().unwrap();
                         println!("PROBE_OPENED");
                     }
-                    Err(error) if error.class() == RepositoryErrorClass::Database => {
+                    Err(error)
+                        if matches!(
+                            error.class(),
+                            RepositoryErrorClass::Database | RepositoryErrorClass::AlreadyOwned
+                        ) =>
+                    {
                         println!("PROBE_LOCKED");
                     }
                     Err(error) => panic!("unexpected probe error: {error:?}"),
                 }
             }
             "owner" => {
+                let path =
+                    PathBuf::from(std::env::var_os("LOXA_REPOSITORY_PATH").expect("helper path"));
                 let repository = ControlRepository::open_or_create(
                     &path,
                     node_id(),
@@ -2702,6 +4507,97 @@ mod tests {
                 let mut release = String::new();
                 std::io::stdin().read_line(&mut release).unwrap();
                 repository.close().unwrap();
+            }
+            "restore_postflight_failure_owner" => {
+                let backup =
+                    PathBuf::from(std::env::var_os("LOXA_RESTORE_BACKUP").expect("restore backup"));
+                let destination = PathBuf::from(
+                    std::env::var_os("LOXA_RESTORE_DESTINATION").expect("restore destination"),
+                );
+                super::fail_next_atomic_install_postflight_for_test();
+                let error = ControlRepository::restore_offline(&backup, &destination).unwrap_err();
+                assert_eq!(error.class(), RepositoryErrorClass::Durability);
+                assert!(!super::atomic_install_postflight_fault_is_pending_for_test());
+                println!("OWNER_READY");
+                std::io::stdout().flush().unwrap();
+                let mut release = String::new();
+                std::io::stdin().read_line(&mut release).unwrap();
+            }
+            "restore_crash" | "restore_failure" => {
+                let inject_returned_failure = mode == "restore_failure";
+                let backup =
+                    PathBuf::from(std::env::var_os("LOXA_RESTORE_BACKUP").expect("restore backup"));
+                let destination = PathBuf::from(
+                    std::env::var_os("LOXA_RESTORE_DESTINATION").expect("restore destination"),
+                );
+                let expected = std::env::var("LOXA_RESTORE_BOUNDARY").expect("restore boundary");
+                let result =
+                    ControlRepository::restore_offline_after(&backup, &destination, |boundary| {
+                        if format!("{boundary:?}") == expected {
+                            println!("RESTORE_REACHED:{boundary:?}");
+                            std::io::stdout().flush().unwrap();
+                            if inject_returned_failure {
+                                return Err(RepositoryError::new(RepositoryErrorClass::Durability));
+                            }
+                            unsafe { libc::_exit(86) };
+                        }
+                        Ok(())
+                    });
+                if inject_returned_failure {
+                    let error = result.expect_err("returned restore failure");
+                    println!("RESTORE_RETURNED:{:?}", error.class());
+                } else {
+                    panic!("restore crash boundary was not reached: {result:?}");
+                }
+            }
+            "rollback_crash" | "rollback_failure" => {
+                let inject_returned_failure = mode == "rollback_failure";
+                let backup = PathBuf::from(
+                    std::env::var_os("LOXA_RESTORE_BACKUP").expect("rollback backup"),
+                );
+                let destination = PathBuf::from(
+                    std::env::var_os("LOXA_RESTORE_DESTINATION").expect("rollback destination"),
+                );
+                let expected = std::env::var("LOXA_RESTORE_BOUNDARY").expect("rollback boundary");
+                let mut repository = ControlRepository::open_or_create(
+                    &destination,
+                    node_id(),
+                    &mut CountingIds::default(),
+                )
+                .unwrap();
+                let proof = repository.migration_rollback_proof().unwrap();
+                repository
+                    .transaction(|transaction| {
+                        transaction.execute(
+                            "UPDATE control_meta SET revision = '9' WHERE singleton = 1",
+                            [],
+                        )?;
+                        Ok(())
+                    })
+                    .unwrap();
+                repository.close().unwrap();
+                let result = ControlRepository::restore_verified_migration_backup_after(
+                    &backup,
+                    &destination,
+                    &proof,
+                    |boundary| {
+                        if format!("{boundary:?}") == expected {
+                            println!("RESTORE_REACHED:{boundary:?}");
+                            std::io::stdout().flush().unwrap();
+                            if inject_returned_failure {
+                                return Err(RepositoryError::new(RepositoryErrorClass::Durability));
+                            }
+                            unsafe { libc::_exit(86) };
+                        }
+                        Ok(())
+                    },
+                );
+                if inject_returned_failure {
+                    let error = result.expect_err("returned rollback failure");
+                    println!("RESTORE_RETURNED:{:?}", error.class());
+                } else {
+                    panic!("rollback crash boundary was not reached: {result:?}");
+                }
             }
             _ => panic!("unknown helper mode"),
         }
@@ -2956,7 +4852,7 @@ mod tests {
         let error =
             ControlRepository::open_or_create(&path, node_id(), &mut CountingIds::default())
                 .unwrap_err();
-        assert_eq!(error.class(), RepositoryErrorClass::Database);
+        assert_eq!(error.class(), RepositoryErrorClass::AlreadyOwned);
         child.stdin.take().unwrap().write_all(b"release\n").unwrap();
         let output = wait_child_with_timeout(child, Duration::from_secs(10));
         assert!(
@@ -2968,6 +4864,83 @@ mod tests {
             ControlRepository::open_or_create(&path, node_id(), &mut CountingIds::default())
                 .unwrap();
         reopened.close().unwrap();
+    }
+
+    #[test]
+    fn postrename_postflight_failure_retains_destination_family_exclusion_until_exit() {
+        let source = TestDirectory::new("postflight-owner-source");
+        let mut source_repository = create_repository(&source.database());
+        source_repository
+            .transaction(|transaction| {
+                transaction.execute(
+                    "UPDATE control_meta SET revision = '41', cursor = '1' WHERE singleton = 1",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let backup = source_repository.backup_before_migration().unwrap();
+        source_repository.close().unwrap();
+        let destination = TestDirectory::new("postflight-owner-destination");
+        let path = destination.database();
+        create_repository(&path).close().unwrap();
+
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "control_state::repository::tests::repository_process_helper",
+                "--nocapture",
+            ])
+            .env("LOXA_REPOSITORY_HELPER", "restore_postflight_failure_owner")
+            .env("LOXA_RESTORE_BACKUP", &backup)
+            .env("LOXA_RESTORE_DESTINATION", &path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(stdout);
+            let mut ready = String::new();
+            let mut ready_sent = false;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+                if !ready_sent {
+                    ready.push_str(&line);
+                    if line.contains("OWNER_READY") {
+                        let _ = ready_tx.send(ready.clone());
+                        ready_sent = true;
+                    }
+                }
+            }
+            if !ready_sent {
+                let _ = ready_tx.send(ready);
+            }
+        });
+        let ready = ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(ready.contains("OWNER_READY"), "{ready}");
+        assert!(child.try_wait().unwrap().is_none(), "owner exited early");
+        assert_eq!(probe_from_subprocess(&path), ChildProbe::DatabaseLocked);
+
+        child.stdin.take().unwrap().write_all(b"release\n").unwrap();
+        let output = wait_child_with_timeout(child, Duration::from_secs(10));
+        assert!(
+            output.status.success(),
+            "child stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let reopened =
+            ControlRepository::open_or_create(&path, node_id(), &mut CountingIds::default())
+                .unwrap();
+        assert_eq!(reopened.validate_all().unwrap().revision, 42);
+        reopened.close().unwrap();
+        assert_no_temporary_restore_artifacts(&destination.0);
     }
 
     #[cfg(unix)]
@@ -3304,6 +5277,137 @@ mod tests {
         assert_eq!(error.class(), RepositoryErrorClass::UnsafePath);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn family_lock_rejects_unsafe_metadata_and_detects_path_substitution() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        for defect in ["symlink", "hardlink", "broad"] {
+            let directory = TestDirectory::new(&format!("family-lock-{defect}"));
+            let path = directory.database();
+            let lock = super::family_lock_path(&path).unwrap();
+            let target = directory.0.join("target.lock");
+            fs::write(&target, []).unwrap();
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+            match defect {
+                "symlink" => symlink(&target, &lock).unwrap(),
+                "hardlink" => fs::hard_link(&target, &lock).unwrap(),
+                "broad" => {
+                    fs::rename(&target, &lock).unwrap();
+                    fs::set_permissions(&lock, fs::Permissions::from_mode(0o644)).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let error =
+                ControlRepository::open_or_create(&path, node_id(), &mut CountingIds::fixed())
+                    .unwrap_err();
+            assert_eq!(error.class(), RepositoryErrorClass::UnsafePath, "{defect}");
+            assert!(!path.exists(), "{defect}");
+        }
+
+        let substituted = TestDirectory::new("family-lock-substitution");
+        let path = substituted.database();
+        let repository = create_repository(&path);
+        let lock = super::family_lock_path(&path).unwrap();
+        fs::rename(&lock, substituted.0.join("displaced.lock")).unwrap();
+        fs::write(&lock, []).unwrap();
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+        let error = repository.validate_all().unwrap_err();
+        assert_eq!(error.class(), RepositoryErrorClass::UnsafePath);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temporary_cleanup_never_unlinks_a_held_family_lock() {
+        let directory = TestDirectory::new("held-temporary-lock");
+        let temporary = directory.0.join("control-state.sqlite3.restore-held.tmp");
+        fs::write(&temporary, b"retained").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600)).unwrap();
+        let guard = super::open_family_guard(&temporary).unwrap();
+        let lock = super::family_lock_path(&temporary).unwrap();
+
+        let error = super::cleanup_unclaimed_temporary_family(&temporary).unwrap_err();
+
+        assert_eq!(error.class(), RepositoryErrorClass::AlreadyOwned);
+        assert!(temporary.exists());
+        assert!(lock.exists());
+        drop(guard);
+        super::cleanup_unclaimed_temporary_family(&temporary).unwrap();
+        assert!(!temporary.exists());
+        assert!(!lock.exists());
+
+        let raced = directory.0.join("control-state.sqlite3.restore-race.tmp");
+        fs::write(&raced, b"retained").unwrap();
+        fs::set_permissions(&raced, fs::Permissions::from_mode(0o600)).unwrap();
+        super::cleanup_unclaimed_temporary_family_after(&raced, || {
+            assert_eq!(probe_from_subprocess(&raced), ChildProbe::DatabaseLocked);
+        })
+        .unwrap();
+        assert!(!raced.exists());
+        assert!(!super::family_lock_path(&raced).unwrap().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_startup_recovers_unclaimed_restore_rollback_and_backup_temporaries() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TestDirectory::new("startup-temp-recovery");
+        let path = directory.database();
+        create_repository(&path).close().unwrap();
+        let names = [
+            "control-state.sqlite3.restore-orphan.tmp",
+            "control-state.sqlite3.rollback-orphan.tmp",
+            "control-state.sqlite3.pre-migration.bak.backup-orphan.tmp",
+        ];
+        for name in names {
+            let temporary = directory.0.join(name);
+            fs::write(&temporary, b"orphan").unwrap();
+            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600)).unwrap();
+            drop(super::open_family_guard(&temporary).unwrap());
+        }
+        let lock_only = directory
+            .0
+            .join("control-state.sqlite3.restore-lock-only.tmp");
+        drop(super::open_family_guard(&lock_only).unwrap());
+
+        ControlRepository::open_or_create(&path, node_id(), &mut CountingIds::default())
+            .unwrap()
+            .close()
+            .unwrap();
+
+        assert_no_temporary_restore_artifacts(&directory.0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_startup_retains_uncertain_orphan_sidecars_without_blocking_destination() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TestDirectory::new("startup-uncertain-temp");
+        let path = directory.database();
+        create_repository(&path).close().unwrap();
+        let temporary = directory
+            .0
+            .join("control-state.sqlite3.restore-uncertain.tmp");
+        fs::write(&temporary, b"uncertain").unwrap();
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600)).unwrap();
+        drop(super::open_family_guard(&temporary).unwrap());
+        let journal = super::auxiliary_path(&temporary, "-journal").unwrap();
+        fs::write(&journal, b"uncertain journal").unwrap();
+        fs::set_permissions(&journal, fs::Permissions::from_mode(0o600)).unwrap();
+
+        ControlRepository::open_or_create(&path, node_id(), &mut CountingIds::default())
+            .unwrap()
+            .close()
+            .unwrap();
+
+        assert!(temporary.exists());
+        assert!(super::family_lock_path(&temporary).unwrap().exists());
+        assert!(journal.exists());
+    }
+
     #[test]
     fn fresh_repository_publishes_a_validated_migration_backup() {
         let directory = TestDirectory::new("initial-backup");
@@ -3319,6 +5423,27 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn backup_publication_respects_the_retained_backup_family_lock_and_cleans_temporary_lock() {
+        let directory = TestDirectory::new("backup-publication-lock");
+        let repository = create_repository(&directory.database());
+        let backup = repository.migration_backup_path().unwrap();
+        let before = file_digest(&backup);
+        let held =
+            super::close_into_image(super::open_validated_image(&backup, Some(node_id())).unwrap())
+                .unwrap();
+
+        let error = repository.backup_before_migration().unwrap_err();
+
+        assert_eq!(error.class(), RepositoryErrorClass::AlreadyOwned);
+        assert_eq!(file_digest(&backup), before);
+        assert_no_temporary_restore_artifacts(&directory.0);
+        held.release().unwrap();
+        repository.backup_before_migration().unwrap();
+        assert_no_temporary_restore_artifacts(&directory.0);
+        repository.close().unwrap();
     }
 
     #[test]
@@ -3351,6 +5476,7 @@ mod tests {
         assert_eq!(restored.cursor, 1);
         assert_eq!(restored.revision, 42);
         assert_eq!(restored.event_rows, 1);
+        assert_no_temporary_restore_artifacts(&destination.0);
     }
 
     #[test]
@@ -3373,11 +5499,44 @@ mod tests {
         repository.close().unwrap();
 
         ControlRepository::restore_verified_migration_backup(&backup, &path, &proof).unwrap();
+        assert_no_temporary_restore_artifacts(&directory.0);
         let reopened =
             ControlRepository::open_or_create(&path, node_id(), &mut CountingIds::default())
                 .unwrap();
         assert_eq!(reopened.stream_epoch(), original_epoch);
         assert_eq!(reopened.validate_all().unwrap().revision, 1);
+    }
+
+    #[test]
+    fn migration_rollback_returns_original_error_unless_rollback_itself_fails() {
+        let success = TestDirectory::new("rollback-original-error");
+        let success_path = success.database();
+        let repository = create_repository(&success_path);
+        let backup = repository.backup_before_migration().unwrap();
+        let proof = repository.migration_rollback_proof().unwrap();
+        repository.close().unwrap();
+        let original = RepositoryError::new(RepositoryErrorClass::UnsupportedSchema);
+
+        let reported =
+            ControlRepository::rollback_failed_migration(&backup, &success_path, &proof, original);
+        assert_eq!(reported, original);
+        assert!(backup.exists());
+
+        let failure = TestDirectory::new("rollback-error-precedence");
+        let failure_path = failure.database();
+        let failure_repository = create_repository(&failure_path);
+        let failure_backup = failure_repository.backup_before_migration().unwrap();
+        let failure_proof = failure_repository.migration_rollback_proof().unwrap();
+        failure_repository.close().unwrap();
+        fs::write(&failure_backup, b"corrupt retained backup").unwrap();
+
+        let reported = ControlRepository::rollback_failed_migration(
+            &failure_backup,
+            &failure_path,
+            &failure_proof,
+            original,
+        );
+        assert_eq!(reported.class(), RepositoryErrorClass::Corrupt);
     }
 
     #[test]
@@ -3425,6 +5584,95 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.class(), RepositoryErrorClass::UnsafePath);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_rejects_backup_substitution_after_its_guard_is_bound() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source = TestDirectory::new("bound-backup-substitution");
+        let repository = create_repository(&source.database());
+        let backup = repository.backup_before_migration().unwrap();
+        repository.close().unwrap();
+        let replacement = source.0.join("replacement.sqlite3");
+        fs::copy(&backup, &replacement).unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
+        let destination = TestDirectory::new("bound-backup-substitution-destination");
+
+        let error = ControlRepository::restore_offline_after(
+            &backup,
+            &destination.database(),
+            |boundary| {
+                if boundary == super::RestoreBoundary::BeforeSourceCopy {
+                    fs::rename(&backup, source.0.join("displaced-backup.sqlite3")).unwrap();
+                    fs::rename(&replacement, &backup).unwrap();
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.class(), RepositoryErrorClass::UnsafePath);
+        assert!(!destination.database().exists());
+        assert_no_temporary_restore_artifacts(&destination.0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vacant_restore_uses_no_replace_and_retains_a_racing_destination() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source = TestDirectory::new("vacant-no-replace-source");
+        let repository = create_repository(&source.database());
+        let backup = repository.backup_before_migration().unwrap();
+        repository.close().unwrap();
+        let destination = TestDirectory::new("vacant-no-replace-destination");
+        let path = destination.database();
+
+        let error = ControlRepository::restore_offline_after(&backup, &path, |boundary| {
+            if boundary == super::RestoreBoundary::BeforeRename {
+                fs::write(&path, b"racing destination").unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert_eq!(error.class(), RepositoryErrorClass::UnsafePath);
+        assert_eq!(fs::read(&path).unwrap(), b"racing destination");
+        assert_no_temporary_restore_artifacts(&destination.0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_refuses_a_sidecar_created_at_the_rename_boundary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source = TestDirectory::new("rename-sidecar-source");
+        let repository = create_repository(&source.database());
+        let backup = repository.backup_before_migration().unwrap();
+        repository.close().unwrap();
+        let destination = TestDirectory::new("rename-sidecar-destination");
+        let path = destination.database();
+        create_repository(&path).close().unwrap();
+        let before = logical_lineage(&path).0;
+        let journal = super::auxiliary_path(&path, "-journal").unwrap();
+
+        let error = ControlRepository::restore_offline_after(&backup, &path, |boundary| {
+            if boundary == super::RestoreBoundary::BeforeRename {
+                fs::write(&journal, b"racing journal").unwrap();
+                fs::set_permissions(&journal, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert_eq!(error.class(), RepositoryErrorClass::UnsafePath);
+        assert_eq!(fs::read(&journal).unwrap(), b"racing journal");
+        fs::remove_file(&journal).unwrap();
+        assert_eq!(logical_lineage(&path).0, before);
+        assert_no_temporary_restore_artifacts(&destination.0);
     }
 
     #[test]
@@ -3494,6 +5742,377 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reopened.stream_epoch(), original_epoch);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn corrupt_destination_with_any_sidecar_is_refused_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for suffix in ["-wal", "-journal", "-shm"] {
+            let source = TestDirectory::new(&format!("restore-sidecar-source-{suffix}"));
+            let source_repository = create_repository(&source.database());
+            let backup = source_repository.backup_before_migration().unwrap();
+            source_repository.close().unwrap();
+
+            let destination = TestDirectory::new(&format!("restore-sidecar-destination-{suffix}"));
+            let destination_path = destination.database();
+            create_repository(&destination_path).close().unwrap();
+            let sidecar = super::auxiliary_path(&destination_path, suffix).unwrap();
+            fs::write(&sidecar, b"retained-sidecar").unwrap();
+            fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o600)).unwrap();
+            let before = family_snapshot(&destination_path);
+
+            let error = ControlRepository::restore_offline(&backup, &destination_path)
+                .expect_err("a destination family with any sidecar must be refused");
+
+            assert_eq!(error.class(), RepositoryErrorClass::UnsafePath, "{suffix}");
+            assert_eq!(family_snapshot(&destination_path), before, "{suffix}");
+            assert_no_temporary_restore_artifacts(&destination.0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_source_family_must_be_sidecar_free_before_copy() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source = TestDirectory::new("restore-source-journal");
+        let source_repository = create_repository(&source.database());
+        let backup = source_repository.backup_before_migration().unwrap();
+        source_repository.close().unwrap();
+        let journal = super::auxiliary_path(&backup, "-journal").unwrap();
+        fs::write(&journal, b"").unwrap();
+        fs::set_permissions(&journal, fs::Permissions::from_mode(0o600)).unwrap();
+        let before = family_snapshot(&backup);
+        let destination = TestDirectory::new("restore-source-journal-destination");
+
+        let error = ControlRepository::restore_offline(&backup, &destination.database())
+            .expect_err("restore source must be standalone before it is copied");
+
+        assert_eq!(error.class(), RepositoryErrorClass::UnsafePath);
+        assert_eq!(family_snapshot(&backup), before);
+        assert!(!destination.database().exists());
+    }
+
+    #[test]
+    fn checkpoint_truncates_the_wal_before_an_offline_transition() {
+        let directory = TestDirectory::new("checkpoint-truncate");
+        let mut repository = create_repository(&directory.database());
+        repository
+            .transaction(|transaction| {
+                transaction.execute(
+                    "UPDATE control_meta SET last_committed_at_unix_ms = '2' WHERE singleton = 1",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let wal = super::auxiliary_path(&directory.database(), "-wal").unwrap();
+        assert!(fs::metadata(&wal).unwrap().len() > 0);
+
+        repository.checkpoint().unwrap();
+
+        assert_eq!(fs::metadata(&wal).unwrap().len(), 0);
+        repository.close().unwrap();
+    }
+
+    #[test]
+    fn closed_image_guards_keep_the_identity_claimed_until_safe_release() {
+        let directory = TestDirectory::new("closed-image-claim");
+        let path = directory.database();
+        create_repository(&path).close().unwrap();
+
+        let image = super::open_validated_image(&path, Some(node_id())).unwrap();
+        let closed = super::close_into_image(image).unwrap();
+        let error =
+            ControlRepository::open_or_create(&path, node_id(), &mut CountingIds::default())
+                .unwrap_err();
+        assert_eq!(error.class(), RepositoryErrorClass::AlreadyOwned);
+
+        closed.release().unwrap();
+        ControlRepository::open_or_create(&path, node_id(), &mut CountingIds::default())
+            .unwrap()
+            .close()
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn corrupt_destination_is_refused_unchanged_before_restore() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source = TestDirectory::new("restore-corrupt-destination-source");
+        let source_repository = create_repository(&source.database());
+        let backup = source_repository.backup_before_migration().unwrap();
+        source_repository.close().unwrap();
+
+        let destination = TestDirectory::new("restore-corrupt-destination");
+        let destination_path = destination.database();
+        fs::write(&destination_path, b"not a control state database").unwrap();
+        fs::set_permissions(&destination_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let before = family_snapshot(&destination_path);
+
+        let error = ControlRepository::restore_offline(&backup, &destination_path)
+            .expect_err("corrupt destinations require operator action");
+
+        assert_eq!(error.class(), RepositoryErrorClass::Corrupt);
+        assert_eq!(family_snapshot(&destination_path), before);
+        assert_no_temporary_restore_artifacts(&destination.0);
+    }
+
+    #[test]
+    fn restore_source_is_checkpointed_switched_closed_and_validated_standalone() {
+        let directory = TestDirectory::new("restore-source-order");
+        let path = directory.database();
+        create_repository(&path).close().unwrap();
+        let image = super::open_validated_image(&path, Some(node_id())).unwrap();
+        let mut trace = Vec::new();
+
+        let closed = super::close_into_image_traced(image, |event| {
+            trace.push(event);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            trace,
+            [
+                super::ImageCloseEvent::CheckpointTruncated,
+                super::ImageCloseEvent::JournalModeDelete,
+                super::ImageCloseEvent::SqliteClosed,
+                super::ImageCloseEvent::SidecarsAbsent,
+                super::ImageCloseEvent::ReadOnlyValidated,
+            ]
+        );
+        assert_eq!(closed.summary.revision, 1);
+        for suffix in ["-wal", "-journal", "-shm"] {
+            assert!(!super::auxiliary_path(&path, suffix).unwrap().exists());
+        }
+        closed.release().unwrap();
+    }
+
+    #[test]
+    fn every_restore_fault_keeps_the_destination_as_a_complete_old_or_new_lineage() {
+        for point in [
+            super::RestoreBoundary::BeforeSourceCopy,
+            super::RestoreBoundary::AfterSourceCopy,
+            super::RestoreBoundary::SourceCheckpointTruncated,
+            super::RestoreBoundary::SourceJournalModeDelete,
+            super::RestoreBoundary::SourceSqliteClosed,
+            super::RestoreBoundary::SourceSidecarsAbsent,
+            super::RestoreBoundary::SourceReadOnlyValidated,
+            super::RestoreBoundary::DestinationCheckpointTruncated,
+            super::RestoreBoundary::DestinationJournalModeDelete,
+            super::RestoreBoundary::DestinationSqliteClosed,
+            super::RestoreBoundary::DestinationSidecarsAbsent,
+            super::RestoreBoundary::DestinationReadOnlyValidated,
+            super::RestoreBoundary::BeforeRename,
+            super::RestoreBoundary::AfterRename,
+            super::RestoreBoundary::AfterDirectorySync,
+            super::RestoreBoundary::ReopenValidated,
+        ] {
+            let outcome = run_restore_fault_subprocess(point);
+            assert!(
+                outcome.reached,
+                "fault point was not reached: {point:?}\n{}",
+                outcome.output
+            );
+            assert_eq!(outcome.exit_code, 86, "{point:?}");
+            assert_canonical_singleton(&outcome.destination_summary);
+            assert!(outcome.backup_digest_unchanged, "{point:?}");
+            assert_temporary_recovery_disposition(&outcome, point);
+            assert!(
+                matches!(outcome.destination_summary.revision, 1 | 42),
+                "{point:?}"
+            );
+            if point == super::RestoreBoundary::DestinationCheckpointTruncated {
+                assert!(
+                    outcome.present_sidecars.is_empty() || outcome.present_sidecars == ["-wal"],
+                    "{point:?}: {:?}",
+                    outcome.present_sidecars
+                );
+            } else {
+                assert!(
+                    outcome.destination_sidecars_absent,
+                    "{point:?}: {:?}",
+                    outcome.present_sidecars
+                );
+            }
+            if matches!(
+                point,
+                super::RestoreBoundary::BeforeSourceCopy
+                    | super::RestoreBoundary::AfterSourceCopy
+                    | super::RestoreBoundary::SourceCheckpointTruncated
+                    | super::RestoreBoundary::SourceJournalModeDelete
+                    | super::RestoreBoundary::SourceSqliteClosed
+                    | super::RestoreBoundary::SourceSidecarsAbsent
+                    | super::RestoreBoundary::SourceReadOnlyValidated
+                    | super::RestoreBoundary::DestinationCheckpointTruncated
+                    | super::RestoreBoundary::DestinationJournalModeDelete
+                    | super::RestoreBoundary::DestinationSqliteClosed
+                    | super::RestoreBoundary::DestinationSidecarsAbsent
+                    | super::RestoreBoundary::DestinationReadOnlyValidated
+                    | super::RestoreBoundary::BeforeRename
+            ) {
+                assert_eq!(outcome.destination_summary.revision, 1, "{point:?}");
+                assert_eq!(
+                    outcome.destination_digest, outcome.old_destination_digest,
+                    "{point:?}"
+                );
+            } else {
+                assert_eq!(outcome.destination_summary.cursor, 1, "{point:?}");
+                assert_eq!(outcome.destination_summary.event_rows, 1, "{point:?}");
+                assert_eq!(
+                    outcome.destination_summary.slot_id, outcome.backup_summary.slot_id,
+                    "{point:?}"
+                );
+                assert_ne!(
+                    outcome.destination_summary.epoch, outcome.backup_summary.epoch,
+                    "{point:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_returned_restore_failure_preserves_old_or_quarantines_exact_new_lineage() {
+        for point in restore_boundaries() {
+            let outcome = run_restore_returned_failure_subprocess(point);
+            assert!(outcome.reached, "{point:?}\n{}", outcome.output);
+            assert_eq!(outcome.exit_code, 0, "{point:?}\n{}", outcome.output);
+            assert_canonical_singleton(&outcome.destination_summary);
+            assert!(outcome.backup_digest_unchanged, "{point:?}");
+            assert_temporary_recovery_disposition(&outcome, point);
+            assert!(
+                outcome.output.contains("RESTORE_RETURNED:Durability"),
+                "{point:?}\n{}",
+                outcome.output
+            );
+            assert_eq!(
+                outcome.destination_summary.revision,
+                if is_pre_rename(point) { 1 } else { 42 },
+                "{point:?}\n{}",
+                outcome.output
+            );
+            assert!(outcome.destination_sidecars_absent, "{point:?}");
+            if is_pre_rename(point) {
+                assert_eq!(outcome.destination_digest, outcome.old_destination_digest);
+            } else {
+                assert_eq!(outcome.destination_summary.cursor, 1);
+                assert_eq!(outcome.destination_summary.event_rows, 1);
+                assert_eq!(
+                    outcome.destination_summary.slot_id,
+                    outcome.backup_summary.slot_id
+                );
+                assert_ne!(
+                    outcome.destination_summary.epoch,
+                    outcome.backup_summary.epoch
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_migration_rollback_fault_keeps_one_complete_lineage() {
+        for point in [
+            super::RestoreBoundary::BeforeSourceCopy,
+            super::RestoreBoundary::AfterSourceCopy,
+            super::RestoreBoundary::SourceCheckpointTruncated,
+            super::RestoreBoundary::SourceJournalModeDelete,
+            super::RestoreBoundary::SourceSqliteClosed,
+            super::RestoreBoundary::SourceSidecarsAbsent,
+            super::RestoreBoundary::SourceReadOnlyValidated,
+            super::RestoreBoundary::DestinationCheckpointTruncated,
+            super::RestoreBoundary::DestinationJournalModeDelete,
+            super::RestoreBoundary::DestinationSqliteClosed,
+            super::RestoreBoundary::DestinationSidecarsAbsent,
+            super::RestoreBoundary::DestinationReadOnlyValidated,
+            super::RestoreBoundary::BeforeRename,
+            super::RestoreBoundary::AfterRename,
+            super::RestoreBoundary::AfterDirectorySync,
+            super::RestoreBoundary::ReopenValidated,
+        ] {
+            let outcome = run_migration_rollback_fault_subprocess(point);
+            assert!(
+                outcome.reached,
+                "fault point was not reached: {point:?}\n{}",
+                outcome.output
+            );
+            assert_eq!(outcome.exit_code, 86, "{point:?}");
+            assert_canonical_singleton(&outcome.destination_summary);
+            assert!(outcome.backup_digest_unchanged, "{point:?}");
+            assert_temporary_recovery_disposition(&outcome, point);
+            assert!(
+                matches!(outcome.destination_summary.revision, 1 | 9),
+                "{point:?}"
+            );
+            if point == super::RestoreBoundary::DestinationCheckpointTruncated {
+                assert!(
+                    outcome.present_sidecars.is_empty() || outcome.present_sidecars == ["-wal"],
+                    "{point:?}: {:?}",
+                    outcome.present_sidecars
+                );
+            } else {
+                assert!(
+                    outcome.destination_sidecars_absent,
+                    "{point:?}: {:?}",
+                    outcome.present_sidecars
+                );
+            }
+            if matches!(
+                point,
+                super::RestoreBoundary::BeforeSourceCopy
+                    | super::RestoreBoundary::AfterSourceCopy
+                    | super::RestoreBoundary::SourceCheckpointTruncated
+                    | super::RestoreBoundary::SourceJournalModeDelete
+                    | super::RestoreBoundary::SourceSqliteClosed
+                    | super::RestoreBoundary::SourceSidecarsAbsent
+                    | super::RestoreBoundary::SourceReadOnlyValidated
+                    | super::RestoreBoundary::DestinationCheckpointTruncated
+                    | super::RestoreBoundary::DestinationJournalModeDelete
+                    | super::RestoreBoundary::DestinationSqliteClosed
+                    | super::RestoreBoundary::DestinationSidecarsAbsent
+                    | super::RestoreBoundary::DestinationReadOnlyValidated
+                    | super::RestoreBoundary::BeforeRename
+            ) {
+                assert_eq!(outcome.destination_summary.revision, 9, "{point:?}");
+                assert_eq!(outcome.destination_digest, outcome.old_destination_digest);
+            } else {
+                assert_eq!(outcome.destination_summary, outcome.backup_summary);
+                assert_eq!(outcome.destination_digest, outcome.backup_lineage_digest);
+            }
+        }
+    }
+
+    #[test]
+    fn every_returned_rollback_failure_preserves_failed_or_quarantines_backup_lineage() {
+        for point in restore_boundaries() {
+            let outcome = run_migration_rollback_returned_failure_subprocess(point);
+            assert!(outcome.reached, "{point:?}\n{}", outcome.output);
+            assert_eq!(outcome.exit_code, 0, "{point:?}\n{}", outcome.output);
+            assert_canonical_singleton(&outcome.destination_summary);
+            assert!(outcome.backup_digest_unchanged, "{point:?}");
+            assert!(
+                outcome.output.contains("RESTORE_RETURNED:Durability"),
+                "{point:?}\n{}",
+                outcome.output
+            );
+            assert_eq!(
+                outcome.destination_summary.revision,
+                if is_pre_rename(point) { 9 } else { 1 },
+                "{point:?}\n{}",
+                outcome.output
+            );
+            assert!(outcome.destination_sidecars_absent, "{point:?}");
+            assert_temporary_recovery_disposition(&outcome, point);
+            if is_pre_rename(point) {
+                assert_eq!(outcome.destination_digest, outcome.old_destination_digest);
+            } else {
+                assert_eq!(outcome.destination_summary, outcome.backup_summary);
+                assert_eq!(outcome.destination_digest, outcome.backup_lineage_digest);
+            }
+        }
     }
 
     #[test]
