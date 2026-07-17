@@ -1,6 +1,11 @@
 use loxa_core::control::auth::ControlToken;
 use loxa_core::control::contracts::NodeStatus;
 use loxa_core::control::contracts::{CONTROL_PROTOCOL_VERSION, NodeIdentityProofResponse};
+use loxa_protocol::v2::{
+    DecimalU64, StreamEpoch, V2NodeCollection, V2OperationCollection, V2OperationKind,
+    V2OperationStatus, V2SlotCollection, V2SlotStatus,
+};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
@@ -11,6 +16,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const MAX_PEER_RESPONSE_BYTES: usize = 16 * 1024;
+const MAX_V2_STATE_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_ACTIVE_OPERATIONS: usize = 128;
+const MAX_TERMINAL_OPERATIONS: usize = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SidecarCandidate {
@@ -157,10 +165,25 @@ pub struct BootstrapSnapshot {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct V2BootstrapState {
+    pub nodes: V2NodeCollection,
+    pub slots: V2SlotCollection,
+    pub operations: V2OperationCollection,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct VerifiedPeerIdentity {
     address: SocketAddr,
     node_id: String,
     runtime_identity: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AcceptedV2Position {
+    peer: VerifiedPeerIdentity,
+    epoch: StreamEpoch,
+    revision: DecimalU64,
+    generated_at_unix_ms: DecimalU64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -186,6 +209,7 @@ pub struct BootstrapState {
     error: Option<String>,
     credential_path: PathBuf,
     verified_peer: Option<VerifiedPeerIdentity>,
+    accepted_v2: Option<AcceptedV2Position>,
     #[cfg(test)]
     fail_startup_inspection_once: bool,
 }
@@ -199,6 +223,7 @@ impl Default for BootstrapState {
             error: None,
             credential_path: default_credential_path(),
             verified_peer: None,
+            accepted_v2: None,
             #[cfg(test)]
             fail_startup_inspection_once: false,
         }
@@ -229,6 +254,100 @@ impl Default for BootstrapConfig {
 }
 
 impl BootstrapState {
+    pub fn read_v2_state(&mut self, timeout: Duration) -> Result<V2BootstrapState, String> {
+        self.refresh_child();
+        let expected = match self.verified_peer.clone().filter(|peer| {
+            self.ownership != Ownership::None
+                && parse_loopback_endpoint(&self.endpoint).ok() == Some(peer.address)
+        }) {
+            Some(expected) => expected,
+            None => return self.reject_v2_state(),
+        };
+        let token = match ControlToken::load(&self.credential_path) {
+            Ok(token) => token,
+            Err(_) => return self.reject_v2_state(),
+        };
+
+        let nodes: V2NodeCollection = match read_v2_json_from_proven_peer(
+            expected.address,
+            "/loxa/v2/nodes",
+            timeout,
+            &token,
+            &expected,
+        ) {
+            Some(value) => value,
+            None => return self.reject_v2_state(),
+        };
+        let node = &nodes.nodes[0];
+        if node.node_id.to_string() != expected.node_id
+            || node.node_instance_id.to_string() != expected.runtime_identity
+            || node.control_endpoint != self.endpoint
+            || nodes.revision.get() == 0
+            || self.accepted_v2.as_ref().is_some_and(|accepted| {
+                accepted.peer == expected
+                    && accepted.epoch == nodes.epoch
+                    && (nodes.revision < accepted.revision
+                        || nodes.generated_at_unix_ms < accepted.generated_at_unix_ms)
+            })
+        {
+            return self.reject_v2_state();
+        }
+
+        let slots_path = format!("/loxa/v2/nodes/{}/slots", node.node_id);
+        let slots: V2SlotCollection = match read_v2_json_from_proven_peer(
+            expected.address,
+            &slots_path,
+            timeout,
+            &token,
+            &expected,
+        ) {
+            Some(value) => value,
+            None => return self.reject_v2_state(),
+        };
+        if slots.node_id != node.node_id
+            || slots.epoch != nodes.epoch
+            || slots.revision < nodes.revision
+            || slots.generated_at_unix_ms < nodes.generated_at_unix_ms
+        {
+            return self.reject_v2_state();
+        }
+
+        let operations: V2OperationCollection = match read_v2_json_from_proven_peer(
+            expected.address,
+            "/loxa/v2/operations",
+            timeout,
+            &token,
+            &expected,
+        ) {
+            Some(value) => value,
+            None => return self.reject_v2_state(),
+        };
+        if operations
+            .operations
+            .iter()
+            .any(|operation| operation.node_id != node.node_id)
+            || operations.epoch != nodes.epoch
+            || operations.revision < slots.revision
+            || operations.generated_at_unix_ms < slots.generated_at_unix_ms
+            || validate_v2_operation_collection(&operations, &slots).is_err()
+        {
+            return self.reject_v2_state();
+        }
+
+        self.accepted_v2 = Some(AcceptedV2Position {
+            peer: expected,
+            epoch: nodes.epoch,
+            revision: operations.revision,
+            generated_at_unix_ms: operations.generated_at_unix_ms,
+        });
+        self.error = None;
+        Ok(V2BootstrapState {
+            nodes,
+            slots,
+            operations,
+        })
+    }
+
     pub fn read_control_token(
         &mut self,
         endpoint: &str,
@@ -607,6 +726,12 @@ impl BootstrapState {
         Err(message)
     }
 
+    fn reject_v2_state<T>(&mut self) -> Result<T, String> {
+        self.verified_peer = None;
+        self.accepted_v2 = None;
+        self.fail(v2_state_read_error())
+    }
+
     fn current_snapshot(&self) -> BootstrapSnapshot {
         BootstrapSnapshot {
             ownership: self.ownership.clone(),
@@ -716,6 +841,76 @@ fn default_credential_path() -> PathBuf {
 
 fn token_read_error() -> String {
     "The local Loxa control credential is unavailable or unsafe.".to_string()
+}
+
+fn v2_state_read_error() -> String {
+    "The local Loxa v2 control state is unavailable or unsafe.".to_string()
+}
+
+fn validate_v2_operation_collection(
+    operations: &V2OperationCollection,
+    slots: &V2SlotCollection,
+) -> Result<(), ()> {
+    if operations.revision.get() == 0
+        || operations.operations.len() > MAX_ACTIVE_OPERATIONS + MAX_TERMINAL_OPERATIONS
+    {
+        return Err(());
+    }
+    let slot = &slots.slots[0];
+    let mut active_count = 0;
+    let mut terminal_count = 0;
+    let mut active_lifecycle = None;
+    let mut previous_order = None;
+    for operation in &operations.operations {
+        let order = (operation.created_revision, operation.operation_id);
+        if previous_order.is_some_and(|previous| previous >= order)
+            || operation.updated_revision > operations.revision
+            || operation.updated_at_unix_ms > operations.generated_at_unix_ms
+            || matches!(
+                operation.kind,
+                V2OperationKind::Load | V2OperationKind::Unload
+            ) && operation.slot_id != Some(slot.slot_id)
+        {
+            return Err(());
+        }
+        previous_order = Some(order);
+        if matches!(
+            operation.status,
+            V2OperationStatus::Queued | V2OperationStatus::Running | V2OperationStatus::Cancelling
+        ) {
+            active_count += 1;
+            if matches!(
+                operation.kind,
+                V2OperationKind::Load | V2OperationKind::Unload
+            ) && active_lifecycle.replace(operation).is_some()
+            {
+                return Err(());
+            }
+        } else {
+            terminal_count += 1;
+        }
+    }
+    if active_count > MAX_ACTIVE_OPERATIONS || terminal_count > MAX_TERMINAL_OPERATIONS {
+        return Err(());
+    }
+    if slots.revision == operations.revision {
+        let correlated = match (slot.status, active_lifecycle) {
+            (V2SlotStatus::Loading, Some(operation)) => {
+                operation.kind == V2OperationKind::Load
+                    && slot.operation_id == Some(operation.operation_id)
+            }
+            (V2SlotStatus::Unloading, Some(operation)) => {
+                operation.kind == V2OperationKind::Unload
+                    && slot.operation_id == Some(operation.operation_id)
+            }
+            (V2SlotStatus::Unloaded | V2SlotStatus::Ready | V2SlotStatus::Recovery, None) => true,
+            _ => false,
+        };
+        if !correlated {
+            return Err(());
+        }
+    }
+    Ok(())
 }
 
 fn parse_loopback_endpoint(endpoint: &str) -> Result<SocketAddr, String> {
@@ -837,6 +1032,145 @@ fn prove_compatible_with_token(
         node_id: value.node_id,
         runtime_identity: value.runtime_identity,
     })
+}
+
+fn read_v2_json_from_proven_peer<T: DeserializeOwned>(
+    address: SocketAddr,
+    path: &str,
+    timeout: Duration,
+    token: &ControlToken,
+    expected: &VerifiedPeerIdentity,
+) -> Option<T> {
+    let timeout = timeout.max(Duration::from_millis(1));
+    let deadline = Instant::now().checked_add(timeout)?;
+    let mut stream = TcpStream::connect_timeout(&address, timeout).ok()?;
+    stream.set_read_timeout(Some(timeout)).ok()?;
+    stream.set_write_timeout(Some(timeout)).ok()?;
+    let host = match address.ip() {
+        IpAddr::V4(ip) => ip.to_string(),
+        IpAddr::V6(ip) => format!("[{ip}]"),
+    };
+    let mut nonce_bytes = [0_u8; 32];
+    getrandom::fill(&mut nonce_bytes).ok()?;
+    let nonce = encode_hex(&nonce_bytes);
+    write!(
+        stream,
+        "GET /loxa/v1/node HTTP/1.1\r\nHost: {host}:{}\r\nX-Loxa-Challenge: {nonce}\r\nConnection: keep-alive\r\n\r\n",
+        address.port(),
+    )
+    .ok()?;
+    let proof: NodeIdentityProofResponse =
+        read_bounded_http_json(&mut stream, deadline, MAX_PEER_RESPONSE_BYTES)?;
+    if proof.protocol_version != CONTROL_PROTOCOL_VERSION
+        || proof.node_id != expected.node_id
+        || proof.runtime_identity != expected.runtime_identity
+        || !token.verify_node_identity_proof(
+            &nonce,
+            &proof.node_id,
+            &proof.runtime_identity,
+            proof.status,
+            &proof.challenge_proof,
+        )
+    {
+        return None;
+    }
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: {host}:{}\r\nAccept: application/json\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+        address.port(),
+        token.expose_for_authorization(),
+    )
+    .ok()?;
+    read_bounded_http_json(&mut stream, deadline, MAX_V2_STATE_RESPONSE_BYTES)
+}
+
+fn read_bounded_http_json<T: DeserializeOwned>(
+    stream: &mut TcpStream,
+    deadline: Instant,
+    maximum_body_bytes: usize,
+) -> Option<T> {
+    let maximum_response_bytes = maximum_body_bytes.checked_add(MAX_PEER_RESPONSE_BYTES)?;
+    let mut response = Vec::with_capacity(4096);
+    let body_offset = loop {
+        if let Some(offset) = response.windows(4).position(|window| window == b"\r\n\r\n") {
+            break offset;
+        }
+        if response.len() > MAX_PEER_RESPONSE_BYTES {
+            return None;
+        }
+        let remaining = deadline.checked_duration_since(Instant::now())?;
+        stream
+            .set_read_timeout(Some(remaining.max(Duration::from_millis(1))))
+            .ok()?;
+        let mut chunk = [0_u8; 8192];
+        match stream.read(&mut chunk) {
+            Ok(0) => return None,
+            Ok(count) => {
+                if response.len().checked_add(count)? > maximum_response_bytes {
+                    return None;
+                }
+                response.extend_from_slice(&chunk[..count]);
+            }
+            Err(_) => return None,
+        }
+    };
+    if body_offset > MAX_PEER_RESPONSE_BYTES {
+        return None;
+    }
+    let headers = std::str::from_utf8(&response[..body_offset]).ok()?;
+    let mut lines = headers.split("\r\n");
+    if !matches!(lines.next(), Some(line) if line.starts_with("HTTP/1.1 200 ") || line.starts_with("HTTP/1.0 200 "))
+    {
+        return None;
+    }
+    let mut content_type = None;
+    let mut content_length = None;
+    for line in lines {
+        let (name, value) = line.split_once(':')?;
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("content-type") {
+            if content_type.replace(value).is_some() {
+                return None;
+            }
+        } else if name.eq_ignore_ascii_case("content-length")
+            && content_length.replace(value).is_some()
+        {
+            return None;
+        }
+    }
+    if content_type?
+        .split(';')
+        .next()
+        .is_none_or(|value| !value.trim().eq_ignore_ascii_case("application/json"))
+    {
+        return None;
+    }
+    let body_length = content_length?.parse::<usize>().ok()?;
+    if body_length > maximum_body_bytes {
+        return None;
+    }
+    let expected_response_length = body_offset.checked_add(4)?.checked_add(body_length)?;
+    if expected_response_length > maximum_response_bytes
+        || response.len() > expected_response_length
+    {
+        return None;
+    }
+    while response.len() < expected_response_length {
+        let remaining = deadline.checked_duration_since(Instant::now())?;
+        stream
+            .set_read_timeout(Some(remaining.max(Duration::from_millis(1))))
+            .ok()?;
+        let remaining_bytes = expected_response_length - response.len();
+        let mut chunk = [0_u8; 8192];
+        let chunk_length = remaining_bytes.min(chunk.len());
+        let count = stream.read(&mut chunk[..chunk_length]).ok()?;
+        if count == 0 {
+            return None;
+        }
+        response.extend_from_slice(&chunk[..count]);
+    }
+    let body = &response[body_offset + 4..];
+    serde_json::from_slice(body).ok()
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -1402,6 +1736,7 @@ mod tests {
             error: None,
             credential_path: default_credential_path(),
             verified_peer: None,
+            accepted_v2: None,
             fail_startup_inspection_once: false,
         }
     }

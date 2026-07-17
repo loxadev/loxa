@@ -1987,6 +1987,7 @@ dependencies = [
  "getrandom 0.4.3",
  "libc",
  "loxa-core",
+ "loxa-protocol",
  "serde",
  "serde_json",
  "tauri",
