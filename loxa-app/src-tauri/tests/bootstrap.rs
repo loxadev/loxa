@@ -1,3 +1,5 @@
+mod support;
+
 use loxa_app_lib::bootstrap::{BootstrapConfig, BootstrapState, Ownership, StartNodeRequest};
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -6,6 +8,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
+use support::{
+    INSTANCE_ID, NODE_ID, REPLACEMENT_EPOCH, ScriptedPeer, ScriptedResponse,
+    active_load_operation_collection, bootstrap_config, node_collection, slot_collection,
+    successful_state_script, successful_state_script_with_epoch, terminal_operation_collection,
+};
 
 fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake loxa executable")
@@ -121,6 +128,270 @@ fn wait_health(port: u16, expected: &str) {
         assert!(Instant::now() < deadline, "fixture did not become ready");
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+fn native_bootstrap_decodes_and_correlates_strict_v2_state_behind_the_proven_peer() {
+    let _guard = test_guard();
+    let mut script = vec![ScriptedResponse::proof()];
+    script.extend(successful_state_script(11));
+    let peer = ScriptedPeer::spawn(script);
+    let mut state = BootstrapState::default();
+    state
+        .attach_with_config(peer.endpoint.clone(), &bootstrap_config(&peer))
+        .unwrap();
+
+    let v2 = state.read_v2_state(Duration::from_secs(1)).unwrap();
+
+    assert_eq!(v2.nodes.nodes[0].node_id.to_string(), NODE_ID);
+    assert_eq!(v2.nodes.nodes[0].node_instance_id.to_string(), INSTANCE_ID);
+    assert_eq!(v2.nodes.nodes[0].control_endpoint, peer.endpoint);
+    assert_eq!(v2.slots.node_id.to_string(), NODE_ID);
+    assert_eq!(v2.slots.slots[0].name, "default");
+    assert!(v2.operations.operations.is_empty());
+    assert!(!state.snapshot().endpoint.contains('@'));
+    peer.finish();
+}
+
+#[test]
+fn native_bootstrap_rejects_malformed_v2_keys_ids_decimals_and_size_bounds() {
+    let _guard = test_guard();
+    let valid = String::from_utf8(node_collection(11)).unwrap();
+    let cases = [
+        valid.replace(
+            "\"schema_version\":2",
+            "\"schema_version\":2,\"extra\":true",
+        ),
+        valid.replace(NODE_ID, "123E4567-E89B-42D3-A456-426614174000"),
+        valid.replace("\"revision\":\"11\"", "\"revision\":11"),
+        format!("{{\"padding\":\"{}\"}}", "x".repeat(2 * 1024 * 1024)),
+    ];
+    for malformed in cases {
+        let peer = ScriptedPeer::spawn(vec![
+            ScriptedResponse::proof(),
+            ScriptedResponse::json("/loxa/v2/nodes", malformed),
+        ]);
+        let mut state = BootstrapState::default();
+        state
+            .attach_with_config(peer.endpoint.clone(), &bootstrap_config(&peer))
+            .unwrap();
+
+        let error = state.read_v2_state(Duration::from_secs(1)).unwrap_err();
+
+        assert!(error.contains("unavailable or unsafe"), "{error}");
+        peer.finish();
+    }
+}
+
+#[test]
+fn native_bootstrap_rejects_same_endpoint_instance_replacement_after_slot_state() {
+    let _guard = test_guard();
+    let peer = ScriptedPeer::spawn(vec![
+        ScriptedResponse::proof(),
+        ScriptedResponse::json("/loxa/v2/nodes", node_collection(11)),
+        ScriptedResponse::replacement_proof(),
+    ]);
+    let mut state = BootstrapState::default();
+    state
+        .attach_with_config(peer.endpoint.clone(), &bootstrap_config(&peer))
+        .unwrap();
+
+    let error = state.read_v2_state(Duration::from_secs(1)).unwrap_err();
+
+    assert!(error.contains("unavailable or unsafe"), "{error}");
+    assert!(
+        state
+            .read_control_token(&peer.endpoint, Duration::from_millis(10))
+            .is_err()
+    );
+    peer.finish();
+}
+
+#[test]
+fn native_bootstrap_never_sends_a_bearer_to_a_replacement_before_operations() {
+    let _guard = test_guard();
+    let peer = ScriptedPeer::spawn(vec![
+        ScriptedResponse::proof(),
+        ScriptedResponse::json("/loxa/v2/nodes", node_collection(11)),
+        ScriptedResponse::json(
+            format!("/loxa/v2/nodes/{NODE_ID}/slots"),
+            slot_collection(11),
+        ),
+        ScriptedResponse::replacement_proof(),
+    ]);
+    let mut state = BootstrapState::default();
+    state
+        .attach_with_config(peer.endpoint.clone(), &bootstrap_config(&peer))
+        .unwrap();
+
+    let error = state.read_v2_state(Duration::from_secs(1)).unwrap_err();
+
+    assert!(error.contains("unavailable or unsafe"), "{error}");
+    peer.finish();
+}
+
+#[test]
+fn native_bootstrap_rejects_a_regressing_revision_from_the_same_proven_instance() {
+    let _guard = test_guard();
+    let mut script = vec![ScriptedResponse::proof()];
+    script.extend(successful_state_script(11));
+    script.extend([ScriptedResponse::json(
+        "/loxa/v2/nodes",
+        node_collection(10),
+    )]);
+    let peer = ScriptedPeer::spawn(script);
+    let mut state = BootstrapState::default();
+    state
+        .attach_with_config(peer.endpoint.clone(), &bootstrap_config(&peer))
+        .unwrap();
+    state.read_v2_state(Duration::from_secs(1)).unwrap();
+
+    let error = state.read_v2_state(Duration::from_secs(1)).unwrap_err();
+
+    assert!(error.contains("unavailable or unsafe"), "{error}");
+    peer.finish();
+}
+
+#[test]
+fn native_bootstrap_accepts_a_new_epoch_as_a_full_replacement_baseline() {
+    let _guard = test_guard();
+    let mut script = vec![ScriptedResponse::proof()];
+    script.extend(successful_state_script(11));
+    script.extend(successful_state_script_with_epoch(1, REPLACEMENT_EPOCH));
+    let peer = ScriptedPeer::spawn(script);
+    let mut state = BootstrapState::default();
+    state
+        .attach_with_config(peer.endpoint.clone(), &bootstrap_config(&peer))
+        .unwrap();
+    state.read_v2_state(Duration::from_secs(1)).unwrap();
+
+    let replaced = state.read_v2_state(Duration::from_secs(1)).unwrap();
+
+    assert_eq!(replaced.nodes.epoch.to_string(), REPLACEMENT_EPOCH);
+    assert_eq!(replaced.nodes.revision.to_string(), "1");
+    peer.finish();
+}
+
+#[test]
+fn native_bootstrap_rejects_generation_time_regression_across_collections() {
+    let _guard = test_guard();
+    let regressing_slots = String::from_utf8(slot_collection(11))
+        .unwrap()
+        .replace("1784246400600", "1784246400599");
+    let peer = ScriptedPeer::spawn(vec![
+        ScriptedResponse::proof(),
+        ScriptedResponse::json("/loxa/v2/nodes", node_collection(11)),
+        ScriptedResponse::json(format!("/loxa/v2/nodes/{NODE_ID}/slots"), regressing_slots),
+    ]);
+    let mut state = BootstrapState::default();
+    state
+        .attach_with_config(peer.endpoint.clone(), &bootstrap_config(&peer))
+        .unwrap();
+
+    assert!(state.read_v2_state(Duration::from_secs(1)).is_err());
+    peer.finish();
+}
+
+#[test]
+fn native_bootstrap_rejects_individually_valid_but_incoherent_capacity_one_state() {
+    let _guard = test_guard();
+    let peer = ScriptedPeer::spawn(vec![
+        ScriptedResponse::proof(),
+        ScriptedResponse::json("/loxa/v2/nodes", node_collection(11)),
+        ScriptedResponse::json(
+            format!("/loxa/v2/nodes/{NODE_ID}/slots"),
+            slot_collection(11),
+        ),
+        ScriptedResponse::json("/loxa/v2/operations", active_load_operation_collection(11)),
+    ]);
+    let mut state = BootstrapState::default();
+    state
+        .attach_with_config(peer.endpoint.clone(), &bootstrap_config(&peer))
+        .unwrap();
+
+    assert!(state.read_v2_state(Duration::from_secs(1)).is_err());
+    peer.finish();
+}
+
+#[test]
+fn native_bootstrap_enforces_the_bounded_recent_operation_collection() {
+    let _guard = test_guard();
+    let peer = ScriptedPeer::spawn(vec![
+        ScriptedResponse::proof(),
+        ScriptedResponse::json("/loxa/v2/nodes", node_collection(11)),
+        ScriptedResponse::json(
+            format!("/loxa/v2/nodes/{NODE_ID}/slots"),
+            slot_collection(11),
+        ),
+        ScriptedResponse::json("/loxa/v2/operations", terminal_operation_collection(129)),
+    ]);
+    let mut state = BootstrapState::default();
+    state
+        .attach_with_config(peer.endpoint.clone(), &bootstrap_config(&peer))
+        .unwrap();
+
+    assert!(state.read_v2_state(Duration::from_secs(1)).is_err());
+    peer.finish();
+}
+
+#[test]
+fn native_bootstrap_rejects_unordered_or_future_operation_rows() {
+    let _guard = test_guard();
+    let first_id = "123e4567-e89b-42d3-a456-000000000000";
+    let second_id = "123e4567-e89b-42d3-a456-000000000001";
+    let placeholder = "123e4567-e89b-42d3-a456-ffffffffffff";
+    let ordered = String::from_utf8(terminal_operation_collection(2)).unwrap();
+    let unordered = ordered
+        .replace(first_id, placeholder)
+        .replace(second_id, first_id)
+        .replace(placeholder, second_id);
+    let one = String::from_utf8(terminal_operation_collection(1)).unwrap();
+    let cases = [
+        unordered,
+        one.replace("\"updated_revision\":\"1\"", "\"updated_revision\":\"12\""),
+        one.replace(
+            "\"updated_at_unix_ms\":\"1\"",
+            "\"updated_at_unix_ms\":\"1784246400601\"",
+        ),
+    ];
+    for operations in cases {
+        let peer = ScriptedPeer::spawn(vec![
+            ScriptedResponse::proof(),
+            ScriptedResponse::json("/loxa/v2/nodes", node_collection(11)),
+            ScriptedResponse::json(
+                format!("/loxa/v2/nodes/{NODE_ID}/slots"),
+                slot_collection(11),
+            ),
+            ScriptedResponse::json("/loxa/v2/operations", operations),
+        ]);
+        let mut state = BootstrapState::default();
+        state
+            .attach_with_config(peer.endpoint.clone(), &bootstrap_config(&peer))
+            .unwrap();
+
+        assert!(state.read_v2_state(Duration::from_secs(1)).is_err());
+        peer.finish();
+    }
+}
+
+#[test]
+fn native_bootstrap_rejects_generation_time_regression_across_same_epoch_reads() {
+    let _guard = test_guard();
+    let mut script = vec![ScriptedResponse::proof()];
+    script.extend(successful_state_script(11));
+    let regressing_nodes = String::from_utf8(node_collection(11))
+        .unwrap()
+        .replace("1784246400600", "1784246400599");
+    script.push(ScriptedResponse::json("/loxa/v2/nodes", regressing_nodes));
+    let peer = ScriptedPeer::spawn(script);
+    let mut state = BootstrapState::default();
+    state
+        .attach_with_config(peer.endpoint.clone(), &bootstrap_config(&peer))
+        .unwrap();
+    state.read_v2_state(Duration::from_secs(1)).unwrap();
+
+    assert!(state.read_v2_state(Duration::from_secs(1)).is_err());
+    peer.finish();
 }
 
 #[test]
