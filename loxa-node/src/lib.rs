@@ -15,6 +15,8 @@ mod bootstrap;
 pub mod chat_history;
 pub mod chat_routes;
 pub mod control_router;
+#[allow(dead_code, unused_imports)]
+mod control_state;
 mod daemon;
 pub mod download_control;
 mod engine_session;
