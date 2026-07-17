@@ -2,6 +2,9 @@ use loxa_protocol::v1::{
     ControlErrorBody, ControlErrorCode, NodeIdentityProofResponse, NodeStatus,
     CONTROL_PROTOCOL_VERSION,
 };
+use loxa_protocol::v2::{
+    DecimalU64, OperationId, StreamEpoch, V2ControlEvent, V2OperationAccepted, V2Slot,
+};
 use loxa_protocol::{NodeId, NodeInstanceId};
 use std::str::FromStr;
 
@@ -129,6 +132,105 @@ fn error_codes_and_body_shape_are_exact() {
     .is_err());
     assert!(serde_json::from_str::<ControlErrorBody>(
         r#"{"code":"not_a_real_code","message":"busy"}"#
+    )
+    .is_err());
+}
+
+#[test]
+fn v2_identifiers_require_canonical_uuid_v4_and_remain_distinct() {
+    let operation: OperationId = "123e4567-e89b-42d3-9456-426614174003".parse().unwrap();
+    assert_eq!(
+        operation.to_string(),
+        "123e4567-e89b-42d3-9456-426614174003"
+    );
+    assert!("123E4567-E89B-42D3-9456-426614174003"
+        .parse::<OperationId>()
+        .is_err());
+    assert!("123e4567-e89b-12d3-9456-426614174003"
+        .parse::<OperationId>()
+        .is_err());
+}
+
+#[test]
+fn decimal_u64_rejects_noncanonical_or_overflowing_values() {
+    for value in ["", "00", "+1", " 1", "1.0", "18446744073709551616"] {
+        assert!(serde_json::from_str::<DecimalU64>(&format!("\"{value}\"")).is_err());
+    }
+    assert_eq!(
+        serde_json::to_string(&DecimalU64::new(42)).unwrap(),
+        "\"42\""
+    );
+}
+
+fn operation_accepted_fixture() -> V2OperationAccepted {
+    V2OperationAccepted {
+        epoch: "123e4567-e89b-42d3-b456-426614174005"
+            .parse::<StreamEpoch>()
+            .unwrap(),
+        operation_id: "123e4567-e89b-42d3-9456-426614174003"
+            .parse::<OperationId>()
+            .unwrap(),
+        revision: DecimalU64::new(10),
+    }
+}
+
+#[test]
+fn v2_operation_acceptance_has_exact_keys_and_string_counters() {
+    let value = serde_json::to_value(operation_accepted_fixture()).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "epoch": "123e4567-e89b-42d3-b456-426614174005",
+            "operation_id": "123e4567-e89b-42d3-9456-426614174003",
+            "revision": "10"
+        })
+    );
+}
+
+#[test]
+fn v2_contracts_reject_unknown_missing_duplicate_and_numeric_counter_fields() {
+    assert!(serde_json::from_str::<V2OperationAccepted>(
+        r#"{"epoch":"123e4567-e89b-42d3-b456-426614174005","operation_id":"123e4567-e89b-42d3-9456-426614174003","revision":10}"#
+    )
+    .is_err());
+    assert!(serde_json::from_slice::<V2OperationAccepted>(br#"{"epoch":"123e4567-e89b-42d3-b456-426614174005","epoch":"123e4567-e89b-42d3-b456-426614174005","operation_id":"123e4567-e89b-42d3-9456-426614174003","revision":"10"}"#).is_err());
+}
+
+#[test]
+fn v2_event_rejects_an_envelope_without_a_committed_record() {
+    assert!(serde_json::from_str::<V2ControlEvent>(
+        r#"{
+            "schema_version":2,
+            "event_id":"123e4567-e89b-42d3-a456-426614174004",
+            "epoch":"123e4567-e89b-42d3-b456-426614174005",
+            "sequence":"11",
+            "revision":"11",
+            "committed_at_unix_ms":"1784246400500",
+            "entity":"operation",
+            "entity_id":"123e4567-e89b-42d3-9456-426614174003",
+            "node_id":"123e4567-e89b-42d3-a456-426614174000",
+            "node_instance_id":null,
+            "slot_id":null,
+            "operation_id":null,
+            "node":null,
+            "slot":null,
+            "operation":null
+        }"#
+    )
+    .is_err());
+}
+
+#[test]
+fn v2_nullable_fields_must_be_present_even_when_null() {
+    assert!(serde_json::from_str::<V2Slot>(
+        r#"{
+            "slot_id":"123e4567-e89b-42d3-8456-426614174002",
+            "node_id":"123e4567-e89b-42d3-a456-426614174000",
+            "name":"default",
+            "status":"ready",
+            "model_id":"gemma-3-4b-it-q4",
+            "error":null
+        }"#
     )
     .is_err());
 }

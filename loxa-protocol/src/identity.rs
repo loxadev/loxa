@@ -15,7 +15,7 @@ impl fmt::Display for ParseIdentityError {
 
 impl std::error::Error for ParseIdentityError {}
 
-fn parse_uuid_v4(text: &str) -> Result<Uuid, ParseIdentityError> {
+pub(crate) fn parse_uuid_v4(text: &str) -> Result<Uuid, ParseIdentityError> {
     if text.len() != 36 || !matches!(text.as_bytes()[19], b'8' | b'9' | b'a' | b'b') {
         return Err(ParseIdentityError);
     }
