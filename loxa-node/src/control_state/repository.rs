@@ -1,15 +1,17 @@
 use super::schema::{schema_checksum, MIGRATION_NAME, SCHEMA_V1, SCHEMA_VERSION};
 use loxa_protocol::v2::DecimalU64;
 use loxa_protocol::v2::{
-    EventId, OperationId, SlotId, StreamEpoch, V2Node, V2Operation, V2OperationErrorCode,
-    V2OperationKind, V2OperationProgress, V2OperationStatus, V2PublicError, V2Slot,
+    EventId, OperationId, SlotId, StreamEpoch, V2ControlEvent, V2EventEntity, V2Node, V2Operation,
+    V2OperationErrorCode, V2OperationKind, V2OperationProgress, V2OperationStatus, V2PublicError,
+    V2Slot, V2SlotErrorCode, V2SlotStatus, V2_SCHEMA_VERSION,
 };
 use loxa_protocol::{NodeId, NodeInstanceId};
 use rusqlite::backup::Backup;
 use rusqlite::config::DbConfig;
 use rusqlite::limits::Limit;
 use rusqlite::{
-    Connection, Error as SqlError, ErrorCode, OpenFlags, Transaction, TransactionBehavior,
+    Connection, Error as SqlError, ErrorCode, OpenFlags, OptionalExtension, Transaction,
+    TransactionBehavior,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString};
@@ -23,8 +25,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
-#[path = "test_support/mod.rs"]
-mod test_support;
+use super::state_machine::test_support;
 
 const SQLITE_LENGTH_LIMIT: i32 = 4 * 1024 * 1024;
 const SQLITE_SQL_LENGTH_LIMIT: i32 = 1024 * 1024;
@@ -44,6 +45,9 @@ type SchemaObject = (String, String, String, Option<String>);
 pub(crate) trait ControlIdGenerator {
     fn new_slot_id(&mut self) -> SlotId;
     fn new_stream_epoch(&mut self) -> StreamEpoch;
+    fn new_initial_event_id(&mut self) -> EventId {
+        EventId::new_v4()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,11 +66,15 @@ pub(crate) enum RepositoryErrorClass {
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) struct RepositoryError {
     class: RepositoryErrorClass,
+    state_machine_tag: Option<&'static str>,
 }
 
 impl RepositoryError {
     fn new(class: RepositoryErrorClass) -> Self {
-        Self { class }
+        Self {
+            class,
+            state_machine_tag: None,
+        }
     }
 
     #[cfg(test)]
@@ -76,6 +84,21 @@ impl RepositoryError {
 
     pub(crate) fn class(&self) -> RepositoryErrorClass {
         self.class
+    }
+
+    pub(super) fn tagged_for_state_machine(tag: &'static str) -> Self {
+        Self {
+            class: RepositoryErrorClass::Database,
+            state_machine_tag: Some(tag),
+        }
+    }
+
+    pub(super) fn state_machine_tag(&self) -> Option<&'static str> {
+        self.state_machine_tag
+    }
+
+    pub(super) fn corrupt_for_state_machine() -> Self {
+        Self::new(RepositoryErrorClass::Corrupt)
     }
 }
 
@@ -133,6 +156,18 @@ pub(crate) struct RestoreSummary {
     pub(crate) revision: u64,
     pub(crate) cursor: u64,
     pub(crate) event_rows: usize,
+}
+
+struct StoredSlotRow {
+    slot_id: String,
+    name: String,
+    status: String,
+    model_id: Option<String>,
+    operation_id: Option<String>,
+    error_code: Option<String>,
+    error_message: Option<String>,
+    updated_revision: String,
+    updated_at_unix_ms: String,
 }
 
 pub(crate) struct ControlRepository {
@@ -1040,6 +1075,18 @@ impl ControlRepository {
         self.stream_epoch
     }
 
+    pub(crate) fn node_id(&self) -> NodeId {
+        self.expected_node_id
+    }
+
+    pub(crate) fn read_transaction<T>(
+        &self,
+        work: impl FnOnce(&Connection) -> Result<T, RepositoryError>,
+    ) -> Result<T, RepositoryError> {
+        self.validate_ownership()?;
+        work(self.connection_ref()?)
+    }
+
     pub(crate) fn transaction<T>(
         &mut self,
         work: impl FnOnce(&Transaction<'_>) -> Result<T, RepositoryError>,
@@ -1492,19 +1539,29 @@ fn open_existing_or_initialize_in_one_transaction(
         (node_id.to_string(), slot_id.to_string(), stream_epoch.to_string(), applied_at_ms.to_string()),
     )?;
     transaction.execute(
-        "INSERT INTO node_state(singleton, node_id, node_instance_id, control_endpoint, status, can_load, can_unload, can_download) VALUES(1, ?1, NULL, NULL, 'unpublished', 0, 0, 0)",
+        "INSERT INTO node_state(singleton, node_id, node_instance_id, control_endpoint, status, model_download, slot_load, slot_unload, operation_cancel, operation_stream) VALUES(1, ?1, NULL, NULL, 'unpublished', 0, 0, 0, 0, 0)",
         [node_id.to_string()],
     )?;
     transaction.execute(
         "INSERT INTO slot_state(singleton, slot_id, name, status, model_id, operation_id, updated_revision, updated_at_unix_ms) VALUES(1, ?1, 'default', 'unloaded', NULL, NULL, '1', ?2)",
         (slot_id.to_string(), applied_at_ms.to_string()),
     )?;
+    let event_id = ids.new_initial_event_id();
     transaction.execute(
         "INSERT INTO events(event_id, stream_epoch, sequence, revision, node_instance_id, v1_sequence, event_kind, payload_json) VALUES(?1, ?2, '1', '1', NULL, NULL, 'initialized', ?3)",
         (
-            EventId::new_v4().to_string(),
+            event_id.to_string(),
             stream_epoch.to_string(),
-            unloaded_slot_payload(node_id, slot_id)?,
+            slot_event_payload(
+                event_id,
+                stream_epoch,
+                1,
+                1,
+                u64::try_from(applied_at_ms)
+                    .map_err(|_| RepositoryError::new(RepositoryErrorClass::Overflow))?,
+                node_id,
+                slot_id,
+            )?,
         ),
     )?;
     transaction.commit()?;
@@ -1550,15 +1607,32 @@ fn validate_connection(
     if node_rows != 1 || slot_rows != 1 || event_rows == 0 {
         return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
     }
-    let stored_node: (String, Option<String>, Option<String>, String, i64, i64, i64) = connection.query_row(
-        "SELECT node_id, node_instance_id, control_endpoint, status, can_load, can_unload, can_download FROM node_state WHERE singleton = 1",
+    let stored_node: (String, Option<String>, Option<String>, String, i64, i64, i64, i64, i64) = connection.query_row(
+        "SELECT node_id, node_instance_id, control_endpoint, status, model_download, slot_load, slot_unload, operation_cancel, operation_stream FROM node_state WHERE singleton = 1",
         [],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?)),
     )?;
     if stored_node.0 != node_id.to_string()
-        || ![stored_node.4, stored_node.5, stored_node.6]
-            .into_iter()
-            .all(|value| matches!(value, 0 | 1))
+        || ![
+            stored_node.4,
+            stored_node.5,
+            stored_node.6,
+            stored_node.7,
+            stored_node.8,
+        ]
+        .into_iter()
+        .all(|value| matches!(value, 0 | 1))
+    {
+        return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
+    }
+    if stored_node.3 == "unpublished"
+        && [
+            stored_node.4,
+            stored_node.5,
+            stored_node.6,
+            stored_node.7,
+            stored_node.8,
+        ] != [0, 0, 0, 0, 0]
     {
         return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
     }
@@ -1581,44 +1655,54 @@ fn validate_connection(
     {
         return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
     }
-    let stored_slot: (String, String, String, Option<String>, Option<String>, String, String) = connection.query_row(
-        "SELECT slot_id, name, status, model_id, operation_id, updated_revision, updated_at_unix_ms FROM slot_state WHERE singleton = 1",
+    let stored_slot: StoredSlotRow = connection.query_row(
+        "SELECT slot_id, name, status, model_id, operation_id, error_code, error_message, updated_revision, updated_at_unix_ms FROM slot_state WHERE singleton = 1",
         [],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+        |row| Ok(StoredSlotRow { slot_id: row.get(0)?, name: row.get(1)?, status: row.get(2)?, model_id: row.get(3)?, operation_id: row.get(4)?, error_code: row.get(5)?, error_message: row.get(6)?, updated_revision: row.get(7)?, updated_at_unix_ms: row.get(8)? }),
     )?;
     let slot_operation_id = stored_slot
-        .4
+        .operation_id
         .as_deref()
         .map(OperationId::from_str)
         .transpose()
         .map_err(|_| RepositoryError::new(RepositoryErrorClass::Corrupt))?;
-    let slot_state_valid = match stored_slot.2.as_str() {
-        "unloaded" => stored_slot.3.is_none() && slot_operation_id.is_none(),
-        "loading" => {
-            stored_slot.3.as_deref().is_some_and(valid_model_id) && slot_operation_id.is_some()
-        }
+    let slot_state_valid = match stored_slot.status.as_str() {
+        "unloaded" => stored_slot.model_id.is_none() && slot_operation_id.is_none(),
+        "loading" => slot_operation_id.is_some(),
         "ready" => {
-            stored_slot.3.as_deref().is_some_and(valid_model_id) && slot_operation_id.is_none()
+            stored_slot.model_id.as_deref().is_some_and(valid_model_id)
+                && slot_operation_id.is_none()
         }
         "unloading" => {
-            stored_slot.3.as_deref().is_some_and(valid_model_id) && slot_operation_id.is_some()
+            stored_slot.model_id.as_deref().is_some_and(valid_model_id)
+                && slot_operation_id.is_some()
         }
-        "recovery" => slot_operation_id.is_none(),
+        "recovery" => {
+            slot_operation_id.is_none()
+                && stored_slot.error_code.as_deref() == Some("lifecycle_recovery_required")
+                && stored_slot
+                    .error_message
+                    .as_deref()
+                    .is_some_and(|message| valid_bounded_text(message, 256))
+        }
         _ => false,
     };
-    if stored_slot.0 != slot_id.to_string()
-        || stored_slot.1 != "default"
+    if stored_slot.slot_id != slot_id.to_string()
+        || stored_slot.name != "default"
         || !slot_state_valid
         || stored_slot
-            .3
+            .model_id
             .as_deref()
             .is_some_and(|model| !valid_model_id(model))
-        || parse_canonical_u64(&stored_slot.5)? > revision
-        || parse_canonical_u64(&stored_slot.6)? > last_committed_at
+        || (stored_slot.status != "recovery"
+            && (stored_slot.error_code.is_some() || stored_slot.error_message.is_some()))
+        || parse_canonical_u64(&stored_slot.updated_revision)? > revision
+        || parse_canonical_u64(&stored_slot.updated_at_unix_ms)? > last_committed_at
     {
         return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
     }
     validate_operation_rows(connection, node_id, slot_id, revision, last_committed_at)?;
+    validate_slot_operation_reference(connection, stored_slot.status.as_str(), slot_operation_id)?;
     validate_event_rows(
         connection,
         node_id,
@@ -1631,7 +1715,7 @@ fn validate_connection(
     Ok(ValidationSummary {
         node_rows,
         slot_rows,
-        slot_name: stored_slot.1,
+        slot_name: stored_slot.name,
         revision,
         cursor,
         event_rows,
@@ -1722,6 +1806,10 @@ fn validate_operation_rows(
         let status: V2OperationStatus = parse_closed_string(&status_text)?;
         let progress = match (progress_current, progress_total) {
             (None, None) => None,
+            (Some(current), None) => Some(V2OperationProgress {
+                completed_bytes: DecimalU64::new(parse_canonical_u64(&current)?),
+                total_bytes: None,
+            }),
             (Some(current), Some(total)) => Some(V2OperationProgress {
                 completed_bytes: DecimalU64::new(parse_canonical_u64(&current)?),
                 total_bytes: Some(DecimalU64::new(parse_canonical_u64(&total)?)),
@@ -1764,6 +1852,37 @@ fn validate_operation_rows(
     Ok(())
 }
 
+fn validate_slot_operation_reference(
+    connection: &Connection,
+    slot_status: &str,
+    operation_id: Option<OperationId>,
+) -> Result<(), RepositoryError> {
+    let Some(operation_id) = operation_id else {
+        if matches!(slot_status, "loading" | "unloading") {
+            return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
+        }
+        return Ok(());
+    };
+    let operation: Option<(String, String)> = connection
+        .query_row(
+            "SELECT kind,status FROM operations WHERE operation_id=?1",
+            [operation_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let valid = operation.is_some_and(|(kind, status)| {
+        matches!(status.as_str(), "running" | "cancelling")
+            && matches!(
+                (slot_status, kind.as_str()),
+                ("loading", "load") | ("unloading", "unload")
+            )
+    });
+    if !valid {
+        return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
+    }
+    Ok(())
+}
+
 fn validate_event_rows(
     connection: &Connection,
     node_id: NodeId,
@@ -1780,7 +1899,7 @@ fn validate_event_rows(
     let mut highest = 0_u64;
     let mut sequences = BTreeSet::new();
     while let Some(row) = rows.next()? {
-        EventId::from_str(&row.get::<_, String>(0)?)
+        let event_id = EventId::from_str(&row.get::<_, String>(0)?)
             .map_err(|_| RepositoryError::new(RepositoryErrorClass::Corrupt))?;
         let row_epoch = StreamEpoch::from_str(&row.get::<_, String>(1)?)
             .map_err(|_| RepositoryError::new(RepositoryErrorClass::Corrupt))?;
@@ -1798,10 +1917,16 @@ fn validate_event_rows(
         validate_event_payload(
             &event_kind,
             &payload_json,
+            EventRowIdentity {
+                event_id,
+                epoch: row_epoch,
+                sequence,
+                revision: event_revision,
+                v1_sequence,
+            },
             node_id,
             slot_id,
             parsed_node_instance,
-            event_revision,
             last_committed_at,
         )?;
         if row_epoch != epoch
@@ -1825,41 +1950,59 @@ fn parse_closed_string<T: serde::de::DeserializeOwned>(value: &str) -> Result<T,
         .map_err(|_| RepositoryError::new(RepositoryErrorClass::Corrupt))
 }
 
+#[derive(Clone, Copy)]
+struct EventRowIdentity {
+    event_id: EventId,
+    epoch: StreamEpoch,
+    sequence: u64,
+    revision: u64,
+    v1_sequence: Option<i64>,
+}
+
 fn validate_event_payload(
     event_kind: &str,
     payload_json: &str,
+    row: EventRowIdentity,
     node_id: NodeId,
     slot_id: SlotId,
     node_instance_id: Option<NodeInstanceId>,
-    event_revision: u64,
     last_committed_at: u64,
 ) -> Result<(), RepositoryError> {
-    match event_kind {
-        "initialized" | "slot_changed" => {
-            let slot: V2Slot = serde_json::from_str(payload_json)
-                .map_err(|_| RepositoryError::new(RepositoryErrorClass::Corrupt))?;
-            if slot.node_id != node_id || slot.slot_id != slot_id {
-                return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
+    let event: V2ControlEvent = serde_json::from_str(payload_json)
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::Corrupt))?;
+    let expected_kind = match event.entity {
+        V2EventEntity::Node => "node_changed",
+        V2EventEntity::Slot => {
+            if row.sequence == 1 {
+                "initialized"
+            } else {
+                "slot_changed"
             }
         }
-        "node_changed" => {
-            let node: V2Node = serde_json::from_str(payload_json)
-                .map_err(|_| RepositoryError::new(RepositoryErrorClass::Corrupt))?;
-            if node.node_id != node_id || Some(node.node_instance_id) != node_instance_id {
-                return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
-            }
-        }
-        "operation_changed" => {
-            let operation: V2Operation = serde_json::from_str(payload_json)
-                .map_err(|_| RepositoryError::new(RepositoryErrorClass::Corrupt))?;
-            if operation.node_id != node_id
-                || operation.updated_revision.get() != event_revision
-                || operation.updated_at_unix_ms.get() > last_committed_at
-            {
-                return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
-            }
-        }
-        _ => return Err(RepositoryError::new(RepositoryErrorClass::Corrupt)),
+        V2EventEntity::Operation => "operation_changed",
+    };
+    let operation_correlation_valid = event.operation.as_ref().is_none_or(|operation| {
+        operation.updated_revision.get() == row.revision
+            && operation.updated_at_unix_ms == event.committed_at_unix_ms
+    });
+    let instance_sequence_correlation_valid = match event.entity {
+        V2EventEntity::Operation => node_instance_id.is_some() && row.v1_sequence.is_some(),
+        V2EventEntity::Node | V2EventEntity::Slot => row.v1_sequence.is_none(),
+    };
+    if event_kind != expected_kind
+        || event.event_id != row.event_id
+        || event.epoch != row.epoch
+        || event.sequence.get() != row.sequence
+        || event.revision.get() != row.revision
+        || event.node_id != node_id
+        || event.node_instance_id != node_instance_id
+        || event.slot_id.is_some_and(|value| value != slot_id)
+        || event.committed_at_unix_ms.get() > last_committed_at
+        || !operation_correlation_valid
+        || !instance_sequence_correlation_valid
+        || event.validate().is_err()
+    {
+        return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
     }
     Ok(())
 }
@@ -1909,19 +2052,34 @@ fn rotate_lineage_after(
         .checked_add(1)
         .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Overflow))?;
     let new_epoch = StreamEpoch::new_v4();
+    let event_id = EventId::new_v4();
+    let committed_at = u64::try_from(current_unix_ms()?)
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::Overflow))?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute("DELETE FROM events", [])?;
     transaction.execute(
-        "UPDATE control_meta SET stream_epoch = ?1, revision = ?2, cursor = '1' WHERE singleton = 1",
-        (new_epoch.to_string(), next_revision.to_string()),
+        "UPDATE control_meta SET stream_epoch = ?1, revision = ?2, cursor = '1', last_committed_at_unix_ms = ?3 WHERE singleton = 1",
+        (
+            new_epoch.to_string(),
+            next_revision.to_string(),
+            committed_at.max(summary.revision).to_string(),
+        ),
     )?;
     transaction.execute(
         "INSERT INTO events(event_id, stream_epoch, sequence, revision, node_instance_id, v1_sequence, event_kind, payload_json) VALUES(?1, ?2, '1', ?3, NULL, NULL, 'initialized', ?4)",
         (
-            EventId::new_v4().to_string(),
+            event_id.to_string(),
             new_epoch.to_string(),
             next_revision.to_string(),
-            unloaded_slot_payload(node_id, summary.slot_id)?,
+            slot_event_payload(
+                event_id,
+                new_epoch,
+                1,
+                next_revision,
+                committed_at,
+                node_id,
+                summary.slot_id,
+            )?,
         ),
     )?;
     transaction.commit()?;
@@ -1929,15 +2087,40 @@ fn rotate_lineage_after(
     close_into_image_traced(image, observe)
 }
 
-fn unloaded_slot_payload(node_id: NodeId, slot_id: SlotId) -> Result<String, RepositoryError> {
-    serde_json::to_string(&V2Slot {
+fn slot_event_payload(
+    event_id: EventId,
+    epoch: StreamEpoch,
+    sequence: u64,
+    revision: u64,
+    committed_at_unix_ms: u64,
+    node_id: NodeId,
+    slot_id: SlotId,
+) -> Result<String, RepositoryError> {
+    let slot = V2Slot {
         slot_id,
         node_id,
         name: "default".to_owned(),
-        status: loxa_protocol::v2::V2SlotStatus::Unloaded,
+        status: V2SlotStatus::Unloaded,
         model_id: None,
         operation_id: None,
         error: None,
+    };
+    serde_json::to_string(&V2ControlEvent {
+        schema_version: V2_SCHEMA_VERSION,
+        event_id,
+        epoch,
+        sequence: DecimalU64::new(sequence),
+        revision: DecimalU64::new(revision),
+        committed_at_unix_ms: DecimalU64::new(committed_at_unix_ms),
+        entity: V2EventEntity::Slot,
+        entity_id: slot_id.to_string(),
+        node_id,
+        node_instance_id: None,
+        slot_id: Some(slot_id),
+        operation_id: None,
+        node: None,
+        slot: Some(slot),
+        operation: None,
     })
     .map_err(|_| RepositoryError::new(RepositoryErrorClass::Database))
 }
@@ -3935,10 +4118,10 @@ fn map_sql_error(error: SqlError) -> RepositoryError {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::storage::{
+    use super::{ControlIdGenerator, ControlRepository, RepositoryError, RepositoryErrorClass};
+    use crate::control_state::state_machine::test_support::storage::{
         apply_auxiliary_defect, family_snapshot, AuxiliaryDefect, AuxiliaryKind,
     };
-    use super::{ControlIdGenerator, ControlRepository, RepositoryError, RepositoryErrorClass};
     use loxa_protocol::v2::{SlotId, StreamEpoch};
     use loxa_protocol::NodeId;
     use rusqlite::{config::DbConfig, limits::Limit};
@@ -3992,6 +4175,7 @@ mod tests {
     struct CountingIds {
         slot_id: Option<SlotId>,
         stream_epoch: Option<StreamEpoch>,
+        initial_event_id: Option<loxa_protocol::v2::EventId>,
         calls: usize,
     }
 
@@ -4000,6 +4184,10 @@ mod tests {
             Self {
                 slot_id: Some(SlotId::from_str(SLOT_ID).unwrap()),
                 stream_epoch: Some(StreamEpoch::from_str(STREAM_EPOCH).unwrap()),
+                initial_event_id: Some(
+                    loxa_protocol::v2::EventId::from_str("66666666-6666-4666-8666-666666666666")
+                        .unwrap(),
+                ),
                 calls: 0,
             }
         }
@@ -4020,6 +4208,13 @@ mod tests {
             self.stream_epoch
                 .take()
                 .expect("unexpected stream epoch generation")
+        }
+
+        fn new_initial_event_id(&mut self) -> loxa_protocol::v2::EventId {
+            self.calls += 1;
+            self.initial_event_id
+                .take()
+                .unwrap_or_else(loxa_protocol::v2::EventId::new_v4)
         }
     }
 
@@ -4101,8 +4296,16 @@ mod tests {
     }
 
     fn commit_revision_two(repository: &mut ControlRepository) {
-        let payload =
-            super::unloaded_slot_payload(node_id(), repository.slot_id()).expect("slot payload");
+        let payload = super::slot_event_payload(
+            loxa_protocol::v2::EventId::from_str("77777777-7777-4777-8777-777777777777").unwrap(),
+            repository.stream_epoch(),
+            2,
+            2,
+            0,
+            node_id(),
+            repository.slot_id(),
+        )
+        .expect("slot payload");
         repository
             .transaction(|transaction| {
                 transaction.execute(
@@ -4248,7 +4451,16 @@ mod tests {
     ) -> RestoreFaultOutcome {
         let source = TestDirectory::new(&format!("{mode}-source-{point:?}"));
         let mut source_repository = create_repository(&source.database());
-        let payload = super::unloaded_slot_payload(node_id(), source_repository.slot_id()).unwrap();
+        let payload = super::slot_event_payload(
+            loxa_protocol::v2::EventId::from_str("44444444-4444-4444-8444-444444444444").unwrap(),
+            source_repository.stream_epoch(),
+            41,
+            41,
+            0,
+            node_id(),
+            source_repository.slot_id(),
+        )
+        .unwrap();
         source_repository
             .transaction(|transaction| {
                 transaction.execute(
@@ -5185,7 +5397,7 @@ mod tests {
         let mut ids = CountingIds::fixed();
         let repository =
             ControlRepository::open_or_create(&directory.database(), node_id(), &mut ids).unwrap();
-        assert_eq!(ids.calls(), 2);
+        assert_eq!(ids.calls(), 3);
         assert_eq!(repository.slot_id().to_string(), SLOT_ID);
         assert_eq!(repository.stream_epoch().to_string(), STREAM_EPOCH);
     }
@@ -5205,11 +5417,13 @@ mod tests {
             })
             .unwrap();
         repository.close().unwrap();
+        let before = file_digest(&path);
 
         let error =
             ControlRepository::open_or_create(&path, node_id(), &mut CountingIds::default())
                 .unwrap_err();
         assert_eq!(error.class(), RepositoryErrorClass::Corrupt);
+        assert_eq!(file_digest(&path), before);
     }
 
     #[test]
@@ -5224,11 +5438,68 @@ mod tests {
             })
             .unwrap();
         repository.close().unwrap();
+        let before = file_digest(&path);
 
         let error =
             ControlRepository::open_or_create(&path, node_id(), &mut CountingIds::default())
                 .unwrap_err();
         assert_eq!(error.class(), RepositoryErrorClass::UnsupportedSchema);
+        assert_eq!(file_digest(&path), before);
+    }
+
+    #[test]
+    fn former_intermediate_task3a_schema_and_checksum_fail_closed_unchanged() {
+        use sha2::{Digest, Sha256};
+
+        let directory = TestDirectory::new("former-task3a-schema");
+        let path = directory.database();
+        let mut repository = create_repository(&path);
+        repository
+            .transaction(|transaction| {
+                transaction.execute_batch(
+                    "DROP TABLE events; DROP TABLE operations; DROP TABLE slot_state; DROP TABLE node_state; DROP TABLE control_meta; DROP TABLE loxa_schema_migrations;",
+                )?;
+                transaction.execute_batch(
+                    super::super::schema::FORMER_INTERMEDIATE_TASK3A_SCHEMA_V1,
+                )?;
+                let digest = Sha256::digest(
+                    super::super::schema::FORMER_INTERMEDIATE_TASK3A_SCHEMA_V1.as_bytes(),
+                );
+                let checksum = digest
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                transaction.execute(
+                    "INSERT INTO loxa_schema_migrations VALUES(1,'capacity_one_control_state',?1,1)",
+                    [checksum],
+                )?;
+                transaction.execute(
+                    "INSERT INTO control_meta VALUES(1,?1,?2,?3,'1','1',1,'fresh','1')",
+                    [NODE_ID, SLOT_ID, STREAM_EPOCH],
+                )?;
+                transaction.execute(
+                    "INSERT INTO node_state VALUES(1,?1,NULL,NULL,'unpublished',0,0,0)",
+                    [NODE_ID],
+                )?;
+                transaction.execute(
+                    "INSERT INTO slot_state VALUES(1,?1,'default','unloaded',NULL,NULL,'1','1')",
+                    [SLOT_ID],
+                )?;
+                transaction.execute(
+                    "INSERT INTO events VALUES('88888888-8888-4888-8888-888888888888',?1,'1','1',NULL,NULL,'initialized','{}')",
+                    [STREAM_EPOCH],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        repository.close().unwrap();
+        let before = family_snapshot(&path);
+
+        let error =
+            ControlRepository::open_or_create(&path, node_id(), &mut CountingIds::default())
+                .unwrap_err();
+        assert_eq!(error.class(), RepositoryErrorClass::UnsupportedSchema);
+        assert_eq!(family_snapshot(&path), before);
     }
 
     #[cfg(unix)]
@@ -5473,8 +5744,16 @@ mod tests {
     fn offline_restore_rotates_epoch_clears_events_and_advances_revision() {
         let source = TestDirectory::new("restore-source");
         let mut repository = create_repository(&source.database());
-        let restored_payload =
-            super::unloaded_slot_payload(node_id(), repository.slot_id()).unwrap();
+        let restored_payload = super::slot_event_payload(
+            loxa_protocol::v2::EventId::from_str("44444444-4444-4444-8444-444444444444").unwrap(),
+            repository.stream_epoch(),
+            41,
+            41,
+            0,
+            node_id(),
+            repository.slot_id(),
+        )
+        .unwrap();
         repository
             .transaction(|transaction| {
                 transaction.execute(
@@ -5715,14 +5994,20 @@ mod tests {
         for (index, sql) in corruptions.into_iter().enumerate() {
             let directory = TestDirectory::new(&format!("logical-corruption-{index}"));
             let mut repository = create_repository(&directory.database());
-            repository
-                .transaction(|transaction| {
-                    transaction.execute(sql, [])?;
-                    Ok(())
-                })
-                .unwrap();
-            let error = repository.validate_all().unwrap_err();
-            assert_eq!(error.class(), RepositoryErrorClass::Corrupt, "{sql}");
+            let mutation = repository.transaction(|transaction| {
+                transaction.execute(sql, [])?;
+                Ok(())
+            });
+            match mutation {
+                Ok(()) => {
+                    let error = repository.validate_all().unwrap_err();
+                    assert_eq!(error.class(), RepositoryErrorClass::Corrupt, "{sql}");
+                }
+                Err(error) => {
+                    assert_eq!(error.class(), RepositoryErrorClass::Database, "{sql}");
+                    repository.validate_all().unwrap();
+                }
+            }
         }
     }
 
