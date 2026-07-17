@@ -1,3 +1,4 @@
+use crate::control_state::ControlStatePath;
 use loxa_core::{download, supervisor};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -43,6 +44,15 @@ impl NodePaths {
             .join("history")
             .join("chat-history.sqlite3"))
     }
+
+    #[allow(dead_code)] // Consumed when the Task 3 composition root wires the repository.
+    pub(crate) fn control_state_path(&self) -> io::Result<ControlStatePath> {
+        Ok(self
+            .loxa_dir()?
+            .join("state")
+            .join("control-state.sqlite3")
+            .into())
+    }
 }
 
 #[cfg(test)]
@@ -61,6 +71,20 @@ mod tests {
         assert_eq!(
             paths.history_path().unwrap(),
             root.join("history/chat-history.sqlite3")
+        );
+    }
+
+    #[test]
+    fn derives_control_state_beside_existing_layered_stores() {
+        let root = PathBuf::from("/tmp/loxa-control-state-path-contract");
+        let paths = NodePaths {
+            models_dir: root.join("models"),
+            state_path: root.join("run/managed.json"),
+            logs_dir: root.join("run/logs"),
+        };
+        assert_eq!(
+            paths.control_state_path().unwrap(),
+            root.join("state/control-state.sqlite3")
         );
     }
 
