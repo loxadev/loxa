@@ -242,6 +242,7 @@ const OTHER_NODE_ID: &str = "123e4567-e89b-42d3-a456-426614174010";
 const INSTANCE_ID: &str = "123e4567-e89b-42d3-b456-426614174001";
 const SLOT_ID: &str = "123e4567-e89b-42d3-8456-426614174002";
 const OPERATION_ID: &str = "123e4567-e89b-42d3-9456-426614174003";
+const OTHER_OPERATION_ID: &str = "123e4567-e89b-42d3-9456-426614174013";
 const EPOCH: &str = "123e4567-e89b-42d3-b456-426614174005";
 
 fn node_json(node_id: &str) -> serde_json::Value {
@@ -264,7 +265,7 @@ fn node_json(node_id: &str) -> serde_json::Value {
 fn slot_json(node_id: &str, status: &str, operation_id: Option<&str>) -> serde_json::Value {
     let (model_id, error) = match status {
         "loading" => (serde_json::Value::Null, serde_json::Value::Null),
-        "ready" => (
+        "ready" | "unloading" => (
             serde_json::json!("gemma-3-4b-it-q4"),
             serde_json::Value::Null,
         ),
@@ -295,6 +296,26 @@ fn operation_json(node_id: &str, kind: &str, status: &str) -> serde_json::Value 
         "updated_revision": "11",
         "created_at_unix_ms": "1784246400000",
         "updated_at_unix_ms": "1784246400500"
+    })
+}
+
+fn event_json() -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 2,
+        "event_id": "123e4567-e89b-42d3-a456-426614174004",
+        "epoch": EPOCH,
+        "sequence": "11",
+        "revision": "11",
+        "committed_at_unix_ms": "1784246400500",
+        "entity": "operation",
+        "entity_id": OPERATION_ID,
+        "node_id": NODE_ID,
+        "node_instance_id": INSTANCE_ID,
+        "slot_id": SLOT_ID,
+        "operation_id": OPERATION_ID,
+        "node": null,
+        "slot": slot_json(NODE_ID, "loading", Some(OPERATION_ID)),
+        "operation": operation_json(NODE_ID, "load", "running")
     })
 }
 
@@ -580,4 +601,129 @@ fn v2_collection_envelope_snapshot_and_error_fixtures_are_exact_and_strict() {
     let mut invalid_capacity = node_json(NODE_ID);
     invalid_capacity["slot_capacity"] = serde_json::json!(2);
     assert!(serde_json::from_value::<loxa_protocol::v2::V2Node>(invalid_capacity).is_err());
+}
+
+#[test]
+fn v2_reconnect_snapshot_enforces_inverse_active_slot_operation_correlation() {
+    for status in ["queued", "running", "cancelling"] {
+        let snapshot = serde_json::json!({
+            "schema_version": 2,
+            "epoch": EPOCH,
+            "revision": "12",
+            "generated_at_unix_ms": "1784246400600",
+            "stream": {"epoch": EPOCH, "cursor": "12", "cursor_gap": false},
+            "nodes": [node_json(NODE_ID)],
+            "slots": [slot_json(NODE_ID, "ready", None)],
+            "operations": [operation_json(NODE_ID, "load", status)],
+            "events": []
+        });
+        assert!(
+            serde_json::from_value::<V2ReconnectSnapshot>(snapshot).is_err(),
+            "accepted active {status} load beside a ready slot"
+        );
+    }
+
+    let mut second_operation = operation_json(NODE_ID, "unload", "running");
+    second_operation["operation_id"] = serde_json::json!(OTHER_OPERATION_ID);
+    let snapshot = serde_json::json!({
+        "schema_version": 2,
+        "epoch": EPOCH,
+        "revision": "12",
+        "generated_at_unix_ms": "1784246400600",
+        "stream": {"epoch": EPOCH, "cursor": "12", "cursor_gap": false},
+        "nodes": [node_json(NODE_ID)],
+        "slots": [slot_json(NODE_ID, "loading", Some(OPERATION_ID))],
+        "operations": [
+            operation_json(NODE_ID, "load", "running"),
+            second_operation
+        ],
+        "events": []
+    });
+    assert!(serde_json::from_value::<V2ReconnectSnapshot>(snapshot).is_err());
+
+    let mut snapshot: V2ReconnectSnapshot = serde_json::from_value(serde_json::json!({
+        "schema_version": 2,
+        "epoch": EPOCH,
+        "revision": "12",
+        "generated_at_unix_ms": "1784246400600",
+        "stream": {"epoch": EPOCH, "cursor": "12", "cursor_gap": false},
+        "nodes": [node_json(NODE_ID)],
+        "slots": [slot_json(NODE_ID, "ready", None)],
+        "operations": [],
+        "events": []
+    }))
+    .unwrap();
+    snapshot
+        .operations
+        .push(serde_json::from_value(operation_json(NODE_ID, "unload", "running")).unwrap());
+    assert!(serde_json::to_value(&snapshot).is_err());
+
+    for (slot_status, kind, operation_status) in [
+        ("loading", "load", "queued"),
+        ("unloading", "unload", "cancelling"),
+    ] {
+        let snapshot = serde_json::json!({
+            "schema_version": 2,
+            "epoch": EPOCH,
+            "revision": "12",
+            "generated_at_unix_ms": "1784246400600",
+            "stream": {"epoch": EPOCH, "cursor": "12", "cursor_gap": false},
+            "nodes": [node_json(NODE_ID)],
+            "slots": [slot_json(NODE_ID, slot_status, Some(OPERATION_ID))],
+            "operations": [operation_json(NODE_ID, kind, operation_status)],
+            "events": []
+        });
+        assert!(serde_json::from_value::<V2ReconnectSnapshot>(snapshot).is_ok());
+    }
+
+    let snapshot = serde_json::json!({
+        "schema_version": 2,
+        "epoch": EPOCH,
+        "revision": "12",
+        "generated_at_unix_ms": "1784246400600",
+        "stream": {"epoch": EPOCH, "cursor": "12", "cursor_gap": false},
+        "nodes": [node_json(NODE_ID)],
+        "slots": [slot_json(NODE_ID, "ready", None)],
+        "operations": [operation_json(NODE_ID, "load", "succeeded")],
+        "events": []
+    });
+    assert!(serde_json::from_value::<V2ReconnectSnapshot>(snapshot).is_ok());
+}
+
+#[test]
+fn v2_control_event_has_exact_strict_and_correlated_wire_contract() {
+    let exact = event_json();
+    let event: V2ControlEvent = serde_json::from_value(exact.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&event).unwrap(), exact);
+
+    let mut unknown = event_json();
+    unknown["extra"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<V2ControlEvent>(unknown).is_err());
+
+    let mut missing = event_json();
+    missing.as_object_mut().unwrap().remove("node");
+    assert!(serde_json::from_value::<V2ControlEvent>(missing).is_err());
+
+    let duplicate = serde_json::to_string(&event_json()).unwrap().replacen(
+        "\"schema_version\":2",
+        "\"schema_version\":2,\"schema_version\":2",
+        1,
+    );
+    assert!(serde_json::from_str::<V2ControlEvent>(&duplicate).is_err());
+
+    let mut missing_instance = event_json();
+    missing_instance["node_instance_id"] = serde_json::Value::Null;
+    assert!(serde_json::from_value::<V2ControlEvent>(missing_instance).is_err());
+
+    let mut stale_slot = event_json();
+    stale_slot["entity"] = serde_json::json!("node");
+    stale_slot["entity_id"] = serde_json::json!(NODE_ID);
+    stale_slot["node"] = node_json(NODE_ID);
+    stale_slot["slot"] = serde_json::Value::Null;
+    stale_slot["operation"] = serde_json::Value::Null;
+    assert!(serde_json::from_value::<V2ControlEvent>(stale_slot).is_err());
+
+    let mut event: V2ControlEvent = serde_json::from_value(event_json()).unwrap();
+    event.entity_id = OTHER_OPERATION_ID.into();
+    assert!(serde_json::to_value(&event).is_err());
 }
