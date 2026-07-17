@@ -1,3 +1,4 @@
+mod recovery;
 mod repository;
 mod schema;
 pub(crate) mod state_machine;
@@ -24,7 +25,13 @@ impl PartialEq<std::path::PathBuf> for ControlStatePath {
     }
 }
 
+pub(crate) use recovery::{
+    existing_database_absence_evidence, gather_recovery_evidence, LifecycleRecoverySource,
+    RecoveryEvidence, SlotRecoveryError,
+};
 pub(crate) use repository::{
     ControlIdGenerator, ControlRepository, RepositoryError, RepositoryErrorClass, RestoreSummary,
-    ValidationSummary,
+    ScalarProvenance, ScalarSource, ValidationSummary,
 };
+pub(crate) use state_machine::InstancePublication;
+pub(crate) use worker::{ControlStateBootstrap, ControlStateInit, ControlStateOpenInput};

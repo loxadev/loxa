@@ -37,11 +37,13 @@ pub use readiness::{
     PROCESS_IDENTITY_POLL_INTERVAL, PROCESS_IDENTITY_TIMEOUT,
 };
 pub use state::{
-    admit_offline_model_mutation, create_starting_run, create_unloaded_node_owner,
-    current_runtime_state_run, finish_runtime_state_run, read_runtime_state,
-    remove_runtime_state_entry, runtime_dir, runtime_logs_dir, runtime_state_path,
-    update_runtime_state_run, update_runtime_state_run_committed, ManagedRun, ManagedRunIdentity,
-    OfflineModelMutationGuard, RunLifecycle, RuntimeStateRead, RUNTIME_STATE_LOCK_POLL_INTERVAL,
+    acquire_managed_owner, admit_offline_model_mutation, create_starting_run,
+    create_unloaded_node_owner, current_runtime_state_run, finish_runtime_state_run,
+    read_runtime_state, remove_runtime_state_entry, runtime_dir, runtime_logs_dir,
+    runtime_state_path, update_runtime_state_run, update_runtime_state_run_committed,
+    ManagedOwnerAcquisition, ManagedRecoverySource, ManagedRun, ManagedRunIdentity,
+    ManagedScalarProvenance, ManagedScalarSource, OfflineModelMutationGuard, RunLifecycle,
+    RuntimeStateRead, ScalarCaptureMode, RUNTIME_STATE_LOCK_POLL_INTERVAL,
     RUNTIME_STATE_LOCK_TIMEOUT, RUNTIME_STATE_SCHEMA_VERSION,
 };
 use state::{record_stop_request, stable_run_is_present, StopRequestMatch};

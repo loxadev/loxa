@@ -158,6 +158,53 @@ pub(crate) struct RestoreSummary {
     pub(crate) event_rows: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub(crate) struct ScalarProvenance {
+    pub(crate) schema_version: u32,
+    pub(crate) run_id: String,
+    pub(crate) owner_pid: u32,
+    pub(crate) owner_process_start_time_unix_s: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ScalarSource {
+    Fresh,
+    PriorDeadChildlessModelFreeUnloadedV4(ScalarProvenance),
+}
+
+impl ScalarSource {
+    pub(crate) fn from_managed(source: loxa_core::supervisor::ManagedScalarSource) -> Option<Self> {
+        match source {
+            loxa_core::supervisor::ManagedScalarSource::Fresh => Some(Self::Fresh),
+            loxa_core::supervisor::ManagedScalarSource::PriorDeadChildlessModelFreeUnloadedV4(
+                provenance,
+            ) => Some(Self::PriorDeadChildlessModelFreeUnloadedV4(
+                ScalarProvenance {
+                    schema_version: provenance.schema_version,
+                    run_id: provenance.run_id,
+                    owner_pid: provenance.owner_pid,
+                    owner_process_start_time_unix_s: provenance.owner_process_start_time_unix_s,
+                },
+            )),
+            loxa_core::supervisor::ManagedScalarSource::ExistingDatabase => None,
+        }
+    }
+
+    fn durable_text(&self) -> Result<String, RepositoryError> {
+        match self {
+            Self::Fresh => Ok("fresh".to_owned()),
+            Self::PriorDeadChildlessModelFreeUnloadedV4(provenance) => {
+                if provenance.schema_version != 4 || provenance.run_id.is_empty() {
+                    return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
+                }
+                serde_json::to_string(provenance)
+                    .map(|json| format!("prior_dead_childless_model_free_unloaded_v4:{json}"))
+                    .map_err(|_| RepositoryError::new(RepositoryErrorClass::Corrupt))
+            }
+        }
+    }
+}
+
 struct StoredSlotRow {
     slot_id: String,
     name: String,
@@ -644,6 +691,25 @@ thread_local! {
     static FAIL_CLAIM_TRANSITIONS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
     static FAIL_NEXT_UNCOMMITTED_CLOSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_ATOMIC_INSTALL_POSTFLIGHT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static RECONCILIATION_TRANSACTION_FAULT: std::cell::Cell<Option<ReconciliationTransactionFault>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ReconciliationTransactionFault {
+    BeforeTransaction,
+    BeforeCommit,
+    AfterCommit,
+}
+
+#[cfg(test)]
+pub(super) fn arm_reconciliation_transaction_fault_for_test(fault: ReconciliationTransactionFault) {
+    RECONCILIATION_TRANSACTION_FAULT.with(|armed| armed.set(Some(fault)));
+}
+
+#[cfg(test)]
+fn take_reconciliation_transaction_fault_for_test() -> Option<ReconciliationTransactionFault> {
+    RECONCILIATION_TRANSACTION_FAULT.with(|armed| armed.take())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1033,7 +1099,64 @@ impl ControlRepository {
         let setup = (|| {
             configure_defensively(&opened)?;
             let initialized =
-                open_existing_or_initialize_in_one_transaction(&mut opened, node_id, ids)?;
+                open_existing_or_initialize_in_one_transaction(&mut opened, node_id, None, ids)?;
+            let summary = validate_connection(&opened, Some(node_id))?;
+            Ok((initialized, summary))
+        })();
+        let (initialized, summary) = match setup {
+            Ok(value) => value,
+            Err(error) => {
+                return match opened.close() {
+                    Ok(()) => Err(error),
+                    Err(close_error) => Err(close_error),
+                };
+            }
+        };
+        let (connection, directory_guard, family_guard, main_guard, live_claim, identity) =
+            opened.into_repository_parts();
+        let repository = Self {
+            connection: Some(connection),
+            path: canonical_path,
+            identity,
+            expected_node_id: node_id,
+            slot_id: summary.slot_id,
+            stream_epoch: summary.epoch,
+            directory_guard: Some(directory_guard),
+            family_guard: Some(family_guard),
+            main_guard: Some(main_guard),
+            live_claim: Some(live_claim),
+        };
+        if initialized {
+            repository.checkpoint()?;
+            repository.publish_migration_backup()?;
+        }
+        Ok(repository)
+    }
+
+    pub(crate) fn open_or_migrate(
+        path: &Path,
+        node_id: NodeId,
+        first_migration_source: Option<ScalarSource>,
+        ids: &mut dyn ControlIdGenerator,
+    ) -> Result<Self, RepositoryError> {
+        if first_migration_source.is_none()
+            && matches!(fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        {
+            return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
+        }
+        ensure_supported_storage_platform()?;
+        ensure_unix_excl_vfs()?;
+        let prepared = prepare_storage_path(path)?;
+        let canonical_path = prepared.canonical_path.clone();
+        let mut opened = open_validated_connection_after(prepared, false, || {})?;
+        let setup = (|| {
+            configure_defensively(&opened)?;
+            let initialized = open_existing_or_initialize_in_one_transaction(
+                &mut opened,
+                node_id,
+                Some(first_migration_source.as_ref()),
+                ids,
+            )?;
             let summary = validate_connection(&opened, Some(node_id))?;
             Ok((initialized, summary))
         })();
@@ -1092,13 +1215,27 @@ impl ControlRepository {
         work: impl FnOnce(&Transaction<'_>) -> Result<T, RepositoryError>,
     ) -> Result<T, RepositoryError> {
         self.validate_ownership()?;
+        #[cfg(test)]
+        let fault = take_reconciliation_transaction_fault_for_test();
+        #[cfg(test)]
+        if fault == Some(ReconciliationTransactionFault::BeforeTransaction) {
+            return Err(RepositoryError::new(RepositoryErrorClass::Durability));
+        }
         let transaction = self
             .connection
             .as_mut()
             .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let value = work(&transaction)?;
+        #[cfg(test)]
+        if fault == Some(ReconciliationTransactionFault::BeforeCommit) {
+            return Err(RepositoryError::new(RepositoryErrorClass::Durability));
+        }
         transaction.commit()?;
+        #[cfg(test)]
+        if fault == Some(ReconciliationTransactionFault::AfterCommit) {
+            return Err(RepositoryError::new(RepositoryErrorClass::Durability));
+        }
         Ok(value)
     }
 
@@ -1514,6 +1651,7 @@ impl Drop for ControlRepository {
 fn open_existing_or_initialize_in_one_transaction(
     connection: &mut Connection,
     node_id: NodeId,
+    strict_source: Option<Option<&ScalarSource>>,
     ids: &mut dyn ControlIdGenerator,
 ) -> Result<bool, RepositoryError> {
     let has_schema: bool = connection.query_row(
@@ -1522,8 +1660,17 @@ fn open_existing_or_initialize_in_one_transaction(
         |row| row.get(0),
     )?;
     if has_schema {
+        if strict_source.is_some_and(|source| source.is_some()) {
+            return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
+        }
         return Ok(false);
     }
+
+    let source = match strict_source {
+        Some(Some(source)) => source.durable_text()?,
+        Some(None) => return Err(RepositoryError::new(RepositoryErrorClass::Corrupt)),
+        None => ScalarSource::Fresh.durable_text()?,
+    };
 
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let slot_id = ids.new_slot_id();
@@ -1535,8 +1682,8 @@ fn open_existing_or_initialize_in_one_transaction(
         (SCHEMA_VERSION, MIGRATION_NAME, schema_checksum(), applied_at_ms),
     )?;
     transaction.execute(
-        "INSERT INTO control_meta(singleton, node_id, slot_id, stream_epoch, revision, cursor, schema_version, migration_source, last_committed_at_unix_ms) VALUES(1, ?1, ?2, ?3, '1', '1', 1, 'fresh', ?4)",
-        (node_id.to_string(), slot_id.to_string(), stream_epoch.to_string(), applied_at_ms.to_string()),
+        "INSERT INTO control_meta(singleton, node_id, slot_id, stream_epoch, revision, cursor, schema_version, migration_source, last_committed_at_unix_ms) VALUES(1, ?1, ?2, ?3, '1', '1', 1, ?4, ?5)",
+        (node_id.to_string(), slot_id.to_string(), stream_epoch.to_string(), source, applied_at_ms.to_string()),
     )?;
     transaction.execute(
         "INSERT INTO node_state(singleton, node_id, node_instance_id, control_endpoint, status, model_download, slot_load, slot_unload, operation_cancel, operation_stream) VALUES(1, ?1, NULL, NULL, 'unpublished', 0, 0, 0, 0, 0)",
@@ -1576,11 +1723,11 @@ fn validate_connection(
     validate_schema_shape(connection)?;
     validate_migration_ledger(connection)?;
 
-    let raw_meta: (String, String, String, String, String, i64, String) = connection
+    let raw_meta: (String, String, String, String, String, i64, String, String) = connection
         .query_row(
-            "SELECT node_id, slot_id, stream_epoch, revision, cursor, schema_version, last_committed_at_unix_ms FROM control_meta WHERE singleton = 1",
+            "SELECT node_id, slot_id, stream_epoch, revision, cursor, schema_version, migration_source, last_committed_at_unix_ms FROM control_meta WHERE singleton = 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
         )
         .map_err(classify_missing_row)?;
     if raw_meta.5 != SCHEMA_VERSION {
@@ -1599,7 +1746,8 @@ fn validate_connection(
         .map_err(|_| RepositoryError::new(RepositoryErrorClass::Corrupt))?;
     let revision = parse_canonical_u64(&raw_meta.3)?;
     let cursor = parse_canonical_u64(&raw_meta.4)?;
-    let last_committed_at = parse_canonical_u64(&raw_meta.6)?;
+    validate_migration_source(&raw_meta.6)?;
+    let last_committed_at = parse_canonical_u64(&raw_meta.7)?;
 
     let node_rows = count_rows(connection, "node_state")?;
     let slot_rows = count_rows(connection, "slot_state")?;
@@ -1723,6 +1871,21 @@ fn validate_connection(
         slot_id,
         epoch,
     })
+}
+
+fn validate_migration_source(value: &str) -> Result<(), RepositoryError> {
+    if value == "fresh" {
+        return Ok(());
+    }
+    let Some(json) = value.strip_prefix("prior_dead_childless_model_free_unloaded_v4:") else {
+        return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
+    };
+    let provenance: ScalarProvenance = serde_json::from_str(json)
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::Corrupt))?;
+    if provenance.schema_version != 4 || provenance.run_id.is_empty() {
+        return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
+    }
+    Ok(())
 }
 
 fn validate_schema_shape(connection: &Connection) -> Result<(), RepositoryError> {
