@@ -1,5 +1,6 @@
 mod repository;
 mod schema;
+pub(crate) mod state_machine;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ControlStatePath(std::path::PathBuf);
