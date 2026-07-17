@@ -903,6 +903,16 @@ impl V2ControlEvent {
         {
             return Err("event has no committed record");
         }
+        let expected_slot_id = self.slot.as_ref().map(|slot| slot.slot_id).or_else(|| {
+            self.operation
+                .as_ref()
+                .and_then(|operation| operation.slot_id)
+        });
+        let expected_operation_id = self
+            .operation
+            .as_ref()
+            .map(|operation| operation.operation_id)
+            .or_else(|| self.slot.as_ref().and_then(|slot| slot.operation_id));
         if self
             .node
             .as_ref()
@@ -923,6 +933,9 @@ impl V2ControlEvent {
                 .operation
                 .as_ref()
                 .is_some_and(|operation| Some(operation.operation_id) != self.operation_id)
+            || self.slot_id != expected_slot_id
+            || self.operation_id != expected_operation_id
+            || (self.operation.is_some() && self.node_instance_id.is_none())
             || self
                 .node
                 .as_ref()
@@ -1041,35 +1054,40 @@ impl V2ReconnectSnapshot {
         let node_id = self.nodes[0].node_id;
         let slot = &self.slots[0];
         let mut operation_ids = HashSet::with_capacity(self.operations.len());
+        let mut active_lifecycle_operation = None;
         for operation in &self.operations {
             if operation.node_id != node_id || !operation_ids.insert(operation.operation_id) {
                 return Err("snapshot operation correlation mismatch");
             }
-        }
-        if let Some(slot_operation_id) = slot.operation_id {
-            let Some(operation) = self
-                .operations
-                .iter()
-                .find(|operation| operation.operation_id == slot_operation_id)
-            else {
-                return Err("slot operation is absent from reconnect snapshot");
-            };
-            let state_matches = match slot.status {
-                V2SlotStatus::Loading => operation.kind == V2OperationKind::Load,
-                V2SlotStatus::Unloading => operation.kind == V2OperationKind::Unload,
-                _ => false,
-            };
-            if operation.slot_id != Some(slot.slot_id)
-                || !state_matches
-                || matches!(
-                    operation.status,
-                    V2OperationStatus::Succeeded
-                        | V2OperationStatus::Failed
-                        | V2OperationStatus::Cancelled
-                )
+            if matches!(
+                operation.kind,
+                V2OperationKind::Load | V2OperationKind::Unload
+            ) && matches!(
+                operation.status,
+                V2OperationStatus::Queued
+                    | V2OperationStatus::Running
+                    | V2OperationStatus::Cancelling
+            ) && active_lifecycle_operation.replace(operation).is_some()
             {
-                return Err("slot operation correlation mismatch");
+                return Err("multiple active lifecycle operations in capacity-one snapshot");
             }
+        }
+        let slot_operation_matches = match (slot.status, active_lifecycle_operation) {
+            (V2SlotStatus::Loading, Some(operation)) => {
+                operation.kind == V2OperationKind::Load
+                    && operation.slot_id == Some(slot.slot_id)
+                    && slot.operation_id == Some(operation.operation_id)
+            }
+            (V2SlotStatus::Unloading, Some(operation)) => {
+                operation.kind == V2OperationKind::Unload
+                    && operation.slot_id == Some(slot.slot_id)
+                    && slot.operation_id == Some(operation.operation_id)
+            }
+            (V2SlotStatus::Unloaded | V2SlotStatus::Ready | V2SlotStatus::Recovery, None) => true,
+            _ => false,
+        };
+        if !slot_operation_matches {
+            return Err("slot operation correlation mismatch");
         }
         let mut event_ids = HashSet::with_capacity(self.events.len());
         let mut previous_sequence = None;
