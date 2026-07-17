@@ -319,6 +319,15 @@ fn event_json() -> serde_json::Value {
     })
 }
 
+fn event_json_at(event_id: &str, sequence: &str, revision: &str) -> serde_json::Value {
+    let mut event = event_json();
+    event["event_id"] = serde_json::json!(event_id);
+    event["sequence"] = serde_json::json!(sequence);
+    event["revision"] = serde_json::json!(revision);
+    event["operation"]["updated_revision"] = serde_json::json!(revision);
+    event
+}
+
 #[test]
 fn v2_invalid_public_values_cannot_be_serialized() {
     let mut node: loxa_protocol::v2::V2Node = serde_json::from_value(node_json(NODE_ID)).unwrap();
@@ -726,4 +735,135 @@ fn v2_control_event_has_exact_strict_and_correlated_wire_contract() {
     let mut event: V2ControlEvent = serde_json::from_value(event_json()).unwrap();
     event.entity_id = OTHER_OPERATION_ID.into();
     assert!(serde_json::to_value(&event).is_err());
+}
+
+#[test]
+fn v2_control_event_sequence_is_epoch_scoped_and_independent_of_revision() {
+    let rotated_epoch_event = event_json_at("123e4567-e89b-42d3-a456-426614174004", "1", "42");
+
+    let event: V2ControlEvent = serde_json::from_value(rotated_epoch_event.clone()).unwrap();
+    assert_eq!(serde_json::to_value(event).unwrap(), rotated_epoch_event);
+
+    for (field, invalid) in [
+        ("sequence", serde_json::json!("0")),
+        ("revision", serde_json::json!("0")),
+        ("sequence", serde_json::json!("01")),
+        ("revision", serde_json::json!(42)),
+    ] {
+        let mut malformed = rotated_epoch_event.clone();
+        malformed[field] = invalid;
+        assert!(
+            serde_json::from_value::<V2ControlEvent>(malformed).is_err(),
+            "accepted invalid {field}"
+        );
+    }
+
+    let mut missing_sequence = rotated_epoch_event.clone();
+    missing_sequence.as_object_mut().unwrap().remove("sequence");
+    assert!(serde_json::from_value::<V2ControlEvent>(missing_sequence).is_err());
+
+    let mut sequence_above_revision = rotated_epoch_event.clone();
+    sequence_above_revision["sequence"] = serde_json::json!("43");
+    assert!(serde_json::from_value::<V2ControlEvent>(sequence_above_revision).is_err());
+
+    let mut stale_operation = rotated_epoch_event;
+    stale_operation["operation"]["updated_revision"] = serde_json::json!("41");
+    assert!(serde_json::from_value::<V2ControlEvent>(stale_operation).is_err());
+}
+
+#[test]
+fn v2_reconnect_cursor_is_epoch_scoped_and_independent_of_revision() {
+    let event = event_json_at("123e4567-e89b-42d3-a456-426614174004", "1", "42");
+    let snapshot = serde_json::json!({
+        "schema_version": 2,
+        "epoch": EPOCH,
+        "revision": "42",
+        "generated_at_unix_ms": "1784246400600",
+        "stream": {"epoch": EPOCH, "cursor": "1", "cursor_gap": false},
+        "nodes": [node_json(NODE_ID)],
+        "slots": [slot_json(NODE_ID, "ready", None)],
+        "operations": [],
+        "events": [event]
+    });
+
+    let decoded: V2ReconnectSnapshot = serde_json::from_value(snapshot.clone()).unwrap();
+    assert_eq!(serde_json::to_value(decoded).unwrap(), snapshot);
+
+    for invalid_cursor in [serde_json::json!("0"), serde_json::json!("01")] {
+        let mut invalid = snapshot.clone();
+        invalid["stream"]["cursor"] = invalid_cursor;
+        assert!(serde_json::from_value::<V2ReconnectSnapshot>(invalid).is_err());
+    }
+}
+
+#[test]
+fn v2_gap_free_reconnect_events_are_a_complete_tandem_sequence() {
+    let first = event_json_at("123e4567-e89b-42d3-a456-426614174004", "1", "42");
+    let second = event_json_at("123e4567-e89b-42d3-a456-426614174014", "2", "43");
+    let snapshot = serde_json::json!({
+        "schema_version": 2,
+        "epoch": EPOCH,
+        "revision": "43",
+        "generated_at_unix_ms": "1784246400600",
+        "stream": {"epoch": EPOCH, "cursor": "2", "cursor_gap": false},
+        "nodes": [node_json(NODE_ID)],
+        "slots": [slot_json(NODE_ID, "ready", None)],
+        "operations": [],
+        "events": [first, second]
+    });
+    assert!(serde_json::from_value::<V2ReconnectSnapshot>(snapshot.clone()).is_ok());
+
+    let mut skipped_sequence = snapshot.clone();
+    skipped_sequence["events"][1]["sequence"] = serde_json::json!("3");
+    skipped_sequence["stream"]["cursor"] = serde_json::json!("3");
+    assert!(serde_json::from_value::<V2ReconnectSnapshot>(skipped_sequence).is_err());
+
+    let mut skipped_revision = snapshot.clone();
+    skipped_revision["events"][1]["revision"] = serde_json::json!("44");
+    skipped_revision["events"][1]["operation"]["updated_revision"] = serde_json::json!("44");
+    skipped_revision["revision"] = serde_json::json!("44");
+    assert!(serde_json::from_value::<V2ReconnectSnapshot>(skipped_revision).is_err());
+
+    for revisions in [["42", "42"], ["42", "41"]] {
+        let mut nonmonotonic = snapshot.clone();
+        nonmonotonic["events"][1]["revision"] = serde_json::json!(revisions[1]);
+        nonmonotonic["events"][1]["operation"]["updated_revision"] =
+            serde_json::json!(revisions[1]);
+        assert!(serde_json::from_value::<V2ReconnectSnapshot>(nonmonotonic).is_err());
+    }
+
+    let mut final_event_below_snapshot = snapshot;
+    final_event_below_snapshot["stream"]["cursor"] = serde_json::json!("3");
+    final_event_below_snapshot["revision"] = serde_json::json!("44");
+    assert!(serde_json::from_value::<V2ReconnectSnapshot>(final_event_below_snapshot).is_err());
+
+    let gap_snapshot = serde_json::json!({
+        "schema_version": 2,
+        "epoch": EPOCH,
+        "revision": "43",
+        "generated_at_unix_ms": "1784246400600",
+        "stream": {"epoch": EPOCH, "cursor": "2", "cursor_gap": true},
+        "nodes": [node_json(NODE_ID)],
+        "slots": [slot_json(NODE_ID, "ready", None)],
+        "operations": [],
+        "events": []
+    });
+    assert!(serde_json::from_value::<V2ReconnectSnapshot>(gap_snapshot.clone()).is_ok());
+
+    let mut gap_with_event = gap_snapshot;
+    gap_with_event["events"] = serde_json::json!([event_json_at(
+        "123e4567-e89b-42d3-a456-426614174014",
+        "2",
+        "43",
+    )]);
+    assert!(serde_json::from_value::<V2ReconnectSnapshot>(gap_with_event).is_err());
+}
+
+#[test]
+fn v2_slot_wire_shape_remains_the_exact_seven_key_contract() {
+    let exact = slot_json(NODE_ID, "ready", None);
+    let slot: V2Slot = serde_json::from_value(exact.clone()).unwrap();
+    assert_eq!(serde_json::to_value(slot).unwrap(), exact);
+    assert_eq!(exact.as_object().unwrap().len(), 7);
+    assert!(!exact.as_object().unwrap().contains_key("updated_revision"));
 }
