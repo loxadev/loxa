@@ -897,10 +897,13 @@ struct V2ControlEventWire {
 
 impl V2ControlEvent {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.schema_version != V2_SCHEMA_VERSION
-            || self.sequence != self.revision
-            || (self.node.is_none() && self.slot.is_none() && self.operation.is_none())
-        {
+        if self.schema_version != V2_SCHEMA_VERSION {
+            return Err("unsupported event schema version");
+        }
+        if self.sequence.get() == 0 || self.revision.get() == 0 || self.sequence > self.revision {
+            return Err("invalid event sequence or revision");
+        }
+        if self.node.is_none() && self.slot.is_none() && self.operation.is_none() {
             return Err("event has no committed record");
         }
         let expected_slot_id = self.slot.as_ref().map(|slot| slot.slot_id).or_else(|| {
@@ -933,6 +936,10 @@ impl V2ControlEvent {
                 .operation
                 .as_ref()
                 .is_some_and(|operation| Some(operation.operation_id) != self.operation_id)
+            || self
+                .operation
+                .as_ref()
+                .is_some_and(|operation| operation.updated_revision != self.revision)
             || self.slot_id != expected_slot_id
             || self.operation_id != expected_operation_id
             || (self.operation.is_some() && self.node_instance_id.is_none())
@@ -1043,7 +1050,9 @@ impl V2ReconnectSnapshot {
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.schema_version != V2_SCHEMA_VERSION
             || self.stream.epoch != self.epoch
-            || self.stream.cursor != self.revision
+            || self.stream.cursor.get() == 0
+            || self.revision.get() == 0
+            || self.stream.cursor > self.revision
             || (self.stream.cursor_gap && !self.events.is_empty())
             || self.nodes.len() != 1
             || self.slots.len() != 1
@@ -1090,18 +1099,30 @@ impl V2ReconnectSnapshot {
             return Err("slot operation correlation mismatch");
         }
         let mut event_ids = HashSet::with_capacity(self.events.len());
-        let mut previous_sequence = None;
+        let mut previous_position = None;
         for event in &self.events {
             if event.epoch != self.epoch
                 || event.node_id != node_id
                 || event.sequence > self.stream.cursor
                 || event.revision > self.revision
                 || !event_ids.insert(event.event_id)
-                || previous_sequence.is_some_and(|previous| previous >= event.sequence)
+                || previous_position.is_some_and(
+                    |(previous_sequence, previous_revision): (DecimalU64, DecimalU64)| {
+                        previous_sequence.checked_next() != Some(event.sequence)
+                            || previous_revision.checked_next() != Some(event.revision)
+                    },
+                )
             {
                 return Err("snapshot event correlation mismatch");
             }
-            previous_sequence = Some(event.sequence);
+            previous_position = Some((event.sequence, event.revision));
+        }
+        if !self.stream.cursor_gap
+            && self.events.last().is_some_and(|event| {
+                event.sequence != self.stream.cursor || event.revision != self.revision
+            })
+        {
+            return Err("snapshot event tail mismatch");
         }
         Ok(())
     }
