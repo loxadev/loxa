@@ -11,218 +11,20 @@ use rusqlite::limits::Limit;
 use rusqlite::{
     Connection, Error as SqlError, ErrorCode, OpenFlags, Transaction, TransactionBehavior,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{CStr, CString};
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-#[cfg(unix)]
-mod descriptor_vfs {
-    use rusqlite::ffi;
-    use std::cell::Cell;
-    use std::collections::HashMap;
-    use std::ffi::{CStr, CString};
-    use std::os::raw::c_int;
-    use std::sync::{Mutex, OnceLock};
-
-    static OPENS: OnceLock<Mutex<HashMap<usize, (usize, c_int)>>> = OnceLock::new();
-    static OPEN_OVERRIDE_LOCK: Mutex<()> = Mutex::new(());
-    static ACTIVE_OPEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    static NEXT_NAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-    thread_local! {
-        static BOUND_FD: Cell<Option<c_int>> = const { Cell::new(None) };
-    }
-
-    fn opens() -> &'static Mutex<HashMap<usize, (usize, c_int)>> {
-        OPENS.get_or_init(|| Mutex::new(HashMap::new()))
-    }
-
-    unsafe extern "C" fn bound_posix_open(
-        path: *const std::os::raw::c_char,
-        flags: c_int,
-        mode: c_int,
-    ) -> c_int {
-        if let Some(fd) = BOUND_FD.with(Cell::take) {
-            let command = if flags & libc::O_CLOEXEC != 0 {
-                libc::F_DUPFD_CLOEXEC
-            } else {
-                libc::F_DUPFD
-            };
-            return unsafe { libc::fcntl(fd, command, 0) };
-        }
-        let pointer = ACTIVE_OPEN.load(std::sync::atomic::Ordering::Acquire);
-        if pointer == 0 {
-            return -1;
-        }
-        let open: unsafe extern "C" fn(*const std::os::raw::c_char, c_int, c_int) -> c_int =
-            unsafe { std::mem::transmute(pointer) };
-        unsafe { open(path, flags, mode) }
-    }
-
-    struct OpenOverride<'a> {
-        vfs: *mut ffi::sqlite3_vfs,
-        name: &'a CStr,
-        original: ffi::sqlite3_syscall_ptr,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl OpenOverride<'_> {
-        unsafe fn install(vfs: *mut ffi::sqlite3_vfs) -> Result<Self, ()> {
-            let lock = OPEN_OVERRIDE_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let get = unsafe { (*vfs).xGetSystemCall }.ok_or(())?;
-            let set = unsafe { (*vfs).xSetSystemCall }.ok_or(())?;
-            let name = c"open";
-            let original = unsafe { get(vfs, name.as_ptr()) }.ok_or(())?;
-            ACTIVE_OPEN.store(
-                original as *const () as usize,
-                std::sync::atomic::Ordering::Release,
-            );
-            let replacement: ffi::sqlite3_syscall_ptr = Some(unsafe {
-                std::mem::transmute::<
-                    unsafe extern "C" fn(*const std::os::raw::c_char, c_int, c_int) -> c_int,
-                    unsafe extern "C" fn(),
-                >(bound_posix_open)
-            });
-            if unsafe { set(vfs, name.as_ptr(), replacement) } != ffi::SQLITE_OK {
-                ACTIVE_OPEN.store(0, std::sync::atomic::Ordering::Release);
-                return Err(());
-            }
-            Ok(Self {
-                vfs,
-                name,
-                original: Some(original),
-                _lock: lock,
-            })
-        }
-    }
-
-    impl Drop for OpenOverride<'_> {
-        fn drop(&mut self) {
-            if let Some(set) = unsafe { (*self.vfs).xSetSystemCall } {
-                unsafe { set(self.vfs, self.name.as_ptr(), self.original) };
-            }
-            ACTIVE_OPEN.store(0, std::sync::atomic::Ordering::Release);
-            BOUND_FD.with(|slot| slot.set(None));
-        }
-    }
-
-    unsafe extern "C" fn bound_open(
-        vfs: *mut ffi::sqlite3_vfs,
-        name: ffi::sqlite3_filename,
-        file: *mut ffi::sqlite3_file,
-        flags: c_int,
-        output_flags: *mut c_int,
-    ) -> c_int {
-        let (original, descriptor) = {
-            let entries = match opens().lock() {
-                Ok(entries) => entries,
-                Err(_) => return ffi::SQLITE_CANTOPEN,
-            };
-            let Some((original, descriptor)) = entries.get(&(vfs as usize)) else {
-                return ffi::SQLITE_CANTOPEN;
-            };
-            (*original as *mut ffi::sqlite3_vfs, *descriptor)
-        };
-        match unsafe { (*original).xOpen } {
-            Some(open) => {
-                let override_guard = if flags & ffi::SQLITE_OPEN_MAIN_DB != 0 {
-                    match unsafe { OpenOverride::install(original) } {
-                        Ok(guard) => {
-                            BOUND_FD.with(|slot| slot.set(Some(descriptor)));
-                            Some(guard)
-                        }
-                        Err(()) => return ffi::SQLITE_CANTOPEN,
-                    }
-                } else {
-                    None
-                };
-                let result = unsafe { open(original, name, file, flags, output_flags) };
-                drop(override_guard);
-                result
-            }
-            None => ffi::SQLITE_CANTOPEN,
-        }
-    }
-
-    pub(super) struct Registration {
-        vfs: Box<ffi::sqlite3_vfs>,
-        name: CString,
-    }
-
-    impl Registration {
-        pub(super) fn new(descriptor: c_int) -> Result<Self, ()> {
-            unsafe { ffi::sqlite3_initialize() };
-            let original = unsafe { ffi::sqlite3_vfs_find(std::ptr::null()) };
-            if original.is_null() {
-                return Err(());
-            }
-            let name = CString::new(format!(
-                "loxa-bound-{}-{}",
-                std::process::id(),
-                NEXT_NAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            ))
-            .map_err(|_| ())?;
-            let mut vfs = Box::new(unsafe { *original });
-            vfs.pNext = std::ptr::null_mut();
-            vfs.zName = name.as_ptr();
-            vfs.xOpen = Some(bound_open);
-            let pointer = (&mut *vfs) as *mut ffi::sqlite3_vfs;
-            opens()
-                .lock()
-                .map_err(|_| ())?
-                .insert(pointer as usize, (original as usize, descriptor));
-            if unsafe { ffi::sqlite3_vfs_register(pointer, 0) } != ffi::SQLITE_OK {
-                if let Ok(mut entries) = opens().lock() {
-                    entries.remove(&(pointer as usize));
-                }
-                return Err(());
-            }
-            Ok(Self { vfs, name })
-        }
-
-        pub(super) fn name(&self) -> &std::ffi::CStr {
-            self.name.as_c_str()
-        }
-    }
-
-    impl Drop for Registration {
-        fn drop(&mut self) {
-            let pointer = (&mut *self.vfs) as *mut ffi::sqlite3_vfs;
-            unsafe { ffi::sqlite3_vfs_unregister(pointer) };
-            if let Ok(mut entries) = opens().lock() {
-                entries.remove(&(pointer as usize));
-            }
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn with_open_override_for_test<T>(work: impl FnOnce() -> T) -> T {
-        unsafe { ffi::sqlite3_initialize() };
-        let original = unsafe { ffi::sqlite3_vfs_find(std::ptr::null()) };
-        let guard = unsafe { OpenOverride::install(original) }.expect("install test override");
-        let value = work();
-        drop(guard);
-        value
-    }
-
-    #[cfg(test)]
-    pub(super) fn open_override_is_installed() -> bool {
-        unsafe { ffi::sqlite3_initialize() };
-        let vfs = unsafe { ffi::sqlite3_vfs_find(std::ptr::null()) };
-        let Some(get) = (unsafe { (*vfs).xGetSystemCall }) else {
-            return false;
-        };
-        let name = c"open";
-        let current = unsafe { get(vfs, name.as_ptr()) };
-        current.is_some_and(|function| function as *const () == bound_posix_open as *const ())
-    }
-}
+#[cfg(test)]
+#[path = "test_support/mod.rs"]
+mod test_support;
 
 const SQLITE_LENGTH_LIMIT: i32 = 4 * 1024 * 1024;
 const SQLITE_SQL_LENGTH_LIMIT: i32 = 1024 * 1024;
@@ -247,12 +49,14 @@ pub(crate) trait ControlIdGenerator {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RepositoryErrorClass {
     UnsafePath,
+    AlreadyOwned,
     Corrupt,
     UnsupportedSchema,
     IdentityMismatch,
     Database,
     Durability,
     Overflow,
+    UnsupportedPlatform,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -288,12 +92,16 @@ impl fmt::Display for RepositoryError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self.class {
             RepositoryErrorClass::UnsafePath => "unsafe control-state path",
+            RepositoryErrorClass::AlreadyOwned => "control-state database already owned",
             RepositoryErrorClass::Corrupt => "corrupt control-state database",
             RepositoryErrorClass::UnsupportedSchema => "unsupported control-state schema",
             RepositoryErrorClass::IdentityMismatch => "control-state identity mismatch",
             RepositoryErrorClass::Database => "control-state database failure",
             RepositoryErrorClass::Durability => "control-state durability failure",
             RepositoryErrorClass::Overflow => "control-state counter overflow",
+            RepositoryErrorClass::UnsupportedPlatform => {
+                "control-state repository unsupported on this platform"
+            }
         })
     }
 }
@@ -328,35 +136,151 @@ pub(crate) struct RestoreSummary {
 }
 
 pub(crate) struct ControlRepository {
-    connection: ValidatedConnection,
+    connection: Option<Connection>,
     path: PathBuf,
+    identity: FileIdentity,
     expected_node_id: NodeId,
     slot_id: SlotId,
     stream_epoch: StreamEpoch,
-    #[cfg(unix)]
-    _directory_guard: fs::File,
-    #[cfg(unix)]
-    _main_guard: fs::File,
+    directory_guard: Option<fs::File>,
+    main_guard: Option<fs::File>,
+    live_claim: Option<LiveDatabaseClaim>,
 }
 
 struct ValidatedConnection {
-    connection: Connection,
-    #[cfg(unix)]
-    _registration: descriptor_vfs::Registration,
+    connection: Option<Connection>,
+    directory_guard: Option<fs::File>,
+    main_guard: Option<fs::File>,
+    live_claim: Option<LiveDatabaseClaim>,
+    identity: FileIdentity,
 }
 
 impl std::ops::Deref for ValidatedConnection {
     type Target = Connection;
 
     fn deref(&self) -> &Self::Target {
-        &self.connection
+        self.connection.as_ref().expect("connection retained")
     }
 }
 
 impl std::ops::DerefMut for ValidatedConnection {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.connection
+        self.connection.as_mut().expect("connection retained")
     }
+}
+
+impl ValidatedConnection {
+    fn close(mut self) -> Result<(), RepositoryError> {
+        let connection = self
+            .connection
+            .take()
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?;
+        match connection.close() {
+            Ok(()) => {
+                drop(self.main_guard.take());
+                drop(self.directory_guard.take());
+                self.live_claim
+                    .take()
+                    .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?
+                    .release_after_proven_close()
+            }
+            Err((connection, error)) => {
+                self.connection = Some(connection);
+                let mapped = map_sql_error(error);
+                Err(quarantine_validated_connection(
+                    &mut self,
+                    mapped,
+                    CloseUncertainty::CheckpointOrClose,
+                ))
+            }
+        }
+    }
+
+    fn into_repository_parts(
+        mut self,
+    ) -> (
+        Connection,
+        fs::File,
+        fs::File,
+        LiveDatabaseClaim,
+        FileIdentity,
+    ) {
+        (
+            self.connection.take().expect("connection retained"),
+            self.directory_guard
+                .take()
+                .expect("directory guard retained"),
+            self.main_guard.take().expect("main guard retained"),
+            self.live_claim.take().expect("live claim retained"),
+            self.identity,
+        )
+    }
+}
+
+impl Drop for ValidatedConnection {
+    fn drop(&mut self) {
+        if self.connection.is_some() {
+            let _ = quarantine_validated_connection(
+                self,
+                RepositoryError::new(RepositoryErrorClass::Durability),
+                CloseUncertainty::ImplicitDrop,
+            );
+        }
+    }
+}
+
+fn retain_poisoned_owner(
+    connection: Option<Connection>,
+    main_guard: Option<fs::File>,
+    directory_guard: Option<fs::File>,
+    mut claim: LiveDatabaseClaim,
+    reason: CloseUncertainty,
+    error: RepositoryError,
+) -> RepositoryError {
+    let _ = claim.poison(reason);
+    let owner = PoisonedDatabaseOwner {
+        connection,
+        main_guard,
+        directory_guard,
+        claim,
+    };
+    let _retained_until_exit: &'static mut PoisonedDatabaseOwner = Box::leak(Box::new(owner));
+    error
+}
+
+fn retain_quarantined_owner(
+    connection: Connection,
+    main_guard: fs::File,
+    directory_guard: fs::File,
+    reservation: ClaimReservation,
+    error: RepositoryError,
+) -> RepositoryError {
+    let owner = PoisonedReservationOwner {
+        connection,
+        main_guard,
+        directory_guard,
+        reservation,
+    };
+    let _retained_until_exit: &'static mut PoisonedReservationOwner = Box::leak(Box::new(owner));
+    error
+}
+
+fn quarantine_validated_connection(
+    owner: &mut ValidatedConnection,
+    error: RepositoryError,
+    reason: CloseUncertainty,
+) -> RepositoryError {
+    let Some(claim) = owner.live_claim.take() else {
+        return error;
+    };
+    retain_poisoned_owner(
+        owner.connection.take(),
+        owner.main_guard.take(),
+        owner.directory_guard.take(),
+        claim,
+        reason,
+        error,
+    )
 }
 
 impl fmt::Debug for ControlRepository {
@@ -370,11 +294,133 @@ impl fmt::Debug for ControlRepository {
 }
 
 struct PreparedStorage {
-    path: PathBuf,
-    #[cfg(unix)]
+    canonical_path: PathBuf,
+    canonical_parent: PathBuf,
+    identity: FileIdentity,
+    directory_identity: FileIdentity,
     directory_guard: fs::File,
-    #[cfg(unix)]
     main_guard: fs::File,
+    reservation: ClaimReservation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ClaimToken(u64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CloseUncertainty {
+    CheckpointOrClose,
+    ImplicitDrop,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CloseEvent {
+    Checkpoint,
+    SqliteClosed,
+    MainGuardClosed,
+    DirectoryGuardClosed,
+    ClaimReleased,
+    Poisoned,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CloseFault {
+    None,
+    #[cfg(test)]
+    Checkpoint,
+    #[cfg(test)]
+    ReturnedConnection,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClaimState {
+    Quarantined { token: ClaimToken },
+    Live { token: ClaimToken },
+    Poisoned { reason: CloseUncertainty },
+}
+
+struct ClaimReservation {
+    identity: FileIdentity,
+    token: ClaimToken,
+    active: bool,
+}
+
+struct LiveDatabaseClaim {
+    identity: FileIdentity,
+    token: ClaimToken,
+}
+
+struct ConnectionOpenSpec {
+    canonical_path: PathBuf,
+    flags: OpenFlags,
+    vfs: &'static str,
+}
+
+struct SqliteOwnedText(*mut std::os::raw::c_char);
+
+impl Drop for SqliteOwnedText {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { rusqlite::ffi::sqlite3_free(self.0.cast()) };
+        }
+    }
+}
+
+struct PoisonedDatabaseOwner {
+    connection: Option<Connection>,
+    main_guard: Option<fs::File>,
+    directory_guard: Option<fs::File>,
+    claim: LiveDatabaseClaim,
+}
+
+struct PoisonedReservationOwner {
+    connection: Connection,
+    main_guard: fs::File,
+    directory_guard: fs::File,
+    reservation: ClaimReservation,
+}
+
+static NEXT_CLAIM_TOKEN: AtomicU64 = AtomicU64::new(1);
+static DATABASE_CLAIMS: OnceLock<Mutex<BTreeMap<FileIdentity, ClaimState>>> = OnceLock::new();
+#[cfg(test)]
+thread_local! {
+    static FAIL_CLAIM_TRANSITIONS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static FAIL_NEXT_UNCOMMITTED_CLOSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StoragePreflight {
+    Production,
+    #[cfg(test)]
+    UnsupportedPlatform,
+    #[cfg(test)]
+    MissingUnixExcl,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OpenBoundarySwap {
+    Parent,
+    Main,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OpenTrace {
+    PlatformPreflight,
+    VfsPreflight,
+    PathIdentityWithoutMainFd,
+    NewFileCreatedWithMainGuard,
+    ClaimQuarantined,
+    MainGuardOpened,
+    SqliteOpened,
+    PostOpenValidated,
+    ClaimLive,
 }
 
 #[derive(Clone, Debug)]
@@ -387,29 +433,319 @@ struct MigrationRollbackProof {
     digest: [u8; 32],
 }
 
+fn claims() -> &'static Mutex<BTreeMap<FileIdentity, ClaimState>> {
+    DATABASE_CLAIMS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+impl ClaimReservation {
+    fn reserve(identity: FileIdentity) -> Result<Self, RepositoryError> {
+        let token = ClaimToken(NEXT_CLAIM_TOKEN.fetch_add(1, Ordering::Relaxed));
+        let mut claims = claims()
+            .lock()
+            .map_err(|_| RepositoryError::new(RepositoryErrorClass::Durability))?;
+        if claims.contains_key(&identity) {
+            return Err(RepositoryError::new(RepositoryErrorClass::AlreadyOwned));
+        }
+        claims.insert(identity, ClaimState::Quarantined { token });
+        Ok(Self {
+            identity,
+            token,
+            active: true,
+        })
+    }
+
+    fn transition_to_live(&mut self) -> Result<LiveDatabaseClaim, RepositoryError> {
+        #[cfg(test)]
+        if FAIL_CLAIM_TRANSITIONS.with(|remaining| {
+            let count = remaining.get();
+            remaining.set(count.saturating_sub(1));
+            count > 0
+        }) {
+            return Err(RepositoryError::new(RepositoryErrorClass::Durability));
+        }
+        let mut claims = claims()
+            .lock()
+            .map_err(|_| RepositoryError::new(RepositoryErrorClass::Durability))?;
+        match claims.get(&self.identity) {
+            Some(ClaimState::Quarantined { token }) if *token == self.token => {}
+            _ => return Err(RepositoryError::new(RepositoryErrorClass::Durability)),
+        }
+        claims.insert(self.identity, ClaimState::Live { token: self.token });
+        self.active = false;
+        Ok(LiveDatabaseClaim {
+            identity: self.identity,
+            token: self.token,
+        })
+    }
+}
+
+#[cfg(test)]
+fn fail_next_claim_transition_for_test() {
+    FAIL_CLAIM_TRANSITIONS.with(|remaining| remaining.set(1));
+}
+
+#[cfg(test)]
+fn fail_next_uncommitted_close_and_two_claim_transitions_for_test() {
+    FAIL_CLAIM_TRANSITIONS.with(|remaining| remaining.set(2));
+    FAIL_NEXT_UNCOMMITTED_CLOSE.with(|fault| fault.set(true));
+}
+
+impl Drop for ClaimReservation {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Ok(mut claims) = claims().lock() {
+            if matches!(
+                claims.get(&self.identity),
+                Some(ClaimState::Quarantined { token }) if *token == self.token
+            ) {
+                claims.remove(&self.identity);
+            }
+        }
+    }
+}
+
+impl LiveDatabaseClaim {
+    fn release_after_proven_close(self) -> Result<(), RepositoryError> {
+        let mut claims = claims()
+            .lock()
+            .map_err(|_| RepositoryError::new(RepositoryErrorClass::Durability))?;
+        match claims.get(&self.identity) {
+            Some(ClaimState::Live { token }) if *token == self.token => {
+                claims.remove(&self.identity);
+                Ok(())
+            }
+            _ => Err(RepositoryError::new(RepositoryErrorClass::Durability)),
+        }
+    }
+
+    fn poison(&mut self, reason: CloseUncertainty) -> Result<(), RepositoryError> {
+        let mut claims = claims()
+            .lock()
+            .map_err(|_| RepositoryError::new(RepositoryErrorClass::Durability))?;
+        match claims.get(&self.identity) {
+            Some(ClaimState::Live { token }) if *token == self.token => {
+                claims.insert(self.identity, ClaimState::Poisoned { reason });
+                Ok(())
+            }
+            Some(ClaimState::Poisoned { .. }) => Ok(()),
+            _ => Err(RepositoryError::new(RepositoryErrorClass::Durability)),
+        }
+    }
+}
+
+impl ConnectionOpenSpec {
+    fn for_existing(canonical_path: PathBuf, read_only: bool) -> Result<Self, RepositoryError> {
+        ensure_supported_storage_platform()?;
+        ensure_unix_excl_vfs()?;
+        Ok(Self {
+            canonical_path,
+            flags: connection_flags(read_only),
+            vfs: "unix-excl",
+        })
+    }
+}
+
+fn ensure_supported_storage_platform() -> Result<(), RepositoryError> {
+    if cfg!(any(target_os = "macos", target_os = "linux")) {
+        Ok(())
+    } else {
+        Err(RepositoryError::new(
+            RepositoryErrorClass::UnsupportedPlatform,
+        ))
+    }
+}
+
+fn ensure_unix_excl_vfs() -> Result<(), RepositoryError> {
+    let name = CString::new("unix-excl")
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::Database))?;
+    if unsafe { rusqlite::ffi::sqlite3_initialize() } != rusqlite::ffi::SQLITE_OK {
+        return Err(RepositoryError::new(RepositoryErrorClass::Database));
+    }
+    if unsafe { rusqlite::ffi::sqlite3_vfs_find(name.as_ptr()) }.is_null() {
+        Err(RepositoryError::new(
+            RepositoryErrorClass::UnsupportedPlatform,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn connected_vfs_name(connection: &Connection) -> Result<String, RepositoryError> {
+    let mut name = std::ptr::null_mut::<std::os::raw::c_char>();
+    let rc = unsafe {
+        rusqlite::ffi::sqlite3_file_control(
+            connection.handle(),
+            c"main".as_ptr(),
+            rusqlite::ffi::SQLITE_FCNTL_VFSNAME,
+            (&mut name as *mut *mut std::os::raw::c_char).cast(),
+        )
+    };
+    decode_sqlite_owned_vfs_name(rc, name)
+}
+
+fn decode_sqlite_owned_vfs_name(
+    rc: std::os::raw::c_int,
+    name: *mut std::os::raw::c_char,
+) -> Result<String, RepositoryError> {
+    let name = SqliteOwnedText(name);
+    if rc != rusqlite::ffi::SQLITE_OK || name.0.is_null() {
+        return Err(RepositoryError::new(RepositoryErrorClass::Database));
+    }
+    let bytes = unsafe { CStr::from_ptr(name.0) }.to_bytes().to_vec();
+    String::from_utf8(bytes).map_err(|_| RepositoryError::new(RepositoryErrorClass::Database))
+}
+
+#[cfg(test)]
+fn decode_non_ok_allocated_vfsname_for_test() -> Result<String, RepositoryError> {
+    let bytes = b"unix-excl\0";
+    let allocation = unsafe { rusqlite::ffi::sqlite3_malloc(bytes.len() as i32) }.cast::<u8>();
+    assert!(!allocation.is_null());
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), allocation, bytes.len()) };
+    decode_sqlite_owned_vfs_name(rusqlite::ffi::SQLITE_ERROR, allocation.cast())
+}
+
+#[cfg(test)]
+fn open_and_query_connected_vfs(spec: ConnectionOpenSpec) -> Result<String, RepositoryError> {
+    let connection = Connection::open_with_flags_and_vfs(spec.canonical_path, spec.flags, spec.vfs)
+        .map_err(map_sql_error)?;
+    let name = connected_vfs_name(&connection)?;
+    connection
+        .close()
+        .map_err(|(_, error)| map_sql_error(error))?;
+    Ok(name)
+}
+
+#[cfg(test)]
+fn open_with_preflight_for_test(
+    path: &Path,
+    preflight: StoragePreflight,
+) -> Result<(), RepositoryError> {
+    let prepared = prepare_storage_path_traced_with_preflight(path, None, preflight)?;
+    open_validated_connection_after(prepared, false, || {})?.close()
+}
+
+#[cfg(test)]
+fn open_trace_for_test(path: &Path) -> Result<Vec<OpenTrace>, RepositoryError> {
+    let mut trace = Vec::new();
+    let prepared = prepare_storage_path_traced(path, Some(&mut trace))?;
+    let connection = open_validated_connection_traced(prepared, false, || {}, Some(&mut trace))?;
+    connection.close()?;
+    Ok(trace)
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+fn open_with_boundary_swap_for_test(swap: OpenBoundarySwap) -> Result<(), RepositoryError> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    let root = test_support::storage::TestRoot::new("open-boundary");
+    let path = root.path().join("control-state.sqlite3");
+    fs::write(&path, b"").map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
+    let prepared = prepare_existing_storage_path(&path)?;
+    open_validated_connection_after(prepared, false, || match swap {
+        OpenBoundarySwap::Main => {
+            let displaced = root.path().join("displaced.sqlite3");
+            fs::rename(&path, &displaced).expect("displace main at open boundary");
+            fs::copy(&displaced, &path).expect("replace main at open boundary");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                .expect("secure replacement main");
+        }
+        OpenBoundarySwap::Parent => {
+            let parent = root.path().to_owned();
+            let displaced = parent.with_extension("displaced");
+            fs::rename(&parent, &displaced).expect("displace parent at open boundary");
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700);
+            builder
+                .create(&parent)
+                .expect("replace parent at open boundary");
+            fs::copy(displaced.join("control-state.sqlite3"), &path)
+                .expect("replace main under replacement parent");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                .expect("secure replacement main");
+        }
+    })?
+    .close()
+}
+
+#[cfg(all(test, unix))]
+fn prepare_with_parent_auxiliary_swap_for_test() -> Result<(), RepositoryError> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let root = test_support::storage::TestRoot::new("prepare-aux-boundary");
+    let path = root.path().join("control-state.sqlite3");
+    let canonical_parent = fs::canonicalize(root.path())
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
+    let displaced = canonical_parent.with_extension("prepare-aux-boundary-displaced");
+    let result = prepare_storage_path_traced_with_preflight_after_directory_bound(
+        &path,
+        None,
+        StoragePreflight::Production,
+        |bound_parent| {
+            assert_eq!(bound_parent, canonical_parent);
+            fs::rename(bound_parent, &displaced).expect("displace guarded parent");
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700);
+            builder
+                .create(bound_parent)
+                .expect("create replacement parent");
+            fs::create_dir(
+                auxiliary_path(&bound_parent.join("control-state.sqlite3"), "-wal").unwrap(),
+            )
+            .expect("create unsafe replacement WAL");
+        },
+    )
+    .map(drop);
+    assert!(
+        !path.exists(),
+        "main created under unchecked replacement parent"
+    );
+    let _ = fs::remove_dir_all(&displaced);
+    result
+}
+
 impl ControlRepository {
     pub(crate) fn open_or_create(
         path: &Path,
         node_id: NodeId,
         ids: &mut dyn ControlIdGenerator,
     ) -> Result<Self, RepositoryError> {
+        ensure_supported_storage_platform()?;
+        ensure_unix_excl_vfs()?;
         let prepared = prepare_storage_path(path)?;
-        validate_auxiliary_files(path)?;
-        let mut connection = open_validated_connection_after(&prepared, false, || {})?;
-        configure_defensively(&connection)?;
-        let initialized =
-            open_existing_or_initialize_in_one_transaction(&mut connection, node_id, ids)?;
-        let summary = validate_connection(&connection, Some(node_id))?;
+        let canonical_path = prepared.canonical_path.clone();
+        let mut opened = open_validated_connection_after(prepared, false, || {})?;
+        let setup = (|| {
+            configure_defensively(&opened)?;
+            let initialized =
+                open_existing_or_initialize_in_one_transaction(&mut opened, node_id, ids)?;
+            let summary = validate_connection(&opened, Some(node_id))?;
+            Ok((initialized, summary))
+        })();
+        let (initialized, summary) = match setup {
+            Ok(value) => value,
+            Err(error) => {
+                return match opened.close() {
+                    Ok(()) => Err(error),
+                    Err(close_error) => Err(close_error),
+                };
+            }
+        };
+        let (connection, directory_guard, main_guard, live_claim, identity) =
+            opened.into_repository_parts();
         let repository = Self {
-            connection,
-            path: path.to_owned(),
+            connection: Some(connection),
+            path: canonical_path,
+            identity,
             expected_node_id: node_id,
             slot_id: summary.slot_id,
             stream_epoch: summary.epoch,
-            #[cfg(unix)]
-            _directory_guard: prepared.directory_guard,
-            #[cfg(unix)]
-            _main_guard: prepared.main_guard,
+            directory_guard: Some(directory_guard),
+            main_guard: Some(main_guard),
+            live_claim: Some(live_claim),
         };
         if initialized {
             repository.checkpoint()?;
@@ -432,6 +768,8 @@ impl ControlRepository {
     ) -> Result<T, RepositoryError> {
         let transaction = self
             .connection
+            .as_mut()
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let value = work(&transaction)?;
         transaction.commit()?;
@@ -439,7 +777,7 @@ impl ControlRepository {
     }
 
     pub(crate) fn validate_all(&self) -> Result<ValidationSummary, RepositoryError> {
-        validate_connection(&self.connection, Some(self.expected_node_id))
+        validate_connection(self.connection_ref()?, Some(self.expected_node_id))
     }
 
     pub(crate) fn migration_backup_path(&self) -> Result<PathBuf, RepositoryError> {
@@ -556,7 +894,7 @@ impl ControlRepository {
 
     fn checkpoint(&self) -> Result<(), RepositoryError> {
         let (busy, _log, _checkpointed): (i64, i64, i64) =
-            self.connection
+            self.connection_ref()?
                 .query_row("PRAGMA wal_checkpoint(FULL)", [], |row| {
                     Ok((row.get(0)?, row.get(1)?, row.get(2)?))
                 })?;
@@ -571,7 +909,7 @@ impl ControlRepository {
         validate_optional_private_file(&backup, None)?;
         let temporary = unique_temporary_path(&backup, "backup")?;
         let result = (|| {
-            backup_connection(&self.connection, &temporary)?;
+            backup_connection(self.connection_ref()?, &temporary)?;
             validate_database_file(&temporary, Some(self.expected_node_id))?;
             sync_private_file(&temporary)?;
             atomic_replace(&temporary, &backup)?;
@@ -586,6 +924,130 @@ impl ControlRepository {
             let _ = fs::remove_file(&temporary);
         }
         result
+    }
+
+    fn connection_ref(&self) -> Result<&Connection, RepositoryError> {
+        self.connection
+            .as_ref()
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))
+    }
+
+    pub(crate) fn close(self) -> Result<(), RepositoryError> {
+        self.close_inner(CloseFault::None, |_| {})
+    }
+
+    fn close_inner(
+        mut self,
+        fault: CloseFault,
+        mut observe: impl FnMut(CloseEvent),
+    ) -> Result<(), RepositoryError> {
+        #[cfg(not(test))]
+        let _ = fault;
+        observe(CloseEvent::Checkpoint);
+        #[cfg(test)]
+        if fault == CloseFault::Checkpoint {
+            let error = RepositoryError::new(RepositoryErrorClass::Durability);
+            observe(CloseEvent::Poisoned);
+            return Err(quarantine_repository_until_exit(
+                &mut self,
+                error,
+                CloseUncertainty::CheckpointOrClose,
+            ));
+        }
+        if let Err(error) = self.checkpoint() {
+            observe(CloseEvent::Poisoned);
+            return Err(quarantine_repository_until_exit(
+                &mut self,
+                error,
+                CloseUncertainty::CheckpointOrClose,
+            ));
+        }
+        let connection = self
+            .connection
+            .take()
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?;
+        #[cfg(test)]
+        if fault == CloseFault::ReturnedConnection {
+            let mut statement = std::ptr::null_mut();
+            let rc = unsafe {
+                rusqlite::ffi::sqlite3_prepare_v2(
+                    connection.handle(),
+                    c"SELECT 1".as_ptr(),
+                    -1,
+                    &mut statement,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(rc, rusqlite::ffi::SQLITE_OK);
+            assert!(!statement.is_null());
+            // Deliberately do not finalize: sqlite3_close must return BUSY and
+            // rusqlite must return the still-live Connection for quarantine.
+        }
+        match connection.close() {
+            Ok(()) => {
+                observe(CloseEvent::SqliteClosed);
+                drop(self.main_guard.take());
+                observe(CloseEvent::MainGuardClosed);
+                drop(self.directory_guard.take());
+                observe(CloseEvent::DirectoryGuardClosed);
+                self.live_claim
+                    .take()
+                    .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?
+                    .release_after_proven_close()?;
+                observe(CloseEvent::ClaimReleased);
+                Ok(())
+            }
+            Err((connection, error)) => {
+                self.connection = Some(connection);
+                let error = map_sql_error(error);
+                observe(CloseEvent::Poisoned);
+                Err(quarantine_repository_until_exit(
+                    &mut self,
+                    error,
+                    CloseUncertainty::CheckpointOrClose,
+                ))
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn close_trace_for_test(
+        self,
+        fault: CloseFault,
+    ) -> (Result<(), RepositoryError>, Vec<CloseEvent>) {
+        let mut trace = Vec::new();
+        let result = self.close_inner(fault, |event| trace.push(event));
+        (result, trace)
+    }
+}
+
+fn quarantine_repository_until_exit(
+    repository: &mut ControlRepository,
+    error: RepositoryError,
+    reason: CloseUncertainty,
+) -> RepositoryError {
+    let Some(claim) = repository.live_claim.take() else {
+        return error;
+    };
+    retain_poisoned_owner(
+        repository.connection.take(),
+        repository.main_guard.take(),
+        repository.directory_guard.take(),
+        claim,
+        reason,
+        error,
+    )
+}
+
+impl Drop for ControlRepository {
+    fn drop(&mut self) {
+        if self.connection.is_some() {
+            let _ = quarantine_repository_until_exit(
+                self,
+                RepositoryError::new(RepositoryErrorClass::Durability),
+                CloseUncertainty::ImplicitDrop,
+            );
+        }
     }
 }
 
@@ -1020,7 +1482,7 @@ fn valid_control_endpoint(value: &str) -> bool {
 
 fn rotate_lineage(path: &Path, node_id: NodeId) -> Result<(), RepositoryError> {
     let prepared = prepare_existing_storage_path(path)?;
-    let mut connection = open_validated_connection_after(&prepared, false, || {})?;
+    let mut connection = open_validated_connection_after(prepared, false, || {})?;
     configure_for_offline_mutation(&connection)?;
     let summary = validate_connection(&connection, Some(node_id))?;
     let next_revision = summary
@@ -1045,7 +1507,7 @@ fn rotate_lineage(path: &Path, node_id: NodeId) -> Result<(), RepositoryError> {
     )?;
     transaction.commit()?;
     connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")?;
-    drop(connection);
+    connection.close()?;
     validate_database_file(path, Some(node_id))?;
     Ok(())
 }
@@ -1167,34 +1629,33 @@ fn validate_database_file(
     expected_node_id: Option<NodeId>,
 ) -> Result<ValidationSummary, RepositoryError> {
     let prepared = prepare_existing_storage_path(path)?;
-    validate_auxiliary_files(path)?;
-    let connection = open_validated_connection_after(&prepared, true, || {})?;
+    let connection = open_validated_connection_after(prepared, true, || {})?;
     connection.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
     connection.execute_batch("PRAGMA trusted_schema=OFF; PRAGMA mmap_size=0;")?;
     apply_limits(&connection)?;
     let summary = validate_connection(&connection, expected_node_id)?;
+    connection.close()?;
     Ok(summary)
 }
 
 fn copy_database(source: &Path, destination: &Path) -> Result<(), RepositoryError> {
     let source_storage = prepare_existing_storage_path(source)?;
-    let source_connection = open_validated_connection_after(&source_storage, true, || {})?;
+    let source_connection = open_validated_connection_after(source_storage, true, || {})?;
     backup_connection(&source_connection, destination)?;
+    source_connection.close()?;
     Ok(())
 }
 
 fn backup_connection(source: &Connection, destination: &Path) -> Result<(), RepositoryError> {
-    let file = create_private_file(destination)?;
-    drop(file);
-    let destination_storage = prepare_existing_storage_path(destination)?;
+    let destination_storage = prepare_storage_path(destination)?;
     let mut destination_connection =
-        open_validated_connection_after(&destination_storage, false, || {})?;
+        open_validated_connection_after(destination_storage, false, || {})?;
     {
         let backup = Backup::new(source, &mut destination_connection)?;
         backup.run_to_completion(128, Duration::from_millis(1), None)?;
     }
     destination_connection.execute_batch("PRAGMA journal_mode=DELETE;")?;
-    drop(destination_connection);
+    destination_connection.close()?;
     sync_private_file(destination)
 }
 
@@ -1210,44 +1671,115 @@ fn connection_flags(read_only: bool) -> OpenFlags {
     }
 }
 
-#[cfg(unix)]
 fn open_validated_connection_after(
-    prepared: &PreparedStorage,
+    prepared: PreparedStorage,
     read_only: bool,
     after_validation: impl FnOnce(),
 ) -> Result<ValidatedConnection, RepositoryError> {
-    use std::os::fd::AsRawFd;
-    validate_file_metadata(
-        &prepared
-            .main_guard
-            .metadata()
-            .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?,
-    )?;
+    open_validated_connection_traced(prepared, read_only, after_validation, None)
+}
+
+fn open_validated_connection_traced(
+    mut prepared: PreparedStorage,
+    read_only: bool,
+    after_validation: impl FnOnce(),
+    #[cfg(test)] mut trace: Option<&mut Vec<OpenTrace>>,
+    #[cfg(not(test))] _trace: Option<&mut Vec<()>>,
+) -> Result<ValidatedConnection, RepositoryError> {
+    validate_prepared_storage_continuity(&prepared)?;
     after_validation();
-    let registration = descriptor_vfs::Registration::new(prepared.main_guard.as_raw_fd())
-        .map_err(|_| RepositoryError::new(RepositoryErrorClass::Database))?;
-    let connection = Connection::open_with_flags_and_vfs(
-        &prepared.path,
-        connection_flags(read_only),
-        registration.name(),
-    )
-    .map_err(map_sql_error)?;
+    let spec = ConnectionOpenSpec::for_existing(prepared.canonical_path.clone(), read_only)?;
+    let connection =
+        Connection::open_with_flags_and_vfs(&spec.canonical_path, spec.flags, spec.vfs)
+            .map_err(map_sql_error)?;
+    #[cfg(test)]
+    if let Some(trace) = trace.as_deref_mut() {
+        trace.push(OpenTrace::SqliteOpened);
+    }
+    if let Err(error) = validate_prepared_storage_continuity(&prepared) {
+        return Err(dispose_uncommitted_open(connection, prepared, error));
+    }
+    let connected_vfs = match connected_vfs_name(&connection) {
+        Ok(name) => name,
+        Err(error) => return Err(dispose_uncommitted_open(connection, prepared, error)),
+    };
+    if connected_vfs != spec.vfs {
+        return Err(dispose_uncommitted_open(
+            connection,
+            prepared,
+            RepositoryError::new(RepositoryErrorClass::Database),
+        ));
+    }
+    #[cfg(test)]
+    if let Some(trace) = trace.as_deref_mut() {
+        trace.push(OpenTrace::PostOpenValidated);
+    }
+    let live_claim = match prepared.reservation.transition_to_live() {
+        Ok(claim) => claim,
+        Err(error) => return Err(dispose_uncommitted_open(connection, prepared, error)),
+    };
+    let PreparedStorage {
+        identity,
+        directory_guard,
+        main_guard,
+        ..
+    } = prepared;
+    #[cfg(test)]
+    if let Some(trace) = trace {
+        trace.push(OpenTrace::ClaimLive);
+    }
     Ok(ValidatedConnection {
-        connection,
-        _registration: registration,
+        connection: Some(connection),
+        directory_guard: Some(directory_guard),
+        main_guard: Some(main_guard),
+        live_claim: Some(live_claim),
+        identity,
     })
 }
 
-#[cfg(not(unix))]
-fn open_validated_connection_after(
-    prepared: &PreparedStorage,
-    read_only: bool,
-    after_validation: impl FnOnce(),
-) -> Result<ValidatedConnection, RepositoryError> {
-    after_validation();
-    let connection = Connection::open_with_flags(&prepared.path, connection_flags(read_only))
-        .map_err(map_sql_error)?;
-    Ok(ValidatedConnection { connection })
+fn dispose_uncommitted_open(
+    connection: Connection,
+    prepared: PreparedStorage,
+    error: RepositoryError,
+) -> RepositoryError {
+    #[cfg(test)]
+    if FAIL_NEXT_UNCOMMITTED_CLOSE.with(|fault| fault.replace(false)) {
+        let mut statement = std::ptr::null_mut();
+        let rc = unsafe {
+            rusqlite::ffi::sqlite3_prepare_v2(
+                connection.handle(),
+                c"SELECT 1".as_ptr(),
+                -1,
+                &mut statement,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, rusqlite::ffi::SQLITE_OK);
+        assert!(!statement.is_null());
+    }
+    match connection.close() {
+        Ok(()) => error,
+        Err((connection, _)) => {
+            let mut prepared = prepared;
+            match prepared.reservation.transition_to_live() {
+                Ok(claim) => retain_poisoned_owner(
+                    Some(connection),
+                    Some(prepared.main_guard),
+                    Some(prepared.directory_guard),
+                    claim,
+                    CloseUncertainty::CheckpointOrClose,
+                    error,
+                ),
+                Err(_) => retain_quarantined_owner(
+                    connection,
+                    prepared.main_guard,
+                    prepared.directory_guard,
+                    prepared.reservation,
+                    error,
+                ),
+            }
+        }
+    }
 }
 
 fn migration_backup_path(path: &Path) -> Result<PathBuf, RepositoryError> {
@@ -1278,8 +1810,28 @@ fn unique_temporary_path(path: &Path, label: &str) -> Result<PathBuf, Repository
 }
 
 fn validate_auxiliary_files(path: &Path) -> Result<(), RepositoryError> {
-    for suffix in ["-wal", "-shm"] {
-        validate_optional_private_file(&auxiliary_path(path, suffix)?, None)?;
+    validate_auxiliary_files_for_owner(path, effective_user_id())
+}
+
+fn validate_auxiliary_files_for_owner(
+    path: &Path,
+    effective_user_id: u32,
+) -> Result<(), RepositoryError> {
+    for suffix in ["-wal", "-journal"] {
+        validate_optional_private_file_for_owner(
+            &auxiliary_path(path, suffix)?,
+            None,
+            effective_user_id,
+        )?;
+    }
+    validate_optional_private_file_for_owner(
+        &migration_backup_path(path)?,
+        None,
+        effective_user_id,
+    )?;
+    let shm = auxiliary_path(path, "-shm")?;
+    if validate_optional_private_file_for_owner(&shm, None, effective_user_id)?.is_some() {
+        return Err(RepositoryError::new(RepositoryErrorClass::UnsafePath));
     }
     Ok(())
 }
@@ -1293,57 +1845,270 @@ fn ensure_auxiliary_files_absent(path: &Path) -> Result<(), RepositoryError> {
     Ok(())
 }
 
-#[cfg(unix)]
 fn prepare_storage_path(path: &Path) -> Result<PreparedStorage, RepositoryError> {
+    prepare_storage_path_traced(path, None)
+}
+
+fn prepare_storage_path_traced(
+    path: &Path,
+    #[cfg(test)] trace: Option<&mut Vec<OpenTrace>>,
+    #[cfg(not(test))] trace: Option<&mut Vec<()>>,
+) -> Result<PreparedStorage, RepositoryError> {
+    prepare_storage_path_traced_with_preflight(path, trace, StoragePreflight::Production)
+}
+
+fn prepare_storage_path_traced_with_preflight(
+    path: &Path,
+    #[cfg(test)] trace: Option<&mut Vec<OpenTrace>>,
+    #[cfg(not(test))] trace: Option<&mut Vec<()>>,
+    preflight: StoragePreflight,
+) -> Result<PreparedStorage, RepositoryError> {
+    prepare_storage_path_traced_with_preflight_after_directory_bound(path, trace, preflight, |_| {})
+}
+
+fn prepare_storage_path_traced_with_preflight_after_directory_bound(
+    path: &Path,
+    #[cfg(test)] mut trace: Option<&mut Vec<OpenTrace>>,
+    #[cfg(not(test))] _trace: Option<&mut Vec<()>>,
+    preflight: StoragePreflight,
+    after_directory_bound: impl FnOnce(&Path),
+) -> Result<PreparedStorage, RepositoryError> {
+    match preflight {
+        StoragePreflight::Production => ensure_supported_storage_platform()?,
+        #[cfg(test)]
+        StoragePreflight::UnsupportedPlatform => {
+            return Err(RepositoryError::new(
+                RepositoryErrorClass::UnsupportedPlatform,
+            ));
+        }
+        #[cfg(test)]
+        StoragePreflight::MissingUnixExcl => {
+            ensure_supported_storage_platform()?;
+        }
+    }
+    #[cfg(test)]
+    if let Some(trace) = trace.as_deref_mut() {
+        trace.push(OpenTrace::PlatformPreflight);
+    }
+    match preflight {
+        StoragePreflight::Production => ensure_unix_excl_vfs()?,
+        #[cfg(test)]
+        StoragePreflight::MissingUnixExcl => {
+            return Err(RepositoryError::new(
+                RepositoryErrorClass::UnsupportedPlatform,
+            ));
+        }
+        #[cfg(test)]
+        StoragePreflight::UnsupportedPlatform => unreachable!(),
+    }
+    #[cfg(test)]
+    if let Some(trace) = trace.as_deref_mut() {
+        trace.push(OpenTrace::VfsPreflight);
+    }
     let parent = path
         .parent()
         .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
-    path.file_name()
+    let file_name = path
+        .file_name()
         .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
     let directory_guard = open_secure_directory(parent, true)?;
-    let (main_guard, _created) = open_or_create_private_file(path)?;
+    let canonical_parent = fs::canonicalize(parent)
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
+    let canonical_path = canonical_parent.join(file_name);
+    let directory_identity = file_identity(
+        &directory_guard
+            .metadata()
+            .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?,
+    )?;
+    after_directory_bound(&canonical_parent);
+    validate_bound_directory_continuity(&canonical_parent, directory_identity, &directory_guard)?;
+    validate_auxiliary_files(&canonical_path)?;
+    validate_bound_directory_continuity(&canonical_parent, directory_identity, &directory_guard)?;
+    let existing = match fs::symlink_metadata(&canonical_path) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return Err(RepositoryError::new(RepositoryErrorClass::UnsafePath)),
+    };
+    let (identity, main_guard, reservation) = if let Some(metadata) = existing {
+        validate_file_metadata(&metadata)?;
+        let identity = file_identity(&metadata)?;
+        #[cfg(test)]
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.push(OpenTrace::PathIdentityWithoutMainFd);
+        }
+        let reservation = ClaimReservation::reserve(identity)?;
+        #[cfg(test)]
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.push(OpenTrace::ClaimQuarantined);
+        }
+        let main_guard = open_existing_main_guard(&canonical_path, identity)?;
+        (identity, main_guard, reservation)
+    } else {
+        let main_guard = create_private_file(&canonical_path)?;
+        main_guard
+            .sync_all()
+            .map_err(|_| RepositoryError::new(RepositoryErrorClass::Durability))?;
+        directory_guard
+            .sync_all()
+            .map_err(|_| RepositoryError::new(RepositoryErrorClass::Durability))?;
+        let identity = file_identity(
+            &main_guard
+                .metadata()
+                .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?,
+        )?;
+        #[cfg(test)]
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.push(OpenTrace::NewFileCreatedWithMainGuard);
+        }
+        let reservation = ClaimReservation::reserve(identity)?;
+        #[cfg(test)]
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.push(OpenTrace::ClaimQuarantined);
+        }
+        (identity, main_guard, reservation)
+    };
+    #[cfg(test)]
+    if let Some(trace) = trace {
+        trace.push(OpenTrace::MainGuardOpened);
+    }
     Ok(PreparedStorage {
-        path: path.to_owned(),
+        canonical_path,
+        canonical_parent,
+        identity,
+        directory_identity,
         directory_guard,
         main_guard,
+        reservation,
     })
 }
 
-#[cfg(not(unix))]
-fn prepare_storage_path(path: &Path) -> Result<PreparedStorage, RepositoryError> {
+fn prepare_existing_storage_path(path: &Path) -> Result<PreparedStorage, RepositoryError> {
+    ensure_supported_storage_platform()?;
+    ensure_unix_excl_vfs()?;
     let parent = path
         .parent()
         .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
-    fs::create_dir_all(parent)
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
+    let directory_guard = open_secure_directory(parent, false)?;
+    let canonical_parent = fs::canonicalize(parent)
         .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
-    let (_file, _created) = open_or_create_private_file(path)?;
+    let canonical_path = canonical_parent.join(file_name);
+    let directory_identity = file_identity(
+        &directory_guard
+            .metadata()
+            .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?,
+    )?;
+    validate_bound_directory_continuity(&canonical_parent, directory_identity, &directory_guard)?;
+    validate_auxiliary_files(&canonical_path)?;
+    validate_bound_directory_continuity(&canonical_parent, directory_identity, &directory_guard)?;
+    let metadata = fs::symlink_metadata(&canonical_path)
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
+    validate_file_metadata(&metadata)?;
+    let identity = file_identity(&metadata)?;
+    let reservation = ClaimReservation::reserve(identity)?;
+    let main_guard = open_existing_main_guard(&canonical_path, identity)?;
     Ok(PreparedStorage {
-        path: path.to_owned(),
+        canonical_path,
+        canonical_parent,
+        identity,
+        directory_identity,
+        directory_guard,
+        main_guard,
+        reservation,
     })
+}
+
+fn open_existing_main_guard(
+    path: &Path,
+    expected: FileIdentity,
+) -> Result<fs::File, RepositoryError> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = options
+        .open(path)
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
+    let opened = file
+        .metadata()
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
+    let after = fs::symlink_metadata(path)
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
+    validate_file_metadata(&opened)?;
+    validate_file_metadata(&after)?;
+    if file_identity(&opened)? != expected || file_identity(&after)? != expected {
+        return Err(RepositoryError::new(RepositoryErrorClass::UnsafePath));
+    }
+    Ok(file)
+}
+
+fn validate_bound_directory_continuity(
+    canonical_parent: &Path,
+    directory_identity: FileIdentity,
+    directory_guard: &fs::File,
+) -> Result<(), RepositoryError> {
+    if fs::canonicalize(canonical_parent)
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?
+        != canonical_parent
+    {
+        return Err(RepositoryError::new(RepositoryErrorClass::UnsafePath));
+    }
+    let directory_path_metadata = fs::symlink_metadata(canonical_parent)
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
+    let directory_guard_metadata = directory_guard
+        .metadata()
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
+    validate_directory_metadata(&directory_path_metadata)?;
+    validate_directory_metadata(&directory_guard_metadata)?;
+    if file_identity(&directory_path_metadata)? != directory_identity
+        || file_identity(&directory_guard_metadata)? != directory_identity
+    {
+        return Err(RepositoryError::new(RepositoryErrorClass::UnsafePath));
+    }
+    Ok(())
+}
+
+fn validate_prepared_storage_continuity(prepared: &PreparedStorage) -> Result<(), RepositoryError> {
+    validate_bound_directory_continuity(
+        &prepared.canonical_parent,
+        prepared.directory_identity,
+        &prepared.directory_guard,
+    )?;
+    let path_metadata = fs::symlink_metadata(&prepared.canonical_path)
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
+    let guard_metadata = prepared
+        .main_guard
+        .metadata()
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
+    validate_file_metadata(&path_metadata)?;
+    validate_file_metadata(&guard_metadata)?;
+    if file_identity(&path_metadata)? != prepared.identity
+        || file_identity(&guard_metadata)? != prepared.identity
+    {
+        return Err(RepositoryError::new(RepositoryErrorClass::UnsafePath));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
-fn prepare_existing_storage_path(path: &Path) -> Result<PreparedStorage, RepositoryError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
-    let directory_guard = open_secure_directory(parent, false)?;
-    let main_guard = validate_optional_private_file(path, None)?
-        .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
-    Ok(PreparedStorage {
-        path: path.to_owned(),
-        directory_guard,
-        main_guard,
+fn file_identity(metadata: &fs::Metadata) -> Result<FileIdentity, RepositoryError> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
     })
 }
 
 #[cfg(not(unix))]
-fn prepare_existing_storage_path(path: &Path) -> Result<PreparedStorage, RepositoryError> {
-    validate_optional_private_file(path, None)?
-        .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
-    Ok(PreparedStorage {
-        path: path.to_owned(),
-    })
+fn file_identity(_metadata: &fs::Metadata) -> Result<FileIdentity, RepositoryError> {
+    Err(RepositoryError::new(
+        RepositoryErrorClass::UnsupportedPlatform,
+    ))
 }
 
 fn prepare_destination_parent(path: &Path) -> Result<PathBuf, RepositoryError> {
@@ -1388,6 +2153,13 @@ fn open_secure_directory(path: &Path, create: bool) -> Result<fs::File, Reposito
             .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?,
     )?;
     Ok(directory)
+}
+
+#[cfg(not(unix))]
+fn open_secure_directory(_path: &Path, _create: bool) -> Result<fs::File, RepositoryError> {
+    Err(RepositoryError::new(
+        RepositoryErrorClass::UnsupportedPlatform,
+    ))
 }
 
 fn open_or_create_private_file(path: &Path) -> Result<(fs::File, bool), RepositoryError> {
@@ -1438,12 +2210,20 @@ fn validate_optional_private_file(
     path: &Path,
     expected: Option<&fs::Metadata>,
 ) -> Result<Option<fs::File>, RepositoryError> {
+    validate_optional_private_file_for_owner(path, expected, effective_user_id())
+}
+
+fn validate_optional_private_file_for_owner(
+    path: &Path,
+    expected: Option<&fs::Metadata>,
+    effective_user_id: u32,
+) -> Result<Option<fs::File>, RepositoryError> {
     let before = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(RepositoryError::new(RepositoryErrorClass::UnsafePath)),
     };
-    validate_file_metadata(&before)?;
+    validate_file_metadata_for_owner(&before, effective_user_id)?;
     let mut options = OpenOptions::new();
     options.read(true).write(true);
     #[cfg(unix)]
@@ -1459,8 +2239,8 @@ fn validate_optional_private_file(
         .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
     let after = fs::symlink_metadata(path)
         .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
-    validate_file_metadata(&opened)?;
-    validate_file_metadata(&after)?;
+    validate_file_metadata_for_owner(&opened, effective_user_id)?;
+    validate_file_metadata_for_owner(&after, effective_user_id)?;
     if !same_file_identity(&before, &opened)
         || !same_file_identity(&opened, &after)
         || expected.is_some_and(|expected| !same_file_identity(expected, &opened))
@@ -1482,17 +2262,42 @@ fn validate_directory_metadata(metadata: &fs::Metadata) -> Result<(), Repository
     Ok(())
 }
 
+#[cfg(not(unix))]
+fn validate_directory_metadata(_metadata: &fs::Metadata) -> Result<(), RepositoryError> {
+    Err(RepositoryError::new(
+        RepositoryErrorClass::UnsupportedPlatform,
+    ))
+}
+
 #[cfg(unix)]
 fn validate_file_metadata(metadata: &fs::Metadata) -> Result<(), RepositoryError> {
+    validate_file_metadata_for_owner(metadata, effective_user_id())
+}
+
+#[cfg(unix)]
+fn validate_file_metadata_for_owner(
+    metadata: &fs::Metadata,
+    effective_user_id: u32,
+) -> Result<(), RepositoryError> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     if !metadata.file_type().is_file()
-        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.uid() != effective_user_id
         || metadata.nlink() != 1
         || metadata.permissions().mode() & 0o777 != 0o600
     {
         return Err(RepositoryError::new(RepositoryErrorClass::UnsafePath));
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn effective_user_id() -> u32 {
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(not(unix))]
+fn effective_user_id() -> u32 {
+    0
 }
 
 #[cfg(not(unix))]
@@ -1502,6 +2307,14 @@ fn validate_file_metadata(metadata: &fs::Metadata) -> Result<(), RepositoryError
     } else {
         Err(RepositoryError::new(RepositoryErrorClass::UnsafePath))
     }
+}
+
+#[cfg(not(unix))]
+fn validate_file_metadata_for_owner(
+    metadata: &fs::Metadata,
+    _effective_user_id: u32,
+) -> Result<(), RepositoryError> {
+    validate_file_metadata(metadata)
 }
 
 #[cfg(unix)]
@@ -1661,13 +2474,21 @@ fn map_sql_error(error: SqlError) -> RepositoryError {
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::storage::{
+        apply_auxiliary_defect, family_snapshot, AuxiliaryDefect, AuxiliaryKind,
+    };
     use super::{ControlIdGenerator, ControlRepository, RepositoryError, RepositoryErrorClass};
     use loxa_protocol::v2::{SlotId, StreamEpoch};
     use loxa_protocol::NodeId;
     use rusqlite::{config::DbConfig, limits::Limit};
     use std::fs;
+    use std::io::{BufRead, Write};
     use std::path::{Path, PathBuf};
+    use std::process::{Child, Command, Stdio};
     use std::str::FromStr;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     const NODE_ID: &str = "11111111-1111-4111-8111-111111111111";
     const SLOT_ID: &str = "22222222-2222-4222-8222-222222222222";
@@ -1749,6 +2570,546 @@ mod tests {
         ControlRepository::open_or_create(path, node_id(), &mut CountingIds::fixed()).unwrap()
     }
 
+    fn commit_revision_two(repository: &mut ControlRepository) {
+        let payload =
+            super::unloaded_slot_payload(node_id(), repository.slot_id()).expect("slot payload");
+        repository
+            .transaction(|transaction| {
+                transaction.execute(
+                    "UPDATE control_meta SET revision = '2', cursor = '2' WHERE singleton = 1",
+                    [],
+                )?;
+                transaction.execute(
+                    "INSERT INTO events(event_id, stream_epoch, sequence, revision, event_kind, payload_json) VALUES('77777777-7777-4777-8777-777777777777', ?1, '2', '2', 'slot_changed', ?2)",
+                    [STREAM_EPOCH, &payload],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ChildProbe {
+        Opened,
+        DatabaseLocked,
+    }
+
+    fn probe_from_subprocess(path: &Path) -> ChildProbe {
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "control_state::repository::tests::repository_process_helper",
+                "--nocapture",
+            ])
+            .env("LOXA_REPOSITORY_HELPER", "probe")
+            .env("LOXA_REPOSITORY_PATH", path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = wait_child_with_timeout(child, Duration::from_secs(15));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stdout.contains("PROBE_OPENED") {
+            ChildProbe::Opened
+        } else if stdout.contains("PROBE_LOCKED") {
+            ChildProbe::DatabaseLocked
+        } else {
+            panic!(
+                "repository probe did not report a result\nstdout:\n{stdout}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    fn spawn_repository_owner(path: &Path) -> Child {
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "control_state::repository::tests::repository_process_helper",
+                "--nocapture",
+            ])
+            .env("LOXA_REPOSITORY_HELPER", "owner")
+            .env("LOXA_REPOSITORY_PATH", path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    }
+
+    fn wait_child_with_timeout(mut child: Child, timeout: Duration) -> std::process::Output {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                return child.wait_with_output().unwrap();
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "repository helper timed out\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    #[ignore = "exact subprocess entrypoint"]
+    fn repository_process_helper() {
+        let mode = std::env::var("LOXA_REPOSITORY_HELPER").expect("helper mode");
+        let path = PathBuf::from(std::env::var_os("LOXA_REPOSITORY_PATH").expect("helper path"));
+        match mode.as_str() {
+            "probe" => {
+                let outcome = ControlRepository::open_or_create(
+                    &path,
+                    node_id(),
+                    &mut CountingIds::default(),
+                );
+                match outcome {
+                    Ok(mut repository) => {
+                        repository
+                            .transaction(|transaction| {
+                                transaction.execute(
+                                    "UPDATE control_meta SET revision = revision WHERE singleton = 1",
+                                    [],
+                                )?;
+                                Ok(())
+                            })
+                            .unwrap();
+                        repository.close().unwrap();
+                        println!("PROBE_OPENED");
+                    }
+                    Err(error) if error.class() == RepositoryErrorClass::Database => {
+                        println!("PROBE_LOCKED");
+                    }
+                    Err(error) => panic!("unexpected probe error: {error:?}"),
+                }
+            }
+            "owner" => {
+                let repository = ControlRepository::open_or_create(
+                    &path,
+                    node_id(),
+                    &mut CountingIds::default(),
+                )
+                .unwrap();
+                println!("OWNER_READY");
+                std::io::stdout().flush().unwrap();
+                let mut release = String::new();
+                std::io::stdin().read_line(&mut release).unwrap();
+                repository.close().unwrap();
+            }
+            _ => panic!("unknown helper mode"),
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn production_open_spec_is_exact_for_read_write_and_read_only() {
+        let directory = TestDirectory::new("production-open-spec");
+        let path = directory.database();
+        fs::write(&path, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        for read_only in [false, true] {
+            let spec = super::ConnectionOpenSpec::for_existing(path.clone(), read_only).unwrap();
+            assert_eq!(spec.vfs, "unix-excl");
+            assert!(spec
+                .flags
+                .contains(rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW));
+            assert!(spec
+                .flags
+                .contains(rusqlite::OpenFlags::SQLITE_OPEN_EXRESCODE));
+            assert!(!spec.flags.contains(rusqlite::OpenFlags::SQLITE_OPEN_CREATE));
+            assert_eq!(
+                spec.flags
+                    .contains(rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY),
+                read_only
+            );
+            assert_eq!(
+                spec.flags
+                    .contains(rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE),
+                !read_only
+            );
+            assert_eq!(
+                super::open_and_query_connected_vfs(spec).unwrap(),
+                "unix-excl"
+            );
+        }
+    }
+
+    #[test]
+    fn non_ok_vfsname_with_non_null_sqlite_allocation_is_freed_and_rejected() {
+        let error = super::decode_non_ok_allocated_vfsname_for_test().unwrap_err();
+        assert_eq!(error.class(), RepositoryErrorClass::Database);
+    }
+
+    #[test]
+    fn unsupported_platform_or_missing_vfs_refuses_before_filesystem_mutation() {
+        for preflight in [
+            super::StoragePreflight::UnsupportedPlatform,
+            super::StoragePreflight::MissingUnixExcl,
+        ] {
+            let root = std::env::temp_dir().join(format!(
+                "loxa-control-state-preflight-{}-{}",
+                std::process::id(),
+                StreamEpoch::new_v4()
+            ));
+            assert!(super::open_with_preflight_for_test(
+                &root.join("state/control-state.sqlite3"),
+                preflight
+            )
+            .is_err());
+            assert!(!root.exists());
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn parent_or_main_change_across_sqlite_open_fails_before_first_statement() {
+        for swap in [
+            super::OpenBoundarySwap::Parent,
+            super::OpenBoundarySwap::Main,
+        ] {
+            assert_eq!(
+                super::open_with_boundary_swap_for_test(swap)
+                    .unwrap_err()
+                    .class(),
+                RepositoryErrorClass::UnsafePath
+            );
+        }
+    }
+
+    #[test]
+    fn missing_main_at_sqlite_open_boundary_is_not_recreated() {
+        let directory = TestDirectory::new("missing-main-open-boundary");
+        let path = directory.database();
+        let prepared = super::prepare_storage_path(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        assert!(super::open_validated_connection_after(prepared, false, || {}).is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn claim_is_quarantined_before_main_descriptor_open() {
+        let directory = TestDirectory::new("claim-open-order");
+        create_repository(&directory.database()).close().unwrap();
+        assert_eq!(
+            super::open_trace_for_test(&directory.database()).unwrap(),
+            [
+                super::OpenTrace::PlatformPreflight,
+                super::OpenTrace::VfsPreflight,
+                super::OpenTrace::PathIdentityWithoutMainFd,
+                super::OpenTrace::ClaimQuarantined,
+                super::OpenTrace::MainGuardOpened,
+                super::OpenTrace::SqliteOpened,
+                super::OpenTrace::PostOpenValidated,
+                super::OpenTrace::ClaimLive,
+            ]
+        );
+    }
+
+    #[test]
+    fn new_file_trace_labels_retained_creation_guard_before_claim() {
+        let directory = TestDirectory::new("new-file-claim-open-order");
+        assert_eq!(
+            super::open_trace_for_test(&directory.database()).unwrap(),
+            [
+                super::OpenTrace::PlatformPreflight,
+                super::OpenTrace::VfsPreflight,
+                super::OpenTrace::NewFileCreatedWithMainGuard,
+                super::OpenTrace::ClaimQuarantined,
+                super::OpenTrace::MainGuardOpened,
+                super::OpenTrace::SqliteOpened,
+                super::OpenTrace::PostOpenValidated,
+                super::OpenTrace::ClaimLive,
+            ]
+        );
+    }
+
+    #[test]
+    fn claim_transition_failure_explicitly_closes_and_releases_after_guards() {
+        let directory = TestDirectory::new("claim-transition-failure");
+        let path = directory.database();
+        create_repository(&path).close().unwrap();
+        super::fail_next_claim_transition_for_test();
+        let error =
+            ControlRepository::open_or_create(&path, node_id(), &mut CountingIds::default())
+                .unwrap_err();
+        assert_eq!(error.class(), RepositoryErrorClass::Durability);
+        let reopened =
+            ControlRepository::open_or_create(&path, node_id(), &mut CountingIds::default())
+                .unwrap();
+        reopened.close().unwrap();
+        assert_eq!(probe_from_subprocess(&path), ChildProbe::Opened);
+    }
+
+    #[test]
+    fn close_and_claim_transition_failure_retains_the_quarantined_owner() {
+        let directory = TestDirectory::new("combined-uncommitted-close-transition-failure");
+        let path = directory.database();
+        create_repository(&path).close().unwrap();
+        super::fail_next_uncommitted_close_and_two_claim_transitions_for_test();
+        let error =
+            ControlRepository::open_or_create(&path, node_id(), &mut CountingIds::default())
+                .unwrap_err();
+        assert_eq!(error.class(), RepositoryErrorClass::Durability);
+        let error =
+            ControlRepository::open_or_create(&path, node_id(), &mut CountingIds::default())
+                .unwrap_err();
+        assert_eq!(error.class(), RepositoryErrorClass::AlreadyOwned);
+        assert_eq!(probe_from_subprocess(&path), ChildProbe::DatabaseLocked);
+    }
+
+    #[test]
+    fn wal_full_sync_reopens_without_filesystem_shm() {
+        let directory = TestDirectory::new("wal-no-shm");
+        let path = directory.database();
+        let mut repository = create_repository(&path);
+        assert!(!super::auxiliary_path(&path, "-shm").unwrap().exists());
+        commit_revision_two(&mut repository);
+        let journal_mode: String = repository
+            .connection_ref()
+            .unwrap()
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        let synchronous: i64 = repository
+            .connection_ref()
+            .unwrap()
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode, "wal");
+        assert_eq!(synchronous, 2);
+        assert!(!super::auxiliary_path(&path, "-shm").unwrap().exists());
+        repository.close().unwrap();
+        let reopened =
+            ControlRepository::open_or_create(&path, node_id(), &mut CountingIds::default())
+                .unwrap();
+        assert_eq!(reopened.validate_all().unwrap().revision, 2);
+        assert!(!super::auxiliary_path(&path, "-shm").unwrap().exists());
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn second_in_process_live_repository_is_rejected_until_owner_closes() {
+        let directory = TestDirectory::new("same-process-owner");
+        let path = directory.database();
+        let mut first = create_repository(&path);
+        let error =
+            ControlRepository::open_or_create(&path, node_id(), &mut CountingIds::default())
+                .unwrap_err();
+        assert_eq!(error.class(), RepositoryErrorClass::AlreadyOwned);
+        commit_revision_two(&mut first);
+        assert_eq!(first.validate_all().unwrap().revision, 2);
+        assert_eq!(probe_from_subprocess(&path), ChildProbe::DatabaseLocked);
+        first.close().unwrap();
+        assert_eq!(probe_from_subprocess(&path), ChildProbe::Opened);
+        let reopened =
+            ControlRepository::open_or_create(&path, node_id(), &mut CountingIds::default())
+                .unwrap();
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn second_process_is_excluded_after_post_open_validation_until_owner_closes() {
+        let directory = TestDirectory::new("second-process-owner");
+        let path = directory.database();
+        create_repository(&path).close().unwrap();
+        let mut child = spawn_repository_owner(&path);
+        let stdout = child.stdout.take().unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(stdout);
+            let mut ready = String::new();
+            let mut ready_sent = false;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+                if !ready_sent {
+                    ready.push_str(&line);
+                    if line.contains("OWNER_READY") {
+                        let _ = ready_tx.send(ready.clone());
+                        ready_sent = true;
+                    }
+                }
+            }
+            if !ready_sent {
+                let _ = ready_tx.send(ready);
+            }
+        });
+        let ready = ready_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|_| {
+                let _ = child.kill();
+                panic!("repository owner did not become READY before timeout")
+            });
+        assert!(ready.contains("OWNER_READY"), "{ready}");
+        let error =
+            ControlRepository::open_or_create(&path, node_id(), &mut CountingIds::default())
+                .unwrap_err();
+        assert_eq!(error.class(), RepositoryErrorClass::Database);
+        child.stdin.take().unwrap().write_all(b"release\n").unwrap();
+        let output = wait_child_with_timeout(child, Duration::from_secs(10));
+        assert!(
+            output.status.success(),
+            "child stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let reopened =
+            ControlRepository::open_or_create(&path, node_id(), &mut CountingIds::default())
+                .unwrap();
+        reopened.close().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_auxiliary_with_missing_main_refuses_without_creating_main() {
+        for kind in AuxiliaryKind::ALL {
+            let directory = TestDirectory::new(&format!("missing-main-{kind:?}"));
+            let path = directory.database();
+            apply_auxiliary_defect(&path, kind, AuxiliaryDefect::WrongMode);
+            let before = family_snapshot(&path);
+            let error =
+                ControlRepository::open_or_create(&path, node_id(), &mut CountingIds::fixed())
+                    .unwrap_err();
+            assert_eq!(error.class(), RepositoryErrorClass::UnsafePath);
+            assert_eq!(family_snapshot(&path), before, "{kind:?}");
+            assert!(!path.exists(), "{kind:?} created the missing main");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_parent_auxiliaries_are_checked_before_main_creation() {
+        let error = super::prepare_with_parent_auxiliary_swap_for_test().unwrap_err();
+        assert_eq!(error.class(), RepositoryErrorClass::UnsafePath);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_wal_journal_backup_and_any_stale_shm_fail_before_mutation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for kind in AuxiliaryKind::ALL {
+            for defect in AuxiliaryDefect::ALL {
+                let directory = TestDirectory::new(&format!("unsafe-family-{kind:?}-{defect:?}"));
+                let path = directory.database();
+                create_repository(&path).close().unwrap();
+                if kind != AuxiliaryKind::Backup {
+                    fs::remove_file(super::migration_backup_path(&path).unwrap()).unwrap();
+                }
+                apply_auxiliary_defect(&path, kind, defect);
+                let before = family_snapshot(&path);
+                let result = if defect == AuxiliaryDefect::WrongOwner {
+                    // Unprivileged tests cannot chown to another UID. Exercise the
+                    // same production metadata path with a deterministic mismatched
+                    // effective UID instead.
+                    let actual = super::effective_user_id();
+                    let mismatched = if actual == u32::MAX { 0 } else { actual + 1 };
+                    super::validate_auxiliary_files_for_owner(&path, mismatched)
+                        .map(|_| unreachable!("wrong-owner family accepted"))
+                } else {
+                    ControlRepository::open_or_create(&path, node_id(), &mut CountingIds::default())
+                        .map(|repository| {
+                            let _ = repository.close();
+                        })
+                };
+                assert!(result.is_err(), "{kind:?} {defect:?}");
+                assert_eq!(family_snapshot(&path), before, "{kind:?} {defect:?}");
+            }
+        }
+
+        let directory = TestDirectory::new("stale-shm");
+        let path = directory.database();
+        create_repository(&path).close().unwrap();
+        let shm = super::auxiliary_path(&path, "-shm").unwrap();
+        fs::write(&shm, b"stale").unwrap();
+        fs::set_permissions(&shm, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            ControlRepository::open_or_create(&path, node_id(), &mut CountingIds::default(),)
+                .is_err()
+        );
+        assert_eq!(fs::read(shm).unwrap(), b"stale");
+    }
+
+    #[test]
+    fn unrelated_sqlite_database_remains_openable_while_repository_is_live() {
+        let repository_directory = TestDirectory::new("repository-live-unrelated");
+        let repository = create_repository(&repository_directory.database());
+        let unrelated = TestDirectory::new("unrelated-sqlite");
+        let connection = rusqlite::Connection::open(unrelated.0.join("unrelated.sqlite3")).unwrap();
+        connection
+            .execute("CREATE TABLE proof(value INTEGER)", [])
+            .unwrap();
+        assert!(repository.validate_all().is_ok());
+        connection.close().unwrap();
+        repository.close().unwrap();
+    }
+
+    #[test]
+    fn implicit_drop_poisons_the_claim_until_process_exit() {
+        let directory = TestDirectory::new("implicit-drop-poison");
+        let path = directory.database();
+        let repository = create_repository(&path);
+        drop(repository);
+        let error =
+            ControlRepository::open_or_create(&path, node_id(), &mut CountingIds::default())
+                .unwrap_err();
+        assert_eq!(error.class(), RepositoryErrorClass::AlreadyOwned);
+        assert_eq!(probe_from_subprocess(&path), ChildProbe::DatabaseLocked);
+    }
+
+    #[test]
+    fn successful_close_orders_checkpoint_sqlite_guards_and_claim_release() {
+        let directory = TestDirectory::new("close-success-trace");
+        let path = directory.database();
+        let (result, trace) =
+            create_repository(&path).close_trace_for_test(super::CloseFault::None);
+        result.unwrap();
+        assert_eq!(
+            trace,
+            [
+                super::CloseEvent::Checkpoint,
+                super::CloseEvent::SqliteClosed,
+                super::CloseEvent::MainGuardClosed,
+                super::CloseEvent::DirectoryGuardClosed,
+                super::CloseEvent::ClaimReleased,
+            ]
+        );
+        assert_eq!(probe_from_subprocess(&path), ChildProbe::Opened);
+    }
+
+    #[test]
+    fn checkpoint_and_returned_connection_close_uncertainty_poison_owners() {
+        for fault in [
+            super::CloseFault::Checkpoint,
+            super::CloseFault::ReturnedConnection,
+        ] {
+            let directory = TestDirectory::new(&format!("close-poison-{fault:?}"));
+            let path = directory.database();
+            let (result, trace) = create_repository(&path).close_trace_for_test(fault);
+            assert!(result.is_err());
+            assert_eq!(
+                trace,
+                [super::CloseEvent::Checkpoint, super::CloseEvent::Poisoned]
+            );
+            let error =
+                ControlRepository::open_or_create(&path, node_id(), &mut CountingIds::default())
+                    .unwrap_err();
+            assert_eq!(error.class(), RepositoryErrorClass::AlreadyOwned);
+            assert_eq!(probe_from_subprocess(&path), ChildProbe::DatabaseLocked);
+        }
+    }
+
     #[test]
     fn new_repository_has_exact_singleton_node_and_default_slot() {
         let directory = TestDirectory::new("singletons");
@@ -1768,12 +3129,14 @@ mod tests {
         let repository = create_repository(&directory.database());
         let pragma = |sql| {
             repository
-                .connection
+                .connection_ref()
+                .unwrap()
                 .query_row(sql, [], |row| row.get::<_, i64>(0))
                 .unwrap()
         };
         let journal_mode: String = repository
-            .connection
+            .connection_ref()
+            .unwrap()
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .unwrap();
         assert_eq!(journal_mode, "wal");
@@ -1785,26 +3148,30 @@ mod tests {
         assert_eq!(pragma("PRAGMA temp_store"), 2);
         assert_eq!(pragma("PRAGMA mmap_size"), 0);
         assert!(repository
-            .connection
+            .connection_ref()
+            .unwrap()
             .db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE)
             .unwrap());
         assert_eq!(
             repository
-                .connection
+                .connection_ref()
+                .unwrap()
                 .limit(Limit::SQLITE_LIMIT_LENGTH)
                 .unwrap(),
             super::SQLITE_LENGTH_LIMIT
         );
         assert_eq!(
             repository
-                .connection
+                .connection_ref()
+                .unwrap()
                 .limit(Limit::SQLITE_LIMIT_ATTACHED)
                 .unwrap(),
             super::SQLITE_ATTACHED_LIMIT
         );
         assert_eq!(
             repository
-                .connection
+                .connection_ref()
+                .unwrap()
                 .limit(Limit::SQLITE_LIMIT_WORKER_THREADS)
                 .unwrap(),
             super::SQLITE_WORKER_THREADS_LIMIT
@@ -1815,7 +3182,7 @@ mod tests {
     fn existing_repository_loads_ids_without_generating_replacements() {
         let directory = TestDirectory::new("persisted-ids");
         let path = directory.database();
-        drop(create_repository(&path));
+        create_repository(&path).close().unwrap();
 
         let mut ids = CountingIds::default();
         let repository = ControlRepository::open_or_create(&path, node_id(), &mut ids).unwrap();
@@ -1828,7 +3195,7 @@ mod tests {
     fn existing_repository_rejects_a_different_stable_node_without_generating_ids() {
         let directory = TestDirectory::new("node-mismatch");
         let path = directory.database();
-        drop(create_repository(&path));
+        create_repository(&path).close().unwrap();
         let different_node = NodeId::from_str("66666666-6666-4666-8666-666666666666").unwrap();
         let mut ids = CountingIds::default();
         let error = ControlRepository::open_or_create(&path, different_node, &mut ids).unwrap_err();
@@ -1861,7 +3228,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        drop(repository);
+        repository.close().unwrap();
 
         let error =
             ControlRepository::open_or_create(&path, node_id(), &mut CountingIds::default())
@@ -1880,7 +3247,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        drop(repository);
+        repository.close().unwrap();
 
         let error =
             ControlRepository::open_or_create(&path, node_id(), &mut CountingIds::default())
@@ -1929,7 +3296,7 @@ mod tests {
 
         let hardlinked = TestDirectory::new("hardlink");
         let path = hardlinked.database();
-        drop(create_repository(&path));
+        create_repository(&path).close().unwrap();
         fs::hard_link(&path, hardlinked.0.join("second-link.sqlite3")).unwrap();
         let error =
             ControlRepository::open_or_create(&path, node_id(), &mut CountingIds::default())
@@ -1975,7 +3342,7 @@ mod tests {
             .unwrap();
         let backup = repository.backup_before_migration().unwrap();
         let old_epoch = repository.stream_epoch();
-        drop(repository);
+        repository.close().unwrap();
 
         let destination = TestDirectory::new("restore-destination");
         let restored =
@@ -2003,7 +3370,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        drop(repository);
+        repository.close().unwrap();
 
         ControlRepository::restore_verified_migration_backup(&backup, &path, &proof).unwrap();
         let reopened =
@@ -2024,89 +3391,14 @@ mod tests {
         let sibling = TestDirectory::new("migration-sibling");
         let sibling_repository = create_repository(&sibling.database());
         let sibling_backup = sibling_repository.backup_before_migration().unwrap();
-        drop(sibling_repository);
+        sibling_repository.close().unwrap();
         fs::copy(sibling_backup, &retained).unwrap();
 
-        drop(repository);
+        repository.close().unwrap();
         let error =
             ControlRepository::restore_verified_migration_backup(&retained, &original_path, &proof)
                 .unwrap_err();
         assert_eq!(error.class(), RepositoryErrorClass::Corrupt);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn sqlite_main_open_remains_bound_to_the_validated_descriptor_during_path_swap() {
-        let directory = TestDirectory::new("descriptor-bound-open");
-        let path = directory.database();
-        drop(create_repository(&path));
-        let replacement = directory.0.join("replacement.sqlite3");
-        fs::write(&replacement, b"not the validated database").unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
-
-        let prepared = super::prepare_existing_storage_path(&path).unwrap();
-        let connection = super::open_validated_connection_after(&prepared, true, || {
-            let displaced = directory.0.join("displaced.sqlite3");
-            fs::rename(&path, displaced).unwrap();
-            fs::rename(&replacement, &path).unwrap();
-        })
-        .unwrap();
-
-        let summary = super::validate_connection(&connection, Some(node_id())).unwrap();
-        assert_eq!(summary.node_id, node_id());
-        assert!(!super::descriptor_vfs::open_override_is_installed());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn descriptor_open_preserves_sibling_wal_and_shm_and_reopens_after_checkpoint() {
-        let directory = TestDirectory::new("descriptor-wal-reopen");
-        let path = directory.database();
-        let mut repository = create_repository(&path);
-        repository
-            .transaction(|transaction| {
-                transaction.execute(
-                    "UPDATE control_meta SET revision = '2' WHERE singleton = 1",
-                    [],
-                )?;
-                Ok(())
-            })
-            .unwrap();
-        assert!(super::auxiliary_path(&path, "-wal").unwrap().exists());
-        assert!(super::auxiliary_path(&path, "-shm").unwrap().exists());
-        repository.checkpoint().unwrap();
-        drop(repository);
-
-        let reopened =
-            ControlRepository::open_or_create(&path, node_id(), &mut CountingIds::default())
-                .unwrap();
-        assert_eq!(reopened.validate_all().unwrap().revision, 2);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn scoped_open_override_does_not_redirect_unrelated_sqlite_and_restores_on_unwind() {
-        let unrelated = TestDirectory::new("unrelated-sqlite");
-        let unrelated_path = unrelated.0.join("unrelated.sqlite3");
-        super::descriptor_vfs::with_open_override_for_test(|| {
-            let connection = rusqlite::Connection::open(&unrelated_path).unwrap();
-            connection
-                .execute_batch("CREATE TABLE independent(value INTEGER);")
-                .unwrap();
-        });
-        assert!(!super::descriptor_vfs::open_override_is_installed());
-
-        let panic = std::panic::catch_unwind(|| {
-            super::descriptor_vfs::with_open_override_for_test(|| panic!("fault injection"));
-        });
-        assert!(panic.is_err());
-        assert!(!super::descriptor_vfs::open_override_is_installed());
-        let connection = rusqlite::Connection::open(&unrelated_path).unwrap();
-        let rows: i64 = connection
-            .query_row("SELECT COUNT(*) FROM independent", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(rows, 0);
     }
 
     #[cfg(unix)]
@@ -2167,7 +3459,7 @@ mod tests {
     fn corruption_is_refused_instead_of_silently_restored() {
         let directory = TestDirectory::new("corruption");
         let path = directory.database();
-        drop(create_repository(&path));
+        create_repository(&path).close().unwrap();
         fs::write(&path, b"not a sqlite database").unwrap();
 
         let error =
@@ -2191,7 +3483,7 @@ mod tests {
         let destination_path = destination.database();
         let original = create_repository(&destination_path);
         let original_epoch = original.stream_epoch();
-        drop(original);
+        original.close().unwrap();
 
         let error = ControlRepository::restore_offline(&backup, &destination_path).unwrap_err();
         assert_eq!(error.class(), RepositoryErrorClass::Corrupt);
