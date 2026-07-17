@@ -228,6 +228,223 @@ async fn required_transition_gets_fresh_ack_window_after_late_enqueue() {
     cleanup(&path);
 }
 
+#[tokio::test]
+async fn blocking_actor_admission_waits_for_queue_and_uses_a_fresh_ack_window() {
+    let (path, repository) = repository();
+    let state = repository.committed_state().unwrap();
+    repository.close().unwrap();
+    let mut synthetic = synthetic_queue_for_test(state);
+    let handle = synthetic.handle.clone();
+    handle.fill_queue_for_test();
+
+    let waiting_handle = handle.clone();
+    let admission = std::thread::spawn(move || {
+        waiting_handle.admit_blocking_with_timeouts_for_test(
+            download("blocking-admission"),
+            Duration::from_millis(250),
+            Duration::from_millis(100),
+        )
+    });
+    tokio::time::sleep(Duration::from_millis(70)).await;
+    assert!(!admission.is_finished());
+    synthetic.pop_one().await;
+    let reply = synthetic.take_admit_reply().await;
+    tokio::time::sleep(Duration::from_millis(70)).await;
+    assert!(!admission.is_finished());
+    let expected = crate::control_state::state_machine::CommittedAdmission {
+        epoch: StreamEpoch::from_str(EPOCH).unwrap(),
+        operation_id: OperationId::from_str("8aaaaaaa-0000-4000-8000-000000000001").unwrap(),
+        revision: DecimalU64::new(2),
+        v1_operation_id: "op-1".into(),
+    };
+    reply.send(Ok(expected.clone())).unwrap();
+
+    assert_eq!(admission.join().unwrap().unwrap(), expected);
+    assert!(handle.is_healthy());
+    drop(handle);
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn blocking_actor_required_observation_closed_ack_poisons_unknown_commit() {
+    let (path, repository) = repository();
+    let state = repository.committed_state().unwrap();
+    repository.close().unwrap();
+    let mut synthetic = synthetic_queue_for_test(state);
+    let handle = synthetic.handle.clone();
+    let waiting_handle = handle.clone();
+    let observation = std::thread::spawn(move || {
+        waiting_handle.observe_required_blocking_with_timeouts_for_test(
+            Transition::Cancelled {
+                operation_id: OperationId::new_v4(),
+            },
+            Duration::from_millis(250),
+            Duration::from_millis(250),
+        )
+    });
+    drop(synthetic.take_observe_reply().await);
+
+    assert_eq!(
+        observation.join().unwrap().unwrap_err(),
+        ControlStateError::UnknownCommit
+    );
+    assert!(!handle.is_healthy());
+    drop(handle);
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn blocking_actor_admission_queue_timeout_is_overload_without_poison_or_mutation() {
+    let (path, repository) = repository();
+    let state = repository.committed_state().unwrap();
+    repository.close().unwrap();
+    let synthetic = synthetic_queue_for_test(state);
+    let handle = synthetic.handle.clone();
+    handle.fill_queue_for_test();
+    let before = handle.snapshot();
+    let waiting_handle = handle.clone();
+    let admission = std::thread::spawn(move || {
+        waiting_handle.admit_blocking_with_timeouts_for_test(
+            download("queue-timeout"),
+            Duration::from_millis(25),
+            Duration::from_millis(250),
+        )
+    });
+
+    assert_eq!(
+        admission.join().unwrap().unwrap_err(),
+        ControlStateError::WriterOverloaded
+    );
+    assert!(handle.is_healthy());
+    assert_eq!(*handle.snapshot(), *before);
+    drop(handle);
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn blocking_required_observation_queue_timeout_poisons_unavailable() {
+    let (path, repository) = repository();
+    let state = repository.committed_state().unwrap();
+    repository.close().unwrap();
+    let synthetic = synthetic_queue_for_test(state);
+    let handle = synthetic.handle.clone();
+    handle.fill_queue_for_test();
+    let before = handle.snapshot();
+    let waiting_handle = handle.clone();
+    let observation = std::thread::spawn(move || {
+        waiting_handle.observe_required_blocking_with_timeouts_for_test(
+            Transition::Cancelled {
+                operation_id: OperationId::new_v4(),
+            },
+            Duration::from_millis(25),
+            Duration::from_millis(250),
+        )
+    });
+
+    assert_eq!(
+        observation.join().unwrap().unwrap_err(),
+        ControlStateError::DurableStateUnavailable
+    );
+    assert!(!handle.is_healthy());
+    assert_eq!(*handle.snapshot(), *before);
+    drop(handle);
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn externally_poisoned_waiting_admission_never_uses_a_released_queue_slot() {
+    let (path, repository) = repository();
+    let state = repository.committed_state().unwrap();
+    repository.close().unwrap();
+    let mut synthetic = synthetic_queue_for_test(state);
+    let handle = synthetic.handle.clone();
+    handle.fill_queue_for_test();
+    let before = handle.snapshot();
+    let waiting_handle = handle.clone();
+    let admission = std::thread::spawn(move || {
+        waiting_handle.admit_blocking_with_timeouts_for_test(
+            download("must-not-submit-after-poison"),
+            Duration::from_millis(250),
+            Duration::from_millis(100),
+        )
+    });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    handle.poison_for_test();
+    synthetic.pop_one().await;
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), synthetic.take_admit_reply())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        admission.join().unwrap().unwrap_err(),
+        ControlStateError::DurableStateUnavailable
+    );
+    assert!(!handle.is_healthy());
+    assert_eq!(*handle.snapshot(), *before);
+    drop(handle);
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn expired_admission_deadline_cannot_enqueue_into_an_open_slot() {
+    let (path, repository) = repository();
+    let state = repository.committed_state().unwrap();
+    repository.close().unwrap();
+    let mut synthetic = synthetic_queue_for_test(state);
+    let handle = synthetic.handle.clone();
+    let waiting_handle = handle.clone();
+    let admission = std::thread::spawn(move || {
+        waiting_handle.admit_blocking_with_timeouts_for_test(
+            download("expired-before-enqueue"),
+            Duration::ZERO,
+            Duration::from_millis(100),
+        )
+    });
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), synthetic.take_admit_reply())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        admission.join().unwrap().unwrap_err(),
+        ControlStateError::WriterOverloaded
+    );
+    assert!(handle.is_healthy());
+    drop(handle);
+    cleanup(&path);
+}
+
+#[test]
+fn expired_ack_deadline_rejects_an_already_available_reply_as_unknown_commit() {
+    let (path, repository) = repository();
+    let state = repository.committed_state().unwrap();
+    repository.close().unwrap();
+    let synthetic = synthetic_queue_for_test(state);
+    let handle = synthetic.handle.clone();
+    let (reply, receive) = tokio::sync::oneshot::channel();
+    reply
+        .send(Ok(CommitReceipt {
+            epoch: StreamEpoch::from_str(EPOCH).unwrap(),
+            revision: DecimalU64::new(2),
+            cursor: DecimalU64::new(2),
+            event_id: Some(EventId::new_v4()),
+        }))
+        .unwrap();
+
+    assert_eq!(
+        handle
+            .receive_blocking_ack_until_for_test(receive, std::time::Instant::now())
+            .unwrap_err(),
+        ControlStateError::UnknownCommit
+    );
+    assert!(!handle.is_healthy());
+    drop(handle);
+    cleanup(&path);
+}
+
 #[tokio::test(start_paused = true)]
 async fn enqueued_transition_without_ack_poisoned_as_unknown_commit() {
     let (path, repository) = repository();

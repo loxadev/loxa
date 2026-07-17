@@ -31,6 +31,16 @@ static STARTUP_PERMANENTLY_POISONED: AtomicBool = AtomicBool::new(false);
 static STARTUP_REAPERS: std::sync::OnceLock<Mutex<Vec<std::thread::JoinHandle<()>>>> =
     std::sync::OnceLock::new();
 
+#[derive(Clone, Copy)]
+enum BlockingEnqueueTimeoutPolicy {
+    AdmissionOverloaded,
+    RequiredObservationUnavailable,
+}
+
+fn checked_deadline_after(now: std::time::Instant, timeout: Duration) -> std::time::Instant {
+    now.checked_add(timeout).unwrap_or(now)
+}
+
 enum StartupBehavior {
     Normal,
     #[cfg(test)]
@@ -233,6 +243,28 @@ impl ControlStateHandle {
             .await
     }
 
+    pub(crate) fn admit_blocking_until(
+        &self,
+        request: AdmissionRequest,
+        enqueue_deadline: std::time::Instant,
+    ) -> Result<CommittedAdmission, ControlStateError> {
+        let maximum = checked_deadline_after(std::time::Instant::now(), ENQUEUE_TIMEOUT);
+        self.admit_blocking_with_deadlines(request, enqueue_deadline.min(maximum), ACK_TIMEOUT)
+    }
+
+    pub(crate) fn observe_required_blocking_until(
+        &self,
+        transition: Transition,
+        enqueue_deadline: std::time::Instant,
+    ) -> Result<CommitReceipt, ControlStateError> {
+        let maximum = checked_deadline_after(std::time::Instant::now(), ENQUEUE_TIMEOUT);
+        self.observe_required_blocking_with_deadlines(
+            transition,
+            enqueue_deadline.min(maximum),
+            ACK_TIMEOUT,
+        )
+    }
+
     pub(crate) async fn publish_instance(
         &self,
         publication: InstancePublication,
@@ -375,6 +407,122 @@ impl ControlStateHandle {
     fn poison_unavailable(&self) -> ControlStateError {
         poison(&self.healthy, &self.health_signal);
         ControlStateError::DurableStateUnavailable
+    }
+
+    fn admit_blocking_with_deadlines(
+        &self,
+        request: AdmissionRequest,
+        enqueue_deadline: std::time::Instant,
+        ack_timeout: Duration,
+    ) -> Result<CommittedAdmission, ControlStateError> {
+        self.blocking_command(
+            enqueue_deadline,
+            ack_timeout,
+            |reply| ControlCommand::Admit {
+                request: request.clone(),
+                reply,
+            },
+            BlockingEnqueueTimeoutPolicy::AdmissionOverloaded,
+        )
+    }
+
+    fn observe_required_blocking_with_deadlines(
+        &self,
+        transition: Transition,
+        enqueue_deadline: std::time::Instant,
+        ack_timeout: Duration,
+    ) -> Result<CommitReceipt, ControlStateError> {
+        self.blocking_command(
+            enqueue_deadline,
+            ack_timeout,
+            |reply| ControlCommand::Observe {
+                transition: transition.clone(),
+                reply,
+            },
+            BlockingEnqueueTimeoutPolicy::RequiredObservationUnavailable,
+        )
+    }
+
+    fn blocking_command<T>(
+        &self,
+        enqueue_deadline: std::time::Instant,
+        ack_timeout: Duration,
+        mut command: impl FnMut(oneshot::Sender<Result<T, ControlStateError>>) -> ControlCommand,
+        timeout_policy: BlockingEnqueueTimeoutPolicy,
+    ) -> Result<T, ControlStateError> {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Err(ControlStateError::DurableStateUnavailable);
+        }
+        if !self.is_healthy() {
+            return Err(ControlStateError::DurableStateUnavailable);
+        }
+        let receive = loop {
+            if !self.is_healthy() {
+                return Err(ControlStateError::DurableStateUnavailable);
+            }
+            if std::time::Instant::now() >= enqueue_deadline {
+                return Err(self.blocking_enqueue_timeout(timeout_policy));
+            }
+            let (reply, receive) = oneshot::channel();
+            let command = command(reply);
+            if !self.is_healthy() {
+                return Err(ControlStateError::DurableStateUnavailable);
+            }
+            if std::time::Instant::now() >= enqueue_deadline {
+                return Err(self.blocking_enqueue_timeout(timeout_policy));
+            }
+            match self.sender.try_send(command) {
+                Ok(()) => break receive,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    let now = std::time::Instant::now();
+                    if now >= enqueue_deadline {
+                        return Err(self.blocking_enqueue_timeout(timeout_policy));
+                    }
+                    std::thread::sleep(ENQUEUE_RETRY.min(enqueue_deadline - now));
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return Err(self.poison_unavailable());
+                }
+            }
+        };
+        let ack_deadline = checked_deadline_after(std::time::Instant::now(), ack_timeout);
+        self.receive_blocking_ack_until(receive, ack_deadline)
+    }
+
+    fn blocking_enqueue_timeout(&self, policy: BlockingEnqueueTimeoutPolicy) -> ControlStateError {
+        match policy {
+            BlockingEnqueueTimeoutPolicy::AdmissionOverloaded => {
+                ControlStateError::WriterOverloaded
+            }
+            BlockingEnqueueTimeoutPolicy::RequiredObservationUnavailable => {
+                self.poison_unavailable()
+            }
+        }
+    }
+
+    fn receive_blocking_ack_until<T>(
+        &self,
+        mut receive: oneshot::Receiver<Result<T, ControlStateError>>,
+        ack_deadline: std::time::Instant,
+    ) -> Result<T, ControlStateError> {
+        loop {
+            if std::time::Instant::now() >= ack_deadline {
+                return Err(self.poison_unknown_commit());
+            }
+            match receive.try_recv() {
+                Ok(result) => return result,
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    return Err(self.poison_unknown_commit());
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                    let now = std::time::Instant::now();
+                    if now >= ack_deadline {
+                        return Err(self.poison_unknown_commit());
+                    }
+                    std::thread::sleep(ENQUEUE_RETRY.min(ack_deadline - now));
+                }
+            }
+        }
     }
 }
 
@@ -971,6 +1119,40 @@ impl ControlStateHandle {
             .expect("subscriber count command must enqueue");
         receive.await.expect("worker must report subscriber count")
     }
+
+    pub(super) fn admit_blocking_with_timeouts_for_test(
+        &self,
+        request: AdmissionRequest,
+        enqueue_timeout: Duration,
+        ack_timeout: Duration,
+    ) -> Result<CommittedAdmission, ControlStateError> {
+        self.admit_blocking_with_deadlines(
+            request,
+            checked_deadline_after(std::time::Instant::now(), enqueue_timeout),
+            ack_timeout,
+        )
+    }
+
+    pub(super) fn observe_required_blocking_with_timeouts_for_test(
+        &self,
+        transition: Transition,
+        enqueue_timeout: Duration,
+        ack_timeout: Duration,
+    ) -> Result<CommitReceipt, ControlStateError> {
+        self.observe_required_blocking_with_deadlines(
+            transition,
+            checked_deadline_after(std::time::Instant::now(), enqueue_timeout),
+            ack_timeout,
+        )
+    }
+
+    pub(super) fn receive_blocking_ack_until_for_test<T>(
+        &self,
+        receive: oneshot::Receiver<Result<T, ControlStateError>>,
+        ack_deadline: std::time::Instant,
+    ) -> Result<T, ControlStateError> {
+        self.receive_blocking_ack_until(receive, ack_deadline)
+    }
 }
 
 #[cfg(test)]
@@ -994,6 +1176,18 @@ impl SyntheticQueue {
         loop {
             match self.receiver.recv().await.expect("synthetic queue command") {
                 ControlCommand::Observe { reply, .. } => return reply,
+                ControlCommand::Noop => {}
+                _ => panic!("unexpected synthetic queue command"),
+            }
+        }
+    }
+
+    pub(super) async fn take_admit_reply(
+        &mut self,
+    ) -> oneshot::Sender<Result<CommittedAdmission, ControlStateError>> {
+        loop {
+            match self.receiver.recv().await.expect("synthetic queue command") {
+                ControlCommand::Admit { reply, .. } => return reply,
                 ControlCommand::Noop => {}
                 _ => panic!("unexpected synthetic queue command"),
             }

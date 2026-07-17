@@ -34,4 +34,6 @@ pub(crate) use repository::{
     ScalarProvenance, ScalarSource, ValidationSummary,
 };
 pub(crate) use state_machine::InstancePublication;
-pub(crate) use worker::{ControlStateBootstrap, ControlStateInit, ControlStateOpenInput};
+pub(crate) use worker::{
+    ControlStateBootstrap, ControlStateHandle, ControlStateInit, ControlStateOpenInput,
+};
