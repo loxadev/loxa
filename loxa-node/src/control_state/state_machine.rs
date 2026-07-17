@@ -1,9 +1,12 @@
+use super::recovery::{
+    decide, ReconciledControlState, RecoveryDecision, RecoveryEvidence, SlotRecoveryError,
+};
 use super::repository::{ControlRepository, RepositoryError, RepositoryErrorClass};
 use loxa_protocol::v2::{
     DecimalU64, EventId, OperationId, StreamEpoch, V2ControlEvent, V2EventEntity, V2Node,
-    V2NodeCapabilities, V2NodeStatus, V2Operation, V2OperationError, V2OperationKind,
-    V2OperationProgress, V2OperationStatus, V2PublicError, V2Slot, V2SlotErrorCode, V2SlotStatus,
-    V2_SCHEMA_VERSION,
+    V2NodeCapabilities, V2NodeStatus, V2Operation, V2OperationError, V2OperationErrorCode,
+    V2OperationKind, V2OperationProgress, V2OperationStatus, V2PublicError, V2Slot,
+    V2SlotErrorCode, V2SlotStatus, V2_SCHEMA_VERSION,
 };
 use loxa_protocol::NodeInstanceId;
 use rusqlite::{OptionalExtension, Row, Transaction as SqlTransaction};
@@ -116,6 +119,14 @@ pub(crate) struct CommittedState {
     pub(crate) slot: V2Slot,
     pub(crate) operations: Vec<V2Operation>,
     pub(crate) events: Vec<V2ControlEvent>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct InstancePublication {
+    pub(crate) node_instance_id: NodeInstanceId,
+    pub(crate) control_endpoint: String,
+    pub(crate) capabilities: V2NodeCapabilities,
+    pub(crate) now_unix_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -308,6 +319,290 @@ impl ControlRepository {
             ids,
             MAX_EVENT_BYTES,
         )
+    }
+
+    pub(crate) fn publish_instance(
+        &mut self,
+        publication: InstancePublication,
+        ids: &mut dyn MutationIds,
+    ) -> Result<CommitReceipt, TransitionError> {
+        let node_id = self.node_id();
+        let epoch = self.stream_epoch();
+        self.transaction(|tx| {
+            let (revision, cursor, last_committed) = read_meta(tx)?;
+            let next_revision = revision.checked_add(1).ok_or_else(overflow_error)?;
+            let next_cursor = cursor.checked_add(1).ok_or_else(overflow_error)?;
+            let effective_now = publication.now_unix_ms.max(last_committed);
+            let node = V2Node {
+                node_id,
+                node_instance_id: publication.node_instance_id,
+                control_endpoint: publication.control_endpoint.clone(),
+                status: V2NodeStatus::Running,
+                slot_capacity: 1,
+                capabilities: publication.capabilities.clone(),
+            };
+            serde_json::to_value(&node)
+                .map_err(|_| tagged_error(TransitionError::Contradiction))?;
+            let event_id = ids.new_event_id();
+            let event = V2ControlEvent {
+                schema_version: V2_SCHEMA_VERSION,
+                event_id,
+                epoch,
+                sequence: DecimalU64::new(next_cursor),
+                revision: DecimalU64::new(next_revision),
+                committed_at_unix_ms: DecimalU64::new(effective_now),
+                entity: V2EventEntity::Node,
+                entity_id: node_id.to_string(),
+                node_id,
+                node_instance_id: Some(publication.node_instance_id),
+                slot_id: None,
+                operation_id: None,
+                node: Some(node),
+                slot: None,
+                operation: None,
+            };
+            event
+                .validate()
+                .map_err(|_| tagged_error(TransitionError::Contradiction))?;
+            let payload = serialize_event(&event)?;
+            tx.execute(
+                "UPDATE node_state SET node_instance_id=?1,control_endpoint=?2,status='running',model_download=?3,slot_load=?4,slot_unload=?5,operation_cancel=?6,operation_stream=?7 WHERE singleton=1",
+                rusqlite::params![
+                    publication.node_instance_id.to_string(),
+                    publication.control_endpoint,
+                    publication.capabilities.model_download as i64,
+                    publication.capabilities.slot_load as i64,
+                    publication.capabilities.slot_unload as i64,
+                    publication.capabilities.operation_cancel as i64,
+                    publication.capabilities.operation_stream as i64,
+                ],
+            )?;
+            update_meta(tx, next_revision, next_cursor, effective_now)?;
+            insert_event(tx, &event, None, &payload)?;
+            prune(tx)?;
+            validate_written_event(tx, event_id, &event)?;
+            Ok(CommitReceipt {
+                epoch,
+                revision: DecimalU64::new(next_revision),
+                cursor: DecimalU64::new(next_cursor),
+                event_id: Some(event_id),
+            })
+        })
+        .map_err(map_tagged_error)
+    }
+
+    pub(crate) fn reconcile_offline(
+        &mut self,
+        evidence: RecoveryEvidence,
+        now_unix_ms: u64,
+        ids: &mut dyn MutationIds,
+    ) -> Result<ReconciledControlState, TransitionError> {
+        let decision = decide(evidence);
+        let interrupted: Vec<(OperationId, V2OperationStatus)> = self.read_transaction(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT operation_id,status FROM operations WHERE status IN ('queued','running','cancelling') ORDER BY length(created_revision),created_revision,operation_id",
+            )?;
+            let rows = statement
+                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.into_iter()
+                .map(|(id, status)| {
+                    Ok((
+                        OperationId::from_str(&id)
+                            .map_err(|_| RepositoryError::corrupt_for_state_machine())?,
+                        parse_operation_status(&status)?,
+                    ))
+                })
+                .collect()
+        })?;
+        let mut receipts = Vec::with_capacity(interrupted.len() + 1);
+        for (operation_id, status) in interrupted {
+            let (code, message) = match status {
+                V2OperationStatus::Queued => (
+                    V2OperationErrorCode::NodeRestartedBeforeStart,
+                    "node restarted before the operation started",
+                ),
+                V2OperationStatus::Running => (
+                    V2OperationErrorCode::NodeRestarted,
+                    "node restarted while the operation was running",
+                ),
+                V2OperationStatus::Cancelling => (
+                    V2OperationErrorCode::CancellationOutcomeUnknown,
+                    "node restarted before cancellation was confirmed",
+                ),
+                _ => return Err(TransitionError::CorruptState),
+            };
+            receipts.push(self.terminalize_interrupted_operation(
+                operation_id,
+                V2OperationError {
+                    code,
+                    message: message.to_owned(),
+                },
+                &decision,
+                now_unix_ms,
+                ids,
+            )?);
+        }
+
+        let ready_model = match &decision {
+            RecoveryDecision::Ready { authority } => Some(authority.model_id().to_owned()),
+            _ => None,
+        };
+        if let Some(receipt) = self.reconcile_slot_if_changed(&decision, now_unix_ms, ids)? {
+            receipts.push(receipt);
+        }
+        let ready_authority = match decision {
+            RecoveryDecision::Ready { authority } => Some(authority),
+            _ => None,
+        };
+        debug_assert_eq!(ready_model.is_some(), ready_authority.is_some());
+        Ok(ReconciledControlState {
+            receipts,
+            ready_authority,
+        })
+    }
+
+    fn terminalize_interrupted_operation(
+        &mut self,
+        operation_id: OperationId,
+        error: V2OperationError,
+        decision: &RecoveryDecision,
+        now_unix_ms: u64,
+        ids: &mut dyn MutationIds,
+    ) -> Result<CommitReceipt, TransitionError> {
+        let node_id = self.node_id();
+        let slot_id = self.slot_id();
+        let epoch = self.stream_epoch();
+        self.transaction(|tx| {
+            let (revision, cursor, last_committed) = read_meta(tx)?;
+            let mut operation = read_operation(tx, node_id, slot_id, operation_id)?
+                .ok_or_else(|| tagged_error(TransitionError::OperationNotFound))?;
+            if !matches!(
+                operation.status,
+                V2OperationStatus::Queued
+                    | V2OperationStatus::Running
+                    | V2OperationStatus::Cancelling
+            ) {
+                return Err(tagged_error(TransitionError::Contradiction));
+            }
+            let admitting_instance: String = tx.query_row(
+                "SELECT admitting_node_instance_id FROM operations WHERE operation_id=?1",
+                [operation_id.to_string()],
+                |row| row.get(0),
+            )?;
+            let admitting_instance = NodeInstanceId::from_str(&admitting_instance)
+                .map_err(|_| tagged_error(TransitionError::CorruptState))?;
+            let effective_now = now_unix_ms
+                .max(last_committed)
+                .max(operation.updated_at_unix_ms.get());
+            let mut slot = read_slot(tx, node_id, slot_id)?;
+            validate_slot_operation_correlation(tx, &slot)?;
+            let previous_slot = slot.clone();
+            operation.status = V2OperationStatus::Failed;
+            operation.error = Some(error);
+            if slot.operation_id == Some(operation_id) {
+                apply_recovery_decision_to_slot(&mut slot, decision)?;
+            }
+            let next_revision = revision.checked_add(1).ok_or_else(overflow_error)?;
+            let next_cursor = cursor.checked_add(1).ok_or_else(overflow_error)?;
+            operation.updated_revision = DecimalU64::new(next_revision);
+            operation.updated_at_unix_ms = DecimalU64::new(effective_now);
+            let slot_changed = slot != previous_slot;
+            let v1_sequence = next_v1_sequence(tx, admitting_instance)?;
+            let event_id = ids.new_event_id();
+            let event = operation_event(
+                EventPosition {
+                    event_id,
+                    epoch,
+                    sequence: next_cursor,
+                    revision: next_revision,
+                },
+                effective_now,
+                admitting_instance,
+                &operation,
+                slot_changed.then_some(slot.clone()),
+            )?;
+            let payload = serialize_event(&event)?;
+            write_operation(tx, &operation, slot_id)?;
+            if slot_changed {
+                write_slot(tx, &slot, next_revision, effective_now)?;
+            }
+            update_meta(tx, next_revision, next_cursor, effective_now)?;
+            insert_event(tx, &event, Some(v1_sequence), &payload)?;
+            prune(tx)?;
+            validate_written_event(tx, event_id, &event)?;
+            Ok(CommitReceipt {
+                epoch,
+                revision: DecimalU64::new(next_revision),
+                cursor: DecimalU64::new(next_cursor),
+                event_id: Some(event_id),
+            })
+        })
+        .map_err(map_tagged_error)
+    }
+
+    fn reconcile_slot_if_changed(
+        &mut self,
+        decision: &RecoveryDecision,
+        now_unix_ms: u64,
+        ids: &mut dyn MutationIds,
+    ) -> Result<Option<CommitReceipt>, TransitionError> {
+        let node_id = self.node_id();
+        let slot_id = self.slot_id();
+        let epoch = self.stream_epoch();
+        let current =
+            self.read_transaction(|connection| read_slot_connection(connection, node_id, slot_id))?;
+        let mut target = current.clone();
+        apply_recovery_decision_to_slot(&mut target, decision)?;
+        if target == current {
+            return Ok(None);
+        }
+        self.transaction(|tx| {
+            let observed = read_slot(tx, node_id, slot_id)?;
+            if observed != current {
+                return Err(tagged_error(TransitionError::Contradiction));
+            }
+            let (revision, cursor, last_committed) = read_meta(tx)?;
+            let next_revision = revision.checked_add(1).ok_or_else(overflow_error)?;
+            let next_cursor = cursor.checked_add(1).ok_or_else(overflow_error)?;
+            let effective_now = now_unix_ms.max(last_committed);
+            let committed = target.clone();
+            let event_id = ids.new_event_id();
+            let event = V2ControlEvent {
+                schema_version: V2_SCHEMA_VERSION,
+                event_id,
+                epoch,
+                sequence: DecimalU64::new(next_cursor),
+                revision: DecimalU64::new(next_revision),
+                committed_at_unix_ms: DecimalU64::new(effective_now),
+                entity: V2EventEntity::Slot,
+                entity_id: slot_id.to_string(),
+                node_id,
+                node_instance_id: None,
+                slot_id: Some(slot_id),
+                operation_id: None,
+                node: None,
+                slot: Some(committed.clone()),
+                operation: None,
+            };
+            event
+                .validate()
+                .map_err(|_| tagged_error(TransitionError::Contradiction))?;
+            let payload = serialize_event(&event)?;
+            write_slot(tx, &committed, next_revision, effective_now)?;
+            update_meta(tx, next_revision, next_cursor, effective_now)?;
+            insert_event(tx, &event, None, &payload)?;
+            prune(tx)?;
+            validate_written_event(tx, event_id, &event)?;
+            Ok(CommitReceipt {
+                epoch,
+                revision: DecimalU64::new(next_revision),
+                cursor: DecimalU64::new(next_cursor),
+                event_id: Some(event_id),
+            })
+        })
+        .map(Some)
+        .map_err(map_tagged_error)
     }
 
     fn observe_with_event_limit(
@@ -567,6 +862,37 @@ fn apply_transition(
             Ok(true)
         }
     }
+}
+
+fn apply_recovery_decision_to_slot(
+    slot: &mut V2Slot,
+    decision: &RecoveryDecision,
+) -> Result<(), RepositoryError> {
+    slot.operation_id = None;
+    match decision {
+        RecoveryDecision::Unloaded => {
+            slot.status = V2SlotStatus::Unloaded;
+            slot.model_id = None;
+            slot.error = None;
+        }
+        RecoveryDecision::Ready { authority } => {
+            slot.status = V2SlotStatus::Ready;
+            slot.model_id = Some(authority.model_id().to_owned());
+            slot.error = None;
+        }
+        RecoveryDecision::Recovery {
+            error: SlotRecoveryError::LifecycleRecoveryRequired,
+        } => {
+            slot.status = V2SlotStatus::Recovery;
+            slot.model_id = None;
+            slot.error = Some(V2PublicError {
+                code: V2SlotErrorCode::LifecycleRecoveryRequired,
+                message: "exact lifecycle ownership could not be recovered".into(),
+            });
+        }
+    }
+    slot.validate()
+        .map_err(|_| tagged_error(TransitionError::Contradiction))
 }
 
 fn terminal_replay(
@@ -986,7 +1312,12 @@ fn insert_event(
     v1: Option<i64>,
     payload: &str,
 ) -> Result<(), RepositoryError> {
-    tx.execute("INSERT INTO events(event_id,stream_epoch,sequence,revision,node_instance_id,v1_sequence,event_kind,payload_json) VALUES(?1,?2,?3,?4,?5,?6,'operation_changed',?7)",rusqlite::params![event.event_id.to_string(),event.epoch.to_string(),event.sequence.to_string(),event.revision.to_string(),event.node_instance_id.map(|id|id.to_string()),v1,payload])?;
+    let kind = match event.entity {
+        V2EventEntity::Node => "node_changed",
+        V2EventEntity::Slot => "slot_changed",
+        V2EventEntity::Operation => "operation_changed",
+    };
+    tx.execute("INSERT INTO events(event_id,stream_epoch,sequence,revision,node_instance_id,v1_sequence,event_kind,payload_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",rusqlite::params![event.event_id.to_string(),event.epoch.to_string(),event.sequence.to_string(),event.revision.to_string(),event.node_instance_id.map(|id|id.to_string()),v1,kind,payload])?;
     Ok(())
 }
 fn prune(tx: &SqlTransaction<'_>) -> Result<(), RepositoryError> {
@@ -1027,6 +1358,18 @@ fn status_text(v: V2OperationStatus) -> &'static str {
         V2OperationStatus::Succeeded => "succeeded",
         V2OperationStatus::Failed => "failed",
         V2OperationStatus::Cancelled => "cancelled",
+    }
+}
+
+fn parse_operation_status(value: &str) -> Result<V2OperationStatus, RepositoryError> {
+    match value {
+        "queued" => Ok(V2OperationStatus::Queued),
+        "running" => Ok(V2OperationStatus::Running),
+        "cancelling" => Ok(V2OperationStatus::Cancelling),
+        "succeeded" => Ok(V2OperationStatus::Succeeded),
+        "failed" => Ok(V2OperationStatus::Failed),
+        "cancelled" => Ok(V2OperationStatus::Cancelled),
+        _ => Err(RepositoryError::corrupt_for_state_machine()),
     }
 }
 fn slot_status_text(v: V2SlotStatus) -> &'static str {

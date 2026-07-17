@@ -1,13 +1,17 @@
+use super::recovery::{ExactAbsenceProof, ExactReady, RecoveryEvidence};
 use super::state_machine::{
-    AdmissionRequest, CommitReceipt, CommittedAdmission, CommittedState, MutationIds, Transition,
-    TransitionError,
+    AdmissionRequest, CommitReceipt, CommittedAdmission, CommittedState, InstancePublication,
+    MutationIds, Transition, TransitionError,
 };
-use super::{ControlRepository, RepositoryErrorClass};
+use super::{
+    ControlIdGenerator, ControlRepository, ControlStatePath, RepositoryErrorClass, ScalarSource,
+};
+use crate::runtime::NodeOwnerGuard;
 use loxa_protocol::v2::{
     DecimalU64, EventId, OperationId, StreamEpoch, V2ControlEvent, V2ReconnectSnapshot,
     V2StreamPosition, V2_SCHEMA_VERSION,
 };
-use loxa_protocol::NodeInstanceId;
+use loxa_protocol::{NodeId, NodeInstanceId};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -22,6 +26,21 @@ const ACK_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const ENQUEUE_RETRY: Duration = Duration::from_millis(10);
 const MAX_PENDING_PROGRESS: usize = 128;
+const CONTROL_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+static STARTUP_PERMANENTLY_POISONED: AtomicBool = AtomicBool::new(false);
+static STARTUP_REAPERS: std::sync::OnceLock<Mutex<Vec<std::thread::JoinHandle<()>>>> =
+    std::sync::OnceLock::new();
+
+enum StartupBehavior {
+    Normal,
+    #[cfg(test)]
+    PanicBeforeInitialization,
+    #[cfg(test)]
+    BlockBeforeInitialization {
+        entered: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    },
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ControlStateError {
@@ -36,6 +55,10 @@ pub(crate) enum ControlStateError {
 }
 
 enum ControlCommand {
+    PublishInstance {
+        publication: InstancePublication,
+        reply: oneshot::Sender<Result<CommitReceipt, ControlStateError>>,
+    },
     Admit {
         request: AdmissionRequest,
         reply: oneshot::Sender<Result<CommittedAdmission, ControlStateError>>,
@@ -130,6 +153,36 @@ impl MutationIds for WorkerIds {
     }
 }
 
+impl ControlIdGenerator for WorkerIds {
+    fn new_slot_id(&mut self) -> loxa_protocol::v2::SlotId {
+        loxa_protocol::v2::SlotId::new_v4()
+    }
+
+    fn new_stream_epoch(&mut self) -> StreamEpoch {
+        StreamEpoch::new_v4()
+    }
+}
+
+pub(crate) struct ControlStateOpenInput {
+    pub(crate) claimed_owner: NodeOwnerGuard,
+    pub(crate) first_migration_source: Option<ScalarSource>,
+}
+
+pub(crate) struct ControlStateInit {
+    pub(crate) path: ControlStatePath,
+    pub(crate) node_id: NodeId,
+    pub(crate) open_input: ControlStateOpenInput,
+    pub(crate) recovery_evidence: RecoveryEvidence,
+    pub(crate) now_unix_ms: u64,
+}
+
+pub(crate) struct ControlStateBootstrap {
+    pub(crate) handle: ControlStateHandle,
+    pub(crate) worker: ControlStateWorker,
+    pub(crate) claimed_owner: NodeOwnerGuard,
+    pub(crate) ready_authority: Option<ExactReady>,
+}
+
 #[derive(Clone)]
 pub(crate) struct ControlStateHandle {
     sender: mpsc::Sender<ControlCommand>,
@@ -172,6 +225,24 @@ impl ControlStateHandle {
         let (reply, receive) = oneshot::channel();
         self.sender
             .try_send(ControlCommand::Admit { request, reply })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => ControlStateError::WriterOverloaded,
+                mpsc::error::TrySendError::Closed(_) => self.poison_unavailable(),
+            })?;
+        self.receive_commit(receive, tokio::time::Instant::now() + ACK_TIMEOUT)
+            .await
+    }
+
+    pub(crate) async fn publish_instance(
+        &self,
+        publication: InstancePublication,
+    ) -> Result<CommitReceipt, ControlStateError> {
+        if !self.is_healthy() {
+            return Err(ControlStateError::DurableStateUnavailable);
+        }
+        let (reply, receive) = oneshot::channel();
+        self.sender
+            .try_send(ControlCommand::PublishInstance { publication, reply })
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => ControlStateError::WriterOverloaded,
                 mpsc::error::TrySendError::Closed(_) => self.poison_unavailable(),
@@ -315,6 +386,194 @@ pub(crate) struct ControlStateWorker {
 }
 
 impl ControlStateWorker {
+    pub(crate) fn open_reconcile_and_spawn(
+        init: ControlStateInit,
+    ) -> Result<ControlStateBootstrap, ControlStateError> {
+        Self::open_reconcile_and_spawn_inner(
+            init,
+            CONTROL_STARTUP_TIMEOUT,
+            CONTROL_STARTUP_TIMEOUT,
+            StartupBehavior::Normal,
+        )
+    }
+
+    fn open_reconcile_and_spawn_inner(
+        init: ControlStateInit,
+        startup_timeout: Duration,
+        cleanup_timeout: Duration,
+        startup_behavior: StartupBehavior,
+    ) -> Result<ControlStateBootstrap, ControlStateError> {
+        if STARTUP_PERMANENTLY_POISONED.load(Ordering::Acquire) {
+            return Err(ControlStateError::DurableStateUnavailable);
+        }
+        type Initialized = (
+            Arc<RwLock<Arc<CommittedState>>>,
+            Arc<Mutex<HashMap<OperationId, Transition>>>,
+            NodeOwnerGuard,
+            Option<ExactReady>,
+        );
+
+        let (sender, receiver) = mpsc::channel(COMMAND_CAPACITY);
+        let worker_sender = sender.downgrade();
+        let healthy = Arc::new(AtomicBool::new(true));
+        let (health_signal, _health_receiver) = watch::channel(true);
+        let worker_health = Arc::clone(&healthy);
+        let worker_health_signal = health_signal.clone();
+        let (initialized, initialization) =
+            std::sync::mpsc::sync_channel::<Result<Initialized, ControlStateError>>(1);
+        let join = std::thread::Builder::new()
+            .name("loxa-control-state".to_owned())
+            .spawn(move || {
+                match startup_behavior {
+                    StartupBehavior::Normal => {}
+                    #[cfg(test)]
+                    StartupBehavior::PanicBeforeInitialization => {
+                        panic!("fault-injected control-state startup panic")
+                    }
+                    #[cfg(test)]
+                    StartupBehavior::BlockBeforeInitialization { entered, release } => {
+                        entered.wait();
+                        release.wait();
+                    }
+                }
+                let ControlStateOpenInput {
+                    claimed_owner,
+                    first_migration_source,
+                } = init.open_input;
+                let startup = (|| {
+                    let evidence = if let Some(source) = first_migration_source.as_ref() {
+                        RecoveryEvidence::ExactAbsent(
+                            ExactAbsenceProof::from_first_migration_claim(&claimed_owner, source)
+                                .map_err(|_| ControlStateError::DurableStateUnavailable)?,
+                        )
+                    } else {
+                        init.recovery_evidence
+                    };
+                    let mut ids = WorkerIds;
+                    let mut repository = ControlRepository::open_or_migrate(
+                        init.path.as_ref(),
+                        init.node_id,
+                        first_migration_source,
+                        &mut ids,
+                    )
+                    .map_err(|error| ControlStateError::Repository(error.class()))?;
+                    let reconciled = repository
+                        .reconcile_offline(evidence, init.now_unix_ms, &mut ids)
+                        .map_err(ControlStateError::Transition)?;
+                    let initial = Arc::new(
+                        repository
+                            .committed_state()
+                            .map_err(|error| ControlStateError::Repository(error.class()))?,
+                    );
+                    let snapshot = Arc::new(RwLock::new(initial));
+                    let pending_progress = Arc::new(Mutex::new(HashMap::new()));
+                    initialized
+                        .send(Ok((
+                            Arc::clone(&snapshot),
+                            Arc::clone(&pending_progress),
+                            claimed_owner,
+                            reconciled.ready_authority,
+                        )))
+                        .map_err(|_| ControlStateError::DurableStateUnavailable)?;
+                    run_worker(
+                        repository,
+                        receiver,
+                        None,
+                        snapshot,
+                        worker_health,
+                        worker_health_signal,
+                        pending_progress,
+                    )
+                })();
+                if let Err(error) = startup {
+                    let _ = initialized.try_send(Err(error));
+                    return Err(error);
+                }
+                Ok(())
+            })
+            .map_err(|_| ControlStateError::DurableStateUnavailable)?;
+        let (snapshot, pending_progress, claimed_owner, ready_authority) =
+            match initialization.recv_timeout(startup_timeout) {
+                Ok(Ok(initialized)) => initialized,
+                Ok(Err(error)) => {
+                    cleanup_failed_initialization(
+                        &sender,
+                        join,
+                        std::time::Instant::now() + cleanup_timeout,
+                    )?;
+                    return Err(error);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return match cleanup_failed_initialization(
+                        &sender,
+                        join,
+                        std::time::Instant::now() + cleanup_timeout,
+                    ) {
+                        Err(ControlStateError::WorkerPanicked) => {
+                            Err(ControlStateError::WorkerPanicked)
+                        }
+                        Err(error) => Err(error),
+                        Ok(()) => Err(ControlStateError::DurableStateUnavailable),
+                    };
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let cleanup = cleanup_failed_initialization(
+                        &sender,
+                        join,
+                        std::time::Instant::now() + cleanup_timeout,
+                    );
+                    return match cleanup {
+                        Ok(()) => Err(ControlStateError::ShutdownDeadlineExceeded),
+                        Err(error) => Err(error),
+                    };
+                }
+            };
+        let handle = ControlStateHandle {
+            sender,
+            snapshot,
+            healthy: Arc::clone(&healthy),
+            health_signal: health_signal.clone(),
+            pending_progress,
+        };
+        Ok(ControlStateBootstrap {
+            handle,
+            worker: Self {
+                sender: worker_sender,
+                join: Some(join),
+                healthy,
+                health_signal,
+            },
+            claimed_owner,
+            ready_authority,
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn panic_during_initialization_for_test(
+        init: ControlStateInit,
+    ) -> Result<ControlStateBootstrap, ControlStateError> {
+        Self::open_reconcile_and_spawn_inner(
+            init,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            StartupBehavior::PanicBeforeInitialization,
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn block_during_initialization_for_test(
+        init: ControlStateInit,
+        entered: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    ) -> Result<ControlStateBootstrap, ControlStateError> {
+        Self::open_reconcile_and_spawn_inner(
+            init,
+            Duration::from_millis(50),
+            Duration::from_secs(1),
+            StartupBehavior::BlockBeforeInitialization { entered, release },
+        )
+    }
+
     pub(crate) async fn shutdown(mut self) -> Result<(), ControlStateError> {
         let deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
         let reaper = self.start_reaper()?;
@@ -449,11 +708,64 @@ fn poison(healthy: &AtomicBool, health_signal: &watch::Sender<bool>) {
     health_signal.send_replace(false);
 }
 
+fn cleanup_failed_initialization(
+    sender: &mpsc::Sender<ControlCommand>,
+    join: std::thread::JoinHandle<Result<(), ControlStateError>>,
+    deadline: std::time::Instant,
+) -> Result<(), ControlStateError> {
+    let (reply, _acknowledgement) = oneshot::channel();
+    let _ = sender.try_send(ControlCommand::Stop { reply });
+    let (finished, completion) = std::sync::mpsc::sync_channel(1);
+    let reaper = std::thread::Builder::new()
+        .name("loxa-control-state-startup-reaper".to_owned())
+        .spawn(move || {
+            let _ = finished.send(join.join());
+        })
+        .map_err(|_| ControlStateError::DurableStateUnavailable)?;
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    match completion.recv_timeout(remaining) {
+        Ok(Ok(Ok(()))) => {
+            reaper
+                .join()
+                .map_err(|_| ControlStateError::WorkerPanicked)?;
+            Ok(())
+        }
+        Ok(Ok(Err(error))) => {
+            let _ = reaper.join();
+            Err(error)
+        }
+        Ok(Err(_)) => {
+            let _ = reaper.join();
+            Err(ControlStateError::WorkerPanicked)
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = reaper.join();
+            Err(ControlStateError::DurableStateUnavailable)
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            STARTUP_PERMANENTLY_POISONED.store(true, Ordering::Release);
+            STARTUP_REAPERS
+                .get_or_init(|| Mutex::new(Vec::new()))
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(reaper);
+            Err(ControlStateError::ShutdownDeadlineExceeded)
+        }
+    }
+}
+
 #[cfg(test)]
 pub(super) fn spawn_from_repository_for_test(
     repository: ControlRepository,
 ) -> Result<(ControlStateHandle, ControlStateWorker), ControlStateError> {
-    spawn(repository, None)
+    spawn(repository, None, true)
+}
+
+#[cfg(test)]
+pub(super) fn spawn_unpublished_from_repository_for_test(
+    repository: ControlRepository,
+) -> Result<(ControlStateHandle, ControlStateWorker), ControlStateError> {
+    spawn(repository, None, false)
 }
 
 #[cfg(test)]
@@ -468,24 +780,24 @@ pub(super) fn spawn_paused_from_repository_for_test(
     ControlStateError,
 > {
     let barrier = Arc::new(std::sync::Barrier::new(2));
-    let result = spawn(repository, Some(Arc::clone(&barrier)))?;
+    let result = spawn(repository, Some(Arc::clone(&barrier)), true)?;
     Ok((result.0, result.1, barrier))
 }
 
 fn spawn(
     repository: ControlRepository,
     start_barrier: Option<Arc<std::sync::Barrier>>,
+    require_published: bool,
 ) -> Result<(ControlStateHandle, ControlStateWorker), ControlStateError> {
     let initial = Arc::new(
         repository
             .committed_state()
             .map_err(|error| ControlStateError::Repository(error.class()))?,
     );
-    let node_instance_id = initial
-        .node
-        .as_ref()
-        .map(|node| node.node_instance_id)
-        .ok_or(ControlStateError::DurableStateUnavailable)?;
+    let node_instance_id = initial.node.as_ref().map(|node| node.node_instance_id);
+    if require_published && node_instance_id.is_none() {
+        return Err(ControlStateError::DurableStateUnavailable);
+    }
     let snapshot = Arc::new(RwLock::new(initial));
     let healthy = Arc::new(AtomicBool::new(true));
     let (health_signal, _health_receiver) = watch::channel(true);
@@ -708,7 +1020,7 @@ pub(super) fn synthetic_queue_for_test(state: CommittedState) -> SyntheticQueue 
 fn run_worker(
     mut repository: ControlRepository,
     mut receiver: mpsc::Receiver<ControlCommand>,
-    node_instance_id: NodeInstanceId,
+    mut node_instance_id: Option<NodeInstanceId>,
     snapshot: Arc<RwLock<Arc<CommittedState>>>,
     healthy: Arc<AtomicBool>,
     health_signal: watch::Sender<bool>,
@@ -743,7 +1055,7 @@ fn run_worker(
         process_command(
             command,
             &mut repository,
-            node_instance_id,
+            &mut node_instance_id,
             &mut ids,
             WorkerPublication {
                 snapshot: &snapshot,
@@ -773,7 +1085,7 @@ fn run_worker(
             process_command(
                 ControlCommand::Observe { transition, reply },
                 &mut repository,
-                node_instance_id,
+                &mut node_instance_id,
                 &mut ids,
                 WorkerPublication {
                     snapshot: &snapshot,
@@ -801,22 +1113,49 @@ struct WorkerPublication<'a> {
 fn process_command(
     command: ControlCommand,
     repository: &mut ControlRepository,
-    node_instance_id: NodeInstanceId,
+    node_instance_id: &mut Option<NodeInstanceId>,
     ids: &mut WorkerIds,
     mut publication: WorkerPublication<'_>,
 ) {
     match command {
-        ControlCommand::Admit { request, reply } => {
+        ControlCommand::PublishInstance {
+            publication: requested,
+            reply,
+        } => {
+            if node_instance_id.is_some() {
+                let _ = reply.send(Err(ControlStateError::DurableStateUnavailable));
+                return;
+            }
+            let published_instance = requested.node_instance_id;
             let result = map_transition_result(
-                repository.admit(node_instance_id, request, now_unix_ms(), ids),
+                repository.publish_instance(requested, ids),
+                publication.healthy,
+                publication.health_signal,
+            );
+            if result.is_ok() {
+                *node_instance_id = Some(published_instance);
+            }
+            finish_commit(repository, result, reply, &mut publication, false);
+        }
+        ControlCommand::Admit { request, reply } => {
+            let Some(instance) = *node_instance_id else {
+                let _ = reply.send(Err(ControlStateError::DurableStateUnavailable));
+                return;
+            };
+            let result = map_transition_result(
+                repository.admit(instance, request, now_unix_ms(), ids),
                 publication.healthy,
                 publication.health_signal,
             );
             finish_commit(repository, result, reply, &mut publication, false);
         }
         ControlCommand::Observe { transition, reply } => {
+            let Some(instance) = *node_instance_id else {
+                let _ = reply.send(Err(ControlStateError::DurableStateUnavailable));
+                return;
+            };
             let result = map_transition_result(
-                repository.observe(node_instance_id, transition, now_unix_ms(), ids),
+                repository.observe(instance, transition, now_unix_ms(), ids),
                 publication.healthy,
                 publication.health_signal,
             );
@@ -865,8 +1204,12 @@ fn process_command(
         ControlCommand::Noop => {}
         #[cfg(test)]
         ControlCommand::AdmitWithSnapshotFailure { request, reply } => {
+            let Some(instance) = *node_instance_id else {
+                let _ = reply.send(Err(ControlStateError::DurableStateUnavailable));
+                return;
+            };
             let result = map_transition_result(
-                repository.admit(node_instance_id, request, now_unix_ms(), ids),
+                repository.admit(instance, request, now_unix_ms(), ids),
                 publication.healthy,
                 publication.health_signal,
             );
@@ -878,8 +1221,12 @@ fn process_command(
             entered,
             release,
         } => {
+            let Some(instance) = *node_instance_id else {
+                let _ = entered.send(());
+                return;
+            };
             let result = map_transition_result(
-                repository.admit(node_instance_id, request, now_unix_ms(), ids),
+                repository.admit(instance, request, now_unix_ms(), ids),
                 publication.healthy,
                 publication.health_signal,
             );
@@ -894,8 +1241,12 @@ fn process_command(
             transition,
             committed,
         } => {
+            let Some(instance) = *node_instance_id else {
+                let _ = committed.send(());
+                return;
+            };
             let result = map_transition_result(
-                repository.observe(node_instance_id, transition, now_unix_ms(), ids),
+                repository.observe(instance, transition, now_unix_ms(), ids),
                 publication.healthy,
                 publication.health_signal,
             );

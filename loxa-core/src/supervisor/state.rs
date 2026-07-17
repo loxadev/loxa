@@ -82,6 +82,64 @@ pub enum RuntimeStateRead {
     Corrupt(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScalarCaptureMode {
+    FirstMigration,
+    ExistingDatabase,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManagedScalarProvenance {
+    pub schema_version: u32,
+    pub run_id: String,
+    pub owner_pid: u32,
+    pub owner_process_start_time_unix_s: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ManagedScalarSource {
+    Fresh,
+    PriorDeadChildlessModelFreeUnloadedV4(ManagedScalarProvenance),
+    ExistingDatabase,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManagedOwnerAcquisition {
+    pub claimed_run: ManagedRun,
+    pub scalar_source: ManagedScalarSource,
+    pub recovery_source: ManagedRecoverySource,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManagedRecoverySource {
+    claimed_run: ManagedRun,
+    kind: ManagedRecoveryKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ManagedRecoveryKind {
+    ExactAbsent,
+    Unavailable,
+    PriorRun(ManagedRun),
+}
+
+impl ManagedRecoverySource {
+    pub fn is_exact_absent(&self) -> bool {
+        matches!(self.kind, ManagedRecoveryKind::ExactAbsent)
+    }
+
+    pub fn is_exact_absent_for(&self, claimed_run: &ManagedRun) -> bool {
+        self.claimed_run == *claimed_run && self.is_exact_absent()
+    }
+
+    pub fn prior_run(&self) -> Option<&ManagedRun> {
+        match &self.kind {
+            ManagedRecoveryKind::ExactAbsent | ManagedRecoveryKind::Unavailable => None,
+            ManagedRecoveryKind::PriorRun(run) => Some(run),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum StopRequestMatch {
     NoMatch,
@@ -209,7 +267,7 @@ pub fn read_runtime_state(path: &Path) -> Result<RuntimeStateRead, SupervisorErr
 }
 
 pub(super) fn write_runtime_state(path: &Path, runs: &[ManagedRun]) -> Result<(), SupervisorError> {
-    write_runtime_state_with_hook(path, runs, |_| Ok(()))
+    write_runtime_state_with_hooks(path, runs, |_| Ok(()), |_| Ok(()))
 }
 
 fn write_runtime_state_with_hook<F>(
@@ -219,6 +277,19 @@ fn write_runtime_state_with_hook<F>(
 ) -> Result<(), SupervisorError>
 where
     F: FnOnce(&Path) -> io::Result<()>,
+{
+    write_runtime_state_with_hooks(path, runs, before_rename, |_| Ok(()))
+}
+
+fn write_runtime_state_with_hooks<F, G>(
+    path: &Path,
+    runs: &[ManagedRun],
+    before_rename: F,
+    after_rename_before_parent_sync: G,
+) -> Result<(), SupervisorError>
+where
+    F: FnOnce(&Path) -> io::Result<()>,
+    G: FnOnce(&Path) -> io::Result<()>,
 {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -255,6 +326,7 @@ where
         before_rename(&temp_path)?;
         drop(file);
         fs::rename(&temp_path, path)?;
+        after_rename_before_parent_sync(path)?;
         #[cfg(unix)]
         if let Some(parent) = path.parent() {
             File::open(parent)?.sync_all()?;
@@ -288,6 +360,224 @@ pub fn create_unloaded_node_owner(
 ) -> Result<ManagedRun, SupervisorError> {
     create_unloaded_node_owner_with_probe(path, run, |pid, expected_start| {
         super::OwnerIdentityProbe::probe(&super::SystemOwnerIdentityProbe, pid, expected_start)
+    })
+}
+
+/// Atomically captures the only admissible scalar migration source and claims
+/// the replacement node owner while the managed-state lock remains held.
+///
+/// The returned source is the caller's complete migration input. Callers must
+/// not re-read `managed.json` after this function returns to infer old truth.
+pub fn acquire_managed_owner(
+    path: &Path,
+    candidate: ManagedRun,
+    mode: ScalarCaptureMode,
+) -> Result<ManagedOwnerAcquisition, SupervisorError> {
+    acquire_managed_owner_with_probe(path, candidate, mode, |pid, expected_start| {
+        super::OwnerIdentityProbe::probe(&super::SystemOwnerIdentityProbe, pid, expected_start)
+    })
+}
+
+fn acquire_managed_owner_with_probe<F>(
+    path: &Path,
+    candidate: ManagedRun,
+    mode: ScalarCaptureMode,
+    owner_probe: F,
+) -> Result<ManagedOwnerAcquisition, SupervisorError>
+where
+    F: FnMut(u32, u64) -> super::OwnerIdentityStatus,
+{
+    acquire_managed_owner_with_probe_and_hook(path, candidate, mode, owner_probe, |_| Ok(()))
+}
+
+fn acquire_managed_owner_with_probe_and_hook<F, H>(
+    path: &Path,
+    candidate: ManagedRun,
+    mode: ScalarCaptureMode,
+    owner_probe: F,
+    before_rename: H,
+) -> Result<ManagedOwnerAcquisition, SupervisorError>
+where
+    F: FnMut(u32, u64) -> super::OwnerIdentityStatus,
+    H: FnOnce(&Path) -> io::Result<()>,
+{
+    acquire_managed_owner_with_probe_and_hooks(
+        path,
+        candidate,
+        mode,
+        owner_probe,
+        before_rename,
+        |_| Ok(()),
+    )
+}
+
+fn acquire_managed_owner_with_probe_and_hooks<F, H, J>(
+    path: &Path,
+    candidate: ManagedRun,
+    mode: ScalarCaptureMode,
+    mut owner_probe: F,
+    before_rename: H,
+    after_rename_before_parent_sync: J,
+) -> Result<ManagedOwnerAcquisition, SupervisorError>
+where
+    F: FnMut(u32, u64) -> super::OwnerIdentityStatus,
+    H: FnOnce(&Path) -> io::Result<()>,
+    J: FnOnce(&Path) -> io::Result<()>,
+{
+    validate_runtime_run(&candidate).map_err(SupervisorError::RunStateConflict)?;
+    if candidate.model_id.is_some()
+        || candidate.lifecycle != RunLifecycle::Unloaded
+        || candidate.stop_requested
+        || candidate.generation != 0
+        || candidate.control_port.is_none()
+        || candidate.child_pid.is_some()
+        || candidate.child_process_start_time_unix_s.is_some()
+        || candidate.child_pgid.is_some()
+    {
+        return Err(SupervisorError::RunStateConflict(
+            "candidate node owner must be initial, unloaded, childless, and model-free".into(),
+        ));
+    }
+
+    let _lock = acquire_runtime_state_lock_for_mutation(
+        path,
+        Duration::MAX,
+        RUNTIME_STATE_LOCK_POLL_INTERVAL,
+    )?;
+    if let Ok(bytes) = fs::read(path) {
+        if !bytes.iter().all(u8::is_ascii_whitespace) {
+            let envelope: RuntimeStateEnvelope = serde_json::from_slice(&bytes).map_err(|_| {
+                SupervisorError::RunStateConflict(
+                    "first migration requires exact managed schema v4 state".into(),
+                )
+            })?;
+            if envelope.schema_version != RUNTIME_STATE_SCHEMA_VERSION
+                || envelope
+                    .runs
+                    .iter()
+                    .any(|run| run.schema_version != RUNTIME_STATE_SCHEMA_VERSION)
+            {
+                return Err(SupervisorError::RunStateConflict(
+                    "first migration requires exact managed schema v4 state".into(),
+                ));
+            }
+        }
+    }
+    let (claimed_run, source, recovery_kind) = match read_runtime_state(path)? {
+        RuntimeStateRead::Missing => match mode {
+            ScalarCaptureMode::FirstMigration => (
+                candidate.clone(),
+                ManagedScalarSource::Fresh,
+                ManagedRecoveryKind::ExactAbsent,
+            ),
+            ScalarCaptureMode::ExistingDatabase => {
+                let mut recovery_claim = candidate.clone();
+                recovery_claim.lifecycle = RunLifecycle::RecoveryRequired;
+                (
+                    recovery_claim,
+                    ManagedScalarSource::ExistingDatabase,
+                    ManagedRecoveryKind::Unavailable,
+                )
+            }
+        },
+        RuntimeStateRead::Loaded(runs) if runs.is_empty() => (
+            candidate.clone(),
+            match mode {
+                ScalarCaptureMode::FirstMigration => ManagedScalarSource::Fresh,
+                ScalarCaptureMode::ExistingDatabase => ManagedScalarSource::ExistingDatabase,
+            },
+            ManagedRecoveryKind::ExactAbsent,
+        ),
+        RuntimeStateRead::Loaded(runs) if runs.len() == 1 => {
+            let existing = &runs[0];
+            let exact_unloaded_absence = existing.schema_version == RUNTIME_STATE_SCHEMA_VERSION
+                && existing.model_id.is_none()
+                && existing.lifecycle == RunLifecycle::Unloaded
+                && !existing.stop_requested
+                && existing.child_pid.is_none()
+                && existing.child_process_start_time_unix_s.is_none()
+                && existing.child_pgid.is_none();
+            let owner_status =
+                owner_probe(existing.owner_pid, existing.owner_process_start_time_unix_s);
+            match mode {
+                ScalarCaptureMode::FirstMigration => {
+                    if !exact_unloaded_absence || owner_status != super::OwnerIdentityStatus::Dead {
+                        return Err(SupervisorError::RecoveryRequired(existing.run_id.clone()));
+                    }
+                    (
+                        candidate.clone(),
+                        ManagedScalarSource::PriorDeadChildlessModelFreeUnloadedV4(
+                            ManagedScalarProvenance {
+                                schema_version: existing.schema_version,
+                                run_id: existing.run_id.clone(),
+                                owner_pid: existing.owner_pid,
+                                owner_process_start_time_unix_s: existing
+                                    .owner_process_start_time_unix_s,
+                            },
+                        ),
+                        ManagedRecoveryKind::ExactAbsent,
+                    )
+                }
+                ScalarCaptureMode::ExistingDatabase => match owner_status {
+                    super::OwnerIdentityStatus::Live => {
+                        return Err(SupervisorError::ActiveRun(existing.run_id.clone()))
+                    }
+                    super::OwnerIdentityStatus::Unavailable
+                    | super::OwnerIdentityStatus::Mismatched => {
+                        return Err(SupervisorError::RecoveryRequired(existing.run_id.clone()))
+                    }
+                    super::OwnerIdentityStatus::Dead if exact_unloaded_absence => (
+                        candidate.clone(),
+                        ManagedScalarSource::ExistingDatabase,
+                        ManagedRecoveryKind::ExactAbsent,
+                    ),
+                    super::OwnerIdentityStatus::Dead => {
+                        let mut recovery_claim = existing.clone();
+                        recovery_claim.run_id = candidate.run_id.clone();
+                        recovery_claim.owner_pid = candidate.owner_pid;
+                        recovery_claim.owner_process_start_time_unix_s =
+                            candidate.owner_process_start_time_unix_s;
+                        recovery_claim.control_port = candidate.control_port;
+                        recovery_claim.lifecycle = RunLifecycle::RecoveryRequired;
+                        (
+                            recovery_claim,
+                            ManagedScalarSource::ExistingDatabase,
+                            ManagedRecoveryKind::PriorRun(existing.clone()),
+                        )
+                    }
+                },
+            }
+        }
+        RuntimeStateRead::Loaded(runs) => {
+            return Err(SupervisorError::RunStateConflict(format!(
+                "managed state contains {} runs",
+                runs.len()
+            )))
+        }
+        RuntimeStateRead::Legacy(legacy_path) => {
+            return Err(SupervisorError::LegacyRuntimeState(legacy_path))
+        }
+        RuntimeStateRead::Corrupt(message) => {
+            return Err(SupervisorError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("managed sidecar state is corrupt: {message}"),
+            )))
+        }
+    };
+    write_runtime_state_with_hooks(
+        path,
+        std::slice::from_ref(&claimed_run),
+        before_rename,
+        after_rename_before_parent_sync,
+    )?;
+    let recovery_source = ManagedRecoverySource {
+        claimed_run: claimed_run.clone(),
+        kind: recovery_kind,
+    };
+    Ok(ManagedOwnerAcquisition {
+        claimed_run,
+        scalar_source: source,
+        recovery_source,
     })
 }
 
@@ -452,13 +742,37 @@ where
 fn update_runtime_state_run_committed_with_lock_options_and_hook<F>(
     path: &Path,
     expected: &ManagedRunIdentity,
-    mut updated: ManagedRun,
+    updated: ManagedRun,
     timeout: Duration,
     interval: Duration,
     before_rename: F,
 ) -> Result<Option<ManagedRun>, SupervisorError>
 where
     F: FnOnce(&Path) -> io::Result<()>,
+{
+    update_runtime_state_run_committed_with_lock_options_and_hooks(
+        path,
+        expected,
+        updated,
+        timeout,
+        interval,
+        before_rename,
+        |_| Ok(()),
+    )
+}
+
+fn update_runtime_state_run_committed_with_lock_options_and_hooks<F, G>(
+    path: &Path,
+    expected: &ManagedRunIdentity,
+    mut updated: ManagedRun,
+    timeout: Duration,
+    interval: Duration,
+    before_rename: F,
+    after_rename_before_parent_sync: G,
+) -> Result<Option<ManagedRun>, SupervisorError>
+where
+    F: FnOnce(&Path) -> io::Result<()>,
+    G: FnOnce(&Path) -> io::Result<()>,
 {
     validate_runtime_run(&updated).map_err(SupervisorError::RunStateConflict)?;
     let _lock = acquire_runtime_state_lock_for_mutation(path, timeout, interval)?;
@@ -484,7 +798,7 @@ where
 
     updated.stop_requested |= current.stop_requested;
     runs[0] = updated.clone();
-    write_runtime_state_with_hook(path, &runs, before_rename)?;
+    write_runtime_state_with_hooks(path, &runs, before_rename, after_rename_before_parent_sync)?;
     Ok(Some(updated))
 }
 
@@ -1081,6 +1395,463 @@ mod tests {
             read_runtime_state(&state_path).unwrap(),
             RuntimeStateRead::Corrupt(message) if message.contains("invalid legacy")
         ));
+    }
+
+    #[test]
+    fn managed_owner_capture_accepts_missing_as_fresh_and_claims_candidate_atomically() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let candidate = unloaded_node_owner(temp.path(), "candidate");
+        let acquired = acquire_managed_owner_with_probe(
+            &state_path,
+            candidate.clone(),
+            ScalarCaptureMode::FirstMigration,
+            |_, _| panic!("missing state must not probe an owner"),
+        )
+        .expect("capture fresh migration source");
+        assert_eq!(acquired.claimed_run, candidate);
+        assert_eq!(acquired.scalar_source, ManagedScalarSource::Fresh);
+        assert!(acquired.recovery_source.is_exact_absent());
+        assert_eq!(
+            read_runtime_state(&state_path).unwrap(),
+            RuntimeStateRead::Loaded(vec![candidate])
+        );
+    }
+
+    #[test]
+    fn existing_database_missing_or_whitespace_state_remains_recovery_required_across_reacquisition(
+    ) {
+        for (label, seed_whitespace) in [("missing", false), ("whitespace", true)] {
+            let temp = tempdir().expect("tempdir");
+            let state_path = temp.path().join("managed.json");
+            if seed_whitespace {
+                fs::write(&state_path, b" \n\t").unwrap();
+            }
+            let first = acquire_managed_owner_with_probe(
+                &state_path,
+                unloaded_node_owner(temp.path(), &format!("first-{label}")),
+                ScalarCaptureMode::ExistingDatabase,
+                |_, _| panic!("missing state must not probe an owner"),
+            )
+            .unwrap();
+            assert_eq!(first.claimed_run.lifecycle, RunLifecycle::RecoveryRequired);
+            assert!(!first
+                .recovery_source
+                .is_exact_absent_for(&first.claimed_run));
+
+            let second = acquire_managed_owner_with_probe(
+                &state_path,
+                unloaded_node_owner(temp.path(), &format!("second-{label}")),
+                ScalarCaptureMode::ExistingDatabase,
+                |pid, start| {
+                    assert_eq!(
+                        (pid, start),
+                        (
+                            first.claimed_run.owner_pid,
+                            first.claimed_run.owner_process_start_time_unix_s
+                        )
+                    );
+                    OwnerIdentityStatus::Dead
+                },
+            )
+            .unwrap();
+            assert_eq!(second.claimed_run.lifecycle, RunLifecycle::RecoveryRequired);
+            assert_eq!(second.recovery_source.prior_run(), Some(&first.claimed_run));
+            assert!(!second
+                .recovery_source
+                .is_exact_absent_for(&second.claimed_run));
+        }
+    }
+
+    #[test]
+    fn managed_owner_capture_accepts_exact_dead_childless_unloaded_v4_with_provenance() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let prior = unloaded_node_owner(temp.path(), "prior");
+        write_runtime_state(&state_path, std::slice::from_ref(&prior)).unwrap();
+        let candidate = unloaded_node_owner(temp.path(), "candidate");
+        let acquired = acquire_managed_owner_with_probe(
+            &state_path,
+            candidate.clone(),
+            ScalarCaptureMode::FirstMigration,
+            |pid, start| {
+                assert_eq!(
+                    (pid, start),
+                    (prior.owner_pid, prior.owner_process_start_time_unix_s)
+                );
+                OwnerIdentityStatus::Dead
+            },
+        )
+        .expect("capture exact prior scalar source");
+        assert_eq!(
+            acquired.scalar_source,
+            ManagedScalarSource::PriorDeadChildlessModelFreeUnloadedV4(ManagedScalarProvenance {
+                schema_version: RUNTIME_STATE_SCHEMA_VERSION,
+                run_id: prior.run_id,
+                owner_pid: prior.owner_pid,
+                owner_process_start_time_unix_s: prior.owner_process_start_time_unix_s,
+            })
+        );
+        assert!(acquired.recovery_source.is_exact_absent());
+        assert_eq!(
+            read_runtime_state(&state_path).unwrap(),
+            RuntimeStateRead::Loaded(vec![candidate])
+        );
+    }
+
+    #[test]
+    fn managed_owner_capture_rejects_live_or_unsafe_prior_state_before_replacement() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let prior = unloaded_node_owner(temp.path(), "prior");
+        write_runtime_state(&state_path, std::slice::from_ref(&prior)).unwrap();
+        let candidate = unloaded_node_owner(temp.path(), "candidate");
+        assert!(matches!(
+            acquire_managed_owner_with_probe(
+                &state_path,
+                candidate,
+                ScalarCaptureMode::FirstMigration,
+                |_, _| OwnerIdentityStatus::Live,
+            ),
+            Err(SupervisorError::RecoveryRequired(_))
+        ));
+        assert_eq!(
+            read_runtime_state(&state_path).unwrap(),
+            RuntimeStateRead::Loaded(vec![prior])
+        );
+    }
+
+    #[test]
+    fn managed_owner_capture_rejects_pre_v4_state_instead_of_using_read_time_upgrade() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let prior = unloaded_node_owner(temp.path(), "prior");
+        write_runtime_state(&state_path, std::slice::from_ref(&prior)).unwrap();
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        json["schema_version"] = serde_json::json!(3);
+        json["runs"][0]["schema_version"] = serde_json::json!(3);
+        fs::write(&state_path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+        let before = fs::read(&state_path).unwrap();
+        let candidate = unloaded_node_owner(temp.path(), "candidate");
+        assert!(matches!(
+            acquire_managed_owner_with_probe(
+                &state_path,
+                candidate,
+                ScalarCaptureMode::FirstMigration,
+                |_, _| OwnerIdentityStatus::Dead,
+            ),
+            Err(SupervisorError::RunStateConflict(_))
+        ));
+        assert_eq!(fs::read(&state_path).unwrap(), before);
+    }
+
+    #[test]
+    fn existing_database_capture_defers_dead_prior_runtime_shapes_to_recovery() {
+        for (label, mutate) in [
+            ("model", 0_u8),
+            ("child", 1_u8),
+            ("starting", 2_u8),
+            ("recovery", 3_u8),
+        ] {
+            let temp = tempdir().expect("tempdir");
+            let state_path = temp.path().join("managed.json");
+            let mut prior = unloaded_node_owner(temp.path(), &format!("prior-{label}"));
+            match mutate {
+                0 => {
+                    prior.model_id = Some("model".into());
+                    prior.lifecycle = RunLifecycle::Running;
+                }
+                1 => {
+                    prior.model_id = Some("model".into());
+                    prior.lifecycle = RunLifecycle::Running;
+                    prior.port = 9_001;
+                    prior.child_pid = Some(77);
+                    prior.child_process_start_time_unix_s = Some(88);
+                    prior.child_pgid = Some(77);
+                }
+                2 => prior.lifecycle = RunLifecycle::Starting,
+                3 => prior.lifecycle = RunLifecycle::RecoveryRequired,
+                _ => unreachable!(),
+            }
+            write_runtime_state(&state_path, std::slice::from_ref(&prior)).unwrap();
+            let candidate = unloaded_node_owner(temp.path(), "candidate");
+            let acquired = acquire_managed_owner_with_probe(
+                &state_path,
+                candidate.clone(),
+                ScalarCaptureMode::ExistingDatabase,
+                |_, _| OwnerIdentityStatus::Dead,
+            )
+            .expect("dead prior runtime shape is handled by database recovery");
+            assert_ne!(acquired.claimed_run, candidate);
+            assert_eq!(acquired.claimed_run.run_id, candidate.run_id);
+            assert_eq!(acquired.claimed_run.owner_pid, candidate.owner_pid);
+            assert_eq!(
+                acquired.claimed_run.owner_process_start_time_unix_s,
+                candidate.owner_process_start_time_unix_s
+            );
+            assert_eq!(
+                acquired.claimed_run.lifecycle,
+                RunLifecycle::RecoveryRequired
+            );
+            assert_eq!(acquired.claimed_run.model_id, prior.model_id);
+            assert_eq!(acquired.claimed_run.child_pid, prior.child_pid);
+            assert_eq!(
+                read_runtime_state(&state_path).unwrap(),
+                RuntimeStateRead::Loaded(vec![acquired.claimed_run.clone()])
+            );
+            assert_eq!(
+                acquired.scalar_source,
+                ManagedScalarSource::ExistingDatabase
+            );
+            assert_eq!(acquired.recovery_source.prior_run(), Some(&prior));
+
+            let next_candidate = unloaded_node_owner(temp.path(), "next-candidate");
+            let reacquired = acquire_managed_owner_with_probe(
+                &state_path,
+                next_candidate.clone(),
+                ScalarCaptureMode::ExistingDatabase,
+                |_, _| OwnerIdentityStatus::Dead,
+            )
+            .expect("a crash before recovery must preserve durable prior evidence");
+            assert_eq!(reacquired.claimed_run.run_id, next_candidate.run_id);
+            assert_eq!(
+                reacquired.claimed_run.model_id,
+                acquired.claimed_run.model_id
+            );
+            assert_eq!(
+                reacquired.claimed_run.child_pid,
+                acquired.claimed_run.child_pid
+            );
+            assert_eq!(
+                reacquired.recovery_source.prior_run(),
+                Some(&acquired.claimed_run)
+            );
+        }
+    }
+
+    #[test]
+    fn existing_database_capture_still_refuses_a_live_prior_owner() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let mut prior = unloaded_node_owner(temp.path(), "prior-live");
+        prior.model_id = Some("model".into());
+        prior.lifecycle = RunLifecycle::Running;
+        write_runtime_state(&state_path, std::slice::from_ref(&prior)).unwrap();
+        let before = fs::read(&state_path).unwrap();
+        assert!(matches!(
+            acquire_managed_owner_with_probe(
+                &state_path,
+                unloaded_node_owner(temp.path(), "candidate"),
+                ScalarCaptureMode::ExistingDatabase,
+                |_, _| OwnerIdentityStatus::Live,
+            ),
+            Err(SupervisorError::ActiveRun(_))
+        ));
+        assert_eq!(fs::read(&state_path).unwrap(), before);
+    }
+
+    #[test]
+    fn existing_database_recovery_claim_failure_preserves_prior_durable_identity() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let mut prior = unloaded_node_owner(temp.path(), "prior-child");
+        prior.model_id = Some("model".into());
+        prior.lifecycle = RunLifecycle::Running;
+        prior.port = 9_001;
+        prior.child_pid = Some(77);
+        prior.child_process_start_time_unix_s = Some(88);
+        prior.child_pgid = Some(77);
+        write_runtime_state(&state_path, std::slice::from_ref(&prior)).unwrap();
+
+        let error = acquire_managed_owner_with_probe_and_hook(
+            &state_path,
+            unloaded_node_owner(temp.path(), "candidate"),
+            ScalarCaptureMode::ExistingDatabase,
+            |_, _| OwnerIdentityStatus::Dead,
+            |_| Err(io::Error::other("fault before recovery-claim rename")),
+        )
+        .unwrap_err();
+        assert!(matches!(error, SupervisorError::Io(_)));
+        assert_eq!(
+            read_runtime_state(&state_path).unwrap(),
+            RuntimeStateRead::Loaded(vec![prior])
+        );
+    }
+
+    #[test]
+    fn postrename_recovery_claim_error_leaves_a_reacquirable_recovery_lineage() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let mut prior = unloaded_node_owner(temp.path(), "prior-child-postrename");
+        prior.model_id = Some("model".into());
+        prior.lifecycle = RunLifecycle::Running;
+        prior.port = 9_001;
+        prior.child_pid = Some(77);
+        prior.child_process_start_time_unix_s = Some(88);
+        prior.child_pgid = Some(77);
+        write_runtime_state(&state_path, std::slice::from_ref(&prior)).unwrap();
+
+        let error = acquire_managed_owner_with_probe_and_hooks(
+            &state_path,
+            unloaded_node_owner(temp.path(), "candidate-postrename"),
+            ScalarCaptureMode::ExistingDatabase,
+            |_, _| OwnerIdentityStatus::Dead,
+            |_| Ok(()),
+            |_| Err(io::Error::other("fault after recovery-claim rename")),
+        )
+        .unwrap_err();
+        assert!(matches!(error, SupervisorError::Io(_)));
+        let RuntimeStateRead::Loaded(current) = read_runtime_state(&state_path).unwrap() else {
+            panic!("post-rename image must be readable")
+        };
+        let [visible_claim] = current.as_slice() else {
+            panic!("one recovery claim must remain")
+        };
+        assert_eq!(visible_claim.lifecycle, RunLifecycle::RecoveryRequired);
+        assert_eq!(visible_claim.child_pid, prior.child_pid);
+
+        let reacquired = acquire_managed_owner_with_probe(
+            &state_path,
+            unloaded_node_owner(temp.path(), "next-postrename"),
+            ScalarCaptureMode::ExistingDatabase,
+            |_, _| OwnerIdentityStatus::Dead,
+        )
+        .unwrap();
+        assert_eq!(reacquired.recovery_source.prior_run(), Some(visible_claim));
+        assert_eq!(reacquired.claimed_run.child_pid, prior.child_pid);
+        assert_eq!(
+            reacquired.claimed_run.lifecycle,
+            RunLifecycle::RecoveryRequired
+        );
+    }
+
+    #[test]
+    fn recovery_cleanup_commit_is_atomic_and_becomes_exact_absence_only_after_commit() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let mut prior = unloaded_node_owner(temp.path(), "prior-child");
+        prior.model_id = Some("model".into());
+        prior.lifecycle = RunLifecycle::Running;
+        prior.port = 9_001;
+        prior.child_pid = Some(77);
+        prior.child_process_start_time_unix_s = Some(88);
+        prior.child_pgid = Some(77);
+        write_runtime_state(&state_path, std::slice::from_ref(&prior)).unwrap();
+        let acquired = acquire_managed_owner_with_probe(
+            &state_path,
+            unloaded_node_owner(temp.path(), "candidate"),
+            ScalarCaptureMode::ExistingDatabase,
+            |_, _| OwnerIdentityStatus::Dead,
+        )
+        .unwrap();
+        let recovery_claim = acquired.claimed_run;
+        let mut cleaned = recovery_claim.clone();
+        cleaned.model_id = None;
+        cleaned.lifecycle = RunLifecycle::Unloaded;
+        cleaned.port = cleaned.control_port.unwrap();
+        cleaned.child_pid = None;
+        cleaned.child_process_start_time_unix_s = None;
+        cleaned.child_pgid = None;
+
+        let error = update_runtime_state_run_committed_with_lock_options_and_hook(
+            &state_path,
+            &recovery_claim.identity(),
+            cleaned.clone(),
+            RUNTIME_STATE_LOCK_TIMEOUT,
+            RUNTIME_STATE_LOCK_POLL_INTERVAL,
+            |_| Err(io::Error::other("fault before cleanup rename")),
+        )
+        .unwrap_err();
+        assert!(matches!(error, SupervisorError::Io(_)));
+        assert_eq!(
+            read_runtime_state(&state_path).unwrap(),
+            RuntimeStateRead::Loaded(vec![recovery_claim.clone()])
+        );
+
+        let cleaned =
+            update_runtime_state_run_committed(&state_path, &recovery_claim.identity(), cleaned)
+                .unwrap()
+                .unwrap();
+        let reacquired = acquire_managed_owner_with_probe(
+            &state_path,
+            unloaded_node_owner(temp.path(), "next-candidate"),
+            ScalarCaptureMode::ExistingDatabase,
+            |pid, start| {
+                assert_eq!(
+                    (pid, start),
+                    (cleaned.owner_pid, cleaned.owner_process_start_time_unix_s)
+                );
+                OwnerIdentityStatus::Dead
+            },
+        )
+        .unwrap();
+        assert!(reacquired
+            .recovery_source
+            .is_exact_absent_for(&reacquired.claimed_run));
+        assert!(reacquired.recovery_source.prior_run().is_none());
+    }
+
+    #[test]
+    fn postrename_cleanup_error_is_classified_from_the_visible_durable_image_on_reacquisition() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let mut prior = unloaded_node_owner(temp.path(), "cleanup-postrename-prior");
+        prior.model_id = Some("model".into());
+        prior.lifecycle = RunLifecycle::Running;
+        prior.port = 9_001;
+        prior.child_pid = Some(77);
+        prior.child_process_start_time_unix_s = Some(88);
+        prior.child_pgid = Some(77);
+        write_runtime_state(&state_path, std::slice::from_ref(&prior)).unwrap();
+        let acquired = acquire_managed_owner_with_probe(
+            &state_path,
+            unloaded_node_owner(temp.path(), "cleanup-postrename-claim"),
+            ScalarCaptureMode::ExistingDatabase,
+            |_, _| OwnerIdentityStatus::Dead,
+        )
+        .unwrap();
+        let recovery_claim = acquired.claimed_run;
+        let mut cleaned = recovery_claim.clone();
+        cleaned.model_id = None;
+        cleaned.lifecycle = RunLifecycle::Unloaded;
+        cleaned.port = cleaned.control_port.unwrap();
+        cleaned.child_pid = None;
+        cleaned.child_process_start_time_unix_s = None;
+        cleaned.child_pgid = None;
+
+        let error = update_runtime_state_run_committed_with_lock_options_and_hooks(
+            &state_path,
+            &recovery_claim.identity(),
+            cleaned.clone(),
+            RUNTIME_STATE_LOCK_TIMEOUT,
+            RUNTIME_STATE_LOCK_POLL_INTERVAL,
+            |_| Ok(()),
+            |_| Err(io::Error::other("fault after cleanup rename")),
+        )
+        .unwrap_err();
+        assert!(matches!(error, SupervisorError::Io(_)));
+        assert_eq!(
+            read_runtime_state(&state_path).unwrap(),
+            RuntimeStateRead::Loaded(vec![cleaned.clone()])
+        );
+
+        let reacquired = acquire_managed_owner_with_probe(
+            &state_path,
+            unloaded_node_owner(temp.path(), "cleanup-postrename-next"),
+            ScalarCaptureMode::ExistingDatabase,
+            |pid, start| {
+                assert_eq!(
+                    (pid, start),
+                    (cleaned.owner_pid, cleaned.owner_process_start_time_unix_s)
+                );
+                OwnerIdentityStatus::Dead
+            },
+        )
+        .unwrap();
+        assert!(reacquired
+            .recovery_source
+            .is_exact_absent_for(&reacquired.claimed_run));
     }
 
     #[test]

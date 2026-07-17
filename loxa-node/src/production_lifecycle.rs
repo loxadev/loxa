@@ -1,7 +1,8 @@
 use crate::engine_session::EngineSession;
 use crate::model_lifecycle::{
     EngineLifecycleDriver, ExactSessionStatus, GatewayPublisher, LaunchPlan, LifecycleError,
-    LifecycleSignals, SessionCorrelation, StableNodeOwner, StartedSession,
+    LifecycleSignals, ModelLifecycle, NodeLifecycleStatus, SessionCorrelation, StableNodeOwner,
+    StartedSession,
 };
 use loxa_core::diagnostics::DiagnosticsHealth;
 use loxa_core::engine::{EngineLaunchSpec, ReadinessStrategy};
@@ -16,6 +17,66 @@ pub(crate) struct ProductionEngineDriver {
     logs_dir: PathBuf,
     gateway_port: u16,
     diagnostics_health: DiagnosticsHealth,
+}
+
+type ProductionModelLifecycle = ModelLifecycle<ProductionEngineDriver, ProductionGatewayPublisher>;
+
+/// Opaque ownership of the exact production lifecycle and its child RAII session.
+pub(crate) struct OwnedLifecycleSession {
+    model_id: String,
+    lifecycle: Option<ProductionModelLifecycle>,
+}
+
+impl OwnedLifecycleSession {
+    pub(crate) fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    #[allow(dead_code)] // Task 7 transfers the sealed authority into NodeRuntime.
+    pub(crate) fn into_lifecycle(mut self) -> ProductionModelLifecycle {
+        self.lifecycle
+            .take()
+            .expect("owned lifecycle session retains authority")
+    }
+}
+
+impl Drop for OwnedLifecycleSession {
+    fn drop(&mut self) {
+        if let Some(mut lifecycle) = self.lifecycle.take() {
+            let _ = lifecycle.shutdown();
+        }
+    }
+}
+
+pub(crate) struct ProvenReady {
+    model_id: String,
+}
+
+impl ProvenReady {
+    pub(crate) fn model_id(&self) -> &str {
+        &self.model_id
+    }
+}
+
+#[allow(dead_code)] // Task 7 calls this only when it owns a recovered ready lifecycle.
+pub(crate) fn seal_owned_ready_lifecycle(
+    lifecycle: ProductionModelLifecycle,
+) -> Result<(OwnedLifecycleSession, ProvenReady), LifecycleError> {
+    let snapshot = lifecycle.snapshot();
+    let model_id = snapshot
+        .active_model_id
+        .filter(|_| snapshot.status == NodeLifecycleStatus::Ready)
+        .ok_or_else(|| LifecycleError::RecoveryRequired {
+            replacement: "lifecycle is not exactly ready".into(),
+            rollback: "ready ownership cannot be transferred".into(),
+        })?;
+    Ok((
+        OwnedLifecycleSession {
+            model_id: model_id.clone(),
+            lifecycle: Some(lifecycle),
+        },
+        ProvenReady { model_id },
+    ))
 }
 
 impl ProductionEngineDriver {
