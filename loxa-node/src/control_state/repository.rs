@@ -2883,7 +2883,10 @@ fn validate_family_guard(path: &Path, guard: &fs::File) -> Result<(), Repository
         .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsafePath))?;
     validate_file_metadata(&path_metadata)?;
     validate_file_metadata(&guard_metadata)?;
-    if file_identity(&path_metadata)? != file_identity(&guard_metadata)? {
+    if path_metadata.len() != 0
+        || guard_metadata.len() != 0
+        || file_identity(&path_metadata)? != file_identity(&guard_metadata)?
+    {
         return Err(RepositoryError::new(RepositoryErrorClass::UnsafePath));
     }
     Ok(())
@@ -5314,6 +5317,26 @@ mod tests {
         fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
         let error = repository.validate_all().unwrap_err();
         assert_eq!(error.class(), RepositoryErrorClass::UnsafePath);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonempty_family_lock_is_rejected_before_database_family_mutation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TestDirectory::new("nonempty-family-lock");
+        let path = directory.database();
+        let lock = super::family_lock_path(&path).unwrap();
+        fs::write(&lock, b"unexpected owner-lock bytes").unwrap();
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let error = ControlRepository::open_or_create(&path, node_id(), &mut CountingIds::fixed())
+            .unwrap_err();
+
+        assert_eq!(error.class(), RepositoryErrorClass::UnsafePath);
+        assert!(!path.exists());
+        assert_eq!(fs::read(&lock).unwrap(), b"unexpected owner-lock bytes");
+        assert_eq!(fs::metadata(&lock).unwrap().len(), 27);
     }
 
     #[cfg(unix)]
