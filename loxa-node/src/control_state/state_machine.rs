@@ -119,6 +119,35 @@ pub(crate) struct CommittedState {
     pub(crate) slot: V2Slot,
     pub(crate) operations: Vec<V2Operation>,
     pub(crate) events: Vec<V2ControlEvent>,
+    pub(crate) current_instance_v1: CurrentInstanceV1State,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CurrentInstanceV1State {
+    pub(crate) cursor: u64,
+    pub(crate) operations: Vec<CurrentInstanceV1Operation>,
+    pub(crate) events: Vec<CurrentInstanceV1Event>,
+}
+
+impl CurrentInstanceV1State {
+    pub(crate) fn cursor_gap(&self, requested: u64) -> bool {
+        self.events
+            .first()
+            .is_some_and(|event| requested.saturating_add(1) < event.sequence)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CurrentInstanceV1Operation {
+    pub(crate) v1_operation_id: String,
+    pub(crate) operation: V2Operation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CurrentInstanceV1Event {
+    pub(crate) sequence: u64,
+    pub(crate) v1_operation_id: String,
+    pub(crate) operation: V2Operation,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -709,9 +738,110 @@ impl ControlRepository {
                 .collect::<Result<Vec<_>, _>>()?;
             let events = payloads.into_iter().map(|payload| serde_json::from_str(&payload)
                 .map_err(|_| RepositoryError::corrupt_for_state_machine())).collect::<Result<Vec<_>, _>>()?;
-            Ok(CommittedState { revision: DecimalU64::new(revision), cursor: DecimalU64::new(cursor), node, slot, operations, events })
+            let current_instance_v1 = read_current_instance_v1(
+                connection,
+                node.as_ref().map(|node| node.node_instance_id),
+                node_id,
+                slot_id,
+            )?;
+            Ok(CommittedState { revision: DecimalU64::new(revision), cursor: DecimalU64::new(cursor), node, slot, operations, events, current_instance_v1 })
         })
     }
+}
+
+fn read_current_instance_v1(
+    connection: &rusqlite::Connection,
+    current_instance: Option<NodeInstanceId>,
+    node_id: loxa_protocol::NodeId,
+    slot_id: loxa_protocol::v2::SlotId,
+) -> Result<CurrentInstanceV1State, RepositoryError> {
+    let Some(current_instance) = current_instance else {
+        return Ok(CurrentInstanceV1State::default());
+    };
+    let instance = current_instance.to_string();
+    let mut operation_rows = connection.prepare(
+        "SELECT operation_id,v1_ordinal FROM operations WHERE admitting_node_instance_id=?1 AND v1_ordinal IS NOT NULL ORDER BY v1_ordinal,operation_id",
+    )?;
+    let operation_rows = operation_rows
+        .query_map([&instance], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut operations = Vec::with_capacity(operation_rows.len());
+    for (operation_id, ordinal) in operation_rows {
+        let operation_id = OperationId::from_str(&operation_id)
+            .map_err(|_| RepositoryError::corrupt_for_state_machine())?;
+        let ordinal = u64::try_from(ordinal)
+            .ok()
+            .filter(|ordinal| *ordinal > 0)
+            .ok_or_else(RepositoryError::corrupt_for_state_machine)?;
+        let operation = read_operation_connection(connection, node_id, slot_id, operation_id)?
+            .ok_or_else(RepositoryError::corrupt_for_state_machine)?;
+        operations.push(CurrentInstanceV1Operation {
+            v1_operation_id: format!("op-{ordinal}"),
+            operation,
+        });
+    }
+
+    let mut event_rows = connection.prepare(
+        "SELECT v1_sequence,payload_json FROM events WHERE node_instance_id=?1 AND v1_sequence IS NOT NULL ORDER BY v1_sequence DESC,event_id DESC",
+    )?;
+    let event_rows = event_rows
+        .query_map([&instance], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut events: Vec<CurrentInstanceV1Event> = Vec::with_capacity(event_rows.len().min(128));
+    for (sequence, payload) in event_rows {
+        let sequence = u64::try_from(sequence)
+            .ok()
+            .filter(|sequence| *sequence > 0)
+            .ok_or_else(RepositoryError::corrupt_for_state_machine)?;
+        let event: V2ControlEvent = serde_json::from_str(&payload)
+            .map_err(|_| RepositoryError::corrupt_for_state_machine())?;
+        if event.node_instance_id != Some(current_instance) {
+            return Err(RepositoryError::corrupt_for_state_machine());
+        }
+        let operation = event
+            .operation
+            .ok_or_else(RepositoryError::corrupt_for_state_machine)?;
+        let ordinal = connection
+            .query_row(
+                "SELECT v1_ordinal FROM operations WHERE operation_id=?1 AND admitting_node_instance_id=?2",
+                rusqlite::params![operation.operation_id.to_string(), &instance],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .and_then(|ordinal| u64::try_from(ordinal).ok())
+            .filter(|ordinal| *ordinal > 0);
+        let Some(ordinal) = ordinal else {
+            if events.is_empty() {
+                continue;
+            }
+            break;
+        };
+        if events
+            .last()
+            .is_some_and(|newer| sequence.checked_add(1) != Some(newer.sequence))
+        {
+            break;
+        }
+        events.push(CurrentInstanceV1Event {
+            sequence,
+            v1_operation_id: format!("op-{ordinal}"),
+            operation,
+        });
+        if events.len() == 128 {
+            break;
+        }
+    }
+    events.reverse();
+    let cursor = events.last().map_or(0, |event| event.sequence);
+    Ok(CurrentInstanceV1State {
+        cursor,
+        operations,
+        events,
+    })
 }
 
 fn apply_transition(

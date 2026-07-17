@@ -554,6 +554,104 @@ fn v1_operation_alias_is_prefixed_and_instance_scoped() {
 }
 
 #[test]
+fn committed_v1_projection_is_current_instance_only_and_survives_reopen() {
+    let mut machine = MachineFixture::new();
+    let old = machine.admit(download("old-instance")).unwrap();
+    machine
+        .observe(Transition::Started {
+            operation_id: old.operation_id,
+            progress: Some(zero_progress()),
+        })
+        .unwrap();
+
+    let replacement = NodeInstanceId::from_str("46666666-6666-4666-8666-666666666666").unwrap();
+    machine
+        .repository
+        .as_mut()
+        .unwrap()
+        .transaction(|tx| {
+            tx.execute(
+                "UPDATE node_state SET node_instance_id=?1 WHERE singleton=1",
+                [replacement.to_string()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let current = machine
+        .repository
+        .as_mut()
+        .unwrap()
+        .admit(
+            replacement,
+            download("current-instance"),
+            machine.now,
+            &mut machine.ids,
+        )
+        .unwrap();
+    assert_eq!(current.v1_operation_id, "op-1");
+
+    let before = machine.state().current_instance_v1;
+    assert_eq!(before.cursor, 1);
+    assert_eq!(before.operations.len(), 1);
+    assert_eq!(
+        before.operations[0].operation.operation_id,
+        current.operation_id
+    );
+    assert_eq!(before.operations[0].v1_operation_id, "op-1");
+    assert_eq!(before.events.len(), 1);
+    assert_eq!(before.events[0].sequence, 1);
+    assert_eq!(before.events[0].v1_operation_id, "op-1");
+    assert_eq!(
+        before.events[0].operation.operation_id,
+        current.operation_id
+    );
+    assert!(!before.cursor_gap(0));
+
+    machine.reopen();
+    assert_eq!(machine.state().current_instance_v1, before);
+}
+
+#[test]
+fn committed_v1_projection_retains_latest_128_ordered_events_with_gap_metadata() {
+    let mut machine = MachineFixture::new();
+    let admission = machine.admit(download("retained-v1-events")).unwrap();
+    machine
+        .observe(Transition::Started {
+            operation_id: admission.operation_id,
+            progress: Some(zero_progress()),
+        })
+        .unwrap();
+    for step in 1..=130_u64 {
+        machine.advance(501);
+        machine
+            .observe(Transition::Progress {
+                operation_id: admission.operation_id,
+                progress: V2OperationProgress {
+                    completed_bytes: DecimalU64::new(step * 1_048_576),
+                    total_bytes: None,
+                },
+            })
+            .unwrap();
+    }
+
+    let before = machine.state().current_instance_v1;
+    assert_eq!(before.cursor, 132);
+    assert_eq!(before.events.len(), 128);
+    assert_eq!(before.events.first().unwrap().sequence, 5);
+    assert_eq!(before.events.last().unwrap().sequence, 132);
+    assert!(before
+        .events
+        .windows(2)
+        .all(|pair| pair[0].sequence + 1 == pair[1].sequence));
+    assert!(before.cursor_gap(0));
+    assert!(!before.cursor_gap(4));
+    assert!(!before.cursor_gap(132));
+
+    machine.reopen();
+    assert_eq!(machine.state().current_instance_v1, before);
+}
+
+#[test]
 fn committed_state_decodes_all_five_capabilities_and_unpublished_is_none() {
     let path = std::env::temp_dir().join(format!(
         "loxa-unpublished-state-{}-{}.sqlite3",
