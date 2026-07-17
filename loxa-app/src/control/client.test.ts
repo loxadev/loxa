@@ -11,10 +11,48 @@ import {
   getNodeIdentityProof,
   getInventory,
   getOperation,
+  fetchV2NodeCollection,
+  fetchV2OperationCollection,
+  fetchV2OperationEnvelope,
+  fetchV2SlotCollection,
+  proveV2ControlPeer,
+  type ProvenControlPeer,
 } from "./client";
+import {
+  validV2NodeCollection,
+  validV2OperationCollection,
+  validV2OperationEnvelope,
+  validV2SlotCollection,
+  v1IdentityProof,
+  v2Ids,
+} from "./testSupport";
 
 const token = "ab".repeat(32);
 const node = { status: "unloaded", active_model_id: null, operation_id: null, error: null };
+
+async function createProvenPeer(responses: Response[] = []) {
+  let provedNodes = false;
+  const fetch = vi.fn(async (input: string, init?: RequestInit) => {
+    if (input.endsWith("/loxa/v1/node")) {
+      const nonce = new Headers(init?.headers).get("x-loxa-challenge") ?? "";
+      return Response.json({
+        protocol_version: 1,
+        node_id: validV2NodeCollection.nodes[0].node_id,
+        runtime_identity: validV2NodeCollection.nodes[0].node_instance_id,
+        status: "unloaded",
+        challenge_proof: await v1IdentityProof(token, nonce),
+      });
+    }
+    if (!provedNodes && input.endsWith("/loxa/v2/nodes")) {
+      provedNodes = true;
+      return Response.json(validV2NodeCollection);
+    }
+    const response = responses.shift();
+    if (!response) throw new Error(`unexpected request: ${input}`);
+    return response;
+  });
+  return { peer: await proveV2ControlPeer("http://127.0.0.1:8080", token, { fetch }), fetch };
+}
 
 describe("control client", () => {
   it("sends the bearer only in the authorization header", async () => {
@@ -234,5 +272,177 @@ describe("control client", () => {
     expect(reader.read).toHaveBeenCalledTimes(3);
     expect(reader.cancel).toHaveBeenCalledOnce();
     expect(reader.releaseLock).toHaveBeenCalledOnce();
+  });
+
+  it("fetches strict v2 collections only through the proven authenticated peer", async () => {
+    const { peer, fetch } = await createProvenPeer([
+      Response.json(validV2NodeCollection),
+      Response.json(validV2SlotCollection),
+      Response.json(validV2OperationCollection),
+      Response.json(validV2OperationEnvelope),
+    ]);
+
+    await expect(fetchV2NodeCollection(peer)).resolves.toEqual(validV2NodeCollection);
+    await expect(fetchV2SlotCollection(peer, validV2NodeCollection.nodes[0].node_id)).resolves.toEqual(
+      validV2SlotCollection,
+    );
+    await expect(fetchV2OperationCollection(peer)).resolves.toEqual(validV2OperationCollection);
+    await expect(fetchV2OperationEnvelope(peer, validV2OperationEnvelope.operation.operation_id)).resolves.toEqual(
+      validV2OperationEnvelope,
+    );
+    expect(fetch.mock.calls.map(([path]) => path)).toEqual([
+      "http://127.0.0.1:8080/loxa/v1/node",
+      "http://127.0.0.1:8080/loxa/v2/nodes",
+      "http://127.0.0.1:8080/loxa/v2/nodes",
+      `http://127.0.0.1:8080/loxa/v2/nodes/${validV2NodeCollection.nodes[0].node_id}/slots`,
+      "http://127.0.0.1:8080/loxa/v1/node",
+      "http://127.0.0.1:8080/loxa/v2/operations",
+      "http://127.0.0.1:8080/loxa/v1/node",
+      `http://127.0.0.1:8080/loxa/v2/operations/${validV2OperationEnvelope.operation.operation_id}`,
+      "http://127.0.0.1:8080/loxa/v1/node",
+    ]);
+    for (const [path, init] of fetch.mock.calls) {
+      const authorization = new Headers(init?.headers).get("authorization");
+      expect(authorization).toBe(path.endsWith("/loxa/v1/node") ? null : `Bearer ${token}`);
+    }
+  });
+
+  it("rejects a structurally forged peer and pins the proved node instance", async () => {
+    const forgedFetch = vi.fn();
+    const forged = { fetch: forgedFetch } as unknown as ProvenControlPeer;
+    await expect(fetchV2NodeCollection(forged)).rejects.toMatchObject({ kind: "credential" });
+    expect(forgedFetch).not.toHaveBeenCalled();
+
+    let proofDone = false;
+    const fetch = vi.fn(async (input: string, init?: RequestInit) => {
+      if (!proofDone) {
+        proofDone = true;
+        const nonce = new Headers(init?.headers).get("x-loxa-challenge") ?? "";
+        return Response.json({
+          protocol_version: 1,
+          node_id: validV2NodeCollection.nodes[0].node_id,
+          runtime_identity: validV2NodeCollection.nodes[0].node_instance_id,
+          status: "unloaded",
+          challenge_proof: await v1IdentityProof(token, nonce),
+        });
+      }
+      void input;
+      return Response.json({
+        ...validV2NodeCollection,
+        nodes: [{ ...validV2NodeCollection.nodes[0], node_instance_id: "123e4567-e89b-42d3-a456-426614174099" }],
+      });
+    });
+    await expect(proveV2ControlPeer("http://127.0.0.1:8080", token, { fetch })).rejects.toMatchObject({
+      kind: "invalid-response",
+    });
+  });
+
+  it("rejects same-endpoint replacement after slot and operation responses without inventing wire keys", async () => {
+    const cases = [
+      {
+        response: validV2SlotCollection,
+        request: (peer: ProvenControlPeer) => fetchV2SlotCollection(peer, v2Ids.node),
+      },
+      { response: validV2OperationCollection, request: fetchV2OperationCollection },
+      {
+        response: validV2OperationEnvelope,
+        request: (peer: ProvenControlPeer) => fetchV2OperationEnvelope(peer, v2Ids.operation),
+      },
+    ];
+    for (const testCase of cases) {
+      let proofCount = 0;
+      let nodesServed = false;
+      let payloadServed = false;
+      const fetch = vi.fn(async (input: string, init?: RequestInit) => {
+        if (input.endsWith("/loxa/v1/node")) {
+          proofCount += 1;
+          const nonce = new Headers(init?.headers).get("x-loxa-challenge") ?? "";
+          const instance = proofCount === 1 ? v2Ids.instance : v2Ids.nextEvent;
+          return Response.json({
+            protocol_version: 1,
+            node_id: v2Ids.node,
+            runtime_identity: instance,
+            status: "unloaded",
+            challenge_proof: await v1IdentityProof(token, nonce, v2Ids.node, instance),
+          });
+        }
+        if (!nodesServed && input.endsWith("/loxa/v2/nodes")) {
+          nodesServed = true;
+          return Response.json(validV2NodeCollection);
+        }
+        if (!payloadServed) {
+          payloadServed = true;
+          return Response.json(testCase.response);
+        }
+        throw new Error(`unexpected request: ${input}`);
+      });
+      const peer = await proveV2ControlPeer("http://127.0.0.1:8080", token, { fetch });
+      await expect(testCase.request(peer)).rejects.toMatchObject({ kind: "credential" });
+      expect(proofCount).toBe(2);
+    }
+  });
+
+  it("bounds v2 bodies and rejects duplicate keys before ordinary JSON construction", async () => {
+    const duplicate = JSON.stringify(validV2NodeCollection).replace(
+      '"schema_version":2,',
+      '"schema_version":2,"schema_version":2,',
+    );
+    const duplicatePeer = await createProvenPeer([
+      new Response(duplicate, { headers: { "content-type": "application/json" } }),
+    ]);
+    await expect(fetchV2NodeCollection(duplicatePeer.peer)).rejects.toMatchObject({
+      kind: "invalid-response",
+    });
+
+    const oversizedChunk = new Uint8Array(2 * 1024 * 1024 + 1);
+    const reader = {
+      read: vi
+        .fn()
+        .mockResolvedValueOnce({ done: false as const, value: oversizedChunk })
+        .mockResolvedValueOnce({ done: true as const, value: undefined }),
+      cancel: vi.fn(async () => undefined),
+      releaseLock: vi.fn(),
+    };
+    const response = { ok: true, status: 200, body: { getReader: () => reader } } as unknown as Response;
+    const oversizedPeer = await createProvenPeer([response]);
+    await expect(fetchV2NodeCollection(oversizedPeer.peer)).rejects.toMatchObject({
+      kind: "invalid-response",
+    });
+    expect(reader.read).toHaveBeenCalledOnce();
+    expect(reader.cancel).toHaveBeenCalledOnce();
+    expect(reader.releaseLock).toHaveBeenCalledOnce();
+
+    const errorReader = {
+      read: vi.fn(async () => ({ done: false as const, value: new Uint8Array(16 * 1024 + 1) })),
+      cancel: vi.fn(async () => undefined),
+      releaseLock: vi.fn(),
+    };
+    const errorResponse = {
+      ok: false,
+      status: 503,
+      body: { getReader: () => errorReader },
+    } as unknown as Response;
+    const errorPeer = await createProvenPeer([errorResponse]);
+    await expect(fetchV2NodeCollection(errorPeer.peer)).rejects.toMatchObject({
+      kind: "invalid-response",
+    });
+    expect(errorReader.read).toHaveBeenCalledOnce();
+    expect(errorReader.cancel).toHaveBeenCalledOnce();
+  });
+
+  it("requires JSON media types and strictly decodes bounded v2 error responses", async () => {
+    const plain = await createProvenPeer([
+      new Response(JSON.stringify(validV2NodeCollection), { headers: { "content-type": "text/plain" } }),
+    ]);
+    await expect(fetchV2NodeCollection(plain.peer)).rejects.toMatchObject({ kind: "invalid-response" });
+
+    const conflict = await createProvenPeer([
+      Response.json({ code: "operation_conflict", message: "A conflicting operation is active." }, { status: 409 }),
+    ]);
+    await expect(fetchV2NodeCollection(conflict.peer)).rejects.toMatchObject({
+      kind: "http",
+      status: 409,
+      code: "operation_conflict",
+    });
   });
 });

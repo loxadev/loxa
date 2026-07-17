@@ -5,7 +5,9 @@ export const v2Ids = {
   slot: "123e4567-e89b-42d3-8456-426614174002",
   operation: "123e4567-e89b-42d3-9456-426614174003",
   event: "123e4567-e89b-42d3-a456-426614174004",
+  nextEvent: "123e4567-e89b-42d3-a456-426614174006",
   epoch: "123e4567-e89b-42d3-b456-426614174005",
+  oldEpoch: "123e4567-e89b-42d3-b456-426614174007",
 } as const;
 
 export const validV2Node = {
@@ -158,4 +160,56 @@ export function v2Event(index: number) {
       updated_at_unix_ms: position,
     },
   } as const;
+}
+
+export const nextV2Event = {
+  ...validV2Event,
+  event_id: v2Ids.nextEvent,
+  sequence: "12",
+  revision: "12",
+  committed_at_unix_ms: "1784246400601",
+  operation: {
+    ...validV2Operation,
+    updated_revision: "12",
+    updated_at_unix_ms: "1784246400601",
+  },
+} as const;
+
+function hexBytes(value: string): Uint8Array {
+  return Uint8Array.from(value.match(/../g) ?? [], (byte) => Number.parseInt(byte, 16));
+}
+
+function lengthPrefix(value: string): Uint8Array {
+  const bytes = new TextEncoder().encode(value);
+  const prefixed = new Uint8Array(4 + bytes.byteLength);
+  new DataView(prefixed.buffer).setUint32(0, bytes.byteLength, false);
+  prefixed.set(bytes, 4);
+  return prefixed;
+}
+
+export async function v1IdentityProof(
+  token: string,
+  nonce: string,
+  nodeId: string = v2Ids.node,
+  instanceId: string = v2Ids.instance,
+): Promise<string> {
+  const domain = new TextEncoder().encode("loxa-control-node-identity-v1\0");
+  const protocol = new Uint8Array([0, 0, 0, 1]);
+  const node = lengthPrefix(nodeId);
+  const instance = lengthPrefix(instanceId);
+  const message = new Uint8Array(domain.length + protocol.length + 32 + node.length + instance.length + 1);
+  let offset = 0;
+  for (const part of [domain, protocol, hexBytes(nonce), node, instance, Uint8Array.of(0)]) {
+    message.set(part, offset);
+    offset += part.length;
+  }
+  const key = await crypto.subtle.importKey(
+    "raw",
+    Uint8Array.from(hexBytes(token)).buffer,
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const signature = new Uint8Array(await crypto.subtle.sign("HMAC", key, Uint8Array.from(message).buffer));
+  return [...signature].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
