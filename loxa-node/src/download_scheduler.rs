@@ -44,12 +44,10 @@ impl DownloadKey {
         expected_size: Option<u64>,
         artifact: ArtifactKey,
     ) -> Result<Self, DownloadKeyError> {
-        validate_field(model_id, MAX_MODEL_ID_BYTES)?;
-        validate_source_field(source_namespace)?;
-        validate_source_field(source_identity)?;
-        if let Some(revision) = immutable_revision {
-            validate_source_field(revision)?;
-        }
+        validate_model_id(model_id)?;
+        validate_source_namespace(source_namespace)?;
+        validate_repository(source_identity)?;
+        validate_revision(immutable_revision)?;
         validate_artifact_subpath(artifact_subpath)?;
         Ok(Self {
             model_id: model_id.into(),
@@ -80,14 +78,35 @@ fn validate_field(value: &str, max: usize) -> Result<(), DownloadKeyError> {
     }
 }
 
-fn validate_source_field(value: &str) -> Result<(), DownloadKeyError> {
+fn validate_model_id(value: &str) -> Result<(), DownloadKeyError> {
+    validate_field(value, MAX_MODEL_ID_BYTES)?;
+    if value
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        Ok(())
+    } else {
+        Err(DownloadKeyError::AmbiguousSource)
+    }
+}
+
+fn validate_source_namespace(value: &str) -> Result<(), DownloadKeyError> {
     validate_field(value, MAX_SOURCE_FIELD_BYTES)?;
-    if value.contains("://")
-        || value.contains(':')
-        || value.contains('?')
-        || value.contains('#')
-        || value.contains('@')
-        || value.contains("..")
+    if value == "hugging-face" {
+        Ok(())
+    } else {
+        Err(DownloadKeyError::AmbiguousSource)
+    }
+}
+
+fn validate_repository(value: &str) -> Result<(), DownloadKeyError> {
+    validate_field(value, MAX_SOURCE_FIELD_BYTES)?;
+    let mut components = value.split('/');
+    let namespace = components.next().unwrap_or_default();
+    let repository = components.next().unwrap_or_default();
+    if components.next().is_some()
+        || !valid_repository_component(namespace)
+        || !valid_repository_component(repository)
     {
         Err(DownloadKeyError::AmbiguousSource)
     } else {
@@ -95,10 +114,37 @@ fn validate_source_field(value: &str) -> Result<(), DownloadKeyError> {
     }
 }
 
+fn valid_repository_component(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with(['.', '-'])
+        && !value.ends_with(['.', '-'])
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        && !value.contains("..")
+}
+
+fn validate_revision(value: Option<&str>) -> Result<(), DownloadKeyError> {
+    let value = value.ok_or(DownloadKeyError::AmbiguousSource)?;
+    validate_field(value, MAX_SOURCE_FIELD_BYTES)?;
+    if value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        Ok(())
+    } else {
+        Err(DownloadKeyError::AmbiguousSource)
+    }
+}
+
 fn validate_artifact_subpath(value: &str) -> Result<(), DownloadKeyError> {
     validate_field(value, MAX_ARTIFACT_SUBPATH_BYTES)?;
     let path = std::path::Path::new(value);
     if path.is_absolute()
+        || value.starts_with('/')
+        || value.ends_with('/')
+        || value.contains("//")
         || path.components().any(|component| {
             matches!(
                 component,
@@ -106,7 +152,14 @@ fn validate_artifact_subpath(value: &str) -> Result<(), DownloadKeyError> {
             )
         })
         || value.contains('\\')
-        || value.contains(['?', '#'])
+        || value.contains(['?', '#', ':', '%', '&', '='])
+        || value.split('/').any(|component| {
+            component.is_empty()
+                || component.ends_with(['.', ' '])
+                || component.bytes().any(|byte| {
+                    !(byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+                })
+        })
     {
         Err(DownloadKeyError::UnsafeSubpath)
     } else {
@@ -146,12 +199,31 @@ impl DownloadContinuation {
             permit,
         )
     }
+
+    #[cfg(test)]
+    pub(super) fn with_release_probe_for_test(
+        operation_id: OperationId,
+        admission_revision: DecimalU64,
+        cancellation: OperationCancellation,
+        artifact: ArtifactMutationLease,
+        release_probe: Box<dyn FnOnce() + Send>,
+    ) -> Self {
+        Self {
+            operation_id,
+            admission_revision,
+            cancellation,
+            artifact,
+            permit: DownloadWorkerPermit::with_release_probe_for_test(release_probe),
+        }
+    }
 }
 
 pub(crate) struct DownloadWorkerPermit {
     owner: Weak<DownloadShared>,
     worker_index: usize,
     released: bool,
+    #[cfg(test)]
+    release_probe: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl DownloadWorkerPermit {
@@ -164,7 +236,21 @@ impl DownloadWorkerPermit {
             if let Some(owner) = self.owner.upgrade() {
                 owner.release_worker(self.worker_index);
             }
+            #[cfg(test)]
+            if let Some(probe) = self.release_probe.take() {
+                probe();
+            }
             self.released = true;
+        }
+    }
+
+    #[cfg(test)]
+    fn with_release_probe_for_test(probe: Box<dyn FnOnce() + Send>) -> Self {
+        Self {
+            owner: Weak::new(),
+            worker_index: 0,
+            released: false,
+            release_probe: Some(probe),
         }
     }
 }
@@ -175,6 +261,7 @@ impl Drop for DownloadWorkerPermit {
     }
 }
 
+#[allow(clippy::large_enum_variant)] // Frozen inline RAII reservation ownership is intentional.
 pub(crate) enum DownloadReserveOutcome {
     Reserved(DownloadAdmissionReservation),
     Active {
@@ -220,11 +307,16 @@ impl Drop for DownloadAdmissionReservation {
                 return;
             }
         };
-        if matches!(
+        let removed = if matches!(
             state.reservations.get(&self.key),
             Some(ReservationEntry::Pending { ticket }) if *ticket == self.ticket
         ) {
-            state.reservations.remove(&self.key);
+            state.reservations.remove(&self.key)
+        } else {
+            None
+        };
+        drop(state);
+        if removed.is_some() {
             owner.changed.notify_all();
         }
     }
@@ -243,7 +335,7 @@ pub(crate) enum WorkerExit {
     Panicked,
 }
 
-pub(crate) struct DownloadShared {
+struct DownloadShared {
     state: Mutex<DownloadState>,
     changed: Condvar,
 }

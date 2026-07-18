@@ -1,5 +1,6 @@
 use crate::verification_scheduler::{
     CompletionDestination, LifecycleVerificationCompletion, LifecycleVerificationOutcome,
+    RetainedCompletionCell,
 };
 use std::sync::Arc;
 
@@ -26,5 +27,12 @@ impl LifecycleMailboxInner {
 
     pub(super) fn notify_verification_ready(&self) -> bool {
         self.verification.notify_ready()
+    }
+
+    pub(super) fn remove_verification_reservation(
+        &self,
+        cell: &Arc<RetainedCompletionCell<LifecycleVerificationOutcome>>,
+    ) {
+        self.verification.remove_reserved(cell);
     }
 }

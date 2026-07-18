@@ -1,13 +1,38 @@
 use crate::operation_cancellation::OperationCancellation;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::Duration;
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) struct ArtifactKey {
     canonical_destination: PathBuf,
+    // Construction fails unless this physical parent identity remains stable
+    // throughout capture. Equality deliberately stays destination-based so a
+    // replaced parent cannot evade an already-held mutation exclusion.
+    _parent_evidence: ParentEvidence,
+}
+
+impl PartialEq for ArtifactKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.canonical_destination == other.canonical_destination
+    }
+}
+
+impl Eq for ArtifactKey {}
+
+impl Hash for ArtifactKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.canonical_destination.hash(state);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ParentEvidence {
+    device: u64,
+    file: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -18,6 +43,22 @@ pub(crate) enum ArtifactKeyError {
 
 impl ArtifactKey {
     pub(crate) fn from_destination(destination: &Path) -> Result<Self, ArtifactKeyError> {
+        Self::from_destination_inner(destination, || {})
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_destination_with_test_hook(
+        destination: &Path,
+        hook: impl FnOnce(),
+    ) -> Result<Self, ArtifactKeyError> {
+        Self::from_destination_inner(destination, hook)
+    }
+
+    fn from_destination_inner(
+        destination: &Path,
+        hook: impl FnOnce(),
+    ) -> Result<Self, ArtifactKeyError> {
+        validate_portable_destination(destination)?;
         let file_name = destination
             .file_name()
             .filter(|name| !name.is_empty())
@@ -28,21 +69,171 @@ impl ArtifactKey {
         {
             return Err(ArtifactKeyError::UnsafeDestination);
         }
-        match std::fs::symlink_metadata(destination) {
-            Ok(metadata) if metadata.file_type().is_file() => {}
-            Ok(_) => return Err(ArtifactKeyError::UnsafeDestination),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err(ArtifactKeyError::AmbiguousDestination),
-        }
         let parent = destination
             .parent()
             .ok_or(ArtifactKeyError::AmbiguousDestination)?;
         let canonical_parent =
             std::fs::canonicalize(parent).map_err(|_| ArtifactKeyError::AmbiguousDestination)?;
+        let opened_parent = open_parent(&canonical_parent)?;
+        let parent_evidence = parent_evidence(&opened_parent)?;
+
+        validate_existing_destination(destination)?;
+        hook();
+
+        let recanonicalized_parent =
+            std::fs::canonicalize(parent).map_err(|_| ArtifactKeyError::AmbiguousDestination)?;
+        if recanonicalized_parent != canonical_parent
+            || path_evidence(&recanonicalized_parent)? != parent_evidence
+        {
+            return Err(ArtifactKeyError::AmbiguousDestination);
+        }
         Ok(Self {
             canonical_destination: canonical_parent.join(file_name),
+            _parent_evidence: parent_evidence,
         })
     }
+}
+
+fn validate_portable_destination(destination: &Path) -> Result<(), ArtifactKeyError> {
+    let raw = destination
+        .to_str()
+        .ok_or(ArtifactKeyError::UnsafeDestination)?;
+    if !destination.is_absolute()
+        || raw.contains('\\')
+        || raw.contains(':')
+        || raw.contains("//")
+        || destination.components().any(|component| {
+            matches!(
+                component,
+                Component::CurDir | Component::ParentDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(ArtifactKeyError::UnsafeDestination);
+    }
+    for component in destination.components() {
+        let Component::Normal(component) = component else {
+            continue;
+        };
+        let component = component
+            .to_str()
+            .ok_or(ArtifactKeyError::UnsafeDestination)?;
+        if component.ends_with(['.', ' ']) || is_windows_reserved_name(component) {
+            return Err(ArtifactKeyError::UnsafeDestination);
+        }
+    }
+    Ok(())
+}
+
+fn is_windows_reserved_name(component: &str) -> bool {
+    let stem = component.split('.').next().unwrap_or(component);
+    matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
+}
+
+fn validate_existing_destination(destination: &Path) -> Result<(), ArtifactKeyError> {
+    match std::fs::symlink_metadata(destination) {
+        Ok(metadata) if metadata.file_type().is_file() && has_single_link(&metadata) => Ok(()),
+        Ok(_) => Err(ArtifactKeyError::UnsafeDestination),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(ArtifactKeyError::AmbiguousDestination),
+    }
+}
+
+#[cfg(unix)]
+fn open_parent(parent: &Path) -> Result<std::fs::File, ArtifactKeyError> {
+    std::fs::File::open(parent).map_err(|_| ArtifactKeyError::AmbiguousDestination)
+}
+
+#[cfg(windows)]
+fn open_parent(parent: &Path) -> Result<std::fs::File, ArtifactKeyError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(parent)
+        .map_err(|_| ArtifactKeyError::AmbiguousDestination)
+}
+
+#[cfg(unix)]
+fn parent_evidence(parent: &std::fs::File) -> Result<ParentEvidence, ArtifactKeyError> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = parent
+        .metadata()
+        .map_err(|_| ArtifactKeyError::AmbiguousDestination)?;
+    Ok(ParentEvidence {
+        device: metadata.dev(),
+        file: metadata.ino(),
+    })
+}
+
+#[cfg(unix)]
+fn path_evidence(parent: &Path) -> Result<ParentEvidence, ArtifactKeyError> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata(parent).map_err(|_| ArtifactKeyError::AmbiguousDestination)?;
+    Ok(ParentEvidence {
+        device: metadata.dev(),
+        file: metadata.ino(),
+    })
+}
+
+#[cfg(unix)]
+fn has_single_link(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.nlink() == 1
+}
+
+#[cfg(windows)]
+fn parent_evidence(parent: &std::fs::File) -> Result<ParentEvidence, ArtifactKeyError> {
+    use std::os::windows::fs::MetadataExt;
+    let metadata = parent
+        .metadata()
+        .map_err(|_| ArtifactKeyError::AmbiguousDestination)?;
+    Ok(ParentEvidence {
+        device: u64::from(
+            metadata
+                .volume_serial_number()
+                .ok_or(ArtifactKeyError::AmbiguousDestination)?,
+        ),
+        file: metadata
+            .file_index()
+            .ok_or(ArtifactKeyError::AmbiguousDestination)?,
+    })
+}
+
+#[cfg(windows)]
+fn path_evidence(parent: &Path) -> Result<ParentEvidence, ArtifactKeyError> {
+    parent_evidence(&open_parent(parent)?)
+}
+
+#[cfg(windows)]
+fn has_single_link(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.number_of_links() == Some(1)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -247,10 +438,15 @@ impl CoordinatorInner {
                 return;
             }
         };
-        if !state.poisoned.contains(key)
+        let removed = if !state.poisoned.contains(key)
             && matches!(state.access.get(key), Some(ArtifactAccessState::Mutating))
         {
-            state.access.remove(key);
+            state.access.remove(key)
+        } else {
+            None
+        };
+        drop(state);
+        if removed.is_some() {
             self.changed.notify_all();
         }
     }
@@ -267,12 +463,17 @@ impl CoordinatorInner {
         if state.poisoned.contains(key) {
             return;
         }
-        if let Some(ArtifactAccessState::Readers(readers)) = state.access.get_mut(key) {
+        let remove = if let Some(ArtifactAccessState::Readers(readers)) = state.access.get_mut(key)
+        {
             *readers -= 1;
-            if *readers == 0 {
-                state.access.remove(key);
-                self.changed.notify_all();
-            }
+            *readers == 0
+        } else {
+            false
+        };
+        let removed = remove.then(|| state.access.remove(key)).flatten();
+        drop(state);
+        if removed.is_some() {
+            self.changed.notify_all();
         }
     }
 
@@ -283,6 +484,7 @@ impl CoordinatorInner {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.poisoned.insert(key.clone());
         state.sealed = true;
+        drop(state);
         self.changed.notify_all();
     }
 }
