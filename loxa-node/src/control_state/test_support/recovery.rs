@@ -5,6 +5,9 @@ use crate::control_state::repository::{
     ControlIdGenerator, DesiredKind, IntentReason, MigrationStatementFault, ReconciliationState,
     ReconciliationTransactionFault, RepositoryErrorClass, ScalarSource,
 };
+use crate::control_state::state_machine::test_support::storage::slice4_migration::{
+    load_operation, unload_operation, V1Fixture,
+};
 use crate::control_state::state_machine::test_support::storage::TestRoot;
 use crate::control_state::state_machine::{
     AdmissionRequest, InstancePublication, MutationIds, Transition,
@@ -209,6 +212,186 @@ fn startup_fixture(label: &str) -> (PathBuf, PathBuf, ControlStateInit) {
         now_unix_ms: 10,
     };
     (root, state_path, init)
+}
+
+fn existing_migration_startup_fixture(
+    label: &str,
+    control_path: &std::path::Path,
+) -> (PathBuf, PathBuf, ControlStateInit) {
+    let root = std::env::temp_dir().join(format!(
+        "loxa-migration-startup-{label}-{}-{}",
+        std::process::id(),
+        StreamEpoch::new_v4()
+    ));
+    std::fs::create_dir_all(root.join("run/logs")).unwrap();
+    let paths = NodePaths {
+        models_dir: root.join("models"),
+        state_path: root.join("run/managed.json"),
+        logs_dir: root.join("run/logs"),
+    };
+    let baseline = loxa_core::supervisor::ManagedRun {
+        schema_version: loxa_core::supervisor::RUNTIME_STATE_SCHEMA_VERSION,
+        run_id: format!("migration-startup-{label}"),
+        model_id: None,
+        owner_pid: std::process::id(),
+        owner_process_start_time_unix_s: 1,
+        stop_requested: false,
+        lifecycle: loxa_core::supervisor::RunLifecycle::Unloaded,
+        generation: 0,
+        generation_alias: format!("loxa-migration-startup-{label}-g0"),
+        control_port: Some(19_431),
+        port: 19_431,
+        log_path: paths.logs_dir.join("owner.log"),
+        child_pid: None,
+        child_process_start_time_unix_s: None,
+        child_pgid: None,
+    };
+    loxa_core::supervisor::create_unloaded_node_owner(&paths.state_path, baseline.clone()).unwrap();
+    let state_path = paths.state_path.clone();
+    let init = ControlStateInit {
+        path: control_path.to_owned().into(),
+        node_id: NodeId::from_str(NODE_ID).unwrap(),
+        open_input: ControlStateOpenInput {
+            claimed_owner: NodeOwnerGuard::new(paths, baseline),
+            first_migration_source: None,
+        },
+        recovery_evidence: RecoveryEvidence::uncertain(UncertaintyReason::OwnershipUnavailable),
+        now_unix_ms: 30,
+    };
+    (root, state_path, init)
+}
+
+#[derive(Clone, Copy)]
+enum MigrationRecoveryStartupCase {
+    MissingLoadingOperation,
+    WrongKind,
+    TerminalNullLoad,
+    ActiveNullLoad,
+    MissingUnloadOperation,
+}
+
+fn migration_recovery_startup_image(label: &str, case: MigrationRecoveryStartupCase) -> V1Fixture {
+    let fixture = V1Fixture::new(label);
+    match case {
+        MigrationRecoveryStartupCase::MissingLoadingOperation => {
+            fixture.set_v1_slot_loading(None, load_operation("target", 9));
+            let connection = fixture.connection();
+            connection.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+            connection.execute("DELETE FROM operations", []).unwrap();
+            connection.close().unwrap();
+        }
+        MigrationRecoveryStartupCase::WrongKind => {
+            let mut operation = load_operation("target", 9);
+            operation.kind = "download";
+            fixture.set_v1_slot_loading(None, operation);
+        }
+        MigrationRecoveryStartupCase::TerminalNullLoad => {
+            let mut operation = load_operation("target", 9);
+            operation.status = "succeeded";
+            operation.model_id = None;
+            fixture.set_v1_slot_loading(None, operation);
+        }
+        MigrationRecoveryStartupCase::ActiveNullLoad => {
+            let mut operation = load_operation("target", 9);
+            operation.model_id = None;
+            fixture.set_v1_slot_loading(None, operation);
+        }
+        MigrationRecoveryStartupCase::MissingUnloadOperation => {
+            fixture.set_v1_slot("unloading", Some("observed"), Some(unload_operation(9)));
+            let connection = fixture.connection();
+            connection.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+            connection.execute("DELETE FROM operations", []).unwrap();
+            connection.close().unwrap();
+        }
+    }
+    let opened = fixture.reopen().unwrap();
+    assert!(matches!(
+        opened.intent.reason,
+        Some(IntentReason::MigrationAmbiguousLoading | IntentReason::MigrationOperationMismatch)
+    ));
+    opened.repository.validate_all().unwrap();
+    opened.repository.close().unwrap();
+    fixture
+}
+
+fn close_unexpected_startup(bootstrap: crate::control_state::worker::ControlStateBootstrap) {
+    let crate::control_state::worker::ControlStateBootstrap {
+        handle,
+        worker,
+        claimed_owner,
+        ready_authority,
+    } = bootstrap;
+    drop(handle);
+    drop(ready_authority);
+    worker.join_for_test();
+    drop(claimed_owner);
+}
+
+fn assert_migration_recovery_startup_gate(label: &str, case: MigrationRecoveryStartupCase) {
+    let fixture = migration_recovery_startup_image(label, case);
+    let before_bytes = std::fs::read(fixture.path()).unwrap();
+    let before_logical = fixture.logical_snapshot();
+
+    for attempt in 0..2 {
+        let (owner_root, state_path, init) =
+            existing_migration_startup_fixture(&format!("{label}-{attempt}"), fixture.path());
+        match ControlStateWorker::open_reconcile_and_spawn(init) {
+            Err(error) => assert_eq!(error, ControlStateError::DurableStateUnavailable),
+            Ok(bootstrap) => {
+                close_unexpected_startup(bootstrap);
+                panic!("migration recovery must fail closed before worker startup")
+            }
+        }
+        assert_managed_owner_released(&state_path);
+        assert_eq!(std::fs::read(fixture.path()).unwrap(), before_bytes);
+        assert_eq!(fixture.logical_snapshot(), before_logical);
+
+        let reopened = fixture.reopen().unwrap();
+        reopened.repository.validate_all().unwrap();
+        reopened.repository.close().unwrap();
+        assert_eq!(fixture.logical_snapshot(), before_logical);
+        let _ = std::fs::remove_dir_all(owner_root);
+    }
+}
+
+#[test]
+fn startup_gate_preserves_ambiguous_loading_migration_recovery() {
+    assert_migration_recovery_startup_gate(
+        "startup-ambiguous-loading",
+        MigrationRecoveryStartupCase::MissingLoadingOperation,
+    );
+}
+
+#[test]
+fn startup_gate_preserves_wrong_kind_migration_recovery() {
+    assert_migration_recovery_startup_gate(
+        "startup-wrong-kind",
+        MigrationRecoveryStartupCase::WrongKind,
+    );
+}
+
+#[test]
+fn startup_gate_preserves_terminal_null_load_migration_recovery() {
+    assert_migration_recovery_startup_gate(
+        "startup-terminal-null-load",
+        MigrationRecoveryStartupCase::TerminalNullLoad,
+    );
+}
+
+#[test]
+fn startup_gate_preserves_active_null_load_migration_recovery() {
+    assert_migration_recovery_startup_gate(
+        "startup-active-null-load",
+        MigrationRecoveryStartupCase::ActiveNullLoad,
+    );
+}
+
+#[test]
+fn startup_gate_preserves_missing_unload_migration_recovery() {
+    assert_migration_recovery_startup_gate(
+        "startup-missing-unload",
+        MigrationRecoveryStartupCase::MissingUnloadOperation,
+    );
 }
 
 fn assert_managed_owner_released(state_path: &std::path::Path) {

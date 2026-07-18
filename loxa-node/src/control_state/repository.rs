@@ -1383,6 +1383,28 @@ impl ControlRepository {
         read_stored_slot_intent(self.connection_ref()?)
     }
 
+    pub(crate) fn requires_specialized_migration_recovery(&self) -> Result<bool, RepositoryError> {
+        self.validate_ownership()?;
+        let connection = self.connection_ref()?;
+        let control_revision = connection
+            .query_row(
+                "SELECT revision FROM control_meta WHERE singleton=1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(classify_missing_row)
+            .and_then(|revision| parse_canonical_u64(&revision))?;
+        let slot: StoredSlotRow = connection
+            .query_row(
+                "SELECT slot_id,name,status,model_id,operation_id,error_code,error_message,updated_revision,updated_at_unix_ms FROM slot_state WHERE singleton=1",
+                [],
+                |row| Ok(StoredSlotRow { slot_id: row.get(0)?, name: row.get(1)?, status: row.get(2)?, model_id: row.get(3)?, operation_id: row.get(4)?, error_code: row.get(5)?, error_message: row.get(6)?, updated_revision: row.get(7)?, updated_at_unix_ms: row.get(8)? }),
+            )
+            .map_err(classify_missing_row)?;
+        let intent = read_stored_slot_intent(connection)?;
+        Ok(exact_migration_recovery(connection, control_revision, &slot, &intent)?.is_some())
+    }
+
     pub(crate) fn migration_backup_path(&self) -> Result<PathBuf, RepositoryError> {
         migration_backup_path(&self.path)
     }
@@ -2250,6 +2272,8 @@ fn validate_slot_intent(
     slot_id: SlotId,
     control_revision: u64,
     slot: &StoredSlotRow,
+    intent: &StoredSlotIntent,
+    migration_recovery: Option<ExactMigrationRecovery>,
 ) -> Result<(), RepositoryError> {
     let stored_slot_id: String = connection
         .query_row(
@@ -2261,7 +2285,6 @@ fn validate_slot_intent(
     if stored_slot_id != slot_id.to_string() {
         return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
     }
-    let intent = read_stored_slot_intent(connection)?;
     if intent.desired_revision > control_revision
         || intent
             .desired_model_id
@@ -2291,12 +2314,114 @@ fn validate_slot_intent(
             validate_applying_slot_intent(connection, slot_id, &intent, slot)?;
         }
         ReconciliationState::RecoveryRequired => {
-            if intent.reason.is_none() {
+            if intent.reason.is_none()
+                || (matches!(
+                    intent.reason,
+                    Some(
+                        IntentReason::MigrationAmbiguousLoading
+                            | IntentReason::MigrationOperationMismatch
+                    )
+                ) && migration_recovery.is_none())
+            {
                 return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
             }
         }
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExactMigrationRecovery {
+    AmbiguousLoading,
+    OperationMismatch {
+        retained_operation_id: Option<OperationId>,
+    },
+}
+
+impl ExactMigrationRecovery {
+    fn retained_operation_id(self) -> Option<OperationId> {
+        match self {
+            Self::AmbiguousLoading => None,
+            Self::OperationMismatch {
+                retained_operation_id,
+            } => retained_operation_id,
+        }
+    }
+}
+
+fn exact_migration_recovery(
+    connection: &Connection,
+    control_revision: u64,
+    slot: &StoredSlotRow,
+    intent: &StoredSlotIntent,
+) -> Result<Option<ExactMigrationRecovery>, RepositoryError> {
+    let slot_revision = parse_canonical_u64(&slot.updated_revision)?;
+    if intent.reconciliation != ReconciliationState::RecoveryRequired
+        || intent.desired_kind != DesiredKind::Unknown
+        || intent.desired_model_id.is_some()
+        || intent.desired_revision != slot_revision
+        || !matches!(slot.status.as_str(), "loading" | "unloading")
+    {
+        return Ok(None);
+    }
+
+    let slot_operation_id = slot
+        .operation_id
+        .as_deref()
+        .map(OperationId::from_str)
+        .transpose()
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::Corrupt))?
+        .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Corrupt))?;
+    let operation: Option<(String, String, String, Option<String>, String)> = connection
+        .query_row(
+            "SELECT slot_id,kind,status,model_id,created_revision FROM operations WHERE operation_id=?1",
+            [slot_operation_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .optional()?;
+    let retained_operation_id = operation.as_ref().map(|_| slot_operation_id);
+    if intent.operation_id != retained_operation_id {
+        return Ok(None);
+    }
+
+    match intent.reason {
+        Some(IntentReason::MigrationAmbiguousLoading)
+            if slot.status == "loading" && operation.is_none() =>
+        {
+            Ok(Some(ExactMigrationRecovery::AmbiguousLoading))
+        }
+        Some(IntentReason::MigrationOperationMismatch) => {
+            let exact_correlation = operation.as_ref().is_some_and(
+                |(operation_slot, kind, status, model_id, created_revision)| {
+                    let Ok(created_revision) = parse_canonical_u64(created_revision) else {
+                        return false;
+                    };
+                    let active = matches!(status.as_str(), "queued" | "running" | "cancelling");
+                    let disposition_matches = match slot.status.as_str() {
+                        "loading" => {
+                            kind == "load" && model_id.as_deref().is_some_and(valid_model_id)
+                        }
+                        "unloading" => kind == "unload",
+                        _ => false,
+                    };
+                    operation_slot == &slot.slot_id
+                        && active
+                        && disposition_matches
+                        && created_revision >= slot_revision
+                        && created_revision <= control_revision
+                },
+            );
+            let missing_operation_is_mismatch = slot.status == "unloading" && operation.is_none();
+            if !exact_correlation && (operation.is_some() || missing_operation_is_mismatch) {
+                Ok(Some(ExactMigrationRecovery::OperationMismatch {
+                    retained_operation_id,
+                }))
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Ok(None),
+    }
 }
 
 fn settled_intent_matches_observed_slot(
@@ -2509,6 +2634,14 @@ fn validate_connection_for_schema(
     {
         return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
     }
+    let stored_intent = (expected_schema_version == SCHEMA_VERSION)
+        .then(|| read_stored_slot_intent(connection))
+        .transpose()?;
+    let migration_recovery = stored_intent
+        .as_ref()
+        .map(|intent| exact_migration_recovery(connection, revision, &stored_slot, intent))
+        .transpose()?
+        .flatten();
     validate_operation_rows(
         connection,
         node_id,
@@ -2516,23 +2649,14 @@ fn validate_connection_for_schema(
         revision,
         last_committed_at,
         expected_schema_version,
+        migration_recovery,
     )?;
     if expected_schema_version == SCHEMA_VERSION {
-        let allows_migration_mismatch = read_stored_slot_intent(connection).is_ok_and(|intent| {
-            intent.reconciliation == ReconciliationState::RecoveryRequired
-                && matches!(
-                    intent.reason,
-                    Some(
-                        IntentReason::MigrationAmbiguousLoading
-                            | IntentReason::MigrationOperationMismatch
-                    )
-                )
-        });
         validate_slot_operation_reference(
             connection,
             stored_slot.status.as_str(),
             slot_operation_id,
-            allows_migration_mismatch,
+            migration_recovery.is_some(),
         )?;
     }
     validate_event_rows(
@@ -2545,7 +2669,16 @@ fn validate_connection_for_schema(
         last_committed_at,
     )?;
     if expected_schema_version == SCHEMA_VERSION {
-        validate_slot_intent(connection, slot_id, revision, &stored_slot)?;
+        validate_slot_intent(
+            connection,
+            slot_id,
+            revision,
+            &stored_slot,
+            stored_intent
+                .as_ref()
+                .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Corrupt))?,
+            migration_recovery,
+        )?;
     }
     Ok(ValidationSummary {
         node_rows,
@@ -2679,6 +2812,7 @@ fn validate_operation_rows(
     revision: u64,
     last_committed_at: u64,
     expected_schema_version: i64,
+    migration_recovery: Option<ExactMigrationRecovery>,
 ) -> Result<(), RepositoryError> {
     let mut statement = connection.prepare(
         "SELECT operation_id, slot_id, admitting_node_instance_id, v1_ordinal, kind, status, model_id, progress_current, progress_total, error_code, error_message, created_revision, updated_revision, created_at_unix_ms, updated_at_unix_ms FROM operations",
@@ -2742,7 +2876,8 @@ fn validate_operation_rows(
         let migration_recovery_load = if kind == V2OperationKind::Load
             && operation.model_id.is_none()
             && (expected_schema_version == 1
-                || is_exact_migration_recovery_load(connection, operation_id)?)
+                || migration_recovery.and_then(ExactMigrationRecovery::retained_operation_id)
+                    == Some(operation_id))
         {
             let mut with_validation_target = operation.clone();
             with_validation_target.model_id = Some("migration-validation-probe".to_owned());
@@ -2762,32 +2897,6 @@ fn validate_operation_rows(
         }
     }
     Ok(())
-}
-
-fn is_exact_migration_recovery_load(
-    connection: &Connection,
-    operation_id: OperationId,
-) -> Result<bool, RepositoryError> {
-    connection
-        .query_row(
-            "SELECT EXISTS(
-                 SELECT 1
-                 FROM slot_intent AS intent
-                 JOIN slot_state AS slot ON slot.singleton=intent.singleton
-                 WHERE intent.singleton=1
-                   AND intent.operation_id=?1
-                   AND slot.operation_id=?1
-                   AND slot.status='loading'
-                   AND intent.desired_kind='unknown'
-                   AND intent.desired_model_id IS NULL
-                   AND intent.desired_revision=slot.updated_revision
-                   AND intent.reconciliation_state='recovery_required'
-                   AND intent.reason_code='migration_operation_mismatch'
-             )",
-            [operation_id.to_string()],
-            |row| row.get(0),
-        )
-        .map_err(RepositoryError::from)
 }
 
 fn validate_slot_operation_reference(
