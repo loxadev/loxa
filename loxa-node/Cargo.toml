@@ -10,6 +10,9 @@ repository.workspace = true
 name = "loxa-node"
 path = "src/main.rs"
 
+[features]
+unsupported-platform-ci = []
+
 [dependencies]
 axum = "0.8"
 futures-util = "0.3"

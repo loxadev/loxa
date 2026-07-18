@@ -126,11 +126,13 @@ jobs:
       - name: Cache Rust
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
-      - name: Compile the unsupported control-state target
-        run: cargo check -p loxa-node --all-targets --all-features --locked
+      - name: Compile the production node library
+        run: cargo check -p loxa-node --lib --locked
 
+      # Select only the unsupported-platform integration target. The supported-host unit
+      # suites intentionally exercise Unix APIs and remain covered on macOS and Linux above.
       - name: Prove production preflight refusal is mutation-free
-        run: cargo test -p loxa-node production_preflight_rejects_unsupported_platform_before_filesystem_mutation --locked
+        run: cargo test -p loxa-node --test unsupported_control_state_platform --features unsupported-platform-ci --locked
 
   frontend:
     name: desktop frontend

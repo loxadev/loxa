@@ -70,3 +70,18 @@ pub(crate) fn open_control_state_for_test(
 pub(crate) fn ownership_unavailable_recovery_for_test() -> RecoveryEvidence {
     recovery::RecoveryEvidence::uncertain(recovery::UncertaintyReason::OwnershipUnavailable)
 }
+
+#[cfg(all(
+    not(any(target_os = "macos", target_os = "linux")),
+    feature = "unsupported-platform-ci"
+))]
+pub(crate) fn unsupported_platform_preflight_for_ci(
+    path: &std::path::Path,
+) -> Result<(), &'static str> {
+    repository::production_preflight_for_unsupported_platform_ci(path).map_err(|error| match error
+        .class()
+    {
+        RepositoryErrorClass::UnsupportedPlatform => "unsupported_platform",
+        _ => "unexpected_repository_error",
+    })
+}

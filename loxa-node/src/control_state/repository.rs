@@ -1004,6 +1004,16 @@ fn open_with_preflight_for_test(
     open_validated_connection_after(prepared, false, || {})?.close()
 }
 
+#[cfg(all(
+    not(any(target_os = "macos", target_os = "linux")),
+    feature = "unsupported-platform-ci"
+))]
+pub(super) fn production_preflight_for_unsupported_platform_ci(
+    path: &Path,
+) -> Result<(), RepositoryError> {
+    prepare_storage_path(path).map(drop)
+}
+
 #[cfg(test)]
 fn open_trace_for_test(path: &Path) -> Result<Vec<OpenTrace>, RepositoryError> {
     let mut trace = Vec::new();
@@ -5043,25 +5053,6 @@ mod tests {
             .is_err());
             assert!(!root.exists());
         }
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    #[test]
-    fn production_preflight_rejects_unsupported_platform_before_filesystem_mutation() {
-        let root = std::env::temp_dir().join(format!(
-            "loxa-control-state-production-unsupported-{}-{}",
-            std::process::id(),
-            StreamEpoch::new_v4()
-        ));
-
-        let error = super::open_with_preflight_for_test(
-            &root.join("state/control-state.sqlite3"),
-            super::StoragePreflight::Production,
-        )
-        .expect_err("the production preflight must reject an unsupported platform");
-
-        assert_eq!(error.class(), RepositoryErrorClass::UnsupportedPlatform);
-        assert!(!root.exists());
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
