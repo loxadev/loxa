@@ -27,6 +27,8 @@ type AcceptedMutation = {
   uiModelId: string;
 };
 
+const MAX_PENDING_OPERATIONS = 128;
+
 export function useModelsController({
   endpoint,
   services,
@@ -56,12 +58,22 @@ export function useModelsController({
   const verificationBudgetRef = useRef<{ key: string | null; attempts: number }>({ key: null, attempts: 0 });
   const getInventory = session.getInventory;
 
-  const rememberAccepted = useCallback((operationId: V2Operation["operation_id"], mutation: AcceptedMutation) => {
-    const next = new Map(acceptedMutationsRef.current);
-    next.set(operationId, mutation);
-    acceptedMutationsRef.current = next;
-    setAcceptedMutations(next);
-  }, []);
+  const rememberAccepted = useCallback(
+    (operationId: V2Operation["operation_id"], mutation: AcceptedMutation) => {
+      const next = new Map(acceptedMutationsRef.current);
+      next.delete(operationId);
+      next.set(operationId, mutation);
+      while (next.size > MAX_PENDING_OPERATIONS) {
+        const oldest = next.keys().next().value as V2Operation["operation_id"] | undefined;
+        if (oldest === undefined) break;
+        next.delete(oldest);
+        void onModelMutationSettled?.(oldest);
+      }
+      acceptedMutationsRef.current = next;
+      setAcceptedMutations(next);
+    },
+    [onModelMutationSettled],
+  );
 
   const operations = useMemo(
     () => (session.control?.operations ?? []).map(projectOperation),
@@ -150,6 +162,12 @@ export function useModelsController({
     let changed = false;
     for (const [operationId, accepted] of acceptedMutationsRef.current) {
       const operation = operationsById.get(operationId);
+      if (!session.pendingOperationIds.has(operationId)) {
+        next.delete(operationId);
+        changed = true;
+        void onModelMutationSettled?.(operationId);
+        continue;
+      }
       if (
         operation === undefined ||
         !isTerminalV2(operation) ||
@@ -175,7 +193,13 @@ export function useModelsController({
       acceptedMutationsRef.current = next;
       setAcceptedMutations(next);
     }
-  }, [acceptedMutations, onModelMutationSettled, refreshInventory, session.control?.operations]);
+  }, [
+    acceptedMutations,
+    onModelMutationSettled,
+    refreshInventory,
+    session.control?.operations,
+    session.pendingOperationIds,
+  ]);
 
   useEffect(
     () => () => {
@@ -202,7 +226,12 @@ export function useModelsController({
     setError("");
     try {
       const accepted = await session.downloadModel(modelId);
-      rememberAccepted(accepted.operation_id, { kind: "download", operationModelId: modelId, uiModelId: modelId });
+      if (!activeRef.current) return;
+      rememberAccepted(accepted.operation_id, {
+        kind: "download",
+        operationModelId: modelId,
+        uiModelId: modelId,
+      });
       onModelMutationStart?.(accepted.operation_id);
       setNotice(`${modelId}: Download queued`);
     } catch (reason) {
@@ -217,6 +246,7 @@ export function useModelsController({
     setError("");
     try {
       const accepted = await session.cancelOperation(operation.id);
+      if (!activeRef.current) return;
       rememberAccepted(accepted.operation_id, {
         kind: operation.kind,
         operationModelId: operation.modelId,
@@ -237,6 +267,7 @@ export function useModelsController({
     setError("");
     try {
       const accepted = kind === "load" ? await session.loadModel(modelId) : await session.unloadModel();
+      if (!activeRef.current) return;
       rememberAccepted(accepted.operation_id, {
         kind,
         operationModelId: kind === "load" ? modelId : null,

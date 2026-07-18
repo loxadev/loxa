@@ -1,4 +1,4 @@
-import { StrictMode } from "react";
+import { StrictMode, useState } from "react";
 import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
@@ -47,6 +47,55 @@ function Probe({ afterStop, afterRetry }: { afterStop?: () => void; afterRetry?:
         }}
       >
         Retry with stale callback
+      </button>
+    </div>
+  );
+}
+
+function operationId(index: number) {
+  return `00000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`;
+}
+
+function AdmissionProbe() {
+  const session = useNodeSession();
+  return (
+    <div>
+      <output aria-label="phase">{session.phase}</output>
+      <button
+        type="button"
+        onClick={() => {
+          void Promise.all(Array.from({ length: 129 }, (_, index) => session.loadModel(`model-${index}`)));
+        }}
+      >
+        Admit 129
+      </button>
+    </div>
+  );
+}
+
+function RejectionProbe({ afterRetry }: { afterRetry?: () => void } = {}) {
+  const session = useNodeSession();
+  const [mutationError, setMutationError] = useState("");
+  return (
+    <div>
+      <output aria-label="phase">{session.phase}</output>
+      <output aria-label="mutation-error">{mutationError}</output>
+      <button
+        type="button"
+        onClick={() =>
+          void session.loadModel("gemma-3-4b-it-q4").catch((error: unknown) => setMutationError(String(error)))
+        }
+      >
+        Load with result
+      </button>
+      <button
+        type="button"
+        onClick={() => {
+          void session.retry();
+          afterRetry?.();
+        }}
+      >
+        Retry authority
       </button>
     </div>
   );
@@ -289,5 +338,228 @@ describe("NodeSessionProvider v2 authority", () => {
     await act(async () => resolveLoad(accepted));
 
     expect(screen.getByLabelText("phase")).toHaveTextContent("unloaded");
+  });
+
+  it("bounds accepted-operation tracking to the durable active-operation limit", async () => {
+    const user = userEvent.setup();
+    const control = scriptedV2Control();
+    const services = servicesWithControl(control);
+    services.loadV2Slot = vi.fn(async (_peer, _nodeId, _slotId, modelId) => {
+      const index = Number(modelId.slice("model-".length));
+      return decodeV2OperationAccepted({
+        ...validV2OperationAccepted,
+        operation_id: operationId(index),
+        revision: "12",
+      });
+    });
+    render(
+      <NodeSessionProvider services={services} endpoint={testEndpoint}>
+        <AdmissionProbe />
+      </NodeSessionProvider>,
+    );
+    expect(await screen.findByText("unloaded")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Admit 129" }));
+    await waitFor(() => expect(services.loadV2Slot).toHaveBeenCalledTimes(129));
+
+    act(() =>
+      control.emitReplacement(
+        controlSnapshot({
+          revision: "13",
+          cursor: "13",
+          operations: Array.from({ length: 128 }, (_, offset) => ({
+            ...validV2Operation,
+            operation_id: operationId(offset + 1),
+            model_id: `model-${offset + 1}`,
+            status: "succeeded",
+            updated_revision: "13",
+          })),
+        }),
+      ),
+    );
+
+    expect(await screen.findByText("unloaded")).toBeInTheDocument();
+  });
+
+  it("does not remain reconciling when a gap snapshot has aged an accepted operation out", async () => {
+    const user = userEvent.setup();
+    const control = scriptedV2Control();
+    const services = servicesWithControl(control);
+    render(
+      <NodeSessionProvider services={services} endpoint={testEndpoint}>
+        <Probe />
+      </NodeSessionProvider>,
+    );
+    expect(await screen.findByText("unloaded")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Load" }));
+    expect(screen.getByLabelText("phase")).toHaveTextContent("reconciling");
+
+    act(() =>
+      control.emitReplacement(controlSnapshot({ revision: "13", cursor: "13", cursorGap: true, operations: [] })),
+    );
+
+    expect(await screen.findByText("unloaded")).toBeInTheDocument();
+  });
+
+  it("releases an absent accepted operation from a gap-free snapshot at or after its revision", async () => {
+    const user = userEvent.setup();
+    const control = scriptedV2Control();
+    const services = servicesWithControl(control);
+    const accepted = decodeV2OperationAccepted({ ...validV2OperationAccepted, revision: "12" });
+    services.loadV2Slot = vi.fn().mockResolvedValue(accepted);
+    render(
+      <NodeSessionProvider services={services} endpoint={testEndpoint}>
+        <Probe />
+      </NodeSessionProvider>,
+    );
+    expect(await screen.findByText("unloaded")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Load" }));
+    expect(screen.getByLabelText("phase")).toHaveTextContent("reconciling");
+
+    act(() => control.emitReplacement(controlSnapshot({ revision: "12", cursor: "12", operations: [] })));
+
+    expect(await screen.findByText("unloaded")).toBeInTheDocument();
+  });
+
+  it("does not reintroduce an accepted operation already absent from a newer same-epoch snapshot", async () => {
+    const user = userEvent.setup();
+    const control = scriptedV2Control();
+    const services = servicesWithControl(control);
+    const accepted = decodeV2OperationAccepted({ ...validV2OperationAccepted, revision: "12" });
+    let resolveLoad!: (value: typeof accepted) => void;
+    services.loadV2Slot = vi.fn(
+      () =>
+        new Promise<typeof accepted>((resolve) => {
+          resolveLoad = resolve;
+        }),
+    );
+    render(
+      <NodeSessionProvider services={services} endpoint={testEndpoint}>
+        <Probe />
+      </NodeSessionProvider>,
+    );
+    expect(await screen.findByText("unloaded")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Load" }));
+    act(() => control.emitReplacement(controlSnapshot({ revision: "13", cursor: "13", operations: [] })));
+    await act(async () => resolveLoad(accepted));
+
+    expect(screen.getByLabelText("phase")).toHaveTextContent("unloaded");
+  });
+
+  it("does not settle an accepted UUID from a terminal row with the wrong kind and model correlation", async () => {
+    const user = userEvent.setup();
+    const control = scriptedV2Control();
+    const services = servicesWithControl(control);
+    const accepted = decodeV2OperationAccepted({
+      ...validV2OperationAccepted,
+      operation_id: v2Ids.nextEvent,
+      revision: "12",
+    });
+    services.loadV2Slot = vi.fn().mockResolvedValue(accepted);
+    render(
+      <NodeSessionProvider services={services} endpoint={testEndpoint}>
+        <Probe />
+      </NodeSessionProvider>,
+    );
+    expect(await screen.findByText("unloaded")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Load" }));
+
+    act(() =>
+      control.emitReplacement(
+        controlSnapshot({
+          revision: "12",
+          cursor: "12",
+          operations: [
+            {
+              ...validV2Operation,
+              operation_id: v2Ids.nextEvent,
+              kind: "unload",
+              model_id: null,
+              status: "succeeded",
+              updated_revision: "12",
+            },
+          ],
+        }),
+      ),
+    );
+    expect(screen.getByLabelText("phase")).toHaveTextContent("reconciling");
+
+    act(() =>
+      control.emitReplacement(
+        controlSnapshot({
+          revision: "13",
+          cursor: "13",
+          operations: [
+            {
+              ...validV2Operation,
+              operation_id: v2Ids.nextEvent,
+              status: "succeeded",
+              updated_revision: "13",
+            },
+          ],
+        }),
+      ),
+    );
+    expect(await screen.findByText("unloaded")).toBeInTheDocument();
+  });
+
+  it("rejects a mutation response callback from a replaced proof authority", async () => {
+    const user = userEvent.setup();
+    const control = scriptedV2Control();
+    const services = servicesWithControl(control);
+    const accepted = decodeV2OperationAccepted(validV2OperationAccepted);
+    let resolveLoad!: (value: typeof accepted) => void;
+    services.loadV2Slot = vi.fn(
+      () =>
+        new Promise<typeof accepted>((resolve) => {
+          resolveLoad = resolve;
+        }),
+    );
+    render(
+      <NodeSessionProvider services={services} endpoint={testEndpoint}>
+        <RejectionProbe />
+      </NodeSessionProvider>,
+    );
+    expect(await screen.findByText("unloaded")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Load with result" }));
+    await user.click(screen.getByRole("button", { name: "Retry authority" }));
+    await waitFor(() => expect(services.proveV2ControlPeer).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByLabelText("phase")).toHaveTextContent("unloaded"));
+
+    await act(async () => resolveLoad(accepted));
+
+    expect(screen.getByLabelText("phase")).toHaveTextContent("unloaded");
+    expect(screen.getByLabelText("mutation-error")).toHaveTextContent("accepted operation no longer belongs");
+  });
+
+  it("rejects an old-epoch mutation response after a replacement snapshot", async () => {
+    const user = userEvent.setup();
+    const control = scriptedV2Control();
+    const services = servicesWithControl(control);
+    const accepted = decodeV2OperationAccepted(validV2OperationAccepted);
+    let resolveLoad!: (value: typeof accepted) => void;
+    services.loadV2Slot = vi.fn(
+      () =>
+        new Promise<typeof accepted>((resolve) => {
+          resolveLoad = resolve;
+        }),
+    );
+    render(
+      <NodeSessionProvider services={services} endpoint={testEndpoint}>
+        <RejectionProbe />
+      </NodeSessionProvider>,
+    );
+    expect(await screen.findByText("unloaded")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Load with result" }));
+    act(() =>
+      control.emitReplacement(
+        controlSnapshot({ epoch: v2Ids.oldEpoch, revision: "20", cursor: "20", cursorGap: true }),
+      ),
+    );
+    expect(await screen.findByText("unloaded")).toBeInTheDocument();
+
+    await act(async () => resolveLoad(accepted));
+
+    expect(screen.getByLabelText("phase")).toHaveTextContent("unloaded");
+    expect(screen.getByLabelText("mutation-error")).toHaveTextContent("accepted operation no longer belongs");
   });
 });
