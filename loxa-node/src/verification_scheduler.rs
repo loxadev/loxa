@@ -461,7 +461,7 @@ impl<T> CompletionDestination<T> {
         self.changed.notify_all();
     }
 
-    fn ready(&self) -> Option<RetainedCompletion<T>> {
+    pub(super) fn ready(&self) -> Option<RetainedCompletion<T>> {
         let cells = self.cells.lock().ok()?;
         cells.iter().find_map(|cell| {
             let ready = match cell.state.lock() {
@@ -477,7 +477,7 @@ impl<T> CompletionDestination<T> {
     }
 
     #[cfg(test)]
-    fn dispose_poisoned(&self) {
+    pub(super) fn dispose_poisoned(&self) {
         let cells = self
             .cells
             .lock()

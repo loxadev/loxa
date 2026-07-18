@@ -499,6 +499,22 @@ where
         self.mark_recovery(format!("automatic engine restart failed: {error:?}"));
     }
 
+    pub(crate) fn fail_observed_child_exit(&mut self, exit: &str) {
+        self.gateway.withdraw();
+        let cleanup = self
+            .current
+            .take()
+            .map(|(_, session)| self.driver.finish_unexpected_exit(session));
+        let detail = match cleanup {
+            Some(Ok(_)) => format!("exact child exit observed: {exit}"),
+            Some(Err(error)) => {
+                format!("exact child exit observed: {exit}; cleanup failed: {error:?}")
+            }
+            None => format!("unowned child exit observed: {exit}"),
+        };
+        self.mark_recovery(detail);
+    }
+
     pub(crate) fn finish_stopped_supervision(&mut self) {
         self.gateway.withdraw();
         self.status = NodeLifecycleStatus::Unloaded;
