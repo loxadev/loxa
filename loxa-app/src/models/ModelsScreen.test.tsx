@@ -4,7 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
 import { decodeV2OperationAccepted } from "../control/contracts";
-import { validV2Operation, v2Ids } from "../control/testSupport";
+import { validV2Operation, validV2OperationAccepted, v2Ids } from "../control/testSupport";
 import {
   SessionHarness,
   controlSnapshot,
@@ -105,8 +105,8 @@ describe("ModelsScreen v2 authority", () => {
     act(() =>
       control.emitReplacement(
         controlSnapshot({
-          revision: "13",
-          cursor: "13",
+          revision: "11",
+          cursor: "11",
           operations: [{ ...validV2Operation, status: "succeeded" }],
         }),
       ),
@@ -234,6 +234,59 @@ describe("ModelsScreen v2 authority", () => {
       ),
     );
     expect(await screen.findByRole("button", { name: "Unload gemma-3-4b-it-q4" })).toBeInTheDocument();
+  });
+
+  it("releases UI-local mutation tracking when a gap snapshot no longer retains the accepted operation", async () => {
+    const user = userEvent.setup();
+    const onSettled = vi.fn();
+    const accepted = decodeV2OperationAccepted({
+      epoch: v2Ids.epoch,
+      operation_id: v2Ids.nextEvent,
+      revision: "12",
+    });
+    const { control, services } = renderModels({ onSettled });
+    vi.mocked(services.loadV2Slot!).mockResolvedValue(accepted);
+    const load = await screen.findByRole("button", { name: "Load gemma-3-4b-it-q4" });
+    await user.click(load);
+    await waitFor(() => expect(load).toBeDisabled());
+
+    act(() =>
+      control.emitReplacement(controlSnapshot({ revision: "13", cursor: "13", cursorGap: true, operations: [] })),
+    );
+
+    await waitFor(() => expect(onSettled).toHaveBeenCalledWith(v2Ids.nextEvent));
+    expect(load).toBeEnabled();
+  });
+
+  it("does not publish mutation-start for an admission returned by an obsolete epoch", async () => {
+    const user = userEvent.setup();
+    const onStart = vi.fn();
+    const control = scriptedV2Control();
+    const services = servicesWithControl(control, { getInventory: vi.fn().mockResolvedValue([modelFixture()]) });
+    const accepted = decodeV2OperationAccepted(validV2OperationAccepted);
+    let resolveLoad!: (value: typeof accepted) => void;
+    services.loadV2Slot = vi.fn(
+      () =>
+        new Promise<typeof accepted>((resolve) => {
+          resolveLoad = resolve;
+        }),
+    );
+    render(
+      <SessionHarness services={services}>
+        <ModelsScreen endpoint="http://127.0.0.1:8080" services={services} onModelMutationStart={onStart} />
+      </SessionHarness>,
+    );
+    await user.click(await screen.findByRole("button", { name: "Load gemma-3-4b-it-q4" }));
+    act(() =>
+      control.emitReplacement(
+        controlSnapshot({ epoch: v2Ids.oldEpoch, revision: "20", cursor: "20", cursorGap: true }),
+      ),
+    );
+
+    await act(async () => resolveLoad(accepted));
+
+    expect(onStart).not.toHaveBeenCalled();
+    expect(await screen.findByText(/accepted operation no longer belongs/)).toBeInTheDocument();
   });
 
   it("fails closed when the one shared v2 proof fails", async () => {

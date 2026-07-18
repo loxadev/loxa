@@ -72,6 +72,7 @@ export type NodeSessionValue = {
   error: string | null;
   proven: boolean;
   control: V2ControlState | null;
+  pendingOperationIds: ReadonlySet<string>;
   getInventory(signal?: AbortSignal): Promise<ModelInventoryEntry[]>;
   downloadModel(modelId: string): Promise<V2OperationAccepted>;
   loadModel(modelId: string): Promise<V2OperationAccepted>;
@@ -90,13 +91,19 @@ type SessionState = Pick<
 >;
 
 type Authority = { peer: ProvenControlPeer; token: string; endpoint: string };
-type PendingOperation = { kind?: V2Operation["kind"]; modelId?: string | null };
+type PendingOperation = {
+  kind?: V2Operation["kind"];
+  modelId?: string | null;
+  epoch?: string;
+  revision?: string;
+};
 
 const NodeSessionContext = createContext<NodeSessionValue | null>(null);
 const pendingEnsures = new WeakMap<BootstrapApi, Map<string, Promise<BootstrapSnapshot>>>();
 const STREAM_RECONNECT_BASE_DELAY_MS = 100;
 const STREAM_RECONNECT_LIMIT = 6;
 const STREAM_RECONNECT_STABLE_MS = 5_000;
+const MAX_PENDING_OPERATIONS = 128;
 
 function ensureNode(bootstrap: BootstrapApi, endpoint: string) {
   let byEndpoint = pendingEnsures.get(bootstrap);
@@ -142,6 +149,8 @@ export function NodeSessionProvider({
   const stateRef = useRef(state);
   const authorityRef = useRef<Authority | null>(null);
   const controlRef = useRef<V2ControlState | null>(null);
+  const snapshotBoundaryRef = useRef<{ epoch: string; revision: string; version: number } | null>(null);
+  const snapshotVersionRef = useRef(0);
   const pendingOperationsRef = useRef(new Map<string, PendingOperation>());
   const bootstrapRun = useRef(0);
   const bootstrapController = useRef<AbortController | null>(null);
@@ -179,6 +188,36 @@ export function NodeSessionProvider({
     });
   }, []);
 
+  const reconcileReplacementSnapshot = useCallback((control: V2ControlState, replaceLineage: boolean) => {
+    if (replaceLineage) {
+      pendingOperationsRef.current.clear();
+      return;
+    }
+    for (const [operationId, pending] of pendingOperationsRef.current) {
+      if (pending.epoch !== undefined && pending.epoch !== control.epoch) {
+        pendingOperationsRef.current.delete(operationId);
+        continue;
+      }
+      const operation = control.operations.find((candidate) => candidate.operation_id === operationId);
+      if (
+        operation === undefined &&
+        pending.revision !== undefined &&
+        BigInt(control.revision) >= BigInt(pending.revision)
+      ) {
+        pendingOperationsRef.current.delete(operationId);
+        continue;
+      }
+      if (
+        operation !== undefined &&
+        isTerminal(operation) &&
+        (pending.kind === undefined || operation.kind === pending.kind) &&
+        (pending.modelId === undefined || operation.model_id === pending.modelId)
+      ) {
+        pendingOperationsRef.current.delete(operationId);
+      }
+    }
+  }, []);
+
   const connect = useCallback(async () => {
     stopping.current = false;
     const generation = ++closingGeneration.current;
@@ -188,6 +227,8 @@ export function NodeSessionProvider({
     bootstrapController.current = controller;
     authorityRef.current = null;
     controlRef.current = null;
+    snapshotBoundaryRef.current = null;
+    pendingOperationsRef.current.clear();
     setPeer(null);
     setState((current) => ({
       ...current,
@@ -234,6 +275,8 @@ export function NodeSessionProvider({
       if (controller.signal.aborted || run !== bootstrapRun.current || generation !== closingGeneration.current) return;
       authorityRef.current = null;
       controlRef.current = null;
+      snapshotBoundaryRef.current = null;
+      pendingOperationsRef.current.clear();
       setPeer(null);
       const detail = message(error);
       setState((current) => ({
@@ -248,6 +291,7 @@ export function NodeSessionProvider({
   }, [endpoint, services]);
 
   useEffect(() => {
+    const pendingOperations = pendingOperationsRef.current;
     void connect();
     return () => {
       stopping.current = true;
@@ -256,6 +300,8 @@ export function NodeSessionProvider({
       bootstrapController.current?.abort();
       authorityRef.current = null;
       controlRef.current = null;
+      snapshotBoundaryRef.current = null;
+      pendingOperations.clear();
     };
   }, [connect]);
 
@@ -325,7 +371,19 @@ export function NodeSessionProvider({
             onSnapshot: (snapshot) => {
               if (!isCurrent()) return;
               resume = { epoch: snapshot.epoch, cursor: snapshot.stream.cursor };
-              publishControl(applyV2Snapshot(controlRef.current ?? undefined, snapshot));
+              const previousEpoch = controlRef.current?.epoch;
+              const control = applyV2Snapshot(controlRef.current ?? undefined, snapshot);
+              snapshotVersionRef.current += 1;
+              snapshotBoundaryRef.current = {
+                epoch: control.epoch,
+                revision: control.revision,
+                version: snapshotVersionRef.current,
+              };
+              reconcileReplacementSnapshot(
+                control,
+                snapshot.stream.cursor_gap || (previousEpoch !== undefined && previousEpoch !== control.epoch),
+              );
+              publishControl(control);
               if (stabilityTimer !== undefined) clearTimeout(stabilityTimer);
               stabilityTimer = setTimeout(() => {
                 if (isCurrent() && controlRef.current !== null) reconnectAttempts = 0;
@@ -365,7 +423,7 @@ export function NodeSessionProvider({
       if (stabilityTimer !== undefined) clearTimeout(stabilityTimer);
       stream?.dispose();
     };
-  }, [peer, publishControl, services]);
+  }, [peer, publishControl, reconcileReplacementSnapshot, services]);
 
   const invalidateModelTruth = useCallback((operationId?: string) => {
     if (stopping.current) return;
@@ -392,10 +450,42 @@ export function NodeSessionProvider({
   );
 
   const trackAcceptedOperation = useCallback(
-    (operationId: V2Operation["operation_id"], pending: PendingOperation) => {
-      pendingOperationsRef.current.set(operationId, pending);
+    (
+      authority: Authority,
+      requestSnapshotVersion: number,
+      accepted: V2OperationAccepted,
+      pending: PendingOperation,
+    ) => {
+      if (
+        stopping.current ||
+        authorityRef.current !== authority ||
+        (controlRef.current !== null && controlRef.current.epoch !== accepted.epoch)
+      ) {
+        throw new Error("The accepted operation no longer belongs to the current control authority.");
+      }
+      const operationId = accepted.operation_id;
+      pendingOperationsRef.current.delete(operationId);
+      pendingOperationsRef.current.set(operationId, {
+        ...pending,
+        epoch: accepted.epoch,
+        revision: accepted.revision,
+      });
+      while (pendingOperationsRef.current.size > MAX_PENDING_OPERATIONS) {
+        const oldest = pendingOperationsRef.current.keys().next().value as string | undefined;
+        if (oldest === undefined) break;
+        pendingOperationsRef.current.delete(oldest);
+      }
       const current = controlRef.current;
       if (current !== null) {
+        const boundary = snapshotBoundaryRef.current;
+        if (
+          boundary?.epoch === accepted.epoch &&
+          boundary.version > requestSnapshotVersion &&
+          BigInt(boundary.revision) >= BigInt(accepted.revision) &&
+          !current.operations.some((operation) => operation.operation_id === operationId)
+        ) {
+          pendingOperationsRef.current.delete(operationId);
+        }
         publishControl(current);
         return;
       }
@@ -426,8 +516,9 @@ export function NodeSessionProvider({
     async (modelId: string) => {
       const authority = requireAuthority(authorityRef.current);
       requireControl(controlRef.current);
+      const requestSnapshotVersion = snapshotVersionRef.current;
       const accepted = await requireService(services.downloadV2Model, "v2 model download")(authority.peer, modelId);
-      trackAcceptedOperation(accepted.operation_id, { kind: "download", modelId });
+      trackAcceptedOperation(authority, requestSnapshotVersion, accepted, { kind: "download", modelId });
       return accepted;
     },
     [services, trackAcceptedOperation],
@@ -437,13 +528,14 @@ export function NodeSessionProvider({
     async (modelId: string) => {
       const authority = requireAuthority(authorityRef.current);
       const control = requireControl(controlRef.current);
+      const requestSnapshotVersion = snapshotVersionRef.current;
       const accepted = await requireService(services.loadV2Slot, "v2 slot load")(
         authority.peer,
         control.nodes[0]!.node_id,
         control.slots[0]!.slot_id,
         modelId,
       );
-      trackAcceptedOperation(accepted.operation_id, { kind: "load", modelId });
+      trackAcceptedOperation(authority, requestSnapshotVersion, accepted, { kind: "load", modelId });
       return accepted;
     },
     [services, trackAcceptedOperation],
@@ -452,12 +544,13 @@ export function NodeSessionProvider({
   const unloadModel = useCallback(async () => {
     const authority = requireAuthority(authorityRef.current);
     const control = requireControl(controlRef.current);
+    const requestSnapshotVersion = snapshotVersionRef.current;
     const accepted = await requireService(services.unloadV2Slot, "v2 slot unload")(
       authority.peer,
       control.nodes[0]!.node_id,
       control.slots[0]!.slot_id,
     );
-    trackAcceptedOperation(accepted.operation_id, { kind: "unload", modelId: null });
+    trackAcceptedOperation(authority, requestSnapshotVersion, accepted, { kind: "unload", modelId: null });
     return accepted;
   }, [services, trackAcceptedOperation]);
 
@@ -465,13 +558,16 @@ export function NodeSessionProvider({
     async (operationId: string) => {
       const authority = requireAuthority(authorityRef.current);
       const control = requireControl(controlRef.current);
+      const requestSnapshotVersion = snapshotVersionRef.current;
       const target = control.operations.find((operation) => operation.operation_id === operationId);
       const accepted = await requireService(services.cancelV2Operation, "v2 operation cancellation")(
         authority.peer,
         operationId,
       );
       trackAcceptedOperation(
-        accepted.operation_id,
+        authority,
+        requestSnapshotVersion,
+        accepted,
         target === undefined ? {} : { kind: target.kind, modelId: target.model_id },
       );
       return accepted;
@@ -487,6 +583,7 @@ export function NodeSessionProvider({
     bootstrapController.current?.abort();
     authorityRef.current = null;
     controlRef.current = null;
+    snapshotBoundaryRef.current = null;
     pendingOperationsRef.current.clear();
     setPeer(null);
     setState((current) => ({ ...current, phase: "stopping", status: null, error: null, proven: false, control: null }));
@@ -512,6 +609,7 @@ export function NodeSessionProvider({
   const value = useMemo<NodeSessionValue>(
     () => ({
       ...state,
+      pendingOperationIds: new Set(pendingOperationsRef.current.keys()),
       getInventory,
       downloadModel,
       loadModel,
