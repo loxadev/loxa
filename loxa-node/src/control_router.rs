@@ -147,7 +147,7 @@ fn control_error(
 
 fn map_download_error(error: DownloadControlError, origin: Option<&str>) -> Response {
     match error {
-        DownloadControlError::Conflict => control_error(
+        DownloadControlError::Conflict | DownloadControlError::WriterOverloaded => control_error(
             StatusCode::CONFLICT,
             ControlErrorCode::OperationConflict,
             "a conflicting model operation is already active",
