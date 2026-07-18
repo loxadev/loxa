@@ -868,6 +868,16 @@ mod tests {
     use tracing::field::{Field, Visit};
     use tracing::{Event, Metadata, Subscriber};
 
+    #[test]
+    fn model_loxa_alias_and_inference_bytes_are_unchanged_by_control_v2() {
+        use crate::slice3_test_support::{inference_compatibility_fixture, ControlVersion};
+
+        let before = inference_compatibility_fixture(ControlVersion::V1Only);
+        let after = inference_compatibility_fixture(ControlVersion::V1AndV2);
+        assert_eq!(after.model_alias, "loxa");
+        assert_eq!(after.response_bytes, before.response_bytes);
+    }
+
     #[derive(Clone, Debug)]
     struct CapturedEvent {
         target: String,

@@ -19,6 +19,9 @@ pub mod supervisor;
 pub mod workload;
 
 #[cfg(test)]
+mod slice3_test_support;
+
+#[cfg(test)]
 mod tests {
     use crate::detect::{InstallState, LocalToolsReport, RunState, ToolDetection};
     use crate::hardware::HardwareReport;
