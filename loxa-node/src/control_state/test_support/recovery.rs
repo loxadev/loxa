@@ -502,6 +502,93 @@ fn publish_instance_persists_all_five_capability_bits_and_one_full_event() {
 }
 
 #[test]
+fn begin_stopping_is_atomic_idempotent_and_persists_one_full_node_event() {
+    let mut fixture = Fixture::unpublished("begin-stopping");
+    let instance = NodeInstanceId::from_str(INSTANCE).unwrap();
+    let mut ids = MutationSequence::default();
+    fixture
+        .repository()
+        .publish_instance(
+            InstancePublication {
+                node_instance_id: instance,
+                control_endpoint: "http://127.0.0.1:19431".into(),
+                capabilities: capabilities(31),
+                now_unix_ms: 100,
+            },
+            &mut ids,
+        )
+        .unwrap();
+    let running = fixture.repository().committed_state().unwrap();
+
+    let committed = fixture
+        .repository()
+        .begin_stopping(instance, 101, &mut ids)
+        .unwrap();
+    assert!(committed.committed());
+    let stopping = fixture.repository().committed_state().unwrap();
+    assert_eq!(
+        stopping.node.as_ref().unwrap().status,
+        loxa_protocol::v2::V2NodeStatus::Stopping
+    );
+    assert_eq!(stopping.revision.get(), running.revision.get() + 1);
+    assert_eq!(stopping.cursor.get(), running.cursor.get() + 1);
+    assert_eq!(
+        stopping.events.last().unwrap().node,
+        stopping.node,
+        "the committed node event must contain the complete stopping node"
+    );
+
+    let repeated = fixture
+        .repository()
+        .begin_stopping(instance, 102, &mut ids)
+        .unwrap();
+    assert!(repeated.is_noop());
+    assert_eq!(fixture.repository().committed_state().unwrap(), stopping);
+}
+
+#[tokio::test]
+async fn begin_stopping_worker_command_acknowledges_the_durable_commit() {
+    let (root, _state_path, init) = startup_fixture("begin-stopping-worker");
+    let bootstrap = ControlStateWorker::open_reconcile_and_spawn(init).unwrap();
+    let instance = NodeInstanceId::from_str(INSTANCE).unwrap();
+    bootstrap
+        .handle
+        .publish_instance(InstancePublication {
+            node_instance_id: instance,
+            control_endpoint: "http://127.0.0.1:19431".into(),
+            capabilities: capabilities(31),
+            now_unix_ms: 100,
+        })
+        .await
+        .unwrap();
+
+    let receipt = bootstrap.handle.begin_stopping(101).await.unwrap();
+    assert!(receipt.committed());
+    assert_eq!(
+        bootstrap
+            .handle
+            .read_snapshot()
+            .unwrap()
+            .node
+            .as_ref()
+            .unwrap()
+            .status,
+        loxa_protocol::v2::V2NodeStatus::Stopping
+    );
+    assert!(bootstrap
+        .handle
+        .begin_stopping(102)
+        .await
+        .unwrap()
+        .is_noop());
+
+    bootstrap.worker.shutdown().await.unwrap();
+    drop(bootstrap.handle);
+    bootstrap.claimed_owner.finish().unwrap();
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn restart_terminalizes_queued_running_and_cancelling_without_replay() {
     let mut fixture = Fixture::unpublished("operations");
     fixture

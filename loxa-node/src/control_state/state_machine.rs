@@ -420,6 +420,76 @@ impl ControlRepository {
         .map_err(map_tagged_error)
     }
 
+    pub(crate) fn begin_stopping(
+        &mut self,
+        node_instance_id: NodeInstanceId,
+        now_unix_ms: u64,
+        ids: &mut dyn MutationIds,
+    ) -> Result<CommitReceipt, TransitionError> {
+        let node_id = self.node_id();
+        let epoch = self.stream_epoch();
+        self.transaction(|tx| {
+            let (revision, cursor, last_committed) = read_meta(tx)?;
+            let mut node = read_node_connection(tx, node_id)?
+                .ok_or_else(|| tagged_error(TransitionError::Contradiction))?;
+            if node.node_instance_id != node_instance_id {
+                return Err(tagged_error(TransitionError::Contradiction));
+            }
+            if node.status == V2NodeStatus::Stopping {
+                return Ok(CommitReceipt {
+                    epoch,
+                    revision: DecimalU64::new(revision),
+                    cursor: DecimalU64::new(cursor),
+                    event_id: None,
+                });
+            }
+            if node.status != V2NodeStatus::Running {
+                return Err(tagged_error(TransitionError::Contradiction));
+            }
+            let next_revision = revision.checked_add(1).ok_or_else(overflow_error)?;
+            let next_cursor = cursor.checked_add(1).ok_or_else(overflow_error)?;
+            let effective_now = now_unix_ms.max(last_committed);
+            node.status = V2NodeStatus::Stopping;
+            let event_id = ids.new_event_id();
+            let event = V2ControlEvent {
+                schema_version: V2_SCHEMA_VERSION,
+                event_id,
+                epoch,
+                sequence: DecimalU64::new(next_cursor),
+                revision: DecimalU64::new(next_revision),
+                committed_at_unix_ms: DecimalU64::new(effective_now),
+                entity: V2EventEntity::Node,
+                entity_id: node_id.to_string(),
+                node_id,
+                node_instance_id: Some(node_instance_id),
+                slot_id: None,
+                operation_id: None,
+                node: Some(node.clone()),
+                slot: None,
+                operation: None,
+            };
+            event
+                .validate()
+                .map_err(|_| tagged_error(TransitionError::Contradiction))?;
+            let payload = serialize_event(&event)?;
+            tx.execute(
+                "UPDATE node_state SET status='stopping' WHERE singleton=1 AND node_instance_id=?1 AND status='running'",
+                [node_instance_id.to_string()],
+            )?;
+            update_meta(tx, next_revision, next_cursor, effective_now)?;
+            insert_event(tx, &event, None, &payload)?;
+            prune(tx)?;
+            validate_written_event(tx, event_id, &event)?;
+            Ok(CommitReceipt {
+                epoch,
+                revision: DecimalU64::new(next_revision),
+                cursor: DecimalU64::new(next_cursor),
+                event_id: Some(event_id),
+            })
+        })
+        .map_err(map_tagged_error)
+    }
+
     pub(crate) fn reconcile_offline(
         &mut self,
         evidence: RecoveryEvidence,

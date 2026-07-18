@@ -69,6 +69,10 @@ enum ControlCommand {
         publication: InstancePublication,
         reply: oneshot::Sender<Result<CommitReceipt, ControlStateError>>,
     },
+    BeginStopping {
+        now_unix_ms: u64,
+        reply: oneshot::Sender<Result<CommitReceipt, ControlStateError>>,
+    },
     Admit {
         request: AdmissionRequest,
         reply: oneshot::Sender<Result<CommittedAdmission, ControlStateError>>,
@@ -276,6 +280,24 @@ impl ControlStateHandle {
         let (reply, receive) = oneshot::channel();
         self.sender
             .try_send(ControlCommand::PublishInstance { publication, reply })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => ControlStateError::WriterOverloaded,
+                mpsc::error::TrySendError::Closed(_) => self.poison_unavailable(),
+            })?;
+        self.receive_commit(receive, tokio::time::Instant::now() + ACK_TIMEOUT)
+            .await
+    }
+
+    pub(crate) async fn begin_stopping(
+        &self,
+        now_unix_ms: u64,
+    ) -> Result<CommitReceipt, ControlStateError> {
+        if !self.is_healthy() {
+            return Err(ControlStateError::DurableStateUnavailable);
+        }
+        let (reply, receive) = oneshot::channel();
+        self.sender
+            .try_send(ControlCommand::BeginStopping { now_unix_ms, reply })
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => ControlStateError::WriterOverloaded,
                 mpsc::error::TrySendError::Closed(_) => self.poison_unavailable(),
@@ -1359,6 +1381,18 @@ fn process_command(
             if result.is_ok() {
                 *node_instance_id = Some(published_instance);
             }
+            finish_commit(repository, result, reply, &mut publication, false);
+        }
+        ControlCommand::BeginStopping { now_unix_ms, reply } => {
+            let Some(instance) = *node_instance_id else {
+                let _ = reply.send(Err(ControlStateError::DurableStateUnavailable));
+                return;
+            };
+            let result = map_transition_result(
+                repository.begin_stopping(instance, now_unix_ms, ids),
+                publication.healthy,
+                publication.health_signal,
+            );
             finish_commit(repository, result, reply, &mut publication, false);
         }
         ControlCommand::Admit { request, reply } => {
