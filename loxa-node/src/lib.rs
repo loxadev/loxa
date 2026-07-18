@@ -74,6 +74,16 @@ pub use bootstrap::{
     emit_final_shutdown_diagnostic, install_daemon_diagnostics, DiagnosticsBootstrap, NodePaths,
 };
 
+/// CI-only proof seam for the fail-closed control-state preflight on unsupported platforms.
+#[cfg(all(
+    not(any(target_os = "macos", target_os = "linux")),
+    feature = "unsupported-platform-ci"
+))]
+#[doc(hidden)]
+pub fn unsupported_control_state_preflight_for_ci(path: &Path) -> Result<(), &'static str> {
+    control_state::unsupported_platform_preflight_for_ci(path)
+}
+
 use bootstrap::NodeBuilder;
 use daemon::signals::{InterruptSource, SignalGuard};
 use engine_session::EngineSession;
