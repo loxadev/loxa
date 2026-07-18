@@ -1,4 +1,6 @@
-use crate::control_state::repository::{ControlIdGenerator, ControlRepository};
+use crate::control_state::repository::{
+    ControlIdGenerator, ControlRepository, DesiredKind, ReconciliationState,
+};
 use crate::control_state::state_machine::test_support::storage::TestRoot;
 use crate::control_state::state_machine::{
     AdmissionRequest, MutationIds, Transition, TransitionError,
@@ -252,6 +254,18 @@ fn terminal_transition_and_slot_observation_commit_atomically_once() {
     assert_eq!(state.slot.status, V2SlotStatus::Ready);
     assert_eq!(state.slot.model_id.as_deref(), Some("model-a"));
     assert_eq!(state.operations[0].status, V2OperationStatus::Succeeded);
+    let intent = machine
+        .repository
+        .as_ref()
+        .unwrap()
+        .stored_slot_intent()
+        .unwrap();
+    assert_eq!(intent.desired_kind, DesiredKind::Loaded);
+    assert_eq!(intent.desired_model_id.as_deref(), Some("model-a"));
+    assert_eq!(intent.desired_revision, receipt.revision.get());
+    assert_eq!(intent.operation_id, None);
+    assert_eq!(intent.reconciliation, ReconciliationState::Settled);
+    assert_eq!(intent.reason, None);
     assert_eq!(
         state
             .events
@@ -261,6 +275,66 @@ fn terminal_transition_and_slot_observation_commit_atomically_once() {
         1
     );
     machine.validate_all();
+}
+
+#[test]
+fn lifecycle_admission_atomically_writes_applying_intent() {
+    let mut load = MachineFixture::new();
+    let admitted = load
+        .admit(AdmissionRequest::Load {
+            model_id: "model-a".into(),
+        })
+        .unwrap();
+    let intent = load
+        .repository
+        .as_ref()
+        .unwrap()
+        .stored_slot_intent()
+        .unwrap();
+    assert_eq!(intent.desired_kind, DesiredKind::Loaded);
+    assert_eq!(intent.desired_model_id.as_deref(), Some("model-a"));
+    assert_eq!(intent.desired_revision, admitted.revision.get());
+    assert_eq!(intent.operation_id, Some(admitted.operation_id));
+    assert_eq!(intent.reconciliation, ReconciliationState::Applying);
+    assert_eq!(intent.reason, None);
+    assert_eq!(load.state().slot.status, V2SlotStatus::Loading);
+    load.validate_all();
+
+    let mut unload = MachineFixture::new();
+    unload
+        .repository
+        .as_mut()
+        .unwrap()
+        .transaction(|transaction| {
+            transaction.execute(
+                "UPDATE slot_state SET status='ready',model_id='model-a' WHERE singleton=1",
+                [],
+            )?;
+            transaction.execute(
+                "UPDATE slot_intent SET desired_kind='loaded',desired_model_id='model-a' WHERE singleton=1",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    unload.validate_all();
+    let admitted = unload.admit(AdmissionRequest::Unload).unwrap();
+    let intent = unload
+        .repository
+        .as_ref()
+        .unwrap()
+        .stored_slot_intent()
+        .unwrap();
+    assert_eq!(intent.desired_kind, DesiredKind::Unloaded);
+    assert_eq!(intent.desired_model_id, None);
+    assert_eq!(intent.desired_revision, admitted.revision.get());
+    assert_eq!(intent.operation_id, Some(admitted.operation_id));
+    assert_eq!(intent.reconciliation, ReconciliationState::Applying);
+    assert_eq!(intent.reason, None);
+    let state = unload.state();
+    assert_eq!(state.slot.status, V2SlotStatus::Unloading);
+    assert_eq!(state.operations[0].model_id, None);
+    unload.validate_all();
 }
 
 #[test]
@@ -478,6 +552,10 @@ fn recovery_slot_error_round_trips_and_non_recovery_error_is_rejected() {
         .transaction(|tx| {
             tx.execute(
                 "UPDATE slot_state SET status='recovery',model_id=NULL,operation_id=NULL,error_code='lifecycle_recovery_required',error_message='restart left lifecycle truth uncertain' WHERE singleton=1",
+                [],
+            )?;
+            tx.execute(
+                "UPDATE slot_intent SET desired_kind='unknown',desired_model_id=NULL,operation_id=NULL,reconciliation_state='recovery_required',reason_code='child_evidence_uncertain' WHERE singleton=1",
                 [],
             )?;
             Ok(())

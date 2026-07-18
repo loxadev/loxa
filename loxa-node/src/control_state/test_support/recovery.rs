@@ -2,8 +2,8 @@ use crate::bootstrap::NodePaths;
 use crate::control_state::recovery::{decide, RecoveryEvidence, UncertaintyReason};
 use crate::control_state::repository::{
     arm_migration_statement_fault_for_test, arm_reconciliation_transaction_fault_for_test,
-    ControlIdGenerator, DesiredKind, MigrationStatementFault, ReconciliationTransactionFault,
-    RepositoryErrorClass, ScalarSource,
+    ControlIdGenerator, DesiredKind, IntentReason, MigrationStatementFault, ReconciliationState,
+    ReconciliationTransactionFault, RepositoryErrorClass, ScalarSource,
 };
 use crate::control_state::state_machine::test_support::storage::TestRoot;
 use crate::control_state::state_machine::{
@@ -48,6 +48,27 @@ fn every_migration_rollback_boundary_is_restart_resumable() {
         assert_eq!(reopened.intent.desired_kind, DesiredKind::Unloaded);
         reopened.repository.close().unwrap();
     }
+}
+
+#[test]
+fn slot_only_uncertainty_atomically_marks_intent_recovery() {
+    let mut fixture = Fixture::unpublished("slot-intent-recovery");
+    let decision = decide(RecoveryEvidence::uncertain(
+        UncertaintyReason::OwnershipUnavailable,
+    ));
+    let receipt = fixture
+        .repository()
+        .reconcile_slot_if_changed(&decision, 30, &mut MutationSequence::default())
+        .unwrap()
+        .expect("uncertain evidence must commit recovery");
+    let intent = fixture.repository().stored_slot_intent().unwrap();
+    assert_eq!(intent.desired_kind, DesiredKind::Unknown);
+    assert_eq!(intent.desired_model_id, None);
+    assert_eq!(intent.desired_revision, receipt.revision.get());
+    assert_eq!(intent.operation_id, None);
+    assert_eq!(intent.reconciliation, ReconciliationState::RecoveryRequired);
+    assert_eq!(intent.reason, Some(IntentReason::ChildEvidenceUncertain));
+    fixture.repository().validate_all().unwrap();
 }
 
 struct InitialIds;

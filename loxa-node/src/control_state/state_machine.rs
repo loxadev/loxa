@@ -1,7 +1,10 @@
 use super::recovery::{
     decide, ReconciledControlState, RecoveryDecision, RecoveryEvidence, SlotRecoveryError,
 };
-use super::repository::{ControlRepository, RepositoryError, RepositoryErrorClass};
+use super::repository::{
+    ControlRepository, DesiredKind, IntentReason, ReconciliationState, RepositoryError,
+    RepositoryErrorClass,
+};
 use loxa_protocol::v2::{
     DecimalU64, EventId, OperationId, StreamEpoch, V2ControlEvent, V2EventEntity, V2Node,
     V2NodeCapabilities, V2NodeStatus, V2Operation, V2OperationError, V2OperationErrorCode,
@@ -285,6 +288,10 @@ impl ControlRepository {
                 created_at_unix_ms: DecimalU64::new(effective_now),
                 updated_at_unix_ms: DecimalU64::new(effective_now),
             };
+            let mut preflight_slot = slot.clone();
+            if kind != V2OperationKind::Download {
+                apply_slot_start(&preflight_operation, &mut preflight_slot)?;
+            }
             let preflight_event = operation_event(
                 EventPosition {
                     event_id: placeholder_event_id(),
@@ -295,7 +302,7 @@ impl ControlRepository {
                 effective_now,
                 node_instance_id,
                 &preflight_operation,
-                None,
+                (kind != V2OperationKind::Download).then_some(preflight_slot),
             )?;
             serialize_event_with_limit(&preflight_event, event_limit)?;
             let operation_id = ids.new_operation_id();
@@ -304,6 +311,10 @@ impl ControlRepository {
                 operation_id,
                 ..preflight_operation
             };
+            let mut admitted_slot = slot;
+            if kind != V2OperationKind::Download {
+                apply_slot_start(&operation, &mut admitted_slot)?;
+            }
             let event = operation_event(
                 EventPosition {
                     event_id,
@@ -314,13 +325,29 @@ impl ControlRepository {
                 effective_now,
                 node_instance_id,
                 &operation,
-                None,
+                (kind != V2OperationKind::Download).then_some(admitted_slot.clone()),
             )?;
             let payload = serialize_event_with_limit(&event, event_limit)?;
             tx.execute(
                 "INSERT INTO operations(operation_id,slot_id,admitting_node_instance_id,v1_ordinal,kind,status,model_id,progress_current,progress_total,created_revision,updated_revision,created_at_unix_ms,updated_at_unix_ms) VALUES(?1,?2,?3,?4,?5,'queued',?6,?7,?8,?9,?9,?10,?10)",
                 rusqlite::params![operation_id.to_string(), slot_id.to_string(), node_instance_id.to_string(), ordinal, kind_text(kind), operation.model_id, operation.progress.as_ref().map(|p| p.completed_bytes.to_string()), operation.progress.as_ref().and_then(|p| p.total_bytes).map(|v| v.to_string()), next_revision.to_string(), effective_now.to_string()],
             )?;
+            if kind != V2OperationKind::Download {
+                write_slot(tx, &admitted_slot, next_revision, effective_now)?;
+                write_intent(
+                    tx,
+                    if kind == V2OperationKind::Load {
+                        DesiredKind::Loaded
+                    } else {
+                        DesiredKind::Unloaded
+                    },
+                    operation.model_id.as_deref(),
+                    next_revision,
+                    Some(operation_id),
+                    ReconciliationState::Applying,
+                    None,
+                )?;
+            }
             update_meta(tx, next_revision, next_cursor, effective_now)?;
             insert_event(tx, &event, Some(v1_sequence), &payload)?;
             prune(tx)?;
@@ -626,6 +653,7 @@ impl ControlRepository {
             write_operation(tx, &operation, slot_id)?;
             if slot_changed {
                 write_slot(tx, &slot, next_revision, effective_now)?;
+                write_intent_for_observed_slot(tx, &slot, next_revision)?;
             }
             update_meta(tx, next_revision, next_cursor, effective_now)?;
             insert_event(tx, &event, Some(v1_sequence), &payload)?;
@@ -690,6 +718,7 @@ impl ControlRepository {
                 .map_err(|_| tagged_error(TransitionError::Contradiction))?;
             let payload = serialize_event(&event)?;
             write_slot(tx, &committed, next_revision, effective_now)?;
+            write_intent_for_observed_slot(tx, &committed, next_revision)?;
             update_meta(tx, next_revision, next_cursor, effective_now)?;
             insert_event(tx, &event, None, &payload)?;
             prune(tx)?;
@@ -772,6 +801,7 @@ impl ControlRepository {
             write_operation(tx, &operation, slot_id)?;
             if slot_changed {
                 write_slot(tx, &slot, next_revision, effective_now)?;
+                write_intent_for_observed_slot(tx, &slot, next_revision)?;
             }
             update_meta(tx, next_revision, next_cursor, effective_now)?;
             insert_event(tx, &event, Some(v1_sequence), &payload)?;
@@ -1137,11 +1167,26 @@ fn apply_slot_start(operation: &V2Operation, slot: &mut V2Slot) -> Result<(), Re
     match operation.kind {
         V2OperationKind::Download => {}
         V2OperationKind::Load => {
+            if slot.status == V2SlotStatus::Loading {
+                if slot.operation_id == Some(operation.operation_id) {
+                    return Ok(());
+                }
+                return Err(tagged_error(TransitionError::Contradiction));
+            }
+            if !matches!(slot.status, V2SlotStatus::Unloaded | V2SlotStatus::Ready) {
+                return Err(tagged_error(TransitionError::Contradiction));
+            }
             slot.status = V2SlotStatus::Loading;
             slot.operation_id = Some(operation.operation_id);
             slot.error = None;
         }
         V2OperationKind::Unload => {
+            if slot.status == V2SlotStatus::Unloading {
+                if slot.operation_id == Some(operation.operation_id) && slot.model_id.is_some() {
+                    return Ok(());
+                }
+                return Err(tagged_error(TransitionError::Contradiction));
+            }
             if slot.status != V2SlotStatus::Ready || slot.model_id.is_none() {
                 return Err(tagged_error(TransitionError::Contradiction));
             }
@@ -1479,7 +1524,7 @@ fn validate_slot_operation_correlation(
         )
         .optional()?;
     let valid = row.is_some_and(|(kind, status)| {
-        matches!(status.as_str(), "running" | "cancelling")
+        matches!(status.as_str(), "queued" | "running" | "cancelling")
             && matches!(
                 (slot.status, kind.as_str()),
                 (V2SlotStatus::Loading, "load") | (V2SlotStatus::Unloading, "unload")
@@ -1510,6 +1555,87 @@ fn write_slot(
     tx.execute("UPDATE slot_state SET status=?1,model_id=?2,operation_id=?3,error_code=?4,error_message=?5,updated_revision=?6,updated_at_unix_ms=?7 WHERE singleton=1",rusqlite::params![slot_status_text(slot.status),slot.model_id,slot.operation_id.map(|id|id.to_string()),slot.error.as_ref().map(|_|"lifecycle_recovery_required"),slot.error.as_ref().map(|error|error.message.clone()),revision.to_string(),now.to_string()])?;
     Ok(())
 }
+
+fn write_intent(
+    tx: &SqlTransaction<'_>,
+    desired_kind: DesiredKind,
+    desired_model_id: Option<&str>,
+    desired_revision: u64,
+    operation_id: Option<OperationId>,
+    reconciliation: ReconciliationState,
+    reason: Option<IntentReason>,
+) -> Result<(), RepositoryError> {
+    let updated = tx.execute(
+        "UPDATE slot_intent SET desired_kind=?1,desired_model_id=?2,desired_revision=?3,operation_id=?4,reconciliation_state=?5,reason_code=?6 WHERE singleton=1",
+        rusqlite::params![
+            match desired_kind {
+                DesiredKind::Unloaded => "unloaded",
+                DesiredKind::Loaded => "loaded",
+                DesiredKind::Unknown => "unknown",
+            },
+            desired_model_id,
+            desired_revision.to_string(),
+            operation_id.map(|id| id.to_string()),
+            match reconciliation {
+                ReconciliationState::Settled => "settled",
+                ReconciliationState::Applying => "applying",
+                ReconciliationState::RecoveryRequired => "recovery_required",
+            },
+            reason.map(|reason| match reason {
+                IntentReason::PreexistingRecovery => "preexisting_recovery",
+                IntentReason::MigrationAmbiguousLoading => "migration_ambiguous_loading",
+                IntentReason::MigrationOperationMismatch => "migration_operation_mismatch",
+                IntentReason::ChildEvidenceUncertain => "child_evidence_uncertain",
+                IntentReason::CompensationFailed => "compensation_failed",
+                IntentReason::DurableCommitUncertain => "durable_commit_uncertain",
+            }),
+        ],
+    )?;
+    if updated != 1 {
+        return Err(tagged_error(TransitionError::CorruptState));
+    }
+    Ok(())
+}
+
+fn write_intent_for_observed_slot(
+    tx: &SqlTransaction<'_>,
+    slot: &V2Slot,
+    revision: u64,
+) -> Result<(), RepositoryError> {
+    match slot.status {
+        V2SlotStatus::Unloaded => write_intent(
+            tx,
+            DesiredKind::Unloaded,
+            None,
+            revision,
+            None,
+            ReconciliationState::Settled,
+            None,
+        ),
+        V2SlotStatus::Ready => write_intent(
+            tx,
+            DesiredKind::Loaded,
+            slot.model_id.as_deref(),
+            revision,
+            None,
+            ReconciliationState::Settled,
+            None,
+        ),
+        V2SlotStatus::Recovery => write_intent(
+            tx,
+            DesiredKind::Unknown,
+            None,
+            revision,
+            None,
+            ReconciliationState::RecoveryRequired,
+            Some(IntentReason::ChildEvidenceUncertain),
+        ),
+        V2SlotStatus::Loading | V2SlotStatus::Unloading => {
+            Err(tagged_error(TransitionError::CorruptState))
+        }
+    }
+}
+
 fn update_meta(
     tx: &SqlTransaction<'_>,
     revision: u64,
