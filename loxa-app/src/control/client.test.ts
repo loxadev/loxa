@@ -15,6 +15,10 @@ import {
   fetchV2OperationCollection,
   fetchV2OperationEnvelope,
   fetchV2SlotCollection,
+  downloadV2Model,
+  loadV2Slot,
+  unloadV2Slot,
+  cancelV2Operation,
   proveV2ControlPeer,
   type ProvenControlPeer,
 } from "./client";
@@ -22,6 +26,7 @@ import {
   validV2NodeCollection,
   validV2OperationCollection,
   validV2OperationEnvelope,
+  validV2OperationAccepted,
   validV2SlotCollection,
   v1IdentityProof,
   v2Ids,
@@ -30,7 +35,10 @@ import {
 const token = "ab".repeat(32);
 const node = { status: "unloaded", active_model_id: null, operation_id: null, error: null };
 
-async function createProvenPeer(responses: Response[] = []) {
+async function createProvenPeer(
+  responses: Response[] = [],
+  options: { timeoutMs?: number; signal?: AbortSignal } = {},
+) {
   let provedNodes = false;
   const fetch = vi.fn(async (input: string, init?: RequestInit) => {
     if (input.endsWith("/loxa/v1/node")) {
@@ -51,7 +59,7 @@ async function createProvenPeer(responses: Response[] = []) {
     if (!response) throw new Error(`unexpected request: ${input}`);
     return response;
   });
-  return { peer: await proveV2ControlPeer("http://127.0.0.1:8080", token, { fetch }), fetch };
+  return { peer: await proveV2ControlPeer("http://127.0.0.1:8080", token, { fetch, ...options }), fetch };
 }
 
 describe("control client", () => {
@@ -443,6 +451,234 @@ describe("control client", () => {
       kind: "http",
       status: 409,
       code: "operation_conflict",
+    });
+  });
+
+  it("posts all four strict v2 mutations through the opaque proven peer", async () => {
+    const accepted = [
+      validV2OperationAccepted,
+      { ...validV2OperationAccepted, operation_id: v2Ids.nextEvent, revision: "11" },
+      { ...validV2OperationAccepted, operation_id: v2Ids.oldEpoch, revision: "12" },
+      { ...validV2OperationAccepted, revision: "13" },
+    ];
+    const { peer, fetch } = await createProvenPeer(accepted.map((value) => Response.json(value, { status: 202 })));
+
+    await expect(downloadV2Model(peer, "gemma-3-4b-it-q4")).resolves.toEqual(accepted[0]);
+    await expect(loadV2Slot(peer, v2Ids.node, v2Ids.slot, "gemma-3-4b-it-q4")).resolves.toEqual(accepted[1]);
+    await expect(unloadV2Slot(peer, v2Ids.node, v2Ids.slot)).resolves.toEqual(accepted[2]);
+    await expect(cancelV2Operation(peer, v2Ids.operation)).resolves.toEqual(accepted[3]);
+
+    const mutationCalls = fetch.mock.calls.filter(([, init]) => init?.method === "POST");
+    expect(mutationCalls.map(([url]) => url)).toEqual([
+      "http://127.0.0.1:8080/loxa/v2/models/gemma-3-4b-it-q4/download",
+      `http://127.0.0.1:8080/loxa/v2/nodes/${v2Ids.node}/slots/${v2Ids.slot}/load`,
+      `http://127.0.0.1:8080/loxa/v2/nodes/${v2Ids.node}/slots/${v2Ids.slot}/unload`,
+      `http://127.0.0.1:8080/loxa/v2/operations/${v2Ids.operation}/cancel`,
+    ]);
+    expect(mutationCalls.map(([, init]) => init?.body)).toEqual([
+      "{}",
+      JSON.stringify({ model_id: "gemma-3-4b-it-q4" }),
+      "{}",
+      "{}",
+    ]);
+    for (const [, init] of mutationCalls) {
+      const headers = new Headers(init?.headers);
+      expect(headers.get("authorization")).toBe(`Bearer ${token}`);
+      expect(headers.get("content-type")).toBe("application/json");
+      expect(headers.get("accept")).toBe("application/json");
+    }
+  });
+
+  it("rejects malformed v2 mutation inputs before sending credentials", async () => {
+    const { peer, fetch } = await createProvenPeer();
+    const baseline = fetch.mock.calls.length;
+    await expect(downloadV2Model(peer, " bad-model ")).rejects.toMatchObject({ kind: "invalid-response" });
+    await expect(loadV2Slot(peer, v2Ids.nextEvent, v2Ids.slot, "gemma-3-4b-it-q4")).rejects.toMatchObject({
+      kind: "invalid-response",
+    });
+    await expect(unloadV2Slot(peer, v2Ids.node, "not-a-uuid")).rejects.toMatchObject({
+      kind: "invalid-response",
+    });
+    await expect(cancelV2Operation(peer, "not-a-uuid")).rejects.toMatchObject({ kind: "invalid-response" });
+    await expect(downloadV2Model(peer, "\ud800")).rejects.toMatchObject({ kind: "invalid-response" });
+    await expect(loadV2Slot(peer, v2Ids.node, v2Ids.slot, "\udc00")).rejects.toMatchObject({
+      kind: "invalid-response",
+    });
+    expect(fetch.mock.calls).toHaveLength(baseline);
+  });
+
+  it("enforces v2 model identifiers at exact UTF-8 byte boundaries", async () => {
+    const exact = "é".repeat(128);
+    const { peer, fetch } = await createProvenPeer([Response.json(validV2OperationAccepted, { status: 202 })]);
+    await expect(downloadV2Model(peer, exact)).resolves.toEqual(validV2OperationAccepted);
+    const baseline = fetch.mock.calls.length;
+    await expect(downloadV2Model(peer, `${exact}a`)).rejects.toMatchObject({ kind: "invalid-response" });
+    expect(fetch.mock.calls).toHaveLength(baseline);
+  });
+
+  it("strictly decodes v2 mutation acceptance and typed overload errors", async () => {
+    const malformed = await createProvenPeer([
+      Response.json({ ...validV2OperationAccepted, extra: true }, { status: 202 }),
+    ]);
+    await expect(downloadV2Model(malformed.peer, "gemma-3-4b-it-q4")).rejects.toMatchObject({
+      kind: "invalid-response",
+    });
+
+    const overload = await createProvenPeer([
+      Response.json(
+        { code: "state_writer_overloaded", message: "The durable state writer is overloaded." },
+        { status: 503 },
+      ),
+    ]);
+    await expect(unloadV2Slot(overload.peer, v2Ids.node, v2Ids.slot)).rejects.toMatchObject({
+      kind: "http",
+      status: 503,
+      code: "state_writer_overloaded",
+    });
+
+    const tooLarge = await createProvenPeer([
+      Response.json({ code: "invalid_request", message: "The request body exceeds 4096 bytes." }, { status: 413 }),
+    ]);
+    await expect(downloadV2Model(tooLarge.peer, "gemma-3-4b-it-q4")).rejects.toMatchObject({
+      kind: "http",
+      status: 413,
+      code: "invalid_request",
+    });
+
+    const mismatched = await createProvenPeer([
+      Response.json({ code: "operation_conflict", message: "Conflict." }, { status: 503 }),
+    ]);
+    await expect(cancelV2Operation(mismatched.peer, v2Ids.operation)).rejects.toMatchObject({
+      kind: "invalid-response",
+    });
+  });
+
+  it("requires exact v2 mutation acceptance status, media type, and size", async () => {
+    const wrongStatus = await createProvenPeer([Response.json(validV2OperationAccepted, { status: 200 })]);
+    await expect(downloadV2Model(wrongStatus.peer, "gemma-3-4b-it-q4")).rejects.toMatchObject({
+      kind: "invalid-response",
+    });
+
+    const wrongMedia = await createProvenPeer([
+      new Response(JSON.stringify(validV2OperationAccepted), {
+        status: 202,
+        headers: { "content-type": "text/plain" },
+      }),
+    ]);
+    await expect(downloadV2Model(wrongMedia.peer, "gemma-3-4b-it-q4")).rejects.toMatchObject({
+      kind: "invalid-response",
+    });
+
+    const oversized = await createProvenPeer([
+      new Response(" ".repeat(16 * 1024 + 1), {
+        status: 202,
+        headers: { "content-type": "application/json" },
+      }),
+    ]);
+    await expect(downloadV2Model(oversized.peer, "gemma-3-4b-it-q4")).rejects.toMatchObject({
+      kind: "invalid-response",
+    });
+  });
+
+  it("rejects a replacement after mutation without sending it follow-up credentials", async () => {
+    let proofCount = 0;
+    let nodesServed = false;
+    let mutationServed = false;
+    const fetch = vi.fn(async (input: string, init?: RequestInit) => {
+      if (input.endsWith("/loxa/v1/node")) {
+        proofCount += 1;
+        const headers = new Headers(init?.headers);
+        expect(headers.has("authorization")).toBe(false);
+        const nonce = headers.get("x-loxa-challenge") ?? "";
+        const instance = proofCount === 1 ? v2Ids.instance : v2Ids.nextEvent;
+        return Response.json({
+          protocol_version: 1,
+          node_id: v2Ids.node,
+          runtime_identity: instance,
+          status: "unloaded",
+          challenge_proof: await v1IdentityProof(token, nonce, v2Ids.node, instance),
+        });
+      }
+      if (!nodesServed && input.endsWith("/loxa/v2/nodes")) {
+        nodesServed = true;
+        return Response.json(validV2NodeCollection);
+      }
+      if (!mutationServed) {
+        mutationServed = true;
+        expect(new Headers(init?.headers).get("authorization")).toBe(`Bearer ${token}`);
+        return Response.json(validV2OperationAccepted, { status: 202 });
+      }
+      throw new Error(`unexpected credentialed follow-up: ${input}`);
+    });
+    const peer = await proveV2ControlPeer("http://127.0.0.1:8080", token, { fetch });
+
+    await expect(downloadV2Model(peer, "gemma-3-4b-it-q4")).rejects.toMatchObject({ kind: "credential" });
+    await expect(downloadV2Model(peer, "gemma-3-4b-it-q4")).rejects.toMatchObject({ kind: "credential" });
+    expect(proofCount).toBe(2);
+  });
+
+  it("times out and revokes a peer whose mutation response body stalls", async () => {
+    const stalled = new Response(new ReadableStream({ start() {} }), {
+      status: 202,
+      headers: { "content-type": "application/json" },
+    });
+    const { peer, fetch } = await createProvenPeer([stalled], { timeoutMs: 10 });
+    await expect(downloadV2Model(peer, "gemma-3-4b-it-q4")).rejects.toMatchObject({ kind: "timeout" });
+    const baseline = fetch.mock.calls.length;
+    await expect(downloadV2Model(peer, "gemma-3-4b-it-q4")).rejects.toMatchObject({ kind: "credential" });
+    expect(fetch.mock.calls).toHaveLength(baseline);
+  });
+
+  it("honors caller cancellation through mutation body consumption and revokes the peer", async () => {
+    const controller = new AbortController();
+    const stalled = new Response(new ReadableStream({ start() {} }), {
+      status: 202,
+      headers: { "content-type": "application/json" },
+    });
+    const { peer, fetch } = await createProvenPeer([stalled], { timeoutMs: 5_000, signal: controller.signal });
+    const mutation = downloadV2Model(peer, "gemma-3-4b-it-q4");
+    await vi.waitFor(() => {
+      expect(fetch.mock.calls.some(([, init]) => init?.method === "POST")).toBe(true);
+    });
+    controller.abort();
+    await expect(mutation).rejects.toMatchObject({ kind: "aborted" });
+    const baseline = fetch.mock.calls.length;
+    await expect(downloadV2Model(peer, "gemma-3-4b-it-q4")).rejects.toMatchObject({ kind: "credential" });
+    expect(fetch.mock.calls).toHaveLength(baseline);
+  });
+
+  it("serializes v2 mutations per proven peer across reproof", async () => {
+    let releaseFirst: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const first = new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          releaseFirst = controller;
+        },
+      }),
+      { status: 202, headers: { "content-type": "application/json" } },
+    );
+    const secondAccepted = { ...validV2OperationAccepted, operation_id: v2Ids.nextEvent, revision: "11" };
+    const { peer, fetch } = await createProvenPeer([first, Response.json(secondAccepted, { status: 202 })]);
+
+    const download = downloadV2Model(peer, "gemma-3-4b-it-q4");
+    const unload = unloadV2Slot(peer, v2Ids.node, v2Ids.slot);
+    await vi.waitFor(() => {
+      expect(fetch.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(1);
+    });
+    releaseFirst?.enqueue(new TextEncoder().encode(JSON.stringify(validV2OperationAccepted)));
+    releaseFirst?.close();
+
+    await expect(download).resolves.toEqual(validV2OperationAccepted);
+    await expect(unload).resolves.toEqual(secondAccepted);
+    expect(fetch.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(2);
+  });
+
+  it("preserves the requested operation UUID across v2 cancellation acceptance", async () => {
+    const wrong = await createProvenPeer([
+      Response.json({ ...validV2OperationAccepted, operation_id: v2Ids.nextEvent }, { status: 202 }),
+    ]);
+    await expect(cancelV2Operation(wrong.peer, v2Ids.operation)).rejects.toMatchObject({
+      kind: "invalid-response",
     });
   });
 });

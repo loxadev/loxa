@@ -11,6 +11,7 @@ import {
   decodeV2NodeCollectionJson,
   decodeV2OperationCollectionJson,
   decodeV2OperationEnvelopeJson,
+  decodeV2OperationAcceptedJson,
   decodeV2SlotCollectionJson,
   type Capabilities,
   type ModelInventoryEntry,
@@ -21,6 +22,7 @@ import {
   type V2NodeCollection,
   type V2OperationCollection,
   type V2OperationEnvelope,
+  type V2OperationAccepted,
   type V2SlotCollection,
 } from "./contracts";
 
@@ -51,6 +53,7 @@ export type ControlClientOptions = {
 const DEFAULT_TIMEOUT_MS = 5_000;
 const MAX_JSON_BYTES = 2 * 1024 * 1024;
 const MAX_V2_ERROR_BYTES = 16 * 1024;
+const MAX_V2_MUTATION_BYTES = 4 * 1024;
 const TOKEN_PATTERN = /^[0-9a-f]{64}$/;
 const MODEL_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,127}$/;
 const NONCE_PATTERN = /^[0-9a-f]{64}$/;
@@ -66,6 +69,7 @@ type ProvenPeerAuthority = {
   signal?: AbortSignal;
 };
 const provenPeerAuthorities = new WeakMap<object, ProvenPeerAuthority>();
+const mutationTails = new WeakMap<object, Promise<void>>();
 
 export function assertControlToken(token: string): void {
   if (!TOKEN_PATTERN.test(token)) {
@@ -136,24 +140,42 @@ async function readBoundedText(response: Response): Promise<string> {
   return new TextDecoder().decode(bytes);
 }
 
-async function readBoundedBytes(response: Response, maxBytes: number): Promise<Uint8Array> {
+async function readBoundedBytes(response: Response, maxBytes: number, signal?: AbortSignal): Promise<Uint8Array> {
+  if (signal?.aborted) {
+    throw new ControlClientError("aborted", "The Loxa control request was cancelled.");
+  }
   const reader = response.body?.getReader();
   if (reader === undefined) return new Uint8Array();
   const chunks: Uint8Array[] = [];
   let total = 0;
+  let rejectAbort: ((error: ControlClientError) => void) | undefined;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    rejectAbort = reject;
+  });
+  const abort = () => {
+    void Promise.resolve(reader.cancel()).catch(() => undefined);
+    rejectAbort?.(new ControlClientError("aborted", "The Loxa control request was cancelled."));
+  };
+  signal?.addEventListener("abort", abort, { once: true });
+  if (signal?.aborted) abort();
   try {
     while (true) {
-      const result = await reader.read();
+      const result = await (signal === undefined ? reader.read() : Promise.race([reader.read(), aborted]));
       if (result.done) break;
       total += result.value.byteLength;
       if (total > maxBytes) {
-        await Promise.resolve(reader.cancel()).catch(() => undefined);
+        void Promise.resolve(reader.cancel()).catch(() => undefined);
         throw new ControlClientError("invalid-response", "The Loxa node returned an oversized control response.");
       }
       chunks.push(result.value);
     }
   } finally {
-    reader.releaseLock();
+    signal?.removeEventListener("abort", abort);
+    try {
+      reader.releaseLock();
+    } catch {
+      // A cancelled pending read releases its lock asynchronously.
+    }
   }
   const bytes = new Uint8Array(total);
   let offset = 0;
@@ -368,11 +390,27 @@ function freshNonce(): string {
 
 async function reproveExactPeer(peer: ProvenControlPeer): Promise<void> {
   const authority = peerAuthority(peer);
+  try {
+    await reproveExactAuthority(authority);
+  } catch (error) {
+    provenPeerAuthorities.delete(peer as object);
+    throw error;
+  }
+}
+
+async function reproveExactAuthority(
+  authority: ProvenPeerAuthority,
+  options: { signal?: AbortSignal; timeoutMs?: number } = {},
+): Promise<void> {
   const nonce = freshNonce();
   const proof = await getNodeIdentityProof(authority.endpoint, nonce, {
     fetch: authority.fetch,
-    timeoutMs: authority.timeoutMs,
-    ...(authority.signal === undefined ? {} : { signal: authority.signal }),
+    timeoutMs: options.timeoutMs ?? authority.timeoutMs,
+    ...(options.signal === undefined
+      ? authority.signal === undefined
+        ? {}
+        : { signal: authority.signal }
+      : { signal: options.signal }),
   });
   if (
     proof.nodeId !== authority.nodeId ||
@@ -528,23 +566,197 @@ async function fetchV2<T>(peer: ProvenControlPeer, path: string, contract: (body
   return decode(() => contract(body));
 }
 
-export async function v2ControlHttpError(response: Response): Promise<ControlClientError> {
-  const body = await readBoundedBytes(response, MAX_V2_ERROR_BYTES);
+export async function v2ControlHttpError(response: Response, signal?: AbortSignal): Promise<ControlClientError> {
+  const body = await readBoundedBytes(response, MAX_V2_ERROR_BYTES, signal);
   if (response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase() !== "application/json") {
-    return new ControlClientError("http", `The Loxa node returned HTTP ${response.status}.`, response.status);
+    return new ControlClientError("invalid-response", "The Loxa node returned an invalid v2 error media type.");
   }
   try {
     const error = decodeV2ControlErrorJson(body);
+    if (!v2ErrorStatusMatches(response.status, error.code)) {
+      return new ControlClientError("invalid-response", "The Loxa node returned a mismatched v2 error status.");
+    }
     return new ControlClientError("http", error.message, response.status, error.code);
   } catch {
-    return new ControlClientError("http", `The Loxa node returned HTTP ${response.status}.`, response.status);
+    return new ControlClientError("invalid-response", "The Loxa node returned an invalid v2 error payload.");
   }
+}
+
+function v2ErrorStatusMatches(status: number, code: string): boolean {
+  if (status === 400) return code === "invalid_request";
+  if (status === 404)
+    return ["node_not_found", "slot_not_found", "operation_not_found", "unknown_model"].includes(code);
+  if (status === 409)
+    return ["operation_conflict", "operation_terminal", "cancellation_not_safe", "model_unavailable"].includes(code);
+  if (status === 413) return code === "invalid_request";
+  if (status === 415) return code === "unsupported_media_type";
+  if (status === 503) return ["node_stopping", "state_writer_overloaded", "durable_state_unavailable"].includes(code);
+  return false;
 }
 
 function assertV2RouteId(value: string): void {
   if (!V2_UUID_PATTERN.test(value)) {
     throw new ControlClientError("invalid-response", "The Loxa v2 control identifier is invalid.");
   }
+}
+
+function assertV2ModelId(value: string): void {
+  const encoder = new TextEncoder();
+  const bytes = encoder.encode(value);
+  if (
+    bytes.byteLength === 0 ||
+    bytes.byteLength > 256 ||
+    new TextDecoder("utf-8", { fatal: true }).decode(bytes) !== value ||
+    value.trim() !== value ||
+    [...value].some((character) => character === "\0" || /\p{Cc}/u.test(character))
+  ) {
+    throw new ControlClientError("invalid-response", "The Loxa v2 model identifier is invalid.");
+  }
+}
+
+async function mutateV2(
+  peer: ProvenControlPeer,
+  path: string,
+  body: Record<string, never> | { model_id: string },
+  expectedOperationId?: string,
+): Promise<V2OperationAccepted> {
+  const encoded = JSON.stringify(body);
+  if (new TextEncoder().encode(encoded).byteLength > MAX_V2_MUTATION_BYTES) {
+    throw new ControlClientError("invalid-response", "The Loxa v2 mutation request is oversized.");
+  }
+  return serializeV2Mutation(peer, async () => {
+    const authority = peerAuthority(peer);
+    if (authority.signal?.aborted) {
+      throw new ControlClientError("aborted", "The proven Loxa control request was cancelled.");
+    }
+    const startedAt = Date.now();
+    const controller = new AbortController();
+    let abortCause: "caller" | "timeout" | null = null;
+    const abort = (cause: "caller" | "timeout") => {
+      if (abortCause !== null) return;
+      abortCause = cause;
+      controller.abort();
+    };
+    const callerAbort = () => abort("caller");
+    authority.signal?.addEventListener("abort", callerAbort, { once: true });
+    const timeout = setTimeout(() => abort("timeout"), authority.timeoutMs);
+    let restored = false;
+    try {
+      const request = fetchFromProvenControlPeer(peer, path, {
+        method: "POST",
+        headers: { accept: "application/json", "content-type": "application/json" },
+        body: encoded,
+        signal: controller.signal,
+      });
+      provenPeerAuthorities.delete(peer as object);
+      const response = await request;
+      let accepted: V2OperationAccepted | undefined;
+      let responseError: unknown;
+      try {
+        if (response.status !== 202) {
+          responseError = await v2ControlHttpError(response, controller.signal);
+        } else if (
+          response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase() !== "application/json"
+        ) {
+          responseError = new ControlClientError(
+            "invalid-response",
+            "The Loxa node returned an invalid control media type.",
+          );
+        } else {
+          const responseBody = await readBoundedBytes(response, MAX_V2_ERROR_BYTES, controller.signal);
+          accepted = decode(() => decodeV2OperationAcceptedJson(responseBody));
+          if (expectedOperationId !== undefined && accepted.operation_id !== expectedOperationId) {
+            responseError = new ControlClientError("invalid-response", "The Loxa v2 operation identity changed.");
+          }
+        }
+      } catch (error) {
+        responseError = error;
+      }
+
+      const remainingMs = Math.max(1, authority.timeoutMs - (Date.now() - startedAt));
+      await reproveExactAuthority(authority, { signal: controller.signal, timeoutMs: remainingMs });
+      if (controller.signal.aborted) {
+        throw new ControlClientError("aborted", "The proven Loxa control request was cancelled.");
+      }
+      provenPeerAuthorities.set(peer as object, authority);
+      restored = true;
+      if (responseError !== undefined) throw responseError;
+      if (accepted === undefined) {
+        throw new ControlClientError("invalid-response", "The Loxa node returned no operation acceptance.");
+      }
+      return accepted;
+    } catch (error) {
+      if (!restored) provenPeerAuthorities.delete(peer as object);
+      if (controller.signal.aborted) {
+        throw new ControlClientError(
+          abortCause === "timeout" ? "timeout" : "aborted",
+          abortCause === "timeout"
+            ? "The proven Loxa control request timed out."
+            : "The proven Loxa control request was cancelled.",
+        );
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+      authority.signal?.removeEventListener("abort", callerAbort);
+    }
+  });
+}
+
+async function serializeV2Mutation<T>(peer: ProvenControlPeer, mutation: () => Promise<T>): Promise<T> {
+  const key = peer as object;
+  const previous = mutationTails.get(key) ?? Promise.resolve();
+  let release: () => void = () => undefined;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = previous.catch(() => undefined).then(() => gate);
+  mutationTails.set(key, tail);
+  await previous.catch(() => undefined);
+  try {
+    return await mutation();
+  } finally {
+    release();
+    if (mutationTails.get(key) === tail) mutationTails.delete(key);
+  }
+}
+
+export async function downloadV2Model(peer: ProvenControlPeer, modelId: string): Promise<V2OperationAccepted> {
+  assertV2ModelId(modelId);
+  return mutateV2(peer, `/loxa/v2/models/${encodeURIComponent(modelId)}/download`, {});
+}
+
+export async function loadV2Slot(
+  peer: ProvenControlPeer,
+  nodeId: string,
+  slotId: string,
+  modelId: string,
+): Promise<V2OperationAccepted> {
+  assertV2RouteId(nodeId);
+  assertV2RouteId(slotId);
+  assertV2ModelId(modelId);
+  if (nodeId !== peerAuthority(peer).nodeId) {
+    throw new ControlClientError("invalid-response", "The proved node ID changed.");
+  }
+  return mutateV2(peer, `/loxa/v2/nodes/${nodeId}/slots/${slotId}/load`, { model_id: modelId });
+}
+
+export async function unloadV2Slot(
+  peer: ProvenControlPeer,
+  nodeId: string,
+  slotId: string,
+): Promise<V2OperationAccepted> {
+  assertV2RouteId(nodeId);
+  assertV2RouteId(slotId);
+  if (nodeId !== peerAuthority(peer).nodeId) {
+    throw new ControlClientError("invalid-response", "The proved node ID changed.");
+  }
+  return mutateV2(peer, `/loxa/v2/nodes/${nodeId}/slots/${slotId}/unload`, {});
+}
+
+export async function cancelV2Operation(peer: ProvenControlPeer, operationId: string): Promise<V2OperationAccepted> {
+  assertV2RouteId(operationId);
+  return mutateV2(peer, `/loxa/v2/operations/${operationId}/cancel`, {}, operationId);
 }
 
 export function fetchV2NodeCollection(peer: ProvenControlPeer): Promise<V2NodeCollection> {
