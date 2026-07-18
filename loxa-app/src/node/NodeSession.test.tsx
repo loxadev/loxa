@@ -72,6 +72,7 @@ describe("NodeSessionProvider v2 authority", () => {
       signal: expect.any(AbortSignal),
     });
     expect(control.openV2Events).toHaveBeenCalledWith(testPeer, undefined, expect.any(Object), expect.any(AbortSignal));
+    expect(services.getInventory).not.toHaveBeenCalled();
   });
 
   it("fully replaces node/default-slot truth on epoch change and ignores an old-epoch event", async () => {
