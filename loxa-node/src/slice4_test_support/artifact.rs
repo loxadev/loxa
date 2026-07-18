@@ -43,7 +43,7 @@ fn download_key(model_id: &str, source: &str, artifact: ArtifactKey) -> Download
         model_id,
         "hugging-face",
         source,
-        Some("0123456789abcdef"),
+        Some("0123456789abcdef0123456789abcdef01234567"),
         "weights/model.gguf",
         Some([7; 32]),
         Some(42),
@@ -80,7 +80,7 @@ fn canonical_key_rejects_ambiguous_or_secret_bearing_source_identity() {
             "coding",
             "hugging-face",
             source,
-            Some("0123456789abcdef"),
+            Some("0123456789abcdef0123456789abcdef01234567"),
             "weights/model.gguf",
             Some([7; 32]),
             Some(42),
@@ -88,6 +88,150 @@ fn canonical_key_rejects_ambiguous_or_secret_bearing_source_identity() {
         )
         .is_err());
     }
+}
+
+#[test]
+fn source_identity_requires_the_closed_recipe_grammar() {
+    let dir = TestDir::new("source-grammar");
+    let artifact = artifact_key(dir.path(), "model.gguf");
+    let invalid = [
+        (
+            "Hugging-Face",
+            "publisher/repository",
+            Some("0123456789abcdef0123456789abcdef01234567"),
+        ),
+        (
+            "hugging-face ",
+            "publisher/repository",
+            Some("0123456789abcdef0123456789abcdef01234567"),
+        ),
+        (
+            "hugging-face",
+            "publisher%2frepository",
+            Some("0123456789abcdef0123456789abcdef01234567"),
+        ),
+        (
+            "hugging-face",
+            "publisher/repository%3ftoken",
+            Some("0123456789abcdef0123456789abcdef01234567"),
+        ),
+        (
+            "hugging-face",
+            "publisher/repository&token=x",
+            Some("0123456789abcdef0123456789abcdef01234567"),
+        ),
+        (
+            "hugging-face",
+            "publisher/repository=secret",
+            Some("0123456789abcdef0123456789abcdef01234567"),
+        ),
+        (
+            "hugging-face",
+            "publisher//repository",
+            Some("0123456789abcdef0123456789abcdef01234567"),
+        ),
+        (
+            "hugging-face",
+            "publisher/repository/extra",
+            Some("0123456789abcdef0123456789abcdef01234567"),
+        ),
+        (
+            "hugging-face",
+            " publisher/repository",
+            Some("0123456789abcdef0123456789abcdef01234567"),
+        ),
+        (
+            "hugging-face",
+            "publisher/repository",
+            Some("ABCDEF0123456789abcdef0123456789abcdef01"),
+        ),
+        ("hugging-face", "publisher/repository", Some("main")),
+        ("hugging-face", "publisher/repository", None),
+    ];
+
+    for (namespace, source, revision) in invalid {
+        assert!(
+            DownloadKey::new(
+                "coding",
+                namespace,
+                source,
+                revision,
+                "weights/model.gguf",
+                Some([7; 32]),
+                Some(42),
+                artifact.clone(),
+            )
+            .is_err(),
+            "accepted {namespace:?} {source:?} {revision:?}"
+        );
+    }
+}
+
+#[test]
+fn artifact_destination_rejects_nonportable_path_forms() {
+    let dir = TestDir::new("portable-path");
+    for name in [
+        "C:model.gguf",
+        "C:\\model.gguf",
+        "model.gguf:stream",
+        "CON",
+        "nul.gguf",
+        "model.gguf.",
+        "model.gguf ",
+        "nested\\model.gguf",
+    ] {
+        assert!(
+            ArtifactKey::from_destination(&dir.path().join(name)).is_err(),
+            "accepted nonportable destination {name:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn artifact_destination_rejects_existing_hardlink_ambiguity() {
+    let dir = TestDir::new("hardlink");
+    let first = dir.path().join("first.gguf");
+    let second = dir.path().join("second.gguf");
+    std::fs::write(&first, b"artifact").unwrap();
+    std::fs::hard_link(&first, &second).unwrap();
+
+    assert!(ArtifactKey::from_destination(&first).is_err());
+    assert!(ArtifactKey::from_destination(&second).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn artifact_destination_rejects_parent_replacement_during_identity_capture() {
+    let root = TestDir::new("parent-swap");
+    let parent = root.path().join("models");
+    let moved = root.path().join("models-old");
+    std::fs::create_dir(&parent).unwrap();
+    let destination = parent.join("model.gguf");
+
+    let result = ArtifactKey::from_destination_with_test_hook(&destination, || {
+        std::fs::rename(&parent, &moved).unwrap();
+        std::fs::create_dir(&parent).unwrap();
+    });
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn dropping_unpublished_completions_returns_bounded_capacity() {
+    let downloads = DownloadCompletionQueue::new(1);
+    let download = downloads.reserve().expect("download slot");
+    assert!(downloads.reserve().is_none());
+    drop(download);
+    assert!(downloads.reserve().is_some());
+
+    let lifecycle = crate::lifecycle_controller::LifecycleMailboxInner::new(1);
+    let completion = lifecycle
+        .reserve_verification()
+        .expect("lifecycle verification slot");
+    assert!(lifecycle.reserve_verification().is_none());
+    drop(completion);
+    assert!(lifecycle.reserve_verification().is_some());
 }
 
 #[test]

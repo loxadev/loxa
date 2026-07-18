@@ -155,7 +155,7 @@ impl<T> RetainedCompletion<T> {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if matches!(&*state, CompletionTransferState::Ready(_)) {
-            Some(ReadyCompletionGuard { state })
+            Some(ReadyCompletionGuard { state: Some(state) })
         } else {
             None
         }
@@ -163,18 +163,21 @@ impl<T> RetainedCompletion<T> {
 
     #[cfg(test)]
     pub(crate) fn dispose_poisoned_for_test(self) {
-        let mut state = self
-            .cell
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let previous = std::mem::replace(&mut *state, CompletionTransferState::Acknowledged);
-        if let CompletionTransferState::Poisoned(mut outcome) = previous {
-            // SAFETY: this test-only fatal owner is the sole explicit disposer.
-            unsafe { ManuallyDrop::drop(&mut outcome) };
-        } else {
-            *state = previous;
-        }
+        let outcome = {
+            let mut state = self
+                .cell
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = std::mem::replace(&mut *state, CompletionTransferState::Acknowledged);
+            if let CompletionTransferState::Poisoned(outcome) = previous {
+                Some(ManuallyDrop::into_inner(outcome))
+            } else {
+                *state = previous;
+                None
+            }
+        };
+        drop(outcome);
     }
 }
 
@@ -187,31 +190,34 @@ impl<T> std::fmt::Debug for RetainedCompletion<T> {
 }
 
 pub(crate) struct ReadyCompletionGuard<'a, T> {
-    state: MutexGuard<'a, CompletionTransferState<T>>,
+    state: Option<MutexGuard<'a, CompletionTransferState<T>>>,
 }
 
 impl<T> ReadyCompletionGuard<'_, T> {
     pub(crate) fn outcome_mut(&mut self) -> &mut T {
-        match &mut *self.state {
+        match &mut **self.state.as_mut().expect("ready guard owns its lock") {
             CompletionTransferState::Ready(outcome) => outcome,
             _ => unreachable!("ready completion guard changed state"),
         }
     }
 
-    pub(crate) fn acknowledge(&mut self) {
-        let previous = std::mem::replace(&mut *self.state, CompletionTransferState::Acknowledged);
-        if let CompletionTransferState::Ready(mut outcome) = previous {
-            // SAFETY: acknowledgement is the single explicit release boundary.
-            unsafe { ManuallyDrop::drop(&mut outcome) };
+    pub(crate) fn acknowledge(mut self) {
+        let mut state = self.state.take().expect("ready guard owns its lock");
+        let previous = std::mem::replace(&mut *state, CompletionTransferState::Acknowledged);
+        let outcome = if let CompletionTransferState::Ready(outcome) = previous {
+            ManuallyDrop::into_inner(outcome)
         } else {
             unreachable!("only a ready completion can be acknowledged");
-        }
+        };
+        drop(state);
+        drop(outcome);
     }
 
     pub(crate) fn poison(&mut self) {
-        let previous = std::mem::replace(&mut *self.state, CompletionTransferState::Acknowledged);
+        let state = self.state.as_mut().expect("ready guard owns its lock");
+        let previous = std::mem::replace(&mut **state, CompletionTransferState::Acknowledged);
         if let CompletionTransferState::Ready(outcome) = previous {
-            *self.state = CompletionTransferState::Poisoned(outcome);
+            **state = CompletionTransferState::Poisoned(outcome);
         } else {
             unreachable!("only a ready completion can be poisoned");
         }
@@ -241,7 +247,7 @@ impl DownloadVerificationCompletion {
         outcome: DownloadVerificationOutcome,
     ) -> Result<(), RetainedCompletion<DownloadVerificationOutcome>> {
         publish_completion(
-            self.cell,
+            self.cell.clone(),
             self.destination.upgrade(),
             outcome,
             |destination| destination.notify_ready(),
@@ -262,11 +268,43 @@ impl LifecycleVerificationCompletion {
         outcome: LifecycleVerificationOutcome,
     ) -> Result<(), RetainedCompletion<LifecycleVerificationOutcome>> {
         publish_completion(
-            self.cell,
+            self.cell.clone(),
             self.destination.upgrade(),
             outcome,
             |destination| destination.notify_verification_ready(),
         )
+    }
+}
+
+impl Drop for DownloadVerificationCompletion {
+    fn drop(&mut self) {
+        if rollback_reserved_cell(&self.cell) {
+            if let Some(destination) = self.destination.upgrade() {
+                destination.completions.remove_reserved(&self.cell);
+            }
+        }
+    }
+}
+
+impl Drop for LifecycleVerificationCompletion {
+    fn drop(&mut self) {
+        if rollback_reserved_cell(&self.cell) {
+            if let Some(destination) = self.destination.upgrade() {
+                destination.remove_verification_reservation(&self.cell);
+            }
+        }
+    }
+}
+
+fn rollback_reserved_cell<T>(cell: &Arc<RetainedCompletionCell<T>>) -> bool {
+    let Ok(mut state) = cell.state.lock() else {
+        return false;
+    };
+    if matches!(&*state, CompletionTransferState::Reserved) {
+        *state = CompletionTransferState::Acknowledged;
+        true
+    } else {
+        false
     }
 }
 
@@ -360,6 +398,21 @@ impl<T> CompletionDestination<T> {
         true
     }
 
+    pub(super) fn remove_reserved(&self, target: &Arc<RetainedCompletionCell<T>>) {
+        let removed = {
+            let mut cells = match self.cells.lock() {
+                Ok(cells) => cells,
+                Err(_) => return,
+            };
+            let Some(index) = cells.iter().position(|cell| Arc::ptr_eq(cell, target)) else {
+                return;
+            };
+            cells.remove(index)
+        };
+        drop(removed);
+        self.changed.notify_all();
+    }
+
     fn ready(&self) -> Option<RetainedCompletion<T>> {
         let cells = self.cells.lock().ok()?;
         cells.iter().find_map(|cell| {
@@ -379,20 +432,12 @@ impl<T> CompletionDestination<T> {
         let cells = self
             .cells
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for cell in cells.iter() {
-            let mut state = cell
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let previous = std::mem::replace(&mut *state, CompletionTransferState::Acknowledged);
-            match previous {
-                CompletionTransferState::Poisoned(mut outcome) => {
-                    // SAFETY: this test-only fatal owner is the sole explicit disposer.
-                    unsafe { ManuallyDrop::drop(&mut outcome) };
-                }
-                other => *state = other,
-            }
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        for cell in cells {
+            RetainedCompletion { cell }.dispose_poisoned_for_test();
         }
     }
 }
@@ -551,7 +596,7 @@ impl Drop for VerificationAdmissionReservation {
     }
 }
 
-pub(crate) struct VerificationShared {
+struct VerificationShared {
     state: Mutex<VerificationState>,
     changed: Condvar,
 }
@@ -604,6 +649,7 @@ impl VerificationShared {
             ),
         );
         state.consume_reservation(&key, VerificationClass::Download);
+        drop(state);
         permit.release();
         self.changed.notify_all();
         Ok(waiter_id)
@@ -655,6 +701,7 @@ impl VerificationShared {
             ),
         );
         state.consume_reservation(&key, VerificationClass::Lifecycle);
+        drop(state);
         self.changed.notify_all();
         Ok(waiter_id)
     }
@@ -668,6 +715,7 @@ impl VerificationShared {
             }
         };
         state.consume_reservation(key, class);
+        drop(state);
         self.changed.notify_all();
     }
 
@@ -679,12 +727,18 @@ impl VerificationShared {
                 return;
             }
         };
-        if state
+        let removed = if state
             .bound
             .get(&waiter_id)
             .is_some_and(|(known, _)| known == key)
         {
-            state.bound.remove(&waiter_id);
+            state.bound.remove(&waiter_id)
+        } else {
+            None
+        };
+        drop(state);
+        if removed.is_some() {
+            drop(removed);
             self.changed.notify_all();
         }
     }
@@ -721,6 +775,26 @@ enum BoundVerification {
         continuation: LifecycleVerificationContinuation,
         completion: LifecycleVerificationCompletion,
     },
+    #[cfg(test)]
+    DropProbe(VerificationLockDropProbe),
+}
+
+#[cfg(test)]
+struct VerificationLockDropProbe {
+    owner: Weak<VerificationShared>,
+    observed_unlocked: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(test)]
+impl Drop for VerificationLockDropProbe {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        let unlocked = self
+            .owner
+            .upgrade()
+            .is_some_and(|owner| owner.state.try_lock().is_ok());
+        self.observed_unlocked.store(unlocked, Ordering::SeqCst);
+    }
 }
 
 pub(crate) struct VerificationSchedulerHandle {
@@ -737,4 +811,166 @@ pub(crate) struct VerificationSchedulerOwner {
 pub(crate) enum VerificationWorkerExit {
     Stopped,
     Panicked,
+}
+
+#[cfg(test)]
+mod lock_order_tests {
+    use super::*;
+    use crate::artifact_coordinator::{ArtifactKey, ArtifactMutationCoordinator};
+    use crate::download_scheduler::DownloadContinuation;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "loxa-verification-lock-{label}-{}-{}",
+                std::process::id(),
+                OperationId::new_v4()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn shared() -> Arc<VerificationShared> {
+        Arc::new(VerificationShared {
+            state: Mutex::new(VerificationState {
+                next_waiter_id: 1,
+                reservations: HashMap::new(),
+                bound: HashMap::new(),
+                stopping: false,
+                sealed: false,
+            }),
+            changed: Condvar::new(),
+        })
+    }
+
+    #[test]
+    fn acknowledgement_drops_payload_after_releasing_cell_lock() {
+        struct Probe {
+            cell: Weak<RetainedCompletionCell<Probe>>,
+            observed_unlocked: Arc<AtomicBool>,
+        }
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                let unlocked = self
+                    .cell
+                    .upgrade()
+                    .is_some_and(|cell| cell.state.try_lock().is_ok());
+                self.observed_unlocked.store(unlocked, Ordering::SeqCst);
+            }
+        }
+
+        let observed_unlocked = Arc::new(AtomicBool::new(false));
+        let cell = Arc::new(RetainedCompletionCell {
+            state: Mutex::new(CompletionTransferState::Reserved),
+        });
+        *cell.state.lock().unwrap() = CompletionTransferState::Ready(ManuallyDrop::new(Probe {
+            cell: Arc::downgrade(&cell),
+            observed_unlocked: Arc::clone(&observed_unlocked),
+        }));
+        RetainedCompletion { cell }
+            .lock_ready()
+            .unwrap()
+            .acknowledge();
+
+        assert!(observed_unlocked.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn waiter_release_drops_bound_ownership_after_releasing_scheduler_lock() {
+        let owner = shared();
+        let observed_unlocked = Arc::new(AtomicBool::new(false));
+        let dir = TestDir::new("waiter");
+        let path = dir.0.join("model.gguf");
+        std::fs::write(&path, b"artifact").unwrap();
+        let key = VerificationKey::new(
+            StableVerificationInput::open(&path, [1; 32])
+                .unwrap()
+                .stable,
+            [1; 32],
+        );
+        owner.state.lock().unwrap().bound.insert(
+            7,
+            (
+                key.clone(),
+                BoundVerification::DropProbe(VerificationLockDropProbe {
+                    owner: Arc::downgrade(&owner),
+                    observed_unlocked: Arc::clone(&observed_unlocked),
+                }),
+            ),
+        );
+
+        owner.release_waiter(&key, 7);
+
+        assert!(observed_unlocked.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn download_bind_releases_worker_permit_after_releasing_scheduler_lock() {
+        let dir = TestDir::new("bind");
+        let path = dir.0.join("model.gguf");
+        std::fs::write(&path, b"artifact").unwrap();
+        let input = StableVerificationInput::open(&path, [2; 32]).unwrap();
+        let key = VerificationKey::new(input.stable.clone(), [2; 32]);
+        let owner = shared();
+        owner
+            .state
+            .lock()
+            .unwrap()
+            .reservations
+            .insert((key.clone(), VerificationClass::Download), 1);
+        let observed_unlocked = Arc::new(AtomicBool::new(false));
+        let weak_owner = Arc::downgrade(&owner);
+        let observed = Arc::clone(&observed_unlocked);
+        let artifact_key = ArtifactKey::from_destination(&path).unwrap();
+        let artifact = ArtifactMutationCoordinator::new()
+            .try_acquire_mutation(artifact_key)
+            .unwrap();
+        let continuation = DownloadContinuation::with_release_probe_for_test(
+            OperationId::new_v4(),
+            DecimalU64::new(1),
+            OperationCancellation::new(),
+            artifact,
+            Box::new(move || {
+                let unlocked = weak_owner
+                    .upgrade()
+                    .is_some_and(|owner| owner.state.try_lock().is_ok());
+                observed.store(unlocked, Ordering::SeqCst);
+            }),
+        );
+        let completion = DownloadCompletionQueue::new(1).reserve().unwrap();
+
+        let waiter_id = match owner.try_bind_download(key.clone(), input, continuation, completion)
+        {
+            Ok(waiter_id) => waiter_id,
+            Err(_) => panic!("valid download binding rejected"),
+        };
+        assert!(observed_unlocked.load(Ordering::SeqCst));
+        owner.release_waiter(&key, waiter_id);
+    }
+
+    #[test]
+    fn poisoned_reserved_completion_fails_closed_without_releasing_capacity() {
+        let queue = DownloadCompletionQueue::new(1);
+        let completion = queue.reserve().unwrap();
+        let cell = completion.cell.clone();
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = cell.state.lock().unwrap();
+            panic!("poison reserved completion cell");
+        });
+
+        drop(completion);
+
+        assert!(queue.reserve().is_none());
+    }
 }
