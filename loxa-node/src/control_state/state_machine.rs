@@ -96,10 +96,23 @@ pub(crate) struct RestartEvidence {
     pub(crate) captured_intent: LifecycleIntentSnapshot,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct RestartTerminalization {
     reconcile_lifecycle: bool,
     allow_migration_mismatch: bool,
+    captured_intent: LifecycleIntentSnapshot,
+    captured_slot: V2Slot,
+}
+
+pub(crate) fn ready_authority_matches_intent_or_observed(
+    authority_model_id: &str,
+    intent: &LifecycleIntentSnapshot,
+    observed: &V2Slot,
+) -> bool {
+    matches!(
+        &intent.desired,
+        DesiredDisposition::Loaded(model_id) if model_id == authority_model_id
+    ) || observed.model_id.as_deref() == Some(authority_model_id)
 }
 
 impl TryFrom<StoredSlotIntent> for LifecycleIntentSnapshot {
@@ -645,6 +658,18 @@ impl ControlRepository {
         if current_intent != evidence.captured_intent {
             return Err(TransitionError::Contradiction);
         }
+        let captured_slot = self.read_transaction(|connection| {
+            read_slot_connection(connection, self.node_id(), self.slot_id())
+        })?;
+        if let RecoveryEvidence::ExactReady(authority) = &evidence.lifecycle {
+            if !ready_authority_matches_intent_or_observed(
+                authority.model_id(),
+                &evidence.captured_intent,
+                &captured_slot,
+            ) {
+                return Err(TransitionError::Contradiction);
+            }
+        }
         let allow_migration_mismatch = matches!(
             evidence.captured_intent.reason,
             Some(
@@ -702,6 +727,8 @@ impl ControlRepository {
                     reconcile_lifecycle: kind != V2OperationKind::Download
                         && lifecycle_operation_id == Some(operation_id),
                     allow_migration_mismatch,
+                    captured_intent: evidence.captured_intent.clone(),
+                    captured_slot: captured_slot.clone(),
                 },
                 now_unix_ms,
                 ids,
@@ -713,7 +740,13 @@ impl ControlRepository {
             _ => None,
         };
         if !has_lifecycle {
-            if let Some(receipt) = self.reconcile_slot_if_changed(&decision, now_unix_ms, ids)? {
+            if let Some(receipt) = self.reconcile_slot_if_changed_with_restart_context(
+                &decision,
+                &evidence.captured_intent,
+                &captured_slot,
+                now_unix_ms,
+                ids,
+            )? {
                 receipts.push(receipt);
             }
         }
@@ -737,6 +770,10 @@ impl ControlRepository {
         now_unix_ms: u64,
         ids: &mut dyn MutationIds,
     ) -> Result<CommitReceipt, TransitionError> {
+        let captured_intent = LifecycleIntentSnapshot::try_from(self.stored_slot_intent()?)?;
+        let captured_slot = self.read_transaction(|connection| {
+            read_slot_connection(connection, self.node_id(), self.slot_id())
+        })?;
         self.terminalize_interrupted_operation_with_restart_context(
             operation_id,
             error,
@@ -744,6 +781,8 @@ impl ControlRepository {
             RestartTerminalization {
                 reconcile_lifecycle: true,
                 allow_migration_mismatch: false,
+                captured_intent,
+                captured_slot,
             },
             now_unix_ms,
             ids,
@@ -792,7 +831,11 @@ impl ControlRepository {
             operation.status = V2OperationStatus::Failed;
             operation.error = Some(error);
             if context.reconcile_lifecycle && slot.operation_id == Some(operation_id) {
-                apply_recovery_decision_to_slot(&mut slot, decision)?;
+                apply_recovery_decision_to_slot(
+                    &mut slot,
+                    decision,
+                    context.captured_slot.model_id.clone(),
+                )?;
             }
             let next_revision = revision.checked_add(1).ok_or_else(overflow_error)?;
             let next_cursor = cursor.checked_add(1).ok_or_else(overflow_error)?;
@@ -817,7 +860,7 @@ impl ControlRepository {
             write_operation(tx, &operation, slot_id)?;
             if slot_changed {
                 write_slot(tx, &slot, next_revision, effective_now)?;
-                write_intent_for_observed_slot(tx, &slot, next_revision)?;
+                write_restart_intent(tx, &slot, decision, &context.captured_intent, next_revision)?;
             }
             update_meta(tx, next_revision, next_cursor, effective_now)?;
             insert_event(tx, &event, Some(v1_sequence), &payload)?;
@@ -833,9 +876,31 @@ impl ControlRepository {
         .map_err(map_tagged_error)
     }
 
+    #[cfg(test)]
     fn reconcile_slot_if_changed(
         &mut self,
         decision: &RecoveryDecision,
+        now_unix_ms: u64,
+        ids: &mut dyn MutationIds,
+    ) -> Result<Option<CommitReceipt>, TransitionError> {
+        let captured_intent = LifecycleIntentSnapshot::try_from(self.stored_slot_intent()?)?;
+        let captured_slot = self.read_transaction(|connection| {
+            read_slot_connection(connection, self.node_id(), self.slot_id())
+        })?;
+        self.reconcile_slot_if_changed_with_restart_context(
+            decision,
+            &captured_intent,
+            &captured_slot,
+            now_unix_ms,
+            ids,
+        )
+    }
+
+    fn reconcile_slot_if_changed_with_restart_context(
+        &mut self,
+        decision: &RecoveryDecision,
+        captured_intent: &LifecycleIntentSnapshot,
+        captured_slot: &V2Slot,
         now_unix_ms: u64,
         ids: &mut dyn MutationIds,
     ) -> Result<Option<CommitReceipt>, TransitionError> {
@@ -845,7 +910,7 @@ impl ControlRepository {
         let current =
             self.read_transaction(|connection| read_slot_connection(connection, node_id, slot_id))?;
         let mut target = current.clone();
-        apply_recovery_decision_to_slot(&mut target, decision)?;
+        apply_recovery_decision_to_slot(&mut target, decision, captured_slot.model_id.clone())?;
         if target == current {
             return Ok(None);
         }
@@ -882,7 +947,7 @@ impl ControlRepository {
                 .map_err(|_| tagged_error(TransitionError::Contradiction))?;
             let payload = serialize_event(&event)?;
             write_slot(tx, &committed, next_revision, effective_now)?;
-            write_intent_for_observed_slot(tx, &committed, next_revision)?;
+            write_restart_intent(tx, &committed, decision, captured_intent, next_revision)?;
             update_meta(tx, next_revision, next_cursor, effective_now)?;
             insert_event(tx, &event, None, &payload)?;
             prune(tx)?;
@@ -963,6 +1028,7 @@ impl ControlRepository {
                     observation,
                     &mut operation,
                     &mut slot,
+                    &previous_slot,
                     effective_now,
                 )?
             } else {
@@ -1013,7 +1079,12 @@ impl ControlRepository {
             if slot_changed {
                 write_slot(tx, &slot, next_revision, effective_now)?;
                 if let Some(observation) = lifecycle_observation.as_ref() {
-                    write_intent_for_lifecycle_observation(tx, observation, next_revision)?;
+                    write_intent_for_lifecycle_observation(
+                        tx,
+                        observation,
+                        &operation,
+                        next_revision,
+                    )?;
                 } else {
                     write_intent_for_observed_slot(tx, &slot, next_revision)?;
                 }
@@ -1327,6 +1398,7 @@ fn apply_lifecycle_observation(
     observation: &LifecycleObservation,
     operation: &mut V2Operation,
     slot: &mut V2Slot,
+    previous_slot: &V2Slot,
     effective_now: u64,
 ) -> Result<bool, RepositoryError> {
     if transition.operation_id() != observation.operation_id()
@@ -1364,7 +1436,13 @@ fn apply_lifecycle_observation(
             }
         }
         LifecycleObservation::Compensated { disposition, .. } => {
-            if matches!(disposition, DesiredDisposition::Unknown)
+            let expected = previous_slot
+                .model_id
+                .as_ref()
+                .map_or(DesiredDisposition::Unloaded, |model_id| {
+                    DesiredDisposition::Loaded(model_id.clone())
+                });
+            if disposition != &expected
                 || !matches!(
                     transition,
                     Transition::Failed { .. } | Transition::Cancelled { .. }
@@ -1397,10 +1475,25 @@ fn apply_lifecycle_observation(
             apply_disposition_to_slot(slot, disposition)?;
         }
         LifecycleObservation::RecoveryRequired { .. } => {
-            apply_disposition_to_slot(slot, &DesiredDisposition::Unknown)?;
+            apply_recovery_to_slot(slot, previous_slot.model_id.clone())?;
         }
     }
     Ok(true)
+}
+
+fn apply_recovery_to_slot(
+    slot: &mut V2Slot,
+    last_observed_model_id: Option<String>,
+) -> Result<(), RepositoryError> {
+    slot.status = V2SlotStatus::Recovery;
+    slot.model_id = last_observed_model_id;
+    slot.operation_id = None;
+    slot.error = Some(V2PublicError {
+        code: V2SlotErrorCode::LifecycleRecoveryRequired,
+        message: "exact lifecycle ownership could not be recovered".into(),
+    });
+    slot.validate()
+        .map_err(|_| tagged_error(TransitionError::Contradiction))
 }
 
 fn apply_disposition_to_slot(
@@ -1437,6 +1530,7 @@ fn apply_disposition_to_slot(
 fn apply_recovery_decision_to_slot(
     slot: &mut V2Slot,
     decision: &RecoveryDecision,
+    last_observed_model_id: Option<String>,
 ) -> Result<(), RepositoryError> {
     slot.operation_id = None;
     match decision {
@@ -1453,16 +1547,37 @@ fn apply_recovery_decision_to_slot(
         RecoveryDecision::Recovery {
             error: SlotRecoveryError::LifecycleRecoveryRequired,
         } => {
-            slot.status = V2SlotStatus::Recovery;
-            slot.model_id = None;
-            slot.error = Some(V2PublicError {
-                code: V2SlotErrorCode::LifecycleRecoveryRequired,
-                message: "exact lifecycle ownership could not be recovered".into(),
-            });
+            return apply_recovery_to_slot(slot, last_observed_model_id);
         }
     }
     slot.validate()
         .map_err(|_| tagged_error(TransitionError::Contradiction))
+}
+
+fn write_restart_intent(
+    tx: &SqlTransaction<'_>,
+    slot: &V2Slot,
+    decision: &RecoveryDecision,
+    captured: &LifecycleIntentSnapshot,
+    revision: u64,
+) -> Result<(), RepositoryError> {
+    if matches!(decision, RecoveryDecision::Recovery { .. }) {
+        let (desired_kind, desired_model_id) = match &captured.desired {
+            DesiredDisposition::Unloaded => (DesiredKind::Unloaded, None),
+            DesiredDisposition::Loaded(model_id) => (DesiredKind::Loaded, Some(model_id.as_str())),
+            DesiredDisposition::Unknown => (DesiredKind::Unknown, None),
+        };
+        return write_intent(
+            tx,
+            desired_kind,
+            desired_model_id,
+            captured.desired_revision.get(),
+            captured.operation_id,
+            ReconciliationState::RecoveryRequired,
+            Some(IntentReason::ChildEvidenceUncertain),
+        );
+    }
+    write_intent_for_observed_slot(tx, slot, revision)
 }
 
 fn terminal_replay(
@@ -1969,6 +2084,7 @@ fn write_intent_for_observed_slot(
 fn write_intent_for_lifecycle_observation(
     tx: &SqlTransaction<'_>,
     observation: &LifecycleObservation,
+    operation: &V2Operation,
     revision: u64,
 ) -> Result<(), RepositoryError> {
     match observation {
@@ -2011,15 +2127,27 @@ fn write_intent_for_lifecycle_observation(
             ),
             DesiredDisposition::Unknown => Err(tagged_error(TransitionError::Contradiction)),
         },
-        LifecycleObservation::RecoveryRequired { reason, .. } => write_intent(
-            tx,
-            DesiredKind::Unknown,
-            None,
-            revision,
-            None,
-            ReconciliationState::RecoveryRequired,
-            Some(*reason),
-        ),
+        LifecycleObservation::RecoveryRequired {
+            operation_id,
+            reason,
+        } => {
+            let (kind, model_id) = match operation.kind {
+                V2OperationKind::Load => (DesiredKind::Loaded, operation.model_id.as_deref()),
+                V2OperationKind::Unload => (DesiredKind::Unloaded, None),
+                V2OperationKind::Download => {
+                    return Err(tagged_error(TransitionError::Contradiction));
+                }
+            };
+            write_intent(
+                tx,
+                kind,
+                model_id,
+                operation.created_revision.get(),
+                Some(*operation_id),
+                ReconciliationState::RecoveryRequired,
+                Some(*reason),
+            )
+        }
     }
 }
 

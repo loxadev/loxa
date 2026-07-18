@@ -3,8 +3,8 @@ use crate::control_state::repository::{
 };
 use crate::control_state::state_machine::test_support::storage::TestRoot;
 use crate::control_state::state_machine::{
-    AdmissionRequest, DesiredDisposition, LifecycleObservation, MutationIds, Transition,
-    TransitionError,
+    ready_authority_matches_intent_or_observed, AdmissionRequest, DesiredDisposition,
+    LifecycleObservation, MutationIds, Transition, TransitionError,
 };
 use loxa_protocol::v2::{
     DecimalU64, EventId, OperationId, SlotId, StreamEpoch, V2OperationError, V2OperationErrorCode,
@@ -237,8 +237,6 @@ mod slice4_intent {
         BeforePriorTeardown,
         PriorStopped,
         CandidateSpawned,
-        CandidateReady,
-        FinalCommitUnknown,
     }
 
     fn make_ready(machine: &mut MachineFixture, model_id: &str) {
@@ -279,6 +277,21 @@ mod slice4_intent {
                 &mut machine.ids,
             )
             .unwrap()
+    }
+
+    fn observe_lifecycle_result(
+        machine: &mut MachineFixture,
+        transition: Transition,
+        observation: LifecycleObservation,
+    ) -> Result<crate::control_state::state_machine::CommitReceipt, TransitionError> {
+        let instance = machine.instance();
+        machine.repository.as_mut().unwrap().observe_lifecycle(
+            instance,
+            transition,
+            observation,
+            machine.now,
+            &mut machine.ids,
+        )
     }
 
     #[test]
@@ -361,7 +374,11 @@ mod slice4_intent {
                 assert_eq!(intent.reason, None);
             } else {
                 assert_eq!(state.slot.status, V2SlotStatus::Recovery, "{boundary:?}");
-                assert_eq!(intent.desired_kind, DesiredKind::Unknown);
+                assert_eq!(state.slot.model_id.as_deref(), Some("prior-model"));
+                assert_eq!(intent.desired_kind, DesiredKind::Loaded);
+                assert_eq!(intent.desired_model_id.as_deref(), Some("candidate-model"));
+                assert_eq!(intent.desired_revision, admission.revision.get());
+                assert_eq!(intent.operation_id, Some(admission.operation_id));
                 assert_eq!(intent.reconciliation, ReconciliationState::RecoveryRequired);
                 assert_eq!(intent.reason, Some(failure_reason));
             }
@@ -427,15 +444,6 @@ mod slice4_intent {
         assert_eq!(state.slot.status, V2SlotStatus::Unloaded);
         assert_eq!(state.slot.model_id, None);
         unload.validate_all();
-
-        assert_eq!(
-            LifecycleBoundary::CandidateReady,
-            LifecycleBoundary::CandidateReady
-        );
-        assert_eq!(
-            LifecycleBoundary::FinalCommitUnknown,
-            LifecycleBoundary::FinalCommitUnknown
-        );
     }
 
     #[test]
@@ -489,6 +497,194 @@ mod slice4_intent {
             TransitionError::Contradiction
         );
         assert_eq!(recovery.state(), before);
+    }
+
+    #[test]
+    fn compensation_accepts_only_the_exact_pre_transition_observed_disposition() {
+        let mut exact_unloaded = MachineFixture::new();
+        let admission = exact_unloaded
+            .admit(AdmissionRequest::Load {
+                model_id: "candidate".into(),
+            })
+            .unwrap();
+        observe_lifecycle(
+            &mut exact_unloaded,
+            Transition::Failed {
+                operation_id: admission.operation_id,
+                error: V2OperationError {
+                    code: V2OperationErrorCode::LoadFailed,
+                    message: "candidate failed".into(),
+                },
+            },
+            LifecycleObservation::Compensated {
+                operation_id: admission.operation_id,
+                disposition: DesiredDisposition::Unloaded,
+            },
+        );
+        assert_eq!(exact_unloaded.state().slot.status, V2SlotStatus::Unloaded);
+
+        let mut unloaded = MachineFixture::new();
+        let admission = unloaded
+            .admit(AdmissionRequest::Load {
+                model_id: "candidate".into(),
+            })
+            .unwrap();
+        let before = unloaded.state();
+        assert_eq!(
+            observe_lifecycle_result(
+                &mut unloaded,
+                Transition::Failed {
+                    operation_id: admission.operation_id,
+                    error: V2OperationError {
+                        code: V2OperationErrorCode::LoadFailed,
+                        message: "candidate failed".into(),
+                    },
+                },
+                LifecycleObservation::Compensated {
+                    operation_id: admission.operation_id,
+                    disposition: DesiredDisposition::Loaded("unrelated".into()),
+                },
+            )
+            .unwrap_err(),
+            TransitionError::Contradiction
+        );
+        assert_eq!(unloaded.state(), before);
+
+        let mut replacement = MachineFixture::new();
+        make_ready(&mut replacement, "prior-model");
+        let admission = replacement
+            .admit(AdmissionRequest::Load {
+                model_id: "candidate".into(),
+            })
+            .unwrap();
+        let before = replacement.state();
+        assert_eq!(
+            observe_lifecycle_result(
+                &mut replacement,
+                Transition::Failed {
+                    operation_id: admission.operation_id,
+                    error: V2OperationError {
+                        code: V2OperationErrorCode::LoadFailed,
+                        message: "rollback failed".into(),
+                    },
+                },
+                LifecycleObservation::Compensated {
+                    operation_id: admission.operation_id,
+                    disposition: DesiredDisposition::Loaded("unrelated".into()),
+                },
+            )
+            .unwrap_err(),
+            TransitionError::Contradiction
+        );
+        assert_eq!(replacement.state(), before);
+
+        let mut unload = MachineFixture::new();
+        make_ready(&mut unload, "prior-model");
+        let admission = unload.admit(AdmissionRequest::Unload).unwrap();
+        let before = unload.state();
+        assert_eq!(
+            observe_lifecycle_result(
+                &mut unload,
+                Transition::Cancelled {
+                    operation_id: admission.operation_id,
+                },
+                LifecycleObservation::Compensated {
+                    operation_id: admission.operation_id,
+                    disposition: DesiredDisposition::Unloaded,
+                },
+            )
+            .unwrap_err(),
+            TransitionError::Contradiction
+        );
+        assert_eq!(unload.state(), before);
+    }
+
+    #[test]
+    fn recovery_required_preserves_desired_intent_and_last_observed_model() {
+        for unload in [false, true] {
+            let mut machine = MachineFixture::new();
+            make_ready(&mut machine, "prior-model");
+            let admission = if unload {
+                machine.admit(AdmissionRequest::Unload).unwrap()
+            } else {
+                machine
+                    .admit(AdmissionRequest::Load {
+                        model_id: "candidate".into(),
+                    })
+                    .unwrap()
+            };
+            observe_lifecycle(
+                &mut machine,
+                Transition::Failed {
+                    operation_id: admission.operation_id,
+                    error: V2OperationError {
+                        code: if unload {
+                            V2OperationErrorCode::UnloadFailed
+                        } else {
+                            V2OperationErrorCode::LoadFailed
+                        },
+                        message: "child outcome uncertain".into(),
+                    },
+                },
+                LifecycleObservation::RecoveryRequired {
+                    operation_id: admission.operation_id,
+                    reason: IntentReason::ChildEvidenceUncertain,
+                },
+            );
+            let state = machine.state();
+            assert_eq!(state.slot.status, V2SlotStatus::Recovery);
+            assert_eq!(state.slot.model_id.as_deref(), Some("prior-model"));
+            assert_eq!(state.intent.operation_id, Some(admission.operation_id));
+            assert_eq!(state.intent.desired_revision, admission.revision);
+            assert_eq!(
+                state.intent.reconciliation,
+                ReconciliationState::RecoveryRequired
+            );
+            assert_eq!(
+                state.intent.reason,
+                Some(IntentReason::ChildEvidenceUncertain)
+            );
+            assert_eq!(
+                state.intent.desired,
+                if unload {
+                    DesiredDisposition::Unloaded
+                } else {
+                    DesiredDisposition::Loaded("candidate".into())
+                }
+            );
+            machine.reopen();
+            machine.validate_all();
+            assert_eq!(machine.state(), state);
+        }
+    }
+
+    #[test]
+    fn exact_ready_adoption_requires_desired_or_prior_observed_model_correlation() {
+        let desired = crate::control_state::state_machine::LifecycleIntentSnapshot {
+            desired: DesiredDisposition::Loaded("candidate".into()),
+            desired_revision: DecimalU64::new(2),
+            operation_id: None,
+            reconciliation: ReconciliationState::Applying,
+            reason: None,
+        };
+        let mut observed = MachineFixture::new().state().slot;
+        observed.status = V2SlotStatus::Ready;
+        observed.model_id = Some("prior-model".into());
+        assert!(ready_authority_matches_intent_or_observed(
+            "candidate",
+            &desired,
+            &observed
+        ));
+        assert!(ready_authority_matches_intent_or_observed(
+            "prior-model",
+            &desired,
+            &observed
+        ));
+        assert!(!ready_authority_matches_intent_or_observed(
+            "unrelated",
+            &desired,
+            &observed
+        ));
     }
 }
 

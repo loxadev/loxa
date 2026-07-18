@@ -10,7 +10,7 @@ use crate::control_state::state_machine::test_support::storage::slice4_migration
 };
 use crate::control_state::state_machine::test_support::storage::TestRoot;
 use crate::control_state::state_machine::{
-    AdmissionRequest, InstancePublication, MutationIds, Transition,
+    AdmissionRequest, DesiredDisposition, InstancePublication, MutationIds, Transition,
 };
 use crate::control_state::worker::{
     spawn_unpublished_from_repository_for_test, ControlStateError, ControlStateInit,
@@ -56,18 +56,19 @@ fn every_migration_rollback_boundary_is_restart_resumable() {
 #[test]
 fn slot_only_uncertainty_atomically_marks_intent_recovery() {
     let mut fixture = Fixture::unpublished("slot-intent-recovery");
+    let before = fixture.repository().stored_slot_intent().unwrap();
     let decision = decide(RecoveryEvidence::uncertain(
         UncertaintyReason::OwnershipUnavailable,
     ));
-    let receipt = fixture
+    fixture
         .repository()
         .reconcile_slot_if_changed(&decision, 30, &mut MutationSequence::default())
         .unwrap()
         .expect("uncertain evidence must commit recovery");
     let intent = fixture.repository().stored_slot_intent().unwrap();
-    assert_eq!(intent.desired_kind, DesiredKind::Unknown);
+    assert_eq!(intent.desired_kind, before.desired_kind);
     assert_eq!(intent.desired_model_id, None);
-    assert_eq!(intent.desired_revision, receipt.revision.get());
+    assert_eq!(intent.desired_revision, before.desired_revision);
     assert_eq!(intent.operation_id, None);
     assert_eq!(intent.reconciliation, ReconciliationState::RecoveryRequired);
     assert_eq!(intent.reason, Some(IntentReason::ChildEvidenceUncertain));
@@ -1187,7 +1188,7 @@ fn loading_plus_uncertain_recovery_emits_only_the_truthful_recovery_slot() {
             &mut ids,
         )
         .unwrap();
-    let operation_id = fixture
+    let admission = fixture
         .repository()
         .admit(
             NodeInstanceId::from_str(INSTANCE).unwrap(),
@@ -1197,8 +1198,8 @@ fn loading_plus_uncertain_recovery_emits_only_the_truthful_recovery_slot() {
             101,
             &mut ids,
         )
-        .unwrap()
-        .operation_id;
+        .unwrap();
+    let operation_id = admission.operation_id;
     fixture
         .repository()
         .observe(
@@ -1224,6 +1225,18 @@ fn loading_plus_uncertain_recovery_emits_only_the_truthful_recovery_slot() {
     let state = fixture.repository().committed_state().unwrap();
     assert_eq!(state.slot.status, loxa_protocol::v2::V2SlotStatus::Recovery);
     assert_eq!(state.slot.model_id, None);
+    assert_eq!(
+        state.intent.desired,
+        DesiredDisposition::Loaded("model".into())
+    );
+    assert_eq!(state.intent.desired_revision, admission.revision);
+    assert_eq!(state.intent.operation_id, Some(operation_id));
+    assert_eq!(
+        state.intent.reconciliation,
+        ReconciliationState::RecoveryRequired
+    );
+    fixture.reopen();
+    fixture.repository().validate_all().unwrap();
     let appended: Vec<_> = state
         .events
         .iter()
@@ -1273,7 +1286,7 @@ fn slot_only_restart_observation_is_not_attributed_to_the_prior_instance() {
 }
 
 #[test]
-fn unloading_with_uncertain_authority_clears_unproven_model_and_has_no_ready_observation() {
+fn unloading_with_uncertain_authority_preserves_last_observed_model_without_ready_observation() {
     let mut fixture = Fixture::unpublished("unloading-absent");
     let mut ids = MutationSequence::default();
     fixture
@@ -1324,7 +1337,7 @@ fn unloading_with_uncertain_authority_clears_unproven_model_and_has_no_ready_obs
             &mut ids,
         )
         .unwrap();
-    let unload = fixture
+    let unload_admission = fixture
         .repository()
         .admit(
             NodeInstanceId::from_str(INSTANCE).unwrap(),
@@ -1332,8 +1345,8 @@ fn unloading_with_uncertain_authority_clears_unproven_model_and_has_no_ready_obs
             104,
             &mut ids,
         )
-        .unwrap()
-        .operation_id;
+        .unwrap();
+    let unload = unload_admission.operation_id;
     fixture
         .repository()
         .observe(
@@ -1358,7 +1371,16 @@ fn unloading_with_uncertain_authority_clears_unproven_model_and_has_no_ready_obs
     assert_eq!(reconciled.receipts.len(), 1);
     let state = fixture.repository().committed_state().unwrap();
     assert_eq!(state.slot.status, loxa_protocol::v2::V2SlotStatus::Recovery);
-    assert_eq!(state.slot.model_id, None);
+    assert_eq!(state.slot.model_id.as_deref(), Some("model"));
+    assert_eq!(state.intent.desired, DesiredDisposition::Unloaded);
+    assert_eq!(state.intent.desired_revision, unload_admission.revision);
+    assert_eq!(state.intent.operation_id, Some(unload));
+    assert_eq!(
+        state.intent.reconciliation,
+        ReconciliationState::RecoveryRequired
+    );
+    fixture.reopen();
+    fixture.repository().validate_all().unwrap();
     let appended: Vec<_> = state
         .events
         .iter()
