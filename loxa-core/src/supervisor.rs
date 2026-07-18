@@ -987,9 +987,22 @@ pub fn teardown_owned_run<C>(
 where
     C: ManagedChild + LogDrainingChild,
 {
+    if let Ok(RuntimeStateRead::Loaded(runs)) = read_runtime_state(state_path) {
+        if runs
+            .first()
+            .is_some_and(|current| current.identity() != *state_identity)
+        {
+            return Ok(OwnerTerminalOutcome::RecoveryRequired);
+        }
+    }
     lifecycle::finish_owner_teardown_with(state_path, state_identity, decision, |_| {
         teardown::teardown_managed_child_result(child).confirmation
     })
+}
+
+#[cfg(test)]
+pub(crate) fn write_runtime_state_for_slice3_fixture(path: &Path, runs: &[ManagedRun]) {
+    state::write_runtime_state(path, runs).expect("seed exact-instance replacement fixture");
 }
 
 pub fn handle_observed_child_exit<C, I>(
@@ -1762,6 +1775,41 @@ mod tests {
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
+
+    #[test]
+    fn exact_instance_replacement_never_tears_down_foreign_child() {
+        use crate::slice3_test_support::{replacement_teardown_fixture, Mismatch};
+
+        for mismatch in [Mismatch::Pid, Mismatch::StartTime, Mismatch::RunId] {
+            let result = replacement_teardown_fixture(mismatch);
+            assert!(!result.foreign_child_signalled);
+            assert!(result.recovery_required);
+        }
+    }
+
+    #[test]
+    fn missing_state_retains_legacy_teardown_before_recovery_classification() {
+        let (signal_count, recovery_required) =
+            crate::slice3_test_support::missing_state_teardown_fixture();
+        assert_eq!(signal_count, 1);
+        assert!(recovery_required);
+    }
+
+    #[test]
+    fn unreadable_legacy_and_corrupt_state_retain_physical_teardown_and_evidence() {
+        use crate::slice3_test_support::{durable_failure_teardown_fixture, DurableFailure};
+
+        for failure in [
+            DurableFailure::Legacy,
+            DurableFailure::Corrupt,
+            DurableFailure::ReadError,
+        ] {
+            let result = durable_failure_teardown_fixture(failure);
+            assert_eq!(result.signal_count, 1, "failure: {failure:?}");
+            assert!(result.failed_closed, "failure: {failure:?}");
+            assert!(result.evidence_preserved, "failure: {failure:?}");
+        }
+    }
     use tracing::field::{Field, Visit};
     use tracing::{Event, Metadata, Subscriber};
 
