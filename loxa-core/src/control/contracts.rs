@@ -252,6 +252,12 @@ pub struct ReconnectSnapshot {
     pub events: Vec<ControlEvent>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DurableV1ProjectionError {
+    InvalidAuthoritativeState,
+    UnsafeInteger,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CapabilitiesSnapshot {

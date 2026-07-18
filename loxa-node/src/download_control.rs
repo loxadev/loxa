@@ -1,23 +1,34 @@
 use crate::actor::{
-    Mutation, MutationCancellation, MutationExecutor, NodeActor, NodeActorHandle, SubmitError,
+    CancelOutcome, Mutation, MutationCancellation, MutationExecutor, NodeActor, NodeActorHandle,
+    SubmitError,
 };
+use crate::control_state::state_machine::{
+    AdmissionRequest, CommittedAdmission, CurrentInstanceV1State, Transition, TransitionError,
+};
+use crate::control_state::{ControlStateError, ControlStateHandle};
 use crate::model_lifecycle::{
     EngineLifecycleDriver, GatewayPublisher, LaunchPlan, LifecycleError, LifecycleSnapshot,
     ModelLifecycle,
 };
 use loxa_core::control::contracts::{
-    OperationKind, OperationStatus, OperationView, ReconnectSnapshot,
+    NodeSnapshot, NodeStatus, OperationKind, OperationStatus, OperationView, ReconnectSnapshot,
 };
 use loxa_core::control::operations::{
-    CancellationSafety, EventSubscription, OperationError, OperationStore,
+    project_durable_v1_counter, project_durable_v1_operation, CancellationSafety,
+    EventSubscription, OperationError, OperationStore,
 };
 use loxa_core::download::{self, DownloadError, DownloadObserver, DownloadProgress};
 use loxa_core::model_inventory::{
     VerificationCache, VerificationCancellation, VerifiedArtifact, VerifiedRecipeInventoryEntry,
 };
 use loxa_core::registry::{ModelEntry, REGISTRY};
+use loxa_protocol::v2::{
+    DecimalU64, OperationId, V2OperationError, V2OperationErrorCode, V2OperationKind,
+    V2OperationProgress, V2OperationStatus, V2PublicError,
+};
 use std::io;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -26,13 +37,35 @@ const OPERATION_CAPACITY: usize = 128;
 
 #[derive(Clone)]
 pub struct DownloadControl {
-    operations: Arc<Mutex<OperationStore>>,
+    authority: AdmissionAuthority,
     actor: NodeActorHandle,
     models_dir: Arc<PathBuf>,
     verification_cache: Arc<VerificationCache>,
     recipes: &'static [ModelEntry],
     lifecycle_snapshot: Option<Arc<Mutex<LifecycleSnapshot>>>,
     lifecycle_destructive: Option<crate::model_lifecycle::CancellationBoundary>,
+}
+
+#[derive(Clone)]
+enum AdmissionAuthority {
+    // TODO(Slice 3 Task 7): remove this production authority once NodeBuilder always supplies
+    // ControlStateHandle. It remains isolated for pre-Task-7 constructors and v1 regressions.
+    Legacy(Arc<Mutex<OperationStore>>),
+    Durable(DurableExecutionControl),
+}
+
+#[derive(Clone)]
+pub(crate) struct DurableExecutionControl {
+    control_state: ControlStateHandle,
+    actor: NodeActorHandle,
+    lifecycle_destructive: Option<crate::model_lifecycle::CancellationBoundary>,
+    projection_healthy: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[derive(Clone)]
+enum ExecutionPersistence {
+    Legacy(Arc<Mutex<OperationStore>>),
+    Durable(ControlStateHandle),
 }
 
 pub struct DownloadControlWorker {
@@ -57,7 +90,126 @@ pub enum DownloadControlError {
     ModelUnavailable,
 }
 
+pub(crate) struct V1EventReceiver {
+    receiver: tokio::sync::mpsc::Receiver<loxa_core::control::contracts::ControlEvent>,
+}
+
+impl V1EventReceiver {
+    pub(crate) async fn recv(&mut self) -> Option<loxa_core::control::contracts::ControlEvent> {
+        self.receiver.recv().await
+    }
+}
+
 impl DownloadControl {
+    pub(crate) async fn start_download_async(
+        &self,
+        model_id: &str,
+    ) -> Result<String, DownloadControlError> {
+        let recipe = find_recipe(self.recipes, model_id).ok_or(DownloadControlError::Missing)?;
+        match &self.authority {
+            AdmissionAuthority::Legacy(_) => self.start(model_id),
+            AdmissionAuthority::Durable(durable) => durable
+                .start_download(model_id, recipe.size_bytes)
+                .await
+                .map(|admission| admission.v1_operation_id),
+        }
+    }
+
+    pub(crate) async fn start_load_async(
+        &self,
+        model_id: &str,
+    ) -> Result<String, DownloadControlError> {
+        if self.lifecycle_snapshot.is_none() {
+            return Err(DownloadControlError::Missing);
+        }
+        let entry = self
+            .inventory(loxa_core::model_inventory::current_available_memory_bytes())
+            .into_iter()
+            .find(|entry| entry.id == model_id)
+            .ok_or(DownloadControlError::Missing)?;
+        LaunchPlan::from_verified_inventory(&entry, &self.models_dir)
+            .map_err(|_| DownloadControlError::ModelUnavailable)?;
+        match &self.authority {
+            AdmissionAuthority::Legacy(_) => self.start_load(model_id),
+            AdmissionAuthority::Durable(durable) => durable
+                .start_load(model_id)
+                .await
+                .map(|admission| admission.v1_operation_id),
+        }
+    }
+
+    pub(crate) async fn start_unload_async(&self) -> Result<String, DownloadControlError> {
+        if self.lifecycle_snapshot.is_none() {
+            return Err(DownloadControlError::Missing);
+        }
+        match &self.authority {
+            AdmissionAuthority::Legacy(_) => self.start_unload(),
+            AdmissionAuthority::Durable(durable) => durable
+                .start_unload()
+                .await
+                .map(|admission| admission.v1_operation_id),
+        }
+    }
+
+    pub(crate) async fn cancel_async(
+        &self,
+        v1_operation_id: &str,
+    ) -> Result<OperationStatus, DownloadControlError> {
+        match &self.authority {
+            AdmissionAuthority::Legacy(_) => self.cancel(v1_operation_id),
+            AdmissionAuthority::Durable(durable) => durable.cancel(v1_operation_id).await,
+        }
+    }
+
+    pub(crate) fn operation_checked(
+        &self,
+        v1_operation_id: &str,
+    ) -> Result<Option<OperationView>, DownloadControlError> {
+        match &self.authority {
+            AdmissionAuthority::Legacy(operations) => Ok(operations
+                .lock()
+                .expect("operation store poisoned")
+                .get(v1_operation_id)),
+            AdmissionAuthority::Durable(durable) => durable.v1_operation(v1_operation_id),
+        }
+    }
+
+    pub(crate) async fn subscribe_v1_with_snapshot(
+        &self,
+        cursor: u64,
+    ) -> Result<(ReconnectSnapshot, V1EventReceiver), DownloadControlError> {
+        match &self.authority {
+            AdmissionAuthority::Legacy(operations) => {
+                let (snapshot, subscription) = operations
+                    .lock()
+                    .expect("operation store poisoned")
+                    .subscribe_with_snapshot(cursor);
+                let (sender, receiver) = tokio::sync::mpsc::channel(OPERATION_CAPACITY);
+                std::thread::spawn(move || loop {
+                    match subscription
+                        .receiver
+                        .recv_timeout(std::time::Duration::from_millis(250))
+                    {
+                        Ok(event) => {
+                            if sender.blocking_send(event).is_err() {
+                                break;
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) if sender.is_closed() => {
+                            break;
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                });
+                Ok((snapshot, V1EventReceiver { receiver }))
+            }
+            AdmissionAuthority::Durable(durable) => {
+                durable.subscribe_v1_with_snapshot(cursor).await
+            }
+        }
+    }
+
     pub fn spawn(models_dir: PathBuf) -> (Self, DownloadControlWorker) {
         Self::spawn_with_cache(
             models_dir,
@@ -78,7 +230,7 @@ impl DownloadControl {
         let verification_cancellation = MutationCancellation::new();
         let executor = DownloadExecutor {
             models_dir: (*models_dir).clone(),
-            operations: Arc::clone(&operations),
+            persistence: ExecutionPersistence::Legacy(Arc::clone(&operations)),
             downloader,
             recipes,
             verification_cancellation: verification_cancellation.clone(),
@@ -101,7 +253,7 @@ impl DownloadControl {
         });
         (
             Self {
-                operations,
+                authority: AdmissionAuthority::Legacy(operations),
                 actor: actor.clone(),
                 models_dir,
                 verification_cache,
@@ -174,15 +326,71 @@ impl DownloadControl {
         D::Session: Send + 'static,
         G: GatewayPublisher + Send + 'static,
     {
-        let operations = Arc::new(Mutex::new(OperationStore::new(OPERATION_CAPACITY)));
+        Self::spawn_with_lifecycle_components_verifier_and_control_state(
+            models_dir,
+            lifecycle,
+            verification_cache,
+            recipes,
+            restart_verifier,
+            None,
+        )
+    }
+
+    #[allow(dead_code)] // Task 7 consumes this at NodeBuilder's composition boundary.
+    pub(crate) fn spawn_with_lifecycle_and_control_state<D, G>(
+        models_dir: PathBuf,
+        lifecycle: ModelLifecycle<D, G>,
+        control_state: ControlStateHandle,
+    ) -> (Self, DownloadControlWorker)
+    where
+        D: EngineLifecycleDriver + Send + 'static,
+        D::Session: Send + 'static,
+        G: GatewayPublisher + Send + 'static,
+    {
+        let verification_cache = Arc::new(VerificationCache::default());
+        let restart_verifier: Box<dyn RestartArtifactVerifier> =
+            Box::new(CacheRestartArtifactVerifier {
+                cache: Arc::clone(&verification_cache),
+            });
+        Self::spawn_with_lifecycle_components_verifier_and_control_state(
+            models_dir,
+            lifecycle,
+            verification_cache,
+            REGISTRY,
+            restart_verifier,
+            Some(control_state),
+        )
+    }
+
+    fn spawn_with_lifecycle_components_verifier_and_control_state<D, G>(
+        models_dir: PathBuf,
+        lifecycle: ModelLifecycle<D, G>,
+        verification_cache: Arc<VerificationCache>,
+        recipes: &'static [ModelEntry],
+        restart_verifier: Box<dyn RestartArtifactVerifier>,
+        control_state: Option<ControlStateHandle>,
+    ) -> (Self, DownloadControlWorker)
+    where
+        D: EngineLifecycleDriver + Send + 'static,
+        D::Session: Send + 'static,
+        G: GatewayPublisher + Send + 'static,
+    {
         let models_dir = Arc::new(models_dir);
         let verification_cancellation = MutationCancellation::new();
         let lifecycle_snapshot = Arc::new(Mutex::new(lifecycle.snapshot()));
         let lifecycle_destructive = lifecycle.destructive_commit_token();
         let lifecycle_stop = lifecycle.stop_token();
+        let legacy_operations = control_state
+            .is_none()
+            .then(|| Arc::new(Mutex::new(OperationStore::new(OPERATION_CAPACITY))));
+        let persistence = match (&control_state, &legacy_operations) {
+            (Some(control_state), None) => ExecutionPersistence::Durable(control_state.clone()),
+            (None, Some(operations)) => ExecutionPersistence::Legacy(Arc::clone(operations)),
+            _ => unreachable!("exactly one execution authority"),
+        };
         let executor = DownloadExecutor {
             models_dir: (*models_dir).clone(),
-            operations: Arc::clone(&operations),
+            persistence,
             downloader: Box::new(VerifiedDownloader),
             recipes,
             verification_cancellation: verification_cancellation.clone(),
@@ -210,9 +418,19 @@ impl DownloadControl {
                 &background_cancellation,
             );
         });
+        let authority = match (control_state, legacy_operations) {
+            (Some(control_state), None) => AdmissionAuthority::Durable(DurableExecutionControl {
+                control_state,
+                actor: actor.clone(),
+                lifecycle_destructive: Some(lifecycle_destructive.clone()),
+                projection_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            }),
+            (None, Some(operations)) => AdmissionAuthority::Legacy(operations),
+            _ => unreachable!("exactly one admission authority"),
+        };
         (
             Self {
-                operations,
+                authority,
                 actor: actor.clone(),
                 models_dir,
                 verification_cache,
@@ -236,9 +454,12 @@ impl DownloadControl {
         if find_recipe(self.recipes, model_id).is_none() {
             return Err(DownloadControlError::Missing);
         }
+        let AdmissionAuthority::Legacy(operations) = &self.authority else {
+            return Err(DownloadControlError::Stopping);
+        };
         let now = now_ms();
         let id = self
-            .operations
+            .legacy_store(operations)
             .lock()
             .expect("operation store poisoned")
             .enqueue_unique(OperationKind::Download, Some(model_id.to_owned()), now)
@@ -256,7 +477,7 @@ impl DownloadControl {
                     SubmitError::Stopping => "node is stopping",
                 };
                 let _ = self
-                    .operations
+                    .legacy_store(operations)
                     .lock()
                     .expect("operation store poisoned")
                     .fail(&id, message, now_ms());
@@ -269,7 +490,10 @@ impl DownloadControl {
     }
 
     pub fn cancel(&self, id: &str) -> Result<OperationStatus, DownloadControlError> {
-        let mut operations = self.operations.lock().expect("operation store poisoned");
+        let AdmissionAuthority::Legacy(store) = &self.authority else {
+            return Err(DownloadControlError::Stopping);
+        };
+        let mut operations = store.lock().expect("operation store poisoned");
         let operation = operations.get(id).ok_or(DownloadControlError::Missing)?;
         if matches!(
             operation.status,
@@ -322,13 +546,21 @@ impl DownloadControl {
         if self.lifecycle_snapshot.is_none() || find_recipe(self.recipes, model_id).is_none() {
             return Err(DownloadControlError::Missing);
         }
-        self.start_lifecycle(
-            OperationKind::Load,
-            Some(model_id),
-            Mutation::Load {
-                model_id: model_id.to_owned(),
-            },
-        )
+        match &self.authority {
+            AdmissionAuthority::Legacy(_) => self.start_lifecycle(
+                OperationKind::Load,
+                Some(model_id),
+                Mutation::Load {
+                    model_id: model_id.to_owned(),
+                },
+            ),
+            AdmissionAuthority::Durable(durable) => durable
+                .start_load_blocking(
+                    model_id,
+                    std::time::Instant::now() + std::time::Duration::from_secs(5),
+                )
+                .map(|admission| admission.v1_operation_id),
+        }
     }
 
     pub fn start_unload(&self) -> Result<String, DownloadControlError> {
@@ -344,8 +576,10 @@ impl DownloadControl {
         model_id: Option<&str>,
         mutation: Mutation,
     ) -> Result<String, DownloadControlError> {
-        let id = self
-            .operations
+        let AdmissionAuthority::Legacy(operations) = &self.authority else {
+            return Err(DownloadControlError::Stopping);
+        };
+        let id = operations
             .lock()
             .expect("operation store poisoned")
             .enqueue_unique_lifecycle(kind, model_id.map(str::to_owned), now_ms())
@@ -358,7 +592,7 @@ impl DownloadControl {
                     SubmitError::Stopping => "node is stopping",
                 };
                 let _ = self
-                    .operations
+                    .legacy_store(operations)
                     .lock()
                     .expect("operation store poisoned")
                     .fail(&id, message, now_ms());
@@ -379,34 +613,92 @@ impl DownloadControl {
         })
     }
 
+    pub(crate) fn node_snapshot_checked(&self) -> Result<NodeSnapshot, DownloadControlError> {
+        match &self.authority {
+            AdmissionAuthority::Legacy(_) => {
+                let lifecycle = self.lifecycle_snapshot();
+                Ok(NodeSnapshot {
+                    status: legacy_lifecycle_status(lifecycle.as_ref()),
+                    active_model_id: lifecycle
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.active_model_id.clone()),
+                    operation_id: lifecycle
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.operation_id.clone()),
+                    error: lifecycle.and_then(|snapshot| snapshot.error),
+                })
+            }
+            AdmissionAuthority::Durable(durable) => {
+                durable.ensure_healthy()?;
+                let state = durable
+                    .control_state
+                    .read_snapshot()
+                    .map_err(map_control_state_error)?;
+                let operation_id = state.slot.operation_id.and_then(|operation_id| {
+                    state
+                        .current_instance_v1
+                        .operations
+                        .iter()
+                        .find(|entry| entry.operation.operation_id == operation_id)
+                        .map(|entry| entry.v1_operation_id.clone())
+                });
+                Ok(NodeSnapshot {
+                    status: match state.slot.status {
+                        loxa_protocol::v2::V2SlotStatus::Unloaded => NodeStatus::Unloaded,
+                        loxa_protocol::v2::V2SlotStatus::Loading => NodeStatus::Loading,
+                        loxa_protocol::v2::V2SlotStatus::Ready => NodeStatus::Ready,
+                        loxa_protocol::v2::V2SlotStatus::Unloading => NodeStatus::Unloading,
+                        loxa_protocol::v2::V2SlotStatus::Recovery => NodeStatus::RecoveryRequired,
+                    },
+                    active_model_id: state.slot.model_id.clone(),
+                    operation_id,
+                    error: state.slot.error.as_ref().map(|error| error.message.clone()),
+                })
+            }
+        }
+    }
+
     pub fn active_lifecycle_operation_id(&self) -> Option<String> {
         self.lifecycle_snapshot()
             .and_then(|snapshot| snapshot.operation_id)
     }
 
     pub fn operation(&self, id: &str) -> Option<OperationView> {
-        self.operations
-            .lock()
-            .expect("operation store poisoned")
-            .get(id)
+        match &self.authority {
+            AdmissionAuthority::Legacy(operations) => {
+                operations.lock().expect("operation store poisoned").get(id)
+            }
+            AdmissionAuthority::Durable(durable) => durable.v1_operation(id).ok().flatten(),
+        }
     }
 
     pub fn snapshot_since(&self, cursor: u64) -> ReconnectSnapshot {
-        self.operations
-            .lock()
-            .expect("operation store poisoned")
-            .snapshot_since(cursor)
+        match &self.authority {
+            AdmissionAuthority::Legacy(operations) => operations
+                .lock()
+                .expect("operation store poisoned")
+                .snapshot_since(cursor),
+            AdmissionAuthority::Durable(durable) => durable
+                .v1_snapshot_since(cursor)
+                .expect("durable v1 projection must be checked by router"),
+        }
     }
 
     pub fn subscribe(&self) -> EventSubscription {
-        self.operations
+        let AdmissionAuthority::Legacy(operations) = &self.authority else {
+            panic!("durable subscriptions use subscribe_v1_with_snapshot")
+        };
+        operations
             .lock()
             .expect("operation store poisoned")
             .subscribe()
     }
 
     pub fn subscribe_with_snapshot(&self, cursor: u64) -> (ReconnectSnapshot, EventSubscription) {
-        self.operations
+        let AdmissionAuthority::Legacy(operations) = &self.authority else {
+            panic!("durable subscriptions use subscribe_v1_with_snapshot")
+        };
+        operations
             .lock()
             .expect("operation store poisoned")
             .subscribe_with_snapshot(cursor)
@@ -437,8 +729,499 @@ impl DownloadControl {
     }
 
     #[cfg(test)]
-    fn stop_actor(&self) {
+    pub(crate) fn spawn_durable_fixture_for_test(
+        models_dir: PathBuf,
+        verification_cache: Arc<VerificationCache>,
+        recipes: &'static [ModelEntry],
+        bytes: &'static [u8],
+        control_state: ControlStateHandle,
+    ) -> (Self, DownloadControlWorker) {
+        let models_dir = Arc::new(models_dir);
+        let verification_cancellation = MutationCancellation::new();
+        let executor = DownloadExecutor {
+            models_dir: (*models_dir).clone(),
+            persistence: ExecutionPersistence::Durable(control_state.clone()),
+            downloader: Box::new(FixtureDownloader { bytes }),
+            recipes,
+            verification_cancellation: verification_cancellation.clone(),
+            verifier: Box::new(CacheArtifactVerifier {
+                cache: Arc::clone(&verification_cache),
+            }),
+            lifecycle: None,
+        };
+        let (actor, worker) = NodeActor::spawn(executor);
+        let authority = AdmissionAuthority::Durable(DurableExecutionControl {
+            control_state,
+            actor: actor.clone(),
+            lifecycle_destructive: None,
+            projection_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        });
+        (
+            Self {
+                authority,
+                actor: actor.clone(),
+                models_dir,
+                verification_cache,
+                recipes,
+                lifecycle_snapshot: None,
+                lifecycle_destructive: None,
+            },
+            DownloadControlWorker {
+                actor,
+                worker: Some(worker),
+                verification: None,
+                lifecycle_stop: None,
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stop_actor(&self) {
         self.actor.stop();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn durable_execution_for_test(&self) -> DurableExecutionControl {
+        let AdmissionAuthority::Durable(durable) = &self.authority else {
+            panic!("fixture must use durable authority")
+        };
+        durable.clone()
+    }
+
+    fn legacy_store<'a>(
+        &'a self,
+        store: &'a Arc<Mutex<OperationStore>>,
+    ) -> &'a Arc<Mutex<OperationStore>> {
+        store
+    }
+}
+
+impl DurableExecutionControl {
+    #[cfg(test)]
+    pub(crate) fn with_actor_for_test(
+        control_state: ControlStateHandle,
+        actor: NodeActorHandle,
+    ) -> Self {
+        Self {
+            control_state,
+            actor,
+            lifecycle_destructive: None,
+            projection_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        }
+    }
+
+    pub(crate) async fn start_download(
+        &self,
+        model_id: &str,
+        total_bytes: u64,
+    ) -> Result<CommittedAdmission, DownloadControlError> {
+        self.admit_and_submit(
+            AdmissionRequest::Download {
+                model_id: model_id.to_owned(),
+                progress: V2OperationProgress {
+                    completed_bytes: DecimalU64::new(0),
+                    total_bytes: Some(DecimalU64::new(total_bytes)),
+                },
+            },
+            Mutation::Download {
+                model_id: model_id.to_owned(),
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn start_load(
+        &self,
+        model_id: &str,
+    ) -> Result<CommittedAdmission, DownloadControlError> {
+        self.admit_and_submit(
+            AdmissionRequest::Load {
+                model_id: model_id.to_owned(),
+            },
+            Mutation::Load {
+                model_id: model_id.to_owned(),
+            },
+        )
+        .await
+    }
+
+    fn start_load_blocking(
+        &self,
+        model_id: &str,
+        deadline: std::time::Instant,
+    ) -> Result<CommittedAdmission, DownloadControlError> {
+        self.ensure_healthy()?;
+        let admission = self
+            .control_state
+            .admit_blocking_until(
+                AdmissionRequest::Load {
+                    model_id: model_id.to_owned(),
+                },
+                deadline,
+            )
+            .map_err(map_admission_error)?;
+        let mutation = Mutation::Load {
+            model_id: model_id.to_owned(),
+        };
+        if let Err(error) = self
+            .actor
+            .submit(admission.operation_id.to_string(), mutation)
+        {
+            self.control_state
+                .observe_required_blocking_until(
+                    submission_failed_transition(admission.operation_id, V2OperationKind::Load),
+                    deadline,
+                )
+                .map_err(map_control_state_error)?;
+            return Err(map_submit_error(error));
+        }
+        Ok(admission)
+    }
+
+    pub(crate) async fn start_unload(&self) -> Result<CommittedAdmission, DownloadControlError> {
+        self.admit_and_submit(AdmissionRequest::Unload, Mutation::Unload)
+            .await
+    }
+
+    async fn admit_and_submit(
+        &self,
+        request: AdmissionRequest,
+        mutation: Mutation,
+    ) -> Result<CommittedAdmission, DownloadControlError> {
+        self.ensure_healthy()?;
+        let kind = admission_kind(&request);
+        let admission = self
+            .control_state
+            .admit(request)
+            .await
+            .map_err(map_admission_error)?;
+        if let Err(error) = self
+            .actor
+            .submit(admission.operation_id.to_string(), mutation)
+        {
+            self.control_state
+                .observe_required_async(submission_failed_transition(admission.operation_id, kind))
+                .await
+                .map_err(map_control_state_error)?;
+            return Err(map_submit_error(error));
+        }
+        Ok(admission)
+    }
+
+    pub(crate) async fn cancel(
+        &self,
+        v1_operation_id: &str,
+    ) -> Result<OperationStatus, DownloadControlError> {
+        let operation = self
+            .find_current_operation(v1_operation_id)?
+            .ok_or(DownloadControlError::Missing)?;
+        if matches!(
+            operation.status,
+            V2OperationStatus::Succeeded | V2OperationStatus::Failed | V2OperationStatus::Cancelled
+        ) {
+            return Err(DownloadControlError::Terminal);
+        }
+        let operation_id = operation.operation_id;
+        let actor_outcome = if matches!(
+            operation.kind,
+            V2OperationKind::Load | V2OperationKind::Unload
+        ) {
+            let boundary = self
+                .lifecycle_destructive
+                .as_ref()
+                .ok_or(DownloadControlError::Missing)?;
+            let outcome = std::cell::Cell::new(CancelOutcome::Missing);
+            if !boundary
+                .try_cancel(|| outcome.set(self.actor.cancel_outcome(&operation_id.to_string())))
+            {
+                return Err(DownloadControlError::CancellationNotSafe);
+            }
+            outcome.get()
+        } else {
+            self.actor.cancel_outcome(&operation_id.to_string())
+        };
+        match actor_outcome {
+            CancelOutcome::Requested => {}
+            CancelOutcome::TerminalClaimed => {
+                return self.await_terminal_cancel_result(v1_operation_id).await;
+            }
+            CancelOutcome::Missing => {
+                return match self.find_current_operation(v1_operation_id)? {
+                    Some(operation)
+                        if matches!(
+                            operation.status,
+                            V2OperationStatus::Succeeded
+                                | V2OperationStatus::Failed
+                                | V2OperationStatus::Cancelled
+                        ) =>
+                    {
+                        Err(DownloadControlError::Terminal)
+                    }
+                    _ => Err(DownloadControlError::Stopping),
+                };
+            }
+        }
+        self.control_state
+            .observe_required_async(Transition::Cancelled { operation_id })
+            .await
+            .map_err(map_public_cancel_transition)?;
+        Ok(OperationStatus::Cancelled)
+    }
+
+    async fn await_terminal_cancel_result(
+        &self,
+        v1_operation_id: &str,
+    ) -> Result<OperationStatus, DownloadControlError> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match self.find_current_operation(v1_operation_id)? {
+                Some(operation)
+                    if matches!(
+                        operation.status,
+                        V2OperationStatus::Succeeded
+                            | V2OperationStatus::Failed
+                            | V2OperationStatus::Cancelled
+                    ) =>
+                {
+                    return Err(DownloadControlError::Terminal)
+                }
+                Some(_) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                _ => return Err(DownloadControlError::Stopping),
+            }
+        }
+    }
+
+    fn v1_operation(
+        &self,
+        v1_operation_id: &str,
+    ) -> Result<Option<OperationView>, DownloadControlError> {
+        let operation = self.find_current_operation(v1_operation_id)?;
+        operation
+            .as_ref()
+            .map(|operation| project_durable_v1_operation(v1_operation_id, operation))
+            .transpose()
+            .map_err(|_| self.poison_projection())
+    }
+
+    fn find_current_operation(
+        &self,
+        v1_operation_id: &str,
+    ) -> Result<Option<loxa_protocol::v2::V2Operation>, DownloadControlError> {
+        self.ensure_healthy()?;
+        let state = self
+            .control_state
+            .read_snapshot()
+            .map_err(map_control_state_error)?;
+        Ok(state
+            .current_instance_v1
+            .operations
+            .iter()
+            .find(|entry| entry.v1_operation_id == v1_operation_id)
+            .map(|entry| entry.operation.clone()))
+    }
+
+    fn v1_snapshot_since(&self, cursor: u64) -> Result<ReconnectSnapshot, DownloadControlError> {
+        self.ensure_healthy()?;
+        let state = self
+            .control_state
+            .read_snapshot()
+            .map_err(map_control_state_error)?;
+        project_current_v1(&state.current_instance_v1, cursor).map_err(|_| self.poison_projection())
+    }
+
+    async fn subscribe_v1_with_snapshot(
+        &self,
+        cursor: u64,
+    ) -> Result<(ReconnectSnapshot, V1EventReceiver), DownloadControlError> {
+        self.ensure_healthy()?;
+        let mut durable = self
+            .control_state
+            .subscribe(None, DecimalU64::new(now_ms()))
+            .await
+            .map_err(map_control_state_error)?;
+        let initial = self.v1_snapshot_since(cursor)?;
+        let mut delivered = initial.cursor;
+        let control_state = self.control_state.clone();
+        let projection_healthy = Arc::clone(&self.projection_healthy);
+        let (sender, receiver) = tokio::sync::mpsc::channel(OPERATION_CAPACITY);
+        tokio::spawn(async move {
+            while let Some(event) = durable.events.recv().await {
+                let Some(changed) = event.operation else {
+                    continue;
+                };
+                let Ok(state) = control_state.read_snapshot() else {
+                    break;
+                };
+                let Some(v1_event) = state.current_instance_v1.events.iter().find(|candidate| {
+                    candidate.operation.operation_id == changed.operation_id
+                        && candidate.operation.updated_revision == changed.updated_revision
+                }) else {
+                    projection_healthy.store(false, std::sync::atomic::Ordering::Release);
+                    break;
+                };
+                if v1_event.sequence <= delivered {
+                    continue;
+                }
+                let Ok(operation) =
+                    project_durable_v1_operation(&v1_event.v1_operation_id, &v1_event.operation)
+                else {
+                    projection_healthy.store(false, std::sync::atomic::Ordering::Release);
+                    break;
+                };
+                let Ok(sequence) = project_durable_v1_counter(v1_event.sequence) else {
+                    projection_healthy.store(false, std::sync::atomic::Ordering::Release);
+                    break;
+                };
+                delivered = sequence;
+                if sender
+                    .send(loxa_core::control::contracts::ControlEvent {
+                        sequence: delivered,
+                        operation,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Ok((initial, V1EventReceiver { receiver }))
+    }
+
+    fn ensure_healthy(&self) -> Result<(), DownloadControlError> {
+        if self
+            .projection_healthy
+            .load(std::sync::atomic::Ordering::Acquire)
+            && self.control_state.is_healthy()
+        {
+            Ok(())
+        } else {
+            Err(DownloadControlError::Stopping)
+        }
+    }
+
+    fn poison_projection(&self) -> DownloadControlError {
+        self.projection_healthy
+            .store(false, std::sync::atomic::Ordering::Release);
+        DownloadControlError::Stopping
+    }
+}
+
+fn project_current_v1(
+    state: &CurrentInstanceV1State,
+    cursor: u64,
+) -> Result<ReconnectSnapshot, loxa_core::control::contracts::DurableV1ProjectionError> {
+    let projected_cursor = project_durable_v1_counter(state.cursor)?;
+    let operations = state
+        .operations
+        .iter()
+        .map(|entry| project_durable_v1_operation(&entry.v1_operation_id, &entry.operation))
+        .collect::<Result<Vec<_>, _>>()?;
+    let events = state
+        .events
+        .iter()
+        .filter(|event| event.sequence > cursor)
+        .map(|event| {
+            Ok(loxa_core::control::contracts::ControlEvent {
+                sequence: project_durable_v1_counter(event.sequence)?,
+                operation: project_durable_v1_operation(&event.v1_operation_id, &event.operation)?,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ReconnectSnapshot {
+        cursor: projected_cursor,
+        cursor_gap: state.cursor_gap(cursor),
+        operations,
+        events,
+    })
+}
+
+fn admission_kind(request: &AdmissionRequest) -> V2OperationKind {
+    match request {
+        AdmissionRequest::Download { .. } => V2OperationKind::Download,
+        AdmissionRequest::Load { .. } => V2OperationKind::Load,
+        AdmissionRequest::Unload => V2OperationKind::Unload,
+    }
+}
+
+fn submission_failed_transition(operation_id: OperationId, kind: V2OperationKind) -> Transition {
+    let (code, message) = match kind {
+        V2OperationKind::Download => (
+            V2OperationErrorCode::DownloadFailed,
+            "download could not be submitted",
+        ),
+        V2OperationKind::Load => (
+            V2OperationErrorCode::LoadFailed,
+            "load could not be submitted",
+        ),
+        V2OperationKind::Unload => (
+            V2OperationErrorCode::UnloadFailed,
+            "unload could not be submitted",
+        ),
+    };
+    Transition::Failed {
+        operation_id,
+        error: V2PublicError {
+            code,
+            message: message.into(),
+        },
+    }
+}
+
+fn map_submit_error(error: SubmitError) -> DownloadControlError {
+    match error {
+        SubmitError::Conflict => DownloadControlError::Conflict,
+        SubmitError::Stopping => DownloadControlError::Stopping,
+    }
+}
+
+fn map_control_state_error(error: ControlStateError) -> DownloadControlError {
+    match error {
+        ControlStateError::WriterOverloaded
+        | ControlStateError::Transition(TransitionError::ActiveLimit)
+        | ControlStateError::Transition(TransitionError::LifecycleConflict)
+        | ControlStateError::Transition(TransitionError::SameModelConflict) => {
+            DownloadControlError::Conflict
+        }
+        ControlStateError::Transition(TransitionError::OperationNotFound) => {
+            DownloadControlError::Missing
+        }
+        ControlStateError::Transition(TransitionError::IllegalTransition)
+        | ControlStateError::Transition(TransitionError::Contradiction) => {
+            DownloadControlError::Terminal
+        }
+        ControlStateError::DurableStateUnavailable
+        | ControlStateError::UnknownCommit
+        | ControlStateError::SnapshotTooLarge
+        | ControlStateError::WorkerPanicked
+        | ControlStateError::ShutdownDeadlineExceeded
+        | ControlStateError::Transition(_)
+        | ControlStateError::Repository(_) => DownloadControlError::Stopping,
+    }
+}
+
+fn map_admission_error(error: ControlStateError) -> DownloadControlError {
+    match error {
+        ControlStateError::WriterOverloaded
+        | ControlStateError::Transition(TransitionError::ActiveLimit)
+        | ControlStateError::Transition(TransitionError::LifecycleConflict)
+        | ControlStateError::Transition(TransitionError::SameModelConflict)
+        | ControlStateError::Transition(TransitionError::Contradiction) => {
+            DownloadControlError::Conflict
+        }
+        other => map_control_state_error(other),
+    }
+}
+
+fn map_public_cancel_transition(error: ControlStateError) -> DownloadControlError {
+    match error {
+        ControlStateError::Transition(TransitionError::IllegalTransition)
+        | ControlStateError::Transition(TransitionError::Contradiction) => {
+            DownloadControlError::Terminal
+        }
+        other => map_control_state_error(other),
     }
 }
 
@@ -476,7 +1259,7 @@ impl DownloadControlWorker {
 
 struct DownloadExecutor {
     models_dir: PathBuf,
-    operations: Arc<Mutex<OperationStore>>,
+    persistence: ExecutionPersistence,
     downloader: Box<dyn ModelDownloader>,
     verification_cancellation: MutationCancellation,
     verifier: Box<dyn ArtifactVerifier>,
@@ -739,7 +1522,7 @@ impl ModelDownloader for FixtureDownloader {
 struct OperationObserver<'a> {
     id: &'a str,
     cancellation: &'a MutationCancellation,
-    operations: Arc<Mutex<OperationStore>>,
+    persistence: ExecutionPersistence,
 }
 
 impl DownloadObserver for OperationObserver<'_> {
@@ -748,29 +1531,174 @@ impl DownloadObserver for OperationObserver<'_> {
     }
 
     fn progress(&mut self, progress: DownloadProgress) {
-        let _ = self
-            .operations
-            .lock()
-            .expect("operation store poisoned")
-            .progress(
-                self.id,
-                progress.downloaded_bytes,
-                Some(progress.total_bytes),
-                now_ms(),
-            );
+        self.persistence.progress(
+            self.id,
+            progress.downloaded_bytes,
+            Some(progress.total_bytes),
+        );
+    }
+}
+
+impl ExecutionPersistence {
+    fn started(&self, id: &str, progress: Option<V2OperationProgress>) -> bool {
+        match self {
+            Self::Legacy(operations) => operations
+                .lock()
+                .expect("operation store poisoned")
+                .start(id, now_ms())
+                .is_ok(),
+            Self::Durable(control_state) => self
+                .durable_observe(control_state, id, |operation_id| Transition::Started {
+                    operation_id,
+                    progress,
+                })
+                .is_ok(),
+        }
+    }
+
+    fn progress(&self, id: &str, completed: u64, total: Option<u64>) {
+        match self {
+            Self::Legacy(operations) => {
+                let _ = operations
+                    .lock()
+                    .expect("operation store poisoned")
+                    .progress(id, completed, total, now_ms());
+            }
+            Self::Durable(control_state) => {
+                if let Ok(operation_id) = OperationId::from_str(id) {
+                    let _ = control_state.try_observe_progress(Transition::Progress {
+                        operation_id,
+                        progress: V2OperationProgress {
+                            completed_bytes: DecimalU64::new(completed),
+                            total_bytes: total.map(DecimalU64::new),
+                        },
+                    });
+                }
+            }
+        }
+    }
+
+    fn succeeded(&self, id: &str, observed_model_id: Option<String>) -> bool {
+        match self {
+            Self::Legacy(operations) => operations
+                .lock()
+                .expect("operation store poisoned")
+                .succeed(id, now_ms())
+                .is_ok(),
+            Self::Durable(control_state) => self
+                .durable_observe(control_state, id, |operation_id| Transition::Succeeded {
+                    operation_id,
+                    observed_model_id,
+                })
+                .is_ok(),
+        }
+    }
+
+    fn failed(&self, id: &str, kind: V2OperationKind, message: &str) -> bool {
+        match self {
+            Self::Legacy(operations) => operations
+                .lock()
+                .expect("operation store poisoned")
+                .fail(id, message, now_ms())
+                .is_ok(),
+            Self::Durable(control_state) => self
+                .durable_observe(control_state, id, |operation_id| Transition::Failed {
+                    operation_id,
+                    error: operation_error(kind, message),
+                })
+                .is_ok(),
+        }
+    }
+
+    fn cancelled(&self, id: &str) -> bool {
+        match self {
+            Self::Legacy(operations) => operations
+                .lock()
+                .expect("operation store poisoned")
+                .cancel(id, CancellationSafety::Safe, now_ms())
+                .is_ok(),
+            Self::Durable(control_state) => self
+                .durable_observe(control_state, id, |operation_id| Transition::Cancelled {
+                    operation_id,
+                })
+                .is_ok(),
+        }
+    }
+
+    fn is_cancelled(&self, id: &str) -> bool {
+        match self {
+            Self::Legacy(operations) => operations
+                .lock()
+                .expect("operation store poisoned")
+                .get(id)
+                .is_some_and(|operation| operation.status == OperationStatus::Cancelled),
+            Self::Durable(control_state) => OperationId::from_str(id).is_ok_and(|operation_id| {
+                control_state.read_snapshot().is_ok_and(|state| {
+                    state.operations.iter().any(|operation| {
+                        operation.operation_id == operation_id
+                            && operation.status == V2OperationStatus::Cancelled
+                    })
+                })
+            }),
+        }
+    }
+
+    fn finish_lifecycle(&self, id: &str, mutation: &Mutation, result: &Result<(), LifecycleError>) {
+        match result {
+            Ok(()) => {
+                let observed_model_id = match mutation {
+                    Mutation::Load { model_id } => Some(model_id.clone()),
+                    Mutation::Unload | Mutation::Download { .. } => None,
+                };
+                self.succeeded(id, observed_model_id);
+            }
+            Err(LifecycleError::Cancelled) => {
+                self.cancelled(id);
+            }
+            Err(error) => {
+                let kind = match mutation {
+                    Mutation::Load { .. } => V2OperationKind::Load,
+                    Mutation::Unload => V2OperationKind::Unload,
+                    Mutation::Download { .. } => V2OperationKind::Download,
+                };
+                self.failed(id, kind, public_lifecycle_error(error));
+            }
+        }
+    }
+
+    fn durable_observe(
+        &self,
+        control_state: &ControlStateHandle,
+        id: &str,
+        transition: impl FnOnce(OperationId) -> Transition,
+    ) -> Result<(), ()> {
+        let operation_id = OperationId::from_str(id).map_err(|_| ())?;
+        let now = std::time::Instant::now();
+        let deadline = now
+            .checked_add(std::time::Duration::from_secs(5))
+            .unwrap_or(now);
+        control_state
+            .observe_required_blocking_until(transition(operation_id), deadline)
+            .map(|_| ())
+            .map_err(|_| ())
+    }
+}
+
+fn operation_error(kind: V2OperationKind, message: &str) -> V2OperationError {
+    V2PublicError {
+        code: match kind {
+            V2OperationKind::Download => V2OperationErrorCode::DownloadFailed,
+            V2OperationKind::Load => V2OperationErrorCode::LoadFailed,
+            V2OperationKind::Unload => V2OperationErrorCode::UnloadFailed,
+        },
+        message: message.into(),
     }
 }
 
 impl MutationExecutor for DownloadExecutor {
     fn execute(&mut self, id: &str, mutation: &Mutation, cancellation: &MutationCancellation) {
         if !matches!(mutation, Mutation::Download { .. }) {
-            if self
-                .operations
-                .lock()
-                .expect("operation store poisoned")
-                .start(id, now_ms())
-                .is_err()
-            {
+            if !self.persistence.started(id, None) {
                 return;
             }
             let result = self
@@ -778,22 +1706,13 @@ impl MutationExecutor for DownloadExecutor {
                 .as_mut()
                 .ok_or_else(|| LifecycleError::StartFailed("model lifecycle unavailable".into()))
                 .and_then(|lifecycle| lifecycle.execute(id, mutation, cancellation));
-            let mut operations = self.operations.lock().expect("operation store poisoned");
-            match result {
-                Ok(()) => {
-                    let _ = operations.succeed(id, now_ms());
-                }
-                Err(LifecycleError::Cancelled) => {
-                    let _ = operations.cancel(id, CancellationSafety::Safe, now_ms());
-                }
-                Err(error) => {
-                    let _ = operations.fail(id, public_lifecycle_error(&error), now_ms());
-                }
-            }
+            let result = if cancellation.claim_terminal() {
+                result
+            } else {
+                Err(LifecycleError::Cancelled)
+            };
+            self.persistence.finish_lifecycle(id, mutation, &result);
             if let Some(lifecycle) = self.lifecycle.as_mut() {
-                // Cancellation takes this same store lock before reading the boundary,
-                // so a destructive operation cannot be cancelled between publication
-                // and its authoritative terminal transition.
                 lifecycle.complete_operation();
             }
             return;
@@ -801,21 +1720,12 @@ impl MutationExecutor for DownloadExecutor {
         let Mutation::Download { model_id } = mutation else {
             unreachable!("download mutation checked")
         };
-        if self
-            .operations
-            .lock()
-            .expect("operation store poisoned")
-            .start(id, now_ms())
-            .is_err()
-        {
+        if !self.persistence.started(id, None) {
             return;
         }
         let Some(recipe) = find_recipe(self.recipes, model_id) else {
-            let _ = self
-                .operations
-                .lock()
-                .expect("operation store poisoned")
-                .fail(id, "unknown registry model", now_ms());
+            self.persistence
+                .failed(id, V2OperationKind::Download, "unknown registry model");
             return;
         };
         tracing::info!(
@@ -829,7 +1739,7 @@ impl MutationExecutor for DownloadExecutor {
         let mut observer = OperationObserver {
             id,
             cancellation,
-            operations: Arc::clone(&self.operations),
+            persistence: self.persistence.clone(),
         };
         let result = self
             .downloader
@@ -845,11 +1755,13 @@ impl MutationExecutor for DownloadExecutor {
                 None
             }
         };
-        let mut operations = self.operations.lock().expect("operation store poisoned");
-        if operations
-            .get(id)
-            .is_some_and(|view| view.status == OperationStatus::Cancelled)
-        {
+        if !cancellation.claim_terminal() {
+            if self.persistence.cancelled(id) {
+                emit_download_terminal(id, model_id, "cancelled");
+            }
+            return;
+        }
+        if self.persistence.is_cancelled(id) {
             emit_download_terminal(id, model_id, "cancelled");
             return;
         }
@@ -860,37 +1772,37 @@ impl MutationExecutor for DownloadExecutor {
                         && evidence.size_bytes == recipe.size_bytes
                         && evidence.expected_sha256 == recipe.sha256 =>
                 {
-                    operations.succeed(id, now_ms()).map(|()| "succeeded")
+                    self.persistence.succeeded(id, None).then_some("succeeded")
                 }
-                Ok(_) => operations
-                    .fail(
+                Ok(_) => self
+                    .persistence
+                    .failed(
                         id,
+                        V2OperationKind::Download,
                         "downloaded artifact failed checksum verification",
-                        now_ms(),
                     )
-                    .map(|()| "failed"),
-                Err(_) if cancellation.is_cancelled() => operations
-                    .cancel(id, CancellationSafety::Safe, now_ms())
-                    .map(|_| "cancelled"),
+                    .then_some("failed"),
+                Err(_) if cancellation.is_cancelled() => {
+                    self.persistence.cancelled(id).then_some("cancelled")
+                }
                 Err(_) => {
                     self.verifier.invalidate(&self.models_dir, recipe);
-                    operations
-                        .fail(
+                    self.persistence
+                        .failed(
                             id,
+                            V2OperationKind::Download,
                             "downloaded artifact could not be verified safely",
-                            now_ms(),
                         )
-                        .map(|()| "failed")
+                        .then_some("failed")
                 }
             },
-            Err(DownloadError::Cancelled) => operations
-                .cancel(id, CancellationSafety::Safe, now_ms())
-                .map(|_| "cancelled"),
-            Err(error) => operations
-                .fail(id, public_download_error(&error), now_ms())
-                .map(|()| "failed"),
+            Err(DownloadError::Cancelled) => self.persistence.cancelled(id).then_some("cancelled"),
+            Err(error) => self
+                .persistence
+                .failed(id, V2OperationKind::Download, public_download_error(&error))
+                .then_some("failed"),
         };
-        if let Ok(result_class) = terminal_result {
+        if let Some(result_class) = terminal_result {
             emit_download_terminal(id, model_id, result_class);
         }
     }
@@ -974,6 +1886,17 @@ fn map_operation_error(error: OperationError) -> DownloadControlError {
     }
 }
 
+fn legacy_lifecycle_status(snapshot: Option<&LifecycleSnapshot>) -> NodeStatus {
+    use crate::model_lifecycle::NodeLifecycleStatus;
+    match snapshot.map(|snapshot| &snapshot.status) {
+        None | Some(NodeLifecycleStatus::Unloaded) => NodeStatus::Unloaded,
+        Some(NodeLifecycleStatus::Loading) => NodeStatus::Loading,
+        Some(NodeLifecycleStatus::Ready) => NodeStatus::Ready,
+        Some(NodeLifecycleStatus::Unloading) => NodeStatus::Unloading,
+        Some(NodeLifecycleStatus::RecoveryRequired) => NodeStatus::RecoveryRequired,
+    }
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1018,6 +1941,19 @@ mod tests {
     use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn v1_snapshot_projection_rejects_an_unsafe_compatibility_cursor() {
+        let state = CurrentInstanceV1State {
+            cursor: 9_007_199_254_740_992,
+            operations: Vec::new(),
+            events: Vec::new(),
+        };
+        assert_eq!(
+            project_current_v1(&state, 0),
+            Err(loxa_core::control::contracts::DurableV1ProjectionError::UnsafeInteger)
+        );
+    }
     use tracing::field::{Field, Visit};
     use tracing::{Event, Metadata, Subscriber};
 
@@ -1386,7 +2322,7 @@ mod tests {
             .unwrap();
         let mut executor = DownloadExecutor {
             models_dir: PathBuf::from("/unused"),
-            operations: Arc::clone(&operations),
+            persistence: ExecutionPersistence::Legacy(Arc::clone(&operations)),
             downloader: Box::new(FakeDownloader {
                 result: Some(result),
             }),
@@ -1519,7 +2455,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let mut executor = DownloadExecutor {
             models_dir: PathBuf::from("/unused"),
-            operations: Arc::clone(&operations),
+            persistence: ExecutionPersistence::Legacy(Arc::clone(&operations)),
             downloader: Box::new(FakeDownloader {
                 result: Some(Ok(())),
             }),
@@ -1581,7 +2517,7 @@ mod tests {
         let cache = Arc::new(VerificationCache::default());
         let mut executor = DownloadExecutor {
             models_dir: models_dir.clone(),
-            operations: Arc::clone(&operations),
+            persistence: ExecutionPersistence::Legacy(Arc::clone(&operations)),
             downloader: Box::new(FixtureDownloader { bytes: b"good" }),
             verification_cancellation,
             verifier: Box::new(GatedArtifactVerifier {
@@ -2227,8 +3163,10 @@ mod tests {
         );
         let (control, worker) =
             DownloadControl::spawn_with_lifecycle(std::env::temp_dir(), lifecycle);
-        let first = control
-            .operations
+        let AdmissionAuthority::Legacy(operations) = &control.authority else {
+            panic!("fixture uses legacy authority")
+        };
+        let first = operations
             .lock()
             .unwrap()
             .enqueue_unique_lifecycle(OperationKind::Load, Some("first".into()), now_ms())

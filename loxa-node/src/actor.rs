@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -14,19 +14,45 @@ pub enum Mutation {
 }
 
 #[derive(Clone, Debug)]
-pub struct MutationCancellation(Arc<AtomicBool>);
+pub struct MutationCancellation(Arc<AtomicU8>);
+
+const CANCELLATION_OPEN: u8 = 0;
+const CANCELLATION_REQUESTED: u8 = 1;
+const TERMINAL_CLAIMED: u8 = 2;
 
 impl MutationCancellation {
     pub(crate) fn new() -> Self {
-        Self(Arc::new(AtomicBool::new(false)))
+        Self(Arc::new(AtomicU8::new(CANCELLATION_OPEN)))
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
+        self.0.load(Ordering::SeqCst) == CANCELLATION_REQUESTED
     }
 
     pub(crate) fn cancel(&self) {
-        self.0.store(true, Ordering::SeqCst);
+        let _ = self.request_cancel();
+    }
+
+    pub(crate) fn request_cancel(&self) -> bool {
+        self.0
+            .compare_exchange(
+                CANCELLATION_OPEN,
+                CANCELLATION_REQUESTED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    pub(crate) fn claim_terminal(&self) -> bool {
+        self.0
+            .compare_exchange(
+                CANCELLATION_OPEN,
+                TERMINAL_CLAIMED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
     }
 }
 
@@ -34,6 +60,13 @@ impl MutationCancellation {
 pub enum SubmitError {
     Conflict,
     Stopping,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CancelOutcome {
+    Requested,
+    TerminalClaimed,
+    Missing,
 }
 
 pub trait MutationExecutor: Send + 'static {
@@ -108,23 +141,35 @@ impl NodeActorHandle {
     }
 
     pub fn cancel(&self, operation_id: &str) -> bool {
+        self.cancel_outcome(operation_id) == CancelOutcome::Requested
+    }
+
+    pub(crate) fn cancel_outcome(&self, operation_id: &str) -> CancelOutcome {
         let mut state = self.0.state.lock().expect("node actor lock poisoned");
         let Some(mutation) = state
             .tracked
             .iter()
             .find_map(|(mutation, tracked)| (tracked.0 == operation_id).then(|| mutation.clone()))
         else {
-            return false;
+            return CancelOutcome::Missing;
         };
-        let (_, cancellation) = state
+        let cancellation = state
+            .tracked
+            .get(&mutation)
+            .expect("tracked mutation exists")
+            .1
+            .clone();
+        if !cancellation.request_cancel() {
+            return CancelOutcome::TerminalClaimed;
+        }
+        let _ = state
             .tracked
             .remove(&mutation)
             .expect("tracked mutation exists");
-        cancellation.cancel();
         state
             .pending
             .retain(|pending| pending.operation_id != operation_id);
-        true
+        CancelOutcome::Requested
     }
 
     pub fn stop(&self) {
@@ -202,6 +247,7 @@ impl NodeActor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -334,5 +380,17 @@ mod tests {
         handle.stop();
         worker.join().unwrap();
         assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn cancellation_and_terminal_claim_have_one_atomic_winner() {
+        let cancellation = MutationCancellation::new();
+        assert!(cancellation.request_cancel());
+        assert!(!cancellation.claim_terminal());
+
+        let terminal = MutationCancellation::new();
+        assert!(terminal.claim_terminal());
+        assert!(!terminal.request_cancel());
+        assert!(!terminal.is_cancelled());
     }
 }
