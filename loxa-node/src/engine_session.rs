@@ -84,10 +84,6 @@ impl<C> EngineSession<C> {
     pub(super) fn child_mut(&mut self) -> &mut C {
         &mut self.child
     }
-
-    pub(super) fn into_parts(self) -> (C, ManagedRun, ManagedServer, String) {
-        (self.child, self.run, self.server, self.process_label)
-    }
 }
 
 #[cfg(test)]

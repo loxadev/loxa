@@ -306,7 +306,10 @@ impl LifecycleMailboxInner {
         self.verification.ready()
     }
 
-    fn cancel_ready_verification_for_shutdown(&self) -> bool {
+    fn settle_ready_verification_for_shutdown(
+        &self,
+        acknowledgement: LifecycleCancelAcknowledgement,
+    ) -> bool {
         let Some(completion) = self.ready_verification() else {
             return false;
         };
@@ -327,12 +330,22 @@ impl LifecycleMailboxInner {
         else {
             state.sealed = true;
             state.fatal = true;
+            drop(state);
+            ticket.poison();
             return false;
         };
         state.normal.remove(index);
         drop(state);
-        ticket.acknowledge();
-        true
+        match acknowledgement {
+            LifecycleCancelAcknowledgement::DurablyConfirmed => {
+                ticket.acknowledge();
+                true
+            }
+            LifecycleCancelAcknowledgement::Unknown => {
+                ticket.poison();
+                false
+            }
+        }
     }
 
     fn take_next(&self) -> Result<MailboxItem, LifecycleSubmitError> {
@@ -558,6 +571,12 @@ pub(crate) enum LifecycleLoadSubmission {
     Verifying,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LifecycleCancelAcknowledgement {
+    DurablyConfirmed,
+    Unknown,
+}
+
 pub(crate) trait LifecycleLoadWorkflow: Send {
     fn submit_load(
         &mut self,
@@ -571,7 +590,9 @@ pub(crate) trait LifecycleLoadWorkflow: Send {
         evidence: &VerifiedArtifact,
     ) -> Result<LaunchPlan, LifecycleError>;
 
-    fn cancel(&mut self, _operation_id: &OperationId) {}
+    fn cancel(&mut self, _operation_id: &OperationId) -> LifecycleCancelAcknowledgement {
+        LifecycleCancelAcknowledgement::Unknown
+    }
 
     /// Returns true only after the result's durable/readiness acknowledgement is known.
     fn acknowledge(
@@ -704,14 +725,17 @@ impl LifecycleControllerOwner {
                     match item {
                         MailboxItem::Fatal => {
                             if let Some(pending) = pending_verified_load.take() {
-                                workflow.cancel(&pending.request.operation_id);
+                                let _ = workflow.cancel(&pending.request.operation_id);
                             }
                             continue;
                         }
                         MailboxItem::Command(LifecycleCommand::Shutdown { deadline: _ }) => {
                             if let Some(pending) = &pending_verified_load {
-                                workflow.cancel(&pending.request.operation_id);
-                                if !worker_mailbox.cancel_ready_verification_for_shutdown() {
+                                let acknowledgement =
+                                    workflow.cancel(&pending.request.operation_id);
+                                if !worker_mailbox
+                                    .settle_ready_verification_for_shutdown(acknowledgement)
+                                {
                                     worker_mailbox.seal_fatal();
                                     let _ = lifecycle.shutdown();
                                     return Err(LifecycleError::RecoveryRequired {
@@ -725,13 +749,13 @@ impl LifecycleControllerOwner {
                         }
                         MailboxItem::Command(LifecycleCommand::ChildExited(exit)) => {
                             if let Some(pending) = pending_verified_load.take() {
-                                workflow.cancel(&pending.request.operation_id);
+                                let _ = workflow.cancel(&pending.request.operation_id);
                             }
                             process_child_exit(lifecycle, exit);
                             worker_mailbox.seal_fatal();
                         }
                         MailboxItem::Command(LifecycleCommand::Cancel { operation_id }) => {
-                            workflow.cancel(&operation_id);
+                            let _ = workflow.cancel(&operation_id);
                             if pending_verified_load
                                 .as_ref()
                                 .is_none_or(|pending| pending.request.operation_id != operation_id)

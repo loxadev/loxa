@@ -74,6 +74,34 @@ pub struct StartedSession<S> {
     pub correlation: SessionCorrelation,
 }
 
+pub struct ExactStopFailure<'a, S> {
+    error: LifecycleError,
+    _session: &'a mut StartedSession<S>,
+}
+
+impl<'a, S> ExactStopFailure<'a, S> {
+    pub fn new(error: LifecycleError, session: &'a mut StartedSession<S>) -> Self {
+        Self {
+            error,
+            _session: session,
+        }
+    }
+
+    pub fn into_error(self) -> LifecycleError {
+        self.error
+    }
+}
+
+impl<S> std::fmt::Debug for ExactStopFailure<'_, S> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExactStopFailure")
+            .field("error", &self.error)
+            .field("retains_exact_session", &true)
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NodeLifecycleStatus {
     Unloaded,
@@ -126,7 +154,10 @@ pub trait EngineLifecycleDriver {
         signals: LifecycleSignals<'_>,
     ) -> Result<(), LifecycleError>;
 
-    fn stop_exact(&mut self, session: StartedSession<Self::Session>) -> Result<(), LifecycleError>;
+    fn stop_exact<'a>(
+        &mut self,
+        session: &'a mut StartedSession<Self::Session>,
+    ) -> Result<(), ExactStopFailure<'a, Self::Session>>;
 
     fn poll_exact(
         &mut self,
@@ -135,10 +166,10 @@ pub trait EngineLifecycleDriver {
         Ok(ExactSessionStatus::Running)
     }
 
-    fn finish_unexpected_exit(
+    fn finish_unexpected_exit<'a>(
         &mut self,
-        session: StartedSession<Self::Session>,
-    ) -> Result<bool, LifecycleError> {
+        session: &'a mut StartedSession<Self::Session>,
+    ) -> Result<bool, ExactStopFailure<'a, Self::Session>> {
         self.stop_exact(session)?;
         Ok(true)
     }
@@ -186,6 +217,7 @@ where
     driver: D,
     gateway: G,
     current: Option<(LaunchPlan, StartedSession<D::Session>)>,
+    retained_uncertain: Option<(LaunchPlan, StartedSession<D::Session>)>,
     generation: u64,
     status: NodeLifecycleStatus,
     error: Option<String>,
@@ -250,6 +282,7 @@ where
             driver,
             gateway,
             current: None,
+            retained_uncertain: None,
             generation: 0,
             status: NodeLifecycleStatus::Unloaded,
             error: None,
@@ -352,11 +385,14 @@ where
         self.error = None;
         self.gateway.withdraw();
 
-        if let Some((_, prior_session)) = self.current.take() {
-            if let Err(error) = self.driver.stop_exact(prior_session) {
+        if let Some((_, prior_session)) = self.current.as_mut() {
+            if let Err(failure) = self.driver.stop_exact(prior_session) {
+                let error = failure.into_error();
+                self.retained_uncertain = self.current.take();
                 self.require_recovery(format!("exact prior-generation teardown failed: {error:?}"));
                 return Err(error);
             }
+            self.current.take();
         }
         if let Err(error) = self.ensure_not_stopping() {
             self.status = NodeLifecycleStatus::Unloaded;
@@ -370,13 +406,13 @@ where
                 Ok(())
             }
             Err(replacement_error) => {
+                if matches!(replacement_error, LifecycleError::RecoveryRequired { .. }) {
+                    self.require_recovery(format!("{replacement_error:?}"));
+                    return Err(replacement_error);
+                }
                 let Some(prior_plan) = prior_plan else {
-                    if matches!(replacement_error, LifecycleError::RecoveryRequired { .. }) {
-                        self.require_recovery(format!("{replacement_error:?}"));
-                    } else {
-                        self.status = NodeLifecycleStatus::Unloaded;
-                        self.error = Some(format!("{replacement_error:?}"));
-                    }
+                    self.status = NodeLifecycleStatus::Unloaded;
+                    self.error = Some(format!("{replacement_error:?}"));
                     return Err(replacement_error);
                 };
                 match self.start_ready(&prior_plan, cancellation) {
@@ -410,13 +446,16 @@ where
         self.status = NodeLifecycleStatus::Unloading;
         self.error = None;
         self.gateway.withdraw();
-        if let Some((_, session)) = self.current.take() {
-            if let Err(error) = self.driver.stop_exact(session) {
+        if let Some((_, session)) = self.current.as_mut() {
+            if let Err(failure) = self.driver.stop_exact(session) {
+                let error = failure.into_error();
+                self.retained_uncertain = self.current.take();
                 self.require_recovery(format!(
                     "exact active-generation teardown failed: {error:?}"
                 ));
                 return Err(error);
             }
+            self.current.take();
         }
         self.status = NodeLifecycleStatus::Unloaded;
         Ok(())
@@ -426,11 +465,20 @@ where
         self.request_stop();
         self.gateway.withdraw();
         self.destructive_commit.set(true);
-        if let Some((_, session)) = self.current.take() {
-            if let Err(error) = self.driver.stop_exact(session) {
+        if self.retained_uncertain.is_some() {
+            return Err(LifecycleError::RecoveryRequired {
+                replacement: "exact lifecycle teardown is uncertain".into(),
+                rollback: "exact session ownership retained".into(),
+            });
+        }
+        if let Some((_, session)) = self.current.as_mut() {
+            if let Err(failure) = self.driver.stop_exact(session) {
+                let error = failure.into_error();
+                self.retained_uncertain = self.current.take();
                 self.require_recovery(format!("node-stop teardown failed: {error:?}"));
                 return Err(error);
             }
+            self.current.take();
         }
         self.status = NodeLifecycleStatus::Unloaded;
         self.destructive_commit.set(false);
@@ -447,8 +495,16 @@ where
             Ok(ExactSessionStatus::Exited) => {}
             Err(error) => {
                 self.gateway.withdraw();
-                if let Some((_, session)) = self.current.take() {
-                    let _ = self.driver.finish_unexpected_exit(session);
+                if let Some((_, session)) = self.current.as_mut() {
+                    match self.driver.finish_unexpected_exit(session) {
+                        Ok(_) => {
+                            self.current.take();
+                        }
+                        Err(failure) => {
+                            let _ = failure.into_error();
+                            self.retained_uncertain = self.current.take();
+                        }
+                    }
                 }
                 self.mark_recovery(format!("exact ready-session observation failed: {error:?}"));
                 return Err(error);
@@ -456,14 +512,22 @@ where
         }
 
         self.gateway.withdraw();
-        let (plan, session) = self.current.take().expect("ready session exists");
-        let restart_allowed = match self.driver.finish_unexpected_exit(session) {
-            Ok(restart_allowed) => restart_allowed,
-            Err(error) => {
+        let restart_allowed = match self
+            .driver
+            .finish_unexpected_exit(&mut self.current.as_mut().expect("ready session exists").1)
+        {
+            Ok(restart_allowed) => {
+                let (plan, _) = self.current.take().expect("ready session exists");
+                (restart_allowed, plan)
+            }
+            Err(failure) => {
+                let error = failure.into_error();
+                self.retained_uncertain = self.current.take();
                 self.mark_recovery(format!("unexpected engine exit cleanup failed: {error:?}"));
                 return Err(error);
             }
         };
+        let (restart_allowed, plan) = restart_allowed;
         self.status = NodeLifecycleStatus::Unloaded;
         if !restart_allowed || self.stopping.load(Ordering::SeqCst) {
             return Ok(None);
@@ -505,10 +569,16 @@ where
 
     pub(crate) fn fail_observed_child_exit(&mut self, exit: &str) {
         self.gateway.withdraw();
-        let cleanup = self
-            .current
-            .take()
-            .map(|(_, session)| self.driver.finish_unexpected_exit(session));
+        let cleanup = self.current.as_mut().map(|(_, session)| {
+            self.driver
+                .finish_unexpected_exit(session)
+                .map_err(ExactStopFailure::into_error)
+        });
+        if matches!(cleanup, Some(Ok(_))) {
+            self.current.take();
+        } else if matches!(cleanup, Some(Err(_))) {
+            self.retained_uncertain = self.current.take();
+        }
         let detail = match cleanup {
             Some(Ok(_)) => format!("exact child exit observed: {exit}"),
             Some(Err(error)) => {
@@ -555,12 +625,16 @@ where
         self.generation = generation;
         if let Err(error) = validate_candidate(&self.owner, plan, generation, &session.correlation)
         {
-            return match self.driver.stop_exact(session) {
+            return match self.driver.stop_exact(&mut session) {
                 Ok(()) => Err(error),
-                Err(cleanup) => Err(LifecycleError::RecoveryRequired {
-                    replacement: format!("{error:?}"),
-                    rollback: format!("invalid-candidate cleanup failed: {cleanup:?}"),
-                }),
+                Err(cleanup) => {
+                    let cleanup = cleanup.into_error();
+                    self.retained_uncertain = Some((plan.clone(), session));
+                    Err(LifecycleError::RecoveryRequired {
+                        replacement: format!("{error:?}"),
+                        rollback: format!("invalid-candidate cleanup failed: {cleanup:?}"),
+                    })
+                }
             };
         }
         if let Err(error) = self.driver.wait_ready(
@@ -570,21 +644,29 @@ where
                 stopping: &self.stopping,
             },
         ) {
-            return match self.driver.stop_exact(session) {
+            return match self.driver.stop_exact(&mut session) {
                 Ok(()) => Err(error),
-                Err(cleanup) => Err(LifecycleError::RecoveryRequired {
-                    replacement: format!("{error:?}"),
-                    rollback: format!("candidate cleanup failed: {cleanup:?}"),
-                }),
+                Err(cleanup) => {
+                    let cleanup = cleanup.into_error();
+                    self.retained_uncertain = Some((plan.clone(), session));
+                    Err(LifecycleError::RecoveryRequired {
+                        replacement: format!("{error:?}"),
+                        rollback: format!("candidate cleanup failed: {cleanup:?}"),
+                    })
+                }
             };
         }
         if let Err(error) = self.ensure_not_stopping() {
-            return match self.driver.stop_exact(session) {
+            return match self.driver.stop_exact(&mut session) {
                 Ok(()) => Err(error),
-                Err(cleanup) => Err(LifecycleError::RecoveryRequired {
-                    replacement: format!("{error:?}"),
-                    rollback: format!("stop-race cleanup failed: {cleanup:?}"),
-                }),
+                Err(cleanup) => {
+                    let cleanup = cleanup.into_error();
+                    self.retained_uncertain = Some((plan.clone(), session));
+                    Err(LifecycleError::RecoveryRequired {
+                        replacement: format!("{error:?}"),
+                        rollback: format!("stop-race cleanup failed: {cleanup:?}"),
+                    })
+                }
             };
         }
         Ok(session)
@@ -697,12 +779,15 @@ mod tests {
             self.outcomes.pop_front().unwrap_or(Ok(()))
         }
 
-        fn stop_exact(
+        fn stop_exact<'a>(
             &mut self,
-            session: StartedSession<Self::Session>,
-        ) -> Result<(), LifecycleError> {
-            self.stopped.push(session.correlation);
-            self.stop_outcomes.pop_front().unwrap_or(Ok(()))
+            session: &'a mut StartedSession<Self::Session>,
+        ) -> Result<(), ExactStopFailure<'a, Self::Session>> {
+            self.stopped.push(session.correlation.clone());
+            self.stop_outcomes
+                .pop_front()
+                .unwrap_or(Ok(()))
+                .map_err(|error| ExactStopFailure::new(error, session))
         }
 
         fn poll_exact(
@@ -714,14 +799,15 @@ mod tests {
                 .unwrap_or(Ok(ExactSessionStatus::Running))
         }
 
-        fn finish_unexpected_exit(
+        fn finish_unexpected_exit<'a>(
             &mut self,
-            session: StartedSession<Self::Session>,
-        ) -> Result<bool, LifecycleError> {
-            self.stopped.push(session.correlation);
+            session: &'a mut StartedSession<Self::Session>,
+        ) -> Result<bool, ExactStopFailure<'a, Self::Session>> {
+            self.stopped.push(session.correlation.clone());
             self.unexpected_exit_outcomes
                 .pop_front()
                 .unwrap_or(Ok(true))
+                .map_err(|error| ExactStopFailure::new(error, session))
         }
     }
 
@@ -1064,7 +1150,10 @@ mod tests {
             ) -> Result<(), LifecycleError> {
                 Ok(())
             }
-            fn stop_exact(&mut self, _: StartedSession<()>) -> Result<(), LifecycleError> {
+            fn stop_exact<'a>(
+                &mut self,
+                _: &'a mut StartedSession<()>,
+            ) -> Result<(), ExactStopFailure<'a, ()>> {
                 Ok(())
             }
         }
@@ -1208,8 +1297,14 @@ mod tests {
             ) -> Result<(), LifecycleError> {
                 Ok(())
             }
-            fn stop_exact(&mut self, _: StartedSession<()>) -> Result<(), LifecycleError> {
-                Err(LifecycleError::TeardownFailed("stuck".into()))
+            fn stop_exact<'a>(
+                &mut self,
+                session: &'a mut StartedSession<()>,
+            ) -> Result<(), ExactStopFailure<'a, ()>> {
+                Err(ExactStopFailure::new(
+                    LifecycleError::TeardownFailed("stuck".into()),
+                    session,
+                ))
             }
         }
         let mut lifecycle = ModelLifecycle::new(owner(), BadCleanupDriver, FakeGateway::default());

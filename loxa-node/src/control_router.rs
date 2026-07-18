@@ -654,10 +654,10 @@ mod tests {
         ) -> Result<(), crate::model_lifecycle::LifecycleError> {
             panic!("unload does not wait")
         }
-        fn stop_exact(
+        fn stop_exact<'a>(
             &mut self,
-            _: crate::model_lifecycle::StartedSession<()>,
-        ) -> Result<(), crate::model_lifecycle::LifecycleError> {
+            _: &'a mut crate::model_lifecycle::StartedSession<()>,
+        ) -> Result<(), crate::model_lifecycle::ExactStopFailure<'a, ()>> {
             Ok(())
         }
     }

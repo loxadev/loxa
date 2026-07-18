@@ -1,8 +1,8 @@
 use crate::engine_session::EngineSession;
 use crate::model_lifecycle::{
-    EngineLifecycleDriver, ExactSessionStatus, GatewayPublisher, LaunchPlan, LifecycleError,
-    LifecycleSignals, ModelLifecycle, NodeLifecycleStatus, SessionCorrelation, StableNodeOwner,
-    StartedSession,
+    EngineLifecycleDriver, ExactSessionStatus, ExactStopFailure, GatewayPublisher, LaunchPlan,
+    LifecycleError, LifecycleSignals, ModelLifecycle, NodeLifecycleStatus, SessionCorrelation,
+    StableNodeOwner, StartedSession,
 };
 use loxa_core::diagnostics::DiagnosticsHealth;
 use loxa_core::engine::{EngineLaunchSpec, ReadinessStrategy};
@@ -131,6 +131,34 @@ impl ProductionEngineDriver {
             return Err(recovery("engine teardown could not be confirmed".into()));
         }
         self.commit_unloaded(run, recovery)
+    }
+
+    fn stop_started_session(
+        &self,
+        session: &mut StartedSession<EngineSession<supervisor::SpawnedServer>>,
+    ) -> Result<(), LifecycleError> {
+        let run = session.value.run().clone();
+        let confirmation = supervisor::teardown_managed_child(
+            session.value.child_mut(),
+            supervisor::CTRL_C_GRACE_PERIOD,
+        )
+        .map_err(|error| LifecycleError::TeardownFailed(error.to_string()))?;
+        if confirmation != supervisor::TeardownConfirmation::Confirmed {
+            return Err(LifecycleError::TeardownFailed(
+                "engine teardown could not be confirmed".into(),
+            ));
+        }
+        let mut unloaded = run.clone();
+        unloaded.model_id = None;
+        unloaded.lifecycle = RunLifecycle::Unloaded;
+        unloaded.port = self.gateway_port;
+        unloaded.child_pid = None;
+        unloaded.child_process_start_time_unix_s = None;
+        unloaded.child_pgid = None;
+        supervisor::update_runtime_state_run_committed(&self.state_path, &run.identity(), unloaded)
+            .map_err(|error| LifecycleError::TeardownFailed(error.to_string()))?
+            .ok_or_else(|| LifecycleError::TeardownFailed("engine generation changed".into()))?;
+        Ok(())
     }
 
     fn commit_unloaded(
@@ -420,27 +448,12 @@ impl EngineLifecycleDriver for ProductionEngineDriver {
         ))
     }
 
-    fn stop_exact(&mut self, session: StartedSession<Self::Session>) -> Result<(), LifecycleError> {
-        let (mut child, run, _, _) = session.value.into_parts();
-        let confirmation =
-            supervisor::teardown_managed_child(&mut child, supervisor::CTRL_C_GRACE_PERIOD)
-                .map_err(|error| LifecycleError::TeardownFailed(error.to_string()))?;
-        if confirmation != supervisor::TeardownConfirmation::Confirmed {
-            return Err(LifecycleError::TeardownFailed(
-                "engine teardown could not be confirmed".into(),
-            ));
-        }
-        let mut unloaded = run.clone();
-        unloaded.model_id = None;
-        unloaded.lifecycle = RunLifecycle::Unloaded;
-        unloaded.port = self.gateway_port;
-        unloaded.child_pid = None;
-        unloaded.child_process_start_time_unix_s = None;
-        unloaded.child_pgid = None;
-        supervisor::update_runtime_state_run_committed(&self.state_path, &run.identity(), unloaded)
-            .map_err(|error| LifecycleError::TeardownFailed(error.to_string()))?
-            .ok_or_else(|| LifecycleError::TeardownFailed("engine generation changed".into()))?;
-        Ok(())
+    fn stop_exact<'a>(
+        &mut self,
+        session: &'a mut StartedSession<Self::Session>,
+    ) -> Result<(), ExactStopFailure<'a, Self::Session>> {
+        let result = self.stop_started_session(session);
+        result.map_err(|error| ExactStopFailure::new(error, session))
     }
 
     fn poll_exact(
@@ -469,29 +482,34 @@ impl EngineLifecycleDriver for ProductionEngineDriver {
             .map_err(|error| LifecycleError::TeardownFailed(error.to_string()))
     }
 
-    fn finish_unexpected_exit(
+    fn finish_unexpected_exit<'a>(
         &mut self,
-        session: StartedSession<Self::Session>,
-    ) -> Result<bool, LifecycleError> {
+        session: &'a mut StartedSession<Self::Session>,
+    ) -> Result<bool, ExactStopFailure<'a, Self::Session>> {
         let owner_run_id = session.correlation.committed_run_id.clone();
-        self.stop_exact(session)?;
-        let supervisor::RuntimeStateRead::Loaded(runs) =
-            supervisor::read_runtime_state(&self.state_path).map_err(Self::public_error)?
-        else {
-            return Err(LifecycleError::TeardownFailed(
-                "stable owner state unavailable after unexpected exit".into(),
-            ));
-        };
-        let current = runs
-            .into_iter()
-            .next()
-            .filter(|run| run.run_id == owner_run_id && run.lifecycle == RunLifecycle::Unloaded)
-            .ok_or_else(|| {
-                LifecycleError::TeardownFailed(
-                    "stable owner was not restored after unexpected exit".into(),
-                )
-            })?;
-        Ok(!current.stop_requested)
+        if let Err(error) = self.stop_started_session(session) {
+            return Err(ExactStopFailure::new(error, session));
+        }
+        let result = (|| {
+            let supervisor::RuntimeStateRead::Loaded(runs) =
+                supervisor::read_runtime_state(&self.state_path).map_err(Self::public_error)?
+            else {
+                return Err(LifecycleError::TeardownFailed(
+                    "stable owner state unavailable after unexpected exit".into(),
+                ));
+            };
+            let current = runs
+                .into_iter()
+                .next()
+                .filter(|run| run.run_id == owner_run_id && run.lifecycle == RunLifecycle::Unloaded)
+                .ok_or_else(|| {
+                    LifecycleError::TeardownFailed(
+                        "stable owner was not restored after unexpected exit".into(),
+                    )
+                })?;
+            Ok(!current.stop_requested)
+        })();
+        result.map_err(|error| ExactStopFailure::new(error, session))
     }
 
     fn mark_recovery_required(&mut self, owner: &StableNodeOwner) -> Result<(), LifecycleError> {
@@ -808,7 +826,7 @@ mod tests {
             ExactSessionStatus::Exited
         );
 
-        assert!(!driver.finish_unexpected_exit(started).unwrap());
+        assert!(!driver.finish_unexpected_exit(&mut started).unwrap());
         let supervisor::RuntimeStateRead::Loaded(runs) =
             supervisor::read_runtime_state(&state_path).unwrap()
         else {

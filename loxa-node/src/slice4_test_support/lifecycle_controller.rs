@@ -4,13 +4,13 @@ use crate::download_scheduler::{
     DownloadSubmitOutcome, DownloadWorkerPermit,
 };
 use crate::lifecycle_controller::{
-    LifecycleCommand, LifecycleControllerHandle, LifecycleControllerOwner, LifecycleLoadRequest,
-    LifecycleLoadSubmission, LifecycleLoadWorkflow, LifecycleMailboxInner, LifecycleSubmitError,
-    LIFECYCLE_NORMAL_CAPACITY,
+    LifecycleCancelAcknowledgement, LifecycleCommand, LifecycleControllerHandle,
+    LifecycleControllerOwner, LifecycleLoadRequest, LifecycleLoadSubmission, LifecycleLoadWorkflow,
+    LifecycleMailboxInner, LifecycleSubmitError, LIFECYCLE_NORMAL_CAPACITY,
 };
 use crate::model_lifecycle::{
-    EngineLifecycleDriver, GatewayPublisher, LaunchPlan, LifecycleError, LifecycleSignals,
-    ModelLifecycle, SessionCorrelation, StableNodeOwner, StartedSession,
+    EngineLifecycleDriver, ExactStopFailure, GatewayPublisher, LaunchPlan, LifecycleError,
+    LifecycleSignals, ModelLifecycle, SessionCorrelation, StableNodeOwner, StartedSession,
 };
 use crate::operation_cancellation::OperationCancellation;
 use crate::verification_scheduler::{
@@ -164,15 +164,18 @@ impl EngineLifecycleDriver for TestDriver {
         }
     }
 
-    fn stop_exact(&mut self, session: StartedSession<Self::Session>) -> Result<(), LifecycleError> {
+    fn stop_exact<'a>(
+        &mut self,
+        session: &'a mut StartedSession<Self::Session>,
+    ) -> Result<(), ExactStopFailure<'a, Self::Session>> {
         self.events.lock().unwrap().push("stop");
         if self.panic_stop {
             panic!("injected lifecycle driver panic");
         }
-        drop(session);
         if self.stop_error {
-            Err(LifecycleError::TeardownFailed(
-                "injected teardown failure".into(),
+            Err(ExactStopFailure::new(
+                LifecycleError::TeardownFailed("injected teardown failure".into()),
+                session,
             ))
         } else {
             Ok(())
@@ -358,12 +361,14 @@ impl EngineLifecycleDriver for RollbackDriver {
         Ok(())
     }
 
-    fn stop_exact(&mut self, session: StartedSession<Self::Session>) -> Result<(), LifecycleError> {
+    fn stop_exact<'a>(
+        &mut self,
+        session: &'a mut StartedSession<Self::Session>,
+    ) -> Result<(), ExactStopFailure<'a, Self::Session>> {
         self.events
             .lock()
             .unwrap()
             .push(format!("stop:{}", session.value.model_id));
-        drop(session);
         Ok(())
     }
 }
@@ -783,6 +788,7 @@ fn callback_panic_seals_handle_and_retains_exact_session_until_fatal_disposal() 
 #[test]
 fn driver_panic_is_caught_and_workflow_resources_remain_in_fatal_envelope() {
     let workflow_dropped = Arc::new(AtomicUsize::new(0));
+    let live = Arc::new(AtomicUsize::new(0));
     let lifecycle = ModelLifecycle::new(
         StableNodeOwner {
             run_id: "owner-driver-panic".into(),
@@ -792,7 +798,7 @@ fn driver_panic_is_caught_and_workflow_resources_remain_in_fatal_envelope() {
         },
         TestDriver {
             events: Arc::new(Mutex::new(Vec::new())),
-            live: Arc::new(AtomicUsize::new(0)),
+            live: Arc::clone(&live),
             ready_entered: None,
             stop_error: false,
             panic_stop: true,
@@ -816,8 +822,10 @@ fn driver_panic_is_caught_and_workflow_resources_remain_in_fatal_envelope() {
         .shutdown(Instant::now() + Duration::from_secs(1))
         .expect_err("driver panic retained by worker envelope");
     assert_eq!(workflow_dropped.load(Ordering::SeqCst), 0);
+    assert_eq!(live.load(Ordering::SeqCst), 1);
     failure.into_owner().dispose_fatal_for_test();
     assert_eq!(workflow_dropped.load(Ordering::SeqCst), 1);
+    assert_eq!(live.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -860,6 +868,7 @@ fn drop_fallback_leaks_uncertain_worker_resources_instead_of_releasing_ownership
 
 #[test]
 fn teardown_error_and_worker_exit_disconnect_never_report_success() {
+    let live = Arc::new(AtomicUsize::new(0));
     let lifecycle = ModelLifecycle::new(
         StableNodeOwner {
             run_id: "owner".into(),
@@ -869,7 +878,7 @@ fn teardown_error_and_worker_exit_disconnect_never_report_success() {
         },
         TestDriver {
             events: Arc::new(Mutex::new(Vec::new())),
-            live: Arc::new(AtomicUsize::new(0)),
+            live: Arc::clone(&live),
             ready_entered: None,
             stop_error: true,
             panic_stop: false,
@@ -895,7 +904,9 @@ fn teardown_error_and_worker_exit_disconnect_never_report_success() {
     let failure = owner
         .shutdown(Instant::now() + Duration::from_secs(1))
         .expect_err("teardown uncertainty retained");
+    assert_eq!(live.load(Ordering::SeqCst), 1);
     failure.into_owner().dispose_fatal_for_test();
+    assert_eq!(live.load(Ordering::SeqCst), 0);
 
     let lifecycle = ModelLifecycle::new(
         StableNodeOwner {
@@ -929,6 +940,7 @@ struct BlockingVerificationWorkflow {
     release: mpsc::Receiver<()>,
     resumed: Arc<AtomicUsize>,
     cancelled: Arc<AtomicUsize>,
+    cancel_acknowledgement: LifecycleCancelAcknowledgement,
 }
 
 impl LifecycleLoadWorkflow for BlockingVerificationWorkflow {
@@ -955,12 +967,26 @@ impl LifecycleLoadWorkflow for BlockingVerificationWorkflow {
         })
     }
 
-    fn cancel(&mut self, _operation_id: &OperationId) {
+    fn cancel(&mut self, _operation_id: &OperationId) -> LifecycleCancelAcknowledgement {
         self.cancelled.fetch_add(1, Ordering::SeqCst);
+        self.cancel_acknowledgement
     }
 }
 
 fn verifying_controller() -> (
+    LifecycleControllerHandle,
+    LifecycleControllerOwner,
+    mpsc::Receiver<LifecycleVerificationCompletion>,
+    mpsc::Sender<()>,
+    Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
+) {
+    verifying_controller_with_cancel_ack(LifecycleCancelAcknowledgement::DurablyConfirmed)
+}
+
+fn verifying_controller_with_cancel_ack(
+    cancel_acknowledgement: LifecycleCancelAcknowledgement,
+) -> (
     LifecycleControllerHandle,
     LifecycleControllerOwner,
     mpsc::Receiver<LifecycleVerificationCompletion>,
@@ -995,6 +1021,7 @@ fn verifying_controller() -> (
             release: release_rx,
             resumed: Arc::clone(&resumed),
             cancelled: Arc::clone(&cancelled),
+            cancel_acknowledgement,
         },
     )
     .unwrap();
@@ -1088,6 +1115,43 @@ fn owner_shutdown_outranks_ready_verification_and_cloneable_handle_cannot_shutdo
     assert!(shutdown.join().unwrap().is_ok());
     assert_eq!(resumed.load(Ordering::SeqCst), 0);
     assert_eq!(cancelled.load(Ordering::SeqCst), 1);
+    assert!(coordinator.try_acquire_mutation(artifact_key).is_ok());
+}
+
+#[test]
+fn unknown_durable_cancel_ack_retains_ready_verification_until_fatal_disposal() {
+    let dir = TestDir::new("shutdown-unknown-cancel-ack");
+    let path = dir.0.join("model.gguf");
+    std::fs::write(&path, b"artifact").unwrap();
+    let artifact_key = ArtifactKey::from_destination(&path).unwrap();
+    let coordinator = ArtifactMutationCoordinator::new();
+    let (handle, owner, completion_rx, release, resumed, cancelled) =
+        verifying_controller_with_cancel_ack(LifecycleCancelAcknowledgement::Unknown);
+    let operation_id = OperationId::new_v4();
+    handle
+        .reserve_normal()
+        .unwrap()
+        .submit(load(operation_id, "model", 1))
+        .unwrap();
+    let completion = completion_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    publish_lifecycle_verification(completion, operation_id, &coordinator, &artifact_key);
+    let shutdown =
+        std::thread::spawn(move || owner.shutdown(Instant::now() + Duration::from_secs(1)));
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !handle.is_sealed_for_test() && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    release.send(()).unwrap();
+    let failure = shutdown
+        .join()
+        .unwrap()
+        .expect_err("unknown durable cancel acknowledgement must retain fatal owner");
+    assert_eq!(resumed.load(Ordering::SeqCst), 0);
+    assert_eq!(cancelled.load(Ordering::SeqCst), 1);
+    assert!(coordinator
+        .try_acquire_mutation(artifact_key.clone())
+        .is_err());
+    failure.into_owner().dispose_fatal_for_test();
     assert!(coordinator.try_acquire_mutation(artifact_key).is_ok());
 }
 
