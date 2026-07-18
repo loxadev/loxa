@@ -273,6 +273,10 @@ where
         self.stopping.load(Ordering::SeqCst)
     }
 
+    pub(crate) fn recovery_required(&self) -> bool {
+        self.status == NodeLifecycleStatus::RecoveryRequired
+    }
+
     pub fn cancellation_is_safe(&self) -> bool {
         self.destructive_commit.is_safe()
     }

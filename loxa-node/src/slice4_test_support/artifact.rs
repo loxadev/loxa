@@ -431,7 +431,7 @@ fn mutex_poisoned_ready_completion_is_retained_without_ack_surface() {
 
     let panicked = catch_unwind(AssertUnwindSafe(|| {
         let retained = queue.ready().expect("ready completion retained");
-        let mut ready = retained.lock_ready().expect("ready completion guard");
+        let mut ready = retained.take_ready().expect("ready completion ticket");
         assert!(matches!(
             ready.outcome_mut().result,
             VerificationResult::Verified(_)
@@ -481,7 +481,7 @@ fn confirmed_completion_acknowledgement_releases_the_artifact_lease() {
 
     let retained = queue.ready().expect("ready completion retained");
     retained
-        .lock_ready()
+        .take_ready()
         .expect("ready completion guard")
         .acknowledge();
 

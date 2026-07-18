@@ -10,7 +10,7 @@ use loxa_protocol::v2::{DecimalU64, OperationId};
 use std::collections::{HashMap, VecDeque};
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -160,6 +160,7 @@ struct RetainedCompletionCell<T> {
 enum CompletionTransferState<T> {
     Reserved,
     Ready(ManuallyDrop<T>),
+    Processing,
     Acknowledged,
     Poisoned(ManuallyDrop<T>),
 }
@@ -169,20 +170,29 @@ pub(crate) struct RetainedCompletion<T> {
 }
 
 impl<T> RetainedCompletion<T> {
-    pub(crate) fn lock_ready(&self) -> Option<ReadyCompletionGuard<'_, T>> {
-        let state = match self.cell.state.lock() {
-            Ok(state) => state,
-            Err(poisoned) => {
-                let mut state = poisoned.into_inner();
-                poison_ready_state(&mut state);
-                return None;
+    pub(crate) fn take_ready(&self) -> Option<ProcessingTicket<T>> {
+        let outcome = {
+            let mut state = match self.cell.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => {
+                    let mut state = poisoned.into_inner();
+                    poison_ready_state(&mut state);
+                    return None;
+                }
+            };
+            let previous = std::mem::replace(&mut *state, CompletionTransferState::Processing);
+            match previous {
+                CompletionTransferState::Ready(outcome) => outcome,
+                other => {
+                    *state = other;
+                    return None;
+                }
             }
         };
-        if matches!(&*state, CompletionTransferState::Ready(_)) {
-            Some(ReadyCompletionGuard { state: Some(state) })
-        } else {
-            None
-        }
+        Some(ProcessingTicket {
+            cell: self.cell.clone(),
+            outcome: Some(outcome),
+        })
     }
 
     #[cfg(test)]
@@ -216,38 +226,65 @@ impl<T> std::fmt::Debug for RetainedCompletion<T> {
     }
 }
 
-pub(crate) struct ReadyCompletionGuard<'a, T> {
-    state: Option<MutexGuard<'a, CompletionTransferState<T>>>,
+pub(crate) struct ProcessingTicket<T> {
+    cell: Arc<RetainedCompletionCell<T>>,
+    outcome: Option<ManuallyDrop<T>>,
 }
 
-impl<T> ReadyCompletionGuard<'_, T> {
+impl<T> ProcessingTicket<T> {
     pub(crate) fn outcome_mut(&mut self) -> &mut T {
-        match &mut **self.state.as_mut().expect("ready guard owns its lock") {
-            CompletionTransferState::Ready(outcome) => outcome,
-            _ => unreachable!("ready completion guard changed state"),
-        }
+        self.outcome
+            .as_mut()
+            .expect("processing ticket owns its outcome")
     }
 
     pub(crate) fn acknowledge(mut self) {
-        let mut state = self.state.take().expect("ready guard owns its lock");
-        let previous = std::mem::replace(&mut *state, CompletionTransferState::Acknowledged);
-        let outcome = if let CompletionTransferState::Ready(outcome) = previous {
-            ManuallyDrop::into_inner(outcome)
-        } else {
-            unreachable!("only a ready completion can be acknowledged");
+        let outcome = self
+            .outcome
+            .take()
+            .expect("processing ticket owns its outcome");
+        let mut state = match self.cell.state.lock() {
+            Ok(state) => state,
+            Err(_) => {
+                self.outcome = Some(outcome);
+                return;
+            }
         };
+        if !matches!(&*state, CompletionTransferState::Processing) {
+            self.outcome = Some(outcome);
+            return;
+        }
+        *state = CompletionTransferState::Acknowledged;
         drop(state);
-        drop(outcome);
+        drop(ManuallyDrop::into_inner(outcome));
     }
 
-    pub(crate) fn poison(&mut self) {
-        let state = self.state.as_mut().expect("ready guard owns its lock");
-        let previous = std::mem::replace(&mut **state, CompletionTransferState::Acknowledged);
-        if let CompletionTransferState::Ready(outcome) = previous {
-            **state = CompletionTransferState::Poisoned(outcome);
+    pub(crate) fn poison(mut self) {
+        self.restore_poisoned();
+    }
+
+    fn restore_poisoned(&mut self) {
+        let Some(outcome) = self.outcome.take() else {
+            return;
+        };
+        let mut state = match self.cell.state.lock() {
+            Ok(state) => state,
+            Err(_) => {
+                self.outcome = Some(outcome);
+                return;
+            }
+        };
+        if matches!(&*state, CompletionTransferState::Processing) {
+            *state = CompletionTransferState::Poisoned(outcome);
         } else {
-            unreachable!("only a ready completion can be poisoned");
+            self.outcome = Some(outcome);
         }
+    }
+}
+
+impl<T> Drop for ProcessingTicket<T> {
+    fn drop(&mut self) {
+        self.restore_poisoned();
     }
 }
 
@@ -444,6 +481,17 @@ impl<T> CompletionDestination<T> {
         }
         self.changed.notify_all();
         true
+    }
+
+    pub(super) fn poison_ready(&self) {
+        let cells = match self.cells.lock() {
+            Ok(cells) => cells.iter().cloned().collect::<Vec<_>>(),
+            Err(poisoned) => poisoned.into_inner().iter().cloned().collect::<Vec<_>>(),
+        };
+        for cell in cells {
+            poison_ready_cell(&cell);
+        }
+        self.changed.notify_all();
     }
 
     fn remove_reserved(&self, target: &Arc<RetainedCompletionCell<T>>) {
@@ -1721,7 +1769,7 @@ mod lock_order_tests {
     use crate::artifact_coordinator::{ArtifactKey, ArtifactMutationCoordinator};
     use crate::download_scheduler::DownloadContinuation;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     struct TestDir(PathBuf);
 
@@ -1784,12 +1832,87 @@ mod lock_order_tests {
             cell: Arc::downgrade(&cell),
             observed_unlocked: Arc::clone(&observed_unlocked),
         }));
-        RetainedCompletion { cell }
-            .lock_ready()
-            .unwrap()
-            .acknowledge();
+        let mut ticket = RetainedCompletion { cell: cell.clone() }
+            .take_ready()
+            .unwrap();
+        assert!(
+            cell.state.try_lock().is_ok(),
+            "processing must not hold cell lock"
+        );
+        let _ = ticket.outcome_mut();
+        ticket.acknowledge();
 
         assert!(observed_unlocked.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn dropped_processing_ticket_restores_poisoned_outcome_without_lock_held_drop() {
+        struct Probe {
+            cell: Weak<RetainedCompletionCell<Probe>>,
+            observed_unlocked: Arc<AtomicBool>,
+        }
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                self.observed_unlocked.store(
+                    self.cell
+                        .upgrade()
+                        .is_some_and(|cell| cell.state.try_lock().is_ok()),
+                    Ordering::SeqCst,
+                );
+            }
+        }
+
+        let observed_unlocked = Arc::new(AtomicBool::new(false));
+        let cell = Arc::new(RetainedCompletionCell {
+            state: Mutex::new(CompletionTransferState::Reserved),
+        });
+        *cell.state.lock().unwrap() = CompletionTransferState::Ready(ManuallyDrop::new(Probe {
+            cell: Arc::downgrade(&cell),
+            observed_unlocked: Arc::clone(&observed_unlocked),
+        }));
+        let ticket = RetainedCompletion { cell: cell.clone() }
+            .take_ready()
+            .expect("ready processing ticket");
+        drop(ticket);
+        assert!(matches!(
+            &*cell.state.lock().unwrap(),
+            CompletionTransferState::Poisoned(_)
+        ));
+        RetainedCompletion { cell }.dispose_poisoned_for_test();
+        assert!(observed_unlocked.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn poisoned_processing_cell_retains_payload_fail_closed() {
+        struct Probe(Arc<AtomicUsize>);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let cell = Arc::new(RetainedCompletionCell {
+            state: Mutex::new(CompletionTransferState::Ready(ManuallyDrop::new(Probe(
+                Arc::clone(&dropped),
+            )))),
+        });
+        let ticket = RetainedCompletion { cell: cell.clone() }
+            .take_ready()
+            .expect("ready processing ticket");
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = cell.state.lock().unwrap();
+            panic!("poison processing completion cell");
+        });
+
+        drop(ticket);
+
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        let state = match cell.state.lock() {
+            Ok(_) => panic!("processing completion cell was not poisoned"),
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        assert!(matches!(&*state, CompletionTransferState::Processing));
     }
 
     #[test]
@@ -2084,7 +2207,7 @@ mod tests {
             }
             std::thread::yield_now();
         };
-        let mut ready = retained.lock_ready().unwrap();
+        let mut ready = retained.take_ready().unwrap();
         let result = ready.outcome_mut().result.clone_for_delivery();
         ready.acknowledge();
         result
@@ -2095,7 +2218,7 @@ mod tests {
             cell: fixture.cell.clone(),
         };
         let mut ready = loop {
-            if let Some(ready) = retained.lock_ready() {
+            if let Some(ready) = retained.take_ready() {
                 break ready;
             }
             std::thread::yield_now();
@@ -2521,7 +2644,7 @@ mod tests {
             .unwrap_or_else(|_| panic!("opened original bind rejected"));
         wait_until(|| queue.ready().is_some());
         let retained = queue.ready().unwrap();
-        let mut ready = retained.lock_ready().unwrap();
+        let mut ready = retained.take_ready().unwrap();
         assert!(matches!(
             &ready.outcome_mut().result,
             VerificationResult::Failed {
@@ -2675,7 +2798,7 @@ mod tests {
         let acknowledged = submit_download(&handle, &dir.file("ack.gguf", b"ack"), [2; 32], 2).1;
         wait_until(|| acknowledged.queue.ready().is_some());
         let retained = acknowledged.queue.ready().unwrap();
-        retained.lock_ready().unwrap().acknowledge();
+        retained.take_ready().unwrap().acknowledge();
         assert!(acknowledged
             .coordinator
             .try_acquire_mutation(acknowledged.artifact_key.clone())
@@ -2687,7 +2810,7 @@ mod tests {
             .queue
             .ready()
             .unwrap()
-            .lock_ready()
+            .take_ready()
             .unwrap()
             .poison();
         assert_eq!(
@@ -2707,7 +2830,7 @@ mod tests {
         wait_until(|| panicked.queue.ready().is_some());
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let retained = panicked.queue.ready().unwrap();
-            let mut ready = retained.lock_ready().unwrap();
+            let mut ready = retained.take_ready().unwrap();
             let _ = ready.outcome_mut();
             panic!("injected completion receiver panic");
         }));
