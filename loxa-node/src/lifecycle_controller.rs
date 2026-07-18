@@ -57,6 +57,7 @@ struct LifecycleMailboxState {
     reserved_normal: usize,
     sealed: bool,
     fatal: bool,
+    fatal_notified: bool,
     active: Option<(OperationId, MutationCancellation)>,
 }
 
@@ -166,6 +167,7 @@ impl LifecycleMailboxInner {
                 reserved_normal: 0,
                 sealed: false,
                 fatal: false,
+                fatal_notified: false,
                 active: None,
             }),
             changed: Condvar::new(),
@@ -203,7 +205,7 @@ impl LifecycleMailboxInner {
                 .state
                 .lock()
                 .map_err(|_| LifecycleSubmitError::Poisoned)?;
-            if state.shutdown.is_some() {
+            if state.sealed || state.shutdown.is_some() {
                 return Err(LifecycleSubmitError::Stopping);
             }
             match &state.cancel {
@@ -231,12 +233,14 @@ impl LifecycleMailboxInner {
                 .state
                 .lock()
                 .map_err(|_| LifecycleSubmitError::Poisoned)?;
+            if state.sealed {
+                return Err(LifecycleSubmitError::Stopping);
+            }
             match &state.child_exit {
                 Some(known) if *known == exit => (Ok(()), None),
                 Some(_) => {
                     state.sealed = true;
                     state.fatal = true;
-                    state.shutdown = Some(Instant::now());
                     (
                         Err(LifecycleSubmitError::ConflictingChildExit),
                         state.active.as_ref().map(|(_, active)| active.clone()),
@@ -255,7 +259,7 @@ impl LifecycleMailboxInner {
         result
     }
 
-    pub(crate) fn request_shutdown(&self, deadline: Instant) -> Result<(), LifecycleSubmitError> {
+    fn request_owner_shutdown(&self, deadline: Instant) -> Result<(), LifecycleSubmitError> {
         let active = {
             let mut state = self
                 .state
@@ -302,6 +306,35 @@ impl LifecycleMailboxInner {
         self.verification.ready()
     }
 
+    fn cancel_ready_verification_for_shutdown(&self) -> bool {
+        let Some(completion) = self.ready_verification() else {
+            return false;
+        };
+        let Some(ticket) = completion.take_ready() else {
+            return false;
+        };
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => {
+                drop(ticket);
+                return false;
+            }
+        };
+        let Some(index) = state
+            .normal
+            .iter()
+            .position(|entry| matches!(entry, LifecycleNormalEntry::Verification))
+        else {
+            state.sealed = true;
+            state.fatal = true;
+            return false;
+        };
+        state.normal.remove(index);
+        drop(state);
+        ticket.acknowledge();
+        true
+    }
+
     fn take_next(&self) -> Result<MailboxItem, LifecycleSubmitError> {
         let mut state = self
             .state
@@ -312,6 +345,17 @@ impl LifecycleMailboxInner {
                 return Ok(MailboxItem::Command(LifecycleCommand::Shutdown {
                     deadline,
                 }));
+            }
+            if state.fatal {
+                if !state.fatal_notified {
+                    state.fatal_notified = true;
+                    return Ok(MailboxItem::Fatal);
+                }
+                (state, _) = self
+                    .changed
+                    .wait_timeout(state, Duration::from_millis(10))
+                    .map_err(|_| LifecycleSubmitError::Poisoned)?;
+                continue;
             }
             if let Some(exit) = state.child_exit.take() {
                 return Ok(MailboxItem::Command(LifecycleCommand::ChildExited(exit)));
@@ -395,37 +439,19 @@ impl LifecycleMailboxInner {
         if let Some(active) = active {
             active.cancel();
         }
+        self.verification.poison_ready();
         self.changed.notify_all();
     }
 
     fn is_fatal(&self) -> bool {
         self.state.lock().map_or(true, |state| state.fatal)
     }
-
-    #[cfg(test)]
-    pub(crate) fn take_next_for_test(&self) -> Option<LifecycleCommand> {
-        let mut state = self.state.lock().ok()?;
-        state
-            .shutdown
-            .take()
-            .map(|deadline| LifecycleCommand::Shutdown { deadline })
-            .or_else(|| state.child_exit.take().map(LifecycleCommand::ChildExited))
-            .or_else(|| {
-                state
-                    .cancel
-                    .take()
-                    .map(|operation_id| LifecycleCommand::Cancel { operation_id })
-            })
-            .or_else(|| match state.normal.pop_front() {
-                Some(LifecycleNormalEntry::Command(command)) => Some(command),
-                Some(LifecycleNormalEntry::Verification) | None => None,
-            })
-    }
 }
 
 enum MailboxItem {
     Command(LifecycleCommand),
     Verification(RetainedCompletion<LifecycleVerificationOutcome>),
+    Fatal,
 }
 
 #[derive(Clone)]
@@ -446,8 +472,9 @@ impl LifecycleControllerHandle {
         self.mailbox.observe_child_exit(exit)
     }
 
-    pub(crate) fn shutdown(&self, deadline: Instant) -> Result<(), LifecycleSubmitError> {
-        self.mailbox.request_shutdown(deadline)
+    #[cfg(test)]
+    pub(crate) fn is_sealed_for_test(&self) -> bool {
+        self.mailbox.is_sealed()
     }
 }
 
@@ -470,6 +497,54 @@ pub(crate) struct LifecycleControllerOwner {
     mailbox: Arc<LifecycleMailboxInner>,
     worker: Option<JoinHandle<()>>,
     completions: mpsc::Receiver<LifecycleCompletion>,
+    worker_exit: mpsc::Receiver<LifecycleWorkerExit>,
+    fallback_exit: Arc<Mutex<Option<LifecycleWorkerExit>>>,
+    retained_exit: Option<LifecycleWorkerExit>,
+}
+
+trait RetainedLifecycleResources: Send {}
+
+impl<T: Send> RetainedLifecycleResources for T {}
+
+struct LifecycleWorkerResources<D, G, W>
+where
+    D: EngineLifecycleDriver,
+    G: GatewayPublisher,
+{
+    lifecycle: ModelLifecycle<D, G>,
+    workflow: W,
+}
+
+struct LifecycleWorkerExit {
+    completion: LifecycleCompletion,
+    resources: Box<dyn RetainedLifecycleResources>,
+}
+
+pub(crate) struct LifecycleControllerStartFailure {
+    error: std::io::Error,
+    resources: ManuallyDrop<Box<dyn RetainedLifecycleResources>>,
+}
+
+impl std::fmt::Debug for LifecycleControllerStartFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LifecycleControllerStartFailure")
+            .field("error", &self.error)
+            .field("retains_resources", &true)
+            .finish()
+    }
+}
+
+impl LifecycleControllerStartFailure {
+    #[cfg(test)]
+    pub(crate) fn dispose_for_test(self) {
+        drop(ManuallyDrop::into_inner(self.resources));
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_LIFECYCLE_SPAWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub(crate) struct LifecycleLoadRequest {
@@ -538,7 +613,7 @@ struct PendingVerifiedLoad {
 }
 
 pub(crate) struct LifecycleControllerShutdownFailure {
-    owner: ManuallyDrop<LifecycleControllerOwner>,
+    owner: ManuallyDrop<Box<LifecycleControllerOwner>>,
 }
 
 impl std::fmt::Debug for LifecycleControllerShutdownFailure {
@@ -552,15 +627,19 @@ impl std::fmt::Debug for LifecycleControllerShutdownFailure {
 
 impl LifecycleControllerShutdownFailure {
     pub(crate) fn into_owner(self) -> LifecycleControllerOwner {
-        ManuallyDrop::into_inner(self.owner)
+        *ManuallyDrop::into_inner(self.owner)
     }
 }
 
 impl LifecycleControllerOwner {
+    #[cfg(test)]
+    pub(crate) fn fail_next_spawn_for_test() {
+        FAIL_NEXT_LIFECYCLE_SPAWN.set(true);
+    }
     pub(crate) fn start<D, G, R>(
         lifecycle: ModelLifecycle<D, G>,
         resolve: R,
-    ) -> std::io::Result<(LifecycleControllerHandle, Self)>
+    ) -> Result<(LifecycleControllerHandle, Self), LifecycleControllerStartFailure>
     where
         D: EngineLifecycleDriver + Send + 'static,
         D::Session: Send + 'static,
@@ -571,9 +650,9 @@ impl LifecycleControllerOwner {
     }
 
     pub(crate) fn start_with_workflow<D, G, W>(
-        mut lifecycle: ModelLifecycle<D, G>,
-        mut workflow: W,
-    ) -> std::io::Result<(LifecycleControllerHandle, Self)>
+        lifecycle: ModelLifecycle<D, G>,
+        workflow: W,
+    ) -> Result<(LifecycleControllerHandle, Self), LifecycleControllerStartFailure>
     where
         D: EngineLifecycleDriver + Send + 'static,
         D::Session: Send + 'static,
@@ -583,37 +662,72 @@ impl LifecycleControllerOwner {
         let mailbox = LifecycleMailboxInner::new(LIFECYCLE_NORMAL_CAPACITY);
         let worker_mailbox = Arc::clone(&mailbox);
         let (completion_tx, completion_rx) = mpsc::channel();
-        let worker = std::thread::Builder::new()
+        let (resources_tx, resources_rx) =
+            mpsc::sync_channel::<LifecycleWorkerResources<D, G, W>>(0);
+        let (exit_tx, exit_rx) = mpsc::channel();
+        let fallback_exit = Arc::new(Mutex::new(None));
+        let worker_fallback = Arc::clone(&fallback_exit);
+        let resources = LifecycleWorkerResources {
+            lifecycle,
+            workflow,
+        };
+        #[cfg(test)]
+        if FAIL_NEXT_LIFECYCLE_SPAWN.replace(false) {
+            return Err(LifecycleControllerStartFailure {
+                error: std::io::Error::other("injected lifecycle spawn failure"),
+                resources: ManuallyDrop::new(Box::new(resources)),
+            });
+        }
+        let worker = match std::thread::Builder::new()
             .name("loxa-lifecycle".into())
             .spawn(move || {
+                let Ok(mut resources) = resources_rx.recv() else {
+                    return;
+                };
+                let lifecycle = &mut resources.lifecycle;
+                let workflow = &mut resources.workflow;
                 let mut cancelled_before_start = None;
                 let mut pending_verified_load: Option<PendingVerifiedLoad> = None;
-                loop {
+                let termination = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loop {
                     let item = match worker_mailbox.take_next() {
                         Ok(item) => item,
                         Err(_) => {
                             lifecycle.request_stop();
-                            let _ = lifecycle.shutdown();
-                            return;
+                            return lifecycle.shutdown().and(Err(
+                                LifecycleError::RecoveryRequired {
+                                    replacement: "lifecycle mailbox failed".into(),
+                                    rollback: "controller ownership retained".into(),
+                                },
+                            ));
                         }
                     };
                     match item {
+                        MailboxItem::Fatal => {
+                            if let Some(pending) = pending_verified_load.take() {
+                                workflow.cancel(&pending.request.operation_id);
+                            }
+                            continue;
+                        }
                         MailboxItem::Command(LifecycleCommand::Shutdown { deadline: _ }) => {
                             if let Some(pending) = &pending_verified_load {
                                 workflow.cancel(&pending.request.operation_id);
+                                if !worker_mailbox.cancel_ready_verification_for_shutdown() {
+                                    worker_mailbox.seal_fatal();
+                                    let _ = lifecycle.shutdown();
+                                    return Err(LifecycleError::RecoveryRequired {
+                                        replacement: "lifecycle verification shutdown is uncertain"
+                                            .into(),
+                                        rollback: "continuation ownership retained".into(),
+                                    });
+                                }
                             }
-                            let result = lifecycle.shutdown();
-                            let _ = completion_tx.send(LifecycleCompletion {
-                                operation_id: None,
-                                result,
-                            });
-                            return;
+                            return lifecycle.shutdown();
                         }
                         MailboxItem::Command(LifecycleCommand::ChildExited(exit)) => {
-                            if let Some(pending) = &pending_verified_load {
+                            if let Some(pending) = pending_verified_load.take() {
                                 workflow.cancel(&pending.request.operation_id);
                             }
-                            process_child_exit(&mut lifecycle, exit);
+                            process_child_exit(lifecycle, exit);
                             worker_mailbox.seal_fatal();
                         }
                         MailboxItem::Command(LifecycleCommand::Cancel { operation_id }) => {
@@ -661,20 +775,31 @@ impl LifecycleControllerOwner {
                                     let mut result = lifecycle.load(plan, &cancellation);
                                     let acknowledged =
                                         workflow.acknowledge(&request, result.as_ref().map(|_| ()));
-                                    worker_mailbox.clear_active(&operation_id);
-                                    lifecycle.complete_operation();
                                     if !acknowledged {
                                         worker_mailbox.seal_fatal();
                                         let unknown = unknown_acknowledgement();
                                         lifecycle.fail_supervision(unknown_acknowledgement());
                                         result = Err(unknown);
                                     }
+                                    if lifecycle.recovery_required()
+                                        || matches!(
+                                            result,
+                                            Err(LifecycleError::RecoveryRequired { .. })
+                                        )
+                                    {
+                                        worker_mailbox.seal_fatal();
+                                    }
+                                    worker_mailbox.clear_active(&operation_id);
+                                    lifecycle.complete_operation();
                                     let _ = completion_tx.send(LifecycleCompletion {
                                         operation_id: Some(operation_id),
                                         result,
                                     });
                                 }
                                 Err(error) => {
+                                    if matches!(error, LifecycleError::RecoveryRequired { .. }) {
+                                        worker_mailbox.seal_fatal();
+                                    }
                                     worker_mailbox.clear_active(&operation_id);
                                     lifecycle.complete_operation();
                                     let _ = completion_tx.send(LifecycleCompletion {
@@ -695,6 +820,11 @@ impl LifecycleControllerOwner {
                             }
                             worker_mailbox.set_active(operation_id, cancellation.clone());
                             let result = lifecycle.unload(&cancellation);
+                            if lifecycle.recovery_required()
+                                || matches!(result, Err(LifecycleError::RecoveryRequired { .. }))
+                            {
+                                worker_mailbox.seal_fatal();
+                            }
                             worker_mailbox.clear_active(&operation_id);
                             lifecycle.complete_operation();
                             let _ = completion_tx.send(LifecycleCompletion {
@@ -713,7 +843,7 @@ impl LifecycleControllerOwner {
                             });
                         }
                         MailboxItem::Verification(completion) => {
-                            let Some(mut ready) = completion.lock_ready() else {
+                            let Some(mut ready) = completion.take_ready() else {
                                 continue;
                             };
                             let operation_id = ready.outcome_mut().ownership.operation_id;
@@ -749,6 +879,11 @@ impl LifecycleControllerOwner {
                                 lifecycle.fail_supervision(unknown_acknowledgement());
                                 result = Err(unknown_acknowledgement());
                             }
+                            if lifecycle.recovery_required()
+                                || matches!(result, Err(LifecycleError::RecoveryRequired { .. }))
+                            {
+                                worker_mailbox.seal_fatal();
+                            }
                             worker_mailbox.clear_active(&operation_id);
                             lifecycle.complete_operation();
                             let _ = completion_tx.send(LifecycleCompletion {
@@ -757,8 +892,46 @@ impl LifecycleControllerOwner {
                             });
                         }
                     }
+                }));
+                let result = match termination {
+                    Ok(result) => result,
+                    Err(_) => {
+                        worker_mailbox.seal_fatal();
+                        Err(LifecycleError::RecoveryRequired {
+                            replacement: "lifecycle worker panicked".into(),
+                            rollback: "exact lifecycle ownership retained".into(),
+                        })
+                    }
+                };
+                let exit = LifecycleWorkerExit {
+                    completion: LifecycleCompletion {
+                        operation_id: None,
+                        result,
+                    },
+                    resources: Box::new(resources),
+                };
+                if let Err(disconnected) = exit_tx.send(exit) {
+                    let mut fallback = worker_fallback
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    *fallback = Some(disconnected.0);
                 }
-            })?;
+            }) {
+            Ok(worker) => worker,
+            Err(error) => {
+                return Err(LifecycleControllerStartFailure {
+                    error,
+                    resources: ManuallyDrop::new(Box::new(resources)),
+                });
+            }
+        };
+        if let Err(failed) = resources_tx.send(resources) {
+            let _ = worker.join();
+            return Err(LifecycleControllerStartFailure {
+                error: std::io::Error::other("lifecycle ownership handoff failed"),
+                resources: ManuallyDrop::new(Box::new(failed.0)),
+            });
+        }
         let handle = LifecycleControllerHandle {
             mailbox: Arc::clone(&mailbox),
         };
@@ -768,6 +941,9 @@ impl LifecycleControllerOwner {
                 mailbox,
                 worker: Some(worker),
                 completions: completion_rx,
+                worker_exit: exit_rx,
+                fallback_exit,
+                retained_exit: None,
             },
         ))
     }
@@ -780,18 +956,31 @@ impl LifecycleControllerOwner {
     }
 
     #[cfg(test)]
-    pub(crate) fn dispose_fatal_for_test(self) {
+    pub(crate) fn dispose_fatal_for_test(mut self) {
         if let Ok(mut state) = self.mailbox.state.lock() {
             state.fatal = false;
         }
         self.mailbox.verification.dispose_poisoned();
+        drop(self.retained_exit.take());
+        let fallback = self
+            .fallback_exit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        drop(fallback);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn disconnect_worker_exit_for_test(&mut self) {
+        let (_, disconnected) = mpsc::channel();
+        self.worker_exit = disconnected;
     }
 
     pub(crate) fn shutdown(
         mut self,
         deadline: Instant,
     ) -> Result<(), LifecycleControllerShutdownFailure> {
-        let _ = self.mailbox.request_shutdown(deadline);
+        let _ = self.mailbox.request_owner_shutdown(deadline);
         while self
             .worker
             .as_ref()
@@ -799,7 +988,7 @@ impl LifecycleControllerOwner {
         {
             if Instant::now() >= deadline {
                 return Err(LifecycleControllerShutdownFailure {
-                    owner: ManuallyDrop::new(self),
+                    owner: ManuallyDrop::new(Box::new(self)),
                 });
             }
             std::thread::sleep(Duration::from_millis(1));
@@ -810,23 +999,63 @@ impl LifecycleControllerOwner {
             .is_some_and(|worker| worker.join().is_err())
         {
             return Err(LifecycleControllerShutdownFailure {
-                owner: ManuallyDrop::new(self),
+                owner: ManuallyDrop::new(Box::new(self)),
             });
         }
-        if self.mailbox.is_fatal() {
+        let direct_exit = self.worker_exit.try_recv();
+        let disconnected = matches!(direct_exit, Err(mpsc::TryRecvError::Disconnected));
+        let mut exit = direct_exit.ok().or_else(|| {
+            self.fallback_exit
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+        });
+        let valid_shutdown = exit.as_ref().is_some_and(|exit| {
+            exit.completion.operation_id.is_none()
+                && exit.completion.result.is_ok()
+                && !self.mailbox.is_fatal()
+                && !disconnected
+        });
+        if !valid_shutdown {
+            self.retained_exit = exit.take();
             return Err(LifecycleControllerShutdownFailure {
-                owner: ManuallyDrop::new(self),
+                owner: ManuallyDrop::new(Box::new(self)),
             });
         }
+        drop(exit);
         Ok(())
     }
 }
 
 impl Drop for LifecycleControllerOwner {
     fn drop(&mut self) {
-        let _ = self.mailbox.request_shutdown(Instant::now());
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+        let _ = self.mailbox.request_owner_shutdown(Instant::now());
+        let joined = self
+            .worker
+            .take()
+            .is_none_or(|worker| worker.join().is_ok());
+        let direct_exit = self.worker_exit.try_recv();
+        let disconnected = matches!(direct_exit, Err(mpsc::TryRecvError::Disconnected));
+        let exit = direct_exit.ok().or_else(|| {
+            self.fallback_exit
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+        });
+        let valid_shutdown = joined
+            && !disconnected
+            && exit.as_ref().is_some_and(|exit| {
+                exit.completion.operation_id.is_none()
+                    && exit.completion.result.is_ok()
+                    && !self.mailbox.is_fatal()
+            });
+        if !valid_shutdown {
+            if let Some(exit) = exit {
+                std::mem::forget(exit);
+            }
+            if let Some(exit) = self.retained_exit.take() {
+                std::mem::forget(exit);
+            }
         }
     }
 }
