@@ -115,6 +115,7 @@ pub(crate) struct CommittedAdmission {
 pub(crate) struct CommittedState {
     pub(crate) revision: DecimalU64,
     pub(crate) cursor: DecimalU64,
+    pub(crate) last_committed_at_unix_ms: DecimalU64,
     pub(crate) node: Option<V2Node>,
     pub(crate) slot: V2Slot,
     pub(crate) operations: Vec<V2Operation>,
@@ -790,7 +791,7 @@ impl ControlRepository {
         let node_id = self.node_id();
         let slot_id = self.slot_id();
         self.read_transaction(|connection| {
-            let (revision, cursor, _) = read_meta_connection(connection)?;
+            let (revision, cursor, last_committed_at_unix_ms) = read_meta_connection(connection)?;
             let node = read_node_connection(connection, node_id)?;
             let slot = read_slot_connection(connection, node_id, slot_id)?;
             let mut operations = Vec::new();
@@ -814,7 +815,16 @@ impl ControlRepository {
                 node_id,
                 slot_id,
             )?;
-            Ok(CommittedState { revision: DecimalU64::new(revision), cursor: DecimalU64::new(cursor), node, slot, operations, events, current_instance_v1 })
+            Ok(CommittedState {
+                revision: DecimalU64::new(revision),
+                cursor: DecimalU64::new(cursor),
+                last_committed_at_unix_ms: DecimalU64::new(last_committed_at_unix_ms),
+                node,
+                slot,
+                operations,
+                events,
+                current_instance_v1,
+            })
         })
     }
 }

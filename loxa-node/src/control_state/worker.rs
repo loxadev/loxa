@@ -14,6 +14,7 @@ use loxa_protocol::v2::{
 use loxa_protocol::{NodeId, NodeInstanceId};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc as sync_mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -200,7 +201,7 @@ pub(crate) struct ControlStateBootstrap {
 
 #[derive(Clone)]
 pub(crate) struct ControlStateHandle {
-    sender: mpsc::Sender<ControlCommand>,
+    sender: Arc<sync_mpsc::SyncSender<ControlCommand>>,
     snapshot: Arc<RwLock<Arc<CommittedState>>>,
     healthy: Arc<AtomicBool>,
     health_signal: watch::Sender<bool>,
@@ -208,6 +209,11 @@ pub(crate) struct ControlStateHandle {
 }
 
 impl ControlStateHandle {
+    #[cfg(test)]
+    pub(super) fn command_sender_type_name_for_test(&self) -> &'static str {
+        std::any::type_name_of_val(&self.sender)
+    }
+
     pub(crate) fn read_snapshot(&self) -> Result<Arc<CommittedState>, ControlStateError> {
         if !self.is_healthy() {
             return Err(ControlStateError::DurableStateUnavailable);
@@ -253,8 +259,8 @@ impl ControlStateHandle {
         self.sender
             .try_send(ControlCommand::Admit { request, reply })
             .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => ControlStateError::WriterOverloaded,
-                mpsc::error::TrySendError::Closed(_) => self.poison_unavailable(),
+                sync_mpsc::TrySendError::Full(_) => ControlStateError::WriterOverloaded,
+                sync_mpsc::TrySendError::Disconnected(_) => self.poison_unavailable(),
             })?;
         self.receive_commit(receive, tokio::time::Instant::now() + ACK_TIMEOUT)
             .await
@@ -310,8 +316,8 @@ impl ControlStateHandle {
         self.sender
             .try_send(ControlCommand::PublishInstance { publication, reply })
             .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => ControlStateError::WriterOverloaded,
-                mpsc::error::TrySendError::Closed(_) => self.poison_unavailable(),
+                sync_mpsc::TrySendError::Full(_) => ControlStateError::WriterOverloaded,
+                sync_mpsc::TrySendError::Disconnected(_) => self.poison_unavailable(),
             })?;
         self.receive_commit(receive, tokio::time::Instant::now() + ACK_TIMEOUT)
             .await
@@ -345,8 +351,8 @@ impl ControlStateHandle {
         self.sender
             .try_send(ControlCommand::BeginStopping { now_unix_ms, reply })
             .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => ControlStateError::WriterOverloaded,
-                mpsc::error::TrySendError::Closed(_) => self.poison_unavailable(),
+                sync_mpsc::TrySendError::Full(_) => ControlStateError::WriterOverloaded,
+                sync_mpsc::TrySendError::Disconnected(_) => self.poison_unavailable(),
             })?;
         self.receive_commit(receive, tokio::time::Instant::now() + ACK_TIMEOUT)
             .await
@@ -375,20 +381,32 @@ impl ControlStateHandle {
         }
         let enqueue_deadline = tokio::time::Instant::now() + ENQUEUE_TIMEOUT;
         let receive = loop {
+            if !self.is_healthy() {
+                return Err(ControlStateError::DurableStateUnavailable);
+            }
+            if tokio::time::Instant::now() >= enqueue_deadline {
+                return Err(self.poison_unavailable());
+            }
             let (reply, receive) = oneshot::channel();
+            if !self.is_healthy() {
+                return Err(ControlStateError::DurableStateUnavailable);
+            }
             match self.sender.try_send(ControlCommand::Observe {
                 transition: transition.clone(),
                 reply,
             }) {
                 Ok(()) => break receive,
-                Err(mpsc::error::TrySendError::Full(_)) => {
+                Err(sync_mpsc::TrySendError::Full(_)) => {
                     let now = tokio::time::Instant::now();
                     if now >= enqueue_deadline {
                         return Err(self.poison_unavailable());
                     }
                     tokio::time::sleep(ENQUEUE_RETRY.min(enqueue_deadline - now)).await;
+                    if !self.is_healthy() {
+                        return Err(ControlStateError::DurableStateUnavailable);
+                    }
                 }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(sync_mpsc::TrySendError::Disconnected(_)) => {
                     return Err(self.poison_unavailable());
                 }
             }
@@ -415,7 +433,7 @@ impl ControlStateHandle {
             reply,
         }) {
             Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(_)) => {
+            Err(sync_mpsc::TrySendError::Full(_)) => {
                 let mut pending = self
                     .pending_progress
                     .lock()
@@ -426,7 +444,7 @@ impl ControlStateHandle {
                 pending.insert(operation_id, transition);
                 Ok(())
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(self.poison_unavailable()),
+            Err(sync_mpsc::TrySendError::Disconnected(_)) => Err(self.poison_unavailable()),
         }
     }
 
@@ -465,8 +483,8 @@ impl ControlStateHandle {
                 reply,
             })
             .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => ControlStateError::WriterOverloaded,
-                mpsc::error::TrySendError::Closed(_) => self.poison_unavailable(),
+                sync_mpsc::TrySendError::Full(_) => ControlStateError::WriterOverloaded,
+                sync_mpsc::TrySendError::Disconnected(_) => self.poison_unavailable(),
             })?;
         self.receive_commit(receive, tokio::time::Instant::now() + ACK_TIMEOUT)
             .await
@@ -492,8 +510,8 @@ impl ControlStateHandle {
                 reply,
             })
             .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => ControlStateError::WriterOverloaded,
-                mpsc::error::TrySendError::Closed(_) => self.poison_unavailable(),
+                sync_mpsc::TrySendError::Full(_) => ControlStateError::WriterOverloaded,
+                sync_mpsc::TrySendError::Disconnected(_) => self.poison_unavailable(),
             })?;
         self.receive_commit(receive, tokio::time::Instant::now() + ACK_TIMEOUT)
             .await
@@ -601,14 +619,14 @@ impl ControlStateHandle {
             }
             match self.sender.try_send(command) {
                 Ok(()) => break receive,
-                Err(mpsc::error::TrySendError::Full(_)) => {
+                Err(sync_mpsc::TrySendError::Full(_)) => {
                     let now = std::time::Instant::now();
                     if now >= enqueue_deadline {
                         return Err(self.blocking_enqueue_timeout(timeout_policy));
                     }
                     std::thread::sleep(ENQUEUE_RETRY.min(enqueue_deadline - now));
                 }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(sync_mpsc::TrySendError::Disconnected(_)) => {
                     return Err(self.poison_unavailable());
                 }
             }
@@ -656,7 +674,7 @@ impl ControlStateHandle {
 }
 
 pub(crate) struct ControlStateWorker {
-    sender: mpsc::WeakSender<ControlCommand>,
+    sender: std::sync::Weak<sync_mpsc::SyncSender<ControlCommand>>,
     join: Option<std::thread::JoinHandle<Result<(), ControlStateError>>>,
     healthy: Arc<AtomicBool>,
     health_signal: watch::Sender<bool>,
@@ -690,8 +708,9 @@ impl ControlStateWorker {
             Option<ExactReady>,
         );
 
-        let (sender, receiver) = mpsc::channel(COMMAND_CAPACITY);
-        let worker_sender = sender.downgrade();
+        let (sender, receiver) = sync_mpsc::sync_channel(COMMAND_CAPACITY);
+        let sender = Arc::new(sender);
+        let worker_sender = Arc::downgrade(&sender);
         let healthy = Arc::new(AtomicBool::new(true));
         let (health_signal, _health_receiver) = watch::channel(true);
         let worker_health = Arc::clone(&healthy);
@@ -862,7 +881,7 @@ impl ControlStateWorker {
         loop {
             match sender.try_send(command) {
                 Ok(()) => break,
-                Err(mpsc::error::TrySendError::Full(returned)) => {
+                Err(sync_mpsc::TrySendError::Full(returned)) => {
                     command = returned;
                     let now = tokio::time::Instant::now();
                     if now >= deadline {
@@ -870,7 +889,7 @@ impl ControlStateWorker {
                     }
                     tokio::time::sleep(ENQUEUE_RETRY.min(deadline - now)).await;
                 }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(sync_mpsc::TrySendError::Disconnected(_)) => {
                     return await_reaper(reaper, deadline, &self.healthy, &self.health_signal)
                         .await;
                 }
@@ -997,7 +1016,7 @@ fn poison(healthy: &AtomicBool, health_signal: &watch::Sender<bool>) {
 }
 
 fn cleanup_failed_initialization(
-    sender: &mpsc::Sender<ControlCommand>,
+    sender: &sync_mpsc::SyncSender<ControlCommand>,
     join: std::thread::JoinHandle<Result<(), ControlStateError>>,
     deadline: std::time::Instant,
 ) -> Result<(), ControlStateError> {
@@ -1090,8 +1109,9 @@ fn spawn(
     let healthy = Arc::new(AtomicBool::new(true));
     let (health_signal, _health_receiver) = watch::channel(true);
     let pending_progress = Arc::new(Mutex::new(HashMap::new()));
-    let (sender, receiver) = mpsc::channel(COMMAND_CAPACITY);
-    let worker_sender = sender.downgrade();
+    let (sender, receiver) = sync_mpsc::sync_channel(COMMAND_CAPACITY);
+    let sender = Arc::new(sender);
+    let worker_sender = Arc::downgrade(&sender);
     let worker_health = Arc::clone(&healthy);
     let worker_health_signal = health_signal.clone();
     let handle = ControlStateHandle {
@@ -1143,8 +1163,8 @@ impl ControlStateHandle {
         loop {
             match self.sender.try_send(ControlCommand::Noop) {
                 Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(_)) => break,
-                Err(mpsc::error::TrySendError::Closed(_)) => panic!("test queue closed"),
+                Err(sync_mpsc::TrySendError::Full(_)) => break,
+                Err(sync_mpsc::TrySendError::Disconnected(_)) => panic!("test queue closed"),
             }
         }
     }
@@ -1193,8 +1213,7 @@ impl ControlStateHandle {
     pub(super) async fn panic_worker_for_test(&self) {
         let (entered, receive) = oneshot::channel();
         self.sender
-            .send(ControlCommand::Panic { entered })
-            .await
+            .try_send(ControlCommand::Panic { entered })
             .expect("panic command must enqueue");
         receive.await.expect("worker must enter panic command");
     }
@@ -1203,11 +1222,10 @@ impl ControlStateHandle {
         let release = Arc::new(std::sync::Barrier::new(2));
         let (entered, receive) = oneshot::channel();
         self.sender
-            .send(ControlCommand::Block {
+            .try_send(ControlCommand::Block {
                 entered,
                 release: Arc::clone(&release),
             })
-            .await
             .expect("block command must enqueue");
         receive.await.expect("worker must enter block command");
         release
@@ -1224,12 +1242,11 @@ impl ControlStateHandle {
         let release = Arc::new(std::sync::Barrier::new(2));
         let (entered, receive) = oneshot::channel();
         self.sender
-            .send(ControlCommand::AdmitWithSnapshotFailureAndBlockCleanup {
+            .try_send(ControlCommand::AdmitWithSnapshotFailureAndBlockCleanup {
                 request,
                 entered,
                 release: Arc::clone(&release),
             })
-            .await
             .expect("uncertainty command must enqueue");
         receive
             .await
@@ -1241,22 +1258,20 @@ impl ControlStateHandle {
         let (reply, receive) = oneshot::channel();
         drop(receive);
         self.sender
-            .send(ControlCommand::Subscribe {
+            .try_send(ControlCommand::Subscribe {
                 requested: None,
                 generated_at_unix_ms: DecimalU64::new(10),
                 max_snapshot_bytes: MAX_SNAPSHOT_BYTES,
                 health: self.health_signal.subscribe(),
                 reply,
             })
-            .await
             .expect("cancelled subscription command must enqueue");
     }
 
     pub(super) async fn subscriber_count_for_test(&self) -> usize {
         let (reply, receive) = oneshot::channel();
         self.sender
-            .send(ControlCommand::SubscriberCount { reply })
-            .await
+            .try_send(ControlCommand::SubscriberCount { reply })
             .expect("subscriber count command must enqueue");
         receive.await.expect("worker must report subscriber count")
     }
@@ -1299,23 +1314,44 @@ impl ControlStateHandle {
 #[cfg(test)]
 pub(super) struct SyntheticQueue {
     pub(super) handle: ControlStateHandle,
-    receiver: mpsc::Receiver<ControlCommand>,
+    receiver: sync_mpsc::Receiver<ControlCommand>,
 }
 
 #[cfg(test)]
 impl SyntheticQueue {
+    pub(super) fn drain_contains_observe_for_test(&mut self) -> bool {
+        let mut observed = false;
+        loop {
+            match self.receiver.try_recv() {
+                Ok(ControlCommand::Observe { .. }) => observed = true,
+                Ok(_) => {}
+                Err(sync_mpsc::TryRecvError::Empty) => return observed,
+                Err(sync_mpsc::TryRecvError::Disconnected) => return observed,
+            }
+        }
+    }
+
+    async fn receive(&mut self) -> ControlCommand {
+        loop {
+            match self.receiver.try_recv() {
+                Ok(command) => return command,
+                Err(sync_mpsc::TryRecvError::Empty) => tokio::task::yield_now().await,
+                Err(sync_mpsc::TryRecvError::Disconnected) => {
+                    panic!("synthetic queue disconnected")
+                }
+            }
+        }
+    }
+
     pub(super) async fn pop_one(&mut self) {
-        assert!(matches!(
-            self.receiver.recv().await,
-            Some(ControlCommand::Noop)
-        ));
+        assert!(matches!(self.receive().await, ControlCommand::Noop));
     }
 
     pub(super) async fn take_observe_reply(
         &mut self,
     ) -> oneshot::Sender<Result<CommitReceipt, ControlStateError>> {
         loop {
-            match self.receiver.recv().await.expect("synthetic queue command") {
+            match self.receive().await {
                 ControlCommand::Observe { reply, .. } => return reply,
                 ControlCommand::Noop => {}
                 _ => panic!("unexpected synthetic queue command"),
@@ -1327,7 +1363,7 @@ impl SyntheticQueue {
         &mut self,
     ) -> oneshot::Sender<Result<CommittedAdmission, ControlStateError>> {
         loop {
-            match self.receiver.recv().await.expect("synthetic queue command") {
+            match self.receive().await {
                 ControlCommand::Admit { reply, .. } => return reply,
                 ControlCommand::Noop => {}
                 _ => panic!("unexpected synthetic queue command"),
@@ -1338,11 +1374,11 @@ impl SyntheticQueue {
 
 #[cfg(test)]
 pub(super) fn synthetic_queue_for_test(state: CommittedState) -> SyntheticQueue {
-    let (sender, receiver) = mpsc::channel(COMMAND_CAPACITY);
+    let (sender, receiver) = sync_mpsc::sync_channel(COMMAND_CAPACITY);
     let (health_signal, _health_receiver) = watch::channel(true);
     SyntheticQueue {
         handle: ControlStateHandle {
-            sender,
+            sender: Arc::new(sender),
             snapshot: Arc::new(RwLock::new(Arc::new(state))),
             healthy: Arc::new(AtomicBool::new(true)),
             health_signal,
@@ -1354,7 +1390,7 @@ pub(super) fn synthetic_queue_for_test(state: CommittedState) -> SyntheticQueue 
 
 fn run_worker(
     mut repository: ControlRepository,
-    mut receiver: mpsc::Receiver<ControlCommand>,
+    receiver: sync_mpsc::Receiver<ControlCommand>,
     mut node_instance_id: Option<NodeInstanceId>,
     snapshot: Arc<RwLock<Arc<CommittedState>>>,
     healthy: Arc<AtomicBool>,
@@ -1367,7 +1403,7 @@ fn run_worker(
     };
     let mut ids = WorkerIds;
     let mut subscribers = Vec::new();
-    while let Some(command) = receiver.blocking_recv() {
+    while let Ok(command) = receiver.recv() {
         if !healthy.load(Ordering::Acquire) {
             break;
         }
@@ -1691,6 +1727,11 @@ pub(crate) fn build_reconnect_snapshot(
     generated_at_unix_ms: DecimalU64,
     max_bytes: usize,
 ) -> Result<V2ReconnectSnapshot, ControlStateError> {
+    let generated_at_unix_ms = DecimalU64::new(
+        generated_at_unix_ms
+            .get()
+            .max(state.last_committed_at_unix_ms.get()),
+    );
     let node = state
         .node
         .clone()
