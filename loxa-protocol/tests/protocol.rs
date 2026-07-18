@@ -328,6 +328,290 @@ fn event_json_at(event_id: &str, sequence: &str, revision: &str) -> serde_json::
     event
 }
 
+fn terminal_operation_json(
+    operation_id: &str,
+    created_revision: u64,
+    updated_revision: u64,
+    updated_at_unix_ms: u64,
+) -> serde_json::Value {
+    let mut operation = operation_json(NODE_ID, "load", "succeeded");
+    operation["operation_id"] = serde_json::json!(operation_id);
+    operation["created_revision"] = serde_json::json!(created_revision.to_string());
+    operation["updated_revision"] = serde_json::json!(updated_revision.to_string());
+    operation["created_at_unix_ms"] = serde_json::json!(updated_at_unix_ms.to_string());
+    operation["updated_at_unix_ms"] = serde_json::json!(updated_at_unix_ms.to_string());
+    operation
+}
+
+fn operation_id_at(index: u64) -> String {
+    format!("123e4567-e89b-42d3-9456-{index:012x}")
+}
+
+#[test]
+fn v2_serving_collections_and_operation_envelopes_reject_zero_revisions() {
+    let fixtures = [
+        serde_json::json!({
+            "schema_version": 2,
+            "epoch": EPOCH,
+            "revision": "0",
+            "generated_at_unix_ms": "1784246400600",
+            "nodes": [node_json(NODE_ID)]
+        }),
+        serde_json::json!({
+            "schema_version": 2,
+            "epoch": EPOCH,
+            "revision": "0",
+            "generated_at_unix_ms": "1784246400600",
+            "node_id": NODE_ID,
+            "slots": [slot_json(NODE_ID, "ready", None)]
+        }),
+        serde_json::json!({
+            "schema_version": 2,
+            "epoch": EPOCH,
+            "revision": "0",
+            "generated_at_unix_ms": "1784246400600",
+            "operations": []
+        }),
+        serde_json::json!({
+            "schema_version": 2,
+            "epoch": EPOCH,
+            "revision": "0",
+            "generated_at_unix_ms": "1784246400500",
+            "operation": operation_json(NODE_ID, "load", "running")
+        }),
+    ];
+
+    assert!(serde_json::from_value::<V2NodeCollection>(fixtures[0].clone()).is_err());
+    assert!(serde_json::from_value::<V2SlotCollection>(fixtures[1].clone()).is_err());
+    assert!(serde_json::from_value::<V2OperationCollection>(fixtures[2].clone()).is_err());
+    assert!(serde_json::from_value::<V2OperationEnvelope>(fixtures[3].clone()).is_err());
+}
+
+#[test]
+fn v2_operation_collection_enforces_bound_uniqueness_and_canonical_order() {
+    let operations: Vec<_> = (1..=257)
+        .map(|index| {
+            terminal_operation_json(
+                &operation_id_at(index),
+                index,
+                index,
+                1_784_246_400_000 + index,
+            )
+        })
+        .collect();
+    let at_bound = serde_json::json!({
+        "schema_version": 2,
+        "epoch": EPOCH,
+        "revision": "300",
+        "generated_at_unix_ms": "1784246401000",
+        "operations": operations[..256]
+    });
+    assert!(serde_json::from_value::<V2OperationCollection>(at_bound).is_ok());
+
+    let over_bound = serde_json::json!({
+        "schema_version": 2,
+        "epoch": EPOCH,
+        "revision": "300",
+        "generated_at_unix_ms": "1784246401000",
+        "operations": operations
+    });
+    assert!(serde_json::from_value::<V2OperationCollection>(over_bound).is_err());
+
+    let first = terminal_operation_json(&operation_id_at(1), 10, 10, 100);
+    let duplicate = serde_json::json!({
+        "schema_version": 2,
+        "epoch": EPOCH,
+        "revision": "12",
+        "generated_at_unix_ms": "200",
+        "operations": [first.clone(), first]
+    });
+    assert!(serde_json::from_value::<V2OperationCollection>(duplicate).is_err());
+
+    let duplicate_id_at_different_revisions = serde_json::json!({
+        "schema_version": 2,
+        "epoch": EPOCH,
+        "revision": "12",
+        "generated_at_unix_ms": "200",
+        "operations": [
+            terminal_operation_json(&operation_id_at(1), 10, 10, 100),
+            terminal_operation_json(&operation_id_at(1), 11, 11, 101)
+        ]
+    });
+    assert!(
+        serde_json::from_value::<V2OperationCollection>(duplicate_id_at_different_revisions)
+            .is_err()
+    );
+
+    let noncanonical = serde_json::json!({
+        "schema_version": 2,
+        "epoch": EPOCH,
+        "revision": "12",
+        "generated_at_unix_ms": "200",
+        "operations": [
+            terminal_operation_json(&operation_id_at(2), 11, 11, 101),
+            terminal_operation_json(&operation_id_at(1), 10, 10, 100)
+        ]
+    });
+    assert!(serde_json::from_value::<V2OperationCollection>(noncanonical).is_err());
+
+    let same_revision_wrong_id_order = serde_json::json!({
+        "schema_version": 2,
+        "epoch": EPOCH,
+        "revision": "12",
+        "generated_at_unix_ms": "200",
+        "operations": [
+            terminal_operation_json(&operation_id_at(2), 10, 10, 100),
+            terminal_operation_json(&operation_id_at(1), 10, 10, 100)
+        ]
+    });
+    assert!(serde_json::from_value::<V2OperationCollection>(same_revision_wrong_id_order).is_err());
+
+    let mut revision_ahead = serde_json::json!({
+        "schema_version": 2,
+        "epoch": EPOCH,
+        "revision": "12",
+        "generated_at_unix_ms": "200",
+        "operations": [terminal_operation_json(&operation_id_at(1), 13, 13, 100)]
+    });
+    assert!(serde_json::from_value::<V2OperationCollection>(revision_ahead.clone()).is_err());
+
+    revision_ahead["revision"] = serde_json::json!("13");
+    revision_ahead["operations"][0]["updated_at_unix_ms"] = serde_json::json!("201");
+    assert!(serde_json::from_value::<V2OperationCollection>(revision_ahead).is_err());
+}
+
+#[test]
+fn v2_operations_and_acceptance_reject_zero_committed_revisions() {
+    let mut zero_operation = operation_json(NODE_ID, "load", "running");
+    zero_operation["created_revision"] = serde_json::json!("0");
+    zero_operation["updated_revision"] = serde_json::json!("0");
+    assert!(
+        serde_json::from_value::<loxa_protocol::v2::V2Operation>(zero_operation.clone()).is_err()
+    );
+
+    let zero_nested = serde_json::json!({
+        "schema_version": 2,
+        "epoch": EPOCH,
+        "revision": "11",
+        "generated_at_unix_ms": "1784246400500",
+        "operation": zero_operation
+    });
+    assert!(serde_json::from_value::<V2OperationEnvelope>(zero_nested).is_err());
+
+    let mut operation: loxa_protocol::v2::V2Operation =
+        serde_json::from_value(operation_json(NODE_ID, "load", "running")).unwrap();
+    operation.created_revision = DecimalU64::new(0);
+    operation.updated_revision = DecimalU64::new(0);
+    assert!(serde_json::to_value(operation).is_err());
+
+    let zero_accepted = serde_json::json!({
+        "epoch": EPOCH,
+        "operation_id": OPERATION_ID,
+        "revision": "0"
+    });
+    assert!(serde_json::from_value::<V2OperationAccepted>(zero_accepted).is_err());
+
+    let mut accepted = operation_accepted_fixture();
+    accepted.revision = DecimalU64::new(0);
+    assert!(serde_json::to_value(accepted).is_err());
+}
+
+#[test]
+fn v2_operation_envelopes_contain_child_revision_and_observation_time() {
+    let mut revision_ahead = serde_json::json!({
+        "schema_version": 2,
+        "epoch": EPOCH,
+        "revision": "11",
+        "generated_at_unix_ms": "1784246400600",
+        "operation": operation_json(NODE_ID, "load", "running")
+    });
+    revision_ahead["operation"]["updated_revision"] = serde_json::json!("12");
+    assert!(serde_json::from_value::<V2OperationEnvelope>(revision_ahead).is_err());
+
+    let mut time_ahead = serde_json::json!({
+        "schema_version": 2,
+        "epoch": EPOCH,
+        "revision": "11",
+        "generated_at_unix_ms": "1784246400500",
+        "operation": operation_json(NODE_ID, "load", "running")
+    });
+    time_ahead["operation"]["updated_at_unix_ms"] = serde_json::json!("1784246400501");
+    assert!(serde_json::from_value::<V2OperationEnvelope>(time_ahead).is_err());
+}
+
+#[test]
+fn v2_events_contain_embedded_operation_revision_and_observation_time() {
+    let mut revision_ahead = event_json();
+    revision_ahead["operation"]["updated_revision"] = serde_json::json!("12");
+    assert!(serde_json::from_value::<V2ControlEvent>(revision_ahead).is_err());
+
+    let mut time_ahead = event_json();
+    time_ahead["committed_at_unix_ms"] = serde_json::json!("1784246400499");
+    assert!(serde_json::from_value::<V2ControlEvent>(time_ahead).is_err());
+}
+
+#[test]
+fn v2_reconnect_snapshot_contains_bounded_canonical_children() {
+    let base = serde_json::json!({
+        "schema_version": 2,
+        "epoch": EPOCH,
+        "revision": "300",
+        "generated_at_unix_ms": "1784246401000",
+        "stream": {"epoch": EPOCH, "cursor": "300", "cursor_gap": false},
+        "nodes": [node_json(NODE_ID)],
+        "slots": [slot_json(NODE_ID, "ready", None)],
+        "operations": [],
+        "events": []
+    });
+
+    let mut over_bound = base.clone();
+    over_bound["operations"] = serde_json::Value::Array(
+        (1..=257)
+            .map(|index| {
+                terminal_operation_json(
+                    &operation_id_at(index),
+                    index,
+                    index,
+                    1_784_246_400_000 + index,
+                )
+            })
+            .collect(),
+    );
+    assert!(serde_json::from_value::<V2ReconnectSnapshot>(over_bound).is_err());
+
+    let mut noncanonical = base.clone();
+    noncanonical["operations"] = serde_json::json!([
+        terminal_operation_json(&operation_id_at(2), 11, 11, 101),
+        terminal_operation_json(&operation_id_at(1), 10, 10, 100)
+    ]);
+    assert!(serde_json::from_value::<V2ReconnectSnapshot>(noncanonical).is_err());
+
+    let mut revision_ahead = base.clone();
+    revision_ahead["operations"] =
+        serde_json::json!([terminal_operation_json(&operation_id_at(1), 301, 301, 100)]);
+    assert!(serde_json::from_value::<V2ReconnectSnapshot>(revision_ahead).is_err());
+
+    let mut time_ahead = base.clone();
+    time_ahead["operations"] = serde_json::json!([terminal_operation_json(
+        &operation_id_at(1),
+        1,
+        1,
+        1_784_246_401_001
+    )]);
+    assert!(serde_json::from_value::<V2ReconnectSnapshot>(time_ahead).is_err());
+
+    let mut event_time_ahead = base;
+    event_time_ahead["events"] = serde_json::json!([event_json_at(
+        "123e4567-e89b-42d3-a456-426614174004",
+        "300",
+        "300"
+    )]);
+    event_time_ahead["events"][0]["committed_at_unix_ms"] = serde_json::json!("1784246401001");
+    event_time_ahead["events"][0]["operation"]["updated_at_unix_ms"] =
+        serde_json::json!("1784246401001");
+    assert!(serde_json::from_value::<V2ReconnectSnapshot>(event_time_ahead).is_err());
+}
+
 #[test]
 fn v2_invalid_public_values_cannot_be_serialized() {
     let mut node: loxa_protocol::v2::V2Node = serde_json::from_value(node_json(NODE_ID)).unwrap();

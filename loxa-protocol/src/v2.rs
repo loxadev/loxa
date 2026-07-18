@@ -131,7 +131,30 @@ impl<'de> Deserialize<'de> for DecimalU64 {
     }
 }
 
+fn deserialize_nonzero_decimal_u64<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<DecimalU64, D::Error> {
+    let value = DecimalU64::deserialize(deserializer)?;
+    if value.get() == 0 {
+        Err(de::Error::custom("committed counter must be nonzero"))
+    } else {
+        Ok(value)
+    }
+}
+
+fn serialize_nonzero_decimal_u64<S: Serializer>(
+    value: &DecimalU64,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    if value.get() == 0 {
+        Err(S::Error::custom("committed counter must be nonzero"))
+    } else {
+        value.serialize(serializer)
+    }
+}
+
 pub const V2_SCHEMA_VERSION: u32 = 2;
+const MAX_PUBLIC_OPERATIONS: usize = 256;
 
 fn deserialize_schema_version<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u32, D::Error> {
     let value = u32::deserialize(deserializer)?;
@@ -140,13 +163,6 @@ fn deserialize_schema_version<'de, D: Deserializer<'de>>(deserializer: D) -> Res
     } else {
         Err(de::Error::custom("unsupported v2 schema version"))
     }
-}
-
-fn serialize_schema_version<S: Serializer>(value: &u32, serializer: S) -> Result<S::Ok, S::Error> {
-    if *value != V2_SCHEMA_VERSION {
-        return Err(S::Error::custom("unsupported v2 schema version"));
-    }
-    serializer.serialize_u32(*value)
 }
 
 fn deserialize_slot_capacity<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u32, D::Error> {
@@ -551,6 +567,8 @@ impl V2Operation {
             .model_id
             .as_deref()
             .is_some_and(|id| !valid_model_id(id))
+            || self.created_revision.get() == 0
+            || self.updated_revision.get() == 0
             || self.created_revision > self.updated_revision
             || self.created_at_unix_ms > self.updated_at_unix_ms
             || self
@@ -657,7 +675,9 @@ pub struct V2NodeCollection {
 
 impl V2NodeCollection {
     pub fn validate(&self) -> Result<(), &'static str> {
-        (self.schema_version == V2_SCHEMA_VERSION && self.nodes.len() == 1)
+        (self.schema_version == V2_SCHEMA_VERSION
+            && self.revision.get() != 0
+            && self.nodes.len() == 1)
             .then_some(())
             .ok_or("node collection must contain exactly one v2 node")
     }
@@ -714,6 +734,7 @@ pub struct V2SlotCollection {
 impl V2SlotCollection {
     pub fn validate(&self) -> Result<(), &'static str> {
         (self.schema_version == V2_SCHEMA_VERSION
+            && self.revision.get() != 0
             && self.slots.len() == 1
             && self.slots[0].node_id == self.node_id)
             .then_some(())
@@ -773,20 +794,35 @@ pub struct V2OperationCollection {
 
 impl V2OperationCollection {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.schema_version != V2_SCHEMA_VERSION {
+        if self.schema_version != V2_SCHEMA_VERSION || self.revision.get() == 0 {
             return Err("unsupported v2 schema version");
+        }
+        if self.operations.len() > MAX_PUBLIC_OPERATIONS {
+            return Err("operation collection exceeds public retention bound");
         }
         let mut operation_ids = HashSet::with_capacity(self.operations.len());
         let node_id = self.operations.first().map(|operation| operation.node_id);
         for operation in &self.operations {
-            if !operation_ids.insert(operation.operation_id)
-                || node_id.is_some_and(|node_id| node_id != operation.node_id)
+            if node_id.is_some_and(|node_id| node_id != operation.node_id)
+                || operation.updated_revision > self.revision
+                || operation.updated_at_unix_ms > self.generated_at_unix_ms
+                || !operation_ids.insert(operation.operation_id)
             {
                 return Err("operation collection correlation mismatch");
             }
         }
+        if !operations_are_canonical(&self.operations) {
+            return Err("operation collection is not canonically ordered");
+        }
         Ok(())
     }
+}
+
+fn operations_are_canonical(operations: &[V2Operation]) -> bool {
+    operations.windows(2).all(|pair| {
+        (pair[0].created_revision, pair[0].operation_id)
+            < (pair[1].created_revision, pair[1].operation_id)
+    })
 }
 
 impl Serialize for V2OperationCollection {
@@ -827,18 +863,65 @@ impl<'de> Deserialize<'de> for V2OperationCollection {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct V2OperationEnvelope {
-    #[serde(
-        deserialize_with = "deserialize_schema_version",
-        serialize_with = "serialize_schema_version"
-    )]
     pub schema_version: u32,
     pub epoch: StreamEpoch,
     pub revision: DecimalU64,
     pub generated_at_unix_ms: DecimalU64,
     pub operation: V2Operation,
+}
+
+impl V2OperationEnvelope {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.schema_version != V2_SCHEMA_VERSION
+            || self.revision.get() == 0
+            || self.operation.updated_revision > self.revision
+            || self.operation.updated_at_unix_ms > self.generated_at_unix_ms
+        {
+            Err("operation lies beyond its published envelope")
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Serialize for V2OperationEnvelope {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(S::Error::custom)?;
+        let mut state = serializer.serialize_struct("V2OperationEnvelope", 5)?;
+        state.serialize_field("schema_version", &self.schema_version)?;
+        state.serialize_field("epoch", &self.epoch)?;
+        state.serialize_field("revision", &self.revision)?;
+        state.serialize_field("generated_at_unix_ms", &self.generated_at_unix_ms)?;
+        state.serialize_field("operation", &self.operation)?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for V2OperationEnvelope {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            #[serde(deserialize_with = "deserialize_schema_version")]
+            schema_version: u32,
+            epoch: StreamEpoch,
+            revision: DecimalU64,
+            generated_at_unix_ms: DecimalU64,
+            operation: V2Operation,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let value = Self {
+            schema_version: wire.schema_version,
+            epoch: wire.epoch,
+            revision: wire.revision,
+            generated_at_unix_ms: wire.generated_at_unix_ms,
+            operation: wire.operation,
+        };
+        value.validate().map_err(de::Error::custom)?;
+        Ok(value)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -940,6 +1023,10 @@ impl V2ControlEvent {
                 .operation
                 .as_ref()
                 .is_some_and(|operation| operation.updated_revision != self.revision)
+            || self
+                .operation
+                .as_ref()
+                .is_some_and(|operation| operation.updated_at_unix_ms > self.committed_at_unix_ms)
             || self.slot_id != expected_slot_id
             || self.operation_id != expected_operation_id
             || (self.operation.is_some() && self.node_instance_id.is_none())
@@ -1056,6 +1143,7 @@ impl V2ReconnectSnapshot {
             || (self.stream.cursor_gap && !self.events.is_empty())
             || self.nodes.len() != 1
             || self.slots.len() != 1
+            || self.operations.len() > MAX_PUBLIC_OPERATIONS
             || self.slots[0].node_id != self.nodes[0].node_id
         {
             return Err("invalid capacity-one reconnect snapshot");
@@ -1065,7 +1153,11 @@ impl V2ReconnectSnapshot {
         let mut operation_ids = HashSet::with_capacity(self.operations.len());
         let mut active_lifecycle_operation = None;
         for operation in &self.operations {
-            if operation.node_id != node_id || !operation_ids.insert(operation.operation_id) {
+            if operation.node_id != node_id
+                || operation.updated_revision > self.revision
+                || operation.updated_at_unix_ms > self.generated_at_unix_ms
+                || !operation_ids.insert(operation.operation_id)
+            {
                 return Err("snapshot operation correlation mismatch");
             }
             if matches!(
@@ -1080,6 +1172,9 @@ impl V2ReconnectSnapshot {
             {
                 return Err("multiple active lifecycle operations in capacity-one snapshot");
             }
+        }
+        if !operations_are_canonical(&self.operations) {
+            return Err("snapshot operations are not canonically ordered");
         }
         let slot_operation_matches = match (slot.status, active_lifecycle_operation) {
             (V2SlotStatus::Loading, Some(operation)) => {
@@ -1105,6 +1200,7 @@ impl V2ReconnectSnapshot {
                 || event.node_id != node_id
                 || event.sequence > self.stream.cursor
                 || event.revision > self.revision
+                || event.committed_at_unix_ms > self.generated_at_unix_ms
                 || !event_ids.insert(event.event_id)
                 || previous_position.is_some_and(
                     |(previous_sequence, previous_revision): (DecimalU64, DecimalU64)| {
@@ -1183,6 +1279,10 @@ impl<'de> Deserialize<'de> for V2ReconnectSnapshot {
 pub struct V2OperationAccepted {
     pub epoch: StreamEpoch,
     pub operation_id: OperationId,
+    #[serde(
+        deserialize_with = "deserialize_nonzero_decimal_u64",
+        serialize_with = "serialize_nonzero_decimal_u64"
+    )]
     pub revision: DecimalU64,
 }
 
