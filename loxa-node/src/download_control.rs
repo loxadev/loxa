@@ -58,6 +58,7 @@ enum AdmissionAuthority {
 pub(crate) struct DurableExecutionControl {
     control_state: ControlStateHandle,
     actor: NodeActorHandle,
+    lifecycle_supported: bool,
     lifecycle_destructive: Option<crate::model_lifecycle::CancellationBoundary>,
     projection_healthy: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -281,6 +282,86 @@ impl DownloadControl {
         )
     }
 
+    #[allow(dead_code)] // Task 7 consumes this at NodeBuilder's composition boundary.
+    pub(crate) fn spawn_with_control_state(
+        models_dir: PathBuf,
+        control_state: ControlStateHandle,
+    ) -> (Self, DownloadControlWorker) {
+        let verification_cache = Arc::new(VerificationCache::default());
+        Self::spawn_with_control_state_components(
+            models_dir,
+            verification_cache,
+            REGISTRY,
+            Box::new(VerifiedDownloader),
+            control_state,
+            true,
+        )
+    }
+
+    fn spawn_with_control_state_components(
+        models_dir: PathBuf,
+        verification_cache: Arc<VerificationCache>,
+        recipes: &'static [ModelEntry],
+        downloader: Box<dyn ModelDownloader>,
+        control_state: ControlStateHandle,
+        verify_existing: bool,
+    ) -> (Self, DownloadControlWorker) {
+        let models_dir = Arc::new(models_dir);
+        let verification_cancellation = MutationCancellation::new();
+        let executor = DownloadExecutor {
+            models_dir: (*models_dir).clone(),
+            persistence: ExecutionPersistence::Durable(control_state.clone()),
+            downloader,
+            recipes,
+            verification_cancellation: verification_cancellation.clone(),
+            verifier: Box::new(CacheArtifactVerifier {
+                cache: Arc::clone(&verification_cache),
+            }),
+            lifecycle: None,
+        };
+        let (actor, worker) = NodeActor::spawn(executor);
+        let verification = verify_existing.then(|| {
+            let background_cancellation = verification_cancellation.clone();
+            let background_models_dir = Arc::clone(&models_dir);
+            let background_cache = Arc::clone(&verification_cache);
+            let worker = thread::spawn(move || {
+                verify_existing_recipes(
+                    &background_models_dir,
+                    recipes,
+                    &background_cache,
+                    &background_cancellation,
+                );
+            });
+            VerificationWorker {
+                cancellation: verification_cancellation,
+                worker,
+            }
+        });
+        (
+            Self {
+                authority: AdmissionAuthority::Durable(DurableExecutionControl {
+                    control_state,
+                    actor: actor.clone(),
+                    lifecycle_supported: false,
+                    lifecycle_destructive: None,
+                    projection_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                }),
+                actor: actor.clone(),
+                models_dir,
+                verification_cache,
+                recipes,
+                lifecycle_snapshot: None,
+                lifecycle_destructive: None,
+            },
+            DownloadControlWorker {
+                actor,
+                worker: Some(worker),
+                verification,
+                lifecycle_stop: None,
+            },
+        )
+    }
+
     pub(crate) fn spawn_with_lifecycle<D, G>(
         models_dir: PathBuf,
         lifecycle: ModelLifecycle<D, G>,
@@ -430,6 +511,7 @@ impl DownloadControl {
             (Some(control_state), None) => AdmissionAuthority::Durable(DurableExecutionControl {
                 control_state,
                 actor: actor.clone(),
+                lifecycle_supported: true,
                 lifecycle_destructive: Some(lifecycle_destructive.clone()),
                 projection_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             }),
@@ -744,42 +826,13 @@ impl DownloadControl {
         bytes: &'static [u8],
         control_state: ControlStateHandle,
     ) -> (Self, DownloadControlWorker) {
-        let models_dir = Arc::new(models_dir);
-        let verification_cancellation = MutationCancellation::new();
-        let executor = DownloadExecutor {
-            models_dir: (*models_dir).clone(),
-            persistence: ExecutionPersistence::Durable(control_state.clone()),
-            downloader: Box::new(FixtureDownloader { bytes }),
+        Self::spawn_with_control_state_components(
+            models_dir,
+            verification_cache,
             recipes,
-            verification_cancellation: verification_cancellation.clone(),
-            verifier: Box::new(CacheArtifactVerifier {
-                cache: Arc::clone(&verification_cache),
-            }),
-            lifecycle: None,
-        };
-        let (actor, worker) = NodeActor::spawn(executor);
-        let authority = AdmissionAuthority::Durable(DurableExecutionControl {
+            Box::new(FixtureDownloader { bytes }),
             control_state,
-            actor: actor.clone(),
-            lifecycle_destructive: None,
-            projection_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        });
-        (
-            Self {
-                authority,
-                actor: actor.clone(),
-                models_dir,
-                verification_cache,
-                recipes,
-                lifecycle_snapshot: None,
-                lifecycle_destructive: None,
-            },
-            DownloadControlWorker {
-                actor,
-                worker: Some(worker),
-                verification: None,
-                lifecycle_stop: None,
-            },
+            false,
         )
     }
 
@@ -813,6 +866,7 @@ impl DurableExecutionControl {
         Self {
             control_state,
             actor,
+            lifecycle_supported: true,
             lifecycle_destructive: None,
             projection_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
@@ -842,6 +896,9 @@ impl DurableExecutionControl {
         &self,
         model_id: &str,
     ) -> Result<CommittedAdmission, DownloadControlError> {
+        if !self.lifecycle_supported {
+            return Err(DownloadControlError::ModelUnavailable);
+        }
         self.admit_and_submit(
             AdmissionRequest::Load {
                 model_id: model_id.to_owned(),
@@ -858,6 +915,9 @@ impl DurableExecutionControl {
         model_id: &str,
         deadline: std::time::Instant,
     ) -> Result<CommittedAdmission, DownloadControlError> {
+        if !self.lifecycle_supported {
+            return Err(DownloadControlError::ModelUnavailable);
+        }
         self.ensure_healthy()?;
         let admission = self
             .control_state
@@ -887,6 +947,9 @@ impl DurableExecutionControl {
     }
 
     pub(crate) async fn start_unload(&self) -> Result<CommittedAdmission, DownloadControlError> {
+        if !self.lifecycle_supported {
+            return Err(DownloadControlError::ModelUnavailable);
+        }
         self.admit_and_submit(AdmissionRequest::Unload, Mutation::Unload)
             .await
     }
@@ -3454,5 +3517,123 @@ mod tests {
         let (control, worker) = DownloadControl::spawn(std::env::temp_dir());
         assert!(control.durable_execution().is_none());
         worker.stop_and_join().unwrap();
+    }
+
+    #[test]
+    fn node_builder_has_a_no_lifecycle_durable_constructor() {
+        let _constructor: fn(
+            PathBuf,
+            ControlStateHandle,
+        ) -> (DownloadControl, DownloadControlWorker) = DownloadControl::spawn_with_control_state;
+    }
+
+    #[tokio::test]
+    async fn no_lifecycle_durable_authority_downloads_without_faking_slot_execution() {
+        let root = std::env::temp_dir().join(format!(
+            "loxa-durable-download-only-{}-{}",
+            std::process::id(),
+            loxa_protocol::v2::StreamEpoch::new_v4()
+        ));
+        let paths = crate::NodePaths {
+            models_dir: root.join("models"),
+            state_path: root.join("run/managed.json"),
+            logs_dir: root.join("run/logs"),
+        };
+        std::fs::create_dir_all(&paths.logs_dir).unwrap();
+        let baseline = loxa_core::supervisor::ManagedRun {
+            schema_version: loxa_core::supervisor::RUNTIME_STATE_SCHEMA_VERSION,
+            run_id: "durable-download-only".into(),
+            model_id: None,
+            owner_pid: std::process::id(),
+            owner_process_start_time_unix_s: 1,
+            stop_requested: false,
+            lifecycle: loxa_core::supervisor::RunLifecycle::Unloaded,
+            generation: 0,
+            generation_alias: "loxa-durable-download-only-g0".into(),
+            control_port: Some(19_432),
+            port: 19_432,
+            log_path: paths.logs_dir.join("owner.log"),
+            child_pid: None,
+            child_process_start_time_unix_s: None,
+            child_pgid: None,
+        };
+        loxa_core::supervisor::create_unloaded_node_owner(&paths.state_path, baseline.clone())
+            .unwrap();
+        let node_id = loxa_protocol::NodeId::new_v4();
+        let fixture = crate::open_slice3_control_state_fixture(
+            root.join("state/control-state.sqlite3"),
+            node_id,
+            paths,
+            baseline,
+        )
+        .unwrap();
+        fixture
+            .handle
+            .publish_instance(crate::control_state::InstancePublication {
+                node_instance_id: loxa_protocol::NodeInstanceId::new_v4(),
+                control_endpoint: "http://127.0.0.1:19432".into(),
+                capabilities: loxa_protocol::v2::V2NodeCapabilities {
+                    model_download: true,
+                    slot_load: false,
+                    slot_unload: false,
+                    operation_cancel: true,
+                    operation_stream: true,
+                },
+                now_unix_ms: 11,
+            })
+            .await
+            .unwrap();
+        let recipe = Box::leak(Box::new(ModelEntry {
+            id: "download-only",
+            repo: "owner/repo",
+            revision: "pinned",
+            filename: "download-only.gguf",
+            sha256: "770e607624d689265ca6c44884d0807d9b054d23c473c106c72be9de08b7376c",
+            size_bytes: 4,
+            license: "apache-2.0",
+            params: "tiny",
+            quant: "Q4",
+            min_free_mem_gb: 0.0,
+        }));
+        let (control, worker) = DownloadControl::spawn_durable_fixture_for_test(
+            root.join("models"),
+            Arc::new(VerificationCache::default()),
+            std::slice::from_ref(recipe),
+            b"good",
+            fixture.handle.clone(),
+        );
+        assert!(control.durable_execution().is_some());
+        assert_eq!(
+            control.start_load_async(recipe.id).await,
+            Err(DownloadControlError::Missing)
+        );
+        assert_eq!(
+            control.start_unload_async().await,
+            Err(DownloadControlError::Missing)
+        );
+        let durable = control.durable_execution().unwrap();
+        let before_unsupported = fixture.handle.read_snapshot().unwrap();
+        assert_eq!(
+            durable.start_load(recipe.id).await,
+            Err(DownloadControlError::ModelUnavailable)
+        );
+        assert_eq!(
+            durable.start_unload().await,
+            Err(DownloadControlError::ModelUnavailable)
+        );
+        let after_unsupported = fixture.handle.read_snapshot().unwrap();
+        assert_eq!(after_unsupported.revision, before_unsupported.revision);
+        assert_eq!(
+            after_unsupported.operations, before_unsupported.operations,
+            "unsupported lifecycle commands must not be durably admitted"
+        );
+        assert_eq!(
+            control.start_download_async(recipe.id).await.unwrap(),
+            "op-1"
+        );
+        assert_eq!(fixture.handle.read_snapshot().unwrap().operations.len(), 1);
+        worker.stop_and_join().unwrap();
+        fixture.shutdown().await;
+        let _ = std::fs::remove_dir_all(root);
     }
 }
