@@ -889,6 +889,48 @@ fn live_list<W: Write>(client: &LiveControlClient, stdout: &mut W) -> io::Result
     Ok(ExitCode::SUCCESS)
 }
 
+#[cfg(test)]
+pub(crate) fn run_v1_compatibility_case(
+    kind: crate::test_support::CliCaseKind,
+    client: &LiveControlClient,
+) -> (ExitCode, Vec<u8>, Vec<u8>) {
+    use crate::test_support::CliCaseKind;
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let parsed = match kind {
+        CliCaseKind::Pull => Some(Cli::try_parse_from(["loxa", "pull", "gemma-3-4b-it-q4"])),
+        CliCaseKind::List => Some(Cli::try_parse_from(["loxa", "list"])),
+        CliCaseKind::Load => Some(Cli::try_parse_from(["loxa", "load", "gemma-3-4b-it-q4"])),
+        CliCaseKind::Unload => Some(Cli::try_parse_from(["loxa", "unload"])),
+        CliCaseKind::Cancel | CliCaseKind::Poll => None,
+    }
+    .transpose()
+    .expect("compatibility command parses");
+    let result = match (kind, parsed.map(|cli| cli.command)) {
+        (CliCaseKind::Pull, Some(Command::Pull { id, quant })) => {
+            live_pull(client, &id, quant.as_deref(), &mut stdout)
+        }
+        (CliCaseKind::List, Some(Command::List)) => live_list(client, &mut stdout),
+        (CliCaseKind::Load, Some(Command::Load { id })) => {
+            live_operation(client, client.load(&id), "load", &mut stdout)
+        }
+        (CliCaseKind::Unload, Some(Command::Unload)) => {
+            live_operation(client, client.unload(), "unload", &mut stdout)
+        }
+        (CliCaseKind::Cancel, None) => {
+            live_operation(client, Ok("op-1".into()), "load", &mut stdout)
+        }
+        (CliCaseKind::Poll, None) => client
+            .wait_terminal("op-1", Duration::from_secs(2))
+            .map(|()| ExitCode::SUCCESS)
+            .map_err(io::Error::other),
+        _ => unreachable!("compatibility parser returned the wrong command"),
+    };
+    let exit = finish_cli_result(result, &mut stderr);
+    (exit, stdout, stderr)
+}
+
 fn live_artifact_status(artifact: &loxa_core::model_inventory::ArtifactState) -> &'static str {
     use loxa_core::model_inventory::ArtifactState;
     match artifact {
