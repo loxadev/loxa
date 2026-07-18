@@ -28,6 +28,8 @@ mod production_lifecycle;
 mod runtime;
 #[cfg(test)]
 mod slice3_test_support;
+#[cfg(test)]
+mod slice4_test_support;
 mod v2_control_router;
 
 #[cfg(test)]
