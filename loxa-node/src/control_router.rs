@@ -9,8 +9,7 @@ use axum::{Json, Router};
 use loxa_core::control::auth::{desktop_origins, is_desktop_origin, AuthPolicy, ControlToken};
 use loxa_core::control::contracts::{
     CapabilitiesSnapshot, ControlErrorBody, ControlErrorCode, ModelRequest, NodeIdentityChallenge,
-    NodeIdentityProofResponse, NodeSnapshot, NodeStatus, OperationAccepted,
-    CONTROL_PROTOCOL_VERSION,
+    NodeIdentityProofResponse, NodeStatus, OperationAccepted, CONTROL_PROTOCOL_VERSION,
 };
 use loxa_core::model_inventory::current_available_memory_bytes;
 use loxa_protocol::{NodeId, NodeInstanceId};
@@ -222,7 +221,11 @@ async fn start_download(
             )
         }
     };
-    match state.downloads.start(&request.model_id) {
+    match state
+        .downloads
+        .start_download_async(&request.model_id)
+        .await
+    {
         Ok(operation_id) => cors(
             (
                 StatusCode::ACCEPTED,
@@ -270,7 +273,7 @@ async fn start_load(
             );
         }
     };
-    match state.downloads.start_load(&request.model_id) {
+    match state.downloads.start_load_async(&request.model_id).await {
         Ok(operation_id) => cors(
             (
                 StatusCode::ACCEPTED,
@@ -291,7 +294,7 @@ async fn start_unload(State(state): State<ControlState>, headers: HeaderMap) -> 
     if let Err(status) = authorize(&state, &headers) {
         return cors(status.into_response(), origin.as_deref());
     }
-    match state.downloads.start_unload() {
+    match state.downloads.start_unload_async().await {
         Ok(operation_id) => cors(
             (
                 StatusCode::ACCEPTED,
@@ -316,9 +319,10 @@ async fn operation(
     if let Err(status) = authorize(&state, &headers) {
         return cors(status.into_response(), origin.as_deref());
     }
-    match state.downloads.operation(&id) {
-        Some(operation) => cors(Json(operation).into_response(), origin.as_deref()),
-        None => map_download_error(DownloadControlError::Missing, origin.as_deref()),
+    match state.downloads.operation_checked(&id) {
+        Ok(Some(operation)) => cors(Json(operation).into_response(), origin.as_deref()),
+        Ok(None) => map_download_error(DownloadControlError::Missing, origin.as_deref()),
+        Err(error) => map_download_error(error, origin.as_deref()),
     }
 }
 
@@ -334,14 +338,12 @@ async fn cancel_operation(
     if let Err(status) = authorize(&state, &headers) {
         return cors(status.into_response(), origin.as_deref());
     }
-    match state.downloads.cancel(&id) {
+    match state.downloads.cancel_async(&id).await {
         Ok(_) => cors(
-            Json(
-                state
-                    .downloads
-                    .operation(&id)
-                    .expect("cancelled operation exists"),
-            )
+            Json(match state.downloads.operation_checked(&id) {
+                Ok(Some(operation)) => operation,
+                _ => return map_download_error(DownloadControlError::Stopping, origin.as_deref()),
+            })
             .into_response(),
             origin.as_deref(),
         ),
@@ -368,34 +370,25 @@ async fn events(
     if let Err(status) = authorize(&state, &headers) {
         return cors(status.into_response(), origin.as_deref());
     }
-    let (snapshot, subscription) = state.downloads.subscribe_with_snapshot(query.cursor);
+    let (snapshot, subscription) = match state
+        .downloads
+        .subscribe_v1_with_snapshot(query.cursor)
+        .await
+    {
+        Ok(subscription) => subscription,
+        Err(error) => return map_download_error(error, origin.as_deref()),
+    };
     let initial = serde_json::to_string(&snapshot).expect("snapshot serializes");
-    let (sender, receiver) = tokio::sync::mpsc::channel(128);
-    std::thread::spawn(move || loop {
-        match subscription
-            .receiver
-            .recv_timeout(Duration::from_millis(250))
-        {
-            Ok(event) => {
-                if sender.blocking_send(event).is_err() {
-                    break;
-                }
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) if sender.is_closed() => break,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-    });
     let stream = futures_util::stream::unfold(
-        (Some(initial), receiver),
-        |(initial, mut receiver)| async move {
+        (Some(initial), subscription),
+        |(initial, mut subscription)| async move {
             if let Some(initial) = initial {
                 return Some((
                     Ok::<_, Infallible>(Event::default().event("snapshot").data(initial)),
-                    (None, receiver),
+                    (None, subscription),
                 ));
             }
-            match receiver.recv().await {
+            match subscription.recv().await {
                 Some(control_event) => Some((
                     Ok(Event::default()
                         .event("operation")
@@ -404,7 +397,7 @@ async fn events(
                             serde_json::to_string(&control_event)
                                 .expect("control event serializes"),
                         )),
-                    (None, receiver),
+                    (None, subscription),
                 )),
                 None => None,
             }
@@ -446,7 +439,10 @@ async fn node_proof(
         Ok(challenge) => challenge,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
-    let status = node_status(&state);
+    let status = match node_status(&state) {
+        Ok(status) => status,
+        Err(error) => return map_download_error(error, origin.as_deref()),
+    };
     let node_id = state.node_id.to_string();
     let node_instance_id = state.node_instance_id.to_string();
     let proof =
@@ -515,38 +511,17 @@ async fn node_snapshot(State(state): State<ControlState>, headers: HeaderMap) ->
     if let Err(status) = authorize(&state, &headers) {
         return cors(status.into_response(), origin.as_deref());
     }
-    let lifecycle = state.downloads.lifecycle_snapshot();
-    let status = lifecycle_status(lifecycle.as_ref());
-    cors(
-        Json(NodeSnapshot {
-            status,
-            active_model_id: lifecycle
-                .as_ref()
-                .and_then(|snapshot| snapshot.active_model_id.clone()),
-            operation_id: lifecycle
-                .as_ref()
-                .and_then(|snapshot| snapshot.operation_id.clone()),
-            error: lifecycle.and_then(|snapshot| snapshot.error),
-        })
-        .into_response(),
-        origin.as_deref(),
-    )
-}
-
-fn node_status(state: &ControlState) -> NodeStatus {
-    let lifecycle = state.downloads.lifecycle_snapshot();
-    lifecycle_status(lifecycle.as_ref())
-}
-
-fn lifecycle_status(snapshot: Option<&crate::model_lifecycle::LifecycleSnapshot>) -> NodeStatus {
-    use crate::model_lifecycle::NodeLifecycleStatus;
-    match snapshot.map(|snapshot| &snapshot.status) {
-        None | Some(NodeLifecycleStatus::Unloaded) => NodeStatus::Unloaded,
-        Some(NodeLifecycleStatus::Loading) => NodeStatus::Loading,
-        Some(NodeLifecycleStatus::Ready) => NodeStatus::Ready,
-        Some(NodeLifecycleStatus::Unloading) => NodeStatus::Unloading,
-        Some(NodeLifecycleStatus::RecoveryRequired) => NodeStatus::RecoveryRequired,
+    match state.downloads.node_snapshot_checked() {
+        Ok(snapshot) => cors(Json(snapshot).into_response(), origin.as_deref()),
+        Err(error) => map_download_error(error, origin.as_deref()),
     }
+}
+
+fn node_status(state: &ControlState) -> Result<NodeStatus, DownloadControlError> {
+    state
+        .downloads
+        .node_snapshot_checked()
+        .map(|snapshot| snapshot.status)
 }
 
 pub fn router(state: ControlState) -> Router {

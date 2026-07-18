@@ -35,5 +35,18 @@ pub(crate) use repository::{
 };
 pub(crate) use state_machine::InstancePublication;
 pub(crate) use worker::{
-    ControlStateBootstrap, ControlStateHandle, ControlStateInit, ControlStateOpenInput,
+    ControlStateBootstrap, ControlStateError, ControlStateHandle, ControlStateInit,
+    ControlStateOpenInput,
 };
+
+#[cfg(test)]
+pub(crate) fn open_control_state_for_test(
+    init: ControlStateInit,
+) -> Result<ControlStateBootstrap, ControlStateError> {
+    worker::ControlStateWorker::open_reconcile_and_spawn(init)
+}
+
+#[cfg(test)]
+pub(crate) fn ownership_unavailable_recovery_for_test() -> RecoveryEvidence {
+    recovery::RecoveryEvidence::uncertain(recovery::UncertaintyReason::OwnershipUnavailable)
+}

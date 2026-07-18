@@ -1,11 +1,62 @@
 #[cfg(test)]
 mod tests {
     use super::*;
+    use loxa_protocol::v2::{
+        DecimalU64, OperationId, V2Operation, V2OperationKind, V2OperationStatus,
+    };
+    use loxa_protocol::NodeId;
     use std::collections::BTreeMap;
     use std::process::Command;
+    use std::str::FromStr;
     use std::sync::{Arc, Mutex};
     use tracing::field::{Field, Visit};
     use tracing::{Event, Metadata, Subscriber};
+
+    fn durable_operation(status: V2OperationStatus, updated_at: u64) -> V2Operation {
+        V2Operation {
+            operation_id: OperationId::from_str("123e4567-e89b-42d3-9456-426614174003").unwrap(),
+            node_id: NodeId::from_str("123e4567-e89b-42d3-a456-426614174000").unwrap(),
+            kind: V2OperationKind::Download,
+            status,
+            slot_id: None,
+            model_id: Some("fixture".into()),
+            progress: None,
+            error: None,
+            created_revision: DecimalU64::new(2),
+            updated_revision: DecimalU64::new(3),
+            created_at_unix_ms: DecimalU64::new(10),
+            updated_at_unix_ms: DecimalU64::new(updated_at),
+        }
+    }
+
+    #[test]
+    fn durable_v1_projection_keeps_exact_alias_and_maps_cancelling_to_running() {
+        let projected = project_durable_v1_operation(
+            "op-7",
+            &durable_operation(V2OperationStatus::Cancelling, 11),
+        )
+        .unwrap();
+        assert_eq!(projected.id, "op-7");
+        assert_eq!(projected.kind, OperationKind::Download);
+        assert_eq!(projected.status, OperationStatus::Running);
+        assert_eq!(projected.created_at_unix_ms, 10);
+        assert_eq!(projected.updated_at_unix_ms, 11);
+    }
+
+    #[test]
+    fn durable_v1_projection_rejects_non_safe_integer_without_partial_output() {
+        assert_eq!(
+            project_durable_v1_operation(
+                "op-1",
+                &durable_operation(V2OperationStatus::Running, 9_007_199_254_740_992),
+            ),
+            Err(DurableV1ProjectionError::UnsafeInteger)
+        );
+        assert_eq!(
+            project_durable_v1_counter(9_007_199_254_740_992),
+            Err(DurableV1ProjectionError::UnsafeInteger)
+        );
+    }
 
     #[derive(Clone, Default)]
     struct EventCapture(Arc<Mutex<Vec<BTreeMap<String, String>>>>);
@@ -252,11 +303,64 @@ mod tests {
     }
 }
 use super::contracts::{
-    ControlEvent, OperationKind, OperationProgress, OperationStatus, OperationView,
-    ReconnectSnapshot,
+    ControlEvent, DurableV1ProjectionError, OperationKind, OperationProgress, OperationStatus,
+    OperationView, ReconnectSnapshot,
 };
+use loxa_protocol::v2::{V2Operation, V2OperationKind, V2OperationStatus};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{mpsc, Arc, Mutex};
+
+const MAX_V1_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
+pub fn project_durable_v1_operation(
+    v1_operation_id: &str,
+    operation: &V2Operation,
+) -> Result<OperationView, DurableV1ProjectionError> {
+    operation
+        .validate()
+        .map_err(|_| DurableV1ProjectionError::InvalidAuthoritativeState)?;
+    let created_at_unix_ms = project_durable_v1_counter(operation.created_at_unix_ms.get())?;
+    let updated_at_unix_ms = project_durable_v1_counter(operation.updated_at_unix_ms.get())?;
+    let progress = operation
+        .progress
+        .as_ref()
+        .map(|progress| {
+            Ok(OperationProgress {
+                completed_bytes: project_durable_v1_counter(progress.completed_bytes.get())?,
+                total_bytes: progress
+                    .total_bytes
+                    .map(|total| project_durable_v1_counter(total.get()))
+                    .transpose()?,
+            })
+        })
+        .transpose()?;
+    Ok(OperationView {
+        id: v1_operation_id.to_owned(),
+        kind: match operation.kind {
+            V2OperationKind::Download => OperationKind::Download,
+            V2OperationKind::Load => OperationKind::Load,
+            V2OperationKind::Unload => OperationKind::Unload,
+        },
+        status: match operation.status {
+            V2OperationStatus::Queued => OperationStatus::Queued,
+            V2OperationStatus::Running | V2OperationStatus::Cancelling => OperationStatus::Running,
+            V2OperationStatus::Succeeded => OperationStatus::Succeeded,
+            V2OperationStatus::Failed => OperationStatus::Failed,
+            V2OperationStatus::Cancelled => OperationStatus::Cancelled,
+        },
+        model_id: operation.model_id.clone(),
+        progress,
+        error: operation.error.as_ref().map(|error| error.message.clone()),
+        created_at_unix_ms,
+        updated_at_unix_ms,
+    })
+}
+
+pub fn project_durable_v1_counter(value: u64) -> Result<u64, DurableV1ProjectionError> {
+    (value <= MAX_V1_SAFE_INTEGER)
+        .then_some(value)
+        .ok_or(DurableV1ProjectionError::UnsafeInteger)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CancellationSafety {

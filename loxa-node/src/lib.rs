@@ -26,6 +26,48 @@ mod identity;
 pub mod model_lifecycle;
 mod production_lifecycle;
 mod runtime;
+#[cfg(test)]
+mod slice3_test_support;
+
+#[cfg(test)]
+struct Slice3ControlStateFixture {
+    handle: control_state::ControlStateHandle,
+    bootstrap: Option<control_state::ControlStateBootstrap>,
+}
+
+#[cfg(test)]
+impl Slice3ControlStateFixture {
+    async fn shutdown(mut self) {
+        let bootstrap = self.bootstrap.take().unwrap();
+        bootstrap.worker.shutdown().await.unwrap();
+        drop(bootstrap.handle);
+        drop(self.handle);
+        drop(bootstrap.claimed_owner);
+    }
+}
+
+#[cfg(test)]
+fn open_slice3_control_state_fixture(
+    path: PathBuf,
+    node_id: loxa_protocol::NodeId,
+    paths: NodePaths,
+    baseline: supervisor::ManagedRun,
+) -> Result<Slice3ControlStateFixture, control_state::ControlStateError> {
+    let bootstrap = control_state::open_control_state_for_test(control_state::ControlStateInit {
+        path: path.into(),
+        node_id,
+        open_input: control_state::ControlStateOpenInput {
+            claimed_owner: runtime::NodeOwnerGuard::new(paths, baseline),
+            first_migration_source: Some(control_state::ScalarSource::Fresh),
+        },
+        recovery_evidence: control_state::ownership_unavailable_recovery_for_test(),
+        now_unix_ms: 10,
+    })?;
+    Ok(Slice3ControlStateFixture {
+        handle: bootstrap.handle.clone(),
+        bootstrap: Some(bootstrap),
+    })
+}
 
 pub use bootstrap::{
     emit_final_shutdown_diagnostic, install_daemon_diagnostics, DiagnosticsBootstrap, NodePaths,
