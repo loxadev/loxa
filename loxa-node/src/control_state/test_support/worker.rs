@@ -1,4 +1,6 @@
-use crate::control_state::state_machine::{AdmissionRequest, CommitReceipt, Transition};
+use crate::control_state::state_machine::{
+    AdmissionRequest, CommitReceipt, DesiredDisposition, LifecycleObservation, Transition,
+};
 use crate::control_state::worker::{
     build_reconnect_snapshot, spawn_from_repository_for_test,
     spawn_paused_from_repository_for_test, spawn_paused_with_reaper_completion_for_test,
@@ -6,7 +8,8 @@ use crate::control_state::worker::{
 };
 use crate::control_state::{ControlIdGenerator, ControlRepository};
 use loxa_protocol::v2::{
-    DecimalU64, EventId, OperationId, SlotId, StreamEpoch, V2OperationProgress, V2OperationStatus,
+    DecimalU64, EventId, OperationId, SlotId, StreamEpoch, V2OperationError, V2OperationErrorCode,
+    V2OperationProgress, V2OperationStatus, V2SlotStatus,
 };
 use loxa_protocol::{NodeId, NodeInstanceId};
 use std::collections::HashSet;
@@ -109,6 +112,149 @@ fn command_transport_is_a_std_sync_bounded_channel() {
 
     drop(handle);
     worker.join_for_test();
+    cleanup(&path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lifecycle_observation_command_commits_operation_slot_and_intent_together() {
+    let (path, repository) = repository();
+    let (handle, worker) = spawn_from_repository_for_test(repository).unwrap();
+    let admission = handle
+        .admit(AdmissionRequest::Load {
+            model_id: "candidate".into(),
+        })
+        .await
+        .unwrap();
+    handle
+        .observe_required_async(Transition::Started {
+            operation_id: admission.operation_id,
+            progress: None,
+        })
+        .await
+        .unwrap();
+    let receipt = handle
+        .observe_lifecycle_async(
+            Transition::Succeeded {
+                operation_id: admission.operation_id,
+                observed_model_id: Some("candidate".into()),
+            },
+            LifecycleObservation::LoadReady {
+                operation_id: admission.operation_id,
+                model_id: "candidate".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let state = handle.snapshot();
+    assert_eq!(state.revision, receipt.revision);
+    assert_eq!(state.slot.status, V2SlotStatus::Ready);
+    assert_eq!(
+        state.intent.desired,
+        DesiredDisposition::Loaded("candidate".into())
+    );
+    drop(handle);
+    worker.join_for_test();
+    cleanup(&path);
+}
+
+#[tokio::test(start_paused = true)]
+async fn lifecycle_observation_without_ack_poisoned_as_unknown_commit() {
+    let (path, repository) = repository();
+    let state = repository.committed_state().unwrap();
+    repository.close().unwrap();
+    let synthetic = synthetic_queue_for_test(state);
+    let handle = synthetic.handle.clone();
+    let waiting = handle.clone();
+    let operation_id = OperationId::new_v4();
+    let observation = tokio::spawn(async move {
+        waiting
+            .observe_lifecycle_async(
+                Transition::Failed {
+                    operation_id,
+                    error: V2OperationError {
+                        code: V2OperationErrorCode::LoadFailed,
+                        message: "candidate failed".into(),
+                    },
+                },
+                LifecycleObservation::RecoveryRequired {
+                    operation_id,
+                    reason: crate::control_state::repository::IntentReason::CompensationFailed,
+                },
+            )
+            .await
+    });
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(10)).await;
+    assert_eq!(
+        observation.await.unwrap().unwrap_err(),
+        ControlStateError::UnknownCommit
+    );
+    assert!(!handle.is_healthy());
+    drop(handle);
+    drop(synthetic);
+    cleanup(&path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lifecycle_final_commit_snapshot_uncertainty_seals_health_and_preserves_durable_truth() {
+    let (path, repository) = repository();
+    let (handle, worker) = spawn_from_repository_for_test(repository).unwrap();
+    let admission = handle
+        .admit(AdmissionRequest::Load {
+            model_id: "candidate".into(),
+        })
+        .await
+        .unwrap();
+    handle
+        .observe_required_async(Transition::Started {
+            operation_id: admission.operation_id,
+            progress: None,
+        })
+        .await
+        .unwrap();
+    let before = handle.snapshot();
+    assert_eq!(
+        handle
+            .observe_lifecycle_with_snapshot_failure_for_test(
+                Transition::Failed {
+                    operation_id: admission.operation_id,
+                    error: V2OperationError {
+                        code: V2OperationErrorCode::LoadFailed,
+                        message: "rollback failed".into(),
+                    },
+                },
+                LifecycleObservation::RecoveryRequired {
+                    operation_id: admission.operation_id,
+                    reason: crate::control_state::repository::IntentReason::CompensationFailed,
+                },
+            )
+            .await
+            .unwrap_err(),
+        ControlStateError::UnknownCommit
+    );
+    assert!(!handle.is_healthy());
+    assert_eq!(*handle.snapshot(), *before);
+    drop(handle);
+    worker.join_for_test();
+
+    let reopened = ControlRepository::open_or_create(
+        &path,
+        NodeId::from_str(NODE_ID).unwrap(),
+        &mut InitialIds,
+    )
+    .unwrap();
+    let durable = reopened.committed_state().unwrap();
+    assert_eq!(durable.slot.status, V2SlotStatus::Recovery);
+    assert_eq!(
+        durable
+            .operations
+            .iter()
+            .find(|operation| operation.operation_id == admission.operation_id)
+            .unwrap()
+            .status,
+        V2OperationStatus::Failed
+    );
+    reopened.close().unwrap();
     cleanup(&path);
 }
 

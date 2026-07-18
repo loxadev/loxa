@@ -354,17 +354,49 @@ fn assert_migration_recovery_startup_gate(label: &str, case: MigrationRecoverySt
     }
 }
 
+fn assert_safe_migration_recovery_is_consumed(label: &str, case: MigrationRecoveryStartupCase) {
+    let fixture = migration_recovery_startup_image(label, case);
+    let (owner_root, state_path, init) =
+        existing_migration_startup_fixture(&format!("{label}-first"), fixture.path());
+    let bootstrap = ControlStateWorker::open_reconcile_and_spawn(init).unwrap();
+    let first_state = bootstrap.handle.snapshot();
+    assert_eq!(
+        first_state.slot.status,
+        loxa_protocol::v2::V2SlotStatus::Recovery
+    );
+    assert!(first_state.operations.iter().all(|operation| !matches!(
+        operation.status,
+        V2OperationStatus::Queued | V2OperationStatus::Running | V2OperationStatus::Cancelling
+    )));
+    close_unexpected_startup(bootstrap);
+    assert_managed_owner_released(&state_path);
+    let after_first = fixture.logical_snapshot();
+    let reopened = fixture.reopen().unwrap();
+    reopened.repository.validate_all().unwrap();
+    reopened.repository.close().unwrap();
+    let _ = std::fs::remove_dir_all(owner_root);
+
+    let (owner_root, state_path, init) =
+        existing_migration_startup_fixture(&format!("{label}-repeat"), fixture.path());
+    let bootstrap = ControlStateWorker::open_reconcile_and_spawn(init).unwrap();
+    assert_eq!(*bootstrap.handle.snapshot(), *first_state);
+    close_unexpected_startup(bootstrap);
+    assert_managed_owner_released(&state_path);
+    assert_eq!(fixture.logical_snapshot(), after_first);
+    let _ = std::fs::remove_dir_all(owner_root);
+}
+
 #[test]
-fn startup_gate_preserves_ambiguous_loading_migration_recovery() {
-    assert_migration_recovery_startup_gate(
+fn startup_consumes_safe_ambiguous_loading_migration_recovery_once() {
+    assert_safe_migration_recovery_is_consumed(
         "startup-ambiguous-loading",
         MigrationRecoveryStartupCase::MissingLoadingOperation,
     );
 }
 
 #[test]
-fn startup_gate_preserves_wrong_kind_migration_recovery() {
-    assert_migration_recovery_startup_gate(
+fn startup_consumes_safe_wrong_kind_migration_recovery_once() {
+    assert_safe_migration_recovery_is_consumed(
         "startup-wrong-kind",
         MigrationRecoveryStartupCase::WrongKind,
     );
@@ -387,8 +419,8 @@ fn startup_gate_preserves_active_null_load_migration_recovery() {
 }
 
 #[test]
-fn startup_gate_preserves_missing_unload_migration_recovery() {
-    assert_migration_recovery_startup_gate(
+fn startup_consumes_safe_missing_unload_migration_recovery_once() {
+    assert_safe_migration_recovery_is_consumed(
         "startup-missing-unload",
         MigrationRecoveryStartupCase::MissingUnloadOperation,
     );

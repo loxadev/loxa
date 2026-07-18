@@ -1,7 +1,7 @@
 use super::recovery::{ExactAbsenceProof, ExactReady, RecoveryEvidence};
 use super::state_machine::{
     AdmissionRequest, CommitReceipt, CommittedAdmission, CommittedState, InstancePublication,
-    MutationIds, Transition, TransitionError,
+    LifecycleObservation, MutationIds, RestartEvidence, Transition, TransitionError,
 };
 use super::{
     ControlIdGenerator, ControlRepository, ControlStatePath, RepositoryErrorClass, ScalarSource,
@@ -82,6 +82,11 @@ enum ControlCommand {
         transition: Transition,
         reply: oneshot::Sender<Result<CommitReceipt, ControlStateError>>,
     },
+    ObserveLifecycle {
+        transition: Transition,
+        observation: LifecycleObservation,
+        reply: oneshot::Sender<Result<CommitReceipt, ControlStateError>>,
+    },
     Subscribe {
         requested: Option<(StreamEpoch, DecimalU64)>,
         generated_at_unix_ms: DecimalU64,
@@ -98,6 +103,12 @@ enum ControlCommand {
     AdmitWithSnapshotFailure {
         request: AdmissionRequest,
         reply: oneshot::Sender<Result<CommittedAdmission, ControlStateError>>,
+    },
+    #[cfg(test)]
+    ObserveLifecycleWithSnapshotFailure {
+        transition: Transition,
+        observation: LifecycleObservation,
+        reply: oneshot::Sender<Result<CommitReceipt, ControlStateError>>,
     },
     #[cfg(test)]
     AdmitWithSnapshotFailureAndBlockCleanup {
@@ -405,6 +416,45 @@ impl ControlStateHandle {
                     if !self.is_healthy() {
                         return Err(ControlStateError::DurableStateUnavailable);
                     }
+                }
+                Err(sync_mpsc::TrySendError::Disconnected(_)) => {
+                    return Err(self.poison_unavailable());
+                }
+            }
+        };
+        self.receive_commit(receive, tokio::time::Instant::now() + ACK_TIMEOUT)
+            .await
+    }
+
+    pub(crate) async fn observe_lifecycle_async(
+        &self,
+        transition: Transition,
+        observation: LifecycleObservation,
+    ) -> Result<CommitReceipt, ControlStateError> {
+        if !self.is_healthy() {
+            return Err(ControlStateError::DurableStateUnavailable);
+        }
+        let enqueue_deadline = tokio::time::Instant::now() + ENQUEUE_TIMEOUT;
+        let receive = loop {
+            if !self.is_healthy() {
+                return Err(ControlStateError::DurableStateUnavailable);
+            }
+            if tokio::time::Instant::now() >= enqueue_deadline {
+                return Err(self.poison_unavailable());
+            }
+            let (reply, receive) = oneshot::channel();
+            match self.sender.try_send(ControlCommand::ObserveLifecycle {
+                transition: transition.clone(),
+                observation: observation.clone(),
+                reply,
+            }) {
+                Ok(()) => break receive,
+                Err(sync_mpsc::TrySendError::Full(_)) => {
+                    let now = tokio::time::Instant::now();
+                    if now >= enqueue_deadline {
+                        return Err(self.poison_unavailable());
+                    }
+                    tokio::time::sleep(ENQUEUE_RETRY.min(enqueue_deadline - now)).await;
                 }
                 Err(sync_mpsc::TrySendError::Disconnected(_)) => {
                     return Err(self.poison_unavailable());
@@ -755,17 +805,31 @@ impl ControlStateWorker {
                         &mut ids,
                     )
                     .map_err(|error| ControlStateError::Repository(error.class()))?;
-                    if repository
+                    let requires_specialized_recovery = repository
                         .requires_specialized_migration_recovery()
-                        .map_err(|error| ControlStateError::Repository(error.class()))?
+                        .map_err(|error| ControlStateError::Repository(error.class()))?;
+                    if requires_specialized_recovery
+                        && !repository
+                            .specialized_migration_recovery_is_safe()
+                            .map_err(|error| ControlStateError::Repository(error.class()))?
                     {
                         repository
                             .close()
                             .map_err(|_| ControlStateError::DurableStateUnavailable)?;
                         return Err(ControlStateError::DurableStateUnavailable);
                     }
+                    let captured_intent = repository
+                        .lifecycle_intent_snapshot()
+                        .map_err(ControlStateError::Transition)?;
                     let reconciled = repository
-                        .reconcile_offline(evidence, init.now_unix_ms, &mut ids)
+                        .reconcile_restart(
+                            RestartEvidence {
+                                lifecycle: evidence,
+                                captured_intent,
+                            },
+                            init.now_unix_ms,
+                            &mut ids,
+                        )
                         .map_err(ControlStateError::Transition)?;
                     let initial = Arc::new(
                         repository
@@ -1225,6 +1289,23 @@ impl ControlStateHandle {
         drop(receive);
     }
 
+    pub(super) async fn observe_lifecycle_with_snapshot_failure_for_test(
+        &self,
+        transition: Transition,
+        observation: LifecycleObservation,
+    ) -> Result<CommitReceipt, ControlStateError> {
+        let (reply, receive) = oneshot::channel();
+        self.sender
+            .try_send(ControlCommand::ObserveLifecycleWithSnapshotFailure {
+                transition,
+                observation,
+                reply,
+            })
+            .expect("fault-injected lifecycle observation must enqueue");
+        self.receive_commit(receive, tokio::time::Instant::now() + ACK_TIMEOUT)
+            .await
+    }
+
     pub(super) fn observe_and_drop_ack_for_test(
         &self,
         transition: Transition,
@@ -1584,6 +1665,22 @@ fn process_command(
             );
             finish_commit(repository, result, reply, &mut publication, false);
         }
+        ControlCommand::ObserveLifecycle {
+            transition,
+            observation,
+            reply,
+        } => {
+            let Some(instance) = *node_instance_id else {
+                let _ = reply.send(Err(ControlStateError::DurableStateUnavailable));
+                return;
+            };
+            let result = map_transition_result(
+                repository.observe_lifecycle(instance, transition, observation, now_unix_ms(), ids),
+                publication.healthy,
+                publication.health_signal,
+            );
+            finish_commit(repository, result, reply, &mut publication, false);
+        }
         ControlCommand::Subscribe {
             requested,
             generated_at_unix_ms,
@@ -1634,6 +1731,23 @@ fn process_command(
             };
             let result = map_transition_result(
                 repository.admit(instance, request, now_unix_ms(), ids),
+                publication.healthy,
+                publication.health_signal,
+            );
+            finish_commit(repository, result, reply, &mut publication, true);
+        }
+        #[cfg(test)]
+        ControlCommand::ObserveLifecycleWithSnapshotFailure {
+            transition,
+            observation,
+            reply,
+        } => {
+            let Some(instance) = *node_instance_id else {
+                let _ = reply.send(Err(ControlStateError::DurableStateUnavailable));
+                return;
+            };
+            let result = map_transition_result(
+                repository.observe_lifecycle(instance, transition, observation, now_unix_ms(), ids),
                 publication.healthy,
                 publication.health_signal,
             );
