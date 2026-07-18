@@ -18,6 +18,7 @@ use std::thread;
 pub(crate) struct NodeOwnerGuard {
     paths: NodePaths,
     baseline: Option<ManagedRun>,
+    acquisition_recovery: Option<loxa_core::supervisor::ManagedRecoverySource>,
 }
 
 impl NodeOwnerGuard {
@@ -25,7 +26,26 @@ impl NodeOwnerGuard {
         Self {
             paths,
             baseline: Some(baseline),
+            acquisition_recovery: None,
         }
+    }
+
+    pub(crate) fn from_acquisition(
+        paths: NodePaths,
+        acquisition: loxa_core::supervisor::ManagedOwnerAcquisition,
+    ) -> (Self, loxa_core::supervisor::ManagedScalarSource) {
+        (
+            Self {
+                paths,
+                baseline: Some(acquisition.claimed_run),
+                acquisition_recovery: Some(acquisition.recovery_source),
+            },
+            acquisition.scalar_source,
+        )
+    }
+
+    pub(crate) fn commit_acquisition(&mut self) {
+        self.acquisition_recovery.take();
     }
 
     pub(crate) fn into_baseline(mut self) -> ManagedRun {
@@ -41,10 +61,20 @@ impl NodeOwnerGuard {
     }
 
     pub(crate) fn finish(mut self) -> io::Result<loxa_core::supervisor::ChildlessFinishOutcome> {
-        let baseline = self.baseline.as_ref().expect("node owner guard armed");
-        let outcome =
+        let outcome = if let Some(recovery) = self.acquisition_recovery.take() {
+            let baseline = self.baseline.take().expect("node owner guard armed");
+            loxa_core::supervisor::abort_managed_owner_acquisition(
+                &self.paths.state_path,
+                &baseline,
+                recovery,
+            )
+            .map_err(crate::supervisor_error_to_io)?;
+            loxa_core::supervisor::ChildlessFinishOutcome::Finished
+        } else {
+            let baseline = self.baseline.as_ref().expect("node owner guard armed");
             loxa_core::supervisor::finish_exact_unloaded_owner(&self.paths.state_path, baseline)
-                .map_err(crate::supervisor_error_to_io)?;
+                .map_err(crate::supervisor_error_to_io)?
+        };
         self.baseline.take();
         Ok(outcome)
     }
@@ -55,8 +85,18 @@ impl Drop for NodeOwnerGuard {
         let Some(baseline) = self.baseline.take() else {
             return;
         };
-        let _ =
-            loxa_core::supervisor::finish_exact_unloaded_owner(&self.paths.state_path, &baseline);
+        if let Some(recovery) = self.acquisition_recovery.take() {
+            let _ = loxa_core::supervisor::abort_managed_owner_acquisition(
+                &self.paths.state_path,
+                &baseline,
+                recovery,
+            );
+        } else {
+            let _ = loxa_core::supervisor::finish_exact_unloaded_owner(
+                &self.paths.state_path,
+                &baseline,
+            );
+        }
     }
 }
 
@@ -462,6 +502,111 @@ mod tests {
         assert_eq!(
             managed_servers(&paths).unwrap(),
             ManagedRunsSnapshot::Runs(Vec::new())
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn acquisition_guard_abort_consumes_the_sealed_exact_absence_source() {
+        let root = std::env::temp_dir().join(format!(
+            "loxa-acquisition-owner-guard-{}-{}",
+            std::process::id(),
+            loxa_protocol::NodeInstanceId::new_v4()
+        ));
+        std::fs::create_dir_all(root.join("logs")).unwrap();
+        let paths = NodePaths {
+            models_dir: root.join("models"),
+            state_path: root.join("managed.json"),
+            logs_dir: root.join("logs"),
+        };
+        let owner_pid = std::process::id();
+        let owner_start = loxa_core::supervisor::process_start_time_with_retry(owner_pid).unwrap();
+        let candidate = ManagedRun {
+            schema_version: loxa_core::supervisor::RUNTIME_STATE_SCHEMA_VERSION,
+            run_id: "acquired-owner".into(),
+            model_id: None,
+            owner_pid,
+            owner_process_start_time_unix_s: owner_start,
+            stop_requested: false,
+            lifecycle: loxa_core::supervisor::RunLifecycle::Unloaded,
+            generation: 0,
+            generation_alias: "loxa-acquired-owner-g0".into(),
+            control_port: Some(19_742),
+            port: 19_742,
+            log_path: paths.logs_dir.join("owner.log"),
+            child_pid: None,
+            child_process_start_time_unix_s: None,
+            child_pgid: None,
+        };
+        let acquisition = loxa_core::supervisor::acquire_managed_owner(
+            &paths.state_path,
+            candidate,
+            loxa_core::supervisor::ScalarCaptureMode::FirstMigration,
+        )
+        .unwrap();
+        let (guard, scalar) = NodeOwnerGuard::from_acquisition(paths.clone(), acquisition);
+        assert_eq!(scalar, loxa_core::supervisor::ManagedScalarSource::Fresh);
+        guard.finish().unwrap();
+
+        assert_eq!(
+            crate::managed_servers(&paths).unwrap(),
+            crate::ManagedRunsSnapshot::Runs(Vec::new())
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn acquisition_guard_abort_failure_cannot_fall_back_to_looser_drop_cleanup() {
+        let root = std::env::temp_dir().join(format!(
+            "loxa-acquisition-mismatch-{}-{}",
+            std::process::id(),
+            loxa_protocol::NodeInstanceId::new_v4()
+        ));
+        std::fs::create_dir_all(root.join("logs")).unwrap();
+        let paths = NodePaths {
+            models_dir: root.join("models"),
+            state_path: root.join("managed.json"),
+            logs_dir: root.join("logs"),
+        };
+        let owner_pid = std::process::id();
+        let owner_start = loxa_core::supervisor::process_start_time_with_retry(owner_pid).unwrap();
+        let candidate = ManagedRun {
+            schema_version: loxa_core::supervisor::RUNTIME_STATE_SCHEMA_VERSION,
+            run_id: "mismatched-owner".into(),
+            model_id: None,
+            owner_pid,
+            owner_process_start_time_unix_s: owner_start,
+            stop_requested: false,
+            lifecycle: loxa_core::supervisor::RunLifecycle::Unloaded,
+            generation: 0,
+            generation_alias: "loxa-mismatched-owner-g0".into(),
+            control_port: Some(19_743),
+            port: 19_743,
+            log_path: paths.logs_dir.join("owner.log"),
+            child_pid: None,
+            child_process_start_time_unix_s: None,
+            child_pgid: None,
+        };
+        let acquisition = loxa_core::supervisor::acquire_managed_owner(
+            &paths.state_path,
+            candidate,
+            loxa_core::supervisor::ScalarCaptureMode::FirstMigration,
+        )
+        .unwrap();
+        let (guard, _) = NodeOwnerGuard::from_acquisition(paths.clone(), acquisition);
+        let mut changed = guard.baseline().clone();
+        changed.stop_requested = true;
+        loxa_core::supervisor::update_runtime_state_run(
+            &paths.state_path,
+            &guard.baseline().identity(),
+            changed.clone(),
+        )
+        .unwrap();
+
+        assert!(guard.finish().is_err());
+        assert_eq!(
+            loxa_core::supervisor::read_runtime_state(&paths.state_path).unwrap(),
+            loxa_core::supervisor::RuntimeStateRead::Loaded(vec![changed])
         );
         std::fs::remove_dir_all(root).unwrap();
     }
