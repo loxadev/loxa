@@ -310,11 +310,15 @@ pub(super) mod slice4_migration {
             Self { _root: root, path }
         }
 
-        pub(super) fn connection(&self) -> Connection {
+        pub(crate) fn connection(&self) -> Connection {
             Connection::open(&self.path).unwrap()
         }
 
-        pub(super) fn set_v1_slot(
+        pub(crate) fn path(&self) -> &Path {
+            &self.path
+        }
+
+        pub(crate) fn set_v1_slot(
             &self,
             status: &str,
             model_id: Option<&str>,
@@ -347,7 +351,7 @@ pub(super) mod slice4_migration {
                 .unwrap();
         }
 
-        pub(super) fn set_v1_slot_loading(
+        pub(crate) fn set_v1_slot_loading(
             &self,
             observed_model_id: Option<&str>,
             operation: OperationFixture<'_>,
@@ -398,22 +402,22 @@ pub(super) mod slice4_migration {
                 .unwrap()
         }
 
-        fn logical_snapshot(&self) -> Vec<String> {
+        pub(crate) fn logical_snapshot(&self) -> Vec<String> {
             logical_snapshot(&self.connection())
         }
     }
 
     #[derive(Clone, Copy)]
-    pub(super) struct OperationFixture<'a> {
+    pub(crate) struct OperationFixture<'a> {
         operation_id: &'a str,
         slot_id: &'a str,
-        kind: &'a str,
-        status: &'a str,
-        model_id: Option<&'a str>,
+        pub(crate) kind: &'a str,
+        pub(crate) status: &'a str,
+        pub(crate) model_id: Option<&'a str>,
         created_revision: u64,
     }
 
-    pub(super) fn load_operation(model_id: &str, revision: u64) -> OperationFixture<'_> {
+    pub(crate) fn load_operation(model_id: &str, revision: u64) -> OperationFixture<'_> {
         OperationFixture {
             operation_id: OPERATION_ID,
             slot_id: SLOT_ID,
@@ -424,7 +428,7 @@ pub(super) mod slice4_migration {
         }
     }
 
-    fn unload_operation(revision: u64) -> OperationFixture<'static> {
+    pub(crate) fn unload_operation(revision: u64) -> OperationFixture<'static> {
         OperationFixture {
             operation_id: OPERATION_ID,
             slot_id: SLOT_ID,
@@ -858,6 +862,98 @@ pub(super) mod slice4_migration {
             RepositoryErrorClass::Corrupt
         );
         opened.repository.close().unwrap();
+    }
+
+    fn migrated_operation_mismatch(label: &str) -> (V1Fixture, OpenedV2) {
+        let fixture = V1Fixture::new(label);
+        let mut operation = load_operation("target", 9);
+        operation.kind = "download";
+        fixture.set_v1_slot_loading(None, operation);
+        let opened = fixture.reopen().unwrap();
+        opened.repository.validate_all().unwrap();
+        (fixture, opened)
+    }
+
+    fn assert_migration_recovery_corrupt((_fixture, mut opened): (V1Fixture, OpenedV2), sql: &str) {
+        opened
+            .repository
+            .transaction(|transaction| {
+                transaction.execute_batch(sql)?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            opened.repository.validate_all().unwrap_err().class(),
+            RepositoryErrorClass::Corrupt
+        );
+        opened.repository.close().unwrap();
+    }
+
+    #[test]
+    fn migration_recovery_requires_unknown_desired_kind() {
+        assert_migration_recovery_corrupt(
+            migrated_operation_mismatch("migration-recovery-kind"),
+            "UPDATE slot_intent SET desired_kind='unloaded' WHERE singleton=1",
+        );
+    }
+
+    #[test]
+    fn migration_recovery_requires_a_null_desired_model() {
+        assert_migration_recovery_corrupt(
+            migrated_operation_mismatch("migration-recovery-model"),
+            "UPDATE slot_intent SET desired_kind='loaded',desired_model_id='target' WHERE singleton=1",
+        );
+    }
+
+    #[test]
+    fn migration_recovery_requires_the_observed_slot_revision() {
+        assert_migration_recovery_corrupt(
+            migrated_operation_mismatch("migration-recovery-revision"),
+            "UPDATE slot_intent SET desired_revision='7' WHERE singleton=1",
+        );
+    }
+
+    #[test]
+    fn migration_recovery_requires_the_exact_retained_operation_link() {
+        assert_migration_recovery_corrupt(
+            migrated_operation_mismatch("migration-recovery-operation-link"),
+            "UPDATE slot_intent SET operation_id=NULL WHERE singleton=1",
+        );
+    }
+
+    #[test]
+    fn migration_recovery_reason_must_match_the_legacy_evidence() {
+        assert_migration_recovery_corrupt(
+            migrated_operation_mismatch("migration-recovery-reason"),
+            "UPDATE slot_intent SET reason_code='migration_ambiguous_loading' WHERE singleton=1",
+        );
+    }
+
+    #[test]
+    fn ambiguous_loading_recovery_requires_a_loading_slot() {
+        let fixture = V1Fixture::new("migration-recovery-status");
+        fixture.set_v1_slot_loading(None, load_operation("target", 9));
+        let connection = fixture.connection();
+        connection.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        connection.execute("DELETE FROM operations", []).unwrap();
+        connection.close().unwrap();
+        let opened = fixture.reopen().unwrap();
+        assert_eq!(
+            opened.intent.reason,
+            Some(IntentReason::MigrationAmbiguousLoading)
+        );
+        assert_migration_recovery_corrupt(
+            (fixture, opened),
+            "UPDATE slot_state SET status='unloading',model_id='observed' WHERE singleton=1",
+        );
+    }
+
+    #[test]
+    fn migration_recovery_requires_an_actual_legacy_mismatch() {
+        assert_migration_recovery_corrupt(
+            migrated_operation_mismatch("migration-recovery-exact-operation"),
+            "UPDATE operations SET kind='load' WHERE operation_id='86666666-6666-4666-8666-666666666666'",
+        );
     }
 
     #[test]

@@ -755,6 +755,15 @@ impl ControlStateWorker {
                         &mut ids,
                     )
                     .map_err(|error| ControlStateError::Repository(error.class()))?;
+                    if repository
+                        .requires_specialized_migration_recovery()
+                        .map_err(|error| ControlStateError::Repository(error.class()))?
+                    {
+                        repository
+                            .close()
+                            .map_err(|_| ControlStateError::DurableStateUnavailable)?;
+                        return Err(ControlStateError::DurableStateUnavailable);
+                    }
                     let reconciled = repository
                         .reconcile_offline(evidence, init.now_unix_ms, &mut ids)
                         .map_err(ControlStateError::Transition)?;
