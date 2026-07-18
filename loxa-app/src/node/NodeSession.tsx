@@ -1,9 +1,26 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
-import type { getStatus as defaultGetStatus } from "./client";
+import {
+  type ProvenControlPeer,
+  type cancelV2Operation as defaultCancelV2Operation,
+  type downloadV2Model as defaultDownloadV2Model,
+  type getInventory as defaultGetInventory,
+  type loadV2Slot as defaultLoadV2Slot,
+  type proveV2ControlPeer as defaultProveV2ControlPeer,
+  type unloadV2Slot as defaultUnloadV2Slot,
+} from "../control/client";
+import {
+  applyV2Event,
+  applyV2Snapshot,
+  type ResumeCursor,
+  type V2ControlState,
+  type openV2Events as defaultOpenV2Events,
+} from "../control/events";
+import type { ModelInventoryEntry, V2Operation, V2OperationAccepted } from "../control/contracts";
 import type { NodeStatus } from "./contracts";
-import type { NodeOwnership } from "./machine";
+import type { getStatus as defaultGetStatus } from "./client";
 import type { streamControlEvents as defaultStreamControlEvents } from "../control/events";
+import type { NodeOwnership } from "./machine";
 
 export type BootstrapSnapshot = {
   ownership: NodeOwnership;
@@ -12,9 +29,7 @@ export type BootstrapSnapshot = {
   error: string | null;
 };
 
-export type StartNodeRequest = {
-  endpoint: string;
-};
+export type StartNodeRequest = { endpoint: string };
 
 export type BootstrapApi = {
   snapshot(): Promise<BootstrapSnapshot>;
@@ -25,8 +40,15 @@ export type BootstrapApi = {
 
 export type NodeSessionServices = {
   bootstrap: BootstrapApi;
-  getStatus: typeof defaultGetStatus;
   readControlToken(endpoint: string): Promise<string>;
+  proveV2ControlPeer?: typeof defaultProveV2ControlPeer;
+  openV2Events?: typeof defaultOpenV2Events;
+  getInventory?: typeof defaultGetInventory;
+  downloadV2Model?: typeof defaultDownloadV2Model;
+  loadV2Slot?: typeof defaultLoadV2Slot;
+  unloadV2Slot?: typeof defaultUnloadV2Slot;
+  cancelV2Operation?: typeof defaultCancelV2Operation;
+  getStatus: typeof defaultGetStatus;
   createControlEventStream: typeof defaultStreamControlEvents;
 };
 
@@ -49,6 +71,12 @@ export type NodeSessionValue = {
   status: NodeStatus | null;
   error: string | null;
   proven: boolean;
+  control: V2ControlState | null;
+  getInventory(signal?: AbortSignal): Promise<ModelInventoryEntry[]>;
+  downloadModel(modelId: string): Promise<V2OperationAccepted>;
+  loadModel(modelId: string): Promise<V2OperationAccepted>;
+  unloadModel(): Promise<V2OperationAccepted>;
+  cancelOperation(operationId: string): Promise<V2OperationAccepted>;
   invalidateModelTruth(operationId?: string): void;
   settleModelMutation(operationId: string): Promise<void>;
   refreshStatus(): Promise<boolean>;
@@ -56,18 +84,19 @@ export type NodeSessionValue = {
   stop(): Promise<void>;
 };
 
-type SessionState = Omit<
+type SessionState = Pick<
   NodeSessionValue,
-  "invalidateModelTruth" | "settleModelMutation" | "refreshStatus" | "retry" | "stop"
+  "phase" | "ownership" | "endpoint" | "status" | "error" | "proven" | "control"
 >;
+
+type Authority = { peer: ProvenControlPeer; token: string; endpoint: string };
+type PendingOperation = { kind?: V2Operation["kind"]; modelId?: string | null };
 
 const NodeSessionContext = createContext<NodeSessionValue | null>(null);
 const pendingEnsures = new WeakMap<BootstrapApi, Map<string, Promise<BootstrapSnapshot>>>();
-const MAX_SETTLED_OPERATIONS_PER_EPOCH = 128;
-const MAX_RETRYABLE_TERMINALS_PER_EPOCH = 128;
 const STREAM_RECONNECT_BASE_DELAY_MS = 100;
 const STREAM_RECONNECT_LIMIT = 6;
-type TrackedLifecycleState = "active" | "retryable-terminal";
+const STREAM_RECONNECT_STABLE_MS = 5_000;
 
 function ensureNode(bootstrap: BootstrapApi, endpoint: string) {
   let byEndpoint = pendingEnsures.get(bootstrap);
@@ -77,7 +106,6 @@ function ensureNode(bootstrap: BootstrapApi, endpoint: string) {
   }
   const current = byEndpoint.get(endpoint);
   if (current) return current;
-
   const pending = bootstrap.start({ endpoint });
   byEndpoint.set(endpoint, pending);
   void pending
@@ -96,6 +124,7 @@ function initialState(endpoint: string): SessionState {
     status: null,
     error: null,
     proven: false,
+    control: null,
   };
 }
 
@@ -109,35 +138,57 @@ export function NodeSessionProvider({
   services: NodeSessionServices;
 }) {
   const [state, setState] = useState<SessionState>(() => initialState(endpoint));
+  const [peer, setPeer] = useState<ProvenControlPeer | null>(null);
   const stateRef = useRef(state);
+  const authorityRef = useRef<Authority | null>(null);
+  const controlRef = useRef<V2ControlState | null>(null);
+  const pendingOperationsRef = useRef(new Map<string, PendingOperation>());
   const bootstrapRun = useRef(0);
   const bootstrapController = useRef<AbortController | null>(null);
-  const modelProbeController = useRef<AbortController | null>(null);
   const closingGeneration = useRef(0);
   const stopping = useRef(false);
-  const trackedLifecycleOperations = useRef(new Map<string, TrackedLifecycleState>());
-  const settledLifecycleOperations = useRef(new Map<string, true>());
-  const pendingLifecycleSettlements = useRef(new Map<string, Promise<void>>());
-
-  const resetLifecycleEpoch = useCallback(() => {
-    trackedLifecycleOperations.current.clear();
-    settledLifecycleOperations.current.clear();
-    pendingLifecycleSettlements.current.clear();
-  }, []);
 
   useEffect(() => {
     stateRef.current = state;
   }, [state]);
 
+  const publishControl = useCallback((control: V2ControlState) => {
+    controlRef.current = control;
+    for (const [operationId, pending] of pendingOperationsRef.current) {
+      const operation = control.operations.find((candidate) => candidate.operation_id === operationId);
+      if (
+        operation !== undefined &&
+        isTerminal(operation) &&
+        (pending.kind === undefined || operation.kind === pending.kind) &&
+        (pending.modelId === undefined || operation.model_id === pending.modelId)
+      ) {
+        pendingOperationsRef.current.delete(operationId);
+      }
+    }
+    setState((current) => {
+      const projection = projectControl(control);
+      const pending = pendingOperationsRef.current.size > 0;
+      const next: SessionState = {
+        ...current,
+        ...(pending ? { phase: "reconciling" as const, status: null, error: null } : projection),
+        proven: true,
+        control: pending ? null : control,
+      };
+      stateRef.current = next;
+      return next;
+    });
+  }, []);
+
   const connect = useCallback(async () => {
     stopping.current = false;
     const generation = ++closingGeneration.current;
-    resetLifecycleEpoch();
     const run = ++bootstrapRun.current;
     bootstrapController.current?.abort();
-    modelProbeController.current?.abort();
     const controller = new AbortController();
     bootstrapController.current = controller;
+    authorityRef.current = null;
+    controlRef.current = null;
+    setPeer(null);
     setState((current) => ({
       ...current,
       phase: "starting",
@@ -145,13 +196,13 @@ export function NodeSessionProvider({
       status: null,
       error: null,
       proven: false,
+      control: null,
     }));
 
     try {
       const bootstrap = await ensureNode(services.bootstrap, endpoint);
       if (controller.signal.aborted || run !== bootstrapRun.current || generation !== closingGeneration.current) return;
       if (bootstrap.error) throw new Error(bootstrap.error);
-
       setState((current) => ({
         ...current,
         phase: "starting",
@@ -160,20 +211,30 @@ export function NodeSessionProvider({
         status: null,
         error: null,
         proven: false,
+        control: null,
       }));
-
-      const status = await services.getStatus(bootstrap.endpoint, { signal: controller.signal });
+      const token = await services.readControlToken(bootstrap.endpoint);
       if (controller.signal.aborted || run !== bootstrapRun.current || generation !== closingGeneration.current) return;
-      setState({
-        phase: status.health === "ready" ? "ready" : "unloaded",
+      const proveV2ControlPeer = requireService(services.proveV2ControlPeer, "v2 control proof");
+      const provedPeer = await proveV2ControlPeer(bootstrap.endpoint, token, { signal: controller.signal });
+      if (controller.signal.aborted || run !== bootstrapRun.current || generation !== closingGeneration.current) return;
+      authorityRef.current = { peer: provedPeer, token, endpoint: bootstrap.endpoint };
+      setState((current) => ({
+        ...current,
+        phase: "reconciling",
         ownership: bootstrap.ownership,
         endpoint: bootstrap.endpoint,
-        status,
+        status: null,
         error: null,
         proven: true,
-      });
+        control: null,
+      }));
+      setPeer(provedPeer);
     } catch (error) {
       if (controller.signal.aborted || run !== bootstrapRun.current || generation !== closingGeneration.current) return;
+      authorityRef.current = null;
+      controlRef.current = null;
+      setPeer(null);
       const detail = message(error);
       setState((current) => ({
         ...current,
@@ -181,9 +242,10 @@ export function NodeSessionProvider({
         status: null,
         error: detail,
         proven: false,
+        control: null,
       }));
     }
-  }, [endpoint, resetLifecycleEpoch, services]);
+  }, [endpoint, services]);
 
   useEffect(() => {
     void connect();
@@ -192,187 +254,242 @@ export function NodeSessionProvider({
       closingGeneration.current += 1;
       bootstrapRun.current += 1;
       bootstrapController.current?.abort();
-      modelProbeController.current?.abort();
+      authorityRef.current = null;
+      controlRef.current = null;
     };
   }, [connect]);
 
-  const invalidateModelTruth = useCallback((operationId?: string) => {
-    if (stopping.current) return;
-    if (operationId) rememberActiveOperation(trackedLifecycleOperations.current, operationId);
-    setState((current) => {
-      if (!current.proven && current.phase !== "reconciling") return current;
-      const next = {
+  useEffect(() => {
+    if (peer === null) return;
+    const generation = closingGeneration.current;
+    const openV2Events = requireService(services.openV2Events, "v2 control events");
+    const controller = new AbortController();
+    let disposed = false;
+    let stream: ReturnType<typeof openV2Events> | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+    let stabilityTimer: ReturnType<typeof setTimeout> | undefined;
+    let reconnectAttempts = 0;
+    let resume: ResumeCursor | undefined;
+
+    const isCurrent = () =>
+      !disposed &&
+      !controller.signal.aborted &&
+      !stopping.current &&
+      generation === closingGeneration.current &&
+      authorityRef.current?.peer === peer;
+
+    const markStreamUnavailable = () => {
+      if (!isCurrent()) return;
+      if (stabilityTimer !== undefined) {
+        clearTimeout(stabilityTimer);
+        stabilityTimer = undefined;
+      }
+      controlRef.current = null;
+      setState((current) => ({
         ...current,
         phase: "reconciling",
         status: null,
         error: null,
-        proven: true,
-      } satisfies SessionState;
-      stateRef.current = next;
-      return next;
-    });
-  }, []);
+        control: null,
+      }));
+    };
 
-  const refreshStatus = useCallback(async () => {
-    if (stopping.current) return false;
-    const generation = closingGeneration.current;
-    modelProbeController.current?.abort();
-    const controller = new AbortController();
-    modelProbeController.current = controller;
-    const currentEndpoint = stateRef.current.endpoint;
+    const scheduleReconnect = () => {
+      if (!isCurrent() || reconnectTimer !== undefined) return;
+      if (reconnectAttempts >= STREAM_RECONNECT_LIMIT) {
+        setState((current) => ({
+          ...current,
+          phase: "disconnected",
+          status: null,
+          error: "Durable node updates disconnected.",
+          control: null,
+        }));
+        return;
+      }
+      const delay = Math.min(3_000, STREAM_RECONNECT_BASE_DELAY_MS * 2 ** Math.min(reconnectAttempts, 4));
+      reconnectAttempts += 1;
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = undefined;
+        open();
+      }, delay);
+    };
+
+    const open = () => {
+      if (!isCurrent()) return;
+      const previous = stream;
+      try {
+        stream = openV2Events(
+          peer,
+          resume,
+          {
+            onSnapshot: (snapshot) => {
+              if (!isCurrent()) return;
+              resume = { epoch: snapshot.epoch, cursor: snapshot.stream.cursor };
+              publishControl(applyV2Snapshot(controlRef.current ?? undefined, snapshot));
+              if (stabilityTimer !== undefined) clearTimeout(stabilityTimer);
+              stabilityTimer = setTimeout(() => {
+                if (isCurrent() && controlRef.current !== null) reconnectAttempts = 0;
+              }, STREAM_RECONNECT_STABLE_MS);
+            },
+            onRetainedEvent: () => {
+              // Retained observations never mutate the replacement snapshot.
+            },
+            onEvent: (event) => {
+              if (!isCurrent() || controlRef.current === null) return;
+              const next = applyV2Event(controlRef.current, event);
+              resume = { epoch: next.epoch, cursor: next.cursor };
+              publishControl(next);
+            },
+            onTerminal: (terminal) => {
+              if (!isCurrent() || terminal.kind === "cancelled") return;
+              const current = controlRef.current;
+              if (current !== null) resume = { epoch: current.epoch, cursor: terminal.cursor };
+              markStreamUnavailable();
+              scheduleReconnect();
+            },
+          },
+          controller.signal,
+        );
+        previous?.dispose();
+      } catch {
+        markStreamUnavailable();
+        scheduleReconnect();
+      }
+    };
+
+    open();
+    return () => {
+      disposed = true;
+      controller.abort();
+      if (reconnectTimer !== undefined) clearTimeout(reconnectTimer);
+      if (stabilityTimer !== undefined) clearTimeout(stabilityTimer);
+      stream?.dispose();
+    };
+  }, [peer, publishControl, services]);
+
+  const invalidateModelTruth = useCallback((operationId?: string) => {
+    if (stopping.current) return;
+    if (operationId !== undefined && !pendingOperationsRef.current.has(operationId)) {
+      pendingOperationsRef.current.set(operationId, {});
+    }
     setState((current) => ({
       ...current,
       phase: "reconciling",
       status: null,
       error: null,
-      proven: true,
+      control: null,
     }));
-    try {
-      const status = await services.getStatus(currentEndpoint, { signal: controller.signal });
-      if (controller.signal.aborted || stopping.current || generation !== closingGeneration.current) return false;
-      setState((current) => {
-        const next = {
-          ...current,
-          phase: status.health === "ready" ? "ready" : "unloaded",
-          status,
-          error: null,
-          proven: true,
-        } satisfies SessionState;
-        stateRef.current = next;
-        return next;
-      });
-      return true;
-    } catch (error) {
-      if (controller.signal.aborted || stopping.current || generation !== closingGeneration.current) return false;
-      const detail = message(error);
-      setState((current) => {
-        const next = {
-          ...current,
-          phase: detail.toLowerCase().includes("recovery required") ? "recovery-required" : "error",
-          status: null,
-          error: detail,
-          proven: false,
-        } satisfies SessionState;
-        stateRef.current = next;
-        return next;
-      });
-      return false;
-    }
-  }, [services]);
+  }, []);
+
+  const refreshStatus = useCallback(async () => controlRef.current !== null && authorityRef.current !== null, []);
 
   const settleModelMutation = useCallback(
-    (operationId: string) => {
-      if (stopping.current || settledLifecycleOperations.current.has(operationId)) {
-        return Promise.resolve();
-      }
-      const current = pendingLifecycleSettlements.current.get(operationId);
-      if (current) return current;
-      if (!trackedLifecycleOperations.current.has(operationId)) {
-        return Promise.resolve();
-      }
-      rememberTerminalOperation(trackedLifecycleOperations.current, pendingLifecycleSettlements.current, operationId);
-
-      const generation = closingGeneration.current;
-      const pending = (async () => {
-        if (stopping.current || generation !== closingGeneration.current) return;
-        const proven = await refreshStatus();
-        if (proven && !stopping.current && generation === closingGeneration.current) {
-          rememberSettledOperation(settledLifecycleOperations.current, operationId);
-          trackedLifecycleOperations.current.delete(operationId);
-        }
-      })();
-      pendingLifecycleSettlements.current.set(operationId, pending);
-      void pending.finally(() => {
-        if (pendingLifecycleSettlements.current.get(operationId) === pending) {
-          pendingLifecycleSettlements.current.delete(operationId);
-        }
-      });
-      return pending;
+    async (operationId: string) => {
+      const operation = controlRef.current?.operations.find((candidate) => candidate.operation_id === operationId);
+      if (operation !== undefined && isTerminal(operation)) publishControl(controlRef.current!);
     },
-    [refreshStatus],
+    [publishControl],
   );
 
-  useEffect(() => {
-    if (!state.proven) return;
-    const controller = new AbortController();
-    let disposed = false;
-    let stream: ReturnType<typeof services.createControlEventStream> | null = null;
-    let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
-    let reconnectAttempts = 0;
+  const trackAcceptedOperation = useCallback(
+    (operationId: V2Operation["operation_id"], pending: PendingOperation) => {
+      pendingOperationsRef.current.set(operationId, pending);
+      const current = controlRef.current;
+      if (current !== null) {
+        publishControl(current);
+        return;
+      }
+      setState((state) => ({
+        ...state,
+        phase: "reconciling",
+        status: null,
+        error: null,
+        control: null,
+      }));
+    },
+    [publishControl],
+  );
 
-    const connect = async (cursor: number) => {
-      const token = await services.readControlToken(state.endpoint);
-      if (disposed || controller.signal.aborted) return;
-      const previous = stream;
-      stream = services.createControlEventStream(
-        state.endpoint,
-        token,
-        cursor,
-        {
-          onSnapshot: (snapshot) => {
-            if (disposed) return;
-            reconnectAttempts = 0;
-            const lifecycle = snapshot.operations.filter(isLifecycleOperation);
-            lifecycle
-              .filter((operation) => isActiveOperation(operation.status))
-              .forEach((operation) => invalidateModelTruth(operation.id));
-            lifecycle
-              .filter((operation) => isTerminalOperation(operation.status))
-              .forEach((operation) => {
-                void settleModelMutation(operation.id);
-              });
-          },
-          onEvent: (event) => {
-            if (disposed || stopping.current || !isLifecycleOperation(event.operation)) return;
-            if (isActiveOperation(event.operation.status)) invalidateModelTruth(event.operation.id);
-            else if (isTerminalOperation(event.operation.status)) void settleModelMutation(event.operation.id);
-          },
-          onTerminal: (terminal) => {
-            if (disposed || controller.signal.aborted) return;
-            scheduleReconnect(terminal.cursor);
-          },
-        },
-        controller.signal,
+  const getInventory = useCallback(
+    async (signal?: AbortSignal) => {
+      const authority = requireAuthority(authorityRef.current);
+      return requireService(services.getInventory, "v1 artifact inventory")(
+        authority.endpoint,
+        authority.token,
+        signal === undefined ? {} : { signal },
       );
-      previous?.dispose();
-    };
+    },
+    [services],
+  );
 
-    const scheduleReconnect = (cursor: number) => {
-      if (disposed || controller.signal.aborted || reconnectTimer !== undefined) return;
-      if (reconnectAttempts >= STREAM_RECONNECT_LIMIT) return;
-      const delay = Math.min(3_000, STREAM_RECONNECT_BASE_DELAY_MS * 2 ** Math.min(reconnectAttempts, 4));
-      reconnectAttempts += 1;
-      reconnectTimer = setTimeout(() => {
-        reconnectTimer = undefined;
-        if (disposed || controller.signal.aborted) return;
-        void connect(cursor).catch(() => scheduleReconnect(cursor));
-      }, delay);
-    };
+  const downloadModel = useCallback(
+    async (modelId: string) => {
+      const authority = requireAuthority(authorityRef.current);
+      requireControl(controlRef.current);
+      const accepted = await requireService(services.downloadV2Model, "v2 model download")(authority.peer, modelId);
+      trackAcceptedOperation(accepted.operation_id, { kind: "download", modelId });
+      return accepted;
+    },
+    [services, trackAcceptedOperation],
+  );
 
-    void connect(0).catch(() => scheduleReconnect(0));
-    return () => {
-      disposed = true;
-      controller.abort();
-      if (reconnectTimer !== undefined) clearTimeout(reconnectTimer);
-      stream?.dispose();
-    };
-  }, [invalidateModelTruth, services, settleModelMutation, state.endpoint, state.proven]);
+  const loadModel = useCallback(
+    async (modelId: string) => {
+      const authority = requireAuthority(authorityRef.current);
+      const control = requireControl(controlRef.current);
+      const accepted = await requireService(services.loadV2Slot, "v2 slot load")(
+        authority.peer,
+        control.nodes[0]!.node_id,
+        control.slots[0]!.slot_id,
+        modelId,
+      );
+      trackAcceptedOperation(accepted.operation_id, { kind: "load", modelId });
+      return accepted;
+    },
+    [services, trackAcceptedOperation],
+  );
+
+  const unloadModel = useCallback(async () => {
+    const authority = requireAuthority(authorityRef.current);
+    const control = requireControl(controlRef.current);
+    const accepted = await requireService(services.unloadV2Slot, "v2 slot unload")(
+      authority.peer,
+      control.nodes[0]!.node_id,
+      control.slots[0]!.slot_id,
+    );
+    trackAcceptedOperation(accepted.operation_id, { kind: "unload", modelId: null });
+    return accepted;
+  }, [services, trackAcceptedOperation]);
+
+  const cancelOperation = useCallback(
+    async (operationId: string) => {
+      const authority = requireAuthority(authorityRef.current);
+      const control = requireControl(controlRef.current);
+      const target = control.operations.find((operation) => operation.operation_id === operationId);
+      const accepted = await requireService(services.cancelV2Operation, "v2 operation cancellation")(
+        authority.peer,
+        operationId,
+      );
+      trackAcceptedOperation(
+        accepted.operation_id,
+        target === undefined ? {} : { kind: target.kind, modelId: target.model_id },
+      );
+      return accepted;
+    },
+    [services, trackAcceptedOperation],
+  );
 
   const stop = useCallback(async () => {
     if (stateRef.current.ownership !== "owned") return;
     stopping.current = true;
     closingGeneration.current += 1;
-    resetLifecycleEpoch();
     const run = ++bootstrapRun.current;
     bootstrapController.current?.abort();
-    modelProbeController.current?.abort();
-    setState((current) => ({
-      ...current,
-      phase: "stopping",
-      status: null,
-      error: null,
-      proven: false,
-    }));
+    authorityRef.current = null;
+    controlRef.current = null;
+    pendingOperationsRef.current.clear();
+    setPeer(null);
+    setState((current) => ({ ...current, phase: "stopping", status: null, error: null, proven: false, control: null }));
     try {
       const snapshot = await services.bootstrap.stop();
       if (run !== bootstrapRun.current) return;
@@ -384,27 +501,41 @@ export function NodeSessionProvider({
         status: null,
         error: null,
         proven: false,
+        control: null,
       });
     } catch (error) {
       if (run !== bootstrapRun.current) return;
-      setState((current) => ({
-        ...current,
-        phase: message(error).toLowerCase().includes("recovery required") ? "recovery-required" : "error",
-        error: message(error),
-      }));
+      setState((current) => ({ ...current, phase: "error", error: message(error) }));
     }
-  }, [resetLifecycleEpoch, services.bootstrap]);
+  }, [services.bootstrap]);
 
   const value = useMemo<NodeSessionValue>(
     () => ({
       ...state,
+      getInventory,
+      downloadModel,
+      loadModel,
+      unloadModel,
+      cancelOperation,
       invalidateModelTruth,
       settleModelMutation,
       refreshStatus,
       retry: connect,
       stop,
     }),
-    [connect, invalidateModelTruth, refreshStatus, settleModelMutation, state, stop],
+    [
+      cancelOperation,
+      connect,
+      downloadModel,
+      getInventory,
+      invalidateModelTruth,
+      loadModel,
+      refreshStatus,
+      settleModelMutation,
+      state,
+      stop,
+      unloadModel,
+    ],
   );
 
   return <NodeSessionContext.Provider value={value}>{children}</NodeSessionContext.Provider>;
@@ -418,53 +549,55 @@ export function useNodeSession() {
   return session;
 }
 
+function requireAuthority(authority: Authority | null): Authority {
+  if (authority === null) throw new Error("The proven Loxa control session is unavailable.");
+  return authority;
+}
+
+function requireService<T>(service: T | undefined, name: string): T {
+  if (service === undefined) throw new Error(`The injected ${name} service is unavailable.`);
+  return service;
+}
+
+function requireControl(control: V2ControlState | null): V2ControlState {
+  if (control?.nodes.length !== 1 || control.slots.length !== 1) {
+    throw new Error("The authoritative default slot is unavailable.");
+  }
+  return control;
+}
+
+function projectControl(control: V2ControlState): Pick<SessionState, "phase" | "status" | "error"> {
+  const node = control.nodes[0];
+  const slot = control.slots[0];
+  if (node === undefined || slot === undefined) {
+    return { phase: "error", status: null, error: "The authoritative default slot is unavailable." };
+  }
+  if (node.status === "stopping") {
+    return { phase: "stopping", status: null, error: null };
+  }
+  const phase: NodeSessionPhase =
+    slot.status === "ready"
+      ? "ready"
+      : slot.status === "unloaded"
+        ? "unloaded"
+        : slot.status === "recovery"
+          ? "recovery-required"
+          : "reconciling";
+  const status: NodeStatus = {
+    node_id: node.node_id,
+    health: slot.status === "ready" ? "ready" : "unavailable",
+    model: "loxa",
+    engine: null,
+    runtime_model: slot.status === "ready" ? slot.model_id : null,
+    profile: null,
+  };
+  return { phase, status, error: slot.error?.message ?? null };
+}
+
+function isTerminal(operation: V2Operation): boolean {
+  return operation.status === "succeeded" || operation.status === "failed" || operation.status === "cancelled";
+}
+
 function message(error: unknown) {
   return error instanceof Error ? error.message : String(error);
-}
-
-function isLifecycleOperation(operation: { kind: string }) {
-  return operation.kind === "load" || operation.kind === "unload";
-}
-
-function isActiveOperation(status: string) {
-  return status === "queued" || status === "running";
-}
-
-function isTerminalOperation(status: string) {
-  return status === "succeeded" || status === "failed" || status === "cancelled";
-}
-
-function rememberSettledOperation(operations: Map<string, true>, operationId: string) {
-  operations.delete(operationId);
-  operations.set(operationId, true);
-  while (operations.size > MAX_SETTLED_OPERATIONS_PER_EPOCH) {
-    const oldest = operations.keys().next().value as string | undefined;
-    if (oldest === undefined) break;
-    operations.delete(oldest);
-  }
-}
-
-function rememberActiveOperation(operations: Map<string, TrackedLifecycleState>, operationId: string) {
-  operations.delete(operationId);
-  operations.set(operationId, "active");
-}
-
-function rememberTerminalOperation(
-  operations: Map<string, TrackedLifecycleState>,
-  pending: Map<string, Promise<void>>,
-  operationId: string,
-) {
-  operations.delete(operationId);
-  operations.set(operationId, "retryable-terminal");
-  let retryable = 0;
-  for (const state of operations.values()) {
-    if (state === "retryable-terminal") retryable += 1;
-  }
-  if (retryable <= MAX_RETRYABLE_TERMINALS_PER_EPOCH) return;
-  for (const [candidate, state] of operations) {
-    if (state === "retryable-terminal" && candidate !== operationId && !pending.has(candidate)) {
-      operations.delete(candidate);
-      return;
-    }
-  }
 }

@@ -14,16 +14,18 @@ import {
   streamPersistentTurn,
 } from "../chat/historyClient";
 import {
-  cancelOperation,
-  downloadModel,
+  cancelV2Operation,
+  downloadV2Model,
   getCapabilities,
   getControlNode,
   getInventory,
   getOperation,
   loadModel,
-  unloadModel,
+  loadV2Slot,
+  proveV2ControlPeer,
+  unloadV2Slot,
 } from "../control/client";
-import { streamControlEvents } from "../control/events";
+import { openV2Events, streamControlEvents } from "../control/events";
 import { getModels, getStatus } from "../node/client";
 import type { BootstrapSnapshot, StartNodeRequest } from "../node/NodeSession";
 import type { AppServices } from "./App";
@@ -55,11 +57,14 @@ export const appServices: AppServices = {
   readControlToken: (endpoint: string) => invokeDesktop<string>("read_control_token", { endpoint }),
   getControlNode,
   getInventory,
-  downloadModel,
+  proveV2ControlPeer,
+  openV2Events,
+  downloadV2Model,
+  loadV2Slot,
+  unloadV2Slot,
+  cancelV2Operation,
   loadModel,
-  unloadModel,
   getOperation,
-  cancelOperation,
   createControlEventStream: streamControlEvents,
   createChatStream: streamChat,
   listChats,

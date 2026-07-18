@@ -2,6 +2,7 @@ import type { AppServices } from "@/app/App";
 import type { PersistentTurnTerminal } from "@/chat/historyClient";
 import type { StreamTerminal } from "@/chat/streamChat";
 import type { ControlStreamTerminal } from "@/control/events";
+import { servicesWithControl } from "@/node/testSupport";
 
 const ENDPOINT = "http://127.0.0.1:8080";
 const TOKEN = "ab".repeat(32);
@@ -12,6 +13,7 @@ const pending = <T>() => new Promise<T>(() => undefined);
 export function createAppServicesFixture(overrides: Partial<AppServices> = {}): AppServices {
   const chat = { id: CHAT_ID, title: "New chat", createdAtMs: 1_700_000_000_000, updatedAtMs: 1_700_000_000_000 };
   const services: AppServices = {
+    ...servicesWithControl(),
     bootstrap: {
       snapshot: async () => ({ ownership: "owned", endpoint: ENDPOINT, childRunning: true, error: null }),
       start: async () => ({ ownership: "owned", endpoint: ENDPOINT, childRunning: true, error: null }),
@@ -35,9 +37,7 @@ export function createAppServicesFixture(overrides: Partial<AppServices> = {}): 
     readControlToken: async () => TOKEN,
     getControlNode: async () => ({ status: "unloaded", activeModelId: null, operationId: null, error: null }),
     getInventory: async () => [],
-    downloadModel: async () => ({ operationId: "browser-download" }),
     loadModel: async () => ({ operationId: "browser-load" }),
-    unloadModel: async () => ({ operationId: "browser-unload" }),
     getOperation: async () => ({
       id: "browser-operation",
       kind: "load",
@@ -47,16 +47,6 @@ export function createAppServicesFixture(overrides: Partial<AppServices> = {}): 
       error: null,
       createdAtUnixMs: 1_700_000_000_000,
       updatedAtUnixMs: 1_700_000_000_000,
-    }),
-    cancelOperation: async () => ({
-      id: "browser-operation",
-      kind: "load",
-      status: "cancelled",
-      modelId: "browser-model",
-      progress: null,
-      error: null,
-      createdAtUnixMs: 1_700_000_000_000,
-      updatedAtUnixMs: 1_700_000_000_001,
     }),
     createControlEventStream: () => ({
       cancel: () => undefined,

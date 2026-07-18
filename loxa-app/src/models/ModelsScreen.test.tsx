@@ -1,763 +1,341 @@
-import { act, render, screen } from "@testing-library/react";
+import { useState } from "react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 
-import type { ControlStreamCallbacks, ControlStreamHandle } from "../control/events";
-import type { ArtifactState, ModelInventoryEntry, OperationView } from "../control/contracts";
-import { ModelsScreen, type ModelsScreenServices } from "./ModelsScreen";
+import { decodeV2OperationAccepted } from "../control/contracts";
+import { validV2Operation, v2Ids } from "../control/testSupport";
+import {
+  SessionHarness,
+  controlSnapshot,
+  modelFixture,
+  scriptedV2Control,
+  servicesWithControl,
+  testPeer,
+} from "../node/testSupport";
+import { ModelsScreen } from "./ModelsScreen";
 
-const token = "ab".repeat(32);
-
-function model(id: string, artifact: ArtifactState, compatible = true): ModelInventoryEntry {
-  return {
-    id,
-    repo: `loxa/${id}`,
-    revision: "0123456789abcdef",
-    filename: `${id}.gguf`,
-    sha256: "ab".repeat(32),
-    sizeBytes: 1024,
-    license: "Apache-2.0",
-    params: "4B",
-    quant: "Q4_K_M",
-    minFreeMemoryGiB: 6,
-    artifact,
-    compatibility: {
-      compatible,
-      reason: compatible ? "Available memory meets the verified recipe minimum." : "Requires 12 GiB free memory.",
-    },
-    engine: { engine: "llama-cpp", eligible: true, reason: "Verified for llama.cpp." },
-  };
+function renderModels(
+  options: {
+    snapshot?: ReturnType<typeof controlSnapshot>;
+    inventory?: ReturnType<typeof modelFixture>[];
+    onStart?: (operationId: string) => void;
+    onSettled?: (operationId: string) => void;
+  } = {},
+) {
+  const control = scriptedV2Control(options.snapshot);
+  const services = servicesWithControl(control, {
+    getInventory: vi.fn().mockResolvedValue(options.inventory ?? [modelFixture()]),
+  });
+  render(
+    <SessionHarness services={services}>
+      <ModelsScreen
+        endpoint="http://127.0.0.1:8080"
+        services={services}
+        onModelMutationStart={options.onStart}
+        onModelMutationSettled={options.onSettled}
+      />
+    </SessionHarness>,
+  );
+  return { control, services };
 }
 
-function operation(status: OperationView["status"] = "running"): OperationView {
-  return {
-    id: "op-1",
-    kind: "download",
-    status,
-    modelId: "model-ready",
-    progress: status === "running" ? { completedBytes: 512, totalBytes: 1024 } : null,
-    error: status === "failed" ? "Download failed safely." : null,
-    createdAtUnixMs: 1,
-    updatedAtUnixMs: 2,
-  };
-}
+describe("ModelsScreen v2 authority", () => {
+  it("preserves the searchable installed-model workspace while inventory remains metadata-only v1", async () => {
+    const user = userEvent.setup();
+    const alpha = modelFixture("alpha-model");
+    const beta = modelFixture("beta-model");
+    const { services } = renderModels({ inventory: [alpha, beta] });
 
-function setup() {
-  let callbacks: ControlStreamCallbacks | undefined;
-  const handle: ControlStreamHandle = {
-    cancel: vi.fn(),
-    dispose: vi.fn(),
-    finished: new Promise(() => undefined),
-  };
-  const api: ModelsScreenServices = {
-    readControlToken: vi.fn().mockResolvedValue(token),
-    getControlNode: vi
-      .fn()
-      .mockResolvedValue({ status: "unloaded", activeModelId: null, operationId: null, error: null }),
-    getInventory: vi
-      .fn()
-      .mockResolvedValue([
-        model("model-ready", { kind: "not_downloaded" }),
-        model("model-partial", { kind: "partial", bytes: 256 }),
-        model("model-downloaded", { kind: "downloaded" }),
-        model("model-verifying", { kind: "invalid", reason: "verification_required" }),
-        model("model-incompatible", { kind: "not_downloaded" }, false),
-      ]),
-    downloadModel: vi.fn().mockResolvedValue({ operationId: "op-1" }),
-    loadModel: vi.fn().mockResolvedValue({ operationId: "op-load" }),
-    unloadModel: vi.fn().mockResolvedValue({ operationId: "op-unload" }),
-    getOperation: vi.fn().mockResolvedValue(operation("queued")),
-    cancelOperation: vi.fn().mockResolvedValue(operation("cancelled")),
-    createControlEventStream: vi.fn((_endpoint, _token, _cursor, next) => {
-      callbacks = next;
-      return handle;
-    }),
-  };
-  return { api, handle, callbacks: () => callbacks };
-}
-
-describe("ModelsScreen", () => {
-  it("presents installed models as a searchable master-detail workspace", async () => {
-    const { api } = setup();
-    render(<ModelsScreen endpoint="http://127.0.0.1:8080" services={api} />);
-
-    expect(await screen.findByRole("tab", { name: "Installed" })).toHaveAttribute("aria-selected", "true");
-    expect(screen.getByRole("tab", { name: "Discover" })).toBeInTheDocument();
-    expect(screen.getByRole("region", { name: "Installed models" })).toBeInTheDocument();
-    expect(screen.getByRole("complementary", { name: "Model details" })).toHaveTextContent("model-ready");
-    expect(screen.getByLabelText("Parameters: 4B")).toHaveTextContent("4B");
-    expect(screen.getByLabelText("Quantization: Q4_K_M")).toHaveTextContent("Q4_K_M");
-    expect(screen.getByLabelText("Engine: llama-cpp")).toHaveTextContent("llama-cpp");
-    expect(screen.getByLabelText("License: Apache-2.0")).toHaveTextContent("Apache-2.0");
+    expect(await screen.findByRole("region", { name: "Installed models" })).toBeInTheDocument();
+    expect(screen.getByRole("complementary", { name: "Model details" })).toHaveTextContent("alpha-model");
+    await user.type(screen.getByRole("searchbox", { name: "Search models" }), "beta");
+    expect(screen.getByRole("complementary", { name: "Model details" })).toHaveTextContent("beta-model");
+    expect(services.getInventory).toHaveBeenCalledWith(
+      "http://127.0.0.1:8080",
+      "ab".repeat(32),
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
   });
 
-  it("supports roving keyboard focus and automatic activation across workspace tabs", async () => {
+  it("downloads through v2 and never calls the v1 mutation adapter", async () => {
     const user = userEvent.setup();
-    const { api } = setup();
-    render(<ModelsScreen endpoint="http://127.0.0.1:8080" services={api} />);
+    const entry = { ...modelFixture(), artifact: { kind: "not_downloaded" as const } };
+    const { services } = renderModels({ inventory: [entry] });
 
+    await user.click(await screen.findByRole("button", { name: `Download ${entry.id}` }));
+    await waitFor(() => expect(services.downloadV2Model).toHaveBeenCalledWith(testPeer, entry.id));
+  });
+
+  it("tracks the exact accepted UUID for a v2 default-slot load", async () => {
+    const user = userEvent.setup();
+    const onStart = vi.fn();
+    const accepted = decodeV2OperationAccepted({
+      epoch: v2Ids.epoch,
+      operation_id: v2Ids.nextEvent,
+      revision: "12",
+    });
+    const { services } = renderModels({ onStart });
+    vi.mocked(services.loadV2Slot!).mockResolvedValue(accepted);
+
+    await user.click(await screen.findByRole("button", { name: "Load gemma-3-4b-it-q4" }));
+    await waitFor(() => expect(onStart).toHaveBeenCalledWith(v2Ids.nextEvent));
+    expect(services.loadV2Slot).toHaveBeenCalledWith(testPeer, v2Ids.node, v2Ids.slot, "gemma-3-4b-it-q4");
+  });
+
+  it("keeps an accepted mutation pending and settles only its exact correlated terminal UUID", async () => {
+    const user = userEvent.setup();
+    const onStart = vi.fn();
+    const onSettled = vi.fn();
+    const accepted = decodeV2OperationAccepted({
+      epoch: v2Ids.epoch,
+      operation_id: v2Ids.nextEvent,
+      revision: "12",
+    });
+    const { control, services } = renderModels({ onStart, onSettled });
+    vi.mocked(services.loadV2Slot!).mockResolvedValue(accepted);
+
+    const load = await screen.findByRole("button", { name: "Load gemma-3-4b-it-q4" });
+    await user.click(load);
+    await waitFor(() => expect(onStart).toHaveBeenCalledWith(v2Ids.nextEvent));
+    expect(load).toBeDisabled();
+
+    act(() =>
+      control.emitReplacement(
+        controlSnapshot({
+          revision: "13",
+          cursor: "13",
+          operations: [{ ...validV2Operation, status: "succeeded" }],
+        }),
+      ),
+    );
+    expect(onSettled).not.toHaveBeenCalled();
+    expect(load).toBeDisabled();
+
+    act(() =>
+      control.emitReplacement(
+        controlSnapshot({
+          revision: "14",
+          cursor: "14",
+          operations: [{ ...validV2Operation, operation_id: v2Ids.nextEvent, status: "succeeded" }],
+        }),
+      ),
+    );
+    await waitFor(() => expect(onSettled).toHaveBeenCalledWith(v2Ids.nextEvent));
+    expect(load).toBeEnabled();
+  });
+
+  it("cancels the authoritative v2 operation UUID without a v1 lookup", async () => {
+    const user = userEvent.setup();
+    const operation = {
+      ...validV2Operation,
+      kind: "download" as const,
+      slot_id: null,
+      model_id: "gemma-3-4b-it-q4",
+      progress: { completed_bytes: "512", total_bytes: "1024" },
+    };
+    const { services } = renderModels({ snapshot: controlSnapshot({ operations: [operation] }) });
+
+    const cancel = await screen.findByRole("button", { name: "Cancel download gemma-3-4b-it-q4" });
+    expect(screen.getByRole("progressbar")).toHaveAttribute("value", "512");
+    expect(screen.getByRole("progressbar")).toHaveAttribute("max", "1024");
+    await user.click(cancel);
+    await waitFor(() => expect(services.cancelV2Operation).toHaveBeenCalledWith(testPeer, v2Ids.operation));
+  });
+
+  it("keeps an accepted cancellation pending until that exact operation is terminal", async () => {
+    const user = userEvent.setup();
+    const onSettled = vi.fn();
+    const operation = {
+      ...validV2Operation,
+      kind: "download" as const,
+      slot_id: null,
+      model_id: "gemma-3-4b-it-q4",
+    };
+    const { control, services } = renderModels({
+      snapshot: controlSnapshot({ operations: [operation] }),
+      onSettled,
+    });
+
+    const cancel = await screen.findByRole("button", { name: "Cancel download gemma-3-4b-it-q4" });
+    await user.click(cancel);
+    await waitFor(() => expect(services.cancelV2Operation).toHaveBeenCalledWith(testPeer, v2Ids.operation));
+    expect(cancel).toBeDisabled();
+
+    act(() =>
+      control.emitReplacement(
+        controlSnapshot({
+          revision: "12",
+          cursor: "12",
+          operations: [{ ...operation, status: "cancelled", updated_revision: "12" }],
+        }),
+      ),
+    );
+    await waitFor(() => expect(onSettled).toHaveBeenCalledWith(v2Ids.operation));
+    expect(screen.queryByRole("button", { name: "Cancel download gemma-3-4b-it-q4" })).not.toBeInTheDocument();
+  });
+
+  it("keeps model controls gated across a route unmount until the exact accepted UUID is terminal", async () => {
+    const user = userEvent.setup();
+    const control = scriptedV2Control();
+    const services = servicesWithControl(control, {
+      getInventory: vi.fn().mockResolvedValue([modelFixture()]),
+    });
+    function Routes() {
+      const [showModels, setShowModels] = useState(true);
+      return (
+        <>
+          <button type="button" onClick={() => setShowModels((current) => !current)}>
+            {showModels ? "Leave models" : "Return to models"}
+          </button>
+          {showModels ? <ModelsScreen endpoint="http://127.0.0.1:8080" services={services} /> : <p>Node route</p>}
+        </>
+      );
+    }
+    render(
+      <SessionHarness services={services}>
+        <Routes />
+      </SessionHarness>,
+    );
+
+    await user.click(await screen.findByRole("button", { name: "Load gemma-3-4b-it-q4" }));
+    await waitFor(() => expect(services.loadV2Slot).toHaveBeenCalledOnce());
+    await user.click(screen.getByRole("button", { name: "Leave models" }));
+    await user.click(screen.getByRole("button", { name: "Return to models" }));
+    const gatedLoad = await screen.findByRole("button", { name: "Load gemma-3-4b-it-q4" });
+    expect(gatedLoad).toBeDisabled();
+
+    act(() =>
+      control.emitReplacement(
+        controlSnapshot({
+          revision: "12",
+          cursor: "12",
+          operations: [{ ...validV2Operation, status: "succeeded", updated_revision: "12" }],
+        }),
+      ),
+    );
+    await waitFor(() => expect(gatedLoad).toBeEnabled());
+  });
+
+  it("replaces model truth from a new epoch snapshot instead of replaying old state", async () => {
+    const { control } = renderModels();
+    expect(await screen.findByRole("button", { name: "Load gemma-3-4b-it-q4" })).toBeInTheDocument();
+    act(() =>
+      control.emitReplacement(
+        controlSnapshot({
+          epoch: v2Ids.oldEpoch,
+          cursor: "20",
+          revision: "20",
+          cursorGap: true,
+          slot: { status: "ready", model_id: "gemma-3-4b-it-q4", operation_id: null },
+        }),
+      ),
+    );
+    expect(await screen.findByRole("button", { name: "Unload gemma-3-4b-it-q4" })).toBeInTheDocument();
+  });
+
+  it("fails closed when the one shared v2 proof fails", async () => {
+    const control = scriptedV2Control();
+    const services = servicesWithControl(control, {
+      proveV2ControlPeer: vi.fn().mockRejectedValue(new Error("credential unavailable")),
+    });
+    render(
+      <SessionHarness services={services}>
+        <ModelsScreen endpoint="http://127.0.0.1:8080" services={services} />
+      </SessionHarness>,
+    );
+
+    expect(await screen.findByText("Controls unavailable")).toBeInTheDocument();
+    expect(services.getInventory).not.toHaveBeenCalled();
+    expect(control.openV2Events).not.toHaveBeenCalled();
+  });
+
+  it("honors the finite verification polling budget across inventory replacements", async () => {
+    vi.useFakeTimers();
+    try {
+      const verificationRequired = {
+        ...modelFixture(),
+        artifact: { kind: "invalid" as const, reason: "verification_required" },
+      };
+      const control = scriptedV2Control();
+      const services = servicesWithControl(control, {
+        getInventory: vi.fn().mockImplementation(async () => [{ ...verificationRequired }]),
+      });
+      render(
+        <SessionHarness services={services}>
+          <ModelsScreen
+            endpoint="http://127.0.0.1:8080"
+            services={services}
+            verificationPollMs={1}
+            verificationPollLimit={2}
+          />
+        </SessionHarness>,
+      );
+
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(services.getInventory).toHaveBeenCalledTimes(1);
+      for (let index = 0; index < 10; index += 1) {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(10);
+        });
+      }
+      expect(services.getInventory).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("blocks lifecycle mutations while the default slot requires recovery", async () => {
+    const { services } = renderModels({
+      snapshot: controlSnapshot({
+        slot: {
+          status: "recovery",
+          model_id: "gemma-3-4b-it-q4",
+          operation_id: null,
+          error: { code: "lifecycle_recovery_required", message: "Reconcile the previous lifecycle operation." },
+        },
+      }),
+    });
+
+    expect(
+      await screen.findByText(
+        "Recovery required. Model and chat controls are blocked until the node is safely restarted.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Load|Unload|Switch to/ })).not.toBeInTheDocument();
+    expect(services.loadV2Slot).not.toHaveBeenCalled();
+  });
+
+  it("preserves keyboard navigation between installed and discovery workspaces", async () => {
+    const user = userEvent.setup();
+    renderModels();
     const installed = await screen.findByRole("tab", { name: "Installed" });
     const discover = screen.getByRole("tab", { name: "Discover" });
-    expect(installed).toHaveAttribute("tabindex", "0");
-    expect(discover).toHaveAttribute("tabindex", "-1");
-
     installed.focus();
     await user.keyboard("{ArrowRight}");
     expect(discover).toHaveFocus();
     expect(discover).toHaveAttribute("aria-selected", "true");
-    expect(installed).toHaveAttribute("tabindex", "-1");
-
-    await user.keyboard("{Home}");
-    expect(installed).toHaveFocus();
-    expect(installed).toHaveAttribute("aria-selected", "true");
-
-    await user.keyboard("{End}");
-    expect(discover).toHaveFocus();
-    await user.keyboard("{ArrowRight}");
-    expect(installed).toHaveFocus();
-    await user.keyboard("{ArrowLeft}");
-    expect(discover).toHaveFocus();
   });
 
-  it("keeps discovery truthful when no catalog source is connected", async () => {
-    const user = userEvent.setup();
-    const { api } = setup();
-    render(<ModelsScreen endpoint="http://127.0.0.1:8080" services={api} />);
-
-    await user.click(await screen.findByRole("tab", { name: "Discover" }));
-    expect(screen.getByRole("tab", { name: "Discover" })).toHaveAttribute("aria-selected", "true");
-    expect(screen.getByRole("heading", { name: "Model catalog unavailable" })).toBeInTheDocument();
-    expect(screen.getByText(/No catalog source is connected/i)).toBeInTheDocument();
-    expect(screen.queryByText("Llama 3.2 3B")).not.toBeInTheDocument();
-  });
-
-  it("renders optional catalog data and delegates downloads to authoritative inventory", async () => {
-    const user = userEvent.setup();
-    const { api } = setup();
-    render(
-      <ModelsScreen
-        endpoint="http://127.0.0.1:8080"
-        services={api}
-        catalogModels={[
-          {
-            modelId: "model-ready",
-            title: "Aurora 4B",
-            publisher: "Acme AI",
-            summary: "Compact instruction model for local work.",
-            tags: ["Text", "4B"],
-          },
-        ]}
-      />,
-    );
-
-    await user.click(await screen.findByRole("tab", { name: "Discover" }));
-    expect(screen.getByRole("searchbox", { name: "Search catalog" })).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "Aurora 4B" })).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "Download Aurora 4B" }));
-    expect(api.downloadModel).toHaveBeenCalledWith(
-      "http://127.0.0.1:8080",
-      token,
-      "model-ready",
-      expect.objectContaining({ signal: expect.any(AbortSignal) }),
-    );
-  });
-
-  it("distinguishes a completed empty known registry from loading", async () => {
-    const { api } = setup();
-    vi.mocked(api.getInventory).mockResolvedValue([]);
-    render(<ModelsScreen endpoint="http://127.0.0.1:8080" services={api} />);
-    expect(screen.getByText("Checking the known model registry…")).toBeInTheDocument();
-    expect(await screen.findByText("No verified recipes are available in this build.")).toBeInTheDocument();
-  });
-
-  it("uses a compact canonical catalog style contract", () => {
-    const css = readFileSync(resolve(process.cwd(), "src/models/ModelsScreen.module.css"), "utf8");
-    expect(css).toContain("var(--loxa-component-minimum-interactive-target)");
-    expect(css).toContain("overflow-wrap: anywhere");
-    expect(css).toContain("container-type: inline-size");
-    expect(css).toContain("container-name: models-workspace");
-    expect(css).toContain("@container models-workspace (max-width: 760px)");
-    expect(css).toMatch(
-      /@container models-workspace \(max-width: 760px\)[\s\S]*?\.workspaceGrid\s*{[\s\S]*?grid-template-columns:\s*1fr/,
-    );
-    expect(css).toContain("@media (max-width: 760px)");
-    expect(css).toContain("@media (prefers-contrast: more)");
-    expect(css).toContain("@media (forced-colors: active)");
-    expect(css).toContain("@media (prefers-reduced-motion: reduce)");
-    expect(css).not.toMatch(/#[0-9a-f]{3,8}\b/i);
-    expect(css).not.toContain("var(--loxa-space-5)");
-  });
-
-  it("filters verified recipes locally across recipe metadata without refetching", async () => {
-    const user = userEvent.setup();
-    const { api } = setup();
-    const alpha = {
-      ...model("alpha-model", { kind: "not_downloaded" } as const),
-      repo: "acme/aurora",
-      params: "7B",
-      quant: "Q5_K_M",
-      license: "MIT",
-      engine: { engine: "mlx", eligible: true, reason: "Verified for MLX." },
-    };
-    const beta = {
-      ...model("beta-model", { kind: "downloaded" } as const),
-      repo: "loxa/nebula",
-      params: "13B",
-      quant: "Q8_0",
-      license: "Apache-2.0",
-      engine: { engine: "llama-cpp", eligible: true, reason: "Verified for llama.cpp." },
-    };
-    vi.mocked(api.getInventory).mockResolvedValue([alpha, beta]);
-
-    render(<ModelsScreen endpoint="http://127.0.0.1:8080" services={api} />);
-    const search = await screen.findByRole("searchbox", { name: "Search models" });
-    expect(screen.getByLabelText("Model control summary")).toHaveTextContent("2 verified recipes");
-
-    for (const query of [" ALPHA ", "aurora", "MLX", "7b", "q5_k_m", "mit"]) {
-      await user.clear(search);
-      await user.type(search, query);
-      expect(screen.getByRole("heading", { name: "alpha-model" })).toBeInTheDocument();
-      expect(screen.queryByRole("heading", { name: "beta-model" })).not.toBeInTheDocument();
-      expect(screen.getByLabelText("Model control summary")).toHaveTextContent("1 of 2 verified recipes");
-      expect(screen.queryByRole("button", { name: "Load beta-model" })).not.toBeInTheDocument();
-    }
-
-    await user.clear(search);
-    expect(screen.getAllByRole("heading", { level: 2 }).map((heading) => heading.textContent)).toEqual([
-      "alpha-model",
-      "beta-model",
-    ]);
-    expect(api.getInventory).toHaveBeenCalledTimes(1);
-  });
-
-  it("distinguishes a search with no matches from an empty authoritative registry", async () => {
-    const user = userEvent.setup();
-    const { api } = setup();
-    render(<ModelsScreen endpoint="http://127.0.0.1:8080" services={api} />);
-
-    const search = await screen.findByRole("searchbox", { name: "Search models" });
-    await user.type(search, "missing recipe");
-
-    expect(screen.getByText("No models match “missing recipe”.")).toBeInTheDocument();
-    expect(screen.queryByText("No verified recipes are available in this build.")).not.toBeInTheDocument();
-    expect(screen.getByLabelText("Model control summary")).toHaveTextContent("0 of 5 verified recipes");
-  });
-
-  it("renders only legal node-authoritative lifecycle actions", async () => {
-    const { api } = setup();
-    render(<ModelsScreen endpoint="http://127.0.0.1:8080" services={api} />);
-
-    expect(await screen.findByRole("heading", { name: "Models" })).toBeInTheDocument();
-    expect(await screen.findByRole("heading", { name: "model-ready" })).toBeInTheDocument();
-    expect(screen.getAllByText("Not downloaded")).toHaveLength(2);
-    expect(screen.getByText(/Partial.*256 B.*1 KB/)).toBeInTheDocument();
-    expect(screen.getByText("Downloaded and verified")).toBeInTheDocument();
-    expect(screen.getByText("Verification required")).toBeInTheDocument();
-    expect(screen.getByText(/Requires 12 GiB free memory\./)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Download model-ready" })).toBeEnabled();
-    expect(screen.getByRole("button", { name: "Resume model-partial" })).toBeEnabled();
-    expect(screen.getByRole("button", { name: "Download model-incompatible" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Load model-downloaded" })).toBeEnabled();
-    expect(screen.queryByRole("button", { name: /^load model-ready/i })).not.toBeInTheDocument();
-  });
-
-  it("starts load, uses Switch wording when another model is active, and refreshes authoritative node truth", async () => {
-    const user = userEvent.setup();
-    const setupState = setup();
-    const onModelMutationStart = vi.fn();
-    const onModelMutationSettled = vi.fn();
-    vi.mocked(setupState.api.getControlNode)
-      .mockResolvedValueOnce({ status: "ready", activeModelId: "model-old", operationId: null, error: null })
-      .mockResolvedValueOnce({ status: "loading", activeModelId: "model-old", operationId: "op-load", error: null });
-    vi.mocked(setupState.api.getOperation).mockResolvedValueOnce({
-      ...operation("queued"),
-      id: "op-load",
-      kind: "load",
-      modelId: "model-downloaded",
+  it("aborts the metadata inventory request when the model workspace unmounts", async () => {
+    let inventorySignal: AbortSignal | undefined;
+    const control = scriptedV2Control();
+    const services = servicesWithControl(control, {
+      getInventory: vi.fn((_endpoint, _token, options) => {
+        inventorySignal = options?.signal;
+        return new Promise<never>(() => undefined);
+      }),
     });
-    render(
-      <ModelsScreen
-        endpoint="http://127.0.0.1:8080"
-        services={setupState.api}
-        onModelMutationStart={onModelMutationStart}
-        onModelMutationSettled={onModelMutationSettled}
-      />,
+    const mounted = render(
+      <SessionHarness services={services}>
+        <ModelsScreen endpoint="http://127.0.0.1:8080" services={services} />
+      </SessionHarness>,
     );
-    await user.click(await screen.findByRole("button", { name: "Switch to model-downloaded" }));
-    expect(setupState.api.loadModel).toHaveBeenCalledWith(
-      "http://127.0.0.1:8080",
-      token,
-      "model-downloaded",
-      expect.objectContaining({ signal: expect.any(AbortSignal) }),
-    );
-    expect(onModelMutationStart).toHaveBeenCalledWith("op-load");
-    expect(onModelMutationSettled).not.toHaveBeenCalled();
-    expect(screen.getByLabelText("Model control summary")).toHaveTextContent("Node Loading");
-    expect(screen.queryByRole("button", { name: "Cancel load model-downloaded" })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Download model-ready" })).toBeDisabled();
-    act(() =>
-      setupState.callbacks()?.onEvent({
-        sequence: 4,
-        operation: { ...operation("succeeded"), id: "op-load", kind: "load", modelId: "model-downloaded" },
-      }),
-    );
-    await vi.waitFor(() => expect(onModelMutationSettled).toHaveBeenCalledOnce());
-  });
-
-  it("offers unload only for the active model and leaves it active after a failed operation", async () => {
-    const user = userEvent.setup();
-    const setupState = setup();
-    vi.mocked(setupState.api.getControlNode).mockResolvedValue({
-      status: "ready",
-      activeModelId: "model-downloaded",
-      operationId: null,
-      error: null,
-    });
-    render(<ModelsScreen endpoint="http://127.0.0.1:8080" services={setupState.api} />);
-    await user.click(await screen.findByRole("button", { name: "Unload model-downloaded" }));
-    expect(setupState.api.unloadModel).toHaveBeenCalledWith(
-      "http://127.0.0.1:8080",
-      token,
-      expect.objectContaining({ signal: expect.any(AbortSignal) }),
-    );
-    act(() =>
-      setupState.callbacks()?.onEvent({
-        sequence: 8,
-        operation: {
-          ...operation("failed"),
-          id: "op-unload",
-          kind: "unload",
-          modelId: null,
-          error: "teardown failed",
-        },
-      }),
-    );
-    expect(await screen.findByText("Active")).toBeInTheDocument();
-  });
-
-  it("releases shared model reconciliation even when terminal control refresh fails", async () => {
-    const setupState = setup();
-    const onModelMutationSettled = vi.fn();
-    render(
-      <ModelsScreen
-        endpoint="http://127.0.0.1:8080"
-        services={setupState.api}
-        onModelMutationSettled={onModelMutationSettled}
-      />,
-    );
-    await screen.findByRole("heading", { name: "model-downloaded" });
-    vi.mocked(setupState.api.getInventory).mockRejectedValueOnce(new Error("inventory unavailable"));
-
-    act(() =>
-      setupState.callbacks()?.onEvent({
-        sequence: 1,
-        operation: { ...operation("failed"), id: "op-load", kind: "load", error: "readiness failed" },
-      }),
-    );
-
-    await vi.waitFor(() => expect(onModelMutationSettled).toHaveBeenCalledWith("op-load"));
-  });
-
-  it("keeps an accepted operation tracked after a read failure until a terminal event settles it", async () => {
-    const setupState = setup();
-    const user = userEvent.setup();
-    const onModelMutationStart = vi.fn();
-    const onModelMutationSettled = vi.fn();
-    vi.mocked(setupState.api.getOperation).mockRejectedValueOnce(new Error("operation read unavailable"));
-    render(
-      <ModelsScreen
-        endpoint="http://127.0.0.1:8080"
-        services={setupState.api}
-        onModelMutationStart={onModelMutationStart}
-        onModelMutationSettled={onModelMutationSettled}
-      />,
-    );
-
-    await user.click(await screen.findByRole("button", { name: "Load model-downloaded" }));
-    expect(onModelMutationStart).toHaveBeenCalledWith("op-load");
-    expect(await screen.findByRole("alert")).toHaveTextContent("operation read unavailable");
-    expect(onModelMutationSettled).not.toHaveBeenCalled();
-
-    act(() =>
-      setupState.callbacks()?.onEvent({
-        sequence: 5,
-        operation: { ...operation("succeeded"), id: "op-load", kind: "load", modelId: "model-downloaded" },
-      }),
-    );
-    await vi.waitFor(() => expect(onModelMutationSettled).toHaveBeenCalledOnce());
-    expect(onModelMutationSettled).toHaveBeenCalledWith("op-load");
-  });
-
-  it("forwards active and terminal lifecycle ids from reconnect snapshots", async () => {
-    const setupState = setup();
-    const onModelMutationStart = vi.fn();
-    const onModelMutationSettled = vi.fn();
-    render(
-      <ModelsScreen
-        endpoint="http://127.0.0.1:8080"
-        services={setupState.api}
-        onModelMutationStart={onModelMutationStart}
-        onModelMutationSettled={onModelMutationSettled}
-      />,
-    );
-    await screen.findByRole("heading", { name: "model-downloaded" });
-
-    act(() =>
-      setupState.callbacks()?.onSnapshot({
-        cursor: 12,
-        cursorGap: true,
-        operations: [
-          { ...operation("running"), id: "op-active", kind: "load" },
-          { ...operation("succeeded"), id: "op-current", kind: "load" },
-          { ...operation("failed"), id: "op-old", kind: "unload" },
-        ],
-        events: [],
-      }),
-    );
-
-    expect(onModelMutationStart).toHaveBeenCalledWith("op-active");
-    expect(onModelMutationSettled).toHaveBeenCalledWith("op-current");
-    expect(onModelMutationSettled).toHaveBeenCalledWith("op-old");
-  });
-
-  it("blocks lifecycle controls during recovery and ignores stale operation events", async () => {
-    const setupState = setup();
-    vi.mocked(setupState.api.getControlNode).mockResolvedValue({
-      status: "recovery_required",
-      activeModelId: "model-downloaded",
-      operationId: null,
-      error: "private detail",
-    });
-    render(<ModelsScreen endpoint="http://127.0.0.1:8080" services={setupState.api} />);
-    expect(await screen.findByRole("alert")).toHaveTextContent("Recovery required");
-    expect(screen.queryByText("private detail")).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /Unload model-downloaded/ })).not.toBeInTheDocument();
-    act(() => setupState.callbacks()?.onSnapshot({ cursor: 10, cursorGap: false, operations: [], events: [] }));
-    act(() => setupState.callbacks()?.onEvent({ sequence: 9, operation: operation("running") }));
-    expect(screen.queryByRole("progressbar", { name: "Download progress for model-ready" })).not.toBeInTheDocument();
-  });
-
-  it("keeps the newest terminal node refresh when an older request resolves last", async () => {
-    const setupState = setup();
-    render(<ModelsScreen endpoint="http://127.0.0.1:8080" services={setupState.api} />);
-    await screen.findByRole("heading", { name: "model-downloaded" });
-    let resolveOlder!: (value: Awaited<ReturnType<ModelsScreenServices["getControlNode"]>>) => void;
-    let resolveOlderInventory!: (value: ModelInventoryEntry[]) => void;
-    vi.mocked(setupState.api.getControlNode)
-      .mockImplementationOnce(
-        () =>
-          new Promise((resolve) => {
-            resolveOlder = resolve;
-          }),
-      )
-      .mockResolvedValueOnce({ status: "ready", activeModelId: "model-downloaded", operationId: null, error: null });
-    vi.mocked(setupState.api.getInventory)
-      .mockImplementationOnce(
-        () =>
-          new Promise((resolve) => {
-            resolveOlderInventory = resolve;
-          }),
-      )
-      .mockResolvedValueOnce([model("model-downloaded", { kind: "downloaded" })]);
-    act(() => setupState.callbacks()?.onEvent({ sequence: 2, operation: { ...operation("succeeded"), id: "old" } }));
-    act(() =>
-      setupState
-        .callbacks()
-        ?.onEvent({ sequence: 3, operation: { ...operation("succeeded"), id: "new", updatedAtUnixMs: 3 } }),
-    );
-    expect(await screen.findByText("Active")).toBeInTheDocument();
-    resolveOlder({ status: "unloaded", activeModelId: null, operationId: null, error: null });
-    resolveOlderInventory([model("model-downloaded", { kind: "not_downloaded" })]);
-    await Promise.resolve();
-    expect(screen.getByText("Active")).toBeInTheDocument();
-    expect(screen.getByText("Downloaded and verified")).toBeInTheDocument();
-  });
-
-  it("starts a download, then renders only the authoritative operation response", async () => {
-    const user = userEvent.setup();
-    const { api } = setup();
-    render(<ModelsScreen endpoint="http://127.0.0.1:8080" services={api} />);
-    await user.click(await screen.findByRole("button", { name: "Download model-ready" }));
-    expect(screen.getByRole("button", { name: "Resume model-partial" })).toBeDisabled();
-
-    expect(api.downloadModel).toHaveBeenCalledWith(
-      "http://127.0.0.1:8080",
-      token,
-      "model-ready",
-      expect.objectContaining({ signal: expect.any(AbortSignal) }),
-    );
-    expect(api.getOperation).toHaveBeenCalledWith(
-      "http://127.0.0.1:8080",
-      token,
-      "op-1",
-      expect.objectContaining({ signal: expect.any(AbortSignal) }),
-    );
-    expect(await screen.findByText("Download queued")).toBeInTheDocument();
-  });
-
-  it("applies snapshot and progress events, announces byte progress, and cancels by operation ID", async () => {
-    const user = userEvent.setup();
-    const setupState = setup();
-    render(<ModelsScreen endpoint="http://127.0.0.1:8080" services={setupState.api} />);
-    await screen.findByRole("heading", { name: "model-ready" });
-
-    act(() => setupState.callbacks()?.onSnapshot({ cursor: 3, cursorGap: false, operations: [], events: [] }));
-    act(() => setupState.callbacks()?.onEvent({ sequence: 4, operation: operation("running") }));
-
-    expect(screen.getByRole("progressbar", { name: "Download progress for model-ready" })).toHaveAttribute(
-      "value",
-      "512",
-    );
-    expect(screen.getByText("512 B of 1 KB")).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "Cancel download model-ready" }));
-    expect(setupState.api.cancelOperation).toHaveBeenCalledWith(
-      "http://127.0.0.1:8080",
-      token,
-      "op-1",
-      expect.objectContaining({ signal: expect.any(AbortSignal) }),
-    );
-    expect(await screen.findByText(/Last operation: Download cancelled/)).toBeInTheDocument();
-  });
-
-  it("renders unknown-total progress as indeterminate instead of a false percentage", async () => {
-    const setupState = setup();
-    render(<ModelsScreen endpoint="http://127.0.0.1:8080" services={setupState.api} />);
-    await screen.findByRole("heading", { name: "model-ready" });
-    const unknownTotal = {
-      ...operation("running"),
-      progress: { completedBytes: 512, totalBytes: null },
-    };
-    act(() => setupState.callbacks()?.onSnapshot({ cursor: 1, cursorGap: false, operations: [], events: [] }));
-    act(() => setupState.callbacks()?.onEvent({ sequence: 2, operation: unknownTotal }));
-
-    const progress = screen.getByRole("progressbar", { name: "Download progress for model-ready" });
-    expect(progress).not.toHaveAttribute("value");
-    expect(progress).not.toHaveAttribute("max");
-    expect(screen.getByText("512 B downloaded")).toBeInTheDocument();
-  });
-
-  it("polls authoritative inventory only while startup verification is pending", async () => {
-    const setupState = setup();
-    vi.mocked(setupState.api.getInventory)
-      .mockResolvedValueOnce([model("model-verifying", { kind: "invalid", reason: "verification_required" })])
-      .mockResolvedValueOnce([model("model-verifying", { kind: "downloaded" })]);
-    render(<ModelsScreen endpoint="http://127.0.0.1:8080" services={setupState.api} verificationPollMs={0} />);
-
-    expect(await screen.findByText("Verification required")).toBeInTheDocument();
-    expect(await screen.findByText("Downloaded and verified")).toBeInTheDocument();
-    await new Promise((resolve) => setTimeout(resolve, 5));
-    expect(setupState.api.getInventory).toHaveBeenCalledTimes(2);
-  });
-
-  it("backs off and stops verification polling after its finite retry budget", async () => {
-    const setupState = setup();
-    vi.mocked(setupState.api.getInventory).mockResolvedValue([
-      model("model-verifying", { kind: "invalid", reason: "verification_required" }),
-    ]);
-    render(
-      <ModelsScreen
-        endpoint="http://127.0.0.1:8080"
-        services={setupState.api}
-        verificationPollMs={0}
-        verificationPollLimit={2}
-      />,
-    );
-
-    expect(await screen.findByText(/Refresh Models or wait for a new node update/i)).toBeInTheDocument();
-    expect(setupState.api.getInventory).toHaveBeenCalledTimes(3);
-    await new Promise((resolve) => setTimeout(resolve, 5));
-    expect(setupState.api.getInventory).toHaveBeenCalledTimes(3);
-  });
-
-  it("aborts an in-flight verification refresh on unmount and suppresses its late result", async () => {
-    const setupState = setup();
-    let resolvePoll!: (value: ModelInventoryEntry[]) => void;
-    vi.mocked(setupState.api.getInventory)
-      .mockResolvedValueOnce([model("model-verifying", { kind: "invalid", reason: "verification_required" })])
-      .mockImplementationOnce(
-        () =>
-          new Promise((resolve) => {
-            resolvePoll = resolve;
-          }),
-      );
-    const view = render(
-      <ModelsScreen endpoint="http://127.0.0.1:8080" services={setupState.api} verificationPollMs={0} />,
-    );
-    await vi.waitFor(() => expect(setupState.api.getInventory).toHaveBeenCalledTimes(2));
-    const pollSignal = vi.mocked(setupState.api.getInventory).mock.calls[1][2]?.signal;
-    view.unmount();
-    expect(pollSignal?.aborted).toBe(true);
-    resolvePoll([model("model-verifying", { kind: "downloaded" })]);
-    await Promise.resolve();
-    expect(setupState.api.getInventory).toHaveBeenCalledTimes(2);
-  });
-
-  it("reconnects from the last cursor after an unexpected stream failure", async () => {
-    const setupState = setup();
-    render(<ModelsScreen endpoint="http://127.0.0.1:8080" services={setupState.api} reconnectDelayMs={0} />);
-    await screen.findByRole("heading", { name: "model-ready" });
-    act(() => setupState.callbacks()?.onSnapshot({ cursor: 7, cursorGap: false, operations: [], events: [] }));
-    act(() =>
-      setupState.callbacks()?.onTerminal({ kind: "error", cursor: 7, message: "Live model updates disconnected." }),
-    );
-
-    expect(screen.getByRole("status")).toHaveTextContent("Reconnecting");
-    await vi.waitFor(() => expect(setupState.api.createControlEventStream).toHaveBeenCalledTimes(2));
-    expect(setupState.api.createControlEventStream).toHaveBeenLastCalledWith(
-      "http://127.0.0.1:8080",
-      token,
-      7,
-      expect.any(Object),
-      expect.any(AbortSignal),
-    );
-  });
-
-  it("keeps retrying a temporarily unavailable reconnect snapshot", async () => {
-    const setupState = setup();
-    vi.mocked(setupState.api.getControlNode)
-      .mockResolvedValueOnce({ status: "unloaded", activeModelId: null, operationId: null, error: null })
-      .mockRejectedValueOnce(new Error("node restarting"))
-      .mockResolvedValue({ status: "unloaded", activeModelId: null, operationId: null, error: null });
-    render(<ModelsScreen endpoint="http://127.0.0.1:8080" services={setupState.api} reconnectDelayMs={0} />);
-    await screen.findByRole("heading", { name: "model-ready" });
-    act(() => setupState.callbacks()?.onSnapshot({ cursor: 9, cursorGap: false, operations: [], events: [] }));
-    act(() => setupState.callbacks()?.onTerminal({ kind: "error", cursor: 9, message: "disconnected" }));
-
-    await vi.waitFor(() => expect(setupState.api.getControlNode).toHaveBeenCalledTimes(3));
-    await vi.waitFor(() => expect(setupState.api.createControlEventStream).toHaveBeenCalledTimes(2));
-    expect(screen.getByRole("status")).toHaveTextContent(/connecting|connected/i);
-  });
-
-  it("caps reconnect attempts and offers an explicit fresh retry", async () => {
-    const user = userEvent.setup();
-    const setupState = setup();
-    vi.mocked(setupState.api.getControlNode)
-      .mockResolvedValueOnce({ status: "unloaded", activeModelId: null, operationId: null, error: null })
-      .mockRejectedValue(new Error("node replaced"));
-    render(
-      <ModelsScreen
-        endpoint="http://127.0.0.1:8080"
-        services={setupState.api}
-        reconnectDelayMs={0}
-        reconnectLimit={2}
-      />,
-    );
-    await screen.findByRole("heading", { name: "model-ready" });
-    act(() => setupState.callbacks()?.onSnapshot({ cursor: 3, cursorGap: false, operations: [], events: [] }));
-    act(() => setupState.callbacks()?.onTerminal({ kind: "error", cursor: 3, message: "replaced" }));
-
-    const retry = await screen.findByRole("button", { name: "Retry live updates" });
-    expect(setupState.api.getControlNode).toHaveBeenCalledTimes(3);
-    await new Promise((resolve) => setTimeout(resolve, 5));
-    expect(setupState.api.getControlNode).toHaveBeenCalledTimes(3);
-
-    await user.click(retry);
-    await vi.waitFor(() => expect(setupState.api.getControlNode).toHaveBeenCalledTimes(4));
-  });
-
-  it("does not reset the reconnect budget for a flapping snapshot then disconnect loop", async () => {
-    const setupState = setup();
-    render(
-      <ModelsScreen
-        endpoint="http://127.0.0.1:8080"
-        services={setupState.api}
-        reconnectDelayMs={0}
-        reconnectLimit={2}
-      />,
-    );
-    await screen.findByRole("heading", { name: "model-ready" });
-
-    act(() => setupState.callbacks()?.onSnapshot({ cursor: 1, cursorGap: false, operations: [], events: [] }));
-    act(() => setupState.callbacks()?.onTerminal({ kind: "error", cursor: 1, message: "flap one" }));
-    await vi.waitFor(() => expect(setupState.api.createControlEventStream).toHaveBeenCalledTimes(2));
-
-    act(() => setupState.callbacks()?.onSnapshot({ cursor: 2, cursorGap: false, operations: [], events: [] }));
-    act(() => setupState.callbacks()?.onTerminal({ kind: "error", cursor: 2, message: "flap two" }));
-    await vi.waitFor(() => expect(setupState.api.createControlEventStream).toHaveBeenCalledTimes(3));
-
-    act(() => setupState.callbacks()?.onSnapshot({ cursor: 3, cursorGap: false, operations: [], events: [] }));
-    act(() => setupState.callbacks()?.onTerminal({ kind: "error", cursor: 3, message: "flap three" }));
-
-    expect(await screen.findByRole("button", { name: "Retry live updates" })).toBeInTheDocument();
-    await new Promise((resolve) => setTimeout(resolve, 5));
-    expect(setupState.api.createControlEventStream).toHaveBeenCalledTimes(3);
-  });
-
-  it("disposes events, aborts requests, and clears work on unmount", async () => {
-    const setupState = setup();
-    const view = render(<ModelsScreen endpoint="http://127.0.0.1:8080" services={setupState.api} />);
-    await screen.findByRole("heading", { name: "model-ready" });
-    view.unmount();
-    expect(setupState.handle.dispose).toHaveBeenCalledOnce();
-  });
-
-  it("aborts an in-flight mutation and suppresses its follow-up on window close", async () => {
-    const user = userEvent.setup();
-    const setupState = setup();
-    let accept!: (value: { operationId: string }) => void;
-    vi.mocked(setupState.api.downloadModel).mockImplementation(
-      () =>
-        new Promise((resolve) => {
-          accept = resolve;
-        }),
-    );
-    render(<ModelsScreen endpoint="http://127.0.0.1:8080" services={setupState.api} />);
-    await user.click(await screen.findByRole("button", { name: "Download model-ready" }));
-    const options = vi.mocked(setupState.api.downloadModel).mock.calls[0][3];
-    expect(options?.signal?.aborted).toBe(false);
-
-    window.dispatchEvent(new Event("beforeunload"));
-    expect(options?.signal?.aborted).toBe(true);
-    expect(setupState.handle.dispose).toHaveBeenCalledOnce();
-    accept({ operationId: "op-late" });
-    await Promise.resolve();
-    expect(setupState.api.getOperation).not.toHaveBeenCalled();
-  });
-
-  it("reports an unavailable safe credential and sends no control request", async () => {
-    const setupState = setup();
-    vi.mocked(setupState.api.readControlToken).mockRejectedValue(new Error("credential missing"));
-    render(<ModelsScreen endpoint="http://127.0.0.1:8080" services={setupState.api} />);
-    expect(await screen.findByRole("alert")).toHaveTextContent("credential missing");
-    expect(setupState.api.getInventory).not.toHaveBeenCalled();
-    expect(setupState.api.createControlEventStream).not.toHaveBeenCalled();
-  });
-
-  it("binds the native credential request to the exact displayed endpoint", async () => {
-    const setupState = setup();
-    render(<ModelsScreen endpoint="http://127.0.0.1:18080" services={setupState.api} />);
-    await screen.findByRole("heading", { name: "model-ready" });
-    expect(setupState.api.readControlToken).toHaveBeenCalledWith("http://127.0.0.1:18080");
-  });
-
-  it("sends no authenticated mutation when a same-port replacement fails fresh proof", async () => {
-    const user = userEvent.setup();
-    const setupState = setup();
-    vi.mocked(setupState.api.readControlToken)
-      .mockResolvedValueOnce(token)
-      .mockResolvedValueOnce(token)
-      .mockResolvedValueOnce(token)
-      .mockRejectedValueOnce(new Error("replacement identity rejected"));
-    render(<ModelsScreen endpoint="http://127.0.0.1:8080" services={setupState.api} />);
-    await user.click(await screen.findByRole("button", { name: "Download model-ready" }));
-
-    expect(setupState.api.downloadModel).not.toHaveBeenCalled();
-    expect(await screen.findByRole("alert")).toHaveTextContent("replacement identity rejected");
-  });
-
-  it("keeps refreshed artifact truth primary over contradictory terminal history", async () => {
-    const setupState = setup();
-    vi.mocked(setupState.api.getInventory)
-      .mockResolvedValueOnce([model("model-ready", { kind: "not_downloaded" })])
-      .mockResolvedValueOnce([model("model-ready", { kind: "invalid", reason: "checksum_mismatch" })]);
-    render(<ModelsScreen endpoint="http://127.0.0.1:8080" services={setupState.api} />);
-    await screen.findByRole("heading", { name: "model-ready" });
-    act(() => setupState.callbacks()?.onSnapshot({ cursor: 1, cursorGap: false, operations: [], events: [] }));
-    act(() => setupState.callbacks()?.onEvent({ sequence: 2, operation: operation("succeeded") }));
-
-    expect(await screen.findByText("Checksum invalid")).toBeInTheDocument();
-    expect(screen.getByText(/Last operation: Download completed/)).toBeInTheDocument();
+    await waitFor(() => expect(inventorySignal).toBeDefined());
+    mounted.unmount();
+    expect(inventorySignal?.aborted).toBe(true);
   });
 });

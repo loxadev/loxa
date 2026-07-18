@@ -1,30 +1,13 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import type {
-  cancelOperation as defaultCancelOperation,
-  downloadModel as defaultDownloadModel,
-  getControlNode as defaultGetControlNode,
-  getInventory as defaultGetInventory,
-  getOperation as defaultGetOperation,
-  loadModel as defaultLoadModel,
-  unloadModel as defaultUnloadModel,
-} from "../control/client";
-import type { ModelInventoryEntry, OperationStatus, OperationView } from "../control/contracts";
-import type { ControlStreamHandle, streamControlEvents as defaultStreamControlEvents } from "../control/events";
-import { operationLabel } from "./modelRowLabels";
+import type { getInventory as defaultGetInventory } from "../control/client";
+import type { ModelInventoryEntry, OperationView, V2Operation, V2Slot } from "../control/contracts";
+import { useNodeSession } from "../node/NodeSession";
 
+// NodeSession owns all control authority. This screen-level seam is metadata-only.
 export type ModelsScreenServices = {
-  readControlToken(endpoint: string): Promise<string>;
-  getControlNode: typeof defaultGetControlNode;
   getInventory: typeof defaultGetInventory;
-  downloadModel: typeof defaultDownloadModel;
-  loadModel: typeof defaultLoadModel;
-  unloadModel: typeof defaultUnloadModel;
-  getOperation: typeof defaultGetOperation;
-  cancelOperation: typeof defaultCancelOperation;
-  createControlEventStream: typeof defaultStreamControlEvents;
 };
-
 export type ModelsLiveState = "connecting" | "live" | "reconnecting" | "error";
 
 type UseModelsControllerOptions = {
@@ -38,6 +21,12 @@ type UseModelsControllerOptions = {
   onModelMutationSettled?: (operationId: string) => void | Promise<void>;
 };
 
+type AcceptedMutation = {
+  kind: "download" | "load" | "unload";
+  operationModelId: string | null;
+  uiModelId: string;
+};
+
 export function useModelsController({
   endpoint,
   services,
@@ -48,251 +37,157 @@ export function useModelsController({
   onModelMutationStart,
   onModelMutationSettled,
 }: UseModelsControllerOptions) {
+  void services;
+  void reconnectDelayMs;
+  void reconnectLimit;
+  const session = useNodeSession();
   const [models, setModels] = useState<ModelInventoryEntry[]>([]);
   const [inventoryLoaded, setInventoryLoaded] = useState(false);
-  const [node, setNode] = useState<Awaited<ReturnType<ModelsScreenServices["getControlNode"]>> | null>(null);
-  const [operations, setOperations] = useState<Record<string, OperationView>>({});
-  const [pendingModels, setPendingModels] = useState<Set<string>>(() => new Set());
-  const [liveState, setLiveState] = useState<ModelsLiveState>("connecting");
+  const [requestPendingModels, setRequestPendingModels] = useState<Set<string>>(() => new Set());
+  const [acceptedMutations, setAcceptedMutations] = useState<Map<V2Operation["operation_id"], AcceptedMutation>>(
+    () => new Map(),
+  );
   const [notice, setNotice] = useState("Connecting to model controls");
   const [error, setError] = useState("");
   const [retryNonce, setRetryNonce] = useState(0);
-  const cursorRef = useRef(0);
-  const streamRef = useRef<ControlStreamHandle | null>(null);
-  const lifetimeSignalRef = useRef<AbortSignal | null>(null);
   const activeRef = useRef(true);
-  const nodeRevisionRef = useRef(0);
+  const acceptedMutationsRef = useRef(acceptedMutations);
+  const terminalRefreshControllers = useRef(new Set<AbortController>());
+  const verificationBudgetRef = useRef<{ key: string | null; attempts: number }>({ key: null, attempts: 0 });
+  const getInventory = session.getInventory;
+
+  const rememberAccepted = useCallback((operationId: V2Operation["operation_id"], mutation: AcceptedMutation) => {
+    const next = new Map(acceptedMutationsRef.current);
+    next.set(operationId, mutation);
+    acceptedMutationsRef.current = next;
+    setAcceptedMutations(next);
+  }, []);
+
+  const operations = useMemo(
+    () => (session.control?.operations ?? []).map(projectOperation),
+    [session.control?.operations],
+  );
+  const node = useMemo(() => projectSlot(session.control?.slots[0]), [session.control?.slots]);
+  const verificationKey = useMemo(
+    () =>
+      models
+        .filter((entry) => entry.artifact.kind === "invalid" && entry.artifact.reason === "verification_required")
+        .map((entry) => entry.id)
+        .sort()
+        .join("\u0000"),
+    [models],
+  );
+  const liveState: ModelsLiveState =
+    session.control !== null
+      ? "live"
+      : session.phase === "disconnected"
+        ? "reconnecting"
+        : session.phase === "error" || session.phase === "recovery-required"
+          ? "error"
+          : "connecting";
+
+  const refreshInventory = useCallback(
+    async (signal: AbortSignal) => {
+      const next = await getInventory(signal);
+      if (signal.aborted || !activeRef.current) return;
+      setModels(next);
+      setInventoryLoaded(true);
+      setError("");
+      setNotice("Live model updates connected");
+    },
+    [getInventory],
+  );
 
   useEffect(() => {
     const controller = new AbortController();
-    let disposed = false;
-    let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
-    let verificationTimer: ReturnType<typeof setTimeout> | undefined;
-    let verificationPending = false;
-    let verificationAttempts = 0;
-    let reconnectAttempts = 0;
     activeRef.current = true;
-    lifetimeSignalRef.current = controller.signal;
-
-    const replaceOperations = (next: OperationView[]) => {
-      if (disposed) return;
-      setOperations(Object.fromEntries(next.map((operation) => [operation.id, operation])));
-    };
-    const applyOperation = (operation: OperationView) => {
-      if (disposed) return;
-      setOperations((current) => ({ ...current, [operation.id]: operation }));
-    };
-
-    const scheduleVerificationPoll = () => {
-      if (disposed || controller.signal.aborted || !verificationPending) return;
-      if (verificationTimer !== undefined) clearTimeout(verificationTimer);
-      if (verificationAttempts >= verificationPollLimit) {
-        setNotice("Model verification is still pending. Refresh Models or wait for a new node update to check again");
-        return;
-      }
-      const backoff = Math.min(30_000, verificationPollMs * 2 ** Math.min(verificationAttempts, 4));
-      verificationTimer = setTimeout(() => {
-        verificationTimer = undefined;
-        if (disposed || !verificationPending) return;
-        verificationAttempts += 1;
-        void services
-          .readControlToken(endpoint)
-          .then((token) => services.getInventory(endpoint, token, { signal: controller.signal }))
-          .then((next) => {
-            if (disposed) return;
-            publishModels(next);
-          })
-          .catch(() => {
-            if (disposed || controller.signal.aborted) return;
-            setNotice("Model verification is still pending. Checking again shortly");
-            scheduleVerificationPoll();
-          });
-      }, backoff);
-    };
-
-    const publishModels = (next: ModelInventoryEntry[]) => {
-      if (disposed) return;
-      setModels(next);
-      setInventoryLoaded(true);
-      verificationPending = next.some(
-        (entry) => entry.artifact.kind === "invalid" && entry.artifact.reason === "verification_required",
-      );
-      if (!verificationPending && verificationTimer !== undefined) {
-        clearTimeout(verificationTimer);
-        verificationTimer = undefined;
-        verificationAttempts = 0;
-      } else if (verificationPending) {
-        scheduleVerificationPoll();
-      }
-    };
-
-    const refreshTruth = async (version: number) => {
-      const [nextModels, nextNode] = await Promise.all([
-        services
-          .readControlToken(endpoint)
-          .then((token) => services.getInventory(endpoint, token, { signal: controller.signal })),
-        services
-          .readControlToken(endpoint)
-          .then((token) => services.getControlNode(endpoint, token, { signal: controller.signal })),
-      ]);
-      if (disposed || version !== nodeRevisionRef.current) return;
-      verificationAttempts = 0;
-      publishModels(nextModels);
-      setNode(nextNode);
-    };
-
-    const connectEvents = async () => {
-      const token = await services.readControlToken(endpoint);
-      if (disposed) return;
-      setLiveState((current) => (current === "reconnecting" ? "reconnecting" : "connecting"));
-      streamRef.current = services.createControlEventStream(
-        endpoint,
-        token,
-        cursorRef.current,
-        {
-          onSnapshot: (snapshot) => {
-            if (disposed) return;
-            cursorRef.current = snapshot.cursor;
-            replaceOperations(snapshot.operations);
-            snapshot.operations
-              .filter(isActiveLifecycleOperation)
-              .forEach((operation) => onModelMutationStart?.(operation.id));
-            snapshot.operations.filter(isTerminalLifecycleOperation).forEach((operation) => {
-              void onModelMutationSettled?.(operation.id);
-            });
-            setLiveState("live");
-            setError("");
-            setNotice(
-              snapshot.cursorGap
-                ? "Live updates restored; older compacted events were replaced by the current snapshot"
-                : "Live model updates connected",
-            );
-          },
-          onEvent: (event) => {
-            if (disposed || event.sequence <= cursorRef.current) return;
-            cursorRef.current = event.sequence;
-            applyOperation(event.operation);
-            setNotice(operationAnnouncement(event.operation));
-            if (isActiveLifecycleOperation(event.operation)) onModelMutationStart?.(event.operation.id);
-            if (isTerminal(event.operation.status)) {
-              const nodeVersion = ++nodeRevisionRef.current;
-              void refreshTruth(nodeVersion)
-                .catch((reason: unknown) => {
-                  if (!disposed && !controller.signal.aborted) setError(message(reason));
-                })
-                .finally(() => {
-                  if (!disposed && (event.operation.kind === "load" || event.operation.kind === "unload")) {
-                    void onModelMutationSettled?.(event.operation.id);
-                  }
-                });
-            }
-          },
-          onTerminal: (terminal) => {
-            if (disposed || terminal.kind === "cancelled") return;
-            cursorRef.current = terminal.cursor;
-            setLiveState("reconnecting");
-            setNotice("Live model updates disconnected. Reconnecting");
-            scheduleReconnect();
-          },
-        },
-        controller.signal,
-      );
-    };
-
-    function scheduleReconnect() {
-      if (disposed || controller.signal.aborted) return;
-      if (reconnectTimer !== undefined) clearTimeout(reconnectTimer);
-      if (reconnectAttempts >= reconnectLimit) {
-        setLiveState("error");
-        setNotice("Live model updates stopped after repeated failures. Retry when the node is available");
-        return;
-      }
-      const delay = Math.min(30_000, reconnectDelayMs * 2 ** Math.min(reconnectAttempts, 4));
-      reconnectTimer = setTimeout(() => {
-        if (disposed) return;
-        reconnectAttempts += 1;
-        void Promise.all([
-          services
-            .readControlToken(endpoint)
-            .then((token) => services.getControlNode(endpoint, token, { signal: controller.signal })),
-          services
-            .readControlToken(endpoint)
-            .then((token) => services.getInventory(endpoint, token, { signal: controller.signal })),
-        ])
-          .then(([nextNode, nextModels]) => {
-            if (disposed) return;
-            setNode(nextNode);
-            nodeRevisionRef.current += 1;
-            verificationAttempts = 0;
-            publishModels(nextModels);
-            setError("");
-            void connectEvents().catch(handleReconnectFailure);
-          })
-          .catch((reason: unknown) => handleReconnectFailure(reason));
-      }, delay);
-    }
-
-    function handleReconnectFailure(reason: unknown) {
-      if (disposed || controller.signal.aborted) return;
-      setError(message(reason));
-      setLiveState("reconnecting");
-      setNotice("Node is temporarily unavailable. Reconnecting");
-      scheduleReconnect();
-    }
-
-    void Promise.all([
-      services
-        .readControlToken(endpoint)
-        .then((token) => services.getControlNode(endpoint, token, { signal: controller.signal })),
-      services
-        .readControlToken(endpoint)
-        .then((token) => services.getInventory(endpoint, token, { signal: controller.signal })),
-    ])
-      .then(async ([nextNode, nextModels]) => {
-        if (disposed) return;
-        setNode(nextNode);
-        nodeRevisionRef.current += 1;
-        publishModels(nextModels);
-        await connectEvents();
-      })
-      .catch((reason: unknown) => {
-        if (disposed || controller.signal.aborted) return;
-        setError(message(reason));
-        setLiveState("error");
-        setNotice("Model controls unavailable");
+    if (session.proven) {
+      void refreshInventory(controller.signal).catch((reason: unknown) => {
+        if (!controller.signal.aborted) {
+          setError(message(reason));
+          setNotice("Model controls unavailable");
+        }
       });
-
-    const disposeWork = () => {
-      if (disposed) return;
-      disposed = true;
+    }
+    return () => {
       activeRef.current = false;
       controller.abort();
-      if (reconnectTimer !== undefined) clearTimeout(reconnectTimer);
-      if (verificationTimer !== undefined) clearTimeout(verificationTimer);
-      streamRef.current?.dispose();
-      streamRef.current = null;
-      lifetimeSignalRef.current = null;
     };
-    window.addEventListener("beforeunload", disposeWork);
+  }, [endpoint, refreshInventory, retryNonce, session.proven]);
+
+  useEffect(() => {
+    if (!session.proven || verificationKey === "" || verificationPollLimit <= 0) {
+      verificationBudgetRef.current = { key: null, attempts: 0 };
+      return;
+    }
+    if (verificationBudgetRef.current.key !== verificationKey) {
+      verificationBudgetRef.current = { key: verificationKey, attempts: 0 };
+    }
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const poll = () => {
+      const budget = verificationBudgetRef.current;
+      if (controller.signal.aborted || budget.key !== verificationKey || budget.attempts >= verificationPollLimit)
+        return;
+      const delay = Math.min(30_000, verificationPollMs * 2 ** Math.min(budget.attempts, 4));
+      timer = setTimeout(() => {
+        verificationBudgetRef.current.attempts += 1;
+        void refreshInventory(controller.signal).then(poll, poll);
+      }, delay);
+    };
+    poll();
     return () => {
-      window.removeEventListener("beforeunload", disposeWork);
-      disposeWork();
+      controller.abort();
+      if (timer !== undefined) clearTimeout(timer);
     };
-  }, [
-    endpoint,
-    onModelMutationSettled,
-    onModelMutationStart,
-    reconnectDelayMs,
-    reconnectLimit,
-    retryNonce,
-    services,
-    verificationPollLimit,
-    verificationPollMs,
-  ]);
+  }, [refreshInventory, session.proven, verificationKey, verificationPollLimit, verificationPollMs]);
+
+  useEffect(() => {
+    const operationsById = new Map(
+      (session.control?.operations ?? []).map((operation) => [operation.operation_id, operation]),
+    );
+    const next = new Map(acceptedMutationsRef.current);
+    let changed = false;
+    for (const [operationId, accepted] of acceptedMutationsRef.current) {
+      const operation = operationsById.get(operationId);
+      if (
+        operation === undefined ||
+        !isTerminalV2(operation) ||
+        operation.kind !== accepted.kind ||
+        operation.model_id !== accepted.operationModelId
+      ) {
+        continue;
+      }
+      next.delete(operationId);
+      changed = true;
+      void onModelMutationSettled?.(operationId);
+      if (operation.kind === "download") {
+        const controller = new AbortController();
+        terminalRefreshControllers.current.add(controller);
+        void refreshInventory(controller.signal)
+          .catch((reason: unknown) => {
+            if (!controller.signal.aborted) setError(message(reason));
+          })
+          .finally(() => terminalRefreshControllers.current.delete(controller));
+      }
+    }
+    if (changed) {
+      acceptedMutationsRef.current = next;
+      setAcceptedMutations(next);
+    }
+  }, [acceptedMutations, onModelMutationSettled, refreshInventory, session.control?.operations]);
+
+  useEffect(
+    () => () => {
+      for (const controller of terminalRefreshControllers.current) controller.abort();
+      terminalRefreshControllers.current.clear();
+    },
+    [],
+  );
 
   const latestByModel = useMemo(() => {
     const latest = new Map<string, OperationView>();
-    for (const operation of Object.values(operations)) {
+    for (const operation of operations) {
       if (operation.modelId === null) continue;
       const current = latest.get(operation.modelId);
       if (current === undefined || operation.updatedAtUnixMs >= current.updatedAtUnixMs) {
@@ -303,91 +198,78 @@ export function useModelsController({
   }, [operations]);
 
   const download = async (modelId: string) => {
-    const signal = lifetimeSignalRef.current;
-    if (signal === null || signal.aborted) return;
-    setPendingModels((current) => withValue(current, modelId, true));
+    setRequestPendingModels((current) => withValue(current, modelId, true));
     setError("");
     try {
-      const downloadToken = await services.readControlToken(endpoint);
-      const accepted = await services.downloadModel(endpoint, downloadToken, modelId, { signal });
-      if (!activeRef.current || signal.aborted) return;
-      const operationToken = await services.readControlToken(endpoint);
-      const authoritative = await services.getOperation(endpoint, operationToken, accepted.operationId, { signal });
-      if (!activeRef.current || signal.aborted) return;
-      setOperations((current) => ({ ...current, [authoritative.id]: authoritative }));
-      setNotice(operationAnnouncement(authoritative));
+      const accepted = await session.downloadModel(modelId);
+      rememberAccepted(accepted.operation_id, { kind: "download", operationModelId: modelId, uiModelId: modelId });
+      onModelMutationStart?.(accepted.operation_id);
+      setNotice(`${modelId}: Download queued`);
     } catch (reason) {
-      if (activeRef.current && !signal.aborted) setError(message(reason));
+      setError(message(reason));
     } finally {
-      if (activeRef.current) setPendingModels((current) => withValue(current, modelId, false));
+      if (activeRef.current) setRequestPendingModels((current) => withValue(current, modelId, false));
     }
   };
 
   const cancel = async (operation: OperationView, modelId: string) => {
-    const signal = lifetimeSignalRef.current;
-    if (signal === null || signal.aborted) return;
-    setPendingModels((current) => withValue(current, modelId, true));
+    setRequestPendingModels((current) => withValue(current, modelId, true));
     setError("");
     try {
-      const token = await services.readControlToken(endpoint);
-      const authoritative = await services.cancelOperation(endpoint, token, operation.id, { signal });
-      if (!activeRef.current || signal.aborted) return;
-      setOperations((current) => ({ ...current, [authoritative.id]: authoritative }));
-      setNotice(operationAnnouncement(authoritative));
+      const accepted = await session.cancelOperation(operation.id);
+      rememberAccepted(accepted.operation_id, {
+        kind: operation.kind,
+        operationModelId: operation.modelId,
+        uiModelId: modelId,
+      });
+      onModelMutationStart?.(accepted.operation_id);
+      setNotice(`${modelId}: Cancellation requested`);
     } catch (reason) {
-      if (activeRef.current && !signal.aborted) setError(message(reason));
+      setError(message(reason));
     } finally {
-      if (activeRef.current) setPendingModels((current) => withValue(current, modelId, false));
+      if (activeRef.current) setRequestPendingModels((current) => withValue(current, modelId, false));
     }
   };
 
   const startLifecycle = async (kind: "load" | "unload", modelId: string) => {
-    const signal = lifetimeSignalRef.current;
-    if (signal === null || signal.aborted || node?.status === "recovery_required") return;
-    setPendingModels((current) => withValue(current, modelId, true));
+    if (node?.status === "recovery_required") return;
+    setRequestPendingModels((current) => withValue(current, modelId, true));
     setError("");
     try {
-      const nodeRevision = nodeRevisionRef.current;
-      const token = await services.readControlToken(endpoint);
-      const accepted =
-        kind === "load"
-          ? await services.loadModel(endpoint, token, modelId, { signal })
-          : await services.unloadModel(endpoint, token, { signal });
-      onModelMutationStart?.(accepted.operationId);
-      if (!activeRef.current || signal.aborted) return;
-      const operationToken = await services.readControlToken(endpoint);
-      const nodeToken = await services.readControlToken(endpoint);
-      const [authoritative, nextNode] = await Promise.all([
-        services.getOperation(endpoint, operationToken, accepted.operationId, { signal }),
-        services.getControlNode(endpoint, nodeToken, { signal }),
-      ]);
-      if (!activeRef.current || signal.aborted) return;
-      setOperations((current) => {
-        const existing = current[authoritative.id];
-        return existing !== undefined && existing.updatedAtUnixMs >= authoritative.updatedAtUnixMs
-          ? current
-          : { ...current, [authoritative.id]: authoritative };
+      const accepted = kind === "load" ? await session.loadModel(modelId) : await session.unloadModel();
+      rememberAccepted(accepted.operation_id, {
+        kind,
+        operationModelId: kind === "load" ? modelId : null,
+        uiModelId: modelId,
       });
-      if (nodeRevisionRef.current === nodeRevision) setNode(nextNode);
-      setNotice(operationAnnouncement(authoritative));
-      if (isTerminal(authoritative.status)) await onModelMutationSettled?.(authoritative.id);
+      onModelMutationStart?.(accepted.operation_id);
+      setNotice(`${modelId}: ${kind === "load" ? "Load" : "Unload"} queued`);
     } catch (reason) {
-      if (activeRef.current && !signal.aborted) setError(message(reason));
+      setError(message(reason));
     } finally {
-      if (activeRef.current) setPendingModels((current) => withValue(current, modelId, false));
+      if (activeRef.current) setRequestPendingModels((current) => withValue(current, modelId, false));
     }
   };
 
   const activeUnload =
     node?.activeModelId === null
       ? undefined
-      : Object.values(operations)
+      : operations
           .filter((operation) => operation.kind === "unload" && operation.id === node?.operationId)
           .sort((left, right) => right.updatedAtUnixMs - left.updatedAtUnixMs)[0];
+  const pendingModels = useMemo(() => {
+    const next = new Set(requestPendingModels);
+    for (const accepted of acceptedMutations.values()) next.add(accepted.uiModelId);
+    return next;
+  }, [acceptedMutations, requestPendingModels]);
   const mutationBusy =
+    session.control === null ||
     pendingModels.size > 0 ||
     node?.operationId !== null ||
-    Object.values(operations).some((operation) => operation.status === "queued" || operation.status === "running");
+    (session.control?.operations ?? []).some(
+      (operation) =>
+        operation.status === "queued" || operation.status === "running" || operation.status === "cancelling",
+    );
 
   return {
     activeUnload,
@@ -402,29 +284,52 @@ export function useModelsController({
     node,
     notice,
     pendingModels,
-    retry: () => setRetryNonce((value) => value + 1),
+    retry: () => {
+      verificationBudgetRef.current = { key: null, attempts: 0 };
+      setRetryNonce((value) => value + 1);
+      void session.retry();
+    },
     startLifecycle,
   };
 }
 
-function isActiveLifecycleOperation(operation: OperationView): boolean {
-  return (
-    (operation.kind === "load" || operation.kind === "unload") &&
-    (operation.status === "queued" || operation.status === "running")
-  );
+function projectSlot(slot: V2Slot | undefined) {
+  if (slot === undefined) return null;
+  return {
+    status: slot.status === "recovery" ? ("recovery_required" as const) : slot.status,
+    activeModelId: slot.model_id,
+    operationId: slot.operation_id,
+    error: slot.error?.message ?? null,
+  };
 }
 
-function isTerminalLifecycleOperation(operation: OperationView): boolean {
-  return (operation.kind === "load" || operation.kind === "unload") && isTerminal(operation.status);
+function projectOperation(operation: V2Operation): OperationView {
+  return {
+    id: operation.operation_id,
+    kind: operation.kind,
+    status: operation.status === "cancelling" ? "running" : operation.status,
+    modelId: operation.model_id,
+    progress:
+      operation.progress === null
+        ? null
+        : {
+            completedBytes: decimalToUiNumber(operation.progress.completed_bytes),
+            totalBytes:
+              operation.progress.total_bytes === null ? null : decimalToUiNumber(operation.progress.total_bytes),
+          },
+    error: operation.error?.message ?? null,
+    createdAtUnixMs: decimalToUiNumber(operation.created_at_unix_ms),
+    updatedAtUnixMs: decimalToUiNumber(operation.updated_at_unix_ms),
+  };
 }
 
-function operationAnnouncement(operation: OperationView): string {
-  const model = operation.modelId ?? "model";
-  return `${model}: ${operationLabel(operation)}`;
+function decimalToUiNumber(value: string): number {
+  const integer = BigInt(value);
+  return integer > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(integer);
 }
 
-function isTerminal(status: OperationStatus): boolean {
-  return status === "succeeded" || status === "failed" || status === "cancelled";
+function isTerminalV2(operation: V2Operation): boolean {
+  return operation.status === "succeeded" || operation.status === "failed" || operation.status === "cancelled";
 }
 
 function withValue(source: Set<string>, value: string, present: boolean): Set<string> {

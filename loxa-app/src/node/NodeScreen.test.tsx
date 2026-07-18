@@ -7,16 +7,10 @@ import { resolve } from "node:path";
 import { NodeScreen, type NodeScreenServices } from "./NodeScreen";
 import { NodeSessionProvider, type BootstrapSnapshot, type NodeSessionServices, useNodeSession } from "./NodeSession";
 import { NodeTable } from "./NodeTable";
+import { controlSnapshot, scriptedV2Control, servicesWithControl } from "./testSupport";
+import { v2Ids } from "../control/testSupport";
 
 const endpoint = "http://127.0.0.1:8080";
-const readyStatus = {
-  node_id: "node-7",
-  health: "ready" as const,
-  model: "loxa" as const,
-  engine: { name: "llama.cpp", version: "b9999" },
-  runtime_model: "gemma-3-4b-it-q4",
-  profile: "default",
-};
 const unloadedStatus = {
   node_id: "node-7",
   health: "unavailable" as const,
@@ -32,19 +26,8 @@ function snapshot(overrides: Partial<BootstrapSnapshot> = {}): BootstrapSnapshot
 
 function services(overrides: Partial<NodeSessionServices & NodeScreenServices> = {}) {
   return {
-    bootstrap: {
-      snapshot: vi.fn().mockResolvedValue(snapshot({ ownership: "none", childRunning: false })),
-      start: vi.fn().mockResolvedValue(snapshot()),
-      attach: vi.fn().mockResolvedValue(snapshot({ ownership: "attached" })),
-      stop: vi.fn().mockResolvedValue(snapshot({ ownership: "none", childRunning: false })),
-    },
+    ...servicesWithControl(),
     getStatus: vi.fn().mockResolvedValue(unloadedStatus),
-    readControlToken: vi.fn().mockResolvedValue("ab".repeat(32)),
-    createControlEventStream: vi.fn(() => ({
-      cancel: vi.fn(),
-      dispose: vi.fn(),
-      finished: new Promise<never>(() => undefined),
-    })),
     copyText: vi.fn().mockResolvedValue(undefined),
     ...overrides,
   };
@@ -309,7 +292,7 @@ describe("NodeScreen", () => {
   it("presents one truthful local node row without unsupported inventory controls", async () => {
     renderNode();
 
-    expect(await screen.findByRole("heading", { level: 1, name: "Nodes" })).toBeVisible();
+    expect(await screen.findByText("Node ready — no model loaded")).toBeVisible();
     const table = screen.getByRole("table", { name: "Local node inventory" });
     expect(
       within(table)
@@ -320,7 +303,7 @@ describe("NodeScreen", () => {
     expect(rows).toHaveLength(2);
     const localNode = rows[1];
     expect(within(localNode).getByText("Local node")).toBeVisible();
-    expect(within(localNode).getByText("node-7")).toBeVisible();
+    expect(within(localNode).getByText(v2Ids.node)).toBeVisible();
     expect(within(localNode).getByText("Node ready — no model loaded")).toBeVisible();
     expect(within(localNode).queryByText("unavailable")).not.toBeInTheDocument();
     expect(within(localNode).getByText("No model loaded")).toBeVisible();
@@ -331,23 +314,25 @@ describe("NodeScreen", () => {
   });
 
   it("renders a selected-node runtime summary from authoritative node fields", async () => {
-    renderNode(
-      services({
-        getStatus: vi.fn().mockResolvedValue(readyStatus),
-      }),
+    const control = scriptedV2Control(
+      controlSnapshot({ slot: { status: "ready", model_id: "gemma-3-4b-it-q4", operation_id: null } }),
     );
+    renderNode({ ...servicesWithControl(control), copyText: vi.fn() });
 
-    const summary = await screen.findByRole("region", { name: "Selected node runtime" });
+    await findStatusBadge("Ready");
+    const summary = screen.getByRole("region", { name: "Selected node runtime" });
     expect(within(summary).getByRole("heading", { name: "Local node runtime" })).toBeVisible();
-    for (const value of ["node-7", endpoint, "gemma-3-4b-it-q4", "llama.cpp", "b9999", "default"]) {
+    for (const value of [v2Ids.node, endpoint, "gemma-3-4b-it-q4"]) {
       expect(within(summary).getByText(value)).toBeVisible();
     }
+    expect(within(summary).getAllByText("Unavailable")).toHaveLength(3);
   });
 
   it("shows truthful unavailable runtime values and an unsupported developer-log state", async () => {
     renderNode();
 
-    const summary = await screen.findByRole("region", { name: "Selected node runtime" });
+    await screen.findByText("Node ready — no model loaded");
+    const summary = screen.getByRole("region", { name: "Selected node runtime" });
     expect(within(summary).getByText("No model loaded")).toBeVisible();
     expect(within(summary).getAllByText("Unavailable")).toHaveLength(3);
 
@@ -421,18 +406,20 @@ describe("NodeScreen", () => {
   });
 
   it("shows ready only from authoritative status and exposes technical fields", async () => {
-    renderNode(
-      services({
-        bootstrap: {
-          ...services().bootstrap,
-          start: vi.fn().mockResolvedValue(snapshot({ ownership: "attached" })),
-        },
-        getStatus: vi.fn().mockResolvedValue(readyStatus),
-      }),
+    const control = scriptedV2Control(
+      controlSnapshot({ slot: { status: "ready", model_id: "gemma-3-4b-it-q4", operation_id: null } }),
     );
+    renderNode({
+      ...servicesWithControl(control),
+      copyText: vi.fn(),
+      bootstrap: {
+        ...services().bootstrap,
+        start: vi.fn().mockResolvedValue(snapshot({ ownership: "attached" })),
+      },
+    });
     expect(await findStatusBadge("Ready")).toBeVisible();
     expect(screen.getByText("Externally attached")).toBeInTheDocument();
-    for (const value of [endpoint, "node-7", "llama.cpp", "b9999", "gemma-3-4b-it-q4", "default"]) {
+    for (const value of [endpoint, v2Ids.node, "gemma-3-4b-it-q4"]) {
       expect(screen.getAllByText(value).every((element) => element.classList.contains("technical-value"))).toBe(true);
     }
     expect(screen.queryByRole("button", { name: "Stop node" })).not.toBeInTheDocument();
@@ -453,7 +440,7 @@ describe("NodeScreen", () => {
   });
 
   it("keeps safe owned-child recovery available when the public probe fails", async () => {
-    renderNode(services({ getStatus: vi.fn().mockRejectedValue(new Error("Public status unavailable.")) }));
+    renderNode(services({ proveV2ControlPeer: vi.fn().mockRejectedValue(new Error("Public status unavailable.")) }));
     const status = await findStatusBadge("Error");
     expect(status).toHaveTextContent("Error");
     expect(status).not.toHaveTextContent("Public status unavailable.");

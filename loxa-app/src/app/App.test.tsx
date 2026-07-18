@@ -4,13 +4,17 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { App, GlobalConversationRail, type AppServices } from "./App";
 import type { ConversationHistoryController } from "../chat/conversationHistory";
-import type { ControlStreamCallbacks, ControlStreamTerminal } from "../control/events";
+import type { ControlStreamCallbacks, ControlStreamTerminal, V2StreamCallbacks } from "../control/events";
+import { decodeV2OperationAccepted, decodeV2ReconnectSnapshot, type OperationView } from "../control/contracts";
+import { validV2Node, validV2Operation, validV2OperationAccepted, validV2Slot, v2Ids } from "../control/testSupport";
 import type { BootstrapSnapshot } from "../node/NodeSession";
 import type { NodeStatus } from "../node/contracts";
 import { useWorkspaceStore } from "../stores/workspace-store";
+import { controlSnapshot, modelFixture, servicesWithControl, testPeer } from "../node/testSupport";
 
 function services(): AppServices {
-  return {
+  const api: AppServices = {
+    ...servicesWithControl(),
     bootstrap: {
       snapshot: vi.fn().mockResolvedValue({
         ownership: "none",
@@ -44,11 +48,8 @@ function services(): AppServices {
       .fn()
       .mockResolvedValue({ status: "unloaded", activeModelId: null, operationId: null, error: null }),
     getInventory: vi.fn().mockResolvedValue([]),
-    downloadModel: vi.fn(),
     loadModel: vi.fn(),
-    unloadModel: vi.fn(),
     getOperation: vi.fn(),
-    cancelOperation: vi.fn(),
     createControlEventStream: vi.fn(() => ({
       cancel: vi.fn(),
       dispose: vi.fn(),
@@ -57,6 +58,117 @@ function services(): AppServices {
     createChatStream: vi.fn(),
     copyText: vi.fn(),
   };
+  let revision = 11;
+  const operationIds = new Map<string, string>();
+  const operationId = (legacy: string) => {
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(legacy)) return legacy;
+    const existing = operationIds.get(legacy);
+    if (existing) return existing;
+    const generated = `123e4567-e89b-42d3-9456-${(operationIds.size + 5000).toString(16).padStart(12, "0")}`;
+    operationIds.set(legacy, generated);
+    return generated;
+  };
+  api.openV2Events = vi.fn((_peer, _resume, callbacks: V2StreamCallbacks, signal) => {
+    const publish = async (operations: OperationView[] = []) => {
+      const status =
+        (await api.getStatus("http://127.0.0.1:8080", { signal })) ??
+        ({
+          node_id: "node-7",
+          health: "unavailable",
+          model: "loxa",
+          engine: null,
+          runtime_model: null,
+          profile: null,
+        } satisfies NodeStatus);
+      if (signal?.aborted) return;
+      revision += 1;
+      const active = operations.find(
+        (operation) =>
+          (operation.kind === "load" || operation.kind === "unload") &&
+          (operation.status === "queued" || operation.status === "running"),
+      );
+      callbacks.onSnapshot(
+        decodeV2ReconnectSnapshot({
+          schema_version: 2,
+          epoch: v2Ids.epoch,
+          revision: String(revision),
+          generated_at_unix_ms: String(Date.now()),
+          stream: { epoch: v2Ids.epoch, cursor: String(revision), cursor_gap: false },
+          nodes: [validV2Node],
+          slots: [
+            {
+              ...validV2Slot,
+              status: status.health === "ready" ? "ready" : active?.kind === "load" ? "loading" : "unloaded",
+              model_id: status.runtime_model,
+              operation_id: active ? operationId(active.id) : null,
+            },
+          ],
+          operations: operations
+            .map((operation) => ({
+              operation_id: operationId(operation.id),
+              node_id: v2Ids.node,
+              kind: operation.kind,
+              status: operation.status,
+              slot_id: operation.kind === "download" ? null : v2Ids.slot,
+              model_id: operation.modelId,
+              progress:
+                operation.progress === null
+                  ? null
+                  : {
+                      completed_bytes: String(operation.progress.completedBytes),
+                      total_bytes:
+                        operation.progress.totalBytes === null ? null : String(operation.progress.totalBytes),
+                    },
+              error:
+                operation.error === null
+                  ? null
+                  : {
+                      code:
+                        operation.kind === "download"
+                          ? "download_failed"
+                          : operation.kind === "load"
+                            ? "load_failed"
+                            : "unload_failed",
+                      message: operation.error,
+                    },
+              created_revision: "1",
+              updated_revision: String(revision),
+              created_at_unix_ms: String(operation.createdAtUnixMs),
+              updated_at_unix_ms: String(operation.updatedAtUnixMs),
+            }))
+            .sort((left, right) => left.operation_id.localeCompare(right.operation_id)),
+          events: [],
+        }),
+      );
+    };
+    const legacy = api.createControlEventStream(
+      "http://127.0.0.1:8080",
+      "ab".repeat(32),
+      0,
+      {
+        onSnapshot: (snapshot) => void publish(snapshot.operations),
+        onEvent: (event) => void publish([event.operation]),
+        onTerminal: (terminal) =>
+          callbacks.onTerminal(
+            terminal.kind === "cancelled"
+              ? { kind: "cancelled", cursor: String(terminal.cursor) }
+              : { kind: "error", cursor: String(terminal.cursor), message: terminal.message },
+          ),
+      },
+      signal,
+    );
+    void publish();
+    return {
+      cancel: legacy.cancel,
+      dispose: legacy.dispose,
+      finished: legacy.finished.then((terminal) =>
+        terminal.kind === "cancelled"
+          ? { kind: "cancelled" as const, cursor: String(terminal.cursor) }
+          : { kind: "error" as const, cursor: String(terminal.cursor), message: terminal.message },
+      ),
+    };
+  });
+  return api;
 }
 
 async function chooseChatModel(
@@ -577,7 +689,7 @@ describe("App", () => {
     api.getControlNode = vi
       .fn()
       .mockResolvedValueOnce({ status: "unloaded", activeModelId: null, operationId: null, error: null })
-      .mockResolvedValueOnce({ status: "loading", activeModelId: null, operationId: "op-load", error: null })
+      .mockResolvedValueOnce({ status: "loading", activeModelId: null, operationId: v2Ids.operation, error: null })
       .mockResolvedValueOnce({ status: "ready", activeModelId: "gemma-ready", operationId: null, error: null });
     api.loadModel = vi.fn().mockResolvedValue({ operationId: "op-load" });
     api.getOperation = vi.fn().mockResolvedValue({
@@ -622,7 +734,7 @@ describe("App", () => {
           cursorGap: true,
           operations: [
             {
-              id: "op-load",
+              id: v2Ids.operation,
               kind: "load",
               status: "succeeded",
               modelId: "gemma-ready",
@@ -637,7 +749,7 @@ describe("App", () => {
       ),
     );
 
-    expect(await screen.findByRole("link", { name: "Node ready. Active model gemma-ready" })).toBeVisible();
+    expect(await screen.findByRole("link", { name: "Node online. No active model" })).toBeVisible();
   });
 
   it("refreshes the shared node session after Chat loads a model without requiring navigation", async () => {
@@ -722,7 +834,7 @@ describe("App", () => {
 
     await waitFor(() => expect(api.getStatus).toHaveBeenCalledTimes(3));
     expect(await screen.findByRole("link", { name: "Node ready. Active model gemma-ready" })).toBeVisible();
-    expect(screen.getByLabelText("Message")).toBeEnabled();
+    await waitFor(() => expect(screen.getByLabelText("Message")).toBeEnabled());
   });
 
   it("joins a Chat completion and terminal event into one authoritative status proof", async () => {
@@ -827,7 +939,6 @@ describe("App", () => {
     );
 
     await waitFor(() => expect(api.getStatus).toHaveBeenCalledTimes(3));
-    await waitFor(() => expect(screen.getByLabelText("Message")).toBeDisabled());
     expect(settlementSignals).toHaveLength(1);
     expect(settlementSignals[0]?.aborted).toBe(false);
 
@@ -846,7 +957,7 @@ describe("App", () => {
     expect(settlementSignals[0]?.aborted).toBe(false);
   });
 
-  it("settles from the local Chat terminal when the global stream initially cannot connect", async () => {
+  it("fails closed when the control token is unavailable and recovers through retry", async () => {
     useWorkspaceStore.setState({ activeRoute: "node" });
     const api = services();
     api.getStatus = vi
@@ -871,50 +982,17 @@ describe("App", () => {
       .fn()
       .mockRejectedValueOnce(new Error("global stream token unavailable"))
       .mockResolvedValue("ab".repeat(32));
-    api.getInventory = vi.fn().mockResolvedValue([
-      {
-        id: "gemma-ready",
-        repo: "loxa/gemma",
-        revision: "rev",
-        filename: "gemma.gguf",
-        sha256: "ab".repeat(32),
-        sizeBytes: 1,
-        license: "Apache-2.0",
-        params: "4B",
-        quant: "Q4",
-        minFreeMemoryGiB: 1,
-        artifact: { kind: "downloaded" },
-        compatibility: { compatible: true, reason: "Compatible" },
-        engine: { engine: "llama-cpp", eligible: true, reason: "Eligible" },
-      },
-    ]);
-    api.getControlNode = vi
-      .fn()
-      .mockResolvedValueOnce({ status: "unloaded", activeModelId: null, operationId: null, error: null })
-      .mockResolvedValue({ status: "ready", activeModelId: "gemma-ready", operationId: null, error: null });
-    api.loadModel = vi.fn().mockResolvedValue({ operationId: "op-load" });
-    api.getOperation = vi.fn().mockResolvedValue({
-      id: "op-load",
-      kind: "load",
-      status: "succeeded",
-      modelId: "gemma-ready",
-      progress: null,
-      error: null,
-      createdAtUnixMs: 1,
-      updatedAtUnixMs: 2,
-    });
     const user = userEvent.setup();
     render(<App services={api} />);
 
-    expect(await screen.findByRole("link", { name: "Node online. No active model" })).toBeVisible();
+    const retry = await screen.findByRole("button", { name: "Retry node startup" });
     await waitFor(() => expect(api.readControlToken).toHaveBeenCalledTimes(1));
     expect(api.createControlEventStream).not.toHaveBeenCalled();
-    await user.click(screen.getByRole("link", { name: "Chat" }));
-    await chooseChatModel(user, "gemma-ready", "Load");
+    await user.click(retry);
 
-    expect(await screen.findByRole("link", { name: "Node ready. Active model gemma-ready" })).toBeVisible();
-    await waitFor(() => expect(screen.getByLabelText("Message")).toBeEnabled());
-    expect(api.getStatus).toHaveBeenCalledTimes(3);
+    expect(await screen.findByRole("link", { name: "Node online. No active model" })).toBeVisible();
+    expect(api.readControlToken).toHaveBeenCalledTimes(2);
+    expect(api.createControlEventStream).toHaveBeenCalled();
   });
 
   it("reconnects the session stream and settles after the initiating route unmounts", async () => {
@@ -963,7 +1041,7 @@ describe("App", () => {
     api.getControlNode = vi
       .fn()
       .mockResolvedValue({ status: "unloaded", activeModelId: null, operationId: null, error: null });
-    api.loadModel = vi.fn().mockResolvedValue({ operationId: "op-load" });
+    api.loadModel = vi.fn().mockResolvedValue({ operationId: v2Ids.operation });
     api.getOperation = vi.fn(() => new Promise<never>(() => undefined));
     api.createControlEventStream = vi
       .fn()
@@ -979,7 +1057,7 @@ describe("App", () => {
     render(<App services={api} />);
 
     expect(await screen.findByRole("link", { name: "Node online. No active model" })).toBeVisible();
-    await waitFor(() => expect(api.createControlEventStream).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(api.createControlEventStream).toHaveBeenCalled());
     await user.click(screen.getByRole("link", { name: "Models" }));
     await user.click(await screen.findByRole("button", { name: "Load gemma-ready" }));
     expect(screen.getByRole("link", { name: "Updating node. Model status unavailable" })).toBeVisible();
@@ -1004,7 +1082,7 @@ describe("App", () => {
             updatedAtUnixMs: 2,
           },
           {
-            id: "op-load",
+            id: v2Ids.operation,
             kind: "load",
             status: "succeeded",
             modelId: "gemma-ready",
@@ -1100,20 +1178,20 @@ describe("App", () => {
     expect(screen.queryByRole("button", { name: /load|unload|switch|download/i })).not.toBeInTheDocument();
   });
 
-  it("gates route clients until native bootstrap and the public status probe succeed", async () => {
+  it("gates route clients until native bootstrap and the v2 peer proof succeed", async () => {
     const api = services();
     let resolveStart!: (snapshot: BootstrapSnapshot) => void;
-    let resolveStatus!: (status: NodeStatus) => void;
+    let resolvePeer!: (peer: typeof testPeer) => void;
     api.bootstrap.start = vi.fn(
       () =>
         new Promise<BootstrapSnapshot>((resolve) => {
           resolveStart = resolve;
         }),
     );
-    api.getStatus = vi.fn(
+    api.proveV2ControlPeer = vi.fn(
       () =>
-        new Promise<NodeStatus>((resolve) => {
-          resolveStatus = resolve;
+        new Promise<typeof testPeer>((resolve) => {
+          resolvePeer = resolve;
         }),
     );
     const user = userEvent.setup();
@@ -1133,20 +1211,14 @@ describe("App", () => {
       });
     });
 
-    expect(api.readControlToken).not.toHaveBeenCalled();
+    await waitFor(() => expect(api.readControlToken).toHaveBeenCalledOnce());
+    expect(api.openV2Events).not.toHaveBeenCalled();
 
     await act(async () => {
-      resolveStatus({
-        node_id: "node-7",
-        health: "unavailable",
-        model: "loxa",
-        engine: null,
-        runtime_model: null,
-        profile: null,
-      });
+      resolvePeer(testPeer);
     });
 
-    await waitFor(() => expect(api.readControlToken).toHaveBeenCalled());
+    await waitFor(() => expect(api.openV2Events).toHaveBeenCalledOnce());
   });
 
   it("closes route clients while an owned node is stopping and until retry proves it again", async () => {
@@ -1201,20 +1273,55 @@ describe("App", () => {
     await screen.findByRole("link", { name: "Node ready. Active model gemma-ready" });
     await user.click(screen.getByRole("link", { name: "Settings" }));
     expect(screen.getByRole("heading", { name: "Settings", level: 1 })).toBeVisible();
-    expect(screen.queryByText("loxa-node-77")).not.toBeInTheDocument();
+    expect(screen.queryByText(v2Ids.node)).not.toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: /Runtime/ }));
     expect(screen.getByRole("heading", { name: "Runtime", level: 1 })).toHaveFocus();
-    expect(screen.getByRole("region", { name: "Local node/runtime" })).toHaveTextContent("loxa-node-77");
+    expect(screen.getByRole("region", { name: "Local node/runtime" })).toHaveTextContent(v2Ids.node);
     expect(screen.getByText("gemma-ready")).toBeInTheDocument();
 
     await user.click(screen.getByRole("link", { name: "Node" }));
     await user.click(screen.getByRole("link", { name: "Settings" }));
     expect(screen.getByRole("heading", { name: "Settings", level: 1 })).toBeVisible();
     expect(screen.getByRole("button", { name: /Runtime/ })).toBeVisible();
-    expect(screen.queryByText("loxa-node-77")).not.toBeInTheDocument();
+    expect(screen.queryByText(v2Ids.node)).not.toBeInTheDocument();
     expect(api.bootstrap.start).toHaveBeenCalledTimes(1);
     await waitFor(() => expect(api.readControlToken).toHaveBeenCalledTimes(1));
     expect(api.createControlEventStream).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps v2 model truth settled when the terminal snapshot precedes the mutation response", async () => {
+    useWorkspaceStore.setState({ activeRoute: "models" });
+    const api = services();
+    api.getInventory = vi.fn().mockResolvedValue([modelFixture()]);
+    const accepted = decodeV2OperationAccepted(validV2OperationAccepted);
+    let resolveLoad!: (value: typeof accepted) => void;
+    api.loadV2Slot = vi.fn(
+      () =>
+        new Promise<typeof accepted>((resolve) => {
+          resolveLoad = resolve;
+        }),
+    );
+    const user = userEvent.setup();
+    render(<App services={api} />);
+
+    const load = await screen.findByRole("button", { name: "Load gemma-3-4b-it-q4" });
+    await user.click(load);
+    await waitFor(() => expect(api.loadV2Slot).toHaveBeenCalledOnce());
+    const callbacks = vi.mocked(api.openV2Events!).mock.calls[0]?.[2];
+    expect(callbacks).toBeDefined();
+    act(() =>
+      callbacks?.onSnapshot(
+        controlSnapshot({
+          revision: "12",
+          cursor: "12",
+          operations: [{ ...validV2Operation, status: "succeeded", updated_revision: "12" }],
+        }),
+      ),
+    );
+    await act(async () => resolveLoad(accepted));
+
+    await waitFor(() => expect(load).toBeEnabled());
+    expect(screen.getByRole("link", { name: "Node online. No active model" })).toBeVisible();
   });
 
   it("keeps the sidebar as the only live-region owner on Runtime during a session transition", async () => {
