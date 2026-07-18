@@ -2190,10 +2190,10 @@ mod tests {
         ) -> Result<(), LifecycleError> {
             panic!("unload must not wait for readiness")
         }
-        fn stop_exact(
+        fn stop_exact<'a>(
             &mut self,
-            _: crate::model_lifecycle::StartedSession<()>,
-        ) -> Result<(), LifecycleError> {
+            _: &'a mut crate::model_lifecycle::StartedSession<()>,
+        ) -> Result<(), crate::model_lifecycle::ExactStopFailure<'a, ()>> {
             Ok(())
         }
     }
@@ -2241,10 +2241,10 @@ mod tests {
             Ok(())
         }
 
-        fn stop_exact(
+        fn stop_exact<'a>(
             &mut self,
-            _: crate::model_lifecycle::StartedSession<()>,
-        ) -> Result<(), LifecycleError> {
+            _: &'a mut crate::model_lifecycle::StartedSession<()>,
+        ) -> Result<(), crate::model_lifecycle::ExactStopFailure<'a, ()>> {
             Ok(())
         }
     }
@@ -2291,10 +2291,10 @@ mod tests {
             Ok(())
         }
 
-        fn stop_exact(
+        fn stop_exact<'a>(
             &mut self,
-            _: crate::model_lifecycle::StartedSession<()>,
-        ) -> Result<(), LifecycleError> {
+            _: &'a mut crate::model_lifecycle::StartedSession<()>,
+        ) -> Result<(), crate::model_lifecycle::ExactStopFailure<'a, ()>> {
             Ok(())
         }
 
