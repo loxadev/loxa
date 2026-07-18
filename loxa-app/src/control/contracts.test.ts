@@ -77,6 +77,23 @@ const inventory = [
 ];
 
 describe("control contracts", () => {
+  it("keeps the closed v1 decoder surface additive beside strict v2 collections", () => {
+    const v1 = decodeNodeSnapshot({
+      status: "unloaded",
+      active_model_id: null,
+      operation_id: null,
+      error: null,
+    });
+    const v2 = decodeV2NodeCollection(validV2NodeCollection);
+
+    expect(v1).toEqual({ status: "unloaded", activeModelId: null, operationId: null, error: null });
+    expect(v2.nodes[0]).toMatchObject({
+      node_id: v2Ids.node,
+      node_instance_id: v2Ids.instance,
+      slot_capacity: 1,
+    });
+  });
+
   it("accepts canonical UUID-shaped and older opaque v1 proof identities", () => {
     const proof = (nodeId: string, runtimeIdentity: string) => ({
       protocol_version: 1,

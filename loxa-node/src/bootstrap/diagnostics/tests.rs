@@ -125,6 +125,90 @@ fn parse_single_record(capture: &Capture) -> Value {
 }
 
 #[test]
+fn diagnostics_emit_only_committed_authoritative_ids_and_no_sensitive_values() {
+    let fixture =
+        crate::slice3_test_support::compatibility::captured_diagnostics_fixture(|operation_id| {
+            capture_events(
+                debug_filter(),
+                || {
+                    tracing::event!(
+                        target: "loxa_node::operation",
+                        Level::INFO,
+                        event_code = "operation.started",
+                        component = "operation",
+                        operation_id,
+                    );
+                    tracing::event!(target: "loxa_node::operation", Level::INFO,
+                        event_code = "operation.terminal", component = "operation",
+                        authorization = "Bearer SECRET_TOKEN");
+                    tracing::event!(target: "loxa_node::operation", Level::INFO,
+                        event_code = "operation.terminal", component = "operation",
+                        prompt = "raw prompt");
+                    tracing::event!(target: "loxa_node::operation", Level::INFO,
+                        event_code = "operation.terminal", component = "operation",
+                        path = "/private/model");
+                    tracing::event!(target: "loxa_node::operation", Level::INFO,
+                        event_code = "operation.terminal", component = "operation",
+                        response = "raw child output");
+                },
+                DiagnosticsHealth::new(),
+            )
+            .text()
+        });
+
+    assert!(!fixture.operation_ids.is_empty());
+    assert!(fixture
+        .operation_ids
+        .iter()
+        .all(|id| !id.to_string().is_empty()));
+    assert!(fixture
+        .operation_ids
+        .iter()
+        .all(|id| fixture.committed_operation_ids.contains(id)));
+    assert!(fixture
+        .event_ids
+        .iter()
+        .all(|id| fixture.committed_event_ids.contains(id)));
+    for forbidden in [
+        "SECRET_TOKEN",
+        "raw prompt",
+        "/private/model",
+        "raw child output",
+    ] {
+        assert!(!fixture.rendered.contains(forbidden));
+    }
+    let forbidden_field_parts = [
+        "authorization",
+        "body",
+        "command",
+        "cookie",
+        "credential",
+        "environment",
+        "error",
+        "header",
+        "path",
+        "prompt",
+        "response",
+        "secret",
+        "token",
+        "uri",
+    ];
+    for record in fixture
+        .rendered
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("valid diagnostics JSONL"))
+    {
+        assert!(record
+            .as_object()
+            .expect("diagnostic record object")
+            .keys()
+            .all(|key| !forbidden_field_parts
+                .iter()
+                .any(|forbidden| key.to_ascii_lowercase().contains(forbidden))));
+    }
+}
+
+#[test]
 fn encodes_stable_fields_as_one_complete_jsonl_write() {
     let health = DiagnosticsHealth::new();
     let capture = capture_events(

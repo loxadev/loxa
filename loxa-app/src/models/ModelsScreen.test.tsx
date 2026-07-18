@@ -56,6 +56,8 @@ describe("ModelsScreen v2 authority", () => {
       "ab".repeat(32),
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
+    expect(services.proveV2ControlPeer).toHaveBeenCalledTimes(1);
+    expect(services.openV2Events).toHaveBeenCalledTimes(1);
   });
 
   it("downloads through v2 and never calls the v1 mutation adapter", async () => {

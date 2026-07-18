@@ -63,6 +63,24 @@ async function createProvenPeer(
 }
 
 describe("control client", () => {
+  it("keeps v1 metadata and v2 authority on additive authenticated routes", async () => {
+    const inventoryFetch = vi.fn(async () => Response.json([]));
+    await expect(getInventory("http://127.0.0.1:8080", token, { fetch: inventoryFetch })).resolves.toEqual([]);
+    const { peer, fetch } = await createProvenPeer([Response.json(validV2NodeCollection)]);
+    const nodes = await fetchV2NodeCollection(peer);
+
+    expect(nodes.nodes[0].node_id).toBe(v2Ids.node);
+    expect(inventoryFetch).toHaveBeenCalledWith(
+      "http://127.0.0.1:8080/loxa/v1/models",
+      expect.objectContaining({ headers: expect.objectContaining({ authorization: `Bearer ${token}` }) }),
+    );
+    expect(fetch.mock.calls.map(([url]) => url)).toEqual([
+      "http://127.0.0.1:8080/loxa/v1/node",
+      "http://127.0.0.1:8080/loxa/v2/nodes",
+      "http://127.0.0.1:8080/loxa/v2/nodes",
+    ]);
+  });
+
   it("sends the bearer only in the authorization header", async () => {
     const fetch = vi.fn(async (input: string, init?: RequestInit) => {
       void input;

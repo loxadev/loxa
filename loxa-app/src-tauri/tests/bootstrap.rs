@@ -140,6 +140,8 @@ fn native_bootstrap_decodes_and_correlates_strict_v2_state_behind_the_proven_pee
     state
         .attach_with_config(peer.endpoint.clone(), &bootstrap_config(&peer))
         .unwrap();
+    assert_eq!(state.snapshot().ownership, Ownership::Attached);
+    assert!(!state.snapshot().child_running);
 
     let v2 = state.read_v2_state(Duration::from_secs(1)).unwrap();
 
@@ -150,6 +152,8 @@ fn native_bootstrap_decodes_and_correlates_strict_v2_state_behind_the_proven_pee
     assert_eq!(v2.slots.slots[0].name, "default");
     assert!(v2.operations.operations.is_empty());
     assert!(!state.snapshot().endpoint.contains('@'));
+    assert_eq!(state.snapshot().ownership, Ownership::Attached);
+    assert!(!state.snapshot().child_running);
     peer.finish();
 }
 

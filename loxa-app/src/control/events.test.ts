@@ -279,6 +279,32 @@ describe("streamControlEvents", () => {
 });
 
 describe("durable v2 control events", () => {
+  it("keeps v1 numeric cursors independent from v2 epoch-scoped decimal cursors", async () => {
+    const v1 = callbacks();
+    const v1Handle = streamControlEvents(
+      "http://127.0.0.1:8080",
+      token,
+      3,
+      v1.value,
+      undefined,
+      vi.fn(async () =>
+        responseFrom([
+          encode('event: snapshot\ndata: {"cursor":4,"cursor_gap":false,"operations":[],"events":[]}\n\n'),
+        ]),
+      ),
+    );
+    await expect(v1Handle.finished).resolves.toEqual({
+      kind: "error",
+      cursor: 4,
+      message: "Live model updates disconnected.",
+    });
+
+    const v2 = applyV2Snapshot(undefined, decodeV2ReconnectSnapshot(validV2ReconnectSnapshot));
+    expect(v1.snapshots).toHaveLength(1);
+    expect(v2.epoch).toBe(v2Ids.epoch);
+    expect(v2.cursor).toBe("11");
+  });
+
   it("fully replaces collections on every snapshot without replaying retained event records", () => {
     const initial = applyV2Snapshot(undefined, decodeV2ReconnectSnapshot(validV2ReconnectSnapshot));
     const replacement = decodeV2ReconnectSnapshot({
