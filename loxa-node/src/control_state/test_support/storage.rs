@@ -38,6 +38,25 @@ impl Drop for TestRoot {
     }
 }
 
+pub(crate) fn assert_private_repository_parent(path: &Path) {
+    let parent = fs::canonicalize(path.parent().expect("repository path has a parent"))
+        .expect("canonicalize repository parent");
+    let temp = fs::canonicalize(std::env::temp_dir()).expect("canonicalize system temp directory");
+    assert_ne!(
+        parent, temp,
+        "repository fixture must not use the shared temp directory directly"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let metadata = fs::metadata(parent).expect("read repository parent metadata");
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AuxiliaryKind {
     Wal,

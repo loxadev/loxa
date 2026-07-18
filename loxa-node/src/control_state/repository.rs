@@ -4618,6 +4618,32 @@ mod tests {
         run_restore_subprocess(point, "restore_failure")
     }
 
+    fn assert_fault_matrix_subprocess(mode: &'static str) {
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "control_state::repository::tests::repository_process_helper",
+                "--nocapture",
+            ])
+            .env("LOXA_REPOSITORY_HELPER", mode)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = wait_child_with_timeout(child, Duration::from_secs(300));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "repository fault matrix failed: {mode}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stdout.contains(&format!("FAULT_MATRIX_COMPLETE:{mode}")),
+            "repository fault matrix did not report completion: {mode}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
     fn run_restore_subprocess(
         point: super::RestoreBoundary,
         mode: &'static str,
@@ -4848,6 +4874,22 @@ mod tests {
     fn repository_process_helper() {
         let mode = std::env::var("LOXA_REPOSITORY_HELPER").expect("helper mode");
         match mode.as_str() {
+            "restore_crash_matrix" => {
+                assert_restore_fault_matrix();
+                println!("FAULT_MATRIX_COMPLETE:{mode}");
+            }
+            "restore_failure_matrix" => {
+                assert_returned_restore_failure_matrix();
+                println!("FAULT_MATRIX_COMPLETE:{mode}");
+            }
+            "rollback_crash_matrix" => {
+                assert_migration_rollback_fault_matrix();
+                println!("FAULT_MATRIX_COMPLETE:{mode}");
+            }
+            "rollback_failure_matrix" => {
+                assert_returned_migration_rollback_failure_matrix();
+                println!("FAULT_MATRIX_COMPLETE:{mode}");
+            }
             "probe" => {
                 let path =
                     PathBuf::from(std::env::var_os("LOXA_REPOSITORY_PATH").expect("helper path"));
@@ -6375,6 +6417,10 @@ mod tests {
 
     #[test]
     fn every_restore_fault_keeps_the_destination_as_a_complete_old_or_new_lineage() {
+        assert_fault_matrix_subprocess("restore_crash_matrix");
+    }
+
+    fn assert_restore_fault_matrix() {
         for point in [
             super::RestoreBoundary::BeforeSourceCopy,
             super::RestoreBoundary::AfterSourceCopy,
@@ -6458,6 +6504,10 @@ mod tests {
 
     #[test]
     fn every_returned_restore_failure_preserves_old_or_quarantines_exact_new_lineage() {
+        assert_fault_matrix_subprocess("restore_failure_matrix");
+    }
+
+    fn assert_returned_restore_failure_matrix() {
         for point in restore_boundaries() {
             let outcome = run_restore_returned_failure_subprocess(point);
             assert!(outcome.reached, "{point:?}\n{}", outcome.output);
@@ -6496,6 +6546,10 @@ mod tests {
 
     #[test]
     fn every_migration_rollback_fault_keeps_one_complete_lineage() {
+        assert_fault_matrix_subprocess("rollback_crash_matrix");
+    }
+
+    fn assert_migration_rollback_fault_matrix() {
         for point in [
             super::RestoreBoundary::BeforeSourceCopy,
             super::RestoreBoundary::AfterSourceCopy,
@@ -6568,6 +6622,10 @@ mod tests {
 
     #[test]
     fn every_returned_rollback_failure_preserves_failed_or_quarantines_backup_lineage() {
+        assert_fault_matrix_subprocess("rollback_failure_matrix");
+    }
+
+    fn assert_returned_migration_rollback_failure_matrix() {
         for point in restore_boundaries() {
             let outcome = run_migration_rollback_returned_failure_subprocess(point);
             assert!(outcome.reached, "{point:?}\n{}", outcome.output);
