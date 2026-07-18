@@ -2299,7 +2299,7 @@ fn validate_slot_intent(
             if intent.operation_id.is_some()
                 || intent.reason.is_some()
                 || intent.desired_kind == DesiredKind::Unknown
-                || !settled_intent_matches_observed_slot(&intent, slot)?
+                || !settled_intent_matches_observed_slot(intent, slot)?
             {
                 return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
             }
@@ -2311,7 +2311,7 @@ fn validate_slot_intent(
             {
                 return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
             }
-            validate_applying_slot_intent(connection, slot_id, &intent, slot)?;
+            validate_applying_slot_intent(connection, slot_id, intent, slot)?;
         }
         ReconciliationState::RecoveryRequired => {
             if intent.reason.is_none()

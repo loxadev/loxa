@@ -53,7 +53,7 @@ fn presentation_key(operation: &V2Operation) -> (u8, DecimalU64, OperationId) {
 
 #[test]
 fn presentation_prioritizes_active_lifecycle_and_keeps_canonical_collection_unchanged() {
-    let canonical = vec![
+    let canonical = [
         operation(
             "11111111-1111-4111-8111-111111111111",
             V2OperationKind::Load,
