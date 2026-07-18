@@ -146,26 +146,14 @@ fn finish_failed_durable_build(
     )
 }
 
-#[cfg(test)]
-static DOWNLOAD_WORKER_SPAWN_COUNT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-#[cfg(test)]
-pub(crate) fn reset_download_worker_spawn_count() {
-    DOWNLOAD_WORKER_SPAWN_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
-}
-
-#[cfg(test)]
-pub(crate) fn download_worker_spawn_count() -> usize {
-    DOWNLOAD_WORKER_SPAWN_COUNT.load(std::sync::atomic::Ordering::SeqCst)
-}
-
 pub(crate) struct NodeBuilder<'a> {
     requested_model: Option<&'a str>,
     port: Option<u16>,
     engine: RuntimeBackendKind,
     paths: &'a NodePaths,
     diagnostics_health: DiagnosticsHealth,
+    #[cfg(test)]
+    download_worker_spawn_count: Option<&'a std::sync::atomic::AtomicUsize>,
 }
 
 impl<'a> NodeBuilder<'a> {
@@ -182,6 +170,8 @@ impl<'a> NodeBuilder<'a> {
             engine,
             paths,
             diagnostics_health: DiagnosticsHealth::new(),
+            #[cfg(test)]
+            download_worker_spawn_count: None,
         }
     }
 
@@ -198,7 +188,18 @@ impl<'a> NodeBuilder<'a> {
             engine,
             paths,
             diagnostics_health,
+            #[cfg(test)]
+            download_worker_spawn_count: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_download_worker_spawn_count(
+        mut self,
+        count: &'a std::sync::atomic::AtomicUsize,
+    ) -> Self {
+        self.download_worker_spawn_count = Some(count);
+        self
     }
 
     pub(crate) fn build(self) -> io::Result<NodeRuntime> {
@@ -321,8 +322,6 @@ impl<'a> NodeBuilder<'a> {
             }
         };
         let gateway_state = loxa_core::gateway::GatewayState::new(node_id, node_instance_id);
-        #[cfg(test)]
-        DOWNLOAD_WORKER_SPAWN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         download_runtime = Some({
             let run = owner_guard.baseline();
             if self.engine == RuntimeBackendKind::LlamaCpp {
@@ -345,6 +344,10 @@ impl<'a> NodeBuilder<'a> {
                         production_lifecycle::ProductionGatewayPublisher(gateway_state.clone()),
                     ),
                 };
+                #[cfg(test)]
+                if let Some(count) = self.download_worker_spawn_count {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
                 download_control::DownloadControl::spawn_with_lifecycle_and_control_state(
                     self.paths.models_dir.clone(),
                     lifecycle,
@@ -362,6 +365,10 @@ impl<'a> NodeBuilder<'a> {
                         Some(history_worker),
                         control_worker,
                     ));
+                }
+                #[cfg(test)]
+                if let Some(count) = self.download_worker_spawn_count {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
                 download_control::DownloadControl::spawn_with_control_state(
                     self.paths.models_dir.clone(),

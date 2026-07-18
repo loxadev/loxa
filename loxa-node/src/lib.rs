@@ -3418,8 +3418,8 @@ mod lifecycle_api_tests {
     #[test]
     fn token_and_history_failures_spawn_no_download_or_model_actor() {
         use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
-        crate::bootstrap::reset_download_worker_spawn_count();
         let token_temp = TestDir::new("builder-token-before-workers");
         let token_paths = NodePaths {
             models_dir: token_temp.0.join("models"),
@@ -3427,12 +3427,14 @@ mod lifecycle_api_tests {
             logs_dir: token_temp.0.join("logs"),
         };
         std::fs::create_dir(token_temp.0.join("control.token")).unwrap();
+        let token_worker_spawns = AtomicUsize::new(0);
         assert!(
             NodeBuilder::new(None, Some(0), RuntimeBackendKind::LlamaCpp, &token_paths)
+                .with_download_worker_spawn_count(&token_worker_spawns)
                 .build()
                 .is_err()
         );
-        assert_eq!(crate::bootstrap::download_worker_spawn_count(), 0);
+        assert_eq!(token_worker_spawns.load(Ordering::SeqCst), 0);
 
         let history_temp = TestDir::new("builder-history-before-workers");
         let history_dir = history_temp.0.join("history");
@@ -3443,12 +3445,14 @@ mod lifecycle_api_tests {
             state_path: history_temp.0.join("run").join("managed.json"),
             logs_dir: history_temp.0.join("run").join("logs"),
         };
+        let history_worker_spawns = AtomicUsize::new(0);
         assert!(
             NodeBuilder::new(None, Some(0), RuntimeBackendKind::LlamaCpp, &history_paths)
+                .with_download_worker_spawn_count(&history_worker_spawns)
                 .build()
                 .is_err()
         );
-        assert_eq!(crate::bootstrap::download_worker_spawn_count(), 0);
+        assert_eq!(history_worker_spawns.load(Ordering::SeqCst), 0);
     }
 
     #[test]
