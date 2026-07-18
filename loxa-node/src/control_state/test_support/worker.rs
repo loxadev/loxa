@@ -196,7 +196,8 @@ async fn lifecycle_observation_without_ack_poisoned_as_unknown_commit() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn lifecycle_final_commit_snapshot_uncertainty_seals_health_and_preserves_durable_truth() {
+async fn candidate_ready_final_commit_snapshot_uncertainty_seals_health_and_preserves_durable_truth(
+) {
     let (path, repository) = repository();
     let (handle, worker) = spawn_from_repository_for_test(repository).unwrap();
     let admission = handle
@@ -216,16 +217,13 @@ async fn lifecycle_final_commit_snapshot_uncertainty_seals_health_and_preserves_
     assert_eq!(
         handle
             .observe_lifecycle_with_snapshot_failure_for_test(
-                Transition::Failed {
+                Transition::Succeeded {
                     operation_id: admission.operation_id,
-                    error: V2OperationError {
-                        code: V2OperationErrorCode::LoadFailed,
-                        message: "rollback failed".into(),
-                    },
+                    observed_model_id: Some("candidate".into()),
                 },
-                LifecycleObservation::RecoveryRequired {
+                LifecycleObservation::LoadReady {
                     operation_id: admission.operation_id,
-                    reason: crate::control_state::repository::IntentReason::CompensationFailed,
+                    model_id: "candidate".into(),
                 },
             )
             .await
@@ -244,7 +242,16 @@ async fn lifecycle_final_commit_snapshot_uncertainty_seals_health_and_preserves_
     )
     .unwrap();
     let durable = reopened.committed_state().unwrap();
-    assert_eq!(durable.slot.status, V2SlotStatus::Recovery);
+    assert_eq!(durable.slot.status, V2SlotStatus::Ready);
+    assert_eq!(durable.slot.model_id.as_deref(), Some("candidate"));
+    assert_eq!(
+        durable.intent.desired,
+        DesiredDisposition::Loaded("candidate".into())
+    );
+    assert_eq!(
+        durable.intent.reconciliation,
+        crate::control_state::repository::ReconciliationState::Settled
+    );
     assert_eq!(
         durable
             .operations
@@ -252,7 +259,7 @@ async fn lifecycle_final_commit_snapshot_uncertainty_seals_health_and_preserves_
             .find(|operation| operation.operation_id == admission.operation_id)
             .unwrap()
             .status,
-        V2OperationStatus::Failed
+        V2OperationStatus::Succeeded
     );
     reopened.close().unwrap();
     cleanup(&path);
