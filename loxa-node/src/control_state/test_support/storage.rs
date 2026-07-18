@@ -835,6 +835,152 @@ pub(super) mod slice4_migration {
     }
 
     #[test]
+    fn unrelated_terminal_null_model_load_is_not_a_migration_exception() {
+        let fixture = V1Fixture::new("unrelated-null-model-load");
+        let mut missing_target = load_operation("target", 9);
+        missing_target.model_id = None;
+        fixture.set_v1_slot_loading(None, missing_target);
+        let mut opened = fixture.reopen().unwrap();
+
+        opened
+            .repository
+            .transaction(|transaction| {
+                transaction.execute(
+                    "INSERT INTO operations(operation_id,slot_id,admitting_node_instance_id,kind,status,model_id,created_revision,updated_revision,created_at_unix_ms,updated_at_unix_ms) VALUES('87777777-7777-4777-8777-777777777777',?1,?2,'load','succeeded',NULL,'10','10','10','10')",
+                    [SLOT_ID, INSTANCE_ID],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            opened.repository.validate_all().unwrap_err().class(),
+            RepositoryErrorClass::Corrupt
+        );
+        opened.repository.close().unwrap();
+    }
+
+    #[test]
+    fn settled_intent_must_match_observed_disposition_and_revision() {
+        let disposition = V1Fixture::new("settled-disposition-drift");
+        disposition.set_v1_slot("ready", Some("ready-model"), None);
+        let mut opened = disposition.reopen().unwrap();
+        opened
+            .repository
+            .transaction(|transaction| {
+                transaction.execute(
+                    "UPDATE slot_intent SET desired_kind='unloaded',desired_model_id=NULL WHERE singleton=1",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            opened.repository.validate_all().unwrap_err().class(),
+            RepositoryErrorClass::Corrupt
+        );
+        opened.repository.close().unwrap();
+
+        let revision = V1Fixture::new("settled-revision-drift");
+        revision.set_v1_slot("ready", Some("ready-model"), None);
+        let mut opened = revision.reopen().unwrap();
+        opened
+            .repository
+            .transaction(|transaction| {
+                transaction.execute(
+                    "UPDATE slot_intent SET desired_revision='7' WHERE singleton=1",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            opened.repository.validate_all().unwrap_err().class(),
+            RepositoryErrorClass::Corrupt
+        );
+        opened.repository.close().unwrap();
+    }
+
+    #[test]
+    fn applying_intent_must_match_the_exact_active_lifecycle_operation() {
+        let model = V1Fixture::new("applying-model-drift");
+        model.set_v1_slot_loading(None, load_operation("target", 9));
+        let mut opened = model.reopen().unwrap();
+        opened
+            .repository
+            .transaction(|transaction| {
+                transaction.execute(
+                    "UPDATE slot_intent SET desired_model_id='other-target' WHERE singleton=1",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            opened.repository.validate_all().unwrap_err().class(),
+            RepositoryErrorClass::Corrupt
+        );
+        opened.repository.close().unwrap();
+
+        let revision = V1Fixture::new("applying-created-revision-drift");
+        revision.set_v1_slot_loading(None, load_operation("target", 9));
+        let mut opened = revision.reopen().unwrap();
+        opened
+            .repository
+            .transaction(|transaction| {
+                transaction.execute(
+                    "UPDATE slot_intent SET desired_revision='8' WHERE singleton=1",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            opened.repository.validate_all().unwrap_err().class(),
+            RepositoryErrorClass::Corrupt
+        );
+        opened.repository.close().unwrap();
+
+        for (label, kind, status, operation_id) in [
+            (
+                "applying-kind-drift",
+                "download",
+                "running",
+                "87777777-7777-4777-8777-777777777777",
+            ),
+            (
+                "applying-status-drift",
+                "load",
+                "succeeded",
+                "88888888-8888-4888-8888-888888888888",
+            ),
+        ] {
+            let fixture = V1Fixture::new(label);
+            fixture.set_v1_slot_loading(None, load_operation("target", 9));
+            let mut opened = fixture.reopen().unwrap();
+            opened
+                .repository
+                .transaction(|transaction| {
+                    transaction.execute(
+                        "INSERT INTO operations(operation_id,slot_id,admitting_node_instance_id,kind,status,model_id,created_revision,updated_revision,created_at_unix_ms,updated_at_unix_ms) VALUES(?1,?2,?3,?4,?5,'target','10','10','10','10')",
+                        [operation_id, SLOT_ID, INSTANCE_ID, kind, status],
+                    )?;
+                    transaction.execute(
+                        "UPDATE slot_intent SET operation_id=?1,desired_revision='10' WHERE singleton=1",
+                        [operation_id],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(
+                opened.repository.validate_all().unwrap_err().class(),
+                RepositoryErrorClass::Corrupt
+            );
+            opened.repository.close().unwrap();
+        }
+    }
+
+    #[test]
     fn a_second_open_is_a_migration_noop() {
         let fixture = V1Fixture::new("repeat-open");
         let first = fixture.reopen().unwrap();
@@ -1053,5 +1199,83 @@ pub(super) mod slice4_migration {
         assert_eq!(intent.desired_model_id.as_deref(), Some("target"));
         assert_eq!(intent.desired_revision, 9);
         restored.close().unwrap();
+    }
+
+    #[test]
+    fn v2_reopen_repairs_stale_v1_backup_at_post_commit_boundaries() {
+        for boundary in ["post-commit", "post-sync", "backup-temporary"] {
+            let fixture = V1Fixture::new(&format!("stale-backup-{boundary}"));
+            fixture.set_v1_slot_loading(None, load_operation("target", 9));
+            let mut backup_name = fixture.path.file_name().unwrap().to_os_string();
+            backup_name.push(".pre-migration.bak");
+            let backup = fixture.path.with_file_name(backup_name);
+            std::fs::copy(&fixture.path, &backup).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+
+            let mut connection = fixture.connection();
+            migrate_v1_to_v2(&mut connection, 30).unwrap();
+            connection.close().unwrap();
+            assert_eq!(fixture.raw_schema_version(), 2);
+            assert_eq!(
+                Connection::open(&backup)
+                    .unwrap()
+                    .query_row(
+                        "SELECT schema_version FROM control_meta WHERE singleton=1",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                1
+            );
+
+            if boundary != "post-commit" {
+                std::fs::File::open(&fixture.path)
+                    .unwrap()
+                    .sync_all()
+                    .unwrap();
+                std::fs::File::open(fixture.path.parent().unwrap())
+                    .unwrap()
+                    .sync_all()
+                    .unwrap();
+            }
+            let orphaned_temporary = (boundary == "backup-temporary").then(|| {
+                let mut name = backup.file_name().unwrap().to_os_string();
+                name.push(".backup-crash.tmp");
+                let temporary = backup.with_file_name(name);
+                std::fs::copy(&fixture.path, &temporary).unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))
+                        .unwrap();
+                }
+                temporary
+            });
+
+            let opened = fixture.reopen().unwrap();
+            opened
+                .repository
+                .validate_backup(&backup)
+                .expect("v2 reopen must replace the stale v1 migration backup");
+            assert_eq!(
+                Connection::open(&backup)
+                    .unwrap()
+                    .query_row(
+                        "SELECT schema_version FROM control_meta WHERE singleton=1",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                2
+            );
+            if let Some(temporary) = orphaned_temporary {
+                assert!(!temporary.exists());
+            }
+            opened.repository.close().unwrap();
+        }
     }
 }

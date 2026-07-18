@@ -1216,6 +1216,8 @@ impl ControlRepository {
                         1,
                     )?;
                 }
+            } else {
+                ensure_current_migration_backup(&opened, &canonical_path, node_id, &summary)?;
             }
             Ok((initialized, summary))
         })();
@@ -1287,6 +1289,8 @@ impl ControlRepository {
                         1,
                     )?;
                 }
+            } else {
+                ensure_current_migration_backup(&opened, &canonical_path, node_id, &summary)?;
             }
             Ok((initialized, summary))
         })();
@@ -2245,7 +2249,7 @@ fn validate_slot_intent(
     connection: &Connection,
     slot_id: SlotId,
     control_revision: u64,
-    _slot: &StoredSlotRow,
+    slot: &StoredSlotRow,
 ) -> Result<(), RepositoryError> {
     let stored_slot_id: String = connection
         .query_row(
@@ -2272,6 +2276,7 @@ fn validate_slot_intent(
             if intent.operation_id.is_some()
                 || intent.reason.is_some()
                 || intent.desired_kind == DesiredKind::Unknown
+                || !settled_intent_matches_observed_slot(&intent, slot)?
             {
                 return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
             }
@@ -2283,12 +2288,79 @@ fn validate_slot_intent(
             {
                 return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
             }
+            validate_applying_slot_intent(connection, slot_id, &intent, slot)?;
         }
         ReconciliationState::RecoveryRequired => {
             if intent.reason.is_none() {
                 return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
             }
         }
+    }
+    Ok(())
+}
+
+fn settled_intent_matches_observed_slot(
+    intent: &StoredSlotIntent,
+    slot: &StoredSlotRow,
+) -> Result<bool, RepositoryError> {
+    let slot_revision = parse_canonical_u64(&slot.updated_revision)?;
+    if intent.desired_revision != slot_revision {
+        return Ok(false);
+    }
+    Ok(match slot.status.as_str() {
+        "unloaded" => intent.desired_kind == DesiredKind::Unloaded,
+        "ready" => {
+            intent.desired_kind == DesiredKind::Loaded
+                && intent.desired_model_id.as_deref() == slot.model_id.as_deref()
+        }
+        _ => false,
+    })
+}
+
+fn validate_applying_slot_intent(
+    connection: &Connection,
+    slot_id: SlotId,
+    intent: &StoredSlotIntent,
+    slot: &StoredSlotRow,
+) -> Result<(), RepositoryError> {
+    let operation_id = intent
+        .operation_id
+        .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Corrupt))?;
+    let slot_operation_id = slot
+        .operation_id
+        .as_deref()
+        .map(OperationId::from_str)
+        .transpose()
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::Corrupt))?;
+    let operation: (String, String, Option<String>, String, String) = connection
+        .query_row(
+            "SELECT slot_id,kind,model_id,status,created_revision FROM operations WHERE operation_id=?1",
+            [operation_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .map_err(classify_missing_row)?;
+    let created_revision = parse_canonical_u64(&operation.4)?;
+    let slot_revision = parse_canonical_u64(&slot.updated_revision)?;
+    let active = matches!(operation.3.as_str(), "queued" | "running" | "cancelling");
+    let disposition_matches = match intent.desired_kind {
+        DesiredKind::Loaded => {
+            slot.status == "loading"
+                && operation.1 == "load"
+                && operation.2.as_deref() == intent.desired_model_id.as_deref()
+        }
+        DesiredKind::Unloaded => {
+            slot.status == "unloading" && operation.1 == "unload" && operation.2.is_none()
+        }
+        DesiredKind::Unknown => false,
+    };
+    if slot_operation_id != Some(operation_id)
+        || operation.0 != slot_id.to_string()
+        || !active
+        || created_revision != intent.desired_revision
+        || intent.desired_revision < slot_revision
+        || !disposition_matches
+    {
+        return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
     }
     Ok(())
 }
@@ -2437,7 +2509,14 @@ fn validate_connection_for_schema(
     {
         return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
     }
-    validate_operation_rows(connection, node_id, slot_id, revision, last_committed_at)?;
+    validate_operation_rows(
+        connection,
+        node_id,
+        slot_id,
+        revision,
+        last_committed_at,
+        expected_schema_version,
+    )?;
     if expected_schema_version == SCHEMA_VERSION {
         let allows_migration_mismatch = read_stored_slot_intent(connection).is_ok_and(|intent| {
             intent.reconciliation == ReconciliationState::RecoveryRequired
@@ -2599,6 +2678,7 @@ fn validate_operation_rows(
     slot_id: SlotId,
     revision: u64,
     last_committed_at: u64,
+    expected_schema_version: i64,
 ) -> Result<(), RepositoryError> {
     let mut statement = connection.prepare(
         "SELECT operation_id, slot_id, admitting_node_instance_id, v1_ordinal, kind, status, model_id, progress_current, progress_total, error_code, error_message, created_revision, updated_revision, created_at_unix_ms, updated_at_unix_ms FROM operations",
@@ -2659,14 +2739,17 @@ fn validate_operation_rows(
             created_at_unix_ms: DecimalU64::new(created_at),
             updated_at_unix_ms: DecimalU64::new(updated_at),
         };
-        let migration_recovery_load =
-            if kind == V2OperationKind::Load && operation.model_id.is_none() {
-                let mut with_validation_target = operation.clone();
-                with_validation_target.model_id = Some("migration-validation-probe".to_owned());
-                with_validation_target.validate().is_ok()
-            } else {
-                false
-            };
+        let migration_recovery_load = if kind == V2OperationKind::Load
+            && operation.model_id.is_none()
+            && (expected_schema_version == 1
+                || is_exact_migration_recovery_load(connection, operation_id)?)
+        {
+            let mut with_validation_target = operation.clone();
+            with_validation_target.model_id = Some("migration-validation-probe".to_owned());
+            with_validation_target.validate().is_ok()
+        } else {
+            false
+        };
         if stored_slot_id != slot_id
             || v1_ordinal.is_some_and(|ordinal| ordinal < 1)
             || (operation.validate().is_err() && !migration_recovery_load)
@@ -2679,6 +2762,32 @@ fn validate_operation_rows(
         }
     }
     Ok(())
+}
+
+fn is_exact_migration_recovery_load(
+    connection: &Connection,
+    operation_id: OperationId,
+) -> Result<bool, RepositoryError> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM slot_intent AS intent
+                 JOIN slot_state AS slot ON slot.singleton=intent.singleton
+                 WHERE intent.singleton=1
+                   AND intent.operation_id=?1
+                   AND slot.operation_id=?1
+                   AND slot.status='loading'
+                   AND intent.desired_kind='unknown'
+                   AND intent.desired_model_id IS NULL
+                   AND intent.desired_revision=slot.updated_revision
+                   AND intent.reconciliation_state='recovery_required'
+                   AND intent.reason_code='migration_operation_mismatch'
+             )",
+            [operation_id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(RepositoryError::from)
 }
 
 fn validate_slot_operation_reference(
@@ -3068,12 +3177,15 @@ fn validate_database_file_for_schema(
 ) -> Result<ValidationSummary, RepositoryError> {
     let prepared = prepare_existing_storage_path(path)?;
     let connection = open_validated_connection_after(prepared, true, || {})?;
-    connection.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
-    connection.execute_batch("PRAGMA trusted_schema=OFF; PRAGMA mmap_size=0;")?;
-    apply_limits(&connection)?;
-    let summary =
-        validate_connection_for_schema(&connection, expected_node_id, expected_schema_version)?;
-    connection.close()?;
+    let validation = (|| {
+        connection.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
+        connection.execute_batch("PRAGMA trusted_schema=OFF; PRAGMA mmap_size=0;")?;
+        apply_limits(&connection)?;
+        validate_connection_for_schema(&connection, expected_node_id, expected_schema_version)
+    })();
+    let close = connection.close();
+    let summary = validation?;
+    close?;
     Ok(summary)
 }
 
@@ -3147,6 +3259,49 @@ fn sync_and_reopen_validate_migration(
             .main_guard
             .as_ref()
             .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?,
+    )
+}
+
+fn ensure_current_migration_backup(
+    opened: &ValidatedConnection,
+    path: &Path,
+    expected_node_id: NodeId,
+    expected_summary: &ValidationSummary,
+) -> Result<(), RepositoryError> {
+    let backup = migration_backup_path(path)?;
+    let destination_schema_version = match fs::symlink_metadata(&backup) {
+        Ok(_) => {
+            match validate_database_file_for_schema(&backup, Some(expected_node_id), SCHEMA_VERSION)
+            {
+                Ok(_) => return Ok(()),
+                Err(current_error) => {
+                    let legacy_validation =
+                        validate_database_file_for_schema(&backup, Some(expected_node_id), 1);
+                    if legacy_validation.is_err() {
+                        return Err(current_error);
+                    }
+                    1
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => SCHEMA_VERSION,
+        Err(_) => return Err(RepositoryError::new(RepositoryErrorClass::UnsafePath)),
+    };
+
+    let (busy, _log, _checkpointed): (i64, i64, i64) =
+        opened.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+    if busy != 0 {
+        return Err(RepositoryError::new(RepositoryErrorClass::Durability));
+    }
+    sync_and_reopen_validate_migration(opened, path, expected_node_id, expected_summary)?;
+    publish_migration_backup_for_schema(
+        opened,
+        path,
+        expected_node_id,
+        SCHEMA_VERSION,
+        destination_schema_version,
     )
 }
 
