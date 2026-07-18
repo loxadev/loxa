@@ -476,6 +476,89 @@ describe("durable v2 control events", () => {
     expect(observed.events).toEqual([nextV2Event]);
   });
 
+  it.each([
+    {
+      name: "unmarked epoch replacement",
+      resume: { epoch: v2Ids.epoch, cursor: "11" },
+      snapshot: {
+        ...validV2ReconnectSnapshot,
+        epoch: v2Ids.oldEpoch,
+        stream: { epoch: v2Ids.oldEpoch, cursor: "11", cursor_gap: false },
+      },
+    },
+    {
+      name: "snapshot behind requested cursor",
+      resume: { epoch: v2Ids.epoch, cursor: "12" },
+      snapshot: validV2ReconnectSnapshot,
+    },
+    {
+      name: "missing retained catch-up",
+      resume: { epoch: v2Ids.epoch, cursor: "10" },
+      snapshot: validV2ReconnectSnapshot,
+    },
+    {
+      name: "retained event at the requested cursor",
+      resume: { epoch: v2Ids.epoch, cursor: "11" },
+      snapshot: { ...validV2ReconnectSnapshot, events: [validV2Event] },
+    },
+  ] as const)("rejects a reconnect snapshot with $name", async ({ resume, snapshot }) => {
+    const peer = await createV2Peer(responseFrom([encode(`event: snapshot\ndata: ${JSON.stringify(snapshot)}\n\n`)]));
+    const observed = v2Callbacks();
+
+    await expect(openV2Events(peer.peer, resume, observed.value).finished).resolves.toMatchObject({
+      kind: "error",
+      message: expect.stringMatching(/invalid/i),
+    });
+    expect(observed.snapshots).toEqual([]);
+    expect(observed.retainedEvents).toEqual([]);
+  });
+
+  it("accepts an explicitly marked replacement gap before delivering its snapshot", async () => {
+    const replacement = {
+      ...validV2ReconnectSnapshot,
+      epoch: v2Ids.oldEpoch,
+      stream: { epoch: v2Ids.oldEpoch, cursor: "11", cursor_gap: true },
+    };
+    const peer = await createV2Peer(
+      responseFrom([encode(`event: snapshot\ndata: ${JSON.stringify(replacement)}\n\n`)]),
+    );
+    const observed = v2Callbacks();
+
+    await expect(
+      openV2Events(peer.peer, { epoch: v2Ids.epoch, cursor: "12" }, observed.value).finished,
+    ).resolves.toMatchObject({ kind: "error", cursor: "11", message: expect.stringMatching(/disconnected/i) });
+    expect(observed.snapshots).toEqual([replacement]);
+  });
+
+  it("rejects an unsolicited cursor gap on an initial stream before callbacks", async () => {
+    const snapshot = {
+      ...validV2ReconnectSnapshot,
+      stream: { ...validV2ReconnectSnapshot.stream, cursor_gap: true },
+    };
+    const peer = await createV2Peer(responseFrom([encode(`event: snapshot\ndata: ${JSON.stringify(snapshot)}\n\n`)]));
+    const observed = v2Callbacks();
+
+    await expect(openV2Events(peer.peer, undefined, observed.value).finished).resolves.toMatchObject({
+      kind: "error",
+      message: expect.stringMatching(/invalid/i),
+    });
+    expect(observed.snapshots).toEqual([]);
+    expect(observed.retainedEvents).toEqual([]);
+  });
+
+  it("rejects unsolicited retained history on an initial stream before callbacks", async () => {
+    const snapshot = { ...validV2ReconnectSnapshot, events: [validV2Event] };
+    const peer = await createV2Peer(responseFrom([encode(`event: snapshot\ndata: ${JSON.stringify(snapshot)}\n\n`)]));
+    const observed = v2Callbacks();
+
+    await expect(openV2Events(peer.peer, undefined, observed.value).finished).resolves.toMatchObject({
+      kind: "error",
+      message: expect.stringMatching(/invalid/i),
+    });
+    expect(observed.snapshots).toEqual([]);
+    expect(observed.retainedEvents).toEqual([]);
+  });
+
   it("rejects oversized or duplicate-key v2 event data before object construction", async () => {
     const observed = v2Callbacks();
     const duplicateEvent = JSON.stringify(nextV2Event).replace('"sequence":"12",', '"sequence":"12","sequence":"12",');
@@ -656,6 +739,36 @@ describe("durable v2 control events", () => {
     expect(observed.events).toEqual([]);
   });
 
+  it("terminates the stream when a live event belongs to a foreign epoch", async () => {
+    const foreign = decodeV2ControlEvent({
+      ...nextV2Event,
+      epoch: v2Ids.oldEpoch,
+    });
+    const peer = await createV2Peer(
+      responseFrom([
+        encode(
+          `event: snapshot\ndata: ${JSON.stringify(validV2ReconnectSnapshot)}\n\n` +
+            `id: 12\nevent: state\ndata: ${JSON.stringify(foreign)}\n\n`,
+        ),
+      ]),
+    );
+    const observed = v2Callbacks();
+
+    await expect(openV2Events(peer.peer, undefined, observed.value).finished).resolves.toEqual({
+      kind: "error",
+      cursor: "11",
+      message: "The Loxa node returned an invalid durable update stream.",
+    });
+    expect(observed.events).toEqual([]);
+    expect(observed.terminals).toEqual([
+      {
+        kind: "error",
+        cursor: "11",
+        message: "The Loxa node returned an invalid durable update stream.",
+      },
+    ]);
+  });
+
   it("switches to the 16 KiB live budget inside one literal ReadableStream chunk", async () => {
     const oversized = `${JSON.stringify(nextV2Event)}${" ".repeat(16 * 1024)}`;
     const chunk = encode(
@@ -699,7 +812,7 @@ describe("durable v2 control events", () => {
     const peer = await createV2Peer(responseFrom([encode(`event: snapshot\ndata: ${JSON.stringify(snapshot)}\n\n`)]));
     const observed = v2Callbacks();
 
-    await openV2Events(peer.peer, undefined, observed.value).finished;
+    await openV2Events(peer.peer, { epoch: v2Ids.epoch, cursor: "11" }, observed.value).finished;
     const replacement = applyV2Snapshot(undefined, snapshot);
     expect(observed.retainedEvents).toEqual([retained]);
     expect(observed.events).toEqual([]);

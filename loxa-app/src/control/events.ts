@@ -335,6 +335,32 @@ function validateResume(resume: ResumeCursor | undefined): void {
   }
 }
 
+function validateReconnectResume(resume: ResumeCursor | undefined, snapshot: V2ReconnectSnapshot): void {
+  if (resume === undefined) {
+    if (snapshot.stream.cursor_gap || snapshot.events.length > 0) {
+      throw new ControlContractError("v2 initial reconnect snapshot included a cursor gap or history");
+    }
+    return;
+  }
+  if (snapshot.epoch !== resume.epoch) {
+    if (!snapshot.stream.cursor_gap) throw new ControlContractError("v2 epoch replacement omitted cursor gap");
+    return;
+  }
+  if (snapshot.stream.cursor_gap) return;
+  const requestedCursor = BigInt(resume.cursor);
+  const snapshotCursor = BigInt(snapshot.stream.cursor);
+  if (snapshotCursor < requestedCursor) throw new ControlContractError("v2 reconnect snapshot cursor regressed");
+  const expectedEvents = snapshotCursor - requestedCursor;
+  if (BigInt(snapshot.events.length) !== expectedEvents) {
+    throw new ControlContractError("v2 reconnect snapshot retained event gap");
+  }
+  for (let index = 0; index < snapshot.events.length; index += 1) {
+    if (BigInt(snapshot.events[index]!.sequence) !== requestedCursor + BigInt(index) + 1n) {
+      throw new ControlContractError("v2 reconnect snapshot retained event gap");
+    }
+  }
+}
+
 export function openV2Events(
   peer: ProvenControlPeer,
   resume: ResumeCursor | undefined,
@@ -411,6 +437,7 @@ export function openV2Events(
           const snapshotNode = snapshot.nodes[0];
           if (!snapshotNode) throw new ControlContractError("v2 snapshot node");
           assertProvenControlIdentity(peer, snapshotNode.node_id, snapshotNode.node_instance_id);
+          validateReconnectResume(resume, snapshot);
           nodeId = snapshotNode.node_id;
           nodeInstanceId = snapshotNode.node_instance_id;
           epoch = snapshot.epoch;
@@ -424,7 +451,7 @@ export function openV2Events(
         } else if (frame.event === "state") {
           if (!sawSnapshot) throw new ControlContractError("v2 event before reconnect snapshot");
           const event = decodeV2ControlEventJson(frame.data);
-          if (event.epoch !== epoch) return;
+          if (event.epoch !== epoch) throw new ControlContractError("v2 live event epoch");
           if (
             event.node_id !== nodeId ||
             event.node_instance_id === null ||
