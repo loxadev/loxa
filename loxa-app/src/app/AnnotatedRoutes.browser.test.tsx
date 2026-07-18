@@ -4,8 +4,10 @@ import { page } from "vitest/browser";
 
 import App from "@/App";
 import { desktopRuntimeUnavailableMessage } from "@/app/services";
-import type { ControlStreamCallbacks } from "@/control/events";
-import type { ModelInventoryEntry, OperationView } from "@/control/contracts";
+import type { V2StreamCallbacks } from "@/control/events";
+import type { ModelInventoryEntry } from "@/control/contracts";
+import { validV2Operation } from "@/control/testSupport";
+import { controlSnapshot } from "@/node/testSupport";
 import { applyTheme } from "@/settings/theme";
 import { useWorkspaceStore } from "@/stores/workspace-store";
 import { expectNoAxeViolations } from "@/test/axe";
@@ -28,16 +30,14 @@ const model: ModelInventoryEntry = {
   engine: { engine: "llama-cpp", eligible: true, reason: "Verified for llama.cpp." },
 };
 
-const runningDownload: OperationView = {
-  id: "browser-download",
+const runningDownload = {
+  ...validV2Operation,
   kind: "download",
   status: "running",
-  modelId: model.id,
-  progress: { completedBytes: 512, totalBytes: 1024 },
-  error: null,
-  createdAtUnixMs: 1_700_000_000_000,
-  updatedAtUnixMs: 1_700_000_000_001,
-};
+  slot_id: null,
+  model_id: model.id,
+  progress: { completed_bytes: "512", total_bytes: "1024" },
+} as const;
 
 async function navigate(name: "Node" | "Models" | "Settings") {
   await act(async () => page.getByRole("link", { name, exact: true }).click());
@@ -171,10 +171,10 @@ test("wraps a long recovery-required error without hiding the Node recovery feed
 test("renders deterministic model download progress and recovery-safe controls at 800 by 600", async () => {
   await page.viewport(800, 600);
   useWorkspaceStore.setState({ activeRoute: "models", sidebarCollapsed: false, expandedSidebarWidth: 220 });
-  const callbacks: ControlStreamCallbacks[] = [];
+  const callbacks: V2StreamCallbacks[] = [];
   const services = createAppServicesFixture({
     getInventory: async () => [model],
-    createControlEventStream: (_endpoint, _token, _cursor, next) => {
+    openV2Events: (_peer, _resume, next) => {
       callbacks.push(next);
       return { cancel: vi.fn(), dispose: vi.fn(), finished: new Promise(() => undefined) };
     },
@@ -184,14 +184,9 @@ test("renders deterministic model download progress and recovery-safe controls a
   await settleApp();
 
   await expect.element(page.getByRole("heading", { name: model.id })).toBeVisible();
-  await vi.waitFor(() => expect(callbacks.length).toBeGreaterThanOrEqual(2));
+  await vi.waitFor(() => expect(callbacks).toHaveLength(1));
   await act(async () => {
-    callbacks[callbacks.length - 1]?.onSnapshot({
-      cursor: 1,
-      cursorGap: false,
-      operations: [runningDownload],
-      events: [],
-    });
+    callbacks[0]?.onSnapshot(controlSnapshot({ operations: [runningDownload] }));
   });
 
   const progress = page.getByRole("progressbar", { name: `Download progress for ${model.id}` });
