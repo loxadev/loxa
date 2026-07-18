@@ -669,6 +669,19 @@ pub fn request_managed_stop(
     )
 }
 
+/// Records a stop request for one exact managed owner without waiting for exit.
+pub fn signal_exact_managed_stop(
+    path: &Path,
+    expected: &ManagedRunIdentity,
+) -> Result<bool, SupervisorError> {
+    let mut current = current_runtime_state_run(path, expected)?;
+    if current.stop_requested {
+        return Ok(true);
+    }
+    current.stop_requested = true;
+    Ok(update_runtime_state_run_committed(path, expected, current)?.is_some())
+}
+
 fn request_managed_stop_with<P, N, S>(
     path: &Path,
     target: &str,

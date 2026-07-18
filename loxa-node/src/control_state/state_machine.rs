@@ -716,7 +716,7 @@ impl ControlRepository {
         let slot_id = self.slot_id();
         let epoch = self.stream_epoch();
         self.transaction(|tx| {
-            require_published_instance(tx, node_instance_id)?;
+            require_observable_instance(tx, node_instance_id)?;
             let (revision, cursor, last_committed) = read_meta(tx)?;
             let mut operation = read_operation(tx, node_id, slot_id, transition.operation_id())?
                 .ok_or_else(|| tagged_error(TransitionError::OperationNotFound))?;
@@ -1223,6 +1223,23 @@ fn require_published_instance(
     tx: &SqlTransaction<'_>,
     instance: NodeInstanceId,
 ) -> Result<(), RepositoryError> {
+    require_instance_status(tx, instance, |status| status == "running")
+}
+
+fn require_observable_instance(
+    tx: &SqlTransaction<'_>,
+    instance: NodeInstanceId,
+) -> Result<(), RepositoryError> {
+    require_instance_status(tx, instance, |status| {
+        matches!(status, "running" | "stopping")
+    })
+}
+
+fn require_instance_status(
+    tx: &SqlTransaction<'_>,
+    instance: NodeInstanceId,
+    accepts: impl FnOnce(&str) -> bool,
+) -> Result<(), RepositoryError> {
     let row: Option<(String, String)> = tx
         .query_row(
             "SELECT node_instance_id,status FROM node_state WHERE singleton=1",
@@ -1232,7 +1249,7 @@ fn require_published_instance(
         .optional()?;
     if row
         .as_ref()
-        .is_none_or(|(id, status)| id != &instance.to_string() || status != "running")
+        .is_none_or(|(id, status)| id != &instance.to_string() || !accepts(status))
     {
         return Err(tagged_error(TransitionError::CorruptState));
     }

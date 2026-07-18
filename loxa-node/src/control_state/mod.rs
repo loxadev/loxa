@@ -36,8 +36,28 @@ pub(crate) use repository::{
 pub(crate) use state_machine::InstancePublication;
 pub(crate) use worker::{
     ControlStateBootstrap, ControlStateError, ControlStateHandle, ControlStateInit,
-    ControlStateOpenInput,
+    ControlStateOpenInput, ControlStateWorker,
 };
+
+pub(crate) fn acquisition_recovery_evidence(
+    owner: &crate::runtime::NodeOwnerGuard,
+    first_migration_source: Option<&ScalarSource>,
+) -> Result<RecoveryEvidence, SlotRecoveryError> {
+    if first_migration_source.is_some() {
+        return Ok(RecoveryEvidence::uncertain(
+            recovery::UncertaintyReason::OwnershipUnavailable,
+        ));
+    }
+    let source = owner
+        .acquisition_recovery()
+        .ok_or(SlotRecoveryError::LifecycleRecoveryRequired)?;
+    match existing_database_absence_evidence(owner, source) {
+        Ok(evidence) => Ok(evidence),
+        Err(SlotRecoveryError::LifecycleRecoveryRequired) => Ok(RecoveryEvidence::uncertain(
+            recovery::UncertaintyReason::LifecycleRecoveryRequired,
+        )),
+    }
+}
 
 #[cfg(test)]
 pub(crate) fn open_control_state_for_test(

@@ -259,6 +259,141 @@ fn existing_database_exact_absence_requires_core_capture_and_the_claimed_owner()
 }
 
 #[test]
+fn acquisition_recovery_keeps_existing_database_exact_absence_exact() {
+    let root = std::env::temp_dir().join(format!(
+        "loxa-acquisition-exact-absence-{}-{}",
+        std::process::id(),
+        StreamEpoch::new_v4()
+    ));
+    std::fs::create_dir_all(root.join("run/logs")).unwrap();
+    let paths = NodePaths {
+        models_dir: root.join("models"),
+        state_path: root.join("run/managed.json"),
+        logs_dir: root.join("run/logs"),
+    };
+    let candidate = loxa_core::supervisor::ManagedRun {
+        schema_version: loxa_core::supervisor::RUNTIME_STATE_SCHEMA_VERSION,
+        run_id: "existing-db-exact-owner".into(),
+        model_id: None,
+        owner_pid: std::process::id(),
+        owner_process_start_time_unix_s: 1,
+        stop_requested: false,
+        lifecycle: loxa_core::supervisor::RunLifecycle::Unloaded,
+        generation: 0,
+        generation_alias: "loxa-existing-db-exact-owner-g0".into(),
+        control_port: Some(19_431),
+        port: 19_431,
+        log_path: paths.logs_dir.join("owner.log"),
+        child_pid: None,
+        child_process_start_time_unix_s: None,
+        child_pgid: None,
+    };
+    std::fs::write(&paths.state_path, br#"{"schema_version":4,"runs":[]}"#).unwrap();
+    let acquisition = loxa_core::supervisor::acquire_managed_owner(
+        &paths.state_path,
+        candidate,
+        loxa_core::supervisor::ScalarCaptureMode::ExistingDatabase,
+    )
+    .unwrap();
+    let (guard, scalar_source) = NodeOwnerGuard::from_acquisition(paths, acquisition);
+    assert!(ScalarSource::from_managed(scalar_source).is_none());
+    assert!(matches!(
+        crate::control_state::acquisition_recovery_evidence(&guard, None),
+        Ok(RecoveryEvidence::ExactAbsent(_))
+    ));
+    guard.finish().unwrap();
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn acquisition_recovery_marks_a_dead_prior_ready_running_shape_uncertain() {
+    let root = std::env::temp_dir().join(format!(
+        "loxa-acquisition-dead-running-{}-{}",
+        std::process::id(),
+        StreamEpoch::new_v4()
+    ));
+    std::fs::create_dir_all(root.join("run/logs")).unwrap();
+    let paths = NodePaths {
+        models_dir: root.join("models"),
+        state_path: root.join("run/managed.json"),
+        logs_dir: root.join("run/logs"),
+    };
+    let mut dead_owner = std::process::Command::new("true").spawn().unwrap();
+    let dead_owner_pid = dead_owner.id();
+    dead_owner.wait().unwrap();
+    let prior = loxa_core::supervisor::ManagedRun {
+        schema_version: loxa_core::supervisor::RUNTIME_STATE_SCHEMA_VERSION,
+        run_id: "prior-running-owner".into(),
+        model_id: Some("ready-model".into()),
+        owner_pid: dead_owner_pid,
+        owner_process_start_time_unix_s: 1,
+        stop_requested: false,
+        lifecycle: loxa_core::supervisor::RunLifecycle::Running,
+        generation: 3,
+        generation_alias: "loxa-prior-running-owner-g3".into(),
+        control_port: Some(19_430),
+        port: 19_432,
+        log_path: paths.logs_dir.join("prior.log"),
+        child_pid: Some(dead_owner_pid),
+        child_process_start_time_unix_s: Some(1),
+        child_pgid: Some(i32::try_from(dead_owner_pid).unwrap()),
+    };
+    std::fs::write(
+        &paths.state_path,
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": loxa_core::supervisor::RUNTIME_STATE_SCHEMA_VERSION,
+            "runs": [&prior],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let candidate = loxa_core::supervisor::ManagedRun {
+        schema_version: loxa_core::supervisor::RUNTIME_STATE_SCHEMA_VERSION,
+        run_id: "replacement-owner".into(),
+        model_id: None,
+        owner_pid: std::process::id(),
+        owner_process_start_time_unix_s: 1,
+        stop_requested: false,
+        lifecycle: loxa_core::supervisor::RunLifecycle::Unloaded,
+        generation: 0,
+        generation_alias: "loxa-replacement-owner-g0".into(),
+        control_port: Some(19_431),
+        port: 19_431,
+        log_path: paths.logs_dir.join("replacement.log"),
+        child_pid: None,
+        child_process_start_time_unix_s: None,
+        child_pgid: None,
+    };
+    let acquisition = loxa_core::supervisor::acquire_managed_owner(
+        &paths.state_path,
+        candidate,
+        loxa_core::supervisor::ScalarCaptureMode::ExistingDatabase,
+    )
+    .unwrap();
+    let (guard, scalar_source) = NodeOwnerGuard::from_acquisition(paths.clone(), acquisition);
+    assert!(ScalarSource::from_managed(scalar_source).is_none());
+    assert_eq!(
+        guard
+            .acquisition_recovery()
+            .and_then(loxa_core::supervisor::ManagedRecoverySource::prior_run),
+        Some(&prior)
+    );
+    assert!(matches!(
+        decide(
+            crate::control_state::acquisition_recovery_evidence(&guard, None)
+                .expect("dead prior running state must produce recovery evidence")
+        ),
+        crate::control_state::recovery::RecoveryDecision::Recovery { .. }
+    ));
+    guard.finish().unwrap();
+    assert_eq!(
+        loxa_core::supervisor::read_runtime_state(&paths.state_path).unwrap(),
+        loxa_core::supervisor::RuntimeStateRead::Loaded(vec![prior])
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn existing_database_missing_managed_state_is_not_exact_absence() {
     let root = std::env::temp_dir().join(format!(
         "loxa-existing-missing-{}-{}",
@@ -298,12 +433,14 @@ fn existing_database_missing_managed_state_is_not_exact_absence() {
         acquisition.claimed_run.lifecycle,
         loxa_core::supervisor::RunLifecycle::RecoveryRequired
     );
-    let guard = NodeOwnerGuard::new(paths, acquisition.claimed_run);
-    assert!(crate::control_state::existing_database_absence_evidence(
-        &guard,
-        &acquisition.recovery_source,
-    )
-    .is_err());
+    let (guard, scalar_source) = NodeOwnerGuard::from_acquisition(paths, acquisition);
+    assert!(ScalarSource::from_managed(scalar_source).is_none());
+    assert!(matches!(
+        crate::control_state::acquisition_recovery_evidence(&guard, None),
+        Ok(RecoveryEvidence::Uncertain(
+            UncertaintyReason::LifecycleRecoveryRequired
+        ))
+    ));
     drop(guard);
     let _ = std::fs::remove_dir_all(root);
 }
