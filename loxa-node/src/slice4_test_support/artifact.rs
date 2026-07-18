@@ -170,19 +170,27 @@ fn source_identity_requires_the_closed_recipe_grammar() {
 #[test]
 fn artifact_destination_rejects_nonportable_path_forms() {
     let dir = TestDir::new("portable-path");
+    for name in ["CON", "nul.gguf", "model.gguf.", "model.gguf "] {
+        assert!(
+            ArtifactKey::from_destination(&dir.path().join(name)).is_err(),
+            "accepted nonportable destination {name:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn native_unix_destination_does_not_apply_portable_separator_grammar() {
+    let dir = TestDir::new("native-unix-path");
     for name in [
         "C:model.gguf",
         "C:\\model.gguf",
         "model.gguf:stream",
-        "CON",
-        "nul.gguf",
-        "model.gguf.",
-        "model.gguf ",
         "nested\\model.gguf",
     ] {
         assert!(
-            ArtifactKey::from_destination(&dir.path().join(name)).is_err(),
-            "accepted nonportable destination {name:?}"
+            ArtifactKey::from_destination(&dir.path().join(name)).is_ok(),
+            "rejected native Unix destination {name:?}"
         );
     }
 }
@@ -212,6 +220,22 @@ fn artifact_destination_rejects_parent_replacement_during_identity_capture() {
     let result = ArtifactKey::from_destination_with_test_hook(&destination, || {
         std::fs::rename(&parent, &moved).unwrap();
         std::fs::create_dir(&parent).unwrap();
+    });
+
+    assert!(result.is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn artifact_destination_rejects_file_replacement_during_identity_capture() {
+    let root = TestDir::new("destination-swap");
+    let destination = root.path().join("model.gguf");
+    let moved = root.path().join("model-old.gguf");
+    std::fs::write(&destination, b"first").unwrap();
+
+    let result = ArtifactKey::from_destination_with_test_hook(&destination, || {
+        std::fs::rename(&destination, &moved).unwrap();
+        std::fs::write(&destination, b"replacement").unwrap();
     });
 
     assert!(result.is_err());

@@ -13,6 +13,7 @@ pub(crate) struct ArtifactKey {
     // throughout capture. Equality deliberately stays destination-based so a
     // replaced parent cannot evade an already-held mutation exclusion.
     _parent_evidence: ParentEvidence,
+    _destination_evidence: Option<ParentEvidence>,
 }
 
 impl PartialEq for ArtifactKey {
@@ -58,7 +59,7 @@ impl ArtifactKey {
         destination: &Path,
         hook: impl FnOnce(),
     ) -> Result<Self, ArtifactKeyError> {
-        validate_portable_destination(destination)?;
+        validate_native_destination(destination)?;
         let file_name = destination
             .file_name()
             .filter(|name| !name.is_empty())
@@ -77,37 +78,31 @@ impl ArtifactKey {
         let opened_parent = open_parent(&canonical_parent)?;
         let parent_evidence = parent_evidence(&opened_parent)?;
 
-        validate_existing_destination(destination)?;
+        let captured_destination = destination_evidence(destination)?;
         hook();
 
         let recanonicalized_parent =
             std::fs::canonicalize(parent).map_err(|_| ArtifactKeyError::AmbiguousDestination)?;
         if recanonicalized_parent != canonical_parent
             || path_evidence(&recanonicalized_parent)? != parent_evidence
+            || destination_evidence(destination)? != captured_destination
         {
             return Err(ArtifactKeyError::AmbiguousDestination);
         }
         Ok(Self {
             canonical_destination: canonical_parent.join(file_name),
             _parent_evidence: parent_evidence,
+            _destination_evidence: captured_destination,
         })
     }
 }
 
-fn validate_portable_destination(destination: &Path) -> Result<(), ArtifactKeyError> {
-    let raw = destination
-        .to_str()
-        .ok_or(ArtifactKeyError::UnsafeDestination)?;
+#[cfg(unix)]
+fn validate_native_destination(destination: &Path) -> Result<(), ArtifactKeyError> {
     if !destination.is_absolute()
-        || raw.contains('\\')
-        || raw.contains(':')
-        || raw.contains("//")
-        || destination.components().any(|component| {
-            matches!(
-                component,
-                Component::CurDir | Component::ParentDir | Component::Prefix(_)
-            )
-        })
+        || destination
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
     {
         return Err(ArtifactKeyError::UnsafeDestination);
     }
@@ -118,15 +113,55 @@ fn validate_portable_destination(destination: &Path) -> Result<(), ArtifactKeyEr
         let component = component
             .to_str()
             .ok_or(ArtifactKeyError::UnsafeDestination)?;
-        if component.ends_with(['.', ' ']) || is_windows_reserved_name(component) {
+        if !valid_portable_artifact_component(component) {
             return Err(ArtifactKeyError::UnsafeDestination);
         }
     }
     Ok(())
 }
 
+#[cfg(windows)]
+fn validate_native_destination(destination: &Path) -> Result<(), ArtifactKeyError> {
+    use std::path::Prefix;
+
+    let raw = destination
+        .to_str()
+        .ok_or(ArtifactKeyError::UnsafeDestination)?;
+    if !destination.is_absolute()
+        || !validate_windows_absolute_text(raw)
+        || destination.components().any(|component| {
+            matches!(component, Component::CurDir | Component::ParentDir)
+                || matches!(
+                    component,
+                    Component::Prefix(prefix)
+                        if !matches!(
+                            prefix.kind(),
+                            Prefix::Disk(_)
+                                | Prefix::UNC(_, _)
+                                | Prefix::VerbatimDisk(_)
+                                | Prefix::VerbatimUNC(_, _)
+                        )
+                )
+        })
+    {
+        return Err(ArtifactKeyError::UnsafeDestination);
+    }
+    Ok(())
+}
+
+pub(crate) fn valid_portable_artifact_component(component: &str) -> bool {
+    !component.is_empty()
+        && !component.ends_with(['.', ' '])
+        && !component.chars().any(char::is_control)
+        && !is_windows_reserved_name(component)
+}
+
 fn is_windows_reserved_name(component: &str) -> bool {
-    let stem = component.split('.').next().unwrap_or(component);
+    let stem = component
+        .split('.')
+        .next()
+        .unwrap_or(component)
+        .trim_end_matches(['.', ' ']);
     matches!(
         stem.to_ascii_uppercase().as_str(),
         "CON"
@@ -154,13 +189,106 @@ fn is_windows_reserved_name(component: &str) -> bool {
     )
 }
 
-fn validate_existing_destination(destination: &Path) -> Result<(), ArtifactKeyError> {
-    match std::fs::symlink_metadata(destination) {
-        Ok(metadata) if metadata.file_type().is_file() && has_single_link(&metadata) => Ok(()),
-        Ok(_) => Err(ArtifactKeyError::UnsafeDestination),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(_) => Err(ArtifactKeyError::AmbiguousDestination),
+fn validate_windows_absolute_text(raw: &str) -> bool {
+    if raw.is_empty() || raw.chars().any(char::is_control) {
+        return false;
     }
+    if let Some(remainder) = raw
+        .strip_prefix(r"\\?\UNC\")
+        .or_else(|| raw.strip_prefix("//?/UNC/"))
+    {
+        return validate_windows_unc_remainder(remainder);
+    }
+    if let Some(remainder) = raw
+        .strip_prefix(r"\\?\")
+        .or_else(|| raw.strip_prefix("//?/"))
+    {
+        return validate_windows_drive_remainder(remainder);
+    }
+    if raw.starts_with(r"\\.\") || raw.starts_with("//./") {
+        return false;
+    }
+    if let Some(remainder) = raw.strip_prefix(r"\\").or_else(|| raw.strip_prefix("//")) {
+        return validate_windows_unc_remainder(remainder);
+    }
+    validate_windows_drive_remainder(raw)
+}
+
+fn validate_windows_drive_remainder(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    if bytes.len() < 4
+        || !bytes[0].is_ascii_alphabetic()
+        || bytes[1] != b':'
+        || !matches!(bytes[2], b'/' | b'\\')
+    {
+        return false;
+    }
+    validate_windows_components(&raw[3..], 1)
+}
+
+fn validate_windows_unc_remainder(raw: &str) -> bool {
+    validate_windows_components(raw, 3)
+}
+
+fn validate_windows_components(raw: &str, minimum: usize) -> bool {
+    let components = raw.split(['/', '\\']).collect::<Vec<_>>();
+    components.len() >= minimum
+        && components.iter().all(|component| {
+            !component.is_empty()
+                && *component != "."
+                && *component != ".."
+                && !component.contains(':')
+                && valid_portable_artifact_component(component)
+        })
+}
+
+#[cfg(unix)]
+fn destination_evidence(destination: &Path) -> Result<Option<ParentEvidence>, ArtifactKeyError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let opened = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(destination)
+    {
+        Ok(opened) => opened,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(ArtifactKeyError::UnsafeDestination);
+        }
+        Err(_) => return Err(ArtifactKeyError::AmbiguousDestination),
+    };
+    let metadata = opened
+        .metadata()
+        .map_err(|_| ArtifactKeyError::AmbiguousDestination)?;
+    if !metadata.file_type().is_file() || !has_single_link(&metadata) {
+        return Err(ArtifactKeyError::UnsafeDestination);
+    }
+    Ok(Some(parent_evidence(&opened)?))
+}
+
+#[cfg(windows)]
+fn destination_evidence(destination: &Path) -> Result<Option<ParentEvidence>, ArtifactKeyError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let opened = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(destination)
+    {
+        Ok(opened) => opened,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(ArtifactKeyError::AmbiguousDestination),
+    };
+    let metadata = opened
+        .metadata()
+        .map_err(|_| ArtifactKeyError::AmbiguousDestination)?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || !has_single_link(&metadata)
+    {
+        return Err(ArtifactKeyError::UnsafeDestination);
+    }
+    Ok(Some(parent_evidence(&opened)?))
 }
 
 #[cfg(unix)]
@@ -213,16 +341,18 @@ fn parent_evidence(parent: &std::fs::File) -> Result<ParentEvidence, ArtifactKey
     let metadata = parent
         .metadata()
         .map_err(|_| ArtifactKeyError::AmbiguousDestination)?;
-    Ok(ParentEvidence {
-        device: u64::from(
-            metadata
-                .volume_serial_number()
-                .ok_or(ArtifactKeyError::AmbiguousDestination)?,
-        ),
-        file: metadata
-            .file_index()
+    let device = u64::from(
+        metadata
+            .volume_serial_number()
             .ok_or(ArtifactKeyError::AmbiguousDestination)?,
-    })
+    );
+    let file = metadata
+        .file_index()
+        .ok_or(ArtifactKeyError::AmbiguousDestination)?;
+    if device == 0 || file == 0 {
+        return Err(ArtifactKeyError::AmbiguousDestination);
+    }
+    Ok(ParentEvidence { device, file })
 }
 
 #[cfg(windows)]
@@ -255,6 +385,21 @@ impl ArtifactMutationCoordinator {
             inner: Arc::new(CoordinatorInner {
                 state: Mutex::new(CoordinatorState::default()),
                 changed: Condvar::new(),
+                #[cfg(test)]
+                notification_probe: None,
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn new_with_notification_probe_for_test(
+        probe: impl Fn(&CoordinatorInner) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            inner: Arc::new(CoordinatorInner {
+                state: Mutex::new(CoordinatorState::default()),
+                changed: Condvar::new(),
+                notification_probe: Some(Arc::new(probe)),
             }),
         }
     }
@@ -343,7 +488,8 @@ impl ArtifactMutationCoordinator {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.sealed = true;
-        self.inner.changed.notify_all();
+        drop(state);
+        self.inner.notify_changed();
     }
 }
 
@@ -413,9 +559,22 @@ impl Drop for ArtifactReadLease {
 struct CoordinatorInner {
     state: Mutex<CoordinatorState>,
     changed: Condvar,
+    #[cfg(test)]
+    notification_probe: Option<CoordinatorNotificationProbe>,
 }
 
+#[cfg(test)]
+type CoordinatorNotificationProbe = Arc<dyn Fn(&CoordinatorInner) + Send + Sync>;
+
 impl CoordinatorInner {
+    fn notify_changed(&self) {
+        #[cfg(test)]
+        if let Some(probe) = &self.notification_probe {
+            probe(self);
+        }
+        self.changed.notify_all();
+    }
+
     fn lock_state(
         &self,
     ) -> Result<std::sync::MutexGuard<'_, CoordinatorState>, ArtifactAcquireError> {
@@ -447,7 +606,7 @@ impl CoordinatorInner {
         };
         drop(state);
         if removed.is_some() {
-            self.changed.notify_all();
+            self.notify_changed();
         }
     }
 
@@ -473,7 +632,7 @@ impl CoordinatorInner {
         let removed = remove.then(|| state.access.remove(key)).flatten();
         drop(state);
         if removed.is_some() {
-            self.changed.notify_all();
+            self.notify_changed();
         }
     }
 
@@ -485,7 +644,7 @@ impl CoordinatorInner {
         state.poisoned.insert(key.clone());
         state.sealed = true;
         drop(state);
-        self.changed.notify_all();
+        self.notify_changed();
     }
 }
 
@@ -511,4 +670,83 @@ impl CoordinatorState {
 enum ArtifactAccessState {
     Mutating,
     Readers(usize),
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn windows_absolute_parser_accepts_native_drive_unc_and_extended_forms() {
+        for path in [
+            r"C:\models\model.gguf",
+            r"C:/models/model.gguf",
+            r"\\server\share\models\model.gguf",
+            r"\\?\C:\models\model.gguf",
+            r"\\?\UNC\server\share\models\model.gguf",
+        ] {
+            assert!(validate_windows_absolute_text(path), "rejected {path:?}");
+        }
+    }
+
+    #[test]
+    fn windows_absolute_parser_rejects_device_relative_ads_and_ambiguous_forms() {
+        for path in [
+            r"model.gguf",
+            r"C:model.gguf",
+            r"\model.gguf",
+            r"\\.\PhysicalDrive0",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume1\model.gguf",
+            r"C:\models\..\model.gguf",
+            r"C:\models\\model.gguf",
+            r"C:\models\model.gguf:stream",
+            r"C:\models\CON .gguf",
+            r"C:\models\COM1 .bin",
+            r"\\server\share",
+            r"\\server\\model.gguf",
+        ] {
+            assert!(!validate_windows_absolute_text(path), "accepted {path:?}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_native_path_components_accept_only_supported_absolute_prefixes() {
+        for path in [
+            r"C:\models\model.gguf",
+            r"\\server\share\models\model.gguf",
+            r"\\?\C:\models\model.gguf",
+            r"\\?\UNC\server\share\models\model.gguf",
+        ] {
+            assert!(
+                validate_native_destination(Path::new(path)).is_ok(),
+                "rejected {path:?}"
+            );
+        }
+        for path in [
+            r"C:model.gguf",
+            r"\\.\PhysicalDrive0",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume1\model.gguf",
+        ] {
+            assert!(
+                validate_native_destination(Path::new(path)).is_err(),
+                "accepted {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn coordinator_seal_notifies_only_after_releasing_state_lock() {
+        let observed_unlocked = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&observed_unlocked);
+        let coordinator =
+            ArtifactMutationCoordinator::new_with_notification_probe_for_test(move |inner| {
+                observed.store(inner.state.try_lock().is_ok(), Ordering::SeqCst);
+            });
+
+        coordinator.seal();
+
+        assert!(observed_unlocked.load(Ordering::SeqCst));
+    }
 }

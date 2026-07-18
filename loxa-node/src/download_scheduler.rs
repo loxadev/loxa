@@ -1,4 +1,6 @@
-use crate::artifact_coordinator::{ArtifactKey, ArtifactMutationLease};
+use crate::artifact_coordinator::{
+    valid_portable_artifact_component, ArtifactKey, ArtifactMutationLease,
+};
 use crate::operation_cancellation::OperationCancellation;
 use loxa_protocol::v2::{DecimalU64, OperationId};
 use std::collections::{BTreeMap, HashMap};
@@ -154,8 +156,7 @@ fn validate_artifact_subpath(value: &str) -> Result<(), DownloadKeyError> {
         || value.contains('\\')
         || value.contains(['?', '#', ':', '%', '&', '='])
         || value.split('/').any(|component| {
-            component.is_empty()
-                || component.ends_with(['.', ' '])
+            !valid_portable_artifact_component(component)
                 || component.bytes().any(|byte| {
                     !(byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
                 })
@@ -303,7 +304,8 @@ impl Drop for DownloadAdmissionReservation {
                 let mut state = poisoned.into_inner();
                 state.sealed = true;
                 self.state = ReservationState::Poisoned;
-                owner.changed.notify_all();
+                drop(state);
+                owner.notify_changed();
                 return;
             }
         };
@@ -317,7 +319,7 @@ impl Drop for DownloadAdmissionReservation {
         };
         drop(state);
         if removed.is_some() {
-            owner.changed.notify_all();
+            owner.notify_changed();
         }
     }
 }
@@ -338,11 +340,24 @@ pub(crate) enum WorkerExit {
 struct DownloadShared {
     state: Mutex<DownloadState>,
     changed: Condvar,
+    #[cfg(test)]
+    notification_probe: Option<DownloadNotificationProbe>,
 }
 
+#[cfg(test)]
+type DownloadNotificationProbe = Arc<dyn Fn(&DownloadShared) + Send + Sync>;
+
 impl DownloadShared {
-    fn release_worker(&self, _worker_index: usize) {
+    fn notify_changed(&self) {
+        #[cfg(test)]
+        if let Some(probe) = &self.notification_probe {
+            probe(self);
+        }
         self.changed.notify_all();
+    }
+
+    fn release_worker(&self, _worker_index: usize) {
+        self.notify_changed();
     }
 }
 
@@ -386,4 +401,99 @@ pub(crate) enum DownloadSubmitOutcome {
     Submitted,
     Cancelled,
     Stopping,
+}
+
+#[cfg(test)]
+fn reservation_with_notification_probe_for_test(
+    probe: impl Fn(&DownloadShared) + Send + Sync + 'static,
+) -> (Arc<DownloadShared>, DownloadAdmissionReservation) {
+    let parent = std::env::temp_dir().join(format!(
+        "loxa-download-reservation-probe-{}-{}",
+        std::process::id(),
+        OperationId::new_v4()
+    ));
+    std::fs::create_dir(&parent).unwrap();
+    let artifact = ArtifactKey::from_destination(&parent.join("model.gguf")).unwrap();
+    let _ = std::fs::remove_dir(&parent);
+    let key = DownloadKey::new(
+        "coding",
+        "hugging-face",
+        "publisher/repository",
+        Some("0123456789abcdef0123456789abcdef01234567"),
+        "weights/model.gguf",
+        Some([7; 32]),
+        Some(42),
+        artifact,
+    )
+    .unwrap();
+    let owner = Arc::new(DownloadShared {
+        state: Mutex::new(DownloadState {
+            reservations: HashMap::from([(key.clone(), ReservationEntry::Pending { ticket: 1 })]),
+            ready: BTreeMap::new(),
+            executing: HashMap::new(),
+            next_ticket: 2,
+            stopping: false,
+            sealed: false,
+        }),
+        changed: Condvar::new(),
+        notification_probe: Some(Arc::new(probe)),
+    });
+    let reservation = DownloadAdmissionReservation {
+        key,
+        ticket: 1,
+        owner: Arc::downgrade(&owner),
+        state: ReservationState::PendingCommit,
+    };
+    (owner, reservation)
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn portable_subpath_rejects_windows_device_basenames() {
+        for path in [
+            "CON",
+            "con.gguf",
+            "weights/CON .gguf",
+            "weights/PRN.bin",
+            "weights/aux",
+            "weights/NUL.gguf",
+            "weights/com1.gguf",
+            "weights/COM1 .bin",
+            "weights/COM9",
+            "weights/lpt1.bin",
+            "weights/LPT9",
+            "weights/model.gguf.",
+            "weights/model.gguf ",
+        ] {
+            assert!(
+                validate_artifact_subpath(path).is_err(),
+                "accepted {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn poisoned_reservation_drop_notifies_only_after_releasing_state_lock() {
+        let observed_unlocked = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&observed_unlocked);
+        let (owner, reservation) = reservation_with_notification_probe_for_test(move |shared| {
+            let available = !matches!(
+                shared.state.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            );
+            observed.store(available, Ordering::SeqCst);
+        });
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = owner.state.lock().unwrap();
+            panic!("poison download state");
+        }));
+        drop(reservation);
+
+        assert!(observed_unlocked.load(Ordering::SeqCst));
+    }
 }
