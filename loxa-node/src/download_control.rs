@@ -83,6 +83,7 @@ struct VerificationWorker {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DownloadControlError {
     Conflict,
+    WriterOverloaded,
     Missing,
     Terminal,
     Stopping,
@@ -101,6 +102,13 @@ impl V1EventReceiver {
 }
 
 impl DownloadControl {
+    pub(crate) fn durable_execution(&self) -> Option<DurableExecutionControl> {
+        match &self.authority {
+            AdmissionAuthority::Durable(durable) => Some(durable.clone()),
+            AdmissionAuthority::Legacy(_) => None,
+        }
+    }
+
     pub(crate) async fn start_download_async(
         &self,
         model_id: &str,
@@ -1179,8 +1187,8 @@ fn map_submit_error(error: SubmitError) -> DownloadControlError {
 
 fn map_control_state_error(error: ControlStateError) -> DownloadControlError {
     match error {
-        ControlStateError::WriterOverloaded
-        | ControlStateError::Transition(TransitionError::ActiveLimit)
+        ControlStateError::WriterOverloaded => DownloadControlError::WriterOverloaded,
+        ControlStateError::Transition(TransitionError::ActiveLimit)
         | ControlStateError::Transition(TransitionError::LifecycleConflict)
         | ControlStateError::Transition(TransitionError::SameModelConflict) => {
             DownloadControlError::Conflict
@@ -1204,8 +1212,8 @@ fn map_control_state_error(error: ControlStateError) -> DownloadControlError {
 
 fn map_admission_error(error: ControlStateError) -> DownloadControlError {
     match error {
-        ControlStateError::WriterOverloaded
-        | ControlStateError::Transition(TransitionError::ActiveLimit)
+        ControlStateError::WriterOverloaded => DownloadControlError::WriterOverloaded,
+        ControlStateError::Transition(TransitionError::ActiveLimit)
         | ControlStateError::Transition(TransitionError::LifecycleConflict)
         | ControlStateError::Transition(TransitionError::SameModelConflict)
         | ControlStateError::Transition(TransitionError::Contradiction) => {
@@ -3430,6 +3438,21 @@ mod tests {
         assert_eq!(operation.kind, OperationKind::Unload);
         assert_eq!(operation.status, OperationStatus::Failed);
         assert_eq!(operation.error.as_deref(), Some("node is stopping"));
+        worker.stop_and_join().unwrap();
+    }
+
+    #[test]
+    fn writer_overload_remains_distinct_at_the_durable_execution_boundary() {
+        assert_eq!(
+            map_control_state_error(ControlStateError::WriterOverloaded),
+            DownloadControlError::WriterOverloaded
+        );
+    }
+
+    #[test]
+    fn legacy_control_cannot_yield_durable_execution_authority() {
+        let (control, worker) = DownloadControl::spawn(std::env::temp_dir());
+        assert!(control.durable_execution().is_none());
         worker.stop_and_join().unwrap();
     }
 }

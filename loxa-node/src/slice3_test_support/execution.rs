@@ -230,6 +230,13 @@ async fn durable_default_slot_preserves_exact_v1_node_bytes() {
 }
 
 #[tokio::test]
+async fn durable_control_yields_only_the_narrow_execution_authority() {
+    let fixture = DurableFixture::new("execution-authority").await;
+    assert!(fixture.downloads.durable_execution().is_some());
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
 async fn v1_route_accepts_exact_op_alias_after_durable_uuid_admission() {
     let fixture = DurableFixture::new("route-alias").await;
     let model_id = REGISTRY[0].id;
