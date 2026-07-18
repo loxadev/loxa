@@ -132,7 +132,7 @@ pub(crate) struct LifecycleVerificationOutcome {
     pub(crate) result: VerificationResult,
 }
 
-pub(super) struct RetainedCompletionCell<T> {
+struct RetainedCompletionCell<T> {
     state: Mutex<CompletionTransferState<T>>,
 }
 
@@ -256,11 +256,21 @@ impl DownloadVerificationCompletion {
 }
 
 impl LifecycleVerificationCompletion {
-    pub(super) fn new(
-        cell: Arc<RetainedCompletionCell<LifecycleVerificationOutcome>>,
-        destination: Weak<LifecycleMailboxInner>,
-    ) -> Self {
-        Self { cell, destination }
+    pub(super) fn reserve(
+        completions: &CompletionDestination<LifecycleVerificationOutcome>,
+        destination: &Arc<LifecycleMailboxInner>,
+    ) -> Option<Self> {
+        Some(Self {
+            cell: completions.reserve()?,
+            destination: Arc::downgrade(destination),
+        })
+    }
+
+    pub(super) fn rollback_from(
+        &self,
+        completions: &CompletionDestination<LifecycleVerificationOutcome>,
+    ) {
+        completions.remove_reserved(&self.cell);
     }
 
     pub(crate) fn publish(
@@ -290,7 +300,7 @@ impl Drop for LifecycleVerificationCompletion {
     fn drop(&mut self) {
         if rollback_reserved_cell(&self.cell) {
             if let Some(destination) = self.destination.upgrade() {
-                destination.remove_verification_reservation(&self.cell);
+                destination.rollback_verification(self);
             }
         }
     }
@@ -369,7 +379,7 @@ impl<T> CompletionDestination<T> {
         }
     }
 
-    pub(super) fn reserve(&self) -> Option<Arc<RetainedCompletionCell<T>>> {
+    fn reserve(&self) -> Option<Arc<RetainedCompletionCell<T>>> {
         let mut cells = self.cells.lock().ok()?;
         cells.retain(|cell| {
             !matches!(
@@ -398,7 +408,7 @@ impl<T> CompletionDestination<T> {
         true
     }
 
-    pub(super) fn remove_reserved(&self, target: &Arc<RetainedCompletionCell<T>>) {
+    fn remove_reserved(&self, target: &Arc<RetainedCompletionCell<T>>) {
         let removed = {
             let mut cells = match self.cells.lock() {
                 Ok(cells) => cells,
