@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub mod actor;
+#[allow(dead_code)]
+mod artifact_coordinator;
 mod bootstrap;
 pub mod chat_history;
 pub mod chat_routes;
@@ -19,11 +21,16 @@ pub mod control_router;
 mod control_state;
 mod daemon;
 pub mod download_control;
+#[allow(dead_code)]
+mod download_scheduler;
 mod engine_session;
 mod http_observability;
 #[allow(dead_code)]
 mod identity;
+#[allow(dead_code)]
+mod lifecycle_controller;
 pub mod model_lifecycle;
+mod operation_cancellation;
 mod production_lifecycle;
 mod runtime;
 #[cfg(test)]
@@ -31,6 +38,8 @@ mod slice3_test_support;
 #[cfg(test)]
 mod slice4_test_support;
 mod v2_control_router;
+#[allow(dead_code)]
+mod verification_scheduler;
 
 #[cfg(test)]
 struct Slice3ControlStateFixture {

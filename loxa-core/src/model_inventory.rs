@@ -4,7 +4,7 @@ use crate::registry::{ModelEntry, REGISTRY};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, Metadata, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -63,23 +63,37 @@ pub struct VerifiedRecipeInventoryEntry {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct StableMetadata {
+pub struct StableVerificationIdentity {
     len: u64,
     modified_ns: Option<u128>,
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-    #[cfg(unix)]
-    change_time_s: i64,
-    #[cfg(unix)]
-    change_time_ns: i64,
+    platform: PlatformFileIdentity,
 }
 
-impl StableMetadata {
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum PlatformFileIdentity {
+    #[cfg(unix)]
+    Unix {
+        device: u64,
+        inode: u64,
+        change_time_s: i64,
+        change_time_ns: i64,
+    },
+    #[cfg(windows)]
+    Windows {
+        volume_serial: u32,
+        file_index: u64,
+        last_write_time: u64,
+    },
+    #[cfg(not(any(unix, windows)))]
+    Unsupported,
+}
+
+impl StableVerificationIdentity {
     fn from(metadata: &Metadata) -> Self {
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
+        #[cfg(windows)]
+        use std::os::windows::fs::MetadataExt;
         Self {
             len: metadata.len(),
             modified_ns: metadata
@@ -88,14 +102,61 @@ impl StableMetadata {
                 .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
                 .map(|value| value.as_nanos()),
             #[cfg(unix)]
-            device: metadata.dev(),
-            #[cfg(unix)]
-            inode: metadata.ino(),
-            #[cfg(unix)]
-            change_time_s: metadata.ctime(),
-            #[cfg(unix)]
-            change_time_ns: metadata.ctime_nsec(),
+            platform: PlatformFileIdentity::Unix {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                change_time_s: metadata.ctime(),
+                change_time_ns: metadata.ctime_nsec(),
+            },
+            #[cfg(windows)]
+            platform: PlatformFileIdentity::Windows {
+                volume_serial: metadata.volume_serial_number().unwrap_or_default(),
+                file_index: metadata.file_index().unwrap_or_default(),
+                last_write_time: metadata.last_write_time(),
+            },
+            #[cfg(not(any(unix, windows)))]
+            platform: PlatformFileIdentity::Unsupported,
         }
+    }
+}
+
+type StableMetadata = StableVerificationIdentity;
+
+pub struct StableVerificationInput {
+    pub opened: File,
+    pub stable: StableVerificationIdentity,
+    pub expected_sha256: [u8; 32],
+}
+
+impl StableVerificationInput {
+    pub fn open(path: &Path, expected_sha256: [u8; 32]) -> io::Result<Self> {
+        let opened = open_regular_no_follow(path)?;
+        let metadata = opened.metadata()?;
+        let stable = StableVerificationIdentity::from(&metadata);
+        #[cfg(windows)]
+        if match &stable.platform {
+            PlatformFileIdentity::Windows {
+                volume_serial,
+                file_index,
+                ..
+            } => *volume_serial == 0 || *file_index == 0,
+        } {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "strong opened-file identity is unavailable",
+            ));
+        }
+        #[cfg(not(any(unix, windows)))]
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "strong opened-file identity is unavailable",
+        ));
+        #[cfg(any(unix, windows))]
+        Ok(Self {
+            opened,
+            stable,
+            expected_sha256,
+        })
     }
 }
 
@@ -104,6 +165,30 @@ pub struct VerifiedArtifact {
     pub size_bytes: u64,
     pub expected_sha256: String,
     pub matches: bool,
+}
+
+pub fn verify_opened_artifact(
+    mut input: StableVerificationInput,
+    cancellation: &dyn VerificationCancellation,
+) -> io::Result<VerifiedArtifact> {
+    input.opened.rewind()?;
+    let digest = hash_open_file_with_cancellation(&mut input.opened, &input.stable, cancellation)?;
+    if StableVerificationIdentity::from(&input.opened.metadata()?) != input.stable {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "artifact changed during verification",
+        ));
+    }
+    let expected_sha256: String = input
+        .expected_sha256
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Ok(VerifiedArtifact {
+        size_bytes: input.stable.len,
+        matches: digest == expected_sha256,
+        expected_sha256,
+    })
 }
 
 #[derive(Clone)]
