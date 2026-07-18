@@ -1,5 +1,4 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -14,19 +13,15 @@ pub enum Mutation {
 }
 
 #[derive(Clone, Debug)]
-pub struct MutationCancellation(Arc<AtomicU8>);
-
-const CANCELLATION_OPEN: u8 = 0;
-const CANCELLATION_REQUESTED: u8 = 1;
-const TERMINAL_CLAIMED: u8 = 2;
+pub struct MutationCancellation(crate::operation_cancellation::OperationCancellation);
 
 impl MutationCancellation {
     pub(crate) fn new() -> Self {
-        Self(Arc::new(AtomicU8::new(CANCELLATION_OPEN)))
+        Self(crate::operation_cancellation::OperationCancellation::new())
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::SeqCst) == CANCELLATION_REQUESTED
+        self.0.is_cancel_requested()
     }
 
     pub(crate) fn cancel(&self) {
@@ -34,25 +29,11 @@ impl MutationCancellation {
     }
 
     pub(crate) fn request_cancel(&self) -> bool {
-        self.0
-            .compare_exchange(
-                CANCELLATION_OPEN,
-                CANCELLATION_REQUESTED,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            )
-            .is_ok()
+        self.0.request_cancel()
     }
 
     pub(crate) fn claim_terminal(&self) -> bool {
-        self.0
-            .compare_exchange(
-                CANCELLATION_OPEN,
-                TERMINAL_CLAIMED,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            )
-            .is_ok()
+        self.0.claim_terminal()
     }
 }
 
@@ -247,7 +228,7 @@ impl NodeActor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::time::Duration;
 
