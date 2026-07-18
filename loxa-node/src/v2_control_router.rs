@@ -20,6 +20,7 @@ use loxa_protocol::v2::{
 use loxa_protocol::NodeId;
 use std::convert::Infallible;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -32,8 +33,53 @@ pub(crate) struct V2ControlState {
     execution: DurableExecutionControl,
     inventory: Option<DownloadControl>,
     publication_gate: Option<crate::runtime::PublicationGate>,
+    generated_at: GeneratedAtClock,
     #[cfg(test)]
     subscription_max_snapshot_bytes: Option<usize>,
+}
+
+#[derive(Clone)]
+struct GeneratedAtClock {
+    floor: Arc<AtomicU64>,
+    #[cfg(test)]
+    observed_unix_ms: Option<Arc<AtomicU64>>,
+}
+
+impl GeneratedAtClock {
+    fn from_control(control: &ControlStateHandle) -> Result<Self, ControlStateError> {
+        let floor = control.read_snapshot()?.last_committed_at_unix_ms.get();
+        Ok(Self {
+            floor: Arc::new(AtomicU64::new(floor)),
+            #[cfg(test)]
+            observed_unix_ms: None,
+        })
+    }
+
+    fn next(&self, snapshot: &crate::control_state::state_machine::CommittedState) -> DecimalU64 {
+        let observed = self.observed_wall_time();
+        let candidate = observed.max(snapshot.last_committed_at_unix_ms.get());
+        let previous = self.floor.fetch_max(candidate, Ordering::AcqRel);
+        DecimalU64::new(previous.max(candidate))
+    }
+
+    fn observed_wall_time(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(observed) = &self.observed_unix_ms {
+            return observed.load(Ordering::Acquire);
+        }
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX)
+    }
+
+    #[cfg(test)]
+    fn with_observed_unix_ms(mut self, observed_unix_ms: Arc<AtomicU64>) -> Self {
+        self.observed_unix_ms = Some(observed_unix_ms);
+        self
+    }
 }
 
 impl V2ControlState {
@@ -46,12 +92,15 @@ impl V2ControlState {
         let execution = downloads
             .durable_execution()
             .ok_or("v2 routes require durable execution authority")?;
+        let generated_at = GeneratedAtClock::from_control(&control)
+            .map_err(|_| "v2 routes require durable control state")?;
         Ok(Self {
             policy: Arc::new(AuthPolicy::new(token, desktop_origins())),
             control,
             execution,
             inventory: Some(downloads),
             publication_gate,
+            generated_at,
             #[cfg(test)]
             subscription_max_snapshot_bytes: None,
         })
@@ -63,12 +112,15 @@ impl V2ControlState {
         control: ControlStateHandle,
         execution: DurableExecutionControl,
     ) -> Self {
+        let generated_at = GeneratedAtClock::from_control(&control)
+            .expect("v2 test routes require durable control state");
         Self {
             policy: Arc::new(AuthPolicy::new(token, desktop_origins())),
             control,
             execution,
             inventory: None,
             publication_gate: None,
+            generated_at,
             subscription_max_snapshot_bytes: None,
         }
     }
@@ -80,12 +132,15 @@ impl V2ControlState {
         execution: DurableExecutionControl,
         inventory: DownloadControl,
     ) -> Self {
+        let generated_at = GeneratedAtClock::from_control(&control)
+            .expect("v2 test routes require durable control state");
         Self {
             policy: Arc::new(AuthPolicy::new(token, desktop_origins())),
             control,
             execution,
             inventory: Some(inventory),
             publication_gate: None,
+            generated_at,
             subscription_max_snapshot_bytes: None,
         }
     }
@@ -105,6 +160,15 @@ impl V2ControlState {
         gate: crate::runtime::PublicationGate,
     ) -> Self {
         self.publication_gate = Some(gate);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_observed_unix_ms_for_test(
+        mut self,
+        observed_unix_ms: Arc<AtomicU64>,
+    ) -> Self {
+        self.generated_at = self.generated_at.with_observed_unix_ms(observed_unix_ms);
         self
     }
 
@@ -325,17 +389,6 @@ fn strict_load_body(body: &[u8]) -> Result<V2LoadRequest, V2RouteError> {
     serde_json::from_slice(body).map_err(|_| V2RouteError::invalid_request())
 }
 
-fn now_unix_ms() -> DecimalU64 {
-    DecimalU64::new(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-            .try_into()
-            .unwrap_or(u64::MAX),
-    )
-}
-
 fn snapshot_parts(
     state: &V2ControlState,
 ) -> Result<
@@ -420,11 +473,12 @@ async fn nodes(State(state): State<V2ControlState>, headers: HeaderMap) -> Respo
         Err(error) => return error.into_response(),
     };
     let result = snapshot_parts(&state).map(|(snapshot, epoch)| {
+        let generated_at_unix_ms = state.generated_at.next(&snapshot);
         Json(V2NodeCollection {
             schema_version: V2_SCHEMA_VERSION,
             epoch,
             revision: snapshot.revision,
-            generated_at_unix_ms: now_unix_ms(),
+            generated_at_unix_ms,
             nodes: snapshot.node.iter().cloned().collect(),
         })
         .into_response()
@@ -462,7 +516,7 @@ async fn slots(
             schema_version: V2_SCHEMA_VERSION,
             epoch,
             revision: snapshot.revision,
-            generated_at_unix_ms: now_unix_ms(),
+            generated_at_unix_ms: state.generated_at.next(&snapshot),
             node_id: requested,
             slots: vec![snapshot.slot.clone()],
         })
@@ -480,11 +534,12 @@ async fn operations(State(state): State<V2ControlState>, headers: HeaderMap) -> 
         Err(error) => return error.into_response(),
     };
     let result = snapshot_parts(&state).map(|(snapshot, epoch)| {
+        let generated_at_unix_ms = state.generated_at.next(&snapshot);
         Json(V2OperationCollection {
             schema_version: V2_SCHEMA_VERSION,
             epoch,
             revision: snapshot.revision,
-            generated_at_unix_ms: now_unix_ms(),
+            generated_at_unix_ms,
             operations: snapshot.operations.clone(),
         })
         .into_response()
@@ -522,7 +577,7 @@ async fn operation(
             schema_version: V2_SCHEMA_VERSION,
             epoch,
             revision: snapshot.revision,
-            generated_at_unix_ms: now_unix_ms(),
+            generated_at_unix_ms: state.generated_at.next(&snapshot),
             operation,
         })
         .into_response())
@@ -782,6 +837,10 @@ async fn events(
         Ok(resume) => resume,
         Err(error) => return cors(error.into_response(), origin.as_deref()),
     };
+    let generated_at_unix_ms = match state.control.read_snapshot() {
+        Ok(snapshot) => state.generated_at.next(&snapshot),
+        Err(error) => return cors(map_control_error(error).into_response(), origin.as_deref()),
+    };
     #[cfg(test)]
     let subscription_result = match state.subscription_max_snapshot_bytes {
         Some(max_snapshot_bytes) => {
@@ -789,15 +848,15 @@ async fn events(
                 .control
                 .subscribe_with_max_snapshot_bytes_for_test(
                     resume,
-                    now_unix_ms(),
+                    generated_at_unix_ms,
                     max_snapshot_bytes,
                 )
                 .await
         }
-        None => state.control.subscribe(resume, now_unix_ms()).await,
+        None => state.control.subscribe(resume, generated_at_unix_ms).await,
     };
     #[cfg(not(test))]
-    let subscription_result = state.control.subscribe(resume, now_unix_ms()).await;
+    let subscription_result = state.control.subscribe(resume, generated_at_unix_ms).await;
     let subscription = match subscription_result {
         Ok(subscription) => subscription,
         Err(error) => return cors(map_control_error(error).into_response(), origin.as_deref()),

@@ -15,7 +15,9 @@ use loxa_protocol::v2::{
 };
 use loxa_protocol::{NodeId, NodeInstanceId};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use tower::ServiceExt;
 
 struct WaitingExecutor {
@@ -200,6 +202,68 @@ async fn body_bytes(response: axum::response::Response) -> axum::body::Bytes {
     axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
         .await
         .unwrap()
+}
+
+#[tokio::test]
+async fn v2_generated_time_uses_the_durable_floor_and_never_regresses_with_wall_clock() {
+    let fixture = RouterFixture::new("generated-time-clamp").await;
+    let durable_floor = fixture
+        .control
+        .handle
+        .read_snapshot()
+        .unwrap()
+        .last_committed_at_unix_ms
+        .get();
+    let observed = Arc::new(AtomicU64::new(1));
+    let state = V2ControlState::new_for_test(
+        fixture.token.clone(),
+        fixture.control.handle.clone(),
+        fixture.execution.clone(),
+    )
+    .with_observed_unix_ms_for_test(Arc::clone(&observed));
+    let app = router(state);
+
+    let first: V2NodeCollection = serde_json::from_slice(
+        &body_bytes(
+            app.clone()
+                .oneshot(fixture.request(Method::GET, "/loxa/v2/nodes", Body::empty()))
+                .await
+                .unwrap(),
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(first.generated_at_unix_ms.get(), durable_floor);
+
+    let advanced_time = durable_floor.checked_add(100).unwrap();
+    observed.store(advanced_time, Ordering::Release);
+    let advanced: V2NodeCollection = serde_json::from_slice(
+        &body_bytes(
+            app.clone()
+                .oneshot(fixture.request(Method::GET, "/loxa/v2/nodes", Body::empty()))
+                .await
+                .unwrap(),
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(advanced.generated_at_unix_ms.get(), advanced_time);
+
+    observed.store(2, Ordering::Release);
+    let regressed: V2NodeCollection = serde_json::from_slice(
+        &body_bytes(
+            app.oneshot(fixture.request(Method::GET, "/loxa/v2/nodes", Body::empty()))
+                .await
+                .unwrap(),
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(
+        regressed.generated_at_unix_ms,
+        advanced.generated_at_unix_ms
+    );
+    fixture.shutdown().await;
 }
 
 async fn sanitized_response(

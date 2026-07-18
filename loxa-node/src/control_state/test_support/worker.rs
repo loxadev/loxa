@@ -77,6 +77,20 @@ fn cleanup(path: &Path) {
     let _ = std::fs::remove_file(format!("{}.migration.bak.owner.lock", path.display()));
 }
 
+#[test]
+fn command_transport_is_a_std_sync_bounded_channel() {
+    let (path, repository) = repository();
+    let (handle, worker) = spawn_from_repository_for_test(repository).unwrap();
+
+    let sender_type = handle.command_sender_type_name_for_test();
+    assert!(sender_type.contains("std::sync::mpsc::SyncSender<"));
+    assert!(!sender_type.contains("tokio::sync::mpsc"));
+
+    drop(handle);
+    worker.join_for_test();
+    cleanup(&path);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_admissions_have_unique_monotonic_commit_order() {
     let (path, repository) = repository();
@@ -387,6 +401,42 @@ async fn externally_poisoned_waiting_admission_never_uses_a_released_queue_slot(
     cleanup(&path);
 }
 
+#[tokio::test(start_paused = true)]
+async fn externally_poisoned_async_required_observation_exits_before_released_slot() {
+    let (path, repository) = repository();
+    let state = repository.committed_state().unwrap();
+    repository.close().unwrap();
+    let mut synthetic = synthetic_queue_for_test(state);
+    let handle = synthetic.handle.clone();
+    handle.fill_queue_for_test();
+    let before = handle.snapshot();
+    let waiting_handle = handle.clone();
+    let observation = tokio::spawn(async move {
+        waiting_handle
+            .observe_required_async(Transition::Cancelled {
+                operation_id: OperationId::new_v4(),
+            })
+            .await
+    });
+    tokio::task::yield_now().await;
+
+    handle.poison_for_test();
+    synthetic.pop_one().await;
+    tokio::time::advance(Duration::from_millis(10)).await;
+    tokio::task::yield_now().await;
+
+    assert!(observation.is_finished());
+    assert!(!synthetic.drain_contains_observe_for_test());
+    assert_eq!(
+        observation.await.unwrap().unwrap_err(),
+        ControlStateError::DurableStateUnavailable
+    );
+    assert!(!handle.is_healthy());
+    assert_eq!(*handle.snapshot(), *before);
+    drop(handle);
+    cleanup(&path);
+}
+
 #[tokio::test]
 async fn expired_admission_deadline_cannot_enqueue_into_an_open_slot() {
     let (path, repository) = repository();
@@ -629,6 +679,10 @@ fn reconnect_epoch_replacement_and_cursor_gap_are_fail_closed() {
     .unwrap();
     assert!(reconnect.stream.cursor_gap);
     assert!(reconnect.events.is_empty());
+    assert_eq!(
+        reconnect.generated_at_unix_ms,
+        state.last_committed_at_unix_ms
+    );
     repository.close().unwrap();
     cleanup(&path);
 }

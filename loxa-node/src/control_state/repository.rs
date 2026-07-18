@@ -5045,6 +5045,25 @@ mod tests {
         }
     }
 
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[test]
+    fn production_preflight_rejects_unsupported_platform_before_filesystem_mutation() {
+        let root = std::env::temp_dir().join(format!(
+            "loxa-control-state-production-unsupported-{}-{}",
+            std::process::id(),
+            StreamEpoch::new_v4()
+        ));
+
+        let error = super::open_with_preflight_for_test(
+            &root.join("state/control-state.sqlite3"),
+            super::StoragePreflight::Production,
+        )
+        .expect_err("the production preflight must reject an unsupported platform");
+
+        assert_eq!(error.class(), RepositoryErrorClass::UnsupportedPlatform);
+        assert!(!root.exists());
+    }
+
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn parent_or_main_change_across_sqlite_open_fails_before_first_statement() {

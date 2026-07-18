@@ -110,6 +110,28 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --all-features --locked
 
+  unsupported-control-state-platform:
+    name: unsupported control-state platform (Windows)
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install --profile minimal --no-self-update
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Compile the unsupported control-state target
+        run: cargo check -p loxa-node --all-targets --all-features --locked
+
+      - name: Prove production preflight refusal is mutation-free
+        run: cargo test -p loxa-node production_preflight_rejects_unsupported_platform_before_filesystem_mutation --locked
+
   frontend:
     name: desktop frontend
     runs-on: ubuntu-24.04
