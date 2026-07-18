@@ -188,11 +188,60 @@ fn native_unix_destination_does_not_apply_portable_separator_grammar() {
         "model.gguf:stream",
         "nested\\model.gguf",
     ] {
+        std::fs::write(dir.path().join(name), b"artifact").unwrap();
         assert!(
             ArtifactKey::from_destination(&dir.path().join(name)).is_ok(),
             "rejected native Unix destination {name:?}"
         );
     }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn existing_case_aliases_share_one_artifact_identity_and_mutation_exclusion() {
+    let dir = TestDir::new("existing-case-alias");
+    let canonical = dir.path().join("Model.GGUF");
+    let alias = dir.path().join("model.gguf");
+    std::fs::write(&canonical, b"artifact").unwrap();
+    assert!(
+        std::fs::metadata(&alias).is_ok(),
+        "fixture requires the current macOS volume's case-alias semantics"
+    );
+    let first = ArtifactKey::from_destination(&canonical).unwrap();
+    let second = ArtifactKey::from_destination(&alias).unwrap();
+    assert_eq!(first, second);
+
+    let coordinator = ArtifactMutationCoordinator::new();
+    let _held = coordinator.try_acquire_mutation(first).unwrap();
+    assert_eq!(
+        coordinator.try_acquire_mutation(second).unwrap_err(),
+        ArtifactAcquireError::Busy
+    );
+}
+
+#[cfg(any(target_os = "macos", windows))]
+#[test]
+fn absent_case_aliases_share_one_artifact_identity_and_mutation_exclusion() {
+    let dir = TestDir::new("absent-case-alias");
+    let first = ArtifactKey::from_destination(&dir.path().join("Model.GGUF")).unwrap();
+    let second = ArtifactKey::from_destination(&dir.path().join("model.gguf")).unwrap();
+    assert_eq!(first, second);
+
+    let coordinator = ArtifactMutationCoordinator::new();
+    let _held = coordinator.try_acquire_mutation(first).unwrap();
+    assert_eq!(
+        coordinator.try_acquire_mutation(second).unwrap_err(),
+        ArtifactAcquireError::Busy
+    );
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn absent_case_variants_remain_distinct_on_case_sensitive_unix_policy() {
+    let dir = TestDir::new("absent-case-sensitive");
+    let first = ArtifactKey::from_destination(&dir.path().join("Model.GGUF")).unwrap();
+    let second = ArtifactKey::from_destination(&dir.path().join("model.gguf")).unwrap();
+    assert_ne!(first, second);
 }
 
 #[cfg(unix)]

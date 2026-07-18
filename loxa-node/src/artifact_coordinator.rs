@@ -89,12 +89,61 @@ impl ArtifactKey {
         {
             return Err(ArtifactKeyError::AmbiguousDestination);
         }
+        let logical_destination = if let Some(captured) = captured_destination {
+            let canonical_destination = std::fs::canonicalize(destination)
+                .map_err(|_| ArtifactKeyError::AmbiguousDestination)?;
+            if canonical_destination.parent() != Some(canonical_parent.as_path())
+                || destination_evidence(&canonical_destination)? != Some(captured)
+                || destination_evidence(destination)? != Some(captured)
+            {
+                return Err(ArtifactKeyError::AmbiguousDestination);
+            }
+            normalize_existing_destination(canonical_destination)?
+        } else {
+            let leaf = file_name
+                .to_str()
+                .ok_or(ArtifactKeyError::UnsafeDestination)?;
+            canonical_parent.join(normalize_absent_leaf(leaf, conservative_ascii_case_fold())?)
+        };
         Ok(Self {
-            canonical_destination: canonical_parent.join(file_name),
+            canonical_destination: logical_destination,
             _parent_evidence: parent_evidence,
             _destination_evidence: captured_destination,
         })
     }
+}
+
+fn normalize_absent_leaf(leaf: &str, fold_ascii_case: bool) -> Result<String, ArtifactKeyError> {
+    if !valid_portable_artifact_component(leaf)
+        || !leaf
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(ArtifactKeyError::UnsafeDestination);
+    }
+    Ok(if fold_ascii_case {
+        leaf.to_ascii_lowercase()
+    } else {
+        leaf.to_owned()
+    })
+}
+
+fn normalize_existing_destination(destination: PathBuf) -> Result<PathBuf, ArtifactKeyError> {
+    if !conservative_ascii_case_fold() {
+        return Ok(destination);
+    }
+    let leaf = destination
+        .file_name()
+        .and_then(|leaf| leaf.to_str())
+        .ok_or(ArtifactKeyError::AmbiguousDestination)?;
+    let parent = destination
+        .parent()
+        .ok_or(ArtifactKeyError::AmbiguousDestination)?;
+    Ok(parent.join(leaf.to_ascii_lowercase()))
+}
+
+const fn conservative_ascii_case_fold() -> bool {
+    cfg!(any(windows, target_os = "macos"))
 }
 
 #[cfg(unix)]
@@ -748,5 +797,31 @@ mod contract_tests {
         coordinator.seal();
 
         assert!(observed_unlocked.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn absent_leaf_normalization_is_portable_and_explicitly_case_policy_driven() {
+        assert_eq!(
+            normalize_absent_leaf("Model-Q4.GGUF", true).unwrap(),
+            "model-q4.gguf"
+        );
+        assert_eq!(
+            normalize_absent_leaf("Model-Q4.GGUF", false).unwrap(),
+            "Model-Q4.GGUF"
+        );
+        for leaf in [
+            "CON.gguf",
+            "model gguf",
+            "model:stream",
+            "nested/model.gguf",
+            "nested\\model.gguf",
+            "mødel.gguf",
+            "model.gguf.",
+        ] {
+            assert!(
+                normalize_absent_leaf(leaf, true).is_err(),
+                "accepted {leaf:?}"
+            );
+        }
     }
 }
