@@ -32,14 +32,12 @@ impl<C> EngineSession<C> {
         observed_child_pid: u32,
         observed_child_process_start_time_unix_s: u64,
     ) -> Result<Self, (C, EngineSessionCorrelationError)> {
-        if run.child_pid != Some(observed_child_pid)
-            || server.pid != observed_child_pid
-            || run.child_process_start_time_unix_s != Some(observed_child_process_start_time_unix_s)
-            || server.process_start_time_unix_s != Some(observed_child_process_start_time_unix_s)
-            || run.model_id.as_deref() != Some(server.id.as_str())
-            || run.port != server.port
-            || run.run_id.is_empty()
-        {
+        if !exactly_correlated(
+            &run,
+            &server,
+            observed_child_pid,
+            observed_child_process_start_time_unix_s,
+        ) {
             return Err((
                 child,
                 EngineSessionCorrelationError(
@@ -53,6 +51,42 @@ impl<C> EngineSession<C> {
             server,
             process_label: process_label.into(),
         })
+    }
+
+    pub(super) fn new_candidate(
+        child: C,
+        run: ManagedRun,
+        server: ManagedServer,
+        process_label: String,
+    ) -> Self {
+        Self {
+            child,
+            run,
+            server,
+            process_label,
+        }
+    }
+
+    pub(super) fn finalize(
+        &mut self,
+        run: ManagedRun,
+        server: ManagedServer,
+        observed_child_pid: u32,
+        observed_child_process_start_time_unix_s: u64,
+    ) -> Result<(), EngineSessionCorrelationError> {
+        if !exactly_correlated(
+            &run,
+            &server,
+            observed_child_pid,
+            observed_child_process_start_time_unix_s,
+        ) {
+            return Err(EngineSessionCorrelationError(
+                "engine child, server, model, port, and committed run are not exactly correlated",
+            ));
+        }
+        self.run = run;
+        self.server = server;
+        Ok(())
     }
 
     pub(super) fn identity(&self) -> ManagedRunIdentity {
@@ -84,6 +118,21 @@ impl<C> EngineSession<C> {
     pub(super) fn child_mut(&mut self) -> &mut C {
         &mut self.child
     }
+}
+
+fn exactly_correlated(
+    run: &ManagedRun,
+    server: &ManagedServer,
+    observed_child_pid: u32,
+    observed_child_process_start_time_unix_s: u64,
+) -> bool {
+    run.child_pid == Some(observed_child_pid)
+        && server.pid == observed_child_pid
+        && run.child_process_start_time_unix_s == Some(observed_child_process_start_time_unix_s)
+        && server.process_start_time_unix_s == Some(observed_child_process_start_time_unix_s)
+        && run.model_id.as_deref() == Some(server.id.as_str())
+        && run.port == server.port
+        && !run.run_id.is_empty()
 }
 
 #[cfg(test)]

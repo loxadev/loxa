@@ -1,8 +1,8 @@
 use crate::engine_session::EngineSession;
 use crate::model_lifecycle::{
-    EngineLifecycleDriver, ExactSessionStatus, ExactStopFailure, GatewayPublisher, LaunchPlan,
-    LifecycleError, LifecycleSignals, ModelLifecycle, NodeLifecycleStatus, SessionCorrelation,
-    StableNodeOwner, StartedSession,
+    CandidateSlot, EngineLifecycleDriver, ExactSessionStatus, ExactStopFailure, GatewayPublisher,
+    LaunchPlan, LifecycleError, LifecycleSignals, ModelLifecycle, NodeLifecycleStatus,
+    SessionCorrelation, StableNodeOwner, StartedSession,
 };
 use loxa_core::diagnostics::DiagnosticsHealth;
 use loxa_core::engine::{EngineLaunchSpec, ReadinessStrategy};
@@ -11,6 +11,39 @@ use loxa_core::supervisor::{self, ManagedChild, ManagedServer, RunLifecycle};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+#[cfg(test)]
+thread_local! {
+    static PANIC_AFTER_CANDIDATE_INSTALL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn install_spawned_candidate(
+    candidate: &mut CandidateSlot<EngineSession<supervisor::SpawnedServer>>,
+    child: supervisor::SpawnedServer,
+    run: loxa_core::supervisor::ManagedRun,
+    server: ManagedServer,
+    correlation: SessionCorrelation,
+    process_label: String,
+) -> Result<(), LifecycleError> {
+    candidate
+        .install(StartedSession {
+            correlation,
+            value: EngineSession::new_candidate(child, run, server, process_label),
+        })
+        .map_err(|_| LifecycleError::RecoveryRequired {
+            replacement: "candidate slot changed during spawn".into(),
+            rollback: "all conflicting exact candidates retained".into(),
+        })?;
+
+    #[cfg(test)]
+    PANIC_AFTER_CANDIDATE_INSTALL.with(|enabled| {
+        if enabled.replace(false) {
+            panic!("injected panic after exact candidate installation");
+        }
+    });
+
+    Ok(())
+}
 
 pub(crate) struct ProductionEngineDriver {
     state_path: PathBuf,
@@ -112,27 +145,6 @@ impl ProductionEngineDriver {
         unloaded
     }
 
-    fn exact_teardown_to_unloaded<C>(
-        &self,
-        child: &mut C,
-        run: &loxa_core::supervisor::ManagedRun,
-    ) -> Result<(), LifecycleError>
-    where
-        C: supervisor::ManagedChild + supervisor::LogDrainingChild,
-    {
-        let recovery = |reason: String| LifecycleError::RecoveryRequired {
-            replacement: "engine lifecycle cleanup was not proven".into(),
-            rollback: reason,
-        };
-        let confirmation =
-            supervisor::teardown_managed_child(child, supervisor::CTRL_C_GRACE_PERIOD)
-                .map_err(|error| recovery(error.to_string()))?;
-        if confirmation != supervisor::TeardownConfirmation::Confirmed {
-            return Err(recovery("engine teardown could not be confirmed".into()));
-        }
-        self.commit_unloaded(run, recovery)
-    }
-
     fn stop_started_session(
         &self,
         session: &mut StartedSession<EngineSession<supervisor::SpawnedServer>>,
@@ -161,6 +173,29 @@ impl ProductionEngineDriver {
         Ok(())
     }
 
+    fn fail_start_candidate(
+        &self,
+        candidate: &mut CandidateSlot<EngineSession<supervisor::SpawnedServer>>,
+        error: LifecycleError,
+    ) -> Result<(), LifecycleError> {
+        let cleanup = self.stop_started_session(
+            candidate
+                .as_mut()
+                .expect("spawned candidate ownership installed"),
+        );
+        match cleanup {
+            Ok(()) => {
+                drop(candidate.take());
+                Err(error)
+            }
+            Err(cleanup) => Err(LifecycleError::RecoveryRequired {
+                replacement: format!("{error:?}"),
+                rollback: format!("candidate cleanup failed: {cleanup:?}"),
+            }),
+        }
+    }
+
+    #[cfg(test)]
     fn commit_unloaded(
         &self,
         run: &loxa_core::supervisor::ManagedRun,
@@ -224,7 +259,14 @@ impl EngineLifecycleDriver for ProductionEngineDriver {
         owner: &StableNodeOwner,
         plan: &LaunchPlan,
         generation: u64,
-    ) -> Result<StartedSession<Self::Session>, LifecycleError> {
+        candidate: &mut CandidateSlot<Self::Session>,
+    ) -> Result<(), LifecycleError> {
+        if candidate.is_occupied() {
+            return Err(LifecycleError::RecoveryRequired {
+                replacement: "candidate slot is already occupied".into(),
+                rollback: "exact candidate ownership retained".into(),
+            });
+        }
         let generation = u32::try_from(generation)
             .map_err(|_| LifecycleError::StartFailed("engine generation overflow".into()))?;
         let state = supervisor::read_runtime_state(&self.state_path).map_err(Self::public_error)?;
@@ -312,6 +354,34 @@ impl EngineLifecycleDriver for ProductionEngineDriver {
                 expected_alias: alias.clone(),
             },
         };
+        // Prebuild every allocating part of the provisional owner before spawn. After spawn,
+        // only infallible scalar reads/assignments and moves occur before the caller-owned slot
+        // receives the exact child.
+        let mut provisional_server = ManagedServer {
+            id: plan.model_id.clone(),
+            pid: 0,
+            port: engine_port,
+            model_path: plan.artifact_path.clone(),
+            started_at_unix_s: now,
+            llama_server_version: version.clone(),
+            process_start_time_unix_s: None,
+        };
+        let mut provisional_correlation = SessionCorrelation {
+            generation: u64::from(generation),
+            child_pid: 0,
+            child_process_start_time_unix_s: 0,
+            server_id: "engine-pending".to_owned(),
+            model_id: plan.model_id.clone(),
+            port: engine_port,
+            committed_run_id: owner.run_id.clone(),
+            owner_pid: owner.pid,
+            owner_process_start_time_unix_s: owner.process_start_time_unix_s,
+            gateway_port: owner.gateway_port,
+            generation_alias: alias.clone(),
+            engine_version: version.clone(),
+        };
+        let candidate_process_label = "llama-server".to_owned();
+        let candidate_starting = starting.clone();
         let spawn = match supervisor::spawn_starting_engine_with_health(
             &self.state_path,
             &starting.identity(),
@@ -328,24 +398,39 @@ impl EngineLifecycleDriver for ProductionEngineDriver {
         };
         let supervisor::SpawnStartingRunOutcome::Spawned {
             run: starting,
-            value: mut child,
+            value: child,
         } = spawn
         else {
             self.reconcile_childless_owner(owner, &starting)?;
             return Err(LifecycleError::Stopping);
         };
-        if let Some(error) = child.take_initialization_error() {
-            self.exact_teardown_to_unloaded(&mut child, &starting)?;
-            return Err(Self::public_error(error));
-        }
         let child_pid = child.pid();
+        provisional_server.pid = child_pid;
+        provisional_correlation.child_pid = child_pid;
+        install_spawned_candidate(
+            candidate,
+            child,
+            candidate_starting,
+            provisional_server,
+            provisional_correlation,
+            candidate_process_label,
+        )?;
+        if let Some(error) = candidate
+            .as_mut()
+            .expect("spawned candidate ownership installed")
+            .value
+            .child_mut()
+            .take_initialization_error()
+        {
+            return self.fail_start_candidate(candidate, Self::public_error(error));
+        }
         let child_start = match supervisor::process_start_time_with_retry(child_pid) {
             Some(start) => start,
             None => {
-                self.exact_teardown_to_unloaded(&mut child, &starting)?;
-                return Err(LifecycleError::StartFailed(
-                    "engine process identity unavailable".into(),
-                ));
+                return self.fail_start_candidate(
+                    candidate,
+                    LifecycleError::StartFailed("engine process identity unavailable".into()),
+                );
             }
         };
         let server = ManagedServer {
@@ -362,7 +447,12 @@ impl EngineLifecycleDriver for ProductionEngineDriver {
         running.lifecycle = RunLifecycle::Running;
         running.child_pid = Some(server.pid);
         running.child_process_start_time_unix_s = server.process_start_time_unix_s;
-        running.child_pgid = child.owned_pgid();
+        running.child_pgid = candidate
+            .as_mut()
+            .expect("spawned candidate ownership installed")
+            .value
+            .child_mut()
+            .owned_pgid();
         let run = match supervisor::update_runtime_state_run_committed(
             &self.state_path,
             &starting.identity(),
@@ -370,44 +460,43 @@ impl EngineLifecycleDriver for ProductionEngineDriver {
         ) {
             Ok(Some(run)) if !run.stop_requested => run,
             Ok(Some(run)) => {
-                self.exact_teardown_to_unloaded(&mut child, &run)?;
-                return Err(LifecycleError::Stopping);
+                let _ = run;
+                return self.fail_start_candidate(candidate, LifecycleError::Stopping);
             }
             Ok(None) => {
-                self.exact_teardown_to_unloaded(&mut child, &starting)?;
-                return Err(LifecycleError::Stopping);
+                return self.fail_start_candidate(candidate, LifecycleError::Stopping);
             }
             Err(error) => {
-                self.exact_teardown_to_unloaded(&mut child, &starting)?;
-                return Err(Self::public_error(error));
+                return self.fail_start_candidate(candidate, Self::public_error(error));
             }
         };
-        let committed_run = run.clone();
-        let session =
-            match EngineSession::new(child, run, server, "llama-server", child_pid, child_start) {
-                Ok(session) => session,
-                Err((mut child, error)) => {
-                    self.exact_teardown_to_unloaded(&mut child, &committed_run)?;
-                    return Err(LifecycleError::StartFailed(error.to_string()));
-                }
-            };
-        Ok(StartedSession {
-            correlation: SessionCorrelation {
-                generation: u64::from(generation),
-                child_pid,
-                child_process_start_time_unix_s: child_start,
-                server_id: format!("engine-{child_pid}-{child_start}"),
-                model_id: plan.model_id.clone(),
-                port: engine_port,
-                committed_run_id: owner.run_id.clone(),
-                owner_pid: owner.pid,
-                owner_process_start_time_unix_s: owner.process_start_time_unix_s,
-                gateway_port: owner.gateway_port,
-                generation_alias: alias,
-                engine_version: version,
-            },
-            value: session,
-        })
+        let finalize = candidate
+            .as_mut()
+            .expect("spawned candidate ownership installed")
+            .value
+            .finalize(run, server, child_pid, child_start);
+        if let Err(error) = finalize {
+            return self
+                .fail_start_candidate(candidate, LifecycleError::StartFailed(error.to_string()));
+        }
+        candidate
+            .as_mut()
+            .expect("spawned candidate ownership installed")
+            .correlation = SessionCorrelation {
+            generation: u64::from(generation),
+            child_pid,
+            child_process_start_time_unix_s: child_start,
+            server_id: format!("engine-{child_pid}-{child_start}"),
+            model_id: plan.model_id.clone(),
+            port: engine_port,
+            committed_run_id: owner.run_id.clone(),
+            owner_pid: owner.pid,
+            owner_process_start_time_unix_s: owner.process_start_time_unix_s,
+            gateway_port: owner.gateway_port,
+            generation_alias: alias,
+            engine_version: version,
+        };
+        Ok(())
     }
 
     fn wait_ready(
@@ -573,6 +662,8 @@ impl GatewayPublisher for ProductionGatewayPublisher {
 mod tests {
     use super::*;
     #[cfg(unix)]
+    use std::os::unix::process::CommandExt;
+    #[cfg(unix)]
     use std::process::{Command, Stdio};
 
     struct TestDir(PathBuf);
@@ -612,6 +703,84 @@ mod tests {
             child_process_start_time_unix_s: None,
             child_pgid: None,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_spawn_panic_retains_exact_live_child_until_explicit_disposal() {
+        let dir = TestDir::new("post-spawn-panic");
+        let owner = StableNodeOwner {
+            run_id: "owner".into(),
+            pid: 11,
+            process_start_time_unix_s: 22,
+            gateway_port: 8080,
+        };
+        let run = starting(&owner, 7);
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 30"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        let child = command.spawn().unwrap();
+        let child_pid = child.id();
+        let child = supervisor::SpawnedServer::from_debug_child_for_composition_test(
+            child,
+            &dir.0.join("candidate.log"),
+        )
+        .unwrap();
+        let server = ManagedServer {
+            id: "model".into(),
+            pid: child_pid,
+            port: run.port,
+            model_path: PathBuf::from("model.gguf"),
+            started_at_unix_s: 1,
+            llama_server_version: "test".into(),
+            process_start_time_unix_s: None,
+        };
+        let correlation = SessionCorrelation {
+            generation: u64::from(run.generation),
+            child_pid,
+            child_process_start_time_unix_s: 0,
+            server_id: "engine-pending".into(),
+            model_id: "model".into(),
+            port: run.port,
+            committed_run_id: owner.run_id,
+            owner_pid: owner.pid,
+            owner_process_start_time_unix_s: owner.process_start_time_unix_s,
+            gateway_port: owner.gateway_port,
+            generation_alias: run.generation_alias.clone(),
+            engine_version: "test".into(),
+        };
+        let mut candidate = CandidateSlot::new();
+        PANIC_AFTER_CANDIDATE_INSTALL.with(|enabled| enabled.set(true));
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            install_spawned_candidate(
+                &mut candidate,
+                child,
+                run,
+                server,
+                correlation,
+                "test-child".into(),
+            )
+            .unwrap();
+        }));
+
+        assert!(panic.is_err());
+        let mut retained = candidate.take().expect("exact child retained after panic");
+        assert!(
+            retained.value.child_mut().try_wait().unwrap().is_none(),
+            "retained child must remain live until explicit disposal"
+        );
+        assert_eq!(
+            supervisor::teardown_managed_child(
+                retained.value.child_mut(),
+                supervisor::CTRL_C_GRACE_PERIOD,
+            )
+            .unwrap(),
+            supervisor::TeardownConfirmation::Confirmed
+        );
     }
 
     #[test]

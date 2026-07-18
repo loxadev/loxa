@@ -102,6 +102,45 @@ impl<S> std::fmt::Debug for ExactStopFailure<'_, S> {
     }
 }
 
+pub struct CandidateSlot<S> {
+    candidate: Option<StartedSession<S>>,
+    retained_conflicts: Vec<StartedSession<S>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CandidateOccupied;
+
+impl<S> CandidateSlot<S> {
+    pub(super) fn new() -> Self {
+        Self {
+            candidate: None,
+            retained_conflicts: Vec::new(),
+        }
+    }
+
+    pub fn install(&mut self, candidate: StartedSession<S>) -> Result<(), CandidateOccupied> {
+        if self.candidate.is_some() {
+            self.retained_conflicts.push(candidate);
+            Err(CandidateOccupied)
+        } else {
+            self.candidate = Some(candidate);
+            Ok(())
+        }
+    }
+
+    pub fn as_mut(&mut self) -> Option<&mut StartedSession<S>> {
+        self.candidate.as_mut()
+    }
+
+    pub fn take(&mut self) -> Option<StartedSession<S>> {
+        self.candidate.take()
+    }
+
+    pub fn is_occupied(&self) -> bool {
+        self.candidate.is_some() || !self.retained_conflicts.is_empty()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NodeLifecycleStatus {
     Unloaded,
@@ -146,7 +185,8 @@ pub trait EngineLifecycleDriver {
         owner: &StableNodeOwner,
         plan: &LaunchPlan,
         generation: u64,
-    ) -> Result<StartedSession<Self::Session>, LifecycleError>;
+        candidate: &mut CandidateSlot<Self::Session>,
+    ) -> Result<(), LifecycleError>;
 
     fn wait_ready(
         &mut self,
@@ -217,6 +257,7 @@ where
     driver: D,
     gateway: G,
     current: Option<(LaunchPlan, StartedSession<D::Session>)>,
+    candidate: CandidateSlot<D::Session>,
     retained_uncertain: Option<(LaunchPlan, StartedSession<D::Session>)>,
     generation: u64,
     status: NodeLifecycleStatus,
@@ -282,6 +323,7 @@ where
             driver,
             gateway,
             current: None,
+            candidate: CandidateSlot::new(),
             retained_uncertain: None,
             generation: 0,
             status: NodeLifecycleStatus::Unloaded,
@@ -400,8 +442,8 @@ where
         }
 
         match self.start_ready(&plan, cancellation) {
-            Ok(session) => {
-                self.publish(plan, session);
+            Ok(()) => {
+                self.publish_candidate(plan);
                 self.crash_restart_used = false;
                 Ok(())
             }
@@ -416,8 +458,8 @@ where
                     return Err(replacement_error);
                 };
                 match self.start_ready(&prior_plan, cancellation) {
-                    Ok(session) => {
-                        self.publish(prior_plan, session);
+                    Ok(()) => {
+                        self.publish_candidate(prior_plan);
                         self.crash_restart_used = false;
                         Err(replacement_error)
                     }
@@ -551,8 +593,8 @@ where
         cancellation: &MutationCancellation,
     ) -> Result<(), LifecycleError> {
         match self.start_ready(&plan, cancellation) {
-            Ok(session) => {
-                self.publish(plan, session);
+            Ok(()) => {
+                self.publish_candidate(plan);
                 Ok(())
             }
             Err(error) => {
@@ -615,21 +657,51 @@ where
         &mut self,
         plan: &LaunchPlan,
         cancellation: &MutationCancellation,
-    ) -> Result<StartedSession<D::Session>, LifecycleError> {
+    ) -> Result<(), LifecycleError> {
         self.ensure_not_stopping()?;
+        if self.candidate.is_occupied() {
+            return Err(LifecycleError::RecoveryRequired {
+                replacement: "candidate slot is already occupied".into(),
+                rollback: "exact candidate ownership retained".into(),
+            });
+        }
         let generation = self
             .generation
             .checked_add(1)
             .ok_or_else(|| LifecycleError::InvalidCandidate("engine generation overflow".into()))?;
-        let mut session = self.driver.start(&self.owner, plan, generation)?;
+        if let Err(error) = self
+            .driver
+            .start(&self.owner, plan, generation, &mut self.candidate)
+        {
+            if self.candidate.is_occupied() {
+                self.retain_candidate(plan);
+                return Err(match error {
+                    recovery @ LifecycleError::RecoveryRequired { .. } => recovery,
+                    other => LifecycleError::RecoveryRequired {
+                        replacement: format!("{other:?}"),
+                        rollback: "start failed with exact candidate ownership retained".into(),
+                    },
+                });
+            }
+            return Err(error);
+        }
+        let Some(session) = self.candidate.as_mut() else {
+            return Err(LifecycleError::RecoveryRequired {
+                replacement: "driver reported start without a candidate".into(),
+                rollback: "candidate ownership contract violated".into(),
+            });
+        };
         self.generation = generation;
         if let Err(error) = validate_candidate(&self.owner, plan, generation, &session.correlation)
         {
-            return match self.driver.stop_exact(&mut session) {
-                Ok(()) => Err(error),
+            return match self.driver.stop_exact(session) {
+                Ok(()) => {
+                    drop(self.candidate.take());
+                    Err(error)
+                }
                 Err(cleanup) => {
                     let cleanup = cleanup.into_error();
-                    self.retained_uncertain = Some((plan.clone(), session));
+                    self.retain_candidate(plan);
                     Err(LifecycleError::RecoveryRequired {
                         replacement: format!("{error:?}"),
                         rollback: format!("invalid-candidate cleanup failed: {cleanup:?}"),
@@ -638,17 +710,23 @@ where
             };
         }
         if let Err(error) = self.driver.wait_ready(
-            &mut session,
+            self.candidate.as_mut().expect("candidate installed"),
             LifecycleSignals {
                 cancellation,
                 stopping: &self.stopping,
             },
         ) {
-            return match self.driver.stop_exact(&mut session) {
-                Ok(()) => Err(error),
+            return match self
+                .driver
+                .stop_exact(self.candidate.as_mut().expect("candidate installed"))
+            {
+                Ok(()) => {
+                    drop(self.candidate.take());
+                    Err(error)
+                }
                 Err(cleanup) => {
                     let cleanup = cleanup.into_error();
-                    self.retained_uncertain = Some((plan.clone(), session));
+                    self.retain_candidate(plan);
                     Err(LifecycleError::RecoveryRequired {
                         replacement: format!("{error:?}"),
                         rollback: format!("candidate cleanup failed: {cleanup:?}"),
@@ -657,11 +735,17 @@ where
             };
         }
         if let Err(error) = self.ensure_not_stopping() {
-            return match self.driver.stop_exact(&mut session) {
-                Ok(()) => Err(error),
+            return match self
+                .driver
+                .stop_exact(self.candidate.as_mut().expect("candidate installed"))
+            {
+                Ok(()) => {
+                    drop(self.candidate.take());
+                    Err(error)
+                }
                 Err(cleanup) => {
                     let cleanup = cleanup.into_error();
-                    self.retained_uncertain = Some((plan.clone(), session));
+                    self.retain_candidate(plan);
                     Err(LifecycleError::RecoveryRequired {
                         replacement: format!("{error:?}"),
                         rollback: format!("stop-race cleanup failed: {cleanup:?}"),
@@ -669,7 +753,7 @@ where
                 }
             };
         }
-        Ok(session)
+        Ok(())
     }
 
     fn require_recovery(&mut self, error: String) {
@@ -685,8 +769,21 @@ where
         });
     }
 
-    fn publish(&mut self, plan: LaunchPlan, session: StartedSession<D::Session>) {
-        self.gateway.publish(&plan, &session.correlation);
+    fn retain_candidate(&mut self, plan: &LaunchPlan) {
+        if let Some(candidate) = self.candidate.take() {
+            self.retained_uncertain = Some((plan.clone(), candidate));
+        }
+    }
+
+    fn publish_candidate(&mut self, plan: LaunchPlan) {
+        let correlation = &self
+            .candidate
+            .candidate
+            .as_ref()
+            .expect("candidate installed")
+            .correlation;
+        self.gateway.publish(&plan, correlation);
+        let session = self.candidate.take().expect("candidate installed");
         self.status = NodeLifecycleStatus::Ready;
         self.error = None;
         self.current = Some((plan, session));
@@ -744,25 +841,31 @@ mod tests {
             owner: &StableNodeOwner,
             plan: &LaunchPlan,
             generation: u64,
-        ) -> Result<StartedSession<Self::Session>, LifecycleError> {
+            candidate: &mut CandidateSlot<Self::Session>,
+        ) -> Result<(), LifecycleError> {
             self.started.push((plan.model_id.clone(), generation));
-            Ok(StartedSession {
-                value: (),
-                correlation: SessionCorrelation {
-                    generation,
-                    child_pid: 100 + generation as u32,
-                    child_process_start_time_unix_s: 200 + generation,
-                    server_id: format!("server-{generation}"),
-                    model_id: plan.model_id.clone(),
-                    port: 9000 + generation as u16,
-                    committed_run_id: owner.run_id.clone(),
-                    owner_pid: owner.pid,
-                    owner_process_start_time_unix_s: owner.process_start_time_unix_s,
-                    gateway_port: owner.gateway_port,
-                    generation_alias: format!("loxa-{}-g{generation}", owner.run_id),
-                    engine_version: "test".into(),
-                },
-            })
+            candidate
+                .install(StartedSession {
+                    value: (),
+                    correlation: SessionCorrelation {
+                        generation,
+                        child_pid: 100 + generation as u32,
+                        child_process_start_time_unix_s: 200 + generation,
+                        server_id: format!("server-{generation}"),
+                        model_id: plan.model_id.clone(),
+                        port: 9000 + generation as u16,
+                        committed_run_id: owner.run_id.clone(),
+                        owner_pid: owner.pid,
+                        owner_process_start_time_unix_s: owner.process_start_time_unix_s,
+                        gateway_port: owner.gateway_port,
+                        generation_alias: format!("loxa-{}-g{generation}", owner.run_id),
+                        engine_version: "test".into(),
+                    },
+                })
+                .map_err(|_| LifecycleError::RecoveryRequired {
+                    replacement: "candidate slot occupied".into(),
+                    rollback: "test driver retained ownership".into(),
+                })
         }
 
         fn wait_ready(
@@ -1124,24 +1227,30 @@ mod tests {
                 owner: &StableNodeOwner,
                 plan: &LaunchPlan,
                 generation: u64,
-            ) -> Result<StartedSession<()>, LifecycleError> {
-                Ok(StartedSession {
-                    value: (),
-                    correlation: SessionCorrelation {
-                        generation: generation - 1,
-                        child_pid: 1,
-                        child_process_start_time_unix_s: 2,
-                        server_id: "server".into(),
-                        model_id: plan.model_id.clone(),
-                        port: 9,
-                        committed_run_id: owner.run_id.clone(),
-                        owner_pid: owner.pid,
-                        owner_process_start_time_unix_s: owner.process_start_time_unix_s,
-                        gateway_port: owner.gateway_port,
-                        generation_alias: format!("loxa-{}-g{}", owner.run_id, generation - 1),
-                        engine_version: "test".into(),
-                    },
-                })
+                candidate: &mut CandidateSlot<()>,
+            ) -> Result<(), LifecycleError> {
+                candidate
+                    .install(StartedSession {
+                        value: (),
+                        correlation: SessionCorrelation {
+                            generation: generation - 1,
+                            child_pid: 1,
+                            child_process_start_time_unix_s: 2,
+                            server_id: "server".into(),
+                            model_id: plan.model_id.clone(),
+                            port: 9,
+                            committed_run_id: owner.run_id.clone(),
+                            owner_pid: owner.pid,
+                            owner_process_start_time_unix_s: owner.process_start_time_unix_s,
+                            gateway_port: owner.gateway_port,
+                            generation_alias: format!("loxa-{}-g{}", owner.run_id, generation - 1),
+                            engine_version: "test".into(),
+                        },
+                    })
+                    .map_err(|_| LifecycleError::RecoveryRequired {
+                        replacement: "candidate slot occupied".into(),
+                        rollback: "test driver retained ownership".into(),
+                    })
             }
             fn wait_ready(
                 &mut self,
@@ -1271,24 +1380,30 @@ mod tests {
                 owner: &StableNodeOwner,
                 plan: &LaunchPlan,
                 generation: u64,
-            ) -> Result<StartedSession<()>, LifecycleError> {
-                Ok(StartedSession {
-                    value: (),
-                    correlation: SessionCorrelation {
-                        generation: generation.saturating_sub(1),
-                        child_pid: 1,
-                        child_process_start_time_unix_s: 2,
-                        server_id: "stale".into(),
-                        model_id: plan.model_id.clone(),
-                        port: 9,
-                        committed_run_id: owner.run_id.clone(),
-                        owner_pid: owner.pid,
-                        owner_process_start_time_unix_s: owner.process_start_time_unix_s,
-                        gateway_port: owner.gateway_port,
-                        generation_alias: "stale".into(),
-                        engine_version: "test".into(),
-                    },
-                })
+                candidate: &mut CandidateSlot<()>,
+            ) -> Result<(), LifecycleError> {
+                candidate
+                    .install(StartedSession {
+                        value: (),
+                        correlation: SessionCorrelation {
+                            generation: generation.saturating_sub(1),
+                            child_pid: 1,
+                            child_process_start_time_unix_s: 2,
+                            server_id: "stale".into(),
+                            model_id: plan.model_id.clone(),
+                            port: 9,
+                            committed_run_id: owner.run_id.clone(),
+                            owner_pid: owner.pid,
+                            owner_process_start_time_unix_s: owner.process_start_time_unix_s,
+                            gateway_port: owner.gateway_port,
+                            generation_alias: "stale".into(),
+                            engine_version: "test".into(),
+                        },
+                    })
+                    .map_err(|_| LifecycleError::RecoveryRequired {
+                        replacement: "candidate slot occupied".into(),
+                        rollback: "test driver retained ownership".into(),
+                    })
             }
             fn wait_ready(
                 &mut self,

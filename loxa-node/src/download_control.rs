@@ -2180,7 +2180,8 @@ mod tests {
             _: &crate::model_lifecycle::StableNodeOwner,
             _: &LaunchPlan,
             _: u64,
-        ) -> Result<crate::model_lifecycle::StartedSession<()>, LifecycleError> {
+            _: &mut crate::model_lifecycle::CandidateSlot<()>,
+        ) -> Result<(), LifecycleError> {
             panic!("unload must not spawn an engine")
         }
         fn wait_ready(
@@ -2213,24 +2214,30 @@ mod tests {
             owner: &crate::model_lifecycle::StableNodeOwner,
             plan: &LaunchPlan,
             generation: u64,
-        ) -> Result<crate::model_lifecycle::StartedSession<()>, LifecycleError> {
-            Ok(crate::model_lifecycle::StartedSession {
-                value: (),
-                correlation: crate::model_lifecycle::SessionCorrelation {
-                    generation,
-                    child_pid: 101,
-                    child_process_start_time_unix_s: 202,
-                    server_id: "fixture-server".into(),
-                    model_id: plan.model_id.clone(),
-                    port: 9_001,
-                    committed_run_id: owner.run_id.clone(),
-                    owner_pid: owner.pid,
-                    owner_process_start_time_unix_s: owner.process_start_time_unix_s,
-                    gateway_port: owner.gateway_port,
-                    generation_alias: format!("loxa-{}-g{generation}", owner.run_id),
-                    engine_version: "fixture".into(),
-                },
-            })
+            candidate: &mut crate::model_lifecycle::CandidateSlot<()>,
+        ) -> Result<(), LifecycleError> {
+            candidate
+                .install(crate::model_lifecycle::StartedSession {
+                    value: (),
+                    correlation: crate::model_lifecycle::SessionCorrelation {
+                        generation,
+                        child_pid: 101,
+                        child_process_start_time_unix_s: 202,
+                        server_id: "fixture-server".into(),
+                        model_id: plan.model_id.clone(),
+                        port: 9_001,
+                        committed_run_id: owner.run_id.clone(),
+                        owner_pid: owner.pid,
+                        owner_process_start_time_unix_s: owner.process_start_time_unix_s,
+                        gateway_port: owner.gateway_port,
+                        generation_alias: format!("loxa-{}-g{generation}", owner.run_id),
+                        engine_version: "fixture".into(),
+                    },
+                })
+                .map_err(|_| LifecycleError::RecoveryRequired {
+                    replacement: "candidate slot occupied".into(),
+                    rollback: "test driver retained ownership".into(),
+                })
         }
 
         fn wait_ready(
@@ -2262,25 +2269,31 @@ mod tests {
             owner: &crate::model_lifecycle::StableNodeOwner,
             plan: &LaunchPlan,
             generation: u64,
-        ) -> Result<crate::model_lifecycle::StartedSession<()>, LifecycleError> {
+            candidate: &mut crate::model_lifecycle::CandidateSlot<()>,
+        ) -> Result<(), LifecycleError> {
             self.starts.fetch_add(1, Ordering::SeqCst);
-            Ok(crate::model_lifecycle::StartedSession {
-                value: (),
-                correlation: crate::model_lifecycle::SessionCorrelation {
-                    generation,
-                    child_pid: 100 + generation as u32,
-                    child_process_start_time_unix_s: 200 + generation,
-                    server_id: format!("fixture-server-{generation}"),
-                    model_id: plan.model_id.clone(),
-                    port: 9_000 + generation as u16,
-                    committed_run_id: owner.run_id.clone(),
-                    owner_pid: owner.pid,
-                    owner_process_start_time_unix_s: owner.process_start_time_unix_s,
-                    gateway_port: owner.gateway_port,
-                    generation_alias: format!("loxa-{}-g{generation}", owner.run_id),
-                    engine_version: "fixture".into(),
-                },
-            })
+            candidate
+                .install(crate::model_lifecycle::StartedSession {
+                    value: (),
+                    correlation: crate::model_lifecycle::SessionCorrelation {
+                        generation,
+                        child_pid: 100 + generation as u32,
+                        child_process_start_time_unix_s: 200 + generation,
+                        server_id: format!("fixture-server-{generation}"),
+                        model_id: plan.model_id.clone(),
+                        port: 9_000 + generation as u16,
+                        committed_run_id: owner.run_id.clone(),
+                        owner_pid: owner.pid,
+                        owner_process_start_time_unix_s: owner.process_start_time_unix_s,
+                        gateway_port: owner.gateway_port,
+                        generation_alias: format!("loxa-{}-g{generation}", owner.run_id),
+                        engine_version: "fixture".into(),
+                    },
+                })
+                .map_err(|_| LifecycleError::RecoveryRequired {
+                    replacement: "candidate slot occupied".into(),
+                    rollback: "test driver retained ownership".into(),
+                })
         }
 
         fn wait_ready(
