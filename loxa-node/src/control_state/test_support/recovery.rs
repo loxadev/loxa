@@ -1,8 +1,9 @@
 use crate::bootstrap::NodePaths;
 use crate::control_state::recovery::{decide, RecoveryEvidence, UncertaintyReason};
 use crate::control_state::repository::{
-    arm_reconciliation_transaction_fault_for_test, ControlIdGenerator,
-    ReconciliationTransactionFault, ScalarSource,
+    arm_migration_statement_fault_for_test, arm_reconciliation_transaction_fault_for_test,
+    ControlIdGenerator, DesiredKind, MigrationStatementFault, ReconciliationTransactionFault,
+    RepositoryErrorClass, ScalarSource,
 };
 use crate::control_state::state_machine::test_support::storage::TestRoot;
 use crate::control_state::state_machine::{
@@ -28,6 +29,26 @@ const SLOT_ID: &str = "82222222-2222-4222-8222-222222222222";
 const EPOCH: &str = "83333333-3333-4333-8333-333333333333";
 const INITIAL_EVENT: &str = "85555555-5555-4555-8555-555555555555";
 const INSTANCE: &str = "84444444-4444-4444-8444-444444444444";
+
+#[test]
+fn every_migration_rollback_boundary_is_restart_resumable() {
+    for completed_statements in 0..=11 {
+        let fixture = super::storage::slice4_migration::V1Fixture::new(&format!(
+            "recovery-rollback-{completed_statements}"
+        ));
+        let _fault = arm_migration_statement_fault_for_test(
+            MigrationStatementFault::AfterStatement(completed_statements),
+        );
+        assert_eq!(
+            fixture.reopen().unwrap_err(),
+            RepositoryErrorClass::Durability
+        );
+        assert_eq!(fixture.raw_schema_version(), 1);
+        let reopened = fixture.reopen().unwrap();
+        assert_eq!(reopened.intent.desired_kind, DesiredKind::Unloaded);
+        reopened.repository.close().unwrap();
+    }
+}
 
 struct InitialIds;
 impl ControlIdGenerator for InitialIds {

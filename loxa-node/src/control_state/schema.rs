@@ -1,7 +1,8 @@
 use sha2::{Digest, Sha256};
 
-pub(super) const SCHEMA_VERSION: i64 = 1;
+pub(super) const SCHEMA_VERSION: i64 = 2;
 pub(super) const MIGRATION_NAME: &str = "capacity_one_control_state";
+pub(super) const MIGRATION_2_NAME: &str = "execution_lane_intent";
 
 pub(super) const SCHEMA_V1: &str = r#"
 CREATE TABLE loxa_schema_migrations (
@@ -106,8 +107,85 @@ CREATE TABLE events (
 ) STRICT;
 "#;
 
+pub(super) const MIGRATION_2: &str = r#"
+CREATE TABLE loxa_schema_migrations_v2 (
+  version INTEGER PRIMARY KEY CHECK(version IN (1, 2)),
+  name TEXT NOT NULL,
+  checksum TEXT NOT NULL,
+  applied_at_ms INTEGER NOT NULL CHECK(applied_at_ms >= 0)
+) STRICT;
+
+INSERT INTO loxa_schema_migrations_v2(version, name, checksum, applied_at_ms)
+SELECT version, name, checksum, applied_at_ms FROM loxa_schema_migrations;
+
+CREATE TABLE control_meta_v2 (
+  singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+  node_id TEXT NOT NULL UNIQUE CHECK(length(node_id) = 36),
+  slot_id TEXT NOT NULL UNIQUE CHECK(length(slot_id) = 36),
+  stream_epoch TEXT NOT NULL UNIQUE CHECK(length(stream_epoch) = 36),
+  revision TEXT NOT NULL CHECK(length(revision) BETWEEN 1 AND 20 AND revision NOT GLOB '*[^0-9]*' AND revision NOT LIKE '0%'),
+  cursor TEXT NOT NULL CHECK(length(cursor) BETWEEN 1 AND 20 AND cursor NOT GLOB '*[^0-9]*' AND cursor NOT LIKE '0%'),
+  schema_version INTEGER NOT NULL CHECK(schema_version = 2),
+  migration_source TEXT NOT NULL,
+  last_committed_at_unix_ms TEXT NOT NULL CHECK(length(last_committed_at_unix_ms) BETWEEN 1 AND 20 AND last_committed_at_unix_ms NOT GLOB '*[^0-9]*' AND (last_committed_at_unix_ms = '0' OR last_committed_at_unix_ms NOT LIKE '0%'))
+) STRICT;
+
+INSERT INTO control_meta_v2(singleton, node_id, slot_id, stream_epoch, revision, cursor, schema_version, migration_source, last_committed_at_unix_ms)
+SELECT singleton, node_id, slot_id, stream_epoch, revision, cursor, 2, migration_source, last_committed_at_unix_ms FROM control_meta;
+
+DROP TABLE control_meta;
+ALTER TABLE control_meta_v2 RENAME TO control_meta;
+DROP TABLE loxa_schema_migrations;
+ALTER TABLE loxa_schema_migrations_v2 RENAME TO loxa_schema_migrations;
+
+CREATE TABLE slot_intent (
+  singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+  slot_id TEXT NOT NULL UNIQUE CHECK(length(slot_id) = 36),
+  desired_kind TEXT NOT NULL
+    CHECK(desired_kind IN ('unloaded', 'loaded', 'unknown')),
+  desired_model_id TEXT
+    CHECK(desired_model_id IS NULL OR length(CAST(desired_model_id AS BLOB)) BETWEEN 1 AND 256),
+  desired_revision TEXT NOT NULL
+    CHECK(length(desired_revision) BETWEEN 1 AND 20 AND desired_revision NOT GLOB '*[^0-9]*' AND desired_revision NOT LIKE '0%'),
+  operation_id TEXT CHECK(operation_id IS NULL OR length(operation_id) = 36),
+  reconciliation_state TEXT NOT NULL
+    CHECK(reconciliation_state IN ('settled', 'applying', 'recovery_required')),
+  reason_code TEXT CHECK(reason_code IS NULL OR reason_code IN (
+    'preexisting_recovery',
+    'migration_ambiguous_loading',
+    'migration_operation_mismatch',
+    'child_evidence_uncertain',
+    'compensation_failed',
+    'durable_commit_uncertain'
+  )),
+  CHECK((desired_kind = 'loaded') = (desired_model_id IS NOT NULL)),
+  CHECK(reconciliation_state != 'settled' OR (operation_id IS NULL AND desired_kind != 'unknown' AND reason_code IS NULL)),
+  CHECK(reconciliation_state != 'applying' OR (operation_id IS NOT NULL AND desired_kind != 'unknown' AND reason_code IS NULL)),
+  CHECK(reconciliation_state != 'recovery_required' OR reason_code IS NOT NULL),
+  FOREIGN KEY(singleton) REFERENCES control_meta(singleton),
+  FOREIGN KEY(slot_id) REFERENCES slot_state(slot_id),
+  FOREIGN KEY(operation_id) REFERENCES operations(operation_id)
+) STRICT;
+
+INSERT INTO slot_intent(
+  singleton, slot_id, desired_kind, desired_model_id, desired_revision,
+  operation_id, reconciliation_state, reason_code
+) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7);
+
+INSERT INTO loxa_schema_migrations(version, name, checksum, applied_at_ms)
+VALUES (2, 'execution_lane_intent', ?8, ?9);
+"#;
+
 pub(super) fn schema_checksum() -> String {
-    let digest = Sha256::digest(SCHEMA_V1.as_bytes());
+    lowercase_sha256(SCHEMA_V1.as_bytes())
+}
+
+pub(super) fn migration_2_checksum() -> String {
+    lowercase_sha256(MIGRATION_2.as_bytes())
+}
+
+fn lowercase_sha256(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
     let mut checksum = String::with_capacity(digest.len() * 2);
     for byte in digest {
         use std::fmt::Write;

@@ -1,4 +1,7 @@
-use super::schema::{schema_checksum, MIGRATION_NAME, SCHEMA_V1, SCHEMA_VERSION};
+use super::schema::{
+    migration_2_checksum, schema_checksum, MIGRATION_2, MIGRATION_2_NAME, MIGRATION_NAME,
+    SCHEMA_V1, SCHEMA_VERSION,
+};
 use loxa_protocol::v2::DecimalU64;
 use loxa_protocol::v2::{
     EventId, OperationId, SlotId, StreamEpoch, V2ControlEvent, V2EventEntity, V2Node, V2Operation,
@@ -10,7 +13,7 @@ use rusqlite::backup::Backup;
 use rusqlite::config::DbConfig;
 use rusqlite::limits::Limit;
 use rusqlite::{
-    Connection, Error as SqlError, ErrorCode, OpenFlags, OptionalExtension, Transaction,
+    params, Connection, Error as SqlError, ErrorCode, OpenFlags, OptionalExtension, Transaction,
     TransactionBehavior,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -217,6 +220,40 @@ struct StoredSlotRow {
     updated_at_unix_ms: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredSlotIntent {
+    pub(crate) desired_kind: DesiredKind,
+    pub(crate) desired_model_id: Option<String>,
+    pub(crate) desired_revision: u64,
+    pub(crate) operation_id: Option<OperationId>,
+    pub(crate) reconciliation: ReconciliationState,
+    pub(crate) reason: Option<IntentReason>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DesiredKind {
+    Unloaded,
+    Loaded,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReconciliationState {
+    Settled,
+    Applying,
+    RecoveryRequired,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IntentReason {
+    PreexistingRecovery,
+    MigrationAmbiguousLoading,
+    MigrationOperationMismatch,
+    ChildEvidenceUncertain,
+    CompensationFailed,
+    DurableCommitUncertain,
+}
+
 pub(crate) struct ControlRepository {
     connection: Option<Connection>,
     path: PathBuf,
@@ -253,6 +290,7 @@ struct OpenValidatedImage {
     main_guard: Option<fs::File>,
     live_claim: Option<LiveDatabaseClaim>,
     summary: ValidationSummary,
+    schema_version: i64,
 }
 
 /// A standalone, sidecar-free SQLite image whose inode remains reserved and guarded.
@@ -264,6 +302,7 @@ struct ClosedImage {
     main_guard: Option<fs::File>,
     reservation: Option<ClaimReservation>,
     summary: ValidationSummary,
+    schema_version: i64,
 }
 
 /// A destination whose existing image is quiesced or whose absence is bound to a
@@ -692,6 +731,59 @@ thread_local! {
     static FAIL_NEXT_UNCOMMITTED_CLOSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_ATOMIC_INSTALL_POSTFLIGHT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static RECONCILIATION_TRANSACTION_FAULT: std::cell::Cell<Option<ReconciliationTransactionFault>> = const { std::cell::Cell::new(None) };
+    static MIGRATION_STATEMENT_FAULT: std::cell::Cell<Option<MigrationStatementFault>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MigrationStatementFault {
+    AfterStatement(usize),
+}
+
+#[cfg(test)]
+pub(crate) struct MigrationStatementFaultGuard {
+    previous: Option<MigrationStatementFault>,
+    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(test)]
+impl Drop for MigrationStatementFaultGuard {
+    fn drop(&mut self) {
+        MIGRATION_STATEMENT_FAULT.with(|armed| armed.set(self.previous));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn arm_migration_statement_fault_for_test(
+    fault: MigrationStatementFault,
+) -> MigrationStatementFaultGuard {
+    let previous = MIGRATION_STATEMENT_FAULT.with(|armed| armed.replace(Some(fault)));
+    MigrationStatementFaultGuard {
+        previous,
+        _not_send: std::marker::PhantomData,
+    }
+}
+
+#[cfg(test)]
+fn fail_at_migration_statement_for_test(completed: usize) -> Result<(), RepositoryError> {
+    let fail = MIGRATION_STATEMENT_FAULT.with(|armed| {
+        if armed.get() == Some(MigrationStatementFault::AfterStatement(completed)) {
+            armed.set(None);
+            true
+        } else {
+            false
+        }
+    });
+    if fail {
+        Err(RepositoryError::new(RepositoryErrorClass::Durability))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(test))]
+fn fail_at_migration_statement_for_test(_completed: usize) -> Result<(), RepositoryError> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1110,7 +1202,21 @@ impl ControlRepository {
             configure_defensively(&opened)?;
             let initialized =
                 open_existing_or_initialize_in_one_transaction(&mut opened, node_id, None, ids)?;
+            let migrated =
+                migrate_to_current_schema(&mut opened, &canonical_path, node_id, !initialized)?;
             let summary = validate_connection(&opened, Some(node_id))?;
+            if migrated {
+                sync_and_reopen_validate_migration(&opened, &canonical_path, node_id, &summary)?;
+                if !initialized {
+                    publish_migration_backup_for_schema(
+                        &opened,
+                        &canonical_path,
+                        node_id,
+                        SCHEMA_VERSION,
+                        1,
+                    )?;
+                }
+            }
             Ok((initialized, summary))
         })();
         let (initialized, summary) = match setup {
@@ -1167,7 +1273,21 @@ impl ControlRepository {
                 Some(first_migration_source.as_ref()),
                 ids,
             )?;
+            let migrated =
+                migrate_to_current_schema(&mut opened, &canonical_path, node_id, !initialized)?;
             let summary = validate_connection(&opened, Some(node_id))?;
+            if migrated {
+                sync_and_reopen_validate_migration(&opened, &canonical_path, node_id, &summary)?;
+                if !initialized {
+                    publish_migration_backup_for_schema(
+                        &opened,
+                        &canonical_path,
+                        node_id,
+                        SCHEMA_VERSION,
+                        1,
+                    )?;
+                }
+            }
             Ok((initialized, summary))
         })();
         let (initialized, summary) = match setup {
@@ -1252,6 +1372,11 @@ impl ControlRepository {
     pub(crate) fn validate_all(&self) -> Result<ValidationSummary, RepositoryError> {
         self.validate_ownership()?;
         validate_connection(self.connection_ref()?, Some(self.expected_node_id))
+    }
+
+    pub(crate) fn stored_slot_intent(&self) -> Result<StoredSlotIntent, RepositoryError> {
+        self.validate_ownership()?;
+        read_stored_slot_intent(self.connection_ref()?)
     }
 
     pub(crate) fn migration_backup_path(&self) -> Result<PathBuf, RepositoryError> {
@@ -1689,7 +1814,7 @@ fn open_existing_or_initialize_in_one_transaction(
     let applied_at_ms = current_unix_ms()?;
     transaction.execute(
         "INSERT INTO loxa_schema_migrations(version, name, checksum, applied_at_ms) VALUES(?1, ?2, ?3, ?4)",
-        (SCHEMA_VERSION, MIGRATION_NAME, schema_checksum(), applied_at_ms),
+        (1_i64, MIGRATION_NAME, schema_checksum(), applied_at_ms),
     )?;
     transaction.execute(
         "INSERT INTO control_meta(singleton, node_id, slot_id, stream_epoch, revision, cursor, schema_version, migration_source, last_committed_at_unix_ms) VALUES(1, ?1, ?2, ?3, '1', '1', 1, ?4, ?5)",
@@ -1725,13 +1850,466 @@ fn open_existing_or_initialize_in_one_transaction(
     Ok(true)
 }
 
+fn migrate_to_current_schema(
+    connection: &mut Connection,
+    path: &Path,
+    expected_node_id: NodeId,
+    backup_v1: bool,
+) -> Result<bool, RepositoryError> {
+    let version: i64 = connection
+        .query_row(
+            "SELECT MAX(version) FROM loxa_schema_migrations",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::Corrupt))?;
+    match version {
+        1 => {
+            validate_connection_for_schema(connection, Some(expected_node_id), 1)?;
+            if backup_v1 {
+                publish_migration_backup_for_schema(connection, path, expected_node_id, 1, 1)?;
+            }
+            migrate_v1_to_v2(connection, current_unix_ms_as_u64()?)?;
+            Ok(true)
+        }
+        SCHEMA_VERSION => Ok(false),
+        version if version > SCHEMA_VERSION => Err(RepositoryError::new(
+            RepositoryErrorClass::UnsupportedSchema,
+        )),
+        _ => Err(RepositoryError::new(RepositoryErrorClass::Corrupt)),
+    }
+}
+
+fn current_unix_ms_as_u64() -> Result<u64, RepositoryError> {
+    u64::try_from(current_unix_ms()?)
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::Overflow))
+}
+
+pub(super) fn migrate_v1_to_v2(
+    connection: &mut Connection,
+    applied_at_ms: u64,
+) -> Result<(), RepositoryError> {
+    connection.execute_batch("PRAGMA foreign_keys=OFF;")?;
+    let foreign_keys: i64 = connection.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+    if foreign_keys != 0 {
+        return Err(RepositoryError::new(RepositoryErrorClass::Database));
+    }
+
+    let migration = (|| {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        quick_check(&transaction)?;
+        validate_migration_ledger_for_version(&transaction, 1)?;
+        validate_schema_shape_for_version(&transaction, 1)?;
+        let intent = derive_v1_slot_intent_backfill(&transaction)?;
+        fail_at_migration_statement_for_test(0)?;
+
+        let slot_id: String = transaction.query_row(
+            "SELECT slot_id FROM control_meta WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        let desired_kind = desired_kind_text(intent.desired_kind);
+        let desired_revision = intent.desired_revision.to_string();
+        let operation_id = intent
+            .operation_id
+            .map(|operation_id| operation_id.to_string());
+        let reconciliation = reconciliation_state_text(intent.reconciliation);
+        let reason = intent.reason.map(intent_reason_text);
+        let checksum = migration_2_checksum();
+        let applied_at_ms = i64::try_from(applied_at_ms)
+            .map_err(|_| RepositoryError::new(RepositoryErrorClass::Overflow))?;
+
+        let statements = MIGRATION_2
+            .split_inclusive(';')
+            .filter(|statement| statement.ends_with(';'))
+            .collect::<Vec<_>>();
+        if statements.len() != 11 {
+            return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
+        }
+        for (index, sql) in statements.into_iter().enumerate() {
+            let mut statement = transaction.prepare(sql)?;
+            match statement.parameter_count() {
+                0 => {
+                    statement.execute([])?;
+                }
+                7 => {
+                    statement.execute(params![
+                        &slot_id,
+                        desired_kind,
+                        intent.desired_model_id.as_deref(),
+                        &desired_revision,
+                        operation_id.as_deref(),
+                        reconciliation,
+                        reason,
+                    ])?;
+                }
+                9 => {
+                    statement.execute(params![
+                        &slot_id,
+                        desired_kind,
+                        intent.desired_model_id.as_deref(),
+                        &desired_revision,
+                        operation_id.as_deref(),
+                        reconciliation,
+                        reason,
+                        &checksum,
+                        applied_at_ms,
+                    ])?;
+                }
+                _ => return Err(RepositoryError::new(RepositoryErrorClass::Corrupt)),
+            }
+            fail_at_migration_statement_for_test(index + 1)?;
+        }
+        require_foreign_key_check_clean(&transaction)?;
+        validate_connection_for_schema(&transaction, None, SCHEMA_VERSION)?;
+        transaction.commit()?;
+
+        let (busy, _log, _checkpointed): (i64, i64, i64) =
+            connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+        if busy != 0 {
+            return Err(RepositoryError::new(RepositoryErrorClass::Durability));
+        }
+        Ok(())
+    })();
+
+    let restore_foreign_keys = connection.execute_batch("PRAGMA foreign_keys=ON;");
+    let restored: Result<i64, SqlError> =
+        connection.query_row("PRAGMA foreign_keys", [], |row| row.get(0));
+    if restore_foreign_keys.is_err() || restored != Ok(1) {
+        return Err(RepositoryError::new(RepositoryErrorClass::Durability));
+    }
+    migration?;
+    validate_connection_for_schema(connection, None, SCHEMA_VERSION)?;
+    Ok(())
+}
+
+fn derive_v1_slot_intent_backfill(
+    transaction: &Transaction<'_>,
+) -> Result<StoredSlotIntent, RepositoryError> {
+    let control_revision = transaction
+        .query_row(
+            "SELECT revision FROM control_meta WHERE singleton=1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(classify_missing_row)
+        .and_then(|revision| parse_canonical_u64(&revision))?;
+    let slot: (String, String, Option<String>, Option<String>, String) = transaction
+        .query_row(
+            "SELECT slot_id,status,model_id,operation_id,updated_revision FROM slot_state WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .map_err(classify_missing_row)?;
+    let slot_id = SlotId::from_str(&slot.0)
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::Corrupt))?;
+    let updated_revision = parse_canonical_u64(&slot.4)?;
+    if updated_revision > control_revision {
+        return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
+    }
+
+    let operation_id = slot
+        .3
+        .as_deref()
+        .map(OperationId::from_str)
+        .transpose()
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::Corrupt))?;
+    let operation = match operation_id {
+        Some(operation_id) => transaction
+            .query_row(
+                "SELECT slot_id,kind,status,model_id,created_revision FROM operations WHERE operation_id=?1",
+                [operation_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()?,
+        None => None,
+    };
+    let retained_operation_id = operation.as_ref().and(operation_id);
+    let active = |status: &str| matches!(status, "queued" | "running" | "cancelling");
+
+    match slot.1.as_str() {
+        "unloaded" => Ok(StoredSlotIntent {
+            desired_kind: DesiredKind::Unloaded,
+            desired_model_id: None,
+            desired_revision: updated_revision,
+            operation_id: None,
+            reconciliation: ReconciliationState::Settled,
+            reason: None,
+        }),
+        "ready" => {
+            let model_id = slot
+                .2
+                .filter(|model_id| valid_model_id(model_id))
+                .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Corrupt))?;
+            Ok(StoredSlotIntent {
+                desired_kind: DesiredKind::Loaded,
+                desired_model_id: Some(model_id),
+                desired_revision: updated_revision,
+                operation_id: None,
+                reconciliation: ReconciliationState::Settled,
+                reason: None,
+            })
+        }
+        "loading" => {
+            let exact = operation.as_ref().and_then(
+                |(operation_slot, kind, status, model_id, created_revision)| {
+                    let created_revision = parse_canonical_u64(created_revision).ok()?;
+                    (operation_slot == &slot_id.to_string()
+                        && kind == "load"
+                        && active(status)
+                        && model_id.as_deref().is_some_and(valid_model_id)
+                        && created_revision >= updated_revision
+                        && created_revision <= control_revision)
+                        .then(|| (model_id.clone().unwrap(), created_revision))
+                },
+            );
+            if let Some((model_id, created_revision)) = exact {
+                Ok(StoredSlotIntent {
+                    desired_kind: DesiredKind::Loaded,
+                    desired_model_id: Some(model_id),
+                    desired_revision: created_revision,
+                    operation_id,
+                    reconciliation: ReconciliationState::Applying,
+                    reason: None,
+                })
+            } else {
+                Ok(StoredSlotIntent {
+                    desired_kind: DesiredKind::Unknown,
+                    desired_model_id: None,
+                    desired_revision: updated_revision,
+                    operation_id: retained_operation_id,
+                    reconciliation: ReconciliationState::RecoveryRequired,
+                    reason: Some(if operation.is_none() {
+                        IntentReason::MigrationAmbiguousLoading
+                    } else {
+                        IntentReason::MigrationOperationMismatch
+                    }),
+                })
+            }
+        }
+        "unloading" => {
+            let exact_revision = operation.as_ref().and_then(
+                |(operation_slot, kind, status, _model_id, created_revision)| {
+                    let created_revision = parse_canonical_u64(created_revision).ok()?;
+                    (operation_slot == &slot_id.to_string()
+                        && kind == "unload"
+                        && active(status)
+                        && created_revision >= updated_revision
+                        && created_revision <= control_revision)
+                        .then_some(created_revision)
+                },
+            );
+            if let Some(created_revision) = exact_revision {
+                Ok(StoredSlotIntent {
+                    desired_kind: DesiredKind::Unloaded,
+                    desired_model_id: None,
+                    desired_revision: created_revision,
+                    operation_id,
+                    reconciliation: ReconciliationState::Applying,
+                    reason: None,
+                })
+            } else {
+                Ok(StoredSlotIntent {
+                    desired_kind: DesiredKind::Unknown,
+                    desired_model_id: None,
+                    desired_revision: updated_revision,
+                    operation_id: retained_operation_id,
+                    reconciliation: ReconciliationState::RecoveryRequired,
+                    reason: Some(IntentReason::MigrationOperationMismatch),
+                })
+            }
+        }
+        "recovery" => Ok(StoredSlotIntent {
+            desired_kind: DesiredKind::Unknown,
+            desired_model_id: None,
+            desired_revision: updated_revision,
+            operation_id: None,
+            reconciliation: ReconciliationState::RecoveryRequired,
+            reason: Some(IntentReason::PreexistingRecovery),
+        }),
+        _ => Err(RepositoryError::new(RepositoryErrorClass::Corrupt)),
+    }
+}
+
+fn require_foreign_key_check_clean(connection: &Connection) -> Result<(), RepositoryError> {
+    let mut statement = connection.prepare("PRAGMA foreign_key_check")?;
+    if statement.query([])?.next()?.is_some() {
+        return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
+    }
+    Ok(())
+}
+
+fn desired_kind_text(kind: DesiredKind) -> &'static str {
+    match kind {
+        DesiredKind::Unloaded => "unloaded",
+        DesiredKind::Loaded => "loaded",
+        DesiredKind::Unknown => "unknown",
+    }
+}
+
+fn reconciliation_state_text(state: ReconciliationState) -> &'static str {
+    match state {
+        ReconciliationState::Settled => "settled",
+        ReconciliationState::Applying => "applying",
+        ReconciliationState::RecoveryRequired => "recovery_required",
+    }
+}
+
+fn intent_reason_text(reason: IntentReason) -> &'static str {
+    match reason {
+        IntentReason::PreexistingRecovery => "preexisting_recovery",
+        IntentReason::MigrationAmbiguousLoading => "migration_ambiguous_loading",
+        IntentReason::MigrationOperationMismatch => "migration_operation_mismatch",
+        IntentReason::ChildEvidenceUncertain => "child_evidence_uncertain",
+        IntentReason::CompensationFailed => "compensation_failed",
+        IntentReason::DurableCommitUncertain => "durable_commit_uncertain",
+    }
+}
+
+fn parse_desired_kind(value: &str) -> Result<DesiredKind, RepositoryError> {
+    match value {
+        "unloaded" => Ok(DesiredKind::Unloaded),
+        "loaded" => Ok(DesiredKind::Loaded),
+        "unknown" => Ok(DesiredKind::Unknown),
+        _ => Err(RepositoryError::new(RepositoryErrorClass::Corrupt)),
+    }
+}
+
+fn parse_reconciliation_state(value: &str) -> Result<ReconciliationState, RepositoryError> {
+    match value {
+        "settled" => Ok(ReconciliationState::Settled),
+        "applying" => Ok(ReconciliationState::Applying),
+        "recovery_required" => Ok(ReconciliationState::RecoveryRequired),
+        _ => Err(RepositoryError::new(RepositoryErrorClass::Corrupt)),
+    }
+}
+
+fn parse_intent_reason(value: &str) -> Result<IntentReason, RepositoryError> {
+    match value {
+        "preexisting_recovery" => Ok(IntentReason::PreexistingRecovery),
+        "migration_ambiguous_loading" => Ok(IntentReason::MigrationAmbiguousLoading),
+        "migration_operation_mismatch" => Ok(IntentReason::MigrationOperationMismatch),
+        "child_evidence_uncertain" => Ok(IntentReason::ChildEvidenceUncertain),
+        "compensation_failed" => Ok(IntentReason::CompensationFailed),
+        "durable_commit_uncertain" => Ok(IntentReason::DurableCommitUncertain),
+        _ => Err(RepositoryError::new(RepositoryErrorClass::Corrupt)),
+    }
+}
+
+fn read_stored_slot_intent(connection: &Connection) -> Result<StoredSlotIntent, RepositoryError> {
+    let count: i64 =
+        connection.query_row("SELECT COUNT(*) FROM slot_intent", [], |row| row.get(0))?;
+    if count != 1 {
+        return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
+    }
+    let raw: (
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+    ) = connection
+        .query_row(
+            "SELECT desired_kind,desired_model_id,desired_revision,operation_id,reconciliation_state,reason_code FROM slot_intent WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+        )
+        .map_err(classify_missing_row)?;
+    Ok(StoredSlotIntent {
+        desired_kind: parse_desired_kind(&raw.0)?,
+        desired_model_id: raw.1,
+        desired_revision: parse_canonical_u64(&raw.2)?,
+        operation_id: raw
+            .3
+            .as_deref()
+            .map(OperationId::from_str)
+            .transpose()
+            .map_err(|_| RepositoryError::new(RepositoryErrorClass::Corrupt))?,
+        reconciliation: parse_reconciliation_state(&raw.4)?,
+        reason: raw.5.as_deref().map(parse_intent_reason).transpose()?,
+    })
+}
+
+fn validate_slot_intent(
+    connection: &Connection,
+    slot_id: SlotId,
+    control_revision: u64,
+    _slot: &StoredSlotRow,
+) -> Result<(), RepositoryError> {
+    let stored_slot_id: String = connection
+        .query_row(
+            "SELECT slot_id FROM slot_intent WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(classify_missing_row)?;
+    if stored_slot_id != slot_id.to_string() {
+        return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
+    }
+    let intent = read_stored_slot_intent(connection)?;
+    if intent.desired_revision > control_revision
+        || intent
+            .desired_model_id
+            .as_deref()
+            .is_some_and(|model_id| !valid_model_id(model_id))
+        || (intent.desired_kind == DesiredKind::Loaded) != intent.desired_model_id.is_some()
+    {
+        return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
+    }
+    match intent.reconciliation {
+        ReconciliationState::Settled => {
+            if intent.operation_id.is_some()
+                || intent.reason.is_some()
+                || intent.desired_kind == DesiredKind::Unknown
+            {
+                return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
+            }
+        }
+        ReconciliationState::Applying => {
+            if intent.operation_id.is_none()
+                || intent.reason.is_some()
+                || intent.desired_kind == DesiredKind::Unknown
+            {
+                return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
+            }
+        }
+        ReconciliationState::RecoveryRequired => {
+            if intent.reason.is_none() {
+                return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_connection(
     connection: &Connection,
     expected_node_id: Option<NodeId>,
 ) -> Result<ValidationSummary, RepositoryError> {
+    validate_connection_for_schema(connection, expected_node_id, SCHEMA_VERSION)
+}
+
+fn validate_connection_for_schema(
+    connection: &Connection,
+    expected_node_id: Option<NodeId>,
+    expected_schema_version: i64,
+) -> Result<ValidationSummary, RepositoryError> {
     quick_check(connection)?;
-    validate_schema_shape(connection)?;
-    validate_migration_ledger(connection)?;
+    require_foreign_key_check_clean(connection)?;
+    reject_newer_migration_version(connection)?;
+    validate_schema_shape_for_version(connection, expected_schema_version)?;
+    validate_migration_ledger_for_version(connection, expected_schema_version)?;
 
     let raw_meta: (String, String, String, String, String, i64, String, String) = connection
         .query_row(
@@ -1740,7 +2318,7 @@ fn validate_connection(
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
         )
         .map_err(classify_missing_row)?;
-    if raw_meta.5 != SCHEMA_VERSION {
+    if raw_meta.5 != expected_schema_version {
         return Err(RepositoryError::new(
             RepositoryErrorClass::UnsupportedSchema,
         ));
@@ -1860,7 +2438,24 @@ fn validate_connection(
         return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
     }
     validate_operation_rows(connection, node_id, slot_id, revision, last_committed_at)?;
-    validate_slot_operation_reference(connection, stored_slot.status.as_str(), slot_operation_id)?;
+    if expected_schema_version == SCHEMA_VERSION {
+        let allows_migration_mismatch = read_stored_slot_intent(connection).is_ok_and(|intent| {
+            intent.reconciliation == ReconciliationState::RecoveryRequired
+                && matches!(
+                    intent.reason,
+                    Some(
+                        IntentReason::MigrationAmbiguousLoading
+                            | IntentReason::MigrationOperationMismatch
+                    )
+                )
+        });
+        validate_slot_operation_reference(
+            connection,
+            stored_slot.status.as_str(),
+            slot_operation_id,
+            allows_migration_mismatch,
+        )?;
+    }
     validate_event_rows(
         connection,
         node_id,
@@ -1870,6 +2465,9 @@ fn validate_connection(
         cursor,
         last_committed_at,
     )?;
+    if expected_schema_version == SCHEMA_VERSION {
+        validate_slot_intent(connection, slot_id, revision, &stored_slot)?;
+    }
     Ok(ValidationSummary {
         node_rows,
         slot_rows,
@@ -1898,9 +2496,28 @@ fn validate_migration_source(value: &str) -> Result<(), RepositoryError> {
     Ok(())
 }
 
-fn validate_schema_shape(connection: &Connection) -> Result<(), RepositoryError> {
+fn validate_schema_shape_for_version(
+    connection: &Connection,
+    expected_schema_version: i64,
+) -> Result<(), RepositoryError> {
     let expected_connection = Connection::open_in_memory()?;
     expected_connection.execute_batch(SCHEMA_V1)?;
+    if expected_schema_version == SCHEMA_VERSION {
+        for sql in MIGRATION_2
+            .split_inclusive(';')
+            .filter(|statement| statement.ends_with(';'))
+        {
+            let mut statement = expected_connection.prepare(sql)?;
+            if statement.parameter_count() != 0 {
+                break;
+            }
+            statement.execute([])?;
+        }
+    } else if expected_schema_version != 1 {
+        return Err(RepositoryError::new(
+            RepositoryErrorClass::UnsupportedSchema,
+        ));
+    }
     let expected = collect_schema_shape(&expected_connection)?;
     let actual = collect_schema_shape(connection)?;
     if actual != expected {
@@ -1924,25 +2541,56 @@ fn collect_schema_shape(connection: &Connection) -> Result<Vec<SchemaObject>, Re
     Ok(shape)
 }
 
-fn validate_migration_ledger(connection: &Connection) -> Result<(), RepositoryError> {
+fn validate_migration_ledger_for_version(
+    connection: &Connection,
+    expected_schema_version: i64,
+) -> Result<(), RepositoryError> {
     let rows = count_rows(connection, "loxa_schema_migrations")?;
-    if rows != 1 {
+    let expected_rows = usize::try_from(expected_schema_version)
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::UnsupportedSchema))?;
+    if rows != expected_rows {
         return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
     }
-    let (version, name, checksum): (i64, String, String) = connection.query_row(
-        "SELECT version, name, checksum FROM loxa_schema_migrations",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    )?;
-    if version > SCHEMA_VERSION {
-        return Err(RepositoryError::new(
-            RepositoryErrorClass::UnsupportedSchema,
+    let mut statement = connection
+        .prepare("SELECT version,name,checksum FROM loxa_schema_migrations ORDER BY version")?;
+    let ledger = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut expected = vec![(1, MIGRATION_NAME.to_owned(), schema_checksum())];
+    if expected_schema_version == SCHEMA_VERSION {
+        expected.push((
+            SCHEMA_VERSION,
+            MIGRATION_2_NAME.to_owned(),
+            migration_2_checksum(),
         ));
     }
-    if version != SCHEMA_VERSION || name != MIGRATION_NAME || checksum != schema_checksum() {
+    if ledger != expected {
         return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
     }
     Ok(())
+}
+
+fn reject_newer_migration_version(connection: &Connection) -> Result<(), RepositoryError> {
+    let maximum: i64 = connection
+        .query_row(
+            "SELECT MAX(version) FROM loxa_schema_migrations",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(classify_missing_row)?;
+    if maximum > SCHEMA_VERSION {
+        Err(RepositoryError::new(
+            RepositoryErrorClass::UnsupportedSchema,
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_operation_rows(
@@ -2011,9 +2659,17 @@ fn validate_operation_rows(
             created_at_unix_ms: DecimalU64::new(created_at),
             updated_at_unix_ms: DecimalU64::new(updated_at),
         };
+        let migration_recovery_load =
+            if kind == V2OperationKind::Load && operation.model_id.is_none() {
+                let mut with_validation_target = operation.clone();
+                with_validation_target.model_id = Some("migration-validation-probe".to_owned());
+                with_validation_target.validate().is_ok()
+            } else {
+                false
+            };
         if stored_slot_id != slot_id
             || v1_ordinal.is_some_and(|ordinal| ordinal < 1)
-            || operation.validate().is_err()
+            || (operation.validate().is_err() && !migration_recovery_load)
             || created > updated
             || updated > revision
             || created_at > updated_at
@@ -2029,9 +2685,10 @@ fn validate_slot_operation_reference(
     connection: &Connection,
     slot_status: &str,
     operation_id: Option<OperationId>,
+    allow_migration_mismatch: bool,
 ) -> Result<(), RepositoryError> {
     let Some(operation_id) = operation_id else {
-        if matches!(slot_status, "loading" | "unloading") {
+        if matches!(slot_status, "loading" | "unloading") && !allow_migration_mismatch {
             return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
         }
         return Ok(());
@@ -2044,13 +2701,13 @@ fn validate_slot_operation_reference(
         )
         .optional()?;
     let valid = operation.is_some_and(|(kind, status)| {
-        matches!(status.as_str(), "running" | "cancelling")
+        matches!(status.as_str(), "queued" | "running" | "cancelling")
             && matches!(
                 (slot_status, kind.as_str()),
                 ("loading", "load") | ("unloading", "unload")
             )
     });
-    if !valid {
+    if !valid && !allow_migration_mismatch {
         return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
     }
     Ok(())
@@ -2401,25 +3058,145 @@ fn validate_database_file(
     path: &Path,
     expected_node_id: Option<NodeId>,
 ) -> Result<ValidationSummary, RepositoryError> {
+    validate_database_file_for_schema(path, expected_node_id, SCHEMA_VERSION)
+}
+
+fn validate_database_file_for_schema(
+    path: &Path,
+    expected_node_id: Option<NodeId>,
+    expected_schema_version: i64,
+) -> Result<ValidationSummary, RepositoryError> {
     let prepared = prepare_existing_storage_path(path)?;
     let connection = open_validated_connection_after(prepared, true, || {})?;
     connection.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
     connection.execute_batch("PRAGMA trusted_schema=OFF; PRAGMA mmap_size=0;")?;
     apply_limits(&connection)?;
-    let summary = validate_connection(&connection, expected_node_id)?;
+    let summary =
+        validate_connection_for_schema(&connection, expected_node_id, expected_schema_version)?;
     connection.close()?;
     Ok(summary)
+}
+
+fn sync_and_reopen_validate_migration(
+    opened: &ValidatedConnection,
+    path: &Path,
+    expected_node_id: NodeId,
+    expected_summary: &ValidationSummary,
+) -> Result<(), RepositoryError> {
+    validate_guarded_image(
+        path,
+        opened.identity,
+        opened
+            .directory_guard
+            .as_ref()
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?,
+        opened
+            .family_guard
+            .as_ref()
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?,
+        opened
+            .main_guard
+            .as_ref()
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?,
+    )?;
+    opened
+        .main_guard
+        .as_ref()
+        .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?
+        .sync_all()
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::Durability))?;
+    opened
+        .directory_guard
+        .as_ref()
+        .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?
+        .sync_all()
+        .map_err(|_| RepositoryError::new(RepositoryErrorClass::Durability))?;
+
+    let spec = ConnectionOpenSpec::for_existing(path.to_owned(), true)?;
+    let connection =
+        Connection::open_with_flags_and_vfs(path, spec.flags, spec.vfs).map_err(map_sql_error)?;
+    let validation = (|| {
+        if connected_vfs_name(&connection)? != spec.vfs {
+            return Err(RepositoryError::new(RepositoryErrorClass::Database));
+        }
+        connection.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
+        connection.execute_batch("PRAGMA trusted_schema=OFF; PRAGMA mmap_size=0;")?;
+        apply_limits(&connection)?;
+        validate_connection(&connection, Some(expected_node_id))
+    })();
+    let close = connection
+        .close()
+        .map_err(|(_, error)| map_sql_error(error));
+    let summary = validation?;
+    close?;
+    if &summary != expected_summary {
+        return Err(RepositoryError::new(RepositoryErrorClass::Corrupt));
+    }
+    validate_guarded_image(
+        path,
+        opened.identity,
+        opened
+            .directory_guard
+            .as_ref()
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?,
+        opened
+            .family_guard
+            .as_ref()
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?,
+        opened
+            .main_guard
+            .as_ref()
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?,
+    )
+}
+
+fn publish_migration_backup_for_schema(
+    connection: &Connection,
+    path: &Path,
+    expected_node_id: NodeId,
+    source_schema_version: i64,
+    destination_schema_version: i64,
+) -> Result<(), RepositoryError> {
+    let backup = migration_backup_path(path)?;
+    let temporary = unique_temporary_path(&backup, "backup")?;
+    let result = (|| {
+        backup_connection(connection, &temporary)?;
+        let source = close_into_image(open_validated_image_for_schema(
+            &temporary,
+            Some(expected_node_id),
+            source_schema_version,
+        )?)?;
+        source
+            .main_guard
+            .as_ref()
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?
+            .sync_all()
+            .map_err(|_| RepositoryError::new(RepositoryErrorClass::Durability))?;
+        let destination =
+            quiesce_destination_for_schema_after(&backup, destination_schema_version, |_| Ok(()))?;
+        install_closed_image_after(source, destination, expected_node_id, |_| Ok(()))?;
+        Ok(())
+    })();
+    finish_with_temporary_cleanup(result, &temporary)
 }
 
 fn open_validated_image(
     path: &Path,
     expected_node_id: Option<NodeId>,
 ) -> Result<OpenValidatedImage, RepositoryError> {
+    open_validated_image_for_schema(path, expected_node_id, SCHEMA_VERSION)
+}
+
+fn open_validated_image_for_schema(
+    path: &Path,
+    expected_node_id: Option<NodeId>,
+    schema_version: i64,
+) -> Result<OpenValidatedImage, RepositoryError> {
     let prepared = prepare_existing_storage_path(path)?;
     let canonical_path = prepared.canonical_path.clone();
     let mut opened = open_validated_connection_after(prepared, false, || {})?;
     configure_for_offline_mutation(&opened)?;
-    let summary = validate_connection(&opened, expected_node_id)?;
+    let summary = validate_connection_for_schema(&opened, expected_node_id, schema_version)?;
     Ok(OpenValidatedImage {
         path: Some(canonical_path),
         identity: opened.identity,
@@ -2429,6 +3206,7 @@ fn open_validated_image(
         main_guard: opened.main_guard.take(),
         live_claim: opened.live_claim.take(),
         summary,
+        schema_version,
     })
 }
 
@@ -2551,6 +3329,7 @@ fn close_into_image_traced(
         main_guard: image.main_guard.take(),
         reservation: Some(reservation),
         summary: image.summary.clone(),
+        schema_version: image.schema_version,
     };
     let path = closed.path()?.to_owned();
     if let Err(error) = validate_guarded_image(
@@ -2595,10 +3374,21 @@ fn quiesce_destination_after(
     path: &Path,
     observe: impl FnMut(ImageCloseEvent) -> Result<(), RepositoryError>,
 ) -> Result<QuiescedDestination, RepositoryError> {
+    quiesce_destination_for_schema_after(path, SCHEMA_VERSION, observe)
+}
+
+fn quiesce_destination_for_schema_after(
+    path: &Path,
+    schema_version: i64,
+    observe: impl FnMut(ImageCloseEvent) -> Result<(), RepositoryError>,
+) -> Result<QuiescedDestination, RepositoryError> {
     match fs::symlink_metadata(path) {
         Ok(_) => {
             ensure_auxiliary_files_absent(path)?;
-            close_into_destination_traced(open_validated_image(path, None)?, observe)
+            close_into_destination_traced(
+                open_validated_image_for_schema(path, None, schema_version)?,
+                observe,
+            )
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let parent = prepare_destination_parent(path)?;
@@ -2699,6 +3489,7 @@ fn install_closed_image_after(
     expected_node_id: NodeId,
     mut observe: impl FnMut(RestoreBoundary) -> Result<(), RepositoryError>,
 ) -> Result<ValidationSummary, RepositoryError> {
+    let source_schema_version = source.schema_version;
     let source_path = source.path()?.to_owned();
     let destination_path = match &destination {
         QuiescedDestination::Existing(image) => image.path()?.to_owned(),
@@ -2866,7 +3657,11 @@ fn install_closed_image_after(
             error,
         ));
     }
-    let summary = match validate_connection(&connection, Some(expected_node_id)) {
+    let summary = match validate_connection_for_schema(
+        &connection,
+        Some(expected_node_id),
+        source_schema_version,
+    ) {
         Ok(summary) => summary,
         Err(error) => {
             return Err(quarantine_closed_image_connection_until_exit(
@@ -2971,7 +3766,11 @@ fn validate_closed_image_read_only(image: &mut ClosedImage) -> Result<(), Reposi
         connection.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
         connection.execute_batch("PRAGMA trusted_schema=OFF; PRAGMA mmap_size=0;")?;
         apply_limits(&connection)?;
-        validate_connection(&connection, Some(image.summary.node_id))
+        validate_connection_for_schema(
+            &connection,
+            Some(image.summary.node_id),
+            image.schema_version,
+        )
     })();
     match connection.close() {
         Ok(()) => {}
@@ -5672,7 +6471,7 @@ mod tests {
         repository
             .transaction(|transaction| {
                 transaction.execute_batch(
-                    "DROP TABLE events; DROP TABLE operations; DROP TABLE slot_state; DROP TABLE node_state; DROP TABLE control_meta; DROP TABLE loxa_schema_migrations;",
+                    "DROP TABLE slot_intent; DROP TABLE events; DROP TABLE operations; DROP TABLE slot_state; DROP TABLE node_state; DROP TABLE control_meta; DROP TABLE loxa_schema_migrations;",
                 )?;
                 transaction.execute_batch(
                     super::super::schema::FORMER_INTERMEDIATE_TASK3A_SCHEMA_V1,
