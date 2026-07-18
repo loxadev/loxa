@@ -3,9 +3,9 @@ use loxa_protocol::v1::{
     CONTROL_PROTOCOL_VERSION,
 };
 use loxa_protocol::v2::{
-    DecimalU64, OperationId, StreamEpoch, V2ControlErrorBody, V2ControlEvent, V2NodeCollection,
-    V2OperationAccepted, V2OperationCollection, V2OperationEnvelope, V2OperationProgress,
-    V2ReconnectSnapshot, V2Slot, V2SlotCollection,
+    DecimalU64, OperationId, StreamEpoch, V2ControlErrorBody, V2ControlErrorCode, V2ControlEvent,
+    V2NodeCollection, V2OperationAccepted, V2OperationCollection, V2OperationEnvelope,
+    V2OperationProgress, V2PublicError, V2ReconnectSnapshot, V2Slot, V2SlotCollection,
 };
 use loxa_protocol::{NodeId, NodeInstanceId};
 use std::str::FromStr;
@@ -173,6 +173,70 @@ fn operation_accepted_fixture() -> V2OperationAccepted {
             .parse::<OperationId>()
             .unwrap(),
         revision: DecimalU64::new(10),
+    }
+}
+
+fn slice4_operation_accepted_fixture() -> V2OperationAccepted {
+    V2OperationAccepted {
+        operation_id: "11111111-1111-4111-8111-111111111111"
+            .parse::<OperationId>()
+            .unwrap(),
+        epoch: "22222222-2222-4222-8222-222222222222"
+            .parse::<StreamEpoch>()
+            .unwrap(),
+        revision: DecimalU64::new(7),
+    }
+}
+
+#[test]
+fn slice4_keeps_operation_acceptance_and_overload_wire_exact() {
+    let accepted = slice4_operation_accepted_fixture();
+    assert_eq!(
+        serde_json::to_value(accepted).unwrap(),
+        serde_json::json!({
+            "operation_id": "11111111-1111-4111-8111-111111111111",
+            "epoch": "22222222-2222-4222-8222-222222222222",
+            "revision": "7"
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(V2PublicError {
+            code: V2ControlErrorCode::OperationConflict,
+            message: "A conflicting operation is active.".into(),
+        })
+        .unwrap(),
+        serde_json::json!({
+            "code": "operation_conflict",
+            "message": "A conflicting operation is active."
+        })
+    );
+}
+
+#[test]
+fn slice4_rejects_new_wire_enums_and_fields() {
+    let mut verify = operation_json(NODE_ID, "download", "running");
+    verify["kind"] = serde_json::json!("verify");
+    assert!(serde_json::from_value::<loxa_protocol::v2::V2Operation>(verify).is_err());
+
+    assert!(
+        serde_json::from_value::<V2ControlErrorBody>(serde_json::json!({
+            "code": "operation_overloaded",
+            "message": "The operation queue is full."
+        }))
+        .is_err()
+    );
+
+    let mut attachment = serde_json::to_value(slice4_operation_accepted_fixture()).unwrap();
+    attachment["attachment"] = serde_json::json!("download-worker-1");
+    assert!(serde_json::from_value::<V2OperationAccepted>(attachment).is_err());
+
+    for field in ["phase", "retry"] {
+        let mut operation = operation_json(NODE_ID, "download", "running");
+        operation[field] = serde_json::json!(true);
+        assert!(
+            serde_json::from_value::<loxa_protocol::v2::V2Operation>(operation).is_err(),
+            "accepted unexpected {field} field"
+        );
     }
 }
 
@@ -712,6 +776,81 @@ fn v2_collections_and_reconnect_snapshot_enforce_capacity_one_and_correlation() 
         "events": []
     });
     assert!(serde_json::from_value::<V2ReconnectSnapshot>(snapshot).is_err());
+}
+
+#[test]
+fn slice4_keeps_concurrent_download_snapshots_and_unload_model_evidence_exact() {
+    let load_id = "11111111-1111-4111-8111-111111111111";
+    let first_download_id = "22222222-2222-4222-8222-222222222222";
+    let second_download_id = "33333333-3333-4333-8333-333333333333";
+
+    let mut load = operation_json(NODE_ID, "load", "running");
+    load["operation_id"] = serde_json::json!(load_id);
+    load["created_revision"] = serde_json::json!("10");
+    load["updated_revision"] = serde_json::json!("10");
+    let mut first_download = operation_json(NODE_ID, "download", "running");
+    first_download["operation_id"] = serde_json::json!(first_download_id);
+    first_download["created_revision"] = serde_json::json!("11");
+    let mut second_download = operation_json(NODE_ID, "download", "queued");
+    second_download["operation_id"] = serde_json::json!(second_download_id);
+    second_download["created_revision"] = serde_json::json!("12");
+    second_download["updated_revision"] = serde_json::json!("12");
+
+    let snapshot_json = serde_json::json!({
+        "schema_version": 2,
+        "epoch": EPOCH,
+        "revision": "12",
+        "generated_at_unix_ms": "1784246400600",
+        "stream": {"epoch": EPOCH, "cursor": "12", "cursor_gap": false},
+        "nodes": [node_json(NODE_ID)],
+        "slots": [slot_json(NODE_ID, "loading", Some(load_id))],
+        "operations": [load.clone(), first_download.clone(), second_download.clone()],
+        "events": []
+    });
+    let snapshot: V2ReconnectSnapshot = serde_json::from_value(snapshot_json.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&snapshot).unwrap(), snapshot_json);
+    assert_eq!(
+        snapshot
+            .operations
+            .iter()
+            .map(|operation| operation.slot_id)
+            .collect::<Vec<_>>(),
+        vec![Some(SLOT_ID.parse().unwrap()), None, None]
+    );
+
+    let mut two_lifecycle = snapshot_json.clone();
+    let mut unload = operation_json(NODE_ID, "unload", "queued");
+    unload["operation_id"] = serde_json::json!(second_download_id);
+    unload["created_revision"] = serde_json::json!("12");
+    unload["updated_revision"] = serde_json::json!("12");
+    two_lifecycle["operations"][2] = unload;
+    assert!(serde_json::from_value::<V2ReconnectSnapshot>(two_lifecycle).is_err());
+
+    let unload_id = "44444444-4444-4444-8444-444444444444";
+    let mut unload = operation_json(NODE_ID, "unload", "running");
+    unload["operation_id"] = serde_json::json!(unload_id);
+    let unload_snapshot_json = serde_json::json!({
+        "schema_version": 2,
+        "epoch": EPOCH,
+        "revision": "11",
+        "generated_at_unix_ms": "1784246400600",
+        "stream": {"epoch": EPOCH, "cursor": "11", "cursor_gap": false},
+        "nodes": [node_json(NODE_ID)],
+        "slots": [slot_json(NODE_ID, "unloading", Some(unload_id))],
+        "operations": [unload],
+        "events": []
+    });
+    let unload_snapshot: V2ReconnectSnapshot =
+        serde_json::from_value(unload_snapshot_json.clone()).unwrap();
+    assert_eq!(
+        serde_json::to_value(&unload_snapshot).unwrap(),
+        unload_snapshot_json
+    );
+    assert_eq!(
+        unload_snapshot.slots[0].model_id.as_deref(),
+        Some("gemma-3-4b-it-q4")
+    );
+    assert_eq!(unload_snapshot.operations[0].model_id, None);
 }
 
 #[test]

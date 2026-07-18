@@ -267,6 +267,98 @@ describe("strict v2 control contracts", () => {
     ).toThrow(ControlContractError);
   });
 
+  it("freezes concurrent downloads and unload model evidence in reconnect snapshots", () => {
+    const load = { ...validV2Operation, status: "running", created_revision: "10", updated_revision: "10" } as const;
+    const firstDownload = {
+      ...validV2Operation,
+      operation_id: v2Ids.nextEvent,
+      kind: "download",
+      status: "running",
+      slot_id: null,
+      created_revision: "11",
+      updated_revision: "11",
+    } as const;
+    const secondDownload = {
+      ...firstDownload,
+      operation_id: v2Ids.oldEpoch,
+      status: "queued",
+      created_revision: "12",
+      updated_revision: "12",
+    } as const;
+    const snapshot = {
+      ...validV2ReconnectSnapshot,
+      revision: "12",
+      stream: { epoch: v2Ids.epoch, cursor: "12", cursor_gap: false },
+      operations: [load, firstDownload, secondDownload],
+      events: [],
+    } as const;
+
+    expect(Object.keys(snapshot)).toEqual([
+      "schema_version",
+      "epoch",
+      "revision",
+      "generated_at_unix_ms",
+      "stream",
+      "nodes",
+      "slots",
+      "operations",
+      "events",
+    ]);
+    expect(decodeV2ReconnectSnapshot(snapshot)).toEqual(snapshot);
+    expect(snapshot.operations.map((operation) => operation.slot_id)).toEqual([v2Ids.slot, null, null]);
+    expect(() =>
+      decodeV2ReconnectSnapshot({
+        ...snapshot,
+        operations: [
+          load,
+          {
+            ...secondDownload,
+            kind: "unload",
+            slot_id: v2Ids.slot,
+            model_id: null,
+            progress: null,
+          },
+        ],
+      }),
+    ).toThrow(ControlContractError);
+
+    const unload = {
+      ...validV2Operation,
+      operation_id: v2Ids.oldEpoch,
+      kind: "unload",
+      status: "running",
+      model_id: null,
+      progress: null,
+    } as const;
+    const unloadSnapshot = {
+      ...validV2ReconnectSnapshot,
+      slots: [{ ...validV2Slot, status: "unloading", model_id: "gemma-3-4b-it-q4", operation_id: v2Ids.oldEpoch }],
+      operations: [unload],
+      events: [],
+    } as const;
+    expect(decodeV2ReconnectSnapshot(unloadSnapshot)).toEqual(unloadSnapshot);
+    expect(unloadSnapshot.slots[0].model_id).toBe("gemma-3-4b-it-q4");
+    expect(unloadSnapshot.operations[0].model_id).toBeNull();
+  });
+
+  it("rejects unapproved Slice 4 fields and enums", () => {
+    expect(() => decodeV2OperationAccepted({ ...validV2OperationAccepted, attachment: "download-worker-1" })).toThrow(
+      ControlContractError,
+    );
+    expect(() => decodeV2ControlError({ ...validV2ControlError, code: "operation_overloaded" })).toThrow(
+      ControlContractError,
+    );
+    for (const operation of [
+      { ...validV2Operation, kind: "verify" },
+      { ...validV2Operation, phase: "verify" },
+      { ...validV2Operation, retry: true },
+    ]) {
+      expect(() => decodeV2OperationCollection({ ...validV2OperationCollection, operations: [operation] })).toThrow(
+        ControlContractError,
+      );
+    }
+  });
+
   it("rejects closed-enum, nested exact-key, model, and nullable-correlation violations", () => {
     expect(() =>
       decodeV2NodeCollection({
