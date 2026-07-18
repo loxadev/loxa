@@ -58,6 +58,7 @@ pub struct ChatRoutesState {
     history: ChatHistory,
     gateway: GatewayState,
     active: Arc<ActiveTurnRegistry>,
+    publication_gate: Option<crate::runtime::PublicationGate>,
 }
 
 impl ChatRoutesState {
@@ -67,7 +68,13 @@ impl ChatRoutesState {
             history,
             gateway,
             active: Arc::new(ActiveTurnRegistry::default()),
+            publication_gate: None,
         }
+    }
+
+    pub(crate) fn with_publication_gate(mut self, gate: crate::runtime::PublicationGate) -> Self {
+        self.publication_gate = Some(gate);
+        self
     }
 
     pub fn shutdown_and_wait(&self) {
@@ -115,6 +122,18 @@ fn authorize(
                 origin.as_deref(),
             ))
         })?;
+    if state
+        .publication_gate
+        .as_ref()
+        .is_some_and(|gate| !gate.is_open())
+    {
+        return Err(Box::new(coded_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "node_stopping",
+            "node is stopping",
+            origin.as_deref(),
+        )));
+    }
     Ok(origin)
 }
 
@@ -1405,7 +1424,7 @@ pub fn router(state: ChatRoutesState) -> Router {
 mod tests {
     use super::*;
     use axum::body::to_bytes;
-    use axum::http::Method;
+    use axum::http::{Method, Request};
     use loxa_protocol::{NodeId, NodeInstanceId};
     use std::collections::BTreeMap;
     use std::process::Command;
@@ -1581,6 +1600,52 @@ mod tests {
             worker: Some(worker),
             root,
         }
+    }
+
+    #[tokio::test]
+    async fn closed_publication_gate_preserves_chat_auth_cors_and_preflight() {
+        let fixture = route_fixture();
+        let app = router(
+            fixture
+                .state
+                .clone()
+                .with_publication_gate(crate::runtime::PublicationGate::default()),
+        );
+        let unauthorized = Request::builder()
+            .method(Method::GET)
+            .uri("/loxa/v1/chats")
+            .header(header::ORIGIN, "tauri://localhost")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(unauthorized).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let authorized = Request::builder()
+            .method(Method::GET)
+            .uri("/loxa/v1/chats")
+            .header(header::ORIGIN, "tauri://localhost")
+            .header(header::AUTHORIZATION, &fixture.bearer)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(authorized).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&HeaderValue::from_static("tauri://localhost"))
+        );
+        let preflight = Request::builder()
+            .method(Method::OPTIONS)
+            .uri("/loxa/v1/chats")
+            .header(header::ORIGIN, "tauri://localhost")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(preflight).await.unwrap().status(),
+            StatusCode::NO_CONTENT
+        );
+        fixture.shutdown();
     }
 
     async fn publish_fake_engine(fixture: &RouteFixture, body: &'static str) {

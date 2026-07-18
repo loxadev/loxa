@@ -230,6 +230,18 @@ impl ControlStateHandle {
         self.healthy.load(Ordering::Acquire)
     }
 
+    pub(crate) fn writer_is_healthy(&self) -> bool {
+        self.is_healthy()
+    }
+
+    pub(crate) fn subscription_is_healthy(&self) -> bool {
+        self.is_healthy()
+    }
+
+    pub(crate) fn health_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.healthy)
+    }
+
     pub(crate) async fn admit(
         &self,
         request: AdmissionRequest,
@@ -270,6 +282,23 @@ impl ControlStateHandle {
         )
     }
 
+    pub(crate) fn observe_required_blocking_before(
+        &self,
+        transition: Transition,
+        deadline: std::time::Instant,
+    ) -> Result<CommitReceipt, ControlStateError> {
+        self.blocking_command_with_ack_deadline(
+            deadline,
+            ACK_TIMEOUT,
+            Some(deadline),
+            |reply| ControlCommand::Observe {
+                transition: transition.clone(),
+                reply,
+            },
+            BlockingEnqueueTimeoutPolicy::RequiredObservationUnavailable,
+        )
+    }
+
     pub(crate) async fn publish_instance(
         &self,
         publication: InstancePublication,
@@ -288,6 +317,23 @@ impl ControlStateHandle {
             .await
     }
 
+    pub(crate) fn publish_instance_blocking_until(
+        &self,
+        publication: InstancePublication,
+        enqueue_deadline: std::time::Instant,
+    ) -> Result<CommitReceipt, ControlStateError> {
+        let maximum = checked_deadline_after(std::time::Instant::now(), ENQUEUE_TIMEOUT);
+        self.blocking_command(
+            enqueue_deadline.min(maximum),
+            ACK_TIMEOUT,
+            |reply| ControlCommand::PublishInstance {
+                publication: publication.clone(),
+                reply,
+            },
+            BlockingEnqueueTimeoutPolicy::RequiredObservationUnavailable,
+        )
+    }
+
     pub(crate) async fn begin_stopping(
         &self,
         now_unix_ms: u64,
@@ -304,6 +350,20 @@ impl ControlStateHandle {
             })?;
         self.receive_commit(receive, tokio::time::Instant::now() + ACK_TIMEOUT)
             .await
+    }
+
+    pub(crate) fn begin_stopping_blocking_until(
+        &self,
+        now_unix_ms: u64,
+        enqueue_deadline: std::time::Instant,
+    ) -> Result<CommitReceipt, ControlStateError> {
+        let maximum = checked_deadline_after(std::time::Instant::now(), ENQUEUE_TIMEOUT);
+        self.blocking_command(
+            enqueue_deadline.min(maximum),
+            ACK_TIMEOUT,
+            |reply| ControlCommand::BeginStopping { now_unix_ms, reply },
+            BlockingEnqueueTimeoutPolicy::RequiredObservationUnavailable,
+        )
     }
 
     pub(crate) async fn observe_required_async(
@@ -498,6 +558,23 @@ impl ControlStateHandle {
         &self,
         enqueue_deadline: std::time::Instant,
         ack_timeout: Duration,
+        command: impl FnMut(oneshot::Sender<Result<T, ControlStateError>>) -> ControlCommand,
+        timeout_policy: BlockingEnqueueTimeoutPolicy,
+    ) -> Result<T, ControlStateError> {
+        self.blocking_command_with_ack_deadline(
+            enqueue_deadline,
+            ack_timeout,
+            None,
+            command,
+            timeout_policy,
+        )
+    }
+
+    fn blocking_command_with_ack_deadline<T>(
+        &self,
+        enqueue_deadline: std::time::Instant,
+        ack_timeout: Duration,
+        absolute_ack_deadline: Option<std::time::Instant>,
         mut command: impl FnMut(oneshot::Sender<Result<T, ControlStateError>>) -> ControlCommand,
         timeout_policy: BlockingEnqueueTimeoutPolicy,
     ) -> Result<T, ControlStateError> {
@@ -536,7 +613,8 @@ impl ControlStateHandle {
                 }
             }
         };
-        let ack_deadline = checked_deadline_after(std::time::Instant::now(), ack_timeout);
+        let ack_deadline = absolute_ack_deadline
+            .unwrap_or_else(|| checked_deadline_after(std::time::Instant::now(), ack_timeout));
         self.receive_blocking_ack_until(receive, ack_deadline)
     }
 
@@ -816,6 +894,17 @@ impl ControlStateWorker {
             Ok(result) => classify_join(result, true, &self.healthy, &self.health_signal),
             Err(_) => Err(shutdown_deadline(&self.healthy, &self.health_signal)),
         }
+    }
+
+    pub(crate) fn shutdown_blocking(self) -> Result<(), ControlStateError> {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Err(ControlStateError::DurableStateUnavailable);
+        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .map_err(|_| ControlStateError::DurableStateUnavailable)?
+            .block_on(self.shutdown())
     }
 
     fn start_reaper(
@@ -1124,7 +1213,7 @@ impl ControlStateHandle {
         release
     }
 
-    pub(super) fn poison_for_test(&self) {
+    pub(crate) fn poison_for_test(&self) {
         let _ = self.poison_unavailable();
     }
 

@@ -457,6 +457,119 @@ async fn v2_control_router_auth_cors_media_type_paths_and_body_limit_are_closed(
 }
 
 #[tokio::test]
+async fn closed_publication_gate_preserves_auth_cors_and_preflight_priority() {
+    let fixture = RouterFixture::new("closed-publication-auth").await;
+    let gate = crate::runtime::PublicationGate::default();
+    let app = router(
+        V2ControlState::new_for_test(
+            fixture.token.clone(),
+            fixture.control.handle.clone(),
+            fixture.execution.clone(),
+        )
+        .with_publication_gate_for_test(gate),
+    );
+
+    let unauthorized = Request::builder()
+        .method(Method::GET)
+        .uri("/loxa/v2/nodes")
+        .header(header::ORIGIN, "tauri://localhost")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(unauthorized).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+        Some(&header::HeaderValue::from_static("tauri://localhost"))
+    );
+
+    let forbidden = Request::builder()
+        .method(Method::GET)
+        .uri("/loxa/v2/nodes")
+        .header(header::ORIGIN, "https://forbidden.example")
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", fixture.token.expose_for_authorization()),
+        )
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(forbidden).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+
+    let preflight = Request::builder()
+        .method(Method::OPTIONS)
+        .uri("/loxa/v2/nodes")
+        .header(header::ORIGIN, "tauri://localhost")
+        .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+        .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "authorization")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(preflight).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+
+    let authorized = Request::builder()
+        .method(Method::GET)
+        .uri("/loxa/v2/nodes")
+        .header(header::ORIGIN, "tauri://localhost")
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", fixture.token.expose_for_authorization()),
+        )
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(authorized).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+        Some(&header::HeaderValue::from_static("tauri://localhost"))
+    );
+
+    let (legacy, legacy_worker) = crate::download_control::DownloadControl::spawn(
+        fixture.root.join("closed-publication-v1-models"),
+    );
+    let v1 = crate::control_router::router(
+        crate::control_router::ControlState::new(
+            fixture.token.clone(),
+            fixture.node_id,
+            NodeInstanceId::new_v4(),
+            legacy,
+        )
+        .with_publication_gate(crate::runtime::PublicationGate::default()),
+    );
+    let unauthorized = Request::builder()
+        .method(Method::GET)
+        .uri("/loxa/v1/models")
+        .header(header::ORIGIN, "tauri://localhost")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        v1.clone().oneshot(unauthorized).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let authorized = Request::builder()
+        .method(Method::GET)
+        .uri("/loxa/v1/models")
+        .header(header::ORIGIN, "tauri://localhost")
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", fixture.token.expose_for_authorization()),
+        )
+        .body(Body::empty())
+        .unwrap();
+    let response = v1.oneshot(authorized).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+        Some(&header::HeaderValue::from_static("tauri://localhost"))
+    );
+    legacy_worker.stop_and_join().unwrap();
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
 async fn v2_control_router_auth_cors_preflight_matches_v1_transport_fence() {
     let fixture = RouterFixture::new("transport-parity").await;
     let legacy_root = fixture.root.join("legacy-models");

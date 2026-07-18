@@ -31,6 +31,7 @@ pub(crate) struct V2ControlState {
     control: ControlStateHandle,
     execution: DurableExecutionControl,
     inventory: Option<DownloadControl>,
+    publication_gate: Option<crate::runtime::PublicationGate>,
     #[cfg(test)]
     subscription_max_snapshot_bytes: Option<usize>,
 }
@@ -40,6 +41,7 @@ impl V2ControlState {
         token: ControlToken,
         control: ControlStateHandle,
         downloads: DownloadControl,
+        publication_gate: Option<crate::runtime::PublicationGate>,
     ) -> Result<Self, &'static str> {
         let execution = downloads
             .durable_execution()
@@ -49,6 +51,7 @@ impl V2ControlState {
             control,
             execution,
             inventory: Some(downloads),
+            publication_gate,
             #[cfg(test)]
             subscription_max_snapshot_bytes: None,
         })
@@ -65,6 +68,7 @@ impl V2ControlState {
             control,
             execution,
             inventory: None,
+            publication_gate: None,
             subscription_max_snapshot_bytes: None,
         }
     }
@@ -81,6 +85,7 @@ impl V2ControlState {
             control,
             execution,
             inventory: Some(inventory),
+            publication_gate: None,
             subscription_max_snapshot_bytes: None,
         }
     }
@@ -91,6 +96,15 @@ impl V2ControlState {
         max_snapshot_bytes: usize,
     ) -> Self {
         self.subscription_max_snapshot_bytes = Some(max_snapshot_bytes);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_publication_gate_for_test(
+        mut self,
+        gate: crate::runtime::PublicationGate,
+    ) -> Self {
+        self.publication_gate = Some(gate);
         self
     }
 
@@ -234,6 +248,21 @@ async fn authenticated_boundary(
         Ok(origin) => origin,
         Err(error) => return error.into_response(),
     };
+    if state
+        .publication_gate
+        .as_ref()
+        .is_some_and(|gate| !gate.is_open())
+    {
+        return cors(
+            V2RouteError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                V2ControlErrorCode::DurableStateUnavailable,
+                "Durable control state is unavailable.",
+            )
+            .into_response(),
+            origin.as_deref(),
+        );
+    }
     let mut response = next.run(request).await;
     if response.status() == StatusCode::PAYLOAD_TOO_LARGE {
         response = V2RouteError::new(

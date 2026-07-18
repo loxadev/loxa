@@ -649,6 +649,7 @@ fn run_model_with_diagnostics_health(
         events,
         diagnostics_health,
         RunOwnerPolicy::Standalone,
+        None,
     )
 }
 
@@ -659,6 +660,7 @@ pub(crate) fn run_prepared_python_model_with_diagnostics_health(
     gateway: Option<&loxa_core::gateway::GatewayState>,
     events: &mut dyn LifecycleEventSink,
     diagnostics_health: &loxa_core::diagnostics::DiagnosticsHealth,
+    durable_interrupt: Option<&std::sync::atomic::AtomicBool>,
 ) -> PreparedPythonRunResult {
     if request.engine != RuntimeBackendKind::PyMlxLm {
         return PreparedPythonRunResult {
@@ -676,6 +678,7 @@ pub(crate) fn run_prepared_python_model_with_diagnostics_health(
         events,
         diagnostics_health,
         RunOwnerPolicy::Prepared(PreparedPythonOwnerPolicy::new(baseline)),
+        durable_interrupt,
     );
     let owner = classify_prepared_python_owner(&paths.state_path, baseline, &outcome);
     PreparedPythonRunResult { outcome, owner }
@@ -706,6 +709,32 @@ fn classify_prepared_python_owner(
     }
 }
 
+struct RuntimeInterrupt<'a> {
+    signal: &'a SignalGuard,
+    durable: Option<&'a std::sync::atomic::AtomicBool>,
+}
+
+impl RuntimeInterrupt<'_> {
+    fn interrupted(&self) -> bool {
+        self.signal.interrupted()
+            || self
+                .durable
+                .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+    }
+}
+
+impl InterruptSource for RuntimeInterrupt<'_> {
+    fn interrupted(&self) -> bool {
+        self.interrupted()
+    }
+}
+
+impl InterruptStatus for RuntimeInterrupt<'_> {
+    fn interrupted(&self) -> bool {
+        self.interrupted()
+    }
+}
+
 fn run_model_with_owner_policy(
     request: RunRequest<'_>,
     paths: &NodePaths,
@@ -713,6 +742,7 @@ fn run_model_with_owner_policy(
     events: &mut dyn LifecycleEventSink,
     diagnostics_health: &loxa_core::diagnostics::DiagnosticsHealth,
     owner_policy: RunOwnerPolicy<'_>,
+    durable_interrupt: Option<&std::sync::atomic::AtomicBool>,
 ) -> io::Result<RunTermination> {
     let RunRequest {
         id,
@@ -738,7 +768,11 @@ fn run_model_with_owner_policy(
 
     ensure_runtime_state_is_mutable(&paths.state_path)?;
 
-    let signal_guard = SignalGuard::install()?;
+    let installed_signal = SignalGuard::install()?;
+    let signal_guard = RuntimeInterrupt {
+        signal: &installed_signal,
+        durable: durable_interrupt,
+    };
     let (owner_pid, owner_process_start_time_unix_s, run_id) = match owner_policy {
         RunOwnerPolicy::Standalone => {
             let owner_pid = std::process::id();
@@ -1374,19 +1408,7 @@ pub fn serve_node_with_diagnostics_health(
     }
 }
 
-fn cleanup_stable_node_runtime(
-    paths: &NodePaths,
-    run: Option<&supervisor::ManagedRun>,
-    runtime: &mut Option<(
-        download_control::DownloadControl,
-        download_control::DownloadControlWorker,
-    )>,
-) -> io::Result<()> {
-    let worker = runtime.take().map(|(_, worker)| worker.stop_and_join());
-    let owner = run.map(|run| finish_unloaded_owner(paths, run));
-    resolve_pre_listening_cleanup(worker, owner)
-}
-
+#[cfg(test)]
 fn resolve_pre_listening_cleanup(
     worker: Option<io::Result<()>>,
     owner: Option<io::Result<()>>,
@@ -1398,12 +1420,14 @@ fn resolve_pre_listening_cleanup(
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 struct StableRuntimeCleanup<'a> {
     paths: &'a NodePaths,
     run: Option<supervisor::ManagedRun>,
     download_worker: Option<download_control::DownloadControlWorker>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn resolve_stable_runtime_cleanup(
     outcome: io::Result<RunTermination>,
     worker_cleanup: io::Result<()>,
@@ -1417,6 +1441,7 @@ fn resolve_stable_runtime_cleanup(
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl<'a> StableRuntimeCleanup<'a> {
     fn new(
         paths: &'a NodePaths,
@@ -1484,6 +1509,11 @@ fn stable_runtime_panic_cleanup_count() -> usize {
 }
 
 #[cfg(test)]
+pub(crate) fn record_stable_runtime_panic_cleanup() {
+    STABLE_RUNTIME_PANIC_CLEANUPS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
 fn run_unloaded_actor(
     paths: &NodePaths,
     run: supervisor::ManagedRun,
@@ -1492,34 +1522,57 @@ fn run_unloaded_actor(
     run_stable_node_actor(paths, run, None, download_worker, None, None)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn run_stable_node_actor(
     paths: &NodePaths,
     run: supervisor::ManagedRun,
     download_control: Option<download_control::DownloadControl>,
     download_worker: download_control::DownloadControlWorker,
     startup_model: Option<&str>,
-    mut events: Option<&mut dyn LifecycleEventSink>,
+    events: Option<&mut dyn LifecycleEventSink>,
 ) -> io::Result<RunTermination> {
     let cleanup = StableRuntimeCleanup::new(paths, run.clone(), download_worker);
-    let signal_guard = match SignalGuard::install() {
-        Ok(guard) => guard,
-        Err(error) => return cleanup.finish(Err(error)),
-    };
+    let outcome = monitor_stable_node_actor(
+        paths,
+        &run,
+        download_control.as_ref(),
+        cleanup.download_worker(),
+        startup_model,
+        None,
+        events,
+    );
+    cleanup.finish(outcome)
+}
+
+fn monitor_stable_node_actor(
+    paths: &NodePaths,
+    run: &supervisor::ManagedRun,
+    download_control: Option<&download_control::DownloadControl>,
+    download_worker: &download_control::DownloadControlWorker,
+    startup_model: Option<&str>,
+    durable_control: Option<&control_state::ControlStateHandle>,
+    mut events: Option<&mut dyn LifecycleEventSink>,
+) -> io::Result<RunTermination> {
+    let signal_guard = SignalGuard::install()?;
     let startup = if let Some(model_id) = startup_model {
-        let download_control = download_control
-            .as_ref()
-            .expect("startup model requires stable model control");
+        let download_control =
+            download_control.expect("startup model requires stable model control");
         match download_control.start_startup_load(model_id) {
             Err(error) => Some(Err(io::Error::other(format!(
                 "startup model admission failed: {error:?}"
             )))),
             Ok(operation_id) => loop {
-                if cleanup.download_worker().is_finished() {
+                if durable_control.is_some_and(|control| !control.is_healthy()) {
+                    break Some(Err(io::Error::other(
+                        "durable control state became unavailable",
+                    )));
+                }
+                if download_worker.is_finished() {
                     break Some(Err(io::Error::other(
                         "model lifecycle actor worker terminated unexpectedly",
                     )));
                 }
-                let current = match current_same_owner_run(paths, &run) {
+                let current = match current_same_owner_run(paths, run) {
                     Ok(current) => current,
                     Err(error) => break Some(Err(error)),
                 };
@@ -1582,16 +1635,19 @@ fn run_stable_node_actor(
     } else {
         None
     };
-    let outcome = if let Some(startup) = startup {
+    if let Some(startup) = startup {
         startup
     } else {
         loop {
-            if cleanup.download_worker().is_finished() {
+            if durable_control.is_some_and(|control| !control.is_healthy()) {
+                break Err(io::Error::other("durable control state became unavailable"));
+            }
+            if download_worker.is_finished() {
                 break Err(io::Error::other(
                     "download actor worker terminated unexpectedly",
                 ));
             }
-            let current = match current_same_owner_run(paths, &run) {
+            let current = match current_same_owner_run(paths, run) {
                 Ok(current) => current,
                 Err(error) => break Err(error),
             };
@@ -1605,8 +1661,7 @@ fn run_stable_node_actor(
             }
             std::thread::sleep(Duration::from_millis(25));
         }
-    };
-    cleanup.finish(outcome)
+    }
 }
 
 fn current_same_owner_run(
@@ -1637,7 +1692,17 @@ fn finish_unloaded_owner(paths: &NodePaths, run: &supervisor::ManagedRun) -> io:
         .map_err(supervisor_error_to_io)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn claim_unloaded_owner(
+    paths: &NodePaths,
+    gateway_port: u16,
+) -> io::Result<supervisor::ManagedRun> {
+    let candidate = unloaded_owner_candidate(paths, gateway_port)?;
+    supervisor::create_unloaded_node_owner(&paths.state_path, candidate)
+        .map_err(supervisor_error_to_io)
+}
+
+fn unloaded_owner_candidate(
     paths: &NodePaths,
     gateway_port: u16,
 ) -> io::Result<supervisor::ManagedRun> {
@@ -1646,27 +1711,23 @@ fn claim_unloaded_owner(
         .ok_or_else(|| io::Error::other("node owner process identity is unavailable"))?;
     let now = unix_timestamp_now();
     let run_id = format!("node-{owner_pid}-{owner_start}-{now}-{gateway_port}");
-    supervisor::create_unloaded_node_owner(
-        &paths.state_path,
-        supervisor::ManagedRun {
-            schema_version: supervisor::RUNTIME_STATE_SCHEMA_VERSION,
-            run_id: run_id.clone(),
-            model_id: None,
-            owner_pid,
-            owner_process_start_time_unix_s: owner_start,
-            stop_requested: false,
-            lifecycle: supervisor::RunLifecycle::Unloaded,
-            generation: 0,
-            generation_alias: format!("loxa-{run_id}-g0"),
-            control_port: Some(gateway_port),
-            port: gateway_port,
-            log_path: paths.logs_dir.join(format!("{run_id}.log")),
-            child_pid: None,
-            child_process_start_time_unix_s: None,
-            child_pgid: None,
-        },
-    )
-    .map_err(supervisor_error_to_io)
+    Ok(supervisor::ManagedRun {
+        schema_version: supervisor::RUNTIME_STATE_SCHEMA_VERSION,
+        run_id: run_id.clone(),
+        model_id: None,
+        owner_pid,
+        owner_process_start_time_unix_s: owner_start,
+        stop_requested: false,
+        lifecycle: supervisor::RunLifecycle::Unloaded,
+        generation: 0,
+        generation_alias: format!("loxa-{run_id}-g0"),
+        control_port: Some(gateway_port),
+        port: gateway_port,
+        log_path: paths.logs_dir.join(format!("{run_id}.log")),
+        child_pid: None,
+        child_process_start_time_unix_s: None,
+        child_pgid: None,
+    })
 }
 
 fn resolve_managed_attachment_typed(
@@ -3307,6 +3368,7 @@ mod lifecycle_api_tests {
             None,
             &mut events,
             &loxa_core::diagnostics::DiagnosticsHealth::new(),
+            None,
         );
 
         assert!(result.outcome.is_err());
@@ -3476,7 +3538,10 @@ mod lifecycle_api_tests {
                 proof["node_id"].as_str().unwrap().to_owned(),
                 proof["runtime_identity"].as_str().unwrap().to_owned(),
             );
-            drop(runtime);
+            assert_eq!(
+                runtime.shutdown_for_test().expect("shutdown runtime"),
+                RunTermination::Interrupted
+            );
             wait_for_runtime_cleanup(&paths, port);
             observed
         };

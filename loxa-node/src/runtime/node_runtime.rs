@@ -1,7 +1,9 @@
 use crate::bootstrap::NodePaths;
 use crate::chat_history::ChatHistoryWorker;
 use crate::chat_routes::ChatRoutesState;
+use crate::control_state::{ControlStateHandle, ControlStateWorker};
 use crate::download_control::{DownloadControl, DownloadControlWorker};
+use crate::runtime::PublicationGate;
 use crate::{
     LifecycleEvent, LifecycleEventSink, PreparedPythonOwnerDisposition, PreparedPythonRunResult,
     RunRequest, RunTermination,
@@ -12,7 +14,18 @@ use loxa_core::gateway::{GatewayServer, GatewayState};
 use loxa_core::supervisor::ManagedRun;
 use loxa_protocol::{NodeId, NodeInstanceId};
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+fn current_unix_ms() -> io::Result<u64> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| io::Error::other("system clock precedes the Unix epoch"))?
+        .as_millis();
+    u64::try_from(millis).map_err(|_| io::Error::other("system time exceeds supported range"))
+}
 
 #[must_use]
 pub(crate) struct NodeOwnerGuard {
@@ -22,6 +35,7 @@ pub(crate) struct NodeOwnerGuard {
 }
 
 impl NodeOwnerGuard {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new(paths: NodePaths, baseline: ManagedRun) -> Self {
         Self {
             paths,
@@ -48,8 +62,10 @@ impl NodeOwnerGuard {
         self.acquisition_recovery.take();
     }
 
-    pub(crate) fn into_baseline(mut self) -> ManagedRun {
-        self.baseline.take().expect("node owner guard armed")
+    pub(crate) fn acquisition_recovery(
+        &self,
+    ) -> Option<&loxa_core::supervisor::ManagedRecoverySource> {
+        self.acquisition_recovery.as_ref()
     }
 
     pub(crate) fn baseline(&self) -> &ManagedRun {
@@ -183,6 +199,96 @@ pub(crate) struct NodeRuntimeParts {
     pub(crate) diagnostics_health: DiagnosticsHealth,
     pub(crate) node_id: NodeId,
     pub(crate) node_instance_id: NodeInstanceId,
+    pub(crate) publication_gate: PublicationGate,
+    pub(crate) control: ControlStateHandle,
+    pub(crate) control_worker: ControlStateWorker,
+    pub(crate) health_monitor: DurableHealthMonitor,
+}
+
+pub(crate) struct DurableHealthMonitor {
+    stop: mpsc::Sender<()>,
+    worker: Option<thread::JoinHandle<()>>,
+    failed: Arc<AtomicBool>,
+    signal_failed: Arc<AtomicBool>,
+}
+
+impl DurableHealthMonitor {
+    pub(crate) fn spawn(
+        control: ControlStateHandle,
+        gate: PublicationGate,
+        gateway: GatewayState,
+        state_path: std::path::PathBuf,
+        owner_identity: loxa_core::supervisor::ManagedRunIdentity,
+    ) -> io::Result<Self> {
+        let (stop, stopped) = mpsc::channel();
+        let failed = Arc::new(AtomicBool::new(false));
+        let worker_failed = Arc::clone(&failed);
+        let signal_failed = Arc::new(AtomicBool::new(false));
+        let worker_signal_failed = Arc::clone(&signal_failed);
+        let worker = thread::Builder::new()
+            .name("loxa-durable-health".into())
+            .spawn(move || loop {
+                if !control.is_healthy() {
+                    worker_failed.store(true, Ordering::Release);
+                    gate.close();
+                    gateway.withdraw();
+                    if !matches!(
+                        loxa_core::supervisor::signal_exact_managed_stop(
+                            &state_path,
+                            &owner_identity,
+                        ),
+                        Ok(true)
+                    ) {
+                        worker_signal_failed.store(true, Ordering::Release);
+                    }
+                    break;
+                }
+                match stopped.recv_timeout(Duration::from_millis(10)) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                }
+            })?;
+        Ok(Self {
+            stop,
+            worker: Some(worker),
+            failed,
+            signal_failed,
+        })
+    }
+
+    pub(crate) fn stop_and_join_until(mut self, deadline: std::time::Instant) -> io::Result<bool> {
+        let _ = self.stop.send(());
+        let worker = self
+            .worker
+            .take()
+            .expect("durable health monitor worker present");
+        let failed = Arc::clone(&self.failed);
+        let signal_failed = Arc::clone(&self.signal_failed);
+        let (completed, receive) = mpsc::sync_channel(1);
+        thread::Builder::new()
+            .name("loxa-durable-health-reaper".into())
+            .spawn(move || {
+                let result = worker
+                    .join()
+                    .map_err(|_| io::Error::other("durable health monitor panicked"))
+                    .and_then(|()| {
+                        if signal_failed.load(Ordering::Acquire) {
+                            Err(io::Error::other("durable health stop signal failed"))
+                        } else {
+                            Ok(failed.load(Ordering::Acquire))
+                        }
+                    });
+                let _ = completed.send(result);
+            })?;
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        receive
+            .recv_timeout(remaining)
+            .map_err(|_| io::Error::other("durable health monitor shutdown deadline exceeded"))?
+    }
+
+    fn failure_signal(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.failed)
+    }
 }
 
 #[must_use]
@@ -201,6 +307,10 @@ pub(crate) struct NodeRuntime {
     diagnostics_health: DiagnosticsHealth,
     node_id: NodeId,
     node_instance_id: NodeInstanceId,
+    publication_gate: PublicationGate,
+    control: Option<ControlStateHandle>,
+    control_worker: Option<ControlStateWorker>,
+    health_monitor: Option<DurableHealthMonitor>,
 }
 
 impl NodeRuntime {
@@ -220,6 +330,10 @@ impl NodeRuntime {
             diagnostics_health: parts.diagnostics_health,
             node_id: parts.node_id,
             node_instance_id: parts.node_instance_id,
+            publication_gate: parts.publication_gate,
+            control: Some(parts.control),
+            control_worker: Some(parts.control_worker),
+            health_monitor: Some(parts.health_monitor),
         }
     }
 
@@ -230,21 +344,49 @@ impl NodeRuntime {
             .port()
     }
 
+    #[cfg(test)]
+    pub(crate) fn control_snapshot_for_test(
+        &self,
+    ) -> std::sync::Arc<crate::control_state::state_machine::CommittedState> {
+        self.control
+            .as_ref()
+            .expect("runtime control handle present")
+            .read_snapshot()
+            .expect("runtime durable snapshot available")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shutdown_for_test(mut self) -> io::Result<RunTermination> {
+        self.shutdown_services(Ok(RunTermination::Interrupted))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poison_control_for_test(&self) {
+        self.control
+            .as_ref()
+            .expect("runtime control handle present")
+            .poison_for_test();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publication_gate_is_open_for_test(&self) -> bool {
+        self.publication_gate.is_open()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gateway_state_for_test(&self) -> GatewayState {
+        self.gateway_state
+            .as_ref()
+            .expect("runtime gateway state present")
+            .clone()
+    }
+
     pub(crate) fn run(mut self, events: &mut dyn LifecycleEventSink) -> io::Result<RunTermination> {
         let outcome = if let Err(error) = events.emit(LifecycleEvent::NodeListening {
             port: self.port(),
             model_alias: "loxa".to_string(),
         }) {
-            let cleanup = crate::cleanup_stable_node_runtime(
-                self.paths.as_ref().expect("runtime paths present"),
-                self.unloaded_run.as_ref(),
-                &mut self.download_runtime,
-            );
-            self.unloaded_run.take();
-            match cleanup {
-                Ok(()) => Err(error),
-                Err(cleanup) => Err(cleanup),
-            }
+            Err(error)
         } else {
             tracing::info!(
                 target: "loxa_node::lifecycle",
@@ -264,26 +406,31 @@ impl NodeRuntime {
         let paths = self.paths.as_ref().expect("runtime paths present");
         match self.startup_model.as_deref() {
             Some(model_id) if self.stable_llama_node => {
-                self.unloaded_run.take();
                 let run = self
                     .owner_guard
-                    .take()
+                    .as_ref()
                     .expect("stable llama node owner guarded")
-                    .into_baseline();
+                    .baseline();
                 let (download_control, download_worker) = self
                     .download_runtime
-                    .take()
+                    .as_ref()
                     .expect("stable llama node has model control");
-                crate::run_stable_node_actor(
+                crate::monitor_stable_node_actor(
                     paths,
                     run,
                     Some(download_control),
                     download_worker,
                     Some(model_id),
+                    self.control.as_ref(),
                     Some(events),
                 )
             }
             Some(model_id) => {
+                let durable_interrupt = self
+                    .health_monitor
+                    .as_ref()
+                    .expect("runtime durable health monitor present")
+                    .failure_signal();
                 let result = crate::run_prepared_python_model_with_diagnostics_health(
                     RunRequest {
                         id: model_id,
@@ -303,6 +450,7 @@ impl NodeRuntime {
                     ),
                     events,
                     &self.diagnostics_health,
+                    Some(durable_interrupt.as_ref()),
                 );
                 resolve_prepared_python_owner(
                     result,
@@ -312,22 +460,22 @@ impl NodeRuntime {
                 )
             }
             None => {
-                self.unloaded_run.take();
                 let run = self
                     .owner_guard
-                    .take()
+                    .as_ref()
                     .expect("unloaded node owner guarded")
-                    .into_baseline();
+                    .baseline();
                 let (download_control, download_worker) = self
                     .download_runtime
-                    .take()
+                    .as_ref()
                     .expect("unloaded node has download control");
-                crate::run_stable_node_actor(
+                crate::monitor_stable_node_actor(
                     paths,
                     run,
                     Some(download_control),
                     download_worker,
                     None,
+                    self.control.as_ref(),
                     Some(events),
                 )
             }
@@ -355,6 +503,15 @@ impl NodeRuntime {
             node_instance_id = self.node_instance_id.to_string().as_str(),
             result_class = "stopping",
         );
+        let stopping_commit = current_unix_ms().and_then(|now| {
+            self.control
+                .as_ref()
+                .expect("runtime control handle present")
+                .begin_stopping_blocking_until(now, shutdown_started + Duration::from_secs(10))
+                .map(|_| ())
+                .map_err(|_| io::Error::other("durable stopping commit failed"))
+        });
+        self.publication_gate.close();
         self.gateway_state
             .take()
             .expect("runtime gateway state present")
@@ -366,6 +523,31 @@ impl NodeRuntime {
             self.node_instance_id,
             None,
         );
+        let execution_shutdown = self
+            .download_runtime
+            .take()
+            .map(|(_, worker)| worker.stop_and_join())
+            .transpose()
+            .map(|_| ());
+        let owner_shutdown = self
+            .owner_guard
+            .take()
+            .map(NodeOwnerGuard::finish)
+            .transpose()
+            .map(|_| ());
+        let health_failure = self
+            .health_monitor
+            .take()
+            .expect("runtime durable health monitor present")
+            .stop_and_join_until(shutdown_started + Duration::from_secs(10))
+            .and_then(|failed| {
+                if failed {
+                    Err(io::Error::other("durable control state became unavailable"))
+                } else {
+                    Ok(())
+                }
+            });
+        self.unloaded_run.take();
         self.chat_routes_state
             .take()
             .expect("runtime chat routes state present")
@@ -402,7 +584,24 @@ impl NodeRuntime {
             self.node_instance_id,
             history_shutdown.as_ref().err(),
         );
-        let result = resolve_shutdown_outcome(outcome, shutdown, history_shutdown);
+        let control = self.control.take().expect("runtime control handle present");
+        let control_shutdown = self
+            .control_worker
+            .take()
+            .expect("runtime control worker present")
+            .shutdown_blocking()
+            .map_err(|error| {
+                io::Error::other(format!("durable control worker shutdown failed: {error:?}"))
+            });
+        drop(control);
+        let service_result = resolve_shutdown_outcome(outcome, shutdown, history_shutdown);
+        let result = owner_shutdown
+            .err()
+            .or_else(|| control_shutdown.err())
+            .or_else(|| health_failure.err())
+            .or_else(|| execution_shutdown.err())
+            .or_else(|| stopping_commit.err())
+            .map_or(service_result, Err);
         let result_class = if result.is_ok() { "stopped" } else { "failed" };
         tracing::info!(
             target: "loxa_node::lifecycle",
@@ -420,6 +619,9 @@ impl NodeRuntime {
 
 impl Drop for NodeRuntime {
     fn drop(&mut self) {
+        #[cfg(test)]
+        let record_panic_cleanup = std::thread::panicking() && self.stable_llama_node;
+        self.publication_gate.close();
         if let Some(gateway_state) = self.gateway_state.take() {
             gateway_state.withdraw();
         }
@@ -431,6 +633,9 @@ impl Drop for NodeRuntime {
         let chat_routes_state = self.chat_routes_state.take();
         let gateway = self.gateway.take();
         let history_worker = self.history_worker.take();
+        let control = self.control.take();
+        let control_worker = self.control_worker.take();
+        let health_monitor = self.health_monitor.take();
 
         if unloaded_run.is_none()
             && download_runtime.is_none()
@@ -438,6 +643,8 @@ impl Drop for NodeRuntime {
             && gateway.is_none()
             && history_worker.is_none()
             && owner_guard.is_none()
+            && control_worker.is_none()
+            && health_monitor.is_none()
         {
             return;
         }
@@ -446,21 +653,48 @@ impl Drop for NodeRuntime {
             .name("loxa-node-runtime-cleanup".to_string())
             .spawn(move || {
                 let _ = (paths, unloaded_run);
-                if let Some((_, download_worker)) = download_runtime {
-                    let _ = download_worker.stop_and_join();
-                }
+                let execution_cleanup = download_runtime
+                    .map(|(_, download_worker)| download_worker.stop_and_join())
+                    .transpose();
+                let owner_cleanup = owner_guard.map(NodeOwnerGuard::finish).transpose();
+                let health_cleanup = health_monitor
+                    .map(|monitor| {
+                        monitor.stop_and_join_until(
+                            std::time::Instant::now() + Duration::from_secs(10),
+                        )
+                    })
+                    .transpose();
                 if let Some(chat_routes_state) = chat_routes_state {
                     chat_routes_state.shutdown_and_wait();
                 }
-                if let Some(gateway) = gateway {
-                    let _ = gateway.shutdown();
+                let gateway_cleanup = gateway.map(GatewayServer::shutdown).transpose();
+                let history_cleanup = history_worker
+                    .map(ChatHistoryWorker::stop_and_join)
+                    .transpose();
+                let control_cleanup = control_worker
+                    .map(ControlStateWorker::shutdown_blocking)
+                    .transpose();
+                drop(control);
+                #[cfg(test)]
+                if record_panic_cleanup
+                    && health_cleanup.is_ok()
+                    && execution_cleanup.is_ok()
+                    && owner_cleanup.is_ok()
+                    && gateway_cleanup.is_ok()
+                    && history_cleanup.is_ok()
+                    && control_cleanup.is_ok()
+                {
+                    crate::record_stable_runtime_panic_cleanup();
                 }
-                if let Some(history_worker) = history_worker {
-                    let _ = history_worker.stop_and_join();
-                }
-                if let Some(owner_guard) = owner_guard {
-                    let _ = owner_guard.finish();
-                }
+                #[cfg(not(test))]
+                let _ = (
+                    execution_cleanup,
+                    owner_cleanup,
+                    gateway_cleanup,
+                    history_cleanup,
+                    control_cleanup,
+                    health_cleanup,
+                );
             });
     }
 }

@@ -25,6 +25,7 @@ pub struct ControlState {
     node_id: NodeId,
     node_instance_id: NodeInstanceId,
     downloads: DownloadControl,
+    publication_gate: Option<crate::runtime::PublicationGate>,
 }
 
 impl ControlState {
@@ -41,8 +42,29 @@ impl ControlState {
             node_id,
             node_instance_id,
             downloads,
+            publication_gate: None,
         }
     }
+
+    pub(crate) fn with_publication_gate(mut self, gate: crate::runtime::PublicationGate) -> Self {
+        self.publication_gate = Some(gate);
+        self
+    }
+}
+
+fn publication_closed(state: &ControlState, origin: Option<&str>) -> Option<Response> {
+    state
+        .publication_gate
+        .as_ref()
+        .is_some_and(|gate| !gate.is_open())
+        .then(|| {
+            control_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                ControlErrorCode::NodeStopping,
+                "node is stopping",
+                origin,
+            )
+        })
 }
 
 fn authorize(state: &ControlState, headers: &HeaderMap) -> Result<(), StatusCode> {
@@ -198,6 +220,9 @@ async fn start_download(
     if let Err(status) = authorize(&state, &headers) {
         return cors(status.into_response(), origin.as_deref());
     }
+    if let Some(response) = publication_closed(&state, origin.as_deref()) {
+        return response;
+    }
     if headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
@@ -250,6 +275,9 @@ async fn start_load(
     if let Err(status) = authorize(&state, &headers) {
         return cors(status.into_response(), origin.as_deref());
     }
+    if let Some(response) = publication_closed(&state, origin.as_deref()) {
+        return response;
+    }
     if headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
@@ -294,6 +322,9 @@ async fn start_unload(State(state): State<ControlState>, headers: HeaderMap) -> 
     if let Err(status) = authorize(&state, &headers) {
         return cors(status.into_response(), origin.as_deref());
     }
+    if let Some(response) = publication_closed(&state, origin.as_deref()) {
+        return response;
+    }
     match state.downloads.start_unload_async().await {
         Ok(operation_id) => cors(
             (
@@ -319,6 +350,9 @@ async fn operation(
     if let Err(status) = authorize(&state, &headers) {
         return cors(status.into_response(), origin.as_deref());
     }
+    if let Some(response) = publication_closed(&state, origin.as_deref()) {
+        return response;
+    }
     match state.downloads.operation_checked(&id) {
         Ok(Some(operation)) => cors(Json(operation).into_response(), origin.as_deref()),
         Ok(None) => map_download_error(DownloadControlError::Missing, origin.as_deref()),
@@ -337,6 +371,9 @@ async fn cancel_operation(
     };
     if let Err(status) = authorize(&state, &headers) {
         return cors(status.into_response(), origin.as_deref());
+    }
+    if let Some(response) = publication_closed(&state, origin.as_deref()) {
+        return response;
     }
     match state.downloads.cancel_async(&id).await {
         Ok(_) => cors(
@@ -369,6 +406,9 @@ async fn events(
     };
     if let Err(status) = authorize(&state, &headers) {
         return cors(status.into_response(), origin.as_deref());
+    }
+    if let Some(response) = publication_closed(&state, origin.as_deref()) {
+        return response;
     }
     let (snapshot, subscription) = match state
         .downloads
@@ -426,6 +466,9 @@ async fn node_proof(
             origin.as_deref(),
         );
     }
+    if let Some(response) = publication_closed(&state, origin.as_deref()) {
+        return response;
+    }
     if query.is_some() {
         return StatusCode::BAD_REQUEST.into_response();
     }
@@ -477,6 +520,9 @@ async fn capabilities(State(state): State<ControlState>, headers: HeaderMap) -> 
     if let Err(status) = authorize(&state, &headers) {
         return cors(status.into_response(), origin.as_deref());
     }
+    if let Some(response) = publication_closed(&state, origin.as_deref()) {
+        return response;
+    }
     cors(
         Json(CapabilitiesSnapshot {
             document_input: false,
@@ -497,6 +543,9 @@ async fn models(State(state): State<ControlState>, headers: HeaderMap) -> Respon
     if let Err(status) = authorize(&state, &headers) {
         return cors(status.into_response(), origin.as_deref());
     }
+    if let Some(response) = publication_closed(&state, origin.as_deref()) {
+        return response;
+    }
     cors(
         Json(state.downloads.inventory(current_available_memory_bytes())).into_response(),
         origin.as_deref(),
@@ -510,6 +559,9 @@ async fn node_snapshot(State(state): State<ControlState>, headers: HeaderMap) ->
     };
     if let Err(status) = authorize(&state, &headers) {
         return cors(status.into_response(), origin.as_deref());
+    }
+    if let Some(response) = publication_closed(&state, origin.as_deref()) {
+        return response;
     }
     match state.downloads.node_snapshot_checked() {
         Ok(snapshot) => cors(Json(snapshot).into_response(), origin.as_deref()),
@@ -567,6 +619,7 @@ pub(crate) fn router_with_optional_v2(
         state.token.clone(),
         control,
         state.downloads.clone(),
+        state.publication_gate.clone(),
     )?;
     Ok(router(state).merge(crate::v2_control_router::router(v2_state)))
 }

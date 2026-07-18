@@ -74,6 +74,7 @@ pub struct DownloadControlWorker {
     worker: Option<JoinHandle<()>>,
     verification: Option<VerificationWorker>,
     lifecycle_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
+    durable_control_state: Option<ControlStateHandle>,
 }
 
 struct VerificationWorker {
@@ -278,6 +279,7 @@ impl DownloadControl {
                     worker: verification_worker,
                 }),
                 lifecycle_stop: None,
+                durable_control_state: None,
             },
         )
     }
@@ -340,7 +342,7 @@ impl DownloadControl {
         (
             Self {
                 authority: AdmissionAuthority::Durable(DurableExecutionControl {
-                    control_state,
+                    control_state: control_state.clone(),
                     actor: actor.clone(),
                     lifecycle_supported: false,
                     lifecycle_destructive: None,
@@ -358,10 +360,12 @@ impl DownloadControl {
                 worker: Some(worker),
                 verification,
                 lifecycle_stop: None,
+                durable_control_state: Some(control_state),
             },
         )
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn spawn_with_lifecycle<D, G>(
         models_dir: PathBuf,
         lifecycle: ModelLifecycle<D, G>,
@@ -379,6 +383,7 @@ impl DownloadControl {
         )
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn spawn_with_lifecycle_components<D, G>(
         models_dir: PathBuf,
         lifecycle: ModelLifecycle<D, G>,
@@ -403,6 +408,7 @@ impl DownloadControl {
         )
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn spawn_with_lifecycle_components_and_verifier<D, G>(
         models_dir: PathBuf,
         lifecycle: ModelLifecycle<D, G>,
@@ -507,6 +513,7 @@ impl DownloadControl {
                 &background_cancellation,
             );
         });
+        let durable_control_state = control_state.clone();
         let authority = match (control_state, legacy_operations) {
             (Some(control_state), None) => AdmissionAuthority::Durable(DurableExecutionControl {
                 control_state,
@@ -536,6 +543,7 @@ impl DownloadControl {
                     worker: verification_worker,
                 }),
                 lifecycle_stop: Some(lifecycle_stop),
+                durable_control_state,
             },
         )
     }
@@ -1324,8 +1332,66 @@ impl DownloadControlWorker {
         } else {
             Ok(())
         };
-        actor_result.and(verification_result)
+        let durable_result = if let Some(control_state) = self.durable_control_state.take() {
+            thread::Builder::new()
+                .name("loxa-durable-shutdown-observer".into())
+                .spawn(move || terminalize_remaining_durable_operations(&control_state))
+                .and_then(|worker| {
+                    worker.join().map_err(|_| {
+                        io::Error::other("durable operation shutdown observer panicked")
+                    })?
+                })
+        } else {
+            Ok(())
+        };
+        actor_result.and(verification_result).and(durable_result)
     }
+}
+
+fn terminalize_remaining_durable_operations(control_state: &ControlStateHandle) -> io::Result<()> {
+    let active = control_state
+        .read_snapshot()
+        .map_err(|_| io::Error::other("durable operation shutdown observation failed"))?
+        .operations
+        .iter()
+        .filter(|operation| {
+            matches!(
+                operation.status,
+                V2OperationStatus::Queued
+                    | V2OperationStatus::Running
+                    | V2OperationStatus::Cancelling
+            )
+        })
+        .map(|operation| (operation.operation_id, operation.kind, operation.status))
+        .collect::<Vec<_>>();
+    let now = std::time::Instant::now();
+    let deadline = now
+        .checked_add(std::time::Duration::from_secs(5))
+        .unwrap_or(now);
+    for (operation_id, kind, status) in active {
+        let error = if status == V2OperationStatus::Cancelling {
+            V2PublicError {
+                code: V2OperationErrorCode::CancellationOutcomeUnknown,
+                message: "node stopped before cancellation was confirmed".into(),
+            }
+        } else {
+            operation_error(kind, "node is stopping")
+        };
+        control_state
+            .observe_required_blocking_before(
+                Transition::Failed {
+                    operation_id,
+                    error,
+                },
+                deadline,
+            )
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "durable operation shutdown observation failed: {error:?}"
+                ))
+            })?;
+    }
+    Ok(())
 }
 
 struct DownloadExecutor {
@@ -2000,6 +2066,7 @@ pub(crate) fn panicking_worker() -> DownloadControlWorker {
         worker: Some(worker),
         verification: None,
         lifecycle_stop: None,
+        durable_control_state: None,
     }
 }
 
@@ -2268,6 +2335,10 @@ mod tests {
         result: Option<Result<(), DownloadError>>,
     }
 
+    struct ShutdownBlockingDownloader {
+        entered: std::sync::mpsc::Sender<()>,
+    }
+
     struct PanicExecutor(std::sync::mpsc::Sender<()>);
 
     struct FakeArtifactVerifier {
@@ -2381,6 +2452,21 @@ mod tests {
                 total_bytes: 10,
             });
             self.result.take().expect("fake result is configured")
+        }
+    }
+
+    impl ModelDownloader for ShutdownBlockingDownloader {
+        fn download(
+            &mut self,
+            _: &'static loxa_core::registry::ModelEntry,
+            _: &std::path::Path,
+            observer: &mut dyn DownloadObserver,
+        ) -> Result<(), DownloadError> {
+            self.entered.send(()).unwrap();
+            while !observer.is_cancelled() {
+                std::thread::yield_now();
+            }
+            Err(DownloadError::Cancelled)
         }
     }
 
@@ -2825,6 +2911,7 @@ mod tests {
             worker: Some(worker),
             verification: None,
             lifecycle_stop: None,
+            durable_control_state: None,
         };
         assert_eq!(
             runtime.stop_and_join().unwrap_err().to_string(),
@@ -2863,6 +2950,7 @@ mod tests {
                 worker: verification,
             }),
             lifecycle_stop: None,
+            durable_control_state: None,
         };
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let join = std::thread::spawn(move || {
@@ -3633,6 +3721,153 @@ mod tests {
         );
         assert_eq!(fixture.handle.read_snapshot().unwrap().operations.len(), 1);
         worker.stop_and_join().unwrap();
+        fixture.shutdown().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn successful_worker_shutdown_terminalizes_durably_queued_work_abandoned_by_actor_stop() {
+        let root = std::env::temp_dir().join(format!(
+            "loxa-durable-shutdown-{}-{}",
+            std::process::id(),
+            loxa_protocol::v2::StreamEpoch::new_v4()
+        ));
+        let paths = crate::NodePaths {
+            models_dir: root.join("models"),
+            state_path: root.join("run/managed.json"),
+            logs_dir: root.join("run/logs"),
+        };
+        std::fs::create_dir_all(&paths.logs_dir).unwrap();
+        let baseline = loxa_core::supervisor::ManagedRun {
+            schema_version: loxa_core::supervisor::RUNTIME_STATE_SCHEMA_VERSION,
+            run_id: "durable-shutdown".into(),
+            model_id: None,
+            owner_pid: std::process::id(),
+            owner_process_start_time_unix_s: 1,
+            stop_requested: false,
+            lifecycle: loxa_core::supervisor::RunLifecycle::Unloaded,
+            generation: 0,
+            generation_alias: "loxa-durable-shutdown-g0".into(),
+            control_port: Some(19_433),
+            port: 19_433,
+            log_path: paths.logs_dir.join("owner.log"),
+            child_pid: None,
+            child_process_start_time_unix_s: None,
+            child_pgid: None,
+        };
+        loxa_core::supervisor::create_unloaded_node_owner(&paths.state_path, baseline.clone())
+            .unwrap();
+        let fixture = crate::open_slice3_control_state_fixture(
+            root.join("state/control-state.sqlite3"),
+            loxa_protocol::NodeId::new_v4(),
+            paths,
+            baseline,
+        )
+        .unwrap();
+        fixture
+            .handle
+            .publish_instance(crate::control_state::InstancePublication {
+                node_instance_id: loxa_protocol::NodeInstanceId::new_v4(),
+                control_endpoint: "http://127.0.0.1:19433".into(),
+                capabilities: loxa_protocol::v2::V2NodeCapabilities {
+                    model_download: true,
+                    slot_load: false,
+                    slot_unload: false,
+                    operation_cancel: true,
+                    operation_stream: true,
+                },
+                now_unix_ms: 11,
+            })
+            .await
+            .unwrap();
+        let recipes: &'static [ModelEntry] = Box::leak(
+            vec![
+                ModelEntry {
+                    id: "shutdown-running",
+                    repo: "owner/repo",
+                    revision: "pinned",
+                    filename: "shutdown-running.gguf",
+                    sha256: "770e607624d689265ca6c44884d0807d9b054d23c473c106c72be9de08b7376c",
+                    size_bytes: 4,
+                    license: "apache-2.0",
+                    params: "tiny",
+                    quant: "Q4",
+                    min_free_mem_gb: 0.0,
+                },
+                ModelEntry {
+                    id: "shutdown-queued",
+                    repo: "owner/repo",
+                    revision: "pinned",
+                    filename: "shutdown-queued.gguf",
+                    sha256: "770e607624d689265ca6c44884d0807d9b054d23c473c106c72be9de08b7376c",
+                    size_bytes: 4,
+                    license: "apache-2.0",
+                    params: "tiny",
+                    quant: "Q4",
+                    min_free_mem_gb: 0.0,
+                },
+            ]
+            .into_boxed_slice(),
+        );
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (control, worker) = DownloadControl::spawn_with_control_state_components(
+            root.join("models"),
+            Arc::new(VerificationCache::default()),
+            recipes,
+            Box::new(ShutdownBlockingDownloader {
+                entered: entered_tx,
+            }),
+            fixture.handle.clone(),
+            false,
+        );
+        let durable = control.durable_execution().unwrap();
+        let running = durable.start_download(recipes[0].id, 4).await.unwrap();
+        entered_rx.recv().unwrap();
+        let queued = durable.start_download(recipes[1].id, 4).await.unwrap();
+        assert_eq!(
+            fixture
+                .handle
+                .read_snapshot()
+                .unwrap()
+                .operations
+                .iter()
+                .find(|operation| operation.operation_id == queued.operation_id)
+                .unwrap()
+                .status,
+            V2OperationStatus::Queued
+        );
+        fixture.handle.begin_stopping(12).await.unwrap();
+
+        std::thread::spawn(move || worker.stop_and_join())
+            .join()
+            .unwrap()
+            .unwrap();
+
+        let state = fixture.handle.read_snapshot().unwrap();
+        let running = state
+            .operations
+            .iter()
+            .find(|operation| operation.operation_id == running.operation_id)
+            .unwrap();
+        assert!(matches!(
+            running.status,
+            V2OperationStatus::Cancelled | V2OperationStatus::Failed
+        ));
+        let queued = state
+            .operations
+            .iter()
+            .find(|operation| operation.operation_id == queued.operation_id)
+            .unwrap();
+        assert_eq!(queued.status, V2OperationStatus::Failed);
+        assert_eq!(
+            queued.error.as_ref().map(|error| error.code),
+            Some(V2OperationErrorCode::DownloadFailed)
+        );
+        assert_eq!(
+            queued.error.as_ref().map(|error| error.message.as_str()),
+            Some("node is stopping")
+        );
+
         fixture.shutdown().await;
         let _ = std::fs::remove_dir_all(root);
     }
