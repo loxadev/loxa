@@ -9,8 +9,9 @@ use crate::lifecycle_controller::{
     LifecycleMailboxInner, LifecycleSubmitError, LIFECYCLE_NORMAL_CAPACITY,
 };
 use crate::model_lifecycle::{
-    EngineLifecycleDriver, ExactStopFailure, GatewayPublisher, LaunchPlan, LifecycleError,
-    LifecycleSignals, ModelLifecycle, SessionCorrelation, StableNodeOwner, StartedSession,
+    CandidateSlot, EngineLifecycleDriver, ExactStopFailure, GatewayPublisher, LaunchPlan,
+    LifecycleError, LifecycleSignals, ModelLifecycle, SessionCorrelation, StableNodeOwner,
+    StartedSession,
 };
 use crate::operation_cancellation::OperationCancellation;
 use crate::verification_scheduler::{
@@ -123,26 +124,32 @@ impl EngineLifecycleDriver for TestDriver {
         owner: &StableNodeOwner,
         plan: &LaunchPlan,
         generation: u64,
-    ) -> Result<StartedSession<Self::Session>, LifecycleError> {
+        candidate: &mut CandidateSlot<Self::Session>,
+    ) -> Result<(), LifecycleError> {
         self.events.lock().unwrap().push("start");
         self.live.fetch_add(1, Ordering::SeqCst);
-        Ok(StartedSession {
-            value: TestSession(Arc::clone(&self.live)),
-            correlation: SessionCorrelation {
-                generation,
-                child_pid: 42,
-                child_process_start_time_unix_s: 7,
-                server_id: "server".into(),
-                model_id: plan.model_id.clone(),
-                port: 9000,
-                committed_run_id: owner.run_id.clone(),
-                owner_pid: owner.pid,
-                owner_process_start_time_unix_s: owner.process_start_time_unix_s,
-                gateway_port: owner.gateway_port,
-                generation_alias: format!("loxa-{}-g{generation}", owner.run_id),
-                engine_version: "test".into(),
-            },
-        })
+        candidate
+            .install(StartedSession {
+                value: TestSession(Arc::clone(&self.live)),
+                correlation: SessionCorrelation {
+                    generation,
+                    child_pid: 42,
+                    child_process_start_time_unix_s: 7,
+                    server_id: "server".into(),
+                    model_id: plan.model_id.clone(),
+                    port: 9000,
+                    committed_run_id: owner.run_id.clone(),
+                    owner_pid: owner.pid,
+                    owner_process_start_time_unix_s: owner.process_start_time_unix_s,
+                    gateway_port: owner.gateway_port,
+                    generation_alias: format!("loxa-{}-g{generation}", owner.run_id),
+                    engine_version: "test".into(),
+                },
+            })
+            .map_err(|_| LifecycleError::RecoveryRequired {
+                replacement: "candidate slot occupied".into(),
+                rollback: "test driver retained ownership".into(),
+            })
     }
 
     fn wait_ready(
@@ -318,33 +325,39 @@ impl EngineLifecycleDriver for RollbackDriver {
         owner: &StableNodeOwner,
         plan: &LaunchPlan,
         generation: u64,
-    ) -> Result<StartedSession<Self::Session>, LifecycleError> {
+        candidate: &mut CandidateSlot<Self::Session>,
+    ) -> Result<(), LifecycleError> {
         self.starts += 1;
         self.events
             .lock()
             .unwrap()
             .push(format!("start:{}", plan.model_id));
         self.live.fetch_add(1, Ordering::SeqCst);
-        Ok(StartedSession {
-            value: RollbackSession {
-                model_id: plan.model_id.clone(),
-                live: Arc::clone(&self.live),
-            },
-            correlation: SessionCorrelation {
-                generation,
-                child_pid: 100 + generation as u32,
-                child_process_start_time_unix_s: 200 + generation,
-                server_id: format!("server-{generation}"),
-                model_id: plan.model_id.clone(),
-                port: 9000 + generation as u16,
-                committed_run_id: owner.run_id.clone(),
-                owner_pid: owner.pid,
-                owner_process_start_time_unix_s: owner.process_start_time_unix_s,
-                gateway_port: owner.gateway_port,
-                generation_alias: format!("loxa-{}-g{generation}", owner.run_id),
-                engine_version: "test".into(),
-            },
-        })
+        candidate
+            .install(StartedSession {
+                value: RollbackSession {
+                    model_id: plan.model_id.clone(),
+                    live: Arc::clone(&self.live),
+                },
+                correlation: SessionCorrelation {
+                    generation,
+                    child_pid: 100 + generation as u32,
+                    child_process_start_time_unix_s: 200 + generation,
+                    server_id: format!("server-{generation}"),
+                    model_id: plan.model_id.clone(),
+                    port: 9000 + generation as u16,
+                    committed_run_id: owner.run_id.clone(),
+                    owner_pid: owner.pid,
+                    owner_process_start_time_unix_s: owner.process_start_time_unix_s,
+                    gateway_port: owner.gateway_port,
+                    generation_alias: format!("loxa-{}-g{generation}", owner.run_id),
+                    engine_version: "test".into(),
+                },
+            })
+            .map_err(|_| LifecycleError::RecoveryRequired {
+                replacement: "candidate slot occupied".into(),
+                rollback: "test driver retained ownership".into(),
+            })
     }
 
     fn wait_ready(
@@ -743,6 +756,152 @@ impl LifecycleLoadWorkflow for RetainedReadyWorkflow {
     ) -> Result<LaunchPlan, LifecycleError> {
         unreachable!()
     }
+}
+
+#[derive(Clone, Copy)]
+enum CandidatePanicBoundary {
+    StartAfterOwnership,
+    WaitReady,
+    Cleanup,
+    GatewayPublish,
+}
+
+struct CandidatePanicDriver {
+    boundary: CandidatePanicBoundary,
+    live: Arc<AtomicUsize>,
+}
+
+impl EngineLifecycleDriver for CandidatePanicDriver {
+    type Session = TestSession;
+
+    fn start(
+        &mut self,
+        owner: &StableNodeOwner,
+        plan: &LaunchPlan,
+        generation: u64,
+        candidate: &mut CandidateSlot<Self::Session>,
+    ) -> Result<(), LifecycleError> {
+        self.live.fetch_add(1, Ordering::SeqCst);
+        candidate
+            .install(StartedSession {
+                value: TestSession(Arc::clone(&self.live)),
+                correlation: SessionCorrelation {
+                    generation,
+                    child_pid: 55,
+                    child_process_start_time_unix_s: 56,
+                    server_id: "candidate-server".into(),
+                    model_id: plan.model_id.clone(),
+                    port: 9055,
+                    committed_run_id: owner.run_id.clone(),
+                    owner_pid: owner.pid,
+                    owner_process_start_time_unix_s: owner.process_start_time_unix_s,
+                    gateway_port: owner.gateway_port,
+                    generation_alias: format!("loxa-{}-g{generation}", owner.run_id),
+                    engine_version: "test".into(),
+                },
+            })
+            .map_err(|_| LifecycleError::RecoveryRequired {
+                replacement: "candidate slot occupied".into(),
+                rollback: "test driver retained ownership".into(),
+            })?;
+        if matches!(self.boundary, CandidatePanicBoundary::StartAfterOwnership) {
+            panic!("injected start-after-ownership panic");
+        }
+        Ok(())
+    }
+
+    fn wait_ready(
+        &mut self,
+        _session: &mut StartedSession<Self::Session>,
+        _signals: LifecycleSignals<'_>,
+    ) -> Result<(), LifecycleError> {
+        match self.boundary {
+            CandidatePanicBoundary::WaitReady => panic!("injected wait-ready panic"),
+            CandidatePanicBoundary::Cleanup => Err(LifecycleError::ReadinessFailed(
+                "injected readiness failure".into(),
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    fn stop_exact<'a>(
+        &mut self,
+        _session: &'a mut StartedSession<Self::Session>,
+    ) -> Result<(), ExactStopFailure<'a, Self::Session>> {
+        if matches!(self.boundary, CandidatePanicBoundary::Cleanup) {
+            panic!("injected candidate-cleanup panic");
+        }
+        Ok(())
+    }
+}
+
+struct CandidatePanicGateway(CandidatePanicBoundary);
+
+impl GatewayPublisher for CandidatePanicGateway {
+    fn withdraw(&mut self) {}
+
+    fn publish(&mut self, _plan: &LaunchPlan, _session: &SessionCorrelation) {
+        if matches!(self.0, CandidatePanicBoundary::GatewayPublish) {
+            panic!("injected gateway-publication panic");
+        }
+    }
+}
+
+fn assert_candidate_panic_retains_owner(boundary: CandidatePanicBoundary) {
+    let live = Arc::new(AtomicUsize::new(0));
+    let lifecycle = ModelLifecycle::new(
+        StableNodeOwner {
+            run_id: "candidate-panic-owner".into(),
+            pid: 61,
+            process_start_time_unix_s: 62,
+            gateway_port: 8061,
+        },
+        CandidatePanicDriver {
+            boundary,
+            live: Arc::clone(&live),
+        },
+        CandidatePanicGateway(boundary),
+    );
+    let (handle, owner) = LifecycleControllerOwner::start_with_workflow(
+        lifecycle,
+        RetainedReadyWorkflow(Arc::new(AtomicUsize::new(0))),
+    )
+    .unwrap();
+    handle
+        .reserve_normal()
+        .unwrap()
+        .submit(load(OperationId::new_v4(), "model", 1))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !handle.is_sealed_for_test() && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let failure = owner
+        .shutdown(Instant::now() + Duration::from_secs(1))
+        .expect_err("candidate panic must retain fatal owner");
+    assert_eq!(live.load(Ordering::SeqCst), 1);
+    failure.into_owner().dispose_fatal_for_test();
+    assert_eq!(live.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn start_after_ownership_panic_retains_candidate_until_fatal_disposal() {
+    assert_candidate_panic_retains_owner(CandidatePanicBoundary::StartAfterOwnership);
+}
+
+#[test]
+fn wait_ready_panic_retains_candidate_until_fatal_disposal() {
+    assert_candidate_panic_retains_owner(CandidatePanicBoundary::WaitReady);
+}
+
+#[test]
+fn candidate_cleanup_panic_retains_candidate_until_fatal_disposal() {
+    assert_candidate_panic_retains_owner(CandidatePanicBoundary::Cleanup);
+}
+
+#[test]
+fn gateway_publication_panic_retains_candidate_until_fatal_disposal() {
+    assert_candidate_panic_retains_owner(CandidatePanicBoundary::GatewayPublish);
 }
 
 #[test]

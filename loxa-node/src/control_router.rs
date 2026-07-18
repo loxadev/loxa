@@ -641,10 +641,8 @@ mod tests {
             _: &crate::model_lifecycle::StableNodeOwner,
             _: &crate::model_lifecycle::LaunchPlan,
             _: u64,
-        ) -> Result<
-            crate::model_lifecycle::StartedSession<()>,
-            crate::model_lifecycle::LifecycleError,
-        > {
+            _: &mut crate::model_lifecycle::CandidateSlot<()>,
+        ) -> Result<(), crate::model_lifecycle::LifecycleError> {
             panic!("unload does not spawn")
         }
         fn wait_ready(
