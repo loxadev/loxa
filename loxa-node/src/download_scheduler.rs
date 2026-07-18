@@ -3,7 +3,7 @@ use crate::artifact_coordinator::{
 };
 use crate::operation_cancellation::OperationCancellation;
 use loxa_protocol::v2::{DecimalU64, OperationId};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
@@ -276,6 +276,13 @@ impl DownloadWorkerPermit {
 
 impl Drop for DownloadWorkerPermit {
     fn drop(&mut self) {
+        if !self.released && thread::panicking() {
+            if let Some(owner) = self.owner.upgrade() {
+                owner.seal();
+                self.released = true;
+                return;
+            }
+        }
         self.release_inner();
     }
 }
@@ -392,6 +399,16 @@ impl DownloadAdmissionReservation {
                 admission_revision,
             },
         );
+        if !state.transferring.insert(operation_id) {
+            state
+                .reservations
+                .insert(self.key.clone(), ReservationEntry::Poisoned);
+            state.sealed = true;
+            self.state = ReservationState::Poisoned;
+            drop(state);
+            owner.seal();
+            return Err(DownloadBindError::Poisoned);
+        }
         self.state = ReservationState::Bound;
         let stopping = state.stopping;
         drop(state);
@@ -498,6 +515,8 @@ impl DownloadShared {
                 reservations: HashMap::new(),
                 ready: BTreeMap::new(),
                 executing: HashMap::new(),
+                transferring: HashSet::new(),
+                workers: [None; DOWNLOAD_WORKERS],
                 next_ticket: 1,
                 stopping: false,
                 sealed: false,
@@ -516,8 +535,51 @@ impl DownloadShared {
         self.changed.notify_all();
     }
 
-    fn release_worker(&self, _worker_index: usize) {
-        self.notify_changed();
+    fn release_worker(&self, worker_index: usize) {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                let mut state = poisoned.into_inner();
+                state.sealed = true;
+                drop(state);
+                self.seal();
+                return;
+            }
+        };
+        if state.sealed {
+            drop(state);
+            self.seal();
+            return;
+        }
+        let Some(operation_id) = state.workers.get(worker_index).copied().flatten() else {
+            state.sealed = true;
+            drop(state);
+            self.seal();
+            return;
+        };
+        if !state.executing.contains_key(&operation_id)
+            || !state.transferring.contains(&operation_id)
+        {
+            state.sealed = true;
+            drop(state);
+            self.seal();
+            return;
+        }
+
+        state.workers[worker_index] = None;
+        let cancellation = state.executing.remove(&operation_id);
+        let transfer_removed = state.transferring.remove(&operation_id);
+        let valid = cancellation.is_some() && transfer_removed;
+        if !valid {
+            state.sealed = true;
+        }
+        drop(state);
+        drop(cancellation);
+        if valid {
+            self.notify_changed();
+        } else {
+            self.seal();
+        }
     }
 
     fn stop(&self) {
@@ -556,9 +618,21 @@ struct DownloadState {
     reservations: HashMap<DownloadKey, ReservationEntry>,
     ready: BTreeMap<(DecimalU64, OperationId), BoundDownload>,
     executing: HashMap<OperationId, OperationCancellation>,
+    transferring: HashSet<OperationId>,
+    workers: [Option<OperationId>; DOWNLOAD_WORKERS],
     next_ticket: u64,
     stopping: bool,
     sealed: bool,
+}
+
+impl DownloadState {
+    fn transfer_population(&self) -> usize {
+        self.reservations
+            .values()
+            .filter(|entry| matches!(entry, ReservationEntry::Pending { .. }))
+            .count()
+            + self.transferring.len()
+    }
 }
 
 enum ReservationEntry {
@@ -691,7 +765,7 @@ impl DownloadSchedulerHandle {
             }
             None => {}
         }
-        if state.reservations.len() >= DOWNLOAD_WORKERS + DOWNLOAD_WAITING {
+        if state.transfer_population() >= DOWNLOAD_WORKERS + DOWNLOAD_WAITING {
             return DownloadReserveOutcome::CapacityConflict;
         }
         let ticket = state.next_ticket;
@@ -738,6 +812,7 @@ impl DownloadSchedulerHandle {
                 && *admission_revision == bound.admission_revision
         );
         if !matches_active
+            || !state.transferring.contains(&bound.operation_id)
             || state
                 .ready
                 .contains_key(&(bound.admission_revision, bound.operation_id))
@@ -799,7 +874,6 @@ impl DownloadSchedulerHandle {
         let Some(ready_key) = ready_key else {
             return false;
         };
-        let bound = state.ready.remove(&ready_key);
         let reservation_key = state.reservations.iter().find_map(|(key, entry)| {
             matches!(
                 entry,
@@ -810,15 +884,29 @@ impl DownloadSchedulerHandle {
             )
             .then(|| key.clone())
         });
+        if reservation_key.is_none() || !state.transferring.contains(&operation_id) {
+            state.sealed = true;
+            drop(state);
+            self.shared.seal();
+            return false;
+        }
+        let bound = state.ready.remove(&ready_key);
         let reservation = reservation_key
             .as_ref()
             .and_then(|key| state.reservations.remove_entry(key));
+        let transfer_removed = state.transferring.remove(&operation_id);
         drop(state);
         let Some(bound) = bound else {
             drop(reservation);
             self.shared.seal();
             return false;
         };
+        if !transfer_removed {
+            drop(bound);
+            drop(reservation);
+            self.shared.seal();
+            return false;
+        }
         let _ = bound.cancellation.request_cancel();
         drop(bound);
         drop(reservation);
@@ -842,6 +930,7 @@ impl DownloadSchedulerHandle {
                 .ready
                 .values()
                 .any(|bound| bound.operation_id == operation_id)
+            || state.workers.contains(&Some(operation_id))
         {
             return false;
         }
@@ -855,11 +944,21 @@ impl DownloadSchedulerHandle {
             )
             .then(|| key.clone())
         });
-        let removed = reservation_key
-            .as_ref()
-            .and_then(|key| state.reservations.remove_entry(key));
+        let Some(reservation_key) = reservation_key else {
+            let inconsistent = state.transferring.contains(&operation_id);
+            if inconsistent {
+                state.sealed = true;
+            }
+            drop(state);
+            if inconsistent {
+                self.shared.seal();
+            }
+            return false;
+        };
+        let removed = state.reservations.remove_entry(&reservation_key);
+        let transfer_removed = state.transferring.remove(&operation_id);
         drop(state);
-        let changed = removed.is_some();
+        let changed = removed.is_some() || transfer_removed;
         drop(removed);
         if changed {
             self.shared.notify_changed();
@@ -1021,13 +1120,18 @@ fn download_worker_loop(
             if state.stopping || state.sealed {
                 return;
             }
-            let (_, bound) = state.ready.pop_first().expect("ready work exists");
-            if state.executing.contains_key(&bound.operation_id) {
+            let (ready_key, bound) = state.ready.pop_first().expect("ready work exists");
+            let invalid = state.executing.contains_key(&bound.operation_id)
+                || !state.transferring.contains(&bound.operation_id)
+                || state.workers.get(worker_index).is_none_or(Option::is_some);
+            if invalid {
+                state.ready.insert(ready_key, bound);
                 state.sealed = true;
                 drop(state);
                 shared.seal();
-                panic!("duplicate executing download operation");
+                panic!("invalid download worker ownership");
             }
+            state.workers[worker_index] = Some(bound.operation_id);
             state
                 .executing
                 .insert(bound.operation_id, bound.cancellation.clone());
@@ -1046,16 +1150,23 @@ fn download_worker_loop(
                 panic!("download scheduler state poisoned");
             }
         };
-        let cancellation = state.executing.remove(&operation_id);
-        let missing = cancellation.is_none();
-        if missing {
+        if state.sealed {
+            return;
+        }
+        let cleaned = state.workers.get(worker_index).is_some_and(Option::is_none)
+            && state
+                .workers
+                .iter()
+                .all(|current| *current != Some(operation_id))
+            && !state.executing.contains_key(&operation_id)
+            && !state.transferring.contains(&operation_id);
+        if !cleaned {
             state.sealed = true;
         }
         drop(state);
-        drop(cancellation);
-        shared.notify_changed();
-        if missing {
-            panic!("download worker ownership disappeared");
+        if !cleaned {
+            shared.seal();
+            panic!("download permit did not release worker ownership");
         }
     }
 }
@@ -1088,6 +1199,8 @@ fn reservation_with_notification_probe_for_test(
             reservations: HashMap::from([(key.clone(), ReservationEntry::Pending { ticket: 1 })]),
             ready: BTreeMap::new(),
             executing: HashMap::new(),
+            transferring: HashSet::new(),
+            workers: [None; DOWNLOAD_WORKERS],
             next_ticket: 2,
             stopping: false,
             sealed: false,
@@ -1209,6 +1322,10 @@ mod tests {
                 changed.notify_all();
             }
         }
+
+        fn reset_release_all(&self) {
+            self.release_all.store(false, Ordering::SeqCst);
+        }
     }
 
     impl DownloadExecutor for GateExecutor {
@@ -1238,6 +1355,37 @@ mod tests {
         fn execute(&self, _: BoundDownload, _: DownloadWorkerPermit) {
             self.0.send(()).unwrap();
             panic!("injected download executor panic");
+        }
+    }
+
+    struct HandoffExecutor {
+        started: mpsc::Sender<OperationId>,
+        accept: Mutex<mpsc::Receiver<()>>,
+        permit_released: mpsc::Sender<()>,
+        return_worker: Mutex<mpsc::Receiver<()>>,
+        returned: mpsc::Sender<()>,
+    }
+
+    impl DownloadExecutor for HandoffExecutor {
+        fn execute(&self, bound: BoundDownload, permit: DownloadWorkerPermit) {
+            self.started.send(bound.operation_id()).unwrap();
+            self.accept.lock().unwrap().recv().unwrap();
+            drop(permit);
+            self.permit_released.send(()).unwrap();
+            self.return_worker.lock().unwrap().recv().unwrap();
+            self.returned.send(()).unwrap();
+        }
+    }
+
+    struct RetainPermitExecutor {
+        started: mpsc::Sender<()>,
+        permit: Mutex<Option<DownloadWorkerPermit>>,
+    }
+
+    impl DownloadExecutor for RetainPermitExecutor {
+        fn execute(&self, _: BoundDownload, permit: DownloadWorkerPermit) {
+            *self.permit.lock().unwrap() = Some(permit);
+            self.started.send(()).unwrap();
         }
     }
 
@@ -1314,6 +1462,24 @@ mod tests {
         }
     }
 
+    fn wait_until_transfers_idle(handle: &DownloadSchedulerHandle) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut state = handle.shared.state.lock().unwrap();
+        while !state.ready.is_empty() || !state.executing.is_empty() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "download transfers did not become idle"
+            );
+            state = handle
+                .shared
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap()
+                .0;
+        }
+    }
+
     #[test]
     fn capacity_is_exactly_two_executing_plus_eight_waiting_unique_keys() {
         let (started_tx, started_rx) = mpsc::channel();
@@ -1344,6 +1510,60 @@ mod tests {
         assert!(cancellations
             .iter()
             .all(OperationCancellation::is_cancel_requested));
+        executor.release_all();
+        shutdown(owner);
+    }
+
+    #[test]
+    fn verification_owned_active_entries_do_not_consume_transfer_capacity() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let executor = Arc::new(GateExecutor::new(started_tx));
+        let (handle, owner) = DownloadSchedulerOwner::spawn(executor.clone()).unwrap();
+        let first_key = key(200);
+        let first_operation = operation(200);
+
+        for sequence in 200..210 {
+            let download_key = if sequence == 200 {
+                first_key.clone()
+            } else {
+                key(sequence)
+            };
+            bind_submit(
+                &handle,
+                reserve(&handle, download_key),
+                operation(sequence),
+                sequence,
+            );
+        }
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        executor.release_all();
+        wait_until_transfers_idle(&handle);
+        executor.reset_release_all();
+
+        assert!(matches!(
+            handle.reserve(first_key),
+            DownloadReserveOutcome::Active {
+                operation_id,
+                admission_revision,
+            } if operation_id == first_operation && admission_revision == DecimalU64::new(200)
+        ));
+        for sequence in 300..310 {
+            bind_submit(
+                &handle,
+                reserve(&handle, key(sequence)),
+                operation(sequence),
+                sequence,
+            );
+        }
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            handle.reserve(key(311)),
+            DownloadReserveOutcome::CapacityConflict
+        ));
+
+        handle.stop();
         executor.release_all();
         shutdown(owner);
     }
@@ -1540,6 +1760,131 @@ mod tests {
     }
 
     #[test]
+    fn permit_release_linearizes_immediate_terminal_finish_before_worker_return() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (accept_tx, accept_rx) = mpsc::channel();
+        let (permit_released_tx, permit_released_rx) = mpsc::channel();
+        let (return_worker_tx, return_worker_rx) = mpsc::channel();
+        let (returned_tx, returned_rx) = mpsc::channel();
+        let executor = Arc::new(HandoffExecutor {
+            started: started_tx,
+            accept: Mutex::new(accept_rx),
+            permit_released: permit_released_tx,
+            return_worker: Mutex::new(return_worker_rx),
+            returned: returned_tx,
+        });
+        let (handle, owner) = DownloadSchedulerOwner::spawn(executor).unwrap();
+        let operation_id = operation(46);
+        bind_submit(&handle, reserve(&handle, key(46)), operation_id, 46);
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            operation_id
+        );
+
+        accept_tx.send(()).unwrap();
+        permit_released_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let first_finish = handle.finish_committed(operation_id);
+        let second_finish = handle.finish_committed(operation_id);
+        return_worker_tx.send(()).unwrap();
+        returned_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        handle.stop();
+        shutdown(owner);
+
+        assert!(
+            first_finish,
+            "permit release must make terminal finish immediate"
+        );
+        assert!(!second_finish, "terminal ownership releases exactly once");
+    }
+
+    #[test]
+    fn mismatched_permit_release_seals_and_retains_transfer_ownership() {
+        let shared = Arc::new(DownloadShared::new());
+        let operation_id = operation(47);
+        let download_key = key(47);
+        let cancellation = OperationCancellation::new();
+        {
+            let mut state = shared.state.lock().unwrap();
+            state.reservations.insert(
+                download_key.clone(),
+                ReservationEntry::Active {
+                    operation_id,
+                    admission_revision: DecimalU64::new(47),
+                },
+            );
+            state.transferring.insert(operation_id);
+            state.executing.insert(operation_id, cancellation);
+            state.workers[0] = Some(operation_id);
+        }
+
+        DownloadWorkerPermit::new(&shared, 1).release();
+
+        let state = shared.state.lock().unwrap();
+        assert!(state.sealed);
+        assert_eq!(state.workers[0], Some(operation_id));
+        assert!(state.executing.contains_key(&operation_id));
+        assert!(state.transferring.contains(&operation_id));
+        assert!(matches!(
+            state.reservations.get(&download_key),
+            Some(ReservationEntry::Active {
+                operation_id: active,
+                admission_revision,
+            }) if *active == operation_id && *admission_revision == DecimalU64::new(47)
+        ));
+    }
+
+    #[test]
+    fn worker_return_without_permit_release_panics_seals_and_retains() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let executor = Arc::new(RetainPermitExecutor {
+            started: started_tx,
+            permit: Mutex::new(None),
+        });
+        let (handle, owner) = DownloadSchedulerOwner::spawn(executor.clone()).unwrap();
+        let operation_id = operation(48);
+        let download_key = key(48);
+        bind_submit(
+            &handle,
+            reserve(&handle, download_key.clone()),
+            operation_id,
+            48,
+        );
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut state = handle.shared.state.lock().unwrap();
+        while !state.sealed {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "worker mismatch did not seal scheduler"
+            );
+            state = handle
+                .shared
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap()
+                .0;
+        }
+        assert_eq!(
+            state.workers.iter().flatten().copied().next(),
+            Some(operation_id)
+        );
+        assert!(state.executing.contains_key(&operation_id));
+        assert!(state.transferring.contains(&operation_id));
+        assert!(state.reservations.contains_key(&download_key));
+        drop(state);
+        drop(executor.permit.lock().unwrap().take());
+
+        let failure = owner
+            .shutdown(Instant::now() + Duration::from_secs(2))
+            .expect_err("worker ownership mismatch must be reported");
+        assert_eq!(failure.reason(), DownloadShutdownReason::WorkerPanicked);
+    }
+
+    #[test]
     fn stop_rejects_new_reservations_and_bound_submission() {
         let (started_tx, _started_rx) = mpsc::channel();
         let executor = Arc::new(GateExecutor::new(started_tx));
@@ -1658,7 +2003,14 @@ mod tests {
         let (started_tx, started_rx) = mpsc::channel();
         let (handle, owner) =
             DownloadSchedulerOwner::spawn(Arc::new(PanicExecutor(started_tx))).unwrap();
-        bind_submit(&handle, reserve(&handle, key(70)), operation(70), 70);
+        let download_key = key(70);
+        let operation_id = operation(70);
+        bind_submit(
+            &handle,
+            reserve(&handle, download_key.clone()),
+            operation_id,
+            70,
+        );
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(1);
@@ -1673,6 +2025,16 @@ mod tests {
                 .unwrap()
                 .0;
         }
+        assert!(matches!(
+            state.reservations.get(&download_key),
+            Some(ReservationEntry::Active {
+                operation_id: active,
+                admission_revision,
+            }) if *active == operation_id && *admission_revision == DecimalU64::new(70)
+        ));
+        assert!(state.workers.contains(&Some(operation_id)));
+        assert!(state.executing.contains_key(&operation_id));
+        assert!(state.transferring.contains(&operation_id));
         drop(state);
         assert!(matches!(
             handle.reserve(key(71)),
