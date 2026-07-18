@@ -170,11 +170,14 @@ pub(crate) struct RetainedCompletion<T> {
 
 impl<T> RetainedCompletion<T> {
     pub(crate) fn lock_ready(&self) -> Option<ReadyCompletionGuard<'_, T>> {
-        let state = self
-            .cell
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = match self.cell.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                let mut state = poisoned.into_inner();
+                poison_ready_state(&mut state);
+                return None;
+            }
+        };
         if matches!(&*state, CompletionTransferState::Ready(_)) {
             Some(ReadyCompletionGuard { state: Some(state) })
         } else {
@@ -185,11 +188,14 @@ impl<T> RetainedCompletion<T> {
     #[cfg(test)]
     pub(crate) fn dispose_poisoned_for_test(self) {
         let outcome = {
-            let mut state = self
-                .cell
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut state = match self.cell.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => {
+                    let mut state = poisoned.into_inner();
+                    poison_ready_state(&mut state);
+                    state
+                }
+            };
             let previous = std::mem::replace(&mut *state, CompletionTransferState::Acknowledged);
             if let CompletionTransferState::Poisoned(outcome) = previous {
                 Some(ManuallyDrop::into_inner(outcome))
@@ -346,10 +352,14 @@ fn publish_completion<T, D>(
     notify: impl FnOnce(&D) -> bool,
 ) -> Result<(), RetainedCompletion<T>> {
     {
-        let mut state = cell
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = match cell.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                let mut state = poisoned.into_inner();
+                poison_ready_state(&mut state);
+                return Err(poisoned_completion(outcome));
+            }
+        };
         if !matches!(&*state, CompletionTransferState::Reserved) {
             return Err(poisoned_completion(outcome));
         }
@@ -373,10 +383,18 @@ fn poisoned_completion<T>(outcome: T) -> RetainedCompletion<T> {
 }
 
 fn poison_ready_cell<T>(cell: &Arc<RetainedCompletionCell<T>>) {
-    let mut state = cell
-        .state
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut state = match cell.state.lock() {
+        Ok(state) => state,
+        Err(poisoned) => {
+            let mut state = poisoned.into_inner();
+            poison_ready_state(&mut state);
+            return;
+        }
+    };
+    poison_ready_state(&mut state);
+}
+
+fn poison_ready_state<T>(state: &mut CompletionTransferState<T>) {
     let previous = std::mem::replace(&mut *state, CompletionTransferState::Acknowledged);
     if let CompletionTransferState::Ready(outcome) = previous {
         *state = CompletionTransferState::Poisoned(outcome);
@@ -402,14 +420,13 @@ impl<T> CompletionDestination<T> {
 
     fn reserve(&self) -> Option<Arc<RetainedCompletionCell<T>>> {
         let mut cells = self.cells.lock().ok()?;
-        cells.retain(|cell| {
-            !matches!(
-                &*cell
-                    .state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
-                CompletionTransferState::Acknowledged
-            )
+        cells.retain(|cell| match cell.state.lock() {
+            Ok(state) => !matches!(&*state, CompletionTransferState::Acknowledged),
+            Err(poisoned) => {
+                let mut state = poisoned.into_inner();
+                poison_ready_state(&mut state);
+                true
+            }
         });
         if cells.len() >= self.capacity {
             return None;
@@ -447,13 +464,14 @@ impl<T> CompletionDestination<T> {
     fn ready(&self) -> Option<RetainedCompletion<T>> {
         let cells = self.cells.lock().ok()?;
         cells.iter().find_map(|cell| {
-            let ready = matches!(
-                &*cell
-                    .state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
-                CompletionTransferState::Ready(_)
-            );
+            let ready = match cell.state.lock() {
+                Ok(state) => matches!(&*state, CompletionTransferState::Ready(_)),
+                Err(poisoned) => {
+                    let mut state = poisoned.into_inner();
+                    poison_ready_state(&mut state);
+                    false
+                }
+            };
             ready.then(|| RetainedCompletion { cell: cell.clone() })
         })
     }
@@ -632,6 +650,8 @@ struct VerificationShared {
     changed: Condvar,
     #[cfg(test)]
     worker_hook: Option<VerificationWorkerHook>,
+    #[cfg(test)]
+    finish_hook: Option<VerificationWorkerHook>,
 }
 
 #[cfg(test)]
@@ -962,8 +982,14 @@ impl VerificationState {
         }
     }
 
-    fn key_is_known(&self, key: &VerificationKey) -> bool {
-        self.jobs.contains_key(key) || self.reservations.keys().any(|(known, _)| known == key)
+    fn key_has_owner(&self, key: &VerificationKey, class: VerificationClass) -> bool {
+        self.reservations
+            .get(&(key.clone(), class))
+            .is_some_and(|count| *count > 0)
+            || self
+                .bound
+                .values()
+                .any(|(known, bound)| known == key && bound.class() == class)
     }
 
     fn unique_download_keys(&self) -> usize {
@@ -995,19 +1021,18 @@ impl VerificationState {
     }
 
     fn download_key_capacity(&self) -> usize {
-        let running_lifecycle_only = self
-            .jobs
-            .values()
-            .filter(|job| {
-                job.state == VerificationJobState::Running
-                    && !job.waiter_ids.iter().any(|waiter_id| {
-                        self.bound
-                            .get(waiter_id)
-                            .is_some_and(|(_, bound)| bound.class() == VerificationClass::Download)
-                    })
+        let lifecycle_only_keys = self
+            .reservations
+            .keys()
+            .map(|(key, _)| key)
+            .chain(self.bound.values().map(|(key, _)| key))
+            .filter(|key| {
+                self.key_has_owner(key, VerificationClass::Lifecycle)
+                    && !self.key_has_owner(key, VerificationClass::Download)
             })
-            .count();
-        VERIFICATION_WORKERS + VERIFICATION_DOWNLOAD_WAITING - running_lifecycle_only
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        VERIFICATION_WORKERS + VERIFICATION_DOWNLOAD_WAITING - lifecycle_only_keys
     }
 }
 
@@ -1168,14 +1193,14 @@ impl VerificationSchedulerHandle {
         {
             return VerificationReserveOutcome::Backpressure;
         }
-        let known_key = state.key_is_known(&key);
+        let has_download_owner = state.key_has_owner(&key, VerificationClass::Download);
         if class == VerificationClass::Lifecycle
             && state.lifecycle_owners() >= VERIFICATION_LIFECYCLE_WAITING
         {
             return VerificationReserveOutcome::Backpressure;
         }
         if class == VerificationClass::Download
-            && !known_key
+            && !has_download_owner
             && state.unique_download_keys() >= state.download_key_capacity()
         {
             return VerificationReserveOutcome::Backpressure;
@@ -1290,6 +1315,8 @@ impl VerificationSchedulerOwner {
         Self::start_inner(
             #[cfg(test)]
             None,
+            #[cfg(test)]
+            None,
         )
     }
 
@@ -1297,11 +1324,21 @@ impl VerificationSchedulerOwner {
     fn start_with_worker_hook_for_test(
         hook: impl Fn(&VerificationKey) + Send + Sync + 'static,
     ) -> (VerificationSchedulerHandle, VerificationSchedulerOwner) {
-        Self::start_inner(Some(Arc::new(hook))).expect("verification test workers start")
+        Self::start_inner(Some(Arc::new(hook)), None).expect("verification test workers start")
+    }
+
+    #[cfg(test)]
+    fn start_with_worker_and_finish_hooks_for_test(
+        worker_hook: impl Fn(&VerificationKey) + Send + Sync + 'static,
+        finish_hook: impl Fn(&VerificationKey) + Send + Sync + 'static,
+    ) -> (VerificationSchedulerHandle, VerificationSchedulerOwner) {
+        Self::start_inner(Some(Arc::new(worker_hook)), Some(Arc::new(finish_hook)))
+            .expect("verification test workers start")
     }
 
     fn start_inner(
         #[cfg(test)] worker_hook: Option<VerificationWorkerHook>,
+        #[cfg(test)] finish_hook: Option<VerificationWorkerHook>,
     ) -> std::io::Result<(VerificationSchedulerHandle, VerificationSchedulerOwner)> {
         let shared = Arc::new(VerificationShared {
             state: Mutex::new(VerificationState {
@@ -1316,6 +1353,8 @@ impl VerificationSchedulerOwner {
             changed: Condvar::new(),
             #[cfg(test)]
             worker_hook,
+            #[cfg(test)]
+            finish_hook,
         });
         let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(VERIFICATION_WORKERS);
         let mut completions = Vec::with_capacity(VERIFICATION_WORKERS);
@@ -1423,12 +1462,8 @@ impl VerificationSchedulerOwner {
 
 impl Drop for VerificationSchedulerOwner {
     fn drop(&mut self) {
-        self.shared.stop();
-        for completion in self.completions.drain(..) {
-            let _ = completion.recv();
-        }
-        for handle in self.handles.drain(..) {
-            let _ = handle.join();
+        if !self.handles.is_empty() || !self.completions.is_empty() {
+            std::process::abort();
         }
         let retain = match self.shared.state.lock() {
             Ok(state) => state.sealed || !state.bound.is_empty() || !state.retained.is_empty(),
@@ -1480,11 +1515,15 @@ fn dispose_retained_for_test(retained: Vec<RetainedVerificationCompletion>) {
 }
 
 fn verification_worker_loop(shared: &Arc<VerificationShared>) -> bool {
+    let mut claimed = None;
     loop {
-        let work = match take_next_work(shared) {
-            Ok(Some(work)) => work,
-            Ok(None) => return true,
-            Err(()) => return false,
+        let work = match claimed.take() {
+            Some(work) => work,
+            None => match take_next_work(shared) {
+                Ok(Some(work)) => work,
+                Ok(None) => return true,
+                Err(()) => return false,
+            },
         };
         #[cfg(test)]
         if let Some(hook) = &shared.worker_hook {
@@ -1492,8 +1531,13 @@ fn verification_worker_loop(shared: &Arc<VerificationShared>) -> bool {
         }
         let result =
             VerificationResult::from(verify_opened_artifact(work.input, &work.cancellation));
-        if !finish_work(shared, &work.key, result) {
-            return false;
+        claimed = match finish_work(shared, &work.key, result) {
+            Ok(next) => next,
+            Err(()) => return false,
+        };
+        #[cfg(test)]
+        if let Some(hook) = &shared.finish_hook {
+            hook(&work.key);
         }
     }
 }
@@ -1512,26 +1556,10 @@ fn take_next_work(shared: &VerificationShared) -> Result<Option<VerificationWork
         }
     };
     loop {
-        if let Some((key, waiter_id)) = state.next_queued_job() {
-            let input = state
-                .bound
-                .get_mut(&waiter_id)
-                .and_then(|(_, bound)| bound.take_input());
-            let Some(input) = input else {
-                state.sealed = true;
-                state.stopping = true;
-                for job in state.jobs.values() {
-                    job.cancellation.cancel();
-                }
-                return Err(());
-            };
-            let job = state.jobs.get_mut(&key).expect("queued job exists");
-            job.state = VerificationJobState::Running;
-            return Ok(Some(VerificationWork {
-                key,
-                input,
-                cancellation: job.cancellation.clone(),
-            }));
+        match state.claim_next_work() {
+            Ok(Some(work)) => return Ok(Some(work)),
+            Ok(None) => {}
+            Err(()) => return Err(()),
         }
         if state.stopping {
             return Ok(None);
@@ -1555,8 +1583,8 @@ fn finish_work(
     shared: &VerificationShared,
     key: &VerificationKey,
     result: VerificationResult,
-) -> bool {
-    let completed = {
+) -> Result<Option<VerificationWork>, ()> {
+    let (completed, claimed) = {
         let mut state = match shared.state.lock() {
             Ok(state) => state,
             Err(poisoned) => {
@@ -1566,11 +1594,11 @@ fn finish_work(
                 for job in state.jobs.values() {
                     job.cancellation.cancel();
                 }
-                return false;
+                return Err(());
             }
         };
         let Some(job) = state.jobs.remove(key) else {
-            return true;
+            return Ok(None);
         };
         let mut completed = Vec::with_capacity(job.waiter_ids.len());
         for waiter_id in job.waiter_ids {
@@ -1582,7 +1610,8 @@ fn finish_work(
                 }
             }
         }
-        completed
+        let claimed = state.claim_next_work();
+        (completed, claimed)
     };
     shared.changed.notify_all();
 
@@ -1622,10 +1651,35 @@ fn finish_work(
         }
     }
     shared.retain_completions(retained);
-    true
+    claimed
 }
 
 impl VerificationState {
+    fn claim_next_work(&mut self) -> Result<Option<VerificationWork>, ()> {
+        let Some((key, waiter_id)) = self.next_queued_job() else {
+            return Ok(None);
+        };
+        let input = self
+            .bound
+            .get_mut(&waiter_id)
+            .and_then(|(_, bound)| bound.take_input());
+        let Some(input) = input else {
+            self.sealed = true;
+            self.stopping = true;
+            for job in self.jobs.values() {
+                job.cancellation.cancel();
+            }
+            return Err(());
+        };
+        let job = self.jobs.get_mut(&key).expect("queued job exists");
+        job.state = VerificationJobState::Running;
+        Ok(Some(VerificationWork {
+            key,
+            input,
+            cancellation: job.cancellation.clone(),
+        }))
+    }
+
     fn next_queued_job(&self) -> Option<(VerificationKey, u64)> {
         self.jobs
             .iter()
@@ -1702,6 +1756,7 @@ mod lock_order_tests {
             }),
             changed: Condvar::new(),
             worker_hook: None,
+            finish_hook: None,
         })
     }
 
@@ -2101,6 +2156,147 @@ mod tests {
     }
 
     #[test]
+    fn pending_lifecycle_reservation_holds_general_capacity_before_bind() {
+        let dir = TestDir::new("pending-lifecycle-capacity");
+        let (handle, owner) = VerificationSchedulerOwner::start().unwrap();
+        let lifecycle_path = dir.file("lifecycle.gguf", b"lifecycle");
+        let (lifecycle_key, _) = input(&lifecycle_path, [1; 32]);
+        let lifecycle = match handle.reserve(lifecycle_key, VerificationClass::Lifecycle) {
+            VerificationReserveOutcome::Reserved(reservation) => reservation,
+            _ => panic!("lifecycle reservation rejected"),
+        };
+
+        let mut downloads = Vec::new();
+        for index in 0..(VERIFICATION_WORKERS + VERIFICATION_DOWNLOAD_WAITING - 1) {
+            let path = dir.file(&format!("download-{index}.gguf"), b"download");
+            let (key, _) = input(&path, [index as u8 + 2; 32]);
+            downloads.push(match handle.reserve(key, VerificationClass::Download) {
+                VerificationReserveOutcome::Reserved(reservation) => reservation,
+                _ => panic!("download reservation {index} rejected"),
+            });
+        }
+        let extra = dir.file("extra.gguf", b"extra");
+        let (extra_key, _) = input(&extra, [99; 32]);
+        assert!(matches!(
+            handle.reserve(extra_key, VerificationClass::Download),
+            VerificationReserveOutcome::Backpressure
+        ));
+
+        drop(downloads);
+        drop(lifecycle);
+        assert!(shutdown(owner).is_ok());
+    }
+
+    #[test]
+    fn download_attaching_to_lifecycle_key_obeys_capacity_and_survives_lifecycle_cancel() {
+        let dir = TestDir::new("mixed-key-capacity");
+        let gate = Arc::new(WorkerGate::default());
+        let (handle, owner) = VerificationSchedulerOwner::start_with_worker_hook_for_test({
+            let gate = gate.clone();
+            move |key| gate.enter(key)
+        });
+        let path = dir.file("mixed.gguf", b"mixed");
+        let (mixed_key, mut lifecycle) = submit_lifecycle(&handle, &path, [1; 32], 1);
+        gate.wait_started(1);
+
+        let mut downloads = Vec::new();
+        for index in 0..(VERIFICATION_WORKERS + VERIFICATION_DOWNLOAD_WAITING - 1) {
+            downloads.push(
+                submit_download(
+                    &handle,
+                    &dir.file(&format!("download-{index}.gguf"), b"download"),
+                    [index as u8 + 2; 32],
+                    index as u64 + 2,
+                )
+                .1,
+            );
+            if index == 0 {
+                gate.wait_started(2);
+            }
+        }
+        let attachment_was_backpressured = matches!(
+            handle.reserve(mixed_key.clone(), VerificationClass::Download),
+            VerificationReserveOutcome::Backpressure
+        );
+
+        drop(downloads.last_mut().unwrap().waiter.take());
+        let mixed_download = submit_download(&handle, &path, [1; 32], 100).1;
+        drop(lifecycle.waiter.take());
+        assert_eq!(handle.waiters_for_key_for_test(&mixed_key), 1);
+
+        let replacement = submit_download(
+            &handle,
+            &dir.file("replacement.gguf", b"replacement"),
+            [90; 32],
+            101,
+        )
+        .1;
+        let extra = dir.file("extra.gguf", b"extra");
+        let (extra_key, _) = input(&extra, [91; 32]);
+        assert!(matches!(
+            handle.reserve(extra_key, VerificationClass::Download),
+            VerificationReserveOutcome::Backpressure
+        ));
+
+        gate.release(64);
+        assert!(shutdown(owner).is_ok());
+        for fixture in downloads.iter().take(downloads.len() - 1) {
+            acknowledge_download(fixture);
+        }
+        acknowledge_download(&mixed_download);
+        acknowledge_download(&replacement);
+        assert!(attachment_was_backpressured);
+    }
+
+    #[test]
+    fn completion_promotes_queued_work_before_reserve_observes_the_free_slot() {
+        let dir = TestDir::new("finish-promote-reserve");
+        let worker_gate = Arc::new(WorkerGate::default());
+        let finish_gate = Arc::new(WorkerGate::default());
+        let (handle, owner) =
+            VerificationSchedulerOwner::start_with_worker_and_finish_hooks_for_test(
+                {
+                    let worker_gate = worker_gate.clone();
+                    move |key| worker_gate.enter(key)
+                },
+                {
+                    let finish_gate = finish_gate.clone();
+                    move |key| finish_gate.enter(key)
+                },
+            );
+        let mut downloads = Vec::new();
+        for index in 0..(VERIFICATION_WORKERS + VERIFICATION_DOWNLOAD_WAITING) {
+            downloads.push(
+                submit_download(
+                    &handle,
+                    &dir.file(&format!("download-{index}.gguf"), b"download"),
+                    [index as u8 + 1; 32],
+                    index as u64 + 1,
+                )
+                .1,
+            );
+            if index + 1 == VERIFICATION_WORKERS {
+                worker_gate.wait_started(VERIFICATION_WORKERS);
+            }
+        }
+
+        worker_gate.release(1);
+        finish_gate.wait_started(1);
+        let extra = submit_download(&handle, &dir.file("extra.gguf", b"extra"), [99; 32], 100).1;
+        let counts = handle.counts_for_test();
+
+        finish_gate.release(64);
+        worker_gate.release(64);
+        assert!(shutdown(owner).is_ok());
+        for fixture in &downloads {
+            acknowledge_download(fixture);
+        }
+        acknowledge_download(&extra);
+        assert_eq!(counts.running, VERIFICATION_WORKERS);
+        assert_eq!(counts.download_queued, VERIFICATION_DOWNLOAD_WAITING);
+    }
+
+    #[test]
     fn running_lifecycle_keeps_the_eighth_waiting_position_out_of_general_use() {
         let dir = TestDir::new("running-lifecycle-capacity");
         let gate = Arc::new(WorkerGate::default());
@@ -2414,9 +2610,11 @@ mod tests {
             .unwrap();
         let releases = Arc::new(AtomicUsize::new(0));
         let observed = releases.clone();
+        let operation_id = OperationId::new_v4();
+        let admission_revision = DecimalU64::new(1);
         let continuation = DownloadContinuation::with_release_probe_for_test(
-            OperationId::new_v4(),
-            DecimalU64::new(1),
+            operation_id,
+            admission_revision,
             OperationCancellation::new(),
             artifact,
             Box::new(move || {
@@ -2431,9 +2629,13 @@ mod tests {
         };
         assert_eq!(releases.load(Ordering::SeqCst), 0);
         assert_eq!(failure.input.expected_sha256, [2; 32]);
+        assert_eq!(failure.continuation.operation_id, operation_id);
+        assert_eq!(failure.continuation.admission_revision, admission_revision);
         assert_eq!(
-            failure.continuation.operation_id,
-            failure.continuation.operation_id
+            coordinator
+                .try_acquire_mutation(artifact_key.clone())
+                .unwrap_err(),
+            ArtifactAcquireError::Busy
         );
         drop(failure);
         assert_eq!(releases.load(Ordering::SeqCst), 1);
@@ -2510,6 +2712,8 @@ mod tests {
             panic!("injected completion receiver panic");
         }));
         assert!(result.is_err());
+        assert!(panicked.queue.ready().is_none());
+        assert!(panicked.queue.reserve().is_none());
         assert_eq!(
             panicked
                 .coordinator
@@ -2517,13 +2721,6 @@ mod tests {
                 .unwrap_err(),
             ArtifactAcquireError::Busy
         );
-        panicked
-            .queue
-            .ready()
-            .unwrap()
-            .lock_ready()
-            .unwrap()
-            .poison();
         panicked.queue.dispose_poisoned_for_test();
         assert!(panicked
             .coordinator
@@ -2603,5 +2800,48 @@ mod tests {
             acknowledge_download(&fixture),
             VerificationResult::Cancelled
         ));
+    }
+
+    #[test]
+    fn dropping_live_owner_aborts_promptly_instead_of_blocking_on_worker() {
+        const CHILD: &str = "LOXA_VERIFICATION_OWNER_DROP_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let dir = TestDir::new("owner-drop-child");
+            let gate = Arc::new(WorkerGate::default());
+            let (handle, owner) = VerificationSchedulerOwner::start_with_worker_hook_for_test({
+                let gate = gate.clone();
+                move |key| gate.enter(key)
+            });
+            let _fixture =
+                submit_download(&handle, &dir.file("model.gguf", b"artifact"), [1; 32], 1).1;
+            gate.wait_started(1);
+            drop(owner);
+            panic!("dropping a live owner returned instead of aborting");
+        }
+
+        let executable = std::env::current_exe().unwrap();
+        let mut child = std::process::Command::new(executable)
+            .arg("verification_scheduler::tests::dropping_live_owner_aborts_promptly_instead_of_blocking_on_worker")
+            .arg("--exact")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(CHILD, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                let _ = child.wait();
+                panic!("dropping a live owner blocked instead of aborting promptly");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(!status.success(), "live owner drop unexpectedly succeeded");
     }
 }
