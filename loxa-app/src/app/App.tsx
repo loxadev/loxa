@@ -136,20 +136,13 @@ function WorkspaceContents({
         <NodeScreen services={services} onNavigateModels={() => setRoute("models")} />
       ) : route === "models" ? (
         <NodeSessionGate heading="Models">
-          <ModelsScreen
-            services={services}
-            endpoint={session.endpoint}
-            onModelMutationStart={session.invalidateModelTruth}
-            onModelMutationSettled={session.settleModelMutation}
-          />
+          <ModelsScreen services={services} endpoint={session.endpoint} />
         </NodeSessionGate>
       ) : route === "chat" ? (
         <ChatScreen
           services={services}
           endpoint={session.endpoint}
           nodeAvailability={{ phase: session.phase, proven: session.proven, error: session.error }}
-          onModelMutationStart={session.invalidateModelTruth}
-          onModelMutationSettled={session.settleModelMutation}
           history={history}
           conversationTitle={conversationTitle}
           onInteractionLockChange={setChatInteractionLocked}
