@@ -407,7 +407,7 @@ fn sealing_rejects_new_access_and_poison_retains_uncertain_key() {
 }
 
 #[test]
-fn ready_completion_survives_processing_panic_and_unknown_ack_poison() {
+fn mutex_poisoned_ready_completion_is_retained_without_ack_surface() {
     let dir = TestDir::new("completion");
     let key = artifact_key(dir.path(), "model.gguf");
     let coordinator = ArtifactMutationCoordinator::new();
@@ -444,8 +444,10 @@ fn ready_completion_survives_processing_panic_and_unknown_ack_poison() {
         ArtifactAcquireError::Busy
     );
 
-    let retained = queue.ready().expect("panic kept ready envelope");
-    retained.lock_ready().expect("ready after panic").poison();
+    assert!(
+        queue.ready().is_none(),
+        "mutex-poisoned completion must not expose a ready or acknowledgement surface"
+    );
     assert_eq!(
         coordinator.try_acquire_mutation(key.clone()).unwrap_err(),
         ArtifactAcquireError::Busy
