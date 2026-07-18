@@ -235,8 +235,8 @@ impl<'a> NodeBuilder<'a> {
             chat_routes::ChatRoutesState::new(token.clone(), history, gateway_state.clone());
         let router = loxa_core::gateway::router(gateway_state.clone())
             .merge(chat_routes::router(chat_routes_state.clone()));
-        let gateway_router =
-            router.merge(control_router::router(control_router::ControlState::new(
+        let control_routes = match control_router::router_with_optional_v2(
+            control_router::ControlState::new(
                 token,
                 node_id,
                 node_instance_id,
@@ -245,7 +245,20 @@ impl<'a> NodeBuilder<'a> {
                     .expect("unloaded node has download control")
                     .0
                     .clone(),
-            )));
+            ),
+            None,
+        ) {
+            Ok(routes) => routes,
+            Err(error) => {
+                return Err(finish_failed_build(
+                    io::Error::other(error),
+                    owner_guard,
+                    &mut download_runtime,
+                    Some(history_worker),
+                ));
+            }
+        };
+        let gateway_router = router.merge(control_routes);
         let gateway_router = crate::http_observability::apply(gateway_router);
         let gateway = match loxa_core::gateway::GatewayServer::start_with_router_on(
             reservation.into_listener(),

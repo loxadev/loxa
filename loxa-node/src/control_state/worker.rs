@@ -80,6 +80,7 @@ enum ControlCommand {
     Subscribe {
         requested: Option<(StreamEpoch, DecimalU64)>,
         generated_at_unix_ms: DecimalU64,
+        max_snapshot_bytes: usize,
         health: watch::Receiver<bool>,
         reply: oneshot::Sender<Result<ControlSubscription, ControlStateError>>,
     },
@@ -377,6 +378,34 @@ impl ControlStateHandle {
             .try_send(ControlCommand::Subscribe {
                 requested,
                 generated_at_unix_ms,
+                max_snapshot_bytes: MAX_SNAPSHOT_BYTES,
+                health: self.health_signal.subscribe(),
+                reply,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => ControlStateError::WriterOverloaded,
+                mpsc::error::TrySendError::Closed(_) => self.poison_unavailable(),
+            })?;
+        self.receive_commit(receive, tokio::time::Instant::now() + ACK_TIMEOUT)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn subscribe_with_max_snapshot_bytes_for_test(
+        &self,
+        requested: Option<(StreamEpoch, DecimalU64)>,
+        generated_at_unix_ms: DecimalU64,
+        max_snapshot_bytes: usize,
+    ) -> Result<ControlSubscription, ControlStateError> {
+        if !self.is_healthy() {
+            return Err(ControlStateError::DurableStateUnavailable);
+        }
+        let (reply, receive) = oneshot::channel();
+        self.sender
+            .try_send(ControlCommand::Subscribe {
+                requested,
+                generated_at_unix_ms,
+                max_snapshot_bytes,
                 health: self.health_signal.subscribe(),
                 reply,
             })
@@ -1104,6 +1133,7 @@ impl ControlStateHandle {
             .send(ControlCommand::Subscribe {
                 requested: None,
                 generated_at_unix_ms: DecimalU64::new(10),
+                max_snapshot_bytes: MAX_SNAPSHOT_BYTES,
                 health: self.health_signal.subscribe(),
                 reply,
             })
@@ -1358,6 +1388,7 @@ fn process_command(
         ControlCommand::Subscribe {
             requested,
             generated_at_unix_ms,
+            max_snapshot_bytes,
             health,
             reply,
         } => {
@@ -1373,7 +1404,7 @@ fn process_command(
                 &state,
                 requested,
                 generated_at_unix_ms,
-                MAX_SNAPSHOT_BYTES,
+                max_snapshot_bytes,
             ) {
                 Ok(snapshot) => {
                     let (events, receiver) = mpsc::channel(SUBSCRIBER_CAPACITY);

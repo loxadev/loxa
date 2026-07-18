@@ -56,7 +56,7 @@ fn authorize(state: &ControlState, headers: &HeaderMap) -> Result<(), StatusCode
         .map_err(|_| StatusCode::UNAUTHORIZED)
 }
 
-fn request_origin(headers: &HeaderMap) -> Result<Option<String>, StatusCode> {
+pub(crate) fn request_origin(headers: &HeaderMap) -> Result<Option<String>, StatusCode> {
     let Some(value) = headers.get(header::ORIGIN) else {
         return Ok(None);
     };
@@ -68,7 +68,7 @@ fn request_origin(headers: &HeaderMap) -> Result<Option<String>, StatusCode> {
     }
 }
 
-fn cors(mut response: Response, origin: Option<&str>) -> Response {
+pub(crate) fn cors(mut response: Response, origin: Option<&str>) -> Response {
     response
         .headers_mut()
         .append(header::VARY, HeaderValue::from_static("Origin"));
@@ -118,11 +118,11 @@ async fn preflight(headers: HeaderMap, methods: &'static str) -> Response {
     cors(response, Some(&origin))
 }
 
-async fn get_preflight(headers: HeaderMap) -> Response {
+pub(crate) async fn get_preflight(headers: HeaderMap) -> Response {
     preflight(headers, "GET, OPTIONS").await
 }
 
-async fn post_preflight(headers: HeaderMap) -> Response {
+pub(crate) async fn post_preflight(headers: HeaderMap) -> Response {
     preflight(headers, "POST, OPTIONS").await
 }
 
@@ -554,6 +554,21 @@ pub fn router(state: ControlState) -> Router {
         .route("/loxa/v1/capabilities", options(get_preflight))
         .route("/loxa/v1/models", options(get_preflight))
         .with_state(state)
+}
+
+pub(crate) fn router_with_optional_v2(
+    state: ControlState,
+    control: Option<crate::control_state::ControlStateHandle>,
+) -> Result<Router, &'static str> {
+    let Some(control) = control else {
+        return Ok(router(state));
+    };
+    let v2_state = crate::v2_control_router::V2ControlState::new(
+        state.token.clone(),
+        control,
+        state.downloads.clone(),
+    )?;
+    Ok(router(state).merge(crate::v2_control_router::router(v2_state)))
 }
 
 #[cfg(test)]
