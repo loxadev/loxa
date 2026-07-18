@@ -4,7 +4,12 @@ use crate::control::contracts::{
     OperationView, CONTROL_PROTOCOL_VERSION,
 };
 use crate::model_inventory::VerifiedRecipeInventoryEntry;
+use loxa_protocol::v2::{
+    OperationId, V2ControlErrorBody, V2NodeCollection, V2OperationCollection, V2OperationEnvelope,
+    V2ReconnectSnapshot, V2SlotCollection,
+};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
@@ -13,6 +18,9 @@ use std::time::{Duration, Instant};
 
 const MAX_PROOF_BYTES: usize = 16 * 1024;
 const MAX_CONTROL_BYTES: usize = 1024 * 1024;
+const MAX_V2_SNAPSHOT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_V2_EVENT_BYTES: usize = 16 * 1024;
+const MAX_V2_DUPLICATE_WINDOW: usize = 256;
 const MAX_SSE_LINE_BYTES: usize = 2 * 1024 * 1024 + 1024;
 const STREAM_READ_POLL: Duration = Duration::from_millis(50);
 
@@ -226,8 +234,14 @@ struct TerminalEvent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClientError {
     Transport(String),
+    InvalidResponse(String),
     PeerProof,
     Rejected(String),
+    V2Rejected {
+        status: u16,
+        code: loxa_protocol::v2::V2ControlErrorCode,
+        message: String,
+    },
     OperationFailed(String),
     OperationCancelled,
     OperationTimeout,
@@ -237,10 +251,19 @@ impl fmt::Display for ClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Transport(message) => write!(f, "control transport failed: {message}"),
+            Self::InvalidResponse(message) => write!(f, "invalid control response: {message}"),
             Self::PeerProof => {
                 f.write_str("managed node peer proof failed; refusing to send credentials")
             }
             Self::Rejected(message) => write!(f, "control request rejected: {message}"),
+            Self::V2Rejected {
+                status,
+                code,
+                message,
+            } => write!(
+                f,
+                "v2 control request rejected ({status} {code:?}): {message}"
+            ),
             Self::OperationFailed(message) => write!(f, "operation failed: {message}"),
             Self::OperationCancelled => f.write_str("operation cancelled"),
             Self::OperationTimeout => f.write_str("operation did not finish before the deadline"),
@@ -250,9 +273,97 @@ impl fmt::Display for ClientError {
 
 impl std::error::Error for ClientError {}
 
+pub struct V2EventStream {
+    snapshot: V2ReconnectSnapshot,
+    replacement: bool,
+    reader: Option<V2SseReader>,
+    cursor: loxa_protocol::v2::DecimalU64,
+    recent_events: VecDeque<(loxa_protocol::v2::DecimalU64, loxa_protocol::v2::EventId)>,
+}
+
+impl V2EventStream {
+    #[must_use]
+    pub fn snapshot(&self) -> &V2ReconnectSnapshot {
+        &self.snapshot
+    }
+
+    #[must_use]
+    pub fn is_replacement(&self) -> bool {
+        self.replacement
+    }
+
+    #[must_use]
+    pub fn into_snapshot(self) -> V2ReconnectSnapshot {
+        self.snapshot
+    }
+
+    /// Reads the next committed state event. Stale or duplicate events are ignored.
+    pub fn next_event(&mut self) -> Result<Option<loxa_protocol::v2::V2ControlEvent>, ClientError> {
+        loop {
+            let Some(reader) = &mut self.reader else {
+                return Ok(None);
+            };
+            let raw = reader.next(MAX_V2_EVENT_BYTES)?;
+            if raw.name != "state" || raw.data.len() > MAX_V2_EVENT_BYTES {
+                return Err(ClientError::InvalidResponse(
+                    "invalid v2 state event name or size".into(),
+                ));
+            }
+            let event: loxa_protocol::v2::V2ControlEvent = serde_json::from_str(&raw.data)
+                .map_err(|_| ClientError::InvalidResponse("malformed v2 state event".into()))?;
+            let wire_cursor = raw
+                .id
+                .as_deref()
+                .and_then(|id| serde_json::from_str(&format!("\"{id}\"")).ok());
+            if wire_cursor != Some(event.sequence) {
+                return Err(ClientError::InvalidResponse(
+                    "v2 state event id does not match its sequence".into(),
+                ));
+            }
+            if event.epoch != self.snapshot.epoch
+                || event.node_id != self.snapshot.nodes[0].node_id
+                || event.node_instance_id != Some(self.snapshot.nodes[0].node_instance_id)
+            {
+                return Err(ClientError::InvalidResponse(
+                    "v2 state event correlation mismatch".into(),
+                ));
+            }
+            if event.sequence <= self.cursor {
+                if self
+                    .recent_events
+                    .contains(&(event.sequence, event.event_id))
+                {
+                    continue;
+                }
+                return Err(ClientError::InvalidResponse(
+                    "stale v2 state event has an unknown event ID".into(),
+                ));
+            }
+            if self.cursor.checked_next() != Some(event.sequence)
+                || self
+                    .recent_events
+                    .iter()
+                    .any(|(_, event_id)| *event_id == event.event_id)
+            {
+                return Err(ClientError::InvalidResponse(
+                    "v2 state event gap or duplicate ID requires a replacement snapshot".into(),
+                ));
+            }
+            self.cursor = event.sequence;
+            self.recent_events
+                .push_back((event.sequence, event.event_id));
+            if self.recent_events.len() > MAX_V2_DUPLICATE_WINDOW {
+                self.recent_events.pop_front();
+            }
+            return Ok(Some(event));
+        }
+    }
+}
+
 pub struct ProvenControlPeer {
     stream: TcpStream,
     address: SocketAddr,
+    node_id: String,
     runtime_identity: String,
     token: ControlToken,
     timeout: Duration,
@@ -264,7 +375,7 @@ impl ProvenControlPeer {
         token: ControlToken,
         timeout: Duration,
     ) -> Result<Self, ClientError> {
-        open_and_prove(address, token, None, timeout)
+        open_and_prove(address, token, None, None, timeout)
     }
 
     pub fn runtime_identity(&self) -> &str {
@@ -274,6 +385,7 @@ impl ProvenControlPeer {
     pub fn into_client(self) -> LiveControlClient {
         LiveControlClient {
             address: self.address,
+            node_id: self.node_id,
             runtime_identity: self.runtime_identity,
             token: self.token,
             timeout: self.timeout,
@@ -294,6 +406,7 @@ impl fmt::Debug for ProvenControlPeer {
 
 pub struct LiveControlClient {
     address: SocketAddr,
+    node_id: String,
     runtime_identity: String,
     token: ControlToken,
     timeout: Duration,
@@ -320,8 +433,14 @@ impl LiveControlClient {
         if !address.ip().is_loopback() || address.port() == 0 {
             return Err(ClientError::PeerProof);
         }
-        open_and_prove(address, token, Some(expected_runtime_identity), timeout)
-            .map(ProvenControlPeer::into_client)
+        open_and_prove(
+            address,
+            token,
+            None,
+            Some(expected_runtime_identity),
+            timeout,
+        )
+        .map(ProvenControlPeer::into_client)
     }
 
     pub fn download(&self, model_id: &str) -> Result<String, ClientError> {
@@ -334,6 +453,231 @@ impl LiveControlClient {
 
     pub fn unload(&self) -> Result<String, ClientError> {
         self.start("/loxa/v1/models/unload", None)
+    }
+
+    /// Returns a credential-free loopback endpoint suitable for display or copying.
+    #[must_use]
+    pub fn endpoint(&self) -> String {
+        format!("http://{}", self.address)
+    }
+
+    pub fn v2_nodes(&self) -> Result<V2NodeCollection, ClientError> {
+        let nodes: V2NodeCollection = self.v2_json("/loxa/v2/nodes")?;
+        let proved_node_id = self.proved_node_id()?;
+        let proved_instance_id = self.runtime_identity.parse().map_err(|_| {
+            ClientError::InvalidResponse("proved node instance ID is not v2-compatible".into())
+        })?;
+        if nodes.nodes[0].node_id != proved_node_id
+            || nodes.nodes[0].node_instance_id != proved_instance_id
+        {
+            return Err(ClientError::InvalidResponse(
+                "v2 node collection does not match the proved peer".into(),
+            ));
+        }
+        Ok(nodes)
+    }
+
+    pub fn v2_slots(
+        &self,
+        node_id: loxa_protocol::NodeId,
+    ) -> Result<V2SlotCollection, ClientError> {
+        if node_id != self.proved_node_id()? {
+            return Err(ClientError::Rejected(
+                "requested v2 node does not match the proved peer".into(),
+            ));
+        }
+        let slots: V2SlotCollection = self.v2_json(&format!("/loxa/v2/nodes/{node_id}/slots"))?;
+        if slots.node_id != node_id {
+            return Err(ClientError::InvalidResponse(
+                "v2 slot collection does not match the proved peer".into(),
+            ));
+        }
+        Ok(slots)
+    }
+
+    pub fn v2_operations(&self) -> Result<V2OperationCollection, ClientError> {
+        let node_id = self.proved_node_id()?;
+        let operations: V2OperationCollection = self.v2_json("/loxa/v2/operations")?;
+        if operations
+            .operations
+            .iter()
+            .any(|operation| operation.node_id != node_id)
+        {
+            return Err(ClientError::InvalidResponse(
+                "v2 operation collection does not match the proved peer".into(),
+            ));
+        }
+        Ok(operations)
+    }
+
+    pub fn v2_operation(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<V2OperationEnvelope, ClientError> {
+        let node_id = self.proved_node_id()?;
+        let envelope: V2OperationEnvelope =
+            self.v2_json(&format!("/loxa/v2/operations/{operation_id}"))?;
+        if envelope.operation.operation_id != operation_id || envelope.operation.node_id != node_id
+        {
+            return Err(ClientError::InvalidResponse(
+                "v2 operation does not match the request or proved peer".into(),
+            ));
+        }
+        Ok(envelope)
+    }
+
+    pub fn v2_events(
+        &self,
+        resume: Option<(
+            loxa_protocol::v2::StreamEpoch,
+            loxa_protocol::v2::DecimalU64,
+        )>,
+    ) -> Result<V2EventStream, ClientError> {
+        let path = resume.map_or_else(
+            || "/loxa/v2/events".to_owned(),
+            |(epoch, cursor)| format!("/loxa/v2/events?epoch={}&cursor={}", epoch, cursor),
+        );
+        let mut stream = self.open_authenticated("GET", &path, &[])?;
+        let mut never_cancelled = || false;
+        let headers = read_stream_headers_interruptible(&mut stream, &mut never_cancelled)?;
+        if headers.status != 200 {
+            if !headers
+                .content_type
+                .as_deref()
+                .is_some_and(|value| media_type_is(value, "application/json"))
+            {
+                return Err(ClientError::InvalidResponse(
+                    "v2 error response content type is not application/json".into(),
+                ));
+            }
+            let body = read_bounded_http_body(&mut stream, &headers, MAX_V2_SNAPSHOT_BYTES)?;
+            return Err(v2_rejected_response(headers.status, &body));
+        }
+        if !headers
+            .content_type
+            .as_deref()
+            .is_some_and(|value| media_type_is(value, "text/event-stream"))
+        {
+            return Err(ClientError::InvalidResponse(
+                "v2 event response content type is not text/event-stream".into(),
+            ));
+        }
+        let streaming = headers.chunked;
+        let mut reader = V2SseReader::new(stream, &headers)?;
+        let event = reader.next(MAX_V2_SNAPSHOT_BYTES)?;
+        if event.name != "snapshot" || event.id.is_some() {
+            return Err(ClientError::InvalidResponse(
+                "v2 event stream is not snapshot-first".into(),
+            ));
+        }
+        if event.data.len() > MAX_V2_SNAPSHOT_BYTES {
+            return Err(ClientError::InvalidResponse(
+                "v2 reconnect snapshot is too large".into(),
+            ));
+        }
+        let snapshot: V2ReconnectSnapshot = serde_json::from_str(&event.data).map_err(|error| {
+            ClientError::InvalidResponse(format!("malformed v2 reconnect snapshot: {error}"))
+        })?;
+        self.validate_v2_snapshot(&snapshot, resume)?;
+        let replacement =
+            resume.is_some_and(|(epoch, _)| snapshot.epoch != epoch || snapshot.stream.cursor_gap);
+        let cursor = snapshot.stream.cursor;
+        let recent_events = snapshot
+            .events
+            .iter()
+            .skip(
+                snapshot
+                    .events
+                    .len()
+                    .saturating_sub(MAX_V2_DUPLICATE_WINDOW),
+            )
+            .map(|event| (event.sequence, event.event_id))
+            .collect();
+        Ok(V2EventStream {
+            snapshot,
+            replacement,
+            reader: streaming.then_some(reader),
+            cursor,
+            recent_events,
+        })
+    }
+
+    fn validate_v2_snapshot(
+        &self,
+        snapshot: &V2ReconnectSnapshot,
+        resume: Option<(
+            loxa_protocol::v2::StreamEpoch,
+            loxa_protocol::v2::DecimalU64,
+        )>,
+    ) -> Result<(), ClientError> {
+        let node_id = self.proved_node_id()?;
+        let instance_id = self.runtime_identity.parse().map_err(|_| {
+            ClientError::InvalidResponse("proved node instance ID is not v2-compatible".into())
+        })?;
+        if snapshot.nodes[0].node_id != node_id
+            || snapshot.nodes[0].node_instance_id != instance_id
+            || snapshot.events.iter().any(|event| {
+                event.node_id != node_id
+                    || serde_json::to_vec(event)
+                        .map_or(true, |wire| wire.len() > MAX_V2_EVENT_BYTES)
+            })
+        {
+            return Err(ClientError::InvalidResponse(
+                "v2 reconnect snapshot does not match the proved peer or event bounds".into(),
+            ));
+        }
+        if let Some((epoch, cursor)) = resume {
+            if snapshot.epoch != epoch && !snapshot.stream.cursor_gap {
+                return Err(ClientError::InvalidResponse(
+                    "v2 epoch replacement omitted cursor_gap".into(),
+                ));
+            }
+            if snapshot.epoch == epoch
+                && !snapshot.stream.cursor_gap
+                && (snapshot.stream.cursor < cursor
+                    || (snapshot.stream.cursor == cursor && !snapshot.events.is_empty())
+                    || (snapshot.stream.cursor > cursor
+                        && snapshot
+                            .events
+                            .first()
+                            .is_none_or(|event| cursor.checked_next() != Some(event.sequence))))
+            {
+                return Err(ClientError::InvalidResponse(
+                    "v2 reconnect snapshot has a stale cursor or unmarked gap".into(),
+                ));
+            }
+        } else if snapshot.stream.cursor_gap || !snapshot.events.is_empty() {
+            return Err(ClientError::InvalidResponse(
+                "initial v2 snapshot unexpectedly reports a cursor gap or history".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn proved_node_id(&self) -> Result<loxa_protocol::NodeId, ClientError> {
+        self.node_id
+            .parse()
+            .map_err(|_| ClientError::InvalidResponse("proved node ID is not v2-compatible".into()))
+    }
+
+    fn v2_json<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T, ClientError> {
+        let mut stream = self.open_authenticated("GET", path, &[])?;
+        let response = read_response(&mut stream, MAX_V2_SNAPSHOT_BYTES)
+            .map_err(|error| ClientError::InvalidResponse(error.to_string()))?;
+        if !response
+            .content_type
+            .as_deref()
+            .is_some_and(|value| media_type_is(value, "application/json"))
+        {
+            return Err(ClientError::InvalidResponse(
+                "v2 response content type is not application/json".into(),
+            ));
+        }
+        if response.status != 200 {
+            return Err(v2_rejected_response(response.status, &response.body));
+        }
+        serde_json::from_slice(&response.body)
+            .map_err(|_| ClientError::InvalidResponse("malformed v2 JSON contract".into()))
     }
 
     fn start(&self, path: &str, model_id: Option<&str>) -> Result<String, ClientError> {
@@ -615,6 +959,7 @@ impl LiveControlClient {
                 open_and_prove(
                     self.address,
                     self.token.clone(),
+                    Some(&self.node_id),
                     Some(&self.runtime_identity),
                     self.timeout,
                 )
@@ -639,6 +984,54 @@ fn rejected_response(status: u16, body: &[u8]) -> ClientError {
         .map(|error| sanitize_error(&error.message))
         .unwrap_or_else(|_| format!("HTTP {status}"));
     ClientError::Rejected(message)
+}
+
+fn v2_rejected_response(status: u16, body: &[u8]) -> ClientError {
+    let Ok(error) = serde_json::from_slice::<V2ControlErrorBody>(body) else {
+        return ClientError::InvalidResponse("malformed v2 error contract".into());
+    };
+    if !valid_v2_error_status(status, error.code) {
+        return ClientError::InvalidResponse("v2 error status and code do not match".into());
+    }
+    ClientError::V2Rejected {
+        status,
+        code: error.code,
+        message: sanitize_error(&error.message),
+    }
+}
+
+fn valid_v2_error_status(status: u16, code: loxa_protocol::v2::V2ControlErrorCode) -> bool {
+    use loxa_protocol::v2::V2ControlErrorCode as Code;
+    matches!(
+        (status, code),
+        (400, Code::InvalidRequest)
+            | (
+                404,
+                Code::NodeNotFound
+                    | Code::SlotNotFound
+                    | Code::OperationNotFound
+                    | Code::UnknownModel
+            )
+            | (
+                409,
+                Code::OperationConflict
+                    | Code::OperationTerminal
+                    | Code::CancellationNotSafe
+                    | Code::ModelUnavailable
+            )
+            | (415, Code::UnsupportedMediaType)
+            | (
+                503,
+                Code::NodeStopping | Code::StateWriterOverloaded | Code::DurableStateUnavailable
+            )
+    )
+}
+
+fn media_type_is(value: &str, expected: &str) -> bool {
+    value
+        .split(';')
+        .next()
+        .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case(expected))
 }
 
 fn safe_id(value: &str) -> Result<&str, ClientError> {
@@ -683,6 +1076,7 @@ fn validate_cursor(value: &str) -> Result<(), ClientError> {
 fn open_and_prove(
     address: SocketAddr,
     token: ControlToken,
+    expected_node_id: Option<&str>,
     expected_runtime_identity: Option<&str>,
     timeout: Duration,
 ) -> Result<ProvenControlPeer, ClientError> {
@@ -721,6 +1115,7 @@ fn open_and_prove(
     let value: NodeIdentityProofResponse =
         serde_json::from_slice(&response.body).map_err(|_| ClientError::PeerProof)?;
     if value.protocol_version != CONTROL_PROTOCOL_VERSION
+        || expected_node_id.is_some_and(|expected| value.node_id != expected)
         || expected_runtime_identity.is_some_and(|expected| value.runtime_identity != expected)
         || matches!(
             value.status,
@@ -740,6 +1135,7 @@ fn open_and_prove(
     Ok(ProvenControlPeer {
         stream,
         address,
+        node_id: value.node_id,
         runtime_identity: value.runtime_identity,
         token,
         timeout,
@@ -748,11 +1144,13 @@ fn open_and_prove(
 
 struct HttpResponse {
     status: u16,
+    content_type: Option<String>,
     body: Vec<u8>,
 }
 
 struct StreamHeaders {
     status: u16,
+    content_type: Option<String>,
     content_length: Option<usize>,
     chunked: bool,
 }
@@ -783,6 +1181,7 @@ fn parse_stream_headers(headers: &[u8]) -> Result<StreamHeaders, ClientError> {
         .and_then(|value| value.parse().ok())
         .ok_or_else(|| ClientError::Transport("invalid HTTP status".into()))?;
     let mut content_length = None;
+    let mut content_type = None;
     let mut chunked = false;
     for line in lines {
         if let Some((name, value)) = line.split_once(':') {
@@ -793,6 +1192,8 @@ fn parse_stream_headers(headers: &[u8]) -> Result<StreamHeaders, ClientError> {
                         .parse()
                         .map_err(|_| ClientError::Transport("invalid content length".into()))?,
                 );
+            } else if name.eq_ignore_ascii_case("content-type") {
+                content_type = Some(value.trim().to_owned());
             } else if name.eq_ignore_ascii_case("transfer-encoding") {
                 chunked = value
                     .split(',')
@@ -807,9 +1208,219 @@ fn parse_stream_headers(headers: &[u8]) -> Result<StreamHeaders, ClientError> {
     }
     Ok(StreamHeaders {
         status,
+        content_type,
         content_length,
         chunked,
     })
+}
+
+struct V2SseReader {
+    stream: TcpStream,
+    content_remaining: Option<usize>,
+    chunk_remaining: usize,
+    chunk_ending_pending: bool,
+    chunked: bool,
+    ended: bool,
+    parser: V2SseParser,
+    queued: VecDeque<RawV2SseEvent>,
+}
+
+impl V2SseReader {
+    fn new(stream: TcpStream, headers: &StreamHeaders) -> Result<Self, ClientError> {
+        if headers.content_length.is_none() && !headers.chunked {
+            return Err(ClientError::InvalidResponse(
+                "v2 event response has no body framing".into(),
+            ));
+        }
+        if headers
+            .content_length
+            .is_some_and(|length| length > MAX_V2_SNAPSHOT_BYTES + 1024)
+        {
+            return Err(ClientError::InvalidResponse(
+                "v2 event response is too large".into(),
+            ));
+        }
+        Ok(Self {
+            stream,
+            content_remaining: headers.content_length,
+            chunk_remaining: 0,
+            chunk_ending_pending: false,
+            chunked: headers.chunked,
+            ended: false,
+            parser: V2SseParser::default(),
+            queued: VecDeque::new(),
+        })
+    }
+
+    fn next(&mut self, max_frame: usize) -> Result<RawV2SseEvent, ClientError> {
+        loop {
+            if let Some(event) = self.queued.pop_front() {
+                if event.raw_len > max_frame {
+                    return Err(ClientError::InvalidResponse(
+                        "v2 SSE frame is too large".into(),
+                    ));
+                }
+                return Ok(event);
+            }
+            if self.ended {
+                return Err(ClientError::InvalidResponse(
+                    "v2 event stream ended before the next event".into(),
+                ));
+            }
+            let mut buffer = [0_u8; 8192];
+            let read = self.read_piece(&mut buffer)?;
+            if read == 0 {
+                self.ended = true;
+                continue;
+            }
+            self.queued
+                .extend(self.parser.push(&buffer[..read], max_frame)?);
+            self.validate_chunk_ending()?;
+        }
+    }
+
+    fn validate_chunk_ending(&mut self) -> Result<(), ClientError> {
+        if !self.chunk_ending_pending {
+            return Ok(());
+        }
+        let mut ending = [0_u8; 2];
+        self.stream
+            .read_exact(&mut ending)
+            .map_err(|error| ClientError::Transport(error.to_string()))?;
+        if ending != *b"\r\n" {
+            return Err(ClientError::InvalidResponse(
+                "invalid v2 event chunk ending".into(),
+            ));
+        }
+        self.chunk_ending_pending = false;
+        Ok(())
+    }
+
+    fn read_piece(&mut self, buffer: &mut [u8]) -> Result<usize, ClientError> {
+        if let Some(remaining) = self.content_remaining {
+            if remaining == 0 {
+                return Ok(0);
+            }
+            let take = remaining.min(buffer.len());
+            self.stream
+                .read_exact(&mut buffer[..take])
+                .map_err(|error| ClientError::Transport(error.to_string()))?;
+            self.content_remaining = Some(remaining - take);
+            return Ok(take);
+        }
+        if !self.chunked {
+            return Ok(0);
+        }
+        self.validate_chunk_ending()?;
+        if self.chunk_remaining == 0 {
+            let size_line = read_crlf_line(&mut self.stream, 128)?;
+            let size = usize::from_str_radix(size_line.split(';').next().unwrap_or("").trim(), 16)
+                .map_err(|_| ClientError::InvalidResponse("invalid v2 event chunk size".into()))?;
+            if size == 0 {
+                loop {
+                    if read_crlf_line(&mut self.stream, 16 * 1024)?.is_empty() {
+                        return Ok(0);
+                    }
+                }
+            }
+            self.chunk_remaining = size;
+        }
+        let take = self.chunk_remaining.min(buffer.len());
+        self.stream
+            .read_exact(&mut buffer[..take])
+            .map_err(|error| ClientError::Transport(error.to_string()))?;
+        self.chunk_remaining -= take;
+        if self.chunk_remaining == 0 {
+            self.chunk_ending_pending = true;
+        }
+        Ok(take)
+    }
+}
+
+#[derive(Default)]
+struct V2SseParser {
+    pending: Vec<u8>,
+    frame_bytes: usize,
+    event_name: Option<String>,
+    event_id: Option<String>,
+    data_lines: Vec<String>,
+}
+
+struct RawV2SseEvent {
+    name: String,
+    id: Option<String>,
+    data: String,
+    raw_len: usize,
+}
+
+impl V2SseParser {
+    fn push(&mut self, bytes: &[u8], max_frame: usize) -> Result<Vec<RawV2SseEvent>, ClientError> {
+        let mut events = Vec::new();
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let next_newline = bytes[offset..].iter().position(|byte| *byte == b'\n');
+            let end = next_newline.map_or(bytes.len(), |index| offset + index + 1);
+            let segment = &bytes[offset..end];
+            if self
+                .frame_bytes
+                .saturating_add(self.pending.len())
+                .saturating_add(segment.len())
+                > max_frame
+            {
+                return Err(ClientError::InvalidResponse(
+                    "v2 SSE frame is too large".into(),
+                ));
+            }
+            self.pending.extend_from_slice(segment);
+            offset = end;
+            if next_newline.is_none() {
+                break;
+            }
+            let mut line = std::mem::take(&mut self.pending);
+            self.frame_bytes = self.frame_bytes.saturating_add(line.len());
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            let line = String::from_utf8(line)
+                .map_err(|_| ClientError::InvalidResponse("v2 SSE is not UTF-8".into()))?;
+            if line.is_empty() {
+                if let (Some(name), false) = (self.event_name.take(), self.data_lines.is_empty()) {
+                    events.push(RawV2SseEvent {
+                        name,
+                        id: self.event_id.take(),
+                        data: self.data_lines.join("\n"),
+                        raw_len: self.frame_bytes,
+                    });
+                }
+                self.event_name = None;
+                self.event_id = None;
+                self.data_lines.clear();
+                self.frame_bytes = 0;
+            } else if let Some(name) = line.strip_prefix("event:") {
+                if self.event_name.is_some() {
+                    return Err(ClientError::InvalidResponse(
+                        "duplicate v2 SSE event field".into(),
+                    ));
+                }
+                self.event_name = Some(name.trim_start().to_owned());
+            } else if let Some(id) = line.strip_prefix("id:") {
+                if self.event_id.is_some() {
+                    return Err(ClientError::InvalidResponse(
+                        "duplicate v2 SSE id field".into(),
+                    ));
+                }
+                self.event_id = Some(id.trim_start().to_owned());
+            } else if let Some(data) = line.strip_prefix("data:") {
+                self.data_lines.push(data.trim_start().to_owned());
+            } else if !line.starts_with(':') {
+                return Err(ClientError::InvalidResponse(
+                    "unsupported v2 SSE field".into(),
+                ));
+            }
+        }
+        Ok(events)
+    }
 }
 
 fn read_bounded_http_body(
@@ -1139,12 +1750,16 @@ fn read_response(stream: &mut TcpStream, max_body: usize) -> std::io::Result<Htt
             std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid HTTP status")
         })?;
     let mut length = None;
+    let mut content_type = None;
     for line in lines {
         if let Some((name, value)) = line.split_once(':') {
             if name.eq_ignore_ascii_case("content-length") {
                 length = Some(value.trim().parse::<usize>().map_err(|_| {
                     std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid content length")
                 })?);
+            }
+            if name.eq_ignore_ascii_case("content-type") {
+                content_type = Some(value.trim().to_owned());
             }
             if name.eq_ignore_ascii_case("transfer-encoding") {
                 return Err(std::io::Error::new(
@@ -1165,7 +1780,11 @@ fn read_response(stream: &mut TcpStream, max_body: usize) -> std::io::Result<Htt
     }
     let mut body = vec![0; length];
     stream.read_exact(&mut body)?;
-    Ok(HttpResponse { status, body })
+    Ok(HttpResponse {
+        status,
+        content_type,
+        body,
+    })
 }
 
 fn sanitize_error(message: &str) -> String {
@@ -2028,5 +2647,250 @@ mod tests {
             assert!(client.cancel_turn(chat, turn).is_err());
             worker.join().unwrap();
         }
+    }
+
+    #[test]
+    fn v2_nodes_rejects_unknown_fields_and_never_embeds_credentials_in_endpoint() {
+        use crate::control::test_support::{ScriptedPeer, INSTANCE_ID};
+
+        let (_dir, token) = token();
+        let peer = ScriptedPeer::spawn(
+            token.clone(),
+            vec![(
+                "application/json",
+                r#"{"schema_version":2,"epoch":"00000000-0000-4000-8000-000000000003","revision":"1","generated_at_unix_ms":"1","nodes":[],"extra":true}"#,
+            )],
+        );
+        let client =
+            LiveControlClient::connect(peer.address, token, INSTANCE_ID, Duration::from_secs(1))
+                .unwrap();
+
+        assert!(matches!(
+            client.v2_nodes(),
+            Err(ClientError::InvalidResponse(_))
+        ));
+        let endpoint = client.endpoint();
+        assert_eq!(endpoint, format!("http://{}", peer.address));
+        assert!(!endpoint.contains('@') && !endpoint.contains('?') && !endpoint.contains('#'));
+        peer.join();
+    }
+
+    #[test]
+    fn v2_nodes_rejects_numeric_decimal_strings_and_oversized_bodies() {
+        use crate::control::test_support::{ScriptedPeer, INSTANCE_ID};
+
+        let (_dir, token) = token();
+        let numeric = r#"{"schema_version":2,"epoch":"00000000-0000-4000-8000-000000000003","revision":1,"generated_at_unix_ms":"1","nodes":[]}"#;
+        let wrong_epoch = r#"{"schema_version":2,"epoch":"not-an-epoch","revision":"1","generated_at_unix_ms":"1","nodes":[]}"#;
+        let oversized = "x".repeat(2 * 1024 * 1024 + 1);
+        let oversized: &'static str = Box::leak(oversized.into_boxed_str());
+        let peer = ScriptedPeer::spawn(
+            token.clone(),
+            vec![
+                ("application/json", numeric),
+                ("application/json", wrong_epoch),
+                ("application/json", oversized),
+            ],
+        );
+        let client =
+            LiveControlClient::connect(peer.address, token, INSTANCE_ID, Duration::from_secs(1))
+                .unwrap();
+
+        assert!(matches!(
+            client.v2_nodes(),
+            Err(ClientError::InvalidResponse(_))
+        ));
+        assert!(matches!(
+            client.v2_nodes(),
+            Err(ClientError::InvalidResponse(_))
+        ));
+        assert!(matches!(
+            client.v2_nodes(),
+            Err(ClientError::InvalidResponse(_))
+        ));
+        peer.join();
+    }
+
+    #[test]
+    fn v2_nodes_requires_json_media_type_and_proved_identity_correlation() {
+        use crate::control::test_support::{ScriptedPeer, INSTANCE_ID, NODE_ID};
+
+        let (_dir, token) = token();
+        let valid = format!(
+            concat!(
+                "{{\"schema_version\":2,\"epoch\":\"00000000-0000-4000-8000-000000000003\",",
+                "\"revision\":\"1\",\"generated_at_unix_ms\":\"1\",\"nodes\":[{{",
+                "\"node_id\":\"{NODE_ID}\",\"node_instance_id\":\"{INSTANCE_ID}\",",
+                "\"control_endpoint\":\"http://127.0.0.1:11435\",\"status\":\"running\",",
+                "\"slot_capacity\":1,\"capabilities\":{{\"model_download\":true,\"slot_load\":true,",
+                "\"slot_unload\":true,\"operation_cancel\":true,\"operation_stream\":true}}}}]}}"
+            ),
+            NODE_ID = NODE_ID,
+            INSTANCE_ID = INSTANCE_ID,
+        );
+        let valid: &'static str = Box::leak(valid.into_boxed_str());
+        let wrong_node = valid.replace(NODE_ID, "00000000-0000-4000-8000-000000000009");
+        let wrong_node: &'static str = Box::leak(wrong_node.into_boxed_str());
+        let peer = ScriptedPeer::spawn(
+            token.clone(),
+            vec![
+                ("text/plain", valid),
+                ("application/json", wrong_node),
+                ("application/json; charset=utf-8", valid),
+            ],
+        );
+        let client =
+            LiveControlClient::connect(peer.address, token, INSTANCE_ID, Duration::from_secs(1))
+                .unwrap();
+
+        assert!(matches!(
+            client.v2_nodes(),
+            Err(ClientError::InvalidResponse(_))
+        ));
+        assert!(matches!(
+            client.v2_nodes(),
+            Err(ClientError::InvalidResponse(_))
+        ));
+        assert_eq!(
+            client.v2_nodes().unwrap().nodes[0].node_id.to_string(),
+            NODE_ID
+        );
+        peer.join();
+    }
+
+    #[test]
+    fn v2_events_accepts_an_epoch_replacement_snapshot_after_reproof() {
+        use crate::control::test_support::{ScriptedPeer, INSTANCE_ID, NODE_ID};
+        use loxa_protocol::v2::{DecimalU64, StreamEpoch};
+        use std::str::FromStr;
+
+        let (_dir, token) = token();
+        let snapshot = format!(
+            concat!(
+                "event: snapshot\n",
+                "data: {{\"schema_version\":2,\"epoch\":\"00000000-0000-4000-8000-000000000003\",",
+                "\"revision\":\"1\",\"generated_at_unix_ms\":\"1\",",
+                "\"stream\":{{\"epoch\":\"00000000-0000-4000-8000-000000000003\",\"cursor\":\"1\",\"cursor_gap\":true}},",
+                "\"nodes\":[{{\"node_id\":\"{NODE_ID}\",\"node_instance_id\":\"{INSTANCE_ID}\",",
+                "\"control_endpoint\":\"http://127.0.0.1:11435\",\"status\":\"running\",\"slot_capacity\":1,",
+                "\"capabilities\":{{\"model_download\":true,\"slot_load\":true,\"slot_unload\":true,\"operation_cancel\":true,\"operation_stream\":true}}}}],",
+                "\"slots\":[{{\"slot_id\":\"00000000-0000-4000-8000-000000000004\",\"node_id\":\"{NODE_ID}\",",
+                "\"name\":\"default\",\"status\":\"unloaded\",\"model_id\":null,\"operation_id\":null,\"error\":null}}],",
+                "\"operations\":[],\"events\":[]}}\n\n"
+            ),
+            NODE_ID = NODE_ID,
+            INSTANCE_ID = INSTANCE_ID,
+        );
+        let snapshot: &'static str = Box::leak(snapshot.into_boxed_str());
+        let peer = ScriptedPeer::spawn(token.clone(), vec![("text/event-stream", snapshot)]);
+        let client =
+            LiveControlClient::connect(peer.address, token, INSTANCE_ID, Duration::from_secs(1))
+                .unwrap();
+        let resume = (
+            StreamEpoch::from_str("00000000-0000-4000-8000-000000000005").unwrap(),
+            DecimalU64::new(9),
+        );
+
+        let stream = client.v2_events(Some(resume)).unwrap();
+
+        assert!(stream.is_replacement());
+        assert_eq!(stream.snapshot().nodes[0].node_id.to_string(), NODE_ID);
+        let requests = peer.requests.lock().unwrap();
+        assert!(requests[1].starts_with(
+            "GET /loxa/v2/events?epoch=00000000-0000-4000-8000-000000000005&cursor=9 "
+        ));
+        drop(requests);
+        peer.join();
+    }
+
+    #[test]
+    fn v2_sse_parser_preserves_coalesced_and_partial_state_frames_with_ids() {
+        let mut parser = V2SseParser::default();
+        let first = parser
+            .push(
+                b"event: snapshot\ndata: {}\n\nevent: state\nid: 2\ndata: {\"sequence\":\"2\"",
+                MAX_V2_SNAPSHOT_BYTES,
+            )
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].name, "snapshot");
+        assert_eq!(first[0].id, None);
+
+        let second = parser
+            .push(b"}\n\n", MAX_V2_EVENT_BYTES)
+            .expect("partial state frame remains bounded");
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].name, "state");
+        assert_eq!(second[0].id.as_deref(), Some("2"));
+        assert_eq!(second[0].data, r#"{"sequence":"2"}"#);
+
+        let mut oversized = V2SseParser::default();
+        assert!(matches!(
+            oversized.push(&vec![b'x'; MAX_V2_EVENT_BYTES + 1], MAX_V2_EVENT_BYTES),
+            Err(ClientError::InvalidResponse(_))
+        ));
+    }
+
+    #[test]
+    fn v2_chunk_reader_preserves_coalesced_split_frames_and_bounds_before_chunk_allocation() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            for chunk in [
+                b"event: snapshot\ndata: {}\n\nevent: state\nid: 2\ndata: {\"sequence\"".as_slice(),
+                b":\"2\"}\n\n".as_slice(),
+            ] {
+                write!(socket, "{:x}\r\n", chunk.len()).unwrap();
+                socket.write_all(chunk).unwrap();
+                socket.write_all(b"\r\n").unwrap();
+            }
+        });
+        let stream = TcpStream::connect(address).unwrap();
+        let headers = StreamHeaders {
+            status: 200,
+            content_type: Some("text/event-stream".into()),
+            content_length: None,
+            chunked: true,
+        };
+        let mut reader = V2SseReader::new(stream, &headers).unwrap();
+        assert_eq!(reader.next(MAX_V2_SNAPSHOT_BYTES).unwrap().name, "snapshot");
+        let state = reader.next(MAX_V2_EVENT_BYTES).unwrap();
+        assert_eq!(state.id.as_deref(), Some("2"));
+        assert_eq!(state.data, r#"{"sequence":"2"}"#);
+        worker.join().unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let oversized = vec![b'x'; MAX_V2_EVENT_BYTES + 1];
+            write!(socket, "{:x}\r\n", oversized.len()).unwrap();
+            let _ = socket.write_all(&oversized);
+        });
+        let stream = TcpStream::connect(address).unwrap();
+        let mut reader = V2SseReader::new(stream, &headers).unwrap();
+        assert!(matches!(
+            reader.next(MAX_V2_EVENT_BYTES),
+            Err(ClientError::InvalidResponse(_))
+        ));
+        worker.join().unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let frame = b"event: state\nid: 2\ndata: {}\n\n";
+            write!(socket, "{:x}\r\n", frame.len()).unwrap();
+            socket.write_all(frame).unwrap();
+            socket.write_all(b"xx").unwrap();
+        });
+        let stream = TcpStream::connect(address).unwrap();
+        let mut reader = V2SseReader::new(stream, &headers).unwrap();
+        assert!(matches!(
+            reader.next(MAX_V2_EVENT_BYTES),
+            Err(ClientError::InvalidResponse(_))
+        ));
+        worker.join().unwrap();
     }
 }
