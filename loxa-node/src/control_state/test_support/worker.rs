@@ -1,8 +1,8 @@
 use crate::control_state::state_machine::{AdmissionRequest, CommitReceipt, Transition};
 use crate::control_state::worker::{
     build_reconnect_snapshot, spawn_from_repository_for_test,
-    spawn_paused_from_repository_for_test, synthetic_queue_for_test, ControlStateError,
-    MAX_SNAPSHOT_BYTES,
+    spawn_paused_from_repository_for_test, spawn_paused_with_reaper_completion_for_test,
+    synthetic_queue_for_test, ControlStateError, MAX_SNAPSHOT_BYTES,
 };
 use crate::control_state::{ControlIdGenerator, ControlRepository};
 use loxa_protocol::v2::{
@@ -10,6 +10,7 @@ use loxa_protocol::v2::{
 };
 use loxa_protocol::{NodeId, NodeInstanceId};
 use std::collections::HashSet;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
@@ -46,12 +47,22 @@ fn download(model_id: impl Into<String>) -> AdmissionRequest {
     }
 }
 
-fn repository() -> (PathBuf, ControlRepository) {
-    let path = std::env::temp_dir().join(format!(
-        "loxa-control-worker-{}-{}.sqlite3",
-        std::process::id(),
-        StreamEpoch::new_v4()
-    ));
+struct RepositoryFixturePath {
+    _root: crate::control_state::state_machine::test_support::storage::TestRoot,
+    path: PathBuf,
+}
+
+impl Deref for RepositoryFixturePath {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
+fn repository() -> (RepositoryFixturePath, ControlRepository) {
+    let root = crate::control_state::state_machine::test_support::storage::TestRoot::new("worker");
+    let path = root.path().join("control-state.sqlite3");
     let mut repository = ControlRepository::open_or_create(
         &path,
         NodeId::from_str(NODE_ID).unwrap(),
@@ -67,7 +78,7 @@ fn repository() -> (PathBuf, ControlRepository) {
             Ok(())
         })
         .unwrap();
-    (path, repository)
+    (RepositoryFixturePath { _root: root, path }, repository)
 }
 
 fn cleanup(path: &Path) {
@@ -75,6 +86,16 @@ fn cleanup(path: &Path) {
     let _ = std::fs::remove_file(format!("{}.owner.lock", path.display()));
     let _ = std::fs::remove_file(format!("{}.migration.bak", path.display()));
     let _ = std::fs::remove_file(format!("{}.migration.bak.owner.lock", path.display()));
+}
+
+#[test]
+fn worker_fixture_repository_parent_is_private() {
+    let (path, repository) = repository();
+    crate::control_state::state_machine::test_support::storage::assert_private_repository_parent(
+        &path,
+    );
+    repository.close().unwrap();
+    cleanup(&path);
 }
 
 #[test]
@@ -858,7 +879,8 @@ async fn worker_panic_is_classified_without_reporting_graceful_shutdown() {
 #[tokio::test(start_paused = true)]
 async fn worker_stop_ack_and_join_share_one_absolute_deadline() {
     let (path, repository) = repository();
-    let (handle, worker, barrier) = spawn_paused_from_repository_for_test(repository).unwrap();
+    let (handle, worker, barrier, reaper_finished) =
+        spawn_paused_with_reaper_completion_for_test(repository).unwrap();
     let started = tokio::time::Instant::now();
     let shutdown = tokio::spawn(worker.shutdown());
     tokio::task::yield_now().await;
@@ -873,6 +895,9 @@ async fn worker_stop_ack_and_join_share_one_absolute_deadline() {
     );
     assert!(!handle.is_healthy());
     barrier.wait();
+    reaper_finished
+        .recv_timeout(Duration::from_secs(1))
+        .expect("shutdown reaper must finish before fixture cleanup");
     drop(handle);
     cleanup(&path);
 }

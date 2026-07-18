@@ -4,6 +4,7 @@ use crate::control_state::repository::{
     arm_reconciliation_transaction_fault_for_test, ControlIdGenerator,
     ReconciliationTransactionFault, ScalarSource,
 };
+use crate::control_state::state_machine::test_support::storage::TestRoot;
 use crate::control_state::state_machine::{
     AdmissionRequest, InstancePublication, MutationIds, Transition,
 };
@@ -55,17 +56,15 @@ impl MutationIds for MutationSequence {
 }
 
 struct Fixture {
+    _root: TestRoot,
     path: PathBuf,
     repository: Option<ControlRepository>,
 }
 
 impl Fixture {
     fn unpublished(label: &str) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "loxa-recovery-{label}-{}-{}.sqlite3",
-            std::process::id(),
-            StreamEpoch::new_v4()
-        ));
+        let root = TestRoot::new(&format!("recovery-{label}"));
+        let path = root.path().join("control-state.sqlite3");
         let repository = ControlRepository::open_or_migrate(
             &path,
             NodeId::from_str(NODE_ID).unwrap(),
@@ -74,6 +73,7 @@ impl Fixture {
         )
         .unwrap();
         Self {
+            _root: root,
             path,
             repository: Some(repository),
         }
@@ -107,6 +107,12 @@ impl Drop for Fixture {
         let _ = std::fs::remove_file(format!("{}.migration.bak", self.path.display()));
         let _ = std::fs::remove_file(format!("{}.migration.bak.owner.lock", self.path.display()));
     }
+}
+
+#[test]
+fn recovery_fixture_repository_parent_is_private() {
+    let fixture = Fixture::unpublished("private-parent");
+    super::storage::assert_private_repository_parent(&fixture.path);
 }
 
 fn capabilities(mask: u8) -> V2NodeCapabilities {

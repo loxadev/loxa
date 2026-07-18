@@ -1,4 +1,5 @@
 use crate::control_state::repository::{ControlIdGenerator, ControlRepository};
+use crate::control_state::state_machine::test_support::storage::TestRoot;
 use crate::control_state::state_machine::{
     AdmissionRequest, MutationIds, Transition, TransitionError,
 };
@@ -59,6 +60,7 @@ impl MutationIds for DeterministicMutationIds {
 }
 
 struct MachineFixture {
+    _root: TestRoot,
     repository: Option<ControlRepository>,
     ids: DeterministicMutationIds,
     now: u64,
@@ -67,11 +69,8 @@ struct MachineFixture {
 
 impl MachineFixture {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "loxa-state-machine-{}-{}.sqlite3",
-            std::process::id(),
-            StreamEpoch::new_v4()
-        ));
+        let root = TestRoot::new("state-machine");
+        let path = root.path().join("control-state.sqlite3");
         let mut repository = ControlRepository::open_or_create(
             &path,
             NodeId::from_str(NODE_ID).unwrap(),
@@ -88,6 +87,7 @@ impl MachineFixture {
             })
             .unwrap();
         Self {
+            _root: root,
             repository: Some(repository),
             ids: DeterministicMutationIds::default(),
             now: std::time::SystemTime::now()
@@ -189,6 +189,12 @@ impl Drop for MachineFixture {
         let _ = std::fs::remove_file(format!("{}.migration.bak", self.path.display()));
         let _ = std::fs::remove_file(format!("{}.migration.bak.owner.lock", self.path.display()));
     }
+}
+
+#[test]
+fn machine_fixture_repository_parent_is_private() {
+    let machine = MachineFixture::new();
+    super::storage::assert_private_repository_parent(&machine.path);
 }
 
 fn zero_progress() -> V2OperationProgress {
@@ -653,11 +659,8 @@ fn committed_v1_projection_retains_latest_128_ordered_events_with_gap_metadata()
 
 #[test]
 fn committed_state_decodes_all_five_capabilities_and_unpublished_is_none() {
-    let path = std::env::temp_dir().join(format!(
-        "loxa-unpublished-state-{}-{}.sqlite3",
-        std::process::id(),
-        StreamEpoch::new_v4()
-    ));
+    let root = TestRoot::new("unpublished-state");
+    let path = root.path().join("control-state.sqlite3");
     let repository = ControlRepository::open_or_create(
         &path,
         NodeId::from_str(NODE_ID).unwrap(),

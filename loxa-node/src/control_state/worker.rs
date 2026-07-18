@@ -678,6 +678,8 @@ pub(crate) struct ControlStateWorker {
     join: Option<std::thread::JoinHandle<Result<(), ControlStateError>>>,
     healthy: Arc<AtomicBool>,
     health_signal: watch::Sender<bool>,
+    #[cfg(test)]
+    reaper_finished_for_test: Option<sync_mpsc::SyncSender<()>>,
 }
 
 impl ControlStateWorker {
@@ -838,6 +840,8 @@ impl ControlStateWorker {
                 join: Some(join),
                 healthy,
                 health_signal,
+                #[cfg(test)]
+                reaper_finished_for_test: None,
             },
             claimed_owner,
             ready_authority,
@@ -933,11 +937,18 @@ impl ControlStateWorker {
         ControlStateError,
     > {
         let (finished, receive) = oneshot::channel();
+        #[cfg(test)]
+        let finished_for_test = self.reaper_finished_for_test.take();
         if let Some(join) = self.join.take() {
             if std::thread::Builder::new()
                 .name("loxa-control-state-reaper".to_owned())
                 .spawn(move || {
-                    let _ = finished.send(join.join());
+                    let result = join.join();
+                    let _ = finished.send(result);
+                    #[cfg(test)]
+                    if let Some(finished_for_test) = finished_for_test {
+                        let _ = finished_for_test.send(());
+                    }
                 })
                 .is_err()
             {
@@ -1091,6 +1102,24 @@ pub(super) fn spawn_paused_from_repository_for_test(
     Ok((result.0, result.1, barrier))
 }
 
+#[cfg(test)]
+pub(super) fn spawn_paused_with_reaper_completion_for_test(
+    repository: ControlRepository,
+) -> Result<
+    (
+        ControlStateHandle,
+        ControlStateWorker,
+        Arc<std::sync::Barrier>,
+        sync_mpsc::Receiver<()>,
+    ),
+    ControlStateError,
+> {
+    let (handle, mut worker, barrier) = spawn_paused_from_repository_for_test(repository)?;
+    let (finished, receive) = sync_mpsc::sync_channel(1);
+    worker.reaper_finished_for_test = Some(finished);
+    Ok((handle, worker, barrier, receive))
+}
+
 fn spawn(
     repository: ControlRepository,
     start_barrier: Option<Arc<std::sync::Barrier>>,
@@ -1145,6 +1174,8 @@ fn spawn(
             join: Some(join),
             healthy,
             health_signal,
+            #[cfg(test)]
+            reaper_finished_for_test: None,
         },
     ))
 }
