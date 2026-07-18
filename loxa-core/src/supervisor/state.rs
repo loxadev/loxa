@@ -103,14 +103,14 @@ pub enum ManagedScalarSource {
     ExistingDatabase,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ManagedOwnerAcquisition {
     pub claimed_run: ManagedRun,
     pub scalar_source: ManagedScalarSource,
     pub recovery_source: ManagedRecoverySource,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ManagedRecoverySource {
     claimed_run: ManagedRun,
     kind: ManagedRecoveryKind,
@@ -376,6 +376,44 @@ pub fn acquire_managed_owner(
     acquire_managed_owner_with_probe(path, candidate, mode, |pid, expected_start| {
         super::OwnerIdentityProbe::probe(&super::SystemOwnerIdentityProbe, pid, expected_start)
     })
+}
+
+/// Aborts a managed-owner acquisition without destroying recovery evidence.
+///
+/// The sealed recovery source is single-use. Cleanup proceeds only while the
+/// durable row is still the exact claim produced by the acquisition.
+pub fn abort_managed_owner_acquisition(
+    path: &Path,
+    claimed_run: &ManagedRun,
+    source: ManagedRecoverySource,
+) -> Result<(), SupervisorError> {
+    if source.claimed_run != *claimed_run {
+        return Err(SupervisorError::RunStateConflict(
+            "managed acquisition recovery source does not match its claim".into(),
+        ));
+    }
+    let _lock = acquire_runtime_state_lock_for_mutation(
+        path,
+        RUNTIME_STATE_LOCK_TIMEOUT,
+        RUNTIME_STATE_LOCK_POLL_INTERVAL,
+    )?;
+    match read_runtime_state(path)? {
+        RuntimeStateRead::Loaded(runs) if runs.len() == 1 && runs.first() == Some(claimed_run) => {}
+        _ => {
+            return Err(SupervisorError::RunStateConflict(
+                "managed acquisition claim changed before abort".into(),
+            ));
+        }
+    }
+    match source.kind {
+        ManagedRecoveryKind::ExactAbsent => write_runtime_state(path, &[]),
+        ManagedRecoveryKind::PriorRun(prior) => {
+            write_runtime_state(path, std::slice::from_ref(&prior))
+        }
+        ManagedRecoveryKind::Unavailable => Err(SupervisorError::RecoveryRequired(
+            claimed_run.run_id.clone(),
+        )),
+    }
 }
 
 fn acquire_managed_owner_with_probe<F>(
@@ -1415,6 +1453,110 @@ mod tests {
         assert_eq!(
             read_runtime_state(&state_path).unwrap(),
             RuntimeStateRead::Loaded(vec![candidate])
+        );
+    }
+
+    #[test]
+    fn abort_exact_absent_acquisition_removes_only_the_exact_claim() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let candidate = unloaded_node_owner(temp.path(), "candidate");
+        let acquired = acquire_managed_owner_with_probe(
+            &state_path,
+            candidate.clone(),
+            ScalarCaptureMode::FirstMigration,
+            |_, _| panic!("missing state must not probe an owner"),
+        )
+        .unwrap();
+
+        abort_managed_owner_acquisition(
+            &state_path,
+            &acquired.claimed_run,
+            acquired.recovery_source,
+        )
+        .unwrap();
+        assert_eq!(
+            read_runtime_state(&state_path).unwrap(),
+            RuntimeStateRead::Loaded(Vec::new())
+        );
+    }
+
+    #[test]
+    fn abort_prior_run_acquisition_atomically_restores_exact_prior_evidence() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let mut prior = unloaded_node_owner(temp.path(), "prior");
+        prior.model_id = Some("model".into());
+        prior.lifecycle = RunLifecycle::Running;
+        prior.port = 9_001;
+        prior.child_pid = Some(77);
+        prior.child_process_start_time_unix_s = Some(88);
+        prior.child_pgid = Some(77);
+        write_runtime_state(&state_path, std::slice::from_ref(&prior)).unwrap();
+        let acquired = acquire_managed_owner_with_probe(
+            &state_path,
+            unloaded_node_owner(temp.path(), "candidate"),
+            ScalarCaptureMode::ExistingDatabase,
+            |_, _| OwnerIdentityStatus::Dead,
+        )
+        .unwrap();
+
+        abort_managed_owner_acquisition(
+            &state_path,
+            &acquired.claimed_run,
+            acquired.recovery_source,
+        )
+        .unwrap();
+        assert_eq!(
+            read_runtime_state(&state_path).unwrap(),
+            RuntimeStateRead::Loaded(vec![prior])
+        );
+    }
+
+    #[test]
+    fn abort_acquisition_preserves_mismatched_or_unavailable_claims() {
+        let temp = tempdir().expect("tempdir");
+        let state_path = temp.path().join("managed.json");
+        let acquired = acquire_managed_owner_with_probe(
+            &state_path,
+            unloaded_node_owner(temp.path(), "candidate"),
+            ScalarCaptureMode::ExistingDatabase,
+            |_, _| panic!("missing state must not probe an owner"),
+        )
+        .unwrap();
+        let preserved = acquired.claimed_run.clone();
+        assert!(abort_managed_owner_acquisition(
+            &state_path,
+            &acquired.claimed_run,
+            acquired.recovery_source,
+        )
+        .is_err());
+        assert_eq!(
+            read_runtime_state(&state_path).unwrap(),
+            RuntimeStateRead::Loaded(vec![preserved])
+        );
+
+        let mismatch_temp = tempdir().expect("tempdir");
+        let mismatch_path = mismatch_temp.path().join("managed.json");
+        let acquired = acquire_managed_owner_with_probe(
+            &mismatch_path,
+            unloaded_node_owner(mismatch_temp.path(), "mismatch-candidate"),
+            ScalarCaptureMode::FirstMigration,
+            |_, _| panic!("missing state must not probe an owner"),
+        )
+        .unwrap();
+        let mut changed = acquired.claimed_run.clone();
+        changed.stop_requested = true;
+        write_runtime_state(&mismatch_path, std::slice::from_ref(&changed)).unwrap();
+        assert!(abort_managed_owner_acquisition(
+            &mismatch_path,
+            &acquired.claimed_run,
+            acquired.recovery_source,
+        )
+        .is_err());
+        assert_eq!(
+            read_runtime_state(&mismatch_path).unwrap(),
+            RuntimeStateRead::Loaded(vec![changed])
         );
     }
 
