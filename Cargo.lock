@@ -939,7 +939,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "winapi-util",
 ]
 
 [[package]]
