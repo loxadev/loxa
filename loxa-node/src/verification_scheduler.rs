@@ -104,6 +104,45 @@ pub(crate) struct VerificationWaiter {
     released: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OperationCancelDelivery {
+    CancelledPublished,
+    CompletionInFlightOrReady,
+    Missing,
+    Poisoned,
+}
+
+impl VerificationWaiter {
+    pub(crate) fn request_cancel(&mut self) -> bool {
+        if self.released {
+            return false;
+        }
+        let Some(owner) = self.owner.upgrade() else {
+            return false;
+        };
+        owner.release_waiter(&self.key, self.waiter_id);
+        self.released = true;
+        true
+    }
+
+    pub(crate) fn request_operation_cancel(&mut self) -> OperationCancelDelivery {
+        if self.released {
+            return OperationCancelDelivery::Missing;
+        }
+        let Some(owner) = self.owner.upgrade() else {
+            return OperationCancelDelivery::Missing;
+        };
+        owner.cancel_waiter_with_completion(&self.key, self.waiter_id)
+    }
+
+    #[cfg(test)]
+    fn release_completion_marker_for_test(&self) {
+        if let Some(owner) = self.owner.upgrade() {
+            owner.release_waiter(&self.key, self.waiter_id);
+        }
+    }
+}
+
 impl Drop for VerificationWaiter {
     fn drop(&mut self) {
         if !self.released {
@@ -145,6 +184,7 @@ pub(crate) struct DownloadVerificationOwnership {
 
 pub(crate) struct DownloadVerificationOutcome {
     pub(crate) ownership: DownloadVerificationOwnership,
+    pub(crate) stable_identity: StableVerificationIdentity,
     pub(crate) result: VerificationResult,
 }
 
@@ -446,6 +486,12 @@ pub(super) struct CompletionDestination<T> {
     changed: Condvar,
 }
 
+pub(crate) enum CompletionWaitOutcome<T> {
+    Ready(RetainedCompletion<T>),
+    TimedOut,
+    Poisoned,
+}
+
 impl<T> CompletionDestination<T> {
     pub(super) fn new(capacity: usize) -> Self {
         Self {
@@ -511,17 +557,36 @@ impl<T> CompletionDestination<T> {
 
     pub(super) fn ready(&self) -> Option<RetainedCompletion<T>> {
         let cells = self.cells.lock().ok()?;
-        cells.iter().find_map(|cell| {
-            let ready = match cell.state.lock() {
-                Ok(state) => matches!(&*state, CompletionTransferState::Ready(_)),
-                Err(poisoned) => {
-                    let mut state = poisoned.into_inner();
-                    poison_ready_state(&mut state);
-                    false
-                }
+        ready_completion(&cells)
+    }
+
+    pub(super) fn wait_ready_until(&self, deadline: Instant) -> CompletionWaitOutcome<T> {
+        let mut cells = match self.cells.lock() {
+            Ok(cells) => cells,
+            Err(_) => return CompletionWaitOutcome::Poisoned,
+        };
+        loop {
+            if let Some(completion) = ready_completion(&cells) {
+                return CompletionWaitOutcome::Ready(completion);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return CompletionWaitOutcome::TimedOut;
+            }
+            let (next, timeout) = match self
+                .changed
+                .wait_timeout(cells, deadline.saturating_duration_since(now))
+            {
+                Ok(waited) => waited,
+                Err(_) => return CompletionWaitOutcome::Poisoned,
             };
-            ready.then(|| RetainedCompletion { cell: cell.clone() })
-        })
+            cells = next;
+            if timeout.timed_out() {
+                return ready_completion(&cells)
+                    .map(CompletionWaitOutcome::Ready)
+                    .unwrap_or(CompletionWaitOutcome::TimedOut);
+            }
+        }
     }
 
     #[cfg(test)]
@@ -539,11 +604,43 @@ impl<T> CompletionDestination<T> {
     }
 }
 
+fn ready_completion<T>(
+    cells: &VecDeque<Arc<RetainedCompletionCell<T>>>,
+) -> Option<RetainedCompletion<T>> {
+    cells.iter().find_map(|cell| {
+        let ready = match cell.state.lock() {
+            Ok(state) => matches!(&*state, CompletionTransferState::Ready(_)),
+            Err(poisoned) => {
+                let mut state = poisoned.into_inner();
+                poison_ready_state(&mut state);
+                false
+            }
+        };
+        ready.then(|| RetainedCompletion { cell: cell.clone() })
+    })
+}
+
 pub(crate) struct DownloadCompletionQueue {
     completions: CompletionDestination<DownloadVerificationOutcome>,
 }
 
 impl DownloadCompletionQueue {
+    #[cfg(test)]
+    pub(crate) fn population_for_test(&self) -> usize {
+        self.completions.cells.lock().unwrap().len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poison_wait_lock_for_test(self: &Arc<Self>) {
+        let queue = Arc::clone(self);
+        let _ = std::thread::spawn(move || {
+            let _guard = queue.completions.cells.lock().unwrap();
+            panic!("injected completion wait lock poison");
+        })
+        .join();
+        self.completions.changed.notify_all();
+    }
+
     pub(crate) fn new(capacity: usize) -> Arc<Self> {
         Arc::new(Self {
             completions: CompletionDestination::new(capacity),
@@ -564,6 +661,13 @@ impl DownloadCompletionQueue {
 
     pub(crate) fn ready(&self) -> Option<RetainedCompletion<DownloadVerificationOutcome>> {
         self.completions.ready()
+    }
+
+    pub(crate) fn wait_ready_until(
+        &self,
+        deadline: Instant,
+    ) -> CompletionWaitOutcome<DownloadVerificationOutcome> {
+        self.completions.wait_ready_until(deadline)
     }
 
     #[cfg(test)]
@@ -590,6 +694,64 @@ pub(crate) struct LifecycleVerificationBindFailure {
     pub(crate) input: StableVerificationInput,
     pub(crate) continuation: LifecycleVerificationContinuation,
     pub(crate) completion: LifecycleVerificationCompletion,
+}
+
+impl VerificationBindFailure {
+    pub(crate) fn poison(mut self) {
+        let Some(owner) = self.reservation.owner.upgrade() else {
+            std::mem::forget(self);
+            return;
+        };
+        let mut state = match owner.state.lock() {
+            Ok(state) => state,
+            Err(_) => {
+                std::mem::forget(self);
+                return;
+            }
+        };
+        self.reservation.state = VerificationReservationState::Poisoned;
+        state.sealed = true;
+        state.stopping = true;
+        for job in state.jobs.values() {
+            job.cancellation.cancel();
+        }
+        state.retained_bind.push(RetainedBindFailure::Download {
+            input: self.input,
+            continuation: self.continuation,
+            completion: self.completion,
+        });
+        drop(state);
+        owner.changed.notify_all();
+    }
+}
+
+impl LifecycleVerificationBindFailure {
+    pub(crate) fn poison(mut self) {
+        let Some(owner) = self.reservation.owner.upgrade() else {
+            std::mem::forget(self);
+            return;
+        };
+        let mut state = match owner.state.lock() {
+            Ok(state) => state,
+            Err(_) => {
+                std::mem::forget(self);
+                return;
+            }
+        };
+        self.reservation.state = VerificationReservationState::Poisoned;
+        state.sealed = true;
+        state.stopping = true;
+        for job in state.jobs.values() {
+            job.cancellation.cancel();
+        }
+        state.retained_bind.push(RetainedBindFailure::Lifecycle {
+            input: self.input,
+            continuation: self.continuation,
+            completion: self.completion,
+        });
+        drop(state);
+        owner.changed.notify_all();
+    }
 }
 
 impl VerificationAdmissionReservation {
@@ -743,6 +905,20 @@ struct VerificationJob {
 enum RetainedVerificationCompletion {
     Download(RetainedCompletion<DownloadVerificationOutcome>),
     Lifecycle(RetainedCompletion<LifecycleVerificationOutcome>),
+}
+
+#[allow(dead_code)]
+enum RetainedBindFailure {
+    Download {
+        input: StableVerificationInput,
+        continuation: DownloadContinuation,
+        completion: DownloadVerificationCompletion,
+    },
+    Lifecycle {
+        input: StableVerificationInput,
+        continuation: LifecycleVerificationContinuation,
+        completion: LifecycleVerificationCompletion,
+    },
 }
 
 impl VerificationShared {
@@ -918,6 +1094,12 @@ impl VerificationShared {
         } else {
             None
         };
+        let completing_removed = state
+            .completing
+            .get(&waiter_id)
+            .is_some_and(|(known, _)| known == key)
+            .then(|| state.completing.remove(&waiter_id))
+            .flatten();
         let empty_queued_job = if removed.is_some() {
             let mut remove_job = false;
             if let Some(job) = state.jobs.get_mut(key) {
@@ -932,11 +1114,101 @@ impl VerificationShared {
             None
         };
         drop(state);
-        if removed.is_some() {
+        if removed.is_some() || completing_removed.is_some() {
             drop(removed);
             drop(empty_queued_job);
             self.changed.notify_all();
         }
+    }
+
+    fn cancel_waiter_with_completion(
+        &self,
+        key: &VerificationKey,
+        waiter_id: u64,
+    ) -> OperationCancelDelivery {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                poisoned.into_inner().sealed = true;
+                return OperationCancelDelivery::Poisoned;
+            }
+        };
+        if state
+            .completing
+            .get(&waiter_id)
+            .is_some_and(|(known, _)| known == key)
+        {
+            return OperationCancelDelivery::CompletionInFlightOrReady;
+        }
+        let removed = if state
+            .bound
+            .get(&waiter_id)
+            .is_some_and(|(known, _)| known == key)
+        {
+            state.bound.remove(&waiter_id).map(|(_, bound)| bound)
+        } else {
+            None
+        };
+        let Some(bound) = removed else {
+            return OperationCancelDelivery::Missing;
+        };
+        state
+            .completing
+            .insert(waiter_id, (key.clone(), bound.class()));
+        let mut remove_job = false;
+        if let Some(job) = state.jobs.get_mut(key) {
+            job.waiter_ids.retain(|known| *known != waiter_id);
+            if job.waiter_ids.is_empty() {
+                job.cancellation.cancel();
+                remove_job = job.state == VerificationJobState::Queued;
+            }
+        }
+        let empty_queued_job = remove_job.then(|| state.jobs.remove(key)).flatten();
+        drop(state);
+        drop(empty_queued_job);
+
+        let retained = match bound {
+            BoundVerification::Download {
+                input,
+                ownership,
+                completion,
+            } => {
+                drop(input);
+                completion
+                    .publish(DownloadVerificationOutcome {
+                        ownership,
+                        stable_identity: key.stable.clone(),
+                        result: VerificationResult::Cancelled,
+                    })
+                    .err()
+                    .map(RetainedVerificationCompletion::Download)
+            }
+            BoundVerification::Lifecycle {
+                input,
+                continuation,
+                completion,
+            } => {
+                drop(input);
+                completion
+                    .publish(LifecycleVerificationOutcome {
+                        ownership: continuation,
+                        result: VerificationResult::Cancelled,
+                    })
+                    .err()
+                    .map(RetainedVerificationCompletion::Lifecycle)
+            }
+            #[cfg(test)]
+            BoundVerification::DropProbe(probe) => {
+                drop(probe);
+                return OperationCancelDelivery::Missing;
+            }
+        };
+        if let Some(retained) = retained {
+            self.retain_completions(vec![retained]);
+            return OperationCancelDelivery::Poisoned;
+        }
+        self.changed.notify_all();
+        OperationCancelDelivery::CancelledPublished
     }
 
     fn stop(&self) {
@@ -999,8 +1271,10 @@ struct VerificationState {
     next_waiter_id: u64,
     reservations: HashMap<(VerificationKey, VerificationClass), usize>,
     bound: HashMap<u64, (VerificationKey, BoundVerification)>,
+    completing: HashMap<u64, (VerificationKey, VerificationClass)>,
     jobs: HashMap<VerificationKey, VerificationJob>,
     retained: Vec<RetainedVerificationCompletion>,
+    retained_bind: Vec<RetainedBindFailure>,
     stopping: bool,
     sealed: bool,
 }
@@ -1011,7 +1285,7 @@ impl VerificationState {
         loop {
             let waiter_id = self.next_waiter_id;
             self.next_waiter_id = self.next_waiter_id.wrapping_add(1);
-            if !self.bound.contains_key(&waiter_id) {
+            if !self.bound.contains_key(&waiter_id) && !self.completing.contains_key(&waiter_id) {
                 return Some(waiter_id);
             }
             if self.next_waiter_id == start {
@@ -1212,6 +1486,51 @@ impl VerificationShutdownFailure {
 }
 
 impl VerificationSchedulerHandle {
+    pub(crate) fn reserve_until(
+        &self,
+        key: VerificationKey,
+        class: VerificationClass,
+        cancellation: &OperationCancellation,
+        deadline: Instant,
+    ) -> VerificationReserveOutcome {
+        loop {
+            match self.reserve(key.clone(), class) {
+                VerificationReserveOutcome::Backpressure => {}
+                outcome => return outcome,
+            }
+            if cancellation.is_cancel_requested() {
+                return VerificationReserveOutcome::Stopping;
+            }
+            let mut state = match self.shared.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => {
+                    poisoned.into_inner().sealed = true;
+                    return VerificationReserveOutcome::Stopping;
+                }
+            };
+            if state.stopping || state.sealed {
+                return VerificationReserveOutcome::Stopping;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return VerificationReserveOutcome::Backpressure;
+            }
+            let (next, _) = match self
+                .shared
+                .changed
+                .wait_timeout(state, deadline.saturating_duration_since(now))
+            {
+                Ok(waited) => waited,
+                Err(poisoned) => {
+                    poisoned.into_inner().0.sealed = true;
+                    return VerificationReserveOutcome::Stopping;
+                }
+            };
+            state = next;
+            drop(state);
+        }
+    }
+
     pub(crate) fn reserve(
         &self,
         key: VerificationKey,
@@ -1310,6 +1629,18 @@ impl VerificationSchedulerHandle {
     }
 
     #[cfg(test)]
+    fn completing_waiters_for_key_for_test(&self, key: &VerificationKey) -> usize {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .completing
+            .values()
+            .filter(|(known, _)| known == key)
+            .count()
+    }
+
+    #[cfg(test)]
     fn job_cancellation_for_test(&self, key: &VerificationKey) -> Option<JobCancellation> {
         self.shared
             .state
@@ -1369,14 +1700,20 @@ impl VerificationSchedulerOwner {
     }
 
     #[cfg(test)]
-    fn start_with_worker_hook_for_test(
+    pub(crate) fn disconnect_first_completion_for_test(&mut self) {
+        let (_sender, disconnected) = std::sync::mpsc::channel();
+        self.completions[0] = disconnected;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_with_worker_hook_for_test(
         hook: impl Fn(&VerificationKey) + Send + Sync + 'static,
     ) -> (VerificationSchedulerHandle, VerificationSchedulerOwner) {
         Self::start_inner(Some(Arc::new(hook)), None).expect("verification test workers start")
     }
 
     #[cfg(test)]
-    fn start_with_worker_and_finish_hooks_for_test(
+    pub(crate) fn start_with_worker_and_finish_hooks_for_test(
         worker_hook: impl Fn(&VerificationKey) + Send + Sync + 'static,
         finish_hook: impl Fn(&VerificationKey) + Send + Sync + 'static,
     ) -> (VerificationSchedulerHandle, VerificationSchedulerOwner) {
@@ -1393,8 +1730,10 @@ impl VerificationSchedulerOwner {
                 next_waiter_id: 1,
                 reservations: HashMap::new(),
                 bound: HashMap::new(),
+                completing: HashMap::new(),
                 jobs: HashMap::new(),
                 retained: Vec::new(),
+                retained_bind: Vec::new(),
                 stopping: false,
                 sealed: false,
             }),
@@ -1486,12 +1825,29 @@ impl VerificationSchedulerOwner {
             }
         }
         let state_uncertain = match self.shared.state.lock() {
-            Ok(state) => {
-                state.sealed
+            Ok(mut state) => loop {
+                let fatal = state.sealed
                     || !state.jobs.is_empty()
                     || !state.bound.is_empty()
                     || !state.retained.is_empty()
-            }
+                    || !state.retained_bind.is_empty();
+                if fatal || state.completing.is_empty() {
+                    break fatal;
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break true;
+                }
+                match self.shared.changed.wait_timeout(state, remaining) {
+                    Ok((next, timeout)) => {
+                        state = next;
+                        if timeout.timed_out() && !state.completing.is_empty() {
+                            break true;
+                        }
+                    }
+                    Err(_) => break true,
+                }
+            },
             Err(_) => true,
         };
         if state_uncertain && failure.is_none() {
@@ -1514,7 +1870,13 @@ impl Drop for VerificationSchedulerOwner {
             std::process::abort();
         }
         let retain = match self.shared.state.lock() {
-            Ok(state) => state.sealed || !state.bound.is_empty() || !state.retained.is_empty(),
+            Ok(state) => {
+                state.sealed
+                    || !state.bound.is_empty()
+                    || !state.completing.is_empty()
+                    || !state.retained.is_empty()
+                    || !state.retained_bind.is_empty()
+            }
             Err(_) => true,
         };
         if retain {
@@ -1529,7 +1891,7 @@ impl VerificationShutdownFailure {
         let owner = self.into_owner();
         assert!(owner.handles.is_empty(), "fatal test owner must be joined");
         let shared = owner.shared.clone();
-        let (bound, retained) = {
+        let (bound, retained, retained_bind) = {
             let mut state = shared
                 .state
                 .lock()
@@ -1537,12 +1899,15 @@ impl VerificationShutdownFailure {
             state.jobs.clear();
             state.reservations.clear();
             let bound = std::mem::take(&mut state.bound);
+            state.completing.clear();
             let retained = std::mem::take(&mut state.retained);
+            let retained_bind = std::mem::take(&mut state.retained_bind);
             state.sealed = false;
-            (bound, retained)
+            (bound, retained, retained_bind)
         };
         drop(bound);
         dispose_retained_for_test(retained);
+        drop(retained_bind);
         drop(owner);
         drop(shared);
     }
@@ -1583,10 +1948,6 @@ fn verification_worker_loop(shared: &Arc<VerificationShared>) -> bool {
             Ok(next) => next,
             Err(()) => return false,
         };
-        #[cfg(test)]
-        if let Some(hook) = &shared.finish_hook {
-            hook(&work.key);
-        }
     }
 }
 
@@ -1652,7 +2013,10 @@ fn finish_work(
         for waiter_id in job.waiter_ids {
             if let Some((known_key, bound)) = state.bound.remove(&waiter_id) {
                 if known_key == *key {
-                    completed.push(bound);
+                    state
+                        .completing
+                        .insert(waiter_id, (known_key, bound.class()));
+                    completed.push((waiter_id, bound));
                 } else {
                     state.bound.insert(waiter_id, (known_key, bound));
                 }
@@ -1662,9 +2026,13 @@ fn finish_work(
         (completed, claimed)
     };
     shared.changed.notify_all();
+    #[cfg(test)]
+    if let Some(hook) = &shared.finish_hook {
+        hook(key);
+    }
 
     let mut retained = Vec::new();
-    for bound in completed {
+    for (_, bound) in completed {
         match bound {
             BoundVerification::Download {
                 input,
@@ -1674,6 +2042,7 @@ fn finish_work(
                 drop(input);
                 let outcome = DownloadVerificationOutcome {
                     ownership,
+                    stable_identity: key.stable.clone(),
                     result: result.clone_for_delivery(),
                 };
                 if let Err(completion) = completion.publish(outcome) {
@@ -1797,8 +2166,10 @@ mod lock_order_tests {
                 next_waiter_id: 1,
                 reservations: HashMap::new(),
                 bound: HashMap::new(),
+                completing: HashMap::new(),
                 jobs: HashMap::new(),
                 retained: Vec::new(),
+                retained_bind: Vec::new(),
                 stopping: false,
                 sealed: false,
             }),
@@ -2210,6 +2581,9 @@ mod tests {
         let mut ready = retained.take_ready().unwrap();
         let result = ready.outcome_mut().result.clone_for_delivery();
         ready.acknowledge();
+        if let Some(waiter) = &fixture.waiter {
+            waiter.release_completion_marker_for_test();
+        }
         result
     }
 
@@ -2225,6 +2599,9 @@ mod tests {
         };
         let result = ready.outcome_mut().result.clone_for_delivery();
         ready.acknowledge();
+        if let Some(waiter) = &fixture.waiter {
+            waiter.release_completion_marker_for_test();
+        }
         result
     }
 
@@ -2271,11 +2648,11 @@ mod tests {
         assert_eq!(handle.counts_for_test(), counts);
 
         gate.release(32);
-        assert!(shutdown(owner).is_ok());
         for fixture in &downloads {
             acknowledge_download(fixture);
         }
         acknowledge_lifecycle(&lifecycle);
+        assert!(shutdown(owner).is_ok());
     }
 
     #[test]
@@ -2362,12 +2739,12 @@ mod tests {
         ));
 
         gate.release(64);
-        assert!(shutdown(owner).is_ok());
         for fixture in downloads.iter().take(downloads.len() - 1) {
             acknowledge_download(fixture);
         }
         acknowledge_download(&mixed_download);
         acknowledge_download(&replacement);
+        assert!(shutdown(owner).is_ok());
         assert!(attachment_was_backpressured);
     }
 
@@ -2389,32 +2766,42 @@ mod tests {
             );
         let mut downloads = Vec::new();
         for index in 0..(VERIFICATION_WORKERS + VERIFICATION_DOWNLOAD_WAITING) {
-            downloads.push(
-                submit_download(
-                    &handle,
-                    &dir.file(&format!("download-{index}.gguf"), b"download"),
-                    [index as u8 + 1; 32],
-                    index as u64 + 1,
-                )
-                .1,
-            );
+            downloads.push(submit_download(
+                &handle,
+                &dir.file(&format!("download-{index}.gguf"), b"download"),
+                [index as u8 + 1; 32],
+                index as u64 + 1,
+            ));
             if index + 1 == VERIFICATION_WORKERS {
                 worker_gate.wait_started(VERIFICATION_WORKERS);
             }
         }
 
         worker_gate.release(1);
-        finish_gate.wait_started(1);
+        let finished_key = finish_gate.wait_started(1)[0].clone();
+        let completing = downloads
+            .iter_mut()
+            .find(|(key, _)| *key == finished_key)
+            .expect("finish hook key remains correlated");
+        assert_eq!(
+            completing
+                .1
+                .waiter
+                .as_mut()
+                .unwrap()
+                .request_operation_cancel(),
+            OperationCancelDelivery::CompletionInFlightOrReady
+        );
         let extra = submit_download(&handle, &dir.file("extra.gguf", b"extra"), [99; 32], 100).1;
         let counts = handle.counts_for_test();
 
         finish_gate.release(64);
         worker_gate.release(64);
-        assert!(shutdown(owner).is_ok());
-        for fixture in &downloads {
+        for (_, fixture) in &downloads {
             acknowledge_download(fixture);
         }
         acknowledge_download(&extra);
+        assert!(shutdown(owner).is_ok());
         assert_eq!(counts.running, VERIFICATION_WORKERS);
         assert_eq!(counts.download_queued, VERIFICATION_DOWNLOAD_WAITING);
     }
@@ -2460,11 +2847,11 @@ mod tests {
         let counts = handle.counts_for_test();
 
         gate.release(32);
-        assert!(shutdown(owner).is_ok());
         acknowledge_lifecycle(&lifecycle);
         for fixture in &downloads {
             acknowledge_download(fixture);
         }
+        assert!(shutdown(owner).is_ok());
         assert!(backpressured);
         assert_eq!(counts.running, 2);
         assert_eq!(counts.download_queued, VERIFICATION_DOWNLOAD_WAITING);
@@ -2500,10 +2887,10 @@ mod tests {
         assert_eq!(crate::download_scheduler::DOWNLOAD_WORKERS, 2);
 
         gate.release(32);
-        assert!(shutdown(owner).is_ok());
         for fixture in &fixtures {
             acknowledge_download(fixture);
         }
+        assert!(shutdown(owner).is_ok());
     }
 
     #[cfg(any(unix, windows))]
@@ -2534,9 +2921,9 @@ mod tests {
         assert_eq!(started.len(), 2);
         assert_ne!(started[0], started[1]);
         gate.release(2);
-        assert!(shutdown(owner).is_ok());
         acknowledge_download(&first_fixture);
         acknowledge_download(&second_fixture);
+        assert!(shutdown(owner).is_ok());
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -2594,10 +2981,10 @@ mod tests {
             .is_err());
 
         gate.release(8);
-        assert!(shutdown(owner).is_ok());
         acknowledge_download(&leader);
         acknowledge_download(&follower);
         acknowledge_download(&digest_fixture);
+        assert!(shutdown(owner).is_ok());
     }
 
     #[cfg(unix)]
@@ -2653,6 +3040,7 @@ mod tests {
             }
         ));
         ready.acknowledge();
+        _waiter.release_completion_marker_for_test();
         assert!(coordinator.try_acquire_mutation(artifact_key).is_ok());
         assert!(shutdown(owner).is_ok());
     }
@@ -2685,6 +3073,177 @@ mod tests {
     }
 
     #[test]
+    fn operation_cancel_delivers_exact_bound_ownership_without_cancelling_shared_follower() {
+        let dir = TestDir::new("operation-cancel-delivery");
+        let path = dir.file("model.gguf", b"artifact");
+        let gate = Arc::new(WorkerGate::default());
+        let (handle, owner) = VerificationSchedulerOwner::start_with_worker_hook_for_test({
+            let gate = gate.clone();
+            move |key| gate.enter(key)
+        });
+        let (key, mut cancelled) = submit_download(&handle, &path, [1; 32], 1);
+        gate.wait_started(1);
+        let (_, mut follower) = submit_download(&handle, &path, [1; 32], 2);
+        let job_cancellation = handle.job_cancellation_for_test(&key).unwrap();
+
+        assert_eq!(
+            cancelled
+                .waiter
+                .as_mut()
+                .unwrap()
+                .request_operation_cancel(),
+            OperationCancelDelivery::CancelledPublished
+        );
+        assert_eq!(handle.waiters_for_key_for_test(&key), 1);
+        assert!(!job_cancellation.is_cancelled());
+        assert!(matches!(
+            acknowledge_download(&cancelled),
+            VerificationResult::Cancelled
+        ));
+        drop(cancelled.waiter.take());
+        assert!(follower.queue.ready().is_none());
+
+        gate.release(1);
+        let follower_result = acknowledge_download(&follower);
+        drop(follower.waiter.take());
+        assert!(shutdown(owner).is_ok());
+        assert!(!matches!(follower_result, VerificationResult::Cancelled));
+    }
+
+    #[test]
+    fn lifecycle_operation_cancel_delivers_cancelled_completion_with_read_lease_retained() {
+        let dir = TestDir::new("lifecycle-operation-cancel-delivery");
+        let path = dir.file("model.gguf", b"artifact");
+        let gate = Arc::new(WorkerGate::default());
+        let (handle, owner) = VerificationSchedulerOwner::start_with_worker_hook_for_test({
+            let gate = gate.clone();
+            move |key| gate.enter(key)
+        });
+        let (key, mut cancelled) = submit_lifecycle(&handle, &path, [1; 32], 1);
+        gate.wait_started(1);
+        let (_, mut follower) = submit_download(&handle, &path, [1; 32], 2);
+        let job_cancellation = handle.job_cancellation_for_test(&key).unwrap();
+
+        assert_eq!(
+            cancelled
+                .waiter
+                .as_mut()
+                .unwrap()
+                .request_operation_cancel(),
+            OperationCancelDelivery::CancelledPublished
+        );
+        assert_eq!(handle.waiters_for_key_for_test(&key), 1);
+        assert!(!job_cancellation.is_cancelled());
+        assert!(matches!(
+            acknowledge_lifecycle(&cancelled),
+            VerificationResult::Cancelled
+        ));
+        drop(cancelled.waiter.take());
+        assert!(follower.queue.ready().is_none());
+
+        gate.release(1);
+        let _ = acknowledge_download(&follower);
+        drop(follower.waiter.take());
+        assert!(shutdown(owner).is_ok());
+    }
+
+    #[test]
+    fn download_cancel_at_bound_to_ready_seam_waits_for_original_completion() {
+        let dir = TestDir::new("download-cancel-completing");
+        let path = dir.file("model.gguf", b"artifact");
+        let worker_gate = Arc::new(WorkerGate::default());
+        let finish_gate = Arc::new(WorkerGate::default());
+        let (handle, owner) =
+            VerificationSchedulerOwner::start_with_worker_and_finish_hooks_for_test(
+                {
+                    let worker_gate = worker_gate.clone();
+                    move |key| worker_gate.enter(key)
+                },
+                {
+                    let finish_gate = finish_gate.clone();
+                    move |key| finish_gate.enter(key)
+                },
+            );
+        let (key, mut leader) = submit_download(&handle, &path, [1; 32], 1);
+        worker_gate.wait_started(1);
+        let (_, mut follower) = submit_download(&handle, &path, [1; 32], 2);
+
+        worker_gate.release(1);
+        finish_gate.wait_started(1);
+        assert_eq!(handle.completing_waiters_for_key_for_test(&key), 2);
+        assert_eq!(
+            leader.waiter.as_mut().unwrap().request_operation_cancel(),
+            OperationCancelDelivery::CompletionInFlightOrReady
+        );
+        assert!(leader.queue.ready().is_none());
+        assert!(follower.queue.ready().is_none());
+
+        finish_gate.release(1);
+        assert!(!matches!(
+            acknowledge_download(&leader),
+            VerificationResult::Cancelled
+        ));
+        drop(leader.waiter.take());
+        assert_eq!(handle.completing_waiters_for_key_for_test(&key), 1);
+        assert!(!matches!(
+            acknowledge_download(&follower),
+            VerificationResult::Cancelled
+        ));
+        drop(follower.waiter.take());
+        assert_eq!(handle.completing_waiters_for_key_for_test(&key), 0);
+        assert!(shutdown(owner).is_ok());
+    }
+
+    #[test]
+    fn lifecycle_cancel_at_bound_to_ready_seam_preserves_shared_download() {
+        let dir = TestDir::new("lifecycle-cancel-completing");
+        let path = dir.file("model.gguf", b"artifact");
+        let worker_gate = Arc::new(WorkerGate::default());
+        let finish_gate = Arc::new(WorkerGate::default());
+        let (handle, owner) =
+            VerificationSchedulerOwner::start_with_worker_and_finish_hooks_for_test(
+                {
+                    let worker_gate = worker_gate.clone();
+                    move |key| worker_gate.enter(key)
+                },
+                {
+                    let finish_gate = finish_gate.clone();
+                    move |key| finish_gate.enter(key)
+                },
+            );
+        let (key, mut lifecycle) = submit_lifecycle(&handle, &path, [1; 32], 1);
+        worker_gate.wait_started(1);
+        let (_, mut follower) = submit_download(&handle, &path, [1; 32], 2);
+
+        worker_gate.release(1);
+        finish_gate.wait_started(1);
+        assert_eq!(handle.completing_waiters_for_key_for_test(&key), 2);
+        assert_eq!(
+            lifecycle
+                .waiter
+                .as_mut()
+                .unwrap()
+                .request_operation_cancel(),
+            OperationCancelDelivery::CompletionInFlightOrReady
+        );
+
+        finish_gate.release(1);
+        assert!(!matches!(
+            acknowledge_lifecycle(&lifecycle),
+            VerificationResult::Cancelled
+        ));
+        drop(lifecycle.waiter.take());
+        assert_eq!(handle.completing_waiters_for_key_for_test(&key), 1);
+        assert!(!matches!(
+            acknowledge_download(&follower),
+            VerificationResult::Cancelled
+        ));
+        drop(follower.waiter.take());
+        assert_eq!(handle.completing_waiters_for_key_for_test(&key), 0);
+        assert!(shutdown(owner).is_ok());
+    }
+
+    #[test]
     fn lifecycle_is_next_but_bounded_priority_cannot_starve_download_fifo() {
         let dir = TestDir::new("priority");
         let gate = Arc::new(WorkerGate::default());
@@ -2708,19 +3267,19 @@ mod tests {
         assert_eq!(started[3], download_key);
 
         gate.release(8);
-        assert!(shutdown(owner).is_ok());
         acknowledge_download(&first);
         acknowledge_download(&second);
         acknowledge_download(&queued_download);
         acknowledge_lifecycle(&lifecycle);
+        assert!(shutdown(owner).is_ok());
     }
 
     #[test]
     fn bind_failure_returns_every_move_only_input_without_releasing_the_permit() {
         let dir = TestDir::new("bind-failure");
         let path = dir.file("model.gguf", b"artifact");
-        let (key, mut input) = input(&path, [1; 32]);
-        input.expected_sha256 = [2; 32];
+        let (key, mut mismatched_input) = input(&path, [1; 32]);
+        mismatched_input.expected_sha256 = [2; 32];
         let (handle, owner) = VerificationSchedulerOwner::start().unwrap();
         let reservation = match handle.reserve(key, VerificationClass::Download) {
             VerificationReserveOutcome::Reserved(reservation) => reservation,
@@ -2746,7 +3305,7 @@ mod tests {
         );
         let queue = DownloadCompletionQueue::new(1);
         let completion = queue.reserve().unwrap();
-        let failure = match reservation.bind_download(input, continuation, completion) {
+        let failure = match reservation.bind_download(mismatched_input, continuation, completion) {
             Err(failure) => failure,
             Ok(_) => panic!("conflicting digest must fail bind"),
         };
@@ -2760,9 +3319,74 @@ mod tests {
                 .unwrap_err(),
             ArtifactAcquireError::Busy
         );
-        drop(failure);
+        failure.poison();
+        assert_eq!(releases.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            coordinator.try_acquire_mutation(artifact_key).unwrap_err(),
+            ArtifactAcquireError::Busy
+        );
+        assert!(matches!(
+            handle.reserve(input(&path, [1; 32]).0, VerificationClass::Download),
+            VerificationReserveOutcome::Stopping
+        ));
+        shutdown(owner)
+            .expect_err("poisoned bind capabilities require fatal retention")
+            .dispose_for_test();
         assert_eq!(releases.load(Ordering::SeqCst), 1);
-        assert!(coordinator.try_acquire_mutation(artifact_key).is_ok());
+    }
+
+    #[test]
+    fn bounded_reservation_wait_wakes_on_capacity_and_observes_exact_cancellation() {
+        let dir = TestDir::new("bounded-reserve-wait");
+        let (handle, owner) = VerificationSchedulerOwner::start().unwrap();
+        let mut held = Vec::new();
+        for index in 0..VERIFICATION_WORKERS + VERIFICATION_DOWNLOAD_WAITING {
+            let path = dir.file(&format!("held-{index}.gguf"), b"artifact");
+            let (key, _) = input(&path, [index as u8; 32]);
+            match handle.reserve(key, VerificationClass::Download) {
+                VerificationReserveOutcome::Reserved(reservation) => held.push(reservation),
+                _ => panic!("declared capacity rejected early"),
+            }
+        }
+        let waiting_path = dir.file("waiting.gguf", b"artifact");
+        let waiting_key = input(&waiting_path, [99; 32]).0;
+        let cancellation = OperationCancellation::new();
+        let waiter = handle.clone();
+        let wait_cancel = cancellation.clone();
+        let joined = std::thread::spawn(move || {
+            waiter.reserve_until(
+                waiting_key,
+                VerificationClass::Download,
+                &wait_cancel,
+                Instant::now() + Duration::from_secs(2),
+            )
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        drop(held.pop());
+        let awakened = match joined.join().unwrap() {
+            VerificationReserveOutcome::Reserved(reservation) => reservation,
+            _ => panic!("released capacity did not wake the bounded waiter"),
+        };
+        held.push(awakened);
+
+        let cancelled_path = dir.file("cancelled.gguf", b"artifact");
+        let cancelled_key = input(&cancelled_path, [100; 32]).0;
+        let waiter = handle.clone();
+        let wait_cancel = cancellation.clone();
+        cancellation.request_cancel();
+        let joined = std::thread::spawn(move || {
+            waiter.reserve_until(
+                cancelled_key,
+                VerificationClass::Download,
+                &wait_cancel,
+                Instant::now() + Duration::from_millis(250),
+            )
+        });
+        assert!(matches!(
+            joined.join().unwrap(),
+            VerificationReserveOutcome::Stopping
+        ));
+        drop(held);
         assert!(shutdown(owner).is_ok());
     }
 
@@ -2789,6 +3413,10 @@ mod tests {
             ArtifactAcquireError::Busy
         );
         handle.dispose_retained_for_test();
+        lost.waiter
+            .as_ref()
+            .unwrap()
+            .release_completion_marker_for_test();
         assert!(lost_coordinator.try_acquire_mutation(lost_key).is_ok());
 
         let fatal = shutdown(owner).expect_err("destination loss seals scheduler");
@@ -2799,6 +3427,11 @@ mod tests {
         wait_until(|| acknowledged.queue.ready().is_some());
         let retained = acknowledged.queue.ready().unwrap();
         retained.take_ready().unwrap().acknowledge();
+        acknowledged
+            .waiter
+            .as_ref()
+            .unwrap()
+            .release_completion_marker_for_test();
         assert!(acknowledged
             .coordinator
             .try_acquire_mutation(acknowledged.artifact_key.clone())
@@ -2821,6 +3454,11 @@ mod tests {
             ArtifactAcquireError::Busy
         );
         unknown.queue.dispose_poisoned_for_test();
+        unknown
+            .waiter
+            .as_ref()
+            .unwrap()
+            .release_completion_marker_for_test();
         assert!(unknown
             .coordinator
             .try_acquire_mutation(unknown.artifact_key.clone())
@@ -2845,6 +3483,11 @@ mod tests {
             ArtifactAcquireError::Busy
         );
         panicked.queue.dispose_poisoned_for_test();
+        panicked
+            .waiter
+            .as_ref()
+            .unwrap()
+            .release_completion_marker_for_test();
         assert!(panicked
             .coordinator
             .try_acquire_mutation(panicked.artifact_key.clone())
@@ -2884,14 +3527,14 @@ mod tests {
             VerificationReserveOutcome::Stopping
         ));
         gate.release(16);
-        let exits = shutdown(owner).expect("clean cancellation joins workers");
-        assert_eq!(exits, vec![VerificationWorkerExit::Stopped; 2]);
         for fixture in &fixtures {
             assert!(matches!(
                 acknowledge_download(fixture),
                 VerificationResult::Cancelled
             ));
         }
+        let exits = shutdown(owner).expect("clean cancellation joins workers");
+        assert_eq!(exits, vec![VerificationWorkerExit::Stopped; 2]);
     }
 
     #[test]
@@ -2916,13 +3559,68 @@ mod tests {
 
         gate.release(1);
         let owner = failure.into_owner();
-        assert!(owner
-            .shutdown(Instant::now() + Duration::from_secs(5))
-            .is_ok());
         assert!(matches!(
             acknowledge_download(&fixture),
             VerificationResult::Cancelled
         ));
+        assert!(owner
+            .shutdown(Instant::now() + Duration::from_secs(5))
+            .is_ok());
+    }
+
+    #[test]
+    fn shutdown_waits_for_ready_acknowledgement_without_releasing_owner_rights() {
+        let dir = TestDir::new("shutdown-ready-drain");
+        let finish_gate = Arc::new(WorkerGate::default());
+        let (handle, owner) =
+            VerificationSchedulerOwner::start_with_worker_and_finish_hooks_for_test(|_| {}, {
+                let finish_gate = finish_gate.clone();
+                move |key| finish_gate.enter(key)
+            });
+        let fixture = submit_download(&handle, &dir.file("model.gguf", b"artifact"), [1; 32], 1).1;
+        finish_gate.wait_started(1);
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            entered_tx.send(()).unwrap();
+            result_tx
+                .send(owner.shutdown(Instant::now() + Duration::from_secs(5)))
+                .unwrap();
+        });
+        entered_rx.recv().unwrap();
+        finish_gate.release(1);
+        wait_until(|| fixture.queue.ready().is_some());
+        assert!(matches!(
+            result_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        acknowledge_download(&fixture);
+        assert!(result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .is_ok());
+    }
+
+    #[test]
+    fn shutdown_ready_ack_deadline_returns_retained_ownership() {
+        let dir = TestDir::new("shutdown-ready-deadline");
+        let (handle, owner) = VerificationSchedulerOwner::start().unwrap();
+        let fixture = submit_download(&handle, &dir.file("model.gguf", b"artifact"), [1; 32], 1).1;
+        wait_until(|| fixture.queue.ready().is_some());
+
+        let failure = owner
+            .shutdown(Instant::now() + Duration::from_millis(20))
+            .expect_err("ready ownership must remain retained until acknowledgement");
+        assert_eq!(
+            failure.reason(),
+            VerificationShutdownReason::RetainedOwnership
+        );
+        assert!(!failure.retains_unjoined_workers());
+        acknowledge_download(&fixture);
+        assert!(failure
+            .into_owner()
+            .shutdown(Instant::now() + Duration::from_secs(1))
+            .is_ok());
     }
 
     #[test]

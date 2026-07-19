@@ -677,6 +677,14 @@ pub(crate) enum DownloadSubmitOutcome {
     Stopping,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DownloadKeyReleaseOutcome {
+    Released,
+    TimedOut,
+    Stopping,
+    Poisoned,
+}
+
 pub(crate) struct DownloadFatalShutdown {
     shared: Arc<DownloadShared>,
 }
@@ -788,6 +796,61 @@ impl DownloadSchedulerHandle {
         })
     }
 
+    pub(crate) fn wait_key_released_until(
+        &self,
+        key: &DownloadKey,
+        deadline: Instant,
+    ) -> DownloadKeyReleaseOutcome {
+        let mut state = match self.shared.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                let mut state = poisoned.into_inner();
+                state.sealed = true;
+                drop(state);
+                self.shared.seal();
+                return DownloadKeyReleaseOutcome::Poisoned;
+            }
+        };
+        loop {
+            if !matches!(
+                state.reservations.get(key),
+                Some(ReservationEntry::Active { .. })
+            ) {
+                return DownloadKeyReleaseOutcome::Released;
+            }
+            if state.stopping || state.sealed {
+                return DownloadKeyReleaseOutcome::Stopping;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return DownloadKeyReleaseOutcome::TimedOut;
+            }
+            let (next, timeout) = match self
+                .shared
+                .changed
+                .wait_timeout(state, deadline.saturating_duration_since(now))
+            {
+                Ok(next) => next,
+                Err(poisoned) => {
+                    let (mut state, _) = poisoned.into_inner();
+                    state.sealed = true;
+                    drop(state);
+                    self.shared.seal();
+                    return DownloadKeyReleaseOutcome::Poisoned;
+                }
+            };
+            state = next;
+            if timeout.timed_out()
+                && matches!(
+                    state.reservations.get(key),
+                    Some(ReservationEntry::Active { .. })
+                )
+            {
+                return DownloadKeyReleaseOutcome::TimedOut;
+            }
+        }
+    }
+
     pub(crate) fn submit(&self, bound: BoundDownload) -> DownloadSubmitOutcome {
         let mut state = match self.shared.state.lock() {
             Ok(state) => state,
@@ -891,25 +954,13 @@ impl DownloadSchedulerHandle {
             return false;
         }
         let bound = state.ready.remove(&ready_key);
-        let reservation = reservation_key
-            .as_ref()
-            .and_then(|key| state.reservations.remove_entry(key));
-        let transfer_removed = state.transferring.remove(&operation_id);
         drop(state);
         let Some(bound) = bound else {
-            drop(reservation);
             self.shared.seal();
             return false;
         };
-        if !transfer_removed {
-            drop(bound);
-            drop(reservation);
-            self.shared.seal();
-            return false;
-        }
         let _ = bound.cancellation.request_cancel();
         drop(bound);
-        drop(reservation);
         self.shared.notify_changed();
         true
     }
@@ -1478,6 +1529,98 @@ mod tests {
                 .unwrap()
                 .0;
         }
+    }
+
+    fn bind_without_submit(
+        handle: &DownloadSchedulerHandle,
+        key: DownloadKey,
+        operation_id: OperationId,
+    ) {
+        reserve(handle, key)
+            .bind(
+                operation_id,
+                DecimalU64::new(1),
+                OperationCancellation::new(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn exact_key_release_wait_wakes_without_mutating_capacity() {
+        let (started_tx, _) = mpsc::channel();
+        let executor = Arc::new(GateExecutor::new(started_tx));
+        let (handle, owner) = DownloadSchedulerOwner::spawn(executor).unwrap();
+        let key = key(901);
+        let operation_id = operation(901);
+        bind_without_submit(&handle, key.clone(), operation_id);
+        let waiter = handle.clone();
+        let waited_key = key.clone();
+        let waiting = thread::spawn(move || {
+            waiter.wait_key_released_until(&waited_key, Instant::now() + Duration::from_secs(1))
+        });
+
+        assert!(handle.finish_committed(operation_id));
+        assert_eq!(waiting.join().unwrap(), DownloadKeyReleaseOutcome::Released);
+        assert_eq!(handle.shared.state.lock().unwrap().transfer_population(), 0);
+        shutdown(owner);
+    }
+
+    #[test]
+    fn exact_key_release_wait_times_out_without_capacity_side_effects() {
+        let (started_tx, _) = mpsc::channel();
+        let executor = Arc::new(GateExecutor::new(started_tx));
+        let (handle, owner) = DownloadSchedulerOwner::spawn(executor).unwrap();
+        let key = key(902);
+        let operation_id = operation(902);
+        bind_without_submit(&handle, key.clone(), operation_id);
+        let before = handle.shared.state.lock().unwrap().transfer_population();
+
+        assert_eq!(
+            handle.wait_key_released_until(&key, Instant::now() + Duration::from_millis(1)),
+            DownloadKeyReleaseOutcome::TimedOut
+        );
+        assert_eq!(
+            handle.shared.state.lock().unwrap().transfer_population(),
+            before
+        );
+        assert!(handle.finish_committed(operation_id));
+        shutdown(owner);
+    }
+
+    #[test]
+    fn exact_key_release_wait_fails_closed_when_scheduler_stops() {
+        let (started_tx, _) = mpsc::channel();
+        let executor = Arc::new(GateExecutor::new(started_tx));
+        let (handle, owner) = DownloadSchedulerOwner::spawn(executor).unwrap();
+        let key = key(903);
+        bind_without_submit(&handle, key.clone(), operation(903));
+        handle.stop();
+
+        assert_eq!(
+            handle.wait_key_released_until(&key, Instant::now() + Duration::from_secs(1)),
+            DownloadKeyReleaseOutcome::Stopping
+        );
+        drop(owner);
+    }
+
+    #[test]
+    fn exact_key_release_wait_reports_poison_and_seals() {
+        let (started_tx, _) = mpsc::channel();
+        let executor = Arc::new(GateExecutor::new(started_tx));
+        let (handle, owner) = DownloadSchedulerOwner::spawn(executor).unwrap();
+        let shared = Arc::clone(&handle.shared);
+        let _ = thread::spawn(move || {
+            let _guard = shared.state.lock().unwrap();
+            panic!("inject scheduler state poison");
+        })
+        .join();
+
+        assert_eq!(
+            handle.wait_key_released_until(&key(904), Instant::now() + Duration::from_secs(1)),
+            DownloadKeyReleaseOutcome::Poisoned
+        );
+        assert!(handle.seal_and_retain().is_sealed());
+        drop(owner);
     }
 
     #[test]

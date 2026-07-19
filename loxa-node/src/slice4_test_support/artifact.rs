@@ -5,6 +5,7 @@ use crate::verification_scheduler::{
     DownloadCompletionQueue, DownloadVerificationOutcome, DownloadVerificationOwnership,
     VerificationResult,
 };
+use loxa_core::model_inventory::{StableVerificationIdentity, StableVerificationInput};
 use loxa_protocol::v2::{DecimalU64, OperationId};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
@@ -36,6 +37,12 @@ impl Drop for TestDir {
 
 fn artifact_key(root: &std::path::Path, name: &str) -> ArtifactKey {
     ArtifactKey::from_destination(&root.join(name)).expect("canonical artifact key")
+}
+
+fn stable_identity(path: &Path) -> StableVerificationIdentity {
+    StableVerificationInput::open(path, [7_u8; 32])
+        .expect("stable test artifact")
+        .stable
 }
 
 fn download_key(model_id: &str, source: &str, artifact: ArtifactKey) -> DownloadKey {
@@ -409,6 +416,7 @@ fn sealing_rejects_new_access_and_poison_retains_uncertain_key() {
 #[test]
 fn mutex_poisoned_ready_completion_is_retained_without_ack_surface() {
     let dir = TestDir::new("completion");
+    std::fs::write(dir.path().join("model.gguf"), vec![0_u8; 42]).unwrap();
     let key = artifact_key(dir.path(), "model.gguf");
     let coordinator = ArtifactMutationCoordinator::new();
     let lease = coordinator.try_acquire_mutation(key.clone()).unwrap();
@@ -421,6 +429,7 @@ fn mutex_poisoned_ready_completion_is_retained_without_ack_surface() {
             cancellation: OperationCancellation::new(),
             artifact: lease,
         },
+        stable_identity: stable_identity(&dir.path().join("model.gguf")),
         result: VerificationResult::Verified(loxa_core::model_inventory::VerifiedArtifact {
             size_bytes: 42,
             expected_sha256: "07".repeat(32),
@@ -460,6 +469,7 @@ fn mutex_poisoned_ready_completion_is_retained_without_ack_surface() {
 #[test]
 fn confirmed_completion_acknowledgement_releases_the_artifact_lease() {
     let dir = TestDir::new("acknowledge");
+    std::fs::write(dir.path().join("model.gguf"), vec![0_u8; 42]).unwrap();
     let key = artifact_key(dir.path(), "model.gguf");
     let coordinator = ArtifactMutationCoordinator::new();
     let queue = DownloadCompletionQueue::new(1);
@@ -471,6 +481,7 @@ fn confirmed_completion_acknowledgement_releases_the_artifact_lease() {
             cancellation: OperationCancellation::new(),
             artifact: coordinator.try_acquire_mutation(key.clone()).unwrap(),
         },
+        stable_identity: stable_identity(&dir.path().join("model.gguf")),
         result: VerificationResult::Verified(loxa_core::model_inventory::VerifiedArtifact {
             size_bytes: 42,
             expected_sha256: "07".repeat(32),
@@ -491,6 +502,7 @@ fn confirmed_completion_acknowledgement_releases_the_artifact_lease() {
 #[test]
 fn failed_destination_upgrade_returns_poisoned_retention_to_fatal_owner() {
     let dir = TestDir::new("destination-failure");
+    std::fs::write(dir.path().join("model.gguf"), vec![0_u8; 42]).unwrap();
     let key = artifact_key(dir.path(), "model.gguf");
     let coordinator = ArtifactMutationCoordinator::new();
     let queue = DownloadCompletionQueue::new(1);
@@ -502,6 +514,7 @@ fn failed_destination_upgrade_returns_poisoned_retention_to_fatal_owner() {
             cancellation: OperationCancellation::new(),
             artifact: coordinator.try_acquire_mutation(key.clone()).unwrap(),
         },
+        stable_identity: stable_identity(&dir.path().join("model.gguf")),
         result: VerificationResult::Verified(loxa_core::model_inventory::VerifiedArtifact {
             size_bytes: 42,
             expected_sha256: "07".repeat(32),

@@ -1314,6 +1314,30 @@ fn unknown_durable_cancel_ack_retains_ready_verification_until_fatal_disposal() 
     assert!(coordinator.try_acquire_mutation(artifact_key).is_ok());
 }
 
+#[test]
+fn shutdown_deadline_retains_pending_verification_when_completion_is_withheld() {
+    let (handle, owner, completion_rx, release, resumed, cancelled) = verifying_controller();
+    let operation_id = OperationId::new_v4();
+    handle
+        .reserve_normal()
+        .unwrap()
+        .submit(load(operation_id, "model", 1))
+        .unwrap();
+    let completion = completion_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    let shutdown =
+        std::thread::spawn(move || owner.shutdown(Instant::now() + Duration::from_millis(100)));
+    release.send(()).unwrap();
+
+    let failure = shutdown
+        .join()
+        .unwrap()
+        .expect_err("withheld completion must retain lifecycle owner at the exact deadline");
+    assert_eq!(resumed.load(Ordering::SeqCst), 0);
+    assert_eq!(cancelled.load(Ordering::SeqCst), 1);
+    drop(completion);
+    failure.into_owner().dispose_fatal_for_test();
+}
+
 struct BlockingDownloadExecutor {
     started: mpsc::Sender<OperationId>,
     release: Arc<(Mutex<bool>, Condvar)>,
