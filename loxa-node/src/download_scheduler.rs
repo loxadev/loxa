@@ -738,6 +738,26 @@ impl DownloadShutdownFailure {
 }
 
 impl DownloadSchedulerHandle {
+    #[cfg(test)]
+    pub(crate) fn replace_active_revision_for_test(
+        &self,
+        key: &DownloadKey,
+        revision: DecimalU64,
+    ) -> bool {
+        let Ok(mut state) = self.shared.state.lock() else {
+            self.shared.seal();
+            return false;
+        };
+        let Some(ReservationEntry::Active {
+            admission_revision, ..
+        }) = state.reservations.get_mut(key)
+        else {
+            return false;
+        };
+        *admission_revision = revision;
+        true
+    }
+
     pub(crate) fn reserve(&self, key: DownloadKey) -> DownloadReserveOutcome {
         let mut state = match self.shared.state.lock() {
             Ok(state) => state,

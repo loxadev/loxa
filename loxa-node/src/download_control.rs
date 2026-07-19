@@ -2416,6 +2416,19 @@ impl DurableExecutionControl {
     }
 
     #[cfg(test)]
+    pub(crate) fn replace_active_download_revision_for_test(
+        &self,
+        model_id: &str,
+        revision: DecimalU64,
+    ) {
+        let key = self.catalog.download_key(model_id).unwrap();
+        let DurableExecutionBackend::Lanes(downloads) = &self.execution else {
+            panic!("durable lane test requires scheduler authority");
+        };
+        assert!(downloads.replace_active_revision_for_test(&key, revision));
+    }
+
+    #[cfg(test)]
     pub(crate) fn artifact_mutation_is_busy_for_test(&self, model_id: &str) -> bool {
         let Ok(key) = self.catalog.download_key(model_id) else {
             return false;
@@ -2688,9 +2701,18 @@ impl DurableExecutionControl {
         let reservation = loop {
             match downloads.reserve(key.clone()) {
                 DownloadReserveOutcome::Reserved(reservation) => break reservation,
-                DownloadReserveOutcome::Active { operation_id, .. } if accept_existing => {
-                    if let Some(existing) = self.existing_admission(operation_id)? {
-                        return Ok(existing);
+                DownloadReserveOutcome::Active {
+                    operation_id,
+                    admission_revision,
+                } if accept_existing => {
+                    match self.existing_admission(operation_id, admission_revision) {
+                        Ok(Some(existing)) => return Ok(existing),
+                        Ok(None) => {}
+                        Err(_) => {
+                            self.projection_healthy.store(false, Ordering::Release);
+                            let _ = downloads.seal_and_retain();
+                            return Err(DownloadControlError::Stopping);
+                        }
                     }
                     match downloads.wait_key_released_until(
                         &key,
@@ -2816,6 +2838,7 @@ impl DurableExecutionControl {
     fn existing_admission(
         &self,
         operation_id: OperationId,
+        admission_revision: DecimalU64,
     ) -> Result<Option<CommittedAdmission>, DownloadControlError> {
         let state = self
             .control_state
@@ -2828,6 +2851,9 @@ impl DurableExecutionControl {
         else {
             return Err(DownloadControlError::Stopping);
         };
+        if operation.created_revision != admission_revision {
+            return Err(DownloadControlError::Stopping);
+        }
         if matches!(
             operation.status,
             V2OperationStatus::Succeeded | V2OperationStatus::Failed | V2OperationStatus::Cancelled
@@ -2849,7 +2875,7 @@ impl DurableExecutionControl {
         Ok(Some(CommittedAdmission {
             epoch,
             operation_id,
-            revision: operation.created_revision,
+            revision: admission_revision,
             v1_operation_id,
         }))
     }
