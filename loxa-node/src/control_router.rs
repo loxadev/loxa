@@ -847,6 +847,110 @@ mod tests {
         worker.stop_and_join().unwrap();
     }
 
+    #[tokio::test]
+    async fn authenticated_load_route_admits_full_restart_artifact_but_rejects_partial_state() {
+        let temp = TestDir::new("restart-load-route");
+        let models_dir = temp.0.join("models");
+        let lifecycle = crate::model_lifecycle::ModelLifecycle::new(
+            crate::model_lifecycle::StableNodeOwner {
+                run_id: "owner".into(),
+                pid: 1,
+                process_start_time_unix_s: 2,
+                gateway_port: 8080,
+            },
+            RouterDriver,
+            RouterGateway,
+        );
+        let (downloads, worker) =
+            DownloadControl::spawn_with_lifecycle(models_dir.clone(), lifecycle);
+        let recipe = loxa_core::registry::REGISTRY
+            .iter()
+            .min_by_key(|entry| entry.size_bytes)
+            .unwrap();
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::File::create(models_dir.join(recipe.filename))
+            .unwrap()
+            .set_len(recipe.size_bytes)
+            .unwrap();
+        let token = ControlToken::load_or_create(&temp.0.join("control.token")).unwrap();
+        let state = ControlState::new(
+            token.clone(),
+            NodeId::new_v4(),
+            NodeInstanceId::new_v4(),
+            downloads,
+        );
+        let mut authorized = HeaderMap::new();
+        authorized.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        authorized.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", token.expose_for_authorization())).unwrap(),
+        );
+
+        let accepted = start_load(
+            State(state.clone()),
+            authorized.clone(),
+            Bytes::from(format!(r#"{{"model_id":"{}"}}"#, recipe.id)),
+        )
+        .await;
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+
+        worker.stop_and_join().unwrap();
+
+        let partial_temp = TestDir::new("partial-load-route");
+        let partial_models = partial_temp.0.join("models");
+        let partial_lifecycle = crate::model_lifecycle::ModelLifecycle::new(
+            crate::model_lifecycle::StableNodeOwner {
+                run_id: "partial-owner".into(),
+                pid: 1,
+                process_start_time_unix_s: 2,
+                gateway_port: 8080,
+            },
+            RouterDriver,
+            RouterGateway,
+        );
+        let (partial_downloads, partial_worker) =
+            DownloadControl::spawn_with_lifecycle(partial_models.clone(), partial_lifecycle);
+        std::fs::create_dir_all(&partial_models).unwrap();
+        std::fs::write(
+            partial_models.join(format!("{}.part", recipe.filename)),
+            b"x",
+        )
+        .unwrap();
+        let partial_token =
+            ControlToken::load_or_create(&partial_temp.0.join("control.token")).unwrap();
+        let partial_state = ControlState::new(
+            partial_token.clone(),
+            NodeId::new_v4(),
+            NodeInstanceId::new_v4(),
+            partial_downloads,
+        );
+        authorized.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!(
+                "Bearer {}",
+                partial_token.expose_for_authorization()
+            ))
+            .unwrap(),
+        );
+        let rejected = start_load(
+            State(partial_state),
+            authorized,
+            Bytes::from(format!(r#"{{"model_id":"{}"}}"#, recipe.id)),
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(rejected.into_body(), 4096)
+            .await
+            .unwrap();
+        let error: loxa_core::control::contracts::ControlErrorBody =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code, ControlErrorCode::ModelUnavailable);
+        partial_worker.stop_and_join().unwrap();
+    }
+
     fn wait_for_terminal_operation(
         downloads: &DownloadControl,
         operation_id: &str,

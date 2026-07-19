@@ -1,6 +1,7 @@
 import type { ModelInventoryEntry, NodeSnapshot, OperationView } from "../control/contracts";
 import { Button } from "../components/ui/button";
 import { TableCell, TableRow } from "../components/ui/table";
+import { canEnterLoadVerification } from "./artifactCapabilities";
 import { artifactLabel, formatBytes, operationLabel } from "./modelRowLabels";
 import styles from "./ModelsScreen.module.css";
 
@@ -50,6 +51,7 @@ export function ModelRow({
     !inProgress &&
     entry.artifact.kind !== "downloaded" &&
     !(entry.artifact.kind === "invalid" && entry.artifact.reason === "verification_required");
+  const loadVerifiable = canEnterLoadVerification(entry.artifact);
   const actionLabel =
     entry.artifact.kind === "partial"
       ? `Resume ${entry.id}`
@@ -129,7 +131,7 @@ export function ModelRow({
           >
             {entry.artifact.kind === "partial" ? "Resume" : entry.artifact.kind === "invalid" ? "Repair" : "Download"}
           </Button>
-        ) : entry.artifact.kind === "downloaded" && actionable && node?.status !== "recovery_required" ? (
+        ) : loadVerifiable && actionable && node?.status !== "recovery_required" ? (
           <Button
             variant={active ? "secondary" : "primary"}
             disabled={pending || lifecycleBusy || globallyClosed}
@@ -141,9 +143,7 @@ export function ModelRow({
             {active ? "Unload" : node?.activeModelId ? "Switch" : "Load"}
           </Button>
         ) : (
-          <span className={styles.actionLabel}>
-            {entry.artifact.kind === "downloaded" ? "Unavailable to load" : "Awaiting verification"}
-          </span>
+          <span className={styles.actionLabel}>Unavailable to load</span>
         )}
       </TableCell>
     </TableRow>

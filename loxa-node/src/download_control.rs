@@ -42,7 +42,8 @@ use loxa_core::control::operations::{
 };
 use loxa_core::download::{self, DownloadError, DownloadObserver, DownloadProgress};
 use loxa_core::model_inventory::{
-    VerificationCache, VerificationCancellation, VerifiedArtifact, VerifiedRecipeInventoryEntry,
+    ArtifactInvalidReason, ArtifactState, VerificationCache, VerificationCancellation,
+    VerifiedArtifact, VerifiedRecipeInventoryEntry,
 };
 use loxa_core::registry::{ModelEntry, REGISTRY};
 use loxa_protocol::v2::{
@@ -60,6 +61,16 @@ use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const OPERATION_CAPACITY: usize = 128;
+
+pub(crate) fn artifact_can_enter_load_verification(artifact: &ArtifactState) -> bool {
+    matches!(
+        artifact,
+        ArtifactState::Downloaded
+            | ArtifactState::Invalid {
+                reason: ArtifactInvalidReason::VerificationRequired,
+            }
+    )
+}
 
 #[derive(Clone)]
 pub struct DownloadControl {
@@ -621,8 +632,13 @@ impl DownloadControl {
             .into_iter()
             .find(|entry| entry.id == model_id)
             .ok_or(DownloadControlError::Missing)?;
-        LaunchPlan::from_verified_inventory(&entry, &self.models_dir)
-            .map_err(|_| DownloadControlError::ModelUnavailable)?;
+        if !artifact_can_enter_load_verification(&entry.artifact)
+            || !entry.compatibility.compatible
+            || !entry.engine.eligible
+            || entry.engine.engine != "llama-cpp"
+        {
+            return Err(DownloadControlError::ModelUnavailable);
+        }
         match &self.authority {
             AdmissionAuthority::Legacy(_) => self.start_load(model_id),
             AdmissionAuthority::Durable(durable) => durable
@@ -1203,8 +1219,13 @@ impl DownloadControl {
             .into_iter()
             .find(|entry| entry.id == model_id)
             .ok_or(DownloadControlError::Missing)?;
-        LaunchPlan::from_verified_inventory(&entry, &self.models_dir)
-            .map_err(|_| DownloadControlError::ModelUnavailable)?;
+        if !artifact_can_enter_load_verification(&entry.artifact)
+            || !entry.compatibility.compatible
+            || !entry.engine.eligible
+            || entry.engine.engine != "llama-cpp"
+        {
+            return Err(DownloadControlError::ModelUnavailable);
+        }
         self.start_lifecycle(
             OperationKind::Load,
             Some(model_id),
@@ -4837,6 +4858,33 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn load_verification_admission_accepts_only_downloaded_or_full_unverified_artifacts() {
+        assert!(artifact_can_enter_load_verification(
+            &ArtifactState::Downloaded
+        ));
+        assert!(artifact_can_enter_load_verification(
+            &ArtifactState::Invalid {
+                reason: ArtifactInvalidReason::VerificationRequired,
+            }
+        ));
+        for artifact in [
+            ArtifactState::NotDownloaded,
+            ArtifactState::Partial { bytes: 1 },
+            ArtifactState::Invalid {
+                reason: ArtifactInvalidReason::SizeMismatch,
+            },
+            ArtifactState::Invalid {
+                reason: ArtifactInvalidReason::ChecksumMismatch,
+            },
+            ArtifactState::Invalid {
+                reason: ArtifactInvalidReason::Unreadable,
+            },
+        ] {
+            assert!(!artifact_can_enter_load_verification(&artifact));
+        }
+    }
+
+    #[test]
     fn v1_snapshot_projection_rejects_an_unsafe_compatibility_cursor() {
         let state = CurrentInstanceV1State {
             cursor: 9_007_199_254_740_992,
@@ -5034,6 +5082,18 @@ mod tests {
         crate::Slice3ControlStateFixture,
         PathBuf,
     ) {
+        durable_lifecycle_fixture_with_recipes(label, REGISTRY).await
+    }
+
+    async fn durable_lifecycle_fixture_with_recipes(
+        label: &str,
+        recipes: &'static [ModelEntry],
+    ) -> (
+        DownloadControl,
+        DownloadControlWorker,
+        crate::Slice3ControlStateFixture,
+        PathBuf,
+    ) {
         let root = std::env::temp_dir().join(format!(
             "loxa-durable-lifecycle-{label}-{}-{}",
             std::process::id(),
@@ -5097,11 +5157,21 @@ mod tests {
             ReadyLifecycleDriver,
             NoopGateway,
         );
-        let (control, worker) = DownloadControl::spawn_with_lifecycle_and_control_state(
-            paths.models_dir,
-            lifecycle,
-            fixture.handle.clone(),
-        );
+        let verification_cache = Arc::new(VerificationCache::default());
+        let restart_verifier: Box<dyn RestartArtifactVerifier> =
+            Box::new(CacheRestartArtifactVerifier {
+                cache: Arc::clone(&verification_cache),
+            });
+        let (control, worker) =
+            DownloadControl::spawn_with_lifecycle_components_verifier_and_control_state(
+                paths.models_dir,
+                lifecycle,
+                verification_cache,
+                recipes,
+                restart_verifier,
+                Box::new(VerifiedDownloader),
+                Some(fixture.handle.clone()),
+            );
         assert!(control.actor.is_none());
         assert!(worker.actor.is_none());
         assert!(worker.worker.is_none());
@@ -5492,6 +5562,112 @@ mod tests {
         let _ = worker.stop_and_join();
         fixture.shutdown().await;
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn public_load_verifies_a_full_restart_artifact_before_launch_and_publishes_evidence() {
+        let recipes = tiny_restart_recipes("restart-verified");
+        let recipe = &recipes[0];
+        let (control, worker, fixture, root) =
+            durable_lifecycle_fixture_with_recipes("restart-verification-load", recipes).await;
+        std::fs::create_dir_all(root.join("models")).unwrap();
+        std::fs::write(root.join("models").join(recipe.filename), b"good").unwrap();
+        assert_eq!(
+            control
+                .inventory(loxa_core::model_inventory::current_available_memory_bytes())
+                .into_iter()
+                .find(|entry| entry.id == recipe.id)
+                .unwrap()
+                .artifact,
+            ArtifactState::Invalid {
+                reason: loxa_core::model_inventory::ArtifactInvalidReason::VerificationRequired,
+            }
+        );
+
+        let operation_id = control.start_load_async(recipe.id).await.unwrap();
+        let operation = (0..200)
+            .find_map(|_| {
+                let operation = control.operation(&operation_id)?;
+                if matches!(
+                    operation.status,
+                    OperationStatus::Succeeded | OperationStatus::Failed
+                ) {
+                    Some(operation)
+                } else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    None
+                }
+            })
+            .expect("restart verification load becomes terminal");
+
+        assert_eq!(operation.status, OperationStatus::Succeeded);
+        assert_eq!(
+            control
+                .inventory(loxa_core::model_inventory::current_available_memory_bytes())
+                .into_iter()
+                .find(|entry| entry.id == recipe.id)
+                .unwrap()
+                .artifact,
+            ArtifactState::Downloaded
+        );
+        worker.stop_and_join().unwrap();
+        fixture.shutdown().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn public_load_fails_same_size_corruption_before_observing_a_ready_slot() {
+        let recipes = tiny_restart_recipes("restart-corrupt");
+        let recipe = &recipes[0];
+        let (control, worker, fixture, root) =
+            durable_lifecycle_fixture_with_recipes("restart-verification-corrupt", recipes).await;
+        std::fs::create_dir_all(root.join("models")).unwrap();
+        std::fs::write(root.join("models").join(recipe.filename), b"evil").unwrap();
+
+        let operation_id = control.start_load_async(recipe.id).await.unwrap();
+        let operation = (0..200)
+            .find_map(|_| {
+                let operation = control.operation(&operation_id)?;
+                if matches!(
+                    operation.status,
+                    OperationStatus::Succeeded | OperationStatus::Failed
+                ) {
+                    Some(operation)
+                } else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    None
+                }
+            })
+            .expect("corrupt restart verification load becomes terminal");
+
+        assert_eq!(operation.status, OperationStatus::Failed);
+        let snapshot = fixture.handle.read_snapshot().unwrap();
+        assert_eq!(
+            snapshot.slot.status,
+            loxa_protocol::v2::V2SlotStatus::Unloaded
+        );
+        assert_eq!(snapshot.slot.model_id, None);
+        worker.stop_and_join().unwrap();
+        fixture.shutdown().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn tiny_restart_recipes(id: &'static str) -> &'static [ModelEntry] {
+        Box::leak(
+            vec![ModelEntry {
+                id,
+                repo: "owner/repo",
+                revision: "0123456789abcdef0123456789abcdef01234567",
+                filename: "restart.gguf",
+                sha256: "770e607624d689265ca6c44884d0807d9b054d23c473c106c72be9de08b7376c",
+                size_bytes: 4,
+                license: "apache-2.0",
+                params: "tiny",
+                quant: "Q4",
+                min_free_mem_gb: 0.0,
+            }]
+            .into_boxed_slice(),
+        )
     }
 
     #[tokio::test]
