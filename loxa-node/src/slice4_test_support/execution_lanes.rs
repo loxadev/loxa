@@ -814,17 +814,12 @@ async fn every_finalization_uncertainty_stage_poison_retains_active_ownership_an
 async fn post_finalization_hardlink_ambiguity_retains_active_ownership_and_seals() {
     let fixture = LaneFixture::new_hardlink("post-finalization-hardlink").await;
     let durable = fixture.downloads().durable_execution_for_test();
+    durable.arm_fatal_admission_pause_for_test();
     let first = durable
         .start_download(fixture.recipes[0].id, 4)
         .await
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(1);
-    while durable.start_download(fixture.recipes[1].id, 4).await
-        != Err(DownloadControlError::Stopping)
-    {
-        assert!(Instant::now() < deadline);
-        tokio::task::yield_now().await;
-    }
+    assert!(durable.wait_fatal_admission_closed_for_test(Instant::now() + Duration::from_secs(1)));
     let state = fixture.control().handle.read_snapshot().unwrap();
     let operation = state
         .operations
@@ -847,6 +842,11 @@ async fn post_finalization_hardlink_ambiguity_retains_active_ownership_and_seals
         durable.start_download(fixture.recipes[0].id, 4).await,
         Err(DownloadControlError::Stopping)
     );
+    assert_eq!(
+        durable.start_download(fixture.recipes[1].id, 4).await,
+        Err(DownloadControlError::Stopping)
+    );
+    durable.release_fatal_admission_for_test();
     drop(fixture);
 }
 
