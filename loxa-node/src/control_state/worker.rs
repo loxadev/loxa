@@ -75,7 +75,7 @@ enum StartupBehavior {
     #[cfg(test)]
     PanicBeforeInitialization,
     #[cfg(test)]
-    BlockBeforeInitialization {
+    BlockBeforePublication {
         entered: Arc<std::sync::Barrier>,
         release: Arc<std::sync::Barrier>,
     },
@@ -379,12 +379,20 @@ impl ControlStateStartupFailure {
         // SAFETY: same single-owner transfer as above.
         let unstarted_init = unsafe { ManuallyDrop::take(&mut ownership.unstarted_init) };
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if let Some(completion) = completion.as_ref() {
-            let _ = completion.recv_timeout(remaining);
-        }
+        let completion_observed = completion
+            .as_ref()
+            .is_some_and(|completion| completion.recv_timeout(remaining).is_ok());
         if let Some(worker) = join.take() {
-            while !worker.is_finished() && std::time::Instant::now() < deadline {
-                std::thread::yield_now();
+            let join_deadline = if completion_observed {
+                checked_deadline_after(std::time::Instant::now(), Duration::from_secs(1))
+            } else {
+                deadline
+            };
+            while !worker.is_finished() && std::time::Instant::now() < join_deadline {
+                std::thread::sleep(
+                    ENQUEUE_RETRY
+                        .min(join_deadline.saturating_duration_since(std::time::Instant::now())),
+                );
             }
             assert!(
                 worker.is_finished(),
@@ -1115,17 +1123,14 @@ impl ControlStateWorker {
                 let init = claimed_ownership
                     .recv()
                     .map_err(|_| ControlStateError::DurableStateUnavailable)?;
-                match startup_behavior {
+                match &startup_behavior {
                     StartupBehavior::Normal => {}
                     #[cfg(test)]
                     StartupBehavior::PanicBeforeInitialization => {
                         panic!("fault-injected control-state startup panic")
                     }
                     #[cfg(test)]
-                    StartupBehavior::BlockBeforeInitialization { entered, release } => {
-                        entered.wait();
-                        release.wait();
-                    }
+                    StartupBehavior::BlockBeforePublication { .. } => {}
                 }
                 let ControlStateOpenInput {
                     claimed_owner,
@@ -1181,6 +1186,13 @@ impl ControlStateWorker {
                     );
                     let snapshot = Arc::new(RwLock::new(initial));
                     let pending_progress = Arc::new(Mutex::new(HashMap::new()));
+                    #[cfg(test)]
+                    if let StartupBehavior::BlockBeforePublication { entered, release } =
+                        &startup_behavior
+                    {
+                        entered.wait();
+                        release.wait();
+                    }
                     initialized
                         .send(Ok(InitializedControlState {
                             snapshot: Arc::clone(&snapshot),
@@ -1312,7 +1324,7 @@ impl ControlStateWorker {
     }
 
     #[cfg(test)]
-    pub(super) fn block_during_initialization_for_test(
+    pub(super) fn block_after_durable_initialization_before_publication_for_test(
         init: ControlStateInit,
         entered: Arc<std::sync::Barrier>,
         release: Arc<std::sync::Barrier>,
@@ -1320,13 +1332,13 @@ impl ControlStateWorker {
         match Self::open_reconcile_and_spawn_inner(
             init,
             checked_deadline_after(std::time::Instant::now(), Duration::from_millis(50)),
-            StartupBehavior::BlockBeforeInitialization { entered, release },
+            StartupBehavior::BlockBeforePublication { entered, release },
         ) {
             Ok(bootstrap) => Ok(bootstrap),
             Err(failure) => Err(
                 failure.dispose_and_return_error_for_test(checked_deadline_after(
                     std::time::Instant::now(),
-                    Duration::from_secs(1),
+                    SHUTDOWN_TIMEOUT,
                 )),
             ),
         }
@@ -1517,6 +1529,23 @@ impl ControlStateWorker {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         let async_deadline = tokio::time::Instant::now() + remaining;
         runtime.block_on(self.shutdown_until(async_deadline))
+    }
+
+    #[cfg(test)]
+    pub(super) fn wait_for_exit_for_test(&self, timeout: Duration) -> Result<(), &'static str> {
+        let deadline = checked_deadline_after(std::time::Instant::now(), timeout);
+        while self
+            .join
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+        {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err("control-state test worker did not finish");
+            }
+            std::thread::sleep(ENQUEUE_RETRY.min(deadline - now));
+        }
+        Ok(())
     }
 
     #[cfg(test)]
