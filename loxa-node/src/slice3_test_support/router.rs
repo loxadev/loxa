@@ -1,5 +1,7 @@
 use crate::actor::{Mutation, MutationCancellation, MutationExecutor, NodeActor};
-use crate::control_state::state_machine::{AdmissionRequest, InstancePublication, Transition};
+use crate::control_state::state_machine::{
+    AdmissionRequest, InstancePublication, LifecycleObservation, Transition,
+};
 use crate::download_control::DurableExecutionControl;
 use crate::v2_control_router::{router, V2ControlState};
 use crate::{open_slice3_control_state_fixture, NodePaths, Slice3ControlStateFixture};
@@ -894,6 +896,140 @@ async fn v2_control_router_every_mutation_uses_and_settles_the_exact_committed_u
             .unwrap()
             .status,
         V2OperationStatus::Cancelled
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn v2_router_preserves_two_downloads_while_load_and_unload_are_admitted() {
+    let fixture = RouterFixture::new("concurrent-lanes").await;
+    let first_model = loxa_core::registry::REGISTRY[0].id;
+    let second_model = loxa_core::registry::REGISTRY[1].id;
+
+    let mut admitted = Vec::new();
+    for model_id in [first_model, second_model] {
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(fixture.request(
+                Method::POST,
+                &format!("/loxa/v2/models/{model_id}/download"),
+                "{}",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        admitted.push(
+            serde_json::from_slice::<V2OperationAccepted>(&body_bytes(response).await).unwrap(),
+        );
+    }
+
+    let load_response = fixture
+        .app
+        .clone()
+        .oneshot(fixture.request(
+            Method::POST,
+            &format!(
+                "/loxa/v2/nodes/{}/slots/{}/load",
+                fixture.node_id, fixture.slot_id
+            ),
+            format!(r#"{{"model_id":"{first_model}"}}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(load_response.status(), StatusCode::ACCEPTED);
+    let load: V2OperationAccepted =
+        serde_json::from_slice(&body_bytes(load_response).await).unwrap();
+
+    fixture
+        .control
+        .handle
+        .observe_required_async(Transition::Started {
+            operation_id: load.operation_id,
+            progress: None,
+        })
+        .await
+        .unwrap();
+    fixture
+        .control
+        .handle
+        .observe_lifecycle_async(
+            Transition::Succeeded {
+                operation_id: load.operation_id,
+                observed_model_id: Some(first_model.to_owned()),
+            },
+            LifecycleObservation::LoadReady {
+                operation_id: load.operation_id,
+                model_id: first_model.to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let unload_response = fixture
+        .app
+        .clone()
+        .oneshot(fixture.request(
+            Method::POST,
+            &format!(
+                "/loxa/v2/nodes/{}/slots/{}/unload",
+                fixture.node_id, fixture.slot_id
+            ),
+            "{}",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unload_response.status(), StatusCode::ACCEPTED);
+    let unload: V2OperationAccepted =
+        serde_json::from_slice(&body_bytes(unload_response).await).unwrap();
+
+    let snapshot = fixture.control.handle.read_snapshot().unwrap();
+    assert_eq!(snapshot.operations.len(), 4);
+    for accepted in admitted.iter().chain([&load, &unload]) {
+        let operation = snapshot
+            .operations
+            .iter()
+            .find(|operation| operation.operation_id == accepted.operation_id)
+            .unwrap();
+        assert_eq!(operation.created_revision, accepted.revision);
+        let admission_event = snapshot
+            .events
+            .iter()
+            .find(|event| {
+                event.operation_id == Some(accepted.operation_id)
+                    && event.revision == accepted.revision
+            })
+            .unwrap();
+        assert_eq!(admission_event.epoch, accepted.epoch);
+    }
+    for download in &admitted {
+        assert!(matches!(
+            snapshot
+                .operations
+                .iter()
+                .find(|operation| operation.operation_id == download.operation_id)
+                .unwrap()
+                .status,
+            V2OperationStatus::Queued | V2OperationStatus::Running
+        ));
+    }
+    assert_eq!(
+        snapshot
+            .operations
+            .iter()
+            .find(|operation| operation.operation_id == load.operation_id)
+            .unwrap()
+            .status,
+        V2OperationStatus::Succeeded
+    );
+    assert_eq!(
+        snapshot
+            .operations
+            .iter()
+            .find(|operation| operation.operation_id == unload.operation_id)
+            .unwrap()
+            .status,
+        V2OperationStatus::Queued
     );
     fixture.shutdown().await;
 }

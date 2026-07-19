@@ -146,6 +146,13 @@ fn existing_cli_live_pull_list_load_unload_cancel_poll_output_is_unchanged() {
 }
 
 #[test]
+fn pull_help_discloses_detach_and_global_cancel_without_runtime_output_changes() {
+    let help = crate::cli::pull_long_help_for_test();
+    assert!(help.contains("Leaving this CLI detaches observation"));
+    assert!(help.contains("an explicit node cancellation is global for every observer"));
+}
+
+#[test]
 fn cli_rejects_replaced_peer_before_followup_request() {
     let root = std::env::temp_dir().join(format!(
         "loxa-cli-replacement-{}-{}",

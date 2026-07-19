@@ -96,6 +96,9 @@ struct Cli {
 enum Command {
     Calibrate,
     Doctor,
+    #[command(
+        long_about = "Download through the running node. Leaving this CLI detaches observation; an explicit node cancellation is global for every observer."
+    )]
     Pull {
         id: String,
         #[arg(long)]
@@ -139,6 +142,18 @@ enum Command {
     Stop {
         target: String,
     },
+}
+
+#[cfg(test)]
+pub(crate) fn pull_long_help_for_test() -> String {
+    use clap::CommandFactory;
+
+    let mut command = Cli::command();
+    command
+        .find_subcommand_mut("pull")
+        .expect("pull subcommand exists")
+        .render_long_help()
+        .to_string()
 }
 
 #[derive(clap::Subcommand)]

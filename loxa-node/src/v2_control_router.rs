@@ -36,6 +36,8 @@ pub(crate) struct V2ControlState {
     generated_at: GeneratedAtClock,
     #[cfg(test)]
     subscription_max_snapshot_bytes: Option<usize>,
+    #[cfg(test)]
+    injected_download_error: Option<DownloadControlError>,
 }
 
 #[derive(Clone)]
@@ -103,6 +105,8 @@ impl V2ControlState {
             generated_at,
             #[cfg(test)]
             subscription_max_snapshot_bytes: None,
+            #[cfg(test)]
+            injected_download_error: None,
         })
     }
 
@@ -122,6 +126,7 @@ impl V2ControlState {
             publication_gate: None,
             generated_at,
             subscription_max_snapshot_bytes: None,
+            injected_download_error: None,
         }
     }
 
@@ -142,6 +147,7 @@ impl V2ControlState {
             publication_gate: None,
             generated_at,
             subscription_max_snapshot_bytes: None,
+            injected_download_error: None,
         }
     }
 
@@ -151,6 +157,15 @@ impl V2ControlState {
         max_snapshot_bytes: usize,
     ) -> Self {
         self.subscription_max_snapshot_bytes = Some(max_snapshot_bytes);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_injected_download_error_for_test(
+        mut self,
+        error: DownloadControlError,
+    ) -> Self {
+        self.injected_download_error = Some(error);
         self
     }
 
@@ -653,6 +668,10 @@ async fn download(
                     V2ControlErrorCode::UnknownModel,
                     "The model was not found.",
                 ))?;
+        #[cfg(test)]
+        if let Some(error) = state.injected_download_error {
+            return Err(map_execution_error(&state, error));
+        }
         state
             .execution
             .start_download(&model_id, recipe.size_bytes)

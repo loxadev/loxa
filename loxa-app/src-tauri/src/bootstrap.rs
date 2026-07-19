@@ -893,6 +893,22 @@ fn validate_v2_operation_collection(
     if active_count > MAX_ACTIVE_OPERATIONS || terminal_count > MAX_TERMINAL_OPERATIONS {
         return Err(());
     }
+    if let Some(referenced_operation) = slot.operation_id.and_then(|operation_id| {
+        operations
+            .operations
+            .iter()
+            .find(|operation| operation.operation_id == operation_id)
+    }) {
+        let lifecycle_correlated = referenced_operation.slot_id == Some(slot.slot_id)
+            && matches!(
+                (slot.status, referenced_operation.kind),
+                (V2SlotStatus::Loading, V2OperationKind::Load)
+                    | (V2SlotStatus::Unloading, V2OperationKind::Unload)
+            );
+        if !lifecycle_correlated {
+            return Err(());
+        }
+    }
     if slots.revision == operations.revision {
         let correlated = match (slot.status, active_lifecycle) {
             (V2SlotStatus::Loading, Some(operation)) => {
