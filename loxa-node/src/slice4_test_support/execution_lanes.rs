@@ -1,5 +1,5 @@
 use crate::artifact_coordinator::{ArtifactAcquireError, ArtifactKey, ArtifactMutationCoordinator};
-use crate::control_state::state_machine::InstancePublication;
+use crate::control_state::state_machine::{InstancePublication, Transition};
 use crate::download_control::{DownloadControl, DownloadControlError, DownloadControlWorker};
 use crate::download_scheduler::{
     BoundDownload, DownloadExecutor, DownloadKey, DownloadReserveOutcome, DownloadSchedulerOwner,
@@ -257,8 +257,7 @@ async fn reserve_commit_bind_progress_verify_publish_and_v2_v1_dedupe_are_atomic
         .start_download(fixture.recipes[0].id, 4)
         .await
         .unwrap();
-    assert_eq!(attached.operation_id, first.operation_id);
-    assert_eq!(attached.revision, first.revision);
+    assert_eq!(attached, first);
     assert_eq!(
         fixture
             .downloads()
@@ -293,6 +292,11 @@ async fn reserve_commit_bind_progress_verify_publish_and_v2_v1_dedupe_are_atomic
         running.progress.unwrap().completed_bytes,
         DecimalU64::new(4)
     );
+    let attached_after_progress = durable
+        .start_download(fixture.recipes[0].id, 4)
+        .await
+        .unwrap();
+    assert_eq!(attached_after_progress, first);
     assert_ne!(
         fixture
             .cache
@@ -315,6 +319,73 @@ async fn reserve_commit_bind_progress_verify_publish_and_v2_v1_dedupe_are_atomic
         assert!(tokio::time::Instant::now() < deadline);
         tokio::task::yield_now().await;
     }
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn duplicate_active_revision_divergence_seals_instead_of_guessing_identity() {
+    let fixture = LaneFixture::new("duplicate-revision-divergence").await;
+    let durable = fixture.downloads().durable_execution_for_test();
+    let first = durable
+        .start_download(fixture.recipes[0].id, 4)
+        .await
+        .unwrap();
+    fixture
+        .entered
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    durable.replace_active_download_revision_for_test(
+        fixture.recipes[0].id,
+        DecimalU64::new(first.revision.get() + 1),
+    );
+
+    assert_eq!(
+        durable.start_download(fixture.recipes[0].id, 4).await,
+        Err(DownloadControlError::Stopping)
+    );
+    assert_eq!(
+        durable.start_download(fixture.recipes[1].id, 4).await,
+        Err(DownloadControlError::Stopping)
+    );
+    fixture.release.send(()).unwrap();
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn terminal_active_revision_divergence_seals_before_release_race_handling() {
+    let fixture = LaneFixture::new("terminal-duplicate-revision-divergence").await;
+    let durable = fixture.downloads().durable_execution_for_test();
+    let first = durable
+        .start_download(fixture.recipes[0].id, 4)
+        .await
+        .unwrap();
+    fixture
+        .entered
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    fixture
+        .control()
+        .handle
+        .observe_required_async(Transition::Succeeded {
+            operation_id: first.operation_id,
+            observed_model_id: None,
+        })
+        .await
+        .unwrap();
+    durable.replace_active_download_revision_for_test(
+        fixture.recipes[0].id,
+        DecimalU64::new(first.revision.get() + 1),
+    );
+
+    assert_eq!(
+        durable.start_download(fixture.recipes[0].id, 4).await,
+        Err(DownloadControlError::Stopping)
+    );
+    assert_eq!(
+        durable.start_download(fixture.recipes[1].id, 4).await,
+        Err(DownloadControlError::Stopping)
+    );
+    fixture.release.send(()).unwrap();
     fixture.shutdown().await;
 }
 
