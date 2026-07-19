@@ -1057,10 +1057,26 @@ impl DownloadSchedulerOwner {
     pub(crate) fn spawn(
         executor: Arc<dyn DownloadExecutor>,
     ) -> io::Result<(DownloadSchedulerHandle, Self)> {
+        Self::spawn_inner(executor, DOWNLOAD_WORKERS)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spawn_with_worker_count_for_test(
+        executor: Arc<dyn DownloadExecutor>,
+        worker_count: usize,
+    ) -> io::Result<(DownloadSchedulerHandle, Self)> {
+        assert!((1..=DOWNLOAD_WORKERS).contains(&worker_count));
+        Self::spawn_inner(executor, worker_count)
+    }
+
+    fn spawn_inner(
+        executor: Arc<dyn DownloadExecutor>,
+        worker_count: usize,
+    ) -> io::Result<(DownloadSchedulerHandle, Self)> {
         let shared = Arc::new(DownloadShared::new());
-        let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(DOWNLOAD_WORKERS);
-        let mut completions = Vec::with_capacity(DOWNLOAD_WORKERS);
-        for worker_index in 0..DOWNLOAD_WORKERS {
+        let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(worker_count);
+        let mut completions = Vec::with_capacity(worker_count);
+        for worker_index in 0..worker_count {
             let worker_shared = Arc::clone(&shared);
             let worker_executor = Arc::clone(&executor);
             let (completion, receiver) = mpsc::channel();

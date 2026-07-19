@@ -695,6 +695,11 @@ impl LifecycleControllerShutdownFailure {
     pub(crate) fn into_owner(self) -> LifecycleControllerOwner {
         *ManuallyDrop::into_inner(self.owner)
     }
+
+    #[cfg(test)]
+    pub(crate) fn retains_worker(&self) -> bool {
+        self.owner.worker.is_some()
+    }
 }
 
 impl LifecycleControllerOwner {
