@@ -1273,7 +1273,7 @@ impl ControlStateHandle {
         }
     }
 
-    pub(super) fn admit_and_drop_ack_for_test(&self, request: AdmissionRequest) {
+    pub(crate) fn admit_and_drop_ack_for_test(&self, request: AdmissionRequest) {
         let (reply, receive) = oneshot::channel();
         self.sender
             .try_send(ControlCommand::Admit { request, reply })
@@ -1306,7 +1306,7 @@ impl ControlStateHandle {
             .await
     }
 
-    pub(super) fn observe_and_drop_ack_for_test(
+    pub(crate) fn observe_and_drop_ack_for_test(
         &self,
         transition: Transition,
     ) -> oneshot::Receiver<()> {

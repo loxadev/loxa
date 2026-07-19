@@ -281,15 +281,25 @@ async fn v1_route_accepts_exact_op_alias_after_durable_uuid_admission() {
 }
 
 #[tokio::test]
-async fn submission_failure_terminalizes_same_durable_operation_without_replacement_id() {
+async fn durable_download_lanes_execute_without_a_compatibility_actor() {
     let fixture = DurableFixture::new("submit-failure").await;
-    fixture.downloads.stop_actor();
+    assert!(!fixture.downloads.has_compatibility_actor_for_test());
     let durable = fixture.downloads.durable_execution_for_test();
-    let error = durable.start_download(REGISTRY[0].id, 4).await.unwrap_err();
-    assert_eq!(error, DownloadControlError::Stopping);
-    let state = fixture.control.handle.read_snapshot().unwrap();
+    let admission = durable.start_download(REGISTRY[0].id, 4).await.unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let state = loop {
+        let state = fixture.control.handle.read_snapshot().unwrap();
+        if state.operations.iter().any(|operation| {
+            operation.operation_id == admission.operation_id
+                && operation.status == V2OperationStatus::Succeeded
+        }) {
+            break state;
+        }
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::task::yield_now().await;
+    };
     assert_eq!(state.operations.len(), 1);
-    assert_eq!(state.operations[0].status, V2OperationStatus::Failed);
+    assert_eq!(state.operations[0].status, V2OperationStatus::Succeeded);
     assert_eq!(state.current_instance_v1.operations.len(), 1);
     assert_eq!(
         state.operations[0].operation_id,

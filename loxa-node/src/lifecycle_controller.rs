@@ -3,8 +3,8 @@ use crate::model_lifecycle::{
     EngineLifecycleDriver, GatewayPublisher, LaunchPlan, LifecycleError, ModelLifecycle,
 };
 use crate::verification_scheduler::{
-    CompletionDestination, LifecycleVerificationCompletion, LifecycleVerificationOutcome,
-    RetainedCompletion, VerificationResult,
+    CompletionDestination, CompletionWaitOutcome, LifecycleVerificationCompletion,
+    LifecycleVerificationOutcome, RetainedCompletion, VerificationResult,
 };
 use loxa_core::model_inventory::VerifiedArtifact;
 use loxa_core::supervisor::ObservedChildExit;
@@ -88,6 +88,15 @@ pub(crate) struct LifecycleNormalReservation {
 }
 
 impl LifecycleNormalReservation {
+    pub(crate) fn poison(mut self) {
+        if let Ok(mut state) = self.mailbox.state.lock() {
+            state.sealed = true;
+            state.fatal = true;
+        }
+        self.reserved = false;
+        self.mailbox.changed.notify_all();
+    }
+
     pub(crate) fn submit(mut self, command: LifecycleCommand) -> Result<(), LifecycleSubmitError> {
         if !command.is_normal() {
             return Err(LifecycleSubmitError::InvalidReservation);
@@ -306,21 +315,33 @@ impl LifecycleMailboxInner {
         self.verification.ready()
     }
 
-    fn settle_ready_verification_for_shutdown(
+    fn settle_ready_verification_for_shutdown_until(
         &self,
         acknowledgement: LifecycleCancelAcknowledgement,
-    ) -> bool {
-        let Some(completion) = self.ready_verification() else {
-            return false;
+        expected_operation_id: OperationId,
+        deadline: Instant,
+    ) -> LifecycleVerificationShutdownSettlement {
+        let completion = match self.verification.wait_ready_until(deadline) {
+            CompletionWaitOutcome::Ready(completion) => completion,
+            CompletionWaitOutcome::TimedOut => {
+                return LifecycleVerificationShutdownSettlement::TimedOut;
+            }
+            CompletionWaitOutcome::Poisoned => {
+                return LifecycleVerificationShutdownSettlement::Poisoned;
+            }
         };
-        let Some(ticket) = completion.take_ready() else {
-            return false;
+        let Some(mut ticket) = completion.take_ready() else {
+            return LifecycleVerificationShutdownSettlement::Poisoned;
         };
+        if ticket.outcome_mut().ownership.operation_id != expected_operation_id {
+            ticket.poison();
+            return LifecycleVerificationShutdownSettlement::Mismatch;
+        }
         let mut state = match self.state.lock() {
             Ok(state) => state,
             Err(_) => {
-                drop(ticket);
-                return false;
+                ticket.poison();
+                return LifecycleVerificationShutdownSettlement::Poisoned;
             }
         };
         let Some(index) = state
@@ -332,18 +353,18 @@ impl LifecycleMailboxInner {
             state.fatal = true;
             drop(state);
             ticket.poison();
-            return false;
+            return LifecycleVerificationShutdownSettlement::Missing;
         };
         state.normal.remove(index);
         drop(state);
         match acknowledgement {
             LifecycleCancelAcknowledgement::DurablyConfirmed => {
                 ticket.acknowledge();
-                true
+                LifecycleVerificationShutdownSettlement::Settled
             }
             LifecycleCancelAcknowledgement::Unknown => {
                 ticket.poison();
-                false
+                LifecycleVerificationShutdownSettlement::Poisoned
             }
         }
     }
@@ -477,6 +498,10 @@ impl LifecycleControllerHandle {
         self.mailbox.reserve_normal()
     }
 
+    pub(crate) fn seal_fatal(&self) {
+        self.mailbox.seal_fatal();
+    }
+
     pub(crate) fn cancel(&self, operation_id: OperationId) -> Result<(), LifecycleSubmitError> {
         self.mailbox.request_cancel(operation_id)
     }
@@ -577,6 +602,15 @@ pub(crate) enum LifecycleCancelAcknowledgement {
     Unknown,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LifecycleVerificationShutdownSettlement {
+    Settled,
+    TimedOut,
+    Poisoned,
+    Missing,
+    Mismatch,
+}
+
 pub(crate) trait LifecycleLoadWorkflow: Send {
     fn submit_load(
         &mut self,
@@ -592,6 +626,13 @@ pub(crate) trait LifecycleLoadWorkflow: Send {
 
     fn cancel(&mut self, _operation_id: &OperationId) -> LifecycleCancelAcknowledgement {
         LifecycleCancelAcknowledgement::Unknown
+    }
+
+    fn cancel_for_shutdown(
+        &mut self,
+        operation_id: &OperationId,
+    ) -> LifecycleCancelAcknowledgement {
+        self.cancel(operation_id)
     }
 
     /// Returns true only after the result's durable/readiness acknowledgement is known.
@@ -729,12 +770,15 @@ impl LifecycleControllerOwner {
                             }
                             continue;
                         }
-                        MailboxItem::Command(LifecycleCommand::Shutdown { deadline: _ }) => {
+                        MailboxItem::Command(LifecycleCommand::Shutdown { deadline }) => {
                             if let Some(pending) = &pending_verified_load {
                                 let acknowledgement =
-                                    workflow.cancel(&pending.request.operation_id);
-                                if !worker_mailbox
-                                    .settle_ready_verification_for_shutdown(acknowledgement)
+                                    workflow.cancel_for_shutdown(&pending.request.operation_id);
+                                if worker_mailbox.settle_ready_verification_for_shutdown_until(
+                                    acknowledgement,
+                                    pending.request.operation_id,
+                                    deadline,
+                                ) != LifecycleVerificationShutdownSettlement::Settled
                                 {
                                     worker_mailbox.seal_fatal();
                                     let _ = lifecycle.shutdown();
@@ -755,11 +799,18 @@ impl LifecycleControllerOwner {
                             worker_mailbox.seal_fatal();
                         }
                         MailboxItem::Command(LifecycleCommand::Cancel { operation_id }) => {
-                            let _ = workflow.cancel(&operation_id);
-                            if pending_verified_load
-                                .as_ref()
-                                .is_none_or(|pending| pending.request.operation_id != operation_id)
+                            if let Some(pending) = pending_verified_load
+                                .as_mut()
+                                .filter(|pending| pending.request.operation_id == operation_id)
                             {
+                                pending.cancellation.cancel();
+                                if workflow.cancel(&operation_id)
+                                    != LifecycleCancelAcknowledgement::DurablyConfirmed
+                                {
+                                    worker_mailbox.seal_fatal();
+                                    lifecycle.fail_supervision(unknown_acknowledgement());
+                                }
+                            } else {
                                 cancelled_before_start = Some(operation_id);
                             }
                         }
