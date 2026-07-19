@@ -67,9 +67,10 @@ type ProvenPeerAuthority = {
   fetch: ControlFetch;
   timeoutMs: number;
   signal?: AbortSignal;
+  revocation: AbortController;
 };
 const provenPeerAuthorities = new WeakMap<object, ProvenPeerAuthority>();
-const mutationTails = new WeakMap<object, Promise<void>>();
+const mutationTails = new WeakMap<object, Map<string, Promise<void>>>();
 
 export function assertControlToken(token: string): void {
   if (!TOKEN_PATTERN.test(token)) {
@@ -302,8 +303,17 @@ async function verifyIdentityProof(token: string, nonce: string, proof: NodeIden
 
 function peerAuthority(peer: ProvenControlPeer): ProvenPeerAuthority {
   const authority = provenPeerAuthorities.get(peer as object);
-  if (!authority) throw new ControlClientError("credential", "The proven Loxa control peer is unavailable.");
+  if (!authority || authority.revocation.signal.aborted) {
+    throw new ControlClientError("credential", "The proven Loxa control peer is unavailable.");
+  }
   return authority;
+}
+
+function revokePeer(peer: ProvenControlPeer, authority: ProvenPeerAuthority): void {
+  if (provenPeerAuthorities.get(peer as object) === authority) {
+    provenPeerAuthorities.delete(peer as object);
+  }
+  authority.revocation.abort();
 }
 
 export function assertProvenControlIdentity(peer: ProvenControlPeer, nodeId: string, nodeInstanceId: string): void {
@@ -322,10 +332,11 @@ export async function fetchFromProvenControlPeer(
   const controller = new AbortController();
   let timedOut = false;
   const abort = () => controller.abort();
-  if (authority.signal?.aborted || init.signal?.aborted) {
+  if (authority.signal?.aborted || authority.revocation.signal.aborted || init.signal?.aborted) {
     throw new ControlClientError("aborted", "The proven Loxa control request was cancelled.");
   }
   authority.signal?.addEventListener("abort", abort, { once: true });
+  authority.revocation.signal.addEventListener("abort", abort, { once: true });
   init.signal?.addEventListener("abort", abort, { once: true });
   const timeout = setTimeout(() => {
     timedOut = true;
@@ -347,6 +358,7 @@ export async function fetchFromProvenControlPeer(
   } finally {
     clearTimeout(timeout);
     authority.signal?.removeEventListener("abort", abort);
+    authority.revocation.signal.removeEventListener("abort", abort);
     init.signal?.removeEventListener("abort", abort);
   }
 }
@@ -371,13 +383,14 @@ export async function proveV2ControlPeer(
     nodeInstanceId: proof.runtimeIdentity,
     fetch: options.fetch ?? globalThis.fetch,
     timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+    revocation: new AbortController(),
     ...(options.signal === undefined ? {} : { signal: options.signal }),
   });
   try {
     await fetchV2NodeCollection(peer);
     return peer;
   } catch (error) {
-    provenPeerAuthorities.delete(peer as object);
+    revokePeer(peer, peerAuthority(peer));
     throw error;
   }
 }
@@ -393,7 +406,7 @@ async function reproveExactPeer(peer: ProvenControlPeer): Promise<void> {
   try {
     await reproveExactAuthority(authority);
   } catch (error) {
-    provenPeerAuthorities.delete(peer as object);
+    revokePeer(peer, authority);
     throw error;
   }
 }
@@ -618,15 +631,16 @@ async function mutateV2(
   peer: ProvenControlPeer,
   path: string,
   body: Record<string, never> | { model_id: string },
+  lane?: string,
   expectedOperationId?: string,
 ): Promise<V2OperationAccepted> {
   const encoded = JSON.stringify(body);
   if (new TextEncoder().encode(encoded).byteLength > MAX_V2_MUTATION_BYTES) {
     throw new ControlClientError("invalid-response", "The Loxa v2 mutation request is oversized.");
   }
-  return serializeV2Mutation(peer, async () => {
+  const mutation = async () => {
     const authority = peerAuthority(peer);
-    if (authority.signal?.aborted) {
+    if (authority.signal?.aborted || authority.revocation.signal.aborted) {
       throw new ControlClientError("aborted", "The proven Loxa control request was cancelled.");
     }
     const startedAt = Date.now();
@@ -639,8 +653,9 @@ async function mutateV2(
     };
     const callerAbort = () => abort("caller");
     authority.signal?.addEventListener("abort", callerAbort, { once: true });
+    authority.revocation.signal.addEventListener("abort", callerAbort, { once: true });
     const timeout = setTimeout(() => abort("timeout"), authority.timeoutMs);
-    let restored = false;
+    let reproved = false;
     try {
       const request = fetchFromProvenControlPeer(peer, path, {
         method: "POST",
@@ -648,7 +663,6 @@ async function mutateV2(
         body: encoded,
         signal: controller.signal,
       });
-      provenPeerAuthorities.delete(peer as object);
       const response = await request;
       let accepted: V2OperationAccepted | undefined;
       let responseError: unknown;
@@ -675,19 +689,23 @@ async function mutateV2(
 
       const remainingMs = Math.max(1, authority.timeoutMs - (Date.now() - startedAt));
       await reproveExactAuthority(authority, { signal: controller.signal, timeoutMs: remainingMs });
-      if (controller.signal.aborted) {
+      if (
+        controller.signal.aborted ||
+        authority.revocation.signal.aborted ||
+        provenPeerAuthorities.get(peer as object) !== authority
+      ) {
         throw new ControlClientError("aborted", "The proven Loxa control request was cancelled.");
       }
-      provenPeerAuthorities.set(peer as object, authority);
-      restored = true;
+      reproved = true;
       if (responseError !== undefined) throw responseError;
       if (accepted === undefined) {
         throw new ControlClientError("invalid-response", "The Loxa node returned no operation acceptance.");
       }
       return accepted;
     } catch (error) {
-      if (!restored) provenPeerAuthorities.delete(peer as object);
-      if (controller.signal.aborted) {
+      const requestAborted = controller.signal.aborted;
+      if (!reproved) revokePeer(peer, authority);
+      if (requestAborted) {
         throw new ControlClientError(
           abortCause === "timeout" ? "timeout" : "aborted",
           abortCause === "timeout"
@@ -699,25 +717,52 @@ async function mutateV2(
     } finally {
       clearTimeout(timeout);
       authority.signal?.removeEventListener("abort", callerAbort);
+      authority.revocation.signal.removeEventListener("abort", callerAbort);
     }
-  });
+  };
+  return lane === undefined ? mutation() : serializeV2Mutation(peer, lane, mutation);
 }
 
-async function serializeV2Mutation<T>(peer: ProvenControlPeer, mutation: () => Promise<T>): Promise<T> {
+async function waitForMutationTail(previous: Promise<void>, authority: ProvenPeerAuthority): Promise<void> {
+  const signals = [authority.signal, authority.revocation.signal].filter(
+    (signal): signal is AbortSignal => signal !== undefined,
+  );
+  if (signals.some((signal) => signal.aborted)) {
+    throw new ControlClientError("aborted", "The proven Loxa control request was cancelled.");
+  }
+  let rejectAbort: ((error: ControlClientError) => void) | undefined;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    rejectAbort = reject;
+  });
+  const onAbort = () =>
+    rejectAbort?.(new ControlClientError("aborted", "The proven Loxa control request was cancelled."));
+  for (const signal of signals) signal.addEventListener("abort", onAbort, { once: true });
+  try {
+    await Promise.race([previous.catch(() => undefined), aborted]);
+  } finally {
+    for (const signal of signals) signal.removeEventListener("abort", onAbort);
+  }
+}
+
+async function serializeV2Mutation<T>(peer: ProvenControlPeer, lane: string, mutation: () => Promise<T>): Promise<T> {
   const key = peer as object;
-  const previous = mutationTails.get(key) ?? Promise.resolve();
+  const authority = peerAuthority(peer);
+  const tails = mutationTails.get(key) ?? new Map<string, Promise<void>>();
+  mutationTails.set(key, tails);
+  const previous = tails.get(lane) ?? Promise.resolve();
   let release: () => void = () => undefined;
   const gate = new Promise<void>((resolve) => {
     release = resolve;
   });
   const tail = previous.catch(() => undefined).then(() => gate);
-  mutationTails.set(key, tail);
-  await previous.catch(() => undefined);
+  tails.set(lane, tail);
   try {
+    await waitForMutationTail(previous, authority);
     return await mutation();
   } finally {
     release();
-    if (mutationTails.get(key) === tail) mutationTails.delete(key);
+    if (tails.get(lane) === tail) tails.delete(lane);
+    if (tails.size === 0 && mutationTails.get(key) === tails) mutationTails.delete(key);
   }
 }
 
@@ -738,7 +783,7 @@ export async function loadV2Slot(
   if (nodeId !== peerAuthority(peer).nodeId) {
     throw new ControlClientError("invalid-response", "The proved node ID changed.");
   }
-  return mutateV2(peer, `/loxa/v2/nodes/${nodeId}/slots/${slotId}/load`, { model_id: modelId });
+  return mutateV2(peer, `/loxa/v2/nodes/${nodeId}/slots/${slotId}/load`, { model_id: modelId }, "lifecycle");
 }
 
 export async function unloadV2Slot(
@@ -751,12 +796,12 @@ export async function unloadV2Slot(
   if (nodeId !== peerAuthority(peer).nodeId) {
     throw new ControlClientError("invalid-response", "The proved node ID changed.");
   }
-  return mutateV2(peer, `/loxa/v2/nodes/${nodeId}/slots/${slotId}/unload`, {});
+  return mutateV2(peer, `/loxa/v2/nodes/${nodeId}/slots/${slotId}/unload`, {}, "lifecycle");
 }
 
 export async function cancelV2Operation(peer: ProvenControlPeer, operationId: string): Promise<V2OperationAccepted> {
   assertV2RouteId(operationId);
-  return mutateV2(peer, `/loxa/v2/operations/${operationId}/cancel`, {}, operationId);
+  return mutateV2(peer, `/loxa/v2/operations/${operationId}/cancel`, {}, `operation:${operationId}`, operationId);
 }
 
 export function fetchV2NodeCollection(peer: ProvenControlPeer): Promise<V2NodeCollection> {

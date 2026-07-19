@@ -15,6 +15,8 @@ function Probe({ afterStop, afterRetry }: { afterStop?: () => void; afterRetry?:
       <output aria-label="phase">{session.phase}</output>
       <output aria-label="model">{session.status?.runtime_model ?? "No Models Loaded"}</output>
       <output aria-label="error">{session.error ?? ""}</output>
+      <output aria-label="control-published">{session.control === null ? "hidden" : "published"}</output>
+      <output aria-label="pending-operations">{session.pendingOperationIds.size}</output>
       <button type="button" onClick={() => void session.downloadModel("gemma-3-4b-it-q4").catch(() => undefined)}>
         Download
       </button>
@@ -168,6 +170,175 @@ describe("NodeSessionProvider v2 authority", () => {
     expect(services.loadV2Slot).toHaveBeenCalledWith(testPeer, v2Ids.node, v2Ids.slot, "gemma-3-4b-it-q4");
     expect(services.unloadV2Slot).toHaveBeenCalledWith(testPeer, v2Ids.node, v2Ids.slot);
     expect(services.cancelV2Operation).toHaveBeenCalledWith(testPeer, v2Ids.operation);
+  });
+
+  it("retains two concurrent accepted download IDs until both durable operations settle", async () => {
+    const user = userEvent.setup();
+    const control = scriptedV2Control();
+    const first = decodeV2OperationAccepted({ ...validV2OperationAccepted, revision: "12" });
+    const second = decodeV2OperationAccepted({
+      ...validV2OperationAccepted,
+      operation_id: v2Ids.nextEvent,
+      revision: "13",
+    });
+    const services = servicesWithControl(control, {
+      downloadV2Model: vi.fn().mockResolvedValueOnce(first).mockResolvedValueOnce(second),
+    });
+    render(
+      <NodeSessionProvider services={services} endpoint={testEndpoint}>
+        <Probe />
+      </NodeSessionProvider>,
+    );
+    expect(await screen.findByText("unloaded")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Download" }));
+    await user.click(screen.getByRole("button", { name: "Download" }));
+    expect(screen.getByLabelText("phase")).toHaveTextContent("unloaded");
+    expect(screen.getByLabelText("control-published")).toHaveTextContent("published");
+    expect(screen.getByLabelText("pending-operations")).toHaveTextContent("2");
+
+    act(() =>
+      control.emitReplacement(
+        controlSnapshot({
+          revision: "13",
+          cursor: "13",
+          operations: [
+            {
+              ...validV2Operation,
+              operation_id: first.operation_id,
+              kind: "download",
+              slot_id: null,
+              status: "succeeded",
+              updated_revision: "13",
+            },
+            {
+              ...validV2Operation,
+              operation_id: second.operation_id,
+              kind: "download",
+              slot_id: null,
+              status: "running",
+              updated_revision: "13",
+            },
+          ],
+        }),
+      ),
+    );
+    expect(screen.getByLabelText("phase")).toHaveTextContent("unloaded");
+    expect(screen.getByLabelText("control-published")).toHaveTextContent("published");
+    expect(screen.getByLabelText("pending-operations")).toHaveTextContent("1");
+
+    act(() =>
+      control.emitReplacement(
+        controlSnapshot({
+          revision: "14",
+          cursor: "14",
+          operations: [
+            {
+              ...validV2Operation,
+              operation_id: first.operation_id,
+              kind: "download",
+              slot_id: null,
+              status: "succeeded",
+              updated_revision: "14",
+            },
+            {
+              ...validV2Operation,
+              operation_id: second.operation_id,
+              kind: "download",
+              slot_id: null,
+              status: "succeeded",
+              updated_revision: "14",
+            },
+          ],
+        }),
+      ),
+    );
+    expect(await screen.findByText("unloaded")).toBeInTheDocument();
+    expect(screen.getByLabelText("pending-operations")).toHaveTextContent("0");
+  });
+
+  it("updates one pending map entry for exact duplicate download acceptance", async () => {
+    const user = userEvent.setup();
+    const control = scriptedV2Control();
+    const accepted = decodeV2OperationAccepted({ ...validV2OperationAccepted, revision: "12" });
+    const services = servicesWithControl(control, {
+      downloadV2Model: vi.fn().mockResolvedValue(accepted),
+    });
+    render(
+      <NodeSessionProvider services={services} endpoint={testEndpoint}>
+        <Probe />
+      </NodeSessionProvider>,
+    );
+    expect(await screen.findByText("unloaded")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Download" }));
+    await user.click(screen.getByRole("button", { name: "Download" }));
+    expect(screen.getByLabelText("pending-operations")).toHaveTextContent("1");
+    expect(screen.getByLabelText("control-published")).toHaveTextContent("published");
+
+    act(() =>
+      control.emitReplacement(
+        controlSnapshot({
+          revision: "12",
+          cursor: "12",
+          operations: [
+            {
+              ...validV2Operation,
+              kind: "download",
+              slot_id: null,
+              status: "succeeded",
+              updated_revision: "12",
+            },
+          ],
+        }),
+      ),
+    );
+    expect(await screen.findByText("unloaded")).toBeInTheDocument();
+    expect(screen.getByLabelText("pending-operations")).toHaveTextContent("0");
+  });
+
+  it("keeps lifecycle pending correlation singular when a later lifecycle operation is accepted", async () => {
+    const user = userEvent.setup();
+    const control = scriptedV2Control();
+    const load = decodeV2OperationAccepted({ ...validV2OperationAccepted, revision: "12" });
+    const unload = decodeV2OperationAccepted({
+      ...validV2OperationAccepted,
+      operation_id: v2Ids.nextEvent,
+      revision: "13",
+    });
+    const services = servicesWithControl(control, {
+      loadV2Slot: vi.fn().mockResolvedValue(load),
+      unloadV2Slot: vi.fn().mockResolvedValue(unload),
+    });
+    render(
+      <NodeSessionProvider services={services} endpoint={testEndpoint}>
+        <Probe />
+      </NodeSessionProvider>,
+    );
+    expect(await screen.findByText("unloaded")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Load" }));
+    await user.click(screen.getByRole("button", { name: "Unload" }));
+    expect(screen.getByLabelText("phase")).toHaveTextContent("reconciling");
+    expect(screen.getByLabelText("control-published")).toHaveTextContent("hidden");
+    expect(screen.getByLabelText("pending-operations")).toHaveTextContent("1");
+
+    act(() =>
+      control.emitReplacement(
+        controlSnapshot({
+          revision: "13",
+          cursor: "13",
+          operations: [
+            {
+              ...validV2Operation,
+              operation_id: unload.operation_id,
+              kind: "unload",
+              model_id: null,
+              status: "succeeded",
+              updated_revision: "13",
+            },
+          ],
+        }),
+      ),
+    );
+    expect(await screen.findByText("unloaded")).toBeInTheDocument();
   });
 
   it("fails closed when v2 proof fails and never opens a durable stream", async () => {

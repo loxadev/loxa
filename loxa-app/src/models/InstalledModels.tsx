@@ -11,7 +11,9 @@ type InstalledModelsProps = {
   operations: Map<string, OperationView>;
   activeUnload?: OperationView;
   pendingModels: Set<string>;
-  mutationBusy: boolean;
+  downloadingModelIds: ReadonlySet<string>;
+  globallyClosed: boolean;
+  lifecycleBusy: boolean;
   onSelect(modelId: string): void;
   onDownload(modelId: string): void;
   onLoad(modelId: string): void;
@@ -44,10 +46,12 @@ export function InstalledModels(props: InstalledModelsProps) {
                 operation={props.operations.get(entry.id)}
                 unloadOperation={props.node?.activeModelId === entry.id ? props.activeUnload : undefined}
                 pending={props.pendingModels.has(entry.id)}
+                downloadBusy={props.downloadingModelIds.has(entry.id)}
                 active={props.node?.activeModelId === entry.id}
                 selected={props.selected?.id === entry.id}
                 node={props.node}
-                mutationBusy={props.mutationBusy}
+                globallyClosed={props.globallyClosed}
+                lifecycleBusy={props.lifecycleBusy}
                 onSelect={() => props.onSelect(entry.id)}
                 onDownload={() => props.onDownload(entry.id)}
                 onLoad={() => props.onLoad(entry.id)}

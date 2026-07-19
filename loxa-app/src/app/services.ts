@@ -37,6 +37,9 @@ export function desktopRuntimeUnavailableMessage(development: boolean) {
 
 export const DESKTOP_RUNTIME_UNAVAILABLE_MESSAGE = desktopRuntimeUnavailableMessage(import.meta.env.DEV);
 
+export const confirmGlobalDownloadCancel = () =>
+  window.confirm("Cancel this shared download for every observer connected to this Loxa node?");
+
 function invokeDesktop<T>(command: string, args?: Record<string, unknown>) {
   if (!("__TAURI_INTERNALS__" in window)) {
     return Promise.reject(new Error(DESKTOP_RUNTIME_UNAVAILABLE_MESSAGE));
@@ -57,6 +60,7 @@ export const appServices: AppServices = {
   readControlToken: (endpoint: string) => invokeDesktop<string>("read_control_token", { endpoint }),
   getControlNode,
   getInventory,
+  confirmGlobalDownloadCancel,
   proveV2ControlPeer,
   openV2Events,
   downloadV2Model,

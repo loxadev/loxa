@@ -140,7 +140,7 @@ export function ChatScreen({
   const stopRequested = useRef(false);
   const lifecycleController = useRef<AbortController | null>(null);
   const controlStream = useRef<ControlStreamHandle | null>(null);
-  const operations = useRef(new Map<string, { status: string }>());
+  const operations = useRef(new Map<string, { kind: string; status: string }>());
   const activeTurnId = useRef<number | null>(null);
   const nextTurnId = useRef(1);
   const mounted = useRef(true);
@@ -428,22 +428,14 @@ export function ChatScreen({
                 void onModelMutationSettledRef.current?.(operation.id);
               });
               setControlStreamState("live");
-              setControlBusy(
-                snapshot.operations.some(
-                  (operation) => operation.status === "queued" || operation.status === "running",
-                ),
-              );
+              setControlBusy(snapshot.operations.some(isActiveLifecycleOperation));
             },
             onEvent: (event) => {
               if (disposed) return;
               setControlStreamState("live");
               operations.current.set(event.operation.id, event.operation);
               if (isActiveLifecycleOperation(event.operation)) onModelMutationStartRef.current?.(event.operation.id);
-              setControlBusy(
-                [...operations.current.values()].some(
-                  (operation) => operation.status === "queued" || operation.status === "running",
-                ),
-              );
+              setControlBusy([...operations.current.values()].some(isActiveLifecycleOperation));
               if (
                 (event.operation.kind === "load" || event.operation.kind === "unload") &&
                 isTerminalOperation(event.operation.status)
@@ -467,10 +459,7 @@ export function ChatScreen({
                     setEligibleModels(eligibleNext);
                     setAuthoritativeNodeStatus(node.status);
                     setControlBusy(
-                      node.operationId !== null ||
-                        [...operations.current.values()].some(
-                          (operation) => operation.status === "queued" || operation.status === "running",
-                        ),
+                      node.operationId !== null || [...operations.current.values()].some(isActiveLifecycleOperation),
                     );
                     if (node.status === "ready" && node.activeModelId !== null) {
                       setActiveModel(node.activeModelId);
@@ -836,11 +825,7 @@ export function ChatScreen({
       const reconciledRequestModel = models.data.find(({ id }) => id === "loxa")?.id ?? models.data[0]?.id ?? null;
       if (reconciledRequestModel === null)
         throw new Error("The node did not publish a chat request model after loading.");
-      reconciledBusy =
-        node.operationId !== null ||
-        [...operations.current.values()].some(
-          (operation) => operation.status === "queued" || operation.status === "running",
-        );
+      reconciledBusy = node.operationId !== null || [...operations.current.values()].some(isActiveLifecycleOperation);
       if (mounted.current) {
         setActiveModel(node.activeModelId);
         setRequestModel(reconciledRequestModel);
@@ -877,10 +862,7 @@ export function ChatScreen({
               setConnection("disconnected");
             }
             reconciledBusy =
-              node.operationId !== null ||
-              [...operations.current.values()].some(
-                (operation) => operation.status === "queued" || operation.status === "running",
-              );
+              node.operationId !== null || [...operations.current.values()].some(isActiveLifecycleOperation);
           }
         } catch {
           reconciledBusy = true;

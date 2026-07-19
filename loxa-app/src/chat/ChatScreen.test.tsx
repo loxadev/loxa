@@ -908,6 +908,36 @@ describe("ChatScreen", () => {
     expect(screen.getAllByText(/model operation in progress/i)).not.toHaveLength(0);
   });
 
+  it("keeps chat and model switching available during an unrelated download", async () => {
+    const setup = services();
+    render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
+    await screen.findByRole("button", { name: "Choose model" });
+
+    act(() =>
+      setup.controlCallbacks()?.onSnapshot({
+        cursor: 4,
+        cursorGap: false,
+        operations: [
+          {
+            id: "download-4",
+            kind: "download",
+            status: "running",
+            modelId: "other",
+            progress: { completedBytes: 1, totalBytes: 2 },
+            error: null,
+            createdAtUnixMs: 1,
+            updatedAtUnixMs: 2,
+          },
+        ],
+        events: [],
+      }),
+    );
+
+    expect(screen.getByRole("status")).toHaveTextContent("Ready");
+    expect(screen.getByLabelText("Message")).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Choose model" })).toBeEnabled();
+  });
+
   it("reconnects from the terminal cursor and restores controls after a fresh snapshot", async () => {
     const setup = services();
     render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);

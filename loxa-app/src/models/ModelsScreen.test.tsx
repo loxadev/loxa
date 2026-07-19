@@ -21,11 +21,13 @@ function renderModels(
     inventory?: ReturnType<typeof modelFixture>[];
     onStart?: (operationId: string) => void;
     onSettled?: (operationId: string) => void;
+    confirmGlobalDownloadCancel?: () => boolean;
   } = {},
 ) {
   const control = scriptedV2Control(options.snapshot);
   const services = servicesWithControl(control, {
     getInventory: vi.fn().mockResolvedValue(options.inventory ?? [modelFixture()]),
+    confirmGlobalDownloadCancel: options.confirmGlobalDownloadCancel ?? vi.fn().mockReturnValue(false),
   });
   render(
     <SessionHarness services={services}>
@@ -67,6 +69,28 @@ describe("ModelsScreen v2 authority", () => {
 
     await user.click(await screen.findByRole("button", { name: `Download ${entry.id}` }));
     await waitFor(() => expect(services.downloadV2Model).toHaveBeenCalledWith(testPeer, entry.id));
+  });
+
+  it("keeps unrelated download and lifecycle actions available during an active download", async () => {
+    const activeDownload = {
+      ...validV2Operation,
+      kind: "download" as const,
+      slot_id: null,
+      model_id: "active-download",
+      status: "running" as const,
+    };
+    const loadable = modelFixture("loadable-model");
+    const downloadable = {
+      ...modelFixture("other-download"),
+      artifact: { kind: "not_downloaded" as const },
+    };
+    renderModels({
+      snapshot: controlSnapshot({ operations: [activeDownload] }),
+      inventory: [loadable, downloadable],
+    });
+
+    expect(await screen.findByRole("button", { name: "Load loadable-model" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Download other-download" })).toBeEnabled();
   });
 
   it("tracks the exact accepted UUID for a v2 default-slot load", async () => {
@@ -136,13 +160,60 @@ describe("ModelsScreen v2 authority", () => {
       model_id: "gemma-3-4b-it-q4",
       progress: { completed_bytes: "512", total_bytes: "1024" },
     };
-    const { services } = renderModels({ snapshot: controlSnapshot({ operations: [operation] }) });
+    const confirmGlobalDownloadCancel = vi.fn().mockReturnValue(true);
+    const { services } = renderModels({
+      snapshot: controlSnapshot({ operations: [operation] }),
+      confirmGlobalDownloadCancel,
+    });
 
     const cancel = await screen.findByRole("button", { name: "Cancel download gemma-3-4b-it-q4" });
     expect(screen.getByRole("progressbar")).toHaveAttribute("value", "512");
     expect(screen.getByRole("progressbar")).toHaveAttribute("max", "1024");
     await user.click(cancel);
+    expect(confirmGlobalDownloadCancel).toHaveBeenCalledOnce();
     await waitFor(() => expect(services.cancelV2Operation).toHaveBeenCalledWith(testPeer, v2Ids.operation));
+  });
+
+  it("keeps a shared download running when global cancellation is declined", async () => {
+    const user = userEvent.setup();
+    const confirmGlobalDownloadCancel = vi.fn().mockReturnValue(false);
+    const operation = {
+      ...validV2Operation,
+      kind: "download" as const,
+      slot_id: null,
+      model_id: "gemma-3-4b-it-q4",
+    };
+    const { services } = renderModels({
+      snapshot: controlSnapshot({ operations: [operation] }),
+      confirmGlobalDownloadCancel,
+    });
+
+    await user.click(await screen.findByRole("button", { name: "Cancel download gemma-3-4b-it-q4" }));
+
+    expect(confirmGlobalDownloadCancel).toHaveBeenCalledOnce();
+    expect(services.cancelV2Operation).not.toHaveBeenCalled();
+  });
+
+  it("fails closed on active-download cancellation during slot recovery", async () => {
+    const operation = {
+      ...validV2Operation,
+      kind: "download" as const,
+      slot_id: null,
+      model_id: "gemma-3-4b-it-q4",
+    };
+    renderModels({
+      snapshot: controlSnapshot({
+        slot: {
+          status: "recovery",
+          model_id: null,
+          operation_id: null,
+          error: { code: "lifecycle_recovery_required", message: "Reconcile lifecycle state." },
+        },
+        operations: [operation],
+      }),
+    });
+
+    expect(await screen.findByRole("button", { name: "Cancel download gemma-3-4b-it-q4" })).toBeDisabled();
   });
 
   it("keeps an accepted cancellation pending until that exact operation is terminal", async () => {
@@ -157,6 +228,7 @@ describe("ModelsScreen v2 authority", () => {
     const { control, services } = renderModels({
       snapshot: controlSnapshot({ operations: [operation] }),
       onSettled,
+      confirmGlobalDownloadCancel: vi.fn().mockReturnValue(true),
     });
 
     const cancel = await screen.findByRole("button", { name: "Cancel download gemma-3-4b-it-q4" });

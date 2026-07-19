@@ -2,11 +2,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type { getInventory as defaultGetInventory } from "../control/client";
 import type { ModelInventoryEntry, OperationView, V2Operation, V2Slot } from "../control/contracts";
+import { activeOperations, operationLane } from "../control/operationPresentation";
 import { useNodeSession } from "../node/NodeSession";
 
 // NodeSession owns all control authority. This screen-level seam is metadata-only.
 export type ModelsScreenServices = {
   getInventory: typeof defaultGetInventory;
+  confirmGlobalDownloadCancel: () => boolean;
 };
 export type ModelsLiveState = "connecting" | "live" | "reconnecting" | "error";
 
@@ -242,6 +244,7 @@ export function useModelsController({
   };
 
   const cancel = async (operation: OperationView, modelId: string) => {
+    if (operation.kind === "download" && !services.confirmGlobalDownloadCancel()) return;
     setRequestPendingModels((current) => withValue(current, modelId, true));
     setError("");
     try {
@@ -293,14 +296,21 @@ export function useModelsController({
     for (const accepted of acceptedMutations.values()) next.add(accepted.uiModelId);
     return next;
   }, [acceptedMutations, requestPendingModels]);
-  const mutationBusy =
-    session.control === null ||
-    pendingModels.size > 0 ||
-    node?.operationId !== null ||
-    (session.control?.operations ?? []).some(
-      (operation) =>
-        operation.status === "queued" || operation.status === "running" || operation.status === "cancelling",
-    );
+  const active = activeOperations(session.control?.operations ?? []);
+  const lifecycleBusy =
+    (node !== null && node.operationId !== null) ||
+    active.some((operation) => operationLane(operation) === "lifecycle") ||
+    [...acceptedMutations.values()].some((mutation) => mutation.kind === "load" || mutation.kind === "unload");
+  const downloadingModelIds = new Set(
+    active
+      .filter((operation) => operation.kind === "download" && operation.model_id !== null)
+      .map((operation) => operation.model_id as string),
+  );
+  for (const accepted of acceptedMutations.values()) {
+    if (accepted.kind === "download") downloadingModelIds.add(accepted.uiModelId);
+  }
+  const globallyClosed =
+    session.control === null || session.phase === "stopping" || node?.status === "recovery_required";
 
   return {
     activeUnload,
@@ -311,7 +321,9 @@ export function useModelsController({
     latestByModel,
     liveState,
     models,
-    mutationBusy,
+    downloadingModelIds,
+    globallyClosed,
+    lifecycleBusy,
     node,
     notice,
     pendingModels,

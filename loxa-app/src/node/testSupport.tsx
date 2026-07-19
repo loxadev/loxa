@@ -85,6 +85,7 @@ export function servicesWithControl(
     proveV2ControlPeer: vi.fn().mockResolvedValue(testPeer),
     openV2Events: control.openV2Events,
     getInventory: vi.fn().mockResolvedValue([]),
+    confirmGlobalDownloadCancel: vi.fn().mockReturnValue(false),
     downloadV2Model: vi.fn().mockResolvedValue(validV2OperationAccepted),
     loadV2Slot: vi.fn().mockResolvedValue(validV2OperationAccepted),
     unloadV2Slot: vi.fn().mockResolvedValue(validV2OperationAccepted),

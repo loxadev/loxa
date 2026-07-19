@@ -9,10 +9,12 @@ export function ModelRow({
   operation,
   unloadOperation,
   pending,
+  downloadBusy,
   active,
   selected,
   node,
-  mutationBusy,
+  globallyClosed,
+  lifecycleBusy,
   onSelect,
   onDownload,
   onLoad,
@@ -23,10 +25,12 @@ export function ModelRow({
   operation?: OperationView;
   unloadOperation?: OperationView;
   pending: boolean;
+  downloadBusy: boolean;
   active: boolean;
   selected: boolean;
   node: NodeSnapshot | null;
-  mutationBusy: boolean;
+  globallyClosed: boolean;
+  lifecycleBusy: boolean;
   onSelect(): void;
   onDownload(): void;
   onLoad(): void;
@@ -108,7 +112,7 @@ export function ModelRow({
         {inProgress && displayedOperation?.kind === "download" ? (
           <Button
             variant="secondary"
-            disabled={pending}
+            disabled={pending || globallyClosed}
             onClick={() => onCancel(displayedOperation)}
             aria-label={`Cancel ${displayedOperation.kind} ${entry.id}`}
           >
@@ -118,7 +122,7 @@ export function ModelRow({
           <span className={styles.actionLabel}>{operationLabel(displayedOperation)}</span>
         ) : showDownload ? (
           <Button
-            disabled={!actionable || pending || mutationBusy}
+            disabled={!actionable || pending || downloadBusy || globallyClosed}
             aria-describedby={reasonId}
             aria-label={actionLabel}
             onClick={onDownload}
@@ -128,7 +132,7 @@ export function ModelRow({
         ) : entry.artifact.kind === "downloaded" && actionable && node?.status !== "recovery_required" ? (
           <Button
             variant={active ? "secondary" : "primary"}
-            disabled={pending || mutationBusy}
+            disabled={pending || lifecycleBusy || globallyClosed}
             onClick={active ? onUnload : onLoad}
             aria-label={
               active ? `Unload ${entry.id}` : node?.activeModelId ? `Switch to ${entry.id}` : `Load ${entry.id}`
