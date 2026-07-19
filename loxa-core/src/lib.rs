@@ -18,6 +18,9 @@ pub mod selector;
 pub mod supervisor;
 pub mod workload;
 
+#[cfg(windows)]
+mod windows_file;
+
 #[cfg(test)]
 mod slice3_test_support;
 

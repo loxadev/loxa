@@ -191,6 +191,7 @@ trait ArtifactFileOps {
     ) -> std::io::Result<()>;
 }
 
+#[cfg(not(windows))]
 #[derive(Clone)]
 struct ArtifactPromotionEvidence {
     parent: fs::Metadata,
@@ -199,6 +200,7 @@ struct ArtifactPromotionEvidence {
     destination_path: PathBuf,
 }
 
+#[cfg(not(windows))]
 impl ArtifactPromotionEvidence {
     fn capture(
         source_file: &File,
@@ -306,6 +308,134 @@ impl ArtifactPromotionEvidence {
         } else {
             Err(invalid_finalization_evidence())
         }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone)]
+struct ArtifactPromotionEvidence {
+    parent: crate::windows_file::FileIdentity,
+    source: crate::windows_file::FileIdentity,
+    destination: Option<crate::windows_file::FileIdentity>,
+    destination_path: PathBuf,
+}
+
+#[cfg(windows)]
+impl ArtifactPromotionEvidence {
+    fn capture(
+        source_file: &File,
+        source: &Path,
+        destination: &Path,
+    ) -> Result<Self, DownloadError> {
+        let source_opened = crate::windows_file::information(source_file)?;
+        if source_opened.number_of_links != 1 {
+            return Err(DownloadError::UnsafeArtifactPath);
+        }
+        let (_, source_metadata, source_path) =
+            crate::windows_file::open_path_no_follow(source, false)?;
+        if !source_metadata.file_type().is_file()
+            || source_path.number_of_links != 1
+            || source_opened.identity != source_path.identity
+        {
+            return Err(DownloadError::UnsafeArtifactPath);
+        }
+
+        let parent_path = destination
+            .parent()
+            .ok_or(DownloadError::UnsafeArtifactPath)?;
+        let (_, parent_metadata, parent) =
+            crate::windows_file::open_path_no_follow(parent_path, true)?;
+        if !parent_metadata.file_type().is_dir() {
+            return Err(DownloadError::UnsafeArtifactPath);
+        }
+
+        Ok(Self {
+            parent: parent.identity,
+            source: source_opened.identity,
+            destination: windows_regular_path_information(destination)?
+                .map(|(_, information)| information.identity),
+            destination_path: destination.to_path_buf(),
+        })
+    }
+
+    fn revalidate_parent(&self, parent: &Path) -> std::io::Result<()> {
+        self.open_revalidated_parent(parent).map(drop)
+    }
+
+    fn open_revalidated_parent(&self, parent: &Path) -> std::io::Result<File> {
+        let (opened, metadata, information) =
+            crate::windows_file::open_path_no_follow(parent, true)?;
+        if !metadata.file_type().is_dir() || information.identity != self.parent {
+            return Err(invalid_finalization_evidence());
+        }
+        Ok(opened)
+    }
+
+    fn revalidate_before_rename(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
+        self.revalidate_parent(
+            destination
+                .parent()
+                .ok_or_else(invalid_finalization_evidence)?,
+        )?;
+        let source =
+            windows_regular_path_information(source)?.ok_or_else(invalid_finalization_evidence)?;
+        if source.1.identity != self.source {
+            return Err(invalid_finalization_evidence());
+        }
+        match (
+            self.destination,
+            windows_regular_path_information(destination)?,
+        ) {
+            (None, None) => Ok(()),
+            (Some(expected), Some((_, current))) if current.identity == expected => Ok(()),
+            _ => Err(invalid_finalization_evidence()),
+        }
+    }
+
+    fn revalidate_after_rename(&self, destination: &Path) -> std::io::Result<()> {
+        self.revalidate_parent(
+            destination
+                .parent()
+                .ok_or_else(invalid_finalization_evidence)?,
+        )?;
+        match windows_regular_path_information(destination)? {
+            Some((_, current)) if current.identity == self.source => Ok(()),
+            _ => Err(invalid_finalization_evidence()),
+        }
+    }
+
+    fn revalidate_opened_final(&self, file: &File) -> std::io::Result<()> {
+        self.revalidate_parent(
+            self.destination_path
+                .parent()
+                .ok_or_else(invalid_finalization_evidence)?,
+        )?;
+        let opened = crate::windows_file::information(file)?;
+        if opened.number_of_links != 1 || opened.identity != self.source {
+            return Err(invalid_finalization_evidence());
+        }
+        match windows_regular_path_information(&self.destination_path)? {
+            Some((_, current)) if current.identity == self.source => Ok(()),
+            _ => Err(invalid_finalization_evidence()),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn windows_regular_path_information(
+    path: &Path,
+) -> std::io::Result<Option<(fs::Metadata, crate::windows_file::FileInformation)>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            let (_, opened, information) = crate::windows_file::open_path_no_follow(path, false)?;
+            if !opened.file_type().is_file() || information.number_of_links != 1 {
+                return Err(invalid_finalization_evidence());
+            }
+            Ok(Some((opened, information)))
+        }
+        Ok(_) => Err(invalid_finalization_evidence()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -1335,6 +1465,7 @@ fn cleanup_stale_restart(part_path: &Path) -> Result<(), DownloadError> {
     }
 }
 
+#[cfg(not(windows))]
 fn regular_artifact_metadata(path: &Path) -> Result<Option<fs::Metadata>, DownloadError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() && artifact_has_single_link(&metadata) => {
@@ -1346,16 +1477,19 @@ fn regular_artifact_metadata(path: &Path) -> Result<Option<fs::Metadata>, Downlo
     }
 }
 
+#[cfg(windows)]
+fn regular_artifact_metadata(path: &Path) -> Result<Option<fs::Metadata>, DownloadError> {
+    match windows_regular_path_information(path) {
+        Ok(Some((metadata, _))) => Ok(Some(metadata)),
+        Ok(None) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 #[cfg(unix)]
 fn artifact_has_single_link(metadata: &fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
     metadata.nlink() == 1
-}
-
-#[cfg(windows)]
-fn artifact_has_single_link(metadata: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    metadata.number_of_links() == Some(1)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1419,6 +1553,7 @@ fn create_regular_truncate_no_follow(path: &Path) -> Result<File, DownloadError>
     })
 }
 
+#[cfg(not(windows))]
 fn open_regular_no_follow(
     path: &Path,
     configure: impl FnOnce(&mut OpenOptions),
@@ -1446,28 +1581,42 @@ fn open_regular_no_follow(
     Ok(file)
 }
 
+#[cfg(windows)]
+fn open_regular_no_follow(
+    path: &Path,
+    configure: impl FnOnce(&mut OpenOptions),
+) -> Result<File, DownloadError> {
+    let before = fs::symlink_metadata(path).ok();
+    if before
+        .as_ref()
+        .is_some_and(|metadata| !metadata.file_type().is_file())
+    {
+        return Err(DownloadError::UnsafeArtifactPath);
+    }
+    let mut options = OpenOptions::new();
+    configure(&mut options);
+    apply_no_follow(&mut options);
+    let file = options.open(path)?;
+    let opened = file.metadata()?;
+    let opened_information = crate::windows_file::information(&file)?;
+    if !opened.file_type().is_file() || opened_information.number_of_links != 1 {
+        return Err(DownloadError::UnsafeArtifactPath);
+    }
+    let (_, current_metadata, current_information) =
+        crate::windows_file::open_path_no_follow(path, false)?;
+    if !current_metadata.file_type().is_file()
+        || current_information.number_of_links != 1
+        || current_information.identity != opened_information.identity
+    {
+        return Err(DownloadError::UnsafeArtifactPath);
+    }
+    Ok(file)
+}
+
 #[cfg(unix)]
 fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
     left.dev() == right.dev() && left.ino() == right.ino()
-}
-
-#[cfg(windows)]
-fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    match (
-        left.volume_serial_number(),
-        left.file_index(),
-        right.volume_serial_number(),
-        right.file_index(),
-    ) {
-        (Some(left_volume), Some(left_index), Some(right_volume), Some(right_index))
-            if left_volume != 0 && left_index != 0 =>
-        {
-            left_volume == right_volume && left_index == right_index
-        }
-        _ => false,
-    }
 }
 
 #[cfg(not(any(unix, windows)))]
