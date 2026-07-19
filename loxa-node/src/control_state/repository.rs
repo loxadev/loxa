@@ -320,6 +320,17 @@ struct GuardedVacantDestination {
     family_guard: Option<fs::File>,
 }
 
+impl Drop for GuardedVacantDestination {
+    fn drop(&mut self) {
+        let Some(guard) = self.family_guard.take() else {
+            return;
+        };
+        if unlock_family_guard(&guard).is_err() {
+            let _retained_until_exit: &'static mut fs::File = Box::leak(Box::new(guard));
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum DestinationInstallExpectation {
     Vacant,
@@ -355,12 +366,15 @@ impl ValidatedConnection {
             Ok(()) => {
                 drop(self.main_guard.take());
                 drop(self.directory_guard.take());
-                self.live_claim
+                let claim = self
+                    .live_claim
                     .take()
-                    .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?
-                    .release_after_proven_close()?;
-                drop(self.family_guard.take());
-                Ok(())
+                    .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?;
+                let family_guard = self
+                    .family_guard
+                    .take()
+                    .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?;
+                release_live_family_after_close(claim, family_guard)
             }
             Err((connection, error)) => {
                 self.connection = Some(connection);
@@ -435,19 +449,15 @@ impl ClosedImage {
     fn release(mut self) -> Result<(), RepositoryError> {
         drop(self.main_guard.take());
         drop(self.directory_guard.take());
-        let release = self
+        let reservation = self
             .reservation
             .take()
-            .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?
-            .release_after_guards_closed();
-        if let Err(error) = release {
-            if let Some(guard) = self.family_guard.take() {
-                let _retained_until_exit: &'static mut fs::File = Box::leak(Box::new(guard));
-            }
-            return Err(error);
-        }
-        drop(self.family_guard.take());
-        Ok(())
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?;
+        let family_guard = self
+            .family_guard
+            .take()
+            .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?;
+        release_reserved_family_after_close(reservation, family_guard)
     }
 }
 
@@ -456,14 +466,16 @@ impl Drop for ClosedImage {
         drop(self.main_guard.take());
         drop(self.directory_guard.take());
         if let Some(reservation) = self.reservation.take() {
-            if reservation.release_after_guards_closed().is_err() {
-                if let Some(guard) = self.family_guard.take() {
-                    let _retained_until_exit: &'static mut fs::File = Box::leak(Box::new(guard));
-                }
-                return;
+            if let Some(family_guard) = self.family_guard.take() {
+                let _ = release_reserved_family_after_close(reservation, family_guard);
+            }
+            return;
+        }
+        if let Some(family_guard) = self.family_guard.take() {
+            if unlock_family_guard(&family_guard).is_err() {
+                let _retained_until_exit: &'static mut fs::File = Box::leak(Box::new(family_guard));
             }
         }
-        drop(self.family_guard.take());
     }
 }
 
@@ -505,6 +517,73 @@ fn retain_quarantined_owner(
     };
     let _retained_until_exit: &'static mut PoisonedReservationOwner = Box::leak(Box::new(owner));
     error
+}
+
+fn retain_poisoned_family_reservation(
+    family_guard: fs::File,
+    mut reservation: ClaimReservation,
+    error: RepositoryError,
+) -> RepositoryError {
+    let _ = reservation.poison(CloseUncertainty::CheckpointOrClose);
+    let owner = PoisonedFamilyReservationOwner {
+        family_guard,
+        reservation,
+    };
+    let _retained_until_exit: &'static mut PoisonedFamilyReservationOwner =
+        Box::leak(Box::new(owner));
+    error
+}
+
+fn release_live_family_after_close(
+    mut claim: LiveDatabaseClaim,
+    family_guard: fs::File,
+) -> Result<(), RepositoryError> {
+    if let Err(error) = unlock_family_guard(&family_guard) {
+        return Err(retain_poisoned_owner(
+            None,
+            None,
+            None,
+            Some(family_guard),
+            claim,
+            CloseUncertainty::CheckpointOrClose,
+            error,
+        ));
+    }
+    if let Err(error) = claim.release_after_proven_close() {
+        return Err(retain_poisoned_owner(
+            None,
+            None,
+            None,
+            Some(family_guard),
+            claim,
+            CloseUncertainty::CheckpointOrClose,
+            error,
+        ));
+    }
+    drop(family_guard);
+    Ok(())
+}
+
+fn release_reserved_family_after_close(
+    mut reservation: ClaimReservation,
+    family_guard: fs::File,
+) -> Result<(), RepositoryError> {
+    if let Err(error) = unlock_family_guard(&family_guard) {
+        return Err(retain_poisoned_family_reservation(
+            family_guard,
+            reservation,
+            error,
+        ));
+    }
+    if let Err(error) = reservation.release_after_guards_closed() {
+        return Err(retain_poisoned_family_reservation(
+            family_guard,
+            reservation,
+            error,
+        ));
+    }
+    drop(family_guard);
+    Ok(())
 }
 
 fn quarantine_closed_image_until_exit(
@@ -723,12 +802,18 @@ struct PoisonedClosedImageOwner {
     reservation: ClaimReservation,
 }
 
+struct PoisonedFamilyReservationOwner {
+    family_guard: fs::File,
+    reservation: ClaimReservation,
+}
+
 static NEXT_CLAIM_TOKEN: AtomicU64 = AtomicU64::new(1);
 static DATABASE_CLAIMS: OnceLock<Mutex<BTreeMap<FileIdentity, ClaimState>>> = OnceLock::new();
 #[cfg(test)]
 thread_local! {
     static FAIL_CLAIM_TRANSITIONS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
     static FAIL_NEXT_UNCOMMITTED_CLOSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_NEXT_FAMILY_UNLOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_ATOMIC_INSTALL_POSTFLIGHT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static RECONCILIATION_TRANSACTION_FAULT: std::cell::Cell<Option<ReconciliationTransactionFault>> = const { std::cell::Cell::new(None) };
     static MIGRATION_STATEMENT_FAULT: std::cell::Cell<Option<MigrationStatementFault>> = const { std::cell::Cell::new(None) };
@@ -889,7 +974,7 @@ impl ClaimReservation {
         })
     }
 
-    fn release_after_guards_closed(mut self) -> Result<(), RepositoryError> {
+    fn release_after_guards_closed(&mut self) -> Result<(), RepositoryError> {
         let mut claims = claims()
             .lock()
             .map_err(|_| RepositoryError::new(RepositoryErrorClass::Durability))?;
@@ -939,6 +1024,11 @@ fn fail_next_atomic_install_postflight_for_test() {
 }
 
 #[cfg(test)]
+fn fail_next_family_unlock_for_test() {
+    FAIL_NEXT_FAMILY_UNLOCK.with(|fault| fault.set(true));
+}
+
+#[cfg(test)]
 fn atomic_install_postflight_fault_is_pending_for_test() -> bool {
     FAIL_ATOMIC_INSTALL_POSTFLIGHT.with(std::cell::Cell::get)
 }
@@ -977,7 +1067,7 @@ impl LiveDatabaseClaim {
         }
     }
 
-    fn release_after_proven_close(self) -> Result<(), RepositoryError> {
+    fn release_after_proven_close(&mut self) -> Result<(), RepositoryError> {
         let mut claims = claims()
             .lock()
             .map_err(|_| RepositoryError::new(RepositoryErrorClass::Durability))?;
@@ -1746,12 +1836,16 @@ impl ControlRepository {
                 observe(CloseEvent::MainGuardClosed);
                 drop(self.directory_guard.take());
                 observe(CloseEvent::DirectoryGuardClosed);
-                self.live_claim
+                let claim = self
+                    .live_claim
                     .take()
-                    .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?
-                    .release_after_proven_close()?;
+                    .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?;
+                let family_guard = self
+                    .family_guard
+                    .take()
+                    .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?;
+                release_live_family_after_close(claim, family_guard)?;
                 observe(CloseEvent::ClaimReleased);
-                drop(self.family_guard.take());
                 Ok(())
             }
             Err((connection, error)) => {
@@ -3862,6 +3956,7 @@ fn install_closed_image_after(
             let error = RepositoryError::new(RepositoryErrorClass::Durability);
             return Err(quarantine_closed_image_until_exit(&mut source, error));
         };
+        let mut reservation = reservation;
         let release = reservation.release_after_guards_closed();
         if let Err(error) = release {
             return Err(quarantine_closed_image_until_exit(&mut source, error));
@@ -4286,6 +4381,30 @@ fn try_lock_family_guard(_guard: &fs::File) -> Result<(), RepositoryError> {
     ))
 }
 
+#[cfg(unix)]
+fn unlock_family_guard(guard: &fs::File) -> Result<(), RepositoryError> {
+    use std::os::fd::AsRawFd;
+
+    #[cfg(test)]
+    if FAIL_NEXT_FAMILY_UNLOCK.with(|fault| fault.replace(false)) {
+        return Err(RepositoryError::new(RepositoryErrorClass::Durability));
+    }
+
+    let result = unsafe { libc::flock(guard.as_raw_fd(), libc::LOCK_UN) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(RepositoryError::new(RepositoryErrorClass::Durability))
+    }
+}
+
+#[cfg(not(unix))]
+fn unlock_family_guard(_guard: &fs::File) -> Result<(), RepositoryError> {
+    Err(RepositoryError::new(
+        RepositoryErrorClass::UnsupportedPlatform,
+    ))
+}
+
 #[cfg(not(unix))]
 fn open_family_guard(_path: &Path) -> Result<fs::File, RepositoryError> {
     Err(RepositoryError::new(
@@ -4320,6 +4439,10 @@ fn remove_guarded_family_lock(path: &Path, guard: fs::File) -> Result<(), Reposi
         .parent()
         .ok_or_else(|| RepositoryError::new(RepositoryErrorClass::Durability))?;
     sync_directory_path(parent)?;
+    if let Err(error) = unlock_family_guard(&guard) {
+        let _retained_until_exit: &'static mut fs::File = Box::leak(Box::new(guard));
+        return Err(error);
+    }
     drop(guard);
     Ok(())
 }
@@ -6552,6 +6675,44 @@ mod tests {
             ]
         );
         assert_eq!(probe_from_subprocess(&path), ChildProbe::Opened);
+    }
+
+    #[test]
+    fn successful_close_explicitly_unlocks_a_duplicated_family_guard() {
+        let directory = TestDirectory::new("close-explicit-unlock-duplicate");
+        let path = directory.database();
+        let repository = create_repository(&path);
+        let duplicate = repository
+            .family_guard
+            .as_ref()
+            .unwrap()
+            .try_clone()
+            .unwrap();
+
+        repository.close().unwrap();
+
+        let reopened =
+            ControlRepository::open_or_create(&path, node_id(), &mut CountingIds::default())
+                .unwrap();
+        reopened.close().unwrap();
+        drop(duplicate);
+    }
+
+    #[test]
+    fn family_unlock_failure_retains_and_poisons_exact_ownership() {
+        let directory = TestDirectory::new("close-explicit-unlock-failure");
+        let path = directory.database();
+        let repository = create_repository(&path);
+        super::fail_next_family_unlock_for_test();
+
+        let error = repository.close().unwrap_err();
+
+        assert_eq!(error.class(), RepositoryErrorClass::Durability);
+        let reopen =
+            ControlRepository::open_or_create(&path, node_id(), &mut CountingIds::default())
+                .unwrap_err();
+        assert_eq!(reopen.class(), RepositoryErrorClass::AlreadyOwned);
+        assert_eq!(probe_from_subprocess(&path), ChildProbe::DatabaseLocked);
     }
 
     #[test]
