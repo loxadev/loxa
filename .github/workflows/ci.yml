@@ -110,29 +110,8 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --all-features --locked
 
-  unsupported-control-state-platform:
-    name: unsupported control-state platform (Windows)
-    runs-on: windows-2025
-    timeout-minutes: 20
-    steps:
-      - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          persist-credentials: false
-
-      - name: Install Rust toolchain
-        run: rustup toolchain install --profile minimal --no-self-update
-
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-
-      - name: Compile the production node library
-        run: cargo check -p loxa-node --lib --locked
-
-      # Select only the unsupported-platform integration target. The supported-host unit
-      # suites intentionally exercise Unix APIs and remain covered on macOS and Linux above.
-      - name: Prove production preflight refusal is mutation-free
-        run: cargo test -p loxa-node --test unsupported_control_state_platform --features unsupported-platform-ci --locked
+  # Windows CI is intentionally disabled: Windows is not a supported Loxa platform yet.
+  # Reintroduce platform compilation and refusal tests only with an approved Windows-support slice.
 
   frontend:
     name: desktop frontend

@@ -89,13 +89,12 @@ pub enum PlatformFileIdentity {
 }
 
 impl StableVerificationIdentity {
-    fn from_opened(opened: &File) -> io::Result<Self> {
-        let metadata = opened.metadata()?;
+    fn from(metadata: &Metadata) -> Self {
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
         #[cfg(windows)]
-        let windows = crate::windows_file::information(opened)?;
-        Ok(Self {
+        use std::os::windows::fs::MetadataExt;
+        Self {
             len: metadata.len(),
             modified_ns: metadata
                 .modified()
@@ -111,13 +110,13 @@ impl StableVerificationIdentity {
             },
             #[cfg(windows)]
             platform: PlatformFileIdentity::Windows {
-                volume_serial: windows.identity.volume_serial,
-                file_index: windows.identity.file_index,
-                last_write_time: windows.last_write_time,
+                volume_serial: metadata.volume_serial_number().unwrap_or_default(),
+                file_index: metadata.file_index().unwrap_or_default(),
+                last_write_time: metadata.last_write_time(),
             },
             #[cfg(not(any(unix, windows)))]
             platform: PlatformFileIdentity::Unsupported,
-        })
+        }
     }
 }
 
@@ -132,7 +131,8 @@ pub struct StableVerificationInput {
 impl StableVerificationInput {
     pub fn open(path: &Path, expected_sha256: [u8; 32]) -> io::Result<Self> {
         let opened = open_regular_no_follow(path)?;
-        let stable = StableVerificationIdentity::from_opened(&opened)?;
+        let metadata = opened.metadata()?;
+        let stable = StableVerificationIdentity::from(&metadata);
         #[cfg(windows)]
         if match &stable.platform {
             PlatformFileIdentity::Windows {
@@ -173,7 +173,7 @@ pub fn verify_opened_artifact(
 ) -> io::Result<VerifiedArtifact> {
     input.opened.rewind()?;
     let digest = hash_open_file_with_cancellation(&mut input.opened, &input.stable, cancellation)?;
-    if StableVerificationIdentity::from_opened(&input.opened)? != input.stable {
+    if StableVerificationIdentity::from(&input.opened.metadata()?) != input.stable {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "artifact changed during verification",
@@ -345,9 +345,7 @@ impl VerificationCache {
                 "artifact is not a regular file",
             ));
         }
-        let opened = open_regular_no_follow(&path)?;
-        let stable = StableVerificationIdentity::from_opened(&opened)?;
-        drop(opened);
+        let stable = StableMetadata::from(&metadata);
         if let Some(evidence) = self.cached(&path, &stable, recipe.sha256) {
             return Ok(evidence);
         }
@@ -401,8 +399,8 @@ impl VerificationCache {
         let result = (|| {
             let matches =
                 hash_file_with_cancellation(&path, &stable, cancellation)? == recipe.sha256;
-            let after = open_regular_no_follow(&path)?;
-            if StableVerificationIdentity::from_opened(&after)? != stable {
+            let after = fs::symlink_metadata(&path)?;
+            if !after.file_type().is_file() || StableMetadata::from(&after) != stable {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "artifact changed during verification",
@@ -460,7 +458,7 @@ impl VerificationCache {
         validate_scheduler_evidence(recipe, stable, evidence)?;
         let path = checked_regular_path(models_dir, recipe.filename)?;
         let opened = open_regular_no_follow(&path)?;
-        let current = StableVerificationIdentity::from_opened(&opened)?;
+        let current = StableVerificationIdentity::from(&opened.metadata()?);
         if &current != stable {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -483,7 +481,7 @@ impl VerificationCache {
         self.revalidate_verified_recipe(models_dir, recipe, stable, evidence)?;
         let path = checked_regular_path(models_dir, recipe.filename)?;
         let opened = open_regular_no_follow(&path)?;
-        let current = StableVerificationIdentity::from_opened(&opened)?;
+        let current = StableVerificationIdentity::from(&opened.metadata()?);
         if &current != stable {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -692,13 +690,14 @@ fn artifact_state(
 ) -> ArtifactState {
     let final_path = models_dir.join(recipe.filename);
     match regular_metadata(&final_path) {
-        Ok(Some((metadata, stable))) => {
+        Ok(Some(metadata)) => {
             if metadata.len() != recipe.size_bytes {
                 return ArtifactState::Invalid {
                     reason: ArtifactInvalidReason::SizeMismatch,
                 };
             }
-            return match cache.cached(&final_path, &stable, recipe.sha256) {
+            return match cache.cached(&final_path, &StableMetadata::from(&metadata), recipe.sha256)
+            {
                 Some(evidence) if evidence.matches => ArtifactState::Downloaded,
                 Some(_) => ArtifactState::Invalid {
                     reason: ArtifactInvalidReason::ChecksumMismatch,
@@ -717,20 +716,22 @@ fn artifact_state(
     }
     let part_path = models_dir.join(format!("{}.part", recipe.filename));
     match regular_metadata(&part_path) {
-        Ok(Some((metadata, _))) if metadata.len() < recipe.size_bytes => ArtifactState::Partial {
+        Ok(Some(metadata)) if metadata.len() < recipe.size_bytes => ArtifactState::Partial {
             bytes: metadata.len(),
         },
-        Ok(Some((metadata, _))) if metadata.len() > recipe.size_bytes => ArtifactState::Invalid {
+        Ok(Some(metadata)) if metadata.len() > recipe.size_bytes => ArtifactState::Invalid {
             reason: ArtifactInvalidReason::SizeMismatch,
         },
-        Ok(Some((metadata, stable))) => match cache.cached(&part_path, &stable, recipe.sha256) {
-            Some(evidence) if !evidence.matches => ArtifactState::Invalid {
-                reason: ArtifactInvalidReason::ChecksumMismatch,
-            },
-            _ => ArtifactState::Partial {
-                bytes: metadata.len(),
-            },
-        },
+        Ok(Some(metadata)) => {
+            match cache.cached(&part_path, &StableMetadata::from(&metadata), recipe.sha256) {
+                Some(evidence) if !evidence.matches => ArtifactState::Invalid {
+                    reason: ArtifactInvalidReason::ChecksumMismatch,
+                },
+                _ => ArtifactState::Partial {
+                    bytes: metadata.len(),
+                },
+            }
+        }
         Ok(None) => ArtifactState::NotDownloaded,
         Err(_) => ArtifactState::Invalid {
             reason: ArtifactInvalidReason::Unreadable,
@@ -738,13 +739,10 @@ fn artifact_state(
     }
 }
 
-fn regular_metadata(path: &Path) -> io::Result<Option<(Metadata, StableMetadata)>> {
+fn regular_metadata(path: &Path) -> io::Result<Option<Metadata>> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_file() => {
-            let opened = open_regular_no_follow(path)?;
-            let metadata = opened.metadata()?;
-            let stable = StableVerificationIdentity::from_opened(&opened)?;
-            Ok(Some((metadata, stable)))
+        Ok(metadata) if metadata.file_type().is_file() && artifact_has_single_link(&metadata) => {
+            Ok(Some(metadata))
         }
         Ok(_) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -759,6 +757,12 @@ fn regular_metadata(path: &Path) -> io::Result<Option<(Metadata, StableMetadata)
 fn artifact_has_single_link(metadata: &Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
     metadata.nlink() == 1
+}
+
+#[cfg(windows)]
+fn artifact_has_single_link(metadata: &Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.number_of_links() == Some(1)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -791,8 +795,7 @@ fn hash_open_file_with_cancellation(
     cancellation: &dyn VerificationCancellation,
 ) -> io::Result<String> {
     let opened = file.metadata()?;
-    if !opened.file_type().is_file() || StableVerificationIdentity::from_opened(file)? != *expected
-    {
+    if !opened.file_type().is_file() || StableMetadata::from(&opened) != *expected {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "artifact changed while opening for verification",
@@ -903,22 +906,10 @@ fn open_regular_no_follow(path: &Path) -> io::Result<File> {
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
     let metadata = file.metadata()?;
-    let opened_information = crate::windows_file::information(&file)?;
-    if !metadata.file_type().is_file() || opened_information.number_of_links != 1 {
+    if !metadata.file_type().is_file() || !artifact_has_single_link(&metadata) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "artifact is not a regular file",
-        ));
-    }
-    let (_, current_metadata, current_information) =
-        crate::windows_file::open_path_no_follow(path, false)?;
-    if !current_metadata.file_type().is_file()
-        || current_information.number_of_links != 1
-        || current_information.identity != opened_information.identity
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "artifact changed while opening",
         ));
     }
     Ok(file)
@@ -944,7 +935,7 @@ fn open_regular_no_follow(path: &Path) -> io::Result<File> {
     let opened = file.metadata()?;
     if !artifact_has_single_link(&before)
         || !artifact_has_single_link(&opened)
-        || metadata_identity(&opened) != metadata_identity(&before)
+        || StableMetadata::from(&opened) != StableMetadata::from(&before)
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -952,18 +943,6 @@ fn open_regular_no_follow(path: &Path) -> io::Result<File> {
         ));
     }
     Ok(file)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn metadata_identity(metadata: &Metadata) -> (u64, Option<u128>) {
-    (
-        metadata.len(),
-        metadata
-            .modified()
-            .ok()
-            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-            .map(|value| value.as_nanos()),
-    )
 }
 
 #[cfg(test)]
@@ -1147,8 +1126,7 @@ mod tests {
         let opened = dir.path().join("opened.gguf");
         fs::write(&checked, b"good").unwrap();
         fs::write(&opened, b"good").unwrap();
-        let checked_file = open_regular_no_follow(&checked).unwrap();
-        let expected = StableVerificationIdentity::from_opened(&checked_file).unwrap();
+        let expected = StableMetadata::from(&fs::symlink_metadata(&checked).unwrap());
         let mut file = open_regular_no_follow(&opened).unwrap();
 
         let error =
@@ -1412,8 +1390,7 @@ mod tests {
         fs::write(&path, b"good").unwrap();
         let cache = VerificationCache::default();
         assert!(cache.verify_recipe(dir.path(), &recipe).unwrap().matches);
-        let opened = open_regular_no_follow(&path).unwrap();
-        let metadata = StableVerificationIdentity::from_opened(&opened).unwrap();
+        let metadata = StableMetadata::from(&fs::symlink_metadata(&path).unwrap());
         assert!(cache
             .cached_with_positive_policy(&path, &metadata, recipe.sha256, false)
             .is_none());
