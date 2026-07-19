@@ -1,12 +1,19 @@
 use crate::bootstrap::NodePaths;
-use crate::chat_history::ChatHistoryWorker;
+use crate::chat_history::{ChatHistoryShutdownResult, ChatHistoryWorker};
 use crate::chat_routes::ChatRoutesState;
 use crate::control_state::{ControlStateHandle, ControlStateWorker};
-use crate::download_control::{DownloadControl, DownloadControlWorker};
-use crate::runtime::PublicationGate;
+use crate::download_control::{
+    DownloadControl, DownloadControlWorker, ExecutionShutdownDeadlines,
+    ExecutionShutdownFailureClass, ExecutionShutdownResult,
+};
+use crate::runtime::{
+    shutdown_failure_rank, FatalShutdown, FatalShutdownParts, PublicationGate, ShutdownDeadlines,
+    ShutdownFailureClass, ShutdownResult,
+};
+#[cfg(test)]
+use crate::PreparedPythonRunResult;
 use crate::{
-    LifecycleEvent, LifecycleEventSink, PreparedPythonOwnerDisposition, PreparedPythonRunResult,
-    RunRequest, RunTermination,
+    LifecycleEvent, LifecycleEventSink, PreparedPythonOwnerDisposition, RunRequest, RunTermination,
 };
 use loxa_core::diagnostics::DiagnosticsHealth;
 use loxa_core::engine::RuntimeBackendKind;
@@ -76,6 +83,7 @@ impl NodeOwnerGuard {
         self.baseline.take();
     }
 
+    #[cfg(test)]
     pub(crate) fn finish(mut self) -> io::Result<loxa_core::supervisor::ChildlessFinishOutcome> {
         let outcome = if let Some(recovery) = self.acquisition_recovery.take() {
             let baseline = self.baseline.take().expect("node owner guard armed");
@@ -93,6 +101,95 @@ impl NodeOwnerGuard {
         };
         self.baseline.take();
         Ok(outcome)
+    }
+
+    pub(crate) fn finish_retained(
+        self,
+        deadline: std::time::Instant,
+    ) -> Result<loxa_core::supervisor::ChildlessFinishOutcome, Box<NodeOwnerShutdownFailure>> {
+        let (completed_tx, completed_rx) = mpsc::sync_channel(1);
+        let owner = std::mem::ManuallyDrop::new(self);
+        let worker = thread::Builder::new()
+            .name("loxa-exact-owner-shutdown".into())
+            .spawn(move || {
+                struct Completion(mpsc::SyncSender<()>);
+                impl Drop for Completion {
+                    fn drop(&mut self) {
+                        let _ = self.0.send(());
+                    }
+                }
+                let _completion = Completion(completed_tx);
+                let mut owner = owner;
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let baseline = owner.baseline.as_ref().expect("node owner guard armed");
+                    if let Some(recovery) = owner.acquisition_recovery.as_ref() {
+                        loxa_core::supervisor::abort_managed_owner_acquisition_preserving_source(
+                            &owner.paths.state_path,
+                            baseline,
+                            recovery,
+                        )
+                        .map(|()| loxa_core::supervisor::ChildlessFinishOutcome::Finished)
+                    } else {
+                        loxa_core::supervisor::finish_exact_unloaded_owner_until(
+                            &owner.paths.state_path,
+                            baseline,
+                            deadline,
+                        )
+                    }
+                }));
+                match result {
+                    Ok(Ok(outcome)) => {
+                        owner.baseline.take();
+                        owner.acquisition_recovery.take();
+                        // SAFETY: the owner was disarmed and is dropped exactly once here.
+                        unsafe { std::mem::ManuallyDrop::drop(&mut owner) };
+                        NodeOwnerWorkerExit::Stopped(outcome)
+                    }
+                    Ok(Err(_)) | Err(_) => NodeOwnerWorkerExit::Retained(Box::new(owner)),
+                }
+            });
+        let worker = worker.unwrap_or_else(|_| std::process::abort());
+        if completed_rx
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .is_err()
+        {
+            return Err(Box::new(NodeOwnerShutdownFailure {
+                diagnostic: "exact node owner shutdown deadline exceeded".into(),
+                _owner: None,
+                _worker: Some(std::mem::ManuallyDrop::new(worker)),
+            }));
+        }
+        match worker.join() {
+            Ok(NodeOwnerWorkerExit::Stopped(outcome)) => Ok(outcome),
+            Ok(NodeOwnerWorkerExit::Retained(owner)) => Err(Box::new(NodeOwnerShutdownFailure {
+                diagnostic: "exact node owner shutdown failed".into(),
+                _owner: Some(*owner),
+                _worker: None,
+            })),
+            Err(_) => Err(Box::new(NodeOwnerShutdownFailure {
+                diagnostic: "exact node owner shutdown worker panicked".into(),
+                _owner: None,
+                _worker: None,
+            })),
+        }
+    }
+}
+
+enum NodeOwnerWorkerExit {
+    Stopped(loxa_core::supervisor::ChildlessFinishOutcome),
+    Retained(Box<std::mem::ManuallyDrop<NodeOwnerGuard>>),
+}
+
+#[must_use = "node owner shutdown failure retains exact ownership"]
+pub(crate) struct NodeOwnerShutdownFailure {
+    diagnostic: String,
+    _owner: Option<std::mem::ManuallyDrop<NodeOwnerGuard>>,
+    _worker: Option<std::mem::ManuallyDrop<thread::JoinHandle<NodeOwnerWorkerExit>>>,
+}
+
+impl std::fmt::Display for NodeOwnerShutdownFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.diagnostic)
     }
 }
 
@@ -148,6 +245,7 @@ fn emit_shutdown_stage(
     }
 }
 
+#[cfg(test)]
 fn resolve_shutdown_outcome(
     outcome: io::Result<RunTermination>,
     gateway_shutdown: io::Result<()>,
@@ -161,26 +259,52 @@ fn resolve_shutdown_outcome(
     }
 }
 
-fn resolve_prepared_python_owner(
-    result: PreparedPythonRunResult,
+fn resolve_node_owner_for_shutdown(
     guard: NodeOwnerGuard,
-) -> io::Result<RunTermination> {
-    match result.owner {
-        PreparedPythonOwnerDisposition::Restored(_) => match guard.finish()? {
-            loxa_core::supervisor::ChildlessFinishOutcome::Finished => result.outcome,
-            loxa_core::supervisor::ChildlessFinishOutcome::RequestedStop => {
-                Ok(RunTermination::RequestedStop)
+    prepared: Option<PreparedPythonOwnerDisposition>,
+    deadline: std::time::Instant,
+    outcome: &mut io::Result<RunTermination>,
+) -> NodeOwnerShutdownResolution {
+    match prepared {
+        None | Some(PreparedPythonOwnerDisposition::Restored(_)) => {
+            match guard.finish_retained(deadline) {
+                Ok(loxa_core::supervisor::ChildlessFinishOutcome::Finished) => {
+                    NodeOwnerShutdownResolution::Released
+                }
+                Ok(loxa_core::supervisor::ChildlessFinishOutcome::RequestedStop) => {
+                    *outcome = Ok(RunTermination::RequestedStop);
+                    NodeOwnerShutdownResolution::Released
+                }
+                Err(failure) => NodeOwnerShutdownResolution::Retained(failure),
             }
-        },
-        PreparedPythonOwnerDisposition::ConsumedByRequestedStop => {
-            guard.disarm();
-            result.outcome
         }
-        PreparedPythonOwnerDisposition::RecoveryRequired => {
+        Some(PreparedPythonOwnerDisposition::ConsumedByRequestedStop) => {
             guard.disarm();
-            Err(io::Error::other("prepared Python owner requires recovery"))
+            NodeOwnerShutdownResolution::Released
+        }
+        Some(PreparedPythonOwnerDisposition::RecoveryRequired) => {
+            guard.disarm();
+            NodeOwnerShutdownResolution::RecoveryRequired
         }
     }
+}
+
+enum NodeOwnerShutdownResolution {
+    Released,
+    Retained(Box<NodeOwnerShutdownFailure>),
+    RecoveryRequired,
+}
+
+#[cfg(test)]
+fn resolve_prepared_python_owner_for_test(
+    result: PreparedPythonRunResult,
+    guard: NodeOwnerGuard,
+    deadline: std::time::Instant,
+) -> (io::Result<RunTermination>, NodeOwnerShutdownResolution) {
+    let mut outcome = result.outcome;
+    let resolution =
+        resolve_node_owner_for_shutdown(guard, Some(result.owner), deadline, &mut outcome);
+    (outcome, resolution)
 }
 
 #[must_use]
@@ -208,11 +332,51 @@ pub(crate) struct NodeRuntimeParts {
 pub(crate) struct DurableHealthMonitor {
     stop: mpsc::Sender<()>,
     worker: Option<thread::JoinHandle<()>>,
+    completion: mpsc::Receiver<()>,
     failed: Arc<AtomicBool>,
     signal_failed: Arc<AtomicBool>,
 }
 
+struct HealthCompletion(mpsc::SyncSender<()>);
+
+impl Drop for HealthCompletion {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
+
+#[must_use = "health shutdown failure retains monitor ownership"]
+pub(crate) struct DurableHealthShutdownFailure {
+    diagnostic: &'static str,
+    _monitor: std::mem::ManuallyDrop<DurableHealthMonitor>,
+}
+
+impl std::fmt::Display for DurableHealthShutdownFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.diagnostic)
+    }
+}
+
+impl std::fmt::Debug for DurableHealthShutdownFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DurableHealthShutdownFailure")
+            .field("diagnostic", &self.diagnostic)
+            .field("retains_monitor", &true)
+            .finish()
+    }
+}
+
+impl std::error::Error for DurableHealthShutdownFailure {}
+
 impl DurableHealthMonitor {
+    #[cfg(test)]
+    fn poison_completion_for_test(&mut self) {
+        let (never_complete, completion) = mpsc::sync_channel(1);
+        self.completion = completion;
+        std::mem::forget(never_complete);
+    }
+
     pub(crate) fn spawn(
         control: ControlStateHandle,
         gate: PublicationGate,
@@ -225,65 +389,72 @@ impl DurableHealthMonitor {
         let worker_failed = Arc::clone(&failed);
         let signal_failed = Arc::new(AtomicBool::new(false));
         let worker_signal_failed = Arc::clone(&signal_failed);
+        let (completion_tx, completion) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name("loxa-durable-health".into())
-            .spawn(move || loop {
-                if !control.is_healthy() {
-                    worker_failed.store(true, Ordering::Release);
-                    gate.close();
-                    gateway.withdraw();
-                    if !matches!(
-                        loxa_core::supervisor::signal_exact_managed_stop(
-                            &state_path,
-                            &owner_identity,
-                        ),
-                        Ok(true)
-                    ) {
-                        worker_signal_failed.store(true, Ordering::Release);
+            .spawn(move || {
+                let _completion = HealthCompletion(completion_tx);
+                loop {
+                    if !control.is_healthy() {
+                        worker_failed.store(true, Ordering::Release);
+                        gate.close();
+                        gateway.withdraw();
+                        if !matches!(
+                            loxa_core::supervisor::signal_exact_managed_stop(
+                                &state_path,
+                                &owner_identity,
+                            ),
+                            Ok(true)
+                        ) {
+                            worker_signal_failed.store(true, Ordering::Release);
+                        }
+                        break;
                     }
-                    break;
-                }
-                match stopped.recv_timeout(Duration::from_millis(10)) {
-                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    match stopped.recv_timeout(Duration::from_millis(10)) {
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
                 }
             })?;
         Ok(Self {
             stop,
             worker: Some(worker),
+            completion,
             failed,
             signal_failed,
         })
     }
 
-    pub(crate) fn stop_and_join_until(mut self, deadline: std::time::Instant) -> io::Result<bool> {
+    pub(crate) fn stop_and_join_until(
+        mut self,
+        deadline: std::time::Instant,
+    ) -> Result<bool, DurableHealthShutdownFailure> {
         let _ = self.stop.send(());
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if self.completion.recv_timeout(remaining).is_err() {
+            return Err(DurableHealthShutdownFailure {
+                diagnostic: "durable health monitor shutdown deadline exceeded",
+                _monitor: std::mem::ManuallyDrop::new(self),
+            });
+        }
         let worker = self
             .worker
             .take()
             .expect("durable health monitor worker present");
-        let failed = Arc::clone(&self.failed);
-        let signal_failed = Arc::clone(&self.signal_failed);
-        let (completed, receive) = mpsc::sync_channel(1);
-        thread::Builder::new()
-            .name("loxa-durable-health-reaper".into())
-            .spawn(move || {
-                let result = worker
-                    .join()
-                    .map_err(|_| io::Error::other("durable health monitor panicked"))
-                    .and_then(|()| {
-                        if signal_failed.load(Ordering::Acquire) {
-                            Err(io::Error::other("durable health stop signal failed"))
-                        } else {
-                            Ok(failed.load(Ordering::Acquire))
-                        }
-                    });
-                let _ = completed.send(result);
-            })?;
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        receive
-            .recv_timeout(remaining)
-            .map_err(|_| io::Error::other("durable health monitor shutdown deadline exceeded"))?
+        if worker.join().is_err() {
+            return Err(DurableHealthShutdownFailure {
+                diagnostic: "durable health monitor panicked",
+                _monitor: std::mem::ManuallyDrop::new(self),
+            });
+        }
+        if self.signal_failed.load(Ordering::Acquire) {
+            return Ok(true);
+        }
+        Ok(self.failed.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn request_shutdown(&self) {
+        let _ = self.stop.send(());
     }
 
     fn failure_signal(&self) -> Arc<AtomicBool> {
@@ -311,9 +482,77 @@ pub(crate) struct NodeRuntime {
     control: Option<ControlStateHandle>,
     control_worker: Option<ControlStateWorker>,
     health_monitor: Option<DurableHealthMonitor>,
+    prepared_owner_disposition: Option<PreparedPythonOwnerDisposition>,
+    #[cfg(test)]
+    injected_missed_completion: Option<InjectedRetainedOwner>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InjectedRetainedOwner {
+    Gateway,
+    Routes,
+    History,
+    Health,
+    Execution,
+    Control,
+    ExactOwner,
 }
 
 impl NodeRuntime {
+    #[cfg(test)]
+    pub(crate) fn shutdown_with_injected_retained_for_test(
+        mut self,
+        injected: InjectedRetainedOwner,
+    ) -> ShutdownResult {
+        match injected {
+            InjectedRetainedOwner::Gateway => self
+                .gateway
+                .as_ref()
+                .expect("runtime gateway present")
+                .poison_completion_for_test(),
+            InjectedRetainedOwner::Routes => self
+                .chat_routes_state
+                .as_ref()
+                .expect("runtime routes present")
+                .poison_shutdown_registry_for_test(),
+            InjectedRetainedOwner::History => self
+                .history_worker
+                .as_mut()
+                .expect("runtime history present")
+                .poison_completion_for_test(),
+            InjectedRetainedOwner::Health => self
+                .health_monitor
+                .as_mut()
+                .expect("runtime health present")
+                .poison_completion_for_test(),
+            InjectedRetainedOwner::Execution => self
+                .download_runtime
+                .as_ref()
+                .expect("runtime execution present")
+                .0
+                .poison_scheduler_completion_for_test(),
+            InjectedRetainedOwner::Control => self.poison_control_for_test(),
+            InjectedRetainedOwner::ExactOwner => {
+                let state_path = &self
+                    .paths
+                    .as_ref()
+                    .expect("runtime paths present")
+                    .state_path;
+                let lock_path = state_path.with_file_name("managed.json.v2.lock");
+                let lock = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(lock_path)
+                    .expect("runtime state lock exists");
+                lock.lock().expect("lock exact owner state");
+                std::mem::forget(lock);
+            }
+        }
+        self.injected_missed_completion = Some(injected);
+        self.shutdown_services(Ok(RunTermination::Interrupted))
+    }
+
     pub(crate) fn new(parts: NodeRuntimeParts) -> Self {
         Self {
             paths: Some(parts.paths),
@@ -334,6 +573,9 @@ impl NodeRuntime {
             control: Some(parts.control),
             control_worker: Some(parts.control_worker),
             health_monitor: Some(parts.health_monitor),
+            prepared_owner_disposition: None,
+            #[cfg(test)]
+            injected_missed_completion: None,
         }
     }
 
@@ -356,7 +598,7 @@ impl NodeRuntime {
     }
 
     #[cfg(test)]
-    pub(crate) fn shutdown_for_test(mut self) -> io::Result<RunTermination> {
+    pub(crate) fn shutdown_for_test(mut self) -> ShutdownResult {
         self.shutdown_services(Ok(RunTermination::Interrupted))
     }
 
@@ -381,7 +623,7 @@ impl NodeRuntime {
             .clone()
     }
 
-    pub(crate) fn run(mut self, events: &mut dyn LifecycleEventSink) -> io::Result<RunTermination> {
+    pub(crate) fn run(mut self, events: &mut dyn LifecycleEventSink) -> ShutdownResult {
         let outcome = if let Err(error) = events.emit(LifecycleEvent::NodeListening {
             port: self.port(),
             model_alias: "loxa".to_string(),
@@ -452,12 +694,8 @@ impl NodeRuntime {
                     &self.diagnostics_health,
                     Some(durable_interrupt.as_ref()),
                 );
-                resolve_prepared_python_owner(
-                    result,
-                    self.owner_guard
-                        .take()
-                        .expect("prepared Python node owner guarded"),
-                )
+                self.prepared_owner_disposition = Some(result.owner);
+                result.outcome
             }
             None => {
                 let run = self
@@ -482,11 +720,20 @@ impl NodeRuntime {
         }
     }
 
-    fn shutdown_services(
-        &mut self,
-        outcome: io::Result<RunTermination>,
-    ) -> io::Result<RunTermination> {
+    fn shutdown_services(&mut self, mut outcome: io::Result<RunTermination>) -> ShutdownResult {
         let shutdown_started = std::time::Instant::now();
+        let deadlines = ShutdownDeadlines::from_started(shutdown_started);
+        #[cfg(test)]
+        let injected_missed_completion = self.injected_missed_completion.take();
+        #[cfg(test)]
+        let missed_deadline = |owner| {
+            if injected_missed_completion == Some(owner) {
+                shutdown_started
+            } else {
+                deadlines.repository
+            }
+        };
+        let mut diagnostics: Vec<(ShutdownFailureClass, String)> = Vec::new();
         tracing::info!(
             target: "loxa_node::shutdown",
             event_code = "shutdown.requested",
@@ -503,14 +750,50 @@ impl NodeRuntime {
             node_instance_id = self.node_instance_id.to_string().as_str(),
             result_class = "stopping",
         );
-        let stopping_commit = current_unix_ms().and_then(|now| {
-            self.control
+        let stopping_now = current_unix_ms();
+        let (stopping_commit, stopping_commit_uncertain) = match stopping_now {
+            Ok(now) => match self
+                .control
                 .as_ref()
                 .expect("runtime control handle present")
-                .begin_stopping_blocking_until(now, shutdown_started + Duration::from_secs(10))
-                .map(|_| ())
-                .map_err(|_| io::Error::other("durable stopping commit failed"))
-        });
+                .begin_stopping_blocking_until(now, deadlines.admission)
+            {
+                Ok(_) => (Ok(()), false),
+                Err(_) => (
+                    Err(io::Error::other("durable stopping commit failed")),
+                    true,
+                ),
+            },
+            Err(error) => (Err(error), false),
+        };
+        if let Some((control, _)) = &self.download_runtime {
+            control.seal_for_shutdown();
+        }
+        if let Some((_, worker)) = &self.download_runtime {
+            worker.request_shutdown(deadlines.lifecycle);
+        }
+        if let Some(routes) = &self.chat_routes_state {
+            if let Err(error) = routes.request_shutdown() {
+                diagnostics.push((
+                    ShutdownFailureClass::Routes,
+                    format!("chat routes stop signal failed: {error:?}"),
+                ));
+            }
+        }
+        if let Some(gateway) = &mut self.gateway {
+            gateway.request_shutdown();
+        }
+        if let Some(history) = &mut self.history_worker {
+            if !history.request_shutdown() {
+                diagnostics.push((
+                    ShutdownFailureClass::DurableRepository,
+                    "chat history stop signal queue was full".into(),
+                ));
+            }
+        }
+        if let Some(health) = &self.health_monitor {
+            health.request_shutdown();
+        }
         self.publication_gate.close();
         self.gateway_state
             .take()
@@ -523,35 +806,160 @@ impl NodeRuntime {
             self.node_instance_id,
             None,
         );
-        let execution_shutdown = self
-            .download_runtime
+        let (execution_retained, execution_failed) = match self.download_runtime.take() {
+            Some((control, worker)) => match worker.shutdown_staged(
+                control,
+                ExecutionShutdownDeadlines {
+                    verification: deadlines.verification,
+                    download: deadlines.download,
+                    lifecycle: deadlines.lifecycle,
+                    finalize: deadlines.repository,
+                },
+            ) {
+                ExecutionShutdownResult::Stopped => (None, None),
+                ExecutionShutdownResult::Failed(summary) => {
+                    for message in summary.messages() {
+                        diagnostics.push((
+                            match summary.primary() {
+                                ExecutionShutdownFailureClass::ExactChild => {
+                                    ShutdownFailureClass::ExactChild
+                                }
+                                ExecutionShutdownFailureClass::Artifact => {
+                                    ShutdownFailureClass::Artifact
+                                }
+                                ExecutionShutdownFailureClass::DurableRepository => {
+                                    ShutdownFailureClass::DurableRepository
+                                }
+                                ExecutionShutdownFailureClass::Lifecycle => {
+                                    ShutdownFailureClass::Lifecycle
+                                }
+                                ExecutionShutdownFailureClass::Download => {
+                                    ShutdownFailureClass::Download
+                                }
+                                ExecutionShutdownFailureClass::Verification => {
+                                    ShutdownFailureClass::Verification
+                                }
+                            },
+                            message.clone(),
+                        ));
+                    }
+                    (None, Some(summary))
+                }
+                ExecutionShutdownResult::Retained(retained) => {
+                    let summary = retained.diagnostics();
+                    for message in summary.messages() {
+                        diagnostics.push((
+                            match summary.primary() {
+                                ExecutionShutdownFailureClass::ExactChild => {
+                                    ShutdownFailureClass::ExactChild
+                                }
+                                ExecutionShutdownFailureClass::Artifact => {
+                                    ShutdownFailureClass::Artifact
+                                }
+                                ExecutionShutdownFailureClass::DurableRepository => {
+                                    ShutdownFailureClass::DurableRepository
+                                }
+                                ExecutionShutdownFailureClass::Lifecycle => {
+                                    ShutdownFailureClass::Lifecycle
+                                }
+                                ExecutionShutdownFailureClass::Download => {
+                                    ShutdownFailureClass::Download
+                                }
+                                ExecutionShutdownFailureClass::Verification => {
+                                    ShutdownFailureClass::Verification
+                                }
+                            },
+                            message.clone(),
+                        ));
+                    }
+                    (Some(retained), None)
+                }
+            },
+            None => (None, None),
+        };
+        let routes_failure = self
+            .chat_routes_state
             .take()
-            .map(|(_, worker)| worker.stop_and_join())
-            .transpose()
-            .map(|_| ());
-        let owner_shutdown = self
-            .owner_guard
-            .take()
-            .map(NodeOwnerGuard::finish)
-            .transpose()
-            .map(|_| ());
-        let health_failure = self
+            .expect("runtime chat routes state present")
+            .shutdown_until({
+                #[cfg(test)]
+                {
+                    if injected_missed_completion == Some(InjectedRetainedOwner::Routes) {
+                        shutdown_started
+                    } else {
+                        deadlines.signal
+                    }
+                }
+                #[cfg(not(test))]
+                {
+                    deadlines.signal
+                }
+            })
+            .err();
+        if let Some(error) = &routes_failure {
+            diagnostics.push((ShutdownFailureClass::Routes, error.to_string()));
+        }
+        let mut owner_recovery_required = false;
+        let owner_failure = match self.owner_guard.take() {
+            Some(owner) => match resolve_node_owner_for_shutdown(
+                owner,
+                self.prepared_owner_disposition.take(),
+                {
+                    #[cfg(test)]
+                    {
+                        missed_deadline(InjectedRetainedOwner::ExactOwner)
+                    }
+                    #[cfg(not(test))]
+                    {
+                        deadlines.repository
+                    }
+                },
+                &mut outcome,
+            ) {
+                NodeOwnerShutdownResolution::Released => None,
+                NodeOwnerShutdownResolution::Retained(failure) => {
+                    diagnostics.push((ShutdownFailureClass::ExactChild, failure.to_string()));
+                    Some(failure)
+                }
+                NodeOwnerShutdownResolution::RecoveryRequired => {
+                    owner_recovery_required = true;
+                    diagnostics.push((
+                        ShutdownFailureClass::ExactChild,
+                        "prepared Python owner requires recovery".into(),
+                    ));
+                    None
+                }
+            },
+            None => None,
+        };
+        let health_shutdown = self
             .health_monitor
             .take()
             .expect("runtime durable health monitor present")
-            .stop_and_join_until(shutdown_started + Duration::from_secs(10))
-            .and_then(|failed| {
-                if failed {
-                    Err(io::Error::other("durable control state became unavailable"))
-                } else {
-                    Ok(())
+            .stop_and_join_until({
+                #[cfg(test)]
+                {
+                    missed_deadline(InjectedRetainedOwner::Health)
+                }
+                #[cfg(not(test))]
+                {
+                    deadlines.repository
                 }
             });
-        self.unloaded_run.take();
-        self.chat_routes_state
-            .take()
-            .expect("runtime chat routes state present")
-            .shutdown_and_wait();
+        let (health_failure, health_was_unavailable) = match health_shutdown {
+            Ok(failed) => (None, failed),
+            Err(failure) => {
+                diagnostics.push((ShutdownFailureClass::Routes, failure.to_string()));
+                (Some(failure), false)
+            }
+        };
+        if health_was_unavailable {
+            diagnostics.push((
+                ShutdownFailureClass::DurableRepository,
+                "durable control state became unavailable".into(),
+            ));
+        }
+        let unloaded_run = self.unloaded_run.take();
         emit_shutdown_stage(
             "chat_cancel_wait",
             u64::try_from(shutdown_started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -559,50 +967,108 @@ impl NodeRuntime {
             self.node_instance_id,
             None,
         );
-        let shutdown = self
+        let gateway_failure = self
             .gateway
             .take()
             .expect("runtime gateway present")
-            .shutdown();
+            .shutdown_until({
+                #[cfg(test)]
+                {
+                    missed_deadline(InjectedRetainedOwner::Gateway)
+                }
+                #[cfg(not(test))]
+                {
+                    deadlines.repository
+                }
+            })
+            .err();
+        if let Some(error) = &gateway_failure {
+            diagnostics.push((
+                ShutdownFailureClass::Routes,
+                format!("gateway shutdown failed: {:?}", error.kind()),
+            ));
+        }
         emit_shutdown_stage(
             "gateway_join",
             u64::try_from(shutdown_started.elapsed().as_millis()).unwrap_or(u64::MAX),
             self.node_id,
             self.node_instance_id,
-            shutdown.as_ref().err(),
+            None,
         );
-        let history_shutdown = self
+        let (history_failure, history_error) = match self
             .history_worker
             .take()
             .expect("runtime history worker present")
-            .stop_and_join()
-            .map_err(io::Error::other);
+            .shutdown_until({
+                #[cfg(test)]
+                {
+                    missed_deadline(InjectedRetainedOwner::History)
+                }
+                #[cfg(not(test))]
+                {
+                    deadlines.repository
+                }
+            }) {
+            ChatHistoryShutdownResult::Stopped => (None, None),
+            ChatHistoryShutdownResult::Failed(error) => {
+                let error = io::Error::other(error);
+                diagnostics.push((ShutdownFailureClass::DurableRepository, error.to_string()));
+                (None, Some(error))
+            }
+            ChatHistoryShutdownResult::Retained(failure) => {
+                diagnostics.push((ShutdownFailureClass::DurableRepository, failure.to_string()));
+                (Some(failure), None)
+            }
+        };
         emit_shutdown_stage(
             "history_join",
             u64::try_from(shutdown_started.elapsed().as_millis()).unwrap_or(u64::MAX),
             self.node_id,
             self.node_instance_id,
-            history_shutdown.as_ref().err(),
+            history_error.as_ref(),
         );
         let control = self.control.take().expect("runtime control handle present");
-        let control_shutdown = self
+        let control_failure = self
             .control_worker
             .take()
             .expect("runtime control worker present")
-            .shutdown_blocking()
-            .map_err(|error| {
-                io::Error::other(format!("durable control worker shutdown failed: {error:?}"))
-            });
-        drop(control);
-        let service_result = resolve_shutdown_outcome(outcome, shutdown, history_shutdown);
-        let result = owner_shutdown
-            .err()
-            .or_else(|| control_shutdown.err())
-            .or_else(|| health_failure.err())
-            .or_else(|| execution_shutdown.err())
-            .or_else(|| stopping_commit.err())
-            .map_or(service_result, Err);
-        let result_class = if result.is_ok() { "stopped" } else { "failed" };
+            .shutdown_blocking_until({
+                #[cfg(test)]
+                {
+                    missed_deadline(InjectedRetainedOwner::Control)
+                }
+                #[cfg(not(test))]
+                {
+                    deadlines.repository
+                }
+            })
+            .err();
+        if let Some(error) = &control_failure {
+            diagnostics.push((
+                ShutdownFailureClass::DurableRepository,
+                format!(
+                    "durable control worker shutdown failed: {:?}",
+                    error.error()
+                ),
+            ));
+        }
+        if let Err(error) = &stopping_commit {
+            diagnostics.push((ShutdownFailureClass::DurableRepository, error.to_string()));
+        }
+        let requires_exit = execution_retained.is_some()
+            || routes_failure.is_some()
+            || gateway_failure.is_some()
+            || history_failure.is_some()
+            || health_failure.is_some()
+            || control_failure.is_some()
+            || owner_failure.is_some()
+            || owner_recovery_required
+            || stopping_commit_uncertain;
+        let result_class = if outcome.is_err() || !diagnostics.is_empty() {
+            "failed"
+        } else {
+            "stopped"
+        };
         tracing::info!(
             target: "loxa_node::lifecycle",
             event_code = "node.stopped",
@@ -613,97 +1079,90 @@ impl NodeRuntime {
             duration_ms = u64::try_from(shutdown_started.elapsed().as_millis())
                 .unwrap_or(u64::MAX),
         );
-        result
+        if requires_exit {
+            if let Err(error) = &outcome {
+                diagnostics.push((
+                    ShutdownFailureClass::OrdinaryCancellation,
+                    error.to_string(),
+                ));
+            }
+            diagnostics.sort_by_key(|(class, _)| shutdown_failure_rank(*class));
+            let diagnostic = diagnostics
+                .iter()
+                .map(|(_, message)| message.as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
+            return ShutdownResult::RequiresProcessExit(Box::new(FatalShutdown::new(
+                FatalShutdownParts {
+                    diagnostic,
+                    gateway: None,
+                    gateway_failure,
+                    history: None,
+                    history_failure,
+                    health: None,
+                    health_failure,
+                    execution: execution_retained,
+                    control_failure,
+                    control_startup_failure: None,
+                    control: Some(control),
+                    unloaded_run,
+                    publication: Some(self.publication_gate.clone()),
+                    owner: None,
+                    owner_failure,
+                    routes: None,
+                    routes_failure,
+                    gateway_state: self.gateway_state.take(),
+                },
+            )));
+        }
+        drop(unloaded_run);
+        drop(control);
+        if let Some(summary) = execution_failed {
+            let message = summary.messages().join("; ");
+            return ShutdownResult::Failed(io::Error::other(message));
+        }
+        if let Some((_, message)) = diagnostics
+            .into_iter()
+            .min_by_key(|(class, _)| shutdown_failure_rank(*class))
+        {
+            return ShutdownResult::Failed(io::Error::other(message));
+        }
+        match outcome {
+            Ok(termination) => ShutdownResult::Stopped(termination),
+            Err(error) => ShutdownResult::Failed(error),
+        }
     }
 }
 
 impl Drop for NodeRuntime {
     fn drop(&mut self) {
-        #[cfg(test)]
-        let record_panic_cleanup = std::thread::panicking() && self.stable_llama_node;
-        self.publication_gate.close();
-        if let Some(gateway_state) = self.gateway_state.take() {
-            gateway_state.withdraw();
-        }
-
-        let paths = self.paths.take();
-        let owner_guard = self.owner_guard.take();
-        let unloaded_run = self.unloaded_run.take();
-        let download_runtime = self.download_runtime.take();
-        let chat_routes_state = self.chat_routes_state.take();
-        let gateway = self.gateway.take();
-        let history_worker = self.history_worker.take();
-        let control = self.control.take();
-        let control_worker = self.control_worker.take();
-        let health_monitor = self.health_monitor.take();
-
-        if unloaded_run.is_none()
-            && download_runtime.is_none()
-            && chat_routes_state.is_none()
-            && gateway.is_none()
-            && history_worker.is_none()
-            && owner_guard.is_none()
-            && control_worker.is_none()
-            && health_monitor.is_none()
-        {
+        let owns_runtime = self.owner_guard.is_some()
+            || self.download_runtime.is_some()
+            || self.gateway.is_some()
+            || self.history_worker.is_some()
+            || self.control_worker.is_some()
+            || self.health_monitor.is_some();
+        if !owns_runtime {
             return;
         }
-
-        let _ = thread::Builder::new()
-            .name("loxa-node-runtime-cleanup".to_string())
-            .spawn(move || {
-                let _ = (paths, unloaded_run);
-                let execution_cleanup = download_runtime
-                    .map(|(_, download_worker)| download_worker.stop_and_join())
-                    .transpose();
-                let owner_cleanup = owner_guard.map(NodeOwnerGuard::finish).transpose();
-                let health_cleanup = health_monitor
-                    .map(|monitor| {
-                        monitor.stop_and_join_until(
-                            std::time::Instant::now() + Duration::from_secs(10),
-                        )
-                    })
-                    .transpose();
-                if let Some(chat_routes_state) = chat_routes_state {
-                    chat_routes_state.shutdown_and_wait();
-                }
-                let gateway_cleanup = gateway.map(GatewayServer::shutdown).transpose();
-                let history_cleanup = history_worker
-                    .map(ChatHistoryWorker::stop_and_join)
-                    .transpose();
-                let control_cleanup = control_worker
-                    .map(ControlStateWorker::shutdown_blocking)
-                    .transpose();
-                drop(control);
-                #[cfg(test)]
-                if record_panic_cleanup
-                    && health_cleanup.is_ok()
-                    && execution_cleanup.is_ok()
-                    && owner_cleanup.is_ok()
-                    && gateway_cleanup.is_ok()
-                    && history_cleanup.is_ok()
-                    && control_cleanup.is_ok()
-                {
-                    crate::record_stable_runtime_panic_cleanup();
-                }
-                #[cfg(not(test))]
-                let _ = (
-                    execution_cleanup,
-                    owner_cleanup,
-                    gateway_cleanup,
-                    history_cleanup,
-                    control_cleanup,
-                    health_cleanup,
-                );
-            });
+        match self.shutdown_services(Err(io::Error::other(
+            "node runtime dropped without explicit shutdown",
+        ))) {
+            ShutdownResult::RequiresProcessExit(fatal) => (*fatal).exit(1),
+            #[cfg(test)]
+            _ if std::thread::panicking() && self.stable_llama_node => {
+                crate::record_stable_runtime_panic_cleanup_for_test();
+            }
+            _ => {}
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        emit_shutdown_stage, resolve_prepared_python_owner, resolve_shutdown_outcome,
-        NodeOwnerGuard,
+        emit_shutdown_stage, resolve_prepared_python_owner_for_test, resolve_shutdown_outcome,
+        NodeOwnerGuard, NodeOwnerShutdownResolution,
     };
     use crate::NodePaths;
     use crate::{
@@ -780,7 +1239,10 @@ mod tests {
         .unwrap();
         let (guard, scalar) = NodeOwnerGuard::from_acquisition(paths.clone(), acquisition);
         assert_eq!(scalar, loxa_core::supervisor::ManagedScalarSource::Fresh);
-        guard.finish().unwrap();
+        match guard.finish_retained(std::time::Instant::now() + std::time::Duration::from_secs(2)) {
+            Ok(_) => {}
+            Err(failure) => panic!("acquisition rollback failed: {failure}"),
+        }
 
         assert_eq!(
             crate::managed_servers(&paths).unwrap(),
@@ -846,6 +1308,76 @@ mod tests {
     }
 
     #[test]
+    fn acquisition_guard_deadline_retains_the_recovery_worker_until_completion() {
+        let root = std::env::temp_dir().join(format!(
+            "loxa-acquisition-retained-{}-{}",
+            std::process::id(),
+            loxa_protocol::NodeInstanceId::new_v4()
+        ));
+        std::fs::create_dir_all(root.join("logs")).unwrap();
+        let paths = NodePaths {
+            models_dir: root.join("models"),
+            state_path: root.join("managed.json"),
+            logs_dir: root.join("logs"),
+        };
+        let owner_pid = std::process::id();
+        let owner_start = loxa_core::supervisor::process_start_time_with_retry(owner_pid).unwrap();
+        let candidate = ManagedRun {
+            schema_version: loxa_core::supervisor::RUNTIME_STATE_SCHEMA_VERSION,
+            run_id: "retained-acquired-owner".into(),
+            model_id: None,
+            owner_pid,
+            owner_process_start_time_unix_s: owner_start,
+            stop_requested: false,
+            lifecycle: loxa_core::supervisor::RunLifecycle::Unloaded,
+            generation: 0,
+            generation_alias: "loxa-retained-acquired-owner-g0".into(),
+            control_port: Some(19_744),
+            port: 19_744,
+            log_path: paths.logs_dir.join("owner.log"),
+            child_pid: None,
+            child_process_start_time_unix_s: None,
+            child_pgid: None,
+        };
+        let acquisition = loxa_core::supervisor::acquire_managed_owner(
+            &paths.state_path,
+            candidate,
+            loxa_core::supervisor::ScalarCaptureMode::FirstMigration,
+        )
+        .unwrap();
+        let (guard, _) = NodeOwnerGuard::from_acquisition(paths.clone(), acquisition);
+
+        let lock_path = paths.state_path.with_file_name("managed.json.v2.lock");
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .unwrap();
+        lock.lock().unwrap();
+        let failure = guard
+            .finish_retained(std::time::Instant::now() + std::time::Duration::from_millis(25))
+            .expect_err("blocked acquisition rollback must retain its owned worker");
+        assert!(failure.to_string().contains("deadline exceeded"));
+
+        lock.unlock().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if crate::managed_servers(&paths).unwrap()
+                == crate::ManagedRunsSnapshot::Runs(Vec::new())
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "retained acquisition rollback worker did not finish after lock release"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        drop(failure);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn cleanup_uncertainty_outranks_the_triggering_runtime_error() {
         let result = resolve_shutdown_outcome(
             Err(io::Error::other("triggering startup error")),
@@ -860,15 +1392,17 @@ mod tests {
     #[test]
     fn prepared_owner_result_explicitly_finishes_restored_owner() {
         let (paths, baseline) = guarded_owner("prepared-restored", 19_761);
-        let result = resolve_prepared_python_owner(
+        let (result, resolution) = resolve_prepared_python_owner_for_test(
             PreparedPythonRunResult {
                 outcome: Ok(RunTermination::Interrupted),
                 owner: PreparedPythonOwnerDisposition::Restored(baseline.clone()),
             },
             NodeOwnerGuard::new(paths.clone(), baseline),
-        )
-        .expect("restored owner finishes explicitly");
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        );
+        let result = result.expect("restored owner finishes explicitly");
 
+        assert!(matches!(resolution, NodeOwnerShutdownResolution::Released));
         assert_eq!(result, RunTermination::Interrupted);
         assert_eq!(
             managed_servers(&paths).unwrap(),
@@ -893,10 +1427,14 @@ mod tests {
         )
         .unwrap();
 
-        let result =
-            resolve_prepared_python_owner(classified, NodeOwnerGuard::new(paths.clone(), baseline))
-                .expect("late stop remains observable");
+        let (result, resolution) = resolve_prepared_python_owner_for_test(
+            classified,
+            NodeOwnerGuard::new(paths.clone(), baseline),
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        );
+        let result = result.expect("late stop remains observable");
 
+        assert!(matches!(resolution, NodeOwnerShutdownResolution::Released));
         assert_eq!(result, RunTermination::RequestedStop);
         assert_eq!(
             managed_servers(&paths).unwrap(),
@@ -918,15 +1456,17 @@ mod tests {
         .unwrap();
         loxa_core::supervisor::finish_exact_unloaded_owner(&paths.state_path, &baseline).unwrap();
 
-        let result = resolve_prepared_python_owner(
+        let (result, resolution) = resolve_prepared_python_owner_for_test(
             PreparedPythonRunResult {
                 outcome: Ok(RunTermination::RequestedStop),
                 owner: PreparedPythonOwnerDisposition::ConsumedByRequestedStop,
             },
             NodeOwnerGuard::new(paths.clone(), baseline),
-        )
-        .expect("consumed stop remains terminal");
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        );
+        let result = result.expect("consumed stop remains terminal");
 
+        assert!(matches!(resolution, NodeOwnerShutdownResolution::Released));
         assert_eq!(result, RunTermination::RequestedStop);
         assert_eq!(
             managed_servers(&paths).unwrap(),
@@ -948,21 +1488,82 @@ mod tests {
         )
         .unwrap();
 
-        let error = resolve_prepared_python_owner(
+        let (outcome, resolution) = resolve_prepared_python_owner_for_test(
             PreparedPythonRunResult {
                 outcome: Err(io::Error::other("triggering runtime error")),
                 owner: PreparedPythonOwnerDisposition::RecoveryRequired,
             },
             NodeOwnerGuard::new(paths.clone(), baseline),
-        )
-        .expect_err("recovery uncertainty must win");
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        );
 
-        assert_eq!(error.to_string(), "prepared Python owner requires recovery");
+        assert!(outcome.is_err());
+        assert!(matches!(
+            resolution,
+            NodeOwnerShutdownResolution::RecoveryRequired
+        ));
         assert_eq!(
             loxa_core::supervisor::read_runtime_state(&paths.state_path).unwrap(),
             loxa_core::supervisor::RuntimeStateRead::Loaded(vec![recovery])
         );
         std::fs::remove_dir_all(paths.state_path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn prepared_restored_owner_deadline_moves_real_cleanup_into_fatal_subprocess() {
+        const CHILD_ENV: &str = "LOXA_TEST_PREPARED_OWNER_DEADLINE";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let (paths, baseline) = guarded_owner("prepared-retained", 19_765);
+            let lock_path = paths.state_path.with_file_name("managed.json.v2.lock");
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(lock_path)
+                .unwrap();
+            lock.lock().unwrap();
+            std::mem::forget(lock);
+            let (_outcome, resolution) = resolve_prepared_python_owner_for_test(
+                PreparedPythonRunResult {
+                    outcome: Ok(RunTermination::Interrupted),
+                    owner: PreparedPythonOwnerDisposition::Restored(baseline.clone()),
+                },
+                NodeOwnerGuard::new(paths, baseline),
+                std::time::Instant::now(),
+            );
+            let NodeOwnerShutdownResolution::Retained(owner_failure) = resolution else {
+                panic!("blocked prepared owner cleanup must retain its owned worker");
+            };
+            crate::runtime::FatalShutdown::new(crate::runtime::FatalShutdownParts {
+                diagnostic: "prepared Python owner cleanup deadline exceeded".into(),
+                gateway: None,
+                gateway_failure: None,
+                history: None,
+                history_failure: None,
+                health: None,
+                health_failure: None,
+                execution: None,
+                control_failure: None,
+                control_startup_failure: None,
+                control: None,
+                unloaded_run: None,
+                publication: Some(crate::runtime::PublicationGate::default()),
+                owner: None,
+                owner_failure: Some(owner_failure),
+                routes: None,
+                routes_failure: None,
+                gateway_state: None,
+            })
+            .exit(17);
+        }
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("runtime::node_runtime::tests::prepared_restored_owner_deadline_moves_real_cleanup_into_fatal_subprocess")
+            .arg("--nocapture")
+            .env(CHILD_ENV, "1")
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(17));
     }
 
     fn guarded_owner(label: &str, port: u16) -> (NodePaths, ManagedRun) {

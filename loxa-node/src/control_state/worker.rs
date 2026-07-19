@@ -13,6 +13,7 @@ use loxa_protocol::v2::{
 };
 use loxa_protocol::{NodeId, NodeInstanceId};
 use std::collections::HashMap;
+use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as sync_mpsc;
 use std::sync::{Arc, Mutex, RwLock};
@@ -28,9 +29,36 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const ENQUEUE_RETRY: Duration = Duration::from_millis(10);
 const MAX_PENDING_PROGRESS: usize = 128;
 const CONTROL_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(not(test))]
 static STARTUP_PERMANENTLY_POISONED: AtomicBool = AtomicBool::new(false);
-static STARTUP_REAPERS: std::sync::OnceLock<Mutex<Vec<std::thread::JoinHandle<()>>>> =
-    std::sync::OnceLock::new();
+
+#[cfg(test)]
+thread_local! {
+    static STARTUP_POISONED_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn startup_is_permanently_poisoned() -> bool {
+    #[cfg(test)]
+    {
+        STARTUP_POISONED_FOR_TEST.get()
+    }
+    #[cfg(not(test))]
+    {
+        STARTUP_PERMANENTLY_POISONED.load(Ordering::Acquire)
+    }
+}
+
+fn poison_future_startup() {
+    #[cfg(test)]
+    STARTUP_POISONED_FOR_TEST.set(true);
+    #[cfg(not(test))]
+    STARTUP_PERMANENTLY_POISONED.store(true, Ordering::Release);
+}
+
+#[cfg(test)]
+fn clear_startup_poison_for_test() {
+    STARTUP_POISONED_FOR_TEST.set(false);
+}
 
 #[derive(Clone, Copy)]
 enum BlockingEnqueueTimeoutPolicy {
@@ -210,6 +238,205 @@ pub(crate) struct ControlStateBootstrap {
     pub(crate) ready_authority: Option<ExactReady>,
 }
 
+struct InitializedControlState {
+    snapshot: Arc<RwLock<Arc<CommittedState>>>,
+    pending_progress: Arc<Mutex<HashMap<OperationId, Transition>>>,
+    claimed_owner: NodeOwnerGuard,
+    ready_authority: Option<ExactReady>,
+}
+
+#[must_use = "startup failure retains durable ownership and must enter fatal shutdown"]
+pub(crate) struct ControlStateStartupFailure {
+    error: ControlStateError,
+    ownership: ManuallyDrop<Box<ControlStateStartupOwnership>>,
+}
+
+struct ControlStateStartupOwnership {
+    sender: ManuallyDrop<Option<Arc<sync_mpsc::SyncSender<ControlCommand>>>>,
+    join: ManuallyDrop<Option<std::thread::JoinHandle<Result<(), ControlStateError>>>>,
+    initialization: ManuallyDrop<
+        Option<sync_mpsc::Receiver<Result<InitializedControlState, ControlStateError>>>,
+    >,
+    completion: ManuallyDrop<Option<sync_mpsc::Receiver<Result<(), ControlStateError>>>>,
+    shutdown_acknowledgement: ManuallyDrop<Option<oneshot::Receiver<()>>>,
+    unstarted_init: ManuallyDrop<Option<ControlStateInit>>,
+    _healthy: Arc<AtomicBool>,
+    _health_signal: watch::Sender<bool>,
+}
+
+impl ControlStateStartupFailure {
+    fn new(
+        error: ControlStateError,
+        sender: Arc<sync_mpsc::SyncSender<ControlCommand>>,
+        join: std::thread::JoinHandle<Result<(), ControlStateError>>,
+        initialization: sync_mpsc::Receiver<Result<InitializedControlState, ControlStateError>>,
+        completion: sync_mpsc::Receiver<Result<(), ControlStateError>>,
+        healthy: Arc<AtomicBool>,
+        health_signal: watch::Sender<bool>,
+    ) -> Self {
+        Self::new_with_unstarted_init(
+            error,
+            sender,
+            join,
+            initialization,
+            completion,
+            healthy,
+            health_signal,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_unstarted_init(
+        error: ControlStateError,
+        sender: Arc<sync_mpsc::SyncSender<ControlCommand>>,
+        join: std::thread::JoinHandle<Result<(), ControlStateError>>,
+        initialization: sync_mpsc::Receiver<Result<InitializedControlState, ControlStateError>>,
+        completion: sync_mpsc::Receiver<Result<(), ControlStateError>>,
+        healthy: Arc<AtomicBool>,
+        health_signal: watch::Sender<bool>,
+        unstarted_init: Option<ControlStateInit>,
+    ) -> Self {
+        poison(&healthy, &health_signal);
+        poison_future_startup();
+        let (reply, acknowledgement) = oneshot::channel();
+        let shutdown_acknowledgement = sender
+            .try_send(ControlCommand::Stop { reply })
+            .ok()
+            .map(|()| acknowledgement);
+        Self {
+            error,
+            ownership: ManuallyDrop::new(Box::new(ControlStateStartupOwnership {
+                sender: ManuallyDrop::new(Some(sender)),
+                join: ManuallyDrop::new(Some(join)),
+                initialization: ManuallyDrop::new(Some(initialization)),
+                completion: ManuallyDrop::new(Some(completion)),
+                shutdown_acknowledgement: ManuallyDrop::new(shutdown_acknowledgement),
+                unstarted_init: ManuallyDrop::new(unstarted_init),
+                _healthy: healthy,
+                _health_signal: health_signal,
+            })),
+        }
+    }
+
+    fn unstarted(error: ControlStateError, init: ControlStateInit) -> Self {
+        let healthy = Arc::new(AtomicBool::new(false));
+        let (health_signal, _receiver) = watch::channel(false);
+        poison_future_startup();
+        Self {
+            error,
+            ownership: ManuallyDrop::new(Box::new(ControlStateStartupOwnership {
+                sender: ManuallyDrop::new(None),
+                join: ManuallyDrop::new(None),
+                initialization: ManuallyDrop::new(None),
+                completion: ManuallyDrop::new(None),
+                shutdown_acknowledgement: ManuallyDrop::new(None),
+                unstarted_init: ManuallyDrop::new(Some(init)),
+                _healthy: healthy,
+                _health_signal: health_signal,
+            })),
+        }
+    }
+
+    pub(crate) fn error(&self) -> ControlStateError {
+        self.error
+    }
+
+    #[cfg(test)]
+    fn retains_worker_for_test(&self) -> bool {
+        self.ownership.join.is_some() || self.ownership.unstarted_init.is_some()
+    }
+
+    #[cfg(test)]
+    fn worker_finished_for_test(&self) -> bool {
+        self.ownership
+            .join
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
+    }
+
+    #[cfg(test)]
+    fn worker_joined_for_test(&self) -> bool {
+        self.ownership.join.is_none()
+    }
+
+    #[cfg(test)]
+    fn dispose_for_test(self, deadline: std::time::Instant) {
+        let mut retained = ManuallyDrop::new(self);
+        // SAFETY: `retained` cannot run Drop, and ownership is taken exactly once.
+        let mut ownership = unsafe { ManuallyDrop::take(&mut retained.ownership) };
+        // SAFETY: each retained field is taken exactly once before the box is released.
+        let sender = unsafe { ManuallyDrop::take(&mut ownership.sender) };
+        // SAFETY: same single-owner transfer as above.
+        let mut join = unsafe { ManuallyDrop::take(&mut ownership.join) };
+        // SAFETY: same single-owner transfer as above.
+        let initialization = unsafe { ManuallyDrop::take(&mut ownership.initialization) };
+        // SAFETY: same single-owner transfer as above.
+        let completion = unsafe { ManuallyDrop::take(&mut ownership.completion) };
+        // SAFETY: same single-owner transfer as above.
+        let mut acknowledgement =
+            unsafe { ManuallyDrop::take(&mut ownership.shutdown_acknowledgement) };
+        // SAFETY: same single-owner transfer as above.
+        let unstarted_init = unsafe { ManuallyDrop::take(&mut ownership.unstarted_init) };
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if let Some(completion) = completion.as_ref() {
+            let _ = completion.recv_timeout(remaining);
+        }
+        if let Some(worker) = join.take() {
+            while !worker.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            assert!(
+                worker.is_finished(),
+                "startup worker must finish before disposal"
+            );
+            let _ = worker.join();
+        }
+        if let Some(acknowledgement) = acknowledgement.as_mut() {
+            let _ = acknowledgement.try_recv();
+        }
+        if let Some(initialization) = initialization.as_ref() {
+            drop(initialization.try_recv());
+        }
+        drop(sender);
+        drop(unstarted_init);
+        drop(ownership);
+        clear_startup_poison_for_test();
+    }
+
+    #[cfg(test)]
+    fn dispose_and_return_error_for_test(self, deadline: std::time::Instant) -> ControlStateError {
+        let error = self.error;
+        self.dispose_for_test(deadline);
+        error
+    }
+}
+
+impl std::fmt::Debug for ControlStateStartupFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ControlStateStartupFailure")
+            .field("error", &self.error)
+            .field(
+                "retains_worker",
+                &(self.ownership.join.is_some() || self.ownership.unstarted_init.is_some()),
+            )
+            .finish()
+    }
+}
+
+impl PartialEq<ControlStateError> for ControlStateStartupFailure {
+    fn eq(&self, other: &ControlStateError) -> bool {
+        self.error == *other
+    }
+}
+
+impl Drop for ControlStateStartupFailure {
+    fn drop(&mut self) {
+        std::process::abort();
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ControlStateHandle {
     sender: Arc<sync_mpsc::SyncSender<ControlCommand>>,
@@ -372,12 +599,13 @@ impl ControlStateHandle {
     pub(crate) fn begin_stopping_blocking_until(
         &self,
         now_unix_ms: u64,
-        enqueue_deadline: std::time::Instant,
+        absolute_deadline: std::time::Instant,
     ) -> Result<CommitReceipt, ControlStateError> {
         let maximum = checked_deadline_after(std::time::Instant::now(), ENQUEUE_TIMEOUT);
-        self.blocking_command(
-            enqueue_deadline.min(maximum),
+        self.blocking_command_with_ack_deadline(
+            absolute_deadline.min(maximum),
             ACK_TIMEOUT,
+            Some(absolute_deadline),
             |reply| ControlCommand::BeginStopping { now_unix_ms, reply },
             BlockingEnqueueTimeoutPolicy::RequiredObservationUnavailable,
         )
@@ -728,38 +956,147 @@ pub(crate) struct ControlStateWorker {
     join: Option<std::thread::JoinHandle<Result<(), ControlStateError>>>,
     healthy: Arc<AtomicBool>,
     health_signal: watch::Sender<bool>,
+    shutdown: Option<ControlStateShutdownProgress>,
     #[cfg(test)]
     reaper_finished_for_test: Option<sync_mpsc::SyncSender<()>>,
 }
 
+struct ControlStateShutdownProgress {
+    acknowledgement: oneshot::Receiver<()>,
+    acknowledged: bool,
+}
+
+#[must_use = "shutdown failure retains the durable writer owner and must be resolved"]
+pub(crate) struct ControlStateShutdownFailure {
+    error: ControlStateError,
+    worker: ManuallyDrop<Box<ControlStateWorker>>,
+}
+
+impl ControlStateShutdownFailure {
+    fn new(error: ControlStateError, worker: ControlStateWorker) -> Self {
+        Self {
+            error,
+            worker: ManuallyDrop::new(Box::new(worker)),
+        }
+    }
+
+    pub(crate) fn error(&self) -> ControlStateError {
+        self.error
+    }
+
+    pub(crate) fn into_worker(mut self) -> ControlStateWorker {
+        // SAFETY: `self.worker` is taken exactly once and `Drop` deliberately
+        // leaves an unhandled owner retained rather than detaching it.
+        let worker = unsafe { ManuallyDrop::take(&mut self.worker) };
+        std::mem::forget(self);
+        *worker
+    }
+
+    #[cfg(test)]
+    fn retains_writer_for_test(&self) -> bool {
+        self.worker.join.is_some() || self.worker.shutdown.is_some()
+    }
+}
+
+impl std::fmt::Debug for ControlStateShutdownFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ControlStateShutdownFailure")
+            .field("error", &self.error)
+            .field("retains_writer", &true)
+            .finish()
+    }
+}
+
+impl Drop for ControlStateShutdownFailure {
+    fn drop(&mut self) {
+        // Fail closed: ignoring the actionable failure must not detach or
+        // implicitly release the writer/repository owner.
+    }
+}
+
 impl ControlStateWorker {
+    pub(crate) fn request_shutdown_blocking_until(
+        &mut self,
+        deadline: std::time::Instant,
+    ) -> Result<(), ControlStateError> {
+        if self.shutdown.is_some() {
+            return Ok(());
+        }
+        let (reply, acknowledgement) = oneshot::channel();
+        let Some(sender) = self.sender.upgrade() else {
+            self.shutdown = Some(ControlStateShutdownProgress {
+                acknowledgement,
+                acknowledged: false,
+            });
+            return Ok(());
+        };
+        let mut command = ControlCommand::Stop { reply };
+        loop {
+            match sender.try_send(command) {
+                Ok(()) => {
+                    self.shutdown = Some(ControlStateShutdownProgress {
+                        acknowledgement,
+                        acknowledged: false,
+                    });
+                    return Ok(());
+                }
+                Err(sync_mpsc::TrySendError::Full(returned)) => {
+                    command = returned;
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        poison(&self.healthy, &self.health_signal);
+                        return Err(ControlStateError::ShutdownDeadlineExceeded);
+                    }
+                    std::thread::sleep(ENQUEUE_RETRY.min(deadline - now));
+                }
+                Err(sync_mpsc::TrySendError::Disconnected(_)) => {
+                    self.shutdown = Some(ControlStateShutdownProgress {
+                        acknowledgement,
+                        acknowledged: false,
+                    });
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn open_reconcile_and_spawn(
         init: ControlStateInit,
     ) -> Result<ControlStateBootstrap, ControlStateError> {
-        Self::open_reconcile_and_spawn_inner(
+        match Self::open_reconcile_and_spawn_until(
             init,
-            CONTROL_STARTUP_TIMEOUT,
-            CONTROL_STARTUP_TIMEOUT,
-            StartupBehavior::Normal,
-        )
+            checked_deadline_after(std::time::Instant::now(), CONTROL_STARTUP_TIMEOUT),
+        ) {
+            Ok(bootstrap) => Ok(bootstrap),
+            Err(failure) => Err(
+                failure.dispose_and_return_error_for_test(checked_deadline_after(
+                    std::time::Instant::now(),
+                    CONTROL_STARTUP_TIMEOUT,
+                )),
+            ),
+        }
+    }
+
+    pub(crate) fn open_reconcile_and_spawn_until(
+        init: ControlStateInit,
+        absolute_deadline: std::time::Instant,
+    ) -> Result<ControlStateBootstrap, ControlStateStartupFailure> {
+        Self::open_reconcile_and_spawn_inner(init, absolute_deadline, StartupBehavior::Normal)
     }
 
     fn open_reconcile_and_spawn_inner(
         init: ControlStateInit,
-        startup_timeout: Duration,
-        cleanup_timeout: Duration,
+        absolute_deadline: std::time::Instant,
         startup_behavior: StartupBehavior,
-    ) -> Result<ControlStateBootstrap, ControlStateError> {
-        if STARTUP_PERMANENTLY_POISONED.load(Ordering::Acquire) {
-            return Err(ControlStateError::DurableStateUnavailable);
+    ) -> Result<ControlStateBootstrap, ControlStateStartupFailure> {
+        if startup_is_permanently_poisoned() {
+            return Err(ControlStateStartupFailure::unstarted(
+                ControlStateError::DurableStateUnavailable,
+                init,
+            ));
         }
-        type Initialized = (
-            Arc<RwLock<Arc<CommittedState>>>,
-            Arc<Mutex<HashMap<OperationId, Transition>>>,
-            NodeOwnerGuard,
-            Option<ExactReady>,
-        );
-
         let (sender, receiver) = sync_mpsc::sync_channel(COMMAND_CAPACITY);
         let sender = Arc::new(sender);
         let worker_sender = Arc::downgrade(&sender);
@@ -768,10 +1105,16 @@ impl ControlStateWorker {
         let worker_health = Arc::clone(&healthy);
         let worker_health_signal = health_signal.clone();
         let (initialized, initialization) =
-            std::sync::mpsc::sync_channel::<Result<Initialized, ControlStateError>>(1);
-        let join = std::thread::Builder::new()
+            std::sync::mpsc::sync_channel::<Result<InitializedControlState, ControlStateError>>(1);
+        let (completed, completion) =
+            std::sync::mpsc::sync_channel::<Result<(), ControlStateError>>(1);
+        let (ownership, claimed_ownership) = sync_mpsc::sync_channel::<ControlStateInit>(1);
+        let join = match std::thread::Builder::new()
             .name("loxa-control-state".to_owned())
             .spawn(move || {
+                let init = claimed_ownership
+                    .recv()
+                    .map_err(|_| ControlStateError::DurableStateUnavailable)?;
                 match startup_behavior {
                     StartupBehavior::Normal => {}
                     #[cfg(test)]
@@ -839,12 +1182,12 @@ impl ControlStateWorker {
                     let snapshot = Arc::new(RwLock::new(initial));
                     let pending_progress = Arc::new(Mutex::new(HashMap::new()));
                     initialized
-                        .send(Ok((
-                            Arc::clone(&snapshot),
-                            Arc::clone(&pending_progress),
+                        .send(Ok(InitializedControlState {
+                            snapshot: Arc::clone(&snapshot),
+                            pending_progress: Arc::clone(&pending_progress),
                             claimed_owner,
-                            reconciled.ready_authority,
-                        )))
+                            ready_authority: reconciled.ready_authority,
+                        }))
                         .map_err(|_| ControlStateError::DurableStateUnavailable)?;
                     run_worker(
                         repository,
@@ -858,47 +1201,74 @@ impl ControlStateWorker {
                 })();
                 if let Err(error) = startup {
                     let _ = initialized.try_send(Err(error));
-                    return Err(error);
                 }
-                Ok(())
-            })
-            .map_err(|_| ControlStateError::DurableStateUnavailable)?;
-        let (snapshot, pending_progress, claimed_owner, ready_authority) =
-            match initialization.recv_timeout(startup_timeout) {
-                Ok(Ok(initialized)) => initialized,
-                Ok(Err(error)) => {
-                    cleanup_failed_initialization(
-                        &sender,
-                        join,
-                        std::time::Instant::now() + cleanup_timeout,
-                    )?;
-                    return Err(error);
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    return match cleanup_failed_initialization(
-                        &sender,
-                        join,
-                        std::time::Instant::now() + cleanup_timeout,
-                    ) {
-                        Err(ControlStateError::WorkerPanicked) => {
-                            Err(ControlStateError::WorkerPanicked)
-                        }
-                        Err(error) => Err(error),
-                        Ok(()) => Err(ControlStateError::DurableStateUnavailable),
-                    };
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    let cleanup = cleanup_failed_initialization(
-                        &sender,
-                        join,
-                        std::time::Instant::now() + cleanup_timeout,
-                    );
-                    return match cleanup {
-                        Ok(()) => Err(ControlStateError::ShutdownDeadlineExceeded),
-                        Err(error) => Err(error),
-                    };
-                }
-            };
+                let _ = completed.try_send(startup);
+                startup
+            }) {
+            Ok(join) => join,
+            Err(_) => {
+                drop(ownership);
+                return Err(ControlStateStartupFailure::unstarted(
+                    ControlStateError::DurableStateUnavailable,
+                    init,
+                ));
+            }
+        };
+        if let Err(error) = ownership.send(init) {
+            return Err(ControlStateStartupFailure::new_with_unstarted_init(
+                ControlStateError::DurableStateUnavailable,
+                sender,
+                join,
+                initialization,
+                completion,
+                healthy,
+                health_signal,
+                Some(error.0),
+            ));
+        }
+        let remaining = absolute_deadline.saturating_duration_since(std::time::Instant::now());
+        let initialized = match initialization.recv_timeout(remaining) {
+            Ok(Ok(initialized)) => initialized,
+            Ok(Err(error)) => {
+                return Err(ControlStateStartupFailure::new(
+                    error,
+                    sender,
+                    join,
+                    initialization,
+                    completion,
+                    healthy,
+                    health_signal,
+                ));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(ControlStateStartupFailure::new(
+                    ControlStateError::WorkerPanicked,
+                    sender,
+                    join,
+                    initialization,
+                    completion,
+                    healthy,
+                    health_signal,
+                ));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                return Err(ControlStateStartupFailure::new(
+                    ControlStateError::ShutdownDeadlineExceeded,
+                    sender,
+                    join,
+                    initialization,
+                    completion,
+                    healthy,
+                    health_signal,
+                ));
+            }
+        };
+        let InitializedControlState {
+            snapshot,
+            pending_progress,
+            claimed_owner,
+            ready_authority,
+        } = initialized;
         let handle = ControlStateHandle {
             sender,
             snapshot,
@@ -913,6 +1283,7 @@ impl ControlStateWorker {
                 join: Some(join),
                 healthy,
                 health_signal,
+                shutdown: None,
                 #[cfg(test)]
                 reaper_finished_for_test: None,
             },
@@ -925,12 +1296,19 @@ impl ControlStateWorker {
     pub(super) fn panic_during_initialization_for_test(
         init: ControlStateInit,
     ) -> Result<ControlStateBootstrap, ControlStateError> {
-        Self::open_reconcile_and_spawn_inner(
+        match Self::open_reconcile_and_spawn_inner(
             init,
-            Duration::from_secs(1),
-            Duration::from_secs(1),
+            checked_deadline_after(std::time::Instant::now(), Duration::from_secs(1)),
             StartupBehavior::PanicBeforeInitialization,
-        )
+        ) {
+            Ok(bootstrap) => Ok(bootstrap),
+            Err(failure) => Err(
+                failure.dispose_and_return_error_for_test(checked_deadline_after(
+                    std::time::Instant::now(),
+                    Duration::from_secs(1),
+                )),
+            ),
+        }
     }
 
     #[cfg(test)]
@@ -939,57 +1317,168 @@ impl ControlStateWorker {
         entered: Arc<std::sync::Barrier>,
         release: Arc<std::sync::Barrier>,
     ) -> Result<ControlStateBootstrap, ControlStateError> {
-        Self::open_reconcile_and_spawn_inner(
+        match Self::open_reconcile_and_spawn_inner(
             init,
-            Duration::from_millis(50),
-            Duration::from_secs(1),
+            checked_deadline_after(std::time::Instant::now(), Duration::from_millis(50)),
             StartupBehavior::BlockBeforeInitialization { entered, release },
-        )
+        ) {
+            Ok(bootstrap) => Ok(bootstrap),
+            Err(failure) => Err(
+                failure.dispose_and_return_error_for_test(checked_deadline_after(
+                    std::time::Instant::now(),
+                    Duration::from_secs(1),
+                )),
+            ),
+        }
     }
 
-    pub(crate) async fn shutdown(mut self) -> Result<(), ControlStateError> {
-        let deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
-        let reaper = self.start_reaper()?;
-        let Some(sender) = self.sender.upgrade() else {
-            return await_reaper(reaper, deadline, &self.healthy, &self.health_signal).await;
-        };
-        let (reply, mut acknowledgement) = oneshot::channel();
-        let mut command = ControlCommand::Stop { reply };
-        loop {
-            match sender.try_send(command) {
-                Ok(()) => break,
-                Err(sync_mpsc::TrySendError::Full(returned)) => {
-                    command = returned;
-                    let now = tokio::time::Instant::now();
-                    if now >= deadline {
-                        return Err(shutdown_deadline(&self.healthy, &self.health_signal));
-                    }
-                    tokio::time::sleep(ENQUEUE_RETRY.min(deadline - now)).await;
-                }
-                Err(sync_mpsc::TrySendError::Disconnected(_)) => {
-                    return await_reaper(reaper, deadline, &self.healthy, &self.health_signal)
-                        .await;
-                }
-            }
-        }
-        tokio::pin!(reaper);
-        let acknowledged = tokio::select! {
-            result = &mut acknowledgement => result.is_ok(),
-            result = &mut reaper => return classify_join(result, false, &self.healthy, &self.health_signal),
-            () = tokio::time::sleep_until(deadline) => {
-                return Err(shutdown_deadline(&self.healthy, &self.health_signal));
-            }
-        };
-        if !acknowledged {
-            return match tokio::time::timeout_at(deadline, &mut reaper).await {
-                Ok(result) => classify_join(result, false, &self.healthy, &self.health_signal),
-                Err(_) => Err(shutdown_deadline(&self.healthy, &self.health_signal)),
+    pub(crate) async fn shutdown_until(
+        mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ControlStateShutdownFailure> {
+        if self.shutdown.is_none() {
+            let (reply, acknowledgement) = oneshot::channel();
+            let Some(sender) = self.sender.upgrade() else {
+                self.shutdown = Some(ControlStateShutdownProgress {
+                    acknowledgement,
+                    acknowledged: false,
+                });
+                return self.await_shutdown_completion_until(deadline).await;
             };
+            let mut command = ControlCommand::Stop { reply };
+            loop {
+                match sender.try_send(command) {
+                    Ok(()) => break,
+                    Err(sync_mpsc::TrySendError::Full(returned)) => {
+                        command = returned;
+                        let now = tokio::time::Instant::now();
+                        if now >= deadline {
+                            poison(&self.healthy, &self.health_signal);
+                            return Err(ControlStateShutdownFailure::new(
+                                ControlStateError::ShutdownDeadlineExceeded,
+                                self,
+                            ));
+                        }
+                        tokio::time::sleep(ENQUEUE_RETRY.min(deadline - now)).await;
+                    }
+                    Err(sync_mpsc::TrySendError::Disconnected(_)) => break,
+                }
+            }
+            self.shutdown = Some(ControlStateShutdownProgress {
+                acknowledgement,
+                acknowledged: false,
+            });
         }
-        match tokio::time::timeout_at(deadline, &mut reaper).await {
-            Ok(result) => classify_join(result, true, &self.healthy, &self.health_signal),
-            Err(_) => Err(shutdown_deadline(&self.healthy, &self.health_signal)),
+        self.await_shutdown_completion_until(deadline).await
+    }
+
+    async fn await_shutdown_completion_until(
+        mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ControlStateShutdownFailure> {
+        if self.join.is_none() {
+            poison(&self.healthy, &self.health_signal);
+            return Err(ControlStateShutdownFailure::new(
+                ControlStateError::DurableStateUnavailable,
+                self,
+            ));
         }
+        loop {
+            let progress = self.shutdown.as_mut().expect("shutdown progress present");
+            if !progress.acknowledged {
+                match progress.acknowledgement.try_recv() {
+                    Ok(()) => progress.acknowledged = true,
+                    Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {}
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+                }
+            }
+            if self
+                .join
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished)
+            {
+                let join = self.join.take().expect("finished worker join present");
+                let result = join.join();
+                #[cfg(test)]
+                if let Some(finished) = self.reaper_finished_for_test.take() {
+                    let _ = finished.send(());
+                }
+                poison(&self.healthy, &self.health_signal);
+                let acknowledged = self
+                    .shutdown
+                    .as_ref()
+                    .expect("shutdown progress present")
+                    .acknowledged;
+                return match result {
+                    Ok(Ok(())) if acknowledged => Ok(()),
+                    Ok(Ok(())) => Err(ControlStateShutdownFailure::new(
+                        ControlStateError::DurableStateUnavailable,
+                        self,
+                    )),
+                    Ok(Err(error)) => Err(ControlStateShutdownFailure::new(error, self)),
+                    Err(_) => Err(ControlStateShutdownFailure::new(
+                        ControlStateError::WorkerPanicked,
+                        self,
+                    )),
+                };
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                poison(&self.healthy, &self.health_signal);
+                return Err(ControlStateShutdownFailure::new(
+                    ControlStateError::ShutdownDeadlineExceeded,
+                    self,
+                ));
+            }
+            tokio::time::sleep(ENQUEUE_RETRY.min(deadline - now)).await;
+        }
+    }
+
+    pub(crate) async fn shutdown(self) -> Result<(), ControlStateError> {
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
+        match self.shutdown_until(deadline).await {
+            Ok(()) => Ok(()),
+            Err(failure) => {
+                let error = failure.error();
+                let worker = failure.into_worker();
+                let _ = worker.await_shutdown_completion_owned().await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn await_shutdown_completion_owned(mut self) -> Result<(), ControlStateShutdownFailure> {
+        if self.shutdown.is_none() {
+            let (reply, acknowledgement) = oneshot::channel();
+            if let Some(sender) = self.sender.upgrade() {
+                let mut command = ControlCommand::Stop { reply };
+                loop {
+                    match sender.try_send(command) {
+                        Ok(()) => break,
+                        Err(sync_mpsc::TrySendError::Full(returned)) => {
+                            command = returned;
+                            tokio::time::sleep(ENQUEUE_RETRY).await;
+                        }
+                        Err(sync_mpsc::TrySendError::Disconnected(_)) => break,
+                    }
+                }
+            }
+            self.shutdown = Some(ControlStateShutdownProgress {
+                acknowledgement,
+                acknowledged: false,
+            });
+        }
+        while self.join.as_ref().is_some_and(|join| !join.is_finished()) {
+            let progress = self.shutdown.as_mut().expect("shutdown progress present");
+            if !progress.acknowledged {
+                if let Ok(()) = progress.acknowledgement.try_recv() {
+                    progress.acknowledged = true;
+                }
+            }
+            tokio::time::sleep(ENQUEUE_RETRY).await;
+        }
+        self.await_shutdown_completion_until(tokio::time::Instant::now())
+            .await
     }
 
     pub(crate) fn shutdown_blocking(self) -> Result<(), ControlStateError> {
@@ -1003,33 +1492,31 @@ impl ControlStateWorker {
             .block_on(self.shutdown())
     }
 
-    fn start_reaper(
-        &mut self,
-    ) -> Result<
-        oneshot::Receiver<std::thread::Result<Result<(), ControlStateError>>>,
-        ControlStateError,
-    > {
-        let (finished, receive) = oneshot::channel();
-        #[cfg(test)]
-        let finished_for_test = self.reaper_finished_for_test.take();
-        if let Some(join) = self.join.take() {
-            if std::thread::Builder::new()
-                .name("loxa-control-state-reaper".to_owned())
-                .spawn(move || {
-                    let result = join.join();
-                    let _ = finished.send(result);
-                    #[cfg(test)]
-                    if let Some(finished_for_test) = finished_for_test {
-                        let _ = finished_for_test.send(());
-                    }
-                })
-                .is_err()
-            {
-                poison(&self.healthy, &self.health_signal);
-                return Err(ControlStateError::DurableStateUnavailable);
-            }
+    pub(crate) fn shutdown_blocking_until(
+        self,
+        deadline: std::time::Instant,
+    ) -> Result<(), ControlStateShutdownFailure> {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Err(ControlStateShutdownFailure::new(
+                ControlStateError::DurableStateUnavailable,
+                self,
+            ));
         }
-        Ok(receive)
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(_) => {
+                return Err(ControlStateShutdownFailure::new(
+                    ControlStateError::DurableStateUnavailable,
+                    self,
+                ));
+            }
+        };
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let async_deadline = tokio::time::Instant::now() + remaining;
+        runtime.block_on(self.shutdown_until(async_deadline))
     }
 
     #[cfg(test)]
@@ -1045,104 +1532,17 @@ impl ControlStateWorker {
 impl Drop for ControlStateWorker {
     fn drop(&mut self) {
         poison(&self.healthy, &self.health_signal);
-        if let Some(sender) = self.sender.upgrade() {
-            let (reply, _receive) = oneshot::channel();
-            let _ = sender.try_send(ControlCommand::Stop { reply });
-        }
+        // Explicit shutdown owns cleanup. A forgotten owner fails closed: it
+        // neither requests ordinary Drop shutdown nor spawns detached cleanup.
         if let Some(join) = self.join.take() {
-            let _ = std::thread::Builder::new()
-                .name("loxa-control-state-drop-reaper".to_owned())
-                .spawn(move || {
-                    let _ = join.join();
-                });
+            std::mem::forget(join);
         }
     }
-}
-
-async fn await_reaper(
-    reaper: oneshot::Receiver<std::thread::Result<Result<(), ControlStateError>>>,
-    deadline: tokio::time::Instant,
-    healthy: &AtomicBool,
-    health_signal: &watch::Sender<bool>,
-) -> Result<(), ControlStateError> {
-    match tokio::time::timeout_at(deadline, reaper).await {
-        Ok(result) => classify_join(result, false, healthy, health_signal),
-        Err(_) => Err(shutdown_deadline(healthy, health_signal)),
-    }
-}
-
-fn classify_join(
-    result: Result<std::thread::Result<Result<(), ControlStateError>>, oneshot::error::RecvError>,
-    acknowledged: bool,
-    healthy: &AtomicBool,
-    health_signal: &watch::Sender<bool>,
-) -> Result<(), ControlStateError> {
-    poison(healthy, health_signal);
-    match result {
-        Ok(Ok(Ok(()))) if acknowledged => Ok(()),
-        Ok(Ok(Ok(()))) | Err(_) => Err(ControlStateError::DurableStateUnavailable),
-        Ok(Ok(Err(error))) => Err(error),
-        Ok(Err(_)) => Err(ControlStateError::WorkerPanicked),
-    }
-}
-
-fn shutdown_deadline(
-    healthy: &AtomicBool,
-    health_signal: &watch::Sender<bool>,
-) -> ControlStateError {
-    poison(healthy, health_signal);
-    ControlStateError::ShutdownDeadlineExceeded
 }
 
 fn poison(healthy: &AtomicBool, health_signal: &watch::Sender<bool>) {
     healthy.store(false, Ordering::Release);
     health_signal.send_replace(false);
-}
-
-fn cleanup_failed_initialization(
-    sender: &sync_mpsc::SyncSender<ControlCommand>,
-    join: std::thread::JoinHandle<Result<(), ControlStateError>>,
-    deadline: std::time::Instant,
-) -> Result<(), ControlStateError> {
-    let (reply, _acknowledgement) = oneshot::channel();
-    let _ = sender.try_send(ControlCommand::Stop { reply });
-    let (finished, completion) = std::sync::mpsc::sync_channel(1);
-    let reaper = std::thread::Builder::new()
-        .name("loxa-control-state-startup-reaper".to_owned())
-        .spawn(move || {
-            let _ = finished.send(join.join());
-        })
-        .map_err(|_| ControlStateError::DurableStateUnavailable)?;
-    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-    match completion.recv_timeout(remaining) {
-        Ok(Ok(Ok(()))) => {
-            reaper
-                .join()
-                .map_err(|_| ControlStateError::WorkerPanicked)?;
-            Ok(())
-        }
-        Ok(Ok(Err(error))) => {
-            let _ = reaper.join();
-            Err(error)
-        }
-        Ok(Err(_)) => {
-            let _ = reaper.join();
-            Err(ControlStateError::WorkerPanicked)
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            let _ = reaper.join();
-            Err(ControlStateError::DurableStateUnavailable)
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            STARTUP_PERMANENTLY_POISONED.store(true, Ordering::Release);
-            STARTUP_REAPERS
-                .get_or_init(|| Mutex::new(Vec::new()))
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(reaper);
-            Err(ControlStateError::ShutdownDeadlineExceeded)
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1247,6 +1647,7 @@ fn spawn(
             join: Some(join),
             healthy,
             health_signal,
+            shutdown: None,
             #[cfg(test)]
             reaper_finished_for_test: None,
         },
@@ -1965,3 +2366,303 @@ fn now_unix_ms() -> u64 {
 #[cfg(test)]
 #[path = "test_support/worker.rs"]
 mod tests;
+
+#[cfg(test)]
+mod shutdown_contract_tests {
+    use super::*;
+
+    enum ShutdownTestBehavior {
+        Clean,
+        BlockAfterAck(Arc<std::sync::Barrier>),
+        Panic,
+        DropAck,
+    }
+
+    fn shutdown_test_worker(
+        behavior: ShutdownTestBehavior,
+    ) -> (
+        ControlStateWorker,
+        Arc<sync_mpsc::SyncSender<ControlCommand>>,
+    ) {
+        let (sender, receiver) = sync_mpsc::sync_channel(1);
+        let sender = Arc::new(sender);
+        let healthy = Arc::new(AtomicBool::new(true));
+        let (health_signal, _health_receiver) = watch::channel(true);
+        let join = std::thread::spawn(move || match behavior {
+            ShutdownTestBehavior::Panic => panic!("fault-injected shutdown panic"),
+            ShutdownTestBehavior::Clean => match receiver.recv().unwrap() {
+                ControlCommand::Stop { reply } => {
+                    let _ = reply.send(());
+                    Ok(())
+                }
+                _ => unreachable!("shutdown test accepts only Stop"),
+            },
+            ShutdownTestBehavior::BlockAfterAck(release) => match receiver.recv().unwrap() {
+                ControlCommand::Stop { reply } => {
+                    let _ = reply.send(());
+                    release.wait();
+                    Ok(())
+                }
+                _ => unreachable!("shutdown test accepts only Stop"),
+            },
+            ShutdownTestBehavior::DropAck => match receiver.recv().unwrap() {
+                ControlCommand::Stop { reply } => {
+                    drop(reply);
+                    Ok(())
+                }
+                _ => unreachable!("shutdown test accepts only Stop"),
+            },
+        });
+        (
+            ControlStateWorker {
+                sender: Arc::downgrade(&sender),
+                join: Some(join),
+                healthy,
+                health_signal,
+                shutdown: None,
+                reaper_finished_for_test: None,
+            },
+            sender,
+        )
+    }
+
+    #[tokio::test]
+    async fn deadline_shutdown_success_acknowledges_and_joins() {
+        let (worker, _sender) = shutdown_test_worker(ShutdownTestBehavior::Clean);
+        worker
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn deadline_shutdown_timeout_returns_move_only_owner() {
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let (worker, sender) =
+            shutdown_test_worker(ShutdownTestBehavior::BlockAfterAck(Arc::clone(&release)));
+        let failure = worker
+            .shutdown_until(tokio::time::Instant::now())
+            .await
+            .unwrap_err();
+        assert_eq!(failure.error(), ControlStateError::ShutdownDeadlineExceeded);
+        assert!(failure.retains_writer_for_test());
+
+        release.wait();
+        drop(sender);
+        failure
+            .into_worker()
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn deadline_shutdown_panic_returns_retained_owner() {
+        let (worker, sender) = shutdown_test_worker(ShutdownTestBehavior::Panic);
+        drop(sender);
+        let failure = worker
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert_eq!(failure.error(), ControlStateError::WorkerPanicked);
+        assert!(failure.retains_writer_for_test());
+    }
+
+    #[tokio::test]
+    async fn lost_ack_returns_retained_owner_after_join() {
+        let (worker, _sender) = shutdown_test_worker(ShutdownTestBehavior::DropAck);
+        let failure = worker
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert_eq!(failure.error(), ControlStateError::DurableStateUnavailable);
+        assert!(failure.retains_writer_for_test());
+    }
+
+    #[tokio::test]
+    async fn lost_completion_handle_returns_retained_owner() {
+        let (sender, receiver) = sync_mpsc::sync_channel(1);
+        drop(receiver);
+        let sender = Arc::new(sender);
+        let healthy = Arc::new(AtomicBool::new(true));
+        let (health_signal, _health_receiver) = watch::channel(true);
+        let worker = ControlStateWorker {
+            sender: Arc::downgrade(&sender),
+            join: None,
+            healthy,
+            health_signal,
+            shutdown: None,
+            reaper_finished_for_test: None,
+        };
+
+        let failure = worker
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert_eq!(failure.error(), ControlStateError::DurableStateUnavailable);
+        assert!(failure.retains_writer_for_test());
+    }
+}
+
+#[cfg(test)]
+mod startup_ownership_contract_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    #[test]
+    fn startup_timeout_retains_join_and_completion_until_explicit_disposal() {
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let failure = retained_startup_failure_for_test(
+            ControlStateError::ShutdownDeadlineExceeded,
+            Some(Arc::clone(&release)),
+            Arc::clone(&completed),
+        );
+
+        assert_eq!(failure.error(), ControlStateError::ShutdownDeadlineExceeded);
+        assert!(failure.retains_worker_for_test());
+        assert_eq!(completed.load(AtomicOrdering::Acquire), 0);
+
+        release.wait();
+        while completed.load(AtomicOrdering::Acquire) == 0 {
+            std::thread::yield_now();
+        }
+        let finish_deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !failure.worker_finished_for_test() && std::time::Instant::now() < finish_deadline {
+            std::thread::yield_now();
+        }
+        assert!(failure.worker_finished_for_test());
+        assert!(!failure.worker_joined_for_test());
+
+        failure.dispose_for_test(std::time::Instant::now() + Duration::from_secs(1));
+    }
+
+    #[test]
+    fn startup_panic_and_completion_disconnect_remain_retained() {
+        for error in [
+            ControlStateError::WorkerPanicked,
+            ControlStateError::DurableStateUnavailable,
+        ] {
+            let completed = Arc::new(AtomicUsize::new(0));
+            let failure = retained_startup_failure_for_test(error, None, Arc::clone(&completed));
+            assert_eq!(failure.error(), error);
+            assert!(failure.retains_worker_for_test());
+            failure.dispose_for_test(std::time::Instant::now() + Duration::from_secs(1));
+        }
+    }
+
+    #[test]
+    fn startup_failure_debug_is_bounded_and_does_not_consume_owner() {
+        let completed = Arc::new(AtomicUsize::new(0));
+        let failure = retained_startup_failure_for_test(
+            ControlStateError::ShutdownDeadlineExceeded,
+            None,
+            completed,
+        );
+        let debug = format!("{failure:?}");
+        assert!(debug.contains("ShutdownDeadlineExceeded"));
+        assert!(debug.contains("retains_worker: true"));
+        assert!(failure.retains_worker_for_test());
+        failure.dispose_for_test(std::time::Instant::now() + Duration::from_secs(1));
+    }
+
+    #[test]
+    fn repeated_retained_startups_have_no_static_join_registry() {
+        for _ in 0..3 {
+            let completed = Arc::new(AtomicUsize::new(0));
+            let failure = retained_startup_failure_for_test(
+                ControlStateError::ShutdownDeadlineExceeded,
+                None,
+                completed,
+            );
+            assert_eq!(startup_retained_join_registry_len_for_test(), 0);
+            failure.dispose_for_test(std::time::Instant::now() + Duration::from_secs(1));
+        }
+    }
+
+    #[test]
+    fn dropping_startup_failure_aborts_promptly() {
+        const CHILD: &str = "LOXA_CONTROL_STARTUP_FAILURE_DROP_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let completed = Arc::new(AtomicUsize::new(0));
+            let failure = retained_startup_failure_for_test(
+                ControlStateError::ShutdownDeadlineExceeded,
+                None,
+                completed,
+            );
+            drop(failure);
+            panic!("dropping retained startup ownership returned");
+        }
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("control_state::worker::startup_ownership_contract_tests::dropping_startup_failure_aborts_promptly")
+            .arg("--exact")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(CHILD, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                let _ = child.wait();
+                panic!("startup failure Drop blocked instead of aborting");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(
+            !status.success(),
+            "startup failure Drop unexpectedly returned"
+        );
+    }
+}
+
+#[cfg(test)]
+fn retained_startup_failure_for_test(
+    error: ControlStateError,
+    release: Option<Arc<std::sync::Barrier>>,
+    completed_count: Arc<std::sync::atomic::AtomicUsize>,
+) -> ControlStateStartupFailure {
+    let (sender, receiver) = sync_mpsc::sync_channel(1);
+    let sender = Arc::new(sender);
+    let (initialized, initialization) = sync_mpsc::sync_channel(1);
+    let (completed, completion) = sync_mpsc::sync_channel(1);
+    let healthy = Arc::new(AtomicBool::new(true));
+    let (health_signal, _health_receiver) = watch::channel(true);
+    let join = std::thread::spawn(move || {
+        if let Some(release) = release {
+            release.wait();
+        }
+        completed_count.fetch_add(1, Ordering::Release);
+        match receiver.recv() {
+            Ok(ControlCommand::Stop { reply }) => {
+                let _ = reply.send(());
+            }
+            _ => return Err(ControlStateError::DurableStateUnavailable),
+        }
+        drop(initialized);
+        let result = Ok(());
+        let _ = completed.send(result);
+        result
+    });
+    ControlStateStartupFailure::new(
+        error,
+        sender,
+        join,
+        initialization,
+        completion,
+        healthy,
+        health_signal,
+    )
+}
+
+#[cfg(test)]
+fn startup_retained_join_registry_len_for_test() -> usize {
+    0
+}

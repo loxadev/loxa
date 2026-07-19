@@ -1,5 +1,5 @@
 use loxa_core::engine::RuntimeBackendKind;
-use loxa_node::{LifecycleEvent, LifecycleEventSink, NodePaths, RunTermination};
+use loxa_node::{LifecycleEvent, LifecycleEventSink, NodePaths, RunTermination, ShutdownResult};
 use std::io;
 
 struct SilentEvents;
@@ -33,8 +33,11 @@ where
     Ok(port)
 }
 
-fn run() -> Result<RunTermination, String> {
-    let port = parse_port(std::env::args().skip(1))?;
+fn run() -> ShutdownResult {
+    let port = match parse_port(std::env::args().skip(1)) {
+        Ok(port) => port,
+        Err(error) => return ShutdownResult::Failed(io::Error::other(error)),
+    };
     let paths = NodePaths::detect();
     let diagnostics = loxa_node::install_daemon_diagnostics(&paths.logs_dir);
     let result = loxa_node::serve_node_with_diagnostics_health(
@@ -46,11 +49,12 @@ fn run() -> Result<RunTermination, String> {
         diagnostics.health(),
     );
     let result_class = match &result {
-        Ok(RunTermination::RequestedStop) => "requested_stop",
-        Ok(RunTermination::Interrupted) => "interrupted",
-        Ok(RunTermination::Failed) => "failed",
-        Ok(RunTermination::RecoveryRequired) => "recovery_required",
-        Err(_) => "error",
+        ShutdownResult::Stopped(RunTermination::RequestedStop) => "requested_stop",
+        ShutdownResult::Stopped(RunTermination::Interrupted) => "interrupted",
+        ShutdownResult::Stopped(RunTermination::Failed) => "failed",
+        ShutdownResult::Stopped(RunTermination::RecoveryRequired) => "recovery_required",
+        ShutdownResult::Failed(_) => "error",
+        ShutdownResult::RequiresProcessExit(_) => "requires_process_exit",
     };
     tracing::info!(
         target: "loxa_node::shutdown",
@@ -59,18 +63,19 @@ fn run() -> Result<RunTermination, String> {
         result_class,
     );
     drop(diagnostics);
-    result.map_err(|error| error.to_string())
+    result
 }
 
 fn main() {
     match run() {
-        Ok(RunTermination::RequestedStop | RunTermination::Interrupted) => {}
-        Ok(RunTermination::Failed) => std::process::exit(1),
-        Ok(RunTermination::RecoveryRequired) => std::process::exit(2),
-        Err(error) => {
+        ShutdownResult::Stopped(RunTermination::RequestedStop | RunTermination::Interrupted) => {}
+        ShutdownResult::Stopped(RunTermination::Failed) => std::process::exit(1),
+        ShutdownResult::Stopped(RunTermination::RecoveryRequired) => std::process::exit(2),
+        ShutdownResult::Failed(error) => {
             eprintln!("loxa-node: {error}");
             std::process::exit(2);
         }
+        ShutdownResult::RequiresProcessExit(fatal) => (*fatal).exit(1),
     }
 }
 
