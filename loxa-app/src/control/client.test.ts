@@ -63,6 +63,27 @@ async function createProvenPeer(
 }
 
 describe("control client", () => {
+  it("invokes a retained browser fetch with the Window-compatible global receiver", async () => {
+    const fetch = vi.fn(async function (this: unknown, input: string, init?: RequestInit) {
+      if (input.endsWith("/loxa/v1/node")) {
+        const nonce = new Headers(init?.headers).get("x-loxa-challenge") ?? "";
+        return Response.json({
+          protocol_version: 1,
+          node_id: validV2NodeCollection.nodes[0].node_id,
+          runtime_identity: validV2NodeCollection.nodes[0].node_instance_id,
+          status: "unloaded",
+          challenge_proof: await v1IdentityProof(token, nonce),
+        });
+      }
+      if (this !== globalThis) {
+        throw new TypeError("Can only call Window.fetch on instances of Window");
+      }
+      return Response.json(validV2NodeCollection);
+    });
+
+    await expect(proveV2ControlPeer("http://127.0.0.1:8080", token, { fetch })).resolves.toBeDefined();
+  });
+
   it("keeps v1 metadata and v2 authority on additive authenticated routes", async () => {
     const inventoryFetch = vi.fn(async () => Response.json([]));
     await expect(getInventory("http://127.0.0.1:8080", token, { fetch: inventoryFetch })).resolves.toEqual([]);

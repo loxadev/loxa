@@ -345,7 +345,10 @@ export async function fetchFromProvenControlPeer(
   const headers = new Headers(init.headers);
   headers.set("authorization", `Bearer ${authority.token}`);
   try {
-    return await authority.fetch(controlUrl(authority.endpoint, path), { ...init, headers, signal: controller.signal });
+    return await Reflect.apply(authority.fetch, globalThis, [
+      controlUrl(authority.endpoint, path),
+      { ...init, headers, signal: controller.signal },
+    ]);
   } catch (error) {
     if (controller.signal.aborted) {
       throw new ControlClientError(
