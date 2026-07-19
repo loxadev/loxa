@@ -5,6 +5,7 @@ import type { ModelInventoryEntry, OperationView } from "../control/contracts";
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
+import { canEnterLoadVerification } from "./artifactCapabilities";
 import type { CatalogModel } from "./catalog";
 import { formatBytes } from "./modelRowLabels";
 import styles from "./ModelsScreen.module.css";
@@ -79,11 +80,15 @@ export function DiscoverModels({
           {visible.map((entry) => {
             const recipe = inventory.find((candidate) => candidate.id === entry.modelId);
             const operation = operations.get(entry.modelId);
+            const installed = recipe?.artifact.kind === "downloaded";
+            const verificationRequired =
+              recipe?.artifact.kind === "invalid" && recipe.artifact.reason === "verification_required";
+            const availableInInstalled = recipe !== undefined && canEnterLoadVerification(recipe.artifact);
             const inProgress =
               operation?.kind === "download" && (operation.status === "queued" || operation.status === "running");
             const canDownload =
               recipe !== undefined &&
-              recipe.artifact.kind !== "downloaded" &&
+              !availableInInstalled &&
               recipe.compatibility.compatible &&
               recipe.engine.eligible;
             return (
@@ -93,7 +98,8 @@ export function DiscoverModels({
                     <p>{entry.publisher}</p>
                     <h2>{entry.title}</h2>
                   </div>
-                  {recipe?.artifact.kind === "downloaded" && <Badge variant="success">Installed</Badge>}
+                  {installed && <Badge variant="success">Installed</Badge>}
+                  {verificationRequired && <Badge>Verification required</Badge>}
                 </div>
                 <p className={styles.catalogSummary}>{entry.summary}</p>
                 <div className={styles.catalogTags}>
@@ -140,8 +146,12 @@ export function DiscoverModels({
                     </Button>
                   ) : recipe === undefined ? (
                     <span>Catalog details only</span>
-                  ) : recipe.artifact.kind === "downloaded" ? (
-                    <span>Available in Installed</span>
+                  ) : availableInInstalled ? (
+                    <span>
+                      {verificationRequired
+                        ? "Available in Installed — verification required"
+                        : "Available in Installed"}
+                    </span>
                   ) : (
                     <span>Unavailable for this Mac</span>
                   )}

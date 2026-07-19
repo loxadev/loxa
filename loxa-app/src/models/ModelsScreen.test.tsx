@@ -109,6 +109,56 @@ describe("ModelsScreen v2 authority", () => {
     expect(services.loadV2Slot).toHaveBeenCalledWith(testPeer, v2Ids.node, v2Ids.slot, "gemma-3-4b-it-q4");
   });
 
+  it("allows a full artifact awaiting restart verification to enter the load workflow", async () => {
+    const user = userEvent.setup();
+    const verificationRequired = {
+      ...modelFixture(),
+      artifact: { kind: "invalid" as const, reason: "verification_required" as const },
+    };
+    const { services } = renderModels({ inventory: [verificationRequired] });
+
+    await user.click(await screen.findByRole("button", { name: "Load gemma-3-4b-it-q4" }));
+
+    await waitFor(() =>
+      expect(services.loadV2Slot).toHaveBeenCalledWith(testPeer, v2Ids.node, v2Ids.slot, "gemma-3-4b-it-q4"),
+    );
+    expect(screen.queryByText("Awaiting verification")).not.toBeInTheDocument();
+  });
+
+  it("refreshes restart verification evidence when the accepted load becomes terminal", async () => {
+    const user = userEvent.setup();
+    const verificationRequired = {
+      ...modelFixture(),
+      artifact: { kind: "invalid" as const, reason: "verification_required" as const },
+    };
+    const downloaded = { ...modelFixture(), artifact: { kind: "downloaded" as const } };
+    const control = scriptedV2Control();
+    const services = servicesWithControl(control, {
+      getInventory: vi.fn().mockResolvedValueOnce([verificationRequired]).mockResolvedValue([downloaded]),
+    });
+    render(
+      <SessionHarness services={services}>
+        <ModelsScreen endpoint="http://127.0.0.1:8080" services={services} verificationPollLimit={0} />
+      </SessionHarness>,
+    );
+
+    await user.click(await screen.findByRole("button", { name: "Load gemma-3-4b-it-q4" }));
+    await waitFor(() => expect(services.loadV2Slot).toHaveBeenCalledOnce());
+    act(() =>
+      control.emitReplacement(
+        controlSnapshot({
+          revision: "12",
+          cursor: "12",
+          operations: [{ ...validV2Operation, status: "succeeded", updated_revision: "12" }],
+          slot: { status: "ready", model_id: "gemma-3-4b-it-q4", operation_id: null },
+        }),
+      ),
+    );
+
+    await waitFor(() => expect(services.getInventory).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText("Downloaded and verified")).toBeInTheDocument();
+  });
+
   it("keeps an accepted mutation pending and settles only its exact correlated terminal UUID", async () => {
     const user = userEvent.setup();
     const onStart = vi.fn();

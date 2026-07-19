@@ -162,12 +162,30 @@ export function useModelsController({
     );
     const next = new Map(acceptedMutationsRef.current);
     let changed = false;
+    const refreshTerminalInventory = (kind: AcceptedMutation["kind"]) => {
+      if (kind !== "download" && kind !== "load") return;
+      const controller = new AbortController();
+      terminalRefreshControllers.current.add(controller);
+      void refreshInventory(controller.signal)
+        .catch((reason: unknown) => {
+          if (!controller.signal.aborted) setError(message(reason));
+        })
+        .finally(() => terminalRefreshControllers.current.delete(controller));
+    };
     for (const [operationId, accepted] of acceptedMutationsRef.current) {
       const operation = operationsById.get(operationId);
       if (!session.pendingOperationIds.has(operationId)) {
         next.delete(operationId);
         changed = true;
         void onModelMutationSettled?.(operationId);
+        if (
+          operation !== undefined &&
+          isTerminalV2(operation) &&
+          operation.kind === accepted.kind &&
+          operation.model_id === accepted.operationModelId
+        ) {
+          refreshTerminalInventory(operation.kind);
+        }
         continue;
       }
       if (
@@ -181,15 +199,7 @@ export function useModelsController({
       next.delete(operationId);
       changed = true;
       void onModelMutationSettled?.(operationId);
-      if (operation.kind === "download") {
-        const controller = new AbortController();
-        terminalRefreshControllers.current.add(controller);
-        void refreshInventory(controller.signal)
-          .catch((reason: unknown) => {
-            if (!controller.signal.aborted) setError(message(reason));
-          })
-          .finally(() => terminalRefreshControllers.current.delete(controller));
-      }
+      refreshTerminalInventory(operation.kind);
     }
     if (changed) {
       acceptedMutationsRef.current = next;

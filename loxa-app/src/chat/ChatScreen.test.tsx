@@ -217,6 +217,24 @@ describe("ChatScreen", () => {
     expect(onNavigateModels).toHaveBeenCalledOnce();
   });
 
+  it("offers a full restart artifact that the load workflow can verify", async () => {
+    const user = userEvent.setup();
+    const setup = services();
+    const inventory = await setup.api.getInventory("http://127.0.0.1:8080", "ab".repeat(32));
+    vi.mocked(setup.api.getInventory).mockResolvedValue(
+      inventory.map((entry) =>
+        entry.id === "gemma"
+          ? { ...entry, artifact: { kind: "invalid" as const, reason: "verification_required" as const } }
+          : entry,
+      ),
+    );
+    render(<ChatScreen services={setup.api} endpoint="http://127.0.0.1:8080" />);
+
+    await openModelPicker(user);
+
+    expect(screen.getByRole("option", { name: "gemma" })).toBeInTheDocument();
+  });
+
   it("normalizes model selection when search excludes the current selection", async () => {
     const user = userEvent.setup();
     const setup = services();

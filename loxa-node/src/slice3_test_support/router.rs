@@ -1146,6 +1146,55 @@ async fn v2_control_router_production_inventory_rejects_unavailable_load_before_
 }
 
 #[tokio::test]
+async fn v2_control_router_admits_a_full_artifact_for_lifecycle_verification() {
+    let fixture = RouterFixture::new("inventory-restart-verification").await;
+    let models_dir = fixture.root.join("restart-verification-inventory");
+    let (inventory, inventory_worker) =
+        crate::download_control::DownloadControl::spawn(models_dir.clone());
+    let recipe = loxa_core::registry::REGISTRY
+        .iter()
+        .min_by_key(|entry| entry.size_bytes)
+        .unwrap();
+    std::fs::create_dir_all(&models_dir).unwrap();
+    std::fs::File::create(models_dir.join(recipe.filename))
+        .unwrap()
+        .set_len(recipe.size_bytes)
+        .unwrap();
+    let app = router(V2ControlState::new_with_inventory_for_test(
+        fixture.token.clone(),
+        fixture.control.handle.clone(),
+        fixture.execution.clone(),
+        inventory,
+    ));
+
+    let response = app
+        .oneshot(fixture.request(
+            Method::POST,
+            &format!(
+                "/loxa/v2/nodes/{}/slots/{}/load",
+                fixture.node_id, fixture.slot_id
+            ),
+            format!(r#"{{"model_id":"{}"}}"#, recipe.id),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let accepted: V2OperationAccepted =
+        serde_json::from_slice(&body_bytes(response).await).unwrap();
+    assert!(fixture
+        .control
+        .handle
+        .read_snapshot()
+        .unwrap()
+        .operations
+        .iter()
+        .any(|operation| operation.operation_id == accepted.operation_id));
+    inventory_worker.stop_and_join().unwrap();
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
 async fn v2_control_router_sse_is_snapshot_first_atomic_and_query_is_closed() {
     let fixture = RouterFixture::new("sse").await;
     for query in [
