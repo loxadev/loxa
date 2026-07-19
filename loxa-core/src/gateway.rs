@@ -1177,6 +1177,27 @@ mod tests {
 
     #[test]
     fn gateway_start_and_shutdown_emit_static_lifecycle_events() {
+        const ISOLATED_CHILD: &str = "LOXA_TEST_GATEWAY_LIFECYCLE_EVENTS_ISOLATED";
+        if std::env::var_os(ISOLATED_CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "gateway::tests::gateway_start_and_shutdown_emit_static_lifecycle_events",
+                    "--exact",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(ISOLATED_CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated gateway lifecycle test failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
         let capture = EventCapture::default();
         let output = capture.0.clone();
         tracing::subscriber::with_default(capture, || {

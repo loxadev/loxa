@@ -959,6 +959,27 @@ fn stale_cleanup_failure_is_nonfatal_and_emits_only_static_signal() {
 
 #[test]
 fn generated_temp_names_have_random_fixed_lowercase_hex_tokens_and_io_holds_no_global_lock() {
+    const ISOLATED_CHILD: &str = "LOXA_TEST_IDENTITY_TEMP_LOCK_ISOLATED";
+    if std::env::var_os(ISOLATED_CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "identity::tests::generated_temp_names_have_random_fixed_lowercase_hex_tokens_and_io_holds_no_global_lock",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(ISOLATED_CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated temporary-lock test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
     let root = TestRoot::new();
     inject_boundary_hook(BoundaryPoint::TemporaryReserved, || {
         assert!(active_temporary_lock_available());
