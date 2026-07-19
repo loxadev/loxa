@@ -455,7 +455,7 @@ fn startup_timeout_reaps_after_bounded_stop_and_releases_authority() {
     let worker_entered = std::sync::Arc::clone(&entered);
     let worker_release = std::sync::Arc::clone(&release);
     let startup = std::thread::spawn(move || {
-        ControlStateWorker::block_during_initialization_for_test(
+        ControlStateWorker::block_after_durable_initialization_before_publication_for_test(
             init,
             worker_entered,
             worker_release,
