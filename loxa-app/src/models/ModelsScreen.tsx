@@ -188,7 +188,9 @@ export function ModelsScreen({
             operations={controller.latestByModel}
             activeUnload={controller.activeUnload}
             pendingModels={controller.pendingModels}
-            mutationBusy={controller.mutationBusy}
+            downloadingModelIds={controller.downloadingModelIds}
+            globallyClosed={controller.globallyClosed}
+            lifecycleBusy={controller.lifecycleBusy}
             onSelect={setSelectedModelId}
             onDownload={(modelId) => void controller.download(modelId)}
             onLoad={(modelId) => void controller.startLifecycle("load", modelId)}
@@ -204,7 +206,8 @@ export function ModelsScreen({
             inventory={controller.models}
             operations={controller.latestByModel}
             pendingModels={controller.pendingModels}
-            mutationBusy={controller.mutationBusy}
+            downloadingModelIds={controller.downloadingModelIds}
+            globallyClosed={controller.globallyClosed}
             onDownload={(modelId) => void controller.download(modelId)}
             onCancel={(operation, modelId) => void controller.cancel(operation, modelId)}
           />

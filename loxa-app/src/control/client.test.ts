@@ -665,7 +665,7 @@ describe("control client", () => {
     expect(fetch.mock.calls).toHaveLength(baseline);
   });
 
-  it("serializes v2 mutations per proven peer across reproof", async () => {
+  it("submits downloads independently while serializing load and unload on one lifecycle lane", async () => {
     let releaseFirst: ReadableStreamDefaultController<Uint8Array> | undefined;
     const first = new Response(
       new ReadableStream<Uint8Array>({
@@ -678,17 +678,87 @@ describe("control client", () => {
     const secondAccepted = { ...validV2OperationAccepted, operation_id: v2Ids.nextEvent, revision: "11" };
     const { peer, fetch } = await createProvenPeer([first, Response.json(secondAccepted, { status: 202 })]);
 
-    const download = downloadV2Model(peer, "gemma-3-4b-it-q4");
+    const firstDownload = downloadV2Model(peer, "gemma-3-4b-it-q4");
+    const secondDownload = downloadV2Model(peer, "qwen2.5-coder-7b-instruct-q4");
+    await vi.waitFor(() => {
+      expect(fetch.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(2);
+    });
+    await expect(secondDownload).resolves.toEqual(secondAccepted);
+    releaseFirst?.enqueue(new TextEncoder().encode(JSON.stringify(validV2OperationAccepted)));
+    releaseFirst?.close();
+    await expect(firstDownload).resolves.toEqual(validV2OperationAccepted);
+
+    let releaseLoad: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const loadResponse = new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          releaseLoad = controller;
+        },
+      }),
+      { status: 202, headers: { "content-type": "application/json" } },
+    );
+    const unloadAccepted = { ...validV2OperationAccepted, operation_id: v2Ids.oldEpoch, revision: "12" };
+    const lifecycle = await createProvenPeer([loadResponse, Response.json(unloadAccepted, { status: 202 })]);
+    const load = loadV2Slot(lifecycle.peer, v2Ids.node, v2Ids.slot, "gemma-3-4b-it-q4");
+    const unload = unloadV2Slot(lifecycle.peer, v2Ids.node, v2Ids.slot);
+    await vi.waitFor(() => {
+      expect(lifecycle.fetch.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(1);
+    });
+    releaseLoad?.enqueue(new TextEncoder().encode(JSON.stringify(validV2OperationAccepted)));
+    releaseLoad?.close();
+
+    await expect(load).resolves.toEqual(validV2OperationAccepted);
+    await expect(unload).resolves.toEqual(unloadAccepted);
+    expect(lifecycle.fetch.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(2);
+  });
+
+  it("serializes cancellation only with the same operation lane", async () => {
+    let releaseFirst: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const first = new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          releaseFirst = controller;
+        },
+      }),
+      { status: 202, headers: { "content-type": "application/json" } },
+    );
+    const otherAccepted = { ...validV2OperationAccepted, operation_id: v2Ids.nextEvent, revision: "11" };
+    const repeatedAccepted = { ...validV2OperationAccepted, revision: "12" };
+    const { peer, fetch } = await createProvenPeer([
+      first,
+      Response.json(otherAccepted, { status: 202 }),
+      Response.json(repeatedAccepted, { status: 202 }),
+    ]);
+
+    const firstCancel = cancelV2Operation(peer, v2Ids.operation);
+    const repeatedCancel = cancelV2Operation(peer, v2Ids.operation);
+    const otherCancel = cancelV2Operation(peer, v2Ids.nextEvent);
+    await vi.waitFor(() => {
+      expect(fetch.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(2);
+    });
+    await expect(otherCancel).resolves.toEqual(otherAccepted);
+    releaseFirst?.enqueue(new TextEncoder().encode(JSON.stringify(validV2OperationAccepted)));
+    releaseFirst?.close();
+    await expect(firstCancel).resolves.toEqual(validV2OperationAccepted);
+    await expect(repeatedCancel).resolves.toEqual(repeatedAccepted);
+  });
+
+  it("peer revocation aborts an active lifecycle mutation and every queued lane tail", async () => {
+    const controller = new AbortController();
+    const stalled = new Response(new ReadableStream({ start() {} }), {
+      status: 202,
+      headers: { "content-type": "application/json" },
+    });
+    const { peer, fetch } = await createProvenPeer([stalled], { signal: controller.signal, timeoutMs: 5_000 });
+    const load = loadV2Slot(peer, v2Ids.node, v2Ids.slot, "gemma-3-4b-it-q4");
     const unload = unloadV2Slot(peer, v2Ids.node, v2Ids.slot);
     await vi.waitFor(() => {
       expect(fetch.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(1);
     });
-    releaseFirst?.enqueue(new TextEncoder().encode(JSON.stringify(validV2OperationAccepted)));
-    releaseFirst?.close();
-
-    await expect(download).resolves.toEqual(validV2OperationAccepted);
-    await expect(unload).resolves.toEqual(secondAccepted);
-    expect(fetch.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(2);
+    controller.abort();
+    await expect(load).rejects.toMatchObject({ kind: "aborted" });
+    await expect(unload).rejects.toMatchObject({ kind: "aborted" });
+    expect(fetch.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(1);
   });
 
   it("preserves the requested operation UUID across v2 cancellation acceptance", async () => {

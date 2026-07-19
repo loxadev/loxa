@@ -176,12 +176,14 @@ export function NodeSessionProvider({
     }
     setState((current) => {
       const projection = projectControl(control);
-      const pending = pendingOperationsRef.current.size > 0;
+      const requiresReconciliation = [...pendingOperationsRef.current.values()].some(
+        (pending) => pending.kind !== "download",
+      );
       const next: SessionState = {
         ...current,
-        ...(pending ? { phase: "reconciling" as const, status: null, error: null } : projection),
+        ...(requiresReconciliation ? { phase: "reconciling" as const, status: null, error: null } : projection),
         proven: true,
-        control: pending ? null : control,
+        control: requiresReconciliation ? null : control,
       };
       stateRef.current = next;
       return next;
@@ -464,6 +466,13 @@ export function NodeSessionProvider({
         throw new Error("The accepted operation no longer belongs to the current control authority.");
       }
       const operationId = accepted.operation_id;
+      if (pending.kind === "load" || pending.kind === "unload") {
+        for (const [pendingId, existing] of pendingOperationsRef.current) {
+          if (pendingId !== operationId && (existing.kind === "load" || existing.kind === "unload")) {
+            pendingOperationsRef.current.delete(pendingId);
+          }
+        }
+      }
       pendingOperationsRef.current.delete(operationId);
       pendingOperationsRef.current.set(operationId, {
         ...pending,

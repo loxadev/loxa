@@ -1,7 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { appServices, DESKTOP_RUNTIME_UNAVAILABLE_MESSAGE, desktopRuntimeUnavailableMessage } from "./services";
+import {
+  appServices,
+  confirmGlobalDownloadCancel,
+  DESKTOP_RUNTIME_UNAVAILABLE_MESSAGE,
+  desktopRuntimeUnavailableMessage,
+} from "./services";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
@@ -12,6 +17,7 @@ describe("desktop app services in browser preview", () => {
 
   afterEach(() => {
     Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
+    vi.restoreAllMocks();
   });
 
   it("rejects Tauri-backed bootstrap calls with a truthful preview error", async () => {
@@ -36,6 +42,13 @@ describe("desktop app services in browser preview", () => {
   it("selects truthful missing-runtime copy for development and production", () => {
     expect(desktopRuntimeUnavailableMessage(true)).toBe("Desktop runtime is unavailable in browser preview.");
     expect(desktopRuntimeUnavailableMessage(false)).toBe("Desktop runtime is unavailable.");
+  });
+
+  it("asks before globally cancelling a shared download", () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    expect(confirmGlobalDownloadCancel()).toBe(true);
+    expect(confirm).toHaveBeenCalledWith("Cancel this shared download for every observer connected to this Loxa node?");
   });
 
   it("forwards exact commands and arguments when the Tauri runtime is available", async () => {

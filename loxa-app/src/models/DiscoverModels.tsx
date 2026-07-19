@@ -14,7 +14,8 @@ export function DiscoverModels({
   inventory,
   operations,
   pendingModels,
-  mutationBusy,
+  downloadingModelIds,
+  globallyClosed,
   onDownload,
   onCancel,
 }: {
@@ -22,7 +23,8 @@ export function DiscoverModels({
   inventory: readonly ModelInventoryEntry[];
   operations: ReadonlyMap<string, OperationView>;
   pendingModels: ReadonlySet<string>;
-  mutationBusy: boolean;
+  downloadingModelIds: ReadonlySet<string>;
+  globallyClosed: boolean;
   onDownload(modelId: string): void;
   onCancel(operation: OperationView, modelId: string): void;
 }) {
@@ -122,14 +124,16 @@ export function DiscoverModels({
                     <Button
                       variant="secondary"
                       onClick={() => onCancel(operation, entry.modelId)}
-                      disabled={pendingModels.has(entry.modelId)}
+                      disabled={pendingModels.has(entry.modelId) || globallyClosed}
                     >
                       Cancel
                     </Button>
                   ) : canDownload ? (
                     <Button
                       onClick={() => onDownload(entry.modelId)}
-                      disabled={pendingModels.has(entry.modelId) || mutationBusy}
+                      disabled={
+                        pendingModels.has(entry.modelId) || downloadingModelIds.has(entry.modelId) || globallyClosed
+                      }
                       aria-label={`Download ${entry.title}`}
                     >
                       <Download aria-hidden="true" size={14} /> Download
