@@ -36,7 +36,8 @@ pub(crate) use repository::{
 pub(crate) use state_machine::InstancePublication;
 pub(crate) use worker::{
     ControlStateBootstrap, ControlStateError, ControlStateHandle, ControlStateInit,
-    ControlStateOpenInput, ControlStateWorker,
+    ControlStateOpenInput, ControlStateShutdownFailure, ControlStateStartupFailure,
+    ControlStateWorker,
 };
 
 pub(crate) fn acquisition_recovery_evidence(

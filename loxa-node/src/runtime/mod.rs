@@ -1,3 +1,4 @@
+mod fatal_shutdown;
 mod node_runtime;
 
 use axum::extract::{Request, State};
@@ -5,8 +6,15 @@ use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
+pub(crate) use fatal_shutdown::{
+    shutdown_failure_rank, FatalShutdownParts, ShutdownDeadlines, ShutdownFailureClass,
+};
+pub use fatal_shutdown::{FatalShutdown, ShutdownResult};
+#[cfg(test)]
+pub(crate) use node_runtime::InjectedRetainedOwner;
 pub(crate) use node_runtime::{
-    DurableHealthMonitor, NodeOwnerGuard, NodeRuntime, NodeRuntimeParts,
+    DurableHealthMonitor, DurableHealthShutdownFailure, NodeOwnerGuard, NodeOwnerShutdownFailure,
+    NodeRuntime, NodeRuntimeParts,
 };
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;

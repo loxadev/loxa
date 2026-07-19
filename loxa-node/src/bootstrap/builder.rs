@@ -1,7 +1,8 @@
 use super::NodePaths;
 use crate::runtime::{
-    effective_capabilities, DurableHealthMonitor, EffectiveCapabilityInputs, NodeOwnerGuard,
-    NodeRuntime, NodeRuntimeParts, PublicationGate,
+    effective_capabilities, DurableHealthMonitor, EffectiveCapabilityInputs, FatalShutdown,
+    FatalShutdownParts, NodeOwnerGuard, NodeRuntime, NodeRuntimeParts, PublicationGate,
+    ShutdownDeadlines, ShutdownResult,
 };
 use crate::{
     chat_history, chat_routes, control_router, control_state, download_control, model_lifecycle,
@@ -15,6 +16,196 @@ use std::io;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const CONTROL_STARTUP_COMMIT_TIMEOUT: Duration = Duration::from_secs(10);
+const NODE_BUILD_OWNERSHIP_TIMEOUT: Duration = Duration::from_secs(20);
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BuilderFailureBoundary {
+    Control,
+    History,
+    Execution,
+    Routes,
+    Gateway,
+    Health,
+    Publication,
+    OpenGate,
+}
+
+#[cfg(test)]
+impl BuilderFailureBoundary {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Control => "control",
+            Self::History => "history",
+            Self::Execution => "execution",
+            Self::Routes => "routes",
+            Self::Gateway => "gateway",
+            Self::Health => "health",
+            Self::Publication => "publication",
+            Self::OpenGate => "open_gate",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "control" => Some(Self::Control),
+            "history" => Some(Self::History),
+            "execution" => Some(Self::Execution),
+            "routes" => Some(Self::Routes),
+            "gateway" => Some(Self::Gateway),
+            "health" => Some(Self::Health),
+            "publication" => Some(Self::Publication),
+            "open_gate" => Some(Self::OpenGate),
+            _ => None,
+        }
+    }
+}
+
+pub(crate) enum NodeBuildError {
+    Ordinary(io::Error),
+    RequiresProcessExit(Box<FatalShutdown>),
+}
+
+impl NodeBuildError {
+    pub(crate) fn into_shutdown_result(self) -> ShutdownResult {
+        match self {
+            Self::Ordinary(error) => ShutdownResult::Failed(error),
+            Self::RequiresProcessExit(fatal) => ShutdownResult::RequiresProcessExit(fatal),
+        }
+    }
+}
+
+impl From<io::Error> for NodeBuildError {
+    fn from(error: io::Error) -> Self {
+        Self::Ordinary(error)
+    }
+}
+
+impl std::fmt::Display for NodeBuildError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ordinary(error) => error.fmt(formatter),
+            Self::RequiresProcessExit(_) => {
+                formatter.write_str("node startup cleanup requires process exit")
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for NodeBuildError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.to_string())
+    }
+}
+
+fn retained_control_startup_failure(
+    failure: control_state::ControlStateStartupFailure,
+) -> NodeBuildError {
+    NodeBuildError::RequiresProcessExit(Box::new(FatalShutdown::new(FatalShutdownParts {
+        diagnostic: "durable control startup did not release authoritative ownership".into(),
+        gateway: None,
+        gateway_failure: None,
+        history: None,
+        history_failure: None,
+        health: None,
+        health_failure: None,
+        execution: None,
+        control_failure: None,
+        control_startup_failure: Some(failure),
+        control: None,
+        unloaded_run: None,
+        publication: Some(PublicationGate::default()),
+        owner: None,
+        owner_failure: None,
+        routes: None,
+        routes_failure: None,
+        gateway_state: None,
+    })))
+}
+
+fn finish_early_owner_or_retain(
+    trigger: io::Error,
+    owner: NodeOwnerGuard,
+    deadline: std::time::Instant,
+) -> NodeBuildError {
+    match owner.finish_retained(deadline) {
+        Ok(_) => NodeBuildError::Ordinary(trigger),
+        Err(owner_failure) => {
+            NodeBuildError::RequiresProcessExit(Box::new(FatalShutdown::new(FatalShutdownParts {
+                diagnostic: format!("{trigger}; exact startup owner cleanup was not proven"),
+                gateway: None,
+                gateway_failure: None,
+                history: None,
+                history_failure: None,
+                health: None,
+                health_failure: None,
+                execution: None,
+                control_failure: None,
+                control_startup_failure: None,
+                control: None,
+                unloaded_run: None,
+                publication: Some(PublicationGate::default()),
+                owner: None,
+                owner_failure: Some(owner_failure),
+                routes: None,
+                routes_failure: None,
+                gateway_state: None,
+            })))
+        }
+    }
+}
+
+fn finish_identity_owner_or_retain(
+    trigger: crate::identity::IdentityError,
+    owner: NodeOwnerGuard,
+    deadline: std::time::Instant,
+) -> NodeBuildError {
+    let trigger_class = trigger.class().as_str();
+    let trigger = identity_error_to_io(trigger);
+    match owner.finish_retained(deadline) {
+        Ok(_) => {
+            tracing::warn!(
+                target: "loxa_node::lifecycle",
+                event_code = "node.identity_open_failed",
+                component = "node",
+                result_class = "failed",
+                trigger_class,
+                cleanup_class = "owner_cleanup_completed",
+            );
+            NodeBuildError::Ordinary(trigger)
+        }
+        Err(owner_failure) => {
+            tracing::warn!(
+                target: "loxa_node::lifecycle",
+                event_code = "node.identity_open_failed",
+                component = "node",
+                result_class = "failed",
+                trigger_class,
+                cleanup_class = "owner_cleanup_failed",
+            );
+            NodeBuildError::RequiresProcessExit(Box::new(FatalShutdown::new(FatalShutdownParts {
+                diagnostic: format!("{trigger}; exact startup owner cleanup was not proven"),
+                gateway: None,
+                gateway_failure: None,
+                history: None,
+                history_failure: None,
+                health: None,
+                health_failure: None,
+                execution: None,
+                control_failure: None,
+                control_startup_failure: None,
+                control: None,
+                unloaded_run: None,
+                publication: Some(PublicationGate::default()),
+                owner: None,
+                owner_failure: Some(owner_failure),
+                routes: None,
+                routes_failure: None,
+                gateway_state: None,
+            })))
+        }
+    }
+}
 
 fn current_unix_ms() -> io::Result<u64> {
     let millis = SystemTime::now()
@@ -28,12 +219,14 @@ fn control_state_error_to_io(_: control_state::ControlStateError) -> io::Error {
     io::Error::other("durable control state is unavailable")
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IdentityCleanupClass {
     Completed,
     OwnerCleanupFailed,
 }
 
+#[cfg(test)]
 impl IdentityCleanupClass {
     const fn as_str(self) -> &'static str {
         match self {
@@ -47,6 +240,7 @@ fn identity_error_to_io(error: crate::identity::IdentityError) -> io::Error {
     io::Error::other(format!("node identity failed: {}", error.class().as_str()))
 }
 
+#[cfg(test)]
 fn resolve_identity_failure(
     trigger: crate::identity::IdentityError,
     owner_cleanup: io::Result<loxa_core::supervisor::ChildlessFinishOutcome>,
@@ -110,40 +304,159 @@ fn finish_failed_durable_build(
         download_control::DownloadControl,
         download_control::DownloadControlWorker,
     )>,
-    chat_routes_state: Option<chat_routes::ChatRoutesState>,
-    gateway: Option<loxa_core::gateway::GatewayServer>,
-    history_worker: Option<chat_history::ChatHistoryWorker>,
+    mut chat_routes_state: Option<chat_routes::ChatRoutesState>,
+    mut gateway: Option<loxa_core::gateway::GatewayServer>,
+    mut history_worker: Option<chat_history::ChatHistoryWorker>,
     control_worker: control_state::ControlStateWorker,
-) -> io::Error {
+    health_monitor: Option<DurableHealthMonitor>,
+    control: control_state::ControlStateHandle,
+    gateway_state: loxa_core::gateway::GatewayState,
+    #[cfg(test)] force_expired_cleanup: bool,
+) -> NodeBuildError {
+    let now = std::time::Instant::now();
+    #[cfg(test)]
+    let deadlines = if force_expired_cleanup {
+        ShutdownDeadlines {
+            admission: now,
+            signal: now,
+            verification: now,
+            download: now,
+            lifecycle: now,
+            repository: now,
+        }
+    } else {
+        ShutdownDeadlines::from_started(now)
+    };
+    #[cfg(not(test))]
+    let deadlines = ShutdownDeadlines::from_started(now);
     gate.close();
-    let gateway_cleanup = gateway
-        .map(loxa_core::gateway::GatewayServer::shutdown)
-        .unwrap_or(Ok(()));
-    if let Some(chat) = chat_routes_state {
-        chat.shutdown_and_wait();
+    if let Some((download, worker)) = runtime.as_ref() {
+        download.seal_for_shutdown();
+        worker.request_shutdown(deadlines.lifecycle);
     }
-    let worker_cleanup = runtime
+    let mut signal_error = None;
+    if let Some(routes) = chat_routes_state.as_ref() {
+        if let Err(error) = routes.request_shutdown() {
+            signal_error = Some(io::Error::other(format!(
+                "chat routes shutdown signal failed: {error:?}"
+            )));
+        }
+    }
+    if let Some(gateway) = gateway.as_mut() {
+        gateway.request_shutdown();
+    }
+    if let Some(history) = history_worker.as_mut() {
+        history.request_shutdown();
+    }
+    if let Some(health) = health_monitor.as_ref() {
+        health.request_shutdown();
+    }
+    gateway_state.withdraw();
+
+    let mut execution_failure = None;
+    let mut execution_error = Ok(());
+    if let Some((download, worker)) = runtime.take() {
+        match worker.shutdown_staged(
+            download,
+            download_control::ExecutionShutdownDeadlines {
+                verification: deadlines.verification,
+                download: deadlines.download,
+                lifecycle: deadlines.lifecycle,
+                finalize: deadlines.repository,
+            },
+        ) {
+            download_control::ExecutionShutdownResult::Stopped => {}
+            download_control::ExecutionShutdownResult::Failed(diagnostics) => {
+                execution_error = Err(io::Error::other(diagnostics.messages().join("; ")));
+            }
+            download_control::ExecutionShutdownResult::Retained(retained) => {
+                execution_failure = Some(retained);
+            }
+        }
+    }
+
+    let routes_failure = chat_routes_state
         .take()
-        .map(|(_, worker)| worker.stop_and_join())
-        .transpose()
-        .map(|_| ());
-    let history_cleanup = history_worker
-        .map(chat_history::ChatHistoryWorker::stop_and_join)
-        .transpose()
-        .map(|_| ())
-        .map_err(io::Error::other);
-    let control_cleanup = control_worker
-        .shutdown_blocking()
-        .map_err(control_state_error_to_io);
-    let owner_cleanup = owner_guard.finish().map(|_| ());
-    resolve_durable_build_failure(
+        .and_then(|routes| routes.shutdown_until(deadlines.repository).err());
+    let gateway_failure = gateway
+        .take()
+        .and_then(|gateway| gateway.shutdown_until(deadlines.repository).err());
+    let health_failure =
+        health_monitor.and_then(|monitor| monitor.stop_and_join_until(deadlines.repository).err());
+
+    let mut retained_history = None;
+    let history_cleanup = match history_worker.take() {
+        None => Ok(()),
+        Some(history) => match history.shutdown_until(deadlines.repository) {
+            chat_history::ChatHistoryShutdownResult::Stopped => Ok(()),
+            chat_history::ChatHistoryShutdownResult::Failed(error) => Err(io::Error::other(error)),
+            chat_history::ChatHistoryShutdownResult::Retained(failure) => {
+                retained_history = Some(failure);
+                Ok(())
+            }
+        },
+    };
+
+    let control_failure = control_worker
+        .shutdown_blocking_until(deadlines.repository)
+        .err();
+    let mut owner = None;
+    let mut owner_failure = None;
+    let owner_cleanup = if std::time::Instant::now() >= deadlines.repository {
+        owner = Some(owner_guard);
+        Ok(())
+    } else {
+        match owner_guard.finish_retained(deadlines.repository) {
+            Ok(_) => Ok(()),
+            Err(failure) => {
+                owner_failure = Some(failure);
+                Ok(())
+            }
+        }
+    };
+
+    let requires_exit = routes_failure.is_some()
+        || gateway_failure.is_some()
+        || health_failure.is_some()
+        || execution_failure.is_some()
+        || retained_history.is_some()
+        || control_failure.is_some()
+        || owner.is_some()
+        || owner_failure.is_some()
+        || signal_error.is_some();
+    if requires_exit {
+        return NodeBuildError::RequiresProcessExit(Box::new(FatalShutdown::new(
+            FatalShutdownParts {
+                diagnostic: "node startup cleanup retained authoritative ownership".into(),
+                gateway: None,
+                gateway_failure,
+                history: None,
+                history_failure: retained_history,
+                health: None,
+                health_failure,
+                execution: execution_failure,
+                control_failure,
+                control_startup_failure: None,
+                control: Some(control),
+                unloaded_run: None,
+                publication: Some(gate.clone()),
+                owner,
+                owner_failure,
+                routes: None,
+                routes_failure,
+                gateway_state: Some(gateway_state),
+            },
+        )));
+    }
+
+    NodeBuildError::Ordinary(resolve_durable_build_failure(
         trigger,
         owner_cleanup,
         history_cleanup,
-        worker_cleanup,
-        control_cleanup,
-        gateway_cleanup,
-    )
+        execution_error,
+        signal_error.map_or(Ok(()), Err),
+        Ok(()),
+    ))
 }
 
 pub(crate) struct NodeBuilder<'a> {
@@ -154,6 +467,10 @@ pub(crate) struct NodeBuilder<'a> {
     diagnostics_health: DiagnosticsHealth,
     #[cfg(test)]
     download_worker_spawn_count: Option<&'a std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    failure_after: Option<BuilderFailureBoundary>,
+    #[cfg(test)]
+    force_expired_failure_cleanup: bool,
 }
 
 impl<'a> NodeBuilder<'a> {
@@ -172,6 +489,10 @@ impl<'a> NodeBuilder<'a> {
             diagnostics_health: DiagnosticsHealth::new(),
             #[cfg(test)]
             download_worker_spawn_count: None,
+            #[cfg(test)]
+            failure_after: None,
+            #[cfg(test)]
+            force_expired_failure_cleanup: false,
         }
     }
 
@@ -190,6 +511,10 @@ impl<'a> NodeBuilder<'a> {
             diagnostics_health,
             #[cfg(test)]
             download_worker_spawn_count: None,
+            #[cfg(test)]
+            failure_after: None,
+            #[cfg(test)]
+            force_expired_failure_cleanup: false,
         }
     }
 
@@ -202,7 +527,20 @@ impl<'a> NodeBuilder<'a> {
         self
     }
 
-    pub(crate) fn build(self) -> io::Result<NodeRuntime> {
+    #[cfg(test)]
+    fn with_failure_after_for_test(
+        mut self,
+        boundary: BuilderFailureBoundary,
+        force_expired_cleanup: bool,
+    ) -> Self {
+        self.failure_after = Some(boundary);
+        self.force_expired_failure_cleanup = force_expired_cleanup;
+        self
+    }
+
+    pub(crate) fn build(self) -> Result<NodeRuntime, NodeBuildError> {
+        let build_started = std::time::Instant::now();
+        let ownership_deadline = build_started + NODE_BUILD_OWNERSHIP_TIMEOUT;
         let startup_model =
             requested_startup_model(&self.paths.models_dir, self.requested_model, self.engine)
                 .map_err(io::Error::other)?;
@@ -217,7 +555,7 @@ impl<'a> NodeBuilder<'a> {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 supervisor::ScalarCaptureMode::FirstMigration
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.into()),
         };
         let candidate = crate::unloaded_owner_candidate(self.paths, gateway_port)?;
         let acquisition =
@@ -233,27 +571,45 @@ impl<'a> NodeBuilder<'a> {
         ) {
             Ok(evidence) => evidence,
             Err(_) => {
-                return Err(owner_guard.finish().err().unwrap_or_else(|| {
-                    io::Error::other("exact lifecycle recovery authority is unavailable")
-                }))
+                return Err(finish_early_owner_or_retain(
+                    io::Error::other("exact lifecycle recovery authority is unavailable"),
+                    owner_guard,
+                    ownership_deadline,
+                ))
             }
         };
         let loxa_dir = match self.paths.loxa_dir() {
             Ok(loxa_dir) => loxa_dir,
-            Err(error) => return Err(owner_guard.finish().err().unwrap_or(error)),
+            Err(error) => {
+                return Err(finish_early_owner_or_retain(
+                    error,
+                    owner_guard,
+                    ownership_deadline,
+                ))
+            }
         };
         let node_id = match crate::identity::open_or_create(loxa_dir) {
             Ok(node_id) => node_id,
             Err(error) => {
-                return Err(resolve_identity_failure(error, owner_guard.finish()));
+                return Err(finish_identity_owner_or_retain(
+                    error,
+                    owner_guard,
+                    ownership_deadline,
+                ));
             }
         };
         let node_instance_id = NodeInstanceId::new_v4();
         let recovery_now_unix_ms = match current_unix_ms() {
             Ok(now_unix_ms) => now_unix_ms,
-            Err(error) => return Err(owner_guard.finish().err().unwrap_or(error)),
+            Err(error) => {
+                return Err(finish_early_owner_or_retain(
+                    error,
+                    owner_guard,
+                    ownership_deadline,
+                ))
+            }
         };
-        let bootstrap = match control_state::ControlStateWorker::open_reconcile_and_spawn(
+        let bootstrap = match control_state::ControlStateWorker::open_reconcile_and_spawn_until(
             control_state::ControlStateInit {
                 path: control_path,
                 node_id,
@@ -264,9 +620,10 @@ impl<'a> NodeBuilder<'a> {
                 recovery_evidence,
                 now_unix_ms: recovery_now_unix_ms,
             },
+            ownership_deadline,
         ) {
             Ok(bootstrap) => bootstrap,
-            Err(error) => return Err(control_state_error_to_io(error)),
+            Err(failure) => return Err(retained_control_startup_failure(failure)),
         };
         let control_state::ControlStateBootstrap {
             handle: control,
@@ -275,6 +632,24 @@ impl<'a> NodeBuilder<'a> {
             ready_authority,
         } = bootstrap;
         let mut download_runtime = None;
+        let gateway_state = loxa_core::gateway::GatewayState::new(node_id, node_instance_id);
+        #[cfg(test)]
+        if self.failure_after == Some(BuilderFailureBoundary::Control) {
+            return Err(finish_failed_durable_build(
+                io::Error::other("injected failure after control construction"),
+                &PublicationGate::default(),
+                owner_guard,
+                &mut download_runtime,
+                None,
+                None,
+                None,
+                control_worker,
+                None,
+                control.clone(),
+                gateway_state.clone(),
+                self.force_expired_failure_cleanup,
+            ));
+        }
         let token_path = loxa_dir.join("control.token");
         let token = match loxa_core::control::auth::ControlToken::load_or_create(&token_path) {
             Ok(token) => token,
@@ -288,6 +663,11 @@ impl<'a> NodeBuilder<'a> {
                     None,
                     None,
                     control_worker,
+                    None,
+                    control.clone(),
+                    gateway_state.clone(),
+                    #[cfg(test)]
+                    self.force_expired_failure_cleanup,
                 ))
             }
         };
@@ -303,6 +683,11 @@ impl<'a> NodeBuilder<'a> {
                     None,
                     None,
                     control_worker,
+                    None,
+                    control.clone(),
+                    gateway_state.clone(),
+                    #[cfg(test)]
+                    self.force_expired_failure_cleanup,
                 ))
             }
         };
@@ -318,10 +703,31 @@ impl<'a> NodeBuilder<'a> {
                     None,
                     None,
                     control_worker,
+                    None,
+                    control.clone(),
+                    gateway_state.clone(),
+                    #[cfg(test)]
+                    self.force_expired_failure_cleanup,
                 ))
             }
         };
-        let gateway_state = loxa_core::gateway::GatewayState::new(node_id, node_instance_id);
+        #[cfg(test)]
+        if self.failure_after == Some(BuilderFailureBoundary::History) {
+            return Err(finish_failed_durable_build(
+                io::Error::other("injected failure after history construction"),
+                &PublicationGate::default(),
+                owner_guard,
+                &mut download_runtime,
+                None,
+                None,
+                Some(history_worker),
+                control_worker,
+                None,
+                control.clone(),
+                gateway_state.clone(),
+                self.force_expired_failure_cleanup,
+            ));
+        }
         download_runtime = Some({
             let run = owner_guard.baseline();
             if self.engine == RuntimeBackendKind::LlamaCpp {
@@ -364,6 +770,11 @@ impl<'a> NodeBuilder<'a> {
                         None,
                         Some(history_worker),
                         control_worker,
+                        None,
+                        control.clone(),
+                        gateway_state.clone(),
+                        #[cfg(test)]
+                        self.force_expired_failure_cleanup,
                     ));
                 }
                 #[cfg(test)]
@@ -376,10 +787,44 @@ impl<'a> NodeBuilder<'a> {
                 )
             }
         });
+        #[cfg(test)]
+        if self.failure_after == Some(BuilderFailureBoundary::Execution) {
+            return Err(finish_failed_durable_build(
+                io::Error::other("injected failure after execution construction"),
+                &PublicationGate::default(),
+                owner_guard,
+                &mut download_runtime,
+                None,
+                None,
+                Some(history_worker),
+                control_worker,
+                None,
+                control.clone(),
+                gateway_state.clone(),
+                self.force_expired_failure_cleanup,
+            ));
+        }
         let publication_gate = PublicationGate::with_durable_health(control.health_flag());
         let chat_routes_state =
             chat_routes::ChatRoutesState::new(token.clone(), history, gateway_state.clone())
                 .with_publication_gate(publication_gate.clone());
+        #[cfg(test)]
+        if self.failure_after == Some(BuilderFailureBoundary::Routes) {
+            return Err(finish_failed_durable_build(
+                io::Error::other("injected failure after routes construction"),
+                &publication_gate,
+                owner_guard,
+                &mut download_runtime,
+                Some(chat_routes_state),
+                None,
+                Some(history_worker),
+                control_worker,
+                None,
+                control.clone(),
+                gateway_state.clone(),
+                self.force_expired_failure_cleanup,
+            ));
+        }
         let router = publication_gate
             .protect(loxa_core::gateway::router(gateway_state.clone()))
             .merge(chat_routes::router(chat_routes_state.clone()));
@@ -401,13 +846,18 @@ impl<'a> NodeBuilder<'a> {
             Err(error) => {
                 return Err(finish_failed_durable_build(
                     io::Error::other(error),
-                    &PublicationGate::default(),
+                    &publication_gate,
                     owner_guard,
                     &mut download_runtime,
                     Some(chat_routes_state),
                     None,
                     Some(history_worker),
                     control_worker,
+                    None,
+                    control.clone(),
+                    gateway_state.clone(),
+                    #[cfg(test)]
+                    self.force_expired_failure_cleanup,
                 ));
             }
         };
@@ -429,9 +879,31 @@ impl<'a> NodeBuilder<'a> {
                     None,
                     Some(history_worker),
                     control_worker,
+                    None,
+                    control.clone(),
+                    gateway_state.clone(),
+                    #[cfg(test)]
+                    self.force_expired_failure_cleanup,
                 ));
             }
         };
+        #[cfg(test)]
+        if self.failure_after == Some(BuilderFailureBoundary::Gateway) {
+            return Err(finish_failed_durable_build(
+                io::Error::other("injected failure after gateway construction"),
+                &publication_gate,
+                owner_guard,
+                &mut download_runtime,
+                Some(chat_routes_state),
+                Some(gateway),
+                Some(history_worker),
+                control_worker,
+                None,
+                control.clone(),
+                gateway_state.clone(),
+                self.force_expired_failure_cleanup,
+            ));
+        }
         let writer_healthy = control.writer_is_healthy();
         let lifecycle_supported = stable_llama_node;
         let capabilities = effective_capabilities(EffectiveCapabilityInputs {
@@ -454,30 +926,14 @@ impl<'a> NodeBuilder<'a> {
                     Some(gateway),
                     Some(history_worker),
                     control_worker,
+                    None,
+                    control.clone(),
+                    gateway_state.clone(),
+                    #[cfg(test)]
+                    self.force_expired_failure_cleanup,
                 ));
             }
         };
-        if let Err(error) = control.publish_instance_blocking_until(
-            control_state::InstancePublication {
-                node_instance_id,
-                control_endpoint: format!("http://127.0.0.1:{}", gateway.port()),
-                capabilities,
-                now_unix_ms: publication_now_unix_ms,
-            },
-            std::time::Instant::now() + CONTROL_STARTUP_COMMIT_TIMEOUT,
-        ) {
-            return Err(finish_failed_durable_build(
-                control_state_error_to_io(error),
-                &publication_gate,
-                owner_guard,
-                &mut download_runtime,
-                Some(chat_routes_state),
-                Some(gateway),
-                Some(history_worker),
-                control_worker,
-            ));
-        }
-        owner_guard.commit_acquisition();
         let health_monitor = match DurableHealthMonitor::spawn(
             control.clone(),
             publication_gate.clone(),
@@ -496,16 +952,18 @@ impl<'a> NodeBuilder<'a> {
                     Some(gateway),
                     Some(history_worker),
                     control_worker,
+                    None,
+                    control.clone(),
+                    gateway_state.clone(),
+                    #[cfg(test)]
+                    self.force_expired_failure_cleanup,
                 ));
             }
         };
-        if !publication_gate.open() {
-            let monitor_error = health_monitor
-                .stop_and_join_until(std::time::Instant::now() + Duration::from_secs(10))
-                .err()
-                .unwrap_or_else(|| io::Error::other("publication gate could not be opened"));
+        #[cfg(test)]
+        if self.failure_after == Some(BuilderFailureBoundary::Health) {
             return Err(finish_failed_durable_build(
-                monitor_error,
+                io::Error::other("injected failure after health construction"),
                 &publication_gate,
                 owner_guard,
                 &mut download_runtime,
@@ -513,6 +971,87 @@ impl<'a> NodeBuilder<'a> {
                 Some(gateway),
                 Some(history_worker),
                 control_worker,
+                Some(health_monitor),
+                control.clone(),
+                gateway_state.clone(),
+                self.force_expired_failure_cleanup,
+            ));
+        }
+        if let Err(error) = control.publish_instance_blocking_until(
+            control_state::InstancePublication {
+                node_instance_id,
+                control_endpoint: format!("http://127.0.0.1:{}", gateway.port()),
+                capabilities,
+                now_unix_ms: publication_now_unix_ms,
+            },
+            std::time::Instant::now() + CONTROL_STARTUP_COMMIT_TIMEOUT,
+        ) {
+            return Err(finish_failed_durable_build(
+                control_state_error_to_io(error),
+                &publication_gate,
+                owner_guard,
+                &mut download_runtime,
+                Some(chat_routes_state),
+                Some(gateway),
+                Some(history_worker),
+                control_worker,
+                Some(health_monitor),
+                control.clone(),
+                gateway_state.clone(),
+                #[cfg(test)]
+                self.force_expired_failure_cleanup,
+            ));
+        }
+        #[cfg(test)]
+        if self.failure_after == Some(BuilderFailureBoundary::Publication) {
+            return Err(finish_failed_durable_build(
+                io::Error::other("injected failure after durable publication"),
+                &publication_gate,
+                owner_guard,
+                &mut download_runtime,
+                Some(chat_routes_state),
+                Some(gateway),
+                Some(history_worker),
+                control_worker,
+                Some(health_monitor),
+                control.clone(),
+                gateway_state.clone(),
+                self.force_expired_failure_cleanup,
+            ));
+        }
+        owner_guard.commit_acquisition();
+        if !publication_gate.open() {
+            return Err(finish_failed_durable_build(
+                io::Error::other("publication gate could not be opened"),
+                &publication_gate,
+                owner_guard,
+                &mut download_runtime,
+                Some(chat_routes_state),
+                Some(gateway),
+                Some(history_worker),
+                control_worker,
+                Some(health_monitor),
+                control.clone(),
+                gateway_state.clone(),
+                #[cfg(test)]
+                self.force_expired_failure_cleanup,
+            ));
+        }
+        #[cfg(test)]
+        if self.failure_after == Some(BuilderFailureBoundary::OpenGate) {
+            return Err(finish_failed_durable_build(
+                io::Error::other("injected failure after publication gate opened"),
+                &publication_gate,
+                owner_guard,
+                &mut download_runtime,
+                Some(chat_routes_state),
+                Some(gateway),
+                Some(history_worker),
+                control_worker,
+                Some(health_monitor),
+                control.clone(),
+                gateway_state.clone(),
+                self.force_expired_failure_cleanup,
             ));
         }
         Ok(NodeRuntime::new(NodeRuntimeParts {
@@ -542,13 +1081,45 @@ impl<'a> NodeBuilder<'a> {
 mod tests {
     use super::{
         identity_error_to_io, resolve_build_failure, resolve_durable_build_failure,
-        resolve_identity_failure,
+        resolve_identity_failure, BuilderFailureBoundary, NodeBuildError, NodeBuilder,
     };
     use crate::identity::{IdentityError, IdentityErrorClass};
+    use crate::NodePaths;
+    use loxa_core::engine::RuntimeBackendKind;
     use loxa_core::supervisor::ChildlessFinishOutcome;
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex};
     use tracing_subscriber::fmt::MakeWriter;
+
+    struct BuilderTestDir(std::path::PathBuf);
+
+    impl BuilderTestDir {
+        fn new(label: &str) -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "loxa-builder-fault-{label}-{}-{}-{}",
+                std::process::id(),
+                super::current_unix_ms().expect("clock"),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            ));
+            std::fs::create_dir_all(&path).expect("create builder test directory");
+            Self(path)
+        }
+
+        fn paths(&self) -> NodePaths {
+            NodePaths {
+                models_dir: self.0.join("models"),
+                state_path: self.0.join("managed.json"),
+                logs_dir: self.0.join("logs"),
+            }
+        }
+    }
+
+    impl Drop for BuilderTestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[derive(Clone, Default)]
     struct Capture(Arc<Mutex<Vec<u8>>>);
@@ -577,6 +1148,138 @@ mod tests {
     impl Capture {
         fn text(&self) -> String {
             String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    #[test]
+    fn every_constructed_owner_and_publication_boundary_uses_retaining_cleanup() {
+        const CHILD_ENV: &str = "LOXA_BUILDER_RETAINED_BOUNDARY";
+        const CHILD_ROOT_ENV: &str = "LOXA_BUILDER_RETAINED_ROOT";
+        const CHILD_PORT_ENV: &str = "LOXA_BUILDER_RETAINED_PORT";
+        const RETAINED_EXIT_CODE: i32 = 73;
+        if let Ok(label) = std::env::var(CHILD_ENV) {
+            let boundary = BuilderFailureBoundary::from_str(&label)
+                .unwrap_or_else(|| panic!("unknown injected builder boundary: {label}"));
+            let root = std::path::PathBuf::from(
+                std::env::var_os(CHILD_ROOT_ENV).expect("retained child root"),
+            );
+            let port = std::env::var(CHILD_PORT_ENV)
+                .expect("retained child port")
+                .parse::<u16>()
+                .expect("valid retained child port");
+            let paths = NodePaths {
+                models_dir: root.join("models"),
+                state_path: root.join("managed.json"),
+                logs_dir: root.join("logs"),
+            };
+            let error =
+                match NodeBuilder::new(None, Some(port), RuntimeBackendKind::LlamaCpp, &paths)
+                    .with_failure_after_for_test(boundary, true)
+                    .build()
+                {
+                    Ok(_) => panic!("injected builder boundary must fail"),
+                    Err(error) => error,
+                };
+            match error {
+                NodeBuildError::RequiresProcessExit(fatal) => {
+                    assert!(
+                        fatal
+                            .diagnostic_for_test()
+                            .contains("retained authoritative ownership"),
+                        "{}: {}",
+                        boundary.as_str(),
+                        fatal.diagnostic_for_test()
+                    );
+                    fatal.exit(RETAINED_EXIT_CODE);
+                }
+                NodeBuildError::Ordinary(error) => panic!(
+                    "{} released all real owners despite an expired cleanup deadline: {error}",
+                    boundary.as_str()
+                ),
+            }
+        }
+
+        let cases = [
+            BuilderFailureBoundary::Control,
+            BuilderFailureBoundary::History,
+            BuilderFailureBoundary::Execution,
+            BuilderFailureBoundary::Routes,
+            BuilderFailureBoundary::Gateway,
+            BuilderFailureBoundary::Health,
+            BuilderFailureBoundary::Publication,
+            BuilderFailureBoundary::OpenGate,
+        ];
+
+        for boundary in cases {
+            let temp = BuilderTestDir::new(boundary.as_str());
+            let listener =
+                std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve retained child port");
+            let port = listener.local_addr().expect("reserved address").port();
+            drop(listener);
+            let mut child = std::process::Command::new(
+                std::env::current_exe().expect("test binary"),
+            )
+                .arg("--exact")
+                .arg("bootstrap::builder::tests::every_constructed_owner_and_publication_boundary_uses_retaining_cleanup")
+                .arg("--nocapture")
+                .env(CHILD_ENV, boundary.as_str())
+                .env(CHILD_ROOT_ENV, &temp.0)
+                .env(CHILD_PORT_ENV, port.to_string())
+                .spawn()
+                .expect("run retained builder boundary child");
+            let child_pid = child.id();
+            let status = child.wait().expect("wait for retained builder child");
+            assert_eq!(
+                status.code(),
+                Some(RETAINED_EXIT_CODE),
+                "{} child {child_pid} did not take the required nonzero exit",
+                boundary.as_str(),
+            );
+            let rebound =
+                std::net::TcpListener::bind(("127.0.0.1", port)).unwrap_or_else(|error| {
+                    panic!(
+                        "{} child {child_pid} left gateway port {port} orphaned: {error}",
+                        boundary.as_str()
+                    )
+                });
+            drop(rebound);
+        }
+    }
+
+    #[test]
+    fn every_constructed_owner_and_publication_boundary_releases_on_completed_cleanup() {
+        let cases = [
+            BuilderFailureBoundary::Control,
+            BuilderFailureBoundary::History,
+            BuilderFailureBoundary::Execution,
+            BuilderFailureBoundary::Routes,
+            BuilderFailureBoundary::Gateway,
+            BuilderFailureBoundary::Health,
+            BuilderFailureBoundary::Publication,
+            BuilderFailureBoundary::OpenGate,
+        ];
+
+        for boundary in cases {
+            let temp = BuilderTestDir::new(boundary.as_str());
+            let paths = temp.paths();
+            let error = match NodeBuilder::new(None, Some(0), RuntimeBackendKind::LlamaCpp, &paths)
+                .with_failure_after_for_test(boundary, false)
+                .build()
+            {
+                Ok(_) => panic!("injected builder boundary must fail"),
+                Err(error) => error,
+            };
+            match error {
+                NodeBuildError::Ordinary(_) => {}
+                NodeBuildError::RequiresProcessExit(fatal) => {
+                    let diagnostic = fatal.diagnostic_for_test().to_owned();
+                    std::mem::forget(fatal);
+                    panic!(
+                        "{} retained ownership despite completed cleanup: {diagnostic}",
+                        boundary.as_str()
+                    );
+                }
+            }
         }
     }
 

@@ -1035,22 +1035,27 @@ async fn worker_stop_ack_and_join_share_one_absolute_deadline() {
     let (handle, worker, barrier, reaper_finished) =
         spawn_paused_with_reaper_completion_for_test(repository).unwrap();
     let started = tokio::time::Instant::now();
-    let shutdown = tokio::spawn(worker.shutdown());
+    let shutdown = tokio::spawn(worker.shutdown_until(started + Duration::from_secs(10)));
     tokio::task::yield_now().await;
     tokio::time::advance(Duration::from_secs(10)).await;
-    assert_eq!(
-        shutdown.await.unwrap().unwrap_err(),
-        ControlStateError::ShutdownDeadlineExceeded
-    );
+    let failure = shutdown.await.unwrap().unwrap_err();
+    assert_eq!(failure.error(), ControlStateError::ShutdownDeadlineExceeded);
     assert_eq!(
         tokio::time::Instant::now() - started,
         Duration::from_secs(10)
     );
     assert!(!handle.is_healthy());
     barrier.wait();
+    let retry = failure
+        .into_worker()
+        .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap_err();
+    assert_eq!(retry.error(), ControlStateError::DurableStateUnavailable);
+    retry.into_worker().join_for_test();
     reaper_finished
         .recv_timeout(Duration::from_secs(1))
-        .expect("shutdown reaper must finish before fixture cleanup");
+        .expect("explicit shutdown retry must join before fixture cleanup");
     drop(handle);
     cleanup(&path);
 }

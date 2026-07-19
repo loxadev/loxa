@@ -84,6 +84,7 @@ fn open_slice3_control_state_fixture(
 pub use bootstrap::{
     emit_final_shutdown_diagnostic, install_daemon_diagnostics, DiagnosticsBootstrap, NodePaths,
 };
+pub use runtime::{FatalShutdown, ShutdownResult};
 
 /// CI-only proof seam for the fail-closed control-state preflight on unsupported platforms.
 #[cfg(all(
@@ -1382,7 +1383,7 @@ pub fn serve_node(
     engine: RuntimeBackendKind,
     paths: &NodePaths,
     events: &mut dyn LifecycleEventSink,
-) -> io::Result<RunTermination> {
+) -> ShutdownResult {
     serve_node_with_diagnostics_health(
         requested_model,
         port,
@@ -1400,7 +1401,7 @@ pub fn serve_node_with_diagnostics_health(
     paths: &NodePaths,
     events: &mut dyn LifecycleEventSink,
     diagnostics_health: loxa_core::diagnostics::DiagnosticsHealth,
-) -> io::Result<RunTermination> {
+) -> ShutdownResult {
     tracing::info!(
         target: "loxa_node::lifecycle",
         event_code = "node.starting",
@@ -1424,7 +1425,7 @@ pub fn serve_node_with_diagnostics_health(
                 component = "node",
                 result_class = "build_failed",
             );
-            Err(error)
+            error.into_shutdown_result()
         }
     }
 }
@@ -1530,7 +1531,7 @@ fn stable_runtime_panic_cleanup_count() -> usize {
 }
 
 #[cfg(test)]
-pub(crate) fn record_stable_runtime_panic_cleanup() {
+pub(crate) fn record_stable_runtime_panic_cleanup_for_test() {
     STABLE_RUNTIME_PANIC_CLEANUPS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
@@ -2865,6 +2866,10 @@ mod lifecycle_api_tests {
                 .unwrap_or_else(|| panic!("missing {expected}: {diagnostics}"));
             previous = position + expected.len();
         }
+        assert!(
+            diagnostics.contains("result_class=\"failed\""),
+            "ordinary runtime failure must remain a failed committed observation: {diagnostics}"
+        );
         for forbidden in [
             "SECRET_MODEL_PATH",
             "--secret-command-argument",

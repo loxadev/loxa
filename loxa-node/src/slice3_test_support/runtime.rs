@@ -229,9 +229,9 @@ fn durable_writer_poison_seals_publication_withdraws_inference_and_fails_shutdow
         "durable health loss must not wait for owner teardown"
     );
     assert!(stop_was_recorded());
-    let error = runtime
-        .shutdown_for_test()
-        .expect_err("durable health loss cannot report graceful shutdown");
-    assert_eq!(error.kind(), std::io::ErrorKind::Other);
+    match runtime.shutdown_for_test() {
+        crate::ShutdownResult::RequiresProcessExit(fatal) => std::mem::forget(fatal),
+        _ => panic!("poisoned durable writer must retain fatal ownership"),
+    }
     let _ = std::fs::remove_dir_all(root);
 }

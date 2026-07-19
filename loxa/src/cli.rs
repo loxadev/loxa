@@ -997,15 +997,20 @@ fn serve_node_cli<W: Write, E: Write>(
 ) -> io::Result<ExitCode> {
     validate_cli_serve_request(requested_model, engine, paths)?;
     let mut events = CliLifecycleSink { stdout, stderr };
-    loxa_node::serve_node_with_diagnostics_health(
+    match loxa_node::serve_node_with_diagnostics_health(
         requested_model,
         port,
         engine,
         paths,
         &mut events,
         diagnostics_health.cloned().unwrap_or_default(),
-    )
-    .map(exit_code_for_termination)
+    ) {
+        loxa_node::ShutdownResult::Stopped(termination) => {
+            Ok(exit_code_for_termination(termination))
+        }
+        loxa_node::ShutdownResult::Failed(error) => Err(error),
+        loxa_node::ShutdownResult::RequiresProcessExit(fatal) => (*fatal).exit(1),
+    }
 }
 
 fn validate_cli_serve_request(
