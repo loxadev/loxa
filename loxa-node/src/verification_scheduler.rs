@@ -1689,6 +1689,10 @@ struct VerificationCounts {
 }
 
 impl VerificationSchedulerOwner {
+    pub(crate) fn request_shutdown(&self) {
+        self.shared.stop();
+    }
+
     pub(crate) fn start(
     ) -> std::io::Result<(VerificationSchedulerHandle, VerificationSchedulerOwner)> {
         Self::start_inner(

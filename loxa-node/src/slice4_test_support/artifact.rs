@@ -414,6 +414,25 @@ fn sealing_rejects_new_access_and_poison_retains_uncertain_key() {
 }
 
 #[test]
+fn shutdown_evidence_distinguishes_graceful_release_from_retained_uncertainty() {
+    let dir = TestDir::new("shutdown-evidence");
+    let coordinator = ArtifactMutationCoordinator::new();
+    let clean_key = artifact_key(dir.path(), "clean.gguf");
+    let poisoned_key = artifact_key(dir.path(), "poisoned.gguf");
+
+    let clean = coordinator.try_acquire_mutation(clean_key).unwrap();
+    assert!(coordinator.has_uncertain_ownership());
+    drop(clean);
+    assert!(!coordinator.has_uncertain_ownership());
+
+    coordinator
+        .try_acquire_mutation(poisoned_key)
+        .unwrap()
+        .poison();
+    assert!(coordinator.has_uncertain_ownership());
+}
+
+#[test]
 fn mutex_poisoned_ready_completion_is_retained_without_ack_surface() {
     let dir = TestDir::new("completion");
     std::fs::write(dir.path().join("model.gguf"), vec![0_u8; 42]).unwrap();

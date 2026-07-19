@@ -1050,6 +1050,10 @@ impl DownloadSchedulerHandle {
 }
 
 impl DownloadSchedulerOwner {
+    pub(crate) fn request_shutdown(&self) {
+        self.shared.stop();
+    }
+
     pub(crate) fn spawn(
         executor: Arc<dyn DownloadExecutor>,
     ) -> io::Result<(DownloadSchedulerHandle, Self)> {

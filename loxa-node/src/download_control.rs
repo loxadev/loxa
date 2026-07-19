@@ -250,6 +250,7 @@ struct DurableCompletionWorker {
 struct DurableLifecycleWorker {
     stopping: Arc<AtomicBool>,
     shutdown_deadline: Arc<Mutex<Option<std::time::Instant>>>,
+    controller: Option<LifecycleControllerHandle>,
     worker: JoinHandle<DurableLifecycleExit>,
 }
 
@@ -259,6 +260,7 @@ struct DurableLifecycleExit {
 }
 
 enum DownloadControlShutdownDiagnostic {
+    ArtifactMutationUncertain,
     ActorWorkerPanicked,
     ActorWorkerDeadlineExceeded,
     LegacyVerificationPanicked,
@@ -277,9 +279,74 @@ enum DownloadControlShutdownDiagnostic {
     DurableObserverDeadlineExceeded,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ExecutionShutdownDeadlines {
+    pub(crate) verification: std::time::Instant,
+    pub(crate) download: std::time::Instant,
+    pub(crate) lifecycle: std::time::Instant,
+    pub(crate) finalize: std::time::Instant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum ExecutionShutdownFailureClass {
+    ExactChild,
+    Artifact,
+    DurableRepository,
+    Lifecycle,
+    Download,
+    Verification,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExecutionShutdownDiagnostics {
+    primary: ExecutionShutdownFailureClass,
+    messages: Vec<String>,
+}
+
+impl ExecutionShutdownDiagnostics {
+    pub(crate) fn primary(&self) -> ExecutionShutdownFailureClass {
+        self.primary
+    }
+
+    pub(crate) fn messages(&self) -> &[String] {
+        &self.messages
+    }
+}
+
+pub(crate) struct RetainedExecutionShutdown {
+    _control: ManuallyDrop<DownloadControl>,
+    failure: ManuallyDrop<DownloadControlShutdownFailure>,
+}
+
+impl RetainedExecutionShutdown {
+    pub(crate) fn diagnostics(&self) -> ExecutionShutdownDiagnostics {
+        execution_shutdown_diagnostics(&self.failure.diagnostics)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dispose_for_test(self) {
+        let mut retained = ManuallyDrop::new(self);
+        unsafe {
+            let control = ManuallyDrop::take(&mut retained._control);
+            let failure = ManuallyDrop::take(&mut retained.failure);
+            drop(control);
+            failure.dispose_for_test();
+        }
+    }
+}
+
+pub(crate) enum ExecutionShutdownResult {
+    Stopped,
+    Failed(ExecutionShutdownDiagnostics),
+    Retained(Box<RetainedExecutionShutdown>),
+}
+
 impl std::fmt::Display for DownloadControlShutdownDiagnostic {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ArtifactMutationUncertain => {
+                formatter.write_str("artifact mutation ownership is uncertain")
+            }
             Self::ActorWorkerPanicked => formatter.write_str("download actor worker panicked"),
             Self::ActorWorkerDeadlineExceeded => {
                 formatter.write_str("download actor worker shutdown deadline exceeded")
@@ -334,6 +401,56 @@ impl std::fmt::Display for DownloadControlShutdownDiagnostic {
     }
 }
 
+fn execution_shutdown_class(
+    diagnostic: &DownloadControlShutdownDiagnostic,
+) -> ExecutionShutdownFailureClass {
+    match diagnostic {
+        DownloadControlShutdownDiagnostic::ArtifactMutationUncertain => {
+            ExecutionShutdownFailureClass::Artifact
+        }
+        DownloadControlShutdownDiagnostic::LifecycleControllerShutdownFailed
+        | DownloadControlShutdownDiagnostic::LifecycleCompletionDeadlineExceeded => {
+            ExecutionShutdownFailureClass::ExactChild
+        }
+        DownloadControlShutdownDiagnostic::DurableObserverSpawnFailed
+        | DownloadControlShutdownDiagnostic::DurableObserverPanicked
+        | DownloadControlShutdownDiagnostic::DurableObserverFailed(_)
+        | DownloadControlShutdownDiagnostic::DurableObserverDeadlineExceeded => {
+            ExecutionShutdownFailureClass::DurableRepository
+        }
+        DownloadControlShutdownDiagnostic::LifecycleCompletionPanicked
+        | DownloadControlShutdownDiagnostic::LifecycleCompletionFailed(_) => {
+            ExecutionShutdownFailureClass::Lifecycle
+        }
+        DownloadControlShutdownDiagnostic::ActorWorkerPanicked
+        | DownloadControlShutdownDiagnostic::ActorWorkerDeadlineExceeded
+        | DownloadControlShutdownDiagnostic::DownloadScheduler(_)
+        | DownloadControlShutdownDiagnostic::CompletionWorkerPanicked
+        | DownloadControlShutdownDiagnostic::CompletionWorkerDeadlineExceeded => {
+            ExecutionShutdownFailureClass::Download
+        }
+        DownloadControlShutdownDiagnostic::LegacyVerificationPanicked
+        | DownloadControlShutdownDiagnostic::LegacyVerificationDeadlineExceeded
+        | DownloadControlShutdownDiagnostic::VerificationScheduler(_) => {
+            ExecutionShutdownFailureClass::Verification
+        }
+    }
+}
+
+fn execution_shutdown_diagnostics(
+    diagnostics: &[DownloadControlShutdownDiagnostic],
+) -> ExecutionShutdownDiagnostics {
+    let primary = diagnostics
+        .iter()
+        .map(execution_shutdown_class)
+        .min()
+        .expect("shutdown diagnostics are non-empty");
+    ExecutionShutdownDiagnostics {
+        primary,
+        messages: diagnostics.iter().map(ToString::to_string).collect(),
+    }
+}
+
 #[derive(Default)]
 struct RetainedDownloadControlOwners {
     actor_worker: Option<JoinHandle<()>>,
@@ -348,7 +465,7 @@ struct RetainedDownloadControlOwners {
 
 pub(crate) struct DownloadControlShutdownFailure {
     diagnostics: Vec<DownloadControlShutdownDiagnostic>,
-    retained: Mutex<ManuallyDrop<RetainedDownloadControlOwners>>,
+    retained: Box<Mutex<ManuallyDrop<RetainedDownloadControlOwners>>>,
 }
 
 impl std::fmt::Debug for DownloadControlShutdownFailure {
@@ -442,6 +559,35 @@ impl V1EventReceiver {
 }
 
 impl DownloadControl {
+    #[cfg(test)]
+    pub(crate) fn poison_scheduler_completion_for_test(&self) {
+        let AdmissionAuthority::Durable(authority) = &self.authority else {
+            panic!("scheduler completion poison requires durable authority");
+        };
+        authority.poison_completion_wait_for_test();
+    }
+
+    fn artifact_ownership_uncertain(&self) -> bool {
+        match &self.authority {
+            AdmissionAuthority::Durable(durable) => durable
+                .lane_seal
+                .as_ref()
+                .is_some_and(|seal| seal.artifacts.has_uncertain_ownership()),
+            AdmissionAuthority::Legacy(_) => false,
+        }
+    }
+
+    pub(crate) fn seal_for_shutdown(&self) {
+        match &self.authority {
+            AdmissionAuthority::Durable(durable) => durable.seal_admission_for_shutdown(),
+            AdmissionAuthority::Legacy(_) => {
+                if let Some(actor) = &self.actor {
+                    actor.stop();
+                }
+            }
+        }
+    }
+
     pub(crate) fn durable_execution(&self) -> Option<DurableExecutionControl> {
         match &self.authority {
             AdmissionAuthority::Durable(durable) => Some(durable.clone()),
@@ -2301,6 +2447,11 @@ fn spawn_durable_lifecycle_worker(
     control_state: ControlStateHandle,
     lane_seal: Arc<DurableLaneSeal>,
 ) -> io::Result<DurableLifecycleWorker> {
+    let controller = lane_seal
+        .lifecycle
+        .get()
+        .expect("lifecycle controller handle installed before completion worker")
+        .clone();
     let stopping = Arc::new(AtomicBool::new(false));
     let worker_stopping = Arc::clone(&stopping);
     let shutdown_deadline = Arc::new(Mutex::new(None));
@@ -2372,6 +2523,9 @@ fn spawn_durable_lifecycle_worker(
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        if worker_stopping.load(Ordering::Acquire) {
+                            break;
+                        }
                         lane_seal.seal_all();
                         operational_error = Some(io::Error::other(
                             "lifecycle completion channel disconnected",
@@ -2393,6 +2547,7 @@ fn spawn_durable_lifecycle_worker(
     Ok(DurableLifecycleWorker {
         stopping,
         shutdown_deadline,
+        controller: Some(controller),
         worker,
     })
 }
@@ -2447,6 +2602,17 @@ impl DurableExecutionControl {
                 .try_acquire_mutation(key.artifact().clone()),
             Err(ArtifactAcquireError::Busy)
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poison_artifact_ownership_for_test(&self, model_id: &str) {
+        let key = self.catalog.download_key(model_id).unwrap();
+        self.test_artifacts
+            .as_ref()
+            .unwrap()
+            .try_acquire_mutation(key.artifact().clone())
+            .unwrap()
+            .poison();
     }
 
     #[cfg(test)]
@@ -3440,6 +3606,10 @@ impl DurableExecutionControl {
         }
     }
 
+    fn seal_admission_for_shutdown(&self) {
+        self.projection_healthy.store(false, Ordering::Release);
+    }
+
     fn poison_projection(&self) -> DownloadControlError {
         self.seal_lanes_fatal();
         DownloadControlError::Stopping
@@ -3564,6 +3734,34 @@ fn map_public_cancel_transition(error: ControlStateError) -> DownloadControlErro
 }
 
 impl DownloadControlWorker {
+    pub(crate) fn request_shutdown(&self, lifecycle_deadline: std::time::Instant) {
+        if let Some(stop) = &self.lifecycle_stop {
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        if let Some(actor) = &self.actor {
+            actor.stop();
+        }
+        if let Some(verification) = &self.verification {
+            verification.cancellation.cancel();
+        }
+        if let Some(verification) = &self.verification_lane {
+            verification.request_shutdown();
+        }
+        if let Some(downloads) = &self.download_lane {
+            downloads.request_shutdown();
+        }
+        if let Some(lifecycle) = &self.lifecycle_lane {
+            *lifecycle
+                .shutdown_deadline
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(lifecycle_deadline);
+            lifecycle.stopping.store(true, Ordering::Release);
+            if let Some(controller) = &lifecycle.controller {
+                let _ = controller.request_shutdown(lifecycle_deadline);
+            }
+        }
+    }
+
     pub fn is_finished(&self) -> bool {
         if let Some(worker) = &self.worker {
             return worker.is_finished();
@@ -3579,33 +3777,65 @@ impl DownloadControlWorker {
 
     pub fn stop_and_join(self) -> std::io::Result<()> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        self.stop_and_join_until(deadline)
+        self.stop_and_join_with_deadlines(ExecutionShutdownDeadlines {
+            verification: deadline,
+            download: deadline,
+            lifecycle: deadline,
+            finalize: deadline,
+        })
+        .map_err(io::Error::other)
     }
 
-    fn stop_and_join_until(mut self, deadline: std::time::Instant) -> std::io::Result<()> {
+    #[cfg(test)]
+    fn stop_and_join_until(self, deadline: std::time::Instant) -> std::io::Result<()> {
+        self.stop_and_join_with_deadlines(ExecutionShutdownDeadlines {
+            verification: deadline,
+            download: deadline,
+            lifecycle: deadline,
+            finalize: deadline,
+        })
+        .map_err(io::Error::other)
+    }
+
+    pub(crate) fn shutdown_staged(
+        self,
+        control: DownloadControl,
+        deadlines: ExecutionShutdownDeadlines,
+    ) -> ExecutionShutdownResult {
+        control.seal_for_shutdown();
+        let artifact_uncertain = control.artifact_ownership_uncertain();
+        match self.stop_and_join_with_deadlines(deadlines) {
+            Ok(()) if !artifact_uncertain => ExecutionShutdownResult::Stopped,
+            Ok(()) => ExecutionShutdownResult::Retained(Box::new(RetainedExecutionShutdown {
+                _control: ManuallyDrop::new(control),
+                failure: ManuallyDrop::new(DownloadControlShutdownFailure {
+                    diagnostics: vec![DownloadControlShutdownDiagnostic::ArtifactMutationUncertain],
+                    retained: Box::new(Mutex::new(ManuallyDrop::new(
+                        RetainedDownloadControlOwners::default(),
+                    ))),
+                }),
+            })),
+            Err(failure) if failure.retains_capabilities() => {
+                ExecutionShutdownResult::Retained(Box::new(RetainedExecutionShutdown {
+                    _control: ManuallyDrop::new(control),
+                    failure: ManuallyDrop::new(failure),
+                }))
+            }
+            Err(failure) => ExecutionShutdownResult::Failed(execution_shutdown_diagnostics(
+                &failure.diagnostics,
+            )),
+        }
+    }
+
+    fn stop_and_join_with_deadlines(
+        mut self,
+        deadlines: ExecutionShutdownDeadlines,
+    ) -> Result<(), DownloadControlShutdownFailure> {
         let mut diagnostics = Vec::new();
         let mut retained = RetainedDownloadControlOwners::default();
-        if let Some(stop) = &self.lifecycle_stop {
-            stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-        if let Some(actor) = &self.actor {
-            actor.stop();
-        }
-        if let Some(verification) = &self.verification {
-            verification.cancellation.cancel();
-        }
-        if let Some(worker) = self.worker.take() {
-            if wait_finished_until(&worker, deadline) {
-                if worker.join().is_err() {
-                    diagnostics.push(DownloadControlShutdownDiagnostic::ActorWorkerPanicked);
-                }
-            } else {
-                diagnostics.push(DownloadControlShutdownDiagnostic::ActorWorkerDeadlineExceeded);
-                retained.actor_worker = Some(worker);
-            }
-        }
+        self.request_shutdown(deadlines.lifecycle);
         if let Some(verification) = self.verification.take() {
-            if wait_finished_until(&verification.worker, deadline) {
+            if wait_finished_until(&verification.worker, deadlines.verification) {
                 if verification.worker.join().is_err() {
                     diagnostics.push(DownloadControlShutdownDiagnostic::LegacyVerificationPanicked);
                 }
@@ -3615,13 +3845,39 @@ impl DownloadControlWorker {
                 retained.legacy_verification = Some(verification);
             }
         }
+        if let Some(verification) = self.verification_lane.take() {
+            if let Err(failure) = verification.shutdown(deadlines.verification) {
+                diagnostics.push(DownloadControlShutdownDiagnostic::VerificationScheduler(
+                    failure.reason(),
+                ));
+                retained.verification_scheduler = Some(failure.into_owner());
+            }
+        }
+        if let Some(worker) = self.worker.take() {
+            if wait_finished_until(&worker, deadlines.download) {
+                if worker.join().is_err() {
+                    diagnostics.push(DownloadControlShutdownDiagnostic::ActorWorkerPanicked);
+                }
+            } else {
+                diagnostics.push(DownloadControlShutdownDiagnostic::ActorWorkerDeadlineExceeded);
+                retained.actor_worker = Some(worker);
+            }
+        }
+        if let Some(downloads) = self.download_lane.take() {
+            if let Err(failure) = downloads.shutdown(deadlines.download) {
+                diagnostics.push(DownloadControlShutdownDiagnostic::DownloadScheduler(
+                    failure.reason(),
+                ));
+                retained.download_scheduler = failure.into_owner();
+            }
+        }
         if let Some(lifecycle) = self.lifecycle_lane.take() {
             *lifecycle
                 .shutdown_deadline
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(deadline);
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(deadlines.lifecycle);
             lifecycle.stopping.store(true, Ordering::Release);
-            if wait_finished_until(&lifecycle.worker, deadline) {
+            if wait_finished_until(&lifecycle.worker, deadlines.lifecycle) {
                 match lifecycle.worker.join() {
                     Ok(exit) => {
                         if let Some(error) = exit.operational_error {
@@ -3647,25 +3903,9 @@ impl DownloadControlWorker {
                 retained.lifecycle_worker = Some(lifecycle);
             }
         }
-        if let Some(downloads) = self.download_lane.take() {
-            if let Err(failure) = downloads.shutdown(deadline) {
-                diagnostics.push(DownloadControlShutdownDiagnostic::DownloadScheduler(
-                    failure.reason(),
-                ));
-                retained.download_scheduler = failure.into_owner();
-            }
-        }
-        if let Some(verification) = self.verification_lane.take() {
-            if let Err(failure) = verification.shutdown(deadline) {
-                diagnostics.push(DownloadControlShutdownDiagnostic::VerificationScheduler(
-                    failure.reason(),
-                ));
-                retained.verification_scheduler = Some(failure.into_owner());
-            }
-        }
         if let Some(completion) = self.completion_lane.take() {
             completion.stopping.store(true, Ordering::Release);
-            if wait_finished_until(&completion.worker, deadline) {
+            if wait_finished_until(&completion.worker, deadlines.finalize) {
                 if completion.worker.join().is_err() {
                     diagnostics.push(DownloadControlShutdownDiagnostic::CompletionWorkerPanicked);
                 }
@@ -3678,17 +3918,21 @@ impl DownloadControlWorker {
         if let Some(control_state) = self.durable_control_state.take() {
             match thread::Builder::new()
                 .name("loxa-durable-shutdown-observer".into())
-                .spawn(move || terminalize_remaining_durable_operations(&control_state, deadline))
-            {
-                Ok(worker) if wait_finished_until(&worker, deadline) => match worker.join() {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => diagnostics.push(
-                        DownloadControlShutdownDiagnostic::DurableObserverFailed(error.to_string()),
-                    ),
-                    Err(_) => {
-                        diagnostics.push(DownloadControlShutdownDiagnostic::DurableObserverPanicked)
+                .spawn(move || {
+                    terminalize_remaining_durable_operations(&control_state, deadlines.finalize)
+                }) {
+                Ok(worker) if wait_finished_until(&worker, deadlines.finalize) => {
+                    match worker.join() {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => diagnostics.push(
+                            DownloadControlShutdownDiagnostic::DurableObserverFailed(
+                                error.to_string(),
+                            ),
+                        ),
+                        Err(_) => diagnostics
+                            .push(DownloadControlShutdownDiagnostic::DurableObserverPanicked),
                     }
-                },
+                }
                 Ok(worker) => {
                     diagnostics
                         .push(DownloadControlShutdownDiagnostic::DurableObserverDeadlineExceeded);
@@ -3702,10 +3946,10 @@ impl DownloadControlWorker {
         if diagnostics.is_empty() {
             Ok(())
         } else {
-            Err(io::Error::other(DownloadControlShutdownFailure {
+            Err(DownloadControlShutdownFailure {
                 diagnostics,
-                retained: Mutex::new(ManuallyDrop::new(retained)),
-            }))
+                retained: Box::new(Mutex::new(ManuallyDrop::new(retained))),
+            })
         }
     }
 }
@@ -4890,6 +5134,66 @@ mod tests {
         durable.release_fatal_admission_for_test();
         closed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         let _ = worker.stop_and_join();
+        fixture.shutdown().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn production_shutdown_seal_closes_every_execution_admission() {
+        let (control, worker, fixture, root) =
+            durable_lifecycle_fixture("production-shutdown-seal").await;
+        let durable = control.durable_execution_for_test();
+
+        control.seal_for_shutdown();
+
+        assert_eq!(
+            durable.start_load(REGISTRY[0].id).await,
+            Err(DownloadControlError::Stopping)
+        );
+        assert_eq!(
+            durable
+                .start_download(REGISTRY[0].id, REGISTRY[0].size_bytes)
+                .await,
+            Err(DownloadControlError::Stopping)
+        );
+        assert!(fixture
+            .handle
+            .read_snapshot()
+            .unwrap()
+            .operations
+            .is_empty());
+
+        let _ = worker.stop_and_join();
+        fixture.shutdown().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn poisoned_artifact_survives_clean_worker_joins_as_retained_shutdown() {
+        let (control, worker, fixture, root) =
+            durable_lifecycle_fixture("artifact-retained-shutdown").await;
+        control
+            .durable_execution_for_test()
+            .poison_artifact_ownership_for_test(REGISTRY[0].id);
+        let now = std::time::Instant::now();
+        let result = worker.shutdown_staged(
+            control,
+            ExecutionShutdownDeadlines {
+                verification: now + Duration::from_secs(2),
+                download: now + Duration::from_secs(2),
+                lifecycle: now + Duration::from_secs(2),
+                finalize: now + Duration::from_secs(2),
+            },
+        );
+        let retained = match result {
+            ExecutionShutdownResult::Retained(retained) => retained,
+            _ => panic!("artifact poison must retain execution ownership"),
+        };
+        assert_eq!(
+            retained.diagnostics().primary(),
+            ExecutionShutdownFailureClass::Artifact
+        );
+        retained.dispose_for_test();
         fixture.shutdown().await;
         let _ = std::fs::remove_dir_all(root);
     }
@@ -6130,6 +6434,7 @@ mod tests {
         let lifecycle_worker = DurableLifecycleWorker {
             stopping,
             shutdown_deadline,
+            controller: None,
             worker: std::thread::spawn(move || {
                 while !worker_stopping.load(Ordering::Acquire) {
                     std::thread::yield_now();

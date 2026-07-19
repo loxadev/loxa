@@ -87,6 +87,51 @@ pub struct ChatHistoryWorker {
     sender: SyncSender<Command>,
     terminal_sender: Sender<TerminalCommand>,
     join: Option<JoinHandle<Result<(), HistoryError>>>,
+    completion: mpsc::Receiver<()>,
+}
+
+struct HistoryCompletion(mpsc::SyncSender<()>);
+
+impl Drop for HistoryCompletion {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
+
+pub(crate) enum ChatHistoryShutdownResult {
+    Stopped,
+    Failed(HistoryError),
+    Retained(ChatHistoryShutdownFailure),
+}
+
+#[must_use = "history shutdown failure retains worker ownership"]
+pub(crate) struct ChatHistoryShutdownFailure {
+    _worker: std::mem::ManuallyDrop<ChatHistoryWorker>,
+}
+
+impl std::fmt::Debug for ChatHistoryShutdownFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ChatHistoryShutdownFailure")
+            .field("retains_worker", &true)
+            .finish()
+    }
+}
+
+impl std::fmt::Display for ChatHistoryShutdownFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("chat history shutdown deadline exceeded")
+    }
+}
+
+impl std::error::Error for ChatHistoryShutdownFailure {}
+
+#[cfg(test)]
+impl ChatHistoryShutdownFailure {
+    fn into_worker_for_test(self) -> ChatHistoryWorker {
+        let mut retained = std::mem::ManuallyDrop::new(self);
+        unsafe { std::mem::ManuallyDrop::take(&mut retained._worker) }
+    }
 }
 
 impl ChatHistory {
@@ -97,9 +142,11 @@ impl ChatHistory {
         // final persistence fail with `Busy`.
         let (terminal_sender, terminal_receiver) = mpsc::channel::<TerminalCommand>();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (completion_tx, completion) = mpsc::sync_channel(1);
         let join = thread::Builder::new()
             .name("loxa-chat-history".into())
             .spawn(move || {
+                let _completion = HistoryCompletion(completion_tx);
                 let mut repository = match ChatHistoryRepository::open(&path) {
                     Ok(repository) => repository,
                     Err(error) => {
@@ -213,6 +260,7 @@ impl ChatHistory {
                 sender,
                 terminal_sender,
                 join: Some(join),
+                completion,
             },
         ))
     }
@@ -344,15 +392,80 @@ impl ChatHistory {
 }
 
 impl ChatHistoryWorker {
+    #[cfg(test)]
+    pub(crate) fn poison_completion_for_test(&mut self) {
+        let (never_complete, completion) = mpsc::sync_channel(1);
+        self.completion = completion;
+        std::mem::forget(never_complete);
+    }
+
+    pub(crate) fn request_shutdown(&mut self) -> bool {
+        let requested = match self.sender.try_send(Command::Stop) {
+            Ok(()) | Err(TrySendError::Disconnected(_)) => true,
+            Err(TrySendError::Full(_)) => false,
+        };
+        if requested {
+            let (replacement, _) = mpsc::channel();
+            drop(std::mem::replace(&mut self.terminal_sender, replacement));
+        }
+        requested
+    }
+
+    pub(crate) fn shutdown_until(
+        mut self,
+        deadline: std::time::Instant,
+    ) -> ChatHistoryShutdownResult {
+        let mut stop = Command::Stop;
+        loop {
+            match self.sender.try_send(stop) {
+                Ok(()) => break,
+                Err(TrySendError::Full(returned)) => {
+                    stop = returned;
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        return ChatHistoryShutdownResult::Retained(ChatHistoryShutdownFailure {
+                            _worker: std::mem::ManuallyDrop::new(self),
+                        });
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1).min(deadline - now));
+                }
+                Err(TrySendError::Disconnected(_)) => break,
+            }
+        }
+        let (replacement, _) = mpsc::channel();
+        drop(std::mem::replace(&mut self.terminal_sender, replacement));
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if self.completion.recv_timeout(remaining).is_err() {
+            return ChatHistoryShutdownResult::Retained(ChatHistoryShutdownFailure {
+                _worker: std::mem::ManuallyDrop::new(self),
+            });
+        }
+        let join = self.join.take().expect("history worker join present");
+        match join.join() {
+            Ok(Ok(())) => ChatHistoryShutdownResult::Stopped,
+            Ok(Err(error)) => ChatHistoryShutdownResult::Failed(error),
+            Err(_) => ChatHistoryShutdownResult::Failed(HistoryError::Database),
+        }
+    }
+
     pub fn stop_and_join(mut self) -> Result<(), HistoryError> {
         let _ = self.sender.send(Command::Stop);
-        drop(self.terminal_sender);
+        let (replacement, _) = mpsc::channel();
+        drop(std::mem::replace(&mut self.terminal_sender, replacement));
         self.join
             .take()
             .ok_or(HistoryError::Database)?
             .join()
             .map_err(|_| HistoryError::Database)??;
         Ok(())
+    }
+}
+
+impl Drop for ChatHistoryWorker {
+    fn drop(&mut self) {
+        if let Some(join) = self.join.take() {
+            std::mem::forget(join);
+        }
     }
 }
 
@@ -377,6 +490,69 @@ mod tests {
             .unwrap()
             .join(format!("loxa-node-history-{}-{nonce}", std::process::id()))
             .join("chat-history.sqlite3")
+    }
+
+    #[test]
+    fn history_worker_shutdown_observes_completion_before_join() {
+        let path = temp_history_path();
+        let (_, worker) = ChatHistory::spawn(path.clone()).unwrap();
+        assert!(matches!(
+            worker.shutdown_until(std::time::Instant::now() + std::time::Duration::from_secs(1)),
+            ChatHistoryShutdownResult::Stopped
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn history_worker_deadline_retains_join_and_stop_capability() {
+        let (sender, receiver) = mpsc::sync_channel(0);
+        let (terminal_sender, _terminal_receiver) = mpsc::channel();
+        let (completion_tx, completion) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let join = std::thread::spawn(move || {
+            let _ = release_rx.recv();
+            drop(completion_tx);
+            drop(receiver);
+            Ok(())
+        });
+        let worker = ChatHistoryWorker {
+            sender,
+            terminal_sender,
+            join: Some(join),
+            completion,
+        };
+
+        let failure = match worker.shutdown_until(std::time::Instant::now()) {
+            ChatHistoryShutdownResult::Retained(failure) => failure,
+            _ => panic!("expired shutdown must retain the history worker"),
+        };
+        let mut retained = failure.into_worker_for_test();
+        assert!(retained.join.is_some());
+        release_tx.send(()).unwrap();
+        retained.join.take().unwrap().join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn history_worker_panic_is_reported_after_completion() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let (terminal_sender, _terminal_receiver) = mpsc::channel();
+        let (completion_tx, completion) = mpsc::channel();
+        let join = std::thread::spawn(move || -> Result<(), HistoryError> {
+            let _ = receiver.recv();
+            completion_tx.send(()).unwrap();
+            panic!("injected history panic")
+        });
+        let worker = ChatHistoryWorker {
+            sender,
+            terminal_sender,
+            join: Some(join),
+            completion,
+        };
+
+        assert!(matches!(
+            worker.shutdown_until(std::time::Instant::now() + std::time::Duration::from_secs(1)),
+            ChatHistoryShutdownResult::Failed(HistoryError::Database)
+        ));
     }
 
     #[tokio::test]
