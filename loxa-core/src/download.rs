@@ -28,6 +28,13 @@ const HF_HOME: &str = "HF_HOME";
 const HF_HUB_DISABLE_IMPLICIT_TOKEN: &str = "HF_HUB_DISABLE_IMPLICIT_TOKEN";
 const XDG_CACHE_HOME: &str = "XDG_CACHE_HOME";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArtifactFinalizationStage {
+    Rename,
+    FinalFileSync,
+    ParentDirectorySync,
+}
+
 #[derive(Debug)]
 pub enum DownloadError {
     Cancelled,
@@ -36,11 +43,30 @@ pub enum DownloadError {
     InvalidFilename,
     UnsafeArtifactPath,
     InvalidContentRange,
-    ChecksumMismatch { expected: String, actual: String },
-    SizeMismatch { expected: u64, actual: u64 },
-    InsufficientDiskSpace { needed: u64, available: u64 },
+    ChecksumMismatch {
+        expected: String,
+        actual: String,
+    },
+    SizeMismatch {
+        expected: u64,
+        actual: u64,
+    },
+    InsufficientDiskSpace {
+        needed: u64,
+        available: u64,
+    },
     Http(String),
     Io(std::io::Error),
+    ArtifactFinalizationUncertain {
+        stage: ArtifactFinalizationStage,
+        source: std::io::Error,
+    },
+}
+
+impl DownloadError {
+    pub fn artifact_state_uncertain(&self) -> bool {
+        matches!(self, Self::ArtifactFinalizationUncertain { .. })
+    }
 }
 
 impl fmt::Display for DownloadError {
@@ -70,6 +96,10 @@ impl fmt::Display for DownloadError {
             ),
             DownloadError::Http(message) => write!(f, "http error: {message}"),
             DownloadError::Io(error) => write!(f, "io error: {error}"),
+            DownloadError::ArtifactFinalizationUncertain { stage, source } => write!(
+                f,
+                "artifact finalization state is uncertain at {stage:?}: {source}"
+            ),
         }
     }
 }
@@ -95,7 +125,8 @@ impl DownloadObserver for NoopDownloadObserver {}
 impl Error for DownloadError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            DownloadError::Io(error) => Some(error),
+            DownloadError::Io(error)
+            | DownloadError::ArtifactFinalizationUncertain { source: error, .. } => Some(error),
             _ => None,
         }
     }
@@ -142,6 +173,181 @@ trait DownloadTransport {
     fn body(&self, url: &Url, offset: u64) -> Result<BodyResponse, DownloadError>;
 }
 
+/// Closed filesystem boundary for artifact finalization. This remains private so callers cannot
+/// weaken no-follow/link validation or substitute publication semantics.
+trait ArtifactFileOps {
+    fn sync_partial(&self, file: &File) -> std::io::Result<()>;
+    fn rename(
+        &self,
+        from: &Path,
+        to: &Path,
+        evidence: &ArtifactPromotionEvidence,
+    ) -> std::io::Result<()>;
+    fn sync_final(&self, file: &File, evidence: &ArtifactPromotionEvidence) -> std::io::Result<()>;
+    fn sync_parent(
+        &self,
+        parent: &Path,
+        evidence: &ArtifactPromotionEvidence,
+    ) -> std::io::Result<()>;
+}
+
+#[derive(Clone)]
+struct ArtifactPromotionEvidence {
+    parent: fs::Metadata,
+    source: fs::Metadata,
+    destination: Option<fs::Metadata>,
+    destination_path: PathBuf,
+}
+
+impl ArtifactPromotionEvidence {
+    fn capture(
+        source_file: &File,
+        source: &Path,
+        destination: &Path,
+    ) -> Result<Self, DownloadError> {
+        let source_opened = source_file.metadata()?;
+        let source_path =
+            regular_artifact_metadata(source)?.ok_or(DownloadError::UnsafeArtifactPath)?;
+        if !same_file_identity(&source_opened, &source_path) {
+            return Err(DownloadError::UnsafeArtifactPath);
+        }
+        let parent_path = destination
+            .parent()
+            .ok_or(DownloadError::UnsafeArtifactPath)?;
+        let parent = fs::symlink_metadata(parent_path)?;
+        let parent_opened = File::open(parent_path)?.metadata()?;
+        if !parent.file_type().is_dir() || !same_file_identity(&parent, &parent_opened) {
+            return Err(DownloadError::UnsafeArtifactPath);
+        }
+        Ok(Self {
+            parent,
+            source: source_opened,
+            destination: regular_artifact_metadata(destination)?,
+            destination_path: destination.to_path_buf(),
+        })
+    }
+
+    fn revalidate_parent(&self, parent: &Path) -> std::io::Result<()> {
+        self.open_revalidated_parent(parent).map(drop)
+    }
+
+    fn open_revalidated_parent(&self, parent: &Path) -> std::io::Result<File> {
+        let path_metadata = fs::symlink_metadata(parent)?;
+        let opened = File::open(parent)?;
+        let opened_metadata = opened.metadata()?;
+        if !path_metadata.file_type().is_dir()
+            || !same_file_identity(&self.parent, &path_metadata)
+            || !same_file_identity(&self.parent, &opened_metadata)
+        {
+            return Err(invalid_finalization_evidence());
+        }
+        Ok(opened)
+    }
+
+    fn revalidate_before_rename(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
+        self.revalidate_parent(
+            destination
+                .parent()
+                .ok_or_else(invalid_finalization_evidence)?,
+        )?;
+        let source_metadata = fs::symlink_metadata(source)?;
+        if !source_metadata.file_type().is_file()
+            || !artifact_has_single_link(&source_metadata)
+            || !same_file_identity(&self.source, &source_metadata)
+        {
+            return Err(invalid_finalization_evidence());
+        }
+        match (self.destination.as_ref(), fs::symlink_metadata(destination)) {
+            (None, Err(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            (Some(expected), Ok(current))
+                if current.file_type().is_file()
+                    && artifact_has_single_link(&current)
+                    && same_file_identity(expected, &current) =>
+            {
+                Ok(())
+            }
+            _ => Err(invalid_finalization_evidence()),
+        }
+    }
+
+    fn revalidate_after_rename(&self, destination: &Path) -> std::io::Result<()> {
+        self.revalidate_parent(
+            destination
+                .parent()
+                .ok_or_else(invalid_finalization_evidence)?,
+        )?;
+        let current = fs::symlink_metadata(destination)?;
+        if current.file_type().is_file()
+            && artifact_has_single_link(&current)
+            && same_file_identity(&self.source, &current)
+        {
+            Ok(())
+        } else {
+            Err(invalid_finalization_evidence())
+        }
+    }
+
+    fn revalidate_opened_final(&self, file: &File) -> std::io::Result<()> {
+        self.revalidate_parent(
+            self.destination_path
+                .parent()
+                .ok_or_else(invalid_finalization_evidence)?,
+        )?;
+        let current = file.metadata()?;
+        let path_metadata = fs::symlink_metadata(&self.destination_path)?;
+        if current.file_type().is_file()
+            && artifact_has_single_link(&current)
+            && same_file_identity(&self.source, &current)
+            && path_metadata.file_type().is_file()
+            && artifact_has_single_link(&path_metadata)
+            && same_file_identity(&self.source, &path_metadata)
+        {
+            Ok(())
+        } else {
+            Err(invalid_finalization_evidence())
+        }
+    }
+}
+
+fn invalid_finalization_evidence() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "artifact finalization evidence changed",
+    )
+}
+
+struct StdArtifactFileOps;
+
+impl ArtifactFileOps for StdArtifactFileOps {
+    fn sync_partial(&self, file: &File) -> std::io::Result<()> {
+        file.sync_all()
+    }
+
+    fn rename(
+        &self,
+        from: &Path,
+        to: &Path,
+        evidence: &ArtifactPromotionEvidence,
+    ) -> std::io::Result<()> {
+        evidence.revalidate_before_rename(from, to)?;
+        fs::rename(from, to)?;
+        evidence.revalidate_after_rename(to)
+    }
+
+    fn sync_final(&self, file: &File, evidence: &ArtifactPromotionEvidence) -> std::io::Result<()> {
+        evidence.revalidate_opened_final(file)?;
+        file.sync_all()
+    }
+
+    fn sync_parent(
+        &self,
+        parent: &Path,
+        evidence: &ArtifactPromotionEvidence,
+    ) -> std::io::Result<()> {
+        evidence.open_revalidated_parent(parent)?.sync_all()
+    }
+}
+
 struct ReqwestTransport {
     client: Client,
 }
@@ -153,6 +359,7 @@ struct DownloadBodyContext<'a> {
     progress: &'a ProgressBar,
     available_space_override: Option<u64>,
     observer: &'a mut dyn DownloadObserver,
+    file_ops: &'a dyn ArtifactFileOps,
 }
 
 impl DownloadTransport for ReqwestTransport {
@@ -308,6 +515,26 @@ fn download_with_transport_and_observer(
     observer: &mut dyn DownloadObserver,
     available_space_override: Option<u64>,
 ) -> Result<PathBuf, DownloadError> {
+    download_with_transport_observer_and_file_ops(
+        entry,
+        dest_dir,
+        base_url,
+        transport,
+        observer,
+        available_space_override,
+        &StdArtifactFileOps,
+    )
+}
+
+fn download_with_transport_observer_and_file_ops(
+    entry: &dyn VerifiedModel,
+    dest_dir: &Path,
+    base_url: &str,
+    transport: &impl DownloadTransport,
+    observer: &mut dyn DownloadObserver,
+    available_space_override: Option<u64>,
+    file_ops: &dyn ArtifactFileOps,
+) -> Result<PathBuf, DownloadError> {
     if observer.is_cancelled() {
         return Err(DownloadError::Cancelled);
     }
@@ -316,9 +543,14 @@ fn download_with_transport_and_observer(
     cleanup_stale_restart(&part_path(dest_dir, &filename))?;
 
     let mut warnings = StderrWarnings;
-    if let ExistingDownload::Ready(path) =
-        inspect_existing_download_with_observer(entry, dest_dir, &mut warnings, false, observer)?
-    {
+    if let ExistingDownload::Ready(path) = inspect_existing_download_with_observer_and_file_ops(
+        entry,
+        dest_dir,
+        &mut warnings,
+        false,
+        observer,
+        file_ops,
+    )? {
         return Ok(path);
     }
 
@@ -336,12 +568,13 @@ fn download_with_transport_and_observer(
 
     let final_path = dest_dir.join(&filename);
     let part_path = part_path(dest_dir, &filename);
-    let resume_from = match inspect_existing_download_with_observer(
+    let resume_from = match inspect_existing_download_with_observer_and_file_ops(
         entry,
         dest_dir,
         &mut warnings,
         true,
         observer,
+        file_ops,
     )? {
         ExistingDownload::Ready(path) => return Ok(path),
         ExistingDownload::Download { resume_from } => resume_from,
@@ -361,6 +594,7 @@ fn download_with_transport_and_observer(
             progress: &progress,
             available_space_override,
             observer,
+            file_ops,
         },
     );
 
@@ -574,12 +808,31 @@ fn inspect_existing_download_with_warnings(
     )
 }
 
+#[cfg(test)]
 fn inspect_existing_download_with_observer(
     entry: &dyn VerifiedModel,
     dest_dir: &Path,
     warnings: &mut impl WarningSink,
     announce_resume: bool,
     observer: &mut dyn DownloadObserver,
+) -> Result<ExistingDownload, DownloadError> {
+    inspect_existing_download_with_observer_and_file_ops(
+        entry,
+        dest_dir,
+        warnings,
+        announce_resume,
+        observer,
+        &StdArtifactFileOps,
+    )
+}
+
+fn inspect_existing_download_with_observer_and_file_ops(
+    entry: &dyn VerifiedModel,
+    dest_dir: &Path,
+    warnings: &mut impl WarningSink,
+    announce_resume: bool,
+    observer: &mut dyn DownloadObserver,
+    file_ops: &dyn ArtifactFileOps,
 ) -> Result<ExistingDownload, DownloadError> {
     let filename = sanitize_filename(entry.filename())?;
     fs::create_dir_all(dest_dir)?;
@@ -617,7 +870,14 @@ fn inspect_existing_download_with_observer(
         }
 
         if part_size == entry.size_bytes() {
-            verify_part_and_rename_observed(entry, &part_path, &final_path, warnings, observer)?;
+            verify_part_and_rename_observed(
+                entry,
+                &part_path,
+                &final_path,
+                warnings,
+                observer,
+                file_ops,
+            )?;
             return Ok(ExistingDownload::Ready(final_path));
         }
 
@@ -766,22 +1026,89 @@ fn download_body(
         });
     }
 
+    context.file_ops.sync_partial(&file)?;
+    if context.observer.is_cancelled() {
+        if restart_from_zero && restart_path.exists() {
+            let _ = fs::remove_file(&restart_path);
+        }
+        return Err(DownloadError::Cancelled);
+    }
+    let promotion_evidence =
+        match ArtifactPromotionEvidence::capture(&file, transfer_path, context.final_path) {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                if restart_from_zero && restart_path.exists() {
+                    let _ = fs::remove_file(&restart_path);
+                }
+                return Err(error);
+            }
+        };
+    drop(file);
+
     if let Err(error) = verify_hash_policy(context.entry, transfer_path, hasher) {
         if restart_from_zero && restart_path.exists() {
             let _ = fs::remove_file(&restart_path);
         }
         return Err(error);
     }
-    if let Err(error) = fs::rename(transfer_path, context.final_path) {
+    if let Err(error) =
+        context
+            .file_ops
+            .rename(transfer_path, context.final_path, &promotion_evidence)
+    {
         if restart_from_zero && restart_path.exists() {
             let _ = fs::remove_file(&restart_path);
         }
-        return Err(DownloadError::Io(error));
+        return Err(finalization_uncertain(
+            ArtifactFinalizationStage::Rename,
+            error,
+        ));
     }
+    let final_file = open_regular_read_no_follow(context.final_path).map_err(|error| {
+        finalization_uncertain_from_download(ArtifactFinalizationStage::Rename, error)
+    })?;
+    context
+        .file_ops
+        .sync_final(&final_file, &promotion_evidence)
+        .map_err(|error| finalization_uncertain(ArtifactFinalizationStage::FinalFileSync, error))?;
+    let parent = context.final_path.parent().ok_or_else(|| {
+        finalization_uncertain(
+            ArtifactFinalizationStage::ParentDirectorySync,
+            invalid_finalization_evidence(),
+        )
+    })?;
+    context
+        .file_ops
+        .sync_parent(parent, &promotion_evidence)
+        .map_err(|error| {
+            finalization_uncertain(ArtifactFinalizationStage::ParentDirectorySync, error)
+        })?;
     if restart_from_zero && context.part_path.exists() {
-        fs::remove_file(context.part_path)?;
+        fs::remove_file(context.part_path).map_err(|error| {
+            finalization_uncertain(ArtifactFinalizationStage::ParentDirectorySync, error)
+        })?;
     }
     Ok(context.final_path.to_path_buf())
+}
+
+fn finalization_uncertain(
+    stage: ArtifactFinalizationStage,
+    source: std::io::Error,
+) -> DownloadError {
+    DownloadError::ArtifactFinalizationUncertain { stage, source }
+}
+
+fn finalization_uncertain_from_download(
+    stage: ArtifactFinalizationStage,
+    error: DownloadError,
+) -> DownloadError {
+    match error {
+        DownloadError::Io(source) => finalization_uncertain(stage, source),
+        DownloadError::ArtifactFinalizationUncertain { source, .. } => {
+            finalization_uncertain(stage, source)
+        }
+        _ => finalization_uncertain(stage, invalid_finalization_evidence()),
+    }
 }
 
 fn send_with_hf_token(request: RequestBuilder, url: &Url) -> RequestBuilder {
@@ -890,6 +1217,7 @@ fn verify_part_and_rename_observed(
     final_path: &Path,
     warnings: &mut impl WarningSink,
     observer: &mut dyn DownloadObserver,
+    file_ops: &dyn ArtifactFileOps,
 ) -> Result<(), DownloadError> {
     let actual_size = fs::metadata(part_path)?.len();
     if actual_size != entry.size_bytes() {
@@ -901,7 +1229,14 @@ fn verify_part_and_rename_observed(
 
     if entry.sha256() == TODO_VERIFY {
         warnings.warn(&hash_unverified_warning(part_path));
-        fs::rename(part_path, final_path)?;
+        let part = open_regular_read_no_follow(part_path)?;
+        file_ops.sync_partial(&part)?;
+        if observer.is_cancelled() {
+            return Err(DownloadError::Cancelled);
+        }
+        let promotion_evidence = ArtifactPromotionEvidence::capture(&part, part_path, final_path)?;
+        drop(part);
+        finalize_part(file_ops, part_path, final_path, &promotion_evidence)?;
         return Ok(());
     }
 
@@ -916,8 +1251,40 @@ fn verify_part_and_rename_observed(
         });
     }
 
-    fs::rename(part_path, final_path)?;
-    Ok(())
+    let part = open_regular_read_no_follow(part_path)?;
+    file_ops.sync_partial(&part)?;
+    if observer.is_cancelled() {
+        return Err(DownloadError::Cancelled);
+    }
+    let promotion_evidence = ArtifactPromotionEvidence::capture(&part, part_path, final_path)?;
+    drop(part);
+    finalize_part(file_ops, part_path, final_path, &promotion_evidence)
+}
+
+fn finalize_part(
+    file_ops: &dyn ArtifactFileOps,
+    part_path: &Path,
+    final_path: &Path,
+    evidence: &ArtifactPromotionEvidence,
+) -> Result<(), DownloadError> {
+    file_ops
+        .rename(part_path, final_path, evidence)
+        .map_err(|error| finalization_uncertain(ArtifactFinalizationStage::Rename, error))?;
+    let final_file = open_regular_read_no_follow(final_path).map_err(|error| {
+        finalization_uncertain_from_download(ArtifactFinalizationStage::Rename, error)
+    })?;
+    file_ops
+        .sync_final(&final_file, evidence)
+        .map_err(|error| finalization_uncertain(ArtifactFinalizationStage::FinalFileSync, error))?;
+    let parent = final_path.parent().ok_or_else(|| {
+        finalization_uncertain(
+            ArtifactFinalizationStage::ParentDirectorySync,
+            invalid_finalization_evidence(),
+        )
+    })?;
+    file_ops.sync_parent(parent, evidence).map_err(|error| {
+        finalization_uncertain(ArtifactFinalizationStage::ParentDirectorySync, error)
+    })
 }
 
 fn verify_hash_policy(
@@ -970,11 +1337,30 @@ fn cleanup_stale_restart(part_path: &Path) -> Result<(), DownloadError> {
 
 fn regular_artifact_metadata(path: &Path) -> Result<Option<fs::Metadata>, DownloadError> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_file() => Ok(Some(metadata)),
+        Ok(metadata) if metadata.file_type().is_file() && artifact_has_single_link(&metadata) => {
+            Ok(Some(metadata))
+        }
         Ok(_) => Err(DownloadError::UnsafeArtifactPath),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
+}
+
+#[cfg(unix)]
+fn artifact_has_single_link(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.nlink() == 1
+}
+
+#[cfg(windows)]
+fn artifact_has_single_link(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.number_of_links() == Some(1)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn artifact_has_single_link(_metadata: &fs::Metadata) -> bool {
+    false
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -1049,7 +1435,7 @@ fn open_regular_no_follow(
     apply_no_follow(&mut options);
     let file = options.open(path)?;
     let opened = file.metadata()?;
-    if !opened.file_type().is_file() {
+    if !opened.file_type().is_file() || !artifact_has_single_link(&opened) {
         return Err(DownloadError::UnsafeArtifactPath);
     }
     if let Some(before) = before {
@@ -1066,9 +1452,27 @@ fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     left.dev() == right.dev() && left.ino() == right.ino()
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    left.len() == right.len() && left.modified().ok() == right.modified().ok()
+    use std::os::windows::fs::MetadataExt;
+    match (
+        left.volume_serial_number(),
+        left.file_index(),
+        right.volume_serial_number(),
+        right.file_index(),
+    ) {
+        (Some(left_volume), Some(left_index), Some(right_volume), Some(right_index))
+            if left_volume != 0 && left_index != 0 =>
+        {
+            left_volume == right_volume && left_index == right_index
+        }
+        _ => false,
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_file_identity(_: &fs::Metadata, _: &fs::Metadata) -> bool {
+    false
 }
 
 fn hash_unverified_warning(path: &Path) -> String {
@@ -1106,7 +1510,7 @@ mod tests {
     use std::env;
     use std::ffi::OsString;
     use std::fs;
-    use std::io::Cursor;
+    use std::io::{self, Cursor};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tempfile::tempdir;
@@ -1441,6 +1845,44 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn mutating_downloader_rejects_final_and_partial_hardlink_ambiguity() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let target = outside.path().join("target");
+        fs::write(&target, b"model").unwrap();
+        let model = entry(
+            "model.gguf",
+            Box::leak(sha256_hex(b"model").into_boxed_str()),
+            5,
+        );
+
+        fs::hard_link(&target, dir.path().join("model.gguf")).unwrap();
+        assert!(matches!(
+            download_with_transport(
+                &model,
+                dir.path(),
+                HF_BASE_URL,
+                &FakeTransport::new(5, vec![])
+            ),
+            Err(DownloadError::UnsafeArtifactPath)
+        ));
+        fs::remove_file(dir.path().join("model.gguf")).unwrap();
+
+        fs::hard_link(&target, dir.path().join("model.gguf.part")).unwrap();
+        assert!(matches!(
+            download_with_transport(
+                &model,
+                dir.path(),
+                HF_BASE_URL,
+                &FakeTransport::new(5, vec![])
+            ),
+            Err(DownloadError::UnsafeArtifactPath)
+        ));
+        assert_eq!(fs::read(target).unwrap(), b"model");
+    }
+
     #[test]
     fn honored_range_removes_stale_restart_before_resuming() {
         let dir = tempdir().unwrap();
@@ -1670,7 +2112,8 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(matches!(error, DownloadError::Io(_)));
+        assert!(matches!(error, DownloadError::UnsafeArtifactPath));
+        assert!(!error.artifact_state_uncertain());
         assert_eq!(fs::read(&part).unwrap(), original);
         assert!(!restart_path(&part).exists());
     }
@@ -2298,5 +2741,387 @@ mod tests {
             fs::metadata(final_path).unwrap().modified().unwrap(),
             original_modified
         );
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum InjectedArtifactFault {
+        PartialSync,
+        Rename,
+        FinalSync,
+        ParentSync,
+    }
+
+    struct FaultArtifactFileOps(InjectedArtifactFault);
+
+    impl ArtifactFileOps for FaultArtifactFileOps {
+        fn sync_partial(&self, file: &File) -> io::Result<()> {
+            if self.0 == InjectedArtifactFault::PartialSync {
+                Err(io::Error::other("injected partial sync failure"))
+            } else {
+                file.sync_all()
+            }
+        }
+
+        fn rename(&self, from: &Path, to: &Path, _: &ArtifactPromotionEvidence) -> io::Result<()> {
+            if self.0 == InjectedArtifactFault::Rename {
+                fs::rename(from, to)?;
+                Err(io::Error::other(
+                    "injected rename failure after destination mutation",
+                ))
+            } else {
+                fs::rename(from, to)
+            }
+        }
+
+        fn sync_final(&self, file: &File, _: &ArtifactPromotionEvidence) -> io::Result<()> {
+            if self.0 == InjectedArtifactFault::FinalSync {
+                Err(io::Error::other("injected final sync failure"))
+            } else {
+                file.sync_all()
+            }
+        }
+
+        fn sync_parent(&self, parent: &Path, _: &ArtifactPromotionEvidence) -> io::Result<()> {
+            if self.0 == InjectedArtifactFault::ParentSync {
+                Err(io::Error::other("injected parent sync failure"))
+            } else {
+                File::open(parent)?.sync_all()
+            }
+        }
+    }
+
+    #[test]
+    fn every_finalize_fault_returns_failure_before_verified_publication() {
+        for fault in [
+            InjectedArtifactFault::PartialSync,
+            InjectedArtifactFault::Rename,
+            InjectedArtifactFault::FinalSync,
+            InjectedArtifactFault::ParentSync,
+        ] {
+            let dir = tempdir().unwrap();
+            let bytes = b"durable artifact".to_vec();
+            let model = entry(
+                "model.gguf",
+                Box::leak(sha256_hex(&bytes).into_boxed_str()),
+                bytes.len() as u64,
+            );
+            let transport = FakeTransport::new(
+                bytes.len() as u64,
+                vec![FakeBody {
+                    status: StatusCode::OK,
+                    content_range: None,
+                    body: bytes,
+                }],
+            );
+            let mut observer = RecordingObserver::default();
+
+            let result = download_with_transport_observer_and_file_ops(
+                &model,
+                dir.path(),
+                HF_BASE_URL,
+                &transport,
+                &mut observer,
+                Some(u64::MAX),
+                &FaultArtifactFileOps(fault),
+            );
+
+            match (fault, result.unwrap_err()) {
+                (InjectedArtifactFault::PartialSync, DownloadError::Io(_)) => {}
+                (
+                    InjectedArtifactFault::Rename,
+                    DownloadError::ArtifactFinalizationUncertain {
+                        stage: ArtifactFinalizationStage::Rename,
+                        ..
+                    },
+                ) => {}
+                (
+                    InjectedArtifactFault::FinalSync,
+                    DownloadError::ArtifactFinalizationUncertain {
+                        stage: ArtifactFinalizationStage::FinalFileSync,
+                        ..
+                    },
+                ) => {}
+                (
+                    InjectedArtifactFault::ParentSync,
+                    DownloadError::ArtifactFinalizationUncertain {
+                        stage: ArtifactFinalizationStage::ParentDirectorySync,
+                        ..
+                    },
+                ) => {}
+                (fault, error) => panic!("unexpected classification for {fault:?}: {error:?}"),
+            }
+        }
+    }
+
+    struct PostRenameHardlinkOps {
+        alias: PathBuf,
+    }
+
+    impl ArtifactFileOps for PostRenameHardlinkOps {
+        fn sync_partial(&self, file: &File) -> io::Result<()> {
+            file.sync_all()
+        }
+
+        fn rename(
+            &self,
+            from: &Path,
+            to: &Path,
+            evidence: &ArtifactPromotionEvidence,
+        ) -> io::Result<()> {
+            StdArtifactFileOps.rename(from, to, evidence)?;
+            fs::hard_link(to, &self.alias)
+        }
+
+        fn sync_final(&self, file: &File, evidence: &ArtifactPromotionEvidence) -> io::Result<()> {
+            StdArtifactFileOps.sync_final(file, evidence)
+        }
+
+        fn sync_parent(
+            &self,
+            parent: &Path,
+            evidence: &ArtifactPromotionEvidence,
+        ) -> io::Result<()> {
+            StdArtifactFileOps.sync_parent(parent, evidence)
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn post_rename_hardlink_is_reported_as_uncertain_publication() {
+        let dir = tempdir().unwrap();
+        let bytes = b"hardlink after rename".to_vec();
+        let model = entry(
+            "model.gguf",
+            Box::leak(sha256_hex(&bytes).into_boxed_str()),
+            bytes.len() as u64,
+        );
+        let transport = FakeTransport::new(
+            bytes.len() as u64,
+            vec![FakeBody {
+                status: StatusCode::OK,
+                content_range: None,
+                body: bytes,
+            }],
+        );
+        let mut observer = RecordingObserver::default();
+
+        let error = download_with_transport_observer_and_file_ops(
+            &model,
+            dir.path(),
+            HF_BASE_URL,
+            &transport,
+            &mut observer,
+            Some(u64::MAX),
+            &PostRenameHardlinkOps {
+                alias: dir.path().join("model-alias.gguf"),
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            DownloadError::ArtifactFinalizationUncertain {
+                stage: ArtifactFinalizationStage::Rename,
+                ..
+            }
+        ));
+        assert!(error.artifact_state_uncertain());
+    }
+
+    #[test]
+    fn std_promotion_rejects_parent_swap_before_rename() {
+        let dir = tempdir().unwrap();
+        let parent = dir.path().join("models");
+        let displaced = dir.path().join("models-displaced");
+        fs::create_dir(&parent).unwrap();
+        let source = parent.join("model.gguf.part");
+        let destination = parent.join("model.gguf");
+        fs::write(&source, b"artifact").unwrap();
+        let source_file = open_regular_read_no_follow(&source).unwrap();
+        let evidence =
+            ArtifactPromotionEvidence::capture(&source_file, &source, &destination).unwrap();
+
+        fs::rename(&parent, &displaced).unwrap();
+        fs::create_dir(&parent).unwrap();
+        fs::write(&source, b"attacker replacement").unwrap();
+
+        let error = StdArtifactFileOps
+            .rename(&source, &destination, &evidence)
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!destination.exists());
+        assert_eq!(
+            fs::read(displaced.join("model.gguf.part")).unwrap(),
+            b"artifact"
+        );
+    }
+
+    struct PermissionDeniedArtifactFileOps;
+
+    impl ArtifactFileOps for PermissionDeniedArtifactFileOps {
+        fn sync_partial(&self, _: &File) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected permission denial",
+            ))
+        }
+
+        fn rename(&self, from: &Path, to: &Path, _: &ArtifactPromotionEvidence) -> io::Result<()> {
+            fs::rename(from, to)
+        }
+
+        fn sync_final(&self, file: &File, _: &ArtifactPromotionEvidence) -> io::Result<()> {
+            file.sync_all()
+        }
+
+        fn sync_parent(&self, parent: &Path, _: &ArtifactPromotionEvidence) -> io::Result<()> {
+            File::open(parent)?.sync_all()
+        }
+    }
+
+    #[test]
+    fn finalize_permission_denial_fails_closed_and_retains_partial() {
+        let dir = tempdir().unwrap();
+        let bytes = b"permission artifact".to_vec();
+        let model = entry(
+            "model.gguf",
+            Box::leak(sha256_hex(&bytes).into_boxed_str()),
+            bytes.len() as u64,
+        );
+        let transport = FakeTransport::new(
+            bytes.len() as u64,
+            vec![FakeBody {
+                status: StatusCode::OK,
+                content_range: None,
+                body: bytes.clone(),
+            }],
+        );
+        let mut observer = RecordingObserver::default();
+
+        let error = download_with_transport_observer_and_file_ops(
+            &model,
+            dir.path(),
+            HF_BASE_URL,
+            &transport,
+            &mut observer,
+            Some(u64::MAX),
+            &PermissionDeniedArtifactFileOps,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            DownloadError::Io(ref error) if error.kind() == io::ErrorKind::PermissionDenied
+        ));
+        assert_eq!(fs::read(dir.path().join("model.gguf.part")).unwrap(), bytes);
+        assert!(!dir.path().join("model.gguf").exists());
+    }
+
+    #[derive(Clone, Copy)]
+    enum CancelFinalizeBoundary {
+        PartialSync,
+        Rename,
+        FinalSync,
+        ParentSync,
+    }
+
+    struct BoundaryCancellationOps {
+        boundary: CancelFinalizeBoundary,
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl BoundaryCancellationOps {
+        fn cancel(&self, boundary: CancelFinalizeBoundary) {
+            if std::mem::discriminant(&self.boundary) == std::mem::discriminant(&boundary) {
+                self.cancelled
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+    }
+
+    impl ArtifactFileOps for BoundaryCancellationOps {
+        fn sync_partial(&self, file: &File) -> io::Result<()> {
+            file.sync_all()?;
+            self.cancel(CancelFinalizeBoundary::PartialSync);
+            Ok(())
+        }
+
+        fn rename(&self, from: &Path, to: &Path, _: &ArtifactPromotionEvidence) -> io::Result<()> {
+            fs::rename(from, to)?;
+            self.cancel(CancelFinalizeBoundary::Rename);
+            Ok(())
+        }
+
+        fn sync_final(&self, file: &File, _: &ArtifactPromotionEvidence) -> io::Result<()> {
+            file.sync_all()?;
+            self.cancel(CancelFinalizeBoundary::FinalSync);
+            Ok(())
+        }
+
+        fn sync_parent(&self, parent: &Path, _: &ArtifactPromotionEvidence) -> io::Result<()> {
+            File::open(parent)?.sync_all()?;
+            self.cancel(CancelFinalizeBoundary::ParentSync);
+            Ok(())
+        }
+    }
+
+    struct SharedCancellationObserver(Arc<std::sync::atomic::AtomicBool>);
+
+    impl DownloadObserver for SharedCancellationObserver {
+        fn is_cancelled(&self) -> bool {
+            self.0.load(std::sync::atomic::Ordering::Acquire)
+        }
+
+        fn progress(&mut self, _: DownloadProgress) {}
+    }
+
+    #[test]
+    fn cancellation_wins_before_rename_and_loses_after_promotion_at_every_finalize_boundary() {
+        for boundary in [
+            CancelFinalizeBoundary::PartialSync,
+            CancelFinalizeBoundary::Rename,
+            CancelFinalizeBoundary::FinalSync,
+            CancelFinalizeBoundary::ParentSync,
+        ] {
+            let dir = tempdir().unwrap();
+            let bytes = b"cancellation boundary".to_vec();
+            let model = entry(
+                "model.gguf",
+                Box::leak(sha256_hex(&bytes).into_boxed_str()),
+                bytes.len() as u64,
+            );
+            let transport = FakeTransport::new(
+                bytes.len() as u64,
+                vec![FakeBody {
+                    status: StatusCode::OK,
+                    content_range: None,
+                    body: bytes.clone(),
+                }],
+            );
+            let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut observer = SharedCancellationObserver(Arc::clone(&cancelled));
+            let result = download_with_transport_observer_and_file_ops(
+                &model,
+                dir.path(),
+                HF_BASE_URL,
+                &transport,
+                &mut observer,
+                Some(u64::MAX),
+                &BoundaryCancellationOps {
+                    boundary,
+                    cancelled,
+                },
+            );
+
+            if matches!(boundary, CancelFinalizeBoundary::PartialSync) {
+                assert!(matches!(result, Err(DownloadError::Cancelled)));
+                assert!(dir.path().join("model.gguf.part").is_file());
+                assert!(!dir.path().join("model.gguf").exists());
+            } else {
+                assert_eq!(fs::read(result.unwrap()).unwrap(), bytes);
+                assert!(!dir.path().join("model.gguf.part").exists());
+            }
+        }
     }
 }

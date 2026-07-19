@@ -446,6 +446,65 @@ impl VerificationCache {
         artifact_state(recipe, models_dir, self)
     }
 
+    /// Revalidates scheduler-produced evidence against the exact current
+    /// no-follow file identity without hashing the artifact again.
+    pub fn revalidate_verified_recipe(
+        &self,
+        models_dir: &Path,
+        recipe: &ModelEntry,
+        stable: &StableVerificationIdentity,
+        evidence: &VerifiedArtifact,
+    ) -> io::Result<()> {
+        validate_scheduler_evidence(recipe, stable, evidence)?;
+        let path = checked_regular_path(models_dir, recipe.filename)?;
+        let opened = open_regular_no_follow(&path)?;
+        let current = StableVerificationIdentity::from(&opened.metadata()?);
+        if &current != stable {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "verified artifact identity changed before publication",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Publishes already-hashed scheduler evidence after the owning durable
+    /// success commit. The current path identity is checked again immediately
+    /// before insertion.
+    pub fn publish_verified_recipe(
+        &self,
+        models_dir: &Path,
+        recipe: &ModelEntry,
+        stable: &StableVerificationIdentity,
+        evidence: &VerifiedArtifact,
+    ) -> io::Result<()> {
+        self.revalidate_verified_recipe(models_dir, recipe, stable, evidence)?;
+        let path = checked_regular_path(models_dir, recipe.filename)?;
+        let opened = open_regular_no_follow(&path)?;
+        let current = StableVerificationIdentity::from(&opened.metadata()?);
+        if &current != stable {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "verified artifact identity changed before cache insertion",
+            ));
+        }
+        drop(opened);
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("verification cache lock poisoned"))?;
+        insert_cached(
+            &mut state,
+            self.capacity,
+            path,
+            CachedVerification {
+                metadata: stable.clone(),
+                evidence: evidence.clone(),
+            },
+        );
+        Ok(())
+    }
+
     /// Invalidates cached evidence after a failed or destructive artifact
     /// mutation. A later inventory snapshot stays fail-closed until a worker
     /// verifies the current on-disk bytes again.
@@ -493,13 +552,35 @@ impl VerificationCache {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.order.retain(|known| known != &path);
-        state.order.push_back(path.clone());
-        state.entries.insert(path, item);
-        while state.entries.len() > self.capacity {
-            if let Some(oldest) = state.order.pop_front() {
-                state.entries.remove(&oldest);
-            }
+        insert_cached(&mut state, self.capacity, path, item);
+    }
+}
+
+fn validate_scheduler_evidence(
+    recipe: &ModelEntry,
+    stable: &StableVerificationIdentity,
+    evidence: &VerifiedArtifact,
+) -> io::Result<()> {
+    if !evidence.matches
+        || evidence.size_bytes != recipe.size_bytes
+        || stable.len != recipe.size_bytes
+        || evidence.expected_sha256 != recipe.sha256
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "scheduler verification evidence does not match the recipe",
+        ));
+    }
+    Ok(())
+}
+
+fn insert_cached(state: &mut CacheState, capacity: usize, path: PathBuf, item: CachedVerification) {
+    state.order.retain(|known| known != &path);
+    state.order.push_back(path.clone());
+    state.entries.insert(path, item);
+    while state.entries.len() > capacity {
+        if let Some(oldest) = state.order.pop_front() {
+            state.entries.remove(&oldest);
         }
     }
 }
@@ -660,7 +741,9 @@ fn artifact_state(
 
 fn regular_metadata(path: &Path) -> io::Result<Option<Metadata>> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_file() => Ok(Some(metadata)),
+        Ok(metadata) if metadata.file_type().is_file() && artifact_has_single_link(&metadata) => {
+            Ok(Some(metadata))
+        }
         Ok(_) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "artifact is not a regular file",
@@ -668,6 +751,23 @@ fn regular_metadata(path: &Path) -> io::Result<Option<Metadata>> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+#[cfg(unix)]
+fn artifact_has_single_link(metadata: &Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.nlink() == 1
+}
+
+#[cfg(windows)]
+fn artifact_has_single_link(metadata: &Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.number_of_links() == Some(1)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn artifact_has_single_link(_: &Metadata) -> bool {
+    false
 }
 
 fn checked_regular_path(models_dir: &Path, filename: &str) -> io::Result<PathBuf> {
@@ -787,7 +887,8 @@ fn open_regular_no_follow(path: &Path) -> io::Result<File> {
         .read(true)
         .custom_flags(NO_FOLLOW_FLAG)
         .open(path)?;
-    if !file.metadata()?.file_type().is_file() {
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() || !artifact_has_single_link(&metadata) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "artifact is not a regular file",
@@ -804,7 +905,8 @@ fn open_regular_no_follow(path: &Path) -> io::Result<File> {
         .read(true)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
-    if !file.metadata()?.file_type().is_file() {
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() || !artifact_has_single_link(&metadata) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "artifact is not a regular file",
@@ -830,7 +932,11 @@ fn open_regular_no_follow(path: &Path) -> io::Result<File> {
         ));
     }
     let file = File::open(path)?;
-    if StableMetadata::from(&file.metadata()?) != StableMetadata::from(&before) {
+    let opened = file.metadata()?;
+    if !artifact_has_single_link(&before)
+        || !artifact_has_single_link(&opened)
+        || StableMetadata::from(&opened) != StableMetadata::from(&before)
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "artifact changed while opening",
@@ -862,6 +968,15 @@ mod tests {
             quant: "Q4",
             min_free_mem_gb: 0.1,
         }
+    }
+
+    fn fixture_digest(recipe: &ModelEntry) -> [u8; 32] {
+        let mut digest = [0_u8; 32];
+        for (index, pair) in recipe.sha256.as_bytes().chunks_exact(2).enumerate() {
+            let pair = std::str::from_utf8(pair).unwrap();
+            digest[index] = u8::from_str_radix(pair, 16).unwrap();
+        }
+        digest
     }
 
     #[test]
@@ -1284,6 +1399,120 @@ mod tests {
                 .cached_with_positive_policy(&path, &metadata, recipe.sha256, true)
                 .unwrap()
                 .matches
+        );
+    }
+
+    #[test]
+    fn scheduler_evidence_publishes_without_a_second_hash_run() {
+        let dir = tempdir().unwrap();
+        let recipe = fixture(b"good");
+        let path = dir.path().join(recipe.filename);
+        fs::write(&path, b"good").unwrap();
+        let input = StableVerificationInput::open(&path, fixture_digest(&recipe)).unwrap();
+        let stable = input.stable.clone();
+        let evidence = verify_opened_artifact(input, &NeverCancel).unwrap();
+        let cache = VerificationCache::default();
+
+        cache
+            .publish_verified_recipe(dir.path(), &recipe, &stable, &evidence)
+            .unwrap();
+
+        assert_eq!(cache.verification_runs(), 0);
+        assert_eq!(
+            cache.artifact_state(dir.path(), &recipe),
+            ArtifactState::Downloaded
+        );
+    }
+
+    #[test]
+    fn scheduler_evidence_rejects_replaced_path_identity() {
+        let dir = tempdir().unwrap();
+        let recipe = fixture(b"good");
+        let path = dir.path().join(recipe.filename);
+        fs::write(&path, b"good").unwrap();
+        let input = StableVerificationInput::open(&path, fixture_digest(&recipe)).unwrap();
+        let stable = input.stable.clone();
+        let evidence = verify_opened_artifact(input, &NeverCancel).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, b"good").unwrap();
+        let cache = VerificationCache::default();
+
+        let error = cache
+            .publish_verified_recipe(dir.path(), &recipe, &stable, &evidence)
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            cache.artifact_state(dir.path(), &recipe),
+            ArtifactState::Invalid {
+                reason: ArtifactInvalidReason::VerificationRequired
+            }
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn stable_verification_input_rejects_hardlinked_artifact() {
+        let dir = tempdir().unwrap();
+        let recipe = fixture(b"good");
+        let path = dir.path().join(recipe.filename);
+        let alias = dir.path().join("artifact-alias.gguf");
+        fs::write(&path, b"good").unwrap();
+        fs::hard_link(&path, alias).unwrap();
+
+        let error = match StableVerificationInput::open(&path, fixture_digest(&recipe)) {
+            Ok(_) => panic!("hardlinked artifact must be rejected"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn scheduler_evidence_revalidation_rejects_post_verify_hardlink() {
+        let dir = tempdir().unwrap();
+        let recipe = fixture(b"good");
+        let path = dir.path().join(recipe.filename);
+        let alias = dir.path().join("artifact-alias.gguf");
+        fs::write(&path, b"good").unwrap();
+        let input = StableVerificationInput::open(&path, fixture_digest(&recipe)).unwrap();
+        let stable = input.stable.clone();
+        let evidence = verify_opened_artifact(input, &NeverCancel).unwrap();
+        fs::hard_link(&path, alias).unwrap();
+        let cache = VerificationCache::default();
+
+        let error = cache
+            .revalidate_verified_recipe(dir.path(), &recipe, &stable, &evidence)
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn scheduler_evidence_publication_rejects_post_verify_hardlink() {
+        let dir = tempdir().unwrap();
+        let recipe = fixture(b"good");
+        let path = dir.path().join(recipe.filename);
+        let alias = dir.path().join("artifact-alias.gguf");
+        fs::write(&path, b"good").unwrap();
+        let input = StableVerificationInput::open(&path, fixture_digest(&recipe)).unwrap();
+        let stable = input.stable.clone();
+        let evidence = verify_opened_artifact(input, &NeverCancel).unwrap();
+        fs::hard_link(&path, alias).unwrap();
+        let cache = VerificationCache::default();
+
+        let error = cache
+            .publish_verified_recipe(dir.path(), &recipe, &stable, &evidence)
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            cache.artifact_state(dir.path(), &recipe),
+            ArtifactState::Invalid {
+                reason: ArtifactInvalidReason::Unreadable
+            }
         );
     }
 }
