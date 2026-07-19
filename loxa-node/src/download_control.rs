@@ -892,6 +892,7 @@ impl DownloadControl {
             verification_cache,
             recipes,
             restart_verifier,
+            Box::new(VerifiedDownloader),
             None,
         )
     }
@@ -918,8 +919,50 @@ impl DownloadControl {
             verification_cache,
             REGISTRY,
             restart_verifier,
+            Box::new(VerifiedDownloader),
             Some(control_state),
         )
+    }
+
+    #[cfg(test)]
+    fn spawn_blocking_with_lifecycle_and_control_state_for_test<D, G>(
+        models_dir: PathBuf,
+        lifecycle: ModelLifecycle<D, G>,
+        recipes: &'static [ModelEntry],
+        bytes: &'static [u8],
+        control_state: ControlStateHandle,
+    ) -> (
+        Self,
+        DownloadControlWorker,
+        std::sync::mpsc::Receiver<String>,
+        std::sync::mpsc::Sender<()>,
+    )
+    where
+        D: EngineLifecycleDriver + Send + 'static,
+        D::Session: Send + 'static,
+        G: GatewayPublisher + Send + 'static,
+    {
+        let verification_cache = Arc::new(VerificationCache::default());
+        let restart_verifier: Box<dyn RestartArtifactVerifier> =
+            Box::new(CacheRestartArtifactVerifier {
+                cache: Arc::clone(&verification_cache),
+            });
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (control, worker) = Self::spawn_with_lifecycle_components_verifier_and_control_state(
+            models_dir,
+            lifecycle,
+            verification_cache,
+            recipes,
+            restart_verifier,
+            Box::new(BlockingFixtureDownloader {
+                bytes,
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+            }),
+            Some(control_state),
+        );
+        (control, worker, entered_rx, release_tx)
     }
 
     fn spawn_with_lifecycle_components_verifier_and_control_state<D, G>(
@@ -928,6 +971,7 @@ impl DownloadControl {
         verification_cache: Arc<VerificationCache>,
         recipes: &'static [ModelEntry],
         restart_verifier: Box<dyn RestartArtifactVerifier>,
+        durable_downloader: Box<dyn ModelDownloader>,
         control_state: Option<ControlStateHandle>,
     ) -> (Self, DownloadControlWorker)
     where
@@ -1007,7 +1051,7 @@ impl DownloadControl {
                 let mut lanes = spawn_durable_download_lanes(
                     Arc::clone(&models_dir),
                     recipes,
-                    Box::new(VerifiedDownloader),
+                    durable_downloader,
                     Arc::clone(&verification_cache),
                     control_state.clone(),
                     None,
@@ -5062,6 +5106,185 @@ mod tests {
         assert!(worker.actor.is_none());
         assert!(worker.worker.is_none());
         (control, worker, fixture, root)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocked_production_download_lane_does_not_block_lifecycle_load_progress() {
+        let root = std::env::temp_dir().join(format!(
+            "loxa-production-separated-lanes-{}-{}",
+            std::process::id(),
+            OperationId::new_v4()
+        ));
+        let paths = crate::NodePaths {
+            models_dir: root.join("models"),
+            state_path: root.join("run/managed.json"),
+            logs_dir: root.join("run/logs"),
+        };
+        std::fs::create_dir_all(&paths.logs_dir).unwrap();
+        let baseline = loxa_core::supervisor::ManagedRun {
+            schema_version: loxa_core::supervisor::RUNTIME_STATE_SCHEMA_VERSION,
+            run_id: "separated-lanes".into(),
+            model_id: None,
+            owner_pid: std::process::id(),
+            owner_process_start_time_unix_s: 1,
+            stop_requested: false,
+            lifecycle: loxa_core::supervisor::RunLifecycle::Unloaded,
+            generation: 0,
+            generation_alias: "loxa-separated-lanes-g0".into(),
+            control_port: Some(19_437),
+            port: 19_437,
+            log_path: paths.logs_dir.join("owner.log"),
+            child_pid: None,
+            child_process_start_time_unix_s: None,
+            child_pgid: None,
+        };
+        loxa_core::supervisor::create_unloaded_node_owner(&paths.state_path, baseline.clone())
+            .unwrap();
+        let fixture = crate::open_slice3_control_state_fixture(
+            root.join("state/control-state.sqlite3"),
+            loxa_protocol::NodeId::new_v4(),
+            paths.clone(),
+            baseline,
+        )
+        .unwrap();
+        fixture
+            .handle
+            .publish_instance(crate::control_state::InstancePublication {
+                node_instance_id: loxa_protocol::NodeInstanceId::new_v4(),
+                control_endpoint: "http://127.0.0.1:19437".into(),
+                capabilities: loxa_protocol::v2::V2NodeCapabilities {
+                    model_download: true,
+                    slot_load: true,
+                    slot_unload: true,
+                    operation_cancel: true,
+                    operation_stream: true,
+                },
+                now_unix_ms: 11,
+            })
+            .await
+            .unwrap();
+        let recipes: &'static [ModelEntry] = Box::leak(
+            vec![
+                ModelEntry {
+                    id: "blocked-download-model",
+                    repo: "owner/repo",
+                    revision: "0123456789abcdef0123456789abcdef01234567",
+                    filename: "blocked.gguf",
+                    sha256: "770e607624d689265ca6c44884d0807d9b054d23c473c106c72be9de08b7376c",
+                    size_bytes: 4,
+                    license: "apache-2.0",
+                    params: "tiny",
+                    quant: "Q4",
+                    min_free_mem_gb: 0.0,
+                },
+                ModelEntry {
+                    id: "second-blocked-download-model",
+                    repo: "owner/repo",
+                    revision: "0123456789abcdef0123456789abcdef01234567",
+                    filename: "second-blocked.gguf",
+                    sha256: "770e607624d689265ca6c44884d0807d9b054d23c473c106c72be9de08b7376c",
+                    size_bytes: 4,
+                    license: "apache-2.0",
+                    params: "tiny",
+                    quant: "Q4",
+                    min_free_mem_gb: 0.0,
+                },
+                ModelEntry {
+                    id: "load-model",
+                    repo: "owner/repo",
+                    revision: "0123456789abcdef0123456789abcdef01234567",
+                    filename: "load.gguf",
+                    sha256: "770e607624d689265ca6c44884d0807d9b054d23c473c106c72be9de08b7376c",
+                    size_bytes: 4,
+                    license: "apache-2.0",
+                    params: "tiny",
+                    quant: "Q4",
+                    min_free_mem_gb: 0.0,
+                },
+            ]
+            .into_boxed_slice(),
+        );
+        std::fs::create_dir_all(&paths.models_dir).unwrap();
+        std::fs::write(paths.models_dir.join(recipes[2].filename), b"good").unwrap();
+        let lifecycle = ModelLifecycle::new(
+            crate::model_lifecycle::StableNodeOwner {
+                run_id: "separated-lanes".into(),
+                pid: std::process::id(),
+                process_start_time_unix_s: 1,
+                gateway_port: 19_437,
+            },
+            ReadyLifecycleDriver,
+            NoopGateway,
+        );
+        let (control, worker, download_entered, release_download) =
+            DownloadControl::spawn_blocking_with_lifecycle_and_control_state_for_test(
+                paths.models_dir.clone(),
+                lifecycle,
+                recipes,
+                b"good",
+                fixture.handle.clone(),
+            );
+        assert!(control.actor.is_none());
+        assert!(worker.actor.is_none());
+        let durable = control.durable_execution_for_test();
+
+        let first_download = durable
+            .start_download(recipes[0].id, recipes[0].size_bytes)
+            .await
+            .unwrap();
+        let second_download = durable
+            .start_download(recipes[1].id, recipes[1].size_bytes)
+            .await
+            .unwrap();
+        let mut entered = [
+            download_entered
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap(),
+            download_entered
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap(),
+        ];
+        entered.sort();
+        let mut expected = [recipes[0].id.to_owned(), recipes[1].id.to_owned()];
+        expected.sort();
+        assert_eq!(entered, expected, "both bounded download workers entered");
+        let load = durable.start_load(recipes[2].id).await.unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = fixture.handle.read_snapshot().unwrap();
+            let first_download_status = snapshot
+                .operations
+                .iter()
+                .find(|operation| operation.operation_id == first_download.operation_id)
+                .map(|operation| operation.status);
+            let second_download_status = snapshot
+                .operations
+                .iter()
+                .find(|operation| operation.operation_id == second_download.operation_id)
+                .map(|operation| operation.status);
+            let load_status = snapshot
+                .operations
+                .iter()
+                .find(|operation| operation.operation_id == load.operation_id)
+                .map(|operation| operation.status);
+            if first_download_status == Some(V2OperationStatus::Running)
+                && second_download_status == Some(V2OperationStatus::Running)
+                && load_status == Some(V2OperationStatus::Succeeded)
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "load did not finish while both workers stayed occupied: first={first_download_status:?} second={second_download_status:?} load={load_status:?}"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        release_download.send(()).unwrap();
+        release_download.send(()).unwrap();
+        worker.stop_and_join().unwrap();
+        fixture.shutdown().await;
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

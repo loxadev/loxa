@@ -9,9 +9,11 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use support::{
-    INSTANCE_ID, NODE_ID, REPLACEMENT_EPOCH, ScriptedPeer, ScriptedResponse,
-    active_load_operation_collection, bootstrap_config, node_collection, slot_collection,
-    successful_state_script, successful_state_script_with_epoch, terminal_operation_collection,
+    EPOCH, FIRST_DOWNLOAD_OPERATION_ID, INSTANCE_ID, LIFECYCLE_OPERATION_ID, NODE_ID,
+    REPLACEMENT_EPOCH, SLOT_ID, ScriptedPeer, ScriptedResponse, active_load_operation_collection,
+    bootstrap_config, concurrent_active_operation_collection, loading_slot_collection,
+    node_collection, slot_collection, successful_state_script, successful_state_script_with_epoch,
+    terminal_operation_collection,
 };
 
 fn fixture() -> PathBuf {
@@ -315,6 +317,118 @@ fn native_bootstrap_rejects_individually_valid_but_incoherent_capacity_one_state
 
     assert!(state.read_v2_state(Duration::from_secs(1)).is_err());
     peer.finish();
+}
+
+#[test]
+fn native_bootstrap_accepts_many_active_downloads_and_one_correlated_lifecycle_operation() {
+    let _guard = test_guard();
+    let peer = ScriptedPeer::spawn(vec![
+        ScriptedResponse::proof(),
+        ScriptedResponse::json("/loxa/v2/nodes", node_collection(20)),
+        ScriptedResponse::json(
+            format!("/loxa/v2/nodes/{NODE_ID}/slots"),
+            loading_slot_collection(20, LIFECYCLE_OPERATION_ID),
+        ),
+        ScriptedResponse::json(
+            "/loxa/v2/operations",
+            concurrent_active_operation_collection(21, 4, 1),
+        ),
+    ]);
+    let mut state = BootstrapState::default();
+    state
+        .attach_with_config(peer.endpoint.clone(), &bootstrap_config(&peer))
+        .unwrap();
+
+    let accepted = state.read_v2_state(Duration::from_secs(1)).unwrap();
+
+    assert_eq!(accepted.operations.operations.len(), 5);
+    assert_eq!(
+        accepted.slots.slots[0].operation_id.unwrap().to_string(),
+        LIFECYCLE_OPERATION_ID
+    );
+    peer.finish();
+}
+
+#[test]
+fn native_bootstrap_rejects_two_active_lifecycle_operations() {
+    let _guard = test_guard();
+    let peer = ScriptedPeer::spawn(vec![
+        ScriptedResponse::proof(),
+        ScriptedResponse::json("/loxa/v2/nodes", node_collection(20)),
+        ScriptedResponse::json(
+            format!("/loxa/v2/nodes/{NODE_ID}/slots"),
+            loading_slot_collection(20, LIFECYCLE_OPERATION_ID),
+        ),
+        ScriptedResponse::json(
+            "/loxa/v2/operations",
+            concurrent_active_operation_collection(20, 2, 2),
+        ),
+    ]);
+    let mut state = BootstrapState::default();
+    state
+        .attach_with_config(peer.endpoint.clone(), &bootstrap_config(&peer))
+        .unwrap();
+
+    assert!(state.read_v2_state(Duration::from_secs(1)).is_err());
+    peer.finish();
+}
+
+#[test]
+fn native_bootstrap_rejects_download_as_the_default_slot_operation() {
+    let _guard = test_guard();
+    let peer = ScriptedPeer::spawn(vec![
+        ScriptedResponse::proof(),
+        ScriptedResponse::json("/loxa/v2/nodes", node_collection(20)),
+        ScriptedResponse::json(
+            format!("/loxa/v2/nodes/{NODE_ID}/slots"),
+            loading_slot_collection(20, FIRST_DOWNLOAD_OPERATION_ID),
+        ),
+        ScriptedResponse::json(
+            "/loxa/v2/operations",
+            concurrent_active_operation_collection(21, 4, 1),
+        ),
+    ]);
+    let mut state = BootstrapState::default();
+    state
+        .attach_with_config(peer.endpoint.clone(), &bootstrap_config(&peer))
+        .unwrap();
+
+    assert!(state.read_v2_state(Duration::from_secs(1)).is_err());
+    peer.finish();
+}
+
+#[test]
+fn native_bootstrap_rejects_cross_collection_identity_position_and_shape_mismatches() {
+    let _guard = test_guard();
+    let valid = String::from_utf8(concurrent_active_operation_collection(20, 2, 1)).unwrap();
+    let wrong_node = "123e4567-e89b-42d3-a456-426614174099";
+    let wrong_slot = "123e4567-e89b-42d3-a456-426614174098";
+    let wrong_epoch = "123e4567-e89b-42d3-a456-426614174097";
+    let cases = [
+        valid.replacen(NODE_ID, wrong_node, 1),
+        valid.replacen(SLOT_ID, wrong_slot, 1),
+        valid.replacen(EPOCH, wrong_epoch, 1),
+        valid.replace("\"revision\":\"20\"", "\"revision\":\"19\""),
+        valid.replacen("\"progress\":null", "\"progress\":null,\"unknown\":true", 1),
+    ];
+    for operations in cases {
+        let peer = ScriptedPeer::spawn(vec![
+            ScriptedResponse::proof(),
+            ScriptedResponse::json("/loxa/v2/nodes", node_collection(20)),
+            ScriptedResponse::json(
+                format!("/loxa/v2/nodes/{NODE_ID}/slots"),
+                loading_slot_collection(20, LIFECYCLE_OPERATION_ID),
+            ),
+            ScriptedResponse::json("/loxa/v2/operations", operations),
+        ]);
+        let mut state = BootstrapState::default();
+        state
+            .attach_with_config(peer.endpoint.clone(), &bootstrap_config(&peer))
+            .unwrap();
+
+        assert!(state.read_v2_state(Duration::from_secs(1)).is_err());
+        peer.finish();
+    }
 }
 
 #[test]

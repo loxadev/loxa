@@ -15,6 +15,8 @@ pub const INSTANCE_ID: &str = "123e4567-e89b-42d3-a456-426614174001";
 pub const REPLACEMENT_INSTANCE_ID: &str = "123e4567-e89b-42d3-a456-426614174099";
 pub const EPOCH: &str = "123e4567-e89b-42d3-a456-426614174002";
 pub const SLOT_ID: &str = "123e4567-e89b-42d3-a456-426614174003";
+pub const LIFECYCLE_OPERATION_ID: &str = "123e4567-e89b-42d3-a456-426614174004";
+pub const FIRST_DOWNLOAD_OPERATION_ID: &str = "123e4567-e89b-42d3-a456-426614174010";
 pub const REPLACEMENT_EPOCH: &str = "123e4567-e89b-42d3-a456-426614174055";
 
 pub enum ScriptedResponse {
@@ -236,6 +238,13 @@ pub fn slot_collection(revision: u64) -> Vec<u8> {
     .into_bytes()
 }
 
+pub fn loading_slot_collection(revision: u64, operation_id: &str) -> Vec<u8> {
+    format!(
+        "{{\"schema_version\":2,\"epoch\":\"{EPOCH}\",\"revision\":\"{revision}\",\"generated_at_unix_ms\":\"1784246400600\",\"node_id\":\"{NODE_ID}\",\"slots\":[{{\"slot_id\":\"{SLOT_ID}\",\"node_id\":\"{NODE_ID}\",\"name\":\"default\",\"status\":\"loading\",\"model_id\":\"model\",\"operation_id\":\"{operation_id}\",\"error\":null}}]}}"
+    )
+    .into_bytes()
+}
+
 pub fn operation_collection(revision: u64) -> Vec<u8> {
     format!(
         "{{\"schema_version\":2,\"epoch\":\"{EPOCH}\",\"revision\":\"{revision}\",\"generated_at_unix_ms\":\"1784246400600\",\"operations\":[]}}"
@@ -246,6 +255,38 @@ pub fn operation_collection(revision: u64) -> Vec<u8> {
 pub fn active_load_operation_collection(revision: u64) -> Vec<u8> {
     format!(
         "{{\"schema_version\":2,\"epoch\":\"{EPOCH}\",\"revision\":\"{revision}\",\"generated_at_unix_ms\":\"1784246400600\",\"operations\":[{{\"operation_id\":\"123e4567-e89b-42d3-a456-426614174004\",\"node_id\":\"{NODE_ID}\",\"kind\":\"load\",\"status\":\"running\",\"slot_id\":\"{SLOT_ID}\",\"model_id\":\"model\",\"progress\":null,\"error\":null,\"created_revision\":\"{revision}\",\"updated_revision\":\"{revision}\",\"created_at_unix_ms\":\"1784246400500\",\"updated_at_unix_ms\":\"1784246400500\"}}]}}"
+    )
+    .into_bytes()
+}
+
+pub fn concurrent_active_operation_collection(
+    revision: u64,
+    download_count: usize,
+    lifecycle_count: usize,
+) -> Vec<u8> {
+    let mut rows = Vec::with_capacity(download_count + lifecycle_count);
+    for index in 0..lifecycle_count {
+        let operation_id = if index == 0 {
+            LIFECYCLE_OPERATION_ID.to_string()
+        } else {
+            format!("123e4567-e89b-42d3-a456-426614174{:03}", 5 + index)
+        };
+        let created_revision = index + 1;
+        rows.push(format!(
+            "{{\"operation_id\":\"{operation_id}\",\"node_id\":\"{NODE_ID}\",\"kind\":\"load\",\"status\":\"running\",\"slot_id\":\"{SLOT_ID}\",\"model_id\":\"model\",\"progress\":null,\"error\":null,\"created_revision\":\"{created_revision}\",\"updated_revision\":\"{revision}\",\"created_at_unix_ms\":\"{created_revision}\",\"updated_at_unix_ms\":\"1784246400500\"}}"
+        ));
+    }
+    for index in 0..download_count {
+        let suffix = 10 + index;
+        let operation_id = format!("123e4567-e89b-42d3-a456-426614174{suffix:03}");
+        let created_revision = lifecycle_count + index + 1;
+        rows.push(format!(
+            "{{\"operation_id\":\"{operation_id}\",\"node_id\":\"{NODE_ID}\",\"kind\":\"download\",\"status\":\"running\",\"slot_id\":null,\"model_id\":\"model-{index}\",\"progress\":null,\"error\":null,\"created_revision\":\"{created_revision}\",\"updated_revision\":\"{revision}\",\"created_at_unix_ms\":\"{created_revision}\",\"updated_at_unix_ms\":\"1784246400500\"}}"
+        ));
+    }
+    format!(
+        "{{\"schema_version\":2,\"epoch\":\"{EPOCH}\",\"revision\":\"{revision}\",\"generated_at_unix_ms\":\"1784246400600\",\"operations\":[{}]}}",
+        rows.join(",")
     )
     .into_bytes()
 }
