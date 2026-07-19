@@ -6076,6 +6076,22 @@ mod tests {
                 assert_returned_migration_rollback_failure_matrix();
                 println!("FAULT_MATRIX_COMPLETE:{mode}");
             }
+            "new_file_trace" => {
+                let directory = TestDirectory::new("new-file-claim-open-order");
+                assert_eq!(
+                    super::open_trace_for_test(&directory.database()).unwrap(),
+                    [
+                        super::OpenTrace::PlatformPreflight,
+                        super::OpenTrace::VfsPreflight,
+                        super::OpenTrace::NewFileCreatedWithMainGuard,
+                        super::OpenTrace::ClaimQuarantined,
+                        super::OpenTrace::MainGuardOpened,
+                        super::OpenTrace::SqliteOpened,
+                        super::OpenTrace::PostOpenValidated,
+                        super::OpenTrace::ClaimLive,
+                    ]
+                );
+            }
             "probe" => {
                 let path =
                     PathBuf::from(std::env::var_os("LOXA_REPOSITORY_PATH").expect("helper path"));
@@ -6330,19 +6346,24 @@ mod tests {
 
     #[test]
     fn new_file_trace_labels_retained_creation_guard_before_claim() {
-        let directory = TestDirectory::new("new-file-claim-open-order");
-        assert_eq!(
-            super::open_trace_for_test(&directory.database()).unwrap(),
-            [
-                super::OpenTrace::PlatformPreflight,
-                super::OpenTrace::VfsPreflight,
-                super::OpenTrace::NewFileCreatedWithMainGuard,
-                super::OpenTrace::ClaimQuarantined,
-                super::OpenTrace::MainGuardOpened,
-                super::OpenTrace::SqliteOpened,
-                super::OpenTrace::PostOpenValidated,
-                super::OpenTrace::ClaimLive,
-            ]
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "control_state::repository::tests::repository_process_helper",
+                "--nocapture",
+            ])
+            .env("LOXA_REPOSITORY_HELPER", "new_file_trace")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = wait_child_with_timeout(child, Duration::from_secs(15));
+        assert!(
+            output.status.success(),
+            "new-file trace helper failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 
