@@ -1696,11 +1696,20 @@ impl VerificationSchedulerOwner {
     pub(crate) fn start(
     ) -> std::io::Result<(VerificationSchedulerHandle, VerificationSchedulerOwner)> {
         Self::start_inner(
+            VERIFICATION_WORKERS,
             #[cfg(test)]
             None,
             #[cfg(test)]
             None,
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_with_worker_count_for_test(
+        worker_count: usize,
+    ) -> std::io::Result<(VerificationSchedulerHandle, VerificationSchedulerOwner)> {
+        assert!((1..=VERIFICATION_WORKERS).contains(&worker_count));
+        Self::start_inner(worker_count, None, None)
     }
 
     #[cfg(test)]
@@ -1713,7 +1722,8 @@ impl VerificationSchedulerOwner {
     pub(crate) fn start_with_worker_hook_for_test(
         hook: impl Fn(&VerificationKey) + Send + Sync + 'static,
     ) -> (VerificationSchedulerHandle, VerificationSchedulerOwner) {
-        Self::start_inner(Some(Arc::new(hook)), None).expect("verification test workers start")
+        Self::start_inner(VERIFICATION_WORKERS, Some(Arc::new(hook)), None)
+            .expect("verification test workers start")
     }
 
     #[cfg(test)]
@@ -1721,11 +1731,16 @@ impl VerificationSchedulerOwner {
         worker_hook: impl Fn(&VerificationKey) + Send + Sync + 'static,
         finish_hook: impl Fn(&VerificationKey) + Send + Sync + 'static,
     ) -> (VerificationSchedulerHandle, VerificationSchedulerOwner) {
-        Self::start_inner(Some(Arc::new(worker_hook)), Some(Arc::new(finish_hook)))
-            .expect("verification test workers start")
+        Self::start_inner(
+            VERIFICATION_WORKERS,
+            Some(Arc::new(worker_hook)),
+            Some(Arc::new(finish_hook)),
+        )
+        .expect("verification test workers start")
     }
 
     fn start_inner(
+        worker_count: usize,
         #[cfg(test)] worker_hook: Option<VerificationWorkerHook>,
         #[cfg(test)] finish_hook: Option<VerificationWorkerHook>,
     ) -> std::io::Result<(VerificationSchedulerHandle, VerificationSchedulerOwner)> {
@@ -1747,9 +1762,9 @@ impl VerificationSchedulerOwner {
             #[cfg(test)]
             finish_hook,
         });
-        let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(VERIFICATION_WORKERS);
-        let mut completions = Vec::with_capacity(VERIFICATION_WORKERS);
-        for worker_index in 0..VERIFICATION_WORKERS {
+        let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(worker_count);
+        let mut completions = Vec::with_capacity(worker_count);
+        for worker_index in 0..worker_count {
             let (completion_tx, completion_rx) = std::sync::mpsc::sync_channel(1);
             let worker_shared = shared.clone();
             let handle = match std::thread::Builder::new()
@@ -1891,7 +1906,7 @@ impl Drop for VerificationSchedulerOwner {
 
 #[cfg(test)]
 impl VerificationShutdownFailure {
-    fn dispose_for_test(self) {
+    pub(crate) fn dispose_for_test(self) {
         let owner = self.into_owner();
         assert!(owner.handles.is_empty(), "fatal test owner must be joined");
         let shared = owner.shared.clone();
