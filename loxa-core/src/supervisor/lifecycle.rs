@@ -334,6 +334,49 @@ pub fn finish_exact_unloaded_owner(
     Ok(outcome)
 }
 
+pub fn finish_exact_unloaded_owner_until(
+    path: &Path,
+    expected_baseline: &ManagedRun,
+    deadline: std::time::Instant,
+) -> Result<ChildlessFinishOutcome, SupervisorError> {
+    validate_unloaded_owner_baseline(expected_baseline)?;
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let _lock = state::acquire_runtime_state_lock_for_mutation(
+        path,
+        remaining,
+        state::RUNTIME_STATE_LOCK_POLL_INTERVAL.min(remaining),
+    )?;
+    let runs = state::runtime_state_runs_for_mutation(path)?;
+    let [current] = runs.as_slice() else {
+        return Err(SupervisorError::RunStateConflict(format!(
+            "unloaded managed owner {} is not the singular current owner",
+            expected_baseline.run_id
+        )));
+    };
+    if !managed_runs_match_except_monotonic_stop(current, expected_baseline) {
+        return Err(SupervisorError::RunStateConflict(format!(
+            "unloaded managed owner {} no longer matches its full baseline",
+            expected_baseline.run_id
+        )));
+    }
+    if current.child_pid.is_some()
+        || current.child_process_start_time_unix_s.is_some()
+        || current.child_pgid.is_some()
+    {
+        return Err(SupervisorError::RunStateConflict(format!(
+            "managed run {} generation {} is not childless at terminal transition",
+            expected_baseline.run_id, expected_baseline.generation
+        )));
+    }
+    let outcome = if current.stop_requested {
+        ChildlessFinishOutcome::RequestedStop
+    } else {
+        ChildlessFinishOutcome::Finished
+    };
+    state::write_runtime_state(path, &[])?;
+    Ok(outcome)
+}
+
 pub fn finish_owner_teardown_with<T>(
     path: &Path,
     expected: &ManagedRunIdentity,

@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::io;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
 
 use crate::control::auth::is_desktop_origin;
@@ -615,8 +615,76 @@ pub fn router(state: GatewayState) -> Router {
 pub struct GatewayServer {
     port: u16,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
-    thread: Option<thread::JoinHandle<io::Result<()>>>,
+    thread: Option<thread::JoinHandle<()>>,
+    completion: Arc<GatewayCompletion>,
     state: GatewayState,
+}
+
+enum GatewayWorkerCompletion {
+    Running,
+    Returned(io::Result<()>),
+    Panicked,
+    Joined,
+}
+
+struct GatewayCompletion {
+    state: Mutex<GatewayWorkerCompletion>,
+    changed: Condvar,
+}
+
+impl GatewayCompletion {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(GatewayWorkerCompletion::Running),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn run(&self, worker: impl FnOnce() -> io::Result<()>) {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(worker));
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        match outcome {
+            Ok(result) => *state = GatewayWorkerCompletion::Returned(result),
+            Err(_) => *state = GatewayWorkerCompletion::Panicked,
+        }
+        self.changed.notify_all();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatewayShutdownFailureKind {
+    DeadlineExceeded,
+    WorkerFailed,
+    WorkerPanicked,
+    CompletionPoisoned,
+}
+
+pub struct GatewayShutdownFailure {
+    kind: GatewayShutdownFailureKind,
+    server: GatewayServer,
+}
+
+impl GatewayShutdownFailure {
+    pub fn kind(&self) -> GatewayShutdownFailureKind {
+        self.kind
+    }
+
+    pub fn retry_until(self, deadline: std::time::Instant) -> Result<(), GatewayShutdownFailure> {
+        self.server.shutdown_until(deadline)
+    }
+}
+
+impl std::fmt::Debug for GatewayShutdownFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GatewayShutdownFailure")
+            .field("kind", &self.kind)
+            .field("port", &self.server.port)
+            .finish_non_exhaustive()
+    }
 }
 
 impl GatewayServer {
@@ -630,21 +698,24 @@ impl GatewayServer {
             port,
             state,
             app,
-            |listener, app, receiver, server_state| {
+            |listener, app, receiver, server_state, completion| {
                 thread::Builder::new()
                     .name("loxa-gateway".into())
                     .spawn(move || {
-                        let runtime = tokio::runtime::Runtime::new().map_err(io::Error::other)?;
-                        runtime.block_on(async move {
-                            let listener = tokio::net::TcpListener::from_std(listener)?;
-                            let _ = server_state;
-                            axum::serve(listener, app)
-                                .with_graceful_shutdown(async move {
-                                    let _ = receiver.await;
-                                })
-                                .await
-                                .map_err(io::Error::other)
-                        })
+                        completion.run(|| {
+                            let runtime =
+                                tokio::runtime::Runtime::new().map_err(io::Error::other)?;
+                            runtime.block_on(async move {
+                                let listener = tokio::net::TcpListener::from_std(listener)?;
+                                let _ = server_state;
+                                axum::serve(listener, app)
+                                    .with_graceful_shutdown(async move {
+                                        let _ = receiver.await;
+                                    })
+                                    .await
+                                    .map_err(io::Error::other)
+                            })
+                        });
                     })
             },
         )
@@ -659,21 +730,24 @@ impl GatewayServer {
             listener,
             state,
             app,
-            |listener, app, receiver, server_state| {
+            |listener, app, receiver, server_state, completion| {
                 thread::Builder::new()
                     .name("loxa-gateway".into())
                     .spawn(move || {
-                        let runtime = tokio::runtime::Runtime::new().map_err(io::Error::other)?;
-                        runtime.block_on(async move {
-                            let listener = tokio::net::TcpListener::from_std(listener)?;
-                            let _ = server_state;
-                            axum::serve(listener, app)
-                                .with_graceful_shutdown(async move {
-                                    let _ = receiver.await;
-                                })
-                                .await
-                                .map_err(io::Error::other)
-                        })
+                        completion.run(|| {
+                            let runtime =
+                                tokio::runtime::Runtime::new().map_err(io::Error::other)?;
+                            runtime.block_on(async move {
+                                let listener = tokio::net::TcpListener::from_std(listener)?;
+                                let _ = server_state;
+                                axum::serve(listener, app)
+                                    .with_graceful_shutdown(async move {
+                                        let _ = receiver.await;
+                                    })
+                                    .await
+                                    .map_err(io::Error::other)
+                            })
+                        });
                     })
             },
         )
@@ -691,7 +765,8 @@ impl GatewayServer {
             Router,
             tokio::sync::oneshot::Receiver<()>,
             GatewayState,
-        ) -> io::Result<thread::JoinHandle<io::Result<()>>>,
+            Arc<GatewayCompletion>,
+        ) -> io::Result<thread::JoinHandle<()>>,
     {
         let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))?;
         Self::start_with_router_on_and_spawner(listener, state, app, spawn)
@@ -709,7 +784,8 @@ impl GatewayServer {
             Router,
             tokio::sync::oneshot::Receiver<()>,
             GatewayState,
-        ) -> io::Result<thread::JoinHandle<io::Result<()>>>,
+            Arc<GatewayCompletion>,
+        ) -> io::Result<thread::JoinHandle<()>>,
     {
         let started = std::time::Instant::now();
         let address = listener.local_addr()?;
@@ -727,7 +803,8 @@ impl GatewayServer {
         let port = address.port();
         let (shutdown, receiver) = tokio::sync::oneshot::channel();
         let server_state = state.clone();
-        let thread = spawn(listener, app, receiver, server_state)?;
+        let completion = Arc::new(GatewayCompletion::new());
+        let thread = spawn(listener, app, receiver, server_state, completion.clone())?;
         let node_id = state.node_id.to_string();
         let node_instance_id = state.node_instance_id.to_string();
         tracing::info!(
@@ -751,6 +828,7 @@ impl GatewayServer {
             port,
             shutdown: Some(shutdown),
             thread: Some(thread),
+            completion,
             state,
         })
     }
@@ -759,7 +837,7 @@ impl GatewayServer {
         self.port
     }
 
-    pub fn shutdown(mut self) -> io::Result<()> {
+    pub fn request_shutdown(&mut self) -> std::time::Instant {
         let started = std::time::Instant::now();
         let node_id = self.state.node_id.to_string();
         let node_instance_id = self.state.node_instance_id.to_string();
@@ -775,10 +853,12 @@ impl GatewayServer {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
-        let result = match self.thread.take().expect("gateway thread present").join() {
-            Ok(result) => result,
-            Err(_) => Err(io::Error::other("gateway thread panicked")),
-        };
+        started
+    }
+
+    fn trace_shutdown_result(&self, started: std::time::Instant, result: &io::Result<()>) {
+        let node_id = self.state.node_id.to_string();
+        let node_instance_id = self.state.node_instance_id.to_string();
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         match result {
             Ok(()) => {
@@ -791,9 +871,8 @@ impl GatewayServer {
                     result_class = "stopped",
                     duration_ms,
                 );
-                Ok(())
             }
-            Err(error) => {
+            Err(_) => {
                 tracing::warn!(
                     target: "loxa_core::gateway",
                     event_code = "gateway.join_failed",
@@ -803,9 +882,151 @@ impl GatewayServer {
                     result_class = "join_failed",
                     duration_ms,
                 );
-                Err(error)
             }
         }
+    }
+
+    fn wait_until(&self, deadline: std::time::Instant) -> Result<(), GatewayShutdownFailureKind> {
+        let mut state = self
+            .completion
+            .state
+            .lock()
+            .map_err(|_| GatewayShutdownFailureKind::CompletionPoisoned)?;
+        loop {
+            match &*state {
+                GatewayWorkerCompletion::Running => {}
+                GatewayWorkerCompletion::Returned(Ok(())) => return Ok(()),
+                GatewayWorkerCompletion::Returned(Err(_)) => {
+                    return Err(GatewayShutdownFailureKind::WorkerFailed)
+                }
+                GatewayWorkerCompletion::Panicked => {
+                    return Err(GatewayShutdownFailureKind::WorkerPanicked)
+                }
+                GatewayWorkerCompletion::Joined => return Ok(()),
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err(GatewayShutdownFailureKind::DeadlineExceeded);
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let (next, timeout) = self
+                .completion
+                .changed
+                .wait_timeout(state, remaining)
+                .map_err(|_| GatewayShutdownFailureKind::CompletionPoisoned)?;
+            state = next;
+            if timeout.timed_out() && matches!(*state, GatewayWorkerCompletion::Running) {
+                return Err(GatewayShutdownFailureKind::DeadlineExceeded);
+            }
+        }
+    }
+
+    fn join_after_completion(&mut self) -> io::Result<()> {
+        let joined = self
+            .thread
+            .take()
+            .expect("gateway thread present after observed completion")
+            .join();
+        match joined {
+            Ok(()) => {
+                let mut state = self
+                    .completion
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                match std::mem::replace(&mut *state, GatewayWorkerCompletion::Joined) {
+                    GatewayWorkerCompletion::Returned(result) => result,
+                    GatewayWorkerCompletion::Panicked => {
+                        Err(io::Error::other("gateway thread panicked"))
+                    }
+                    GatewayWorkerCompletion::Running => {
+                        Err(io::Error::other("gateway completion was not observed"))
+                    }
+                    GatewayWorkerCompletion::Joined => Ok(()),
+                }
+            }
+            Err(_) => Err(io::Error::other("gateway thread panicked")),
+        }
+    }
+
+    pub fn shutdown_until(
+        mut self,
+        deadline: std::time::Instant,
+    ) -> Result<(), GatewayShutdownFailure> {
+        let started = self.request_shutdown();
+        if let Err(kind) = self.wait_until(deadline) {
+            return Err(GatewayShutdownFailure { kind, server: self });
+        }
+        let result = self.join_after_completion();
+        self.trace_shutdown_result(started, &result);
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => panic!("gateway completion claimed success before join failed: {error}"),
+        }
+    }
+
+    pub fn shutdown(mut self) -> io::Result<()> {
+        let started = self.request_shutdown();
+        let mut completion = self
+            .completion
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        while matches!(*completion, GatewayWorkerCompletion::Running) {
+            completion = self
+                .completion
+                .changed
+                .wait(completion)
+                .unwrap_or_else(|poison| poison.into_inner());
+        }
+        drop(completion);
+        let result = self.join_after_completion();
+        self.trace_shutdown_result(started, &result);
+        result
+    }
+
+    #[cfg(test)]
+    fn start_with_worker_for_test(
+        state: GatewayState,
+        worker: impl FnOnce() -> io::Result<()> + Send + 'static,
+    ) -> io::Result<Self> {
+        let completion = Arc::new(GatewayCompletion::new());
+        let worker_completion = completion.clone();
+        let thread = thread::Builder::new().spawn(move || worker_completion.run(worker))?;
+        Ok(Self {
+            port: 0,
+            shutdown: None,
+            thread: Some(thread),
+            completion,
+            state,
+        })
+    }
+
+    #[cfg(test)]
+    fn wait_for_completion_for_test(&self) {
+        let mut completion = self
+            .completion
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        while matches!(*completion, GatewayWorkerCompletion::Running) {
+            completion = self
+                .completion
+                .changed
+                .wait(completion)
+                .unwrap_or_else(|poison| poison.into_inner());
+        }
+    }
+
+    #[cfg(any(test, feature = "composition-test-support"))]
+    #[doc(hidden)]
+    pub fn poison_completion_for_test(&self) {
+        let completion = self.completion.clone();
+        let _ = thread::spawn(move || {
+            let _guard = completion.state.lock().expect("completion lock");
+            panic!("poison gateway completion for test");
+        })
+        .join();
     }
 }
 
@@ -814,15 +1035,31 @@ impl Drop for GatewayServer {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
+        let mut completion = self
+            .completion
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        while matches!(*completion, GatewayWorkerCompletion::Running) {
+            completion = self
+                .completion
+                .changed
+                .wait(completion)
+                .unwrap_or_else(|poison| poison.into_inner());
+        }
+        drop(completion);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        next_sse_boundary, normalize_sse, router, EngineTarget, GatewayServer, GatewayState,
-        GenerationError, GenerationOutput, GenerationProvenance, GenerationStreamError,
-        MAX_SSE_EVENT_BYTES,
+        next_sse_boundary, normalize_sse, router, EngineTarget, GatewayServer,
+        GatewayShutdownFailureKind, GatewayState, GenerationError, GenerationOutput,
+        GenerationProvenance, GenerationStreamError, MAX_SSE_EVENT_BYTES,
     };
     use axum::http::{header, HeaderMap, Method, StatusCode};
     use axum::{
@@ -1041,7 +1278,7 @@ mod tests {
                 0,
                 gateway_state(),
                 Router::new(),
-                |_, _, _, _| Err(io::Error::other("ARBITRARY_THREAD_SPAWN_ERROR")),
+                |_, _, _, _, _| Err(io::Error::other("ARBITRARY_THREAD_SPAWN_ERROR")),
             ) {
                 Ok(_) => panic!("thread spawn must fail"),
                 Err(error) => error,
@@ -1063,8 +1300,10 @@ mod tests {
                 0,
                 gateway_state(),
                 Router::new(),
-                |_, _, _, _| {
-                    thread::Builder::new().spawn(|| panic!("ARBITRARY_GATEWAY_THREAD_PANIC"))
+                |_, _, _, _, completion| {
+                    thread::Builder::new().spawn(move || {
+                        completion.run(|| panic!("ARBITRARY_GATEWAY_THREAD_PANIC"));
+                    })
                 },
             )
             .expect("thread ownership acquired");
@@ -1089,6 +1328,107 @@ mod tests {
             .iter()
             .all(|event| event.target == "loxa_core::gateway"));
         assert!(!format!("{output:?}").contains("ARBITRARY_GATEWAY_THREAD_PANIC"));
+    }
+
+    #[test]
+    fn deadline_shutdown_joins_only_after_worker_completion() {
+        let server = GatewayServer::start_with_worker_for_test(gateway_state(), || Ok(()))
+            .expect("start gateway worker");
+
+        server
+            .shutdown_until(std::time::Instant::now() + std::time::Duration::from_secs(2))
+            .expect("gateway stops before the absolute deadline");
+    }
+
+    #[test]
+    fn deadline_shutdown_retains_server_when_worker_does_not_complete() {
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let worker_release = release.clone();
+        let disposed = Arc::new(AtomicBool::new(false));
+        let worker_disposed = disposed.clone();
+        let server = GatewayServer::start_with_worker_for_test(gateway_state(), move || {
+            struct Disposed(Arc<AtomicBool>);
+            impl Drop for Disposed {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::Release);
+                }
+            }
+            let _disposed = Disposed(worker_disposed);
+            let (lock, changed) = &*worker_release;
+            let mut released = lock.lock().expect("release lock");
+            while !*released {
+                released = changed.wait(released).expect("release wait");
+            }
+            Ok(())
+        })
+        .expect("start controlled gateway worker");
+
+        let failure = server
+            .shutdown_until(std::time::Instant::now())
+            .expect_err("expired absolute deadline must retain ownership");
+        assert_eq!(failure.kind(), GatewayShutdownFailureKind::DeadlineExceeded);
+        assert!(!disposed.load(Ordering::Acquire));
+        assert!(format!("{failure:?}").contains("DeadlineExceeded"));
+        assert!(!disposed.load(Ordering::Acquire));
+
+        let (lock, changed) = &*release;
+        *lock.lock().expect("release lock") = true;
+        changed.notify_all();
+        failure
+            .retry_until(std::time::Instant::now() + std::time::Duration::from_secs(2))
+            .expect("retained server remains retryable");
+        assert!(disposed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn deadline_shutdown_retains_panicked_worker_until_failure_drop_disposes_it() {
+        let disposed = Arc::new(AtomicBool::new(false));
+        let worker_disposed = disposed.clone();
+        let server = GatewayServer::start_with_worker_for_test(gateway_state(), move || {
+            struct Disposed(Arc<AtomicBool>);
+            impl Drop for Disposed {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::Release);
+                }
+            }
+            let _disposed = Disposed(worker_disposed);
+            panic!("ARBITRARY_GATEWAY_DEADLINE_PANIC");
+        })
+        .expect("start panicking gateway worker");
+
+        let failure = server
+            .shutdown_until(std::time::Instant::now() + std::time::Duration::from_secs(2))
+            .expect_err("panicked worker retains shutdown capability");
+        assert_eq!(failure.kind(), GatewayShutdownFailureKind::WorkerPanicked);
+        assert!(disposed.load(Ordering::Acquire));
+        drop(failure);
+    }
+
+    #[test]
+    fn deadline_shutdown_retains_poisoned_completion_until_failure_drop_disposes_it() {
+        let server = GatewayServer::start_with_worker_for_test(gateway_state(), || Ok(()))
+            .expect("start gateway worker");
+        server.poison_completion_for_test();
+
+        let failure = server
+            .shutdown_until(std::time::Instant::now() + std::time::Duration::from_secs(2))
+            .expect_err("poisoned completion retains shutdown capability");
+        assert_eq!(
+            failure.kind(),
+            GatewayShutdownFailureKind::CompletionPoisoned
+        );
+        drop(failure);
+    }
+
+    #[test]
+    fn deadline_shutdown_accepts_a_worker_that_already_stopped() {
+        let server = GatewayServer::start_with_worker_for_test(gateway_state(), || Ok(()))
+            .expect("start gateway worker");
+        server.wait_for_completion_for_test();
+
+        server
+            .shutdown_until(std::time::Instant::now())
+            .expect("already-stopped worker joins at an expired deadline");
     }
     use std::task::{Context, Poll};
     use tokio::net::TcpListener;

@@ -387,6 +387,19 @@ pub fn abort_managed_owner_acquisition(
     claimed_run: &ManagedRun,
     source: ManagedRecoverySource,
 ) -> Result<(), SupervisorError> {
+    abort_managed_owner_acquisition_preserving_source(path, claimed_run, &source)
+}
+
+/// Attempts to abort a managed-owner acquisition while the caller retains the
+/// sealed recovery source for a later retry if cleanup cannot be confirmed.
+///
+/// This is used by bounded shutdown workers: a missed completion must retain
+/// both the worker and the only recovery capability until process exit.
+pub fn abort_managed_owner_acquisition_preserving_source(
+    path: &Path,
+    claimed_run: &ManagedRun,
+    source: &ManagedRecoverySource,
+) -> Result<(), SupervisorError> {
     if source.claimed_run != *claimed_run {
         return Err(SupervisorError::RunStateConflict(
             "managed acquisition recovery source does not match its claim".into(),
@@ -405,10 +418,10 @@ pub fn abort_managed_owner_acquisition(
             ));
         }
     }
-    match source.kind {
+    match &source.kind {
         ManagedRecoveryKind::ExactAbsent => write_runtime_state(path, &[]),
         ManagedRecoveryKind::PriorRun(prior) => {
-            write_runtime_state(path, std::slice::from_ref(&prior))
+            write_runtime_state(path, std::slice::from_ref(prior))
         }
         ManagedRecoveryKind::Unavailable => Err(SupervisorError::RecoveryRequired(
             claimed_run.run_id.clone(),

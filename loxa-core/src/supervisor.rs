@@ -24,11 +24,11 @@ mod teardown;
 
 pub use lifecycle::{
     decide_observed_child_exit, finish_childless_runtime_state_run, finish_exact_unloaded_owner,
-    finish_owner_teardown_with, prepare_unloaded_owner_for_model,
-    restore_unloaded_owner_after_prepared_run, ChildlessFinishOutcome, InterruptStatus,
-    ObservedChildExit, OwnerTeardownDecision, OwnerTerminalOutcome, PostSpawnCleanupOutcome,
-    PrepareUnloadedOwnerOutcome, PreparedOwnerCleanup, RestoreUnloadedOwnerOutcome,
-    SpawnStartingRunOutcome,
+    finish_exact_unloaded_owner_until, finish_owner_teardown_with,
+    prepare_unloaded_owner_for_model, restore_unloaded_owner_after_prepared_run,
+    ChildlessFinishOutcome, InterruptStatus, ObservedChildExit, OwnerTeardownDecision,
+    OwnerTerminalOutcome, PostSpawnCleanupOutcome, PrepareUnloadedOwnerOutcome,
+    PreparedOwnerCleanup, RestoreUnloadedOwnerOutcome, SpawnStartingRunOutcome,
 };
 pub use readiness::{
     process_start_time_with_retry, reserve_localhost_port, spawn_chat_completion_readiness_worker,
@@ -37,13 +37,14 @@ pub use readiness::{
     PROCESS_IDENTITY_POLL_INTERVAL, PROCESS_IDENTITY_TIMEOUT,
 };
 pub use state::{
-    abort_managed_owner_acquisition, acquire_managed_owner, admit_offline_model_mutation,
-    create_starting_run, create_unloaded_node_owner, current_runtime_state_run,
-    finish_runtime_state_run, read_runtime_state, remove_runtime_state_entry, runtime_dir,
-    runtime_logs_dir, runtime_state_path, update_runtime_state_run,
-    update_runtime_state_run_committed, ManagedOwnerAcquisition, ManagedRecoverySource, ManagedRun,
-    ManagedRunIdentity, ManagedScalarProvenance, ManagedScalarSource, OfflineModelMutationGuard,
-    RunLifecycle, RuntimeStateRead, ScalarCaptureMode, RUNTIME_STATE_LOCK_POLL_INTERVAL,
+    abort_managed_owner_acquisition, abort_managed_owner_acquisition_preserving_source,
+    acquire_managed_owner, admit_offline_model_mutation, create_starting_run,
+    create_unloaded_node_owner, current_runtime_state_run, finish_runtime_state_run,
+    read_runtime_state, remove_runtime_state_entry, runtime_dir, runtime_logs_dir,
+    runtime_state_path, update_runtime_state_run, update_runtime_state_run_committed,
+    ManagedOwnerAcquisition, ManagedRecoverySource, ManagedRun, ManagedRunIdentity,
+    ManagedScalarProvenance, ManagedScalarSource, OfflineModelMutationGuard, RunLifecycle,
+    RuntimeStateRead, ScalarCaptureMode, RUNTIME_STATE_LOCK_POLL_INTERVAL,
     RUNTIME_STATE_LOCK_TIMEOUT, RUNTIME_STATE_SCHEMA_VERSION,
 };
 use state::{record_stop_request, stable_run_is_present, StopRequestMatch};
