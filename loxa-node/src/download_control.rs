@@ -88,6 +88,7 @@ pub(crate) struct DurableExecutionControl {
     catalog: Arc<DurableLaneCatalog>,
     pending_downloads: Arc<PendingDownloadVerifications>,
     projection_healthy: Arc<AtomicBool>,
+    lane_seal: Option<Arc<DurableLaneSeal>>,
     #[cfg(test)]
     faults: Arc<DurableLaneFaults>,
     #[cfg(test)]
@@ -117,6 +118,10 @@ struct DurableLaneFaults {
     verification_before_publish_changed: std::sync::Condvar,
     lifecycle_cancel_pause: Mutex<CompletionPause>,
     lifecycle_cancel_changed: std::sync::Condvar,
+    fatal_admission_pause: Mutex<CompletionPause>,
+    fatal_admission_changed: std::sync::Condvar,
+    lifecycle_before_admit_pause: Mutex<CompletionPause>,
+    lifecycle_before_admit_changed: std::sync::Condvar,
 }
 
 #[cfg(test)]
@@ -180,6 +185,32 @@ impl DurableLaneFaults {
         self.lifecycle_cancel_changed.notify_all();
         while !state.released {
             state = self.lifecycle_cancel_changed.wait(state).unwrap();
+        }
+        state.armed = false;
+    }
+
+    fn pause_after_fatal_admission_close(&self) {
+        let mut state = self.fatal_admission_pause.lock().unwrap();
+        if !state.armed {
+            return;
+        }
+        state.reached = true;
+        self.fatal_admission_changed.notify_all();
+        while !state.released {
+            state = self.fatal_admission_changed.wait(state).unwrap();
+        }
+        state.armed = false;
+    }
+
+    fn pause_before_lifecycle_admit(&self) {
+        let mut state = self.lifecycle_before_admit_pause.lock().unwrap();
+        if !state.armed {
+            return;
+        }
+        state.reached = true;
+        self.lifecycle_before_admit_changed.notify_all();
+        while !state.released {
+            state = self.lifecycle_before_admit_changed.wait(state).unwrap();
         }
         state.armed = false;
     }
@@ -852,19 +883,22 @@ impl DownloadControl {
                         workflow,
                     )
                     .expect("durable lifecycle controller must start");
-                let downloads = match &lanes.execution.execution {
-                    DurableExecutionBackend::Lanes(downloads) => downloads.clone(),
-                    #[cfg(test)]
-                    DurableExecutionBackend::CompatibilityActor(_) => unreachable!(),
-                };
+                let lane_seal = Arc::clone(
+                    lanes
+                        .execution
+                        .lane_seal
+                        .as_ref()
+                        .expect("durable lanes own fatal sealing"),
+                );
+                lane_seal
+                    .lifecycle
+                    .set(lifecycle_handle.clone())
+                    .unwrap_or_else(|_| panic!("lifecycle authority initialized twice"));
                 lifecycle_lane = Some(
                     spawn_durable_lifecycle_worker(
                         lifecycle_controller,
                         control_state.clone(),
-                        downloads,
-                        lanes.verification.clone(),
-                        lanes.artifacts.clone(),
-                        Arc::clone(&lanes.execution.projection_healthy),
+                        lane_seal,
                     )
                     .expect("durable lifecycle completion owner must start"),
                 );
@@ -1682,6 +1716,36 @@ impl LifecycleLoadWorkflow for SchedulerLifecycleWorkflow {
     }
 }
 
+struct DurableLaneSeal {
+    downloads: Arc<OnceLock<DownloadSchedulerHandle>>,
+    lifecycle: Arc<OnceLock<LifecycleControllerHandle>>,
+    verification: VerificationSchedulerHandle,
+    artifacts: ArtifactMutationCoordinator,
+    projection_healthy: Arc<AtomicBool>,
+    #[cfg(test)]
+    faults: Arc<DurableLaneFaults>,
+}
+
+impl DurableLaneSeal {
+    fn seal_admission(&self) {
+        if let Some(downloads) = self.downloads.get() {
+            let _ = downloads.seal_and_retain();
+        }
+        if let Some(lifecycle) = self.lifecycle.get() {
+            lifecycle.seal_fatal();
+        }
+        self.projection_healthy.store(false, Ordering::Release);
+        #[cfg(test)]
+        self.faults.pause_after_fatal_admission_close();
+    }
+
+    fn seal_all(&self) {
+        self.seal_admission();
+        self.artifacts.seal();
+        self.verification.stop();
+    }
+}
+
 struct DurableDownloadLaneExecutor {
     catalog: Arc<DurableLaneCatalog>,
     control_state: ControlStateHandle,
@@ -1690,8 +1754,7 @@ struct DurableDownloadLaneExecutor {
     completions: Arc<DownloadCompletionQueue>,
     artifacts: ArtifactMutationCoordinator,
     pending: Arc<PendingDownloadVerifications>,
-    downloads: Arc<OnceLock<DownloadSchedulerHandle>>,
-    projection_healthy: Arc<AtomicBool>,
+    seal: Arc<DurableLaneSeal>,
 }
 
 struct LaneDownloadObserver {
@@ -1753,6 +1816,7 @@ impl DurableDownloadLaneExecutor {
         drop(permit);
         if committed {
             if !self
+                .seal
                 .downloads
                 .get()
                 .is_some_and(|downloads| downloads.finish_committed(operation_id))
@@ -1765,12 +1829,7 @@ impl DurableDownloadLaneExecutor {
     }
 
     fn seal(&self) {
-        self.projection_healthy.store(false, Ordering::Release);
-        self.artifacts.seal();
-        self.verification.stop();
-        if let Some(downloads) = self.downloads.get() {
-            let _ = downloads.seal_and_retain();
-        }
+        self.seal.seal_all();
     }
 }
 
@@ -1976,6 +2035,21 @@ fn spawn_durable_download_lanes(
     let test_completions = Arc::clone(&completions);
     let pending = Arc::new(PendingDownloadVerifications::default());
     let download_slot = Arc::new(OnceLock::new());
+    let lifecycle_slot = Arc::new(OnceLock::new());
+    if let Some(lifecycle) = &lifecycle {
+        lifecycle_slot
+            .set(lifecycle.clone())
+            .map_err(|_| io::Error::other("lifecycle authority was initialized twice"))?;
+    }
+    let lane_seal = Arc::new(DurableLaneSeal {
+        downloads: Arc::clone(&download_slot),
+        lifecycle: Arc::clone(&lifecycle_slot),
+        verification: verification.clone(),
+        artifacts: artifacts.clone(),
+        projection_healthy: Arc::clone(&projection_healthy),
+        #[cfg(test)]
+        faults: Arc::clone(&faults),
+    });
     let executor = Arc::new(DurableDownloadLaneExecutor {
         catalog: Arc::clone(&catalog),
         control_state: control_state.clone(),
@@ -1984,8 +2058,7 @@ fn spawn_durable_download_lanes(
         completions: Arc::clone(&completions),
         artifacts: artifacts.clone(),
         pending: Arc::clone(&pending),
-        downloads: Arc::clone(&download_slot),
-        projection_healthy: Arc::clone(&projection_healthy),
+        seal: Arc::clone(&lane_seal),
     });
     let (downloads, download_owner) = DownloadSchedulerOwner::spawn(executor)?;
     download_slot
@@ -1994,13 +2067,11 @@ fn spawn_durable_download_lanes(
     let stopping = Arc::new(AtomicBool::new(false));
     let worker_stopping = Arc::clone(&stopping);
     let worker_downloads = downloads.clone();
-    let worker_verification = verification.clone();
+    let worker_seal = Arc::clone(&lane_seal);
     let worker_control_state = control_state.clone();
     let worker_catalog = Arc::clone(&catalog);
     let worker_cache = verification_cache;
     let worker_pending = Arc::clone(&pending);
-    let worker_projection = Arc::clone(&projection_healthy);
-    let worker_artifacts = artifacts.clone();
     #[cfg(test)]
     let worker_faults = Arc::clone(&faults);
     let completion_worker = thread::Builder::new()
@@ -2012,22 +2083,12 @@ fn spawn_durable_download_lanes(
                 CompletionWaitOutcome::TimedOut if worker_stopping.load(Ordering::Acquire) => break,
                 CompletionWaitOutcome::TimedOut => continue,
                 CompletionWaitOutcome::Poisoned => {
-                    seal_durable_lanes(
-                        &worker_downloads,
-                        &worker_verification,
-                        &worker_artifacts,
-                        &worker_projection,
-                    );
+                    worker_seal.seal_all();
                     break;
                 }
             };
             let Some(mut ticket) = retained.take_ready() else {
-                seal_durable_lanes(
-                    &worker_downloads,
-                    &worker_verification,
-                    &worker_artifacts,
-                    &worker_projection,
-                );
+                worker_seal.seal_all();
                 break;
             };
             let operation_id = ticket.outcome_mut().ownership.operation_id;
@@ -2036,12 +2097,7 @@ fn spawn_durable_download_lanes(
                 std::time::Instant::now() + std::time::Duration::from_secs(5),
             ) else {
                 ticket.poison();
-                seal_durable_lanes(
-                    &worker_downloads,
-                    &worker_verification,
-                    &worker_artifacts,
-                    &worker_projection,
-                );
+                worker_seal.seal_all();
                 break;
             };
             let _waiter = pending.waiter;
@@ -2059,12 +2115,7 @@ fn spawn_durable_download_lanes(
                 CompletionDisposition::Committed { publish_cache } => {
                     if !worker_downloads.finish_committed(operation_id) {
                         ticket.poison();
-                        seal_durable_lanes(
-                            &worker_downloads,
-                            &worker_verification,
-                            &worker_artifacts,
-                            &worker_projection,
-                        );
+                        worker_seal.seal_all();
                         break;
                     }
                     #[cfg(test)]
@@ -2091,7 +2142,7 @@ fn spawn_durable_download_lanes(
                             {
                                 tracing::error!(operation_id = %operation_id, error = %error, "verified artifact identity changed after durable success");
                                 ticket.poison();
-                                seal_durable_lanes(&worker_downloads, &worker_verification, &worker_artifacts, &worker_projection);
+                                worker_seal.seal_all();
                                 break;
                             }
                             tracing::warn!(operation_id = %operation_id, error = %error, "durable download succeeded but cache evidence was not published");
@@ -2102,24 +2153,14 @@ fn spawn_durable_download_lanes(
                 CompletionDisposition::TerminalWon => {
                     if !worker_downloads.finish_committed(operation_id) {
                         ticket.poison();
-                        seal_durable_lanes(
-                            &worker_downloads,
-                            &worker_verification,
-                            &worker_artifacts,
-                            &worker_projection,
-                        );
+                        worker_seal.seal_all();
                         break;
                     }
                     ticket.acknowledge();
                 }
                 CompletionDisposition::Unknown => {
                     ticket.poison();
-                    seal_durable_lanes(
-                        &worker_downloads,
-                        &worker_verification,
-                        &worker_artifacts,
-                        &worker_projection,
-                    );
+                    worker_seal.seal_all();
                     break;
                 }
             }
@@ -2132,6 +2173,7 @@ fn spawn_durable_download_lanes(
             catalog,
             pending_downloads: pending,
             projection_healthy,
+            lane_seal: Some(lane_seal),
             #[cfg(test)]
             faults,
             #[cfg(test)]
@@ -2254,25 +2296,10 @@ fn classify_download_completion(
     }
 }
 
-fn seal_durable_lanes(
-    downloads: &DownloadSchedulerHandle,
-    verification: &VerificationSchedulerHandle,
-    artifacts: &ArtifactMutationCoordinator,
-    projection_healthy: &AtomicBool,
-) {
-    projection_healthy.store(false, Ordering::Release);
-    artifacts.seal();
-    verification.stop();
-    let _ = downloads.seal_and_retain();
-}
-
 fn spawn_durable_lifecycle_worker(
     owner: LifecycleControllerOwner,
     control_state: ControlStateHandle,
-    downloads: DownloadSchedulerHandle,
-    verification: VerificationSchedulerHandle,
-    artifacts: ArtifactMutationCoordinator,
-    projection_healthy: Arc<AtomicBool>,
+    lane_seal: Arc<DurableLaneSeal>,
 ) -> io::Result<DurableLifecycleWorker> {
     let stopping = Arc::new(AtomicBool::new(false));
     let worker_stopping = Arc::clone(&stopping);
@@ -2291,12 +2318,7 @@ fn spawn_durable_lifecycle_worker(
                         let snapshot = match control_state.read_snapshot() {
                             Ok(snapshot) => snapshot,
                             Err(_) => {
-                                seal_durable_lanes(
-                                    &downloads,
-                                    &verification,
-                                    &artifacts,
-                                    &projection_healthy,
-                                );
+                                lane_seal.seal_all();
                                 operational_error = Some(io::Error::other(
                                     "lifecycle completion state unavailable",
                                 ));
@@ -2308,12 +2330,7 @@ fn spawn_durable_lifecycle_worker(
                             .iter()
                             .find(|operation| operation.operation_id == operation_id)
                         else {
-                            seal_durable_lanes(
-                                &downloads,
-                                &verification,
-                                &artifacts,
-                                &projection_healthy,
-                            );
+                            lane_seal.seal_all();
                             operational_error =
                                 Some(io::Error::other("lifecycle completion operation missing"));
                             break;
@@ -2346,12 +2363,7 @@ fn spawn_durable_lifecycle_worker(
                             }
                         };
                         if !observe_download_terminal(&control_state, transition) {
-                            seal_durable_lanes(
-                                &downloads,
-                                &verification,
-                                &artifacts,
-                                &projection_healthy,
-                            );
+                            lane_seal.seal_all();
                             operational_error = Some(io::Error::other(
                                 "lifecycle completion durable commit uncertain",
                             ));
@@ -2360,12 +2372,7 @@ fn spawn_durable_lifecycle_worker(
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        seal_durable_lanes(
-                            &downloads,
-                            &verification,
-                            &artifacts,
-                            &projection_healthy,
-                        );
+                        lane_seal.seal_all();
                         operational_error = Some(io::Error::other(
                             "lifecycle completion channel disconnected",
                         ));
@@ -2627,6 +2634,93 @@ impl DurableExecutionControl {
     }
 
     #[cfg(test)]
+    pub(crate) fn arm_fatal_admission_pause_for_test(&self) {
+        let mut state = self.faults.fatal_admission_pause.lock().unwrap();
+        *state = CompletionPause {
+            armed: true,
+            reached: false,
+            released: false,
+        };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_fatal_admission_closed_for_test(
+        &self,
+        deadline: std::time::Instant,
+    ) -> bool {
+        let mut state = self.faults.fatal_admission_pause.lock().unwrap();
+        while !state.reached {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (next, timeout) = self
+                .faults
+                .fatal_admission_changed
+                .wait_timeout(state, deadline.saturating_duration_since(now))
+                .unwrap();
+            state = next;
+            if timeout.timed_out() && !state.reached {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_fatal_admission_for_test(&self) {
+        let mut state = self.faults.fatal_admission_pause.lock().unwrap();
+        state.released = true;
+        self.faults.fatal_admission_changed.notify_all();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seal_durable_lanes_for_test(&self) {
+        self.seal_lanes_fatal();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_lifecycle_before_admit_pause_for_test(&self) {
+        let mut state = self.faults.lifecycle_before_admit_pause.lock().unwrap();
+        *state = CompletionPause {
+            armed: true,
+            reached: false,
+            released: false,
+        };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_lifecycle_before_admit_for_test(
+        &self,
+        deadline: std::time::Instant,
+    ) -> bool {
+        let mut state = self.faults.lifecycle_before_admit_pause.lock().unwrap();
+        while !state.reached {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (next, timeout) = self
+                .faults
+                .lifecycle_before_admit_changed
+                .wait_timeout(state, deadline.saturating_duration_since(now))
+                .unwrap();
+            state = next;
+            if timeout.timed_out() && !state.reached {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_lifecycle_before_admit_for_test(&self) {
+        let mut state = self.faults.lifecycle_before_admit_pause.lock().unwrap();
+        state.released = true;
+        self.faults.lifecycle_before_admit_changed.notify_all();
+    }
+
+    #[cfg(test)]
     pub(crate) fn with_actor_for_test(
         control_state: ControlStateHandle,
         actor: NodeActorHandle,
@@ -2641,6 +2735,7 @@ impl DurableExecutionControl {
             }),
             pending_downloads: Arc::new(PendingDownloadVerifications::default()),
             projection_healthy: Arc::new(AtomicBool::new(true)),
+            lane_seal: None,
             faults: Arc::new(DurableLaneFaults::default()),
             test_verification: None,
             test_completions: None,
@@ -2705,12 +2800,12 @@ impl DurableExecutionControl {
                     operation_id,
                     admission_revision,
                 } if accept_existing => {
+                    self.ensure_healthy()?;
                     match self.existing_admission(operation_id, admission_revision) {
                         Ok(Some(existing)) => return Ok(existing),
                         Ok(None) => {}
                         Err(_) => {
-                            self.projection_healthy.store(false, Ordering::Release);
-                            let _ = downloads.seal_and_retain();
+                            self.seal_lanes_fatal();
                             return Err(DownloadControlError::Stopping);
                         }
                     }
@@ -2763,8 +2858,7 @@ impl DurableExecutionControl {
                 tokio::task::yield_now().await;
             }
             drop(reservation.poison());
-            let _ = downloads.seal_and_retain();
-            self.projection_healthy.store(false, Ordering::Release);
+            self.seal_lanes_fatal();
             return Err(DownloadControlError::Stopping);
         }
         let admission = match self
@@ -2781,7 +2875,7 @@ impl DurableExecutionControl {
             Ok(admission) => admission,
             Err(ControlStateError::UnknownCommit) => {
                 drop(reservation.poison());
-                let _ = downloads.seal_and_retain();
+                self.seal_lanes_fatal();
                 return Err(DownloadControlError::Stopping);
             }
             Err(error) => return Err(map_admission_error(error)),
@@ -2806,8 +2900,7 @@ impl DurableExecutionControl {
                         ),
                     );
                     let _ = committed.await;
-                    let _ = downloads.seal_and_retain();
-                    self.projection_healthy.store(false, Ordering::Release);
+                    self.seal_lanes_fatal();
                     return Err(DownloadControlError::Stopping);
                 }
                 self.control_state
@@ -2919,8 +3012,7 @@ impl DurableExecutionControl {
             Ok(admission) => admission,
             Err(ControlStateError::UnknownCommit) => {
                 reservation.poison();
-                lifecycle.seal_fatal();
-                self.projection_healthy.store(false, Ordering::Release);
+                self.seal_lanes_fatal();
                 return Err(DownloadControlError::Stopping);
             }
             Err(error) => return Err(map_admission_error(error)),
@@ -2941,8 +3033,7 @@ impl DurableExecutionControl {
                 )
                 .is_err()
             {
-                lifecycle.seal_fatal();
-                self.projection_healthy.store(false, Ordering::Release);
+                self.seal_lanes_fatal();
             }
             return Err(DownloadControlError::Stopping);
         }
@@ -3003,6 +3094,8 @@ impl DurableExecutionControl {
             .ok_or(DownloadControlError::Conflict)?;
         let kind = admission_kind(&request);
         #[cfg(test)]
+        self.faults.pause_before_lifecycle_admit();
+        #[cfg(test)]
         if self
             .faults
             .lifecycle_admission_lost_ack
@@ -3021,16 +3114,14 @@ impl DurableExecutionControl {
                 tokio::task::yield_now().await;
             }
             reservation.poison();
-            lifecycle.seal_fatal();
-            self.projection_healthy.store(false, Ordering::Release);
+            self.seal_lanes_fatal();
             return Err(DownloadControlError::Stopping);
         }
         let admission = match self.control_state.admit(request).await {
             Ok(admission) => admission,
             Err(ControlStateError::UnknownCommit) => {
                 reservation.poison();
-                lifecycle.seal_fatal();
-                self.projection_healthy.store(false, Ordering::Release);
+                self.seal_lanes_fatal();
                 return Err(DownloadControlError::Stopping);
             }
             Err(error) => return Err(map_admission_error(error)),
@@ -3052,7 +3143,7 @@ impl DurableExecutionControl {
             .lifecycle_submit_failure
             .swap(false, Ordering::AcqRel)
         {
-            lifecycle.seal_fatal();
+            self.seal_lanes_fatal();
         }
         if reservation.submit(command).is_err() {
             #[cfg(test)]
@@ -3068,8 +3159,7 @@ impl DurableExecutionControl {
                             kind,
                         ));
                 let _ = committed.await;
-                lifecycle.seal_fatal();
-                self.projection_healthy.store(false, Ordering::Release);
+                self.seal_lanes_fatal();
                 return Err(DownloadControlError::Stopping);
             }
             if self
@@ -3078,8 +3168,7 @@ impl DurableExecutionControl {
                 .await
                 .is_err()
             {
-                lifecycle.seal_fatal();
-                self.projection_healthy.store(false, Ordering::Release);
+                self.seal_lanes_fatal();
             }
             return Err(DownloadControlError::Stopping);
         }
@@ -3149,7 +3238,7 @@ impl DurableExecutionControl {
                 .control_state
                 .observe_and_drop_ack_for_test(Transition::Cancelling { operation_id });
             let _ = committed.await;
-            self.projection_healthy.store(false, Ordering::Release);
+            self.seal_lanes_fatal();
             return Err(DownloadControlError::Stopping);
         }
         self.control_state
@@ -3173,8 +3262,7 @@ impl DurableExecutionControl {
                         .await
                         .map_err(map_public_cancel_transition)?;
                     if !downloads.finish_committed(operation_id) {
-                        let _ = downloads.seal_and_retain();
-                        self.projection_healthy.store(false, Ordering::Release);
+                        self.seal_lanes_fatal();
                         return Err(DownloadControlError::Stopping);
                     }
                     Ok(OperationStatus::Cancelled)
@@ -3274,6 +3362,7 @@ impl DurableExecutionControl {
         let mut delivered = initial.cursor;
         let control_state = self.control_state.clone();
         let projection_healthy = Arc::clone(&self.projection_healthy);
+        let lane_seal = self.lane_seal.clone();
         let (sender, receiver) = tokio::sync::mpsc::channel(OPERATION_CAPACITY);
         tokio::spawn(async move {
             while let Some(event) = durable.events.recv().await {
@@ -3287,7 +3376,11 @@ impl DurableExecutionControl {
                     candidate.operation.operation_id == changed.operation_id
                         && candidate.operation.updated_revision == changed.updated_revision
                 }) else {
-                    projection_healthy.store(false, std::sync::atomic::Ordering::Release);
+                    if let Some(seal) = &lane_seal {
+                        seal.seal_all();
+                    } else {
+                        projection_healthy.store(false, Ordering::Release);
+                    }
                     break;
                 };
                 if v1_event.sequence <= delivered {
@@ -3296,11 +3389,19 @@ impl DurableExecutionControl {
                 let Ok(operation) =
                     project_durable_v1_operation(&v1_event.v1_operation_id, &v1_event.operation)
                 else {
-                    projection_healthy.store(false, std::sync::atomic::Ordering::Release);
+                    if let Some(seal) = &lane_seal {
+                        seal.seal_all();
+                    } else {
+                        projection_healthy.store(false, Ordering::Release);
+                    }
                     break;
                 };
                 let Ok(sequence) = project_durable_v1_counter(v1_event.sequence) else {
-                    projection_healthy.store(false, std::sync::atomic::Ordering::Release);
+                    if let Some(seal) = &lane_seal {
+                        seal.seal_all();
+                    } else {
+                        projection_healthy.store(false, Ordering::Release);
+                    }
                     break;
                 };
                 delivered = sequence;
@@ -3331,9 +3432,16 @@ impl DurableExecutionControl {
         }
     }
 
+    fn seal_lanes_fatal(&self) {
+        if let Some(seal) = &self.lane_seal {
+            seal.seal_all();
+        } else {
+            self.projection_healthy.store(false, Ordering::Release);
+        }
+    }
+
     fn poison_projection(&self) -> DownloadControlError {
-        self.projection_healthy
-            .store(false, std::sync::atomic::Ordering::Release);
+        self.seal_lanes_fatal();
         DownloadControlError::Stopping
     }
 }
@@ -4744,6 +4852,119 @@ mod tests {
             assert_eq!(result, Err(DownloadControlError::Stopping));
             assert_eq!(status, V2OperationStatus::Failed);
         }
+    }
+
+    #[tokio::test]
+    async fn fatal_admission_gate_rejects_lifecycle_and_download_before_cleanup() {
+        let (control, worker, fixture, root) =
+            durable_lifecycle_fixture("fatal-admission-gate").await;
+        let durable = control.durable_execution_for_test();
+        durable.arm_fatal_admission_pause_for_test();
+        let closer = durable.clone();
+        let (closed_tx, closed_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            closer.seal_durable_lanes_for_test();
+            closed_tx.send(()).unwrap();
+        });
+        assert!(durable.wait_fatal_admission_closed_for_test(
+            std::time::Instant::now() + Duration::from_secs(1)
+        ));
+
+        assert_eq!(
+            durable.start_load(REGISTRY[0].id).await,
+            Err(DownloadControlError::Stopping)
+        );
+        assert_eq!(
+            durable
+                .start_download(REGISTRY[0].id, REGISTRY[0].size_bytes)
+                .await,
+            Err(DownloadControlError::Stopping)
+        );
+        assert!(fixture
+            .handle
+            .read_snapshot()
+            .unwrap()
+            .operations
+            .is_empty());
+
+        durable.release_fatal_admission_for_test();
+        closed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let _ = worker.stop_and_join();
+        fixture.shutdown().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fatal_admission_seal_compensates_lifecycle_reserved_before_the_boundary() {
+        let (control, worker, fixture, root) =
+            durable_lifecycle_fixture("fatal-inflight-lifecycle").await;
+        let durable = control.durable_execution_for_test();
+        durable.arm_lifecycle_before_admit_pause_for_test();
+        durable.arm_fatal_admission_pause_for_test();
+
+        let starter = durable.clone();
+        let admission = tokio::spawn(async move { starter.start_load(REGISTRY[0].id).await });
+        assert!(durable.wait_lifecycle_before_admit_for_test(
+            std::time::Instant::now() + Duration::from_secs(1)
+        ));
+
+        let closer = durable.clone();
+        let (closed_tx, closed_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            closer.seal_durable_lanes_for_test();
+            closed_tx.send(()).unwrap();
+        });
+        assert!(durable.wait_fatal_admission_closed_for_test(
+            std::time::Instant::now() + Duration::from_secs(1)
+        ));
+
+        durable.release_lifecycle_before_admit_for_test();
+        assert_eq!(
+            admission.await.unwrap(),
+            Err(DownloadControlError::Stopping)
+        );
+        let snapshot = fixture.handle.read_snapshot().unwrap();
+        assert_eq!(snapshot.operations.len(), 1);
+        assert_eq!(snapshot.operations[0].status, V2OperationStatus::Failed);
+        drop(snapshot);
+
+        durable.release_fatal_admission_for_test();
+        closed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let _ = worker.stop_and_join();
+        fixture.shutdown().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_submitted_before_fatal_admission_boundary_remains_accepted() {
+        let (control, worker, fixture, root) =
+            durable_lifecycle_fixture("fatal-after-submit").await;
+        let durable = control.durable_execution_for_test();
+        let admission = durable.start_load(REGISTRY[0].id).await.unwrap();
+
+        durable.arm_fatal_admission_pause_for_test();
+        let closer = durable.clone();
+        let (closed_tx, closed_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            closer.seal_durable_lanes_for_test();
+            closed_tx.send(()).unwrap();
+        });
+        assert!(durable.wait_fatal_admission_closed_for_test(
+            std::time::Instant::now() + Duration::from_secs(1)
+        ));
+        assert!(fixture
+            .handle
+            .read_snapshot()
+            .unwrap()
+            .operations
+            .iter()
+            .any(|operation| operation.operation_id == admission.operation_id));
+
+        durable.release_fatal_admission_for_test();
+        closed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let _ = worker.stop_and_join();
+        fixture.shutdown().await;
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
