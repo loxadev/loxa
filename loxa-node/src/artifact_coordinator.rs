@@ -540,6 +540,12 @@ impl ArtifactMutationCoordinator {
         drop(state);
         self.inner.notify_changed();
     }
+
+    pub(crate) fn has_uncertain_ownership(&self) -> bool {
+        self.inner.state.lock().map_or(true, |state| {
+            !state.poisoned.is_empty() || !state.access.is_empty()
+        })
+    }
 }
 
 pub(crate) struct ArtifactMutationLease {

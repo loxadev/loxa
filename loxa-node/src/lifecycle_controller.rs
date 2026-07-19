@@ -494,6 +494,10 @@ pub(crate) struct LifecycleControllerHandle {
 }
 
 impl LifecycleControllerHandle {
+    pub(crate) fn request_shutdown(&self, deadline: Instant) -> Result<(), LifecycleSubmitError> {
+        self.mailbox.request_owner_shutdown(deadline)
+    }
+
     pub(crate) fn reserve_normal(&self) -> Option<LifecycleNormalReservation> {
         self.mailbox.reserve_normal()
     }

@@ -22,6 +22,7 @@ use serde_json::json;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     convert::Infallible,
+    mem::ManuallyDrop,
     pin::Pin,
     sync::{Arc, Condvar, Mutex},
     task::{Context, Poll},
@@ -61,6 +62,76 @@ pub struct ChatRoutesState {
     publication_gate: Option<crate::runtime::PublicationGate>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ChatRoutesShutdownFailureReason {
+    DeadlineExceeded,
+    RegistryPoisoned,
+}
+
+#[must_use = "shutdown failure retains chat route ownership and must be resolved"]
+pub(crate) struct ChatRoutesShutdownFailure {
+    reason: ChatRoutesShutdownFailureReason,
+    state: ManuallyDrop<ChatRoutesState>,
+}
+
+impl ChatRoutesShutdownFailure {
+    fn new(reason: ChatRoutesShutdownFailureReason, state: ChatRoutesState) -> Self {
+        Self {
+            reason,
+            state: ManuallyDrop::new(state),
+        }
+    }
+
+    pub(crate) fn reason(&self) -> ChatRoutesShutdownFailureReason {
+        self.reason
+    }
+
+    fn retains_active_registry(&self) -> bool {
+        Arc::strong_count(&self.state.active) > 0
+    }
+
+    #[cfg(test)]
+    fn dispose_for_test(self) {
+        let mut retained = ManuallyDrop::new(self);
+        // SAFETY: the state is taken exactly once and the enclosing failure is
+        // then suppressed so its fail-closed Drop cannot run.
+        let state = unsafe { ManuallyDrop::take(&mut retained.state) };
+        drop(state);
+    }
+}
+
+impl std::fmt::Debug for ChatRoutesShutdownFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ChatRoutesShutdownFailure")
+            .field("reason", &self.reason())
+            .field("retains_active_registry", &self.retains_active_registry())
+            .finish()
+    }
+}
+
+impl std::fmt::Display for ChatRoutesShutdownFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.reason {
+            ChatRoutesShutdownFailureReason::DeadlineExceeded => {
+                formatter.write_str("chat routes shutdown deadline exceeded")
+            }
+            ChatRoutesShutdownFailureReason::RegistryPoisoned => {
+                formatter.write_str("chat routes active registry is poisoned")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ChatRoutesShutdownFailure {}
+
+impl Drop for ChatRoutesShutdownFailure {
+    fn drop(&mut self) {
+        // Fail closed: an ignored deadline/poison failure must retain the route
+        // state and its active-turn shutdown capability rather than detach it.
+    }
+}
+
 impl ChatRoutesState {
     pub fn new(token: ControlToken, history: ChatHistory, gateway: GatewayState) -> Self {
         Self {
@@ -77,18 +148,108 @@ impl ChatRoutesState {
         self
     }
 
-    pub fn shutdown_and_wait(&self) {
-        let mut active = self.active.state.lock().expect("active turns poisoned");
+    #[cfg(test)]
+    pub(crate) fn poison_shutdown_registry_for_test(&self) {
+        let registry = Arc::clone(&self.active);
+        assert!(std::thread::spawn(move || {
+            let _guard = registry.state.lock().expect("active turn registry lock");
+            panic!("poison active turn registry for composition test");
+        })
+        .join()
+        .is_err());
+    }
+
+    pub(crate) fn shutdown_until(self, deadline: Instant) -> Result<(), ChatRoutesShutdownFailure> {
+        self.shutdown_with_deadline(Some(deadline))
+    }
+
+    pub(crate) fn request_shutdown(&self) -> Result<(), ChatRoutesShutdownFailureReason> {
+        let mut active = self
+            .active
+            .state
+            .lock()
+            .map_err(|_| ChatRoutesShutdownFailureReason::RegistryPoisoned)?;
+        active.shutting_down = true;
+        for turn in active.running.values() {
+            turn.cancel.send_replace(true);
+        }
+        Ok(())
+    }
+
+    fn shutdown_with_deadline(
+        self,
+        deadline: Option<Instant>,
+    ) -> Result<(), ChatRoutesShutdownFailure> {
+        let registry = Arc::clone(&self.active);
+        let mut active = match registry.state.lock() {
+            Ok(active) => active,
+            Err(poisoned) => {
+                drop(poisoned.into_inner());
+                return Err(ChatRoutesShutdownFailure::new(
+                    ChatRoutesShutdownFailureReason::RegistryPoisoned,
+                    self,
+                ));
+            }
+        };
         active.shutting_down = true;
         for turn in active.running.values() {
             turn.cancel.send_replace(true);
         }
         while !active.running.is_empty() || !active.starting.is_empty() {
-            active = self
-                .active
-                .empty
-                .wait(active)
-                .expect("active turns poisoned");
+            active = match deadline {
+                Some(deadline) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        drop(active);
+                        return Err(ChatRoutesShutdownFailure::new(
+                            ChatRoutesShutdownFailureReason::DeadlineExceeded,
+                            self,
+                        ));
+                    }
+                    match registry
+                        .empty
+                        .wait_timeout(active, deadline.saturating_duration_since(now))
+                    {
+                        Ok((next, _)) => {
+                            if Instant::now() >= deadline {
+                                drop(next);
+                                return Err(ChatRoutesShutdownFailure::new(
+                                    ChatRoutesShutdownFailureReason::DeadlineExceeded,
+                                    self,
+                                ));
+                            }
+                            next
+                        }
+                        Err(poisoned) => {
+                            let (guard, _) = poisoned.into_inner();
+                            drop(guard);
+                            return Err(ChatRoutesShutdownFailure::new(
+                                ChatRoutesShutdownFailureReason::RegistryPoisoned,
+                                self,
+                            ));
+                        }
+                    }
+                }
+                None => match registry.empty.wait(active) {
+                    Ok(next) => next,
+                    Err(poisoned) => {
+                        drop(poisoned.into_inner());
+                        return Err(ChatRoutesShutdownFailure::new(
+                            ChatRoutesShutdownFailureReason::RegistryPoisoned,
+                            self,
+                        ));
+                    }
+                },
+            };
+        }
+        drop(active);
+        drop(registry);
+        Ok(())
+    }
+
+    pub fn shutdown_and_wait(&self) {
+        if let Err(failure) = self.clone().shutdown_with_deadline(None) {
+            panic!("{failure}");
         }
     }
 }
@@ -2567,5 +2728,179 @@ mod tests {
         );
         worker.stop_and_join().unwrap();
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn shutdown_test_state() -> (
+        ChatRoutesState,
+        crate::chat_history::ChatHistoryWorker,
+        std::path::PathBuf,
+    ) {
+        let path = temp_history_path();
+        let root = path.parent().unwrap().to_owned();
+        let token = ControlToken::load_or_create(&root.join("control.token")).unwrap();
+        let (history, worker) = ChatHistory::spawn(path).unwrap();
+        (
+            ChatRoutesState::new(token, history, gateway_state()),
+            worker,
+            root,
+        )
+    }
+
+    fn insert_shutdown_test_turn(state: &ChatRoutesState) -> tokio::sync::watch::Receiver<bool> {
+        let (cancel, cancelled) = tokio::sync::watch::channel(false);
+        state.active.state.lock().unwrap().running.insert(
+            "shutdown-test-chat".to_owned(),
+            ActiveTurn {
+                turn_id: TurnId::generate().unwrap(),
+                cancel,
+            },
+        );
+        cancelled
+    }
+
+    #[test]
+    fn deadline_shutdown_signals_cancellation_and_stops_after_active_turn_releases() {
+        let (state, worker, root) = shutdown_test_state();
+        let registry = Arc::clone(&state.active);
+        let cancelled = insert_shutdown_test_turn(&state);
+        let release = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while !cancelled.has_changed().unwrap() {
+                assert!(
+                    Instant::now() < deadline,
+                    "shutdown did not signal cancellation"
+                );
+                std::thread::yield_now();
+            }
+            assert!(*cancelled.borrow());
+            let mut active = registry.state.lock().unwrap();
+            active.running.clear();
+            registry.empty.notify_all();
+        });
+
+        assert!(state
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .is_ok());
+        release.join().unwrap();
+        worker.stop_and_join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deadline_shutdown_retains_blocked_active_registry_at_exact_timeout() {
+        let (state, worker, root) = shutdown_test_state();
+        let mut cancelled = insert_shutdown_test_turn(&state);
+        let deadline = Instant::now() + Duration::from_millis(20);
+
+        let failure = state
+            .shutdown_until(deadline)
+            .expect_err("blocked active turn must retain shutdown ownership");
+        assert_eq!(
+            failure.reason(),
+            ChatRoutesShutdownFailureReason::DeadlineExceeded
+        );
+        assert!(*cancelled.borrow_and_update());
+        assert!(Instant::now() >= deadline);
+        failure.dispose_for_test();
+        worker.stop_and_join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deadline_shutdown_does_not_accept_release_observed_after_exact_deadline() {
+        let (state, worker, root) = shutdown_test_state();
+        let registry = Arc::clone(&state.active);
+        let cancelled = insert_shutdown_test_turn(&state);
+        let release = std::thread::spawn(move || {
+            let signal_deadline = Instant::now() + Duration::from_secs(1);
+            while !cancelled.has_changed().unwrap() {
+                assert!(Instant::now() < signal_deadline);
+                std::thread::yield_now();
+            }
+            let mut active = registry.state.lock().unwrap();
+            std::thread::sleep(Duration::from_millis(40));
+            active.running.clear();
+            registry.empty.notify_all();
+        });
+        let deadline = Instant::now() + Duration::from_millis(10);
+
+        let failure = state
+            .shutdown_until(deadline)
+            .expect_err("release observed after the deadline must retain ownership");
+        assert_eq!(
+            failure.reason(),
+            ChatRoutesShutdownFailureReason::DeadlineExceeded
+        );
+        assert!(Instant::now() >= deadline);
+        release.join().unwrap();
+        failure.dispose_for_test();
+        worker.stop_and_join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deadline_shutdown_retains_poisoned_active_registry() {
+        let (state, worker, root) = shutdown_test_state();
+        let registry = Arc::clone(&state.active);
+        let poison = std::thread::spawn(move || {
+            let _guard = registry.state.lock().unwrap();
+            panic!("poison active registry for shutdown test");
+        });
+        assert!(poison.join().is_err());
+
+        let failure = state
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .expect_err("poison must retain shutdown ownership");
+        assert_eq!(
+            failure.reason(),
+            ChatRoutesShutdownFailureReason::RegistryPoisoned
+        );
+        failure.dispose_for_test();
+        worker.stop_and_join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deadline_shutdown_accepts_already_stopped_empty_registry() {
+        let (state, worker, root) = shutdown_test_state();
+        state.active.state.lock().unwrap().shutting_down = true;
+
+        assert!(state.shutdown_until(Instant::now()).is_ok());
+        worker.stop_and_join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shutdown_failure_formatting_and_drop_retain_until_explicit_test_disposal() {
+        let (state, worker, root) = shutdown_test_state();
+        insert_shutdown_test_turn(&state);
+        let registry = Arc::clone(&state.active);
+        let failure = state
+            .shutdown_until(Instant::now())
+            .expect_err("active turn must time out");
+        let retained_count = Arc::strong_count(&registry);
+        assert!(format!("{failure:?}").contains("retains_active_registry: true"));
+        assert_eq!(
+            format!("{failure}"),
+            "chat routes shutdown deadline exceeded"
+        );
+        assert_eq!(Arc::strong_count(&registry), retained_count);
+        failure.dispose_for_test();
+        assert_eq!(Arc::strong_count(&registry), retained_count - 1);
+
+        let (state, dropped_worker, dropped_root) = shutdown_test_state();
+        insert_shutdown_test_turn(&state);
+        let dropped_registry = Arc::clone(&state.active);
+        let dropped_failure = state
+            .shutdown_until(Instant::now())
+            .expect_err("active turn must time out");
+        let dropped_count = Arc::strong_count(&dropped_registry);
+        drop(dropped_failure);
+        assert_eq!(Arc::strong_count(&dropped_registry), dropped_count);
+
+        worker.stop_and_join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        dropped_worker.stop_and_join().unwrap();
+        std::fs::remove_dir_all(dropped_root).unwrap();
     }
 }
