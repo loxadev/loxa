@@ -213,7 +213,7 @@ impl V2ControlState {
             V2ControlErrorCode::UnknownModel,
             "The model was not found.",
         ))?;
-        if entry.artifact != loxa_core::model_inventory::ArtifactState::Downloaded
+        if !crate::download_control::artifact_can_enter_load_verification(&entry.artifact)
             || !entry.compatibility.compatible
             || !entry.engine.eligible
             || entry.engine.engine != "llama-cpp"

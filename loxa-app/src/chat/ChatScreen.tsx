@@ -12,6 +12,7 @@ import type { ModelInventoryEntry, NodeControlStatus } from "../control/contract
 import type { ControlStreamHandle, streamControlEvents as defaultStreamControlEvents } from "../control/events";
 import type { getModels as defaultGetModels, getStatus as defaultGetStatus } from "../node/client";
 import type { NodeSessionPhase } from "../node/NodeSession";
+import { isLoadVerificationCandidate } from "../models/artifactCapabilities";
 import { IconButton } from "../components/ui/button";
 import { ChatComposer } from "./ChatComposer";
 import { ChatModelControl } from "./ChatModelControl";
@@ -370,9 +371,7 @@ export function ChatScreen({
           ? "Document input transport is not available in this desktop build."
           : capabilities.documentInputReason,
       );
-      const eligible = inventory.filter(
-        (entry) => entry.artifact.kind === "downloaded" && entry.compatibility.compatible && entry.engine.eligible,
-      );
+      const eligible = inventory.filter(isLoadVerificationCandidate);
       setEligibleModels(eligible);
       setAuthoritativeNodeStatus(controlNode.status);
       setActiveModel(controlNode.activeModelId);
@@ -394,9 +393,7 @@ export function ChatScreen({
               .then((token) => services.getInventory(endpoint, token, { signal: controller.signal })),
           ]);
           if (disposed) return;
-          const eligibleNext = nextInventory.filter(
-            (entry) => entry.artifact.kind === "downloaded" && entry.compatibility.compatible && entry.engine.eligible,
-          );
+          const eligibleNext = nextInventory.filter(isLoadVerificationCandidate);
           setEligibleModels(eligibleNext);
           setAuthoritativeNodeStatus(node.status);
           if (node.status === "ready" && node.activeModelId !== null) {
@@ -452,10 +449,7 @@ export function ChatScreen({
                 ])
                   .then(([node, nextInventory]) => {
                     if (disposed || version !== truthVersion.current) return;
-                    const eligibleNext = nextInventory.filter(
-                      (entry) =>
-                        entry.artifact.kind === "downloaded" && entry.compatibility.compatible && entry.engine.eligible,
-                    );
+                    const eligibleNext = nextInventory.filter(isLoadVerificationCandidate);
                     setEligibleModels(eligibleNext);
                     setAuthoritativeNodeStatus(node.status);
                     setControlBusy(
@@ -848,10 +842,7 @@ export function ChatScreen({
           ]);
           if (version === truthVersion.current) {
             publishReconciledBusy = true;
-            const eligible = inventory.filter(
-              (entry) =>
-                entry.artifact.kind === "downloaded" && entry.compatibility.compatible && entry.engine.eligible,
-            );
+            const eligible = inventory.filter(isLoadVerificationCandidate);
             setEligibleModels(eligible);
             setAuthoritativeNodeStatus(node.status);
             if (node.status === "ready" && node.activeModelId !== null) {
@@ -1078,8 +1069,8 @@ function emptyChatMessage(
   if (operation === "switching")
     return "Loading the selected model. Chat will unlock after the node confirms readiness.";
   if (controlBusy) return "A model operation is in progress. Chat will unlock after the node confirms completion.";
-  if (eligibleModelCount === 0) return "No downloaded compatible model is available. Download one from Models.";
-  if (activeModel === null) return "No model is loaded. Choose a downloaded model below or open Models.";
+  if (eligibleModelCount === 0) return "No compatible model artifact is available. Download one from Models.";
+  if (activeModel === null) return "No model is loaded. Choose an available model below or open Models.";
   return "Start a new conversation or continue one from your local history.";
 }
 
