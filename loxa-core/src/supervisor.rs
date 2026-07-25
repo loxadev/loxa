@@ -372,6 +372,7 @@ pub enum SupervisorError {
     UnknownModel(String),
     ModelNotDownloaded(PathBuf),
     LlamaServerNotFound,
+    LlamaServerVersionFailed { exit_code: Option<i32> },
     LlamaServerVersionTimeout,
     NoFreePort,
     ProcessIdentityUnavailable(u32),
@@ -395,6 +396,15 @@ impl fmt::Display for SupervisorError {
                 write!(f, "model not downloaded: {}", path.display())
             }
             SupervisorError::LlamaServerNotFound => write!(f, "llama-server not found"),
+            SupervisorError::LlamaServerVersionFailed {
+                exit_code: Some(exit_code),
+            } => write!(
+                f,
+                "llama-server --version failed with exit code {exit_code}"
+            ),
+            SupervisorError::LlamaServerVersionFailed { exit_code: None } => {
+                write!(f, "llama-server --version failed without an exit code")
+            }
             SupervisorError::LlamaServerVersionTimeout => {
                 write!(f, "llama-server --version timed out")
             }
@@ -634,13 +644,18 @@ pub fn llama_server_version(path: &Path) -> Result<String, SupervisorError> {
 
     let started = Instant::now();
     while started.elapsed() < LLAMA_SERVER_VERSION_TIMEOUT {
-        if child.try_wait()?.is_some() {
-            let output = read_child_output(&mut child)?;
-            let version = output.trim();
-            if version.is_empty() {
+        if let Some(status) = child.try_wait()? {
+            let (stdout, stderr) = read_child_output_streams(&mut child)?;
+            if !status.success() {
+                return Err(SupervisorError::LlamaServerVersionFailed {
+                    exit_code: status.code(),
+                });
+            }
+            let output = if stdout.is_empty() { &stderr } else { &stdout };
+            if output.is_empty() {
                 return Ok("unknown".to_string());
             }
-            return Ok(version.to_string());
+            return Ok(llama_server_version_first_line(output).to_string());
         }
 
         thread::sleep(Duration::from_millis(50));
@@ -1540,7 +1555,7 @@ pub fn cleanup_after_ctrl_c<C: ManagedChild + LogDrainingChild>(
     })
 }
 
-fn read_child_output(child: &mut Child) -> io::Result<String> {
+fn read_child_output_streams(child: &mut Child) -> io::Result<(String, String)> {
     let mut stdout = String::new();
     let mut stderr = String::new();
 
@@ -1551,8 +1566,14 @@ fn read_child_output(child: &mut Child) -> io::Result<String> {
         handle.read_to_string(&mut stderr)?;
     }
 
-    let output = format!("{stdout}{stderr}");
-    Ok(output)
+    Ok((stdout, stderr))
+}
+
+fn llama_server_version_first_line(output: &str) -> &str {
+    match output.split_once('\n') {
+        Some((line, _)) => line.strip_suffix('\r').unwrap_or(line),
+        None => output,
+    }
 }
 
 #[cfg(test)]
@@ -2201,6 +2222,143 @@ mod tests {
         let mut permissions = fs::metadata(path).expect("script metadata").permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(path, permissions).expect("make script executable");
+    }
+
+    #[cfg(unix)]
+    fn qualified_launch_spec_for_probed_version(
+        version: &str,
+    ) -> Result<crate::engine::EngineLaunchSpec, crate::engine::llama_cpp::LlamaCppLaunchError>
+    {
+        crate::engine::llama_cpp::build_launch_spec(crate::engine::llama_cpp::LlamaCppLaunchInput {
+            program: Path::new("/opt/llama/llama-server"),
+            target: Path::new("/models/target.gguf"),
+            alias: "loxa-probe-g1",
+            port: 11_435,
+            engine_version: version,
+            mode: crate::engine::llama_cpp::LlamaCppLaunchMode::QualifiedGemma4Mtp {
+                drafter: Path::new("/models/drafter.gguf"),
+                ctx_size: 8_192,
+                jinja: true,
+                spec_type: "draft-mtp",
+                draft_n_max: 4,
+            },
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn llama_version_probe_preserves_the_exact_first_stdout_line_and_normalizes_crlf() {
+        let temp = tempdir().expect("tempdir");
+        let program = temp.path().join("qualified-version");
+        executable_script(
+            &program,
+            "#!/bin/sh\nprintf 'version: 10107 (c0bc8591e)\\r\\ncompiler: test\\n'\n",
+        );
+
+        let version = llama_server_version(&program).expect("successful version probe");
+
+        assert_eq!(
+            version,
+            crate::engine::llama_cpp::QUALIFIED_LLAMA_CPP_RUNTIME_IDENTITY
+        );
+        assert!(qualified_launch_spec_for_probed_version(&version).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn llama_version_probe_accepts_the_first_stderr_line_when_stdout_is_empty() {
+        let temp = tempdir().expect("tempdir");
+        let program = temp.path().join("stderr-version");
+        executable_script(
+            &program,
+            "#!/bin/sh\nprintf 'version: 10107 (c0bc8591e)\\r\\ncompiler: test\\n' >&2\n",
+        );
+
+        let version = llama_server_version(&program).expect("successful stderr version probe");
+
+        assert_eq!(
+            version,
+            crate::engine::llama_cpp::QUALIFIED_LLAMA_CPP_RUNTIME_IDENTITY
+        );
+        assert!(qualified_launch_spec_for_probed_version(&version).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn llama_version_probe_keeps_deceptive_first_line_bytes_visible_to_validation() {
+        for (label, source, expected_first_line) in [
+            (
+                "leading-blank",
+                "#!/bin/sh\nprintf '\\nversion: 10107 (c0bc8591e)\\n'\n",
+                "",
+            ),
+            (
+                "leading-space",
+                "#!/bin/sh\nprintf ' version: 10107 (c0bc8591e)\\n'\n",
+                " version: 10107 (c0bc8591e)",
+            ),
+            (
+                "trailing-space",
+                "#!/bin/sh\nprintf 'version: 10107 (c0bc8591e) \\n'\n",
+                "version: 10107 (c0bc8591e) ",
+            ),
+            (
+                "correct-second-line",
+                "#!/bin/sh\nprintf 'diagnostic\\nversion: 10107 (c0bc8591e)\\n'\n",
+                "diagnostic",
+            ),
+        ] {
+            let temp = tempdir().expect("tempdir");
+            let program = temp.path().join(label);
+            executable_script(&program, source);
+
+            let version = llama_server_version(&program).expect("successful version probe");
+
+            assert_eq!(version, expected_first_line, "{label}");
+            assert!(
+                qualified_launch_spec_for_probed_version(&version).is_err(),
+                "{label}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn llama_version_probe_never_stitches_stdout_and_stderr_into_one_identity_line() {
+        let temp = tempdir().expect("tempdir");
+        let program = temp.path().join("split-version");
+        executable_script(
+            &program,
+            "#!/bin/sh\nprintf 'version: 10107 ('\nprintf 'c0bc8591e)\\n' >&2\n",
+        );
+
+        let version = llama_server_version(&program).expect("successful version probe");
+
+        assert_eq!(version, "version: 10107 (");
+        assert!(qualified_launch_spec_for_probed_version(&version).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn llama_version_probe_rejects_correct_text_from_an_unsuccessful_process() {
+        let temp = tempdir().expect("tempdir");
+        let program = temp.path().join("failed-version");
+        executable_script(
+            &program,
+            "#!/bin/sh\nprintf 'version: 10107 (c0bc8591e)\\n'\nexit 7\n",
+        );
+
+        let error = llama_server_version(&program).expect_err("nonzero version probe");
+
+        assert!(matches!(
+            error,
+            SupervisorError::LlamaServerVersionFailed { exit_code: Some(7) }
+        ));
+        assert_eq!(
+            error.to_string(),
+            "llama-server --version failed with exit code 7"
+        );
+        assert!(!error.to_string().contains(&program.display().to_string()));
     }
 
     #[cfg(unix)]
