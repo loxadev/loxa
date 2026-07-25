@@ -614,9 +614,15 @@ pub fn router(state: GatewayState) -> Router {
 
 pub fn remote_router(state: GatewayState) -> Router {
     Router::new()
-        .route("/v1/models", get(models))
+        .route(
+            "/v1/models",
+            get(models).head(|| async { StatusCode::METHOD_NOT_ALLOWED }),
+        )
         .route("/v1/chat/completions", post(chat))
-        .route("/loxa/status", get(status))
+        .route(
+            "/loxa/status",
+            get(status).head(|| async { StatusCode::METHOD_NOT_ALLOWED }),
+        )
         .with_state(state)
 }
 
@@ -1134,6 +1140,11 @@ mod tests {
                 .await
                 .unwrap(),
             client
+                .head(format!("{base}/v1/models"))
+                .send()
+                .await
+                .unwrap(),
+            client
                 .post(format!("{base}/v1/models"))
                 .send()
                 .await
@@ -1145,6 +1156,11 @@ mod tests {
                 .unwrap(),
             client
                 .post(format!("{base}/loxa/status"))
+                .send()
+                .await
+                .unwrap(),
+            client
+                .head(format!("{base}/loxa/status"))
                 .send()
                 .await
                 .unwrap(),
