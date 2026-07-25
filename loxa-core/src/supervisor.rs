@@ -75,6 +75,7 @@ pub const FORCE_KILL_CONFIRMATION_PERIOD: Duration = Duration::from_secs(5);
 pub const STOP_OWNER_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 pub const LOG_TAIL_BYTES: usize = 8 * 1024;
 pub const MAX_LOG_BYTES: usize = 1024 * 1024;
+const LLAMA_SERVER_VERSION_STREAM_LIMIT_BYTES: usize = 1024;
 const RETAIN_INACTIVE_CHILD_LOGS: usize = 7;
 const CHILD_LOG_ROOT_LOCK_FILE: &str = ".child-output.v1.lock";
 const CHILD_LOG_ROOT_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -373,6 +374,7 @@ pub enum SupervisorError {
     ModelNotDownloaded(PathBuf),
     LlamaServerNotFound,
     LlamaServerVersionFailed { exit_code: Option<i32> },
+    LlamaServerVersionInvalid,
     LlamaServerVersionTimeout,
     NoFreePort,
     ProcessIdentityUnavailable(u32),
@@ -404,6 +406,12 @@ impl fmt::Display for SupervisorError {
             ),
             SupervisorError::LlamaServerVersionFailed { exit_code: None } => {
                 write!(f, "llama-server --version failed without an exit code")
+            }
+            SupervisorError::LlamaServerVersionInvalid => {
+                write!(
+                    f,
+                    "llama-server --version returned invalid identity output"
+                )
             }
             SupervisorError::LlamaServerVersionTimeout => {
                 write!(f, "llama-server --version timed out")
@@ -636,34 +644,92 @@ pub fn detect_llama_server() -> Result<PathBuf, SupervisorError> {
 }
 
 pub fn llama_server_version(path: &Path) -> Result<String, SupervisorError> {
+    llama_server_version_with_timeout(path, LLAMA_SERVER_VERSION_TIMEOUT)
+}
+
+fn llama_server_version_with_timeout(
+    path: &Path,
+    timeout: Duration,
+) -> Result<String, SupervisorError> {
+    let started = Instant::now();
     let mut child = Command::new(path)
         .arg("--version")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or(SupervisorError::LlamaServerVersionInvalid)?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or(SupervisorError::LlamaServerVersionInvalid)?;
+    let mut stdout_drain = Some(
+        spawn_version_probe_drain(stdout)
+            .map_err(|_| SupervisorError::LlamaServerVersionInvalid)?,
+    );
+    let mut stderr_drain = Some(
+        spawn_version_probe_drain(stderr)
+            .map_err(|_| SupervisorError::LlamaServerVersionInvalid)?,
+    );
+    let mut stdout_result = None;
+    let mut stderr_result = None;
+    let mut status = None;
 
-    let started = Instant::now();
-    while started.elapsed() < LLAMA_SERVER_VERSION_TIMEOUT {
-        if let Some(status) = child.try_wait()? {
-            let (stdout, stderr) = read_child_output_streams(&mut child)?;
+    while started.elapsed() < timeout {
+        if status.is_none() {
+            status = child.try_wait()?;
+        }
+        if stdout_result.is_none() {
+            stdout_result = take_finished_version_probe_drain(&mut stdout_drain);
+        }
+        if stderr_result.is_none() {
+            stderr_result = take_finished_version_probe_drain(&mut stderr_drain);
+        }
+
+        if let Some(status) = status.as_ref() {
             if !status.success() {
                 return Err(SupervisorError::LlamaServerVersionFailed {
                     exit_code: status.code(),
                 });
             }
-            let output = if stdout.is_empty() { &stderr } else { &stdout };
-            if output.is_empty() {
-                return Ok("unknown".to_string());
+            if version_probe_drain_failed(stdout_result.as_ref())
+                || version_probe_drain_failed(stderr_result.as_ref())
+            {
+                return Err(SupervisorError::LlamaServerVersionInvalid);
             }
-            return Ok(llama_server_version_first_line(output).to_string());
+            if let (Some(Ok(stdout)), Some(Ok(stderr))) =
+                (stdout_result.take(), stderr_result.take())
+            {
+                return finish_version_probe(stdout, stderr);
+            }
+        } else if version_probe_drain_failed(stdout_result.as_ref())
+            || version_probe_drain_failed(stderr_result.as_ref())
+        {
+            stop_version_probe_within_deadline(&mut child, started, timeout);
+            return Err(SupervisorError::LlamaServerVersionInvalid);
         }
 
-        thread::sleep(Duration::from_millis(50));
+        let remaining = timeout.saturating_sub(started.elapsed());
+        thread::sleep(Duration::from_millis(10).min(remaining));
     }
 
-    let _ = child.kill();
-    let _ = child.wait();
-    Err(SupervisorError::LlamaServerVersionTimeout)
+    if status.is_none() {
+        status = child.try_wait()?;
+    }
+    if let Some(status) = status {
+        if !status.success() {
+            return Err(SupervisorError::LlamaServerVersionFailed {
+                exit_code: status.code(),
+            });
+        }
+        Err(SupervisorError::LlamaServerVersionInvalid)
+    } else {
+        let _ = child.kill();
+        let _ = child.try_wait();
+        Err(SupervisorError::LlamaServerVersionTimeout)
+    }
 }
 
 pub fn log_file_path(id: &str, port: u16, started_at_unix_s: u64) -> PathBuf {
@@ -1555,18 +1621,66 @@ pub fn cleanup_after_ctrl_c<C: ManagedChild + LogDrainingChild>(
     })
 }
 
-fn read_child_output_streams(child: &mut Child) -> io::Result<(String, String)> {
-    let mut stdout = String::new();
-    let mut stderr = String::new();
+type VersionProbeDrain = thread::JoinHandle<io::Result<Vec<u8>>>;
 
-    if let Some(mut handle) = child.stdout.take() {
-        handle.read_to_string(&mut stdout)?;
-    }
-    if let Some(mut handle) = child.stderr.take() {
-        handle.read_to_string(&mut stderr)?;
-    }
+fn spawn_version_probe_drain(reader: impl Read + Send + 'static) -> io::Result<VersionProbeDrain> {
+    thread::Builder::new()
+        .name("loxa-version-probe-drain".to_string())
+        .spawn(move || {
+            let mut output = Vec::with_capacity(LLAMA_SERVER_VERSION_STREAM_LIMIT_BYTES + 1);
+            reader
+                .take((LLAMA_SERVER_VERSION_STREAM_LIMIT_BYTES + 1) as u64)
+                .read_to_end(&mut output)?;
+            if output.len() > LLAMA_SERVER_VERSION_STREAM_LIMIT_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "version probe stream exceeded its byte limit",
+                ));
+            }
+            Ok(output)
+        })
+}
 
-    Ok((stdout, stderr))
+fn take_finished_version_probe_drain(
+    drain: &mut Option<VersionProbeDrain>,
+) -> Option<io::Result<Vec<u8>>> {
+    if !drain.as_ref().is_some_and(thread::JoinHandle::is_finished) {
+        return None;
+    }
+    Some(
+        drain
+            .take()
+            .expect("finished version probe drain remains owned")
+            .join()
+            .unwrap_or_else(|_| Err(io::Error::other("version probe drain panicked"))),
+    )
+}
+
+fn version_probe_drain_failed(result: Option<&io::Result<Vec<u8>>>) -> bool {
+    result.is_some_and(Result::is_err)
+}
+
+fn finish_version_probe(stdout: Vec<u8>, stderr: Vec<u8>) -> Result<String, SupervisorError> {
+    let stdout =
+        String::from_utf8(stdout).map_err(|_| SupervisorError::LlamaServerVersionInvalid)?;
+    let stderr =
+        String::from_utf8(stderr).map_err(|_| SupervisorError::LlamaServerVersionInvalid)?;
+    let output = if stdout.is_empty() { &stderr } else { &stdout };
+    if output.is_empty() {
+        return Ok("unknown".to_string());
+    }
+    Ok(llama_server_version_first_line(output).to_string())
+}
+
+fn stop_version_probe_within_deadline(child: &mut Child, started: Instant, timeout: Duration) {
+    let _ = child.kill();
+    while started.elapsed() < timeout {
+        if child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        let remaining = timeout.saturating_sub(started.elapsed());
+        thread::sleep(Duration::from_millis(10).min(remaining));
+    }
 }
 
 fn llama_server_version_first_line(output: &str) -> &str {
@@ -1797,6 +1911,16 @@ mod tests {
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
+
+    #[cfg(unix)]
+    static LLAMA_VERSION_PROBE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(unix)]
+    fn lock_llama_version_probe_test() -> std::sync::MutexGuard<'static, ()> {
+        LLAMA_VERSION_PROBE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     #[test]
     fn exact_instance_replacement_never_tears_down_foreign_child() {
@@ -2248,6 +2372,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn llama_version_probe_preserves_the_exact_first_stdout_line_and_normalizes_crlf() {
+        let _guard = lock_llama_version_probe_test();
         let temp = tempdir().expect("tempdir");
         let program = temp.path().join("qualified-version");
         executable_script(
@@ -2267,6 +2392,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn llama_version_probe_accepts_the_first_stderr_line_when_stdout_is_empty() {
+        let _guard = lock_llama_version_probe_test();
         let temp = tempdir().expect("tempdir");
         let program = temp.path().join("stderr-version");
         executable_script(
@@ -2286,6 +2412,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn llama_version_probe_keeps_deceptive_first_line_bytes_visible_to_validation() {
+        let _guard = lock_llama_version_probe_test();
         for (label, source, expected_first_line) in [
             (
                 "leading-blank",
@@ -2325,6 +2452,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn llama_version_probe_never_stitches_stdout_and_stderr_into_one_identity_line() {
+        let _guard = lock_llama_version_probe_test();
         let temp = tempdir().expect("tempdir");
         let program = temp.path().join("split-version");
         executable_script(
@@ -2341,6 +2469,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn llama_version_probe_rejects_correct_text_from_an_unsuccessful_process() {
+        let _guard = lock_llama_version_probe_test();
         let temp = tempdir().expect("tempdir");
         let program = temp.path().join("failed-version");
         executable_script(
@@ -2359,6 +2488,124 @@ mod tests {
             "llama-server --version failed with exit code 7"
         );
         assert!(!error.to_string().contains(&program.display().to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn llama_version_probe_checks_nonzero_status_before_decoding_invalid_bytes() {
+        let _guard = lock_llama_version_probe_test();
+        let temp = tempdir().expect("tempdir");
+        let program = temp.path().join("failed-invalid-version");
+        executable_script(&program, "#!/bin/sh\nprintf '\\377'\nexit 9\n");
+
+        let error = llama_server_version(&program).expect_err("nonzero invalid version probe");
+
+        assert!(matches!(
+            error,
+            SupervisorError::LlamaServerVersionFailed { exit_code: Some(9) }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn llama_version_probe_maps_zero_exit_invalid_bytes_to_typed_path_free_error() {
+        let _guard = lock_llama_version_probe_test();
+        let temp = tempdir().expect("tempdir");
+        let program = temp.path().join("successful-invalid-version");
+        executable_script(&program, "#!/bin/sh\nprintf '\\377'\n");
+
+        let error = llama_server_version(&program).expect_err("zero exit invalid version probe");
+
+        assert!(
+            matches!(error, SupervisorError::LlamaServerVersionInvalid),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "llama-server --version returned invalid identity output"
+        );
+        assert!(!error.to_string().contains(&program.display().to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn llama_version_probe_rejects_oversized_zero_exit_output() {
+        let _guard = lock_llama_version_probe_test();
+        let temp = tempdir().expect("tempdir");
+        let program = temp.path().join("oversized-version");
+        executable_script(
+            &program,
+            "#!/bin/sh\ndd if=/dev/zero bs=2048 count=1 2>/dev/null\n",
+        );
+
+        let error = llama_server_version(&program).expect_err("oversized version probe");
+
+        assert!(
+            matches!(error, SupervisorError::LlamaServerVersionInvalid),
+            "{error:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn llama_version_probe_settles_on_one_deadline_when_a_descendant_holds_pipes_open() {
+        let _guard = lock_llama_version_probe_test();
+        let temp = tempdir().expect("tempdir");
+        let program = temp.path().join("inherited-version-pipes");
+        let descendant_pid = temp.path().join("descendant.pid");
+        executable_script(
+            &program,
+            &format!(
+                "#!/bin/sh\nsleep 12 &\nprintf '%s' \"$!\" > '{}'\nprintf 'version: 10107 (c0bc8591e)\\n'\n",
+                descendant_pid.display()
+            ),
+        );
+        let started = Instant::now();
+
+        let error = llama_server_version_with_timeout(&program, Duration::from_secs(5))
+            .expect_err("incomplete inherited-pipe probe");
+        let elapsed = started.elapsed();
+        let pid = fs::read_to_string(&descendant_pid).expect("descendant pid");
+        let status = Command::new("/bin/kill")
+            .arg(pid)
+            .status()
+            .expect("kill inherited-pipe descendant");
+        assert!(status.success(), "kill inherited-pipe descendant");
+
+        assert!(
+            matches!(error, SupervisorError::LlamaServerVersionInvalid),
+            "{error:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "probe must settle near its own deadline without waiting for the descendant"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn llama_version_probe_bounds_continuous_output_and_settles_without_a_thread_join() {
+        let _guard = lock_llama_version_probe_test();
+        let temp = tempdir().expect("tempdir");
+        let program = temp.path().join("continuous-version-output");
+        executable_script(&program, "#!/bin/sh\nexec yes 0123456789abcdef\n");
+        let started = Instant::now();
+
+        let error = llama_server_version_with_timeout(&program, Duration::from_secs(2))
+            .expect_err("continuous oversized probe");
+
+        assert!(
+            matches!(
+                error,
+                SupervisorError::LlamaServerVersionInvalid
+                    | SupervisorError::LlamaServerVersionFailed { .. }
+            ),
+            "{error:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "continuous output must settle within the probe deadline"
+        );
     }
 
     #[cfg(unix)]
