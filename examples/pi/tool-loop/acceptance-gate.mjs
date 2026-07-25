@@ -31,21 +31,45 @@ function matchesExactly(actual, expected) {
 
 export function createAcceptanceGate() {
   let step = 0;
-  return async ({ toolName, input } = {}) => {
+  let pending;
+  let failed = false;
+  const gate = async ({ toolCallId, toolName, input } = {}) => {
     const expected = STEPS[step];
     if (
+      failed ||
+      pending !== undefined ||
       expected === undefined ||
+      typeof toolCallId !== "string" ||
+      toolCallId.length === 0 ||
       toolName !== expected.toolName ||
       !matchesExactly(input, expected.input)
     ) {
       return BLOCKED;
     }
+    pending = { toolCallId, toolName, input: { ...input } };
+    return undefined;
+  };
+  gate.toolResult = async ({ toolCallId, toolName, input, isError } = {}) => {
+    if (
+      pending === undefined ||
+      isError !== false ||
+      toolCallId !== pending.toolCallId ||
+      toolName !== pending.toolName ||
+      !matchesExactly(input, pending.input)
+    ) {
+      failed = true;
+      pending = undefined;
+      return BLOCKED;
+    }
+    pending = undefined;
     step += 1;
     return undefined;
   };
+  return gate;
 }
 
 export default function acceptanceGate(pi) {
   const gate = createAcceptanceGate();
   pi.on("tool_call", gate);
+  pi.on("tool_result", gate.toolResult);
 }

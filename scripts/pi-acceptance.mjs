@@ -28,9 +28,11 @@ const MAX_TRACE_RECORDS = 10_000;
 const MAX_PI_STDOUT_BYTES = 1024 * 1024;
 const MAX_PI_STDERR_BYTES = 64 * 1024;
 const MAX_PI_LINE_BYTES = 64 * 1024;
+const MAX_PI_VERSION_STDOUT_BYTES = 4096;
 const MAX_GATEWAY_RESPONSE_BYTES = 64 * 1024;
 const MAX_PROCESS_TIMEOUT_MS = 5 * 60 * 1000;
 const GATEWAY_TIMEOUT_MS = 5000;
+const PI_VERSION_TIMEOUT_MS = 5000;
 const FORCE_KILL_DELAY_MS = 250;
 const TERMINAL_DEADLINE_MS = 250;
 const KNOWN_LIFECYCLE_EVENTS = new Set([
@@ -469,10 +471,11 @@ class QualifiedPiEventAdapter {
       const toolName = validateEventIdentifier(record.toolName, "toolName");
       if (
         !ALLOWED_TOOL_NAMES.has(toolName) ||
+        this.pending.size !== 0 ||
         this.pending.has(toolCallId) ||
         this.completed.has(toolCallId)
       ) {
-        fail("Pi tool correlation is invalid");
+        fail("Pi tool correlation is invalid or concurrent tool execution started");
       }
       this.pending.set(toolCallId, toolName);
       return;
@@ -960,11 +963,90 @@ function isAbsoluteExecutable(value) {
   return typeof value === "string" && (path.isAbsolute(value) || path.win32.isAbsolute(value));
 }
 
-function readPiVersion(program) {
+export function readPiVersion(
+  program,
+  {
+    spawnProcess = spawn,
+    timeoutMs = PI_VERSION_TIMEOUT_MS,
+    forceKillDelayMs = FORCE_KILL_DELAY_MS,
+    terminalTimeoutMs = TERMINAL_DEADLINE_MS,
+  } = {},
+) {
   return new Promise((resolve, reject) => {
     let child;
+    let settled = false;
+    let terminationRequested = false;
+    let output = "";
+    let outputBytes = 0;
+    let timeout;
+    let forceKillTimer;
+    let terminalTimer;
+    const cleanup = () => {
+      clearTimeout(timeout);
+      clearTimeout(forceKillTimer);
+      clearTimeout(terminalTimer);
+      child?.stdout?.off("data", onStdout);
+      child?.off("error", onError);
+      child?.off("close", onClose);
+      child?.stdout?.destroy();
+    };
+    const failProbe = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      reject(new Error("qualified Pi executable verification failed"));
+    };
+    const succeed = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      resolve(output);
+    };
+    const terminate = () => {
+      if (terminationRequested || settled) {
+        return;
+      }
+      terminationRequested = true;
+      try {
+        child?.kill?.("SIGTERM");
+      } catch {
+        // The terminal deadline below is authoritative.
+      }
+      forceKillTimer = setTimeout(() => {
+        try {
+          child?.kill?.("SIGKILL");
+        } catch {
+          // The terminal deadline below is authoritative.
+        }
+        terminalTimer = setTimeout(failProbe, terminalTimeoutMs);
+      }, forceKillDelayMs);
+    };
+    const rejectAfterTermination = () => {
+      terminate();
+    };
+    const onStdout = (chunk) => {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      outputBytes += bytes.length;
+      if (outputBytes > MAX_PI_VERSION_STDOUT_BYTES) {
+        rejectAfterTermination();
+        return;
+      }
+      output += bytes.toString("utf8");
+    };
+    const onError = () => rejectAfterTermination();
+    const onClose = (code) => {
+      if (terminationRequested || code !== 0) {
+        failProbe();
+        return;
+      }
+      succeed();
+    };
     try {
-      child = spawn(program, ["--version"], {
+      child = spawnProcess(program, ["--version"], {
         shell: false,
         stdio: ["ignore", "pipe", "ignore"],
         windowsHide: true,
@@ -977,20 +1059,10 @@ function readPiVersion(program) {
       reject(new Error("qualified Pi executable verification failed"));
       return;
     }
-    let output = "";
-    child.stdout.on("data", (chunk) => {
-      output += Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
-    });
-    child.once("error", () =>
-      reject(new Error("qualified Pi executable verification failed")),
-    );
-    child.once("close", (code) => {
-      if (code !== 0) {
-        reject(new Error("qualified Pi executable verification failed"));
-        return;
-      }
-      resolve(output);
-    });
+    child.stdout.on("data", onStdout);
+    child.once("error", onError);
+    child.once("close", onClose);
+    timeout = setTimeout(rejectAfterTermination, timeoutMs);
   });
 }
 
@@ -1025,6 +1097,7 @@ export function terminateOwnedProcessTree({
   signalProcess,
   spawnTreeKiller,
   taskkillExecutable,
+  terminalTimeoutMs = TERMINAL_DEADLINE_MS,
 }) {
   const signalExactChild = () => {
     try {
@@ -1055,23 +1128,37 @@ export function terminateOwnedProcessTree({
         killer?.unref?.();
         return new Promise((resolve, reject) => {
           let complete = false;
+          const terminalTimer = setTimeout(() => {
+            try {
+              killer.kill?.("SIGKILL");
+            } catch {
+              // The terminal cleanup failure remains authoritative.
+            }
+            failCleanup();
+          }, terminalTimeoutMs);
+          const finish = (callback) => {
+            clearTimeout(terminalTimer);
+            callback();
+          };
           const failCleanup = () => {
             if (!complete) {
               complete = true;
               reject(new Error("Pi process cleanup failed"));
             }
           };
-          killer.once("error", failCleanup);
+          killer.once("error", () => finish(failCleanup));
           killer.once("close", (code) => {
             if (complete) {
               return;
             }
-            complete = true;
-            if (code === 0) {
-              resolve();
-            } else {
-              reject(new Error("Pi process cleanup failed"));
-            }
+            finish(() => {
+              complete = true;
+              if (code === 0) {
+                resolve();
+              } else {
+                reject(new Error("Pi process cleanup failed"));
+              }
+            });
           });
         });
       } catch {
@@ -1103,6 +1190,7 @@ function runPiProcess({
   signalProcess,
   spawnTreeKiller,
   taskkillExecutable,
+  taskkillTerminalTimeoutMs,
 }) {
   if (cancellation?.aborted) {
     return Promise.reject(new Error("Pi acceptance was cancelled"));
@@ -1189,6 +1277,7 @@ function runPiProcess({
               signalProcess,
               spawnTreeKiller,
               taskkillExecutable,
+              terminalTimeoutMs: taskkillTerminalTimeoutMs,
             }),
           )
           .catch(() => {
@@ -1475,6 +1564,7 @@ export async function runQualifiedPiAdapter(
       taskkillExecutable:
         testSeam.taskkillExecutable ??
         path.win32.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "taskkill.exe"),
+      taskkillTerminalTimeoutMs: testSeam.taskkillTerminalTimeoutMs,
     });
     await validateExactWorkspace({
       seedRoot: path.join(repositoryRoot, "examples/pi/tool-loop/seed"),
