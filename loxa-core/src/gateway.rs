@@ -1828,7 +1828,11 @@ mod tests {
 
         let response = Client::new()
             .post(format!("{base}/v1/chat/completions"))
-            .json(&json!({"model": "loxa", "messages": [{"role": "user", "content": "hi"}]}))
+            .json(&json!({
+                "model": "loxa",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 4096
+            }))
             .send()
             .await
             .unwrap();
@@ -1837,10 +1841,9 @@ mod tests {
         assert!(!text.contains("loxa-node-test-g0"));
         let json: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(json["model"], "loxa");
-        assert_eq!(
-            seen.lock().unwrap().as_ref().unwrap()["model"],
-            "loxa-node-test-g0"
-        );
+        let forwarded = seen.lock().unwrap().clone().unwrap();
+        assert_eq!(forwarded["model"], "loxa-node-test-g0");
+        assert_eq!(forwarded["max_tokens"], 4096);
     }
 
     #[tokio::test]
