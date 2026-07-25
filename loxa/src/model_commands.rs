@@ -2,6 +2,7 @@ use loxa_core::download;
 use loxa_core::hardware::HardwareReport;
 use loxa_core::registry::{self, ModelEntry, VerifiedModel, REGISTRY};
 use loxa_core::runtime_profile::runtime_profile;
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::io::{self, Write};
@@ -259,9 +260,13 @@ pub(crate) fn pull_model<W: Write, E: Write>(
     }
 }
 
-fn user_registry_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
+pub(crate) fn user_registry_dir() -> PathBuf {
+    let home = std::env::var_os("HOME");
+    user_registry_dir_from_home(home.as_deref())
+}
+
+pub(crate) fn user_registry_dir_from_home(home: Option<&OsStr>) -> PathBuf {
+    home.map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".loxa/registry.d")
 }
@@ -428,6 +433,18 @@ mod tests {
     use loxa_core::registry::VerifiedModel;
     use loxa_core::runtime_profile::runtime_profile;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn user_registry_resolver_uses_only_home_and_preserves_the_no_home_fallback() {
+        assert_eq!(
+            user_registry_dir_from_home(Some(std::ffi::OsStr::new("home-root"))),
+            PathBuf::from("home-root").join(".loxa/registry.d")
+        );
+        assert_eq!(
+            user_registry_dir_from_home(None),
+            PathBuf::from(".").join(".loxa/registry.d")
+        );
+    }
 
     #[test]
     fn fixed_pair_status_and_list_use_aggregate_artifacts_and_size() {
