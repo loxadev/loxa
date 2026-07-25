@@ -790,7 +790,11 @@ function validateEvidenceDirectory(value) {
   return normalized;
 }
 
-async function writeSanitizedEvidence(evidenceDirectory, evidence) {
+async function writeSanitizedEvidence(
+  evidenceDirectory,
+  evidence,
+  publishEvidence = link,
+) {
   let directory = repositoryRoot;
   for (const component of evidenceDirectory.split("/")) {
     directory = path.join(directory, component);
@@ -826,7 +830,7 @@ async function writeSanitizedEvidence(evidenceDirectory, evidence) {
       mode: 0o600,
       flag: "wx",
     });
-    await link(temporary, destination);
+    await publishEvidence(temporary, destination);
   } finally {
     await rm(temporary, { force: true });
   }
@@ -1520,6 +1524,7 @@ export async function runQualifiedPiAdapter(
   const spawnProcess = testSeam.spawnProcess ?? spawn;
   const signalProcess = testSeam.signalProcess ?? process.kill;
   const spawnTreeKiller = testSeam.spawnTreeKiller ?? spawn;
+  const publishEvidence = testSeam.publishEvidence ?? link;
   const resolveExecutable =
     testSeam.resolveExecutable ??
     (testSeam.spawnProcess === undefined ? realpath : async (value) => value);
@@ -1531,7 +1536,8 @@ export async function runQualifiedPiAdapter(
   if (
     typeof spawnProcess !== "function" ||
     typeof signalProcess !== "function" ||
-    typeof spawnTreeKiller !== "function"
+    typeof spawnTreeKiller !== "function" ||
+    typeof publishEvidence !== "function"
   ) {
     fail("Pi process launcher is invalid");
   }
@@ -1640,7 +1646,11 @@ export async function runQualifiedPiAdapter(
       readyAfter: true,
     });
     if (evidenceDirectory !== undefined) {
-      await writeSanitizedEvidence(evidenceDirectory, evidence);
+      await writeSanitizedEvidence(
+        evidenceDirectory,
+        evidence,
+        publishEvidence,
+      );
     }
     return {
       providerConfigSha256,
