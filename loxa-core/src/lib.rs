@@ -14,6 +14,7 @@ pub mod model_inventory;
 pub mod provider;
 pub mod registry;
 pub mod resolve;
+pub mod runtime_profile;
 pub mod selector;
 pub mod supervisor;
 pub mod workload;

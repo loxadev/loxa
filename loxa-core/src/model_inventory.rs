@@ -1,6 +1,6 @@
 //! Non-blocking inventory snapshots for the compiled, verified model recipes.
 
-use crate::registry::{ModelEntry, REGISTRY};
+use crate::registry::{ModelEntry, VerifiedModel, REGISTRY};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, Metadata, OpenOptions};
@@ -328,7 +328,7 @@ impl VerificationCache {
         models_dir: &Path,
         recipe: &ModelEntry,
     ) -> io::Result<VerifiedArtifact> {
-        self.verify_recipe_with_cancellation(models_dir, recipe, &NeverCancel)
+        self.verify_artifact(models_dir, recipe)
     }
 
     pub fn verify_recipe_with_cancellation(
@@ -337,7 +337,25 @@ impl VerificationCache {
         recipe: &ModelEntry,
         cancellation: &dyn VerificationCancellation,
     ) -> io::Result<VerifiedArtifact> {
-        let path = checked_regular_path(models_dir, recipe.filename)?;
+        self.verify_artifact_with_cancellation(models_dir, recipe, cancellation)
+    }
+
+    /// Potentially expensive; intended for a bounded background/blocking worker.
+    pub fn verify_artifact(
+        &self,
+        models_dir: &Path,
+        artifact: &dyn VerifiedModel,
+    ) -> io::Result<VerifiedArtifact> {
+        self.verify_artifact_with_cancellation(models_dir, artifact, &NeverCancel)
+    }
+
+    pub fn verify_artifact_with_cancellation(
+        &self,
+        models_dir: &Path,
+        artifact: &dyn VerifiedModel,
+        cancellation: &dyn VerificationCancellation,
+    ) -> io::Result<VerifiedArtifact> {
+        let path = checked_regular_path(models_dir, artifact.filename())?;
         let metadata = fs::symlink_metadata(&path)?;
         if !metadata.file_type().is_file() {
             return Err(io::Error::new(
@@ -346,14 +364,21 @@ impl VerificationCache {
             ));
         }
         let stable = StableMetadata::from(&metadata);
-        if let Some(evidence) = self.cached(&path, &stable, recipe.sha256) {
+        if stable.len != artifact.size_bytes() {
+            return Ok(VerifiedArtifact {
+                size_bytes: stable.len,
+                expected_sha256: artifact.sha256().into(),
+                matches: false,
+            });
+        }
+        if let Some(evidence) = self.cached(&path, &stable, artifact.sha256()) {
             return Ok(evidence);
         }
 
         let key = VerificationKey {
             path: path.clone(),
             metadata: stable.clone(),
-            expected_sha256: recipe.sha256.into(),
+            expected_sha256: artifact.sha256().into(),
         };
         let (flight, leader) = {
             let mut state = self
@@ -362,7 +387,7 @@ impl VerificationCache {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(item) = state.entries.get(&path).filter(|item| {
                 item.metadata == stable
-                    && item.evidence.expected_sha256 == recipe.sha256
+                    && item.evidence.expected_sha256 == artifact.sha256()
                     && evidence_reusable(&item.evidence, positive_cache_reusable())
             }) {
                 return Ok(item.evidence.clone());
@@ -398,7 +423,7 @@ impl VerificationCache {
         self.verification_runs.fetch_add(1, Ordering::Relaxed);
         let result = (|| {
             let matches =
-                hash_file_with_cancellation(&path, &stable, cancellation)? == recipe.sha256;
+                hash_file_with_cancellation(&path, &stable, cancellation)? == artifact.sha256();
             let after = fs::symlink_metadata(&path)?;
             if !after.file_type().is_file() || StableMetadata::from(&after) != stable {
                 return Err(io::Error::new(
@@ -408,7 +433,7 @@ impl VerificationCache {
             }
             Ok(VerifiedArtifact {
                 size_bytes: stable.len,
-                expected_sha256: recipe.sha256.into(),
+                expected_sha256: artifact.sha256().into(),
                 matches,
             })
         })();
@@ -948,8 +973,53 @@ fn open_regular_no_follow(path: &Path) -> io::Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::VerifiedModel;
     use std::sync::Barrier;
     use tempfile::tempdir;
+
+    struct PinnedArtifact {
+        filename: &'static str,
+        sha256: &'static str,
+        size_bytes: u64,
+    }
+
+    impl VerifiedModel for PinnedArtifact {
+        fn id(&self) -> &str {
+            "pinned-fixture"
+        }
+
+        fn repo(&self) -> &str {
+            "owner/repo"
+        }
+
+        fn revision(&self) -> &str {
+            "0123456789abcdef0123456789abcdef01234567"
+        }
+
+        fn filename(&self) -> &str {
+            self.filename
+        }
+
+        fn sha256(&self) -> &str {
+            self.sha256
+        }
+
+        fn size_bytes(&self) -> u64 {
+            self.size_bytes
+        }
+    }
+
+    fn pinned_fixture(bytes: &'static [u8]) -> PinnedArtifact {
+        let sha: String = Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        PinnedArtifact {
+            filename: "pinned-fixture.gguf",
+            sha256: Box::leak(sha.into_boxed_str()),
+            size_bytes: bytes.len() as u64,
+        }
+    }
 
     fn fixture(bytes: &'static [u8]) -> ModelEntry {
         let sha: String = Sha256::digest(bytes)
@@ -968,6 +1038,93 @@ mod tests {
             quant: "Q4",
             min_free_mem_gb: 0.1,
         }
+    }
+
+    #[test]
+    fn verify_artifact_accepts_matching_pinned_artifact() {
+        let dir = tempdir().unwrap();
+        let artifact = pinned_fixture(b"qualified");
+        fs::write(dir.path().join(artifact.filename()), b"qualified").unwrap();
+
+        let evidence = VerificationCache::default()
+            .verify_artifact(dir.path(), &artifact)
+            .unwrap();
+
+        assert!(evidence.matches);
+        assert_eq!(evidence.size_bytes, 9);
+        assert_eq!(evidence.expected_sha256, artifact.sha256());
+    }
+
+    #[test]
+    fn verify_artifact_rejects_wrong_size() {
+        let dir = tempdir().unwrap();
+        let mut artifact = pinned_fixture(b"qualified");
+        artifact.size_bytes += 1;
+        fs::write(dir.path().join(artifact.filename()), b"qualified").unwrap();
+
+        let evidence = VerificationCache::default()
+            .verify_artifact(dir.path(), &artifact)
+            .unwrap();
+
+        assert!(!evidence.matches);
+        assert_eq!(evidence.size_bytes, 9);
+    }
+
+    #[test]
+    fn verify_artifact_rejects_wrong_hash() {
+        let dir = tempdir().unwrap();
+        let mut artifact = pinned_fixture(b"qualified");
+        artifact.sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        fs::write(dir.path().join(artifact.filename()), b"qualified").unwrap();
+
+        let evidence = VerificationCache::default()
+            .verify_artifact(dir.path(), &artifact)
+            .unwrap();
+
+        assert!(!evidence.matches);
+    }
+
+    #[test]
+    fn verify_artifact_rejects_missing_file() {
+        let dir = tempdir().unwrap();
+        let artifact = pinned_fixture(b"qualified");
+
+        let error = VerificationCache::default()
+            .verify_artifact(dir.path(), &artifact)
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn verify_artifact_rejects_non_regular_file() {
+        let dir = tempdir().unwrap();
+        let artifact = pinned_fixture(b"qualified");
+        fs::create_dir(dir.path().join(artifact.filename())).unwrap();
+
+        let error = VerificationCache::default()
+            .verify_artifact(dir.path(), &artifact)
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_artifact_rejects_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let artifact = pinned_fixture(b"qualified");
+        let target = dir.path().join("outside.gguf");
+        fs::write(&target, b"qualified").unwrap();
+        symlink(&target, dir.path().join(artifact.filename())).unwrap();
+
+        let error = VerificationCache::default()
+            .verify_artifact(dir.path(), &artifact)
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     fn fixture_digest(recipe: &ModelEntry) -> [u8; 32] {
