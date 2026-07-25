@@ -128,6 +128,10 @@ struct DurableLaneFaults {
     verification_worker_changed: std::sync::Condvar,
     verification_before_publish_pause: Mutex<CompletionPause>,
     verification_before_publish_changed: std::sync::Condvar,
+    drafter_verification_pause: Mutex<CompletionPause>,
+    drafter_verification_changed: std::sync::Condvar,
+    completion_before_terminal_pause: Mutex<CompletionPause>,
+    completion_before_terminal_changed: std::sync::Condvar,
     lifecycle_cancel_pause: Mutex<CompletionPause>,
     lifecycle_cancel_changed: std::sync::Condvar,
     fatal_admission_pause: Mutex<CompletionPause>,
@@ -184,6 +188,32 @@ impl DurableLaneFaults {
                 .verification_before_publish_changed
                 .wait(state)
                 .unwrap();
+        }
+        state.armed = false;
+    }
+
+    fn pause_drafter_verification(&self) {
+        let mut state = self.drafter_verification_pause.lock().unwrap();
+        if !state.armed {
+            return;
+        }
+        state.reached = true;
+        self.drafter_verification_changed.notify_all();
+        while !state.released {
+            state = self.drafter_verification_changed.wait(state).unwrap();
+        }
+        state.armed = false;
+    }
+
+    fn pause_completion_before_terminal(&self) {
+        let mut state = self.completion_before_terminal_pause.lock().unwrap();
+        if !state.armed {
+            return;
+        }
+        state.reached = true;
+        self.completion_before_terminal_changed.notify_all();
+        while !state.released {
+            state = self.completion_before_terminal_changed.wait(state).unwrap();
         }
         state.armed = false;
     }
@@ -1579,23 +1609,32 @@ struct PendingDownloadVerification {
     waiter: VerificationWaiter,
     recipe: &'static ModelEntry,
     drafter: Option<&'static PinnedArtifact>,
+    cancellation: OperationCancellation,
+}
+
+#[derive(Default)]
+struct PendingDownloadVerificationState {
+    waiting: HashMap<OperationId, PendingDownloadVerification>,
+    completing: HashMap<OperationId, OperationCancellation>,
 }
 
 #[derive(Default)]
 struct PendingDownloadVerifications {
-    entries: Mutex<HashMap<OperationId, PendingDownloadVerification>>,
+    state: Mutex<PendingDownloadVerificationState>,
     changed: Condvar,
 }
 
 impl PendingDownloadVerifications {
     fn insert(&self, operation_id: OperationId, pending: PendingDownloadVerification) -> bool {
-        let Ok(mut entries) = self.entries.lock() else {
+        let Ok(mut state) = self.state.lock() else {
             return false;
         };
-        if entries.insert(operation_id, pending).is_some() {
+        if state.waiting.contains_key(&operation_id) || state.completing.contains_key(&operation_id)
+        {
             return false;
         }
-        drop(entries);
+        state.waiting.insert(operation_id, pending);
+        drop(state);
         self.changed.notify_all();
         true
     }
@@ -1605,9 +1644,12 @@ impl PendingDownloadVerifications {
         operation_id: OperationId,
         deadline: std::time::Instant,
     ) -> Option<PendingDownloadVerification> {
-        let mut entries = self.entries.lock().ok()?;
+        let mut state = self.state.lock().ok()?;
         loop {
-            if let Some(pending) = entries.remove(&operation_id) {
+            if let Some(pending) = state.waiting.remove(&operation_id) {
+                state
+                    .completing
+                    .insert(operation_id, pending.cancellation.clone());
                 return Some(pending);
             }
             let now = std::time::Instant::now();
@@ -1616,29 +1658,42 @@ impl PendingDownloadVerifications {
             }
             let (next, timeout) = self
                 .changed
-                .wait_timeout(entries, deadline.saturating_duration_since(now))
+                .wait_timeout(state, deadline.saturating_duration_since(now))
                 .ok()?;
-            entries = next;
+            state = next;
             if timeout.timed_out() {
-                return entries.remove(&operation_id);
+                let pending = state.waiting.remove(&operation_id)?;
+                state
+                    .completing
+                    .insert(operation_id, pending.cancellation.clone());
+                return Some(pending);
             }
         }
     }
 
     fn request_cancel(&self, operation_id: OperationId) -> bool {
-        self.entries
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        if let Some(pending) = state.waiting.get_mut(&operation_id) {
+            return matches!(
+                pending.waiter.request_operation_cancel(),
+                OperationCancelDelivery::CancelledPublished
+                    | OperationCancelDelivery::CompletionInFlightOrReady
+            );
+        }
+        state
+            .completing
+            .get(&operation_id)
+            .is_some_and(OperationCancellation::request_cancel)
+    }
+
+    fn finish_completion(&self, operation_id: OperationId) -> bool {
+        self.state
             .lock()
             .ok()
-            .and_then(|mut entries| {
-                entries.get_mut(&operation_id).map(|pending| {
-                    matches!(
-                        pending.waiter.request_operation_cancel(),
-                        OperationCancelDelivery::CancelledPublished
-                            | OperationCancelDelivery::CompletionInFlightOrReady
-                    )
-                })
-            })
-            .unwrap_or(false)
+            .and_then(|mut state| state.completing.remove(&operation_id))
+            .is_some()
     }
 }
 
@@ -2184,6 +2239,7 @@ impl LaneDownloadExecutor for DurableDownloadLaneExecutor {
                 waiter,
                 recipe,
                 drafter: required_drafter(recipe),
+                cancellation: cancellation.clone(),
             },
         ) {
             self.seal();
@@ -2368,10 +2424,20 @@ fn spawn_durable_download_lanes(
                             tracing::warn!(operation_id = %operation_id, error = %error, "durable download succeeded but cache evidence was not published");
                         }
                     }
+                    if !worker_pending.finish_completion(operation_id) {
+                        ticket.poison();
+                        worker_seal.seal_all();
+                        break;
+                    }
                     ticket.acknowledge();
                 }
                 CompletionDisposition::TerminalWon => {
                     if !worker_downloads.finish_committed(operation_id) {
+                        ticket.poison();
+                        worker_seal.seal_all();
+                        break;
+                    }
+                    if !worker_pending.finish_completion(operation_id) {
                         ticket.poison();
                         worker_seal.seal_all();
                         break;
@@ -2446,102 +2512,148 @@ fn classify_download_completion(
     ) {
         return CompletionDisposition::TerminalWon;
     }
-    let (transition, publish_cache) = if operation.status == V2OperationStatus::Cancelling {
+    let (candidate_transition, candidate_publish_cache) =
+        if operation.status == V2OperationStatus::Cancelling {
+            (Transition::Cancelled { operation_id }, false)
+        } else {
+            match &outcome.result {
+                VerificationResult::Verified(evidence) => {
+                    if cache
+                        .revalidate_verified_recipe(
+                            models_dir,
+                            recipe,
+                            &outcome.stable_identity,
+                            evidence,
+                        )
+                        .is_err()
+                    {
+                        (
+                            Transition::Failed {
+                                operation_id,
+                                error: operation_error(
+                                    V2OperationKind::Download,
+                                    "verified artifact identity changed before durable publication",
+                                ),
+                            },
+                            false,
+                        )
+                    } else if let Some(drafter) = drafter {
+                        #[cfg(test)]
+                        faults.pause_drafter_verification();
+                        match cache.verify_artifact_with_cancellation(
+                            models_dir,
+                            drafter,
+                            &outcome.ownership.cancellation,
+                        ) {
+                            Ok(evidence)
+                                if evidence.matches
+                                    && evidence.size_bytes == drafter.size_bytes()
+                                    && evidence.expected_sha256 == drafter.sha256() =>
+                            {
+                                (
+                                    Transition::Succeeded {
+                                        operation_id,
+                                        observed_model_id: None,
+                                    },
+                                    true,
+                                )
+                            }
+                            Ok(_) => (
+                                Transition::Failed {
+                                    operation_id,
+                                    error: operation_error(
+                                        V2OperationKind::Download,
+                                        "downloaded drafter failed verification",
+                                    ),
+                                },
+                                false,
+                            ),
+                            Err(_) => (
+                                Transition::Failed {
+                                    operation_id,
+                                    error: operation_error(
+                                        V2OperationKind::Download,
+                                        "downloaded drafter could not be verified safely",
+                                    ),
+                                },
+                                false,
+                            ),
+                        }
+                    } else {
+                        (
+                            Transition::Succeeded {
+                                operation_id,
+                                observed_model_id: None,
+                            },
+                            true,
+                        )
+                    }
+                }
+                VerificationResult::Cancelled => (
+                    Transition::Failed {
+                        operation_id,
+                        error: operation_error(
+                            V2OperationKind::Download,
+                            "download verification was interrupted without committed cancellation",
+                        ),
+                    },
+                    false,
+                ),
+                VerificationResult::Failed { .. } => (
+                    Transition::Failed {
+                        operation_id,
+                        error: operation_error(
+                            V2OperationKind::Download,
+                            "downloaded artifact failed verification",
+                        ),
+                    },
+                    false,
+                ),
+            }
+        };
+    let Ok(snapshot) = control_state.read_snapshot() else {
+        return CompletionDisposition::Unknown;
+    };
+    let Some(operation) = snapshot
+        .operations
+        .iter()
+        .find(|operation| operation.operation_id == operation_id)
+    else {
+        return CompletionDisposition::Unknown;
+    };
+    if matches!(
+        operation.status,
+        V2OperationStatus::Succeeded | V2OperationStatus::Failed | V2OperationStatus::Cancelled
+    ) {
+        return CompletionDisposition::TerminalWon;
+    }
+    let (mut transition, mut publish_cache) = if operation.status == V2OperationStatus::Cancelling {
         (Transition::Cancelled { operation_id }, false)
     } else {
-        match &outcome.result {
-            VerificationResult::Verified(evidence) => {
-                if cache
-                    .revalidate_verified_recipe(
-                        models_dir,
-                        recipe,
-                        &outcome.stable_identity,
-                        evidence,
-                    )
-                    .is_err()
-                {
-                    (
-                        Transition::Failed {
-                            operation_id,
-                            error: operation_error(
-                                V2OperationKind::Download,
-                                "verified artifact identity changed before durable publication",
-                            ),
-                        },
-                        false,
-                    )
-                } else if let Some(drafter) = drafter {
-                    match cache.verify_artifact_with_cancellation(
-                        models_dir,
-                        drafter,
-                        &outcome.ownership.cancellation,
-                    ) {
-                        Ok(evidence)
-                            if evidence.matches
-                                && evidence.size_bytes == drafter.size_bytes()
-                                && evidence.expected_sha256 == drafter.sha256() =>
-                        {
-                            (
-                                Transition::Succeeded {
-                                    operation_id,
-                                    observed_model_id: None,
-                                },
-                                true,
-                            )
-                        }
-                        Ok(_) => (
-                            Transition::Failed {
-                                operation_id,
-                                error: operation_error(
-                                    V2OperationKind::Download,
-                                    "downloaded drafter failed verification",
-                                ),
-                            },
-                            false,
-                        ),
-                        Err(_) => (
-                            Transition::Failed {
-                                operation_id,
-                                error: operation_error(
-                                    V2OperationKind::Download,
-                                    "downloaded drafter could not be verified safely",
-                                ),
-                            },
-                            false,
-                        ),
-                    }
-                } else {
-                    (
-                        Transition::Succeeded {
-                            operation_id,
-                            observed_model_id: None,
-                        },
-                        true,
-                    )
-                }
-            }
-            VerificationResult::Cancelled => (
-                Transition::Failed {
-                    operation_id,
-                    error: operation_error(
-                        V2OperationKind::Download,
-                        "download verification was interrupted without committed cancellation",
-                    ),
-                },
-                false,
-            ),
-            VerificationResult::Failed { .. } => (
-                Transition::Failed {
-                    operation_id,
-                    error: operation_error(
-                        V2OperationKind::Download,
-                        "downloaded artifact failed verification",
-                    ),
-                },
-                false,
-            ),
-        }
+        (candidate_transition, candidate_publish_cache)
     };
+    #[cfg(test)]
+    faults.pause_completion_before_terminal();
+    let Ok(snapshot) = control_state.read_snapshot() else {
+        return CompletionDisposition::Unknown;
+    };
+    let Some(operation) = snapshot
+        .operations
+        .iter()
+        .find(|operation| operation.operation_id == operation_id)
+    else {
+        return CompletionDisposition::Unknown;
+    };
+    if matches!(
+        operation.status,
+        V2OperationStatus::Succeeded | V2OperationStatus::Failed | V2OperationStatus::Cancelled
+    ) {
+        return CompletionDisposition::TerminalWon;
+    }
+    if operation.status == V2OperationStatus::Cancelling {
+        transition = Transition::Cancelled { operation_id };
+        publish_cache = false;
+    }
     #[cfg(test)]
     if faults.completion_lost_ack.swap(false, Ordering::AcqRel) {
         let committed = control_state.observe_and_drop_ack_for_test(transition);
@@ -2552,6 +2664,52 @@ fn classify_download_completion(
     }
     if observe_download_terminal(control_state, transition) {
         CompletionDisposition::Committed { publish_cache }
+    } else {
+        reconcile_download_terminal_race(control_state, operation_id)
+    }
+}
+
+fn reconcile_download_terminal_race(
+    control_state: &ControlStateHandle,
+    operation_id: OperationId,
+) -> CompletionDisposition {
+    let Ok(snapshot) = control_state.read_snapshot() else {
+        return CompletionDisposition::Unknown;
+    };
+    let Some(operation) = snapshot
+        .operations
+        .iter()
+        .find(|operation| operation.operation_id == operation_id)
+    else {
+        return CompletionDisposition::Unknown;
+    };
+    if matches!(
+        operation.status,
+        V2OperationStatus::Succeeded | V2OperationStatus::Failed | V2OperationStatus::Cancelled
+    ) {
+        return CompletionDisposition::TerminalWon;
+    }
+    if operation.status != V2OperationStatus::Cancelling {
+        return CompletionDisposition::Unknown;
+    }
+    if observe_download_terminal(control_state, Transition::Cancelled { operation_id }) {
+        return CompletionDisposition::Committed {
+            publish_cache: false,
+        };
+    }
+    let Ok(snapshot) = control_state.read_snapshot() else {
+        return CompletionDisposition::Unknown;
+    };
+    if snapshot.operations.iter().any(|operation| {
+        operation.operation_id == operation_id
+            && matches!(
+                operation.status,
+                V2OperationStatus::Succeeded
+                    | V2OperationStatus::Failed
+                    | V2OperationStatus::Cancelled
+            )
+    }) {
+        CompletionDisposition::TerminalWon
     } else {
         CompletionDisposition::Unknown
     }
@@ -2871,6 +3029,88 @@ impl DurableExecutionControl {
             .unwrap();
         state.released = true;
         self.faults.verification_before_publish_changed.notify_all();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_drafter_verification_pause_for_test(&self) {
+        let mut state = self.faults.drafter_verification_pause.lock().unwrap();
+        *state = CompletionPause {
+            armed: true,
+            reached: false,
+            released: false,
+        };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_drafter_verification_paused_for_test(
+        &self,
+        deadline: std::time::Instant,
+    ) -> bool {
+        let mut state = self.faults.drafter_verification_pause.lock().unwrap();
+        while !state.reached {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (next, timeout) = self
+                .faults
+                .drafter_verification_changed
+                .wait_timeout(state, deadline.saturating_duration_since(now))
+                .unwrap();
+            state = next;
+            if timeout.timed_out() && !state.reached {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_drafter_verification_for_test(&self) {
+        let mut state = self.faults.drafter_verification_pause.lock().unwrap();
+        state.released = true;
+        self.faults.drafter_verification_changed.notify_all();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_completion_before_terminal_pause_for_test(&self) {
+        let mut state = self.faults.completion_before_terminal_pause.lock().unwrap();
+        *state = CompletionPause {
+            armed: true,
+            reached: false,
+            released: false,
+        };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_completion_before_terminal_paused_for_test(
+        &self,
+        deadline: std::time::Instant,
+    ) -> bool {
+        let mut state = self.faults.completion_before_terminal_pause.lock().unwrap();
+        while !state.reached {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (next, timeout) = self
+                .faults
+                .completion_before_terminal_changed
+                .wait_timeout(state, deadline.saturating_duration_since(now))
+                .unwrap();
+            state = next;
+            if timeout.timed_out() && !state.reached {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_completion_before_terminal_for_test(&self) {
+        let mut state = self.faults.completion_before_terminal_pause.lock().unwrap();
+        state.released = true;
+        self.faults.completion_before_terminal_changed.notify_all();
     }
 
     #[cfg(test)]
@@ -4287,7 +4527,7 @@ trait ArtifactVerifier: Send {
         &mut self,
         models_dir: &std::path::Path,
         artifact: &'static dyn VerifiedModel,
-        cancellation: &MutationCancellation,
+        cancellation: &dyn VerificationCancellation,
     ) -> io::Result<VerifiedArtifact>;
 
     fn invalidate(&mut self, models_dir: &std::path::Path, recipe: &'static ModelEntry);
@@ -4302,7 +4542,7 @@ impl ArtifactVerifier for CacheArtifactVerifier {
         &mut self,
         models_dir: &std::path::Path,
         artifact: &'static dyn VerifiedModel,
-        cancellation: &MutationCancellation,
+        cancellation: &dyn VerificationCancellation,
     ) -> io::Result<VerifiedArtifact> {
         self.cache
             .verify_artifact_with_cancellation(models_dir, artifact, cancellation)
@@ -4322,6 +4562,17 @@ impl VerificationCancellation for MutationCancellation {
 impl VerificationCancellation for OperationCancellation {
     fn is_cancelled(&self) -> bool {
         self.is_cancel_requested()
+    }
+}
+
+struct DownloadVerificationCancellation<'a> {
+    operation: &'a MutationCancellation,
+    shutdown: &'a MutationCancellation,
+}
+
+impl VerificationCancellation for DownloadVerificationCancellation<'_> {
+    fn is_cancelled(&self) -> bool {
+        self.operation.is_cancelled() || self.shutdown.is_cancelled()
     }
 }
 
@@ -4793,6 +5044,16 @@ impl MutationExecutor for DownloadExecutor {
             &self.models_dir,
             &mut observer,
         );
+        let paired_verification_cancellation = DownloadVerificationCancellation {
+            operation: cancellation,
+            shutdown: &self.verification_cancellation,
+        };
+        let verification_cancellation: &dyn VerificationCancellation =
+            if required_drafter(recipe).is_some() {
+                &paired_verification_cancellation
+            } else {
+                &self.verification_cancellation
+            };
         let verification = match &result {
             Ok(()) => Some(
                 std::iter::once(recipe as &dyn VerifiedModel)
@@ -4807,7 +5068,7 @@ impl MutationExecutor for DownloadExecutor {
                             self.verifier.verify(
                                 &self.models_dir,
                                 artifact,
-                                &self.verification_cancellation,
+                                verification_cancellation,
                             ),
                         )
                     })
@@ -6243,6 +6504,13 @@ mod tests {
         calls: Arc<Mutex<Vec<String>>>,
     }
 
+    struct GatedPairVerifier {
+        gate_filename: String,
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+        observed_cancellation: Arc<AtomicBool>,
+    }
+
     struct ShutdownBlockingDownloader {
         entered: std::sync::mpsc::Sender<()>,
     }
@@ -6310,7 +6578,7 @@ mod tests {
             &mut self,
             _: &std::path::Path,
             _: &'static dyn VerifiedModel,
-            _: &MutationCancellation,
+            _: &dyn VerificationCancellation,
         ) -> std::io::Result<VerifiedArtifact> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.result.take().expect("fake verification result")
@@ -6324,7 +6592,7 @@ mod tests {
             &mut self,
             models_dir: &std::path::Path,
             artifact: &'static dyn VerifiedModel,
-            cancellation: &MutationCancellation,
+            cancellation: &dyn VerificationCancellation,
         ) -> std::io::Result<VerifiedArtifact> {
             self.entered.send(()).unwrap();
             self.release.recv().unwrap();
@@ -6404,12 +6672,40 @@ mod tests {
             &mut self,
             _: &std::path::Path,
             artifact: &'static dyn VerifiedModel,
-            _: &MutationCancellation,
+            _: &dyn VerificationCancellation,
         ) -> std::io::Result<VerifiedArtifact> {
             self.calls
                 .lock()
                 .unwrap()
                 .push(artifact.filename().to_owned());
+            Ok(VerifiedArtifact {
+                size_bytes: artifact.size_bytes(),
+                expected_sha256: artifact.sha256().to_owned(),
+                matches: true,
+            })
+        }
+
+        fn invalidate(&mut self, _: &std::path::Path, _: &'static ModelEntry) {}
+    }
+
+    impl ArtifactVerifier for GatedPairVerifier {
+        fn verify(
+            &mut self,
+            _: &std::path::Path,
+            artifact: &'static dyn VerifiedModel,
+            cancellation: &dyn VerificationCancellation,
+        ) -> std::io::Result<VerifiedArtifact> {
+            if artifact.filename() == self.gate_filename {
+                self.entered.send(()).unwrap();
+                self.release.recv().unwrap();
+            }
+            if cancellation.is_cancelled() {
+                self.observed_cancellation.store(true, Ordering::SeqCst);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "operation cancelled during paired verification",
+                ));
+            }
             Ok(VerifiedArtifact {
                 size_bytes: artifact.size_bytes(),
                 expected_sha256: artifact.sha256().to_owned(),
@@ -6604,6 +6900,51 @@ mod tests {
             .join(format!("{}.part", profile.drafter.filename))
             .is_file());
         let _ = std::fs::remove_dir_all(models_dir);
+    }
+
+    #[test]
+    fn fixed_profile_legacy_verification_observes_operation_cancellation_for_each_artifact() {
+        let profile = loxa_core::runtime_profile::runtime_profile("loxa").unwrap();
+        for gate_filename in ["target.gguf", profile.drafter.filename] {
+            let (operations, id, mut executor, _, _, models_dir) =
+                paired_legacy_fixture(vec![Ok(()), Ok(())], false);
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let observed_cancellation = Arc::new(AtomicBool::new(false));
+            executor.verifier = Box::new(GatedPairVerifier {
+                gate_filename: gate_filename.to_owned(),
+                entered: entered_tx,
+                release: release_rx,
+                observed_cancellation: Arc::clone(&observed_cancellation),
+            });
+            let cancellation = MutationCancellation::new();
+            let worker_cancellation = cancellation.clone();
+            let worker_id = id.clone();
+            let worker = std::thread::spawn(move || {
+                executor.execute(
+                    &worker_id,
+                    &Mutation::Download {
+                        model_id: "loxa".into(),
+                    },
+                    &worker_cancellation,
+                );
+            });
+
+            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            cancellation.cancel();
+            release_tx.send(()).unwrap();
+            worker.join().unwrap();
+
+            assert!(
+                observed_cancellation.load(Ordering::SeqCst),
+                "{gate_filename} verification received only shutdown cancellation"
+            );
+            assert_eq!(
+                operations.lock().unwrap().get(&id).unwrap().status,
+                OperationStatus::Cancelled
+            );
+            let _ = std::fs::remove_dir_all(models_dir);
+        }
     }
 
     fn execute_fake(result: Result<(), DownloadError>) -> OperationView {
@@ -8229,6 +8570,73 @@ mod tests {
         assert_eq!(
             terminal.error.as_ref().map(|error| error.message.as_str()),
             Some("downloaded drafter failed verification")
+        );
+
+        durable.arm_drafter_verification_pause_for_test();
+        let cancelled = durable
+            .start_download(recipe.id, required_download_bytes(recipe))
+            .await
+            .unwrap();
+        assert!(durable.wait_drafter_verification_paused_for_test(
+            std::time::Instant::now() + Duration::from_secs(2)
+        ));
+        let cancel_result = durable.cancel(&cancelled.v1_operation_id).await;
+        durable.release_drafter_verification_for_test();
+        assert_eq!(cancel_result, Ok(OperationStatus::Running));
+        let cancellation_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = fixture.handle.read_snapshot().unwrap();
+            let operation = snapshot
+                .operations
+                .iter()
+                .find(|operation| operation.operation_id == cancelled.operation_id)
+                .unwrap();
+            if operation.status == V2OperationStatus::Cancelled {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < cancellation_deadline,
+                "drafter verification cancellation did not become terminal"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            durable.ensure_healthy().is_ok(),
+            "cancellation sealed lanes"
+        );
+
+        durable.arm_completion_before_terminal_pause_for_test();
+        let post_read_cancelled = durable
+            .start_download(recipe.id, required_download_bytes(recipe))
+            .await
+            .unwrap();
+        assert!(durable.wait_completion_before_terminal_paused_for_test(
+            std::time::Instant::now() + Duration::from_secs(2)
+        ));
+        let cancel_result = durable.cancel(&post_read_cancelled.v1_operation_id).await;
+        durable.release_completion_before_terminal_for_test();
+        assert_eq!(cancel_result, Ok(OperationStatus::Running));
+        let cancellation_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = fixture.handle.read_snapshot().unwrap();
+            let operation = snapshot
+                .operations
+                .iter()
+                .find(|operation| operation.operation_id == post_read_cancelled.operation_id)
+                .unwrap();
+            if operation.status == V2OperationStatus::Cancelled {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < cancellation_deadline,
+                "post-read cancellation did not become terminal: {:?}",
+                operation.status
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            durable.ensure_healthy().is_ok(),
+            "post-read cancellation sealed lanes"
         );
         worker.stop_and_join().unwrap();
         fixture.shutdown().await;
