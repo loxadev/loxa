@@ -609,6 +609,9 @@ fn lifecycle_sample(root: &Path, sequence: u64) -> io::Result<LifecycleSample> {
             model_id: model_id.to_owned(),
             artifact_path: PathBuf::from("capacity.gguf"),
             engine: "llama-cpp".into(),
+            ctx_size: loxa_core::supervisor::DEFAULT_CTX_TOKENS,
+            jinja: false,
+            speculative: None,
         })
     })
     .map_err(|failure| io::Error::other(format!("lifecycle start: {failure:?}")))?;

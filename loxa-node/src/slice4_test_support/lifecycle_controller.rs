@@ -1,3 +1,4 @@
+use crate::actor::MutationCancellation;
 use crate::artifact_coordinator::{ArtifactKey, ArtifactMutationCoordinator};
 use crate::download_scheduler::{
     BoundDownload, DownloadExecutor, DownloadKey, DownloadReserveOutcome, DownloadSchedulerOwner,
@@ -222,6 +223,9 @@ fn controller_is_the_only_exact_session_owner_and_shutdown_joins_it() {
             model_id: model_id.to_owned(),
             artifact_path: model_id.into(),
             engine: "llama-cpp".into(),
+            ctx_size: loxa_core::supervisor::DEFAULT_CTX_TOKENS,
+            jinja: false,
+            speculative: None,
         })
     })
     .unwrap();
@@ -270,6 +274,9 @@ fn cancel_priority_interrupts_active_readiness_without_waiting_for_the_worker_lo
             model_id: model_id.to_owned(),
             artifact_path: model_id.into(),
             engine: "llama-cpp".into(),
+            ctx_size: loxa_core::supervisor::DEFAULT_CTX_TOKENS,
+            jinja: false,
+            speculative: None,
         })
     })
     .unwrap();
@@ -416,6 +423,9 @@ fn rollback_controller(
             model_id: model_id.to_owned(),
             artifact_path: model_id.into(),
             engine: "llama-cpp".into(),
+            ctx_size: loxa_core::supervisor::DEFAULT_CTX_TOKENS,
+            jinja: false,
+            speculative: None,
         })
     })
     .unwrap();
@@ -508,6 +518,9 @@ impl LifecycleLoadWorkflow for UnknownAcknowledgement {
             model_id: request.model_id.clone(),
             artifact_path: request.model_id.clone().into(),
             engine: "llama-cpp".into(),
+            ctx_size: loxa_core::supervisor::DEFAULT_CTX_TOKENS,
+            jinja: false,
+            speculative: None,
         }))
     }
 
@@ -515,6 +528,7 @@ impl LifecycleLoadWorkflow for UnknownAcknowledgement {
         &mut self,
         _request: &LifecycleLoadRequest,
         _evidence: &loxa_core::model_inventory::VerifiedArtifact,
+        _cancellation: &MutationCancellation,
     ) -> Result<LaunchPlan, LifecycleError> {
         unreachable!()
     }
@@ -597,6 +611,9 @@ fn operationless_child_crash_reaps_exact_owner_seals_and_does_not_restart_or_ver
             model_id: model_id.to_owned(),
             artifact_path: model_id.into(),
             engine: "llama-cpp".into(),
+            ctx_size: loxa_core::supervisor::DEFAULT_CTX_TOKENS,
+            jinja: false,
+            speculative: None,
         })
     })
     .unwrap();
@@ -657,6 +674,7 @@ impl LifecycleLoadWorkflow for DropProbeWorkflow {
         &mut self,
         _request: &LifecycleLoadRequest,
         _evidence: &loxa_core::model_inventory::VerifiedArtifact,
+        _cancellation: &MutationCancellation,
     ) -> Result<LaunchPlan, LifecycleError> {
         unreachable!()
     }
@@ -707,6 +725,9 @@ impl LifecycleLoadWorkflow for PanicAcknowledge {
             model_id: request.model_id.clone(),
             artifact_path: request.model_id.clone().into(),
             engine: "llama-cpp".into(),
+            ctx_size: loxa_core::supervisor::DEFAULT_CTX_TOKENS,
+            jinja: false,
+            speculative: None,
         }))
     }
 
@@ -714,6 +735,7 @@ impl LifecycleLoadWorkflow for PanicAcknowledge {
         &mut self,
         _request: &LifecycleLoadRequest,
         _evidence: &loxa_core::model_inventory::VerifiedArtifact,
+        _cancellation: &MutationCancellation,
     ) -> Result<LaunchPlan, LifecycleError> {
         unreachable!()
     }
@@ -746,6 +768,9 @@ impl LifecycleLoadWorkflow for RetainedReadyWorkflow {
             model_id: request.model_id.clone(),
             artifact_path: request.model_id.clone().into(),
             engine: "llama-cpp".into(),
+            ctx_size: loxa_core::supervisor::DEFAULT_CTX_TOKENS,
+            jinja: false,
+            speculative: None,
         }))
     }
 
@@ -753,6 +778,7 @@ impl LifecycleLoadWorkflow for RetainedReadyWorkflow {
         &mut self,
         _request: &LifecycleLoadRequest,
         _evidence: &loxa_core::model_inventory::VerifiedArtifact,
+        _cancellation: &MutationCancellation,
     ) -> Result<LaunchPlan, LifecycleError> {
         unreachable!()
     }
@@ -1049,6 +1075,9 @@ fn teardown_error_and_worker_exit_disconnect_never_report_success() {
             model_id: model_id.to_owned(),
             artifact_path: model_id.into(),
             engine: "llama-cpp".into(),
+            ctx_size: loxa_core::supervisor::DEFAULT_CTX_TOKENS,
+            jinja: false,
+            speculative: None,
         })
     })
     .unwrap();
@@ -1117,12 +1146,16 @@ impl LifecycleLoadWorkflow for BlockingVerificationWorkflow {
         &mut self,
         request: &LifecycleLoadRequest,
         _evidence: &loxa_core::model_inventory::VerifiedArtifact,
+        _cancellation: &MutationCancellation,
     ) -> Result<LaunchPlan, LifecycleError> {
         self.resumed.fetch_add(1, Ordering::SeqCst);
         Ok(LaunchPlan {
             model_id: request.model_id.clone(),
             artifact_path: request.model_id.clone().into(),
             engine: "llama-cpp".into(),
+            ctx_size: loxa_core::supervisor::DEFAULT_CTX_TOKENS,
+            jinja: false,
+            speculative: None,
         })
     }
 
