@@ -1,11 +1,15 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import {
   access,
   chmod,
   cp,
   link,
+  lstat,
+  mkdir,
   mkdtemp,
+  readdir,
   readFile,
   rename,
   rm,
@@ -45,6 +49,28 @@ async function withTempDirectory(name, run) {
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+}
+
+function runCli(argv) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ["scripts/pi-acceptance.mjs", ...argv], {
+      cwd: repositoryRoot,
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.once("error", reject);
+    child.once("close", (code) => resolve({ code, stdout, stderr }));
+  });
 }
 
 function successfulTrace(thirdTool = "write") {
@@ -107,7 +133,10 @@ async function withFakeGateway(run, responses = {}) {
           JSON.stringify({
             health: "ready",
             model: "loxa",
-            engine: { name: "llama.cpp", version: "b10107" },
+            engine: {
+              name: "llama-cpp",
+              version: "version: 10107 (c0bc8591e)\nbuild: test",
+            },
           }),
       );
       return;
@@ -585,7 +614,7 @@ test("child environment still rejects non-record object containers", () => {
   }
 });
 
-test("gateway preflight and postflight validators require model loxa and ready status", () => {
+test("gateway preflight and postflight validators pin the qualified llama-cpp build", () => {
   assert.doesNotThrow(() =>
     validateModelsResponse({
       object: "list",
@@ -596,7 +625,10 @@ test("gateway preflight and postflight validators require model loxa and ready s
     validateReadyStatus({
       health: "ready",
       model: "loxa",
-      engine: { name: "llama.cpp", version: "b10107" },
+      engine: {
+        name: "llama-cpp",
+        version: "version: 10107 (c0bc8591e)\nbuild: test",
+      },
     }),
   );
   assert.throws(
@@ -611,6 +643,22 @@ test("gateway preflight and postflight validators require model loxa and ready s
     () => validateReadyStatus({ health: "ready", model: "other" }),
     /status response/i,
   );
+  assert.throws(
+    () => validateReadyStatus({ health: "ready", model: "loxa" }),
+    /status response/i,
+  );
+  for (const engine of [
+    { name: "llama.cpp", version: "version: 10107 (c0bc8591e)" },
+    { name: "llama-cpp", version: "version: 10106 (c0bc8591e)" },
+    { name: "llama-cpp", version: "launcher version: 10107 (c0bc8591e)" },
+    { name: "llama-cpp", version: "version: 10107 (c0bc8591e) extra" },
+    { name: "llama-cpp", version: "build: test\nversion: 10107 (c0bc8591e)" },
+  ]) {
+    assert.throws(
+      () => validateReadyStatus({ health: "ready", model: "loxa", engine }),
+      /status response/i,
+    );
+  }
 });
 
 test("Windows child environment isolates home profile AppData and temp", () => {
@@ -885,6 +933,8 @@ test("CLI parser exposes only the static acceptance arguments", () => {
         "1024",
         "--expected-config-sha256",
         "not-a-digest",
+        "--evidence-dir",
+        "target/pi-acceptance/run",
       ]),
     /digest/i,
   );
@@ -899,12 +949,14 @@ test("CLI parser exposes only the static acceptance arguments", () => {
         `pi${"\0"}private`,
         "--max-tokens",
         "1024",
+        "--evidence-dir",
+        "target/pi-acceptance/run",
       ]),
     /invalid/i,
   );
 });
 
-test("qualified Pi CLI requires a bounded max-token request configuration", () => {
+test("qualified Pi CLI requires bounded max tokens and an evidence directory", () => {
   const required = [
     "--phase",
     "mac-local",
@@ -914,20 +966,190 @@ test("qualified Pi CLI requires a bounded max-token request configuration", () =
     "/opt/pi",
     "--max-tokens",
     "1024",
+    "--evidence-dir",
+    "target/pi-acceptance/test",
   ];
   assert.deepEqual(parseArguments(required), {
     phase: "mac-local",
     baseUrl: "http://127.0.0.1:11435/v1",
     piBin: "/opt/pi",
     maxTokens: 1024,
+    evidenceDir: "target/pi-acceptance/test",
   });
-  assert.throws(() => parseArguments(required.slice(0, -2)), /max.tokens/i);
+  assert.throws(() => parseArguments(required.slice(0, -2)), /evidence directory/i);
   for (const value of ["0", "8192", "1.5", "words"]) {
+    const invalidMaxTokens = [...required];
+    invalidMaxTokens[7] = value;
     assert.throws(
-      () => parseArguments([...required.slice(0, -1), value]),
+      () => parseArguments(invalidMaxTokens),
       /max.tokens/i,
     );
   }
+});
+
+test("CLI atomically retains only sanitized successful evidence and exposes its reusable digest", async () => {
+  const evidenceDir = `target/pi-acceptance/test-cli-evidence-${process.pid}`;
+  const recoveryDir = `target/pi-acceptance/test-cli-recovery-${process.pid}`;
+  const failureDir = `target/pi-acceptance/test-cli-failure-${process.pid}`;
+  const unsafeDir = `target/pi-acceptance/test-cli-unsafe-${process.pid}`;
+  const unsafeArtifactDir = `target/pi-acceptance/test-cli-artifact-${process.pid}`;
+  const evidencePath = path.join(repositoryRoot, evidenceDir, "evidence.json");
+  const recoveryPath = path.join(repositoryRoot, recoveryDir, "evidence.json");
+  const failurePath = path.join(repositoryRoot, failureDir, "evidence.json");
+  await rm(path.join(repositoryRoot, evidenceDir), { recursive: true, force: true });
+  await rm(path.join(repositoryRoot, recoveryDir), { recursive: true, force: true });
+  await rm(path.join(repositoryRoot, failureDir), { recursive: true, force: true });
+  await rm(path.join(repositoryRoot, unsafeDir), { recursive: true, force: true });
+  await rm(path.join(repositoryRoot, unsafeArtifactDir), { recursive: true, force: true });
+  await withTempDirectory("pi-cli", async (directory) => {
+    const piBin = path.join(directory, "fake-pi");
+    await writeFile(
+      piBin,
+      `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf '0.82.1\\n'
+  exit 0
+fi
+printf 'sum=18\\n' > result.txt
+cat <<'EOF'
+${successfulQualifiedLines().join("\n")}
+EOF
+`,
+      { mode: 0o700 },
+    );
+    await chmod(piBin, 0o700);
+
+    await withFakeGateway(async ({ baseUrl }) => {
+      const first = await runCli([
+        "--phase",
+        "mac-local",
+        "--base-url",
+        baseUrl,
+        "--pi-bin",
+        piBin,
+        "--max-tokens",
+        "1024",
+        "--evidence-dir",
+        evidenceDir,
+      ]);
+      assert.equal(first.code, 0, first.stderr);
+      assert.equal(first.stderr, "");
+      const evidence = JSON.parse(first.stdout);
+      assert.deepEqual(evidence, {
+        schemaVersion: 1,
+        phase: "mac-local",
+        providerConfigSha256: evidence.providerConfigSha256,
+        modelsBefore: true,
+        readyBefore: true,
+        toolOrder: true,
+        exactWorkspace: true,
+        verification: true,
+        modelsAfter: true,
+        readyAfter: true,
+      });
+      assert.match(evidence.providerConfigSha256, /^[a-f0-9]{64}$/);
+      assert.deepEqual(JSON.parse(await readFile(evidencePath, "utf8")), evidence);
+      assert.equal((await lstat(evidencePath)).mode & 0o777, 0o600);
+      assert.deepEqual(await readdir(path.dirname(evidencePath)), ["evidence.json"]);
+      const serialized = JSON.stringify(evidence);
+      for (const privateSentinel of [piBin, baseUrl, "private", "source.txt"]) {
+        assert.equal(serialized.includes(privateSentinel), false, privateSentinel);
+      }
+
+      const recovery = await runCli([
+        "--phase",
+        "post-recovery",
+        "--base-url",
+        baseUrl,
+        "--pi-bin",
+        piBin,
+        "--max-tokens",
+        "1024",
+        "--expected-config-sha256",
+        evidence.providerConfigSha256,
+        "--evidence-dir",
+        recoveryDir,
+      ]);
+      assert.equal(recovery.code, 0);
+      assert.equal(JSON.parse(recovery.stdout).providerConfigSha256, evidence.providerConfigSha256);
+      assert.equal(
+        JSON.parse(await readFile(recoveryPath, "utf8")).providerConfigSha256,
+        evidence.providerConfigSha256,
+      );
+    });
+
+    await withFakeGateway(
+      async ({ baseUrl }) => {
+        const failed = await runCli([
+          "--phase",
+          "mac-local",
+          "--base-url",
+          baseUrl,
+          "--pi-bin",
+          piBin,
+          "--max-tokens",
+          "1024",
+          "--evidence-dir",
+          failureDir,
+        ]);
+        assert.equal(failed.code, 2);
+        assert.equal(failed.stdout, "");
+        await assertMissing(failurePath);
+      },
+      {
+        status: JSON.stringify({
+          health: "ready",
+          model: "loxa",
+          engine: { name: "llama-cpp", version: "version: 10106 (c0bc8591e)" },
+        }),
+      },
+    );
+
+    const escapedEvidence = path.join(directory, "escaped-evidence");
+    await symlink(escapedEvidence, path.join(repositoryRoot, unsafeDir));
+    await withFakeGateway(async ({ baseUrl }) => {
+      const unsafe = await runCli([
+        "--phase",
+        "mac-local",
+        "--base-url",
+        baseUrl,
+        "--pi-bin",
+        piBin,
+        "--max-tokens",
+        "1024",
+        "--evidence-dir",
+        unsafeDir,
+      ]);
+      assert.equal(unsafe.code, 2);
+      await assertMissing(path.join(escapedEvidence, "evidence.json"));
+    });
+
+    const escapedArtifact = path.join(directory, "escaped-artifact");
+    const unsafeArtifactPath = path.join(repositoryRoot, unsafeArtifactDir);
+    await mkdir(unsafeArtifactPath, { recursive: true });
+    await symlink(escapedArtifact, path.join(unsafeArtifactPath, "evidence.json"));
+    await withFakeGateway(async ({ baseUrl }) => {
+      const unsafe = await runCli([
+        "--phase",
+        "mac-local",
+        "--base-url",
+        baseUrl,
+        "--pi-bin",
+        piBin,
+        "--max-tokens",
+        "1024",
+        "--evidence-dir",
+        unsafeArtifactDir,
+      ]);
+      assert.equal(unsafe.code, 2);
+      await assertMissing(escapedArtifact);
+    });
+  });
+  await rm(path.join(repositoryRoot, evidenceDir), { recursive: true, force: true });
+  await rm(path.join(repositoryRoot, recoveryDir), { recursive: true, force: true });
+  await rm(path.join(repositoryRoot, failureDir), { recursive: true, force: true });
+  await rm(path.join(repositoryRoot, unsafeDir), { recursive: true, force: true });
+  await rm(path.join(repositoryRoot, unsafeArtifactDir), { recursive: true, force: true });
 });
 
 test("qualified Pi config and argv pin the output field, trusted extension, and no-session mode", async () => {
