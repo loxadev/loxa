@@ -411,6 +411,7 @@ struct ManagedUsage {
 mod tests {
     use super::{managed_candidate_spec, ManagedLlamaAdapter};
     use crate::provider::{EngineRevision, ProviderAdapter, ProviderKind, ProviderOwnership};
+    use tempfile::tempdir;
 
     #[test]
     fn managed_adapter_is_usable_through_object_safe_boundary() {
@@ -422,10 +423,16 @@ mod tests {
     }
 
     #[test]
-    fn managed_adapter_exposes_typed_health_and_activity() {
+    fn managed_adapter_reports_missing_isolated_state_as_inactive() {
+        let tempdir = tempdir().unwrap();
         let mut adapter = ManagedLlamaAdapter::new("llama-server 1.2.3", "rev-abc").unwrap();
+        adapter.state_path = tempdir.path().join("managed.json");
+
         assert!(!adapter.verify_health().unwrap().healthy);
-        assert!(!adapter.observe_activity().unwrap().target_active);
+        let activity = adapter.observe_activity().unwrap();
+        assert!(!activity.target_active);
+        assert!(activity.unrelated_activity.is_empty());
+        assert_eq!(activity.evidence, vec!["managed_state_missing"]);
     }
 
     #[test]
