@@ -1,5 +1,5 @@
 use loxa_core::engine::{py_mlx_lm, EngineLaunchSpec, ReadinessStrategy, RuntimeBackendKind};
-use loxa_core::model_inventory::VerificationCache;
+use loxa_core::model_inventory::{VerificationCache, VerificationCancellation};
 use loxa_core::registry::{self, ModelEntry, REGISTRY};
 use loxa_core::supervisor::{
     self, InterruptStatus, LogDrainingChild, ManagedChild, ManagedServer, ObservedChildExit,
@@ -517,27 +517,22 @@ fn resolve_runtime_backend(
     id: &str,
     models_dir: &Path,
     verification_cache: &VerificationCache,
+    verification_cancellation: &dyn VerificationCancellation,
 ) -> Result<ResolvedRuntimeBackend, SupervisorError> {
     let mut verify_fixed_profile =
-        |models_dir: &Path, recipe: &'static ModelEntry, cache: &VerificationCache| {
-            download_control::verify_runtime_artifacts(
-                models_dir,
-                recipe,
-                cache,
-                &crate::actor::MutationCancellation::new(),
-            )
-            .map_err(|_| {
-                SupervisorError::Io(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "runtime artifacts are not verified",
-                ))
-            })
+        |models_dir: &Path,
+         recipe: &'static ModelEntry,
+         cache: &VerificationCache,
+         cancellation: &dyn VerificationCancellation| {
+            download_control::verify_runtime_artifacts(models_dir, recipe, cache, cancellation)
+                .map_err(direct_runtime_verification_error)
         };
     resolve_runtime_backend_with_fixed_profile_verifier(
         kind,
         id,
         models_dir,
         verification_cache,
+        verification_cancellation,
         &mut verify_fixed_profile,
     )
 }
@@ -547,17 +542,24 @@ fn resolve_runtime_backend_with_fixed_profile_verifier(
     id: &str,
     models_dir: &Path,
     verification_cache: &VerificationCache,
+    verification_cancellation: &dyn VerificationCancellation,
     verify_fixed_profile: &mut dyn FnMut(
         &Path,
         &'static ModelEntry,
         &VerificationCache,
+        &dyn VerificationCancellation,
     ) -> Result<(), SupervisorError>,
 ) -> Result<ResolvedRuntimeBackend, SupervisorError> {
     match kind {
         RuntimeBackendKind::LlamaCpp => {
             let (recipe, model_path) = supervisor::resolve_model_path(id, models_dir)?;
             if loxa_core::runtime_profile::runtime_profile(recipe.id).is_some() {
-                verify_fixed_profile(models_dir, recipe, verification_cache)?;
+                verify_fixed_profile(
+                    models_dir,
+                    recipe,
+                    verification_cache,
+                    verification_cancellation,
+                )?;
             }
             let program = supervisor::detect_llama_server()?;
             let engine_version = supervisor::llama_server_version(&program)?;
@@ -588,6 +590,38 @@ fn resolve_runtime_backend_with_fixed_profile_verifier(
                 engine_version,
             })
         }
+    }
+}
+
+fn direct_runtime_verification_error(
+    error: crate::model_lifecycle::LifecycleError,
+) -> SupervisorError {
+    let (kind, message) = match error {
+        crate::model_lifecycle::LifecycleError::Cancelled => (
+            io::ErrorKind::Interrupted,
+            "runtime artifact verification was interrupted",
+        ),
+        _ => (
+            io::ErrorKind::InvalidData,
+            "runtime artifacts are not verified",
+        ),
+    };
+    SupervisorError::Io(io::Error::new(kind, message))
+}
+
+fn finish_initial_runtime_resolution_error(error: SupervisorError) -> io::Result<RunTermination> {
+    match error {
+        SupervisorError::Io(source) if source.kind() == io::ErrorKind::Interrupted => {
+            Ok(RunTermination::Interrupted)
+        }
+        other => Err(direct_runtime_resolution_error_to_io(other)),
+    }
+}
+
+fn direct_runtime_resolution_error_to_io(error: SupervisorError) -> io::Error {
+    match error {
+        SupervisorError::Io(source) => source,
+        other => supervisor_error_to_io(other),
     }
 }
 
@@ -797,6 +831,16 @@ impl InterruptStatus for RuntimeInterrupt<'_> {
     }
 }
 
+struct RuntimeVerificationCancellation<'a> {
+    interrupt: &'a (dyn InterruptStatus + Sync),
+}
+
+impl VerificationCancellation for RuntimeVerificationCancellation<'_> {
+    fn is_cancelled(&self) -> bool {
+        self.interrupt.interrupted()
+    }
+}
+
 fn run_model_with_owner_policy(
     request: RunRequest<'_>,
     paths: &NodePaths,
@@ -813,8 +857,6 @@ fn run_model_with_owner_policy(
         engine,
     } = request;
     let runtime_verification_cache = VerificationCache::default();
-    let resolve_backend =
-        || resolve_runtime_backend(engine, id, &paths.models_dir, &runtime_verification_cache);
     let mut initial_backend = match engine {
         RuntimeBackendKind::LlamaCpp => {
             let Some(_) = registry::find(id) else {
@@ -825,7 +867,16 @@ fn run_model_with_owner_policy(
             };
             None
         }
-        RuntimeBackendKind::PyMlxLm => Some(resolve_backend().map_err(supervisor_error_to_io)?),
+        RuntimeBackendKind::PyMlxLm => Some(
+            resolve_runtime_backend(
+                engine,
+                id,
+                &paths.models_dir,
+                &runtime_verification_cache,
+                &crate::actor::MutationCancellation::new(),
+            )
+            .map_err(supervisor_error_to_io)?,
+        ),
     };
 
     ensure_runtime_state_is_mutable(&paths.state_path)?;
@@ -834,6 +885,18 @@ fn run_model_with_owner_policy(
     let signal_guard = RuntimeInterrupt {
         signal: &installed_signal,
         durable: durable_interrupt,
+    };
+    let verification_cancellation = RuntimeVerificationCancellation {
+        interrupt: &signal_guard,
+    };
+    let resolve_backend = || {
+        resolve_runtime_backend(
+            engine,
+            id,
+            &paths.models_dir,
+            &runtime_verification_cache,
+            &verification_cancellation,
+        )
     };
     let (owner_pid, owner_process_start_time_unix_s, run_id) = match owner_policy {
         RunOwnerPolicy::Standalone => {
@@ -877,7 +940,7 @@ fn run_model_with_owner_policy(
                             format!("model not downloaded: {id}"),
                         ));
                     }
-                    Err(error) => return Err(supervisor_error_to_io(error)),
+                    Err(error) => return Err(direct_runtime_resolution_error_to_io(error)),
                 };
                 match preparation {
                     OwnedReplacementPreparation::Prepared {
@@ -908,7 +971,7 @@ fn run_model_with_owner_policy(
                             format!("model not downloaded: {id}"),
                         ));
                     }
-                    Err(error) => return Err(supervisor_error_to_io(error)),
+                    Err(error) => return finish_initial_runtime_resolution_error(error),
                 };
                 if signal_guard.interrupted() {
                     return Ok(RunTermination::Interrupted);
@@ -1843,7 +1906,12 @@ where
 
     let resolved = match resolve() {
         Ok(resolved) => resolved,
-        Err(error) => return finish_owned_replacement_error(state_path, &run, owner_policy, error),
+        Err(error) => {
+            if InterruptSource::interrupted(interrupt) {
+                return finish_owned_replacement_interrupt(state_path, &run, owner_policy);
+            }
+            return finish_owned_replacement_error(state_path, &run, owner_policy, error);
+        }
     };
     if InterruptSource::interrupted(interrupt) {
         return finish_owned_replacement_interrupt(state_path, &run, owner_policy);
@@ -2575,6 +2643,20 @@ mod lifecycle_api_tests {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     static MLX_ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    struct TestInterruptFlag<'a>(&'a TestAtomicBool);
+
+    impl InterruptSource for TestInterruptFlag<'_> {
+        fn interrupted(&self) -> bool {
+            self.0.load(TestOrdering::Acquire)
+        }
+    }
+
+    impl InterruptStatus for TestInterruptFlag<'_> {
+        fn interrupted(&self) -> bool {
+            self.0.load(TestOrdering::Acquire)
+        }
+    }
+
     #[derive(Clone, Default)]
     struct DiagnosticCapture(Arc<Mutex<Vec<u8>>>);
 
@@ -3238,12 +3320,14 @@ mod lifecycle_api_tests {
         std::fs::create_dir_all(&models_dir).unwrap();
         let recipe = registry::find("loxa").expect("fixed runtime recipe");
         std::fs::write(models_dir.join(recipe.filename), b"unverified target").unwrap();
+        let cancellation = crate::actor::MutationCancellation::new();
 
         let error = resolve_runtime_backend(
             RuntimeBackendKind::LlamaCpp,
             recipe.id,
             &models_dir,
             &VerificationCache::default(),
+            &cancellation,
         )
         .expect_err("target-only fixed profile must fail verification");
 
@@ -3272,10 +3356,12 @@ mod lifecycle_api_tests {
         )
         .unwrap();
         let cache = VerificationCache::default();
+        let cancellation = crate::actor::MutationCancellation::new();
         let calls = Cell::new(0_u8);
         let mut verify = |observed_dir: &Path,
                           observed_recipe: &'static ModelEntry,
-                          observed_cache: &VerificationCache| {
+                          observed_cache: &VerificationCache,
+                          _: &dyn VerificationCancellation| {
             assert_eq!(observed_dir, models_dir);
             assert_eq!(observed_recipe.id, recipe.id);
             assert!(std::ptr::eq(observed_cache, &cache));
@@ -3296,6 +3382,7 @@ mod lifecycle_api_tests {
             recipe.id,
             &models_dir,
             &cache,
+            &cancellation,
             &mut verify,
         );
         assert!(matches!(initial, Err(SupervisorError::NoFreePort)));
@@ -3310,6 +3397,7 @@ mod lifecycle_api_tests {
             recipe.id,
             &models_dir,
             &cache,
+            &cancellation,
             &mut verify,
         );
 
@@ -3319,6 +3407,99 @@ mod lifecycle_api_tests {
                 if source.kind() == io::ErrorKind::InvalidData
         ));
         assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn direct_fixed_verification_observes_interrupt_before_runtime_detection() {
+        let temp = TestDir::new("direct-verification-interrupt");
+        let models_dir = temp.0.join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let recipe = registry::find("loxa").expect("fixed runtime recipe");
+        std::fs::write(models_dir.join(recipe.filename), b"target sentinel").unwrap();
+        let interrupted = TestAtomicBool::new(false);
+        let interrupt = TestInterruptFlag(&interrupted);
+        let cancellation = RuntimeVerificationCancellation {
+            interrupt: &interrupt,
+        };
+        let cache = VerificationCache::default();
+        let calls = Cell::new(0_u8);
+        let mut verify = |_: &Path,
+                          _: &'static ModelEntry,
+                          _: &VerificationCache,
+                          observed_cancellation: &dyn loxa_core::model_inventory::VerificationCancellation| {
+            calls.set(calls.get() + 1);
+            interrupted.store(true, TestOrdering::Release);
+            assert!(observed_cancellation.is_cancelled());
+            Err(direct_runtime_verification_error(
+                crate::model_lifecycle::LifecycleError::Cancelled,
+            ))
+        };
+
+        let error = resolve_runtime_backend_with_fixed_profile_verifier(
+            RuntimeBackendKind::LlamaCpp,
+            recipe.id,
+            &models_dir,
+            &cache,
+            &cancellation,
+            &mut verify,
+        )
+        .expect_err("interrupted verification must stop before runtime detection");
+
+        assert!(matches!(
+            error,
+            SupervisorError::Io(ref source)
+                if source.kind() == io::ErrorKind::Interrupted
+        ));
+        assert!(matches!(
+            finish_initial_runtime_resolution_error(error),
+            Ok(RunTermination::Interrupted)
+        ));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn durable_interrupt_cancels_direct_fixed_verification() {
+        let _signal_lock = SIGNAL_TEST_LOCK.lock().expect("signal test lock");
+        let installed_signal = SignalGuard::install().unwrap();
+        let durable = TestAtomicBool::new(true);
+        let interrupt = RuntimeInterrupt {
+            signal: &installed_signal,
+            durable: Some(&durable),
+        };
+        let cancellation = RuntimeVerificationCancellation {
+            interrupt: &interrupt,
+        };
+        let temp = TestDir::new("direct-durable-verification-interrupt");
+        let models_dir = temp.0.join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let recipe = registry::find("loxa").expect("fixed runtime recipe");
+        std::fs::write(models_dir.join(recipe.filename), b"target sentinel").unwrap();
+        let cache = VerificationCache::default();
+        let mut verify = |_: &Path,
+                          _: &'static ModelEntry,
+                          _: &VerificationCache,
+                          observed_cancellation: &dyn loxa_core::model_inventory::VerificationCancellation| {
+            assert!(observed_cancellation.is_cancelled());
+            Err(direct_runtime_verification_error(
+                crate::model_lifecycle::LifecycleError::Cancelled,
+            ))
+        };
+
+        let error = resolve_runtime_backend_with_fixed_profile_verifier(
+            RuntimeBackendKind::LlamaCpp,
+            recipe.id,
+            &models_dir,
+            &cache,
+            &cancellation,
+            &mut verify,
+        )
+        .expect_err("durable interruption must cancel fixed verification");
+
+        assert!(matches!(
+            error,
+            SupervisorError::Io(ref source)
+                if source.kind() == io::ErrorKind::Interrupted
+        ));
     }
 
     #[test]
@@ -3334,8 +3515,12 @@ mod lifecycle_api_tests {
         let python_model = temp.0.join("python-model");
         std::fs::create_dir(&python_model).unwrap();
         let cache = VerificationCache::default();
+        let cancellation = crate::actor::MutationCancellation::new();
         let calls = Cell::new(0_u8);
-        let mut verify = |_: &Path, _: &'static ModelEntry, _: &VerificationCache| {
+        let mut verify = |_: &Path,
+                          _: &'static ModelEntry,
+                          _: &VerificationCache,
+                          _: &dyn VerificationCancellation| {
             calls.set(calls.get() + 1);
             Err(SupervisorError::NoFreePort)
         };
@@ -3345,6 +3530,7 @@ mod lifecycle_api_tests {
             unpaired.id,
             &models_dir,
             &cache,
+            &cancellation,
             &mut verify,
         );
         let _ = resolve_runtime_backend_with_fixed_profile_verifier(
@@ -3352,6 +3538,7 @@ mod lifecycle_api_tests {
             python_model.to_str().unwrap(),
             &models_dir,
             &cache,
+            &cancellation,
             &mut verify,
         );
 
@@ -4626,6 +4813,40 @@ mod lifecycle_api_tests {
         .expect_err("resolution failure");
 
         assert!(matches!(error, SupervisorError::NoFreePort));
+        assert_eq!(
+            supervisor::read_runtime_state(&state_path).expect("read terminal state"),
+            RuntimeStateRead::Loaded(Vec::new())
+        );
+    }
+
+    #[test]
+    fn published_replacement_interrupt_during_resolution_uses_interrupt_cleanup() {
+        let temp = TempDir::new("loxa-replacement-resolution-interrupt");
+        let state_path = temp.path().join("managed.json");
+        let mut run = starting_run_for_test(&state_path, "run-1");
+        run.generation = 1;
+        run.generation_alias = "loxa-run-1-g1".to_string();
+        supervisor::create_starting_run(&state_path, run.clone()).expect("publish generation one");
+        let signal = FakeInterruptSource::new(vec![false, true]);
+
+        let outcome = prepare_owned_replacement_run(
+            &state_path,
+            run,
+            RunOwnerPolicy::Standalone,
+            &signal,
+            || {
+                Err::<(), _>(SupervisorError::Io(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "verification interrupted",
+                )))
+            },
+            || -> Result<(), SupervisorError> {
+                panic!("detection must not run after interrupted resolution")
+            },
+        )
+        .expect("interrupt must outrank the resolver error");
+
+        assert!(matches!(outcome, OwnedReplacementPreparation::Interrupted));
         assert_eq!(
             supervisor::read_runtime_state(&state_path).expect("read terminal state"),
             RuntimeStateRead::Loaded(Vec::new())
