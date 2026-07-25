@@ -170,6 +170,45 @@ where
     Ok(vec![download_artifact(entry, dir)?])
 }
 
+enum ResolvedRegistryModel {
+    Compiled(&'static ModelEntry),
+    User(registry::UserModelEntry),
+}
+
+fn resolve_registry_model(
+    id: &str,
+    registry_dir: &Path,
+) -> io::Result<Option<ResolvedRegistryModel>> {
+    if let Some(entry) = REGISTRY.iter().find(|entry| entry.id == id) {
+        return Ok(Some(ResolvedRegistryModel::Compiled(entry)));
+    }
+    Ok(registry::load_user_entries(registry_dir)
+        .map_err(io::Error::other)?
+        .into_iter()
+        .find(|entry| entry.id == id)
+        .map(ResolvedRegistryModel::User))
+}
+
+fn registry_model_id_exists(id: &str, registry_dir: &Path) -> io::Result<bool> {
+    Ok(resolve_registry_model(id, registry_dir)?.is_some())
+}
+
+fn download_resolved_model_with<F>(
+    entry: &ResolvedRegistryModel,
+    dir: &Path,
+    mut download_artifact: F,
+) -> Result<Vec<PathBuf>, download::DownloadError>
+where
+    F: FnMut(&dyn VerifiedModel, &Path) -> Result<PathBuf, download::DownloadError>,
+{
+    match entry {
+        ResolvedRegistryModel::Compiled(entry) => {
+            download_registry_entry_with(entry, dir, download_artifact)
+        }
+        ResolvedRegistryModel::User(entry) => Ok(vec![download_artifact(entry, dir)?]),
+    }
+}
+
 pub(crate) fn pull_model<W: Write, E: Write>(
     id: &str,
     quant: Option<&str>,
@@ -211,12 +250,7 @@ pub(crate) fn pull_model<W: Write, E: Write>(
             quant: resolved.quant,
             min_free_mem_gb: resolved.min_free_mem_gb,
         };
-        if registry::find(&entry.id).is_some()
-            || registry::load_user_entries(registry_dir)
-                .map_err(io::Error::other)?
-                .iter()
-                .any(|old| old.id == entry.id)
-        {
+        if registry_model_id_exists(&entry.id, registry_dir)? {
             writeln!(
                 stderr,
                 "model id {} already exists; run `loxa rm {}` first",
@@ -241,12 +275,12 @@ pub(crate) fn pull_model<W: Write, E: Write>(
             }
         };
     }
-    let Some(entry) = registry::find(id) else {
+    let Some(entry) = resolve_registry_model(id, registry_dir)? else {
         write_unknown_id(id, stderr)?;
         return Ok(ExitCode::from(1));
     };
 
-    match download_registry_entry_with(entry, models_dir, download::download) {
+    match download_resolved_model_with(&entry, models_dir, download::download) {
         Ok(paths) => {
             for path in paths {
                 writeln!(stdout, "{}", path.display())?;
@@ -444,6 +478,71 @@ mod tests {
             user_registry_dir_from_home(None),
             PathBuf::from(".").join(".loxa/registry.d")
         );
+    }
+
+    #[test]
+    fn injected_user_registry_entry_downloads_as_one_artifact() {
+        let temp = TempDir::new("loxa-injected-user-pull");
+        let registry_dir = temp.path().join("registry.d");
+        let models_dir = temp.path().join("models");
+        let entry = user_entry("injected-model", "injected-model.gguf");
+        registry::save_user_entry(&registry_dir, &entry).unwrap();
+        let resolved = resolve_registry_model(&entry.id, &registry_dir)
+            .unwrap()
+            .expect("injected user model resolves");
+        let mut downloads = Vec::new();
+
+        let paths = download_resolved_model_with(&resolved, &models_dir, |artifact, dir| {
+            downloads.push((artifact.id().to_string(), dir.to_path_buf()));
+            Ok(dir.join(artifact.filename()))
+        })
+        .unwrap();
+
+        assert_eq!(
+            downloads,
+            vec![("injected-model".into(), models_dir.clone())]
+        );
+        assert_eq!(paths, vec![models_dir.join("injected-model.gguf")]);
+    }
+
+    #[test]
+    fn compiled_registry_entry_preserves_paired_runtime_profile_downloads() {
+        let temp = TempDir::new("loxa-compiled-pair-pull");
+        let resolved = resolve_registry_model("loxa", temp.path())
+            .unwrap()
+            .expect("compiled model resolves");
+        let mut downloads = Vec::new();
+
+        let paths = download_resolved_model_with(&resolved, temp.path(), |artifact, dir| {
+            downloads.push(artifact.filename().to_string());
+            Ok(dir.join(artifact.filename()))
+        })
+        .unwrap();
+
+        assert_eq!(
+            downloads,
+            vec![
+                "gemma-4-12B-it-qat-UD-Q4_K_XL.gguf",
+                "mtp-gemma-4-12B-it.gguf",
+            ]
+        );
+        assert_eq!(paths.len(), 2);
+    }
+
+    #[test]
+    fn lookup_and_collision_check_only_use_the_injected_registry() {
+        let injected = TempDir::new("loxa-injected-registry");
+        let outside = TempDir::new("loxa-outside-registry");
+        let injected_entry = user_entry("injected-model", "injected-model.gguf");
+        let outside_entry = user_entry("outside-model", "outside-model.gguf");
+        registry::save_user_entry(injected.path(), &injected_entry).unwrap();
+        registry::save_user_entry(outside.path(), &outside_entry).unwrap();
+
+        assert!(registry_model_id_exists(&injected_entry.id, injected.path()).unwrap());
+        assert!(!registry_model_id_exists(&outside_entry.id, injected.path()).unwrap());
+        assert!(resolve_registry_model(&outside_entry.id, injected.path())
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -662,6 +761,21 @@ mod tests {
 
     fn write_sparse(path: &Path, size: u64) {
         fs::File::create(path).unwrap().set_len(size).unwrap();
+    }
+
+    fn user_entry(id: &str, filename: &str) -> registry::UserModelEntry {
+        registry::UserModelEntry {
+            id: id.into(),
+            repo: "owner/repo".into(),
+            revision: "0123456789abcdef0123456789abcdef01234567".into(),
+            filename: filename.into(),
+            sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            size_bytes: 100 * 1024 * 1024,
+            license: "apache-2.0".into(),
+            params: "unknown".into(),
+            quant: "Q4_K_M".into(),
+            min_free_mem_gb: 0.1,
+        }
     }
 
     struct TempDir {
