@@ -461,10 +461,14 @@ pub(crate) fn run_with_runtime(
     ensure_safe_evidence_directory(repository_root, &request.evidence_dir)?;
 
     let temporary = Builder::new().prefix("loxa-pi-acceptance-").tempdir()?;
-    let home = temporary.path().join("home");
-    let config_directory = temporary.path().join("pi-config");
-    let workspace = temporary.path().join("workspace");
-    let child_temp = temporary.path().join("tmp");
+    #[cfg(target_os = "macos")]
+    let temporary_root = fs::canonicalize(temporary.path())?;
+    #[cfg(not(target_os = "macos"))]
+    let temporary_root = temporary.path().to_path_buf();
+    let home = temporary_root.join("home");
+    let config_directory = temporary_root.join("pi-config");
+    let workspace = temporary_root.join("workspace");
+    let child_temp = temporary_root.join("tmp");
     for directory in [&home, &config_directory, &workspace, &child_temp] {
         fs::create_dir(directory)?;
     }
@@ -1077,6 +1081,7 @@ mod tests {
         gateway_urls: Vec<String>,
         bridge_calls: usize,
         temporary_root: Option<PathBuf>,
+        temporary_root_is_canonical: bool,
         config_bytes: Option<Vec<u8>>,
     }
 
@@ -1093,6 +1098,7 @@ mod tests {
                 gateway_urls: Vec::new(),
                 bridge_calls: 0,
                 temporary_root: None,
+                temporary_root_is_canonical: false,
                 config_bytes: None,
             }
         }
@@ -1109,6 +1115,19 @@ mod tests {
         fn run_bridge(&mut self, invocation: &BridgeInvocation) -> std::io::Result<Vec<u8>> {
             self.bridge_calls += 1;
             self.temporary_root = invocation.workspace.parent().map(Path::to_path_buf);
+            self.temporary_root_is_canonical = if cfg!(target_os = "macos") {
+                fs::canonicalize(
+                    invocation
+                        .workspace
+                        .parent()
+                        .expect("workspace has temporary root"),
+                )? == invocation
+                    .workspace
+                    .parent()
+                    .expect("workspace has temporary root")
+            } else {
+                true
+            };
             let config_directory = PathBuf::from(
                 invocation
                     .environment
@@ -1161,6 +1180,7 @@ mod tests {
         assert!(config.contains(r#""maxTokens": 4096"#));
         assert!(config.contains(r#""maxTokensField": "max_tokens""#));
         assert_eq!(evidence.phase, AcceptancePhase::MacLocal);
+        assert!(runtime.temporary_root_is_canonical);
         assert!(runtime.temporary_root.is_some_and(|path| !path.exists()));
         let persisted = fs::read(
             repository
