@@ -319,6 +319,7 @@ pub(crate) struct NodeRuntimeParts {
     pub(crate) gateway_state: GatewayState,
     pub(crate) chat_routes_state: ChatRoutesState,
     pub(crate) gateway: GatewayServer,
+    pub(crate) inference_gateway: Option<GatewayServer>,
     pub(crate) history_worker: ChatHistoryWorker,
     pub(crate) diagnostics_health: DiagnosticsHealth,
     pub(crate) node_id: NodeId,
@@ -474,6 +475,7 @@ pub(crate) struct NodeRuntime {
     gateway_state: Option<GatewayState>,
     chat_routes_state: Option<ChatRoutesState>,
     gateway: Option<GatewayServer>,
+    inference_gateway: Option<GatewayServer>,
     history_worker: Option<ChatHistoryWorker>,
     diagnostics_health: DiagnosticsHealth,
     node_id: NodeId,
@@ -565,6 +567,7 @@ impl NodeRuntime {
             gateway_state: Some(parts.gateway_state),
             chat_routes_state: Some(parts.chat_routes_state),
             gateway: Some(parts.gateway),
+            inference_gateway: parts.inference_gateway,
             history_worker: Some(parts.history_worker),
             diagnostics_health: parts.diagnostics_health,
             node_id: parts.node_id,
@@ -584,6 +587,11 @@ impl NodeRuntime {
             .as_ref()
             .expect("runtime gateway present")
             .port()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inference_port_for_test(&self) -> Option<u16> {
+        self.inference_gateway.as_ref().map(GatewayServer::port)
     }
 
     #[cfg(test)]
@@ -781,6 +789,9 @@ impl NodeRuntime {
             }
         }
         if let Some(gateway) = &mut self.gateway {
+            gateway.request_shutdown();
+        }
+        if let Some(gateway) = &mut self.inference_gateway {
             gateway.request_shutdown();
         }
         if let Some(history) = &mut self.history_worker {
@@ -995,6 +1006,16 @@ impl NodeRuntime {
             self.node_instance_id,
             None,
         );
+        let inference_gateway_failure = self
+            .inference_gateway
+            .take()
+            .and_then(|gateway| gateway.shutdown_until(deadlines.repository).err());
+        if let Some(error) = &inference_gateway_failure {
+            diagnostics.push((
+                ShutdownFailureClass::Routes,
+                format!("inference gateway shutdown failed: {:?}", error.kind()),
+            ));
+        }
         let (history_failure, history_error) = match self
             .history_worker
             .take()
@@ -1058,6 +1079,7 @@ impl NodeRuntime {
         let requires_exit = execution_retained.is_some()
             || routes_failure.is_some()
             || gateway_failure.is_some()
+            || inference_gateway_failure.is_some()
             || history_failure.is_some()
             || health_failure.is_some()
             || control_failure.is_some()
@@ -1097,6 +1119,8 @@ impl NodeRuntime {
                     diagnostic,
                     gateway: None,
                     gateway_failure,
+                    inference_gateway: None,
+                    inference_gateway_failure,
                     history: None,
                     history_failure,
                     health: None,
@@ -1139,6 +1163,7 @@ impl Drop for NodeRuntime {
         let owns_runtime = self.owner_guard.is_some()
             || self.download_runtime.is_some()
             || self.gateway.is_some()
+            || self.inference_gateway.is_some()
             || self.history_worker.is_some()
             || self.control_worker.is_some()
             || self.health_monitor.is_some();
@@ -1537,6 +1562,8 @@ mod tests {
                 diagnostic: "prepared Python owner cleanup deadline exceeded".into(),
                 gateway: None,
                 gateway_failure: None,
+                inference_gateway: None,
+                inference_gateway_failure: None,
                 history: None,
                 history_failure: None,
                 health: None,

@@ -105,6 +105,8 @@ fn retained_control_startup_failure(
         diagnostic: "durable control startup did not release authoritative ownership".into(),
         gateway: None,
         gateway_failure: None,
+        inference_gateway: None,
+        inference_gateway_failure: None,
         history: None,
         history_failure: None,
         health: None,
@@ -135,6 +137,8 @@ fn finish_early_owner_or_retain(
                 diagnostic: format!("{trigger}; exact startup owner cleanup was not proven"),
                 gateway: None,
                 gateway_failure: None,
+                inference_gateway: None,
+                inference_gateway_failure: None,
                 history: None,
                 history_failure: None,
                 health: None,
@@ -187,6 +191,8 @@ fn finish_identity_owner_or_retain(
                 diagnostic: format!("{trigger}; exact startup owner cleanup was not proven"),
                 gateway: None,
                 gateway_failure: None,
+                inference_gateway: None,
+                inference_gateway_failure: None,
                 history: None,
                 history_failure: None,
                 health: None,
@@ -306,6 +312,7 @@ fn finish_failed_durable_build(
     )>,
     mut chat_routes_state: Option<chat_routes::ChatRoutesState>,
     mut gateway: Option<loxa_core::gateway::GatewayServer>,
+    mut inference_gateway: Option<loxa_core::gateway::GatewayServer>,
     mut history_worker: Option<chat_history::ChatHistoryWorker>,
     control_worker: control_state::ControlStateWorker,
     health_monitor: Option<DurableHealthMonitor>,
@@ -345,6 +352,9 @@ fn finish_failed_durable_build(
     if let Some(gateway) = gateway.as_mut() {
         gateway.request_shutdown();
     }
+    if let Some(gateway) = inference_gateway.as_mut() {
+        gateway.request_shutdown();
+    }
     if let Some(history) = history_worker.as_mut() {
         history.request_shutdown();
     }
@@ -379,6 +389,9 @@ fn finish_failed_durable_build(
         .take()
         .and_then(|routes| routes.shutdown_until(deadlines.repository).err());
     let gateway_failure = gateway
+        .take()
+        .and_then(|gateway| gateway.shutdown_until(deadlines.repository).err());
+    let inference_gateway_failure = inference_gateway
         .take()
         .and_then(|gateway| gateway.shutdown_until(deadlines.repository).err());
     let health_failure =
@@ -417,6 +430,7 @@ fn finish_failed_durable_build(
 
     let requires_exit = routes_failure.is_some()
         || gateway_failure.is_some()
+        || inference_gateway_failure.is_some()
         || health_failure.is_some()
         || execution_failure.is_some()
         || retained_history.is_some()
@@ -430,6 +444,8 @@ fn finish_failed_durable_build(
                 diagnostic: "node startup cleanup retained authoritative ownership".into(),
                 gateway: None,
                 gateway_failure,
+                inference_gateway: None,
+                inference_gateway_failure,
                 history: None,
                 history_failure: retained_history,
                 health: None,
@@ -462,6 +478,7 @@ fn finish_failed_durable_build(
 pub(crate) struct NodeBuilder<'a> {
     requested_model: Option<&'a str>,
     port: Option<u16>,
+    inference_port: Option<u16>,
     engine: RuntimeBackendKind,
     paths: &'a NodePaths,
     diagnostics_health: DiagnosticsHealth,
@@ -484,6 +501,7 @@ impl<'a> NodeBuilder<'a> {
         Self {
             requested_model,
             port,
+            inference_port: None,
             engine,
             paths,
             diagnostics_health: DiagnosticsHealth::new(),
@@ -506,6 +524,7 @@ impl<'a> NodeBuilder<'a> {
         Self {
             requested_model,
             port,
+            inference_port: None,
             engine,
             paths,
             diagnostics_health,
@@ -524,6 +543,11 @@ impl<'a> NodeBuilder<'a> {
         count: &'a std::sync::atomic::AtomicUsize,
     ) -> Self {
         self.download_worker_spawn_count = Some(count);
+        self
+    }
+
+    pub(crate) fn with_inference_port(mut self, inference_port: Option<u16>) -> Self {
+        self.inference_port = inference_port;
         self
     }
 
@@ -643,6 +667,7 @@ impl<'a> NodeBuilder<'a> {
                 None,
                 None,
                 None,
+                None,
                 control_worker,
                 None,
                 control.clone(),
@@ -659,6 +684,7 @@ impl<'a> NodeBuilder<'a> {
                     &PublicationGate::default(),
                     owner_guard,
                     &mut download_runtime,
+                    None,
                     None,
                     None,
                     None,
@@ -682,6 +708,7 @@ impl<'a> NodeBuilder<'a> {
                     None,
                     None,
                     None,
+                    None,
                     control_worker,
                     None,
                     control.clone(),
@@ -702,6 +729,7 @@ impl<'a> NodeBuilder<'a> {
                     None,
                     None,
                     None,
+                    None,
                     control_worker,
                     None,
                     control.clone(),
@@ -718,6 +746,7 @@ impl<'a> NodeBuilder<'a> {
                 &PublicationGate::default(),
                 owner_guard,
                 &mut download_runtime,
+                None,
                 None,
                 None,
                 Some(history_worker),
@@ -768,6 +797,7 @@ impl<'a> NodeBuilder<'a> {
                         &mut download_runtime,
                         None,
                         None,
+                        None,
                         Some(history_worker),
                         control_worker,
                         None,
@@ -796,6 +826,7 @@ impl<'a> NodeBuilder<'a> {
                 &mut download_runtime,
                 None,
                 None,
+                None,
                 Some(history_worker),
                 control_worker,
                 None,
@@ -816,6 +847,7 @@ impl<'a> NodeBuilder<'a> {
                 owner_guard,
                 &mut download_runtime,
                 Some(chat_routes_state),
+                None,
                 None,
                 Some(history_worker),
                 control_worker,
@@ -851,6 +883,7 @@ impl<'a> NodeBuilder<'a> {
                     &mut download_runtime,
                     Some(chat_routes_state),
                     None,
+                    None,
                     Some(history_worker),
                     control_worker,
                     None,
@@ -877,6 +910,7 @@ impl<'a> NodeBuilder<'a> {
                     &mut download_runtime,
                     Some(chat_routes_state),
                     None,
+                    None,
                     Some(history_worker),
                     control_worker,
                     None,
@@ -887,6 +921,34 @@ impl<'a> NodeBuilder<'a> {
                 ));
             }
         };
+        let inference_gateway = match self.inference_port {
+            Some(port) => match loxa_core::gateway::GatewayServer::start_with_router(
+                port,
+                gateway_state.clone(),
+                loxa_core::gateway::remote_router(gateway_state.clone()),
+            ) {
+                Ok(gateway) => Some(gateway),
+                Err(error) => {
+                    return Err(finish_failed_durable_build(
+                        error,
+                        &publication_gate,
+                        owner_guard,
+                        &mut download_runtime,
+                        Some(chat_routes_state),
+                        Some(gateway),
+                        None,
+                        Some(history_worker),
+                        control_worker,
+                        None,
+                        control.clone(),
+                        gateway_state.clone(),
+                        #[cfg(test)]
+                        self.force_expired_failure_cleanup,
+                    ));
+                }
+            },
+            None => None,
+        };
         #[cfg(test)]
         if self.failure_after == Some(BuilderFailureBoundary::Gateway) {
             return Err(finish_failed_durable_build(
@@ -896,6 +958,7 @@ impl<'a> NodeBuilder<'a> {
                 &mut download_runtime,
                 Some(chat_routes_state),
                 Some(gateway),
+                inference_gateway,
                 Some(history_worker),
                 control_worker,
                 None,
@@ -924,6 +987,7 @@ impl<'a> NodeBuilder<'a> {
                     &mut download_runtime,
                     Some(chat_routes_state),
                     Some(gateway),
+                    inference_gateway,
                     Some(history_worker),
                     control_worker,
                     None,
@@ -950,6 +1014,7 @@ impl<'a> NodeBuilder<'a> {
                     &mut download_runtime,
                     Some(chat_routes_state),
                     Some(gateway),
+                    inference_gateway,
                     Some(history_worker),
                     control_worker,
                     None,
@@ -969,6 +1034,7 @@ impl<'a> NodeBuilder<'a> {
                 &mut download_runtime,
                 Some(chat_routes_state),
                 Some(gateway),
+                inference_gateway,
                 Some(history_worker),
                 control_worker,
                 Some(health_monitor),
@@ -993,6 +1059,7 @@ impl<'a> NodeBuilder<'a> {
                 &mut download_runtime,
                 Some(chat_routes_state),
                 Some(gateway),
+                inference_gateway,
                 Some(history_worker),
                 control_worker,
                 Some(health_monitor),
@@ -1011,6 +1078,7 @@ impl<'a> NodeBuilder<'a> {
                 &mut download_runtime,
                 Some(chat_routes_state),
                 Some(gateway),
+                inference_gateway,
                 Some(history_worker),
                 control_worker,
                 Some(health_monitor),
@@ -1028,6 +1096,7 @@ impl<'a> NodeBuilder<'a> {
                 &mut download_runtime,
                 Some(chat_routes_state),
                 Some(gateway),
+                inference_gateway,
                 Some(history_worker),
                 control_worker,
                 Some(health_monitor),
@@ -1046,6 +1115,7 @@ impl<'a> NodeBuilder<'a> {
                 &mut download_runtime,
                 Some(chat_routes_state),
                 Some(gateway),
+                inference_gateway,
                 Some(history_worker),
                 control_worker,
                 Some(health_monitor),
@@ -1065,6 +1135,7 @@ impl<'a> NodeBuilder<'a> {
             gateway_state,
             chat_routes_state,
             gateway,
+            inference_gateway,
             history_worker,
             diagnostics_health: self.diagnostics_health,
             node_id,
@@ -1103,6 +1174,14 @@ mod tests {
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             ));
             std::fs::create_dir_all(&path).expect("create builder test directory");
+            let path = std::fs::canonicalize(path).expect("canonical builder test directory");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                    .expect("make builder test directory private");
+            }
             Self(path)
         }
 
@@ -1334,6 +1413,116 @@ mod tests {
             .to_string(),
             "execution"
         );
+    }
+
+    #[test]
+    fn inference_listener_releases_both_ports_on_normal_shutdown() {
+        let temp = BuilderTestDir::new("inference-listener-normal-shutdown");
+        let paths = temp.paths();
+        let gateway_listener =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve gateway port");
+        let gateway_port = gateway_listener
+            .local_addr()
+            .expect("gateway address")
+            .port();
+        let inference_listener =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve inference port");
+        let inference_port = inference_listener
+            .local_addr()
+            .expect("inference address")
+            .port();
+        drop(gateway_listener);
+        drop(inference_listener);
+
+        let runtime = NodeBuilder::new(
+            None,
+            Some(gateway_port),
+            RuntimeBackendKind::LlamaCpp,
+            &paths,
+        )
+        .with_inference_port(Some(inference_port))
+        .build()
+        .expect("build inference listener");
+        assert_eq!(runtime.inference_port_for_test(), Some(inference_port));
+
+        runtime.shutdown_for_test().expect("shutdown runtime");
+        for port in [gateway_port, inference_port] {
+            std::net::TcpListener::bind(("127.0.0.1", port))
+                .unwrap_or_else(|error| panic!("listener port {port} was not released: {error}"));
+        }
+    }
+
+    #[test]
+    fn fatal_shutdown_releases_both_listener_ports_at_process_exit() {
+        const CHILD_ENV: &str = "LOXA_INFERENCE_LISTENER_FATAL_SHUTDOWN";
+        const ROOT_ENV: &str = "LOXA_INFERENCE_LISTENER_ROOT";
+        const GATEWAY_PORT_ENV: &str = "LOXA_INFERENCE_LISTENER_GATEWAY_PORT";
+        const INFERENCE_PORT_ENV: &str = "LOXA_INFERENCE_LISTENER_PORT";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let root = std::path::PathBuf::from(std::env::var_os(ROOT_ENV).expect("child root"));
+            let paths = NodePaths {
+                models_dir: root.join("models"),
+                state_path: root.join("managed.json"),
+                logs_dir: root.join("logs"),
+            };
+            let gateway_port = std::env::var(GATEWAY_PORT_ENV)
+                .expect("gateway port")
+                .parse()
+                .expect("gateway port is valid");
+            let inference_port = std::env::var(INFERENCE_PORT_ENV)
+                .expect("inference port")
+                .parse()
+                .expect("inference port is valid");
+            let runtime = NodeBuilder::new(
+                None,
+                Some(gateway_port),
+                RuntimeBackendKind::LlamaCpp,
+                &paths,
+            )
+            .with_inference_port(Some(inference_port))
+            .build()
+            .expect("build inference listener");
+            let fatal = match runtime.shutdown_with_injected_retained_for_test(
+                crate::runtime::InjectedRetainedOwner::Gateway,
+            ) {
+                crate::runtime::ShutdownResult::RequiresProcessExit(fatal) => fatal,
+                _ => panic!("injected gateway shutdown must retain fatal ownership"),
+            };
+            fatal.exit(74);
+        }
+
+        let temp = BuilderTestDir::new("inference-listener-fatal-shutdown");
+        let gateway_listener =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve gateway port");
+        let gateway_port = gateway_listener
+            .local_addr()
+            .expect("gateway address")
+            .port();
+        let inference_listener =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve inference port");
+        let inference_port = inference_listener
+            .local_addr()
+            .expect("inference address")
+            .port();
+        drop(gateway_listener);
+        drop(inference_listener);
+
+        let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .arg("--exact")
+            .arg("bootstrap::builder::tests::fatal_shutdown_releases_both_listener_ports_at_process_exit")
+            .arg("--nocapture")
+            .env(CHILD_ENV, "1")
+            .env(ROOT_ENV, &temp.0)
+            .env(GATEWAY_PORT_ENV, gateway_port.to_string())
+            .env(INFERENCE_PORT_ENV, inference_port.to_string())
+            .status()
+            .expect("run fatal shutdown child");
+        assert_eq!(status.code(), Some(74));
+        for port in [gateway_port, inference_port] {
+            std::net::TcpListener::bind(("127.0.0.1", port)).unwrap_or_else(|error| {
+                panic!("fatal process exit did not release listener port {port}: {error}")
+            });
+        }
     }
 
     #[test]

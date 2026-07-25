@@ -10,32 +10,37 @@ impl LifecycleEventSink for SilentEvents {
     }
 }
 
-fn parse_port<I>(arguments: I) -> Result<Option<u16>, String>
+fn parse_ports<I>(arguments: I) -> Result<(Option<u16>, Option<u16>), String>
 where
     I: IntoIterator<Item = String>,
 {
     let mut arguments = arguments.into_iter();
     let mut port = None;
+    let mut inference_port = None;
     while let Some(argument) = arguments.next() {
-        if argument != "--port" || port.is_some() {
-            return Err(format!("unsupported loxa-node argument: {argument}"));
-        }
+        let target = match argument.as_str() {
+            "--port" if port.is_none() => &mut port,
+            "--inference-port" if inference_port.is_none() => &mut inference_port,
+            _ => return Err(format!("unsupported loxa-node argument: {argument}")),
+        };
         let value = arguments
             .next()
-            .ok_or_else(|| "--port requires a value".to_string())?;
+            .ok_or_else(|| format!("{argument} requires a value"))?;
         let parsed = value
             .parse::<u16>()
             .ok()
             .filter(|port| *port != 0)
-            .ok_or_else(|| "--port must be between 1 and 65535".to_string())?;
-        port = Some(parsed);
+            .ok_or_else(|| format!("{argument} must be between 1 and 65535"))?;
+        if target.replace(parsed).is_some() {
+            return Err(format!("unsupported loxa-node argument: {argument}"));
+        }
     }
-    Ok(port)
+    Ok((port, inference_port))
 }
 
 fn run() -> ShutdownResult {
-    let port = match parse_port(std::env::args().skip(1)) {
-        Ok(port) => port,
+    let (port, inference_port) = match parse_ports(std::env::args().skip(1)) {
+        Ok(ports) => ports,
         Err(error) => return ShutdownResult::Failed(io::Error::other(error)),
     };
     let paths = NodePaths::detect();
@@ -43,6 +48,7 @@ fn run() -> ShutdownResult {
     let result = loxa_node::serve_node_with_diagnostics_health(
         None,
         port,
+        inference_port,
         RuntimeBackendKind::LlamaCpp,
         &paths,
         &mut SilentEvents,
@@ -85,10 +91,10 @@ mod tests {
 
     #[test]
     fn accepts_only_an_optional_nonzero_port() {
-        assert_eq!(parse_port(Vec::<String>::new()).unwrap(), None);
+        assert_eq!(parse_ports(Vec::<String>::new()).unwrap(), (None, None));
         assert_eq!(
-            parse_port(["--port".into(), "8080".into()]).unwrap(),
-            Some(8080)
+            parse_ports(["--port".into(), "8080".into()]).unwrap(),
+            (Some(8080), None)
         );
         for invalid in [
             vec!["--model".into(), "x".into()],
@@ -101,7 +107,34 @@ mod tests {
                 "8081".into(),
             ],
         ] {
-            assert!(parse_port(invalid).is_err());
+            assert!(parse_ports(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn accepts_an_optional_nonzero_inference_port() {
+        assert_eq!(parse_ports(Vec::<String>::new()).unwrap(), (None, None));
+        assert_eq!(
+            parse_ports([
+                "--port".into(),
+                "8080".into(),
+                "--inference-port".into(),
+                "8081".into(),
+            ])
+            .unwrap(),
+            (Some(8080), Some(8081))
+        );
+        for invalid in [
+            vec!["--inference-port".into()],
+            vec!["--inference-port".into(), "0".into()],
+            vec![
+                "--inference-port".into(),
+                "8080".into(),
+                "--inference-port".into(),
+                "8081".into(),
+            ],
+        ] {
+            assert!(parse_ports(invalid).is_err());
         }
     }
 }
