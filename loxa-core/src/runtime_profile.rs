@@ -8,6 +8,9 @@ pub struct PinnedArtifact {
     pub filename: &'static str,
     pub sha256: &'static str,
     pub size_bytes: u64,
+    pub quantization: &'static str,
+    pub license_id: &'static str,
+    pub license_url: &'static str,
 }
 
 impl VerifiedModel for PinnedArtifact {
@@ -58,6 +61,9 @@ impl LlamaRuntimeProfile {
     }
 }
 
+const GEMMA_4_LICENSE_ID: &str = "apache-2.0";
+const GEMMA_4_LICENSE_URL: &str = "https://ai.google.dev/gemma/docs/gemma_4_license";
+
 const GEMMA_4_MTP_PROFILE: LlamaRuntimeProfile = LlamaRuntimeProfile {
     model_id: "loxa",
     target: PinnedArtifact {
@@ -67,6 +73,9 @@ const GEMMA_4_MTP_PROFILE: LlamaRuntimeProfile = LlamaRuntimeProfile {
         filename: "gemma-4-12B-it-qat-UD-Q4_K_XL.gguf",
         sha256: "90fd44e29e0d7cffeb0fd00dc73cfdab9ed0b0e95306ecf7821ea634c940c370",
         size_bytes: 6_716_356_800,
+        quantization: "UD-Q4_K_XL",
+        license_id: GEMMA_4_LICENSE_ID,
+        license_url: GEMMA_4_LICENSE_URL,
     },
     drafter: PinnedArtifact {
         id: "loxa-mtp-drafter",
@@ -75,6 +84,9 @@ const GEMMA_4_MTP_PROFILE: LlamaRuntimeProfile = LlamaRuntimeProfile {
         filename: "mtp-gemma-4-12B-it.gguf",
         sha256: "fcb35dea42c71333db904cee11baac525c9ef872818ee3753f6cb156f3c6f4f6",
         size_bytes: 253_708_800,
+        quantization: "Q4_0",
+        license_id: GEMMA_4_LICENSE_ID,
+        license_url: GEMMA_4_LICENSE_URL,
     },
     ctx_size: 8192,
     spec_type: "draft-mtp",
@@ -112,6 +124,12 @@ mod tests {
             "90fd44e29e0d7cffeb0fd00dc73cfdab9ed0b0e95306ecf7821ea634c940c370"
         );
         assert_eq!(profile.target.size_bytes(), 6_716_356_800);
+        assert_eq!(profile.target.quantization, "UD-Q4_K_XL");
+        assert_eq!(profile.target.license_id, "apache-2.0");
+        assert_eq!(
+            profile.target.license_url,
+            "https://ai.google.dev/gemma/docs/gemma_4_license"
+        );
 
         assert_eq!(profile.drafter.id(), "loxa-mtp-drafter");
         assert_eq!(profile.drafter.repo(), "unsloth/gemma-4-12B-it-qat-GGUF");
@@ -122,6 +140,12 @@ mod tests {
             "fcb35dea42c71333db904cee11baac525c9ef872818ee3753f6cb156f3c6f4f6"
         );
         assert_eq!(profile.drafter.size_bytes(), 253_708_800);
+        assert_eq!(profile.drafter.quantization, "Q4_0");
+        assert_eq!(profile.drafter.license_id, "apache-2.0");
+        assert_eq!(
+            profile.drafter.license_url,
+            "https://ai.google.dev/gemma/docs/gemma_4_license"
+        );
 
         assert_eq!(profile.ctx_size, 8192);
         assert_eq!(profile.spec_type, "draft-mtp");
@@ -149,6 +173,12 @@ mod tests {
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
             assert!(artifact.size_bytes() > 0);
+            assert!(!artifact.quantization.is_empty());
+            assert_eq!(artifact.license_id, "apache-2.0");
+            assert_eq!(
+                artifact.license_url,
+                "https://ai.google.dev/gemma/docs/gemma_4_license"
+            );
         }
 
         assert!(runtime_profile("unknown-model").is_none());
