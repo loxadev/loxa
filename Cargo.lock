@@ -914,8 +914,15 @@ name = "loxa"
 version = "0.1.0-dev"
 dependencies = [
  "clap",
+ "libc",
  "loxa-core",
  "loxa-node",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "url",
 ]
 
 [[package]]

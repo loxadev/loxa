@@ -1,38 +1,18 @@
 #!/usr/bin/env node
 
-import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import {
-  cp,
-  link,
-  lstat,
-  mkdir,
-  mkdtemp,
-  readdir,
-  readFile,
-  realpath,
-  rm,
-  writeFile,
-} from "node:fs/promises";
-import os from "node:os";
+import { realpath } from "node:fs/promises";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 
-const PHASES = new Set(["mac-local", "windows-tailnet", "post-recovery"]);
-const DIGEST_PATTERN = /^[a-f0-9]{64}$/;
-const TAILNET_HOSTNAME_PATTERN =
-  /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+ts\.net$/;
 const MAX_ARGUMENT_LENGTH = 4096;
-const MAX_BASE_URL_LENGTH = 2048;
 const MAX_TRACE_RECORDS = 10_000;
 const MAX_PI_STDOUT_BYTES = 1024 * 1024;
 const MAX_PI_STDERR_BYTES = 64 * 1024;
 const MAX_PI_LINE_BYTES = 64 * 1024;
 const MAX_PI_VERSION_STDOUT_BYTES = 4096;
-const MAX_GATEWAY_RESPONSE_BYTES = 64 * 1024;
 const MAX_PROCESS_TIMEOUT_MS = 5 * 60 * 1000;
-const GATEWAY_TIMEOUT_MS = 5000;
 const PI_VERSION_TIMEOUT_MS = 5000;
 const FORCE_KILL_DELAY_MS = 250;
 const TERMINAL_DEADLINE_MS = 250;
@@ -45,19 +25,6 @@ const KNOWN_LIFECYCLE_EVENTS = new Set([
   "turn_end",
 ]);
 const ALLOWED_TOOL_NAMES = new Set(["read", "bash", "write"]);
-const repositoryRoot = path.resolve(
-  path.dirname(fileURLToPath(import.meta.url)),
-  "..",
-);
-
-export class QualificationRequiredError extends Error {
-  constructor() {
-    super(
-      "Safe output-token limit qualification required before live Pi execution.",
-    );
-    this.name = "QualificationRequiredError";
-  }
-}
 
 function fail(message) {
   throw new Error(message);
@@ -72,15 +39,6 @@ function isPlainObject(value) {
   );
 }
 
-function isEnvironmentRecord(value) {
-  return (
-    value !== null &&
-    typeof value === "object" &&
-    !Array.isArray(value) &&
-    Object.prototype.toString.call(value) === "[object Object]"
-  );
-}
-
 function validateBoundedString(value, label, maximum = MAX_ARGUMENT_LENGTH) {
   if (
     typeof value !== "string" ||
@@ -91,260 +49,6 @@ function validateBoundedString(value, label, maximum = MAX_ARGUMENT_LENGTH) {
     fail(`${label} is invalid`);
   }
   return value;
-}
-
-function validateDigest(digest, label = "provider config digest") {
-  if (typeof digest !== "string" || !DIGEST_PATTERN.test(digest)) {
-    fail(`${label} must be a lowercase SHA-256 digest`);
-  }
-  return digest;
-}
-
-function validatePhase(phase) {
-  if (!PHASES.has(phase)) {
-    fail("phase must be mac-local, windows-tailnet, or post-recovery");
-  }
-  return phase;
-}
-
-export function validateBaseUrl(value) {
-  validateBoundedString(value, "base URL", MAX_BASE_URL_LENGTH);
-  let parsed;
-  try {
-    parsed = new URL(value);
-  } catch {
-    fail("base URL must be a valid absolute URL");
-  }
-  if (!["http:", "https:"].includes(parsed.protocol)) {
-    fail("base URL must use http or https");
-  }
-  if (
-    parsed.username ||
-    parsed.password ||
-    parsed.search ||
-    parsed.hash ||
-    parsed.pathname !== "/v1" ||
-    !parsed.hostname ||
-    parsed.hostname === "0.0.0.0"
-  ) {
-    fail("base URL must be credential-free and end at exact /v1");
-  }
-  return parsed;
-}
-
-export function validatePhaseEndpoint(
-  phase,
-  baseUrl,
-  expectedConfigSha256,
-) {
-  validatePhase(phase);
-  const parsed = validateBaseUrl(baseUrl);
-  if (phase === "mac-local" && parsed.hostname !== "127.0.0.1") {
-    fail("mac-local requires the IPv4 loopback endpoint");
-  }
-  if (phase === "windows-tailnet") {
-    if (parsed.protocol !== "https:") {
-      fail("windows-tailnet requires https");
-    }
-    if (
-      parsed.hostname === "127.0.0.1" ||
-      parsed.hostname === "localhost" ||
-      parsed.hostname === "::1" ||
-      parsed.hostname === "[::1]"
-    ) {
-      fail("windows-tailnet requires a non-loopback tailnet endpoint");
-    }
-    if (!TAILNET_HOSTNAME_PATTERN.test(parsed.hostname)) {
-      fail("windows-tailnet requires a syntactically valid tailnet hostname");
-    }
-  }
-  if (phase === "post-recovery" && expectedConfigSha256 === undefined) {
-    fail("post-recovery requires the expected provider config digest");
-  }
-  if (expectedConfigSha256 !== undefined) {
-    validateDigest(expectedConfigSha256, "expected provider config digest");
-  }
-  return parsed;
-}
-
-export function validateModelsConfig(config) {
-  if (!isPlainObject(config) || !isPlainObject(config.providers)) {
-    fail("models config must contain a providers object");
-  }
-  const providerNames = Object.keys(config.providers);
-  if (providerNames.length !== 1 || providerNames[0] !== "loxa") {
-    fail("models config must define exactly the stable loxa provider");
-  }
-  const provider = config.providers.loxa;
-  if (!isPlainObject(provider)) {
-    fail("loxa provider config must be an object");
-  }
-  if ("compat" in provider) {
-    fail("compat overrides require live qualification");
-  }
-  validateBaseUrl(provider.baseUrl);
-  if (provider.api !== "openai-completions") {
-    fail("loxa provider must use openai-completions");
-  }
-  if (provider.apiKey !== "loxa-dummy-key") {
-    fail("loxa provider must use the documented dummy key");
-  }
-  if (!Array.isArray(provider.models) || provider.models.length !== 1) {
-    fail("loxa provider must define exactly one model");
-  }
-  const model = provider.models[0];
-  if (!isPlainObject(model)) {
-    fail("loxa model config must be an object");
-  }
-  if ("compat" in model) {
-    fail("model compat overrides require live qualification");
-  }
-  if ("maxTokens" in model) {
-    fail("maxTokens requires live qualification");
-  }
-  if (
-    model.id !== "loxa" ||
-    model.reasoning !== false ||
-    !Array.isArray(model.input) ||
-    model.input.length !== 1 ||
-    model.input[0] !== "text" ||
-    model.contextWindow !== 8192
-  ) {
-    fail("loxa model must be the fixed non-reasoning text-only 8192 profile");
-  }
-  return {
-    providerName: "loxa",
-    provider,
-    api: provider.api,
-    apiKey: provider.apiKey,
-    model,
-  };
-}
-
-export function validateModelsResponse(response) {
-  if (
-    !isPlainObject(response) ||
-    !Array.isArray(response.data) ||
-    response.data.length > 10_000 ||
-    !response.data.some(
-      (model) => isPlainObject(model) && model.id === "loxa",
-    )
-  ) {
-    fail("models response does not contain the stable loxa model");
-  }
-  return true;
-}
-
-export function validateReadyStatus(response) {
-  if (
-    !isPlainObject(response) ||
-    response.health !== "ready" ||
-    response.model !== "loxa" ||
-    !isPlainObject(response.engine) ||
-    response.engine.name !== "llama-cpp" ||
-    typeof response.engine.version !== "string" ||
-    !/^version: 10107 \(c0bc8591e\)(?:\n[^\r\n]*)?$/.test(
-      response.engine.version,
-    )
-  ) {
-    fail("status response is not ready for the qualified stable loxa model");
-  }
-  return true;
-}
-
-function sourceValue(source, key, caseInsensitive) {
-  if (Object.hasOwn(source, key)) {
-    return source[key];
-  }
-  if (!caseInsensitive) {
-    return undefined;
-  }
-  const found = Object.keys(source).find(
-    (candidate) => candidate.toLowerCase() === key.toLowerCase(),
-  );
-  return found === undefined ? undefined : source[found];
-}
-
-function copyAllowedEnvironment(source, keys, caseInsensitive) {
-  const environment = {};
-  for (const key of keys) {
-    const value = sourceValue(source, key, caseInsensitive);
-    if (
-      typeof value === "string" &&
-      value.length <= MAX_ARGUMENT_LENGTH &&
-      !value.includes("\0")
-    ) {
-      environment[key] = value;
-    }
-  }
-  return environment;
-}
-
-export function buildIsolatedChildEnvironment(
-  platform,
-  { home, temp, source = {} },
-) {
-  if (!isEnvironmentRecord(source)) {
-    fail("child environment source must be an object");
-  }
-  validateBoundedString(home, "isolated home");
-  validateBoundedString(temp, "isolated temp");
-  if (platform === "darwin") {
-    if (!path.posix.isAbsolute(home) || !path.posix.isAbsolute(temp)) {
-      fail("isolated Mac home and temp must be absolute");
-    }
-    return {
-      ...copyAllowedEnvironment(
-        source,
-        ["PATH", "LANG", "LC_ALL", "LC_CTYPE"],
-        false,
-      ),
-      HOME: home,
-      XDG_CONFIG_HOME: path.posix.join(home, ".config"),
-      XDG_CACHE_HOME: path.posix.join(home, ".cache"),
-      XDG_DATA_HOME: path.posix.join(home, ".local", "share"),
-      TMPDIR: temp,
-    };
-  }
-  if (platform === "win32") {
-    if (
-      !path.win32.isAbsolute(home) ||
-      !path.win32.isAbsolute(temp) ||
-      !/^[A-Za-z]:\\/.test(home)
-    ) {
-      fail("isolated Windows home and temp must be absolute drive paths");
-    }
-    const drive = home.slice(0, 2);
-    const homePath = home.slice(2);
-    return {
-      ...copyAllowedEnvironment(
-        source,
-        [
-          "PATH",
-          "PATHEXT",
-          "SYSTEMROOT",
-          "WINDIR",
-          "COMSPEC",
-          "LANG",
-          "LC_ALL",
-          "LC_CTYPE",
-        ],
-        true,
-      ),
-      HOME: home,
-      USERPROFILE: home,
-      HOMEDRIVE: drive,
-      HOMEPATH: homePath,
-      APPDATA: path.win32.join(home, "AppData", "Roaming"),
-      LOCALAPPDATA: path.win32.join(home, "AppData", "Local"),
-      XDG_CONFIG_HOME: path.win32.join(home, ".config"),
-      XDG_CACHE_HOME: path.win32.join(home, ".cache"),
-      XDG_DATA_HOME: path.win32.join(home, ".local", "share"),
-      TEMP: temp,
-      TMP: temp,
-    };
-  }
-  fail("child environment platform must be darwin or win32");
 }
 
 export function validateSemanticToolTrace(records) {
@@ -575,344 +279,8 @@ export function adaptQualifiedPiJsonl(lines) {
   return adapter.finish();
 }
 
-export function providerConfigDigest(bytes) {
-  if (
-    !(typeof bytes === "string") &&
-    !Buffer.isBuffer(bytes) &&
-    !(bytes instanceof Uint8Array)
-  ) {
-    fail("provider config digest input must be exact bytes");
-  }
-  return createHash("sha256").update(bytes).digest("hex");
-}
-
-export function assertProviderDigest(actual, expected) {
-  validateDigest(actual);
-  validateDigest(expected, "expected provider config digest");
-  if (actual !== expected) {
-    fail("provider config digest changed");
-  }
-}
-
-function normalizedRelativePath(relativePath) {
-  return relativePath.split(path.sep).join("/");
-}
-
-async function snapshotTree(root) {
-  const rootStat = await lstat(root);
-  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
-    fail("workspace root must be a real directory");
-  }
-  const entries = new Map();
-  const foldedPaths = new Map();
-
-  async function walk(directory, parentRelative) {
-    const names = (await readdir(directory)).sort((left, right) =>
-      left < right ? -1 : left > right ? 1 : 0,
-    );
-    for (const name of names) {
-      const relative = parentRelative ? path.join(parentRelative, name) : name;
-      const normalized = normalizedRelativePath(relative);
-      const folded = normalized.toLocaleLowerCase("en-US");
-      if (foldedPaths.has(folded)) {
-        fail("workspace contains a case-only path collision");
-      }
-      foldedPaths.set(folded, normalized);
-
-      const absolute = path.join(directory, name);
-      const stat = await lstat(absolute);
-      const record = {
-        type: stat.isDirectory()
-          ? "directory"
-          : stat.isFile()
-            ? "file"
-            : stat.isSymbolicLink()
-              ? "symlink"
-              : "other",
-        mode: stat.mode & 0o777,
-        nlink: stat.nlink,
-      };
-      if (record.type === "file") {
-        if (record.nlink !== 1) {
-          fail("workspace contains a hard-linked file");
-        }
-        record.sha256 = providerConfigDigest(await readFile(absolute));
-      }
-      entries.set(normalized, record);
-      if (record.type === "directory") {
-        await walk(absolute, relative);
-      }
-    }
-  }
-
-  await walk(root, "");
-  return entries;
-}
-
-function validateChangedPath(value) {
-  validateBoundedString(value, "changed workspace path");
-  const normalized = value.replaceAll("\\", "/");
-  if (
-    normalized.startsWith("/") ||
-    normalized.includes("../") ||
-    normalized === ".." ||
-    path.posix.normalize(normalized) !== normalized
-  ) {
-    fail("changed workspace path must be a normalized relative path");
-  }
-  return normalized;
-}
-
-export async function validateExactWorkspace({
-  seedRoot,
-  workspaceRoot,
-  expectedResult,
-  changedPath,
-}) {
-  const expectedChangedPath = validateChangedPath(changedPath);
-  const [seed, workspace, expectedBytes] = await Promise.all([
-    snapshotTree(seedRoot),
-    snapshotTree(workspaceRoot),
-    readFile(expectedResult),
-  ]);
-  const seedPaths = [...seed.keys()];
-  const workspacePaths = [...workspace.keys()];
-  const seedFolded = seedPaths
-    .map((entry) => entry.toLocaleLowerCase("en-US"))
-    .sort();
-  const workspaceFolded = workspacePaths
-    .map((entry) => entry.toLocaleLowerCase("en-US"))
-    .sort();
-  if (
-    seedPaths.some((entry, index) => entry !== workspacePaths[index]) &&
-    seedFolded.length === workspaceFolded.length &&
-    seedFolded.every((entry, index) => entry === workspaceFolded[index])
-  ) {
-    fail("workspace contains a case-only path change");
-  }
-  if (
-    seedPaths.length !== workspacePaths.length ||
-    seedPaths.some((entry, index) => entry !== workspacePaths[index])
-  ) {
-    fail("workspace has extra, deleted, or renamed paths");
-  }
-
-  const expectedDigest = providerConfigDigest(expectedBytes);
-  let changedFiles = 0;
-  for (const relative of seedPaths) {
-    const before = seed.get(relative);
-    const after = workspace.get(relative);
-    if (
-      before.type === "symlink" ||
-      after.type === "symlink" ||
-      before.type === "other" ||
-      after.type === "other" ||
-      before.type !== after.type
-    ) {
-      fail("workspace contains a symlink or type change");
-    }
-    if (process.platform !== "win32" && before.mode !== after.mode) {
-      fail("workspace contains a mode change");
-    }
-    if (before.type !== "file") {
-      continue;
-    }
-    if (before.sha256 !== after.sha256) {
-      changedFiles += 1;
-      if (relative !== expectedChangedPath) {
-        fail("workspace contains an unrelated byte change");
-      }
-    }
-    if (
-      relative === expectedChangedPath &&
-      (after.sha256 !== expectedDigest || before.sha256 === expectedDigest)
-    ) {
-      fail("workspace result does not match the expected byte change");
-    }
-  }
-  if (
-    changedFiles !== 1 ||
-    !workspace.has(expectedChangedPath) ||
-    workspace.get(expectedChangedPath).type !== "file"
-  ) {
-    fail("workspace must contain exactly one expected byte change");
-  }
-  return { changedPath: expectedChangedPath, changedFiles };
-}
-
-export function buildSanitizedEvidence(input) {
-  if (!isPlainObject(input)) {
-    fail("sanitized evidence input must be an object");
-  }
-  const phase = validatePhase(input.phase);
-  const providerConfigSha256 = validateDigest(input.providerConfigSha256);
-  const booleanFields = [
-    "modelsBefore",
-    "readyBefore",
-    "toolOrder",
-    "exactWorkspace",
-    "verification",
-    "modelsAfter",
-    "readyAfter",
-  ];
-  for (const field of booleanFields) {
-    if (typeof input[field] !== "boolean") {
-      fail("sanitized evidence checks must be boolean");
-    }
-  }
-  return {
-    schemaVersion: 1,
-    phase,
-    providerConfigSha256,
-    modelsBefore: input.modelsBefore,
-    readyBefore: input.readyBefore,
-    toolOrder: input.toolOrder,
-    exactWorkspace: input.exactWorkspace,
-    verification: input.verification,
-    modelsAfter: input.modelsAfter,
-    readyAfter: input.readyAfter,
-  };
-}
-
-function validateEvidenceDirectory(value) {
-  validateBoundedString(value, "evidence directory");
-  const portable = value.replaceAll("\\", "/");
-  if (path.posix.isAbsolute(portable) || path.win32.isAbsolute(value)) {
-    fail("evidence directory must be under target/pi-acceptance");
-  }
-  const normalized = path.posix.normalize(portable);
-  if (
-    normalized !== "target/pi-acceptance" &&
-    !normalized.startsWith("target/pi-acceptance/")
-  ) {
-    fail("evidence directory must be under target/pi-acceptance");
-  }
-  return normalized;
-}
-
-async function writeSanitizedEvidence(
-  evidenceDirectory,
-  evidence,
-  publishEvidence = link,
-) {
-  let directory = repositoryRoot;
-  for (const component of evidenceDirectory.split("/")) {
-    directory = path.join(directory, component);
-    try {
-      await mkdir(directory, { mode: 0o700 });
-    } catch (error) {
-      if (error?.code !== "EEXIST") {
-        throw error;
-      }
-    }
-    const metadata = await lstat(directory);
-    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
-      fail("evidence directory is unsafe");
-    }
-  }
-  const destination = path.join(directory, "evidence.json");
-  try {
-    await lstat(destination);
-    fail("evidence artifact already exists");
-  } catch (error) {
-    if (error?.code !== "ENOENT") {
-      throw error;
-    }
-  }
-  const temporary = path.join(
-    directory,
-    `.evidence-${process.pid}-${randomUUID()}.tmp`,
-  );
-  const bytes = `${JSON.stringify(evidence)}\n`;
-  try {
-    await writeFile(temporary, bytes, {
-      encoding: "utf8",
-      mode: 0o600,
-      flag: "wx",
-    });
-    await publishEvidence(temporary, destination);
-  } finally {
-    await rm(temporary, { force: true });
-  }
-}
-
-export function parseArguments(argv) {
-  if (!Array.isArray(argv) || argv.length > 12) {
-    fail("CLI arguments are invalid");
-  }
-  const supported = new Map([
-    ["--phase", "phase"],
-    ["--base-url", "baseUrl"],
-    ["--pi-bin", "piBin"],
-    ["--max-tokens", "maxTokens"],
-    ["--expected-config-sha256", "expectedConfigSha256"],
-    ["--evidence-dir", "evidenceDir"],
-  ]);
-  const parsed = {};
-  for (let index = 0; index < argv.length; index += 2) {
-    const flag = argv[index];
-    const key = supported.get(flag);
-    if (key === undefined) {
-      fail("unknown Pi acceptance argument");
-    }
-    if (Object.hasOwn(parsed, key)) {
-      fail("duplicate Pi acceptance argument");
-    }
-    const value = argv[index + 1];
-    validateBoundedString(value, "Pi acceptance argument");
-    parsed[key] = value;
-  }
-  if (
-    parsed.phase === undefined ||
-    parsed.baseUrl === undefined ||
-    parsed.piBin === undefined ||
-    parsed.maxTokens === undefined ||
-    parsed.evidenceDir === undefined
-  ) {
-    fail("phase, base URL, Pi binary, max tokens, and evidence directory are required");
-  }
-  validatePhaseEndpoint(
-    parsed.phase,
-    parsed.baseUrl,
-    parsed.expectedConfigSha256,
-  );
-  validateBoundedString(parsed.piBin, "Pi binary");
-  if (!/^[1-9][0-9]*$/.test(parsed.maxTokens)) {
-    fail("max tokens must be an integer between 1 and 8191");
-  }
-  parsed.maxTokens = Number(parsed.maxTokens);
-  if (!Number.isSafeInteger(parsed.maxTokens) || parsed.maxTokens >= 8192) {
-    fail("max tokens must be an integer between 1 and 8191");
-  }
-  parsed.evidenceDir = validateEvidenceDirectory(parsed.evidenceDir);
-  return parsed;
-}
-
-export function buildRuntimeModelsConfig(baseUrl, qualifiedMaxTokens) {
-  return {
-    providers: {
-      loxa: {
-        baseUrl,
-        api: "openai-completions",
-        apiKey: "loxa-dummy-key",
-        models: [
-          {
-            id: "loxa",
-            name: "Loxa",
-            reasoning: false,
-            input: ["text"],
-            contextWindow: 8192,
-            maxTokens: qualifiedMaxTokens,
-            compat: { maxTokensField: "max_tokens" },
-          },
-        ],
-      },
-    },
-  };
-}
-
 export function buildQualifiedPiArgv(extensionPath, prompt) {
-  if (!path.isAbsolute(extensionPath)) {
+  if (!path.isAbsolute(extensionPath) && !path.win32.isAbsolute(extensionPath)) {
     fail("trusted Pi extension path must be absolute");
   }
   return [
@@ -938,87 +306,16 @@ export function buildQualifiedPiArgv(extensionPath, prompt) {
   ];
 }
 
-async function boundedGatewayJson(url, cancellation) {
-  const controller = new AbortController();
-  const cancel = () => controller.abort();
-  if (cancellation?.aborted) {
-    fail("Pi acceptance was cancelled");
-  }
-  cancellation?.addEventListener("abort", cancel, { once: true });
-  const timeout = setTimeout(() => controller.abort(), GATEWAY_TIMEOUT_MS);
-  try {
-    const response = await fetch(url, {
-      method: "GET",
-      redirect: "error",
-      signal: controller.signal,
-    });
-    if (!response.ok) {
-      fail("gateway acceptance endpoint was unavailable");
-    }
-    if (response.body === null) {
-      fail("gateway acceptance response was invalid");
-    }
-    const chunks = [];
-    let byteCount = 0;
-    const reader = response.body.getReader();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) {
-        break;
-      }
-      byteCount += value.byteLength;
-      if (byteCount > MAX_GATEWAY_RESPONSE_BYTES) {
-        try {
-          await reader.cancel();
-        } catch {
-          // The fixed size-limit failure remains authoritative.
-        }
-        fail("gateway acceptance response exceeded its size limit");
-      }
-      chunks.push(Buffer.from(value));
-    }
-    const bytes = Buffer.concat(chunks, byteCount);
-    try {
-      return JSON.parse(bytes.toString("utf8"));
-    } catch {
-      fail("gateway acceptance response was invalid");
-    }
-  } catch (error) {
-    if (cancellation?.aborted) {
-      fail("Pi acceptance was cancelled");
-    }
-    if (
-      error instanceof Error &&
-      error.message.startsWith("gateway acceptance")
-    ) {
-      throw error;
-    }
-    fail("gateway acceptance request failed");
-  } finally {
-    clearTimeout(timeout);
-    cancellation?.removeEventListener("abort", cancel);
-  }
-}
-
-async function validateGatewayAcceptance(baseUrl, cancellation) {
-  const parsed = validateBaseUrl(baseUrl);
-  const origin = `${parsed.protocol}//${parsed.host}`;
-  validateModelsResponse(
-    await boundedGatewayJson(`${origin}/v1/models`, cancellation),
-  );
-  validateReadyStatus(
-    await boundedGatewayJson(`${origin}/loxa/status`, cancellation),
-  );
-}
-
 function isAbsoluteExecutable(value) {
   return typeof value === "string" && (path.isAbsolute(value) || path.win32.isAbsolute(value));
 }
 
 export function readPiVersion(
   program,
+  argv,
   {
     spawnProcess = spawn,
+    cancellation,
     timeoutMs = PI_VERSION_TIMEOUT_MS,
     forceKillDelayMs = FORCE_KILL_DELAY_MS,
     terminalTimeoutMs = TERMINAL_DEADLINE_MS,
@@ -1040,6 +337,7 @@ export function readPiVersion(
       child?.stdout?.off("data", onStdout);
       child?.off("error", onError);
       child?.off("close", onClose);
+      cancellation?.removeEventListener("abort", rejectAfterTermination);
       child?.stdout?.destroy();
     };
     const failProbe = () => {
@@ -1098,7 +396,7 @@ export function readPiVersion(
       succeed();
     };
     try {
-      child = spawnProcess(program, ["--version"], {
+      child = spawnProcess(program, argv, {
         shell: false,
         stdio: ["ignore", "pipe", "ignore"],
         windowsHide: true,
@@ -1114,39 +412,63 @@ export function readPiVersion(
     child.stdout.on("data", onStdout);
     child.once("error", onError);
     child.once("close", onClose);
+    cancellation?.addEventListener("abort", rejectAfterTermination, {
+      once: true,
+    });
+    if (cancellation?.aborted) {
+      rejectAfterTermination();
+    }
     timeout = setTimeout(rejectAfterTermination, timeoutMs);
   });
 }
 
-export async function qualifyPiExecutable(piBin, {
-  resolveExecutable = realpath,
+export async function qualifyPiEntrypoint(piEntrypoint, {
+  nodeExecutable = process.execPath,
+  resolveEntrypoint = realpath,
   readVersion = readPiVersion,
+  cancellation,
 } = {}) {
-  if (!isAbsoluteExecutable(piBin)) {
-    fail("qualified Pi executable must be an absolute path");
+  if (
+    !isAbsoluteExecutable(piEntrypoint) ||
+    !isAbsoluteExecutable(nodeExecutable)
+  ) {
+    fail("qualified Pi CLI entrypoint must use absolute paths");
   }
   let resolved;
   let version;
   try {
-    resolved = await resolveExecutable(piBin);
-    if (!isAbsoluteExecutable(resolved)) {
-      throw new Error("non-absolute executable");
+    if (cancellation?.aborted) {
+      throw new Error("Pi acceptance was cancelled");
     }
-    version = await readVersion(resolved);
+    resolved = await resolveEntrypoint(piEntrypoint);
+    if (cancellation?.aborted) {
+      throw new Error("Pi acceptance was cancelled");
+    }
+    if (
+      !isAbsoluteExecutable(resolved) ||
+      path.win32.basename(resolved).toLowerCase() !== "cli.js" ||
+      path.win32.basename(path.win32.dirname(resolved)).toLowerCase() !== "dist"
+    ) {
+      throw new Error("invalid Pi CLI entrypoint");
+    }
+    version = await readVersion(
+      nodeExecutable,
+      [resolved, "--version"],
+      { cancellation },
+    );
   } catch {
-    fail("qualified Pi executable verification failed");
+    fail("qualified Pi CLI entrypoint verification failed");
   }
   if (version.trim() !== "0.82.1") {
-    fail("qualified Pi executable version must be 0.82.1");
+    fail("qualified Pi CLI entrypoint version must be 0.82.1");
   }
-  return resolved;
+  return { program: nodeExecutable, prefixArgs: [resolved] };
 }
 
 export function terminateOwnedProcessTree({
   child,
   platform,
   signal,
-  signalProcess,
   spawnTreeKiller,
   taskkillExecutable,
   terminalTimeoutMs = TERMINAL_DEADLINE_MS,
@@ -1195,6 +517,7 @@ export function terminateOwnedProcessTree({
           const failCleanup = () => {
             if (!complete) {
               complete = true;
+              signalExactChild();
               reject(new Error("Pi process cleanup failed"));
             }
           };
@@ -1204,11 +527,11 @@ export function terminateOwnedProcessTree({
               return;
             }
             finish(() => {
-              complete = true;
               if (code === 0) {
+                complete = true;
                 resolve();
               } else {
-                reject(new Error("Pi process cleanup failed"));
+                failCleanup();
               }
             });
           });
@@ -1218,12 +541,8 @@ export function terminateOwnedProcessTree({
         return Promise.reject(new Error("Pi process cleanup failed"));
       }
     } else {
-      try {
-        signalProcess(-pid, signal);
-        return Promise.resolve();
-      } catch {
-        // Fall back to the exact child if the owned group already disappeared.
-      }
+      signalExactChild();
+      return Promise.resolve();
     }
   }
   signalExactChild();
@@ -1239,7 +558,6 @@ function runPiProcess({
   cancellation,
   spawnProcess,
   platform,
-  signalProcess,
   spawnTreeKiller,
   taskkillExecutable,
   taskkillTerminalTimeoutMs,
@@ -1252,7 +570,7 @@ function runPiProcess({
     try {
       child = spawnProcess(program, argv, {
         cwd,
-        detached: platform !== "win32",
+        detached: false,
         env: environment,
         shell: false,
         stdio: ["ignore", "pipe", "pipe"],
@@ -1326,7 +644,6 @@ function runPiProcess({
               child,
               platform,
               signal,
-              signalProcess,
               spawnTreeKiller,
               taskkillExecutable,
               terminalTimeoutMs: taskkillTerminalTimeoutMs,
@@ -1466,34 +783,169 @@ function runPiProcess({
   });
 }
 
-export async function runQualifiedPiAdapter(
+export function parseBridgeArguments(argv) {
+  if (!Array.isArray(argv) || argv.length !== 8) {
+    fail("Pi bridge arguments are invalid");
+  }
+  const supported = new Map([
+    ["--pi-entrypoint", "piEntrypoint"],
+    ["--extension", "extension"],
+    ["--prompt", "prompt"],
+    ["--timeout-ms", "processTimeoutMs"],
+  ]);
+  const parsed = {};
+  for (let index = 0; index < argv.length; index += 2) {
+    const key = supported.get(argv[index]);
+    if (key === undefined || Object.hasOwn(parsed, key)) {
+      fail("Pi bridge arguments are invalid");
+    }
+    parsed[key] = validateBoundedString(
+      argv[index + 1],
+      "Pi bridge argument",
+      key === "prompt" ? 32 * 1024 : MAX_ARGUMENT_LENGTH,
+    );
+  }
+  if (!/^[1-9][0-9]*$/.test(parsed.processTimeoutMs)) {
+    fail("Pi process timeout is invalid");
+  }
+  parsed.processTimeoutMs = Number(parsed.processTimeoutMs);
+  if (
+    !Number.isSafeInteger(parsed.processTimeoutMs) ||
+    parsed.processTimeoutMs < 10 ||
+    parsed.processTimeoutMs > MAX_PROCESS_TIMEOUT_MS
+  ) {
+    fail("Pi process timeout is invalid");
+  }
+  if (!isAbsoluteExecutable(parsed.piEntrypoint)) {
+    fail("Pi CLI entrypoint must be absolute");
+  }
+  if (!path.isAbsolute(parsed.extension)) {
+    fail("trusted Pi extension path must be absolute");
+  }
+  return parsed;
+}
+
+export function validateIsolatedEnvironment(
+  environment,
+  cwd,
+  platform = process.platform,
+) {
+  const platformPath = platform === "win32" ? path.win32 : path.posix;
+  if (!isPlainObject(environment) || !platformPath.isAbsolute(cwd)) {
+    fail("Pi bridge environment is invalid");
+  }
+  const allowed =
+    platform === "win32"
+      ? new Set([
+          "APPDATA",
+          "COMSPEC",
+          "HOME",
+          "HOMEDRIVE",
+          "HOMEPATH",
+          "LANG",
+          "LC_ALL",
+          "LC_CTYPE",
+          "LOCALAPPDATA",
+          "PATH",
+          "PATHEXT",
+          "PI_CODING_AGENT_DIR",
+          "PI_OFFLINE",
+          "PI_SKIP_VERSION_CHECK",
+          "PI_TELEMETRY",
+          "SYSTEMROOT",
+          "TEMP",
+          "TMP",
+          "USERPROFILE",
+          "WINDIR",
+          "XDG_CACHE_HOME",
+          "XDG_CONFIG_HOME",
+          "XDG_DATA_HOME",
+        ])
+      : new Set([
+          "HOME",
+          "LANG",
+          "LC_ALL",
+          "LC_CTYPE",
+          "PATH",
+          "PI_CODING_AGENT_DIR",
+          "PI_OFFLINE",
+          "PI_SKIP_VERSION_CHECK",
+          "PI_TELEMETRY",
+          "TMPDIR",
+          "XDG_CACHE_HOME",
+          "XDG_CONFIG_HOME",
+          "XDG_DATA_HOME",
+        ]);
+  if (
+    !["darwin", "win32"].includes(platform) ||
+    Object.keys(environment).some((key) => !allowed.has(key))
+  ) {
+    fail("Pi bridge environment contains an unapproved key");
+  }
+  const requiredPaths = [
+    ["HOME", environment.HOME],
+    ["XDG_CONFIG_HOME", environment.XDG_CONFIG_HOME],
+    ["XDG_CACHE_HOME", environment.XDG_CACHE_HOME],
+    ["XDG_DATA_HOME", environment.XDG_DATA_HOME],
+    ["PI_CODING_AGENT_DIR", environment.PI_CODING_AGENT_DIR],
+  ];
+  if (platform === "win32") {
+    requiredPaths.push(
+      ["USERPROFILE", environment.USERPROFILE],
+      ["APPDATA", environment.APPDATA],
+      ["LOCALAPPDATA", environment.LOCALAPPDATA],
+    );
+  }
+  for (const [key, value] of requiredPaths) {
+    validateBoundedString(value, key);
+    if (!platformPath.isAbsolute(value)) {
+      fail("Pi bridge environment must use absolute isolated paths");
+    }
+  }
+  const temp =
+    platform === "win32" ? environment.TEMP : environment.TMPDIR;
+  validateBoundedString(temp, "isolated temp");
+  if (!platformPath.isAbsolute(temp)) {
+    fail("Pi bridge environment must use absolute isolated paths");
+  }
+  if (
+    environment.PI_OFFLINE !== "1" ||
+    environment.PI_TELEMETRY !== "0" ||
+    environment.PI_SKIP_VERSION_CHECK !== "1"
+  ) {
+    fail("Pi bridge environment is not safely isolated");
+  }
+  const root = platformPath.dirname(cwd);
+  for (const value of [
+    environment.HOME,
+    environment.PI_CODING_AGENT_DIR,
+    temp,
+  ]) {
+    if (platformPath.dirname(value) !== root) {
+      fail("Pi bridge environment is not safely isolated");
+    }
+  }
+  if (
+    platform === "win32" &&
+    (environment.USERPROFILE !== environment.HOME ||
+      platformPath.dirname(environment.APPDATA) !==
+        platformPath.join(environment.HOME, "AppData") ||
+      platformPath.dirname(environment.LOCALAPPDATA) !==
+        platformPath.join(environment.HOME, "AppData"))
+  ) {
+    fail("Pi bridge environment is not safely isolated");
+  }
+  return true;
+}
+
+export async function runQualifiedPiBridge(
   options = {},
   testSeam = {},
 ) {
   if (!isPlainObject(options) || !isPlainObject(testSeam)) {
-    fail("qualified Pi adapter input is invalid");
+    fail("qualified Pi bridge input is invalid");
   }
-  const maxTokens = options.maxTokens ?? options.qualifiedMaxTokens;
-  if (maxTokens === undefined) {
-    throw new QualificationRequiredError();
-  }
-  if (
-    !Number.isSafeInteger(maxTokens) ||
-    maxTokens <= 0 ||
-    maxTokens >= 8192
-  ) {
-    fail("qualified output-token limit must be between 1 and 8191");
-  }
-  const parsedEndpoint = validatePhaseEndpoint(
-    options.phase,
-    options.baseUrl,
-    options.expectedConfigSha256,
-  );
-  const evidenceDirectory =
-    options.evidenceDir === undefined
-      ? undefined
-      : validateEvidenceDirectory(options.evidenceDir);
-  const processTimeoutMs = options.processTimeoutMs ?? 120_000;
+  const processTimeoutMs = options.processTimeoutMs;
   if (
     !Number.isSafeInteger(processTimeoutMs) ||
     processTimeoutMs < 10 ||
@@ -1501,8 +953,16 @@ export async function runQualifiedPiAdapter(
   ) {
     fail("Pi process timeout is invalid");
   }
-  const piBin = options.piBin;
-  validateBoundedString(piBin, "Pi binary");
+  const piEntrypoint = options.piEntrypoint;
+  validateBoundedString(piEntrypoint, "Pi CLI entrypoint");
+  validateBoundedString(options.extension, "trusted Pi extension");
+  validateBoundedString(options.prompt, "Pi acceptance prompt", 32 * 1024);
+  const cwd = options.cwd ?? process.cwd();
+  validateIsolatedEnvironment(
+    options.environment ?? process.env,
+    cwd,
+    testSeam.platform ?? process.platform,
+  );
   if (
     options.signal !== undefined &&
     (typeof options.signal !== "object" ||
@@ -1515,18 +975,14 @@ export async function runQualifiedPiAdapter(
     fail("Pi acceptance was cancelled");
   }
 
-  const platform = testSeam.platform ?? process.platform;
-  const processPlatform = testSeam.processPlatform ?? platform;
+  const processPlatform = testSeam.platform ?? process.platform;
   if (processPlatform !== "darwin" && processPlatform !== "win32") {
     fail("Pi process platform is invalid");
   }
-  const sourceEnvironment = testSeam.sourceEnvironment ?? process.env;
   const spawnProcess = testSeam.spawnProcess ?? spawn;
-  const signalProcess = testSeam.signalProcess ?? process.kill;
   const spawnTreeKiller = testSeam.spawnTreeKiller ?? spawn;
-  const publishEvidence = testSeam.publishEvidence ?? link;
-  const resolveExecutable =
-    testSeam.resolveExecutable ??
+  const resolveEntrypoint =
+    testSeam.resolveEntrypoint ??
     (testSeam.spawnProcess === undefined ? realpath : async (value) => value);
   const readQualifiedPiVersion =
     testSeam.readPiVersion ??
@@ -1535,145 +991,86 @@ export async function runQualifiedPiAdapter(
       : async () => "0.82.1\n");
   if (
     typeof spawnProcess !== "function" ||
-    typeof signalProcess !== "function" ||
-    typeof spawnTreeKiller !== "function" ||
-    typeof publishEvidence !== "function"
+    typeof spawnTreeKiller !== "function"
   ) {
     fail("Pi process launcher is invalid");
   }
-  const qualifiedPiBin = await qualifyPiExecutable(piBin, {
-    resolveExecutable,
+  const qualifiedPi = await qualifyPiEntrypoint(piEntrypoint, {
+    nodeExecutable: testSeam.nodeExecutable ?? process.execPath,
+    resolveEntrypoint,
     readVersion: readQualifiedPiVersion,
+    cancellation: options.signal,
   });
-
-  const temporaryRoot = await mkdtemp(
-    path.join(os.tmpdir(), "loxa-pi-acceptance-"),
-  );
-  const home = path.join(temporaryRoot, "home");
-  const configDirectory = path.join(temporaryRoot, "pi-config");
-  const workspace = path.join(temporaryRoot, "workspace");
-  const childTemp = path.join(temporaryRoot, "tmp");
-  try {
-    await Promise.all([
-      mkdir(home, { recursive: true }),
-      mkdir(configDirectory, { recursive: true }),
-      mkdir(childTemp, { recursive: true }),
-      cp(
-        path.join(repositoryRoot, "examples/pi/tool-loop/seed"),
-        workspace,
-        { recursive: true },
+  const toolTrace = await runPiProcess({
+    program: qualifiedPi.program,
+    argv: [
+      ...qualifiedPi.prefixArgs,
+      ...buildQualifiedPiArgv(options.extension, options.prompt),
+    ],
+    cwd,
+    environment: options.environment ?? process.env,
+    processTimeoutMs,
+    cancellation: options.signal,
+    spawnProcess,
+    platform: processPlatform,
+    spawnTreeKiller,
+    taskkillExecutable:
+      testSeam.taskkillExecutable ??
+      path.win32.join(
+        process.env.SystemRoot ?? "C:\\Windows",
+        "System32",
+        "taskkill.exe",
       ),
-    ]);
-    const prompt = await readFile(
-      path.join(repositoryRoot, "examples/pi/tool-loop/prompt.txt"),
-      "utf8",
-    );
-    validateBoundedString(prompt, "Pi acceptance prompt", 32 * 1024);
-    const configBytes = Buffer.from(
-      `${JSON.stringify(
-        buildRuntimeModelsConfig(
-          parsedEndpoint.toString(),
-          maxTokens,
-        ),
-        null,
-        2,
-      )}\n`,
-    );
-    const providerConfigSha256 = providerConfigDigest(configBytes);
-    if (options.expectedConfigSha256 !== undefined) {
-      assertProviderDigest(
-        providerConfigSha256,
-        options.expectedConfigSha256,
-      );
-    }
-    await writeFile(
-      path.join(configDirectory, "models.json"),
-      configBytes,
-      { mode: 0o600 },
-    );
-    const environment = {
-      ...buildIsolatedChildEnvironment(platform, {
-        home,
-        temp: childTemp,
-        source: sourceEnvironment,
-      }),
-      PI_CODING_AGENT_DIR: configDirectory,
-      PI_OFFLINE: "1",
-      PI_TELEMETRY: "0",
-      PI_SKIP_VERSION_CHECK: "1",
-    };
-    const argv = buildQualifiedPiArgv(
-      path.join(repositoryRoot, "examples/pi/tool-loop/acceptance-gate.mjs"),
-      prompt,
-    );
+    taskkillTerminalTimeoutMs: testSeam.taskkillTerminalTimeoutMs,
+  });
+  return { schemaVersion: 1, toolTrace };
+}
 
-    await validateGatewayAcceptance(parsedEndpoint.toString(), options.signal);
-    const semanticTrace = await runPiProcess({
-      program: qualifiedPiBin,
-      argv,
-      cwd: workspace,
-      environment,
-      processTimeoutMs,
-      cancellation: options.signal,
-      spawnProcess,
-      platform: processPlatform,
-      signalProcess,
-      spawnTreeKiller,
-      taskkillExecutable:
-        testSeam.taskkillExecutable ??
-        path.win32.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "taskkill.exe"),
-      taskkillTerminalTimeoutMs: testSeam.taskkillTerminalTimeoutMs,
-    });
-    await validateExactWorkspace({
-      seedRoot: path.join(repositoryRoot, "examples/pi/tool-loop/seed"),
-      workspaceRoot: workspace,
-      expectedResult: path.join(
-        repositoryRoot,
-        "examples/pi/tool-loop/expected/result.txt",
-      ),
-      changedPath: "result.txt",
-    });
-    await validateGatewayAcceptance(parsedEndpoint.toString(), options.signal);
-    const evidence = buildSanitizedEvidence({
-      phase: options.phase,
-      providerConfigSha256,
-      modelsBefore: true,
-      readyBefore: true,
-      toolOrder: true,
-      exactWorkspace: true,
-      verification: true,
-      modelsAfter: true,
-      readyAfter: true,
-    });
-    if (evidenceDirectory !== undefined) {
-      await writeSanitizedEvidence(
-        evidenceDirectory,
-        evidence,
-        publishEvidence,
-      );
-    }
-    return {
-      providerConfigSha256,
-      semanticTrace,
-      evidence,
-    };
-  } finally {
-    await rm(temporaryRoot, { recursive: true, force: true });
+export function createBridgeCancellation(controlInput) {
+  if (
+    controlInput === null ||
+    typeof controlInput !== "object" ||
+    typeof controlInput.once !== "function" ||
+    typeof controlInput.off !== "function" ||
+    typeof controlInput.resume !== "function"
+  ) {
+    fail("Pi bridge control channel is invalid");
   }
+  const controller = new AbortController();
+  const cancel = () => controller.abort();
+  controlInput.once("data", cancel);
+  controlInput.once("end", cancel);
+  controlInput.once("error", cancel);
+  controlInput.resume();
+  return {
+    signal: controller.signal,
+    dispose() {
+      controlInput.off("data", cancel);
+      controlInput.off("end", cancel);
+      controlInput.off("error", cancel);
+      controlInput.pause?.();
+    },
+  };
 }
 
 async function main() {
+  const cancellation = createBridgeCancellation(process.stdin);
   try {
-    const options = parseArguments(process.argv.slice(2));
-    const result = await runQualifiedPiAdapter(options);
-    process.stdout.write(`${JSON.stringify(result.evidence)}\n`);
-  } catch (error) {
-    if (error instanceof QualificationRequiredError) {
-      console.error(error.message);
-    } else {
-      console.error("Pi acceptance input validation failed.");
+    const options = parseBridgeArguments(process.argv.slice(2));
+    const result = await runQualifiedPiBridge({
+      ...options,
+      signal: cancellation.signal,
+    });
+    const serialized = JSON.stringify(result);
+    if (Buffer.byteLength(serialized) > MAX_PI_LINE_BYTES) {
+      fail("Pi bridge result exceeded its size limit");
     }
+    process.stdout.write(`${serialized}\n`);
+  } catch {
+    console.error("Pi bridge failed.");
     process.exitCode = 2;
+  } finally {
+    cancellation.dispose();
   }
 }
 
