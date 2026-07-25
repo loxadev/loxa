@@ -71,6 +71,14 @@ pub(crate) struct LifecycleMailboxInner {
     state: Mutex<LifecycleMailboxState>,
     changed: Condvar,
     verification: CompletionDestination<LifecycleVerificationOutcome>,
+    #[cfg(test)]
+    before_idle_wait: Mutex<Option<IdleWaitGate>>,
+}
+
+#[cfg(test)]
+struct IdleWaitGate {
+    entered: mpsc::Sender<()>,
+    release: mpsc::Receiver<()>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -183,7 +191,30 @@ impl LifecycleMailboxInner {
             }),
             changed: Condvar::new(),
             verification: CompletionDestination::new(verification_capacity),
+            #[cfg(test)]
+            before_idle_wait: Mutex::new(None),
         })
+    }
+
+    #[cfg(test)]
+    fn gate_before_idle_wait(&self, entered: mpsc::Sender<()>, release: mpsc::Receiver<()>) {
+        *self
+            .before_idle_wait
+            .lock()
+            .expect("idle wait gate poisoned") = Some(IdleWaitGate { entered, release });
+    }
+
+    #[cfg(test)]
+    fn pause_before_idle_wait(&self) {
+        let gate = self
+            .before_idle_wait
+            .lock()
+            .expect("idle wait gate poisoned")
+            .take();
+        if let Some(gate) = gate {
+            gate.entered.send(()).unwrap();
+            gate.release.recv().unwrap();
+        }
     }
 
     pub(crate) fn reserve_normal(self: &Arc<Self>) -> Option<LifecycleNormalReservation> {
@@ -444,6 +475,8 @@ impl LifecycleMailboxInner {
             if let Some(completion) = self.ready_verification() {
                 return Ok(MailboxItem::Verification(completion));
             }
+            #[cfg(test)]
+            self.pause_before_idle_wait();
             state = self
                 .state
                 .lock()
@@ -454,6 +487,20 @@ impl LifecycleMailboxInner {
                 .map_err(|_| LifecycleSubmitError::Poisoned)?;
             state = next;
             if timeout.timed_out() {
+                if mailbox_has_pending_priority(&state) {
+                    continue;
+                }
+                drop(state);
+                if let Some(completion) = self.ready_verification() {
+                    return Ok(MailboxItem::Verification(completion));
+                }
+                state = self
+                    .state
+                    .lock()
+                    .map_err(|_| LifecycleSubmitError::Poisoned)?;
+                if mailbox_has_pending_priority(&state) {
+                    continue;
+                }
                 return Ok(MailboxItem::Tick);
             }
         }
@@ -561,6 +608,27 @@ impl LifecycleControllerHandle {
     #[cfg(test)]
     pub(crate) fn is_sealed_for_test(&self) -> bool {
         self.mailbox.is_sealed()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_until_sealed_for_test(&self, deadline: Instant) -> bool {
+        let Ok(mut state) = self.mailbox.state.lock() else {
+            return false;
+        };
+        while !state.sealed {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let Ok((next, timeout)) = self.mailbox.changed.wait_timeout(state, remaining) else {
+                return false;
+            };
+            state = next;
+            if timeout.timed_out() && !state.sealed {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -1278,6 +1346,14 @@ fn verification_result_ref(result: &VerificationResult) -> Result<(), LifecycleE
     }
 }
 
+fn mailbox_has_pending_priority(state: &LifecycleMailboxState) -> bool {
+    state.shutdown.is_some()
+        || state.fatal
+        || state.child_exit.is_some()
+        || state.cancel.is_some()
+        || !state.normal.is_empty()
+}
+
 fn unknown_acknowledgement() -> LifecycleError {
     LifecycleError::RecoveryRequired {
         replacement: "lifecycle acknowledgement is uncertain".into(),
@@ -1301,7 +1377,8 @@ where
 
 #[cfg(test)]
 mod supervision_tick_tests {
-    use super::{LifecycleMailboxInner, LIFECYCLE_NORMAL_CAPACITY};
+    use super::{LifecycleCommand, LifecycleMailboxInner, MailboxItem, LIFECYCLE_NORMAL_CAPACITY};
+    use loxa_protocol::v2::OperationId;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
@@ -1324,5 +1401,37 @@ mod supervision_tick_tests {
         worker.join().unwrap();
 
         assert!(timely, "an idle mailbox never returned a supervision tick");
+    }
+
+    #[test]
+    fn higher_priority_cancel_queued_before_idle_wait_outranks_tick_timeout() {
+        let mailbox = LifecycleMailboxInner::new(LIFECYCLE_NORMAL_CAPACITY);
+        let operation_id = OperationId::new_v4();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        mailbox.gate_before_idle_wait(entered_tx, release_rx);
+        let worker_mailbox = mailbox.clone();
+        let (returned_tx, returned_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            returned_tx.send(worker_mailbox.take_next()).unwrap();
+        });
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("mailbox reached the pre-wait window");
+        mailbox.request_cancel(operation_id).unwrap();
+        release_tx.send(()).unwrap();
+        let returned = returned_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("mailbox returned after its bounded wait")
+            .unwrap();
+        worker.join().unwrap();
+
+        assert!(matches!(
+            returned,
+            MailboxItem::Command(LifecycleCommand::Cancel {
+                operation_id: returned_id
+            }) if returned_id == operation_id
+        ));
     }
 }
