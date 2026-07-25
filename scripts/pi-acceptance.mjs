@@ -1,8 +1,21 @@
 #!/usr/bin/env node
 
 import { createHash } from "node:crypto";
-import { lstat, readdir, readFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import {
+  cp,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  realpath,
+  rm,
+  writeFile,
+} from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 
 const PHASES = new Set(["mac-local", "windows-tailnet", "post-recovery"]);
@@ -12,11 +25,32 @@ const TAILNET_HOSTNAME_PATTERN =
 const MAX_ARGUMENT_LENGTH = 4096;
 const MAX_BASE_URL_LENGTH = 2048;
 const MAX_TRACE_RECORDS = 10_000;
+const MAX_PI_STDOUT_BYTES = 1024 * 1024;
+const MAX_PI_STDERR_BYTES = 64 * 1024;
+const MAX_PI_LINE_BYTES = 64 * 1024;
+const MAX_GATEWAY_RESPONSE_BYTES = 64 * 1024;
+const MAX_PROCESS_TIMEOUT_MS = 5 * 60 * 1000;
+const GATEWAY_TIMEOUT_MS = 5000;
+const FORCE_KILL_DELAY_MS = 250;
+const TERMINAL_DEADLINE_MS = 250;
+const KNOWN_LIFECYCLE_EVENTS = new Set([
+  "agent_start",
+  "turn_start",
+  "message_start",
+  "message_update",
+  "message_end",
+  "turn_end",
+]);
+const ALLOWED_TOOL_NAMES = new Set(["read", "bash", "write"]);
+const repositoryRoot = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "..",
+);
 
 export class QualificationRequiredError extends Error {
   constructor() {
     super(
-      "Pi CLI qualification required before live execution; invocation flags and JSONL event names are not pinned.",
+      "Safe output-token limit qualification required before live Pi execution.",
     );
     this.name = "QualificationRequiredError";
   }
@@ -32,6 +66,15 @@ function isPlainObject(value) {
     typeof value === "object" &&
     !Array.isArray(value) &&
     Object.getPrototypeOf(value) === Object.prototype
+  );
+}
+
+function isEnvironmentRecord(value) {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    Object.prototype.toString.call(value) === "[object Object]"
   );
 }
 
@@ -232,7 +275,7 @@ export function buildIsolatedChildEnvironment(
   platform,
   { home, temp, source = {} },
 ) {
-  if (!isPlainObject(source)) {
+  if (!isEnvironmentRecord(source)) {
     fail("child environment source must be an object");
   }
   validateBoundedString(home, "isolated home");
@@ -298,10 +341,9 @@ export function buildIsolatedChildEnvironment(
 export function validateSemanticToolTrace(records) {
   if (
     !Array.isArray(records) ||
-    records.length === 0 ||
-    records.length > MAX_TRACE_RECORDS
+    records.length !== 4
   ) {
-    fail("semantic tool trace is invalid");
+    fail("semantic tool trace must contain exactly four records");
   }
   for (const record of records) {
     if (
@@ -323,24 +365,204 @@ export function validateSemanticToolTrace(records) {
       record.stage === "precheck" &&
       record.status === "success",
     (record) =>
-      (record.tool === "edit" || record.tool === "write") &&
+      record.tool === "write" &&
       record.status === "success",
     (record) =>
       record.tool === "bash" &&
       record.stage === "verification" &&
       record.status === "success",
   ];
-  let cursor = 0;
-  for (const matches of required) {
-    const found = records.findIndex(
-      (record, index) => index >= cursor && matches(record),
-    );
-    if (found === -1) {
-      fail("semantic tool trace is missing the ordered successful tool loop");
-    }
-    cursor = found + 1;
+  if (!required.every((matches, index) => matches(records[index]))) {
+    fail("semantic tool trace is missing the exact successful tool loop");
   }
   return true;
+}
+
+function validateEventIdentifier(value, label) {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > 256 ||
+    value.includes("\0")
+  ) {
+    fail(`Pi JSONL ${label} is invalid`);
+  }
+  return value;
+}
+
+function validatePrivateEventObject(record, field) {
+  if (!Object.hasOwn(record, field) || !isPlainObject(record[field])) {
+    fail("Pi JSONL event shape is invalid");
+  }
+}
+
+class QualifiedPiEventAdapter {
+  constructor() {
+    this.pending = new Map();
+    this.completed = new Set();
+    this.semanticTrace = [];
+    this.requiredStep = 0;
+    this.sessionSeen = false;
+    this.agentEndSeen = false;
+    this.settledSeen = false;
+    this.recordCount = 0;
+  }
+
+  acceptLine(line) {
+    if (
+      typeof line !== "string" ||
+      line.length === 0 ||
+      Buffer.byteLength(line) > MAX_PI_LINE_BYTES
+    ) {
+      fail("Pi process output limit exceeded");
+    }
+    let record;
+    try {
+      record = JSON.parse(line);
+    } catch {
+      fail("invalid Pi JSONL record");
+    }
+    if (!isPlainObject(record) || typeof record.type !== "string") {
+      fail("invalid Pi JSONL record");
+    }
+    const isFirstRecord = this.recordCount === 0;
+    this.recordCount += 1;
+    if (this.settledSeen) {
+      if (record.type === "agent_settled") {
+        fail("duplicate terminal Pi lifecycle record");
+      }
+      fail("Pi JSONL record appeared after agent_settled");
+    }
+    if (record.type === "session") {
+      if (!isFirstRecord || this.sessionSeen || record.version !== 3) {
+        fail("duplicate or invalid Pi session record");
+      }
+      this.sessionSeen = true;
+      return;
+    }
+    if (this.agentEndSeen && record.type === "agent_end") {
+      fail("duplicate terminal Pi lifecycle record");
+    }
+    if (this.agentEndSeen && record.type !== "agent_settled") {
+      fail("Pi JSONL record appeared after agent_end");
+    }
+    if (KNOWN_LIFECYCLE_EVENTS.has(record.type)) {
+      return;
+    }
+    if (record.type === "agent_end") {
+      this.agentEndSeen = true;
+      return;
+    }
+    if (record.type === "agent_settled") {
+      if (this.pending.size !== 0) {
+        fail("agent_settled arrived with a pending tool call");
+      }
+      this.settledSeen = true;
+      return;
+    }
+    if (record.type === "tool_execution_start") {
+      validatePrivateEventObject(record, "args");
+      const toolCallId = validateEventIdentifier(
+        record.toolCallId,
+        "toolCallId",
+      );
+      const toolName = validateEventIdentifier(record.toolName, "toolName");
+      if (
+        !ALLOWED_TOOL_NAMES.has(toolName) ||
+        this.pending.has(toolCallId) ||
+        this.completed.has(toolCallId)
+      ) {
+        fail("Pi tool correlation is invalid");
+      }
+      this.pending.set(toolCallId, toolName);
+      return;
+    }
+    if (record.type === "tool_execution_update") {
+      validatePrivateEventObject(record, "args");
+      validatePrivateEventObject(record, "partialResult");
+      this.correlate(record);
+      return;
+    }
+    if (record.type === "tool_execution_end") {
+      validatePrivateEventObject(record, "result");
+      const { toolCallId, toolName } = this.correlate(record);
+      this.pending.delete(toolCallId);
+      this.completed.add(toolCallId);
+      if (record.isError !== false) {
+        fail("Pi tool execution failed");
+      }
+      this.advanceSemanticTrace(toolName);
+      return;
+    }
+    fail("unknown Pi JSONL record type");
+  }
+
+  correlate(record) {
+    const toolCallId = validateEventIdentifier(
+      record.toolCallId,
+      "toolCallId",
+    );
+    const toolName = validateEventIdentifier(record.toolName, "toolName");
+    if (
+      !this.pending.has(toolCallId) ||
+      this.pending.get(toolCallId) !== toolName
+    ) {
+      fail("Pi tool correlation is invalid");
+    }
+    return { toolCallId, toolName };
+  }
+
+  advanceSemanticTrace(toolName) {
+    const expected = [
+      (name) => name === "read",
+      (name) => name === "bash",
+      (name) => name === "write",
+      (name) => name === "bash",
+    ];
+    if (!expected[this.requiredStep]?.(toolName)) {
+      fail("Pi JSONL must contain exactly four successful tool completions");
+    }
+    const record = { tool: toolName, status: "success" };
+    if (this.requiredStep === 1) {
+      record.stage = "precheck";
+    } else if (this.requiredStep === 3) {
+      record.stage = "verification";
+    }
+    this.semanticTrace.push(record);
+    this.requiredStep += 1;
+  }
+
+  finish() {
+    if (!this.sessionSeen) {
+      fail("Pi JSONL is missing version-3 session header");
+    }
+    if (!this.agentEndSeen) {
+      fail("Pi JSONL is missing agent_end");
+    }
+    if (!this.settledSeen) {
+      fail("Pi JSONL is missing agent_settled");
+    }
+    if (this.pending.size !== 0) {
+      fail("Pi JSONL ended with a pending tool call");
+    }
+    validateSemanticToolTrace(this.semanticTrace);
+    return this.semanticTrace.map((record) => ({ ...record }));
+  }
+}
+
+export function adaptQualifiedPiJsonl(lines) {
+  if (
+    !Array.isArray(lines) ||
+    lines.length === 0 ||
+    lines.length > MAX_TRACE_RECORDS
+  ) {
+    fail("Pi JSONL line count is invalid");
+  }
+  const adapter = new QualifiedPiEventAdapter();
+  for (const line of lines) {
+    adapter.acceptLine(line);
+  }
+  return adapter.finish();
 }
 
 export function providerConfigDigest(bytes) {
@@ -566,6 +788,7 @@ export function parseArguments(argv) {
     ["--phase", "phase"],
     ["--base-url", "baseUrl"],
     ["--pi-bin", "piBin"],
+    ["--max-tokens", "maxTokens"],
     ["--expected-config-sha256", "expectedConfigSha256"],
     ["--evidence-dir", "evidenceDir"],
   ]);
@@ -583,16 +806,26 @@ export function parseArguments(argv) {
     validateBoundedString(value, "Pi acceptance argument");
     parsed[key] = value;
   }
-  if (parsed.phase === undefined || parsed.baseUrl === undefined) {
-    fail("phase and base URL are required");
+  if (
+    parsed.phase === undefined ||
+    parsed.baseUrl === undefined ||
+    parsed.piBin === undefined ||
+    parsed.maxTokens === undefined
+  ) {
+    fail("phase, base URL, Pi binary, and max tokens are required");
   }
   validatePhaseEndpoint(
     parsed.phase,
     parsed.baseUrl,
     parsed.expectedConfigSha256,
   );
-  if (parsed.piBin !== undefined) {
-    validateBoundedString(parsed.piBin, "Pi binary");
+  validateBoundedString(parsed.piBin, "Pi binary");
+  if (!/^[1-9][0-9]*$/.test(parsed.maxTokens)) {
+    fail("max tokens must be an integer between 1 and 8191");
+  }
+  parsed.maxTokens = Number(parsed.maxTokens);
+  if (!Number.isSafeInteger(parsed.maxTokens) || parsed.maxTokens >= 8192) {
+    fail("max tokens must be an integer between 1 and 8191");
   }
   if (parsed.evidenceDir !== undefined) {
     parsed.evidenceDir = validateEvidenceDirectory(parsed.evidenceDir);
@@ -600,8 +833,666 @@ export function parseArguments(argv) {
   return parsed;
 }
 
-export async function runQualifiedPiAdapter() {
-  throw new QualificationRequiredError();
+export function buildRuntimeModelsConfig(baseUrl, qualifiedMaxTokens) {
+  return {
+    providers: {
+      loxa: {
+        baseUrl,
+        api: "openai-completions",
+        apiKey: "loxa-dummy-key",
+        models: [
+          {
+            id: "loxa",
+            name: "Loxa",
+            reasoning: false,
+            input: ["text"],
+            contextWindow: 8192,
+            maxTokens: qualifiedMaxTokens,
+            compat: { maxTokensField: "max_tokens" },
+          },
+        ],
+      },
+    },
+  };
+}
+
+export function buildQualifiedPiArgv(extensionPath, prompt) {
+  if (!path.isAbsolute(extensionPath)) {
+    fail("trusted Pi extension path must be absolute");
+  }
+  return [
+    "--provider",
+    "loxa",
+    "--model",
+    "loxa",
+    "--mode",
+    "json",
+    "--no-session",
+    "--tools",
+    "read,bash,write",
+    "--no-extensions",
+    "--extension",
+    extensionPath,
+    "--no-skills",
+    "--no-prompt-templates",
+    "--no-context-files",
+    "--no-themes",
+    "--no-approve",
+    "--offline",
+    prompt,
+  ];
+}
+
+async function boundedGatewayJson(url, cancellation) {
+  const controller = new AbortController();
+  const cancel = () => controller.abort();
+  if (cancellation?.aborted) {
+    fail("Pi acceptance was cancelled");
+  }
+  cancellation?.addEventListener("abort", cancel, { once: true });
+  const timeout = setTimeout(() => controller.abort(), GATEWAY_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      redirect: "error",
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      fail("gateway acceptance endpoint was unavailable");
+    }
+    if (response.body === null) {
+      fail("gateway acceptance response was invalid");
+    }
+    const chunks = [];
+    let byteCount = 0;
+    const reader = response.body.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      byteCount += value.byteLength;
+      if (byteCount > MAX_GATEWAY_RESPONSE_BYTES) {
+        try {
+          await reader.cancel();
+        } catch {
+          // The fixed size-limit failure remains authoritative.
+        }
+        fail("gateway acceptance response exceeded its size limit");
+      }
+      chunks.push(Buffer.from(value));
+    }
+    const bytes = Buffer.concat(chunks, byteCount);
+    try {
+      return JSON.parse(bytes.toString("utf8"));
+    } catch {
+      fail("gateway acceptance response was invalid");
+    }
+  } catch (error) {
+    if (cancellation?.aborted) {
+      fail("Pi acceptance was cancelled");
+    }
+    if (
+      error instanceof Error &&
+      error.message.startsWith("gateway acceptance")
+    ) {
+      throw error;
+    }
+    fail("gateway acceptance request failed");
+  } finally {
+    clearTimeout(timeout);
+    cancellation?.removeEventListener("abort", cancel);
+  }
+}
+
+async function validateGatewayAcceptance(baseUrl, cancellation) {
+  const parsed = validateBaseUrl(baseUrl);
+  const origin = `${parsed.protocol}//${parsed.host}`;
+  validateModelsResponse(
+    await boundedGatewayJson(`${origin}/v1/models`, cancellation),
+  );
+  validateReadyStatus(
+    await boundedGatewayJson(`${origin}/loxa/status`, cancellation),
+  );
+}
+
+function isAbsoluteExecutable(value) {
+  return typeof value === "string" && (path.isAbsolute(value) || path.win32.isAbsolute(value));
+}
+
+function readPiVersion(program) {
+  return new Promise((resolve, reject) => {
+    let child;
+    try {
+      child = spawn(program, ["--version"], {
+        shell: false,
+        stdio: ["ignore", "pipe", "ignore"],
+        windowsHide: true,
+      });
+    } catch {
+      reject(new Error("qualified Pi executable verification failed"));
+      return;
+    }
+    if (!child?.stdout || typeof child.once !== "function") {
+      reject(new Error("qualified Pi executable verification failed"));
+      return;
+    }
+    let output = "";
+    child.stdout.on("data", (chunk) => {
+      output += Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
+    });
+    child.once("error", () =>
+      reject(new Error("qualified Pi executable verification failed")),
+    );
+    child.once("close", (code) => {
+      if (code !== 0) {
+        reject(new Error("qualified Pi executable verification failed"));
+        return;
+      }
+      resolve(output);
+    });
+  });
+}
+
+export async function qualifyPiExecutable(piBin, {
+  resolveExecutable = realpath,
+  readVersion = readPiVersion,
+} = {}) {
+  if (!isAbsoluteExecutable(piBin)) {
+    fail("qualified Pi executable must be an absolute path");
+  }
+  let resolved;
+  let version;
+  try {
+    resolved = await resolveExecutable(piBin);
+    if (!isAbsoluteExecutable(resolved)) {
+      throw new Error("non-absolute executable");
+    }
+    version = await readVersion(resolved);
+  } catch {
+    fail("qualified Pi executable verification failed");
+  }
+  if (version.trim() !== "0.82.1") {
+    fail("qualified Pi executable version must be 0.82.1");
+  }
+  return resolved;
+}
+
+export function terminateOwnedProcessTree({
+  child,
+  platform,
+  signal,
+  signalProcess,
+  spawnTreeKiller,
+  taskkillExecutable,
+}) {
+  const signalExactChild = () => {
+    try {
+      child.kill(signal);
+    } catch {
+      // The fixed terminal deadline remains authoritative.
+    }
+  };
+  const pid = child.pid;
+  if (Number.isSafeInteger(pid) && pid > 0) {
+    if (platform === "win32") {
+      const argv = ["/PID", String(pid), "/T"];
+      if (signal === "SIGKILL") {
+        argv.push("/F");
+      }
+      try {
+        if (!isAbsoluteExecutable(taskkillExecutable)) {
+          throw new Error("taskkill path is invalid");
+        }
+        const killer = spawnTreeKiller(taskkillExecutable, argv, {
+          shell: false,
+          stdio: "ignore",
+          windowsHide: true,
+        });
+        if (typeof killer?.once !== "function") {
+          throw new Error("taskkill launcher is invalid");
+        }
+        killer?.unref?.();
+        return new Promise((resolve, reject) => {
+          let complete = false;
+          const failCleanup = () => {
+            if (!complete) {
+              complete = true;
+              reject(new Error("Pi process cleanup failed"));
+            }
+          };
+          killer.once("error", failCleanup);
+          killer.once("close", (code) => {
+            if (complete) {
+              return;
+            }
+            complete = true;
+            if (code === 0) {
+              resolve();
+            } else {
+              reject(new Error("Pi process cleanup failed"));
+            }
+          });
+        });
+      } catch {
+        signalExactChild();
+        return Promise.reject(new Error("Pi process cleanup failed"));
+      }
+    } else {
+      try {
+        signalProcess(-pid, signal);
+        return Promise.resolve();
+      } catch {
+        // Fall back to the exact child if the owned group already disappeared.
+      }
+    }
+  }
+  signalExactChild();
+  return Promise.resolve();
+}
+
+function runPiProcess({
+  program,
+  argv,
+  cwd,
+  environment,
+  processTimeoutMs,
+  cancellation,
+  spawnProcess,
+  platform,
+  signalProcess,
+  spawnTreeKiller,
+  taskkillExecutable,
+}) {
+  if (cancellation?.aborted) {
+    return Promise.reject(new Error("Pi acceptance was cancelled"));
+  }
+  return new Promise((resolve, reject) => {
+    let child;
+    try {
+      child = spawnProcess(program, argv, {
+        cwd,
+        detached: platform !== "win32",
+        env: environment,
+        shell: false,
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+      });
+    } catch {
+      reject(new Error("Pi process failed to start"));
+      return;
+    }
+    if (!child?.stdout || !child?.stderr || typeof child.kill !== "function") {
+      reject(new Error("Pi process failed to start"));
+      return;
+    }
+
+    const adapter = new QualifiedPiEventAdapter();
+    const decoder = new StringDecoder("utf8");
+    let stdoutBuffer = "";
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let lineCount = 0;
+    let failure;
+    let settled = false;
+    let terminationRequested = false;
+    let forceKillTimer;
+    let terminalDeadlineTimer;
+    let timeout;
+    let cleanup = Promise.resolve();
+
+    const stopWatching = () => {
+      clearTimeout(timeout);
+      clearTimeout(forceKillTimer);
+      clearTimeout(terminalDeadlineTimer);
+      cancellation?.removeEventListener("abort", cancel);
+      child.stdout.off("data", onStdout);
+      child.stderr.off("data", onStderr);
+      child.off("error", onError);
+      child.off("close", onClose);
+    };
+
+    const settleRejected = (error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      stopWatching();
+      child.stdout.destroy();
+      child.stderr.destroy();
+      reject(error);
+    };
+
+    const settleResolved = (value) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      stopWatching();
+      child.stdout.destroy();
+      child.stderr.destroy();
+      resolve(value);
+    };
+
+    const requestTermination = () => {
+      if (terminationRequested || settled) {
+        return;
+      }
+      terminationRequested = true;
+      const requestTreeTermination = (signal) => {
+        cleanup = cleanup
+          .then(() =>
+            terminateOwnedProcessTree({
+              child,
+              platform,
+              signal,
+              signalProcess,
+              spawnTreeKiller,
+              taskkillExecutable,
+            }),
+          )
+          .catch(() => {
+            failure = new Error("Pi process cleanup failed");
+          });
+      };
+      requestTreeTermination("SIGTERM");
+      forceKillTimer = setTimeout(() => {
+        if (settled) {
+          return;
+        }
+        requestTreeTermination("SIGKILL");
+        terminalDeadlineTimer = setTimeout(() => {
+          void cleanup.then(() => {
+            if (!settled) {
+              settleRejected(
+                failure ?? new Error("Pi process did not terminate"),
+              );
+            }
+          });
+        }, TERMINAL_DEADLINE_MS);
+      }, FORCE_KILL_DELAY_MS);
+    };
+
+    const recordFailure = (message) => {
+      if (failure === undefined) {
+        failure = new Error(message);
+      }
+      requestTermination();
+    };
+
+    const acceptLine = (line) => {
+      if (line.endsWith("\r")) {
+        line = line.slice(0, -1);
+      }
+      lineCount += 1;
+      if (lineCount > MAX_TRACE_RECORDS) {
+        fail("Pi process output limit exceeded");
+      }
+      adapter.acceptLine(line);
+    };
+
+    const consumeText = (text) => {
+      stdoutBuffer += text;
+      while (true) {
+        const boundary = stdoutBuffer.indexOf("\n");
+        if (boundary === -1) {
+          break;
+        }
+        const line = stdoutBuffer.slice(0, boundary);
+        stdoutBuffer = stdoutBuffer.slice(boundary + 1);
+        acceptLine(line);
+      }
+      if (Buffer.byteLength(stdoutBuffer) > MAX_PI_LINE_BYTES) {
+        fail("Pi process output limit exceeded");
+      }
+    };
+
+    const onStdout = (chunk) => {
+      if (failure !== undefined) {
+        return;
+      }
+      try {
+        const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        stdoutBytes += bytes.length;
+        if (stdoutBytes > MAX_PI_STDOUT_BYTES) {
+          fail("Pi process output limit exceeded");
+        }
+        consumeText(decoder.write(bytes));
+      } catch {
+        recordFailure("Pi process output limit or JSONL validation failed");
+      }
+    };
+    const onStderr = (chunk) => {
+      if (failure !== undefined) {
+        return;
+      }
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      stderrBytes += bytes.length;
+      if (stderrBytes > MAX_PI_STDERR_BYTES) {
+        recordFailure("Pi process output limit exceeded");
+      }
+    };
+    const onError = () => {
+      recordFailure("Pi process failed to start");
+    };
+
+    const cancel = () => {
+      recordFailure("Pi acceptance was cancelled");
+    };
+    const onClose = (code) => {
+      if (failure !== undefined) {
+        return;
+      }
+      try {
+        consumeText(decoder.end());
+        if (stdoutBuffer.length > 0) {
+          acceptLine(stdoutBuffer);
+          stdoutBuffer = "";
+        }
+        if (code !== 0) {
+          recordFailure("Pi process exited unsuccessfully");
+          return;
+        }
+        settleResolved(adapter.finish());
+      } catch (error) {
+        recordFailure(
+          error instanceof Error &&
+          error.message.startsWith("Pi process output limit")
+            ? error.message
+            : error instanceof Error &&
+                (error.message.startsWith("Pi JSONL") ||
+                  error.message.startsWith("invalid Pi JSONL") ||
+                  error.message.startsWith("unknown Pi JSONL") ||
+                  error.message.startsWith("duplicate terminal") ||
+                  error.message.startsWith("agent_settled"))
+              ? error.message
+              : "Pi process output was invalid",
+        );
+      }
+    };
+
+    child.stdout.on("data", onStdout);
+    child.stderr.on("data", onStderr);
+    child.once("error", onError);
+    child.once("close", onClose);
+    timeout = setTimeout(() => {
+      recordFailure("Pi process timed out");
+    }, processTimeoutMs);
+    cancellation?.addEventListener("abort", cancel, { once: true });
+    if (cancellation?.aborted) {
+      cancel();
+    }
+  });
+}
+
+export async function runQualifiedPiAdapter(
+  options = {},
+  testSeam = {},
+) {
+  if (!isPlainObject(options) || !isPlainObject(testSeam)) {
+    fail("qualified Pi adapter input is invalid");
+  }
+  const maxTokens = options.maxTokens ?? options.qualifiedMaxTokens;
+  if (maxTokens === undefined) {
+    throw new QualificationRequiredError();
+  }
+  if (
+    !Number.isSafeInteger(maxTokens) ||
+    maxTokens <= 0 ||
+    maxTokens >= 8192
+  ) {
+    fail("qualified output-token limit must be between 1 and 8191");
+  }
+  const parsedEndpoint = validatePhaseEndpoint(
+    options.phase,
+    options.baseUrl,
+    options.expectedConfigSha256,
+  );
+  const processTimeoutMs = options.processTimeoutMs ?? 120_000;
+  if (
+    !Number.isSafeInteger(processTimeoutMs) ||
+    processTimeoutMs < 10 ||
+    processTimeoutMs > MAX_PROCESS_TIMEOUT_MS
+  ) {
+    fail("Pi process timeout is invalid");
+  }
+  const piBin = options.piBin;
+  validateBoundedString(piBin, "Pi binary");
+  if (
+    options.signal !== undefined &&
+    (typeof options.signal !== "object" ||
+      typeof options.signal.addEventListener !== "function" ||
+      typeof options.signal.removeEventListener !== "function")
+  ) {
+    fail("Pi cancellation signal is invalid");
+  }
+  if (options.signal?.aborted) {
+    fail("Pi acceptance was cancelled");
+  }
+
+  const platform = testSeam.platform ?? process.platform;
+  const processPlatform = testSeam.processPlatform ?? platform;
+  if (processPlatform !== "darwin" && processPlatform !== "win32") {
+    fail("Pi process platform is invalid");
+  }
+  const sourceEnvironment = testSeam.sourceEnvironment ?? process.env;
+  const spawnProcess = testSeam.spawnProcess ?? spawn;
+  const signalProcess = testSeam.signalProcess ?? process.kill;
+  const spawnTreeKiller = testSeam.spawnTreeKiller ?? spawn;
+  const resolveExecutable =
+    testSeam.resolveExecutable ??
+    (testSeam.spawnProcess === undefined ? realpath : async (value) => value);
+  const readQualifiedPiVersion =
+    testSeam.readPiVersion ??
+    (testSeam.spawnProcess === undefined
+      ? readPiVersion
+      : async () => "0.82.1\n");
+  if (
+    typeof spawnProcess !== "function" ||
+    typeof signalProcess !== "function" ||
+    typeof spawnTreeKiller !== "function"
+  ) {
+    fail("Pi process launcher is invalid");
+  }
+  const qualifiedPiBin = await qualifyPiExecutable(piBin, {
+    resolveExecutable,
+    readVersion: readQualifiedPiVersion,
+  });
+
+  const temporaryRoot = await mkdtemp(
+    path.join(os.tmpdir(), "loxa-pi-acceptance-"),
+  );
+  const home = path.join(temporaryRoot, "home");
+  const configDirectory = path.join(temporaryRoot, "pi-config");
+  const workspace = path.join(temporaryRoot, "workspace");
+  const childTemp = path.join(temporaryRoot, "tmp");
+  try {
+    await Promise.all([
+      mkdir(home, { recursive: true }),
+      mkdir(configDirectory, { recursive: true }),
+      mkdir(childTemp, { recursive: true }),
+      cp(
+        path.join(repositoryRoot, "examples/pi/tool-loop/seed"),
+        workspace,
+        { recursive: true },
+      ),
+    ]);
+    const prompt = await readFile(
+      path.join(repositoryRoot, "examples/pi/tool-loop/prompt.txt"),
+      "utf8",
+    );
+    validateBoundedString(prompt, "Pi acceptance prompt", 32 * 1024);
+    const configBytes = Buffer.from(
+      `${JSON.stringify(
+        buildRuntimeModelsConfig(
+          parsedEndpoint.toString(),
+          maxTokens,
+        ),
+        null,
+        2,
+      )}\n`,
+    );
+    const providerConfigSha256 = providerConfigDigest(configBytes);
+    if (options.expectedConfigSha256 !== undefined) {
+      assertProviderDigest(
+        providerConfigSha256,
+        options.expectedConfigSha256,
+      );
+    }
+    await writeFile(
+      path.join(configDirectory, "models.json"),
+      configBytes,
+      { mode: 0o600 },
+    );
+    const environment = {
+      ...buildIsolatedChildEnvironment(platform, {
+        home,
+        temp: childTemp,
+        source: sourceEnvironment,
+      }),
+      PI_CODING_AGENT_DIR: configDirectory,
+      PI_OFFLINE: "1",
+      PI_TELEMETRY: "0",
+      PI_SKIP_VERSION_CHECK: "1",
+    };
+    const argv = buildQualifiedPiArgv(
+      path.join(repositoryRoot, "examples/pi/tool-loop/acceptance-gate.mjs"),
+      prompt,
+    );
+
+    await validateGatewayAcceptance(parsedEndpoint.toString(), options.signal);
+    const semanticTrace = await runPiProcess({
+      program: qualifiedPiBin,
+      argv,
+      cwd: workspace,
+      environment,
+      processTimeoutMs,
+      cancellation: options.signal,
+      spawnProcess,
+      platform: processPlatform,
+      signalProcess,
+      spawnTreeKiller,
+      taskkillExecutable:
+        testSeam.taskkillExecutable ??
+        path.win32.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "taskkill.exe"),
+    });
+    await validateExactWorkspace({
+      seedRoot: path.join(repositoryRoot, "examples/pi/tool-loop/seed"),
+      workspaceRoot: workspace,
+      expectedResult: path.join(
+        repositoryRoot,
+        "examples/pi/tool-loop/expected/result.txt",
+      ),
+      changedPath: "result.txt",
+    });
+    await validateGatewayAcceptance(parsedEndpoint.toString(), options.signal);
+    return {
+      providerConfigSha256,
+      semanticTrace,
+    };
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
 }
 
 async function main() {
