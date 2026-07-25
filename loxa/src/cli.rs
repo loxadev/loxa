@@ -23,7 +23,7 @@ use loxa_core::supervisor::{self, SupervisorError};
 use loxa_node::*;
 use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -141,6 +141,20 @@ enum Command {
         inference_port: Option<u16>,
         #[arg(long, default_value_t = RuntimeBackendKind::LlamaCpp)]
         engine: RuntimeBackendKind,
+    },
+    PiAcceptance {
+        #[arg(long)]
+        phase: String,
+        #[arg(long)]
+        base_url: String,
+        #[arg(long)]
+        pi_entrypoint: PathBuf,
+        #[arg(long)]
+        max_tokens: u16,
+        #[arg(long)]
+        expected_config_sha256: Option<String>,
+        #[arg(long)]
+        evidence_dir: PathBuf,
     },
     Ps,
     Stop {
@@ -335,6 +349,26 @@ fn run_with_paths_and_diagnostics_health<W: Write, E: Write>(
                 &mut stderr,
                 diagnostics_health.as_ref(),
             ),
+            Command::PiAcceptance {
+                phase,
+                base_url,
+                pi_entrypoint,
+                max_tokens,
+                expected_config_sha256,
+                evidence_dir,
+            } => {
+                let evidence =
+                    crate::pi_acceptance::run_live(crate::pi_acceptance::PiAcceptanceRequest {
+                        phase: crate::pi_acceptance::AcceptancePhase::parse(&phase)?,
+                        base_url,
+                        pi_entrypoint,
+                        max_tokens,
+                        expected_config_sha256,
+                        evidence_dir,
+                    })?;
+                crate::pi_acceptance::write_evidence_json(&evidence, &mut stdout)?;
+                Ok(ExitCode::SUCCESS)
+            }
             Command::Ps => render_managed_servers(managed_servers(paths), &mut stdout),
             Command::Stop { target } => render_stop_outcome(
                 &target,
@@ -2326,6 +2360,43 @@ mod tests {
         ])
         .is_ok());
         assert!(Cli::try_parse_from(["loxa", "chats", "clear", "--yes"]).is_ok());
+    }
+
+    #[test]
+    fn clap_parses_qualified_pi_acceptance_inputs() {
+        let cli = Cli::try_parse_from([
+            "loxa",
+            "pi-acceptance",
+            "--phase",
+            "post-recovery",
+            "--base-url",
+            "http://127.0.0.1:11435/v1",
+            "--pi-entrypoint",
+            "/private/tmp/pi/dist/cli.js",
+            "--max-tokens",
+            "4096",
+            "--expected-config-sha256",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--evidence-dir",
+            "target/pi-acceptance/post-recovery",
+        ])
+        .expect("qualified Pi acceptance command must parse");
+
+        assert!(matches!(
+            cli.command,
+            Command::PiAcceptance {
+                phase,
+                base_url,
+                pi_entrypoint,
+                max_tokens: 4096,
+                expected_config_sha256: Some(expected),
+                evidence_dir,
+            } if phase == "post-recovery"
+                && base_url == "http://127.0.0.1:11435/v1"
+                && pi_entrypoint.as_path() == Path::new("/private/tmp/pi/dist/cli.js")
+                && expected == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                && evidence_dir.as_path() == Path::new("target/pi-acceptance/post-recovery")
+        ));
     }
 
     #[test]
