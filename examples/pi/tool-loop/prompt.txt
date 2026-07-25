@@ -1,0 +1,8 @@
+Work only in the current directory and complete this exact task:
+
+1. Read source.txt.
+2. Use bash to run `node verify.mjs --precheck`.
+3. Edit or write result.txt so it contains the sum of the two values from source.txt.
+4. Use bash to run `node verify.mjs` as the final verification.
+
+Do not create, delete, rename, link, or modify any other file.

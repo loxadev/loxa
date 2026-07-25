@@ -1844,6 +1844,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_request_and_response_fields_survive_alias_normalization() {
+        async fn fake_tool_chat(
+            State(seen): State<Arc<Mutex<Option<Value>>>>,
+            Json(request): Json<Value>,
+        ) -> Json<Value> {
+            *seen.lock().unwrap() = Some(request);
+            Json(json!({
+                "id": "chatcmpl-tools",
+                "object": "chat.completion",
+                "model": "loxa-node-test-g0",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_read",
+                            "type": "function",
+                            "function": {
+                                "name": "read",
+                                "arguments": "{\"path\":\"loxa-node-test-g0/source.txt\"}"
+                            }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            }))
+        }
+
+        let seen = Arc::new(Mutex::new(None));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/v1/chat/completions", post(fake_tool_chat))
+            .with_state(seen.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let state = gateway_state();
+        state.publish(EngineTarget {
+            base_url: format!("http://{address}"),
+            backend_alias: "loxa-node-test-g0".into(),
+            engine: "llama.cpp".into(),
+            engine_version: "b10107".into(),
+            model_id: "loxa".into(),
+            profile: "gemma-4-mtp".into(),
+        });
+        let base = spawn_gateway(state).await;
+        let tools = json!([{
+            "type": "function",
+            "function": {
+                "name": "read",
+                "description": "Read one file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                }
+            }
+        }]);
+        let tool_choice = json!({
+            "type": "function",
+            "function": {"name": "read"}
+        });
+
+        let response = Client::new()
+            .post(format!("{base}/v1/chat/completions"))
+            .json(&json!({
+                "model": "loxa",
+                "messages": [{"role": "user", "content": "Read source.txt"}],
+                "tools": tools,
+                "tool_choice": tool_choice
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        let forwarded = seen.lock().unwrap().clone().unwrap();
+
+        assert_eq!(forwarded["model"], "loxa-node-test-g0");
+        assert_eq!(forwarded["tools"], tools);
+        assert_eq!(forwarded["tool_choice"], tool_choice);
+        assert_eq!(body["model"], "loxa");
+        assert_eq!(
+            body["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "read"
+        );
+        assert_eq!(
+            body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            "{\"path\":\"loxa-node-test-g0/source.txt\"}"
+        );
+        assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    #[tokio::test]
     async fn internal_generation_service_holds_one_target_snapshot_and_normalizes_output() {
         let seen = Arc::new(Mutex::new(None));
         let engine = spawn_fake_engine(seen.clone()).await;

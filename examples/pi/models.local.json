@@ -1,0 +1,20 @@
+{
+  "providers": {
+    "loxa": {
+      "baseUrl": "http://127.0.0.1:11435/v1",
+      "api": "openai-completions",
+      "apiKey": "loxa-dummy-key",
+      "models": [
+        {
+          "id": "loxa",
+          "name": "Loxa",
+          "reasoning": false,
+          "input": [
+            "text"
+          ],
+          "contextWindow": 8192
+        }
+      ]
+    }
+  }
+}
