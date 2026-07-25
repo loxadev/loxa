@@ -2535,6 +2535,7 @@ enum CompletionDisposition {
     Unknown,
 }
 
+#[cfg_attr(test, allow(clippy::too_many_arguments))]
 fn classify_download_completion(
     control_state: &ControlStateHandle,
     operation_id: OperationId,
@@ -4699,11 +4700,9 @@ fn visit_existing_recipe_artifacts(
     mut visit: impl FnMut(&dyn VerifiedModel),
 ) {
     for recipe in recipes {
-        for artifact in std::iter::once(recipe as &dyn VerifiedModel).chain(
-            required_drafter(recipe)
-                .map(|drafter| drafter as &dyn VerifiedModel)
-                .into_iter(),
-        ) {
+        for artifact in std::iter::once(recipe as &dyn VerifiedModel)
+            .chain(required_drafter(recipe).map(|drafter| drafter as &dyn VerifiedModel))
+        {
             if cancellation.is_cancelled() {
                 return;
             }
@@ -5163,11 +5162,7 @@ impl MutationExecutor for DownloadExecutor {
         let verification = match &result {
             Ok(()) => Some(
                 std::iter::once(recipe as &dyn VerifiedModel)
-                    .chain(
-                        required_drafter(recipe)
-                            .map(|drafter| drafter as &dyn VerifiedModel)
-                            .into_iter(),
-                    )
+                    .chain(required_drafter(recipe).map(|drafter| drafter as &dyn VerifiedModel))
                     .map(|artifact| {
                         (
                             artifact,
@@ -7171,11 +7166,13 @@ mod tests {
         exit_requested: Arc<std::sync::atomic::AtomicBool>,
     }
 
+    type ReplacementReadyGate = (std::sync::mpsc::Sender<()>, Arc<(Mutex<bool>, Condvar)>);
+
     struct DurableRecoveryDriver {
         starts: Arc<AtomicUsize>,
         live_sessions: Arc<AtomicUsize>,
         exit_requested: Arc<AtomicBool>,
-        replacement_ready: Option<(std::sync::mpsc::Sender<()>, Arc<(Mutex<bool>, Condvar)>)>,
+        replacement_ready: Option<ReplacementReadyGate>,
         recovery_marked: Option<std::sync::mpsc::Sender<()>>,
     }
 
@@ -7680,17 +7677,19 @@ mod tests {
         }
     }
 
-    fn paired_legacy_fixture(
-        outcomes: Vec<Result<(), DownloadError>>,
-        leave_partial_on_error: bool,
-    ) -> (
+    type PairedLegacyFixture = (
         Arc<Mutex<OperationStore>>,
         String,
         DownloadExecutor,
         Arc<Mutex<Vec<String>>>,
         Arc<Mutex<Vec<String>>>,
         PathBuf,
-    ) {
+    );
+
+    fn paired_legacy_fixture(
+        outcomes: Vec<Result<(), DownloadError>>,
+        leave_partial_on_error: bool,
+    ) -> PairedLegacyFixture {
         let recipe = Box::leak(Box::new(ModelEntry {
             id: "loxa",
             repo: "owner/repo",
