@@ -26,6 +26,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MAX_JSON_BODY_BYTES: usize = 4 * 1024;
 
+fn download_admission_bytes(recipe: &loxa_core::registry::ModelEntry) -> u64 {
+    loxa_core::runtime_profile::runtime_profile(recipe.id)
+        .map(|profile| profile.total_size_bytes())
+        .unwrap_or(recipe.size_bytes)
+}
+
 #[derive(Clone)]
 pub(crate) struct V2ControlState {
     policy: Arc<AuthPolicy>,
@@ -674,7 +680,7 @@ async fn download(
         }
         state
             .execution
-            .start_download(&model_id, recipe.size_bytes)
+            .start_download(&model_id, download_admission_bytes(recipe))
             .await
             .map(accepted)
             .map_err(|error| map_execution_error(&state, error))
@@ -956,4 +962,16 @@ pub(crate) fn router(state: V2ControlState) -> Router {
             authenticated_boundary,
         ))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::download_admission_bytes;
+
+    #[test]
+    fn fixed_profile_download_admission_reports_aggregate_bytes() {
+        let recipe = loxa_core::registry::find("loxa").expect("fixed profile recipe");
+
+        assert_eq!(download_admission_bytes(recipe), 6_970_065_600);
+    }
 }
