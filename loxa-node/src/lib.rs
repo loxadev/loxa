@@ -579,6 +579,14 @@ fn validate_direct_context_override(
     }
 }
 
+type FixedProfileVerifier<'a> = dyn FnMut(
+        &Path,
+        &'static ModelEntry,
+        &VerificationCache,
+        &dyn VerificationCancellation,
+    ) -> Result<(), SupervisorError>
+    + 'a;
+
 fn resolve_runtime_backend(
     kind: RuntimeBackendKind,
     id: &str,
@@ -610,12 +618,7 @@ fn resolve_runtime_backend_with_fixed_profile_verifier(
     models_dir: &Path,
     verification_cache: &VerificationCache,
     verification_cancellation: &dyn VerificationCancellation,
-    verify_fixed_profile: &mut dyn FnMut(
-        &Path,
-        &'static ModelEntry,
-        &VerificationCache,
-        &dyn VerificationCancellation,
-    ) -> Result<(), SupervisorError>,
+    verify_fixed_profile: &mut FixedProfileVerifier<'_>,
 ) -> Result<ResolvedRuntimeBackend, SupervisorError> {
     match kind {
         RuntimeBackendKind::LlamaCpp => {
@@ -999,7 +1002,7 @@ fn run_model_with_owner_policy(
                     run,
                     owner_policy,
                     &signal_guard,
-                    || resolve_backend(),
+                    resolve_backend,
                     || Ok(()),
                 );
                 let preparation = match preparation {
@@ -1032,7 +1035,7 @@ fn run_model_with_owner_policy(
                 let backend = match initial_backend
                     .take()
                     .map(Ok)
-                    .unwrap_or_else(|| resolve_backend())
+                    .unwrap_or_else(resolve_backend)
                 {
                     Ok(resolved) => resolved,
                     Err(SupervisorError::ModelNotDownloaded(_)) => {
