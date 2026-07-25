@@ -626,6 +626,7 @@ pub(crate) trait LifecycleLoadWorkflow: Send {
         &mut self,
         request: &LifecycleLoadRequest,
         evidence: &VerifiedArtifact,
+        cancellation: &MutationCancellation,
     ) -> Result<LaunchPlan, LifecycleError>;
 
     fn cancel(&mut self, _operation_id: &OperationId) -> LifecycleCancelAcknowledgement {
@@ -668,6 +669,7 @@ where
         &mut self,
         request: &LifecycleLoadRequest,
         _evidence: &VerifiedArtifact,
+        _cancellation: &MutationCancellation,
     ) -> Result<LaunchPlan, LifecycleError> {
         (self.0)(&request.model_id)
     }
@@ -946,7 +948,11 @@ impl LifecycleControllerOwner {
                             }
                             let mut result = match &ready.outcome_mut().result {
                                 VerificationResult::Verified(evidence) => workflow
-                                    .resume_verified(&pending.request, evidence)
+                                    .resume_verified(
+                                        &pending.request,
+                                        evidence,
+                                        &pending.cancellation,
+                                    )
                                     .and_then(|plan| lifecycle.load(plan, &pending.cancellation)),
                                 VerificationResult::Cancelled => Err(LifecycleError::Cancelled),
                                 VerificationResult::Failed { .. } => {

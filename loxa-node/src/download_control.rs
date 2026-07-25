@@ -1808,6 +1808,7 @@ impl LifecycleLoadWorkflow for SchedulerLifecycleWorkflow {
         &mut self,
         request: &LifecycleLoadRequest,
         evidence: &VerifiedArtifact,
+        cancellation: &MutationCancellation,
     ) -> Result<LaunchPlan, LifecycleError> {
         let recipe = self
             .catalog
@@ -1822,6 +1823,12 @@ impl LifecycleLoadWorkflow for SchedulerLifecycleWorkflow {
         self.verification_cache
             .publish_verified_recipe(&self.catalog.models_dir, recipe, &pending.stable, evidence)
             .map_err(|_| LifecycleError::ModelNotVerified)?;
+        verify_runtime_artifacts(
+            &self.catalog.models_dir,
+            recipe,
+            &self.verification_cache,
+            cancellation,
+        )?;
         let entry = loxa_core::model_inventory::verified_recipe_inventory_with_cache(
             self.catalog.recipes,
             &self.catalog.models_dir,
@@ -4398,7 +4405,7 @@ trait RestartArtifactVerifier: Send {
         models_dir: &std::path::Path,
         recipe: &'static ModelEntry,
         cancellation: &dyn VerificationCancellation,
-    ) -> std::io::Result<VerifiedArtifact>;
+    ) -> Result<(), LifecycleError>;
 }
 
 struct CacheRestartArtifactVerifier {
@@ -4411,10 +4418,66 @@ impl RestartArtifactVerifier for CacheRestartArtifactVerifier {
         models_dir: &std::path::Path,
         recipe: &'static ModelEntry,
         cancellation: &dyn VerificationCancellation,
-    ) -> std::io::Result<VerifiedArtifact> {
-        self.cache
-            .verify_recipe_with_cancellation(models_dir, recipe, cancellation)
+    ) -> Result<(), LifecycleError> {
+        verify_runtime_artifacts(models_dir, recipe, &self.cache, cancellation)
     }
+}
+
+pub(crate) fn verify_runtime_artifacts(
+    models_dir: &std::path::Path,
+    recipe: &'static ModelEntry,
+    cache: &VerificationCache,
+    cancellation: &dyn VerificationCancellation,
+) -> Result<(), LifecycleError> {
+    let profile = loxa_core::runtime_profile::runtime_profile(recipe.id);
+    let drafter = profile
+        .filter(|profile| {
+            recipe.repo == profile.target.repo()
+                && recipe.revision == profile.target.revision()
+                && recipe.filename == profile.target.filename()
+                && recipe.sha256 == profile.target.sha256()
+                && recipe.size_bytes == profile.target.size_bytes()
+        })
+        .map(|profile| &profile.drafter);
+    if profile.is_some() && drafter.is_none() {
+        return Err(LifecycleError::ModelNotVerified);
+    }
+    verify_artifact_set(
+        models_dir,
+        std::iter::once(recipe as &dyn VerifiedModel).chain(
+            drafter
+                .map(|artifact| artifact as &dyn VerifiedModel)
+                .into_iter(),
+        ),
+        cache,
+        cancellation,
+    )
+}
+
+fn verify_artifact_set<'a>(
+    models_dir: &std::path::Path,
+    artifacts: impl IntoIterator<Item = &'a dyn VerifiedModel>,
+    cache: &VerificationCache,
+    cancellation: &dyn VerificationCancellation,
+) -> Result<(), LifecycleError> {
+    for artifact in artifacts {
+        let evidence = cache
+            .verify_artifact_with_cancellation(models_dir, artifact, cancellation)
+            .map_err(|_| {
+                if cancellation.is_cancelled() {
+                    LifecycleError::Cancelled
+                } else {
+                    LifecycleError::ModelNotVerified
+                }
+            })?;
+        if !evidence.matches
+            || evidence.size_bytes != artifact.size_bytes()
+            || evidence.expected_sha256 != artifact.sha256()
+        {
+            return Err(LifecycleError::ModelNotVerified);
+        }
+    }
+    Ok(())
 }
 
 struct RestartVerificationCancellation {
@@ -4454,9 +4517,12 @@ where
             Mutation::Load { model_id } => {
                 let recipe =
                     find_recipe(self.recipes, model_id).ok_or(LifecycleError::ModelNotVerified)?;
-                self.verification_cache
-                    .verify_recipe_with_cancellation(&self.models_dir, recipe, cancellation)
-                    .map_err(|_| LifecycleError::ModelNotVerified)?;
+                verify_runtime_artifacts(
+                    &self.models_dir,
+                    recipe,
+                    &self.verification_cache,
+                    cancellation,
+                )?;
                 let entry = loxa_core::model_inventory::verified_recipe_inventory_with_cache(
                     self.recipes,
                     &self.models_dir,
@@ -4490,9 +4556,11 @@ where
             let restart = find_recipe(self.recipes, &model_id)
                 .ok_or(LifecycleError::ModelNotVerified)
                 .and_then(|recipe| {
-                    self.restart_verifier
-                        .verify(&self.models_dir, recipe, &verification_cancellation)
-                        .map_err(|_| LifecycleError::ModelNotVerified)?;
+                    self.restart_verifier.verify(
+                        &self.models_dir,
+                        recipe,
+                        &verification_cancellation,
+                    )?;
                     let entry = loxa_core::model_inventory::verified_recipe_inventory_with_cache(
                         self.recipes,
                         &self.models_dir,
@@ -5276,6 +5344,89 @@ mod tests {
     use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn shared_runtime_verifier_requires_every_artifact() {
+        let dir = std::env::temp_dir().join(format!("loxa-runtime-pair-{}", OperationId::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = ModelEntry {
+            id: "target",
+            repo: "owner/repo",
+            revision: "pinned",
+            filename: "target.gguf",
+            sha256: "770e607624d689265ca6c44884d0807d9b054d23c473c106c72be9de08b7376c",
+            size_bytes: 4,
+            license: "apache-2.0",
+            params: "tiny",
+            quant: "Q4",
+            min_free_mem_gb: 0.0,
+        };
+        let drafter = ModelEntry {
+            id: "drafter",
+            filename: "drafter.gguf",
+            ..target
+        };
+        std::fs::write(dir.join(target.filename), b"good").unwrap();
+
+        let result = verify_artifact_set(
+            &dir,
+            [
+                &target as &dyn VerifiedModel,
+                &drafter as &dyn VerifiedModel,
+            ],
+            &VerificationCache::default(),
+            &MutationCancellation::new(),
+        );
+        assert_eq!(result, Err(LifecycleError::ModelNotVerified));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cancellation_interrupts_drafter_verification_after_a_cached_target() {
+        let dir = std::env::temp_dir().join(format!(
+            "loxa-runtime-pair-cancel-{}",
+            OperationId::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = ModelEntry {
+            id: "target",
+            repo: "owner/repo",
+            revision: "pinned",
+            filename: "target.gguf",
+            sha256: "770e607624d689265ca6c44884d0807d9b054d23c473c106c72be9de08b7376c",
+            size_bytes: 4,
+            license: "apache-2.0",
+            params: "tiny",
+            quant: "Q4",
+            min_free_mem_gb: 0.0,
+        };
+        let drafter = ModelEntry {
+            id: "drafter",
+            filename: "drafter.gguf",
+            ..target
+        };
+        std::fs::write(dir.join(target.filename), b"good").unwrap();
+        std::fs::write(dir.join(drafter.filename), b"good").unwrap();
+        let cache = VerificationCache::default();
+        cache.verify_artifact(&dir, &target).unwrap();
+        let cancellation = MutationCancellation::new();
+        cancellation.cancel();
+
+        assert_eq!(
+            verify_artifact_set(
+                &dir,
+                [
+                    &target as &dyn VerifiedModel,
+                    &drafter as &dyn VerifiedModel
+                ],
+                &cache,
+                &cancellation,
+            ),
+            Err(LifecycleError::Cancelled)
+        );
+        assert_eq!(cache.verification_runs(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn load_verification_admission_accepts_only_downloaded_or_full_unverified_artifacts() {
@@ -6539,7 +6690,7 @@ mod tests {
             models_dir: &std::path::Path,
             recipe: &'static ModelEntry,
             cancellation: &dyn VerificationCancellation,
-        ) -> std::io::Result<VerifiedArtifact> {
+        ) -> Result<(), LifecycleError> {
             struct HashLoopGate<'a> {
                 cancellation: &'a dyn VerificationCancellation,
                 entered: &'a std::sync::mpsc::Sender<()>,
@@ -6561,9 +6712,10 @@ mod tests {
                 }
             }
 
-            self.cache.verify_recipe_with_cancellation(
+            verify_runtime_artifacts(
                 models_dir,
                 recipe,
+                &self.cache,
                 &HashLoopGate {
                     cancellation,
                     entered: &self.entered,
@@ -8205,6 +8357,9 @@ mod tests {
                                 model_id: recipe.id.into(),
                                 artifact_path: dir.join(recipe.filename),
                                 engine: "llama.cpp".into(),
+                                ctx_size: loxa_core::supervisor::DEFAULT_CTX_TOKENS,
+                                jinja: false,
+                                speculative: None,
                             },
                             &MutationCancellation::new(),
                         )

@@ -1,5 +1,6 @@
 use crate::actor::MutationCancellation;
 use loxa_core::model_inventory::{ArtifactState, VerifiedRecipeInventoryEntry};
+use loxa_core::registry::VerifiedModel;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -14,10 +15,20 @@ pub struct StableNodeOwner {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpeculativeLaunchPlan {
+    pub(crate) drafter_path: std::path::PathBuf,
+    pub(crate) spec_type: String,
+    pub(crate) draft_n_max: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LaunchPlan {
     pub model_id: String,
     pub artifact_path: std::path::PathBuf,
     pub engine: String,
+    pub(crate) ctx_size: u32,
+    pub(crate) jinja: bool,
+    pub(crate) speculative: Option<SpeculativeLaunchPlan>,
 }
 
 impl LaunchPlan {
@@ -44,10 +55,35 @@ impl LaunchPlan {
                 entry.engine.engine
             )));
         }
+        let (ctx_size, jinja, speculative) =
+            if let Some(profile) = loxa_core::runtime_profile::runtime_profile(&entry.id) {
+                let target_matches = entry.repo == profile.target.repo()
+                    && entry.revision == profile.target.revision()
+                    && entry.filename == profile.target.filename()
+                    && entry.sha256 == profile.target.sha256()
+                    && entry.size_bytes == profile.total_size_bytes();
+                if !target_matches {
+                    return Err(LifecycleError::ModelNotVerified);
+                }
+                (
+                    profile.ctx_size,
+                    profile.jinja,
+                    Some(SpeculativeLaunchPlan {
+                        drafter_path: models_dir.join(profile.drafter.filename()),
+                        spec_type: profile.spec_type.to_owned(),
+                        draft_n_max: profile.draft_n_max,
+                    }),
+                )
+            } else {
+                (loxa_core::supervisor::DEFAULT_CTX_TOKENS, false, None)
+            };
         Ok(Self {
             model_id: entry.id.clone(),
             artifact_path: models_dir.join(&entry.filename),
             engine: entry.engine.engine.clone(),
+            ctx_size,
+            jinja,
+            speculative,
         })
     }
 }
@@ -943,7 +979,45 @@ mod tests {
             model_id: id.into(),
             artifact_path: format!("{id}.gguf").into(),
             engine: "llama.cpp".into(),
+            ctx_size: loxa_core::supervisor::DEFAULT_CTX_TOKENS,
+            jinja: false,
+            speculative: None,
         }
+    }
+
+    fn verified_inventory_entry(id: &str, filename: &str) -> VerifiedRecipeInventoryEntry {
+        VerifiedRecipeInventoryEntry {
+            id: id.into(),
+            repo: "owner/repo".into(),
+            revision: "pinned".into(),
+            filename: filename.into(),
+            sha256: "00".repeat(32),
+            size_bytes: 4,
+            license: "apache-2.0".into(),
+            params: "tiny".into(),
+            quant: "Q4".into(),
+            min_free_mem_gb: 0.1,
+            artifact: ArtifactState::Downloaded,
+            compatibility: loxa_core::model_inventory::Compatibility {
+                compatible: true,
+                reason: "compatible".into(),
+            },
+            engine: loxa_core::model_inventory::EngineEligibility {
+                engine: "llama-cpp".into(),
+                eligible: true,
+                reason: "eligible".into(),
+            },
+        }
+    }
+
+    fn verified_profile_inventory_entry() -> VerifiedRecipeInventoryEntry {
+        let profile = loxa_core::runtime_profile::runtime_profile("loxa").unwrap();
+        let mut entry = verified_inventory_entry(profile.model_id, profile.target.filename());
+        entry.repo = profile.target.repo().into();
+        entry.revision = profile.target.revision().into();
+        entry.sha256 = profile.target.sha256().into();
+        entry.size_bytes = profile.total_size_bytes();
+        entry
     }
 
     #[test]
@@ -987,6 +1061,84 @@ mod tests {
             LaunchPlan::from_verified_inventory(&entry, std::path::Path::new("models")),
             Err(LifecycleError::EngineIneligible(reason)) if reason.contains("future-engine")
         ));
+    }
+
+    #[test]
+    fn ordinary_inventory_builds_an_unpaired_plan_with_legacy_defaults() {
+        let entry = verified_inventory_entry("ordinary", "ordinary.gguf");
+        let plan =
+            LaunchPlan::from_verified_inventory(&entry, std::path::Path::new("models")).unwrap();
+
+        assert_eq!(plan.ctx_size, loxa_core::supervisor::DEFAULT_CTX_TOKENS);
+        assert!(!plan.jinja);
+        assert_eq!(plan.speculative, None);
+    }
+
+    #[test]
+    fn fixed_pair_plan_carries_the_exact_drafter_and_controls() {
+        let profile = loxa_core::runtime_profile::runtime_profile("loxa").unwrap();
+        let entry = verified_profile_inventory_entry();
+        let plan =
+            LaunchPlan::from_verified_inventory(&entry, std::path::Path::new("models")).unwrap();
+
+        assert_eq!(plan.ctx_size, 8192);
+        assert!(plan.jinja);
+        assert_eq!(
+            plan.speculative,
+            Some(SpeculativeLaunchPlan {
+                drafter_path: std::path::PathBuf::from("models").join(profile.drafter.filename),
+                spec_type: "draft-mtp".into(),
+                draft_n_max: 4,
+            })
+        );
+    }
+
+    #[test]
+    fn fixed_pair_rejects_non_downloaded_or_target_mismatched_inventory() {
+        let mut entry = verified_profile_inventory_entry();
+        entry.artifact = ArtifactState::Partial { bytes: 1 };
+        assert_eq!(
+            LaunchPlan::from_verified_inventory(&entry, std::path::Path::new("models")),
+            Err(LifecycleError::ModelNotVerified)
+        );
+
+        entry = verified_profile_inventory_entry();
+        entry.sha256 = "00".repeat(32);
+        assert_eq!(
+            LaunchPlan::from_verified_inventory(&entry, std::path::Path::new("models")),
+            Err(LifecycleError::ModelNotVerified)
+        );
+    }
+
+    #[test]
+    fn fixed_pair_plan_accepts_the_real_aggregate_inventory_contract() {
+        let dir = std::env::temp_dir().join(format!(
+            "loxa-plan-inventory-{}",
+            loxa_protocol::v2::OperationId::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let profile = loxa_core::runtime_profile::runtime_profile("loxa").unwrap();
+        for artifact in profile.artifacts() {
+            std::fs::File::create(dir.join(artifact.filename()))
+                .unwrap()
+                .set_len(artifact.size_bytes())
+                .unwrap();
+        }
+        let cache = loxa_core::model_inventory::VerificationCache::default();
+        let mut entry = loxa_core::model_inventory::verified_recipe_inventory_with_cache(
+            loxa_core::registry::REGISTRY,
+            &dir,
+            u64::MAX,
+            &cache,
+        )
+        .into_iter()
+        .find(|entry| entry.id == "loxa")
+        .unwrap();
+
+        assert_eq!(entry.size_bytes, profile.total_size_bytes());
+        entry.artifact = ArtifactState::Downloaded;
+        assert!(LaunchPlan::from_verified_inventory(&entry, &dir).is_ok());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
