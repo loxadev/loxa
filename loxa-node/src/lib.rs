@@ -1380,6 +1380,7 @@ fn uses_stable_node_host(startup_model: Option<&str>, engine: RuntimeBackendKind
 pub fn serve_node(
     requested_model: Option<&str>,
     port: Option<u16>,
+    inference_port: Option<u16>,
     engine: RuntimeBackendKind,
     paths: &NodePaths,
     events: &mut dyn LifecycleEventSink,
@@ -1387,6 +1388,7 @@ pub fn serve_node(
     serve_node_with_diagnostics_health(
         requested_model,
         port,
+        inference_port,
         engine,
         paths,
         events,
@@ -1397,6 +1399,7 @@ pub fn serve_node(
 pub fn serve_node_with_diagnostics_health(
     requested_model: Option<&str>,
     port: Option<u16>,
+    inference_port: Option<u16>,
     engine: RuntimeBackendKind,
     paths: &NodePaths,
     events: &mut dyn LifecycleEventSink,
@@ -1415,6 +1418,7 @@ pub fn serve_node_with_diagnostics_health(
         paths,
         diagnostics_health,
     )
+    .with_inference_port(inference_port)
     .build();
     match runtime {
         Ok(runtime) => runtime.run(events),
@@ -2834,6 +2838,7 @@ mod lifecycle_api_tests {
             serve_node(
                 None,
                 Some(0),
+                None,
                 RuntimeBackendKind::LlamaCpp,
                 &paths,
                 &mut sink,
@@ -3201,6 +3206,7 @@ mod lifecycle_api_tests {
             serve_node(
                 Some("ARBITRARY_ERROR_SENTINEL"),
                 Some(0),
+                None,
                 RuntimeBackendKind::LlamaCpp,
                 &paths,
                 &mut RecordingLifecycleSink::default(),
@@ -3279,6 +3285,7 @@ mod lifecycle_api_tests {
             serve_node(
                 None,
                 Some(startup_port),
+                None,
                 RuntimeBackendKind::LlamaCpp,
                 &paths,
                 &mut RecordingLifecycleSink::default(),
@@ -3961,6 +3968,7 @@ mod lifecycle_api_tests {
                 serve_node(
                     None,
                     Some(0),
+                    None,
                     RuntimeBackendKind::LlamaCpp,
                     &serve_paths,
                     &mut ChannelLifecycleSink(event_tx),
@@ -4195,6 +4203,7 @@ mod lifecycle_api_tests {
             serve_node(
                 Some(recipe.id),
                 Some(0),
+                None,
                 RuntimeBackendKind::LlamaCpp,
                 &serve_paths,
                 &mut BlockingListeningSink {

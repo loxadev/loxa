@@ -135,6 +135,8 @@ enum Command {
         model: Option<String>,
         #[arg(long)]
         port: Option<u16>,
+        #[arg(long)]
+        inference_port: Option<u16>,
         #[arg(long, default_value_t = RuntimeBackendKind::LlamaCpp)]
         engine: RuntimeBackendKind,
     },
@@ -294,10 +296,12 @@ fn run_with_paths_and_diagnostics_health<W: Write, E: Write>(
             Command::Serve {
                 model,
                 port,
+                inference_port,
                 engine,
             } => serve_node_cli(
                 model.as_deref(),
                 port,
+                inference_port,
                 engine,
                 paths,
                 &mut stdout,
@@ -1004,6 +1008,7 @@ fn run_model_cli<W: Write, E: Write>(
 fn serve_node_cli<W: Write, E: Write>(
     requested_model: Option<&str>,
     port: Option<u16>,
+    inference_port: Option<u16>,
     engine: RuntimeBackendKind,
     paths: &NodePaths,
     stdout: &mut W,
@@ -1015,6 +1020,7 @@ fn serve_node_cli<W: Write, E: Write>(
     match loxa_node::serve_node_with_diagnostics_health(
         requested_model,
         port,
+        inference_port,
         engine,
         paths,
         &mut events,
@@ -2072,10 +2078,40 @@ mod tests {
             Command::Serve {
                 model,
                 port,
+                inference_port,
                 engine,
             } => {
                 assert_eq!(model.as_deref(), Some("gemma-3-4b-it-q4"));
                 assert_eq!(port, Some(11435));
+                assert_eq!(inference_port, None);
+                assert_eq!(engine, RuntimeBackendKind::LlamaCpp);
+            }
+            _ => panic!("expected serve command"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_optional_inference_port_without_changing_gateway_port() {
+        let cli = Cli::try_parse_from([
+            "loxa",
+            "serve",
+            "--port",
+            "11435",
+            "--inference-port",
+            "11436",
+        ])
+        .expect("inference listener port must parse");
+
+        match cli.command {
+            Command::Serve {
+                model,
+                port,
+                inference_port,
+                engine,
+            } => {
+                assert_eq!(model, None);
+                assert_eq!(port, Some(11435));
+                assert_eq!(inference_port, Some(11436));
                 assert_eq!(engine, RuntimeBackendKind::LlamaCpp);
             }
             _ => panic!("expected serve command"),

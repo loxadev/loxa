@@ -612,6 +612,14 @@ pub fn router(state: GatewayState) -> Router {
         .with_state(state)
 }
 
+pub fn remote_router(state: GatewayState) -> Router {
+    Router::new()
+        .route("/v1/models", get(models))
+        .route("/v1/chat/completions", post(chat))
+        .route("/loxa/status", get(status))
+        .with_state(state)
+}
+
 pub struct GatewayServer {
     port: u16,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
@@ -1057,7 +1065,7 @@ impl Drop for GatewayServer {
 #[cfg(test)]
 mod tests {
     use super::{
-        next_sse_boundary, normalize_sse, router, EngineTarget, GatewayServer,
+        next_sse_boundary, normalize_sse, remote_router, router, EngineTarget, GatewayServer,
         GatewayShutdownFailureKind, GatewayState, GenerationError, GenerationOutput,
         GenerationProvenance, GenerationStreamError, MAX_SSE_EVENT_BYTES,
     };
@@ -1080,6 +1088,83 @@ mod tests {
 
     fn gateway_state() -> GatewayState {
         GatewayState::new(NodeId::new_v4(), NodeInstanceId::new_v4())
+    }
+
+    #[tokio::test]
+    async fn remote_router_exposes_only_inference_methods() {
+        let state = gateway_state();
+        let server = GatewayServer::start_with_router(0, state.clone(), remote_router(state))
+            .expect("start inference-only listener");
+        let base = format!("http://127.0.0.1:{}", server.port());
+        let client = Client::new();
+
+        assert_eq!(
+            client
+                .get(format!("{base}/v1/models"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            client
+                .get(format!("{base}/loxa/status"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            client
+                .post(format!("{base}/v1/chat/completions"))
+                .json(&json!({"model": "loxa", "messages": []}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        for response in [
+            client
+                .request(reqwest::Method::OPTIONS, format!("{base}/v1/models"))
+                .send()
+                .await
+                .unwrap(),
+            client
+                .post(format!("{base}/v1/models"))
+                .send()
+                .await
+                .unwrap(),
+            client
+                .get(format!("{base}/v1/chat/completions"))
+                .send()
+                .await
+                .unwrap(),
+            client
+                .post(format!("{base}/loxa/status"))
+                .send()
+                .await
+                .unwrap(),
+        ] {
+            assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        }
+        for path in ["/loxa/v1/node", "/loxa/v1/chats", "/loxa/v2/operations"] {
+            assert_eq!(
+                client
+                    .get(format!("{base}{path}"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::NOT_FOUND,
+                "{path} must not be exposed by the inference listener"
+            );
+        }
+
+        server.shutdown().expect("stop inference-only listener");
     }
 
     #[tokio::test]

@@ -74,6 +74,8 @@ pub(crate) struct FatalShutdownParts {
     pub(crate) diagnostic: String,
     pub(crate) gateway: Option<GatewayServer>,
     pub(crate) gateway_failure: Option<GatewayShutdownFailure>,
+    pub(crate) inference_gateway: Option<GatewayServer>,
+    pub(crate) inference_gateway_failure: Option<GatewayShutdownFailure>,
     pub(crate) history: Option<ChatHistoryWorker>,
     pub(crate) history_failure: Option<ChatHistoryShutdownFailure>,
     pub(crate) health: Option<DurableHealthMonitor>,
@@ -96,6 +98,8 @@ pub struct FatalShutdown {
     _diagnostic: ManuallyDrop<String>,
     _gateway: ManuallyDrop<Option<GatewayServer>>,
     _gateway_failure: ManuallyDrop<Option<GatewayShutdownFailure>>,
+    _inference_gateway: ManuallyDrop<Option<GatewayServer>>,
+    _inference_gateway_failure: ManuallyDrop<Option<GatewayShutdownFailure>>,
     _history: ManuallyDrop<Option<ChatHistoryWorker>>,
     _history_failure: ManuallyDrop<Option<ChatHistoryShutdownFailure>>,
     _health: ManuallyDrop<Option<DurableHealthMonitor>>,
@@ -119,6 +123,8 @@ impl FatalShutdown {
             _diagnostic: ManuallyDrop::new(parts.diagnostic),
             _gateway: ManuallyDrop::new(parts.gateway),
             _gateway_failure: ManuallyDrop::new(parts.gateway_failure),
+            _inference_gateway: ManuallyDrop::new(parts.inference_gateway),
+            _inference_gateway_failure: ManuallyDrop::new(parts.inference_gateway_failure),
             _history: ManuallyDrop::new(parts.history),
             _history_failure: ManuallyDrop::new(parts.history_failure),
             _health: ManuallyDrop::new(parts.health),
@@ -150,7 +156,10 @@ impl FatalShutdown {
     #[cfg(test)]
     pub(crate) fn retained_classes_for_test(&self) -> Vec<ShutdownFailureClass> {
         let mut classes = Vec::new();
-        if self._gateway_failure.is_some() || self._routes_failure.is_some() {
+        if self._gateway_failure.is_some()
+            || self._inference_gateway_failure.is_some()
+            || self._routes_failure.is_some()
+        {
             classes.push(ShutdownFailureClass::Routes);
         }
         if self._history_failure.is_some() || self._control_failure.is_some() {
