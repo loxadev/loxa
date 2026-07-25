@@ -3,9 +3,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::path::Path;
 
-pub const QUALIFIED_LLAMA_CPP_BUILD: &str = "10107";
-pub const QUALIFIED_LLAMA_CPP_COMMIT: &str = "c0bc8591e";
-pub const QUALIFIED_LLAMA_CPP_VERSION_FIRST_LINE: &str = "version: 10107 (c0bc8591e)";
+pub const QUALIFIED_LLAMA_CPP_RUNTIME_IDENTITY: &str = "version: 10107 (c0bc8591e)";
 
 #[derive(Clone, Copy, Debug)]
 pub enum LlamaCppLaunchMode<'a> {
@@ -48,7 +46,7 @@ impl fmt::Display for LlamaCppLaunchError {
             }
             Self::UnqualifiedRuntimeVersion => write!(
                 formatter,
-                "qualified Gemma 4 MTP requires llama.cpp version: {QUALIFIED_LLAMA_CPP_BUILD} ({QUALIFIED_LLAMA_CPP_COMMIT})"
+                "qualified Gemma 4 MTP requires llama.cpp {QUALIFIED_LLAMA_CPP_RUNTIME_IDENTITY}"
             ),
         }
     }
@@ -132,7 +130,7 @@ pub fn build_launch_spec(
 
 fn validate_qualified_runtime_version(engine_version: &str) -> Result<(), LlamaCppLaunchError> {
     match engine_version.lines().next() {
-        Some(QUALIFIED_LLAMA_CPP_VERSION_FIRST_LINE) => Ok(()),
+        Some(QUALIFIED_LLAMA_CPP_RUNTIME_IDENTITY) => Ok(()),
         _ => Err(LlamaCppLaunchError::UnqualifiedRuntimeVersion),
     }
 }
