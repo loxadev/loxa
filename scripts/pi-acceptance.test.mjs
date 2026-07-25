@@ -109,9 +109,11 @@ test("phase and endpoint relationship fails closed without pinning a tailnet hos
     "127.0.0.1",
   );
   assert.equal(
-    validatePhaseEndpoint("windows-tailnet", "https://node-one.invalid/v1")
-      .hostname,
-    "node-one.invalid",
+    validatePhaseEndpoint(
+      "windows-tailnet",
+      "https://device.tailnet.ts.net/v1",
+    ).hostname,
+    "device.tailnet.ts.net",
   );
   assert.equal(
     validatePhaseEndpoint(
@@ -145,6 +147,26 @@ test("phase and endpoint relationship fails closed without pinning a tailnet hos
   assert.throws(
     () => validatePhaseEndpoint("windows-tailnet", "http://node.invalid/v1"),
     /https/i,
+  );
+  assert.throws(
+    () =>
+      validatePhaseEndpoint(
+        "windows-tailnet",
+        "https://example.com/v1",
+      ),
+    /tailnet/i,
+  );
+  assert.throws(
+    () =>
+      validatePhaseEndpoint(
+        "windows-tailnet",
+        "https://node.invalid/v1",
+      ),
+    /tailnet/i,
+  );
+  assert.throws(
+    () => validatePhaseEndpoint("windows-tailnet", "https://ts.net/v1"),
+    /tailnet/i,
   );
   assert.throws(
     () =>

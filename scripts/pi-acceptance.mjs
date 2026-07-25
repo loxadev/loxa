@@ -7,6 +7,8 @@ import { fileURLToPath } from "node:url";
 
 const PHASES = new Set(["mac-local", "windows-tailnet", "post-recovery"]);
 const DIGEST_PATTERN = /^[a-f0-9]{64}$/;
+const TAILNET_HOSTNAME_PATTERN =
+  /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+ts\.net$/;
 const MAX_ARGUMENT_LENGTH = 4096;
 const MAX_BASE_URL_LENGTH = 2048;
 const MAX_TRACE_RECORDS = 10_000;
@@ -105,6 +107,9 @@ export function validatePhaseEndpoint(
       parsed.hostname === "[::1]"
     ) {
       fail("windows-tailnet requires a non-loopback tailnet endpoint");
+    }
+    if (!TAILNET_HOSTNAME_PATTERN.test(parsed.hostname)) {
+      fail("windows-tailnet requires a syntactically valid tailnet hostname");
     }
   }
   if (phase === "post-recovery" && expectedConfigSha256 === undefined) {
