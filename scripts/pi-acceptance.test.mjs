@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import {
+  access,
   chmod,
   cp,
   link,
@@ -10,12 +12,15 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
+import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import test from "node:test";
 
 import {
   QualificationRequiredError,
+  adaptQualifiedPiJsonl,
   assertProviderDigest,
   buildIsolatedChildEnvironment,
   buildSanitizedEvidence,
@@ -42,14 +47,250 @@ async function withTempDirectory(name, run) {
   }
 }
 
-function successfulTrace(editTool = "edit") {
+function successfulTrace(thirdTool = "write") {
   return [
     { tool: "read", status: "success" },
     { tool: "bash", stage: "precheck", status: "success" },
-    { tool: editTool, status: "success" },
+    { tool: thirdTool, status: "success" },
     { tool: "bash", stage: "verification", status: "success" },
   ];
 }
+
+function successfulQualifiedLines(thirdTool = "write") {
+  const calls = [
+    ["read-1", "read", { path: "source.txt" }],
+    ["bash-1", "bash", { command: "node verify.mjs --precheck" }],
+    ["write-1", thirdTool, { path: "result.txt", content: "sum=18\n" }],
+    ["bash-2", "bash", { command: "node verify.mjs" }],
+  ];
+  return [
+    JSON.stringify({ type: "session", version: 3 }),
+    JSON.stringify({ type: "agent_start" }),
+    ...calls.flatMap(([toolCallId, toolName, args]) => [
+      JSON.stringify({
+        type: "tool_execution_start",
+        toolCallId,
+        toolName,
+        args,
+      }),
+      JSON.stringify({
+        type: "tool_execution_end",
+        toolCallId,
+        toolName,
+        result: { content: `private ${toolName} result` },
+        isError: false,
+      }),
+    ]),
+    JSON.stringify({ type: "agent_end" }),
+    JSON.stringify({ type: "agent_settled" }),
+  ];
+}
+
+async function withFakeGateway(run, responses = {}) {
+  const requests = [];
+  const server = createServer((request, response) => {
+    requests.push(request.url);
+    response.setHeader("content-type", "application/json");
+    if (request.url === "/v1/models") {
+      response.end(
+        responses.models ??
+          JSON.stringify({
+            object: "list",
+            data: [{ id: "loxa", object: "model", owned_by: "loxa" }],
+          }),
+      );
+      return;
+    }
+    if (request.url === "/loxa/status") {
+      response.end(
+        responses.status ??
+          JSON.stringify({
+            health: "ready",
+            model: "loxa",
+            engine: { name: "llama.cpp", version: "b10107" },
+          }),
+      );
+      return;
+    }
+    response.statusCode = 404;
+    response.end("{}");
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  try {
+    return await run({
+      baseUrl: `http://127.0.0.1:${address.port}/v1`,
+      requests,
+    });
+  } finally {
+    await new Promise((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+}
+
+function fakeSpawn(scenario, capture = {}) {
+  return (program, argv, options) => {
+    capture.program = program;
+    capture.argv = [...argv];
+    capture.options = {
+      cwd: options.cwd,
+      detached: options.detached,
+      shell: options.shell,
+      stdio: options.stdio,
+      windowsHide: options.windowsHide,
+      env: { ...options.env },
+    };
+    capture.kills = [];
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    if (scenario.pid !== undefined) {
+      child.pid = scenario.pid;
+    }
+    let closed = false;
+    const close = (code, signal = null) => {
+      if (closed) {
+        return;
+      }
+      closed = true;
+      child.stdout.end();
+      child.stderr.end();
+      child.emit("close", code, signal);
+    };
+    capture.close = close;
+    capture.child = child;
+    child.kill = (signal = "SIGTERM") => {
+      capture.kills.push(signal);
+      if (scenario.ignoreAllKills) {
+        return true;
+      }
+      if (scenario.descendantKeepsPipes) {
+        queueMicrotask(() => child.emit("exit", null, signal));
+        return true;
+      }
+      if (signal === "SIGTERM" && scenario.ignoreSigterm) {
+        return true;
+      }
+      queueMicrotask(() => close(null, signal));
+      return true;
+    };
+
+    queueMicrotask(async () => {
+      if (scenario.onStart) {
+        scenario.onStart();
+      }
+      if (scenario.hang || closed) {
+        return;
+      }
+      try {
+        capture.modelsConfig = JSON.parse(
+          await readFile(
+            path.join(options.env.PI_CODING_AGENT_DIR, "models.json"),
+            "utf8",
+          ),
+        );
+        if (scenario.writeExpectedResult) {
+          await writeFile(path.join(options.cwd, "result.txt"), "sum=18\n");
+        }
+        if (scenario.stdoutBytes) {
+          child.stdout.write(scenario.stdoutBytes);
+        } else {
+          for (const line of scenario.lines ?? successfulQualifiedLines()) {
+            child.stdout.write(`${line}\n`);
+          }
+        }
+        if (scenario.stderrBytes) {
+          child.stderr.write(scenario.stderrBytes);
+        }
+        if (scenario.processError) {
+          child.emit("error", new Error("private process error"));
+          return;
+        }
+        close(scenario.exitCode ?? 0);
+      } catch (error) {
+        capture.fixtureError = error;
+        close(97);
+      }
+    });
+    return child;
+  };
+}
+
+async function assertMissing(absolutePath) {
+  await assert.rejects(access(absolutePath), { code: "ENOENT" });
+}
+
+async function observeSettlement(promise, timeoutMs) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise.then(
+        (value) => ({ status: "resolved", value }),
+        (error) => ({ status: "rejected", error }),
+      ),
+      new Promise((resolve) => {
+        timer = setTimeout(
+          () => resolve({ status: "watchdog" }),
+          timeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+test("pre-execution acceptance gate permits only the exact four literal tool calls", async () => {
+  const { createAcceptanceGate } = await import(
+    "../examples/pi/tool-loop/acceptance-gate.mjs"
+  );
+  const gate = createAcceptanceGate();
+  const calls = [
+    { toolName: "read", input: { path: "source.txt" } },
+    { toolName: "bash", input: { command: "node verify.mjs --precheck" } },
+    {
+      toolName: "write",
+      input: { path: "result.txt", content: "sum=18\n" },
+    },
+    { toolName: "bash", input: { command: "node verify.mjs" } },
+  ];
+
+  for (const call of calls) {
+    assert.equal(await gate(call), undefined);
+  }
+  assert.deepEqual(await gate(calls[3]), {
+    block: true,
+    reason: "Pi acceptance tool call is not the next exact step.",
+  });
+});
+
+test("pre-execution acceptance gate blocks all off-contract literal calls before execution", async () => {
+  const { createAcceptanceGate } = await import(
+    "../examples/pi/tool-loop/acceptance-gate.mjs"
+  );
+  const rejected = [
+    { toolName: "read", input: { path: "/source.txt" } },
+    { toolName: "read", input: { path: "nested/../source.txt" } },
+    { toolName: "bash", input: { command: "node verify.mjs" } },
+    {
+      toolName: "write",
+      input: { path: "result.txt", content: "sum=18" },
+    },
+    { toolName: "edit", input: { path: "result.txt" } },
+  ];
+
+  for (const call of rejected) {
+    const gate = createAcceptanceGate();
+    assert.deepEqual(await gate(call), {
+      block: true,
+      reason: "Pi acceptance tool call is not the next exact step.",
+    });
+  }
+});
 
 test("committed model examples use the fixed text-only provider contract", async () => {
   for (const relative of [
@@ -72,6 +313,37 @@ test("committed model examples use the fixed text-only provider contract", async
     assert.equal("compat" in validated.model, false);
     assert.equal("maxTokens" in validated.model, false);
   }
+});
+
+test("tool-loop prompt requires the qualified four-call sequence and exact output", async () => {
+  const prompt = await readFile(
+    path.join(repositoryRoot, "examples/pi/tool-loop/prompt.txt"),
+    "utf8",
+  );
+
+  assert.match(prompt, /exactly four tool calls and no others/i);
+  assert.match(prompt, /read, bash, write, bash/i);
+  assert.match(prompt, /^1\. Use read to read source\.txt\.$/m);
+  assert.match(
+    prompt,
+    /^2\. Use bash to run `node verify\.mjs --precheck`\.$/m,
+  );
+  assert.match(
+    prompt,
+    /^3\. Use write to write result\.txt as exactly one `sum=<computed integer>` line followed by exactly one LF, with no spaces, Markdown, or extra line\.$/m,
+  );
+  assert.match(
+    prompt,
+    /^4\. Use bash to run `node verify\.mjs` as the final verification\.$/m,
+  );
+  assert.match(prompt, /never (?:use|run) bash before (?:the )?read/i);
+  assert.match(prompt, /do not use edit or retry/i);
+  assert.match(
+    prompt,
+    /exactly one `sum=<computed integer>` line followed by exactly one LF/i,
+  );
+  assert.match(prompt, /no spaces, Markdown, or extra line/i);
+  assert.match(prompt, /stop after (?:the )?final verification/i);
 });
 
 test("model validation rejects unqualified compatibility and output-limit overrides", async () => {
@@ -210,6 +482,47 @@ test("Mac child environment is an allowlist with isolated home XDG and temp", ()
   });
 });
 
+test("Mac child environment accepts Node process.env through the same allowlist", () => {
+  const environment = buildIsolatedChildEnvironment("darwin", {
+    home: "/private/tmp/pi-live-home",
+    temp: "/private/tmp/pi-live-temp",
+    source: process.env,
+  });
+  const allowedKeys = new Set([
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_DATA_HOME",
+    "TMPDIR",
+  ]);
+
+  assert.equal(
+    Object.keys(environment).every((key) => allowedKeys.has(key)),
+    true,
+  );
+  assert.equal(environment.HOME, "/private/tmp/pi-live-home");
+  assert.equal(environment.TMPDIR, "/private/tmp/pi-live-temp");
+  assert.equal(environment.OPENAI_API_KEY, undefined);
+});
+
+test("child environment still rejects non-record object containers", () => {
+  for (const source of [null, [], new Date(0), new Map()]) {
+    assert.throws(
+      () =>
+        buildIsolatedChildEnvironment("darwin", {
+          home: "/private/tmp/pi-home",
+          temp: "/private/tmp/pi-temp",
+          source,
+        }),
+      /child environment source/i,
+    );
+  }
+});
+
 test("gateway preflight and postflight validators require model loxa and ready status", () => {
   assert.doesNotThrow(() =>
     validateModelsResponse({
@@ -275,8 +588,11 @@ test("Windows child environment isolates home profile AppData and temp", () => {
 });
 
 test("semantic post-adapter tool trace accepts ordered read bash write verify", () => {
-  assert.doesNotThrow(() => validateSemanticToolTrace(successfulTrace("edit")));
   assert.doesNotThrow(() => validateSemanticToolTrace(successfulTrace("write")));
+  assert.throws(
+    () => validateSemanticToolTrace(successfulTrace("edit")),
+    /tool trace/i,
+  );
 });
 
 test("semantic post-adapter tool trace rejects failed missing and reordered tools", () => {
@@ -449,6 +765,8 @@ test("CLI parser exposes only the static acceptance arguments", () => {
       "http://127.0.0.1:11435/v1",
       "--pi-bin",
       "/opt/pi",
+      "--max-tokens",
+      "1024",
       "--expected-config-sha256",
       "b".repeat(64),
       "--evidence-dir",
@@ -458,6 +776,7 @@ test("CLI parser exposes only the static acceptance arguments", () => {
       phase: "post-recovery",
       baseUrl: "http://127.0.0.1:11435/v1",
       piBin: "/opt/pi",
+      maxTokens: 1024,
       expectedConfigSha256: "b".repeat(64),
       evidenceDir: "target/pi-acceptance/run",
     },
@@ -482,6 +801,10 @@ test("CLI parser exposes only the static acceptance arguments", () => {
         "mac-local",
         "--base-url",
         "http://127.0.0.1:11435/v1",
+        "--pi-bin",
+        "/opt/pi",
+        "--max-tokens",
+        "1024",
         "--evidence-dir",
         "target/pi-acceptance/../../private",
       ]),
@@ -494,6 +817,10 @@ test("CLI parser exposes only the static acceptance arguments", () => {
         "post-recovery",
         "--base-url",
         "http://127.0.0.1:11435/v1",
+        "--pi-bin",
+        "/opt/pi",
+        "--max-tokens",
+        "1024",
         "--expected-config-sha256",
         "not-a-digest",
       ]),
@@ -508,16 +835,953 @@ test("CLI parser exposes only the static acceptance arguments", () => {
         "http://127.0.0.1:11435/v1",
         "--pi-bin",
         `pi${"\0"}private`,
+        "--max-tokens",
+        "1024",
       ]),
     /invalid/i,
   );
 });
 
-test("live Pi adapter fails truthfully until CLI flags and JSONL schema are qualified", async () => {
+test("qualified Pi CLI requires a bounded max-token request configuration", () => {
+  const required = [
+    "--phase",
+    "mac-local",
+    "--base-url",
+    "http://127.0.0.1:11435/v1",
+    "--pi-bin",
+    "/opt/pi",
+    "--max-tokens",
+    "1024",
+  ];
+  assert.deepEqual(parseArguments(required), {
+    phase: "mac-local",
+    baseUrl: "http://127.0.0.1:11435/v1",
+    piBin: "/opt/pi",
+    maxTokens: 1024,
+  });
+  assert.throws(() => parseArguments(required.slice(0, -2)), /max.tokens/i);
+  for (const value of ["0", "8192", "1.5", "words"]) {
+    assert.throws(
+      () => parseArguments([...required.slice(0, -1), value]),
+      /max.tokens/i,
+    );
+  }
+});
+
+test("qualified Pi config and argv pin the output field, trusted extension, and no-session mode", async () => {
+  const { buildQualifiedPiArgv, buildRuntimeModelsConfig } = await import(
+    "./pi-acceptance.mjs"
+  );
+  assert.deepEqual(
+    buildRuntimeModelsConfig("http://127.0.0.1:11435/v1", 1024),
+    {
+      providers: {
+        loxa: {
+          baseUrl: "http://127.0.0.1:11435/v1",
+          api: "openai-completions",
+          apiKey: "loxa-dummy-key",
+          models: [
+            {
+              id: "loxa",
+              name: "Loxa",
+              reasoning: false,
+              input: ["text"],
+              contextWindow: 8192,
+              maxTokens: 1024,
+              compat: { maxTokensField: "max_tokens" },
+            },
+          ],
+        },
+      },
+    },
+  );
+  const argv = buildQualifiedPiArgv("/trusted/acceptance-gate.mjs", "prompt");
+  assert.deepEqual(argv, [
+    "--provider",
+    "loxa",
+    "--model",
+    "loxa",
+    "--mode",
+    "json",
+    "--no-session",
+    "--tools",
+    "read,bash,write",
+    "--no-extensions",
+    "--extension",
+    "/trusted/acceptance-gate.mjs",
+    "--no-skills",
+    "--no-prompt-templates",
+    "--no-context-files",
+    "--no-themes",
+    "--no-approve",
+    "--offline",
+    "prompt",
+  ]);
+});
+
+test("qualified Pi JSONL requires the version-3 session, agent end, and agent settled", () => {
+  assert.throws(
+    () =>
+      adaptQualifiedPiJsonl(
+        successfulQualifiedLines().filter(
+          (line) => JSON.parse(line).type !== "agent_end",
+        ),
+      ),
+    /agent_end/i,
+  );
+});
+
+test("qualified Pi executable must resolve absolutely and report exactly version 0.82.1", async () => {
+  const { qualifyPiExecutable } = await import("./pi-acceptance.mjs");
+  await assert.doesNotReject(
+    qualifyPiExecutable("/opt/pi", {
+      resolveExecutable: async () => "/opt/pi",
+      readVersion: async () => "0.82.1\n",
+    }),
+  );
+  for (const [resolved, version] of [
+    ["pi", "0.82.1\n"],
+    ["/opt/pi", "0.82.0\n"],
+  ]) {
+    await assert.rejects(
+      qualifyPiExecutable("/opt/pi", {
+        resolveExecutable: async () => resolved,
+        readVersion: async () => version,
+      }),
+      /qualified Pi executable/i,
+    );
+  }
+});
+
+test("Windows taskkill cleanup resolves the system executable and waits for close or error", async () => {
+  const { terminateOwnedProcessTree } = await import("./pi-acceptance.mjs");
+  for (const terminal of [
+    ["close", 0, false],
+    ["close", 1, true],
+    ["error", new Error("unavailable"), true],
+  ]) {
+    const events = new EventEmitter();
+    events.unref = () => {};
+    const child = { pid: 42, kill: () => assert.fail("fallback must not run") };
+    const completion = terminateOwnedProcessTree({
+      child,
+      platform: "win32",
+      signal: "SIGTERM",
+      signalProcess: () => assert.fail("POSIX signal must not run"),
+      spawnTreeKiller: (program, argv) => {
+        assert.equal(program, "C:\\Windows\\System32\\taskkill.exe");
+        assert.deepEqual(argv, ["/PID", "42", "/T"]);
+        return events;
+      },
+      taskkillExecutable: "C:\\Windows\\System32\\taskkill.exe",
+    });
+    const [event, value, rejected] = terminal;
+    if (rejected) {
+      events.emit(event, value);
+      await assert.rejects(completion, /Pi process cleanup failed/i);
+    } else {
+      let settled = false;
+      completion.then(() => {
+        settled = true;
+      });
+      await Promise.resolve();
+      assert.equal(settled, false);
+      events.emit(event, value);
+      await completion;
+    }
+  }
+});
+
+test("qualified Pi JSONL maps correlated successful tools to the semantic trace", () => {
+  const lines = successfulQualifiedLines();
+  lines.splice(
+    3,
+    0,
+    JSON.stringify({
+      type: "tool_execution_update",
+      toolCallId: "read-1",
+      toolName: "read",
+      args: { path: "source.txt" },
+      partialResult: { content: "private partial result" },
+    }),
+  );
+  const trace = adaptQualifiedPiJsonl(lines);
+
+  assert.deepEqual(trace, successfulTrace());
+  assert.equal(JSON.stringify(trace).includes("private"), false);
+});
+
+test("qualified Pi JSONL rejects edit as the canonical third completion", () => {
+  assert.throws(
+    () => adaptQualifiedPiJsonl(successfulQualifiedLines("edit")),
+    /tool correlation/i,
+  );
+});
+
+test("qualified Pi JSONL rejects every extra successful allowed tool completion", () => {
+  const insertions = [
+    { index: 2, toolCallId: "extra-before", toolName: "bash" },
+    { index: 4, toolCallId: "extra-within", toolName: "read" },
+    { index: 10, toolCallId: "extra-after", toolName: "write" },
+  ];
+  for (const { index, toolCallId, toolName } of insertions) {
+    const lines = successfulQualifiedLines();
+    lines.splice(
+      index,
+      0,
+      JSON.stringify({
+        type: "tool_execution_start",
+        toolCallId,
+        toolName,
+        args: { private: "PRIVATE ARGUMENT" },
+      }),
+      JSON.stringify({
+        type: "tool_execution_end",
+        toolCallId,
+        toolName,
+        result: { content: "PRIVATE RESULT" },
+        isError: false,
+      }),
+    );
+
+    assert.throws(
+      () => adaptQualifiedPiJsonl(lines),
+      (error) =>
+        /exactly four successful tool completions/i.test(error.message) &&
+        !error.message.includes("PRIVATE"),
+    );
+  }
+  assert.throws(
+    () =>
+      validateSemanticToolTrace([
+        ...successfulTrace(),
+        { tool: "read", status: "success" },
+      ]),
+    /tool trace/i,
+  );
+});
+
+test("qualified Pi JSONL requires exact private payload object fields", () => {
+  const mutations = [
+    ["tool_execution_start", "args", undefined],
+    ["tool_execution_start", "args", []],
+    ["tool_execution_update", "args", undefined],
+    ["tool_execution_update", "args", "PRIVATE ARGUMENT"],
+    ["tool_execution_update", "partialResult", undefined],
+    ["tool_execution_update", "partialResult", []],
+    ["tool_execution_end", "result", undefined],
+    ["tool_execution_end", "result", "PRIVATE RESULT"],
+  ];
+  for (const [type, field, value] of mutations) {
+    const lines = successfulQualifiedLines();
+    if (type === "tool_execution_update") {
+      lines.splice(
+        3,
+        0,
+        JSON.stringify({
+          type,
+          toolCallId: "read-1",
+          toolName: "read",
+          args: { path: "PRIVATE PATH" },
+          partialResult: { content: "PRIVATE RESULT" },
+        }),
+      );
+    }
+    const index = lines.findIndex(
+      (line) => JSON.parse(line).type === type,
+    );
+    const record = JSON.parse(lines[index]);
+    if (value === undefined) {
+      delete record[field];
+    } else {
+      record[field] = value;
+    }
+    lines[index] = JSON.stringify(record);
+
+    assert.throws(
+      () => adaptQualifiedPiJsonl(lines),
+      (error) =>
+        /Pi JSONL event shape is invalid/i.test(error.message) &&
+        !error.message.includes("PRIVATE"),
+    );
+  }
+});
+
+test("qualified Pi JSONL rejects malformed ambiguous mismatched and failed records privately", () => {
+  const rejected = [
+    ["{PRIVATE MALFORMED", /invalid Pi JSONL/i],
+    [
+      JSON.stringify({
+        type: "tool_execution_end",
+        toolCallId: "unknown",
+        toolName: "read",
+        result: { content: "PRIVATE RESULT" },
+        isError: false,
+      }),
+      /tool correlation/i,
+    ],
+    [
+      [
+        ...successfulQualifiedLines().slice(0, 3),
+        JSON.stringify({
+          type: "tool_execution_end",
+          toolCallId: "read-1",
+          toolName: "bash",
+          result: { content: "PRIVATE RESULT" },
+          isError: false,
+        }),
+      ],
+      /tool correlation/i,
+    ],
+    [
+      [
+        JSON.stringify({
+          type: "tool_execution_start",
+          toolCallId: "read-1",
+          toolName: "read",
+          args: { path: "PRIVATE PATH" },
+        }),
+        JSON.stringify({
+          type: "tool_execution_end",
+          toolCallId: "read-1",
+          toolName: "read",
+          result: { content: "PRIVATE RESULT" },
+          isError: true,
+        }),
+      ],
+      /tool execution failed/i,
+    ],
+    [JSON.stringify({ type: "unknown_private_event" }), /unknown Pi JSONL/i],
+    [
+      [
+        JSON.stringify({ type: "agent_start" }),
+        JSON.stringify({ type: "session", version: 3 }),
+      ],
+      /session/i,
+    ],
+    [
+      [
+        JSON.stringify({ type: "agent_end" }),
+        JSON.stringify({ type: "agent_end" }),
+      ],
+      /duplicate terminal/i,
+    ],
+    [
+      [
+        JSON.stringify({
+          type: "tool_execution_start",
+          toolCallId: "read-1",
+          toolName: "read",
+          args: { path: "PRIVATE PATH" },
+        }),
+        JSON.stringify({
+          type: "tool_execution_update",
+          toolCallId: "other",
+          toolName: "read",
+          args: { path: "PRIVATE PATH" },
+          partialResult: { content: "PRIVATE RESULT" },
+        }),
+      ],
+      /tool correlation/i,
+    ],
+    [
+      [
+        JSON.stringify({
+          type: "tool_execution_start",
+          toolCallId: "read-1",
+          toolName: "read",
+          args: { path: "PRIVATE PATH" },
+        }),
+        JSON.stringify({
+          type: "tool_execution_end",
+          toolCallId: "read-1",
+          toolName: "read",
+          result: { content: "PRIVATE RESULT" },
+        }),
+      ],
+      /tool execution failed/i,
+    ],
+    [
+      [
+        ...successfulQualifiedLines(),
+        JSON.stringify({ type: "agent_settled" }),
+      ],
+      /duplicate terminal/i,
+    ],
+  ];
+
+  for (const [lines, expected] of rejected) {
+    assert.throws(
+      () => adaptQualifiedPiJsonl(Array.isArray(lines) ? lines : [lines]),
+      (error) =>
+        expected.test(error.message) && !error.message.includes("PRIVATE"),
+    );
+  }
+});
+
+test("qualified Pi JSONL requires settled lifecycle and no pending tool call", () => {
+  assert.throws(
+    () => adaptQualifiedPiJsonl(successfulQualifiedLines().slice(0, -1)),
+    /agent_settled/i,
+  );
+  assert.throws(
+    () =>
+      adaptQualifiedPiJsonl([
+        JSON.stringify({
+          type: "tool_execution_start",
+          toolCallId: "pending",
+          toolName: "read",
+          args: { path: "source.txt" },
+        }),
+        JSON.stringify({ type: "agent_settled" }),
+      ]),
+    /pending tool/i,
+  );
+  assert.throws(
+    () =>
+      adaptQualifiedPiJsonl(
+        Array.from({ length: 10_001 }, () =>
+          JSON.stringify({ type: "agent_start" }),
+        ),
+      ),
+    /line count/i,
+  );
+});
+
+test("qualified Pi adapter uses exact argv isolated env config endpoints and cleanup", async () => {
+  await withFakeGateway(async ({ baseUrl, requests }) => {
+    const capture = {};
+    const result = await runQualifiedPiAdapter(
+      {
+        phase: "mac-local",
+        baseUrl,
+        piBin: "/fake/pi",
+        maxTokens: 1024,
+        processTimeoutMs: 1000,
+      },
+      {
+        platform: "darwin",
+        sourceEnvironment: {
+          PATH: "/usr/bin:/bin",
+          LANG: "en_US.UTF-8",
+          OPENAI_API_KEY: "must-not-leak",
+        },
+        spawnProcess: fakeSpawn(
+          { lines: successfulQualifiedLines(), writeExpectedResult: true },
+          capture,
+        ),
+      },
+    );
+
+    const prompt = await readFile(
+      path.join(repositoryRoot, "examples/pi/tool-loop/prompt.txt"),
+      "utf8",
+    );
+    const extensionPath = path.join(
+      repositoryRoot,
+      "examples/pi/tool-loop/acceptance-gate.mjs",
+    );
+    assert.equal(capture.program, "/fake/pi");
+    assert.deepEqual(capture.argv, [
+      "--provider",
+      "loxa",
+      "--model",
+      "loxa",
+      "--mode",
+      "json",
+      "--no-session",
+      "--tools",
+      "read,bash,write",
+      "--no-extensions",
+      "--extension",
+      extensionPath,
+      "--no-skills",
+      "--no-prompt-templates",
+      "--no-context-files",
+      "--no-themes",
+      "--no-approve",
+      "--offline",
+      prompt,
+    ]);
+    assert.equal(capture.argv.includes("--print"), false);
+    assert.equal(capture.options.detached, true);
+    assert.equal(capture.options.shell, false);
+    assert.deepEqual(capture.options.stdio, ["ignore", "pipe", "pipe"]);
+    assert.equal(capture.options.windowsHide, true);
+    assert.equal(
+      path.relative(repositoryRoot, capture.options.cwd).startsWith(".."),
+      true,
+    );
+    assert.equal(capture.options.env.OPENAI_API_KEY, undefined);
+    assert.deepEqual(Object.keys(capture.options.env).sort(), [
+      "HOME",
+      "LANG",
+      "PATH",
+      "PI_CODING_AGENT_DIR",
+      "PI_OFFLINE",
+      "PI_SKIP_VERSION_CHECK",
+      "PI_TELEMETRY",
+      "TMPDIR",
+      "XDG_CACHE_HOME",
+      "XDG_CONFIG_HOME",
+      "XDG_DATA_HOME",
+    ]);
+    assert.equal(capture.options.env.PI_OFFLINE, "1");
+    assert.equal(capture.options.env.PI_TELEMETRY, "0");
+    assert.equal(capture.options.env.PI_SKIP_VERSION_CHECK, "1");
+    assert.equal(
+      path.basename(
+        path.join(
+          capture.options.env.PI_CODING_AGENT_DIR,
+          "models.json",
+        ),
+      ),
+      "models.json",
+    );
+    assert.equal(
+      capture.modelsConfig.providers.loxa.models[0].maxTokens,
+      1024,
+    );
+    assert.equal(
+      capture.modelsConfig.providers.loxa.models[0].compat.maxTokensField,
+      "max_tokens",
+    );
+    assert.equal(capture.modelsConfig.providers.loxa.baseUrl, baseUrl);
+    assert.deepEqual(requests, [
+      "/v1/models",
+      "/loxa/status",
+      "/v1/models",
+      "/loxa/status",
+    ]);
+    assert.deepEqual(result.semanticTrace, successfulTrace());
+    assert.match(result.providerConfigSha256, /^[a-f0-9]{64}$/);
+    assert.equal(JSON.stringify(result).includes("private"), false);
+    await assertMissing(capture.options.cwd);
+    await assertMissing(capture.options.env.HOME);
+    await assertMissing(capture.options.env.PI_CODING_AGENT_DIR);
+  });
+});
+
+test("qualified Pi adapter accepts its live default process environment without a real spawn", async () => {
+  await withFakeGateway(async ({ baseUrl }) => {
+    const capture = {};
+    const result = await runQualifiedPiAdapter(
+      {
+        phase: "mac-local",
+        baseUrl,
+        piBin: "/fake/pi",
+        qualifiedMaxTokens: 1024,
+        processTimeoutMs: 1000,
+      },
+      {
+        platform: "darwin",
+        spawnProcess: fakeSpawn(
+          { lines: successfulQualifiedLines(), writeExpectedResult: true },
+          capture,
+        ),
+      },
+    );
+    const allowedKeys = new Set([
+      "PATH",
+      "LANG",
+      "LC_ALL",
+      "LC_CTYPE",
+      "HOME",
+      "XDG_CONFIG_HOME",
+      "XDG_CACHE_HOME",
+      "XDG_DATA_HOME",
+      "TMPDIR",
+      "PI_CODING_AGENT_DIR",
+      "PI_OFFLINE",
+      "PI_SKIP_VERSION_CHECK",
+      "PI_TELEMETRY",
+    ]);
+
+    assert.deepEqual(result.semanticTrace, successfulTrace());
+    assert.equal(
+      Object.keys(capture.options.env).every((key) =>
+        allowedKeys.has(key),
+      ),
+      true,
+    );
+    assert.equal(capture.options.env.OPENAI_API_KEY, undefined);
+    await assertMissing(capture.options.cwd);
+  });
+});
+
+test("qualified Pi adapter bounds gateway response bodies before spawning", async () => {
+  let spawned = false;
+  await withFakeGateway(
+    async ({ baseUrl }) => {
+      await assert.rejects(
+        runQualifiedPiAdapter(
+          {
+            phase: "mac-local",
+            baseUrl,
+            piBin: "/fake/pi",
+            qualifiedMaxTokens: 1024,
+            processTimeoutMs: 1000,
+          },
+          {
+            platform: "darwin",
+            sourceEnvironment: { PATH: "/usr/bin:/bin" },
+            spawnProcess: () => {
+              spawned = true;
+              throw new Error("must not spawn");
+            },
+          },
+        ),
+        /gateway acceptance response exceeded/i,
+      );
+    },
+    { models: JSON.stringify({ padding: "x".repeat(64 * 1024) }) },
+  );
+  assert.equal(spawned, false);
+});
+
+test("qualified Pi adapter rejects nonzero exit and process errors without leaking stderr", async () => {
+  for (const scenario of [
+    {
+      lines: successfulQualifiedLines(),
+      stderrBytes: "PRIVATE STDERR",
+      exitCode: 7,
+    },
+    { processError: true },
+  ]) {
+    await withFakeGateway(async ({ baseUrl }) => {
+      await assert.rejects(
+        runQualifiedPiAdapter(
+          {
+            phase: "mac-local",
+            baseUrl,
+            piBin: "/fake/pi",
+            qualifiedMaxTokens: 1024,
+            processTimeoutMs: 1000,
+          },
+          {
+            platform: "darwin",
+            sourceEnvironment: { PATH: "/usr/bin:/bin" },
+            spawnProcess: fakeSpawn(scenario),
+          },
+        ),
+        (error) =>
+          /Pi process/i.test(error.message) &&
+          !error.message.includes("PRIVATE"),
+      );
+    });
+  }
+});
+
+test("qualified Pi adapter enforces stdout stderr line and lifecycle bounds", async () => {
+  const scenarios = [
+    { stdoutBytes: Buffer.alloc(1024 * 1024 + 1, 120) },
+    { stdoutBytes: `${"x".repeat(64 * 1024 + 1)}\n` },
+    { stderrBytes: Buffer.alloc(64 * 1024 + 1, 120), hang: false },
+  ];
+  for (const scenario of scenarios) {
+    await withFakeGateway(async ({ baseUrl }) => {
+      await assert.rejects(
+        runQualifiedPiAdapter(
+          {
+            phase: "mac-local",
+            baseUrl,
+            piBin: "/fake/pi",
+            qualifiedMaxTokens: 1024,
+            processTimeoutMs: 1000,
+          },
+          {
+            platform: "darwin",
+            sourceEnvironment: { PATH: "/usr/bin:/bin" },
+            spawnProcess: fakeSpawn(scenario),
+          },
+        ),
+        /Pi process output limit/i,
+      );
+    });
+  }
+});
+
+test("qualified Pi adapter times out and honors cancellation with child termination", async () => {
+  await withFakeGateway(async ({ baseUrl }) => {
+    const timeoutCapture = {};
+    await assert.rejects(
+      runQualifiedPiAdapter(
+        {
+          phase: "mac-local",
+          baseUrl,
+          piBin: "/fake/pi",
+          qualifiedMaxTokens: 1024,
+          processTimeoutMs: 20,
+        },
+        {
+          platform: "darwin",
+          sourceEnvironment: { PATH: "/usr/bin:/bin" },
+          spawnProcess: fakeSpawn({ hang: true }, timeoutCapture),
+        },
+      ),
+      /timed out/i,
+    );
+    assert.deepEqual(timeoutCapture.kills, ["SIGTERM", "SIGKILL"]);
+
+    const controller = new AbortController();
+    const cancellationCapture = {};
+    await assert.rejects(
+      runQualifiedPiAdapter(
+        {
+          phase: "mac-local",
+          baseUrl,
+          piBin: "/fake/pi",
+          qualifiedMaxTokens: 1024,
+          processTimeoutMs: 1000,
+          signal: controller.signal,
+        },
+        {
+          platform: "darwin",
+          sourceEnvironment: { PATH: "/usr/bin:/bin" },
+          spawnProcess: fakeSpawn(
+            { hang: true, onStart: () => controller.abort() },
+            cancellationCapture,
+          ),
+        },
+      ),
+      /cancelled/i,
+    );
+    assert.deepEqual(cancellationCapture.kills, ["SIGTERM", "SIGKILL"]);
+
+    const fallbackCapture = {};
+    await assert.rejects(
+      runQualifiedPiAdapter(
+        {
+          phase: "mac-local",
+          baseUrl,
+          piBin: "/fake/pi",
+          qualifiedMaxTokens: 1024,
+          processTimeoutMs: 20,
+        },
+        {
+          platform: "darwin",
+          sourceEnvironment: { PATH: "/usr/bin:/bin" },
+          spawnProcess: fakeSpawn(
+            { hang: true, ignoreSigterm: true },
+            fallbackCapture,
+          ),
+        },
+      ),
+      /timed out/i,
+    );
+    assert.deepEqual(fallbackCapture.kills, ["SIGTERM", "SIGKILL"]);
+  });
+});
+
+test("qualified Pi adapter owns macOS and Windows process trees", async () => {
+  const cases = [
+    {
+      platform: "darwin",
+      expected: [
+        { pid: -4242, signal: "SIGTERM" },
+        { pid: -4242, signal: "SIGKILL" },
+      ],
+    },
+    {
+      platform: "win32",
+      expected: [
+        {
+          program: "C:\\Windows\\System32\\taskkill.exe",
+          argv: ["/PID", "4242", "/T"],
+          options: {
+            shell: false,
+            stdio: "ignore",
+            windowsHide: true,
+          },
+        },
+        {
+          program: "C:\\Windows\\System32\\taskkill.exe",
+          argv: ["/PID", "4242", "/T", "/F"],
+          options: {
+            shell: false,
+            stdio: "ignore",
+            windowsHide: true,
+          },
+        },
+      ],
+    },
+  ];
+  for (const { platform, expected } of cases) {
+    await withFakeGateway(async ({ baseUrl }) => {
+      const capture = {};
+      const treeSignals = [];
+      const treeKillers = [];
+      const adapter = runQualifiedPiAdapter(
+        {
+          phase: "mac-local",
+          baseUrl,
+          piBin: "/fake/pi",
+          qualifiedMaxTokens: 1024,
+          processTimeoutMs: 10,
+        },
+        {
+          platform: "darwin",
+          processPlatform: platform,
+          sourceEnvironment: { PATH: "/usr/bin:/bin" },
+          spawnProcess: fakeSpawn(
+            { hang: true, pid: 4242, ignoreAllKills: true },
+            capture,
+          ),
+          signalProcess: (pid, signal) => {
+            treeSignals.push({ pid, signal });
+          },
+          spawnTreeKiller: (program, argv, options) => {
+            treeKillers.push({ program, argv, options });
+            const killer = new EventEmitter();
+            killer.unref = () => {};
+            queueMicrotask(() => killer.emit("close", 0));
+            return killer;
+          },
+        },
+      );
+      const outcome = await observeSettlement(adapter, 1000);
+      if (outcome.status === "watchdog") {
+        capture.close(null, "SIGKILL");
+        await assert.rejects(adapter);
+      }
+
+      assert.equal(outcome.status, "rejected");
+      assert.match(outcome.error.message, /timed out/i);
+      assert.deepEqual(
+        platform === "win32" ? treeKillers : treeSignals,
+        expected,
+      );
+      assert.equal(capture.options.detached, platform !== "win32");
+      await assertMissing(capture.options.cwd);
+    });
+  }
+});
+
+test("qualified Pi adapter forces the owned group after the direct child closes", async () => {
+  await withFakeGateway(async ({ baseUrl }) => {
+    const capture = {};
+    const treeSignals = [];
+    const adapter = runQualifiedPiAdapter(
+      {
+        phase: "mac-local",
+        baseUrl,
+        piBin: "/fake/pi",
+        qualifiedMaxTokens: 1024,
+        processTimeoutMs: 10,
+      },
+      {
+        platform: "darwin",
+        sourceEnvironment: { PATH: "/usr/bin:/bin" },
+        spawnProcess: fakeSpawn(
+          { hang: true, pid: 4242, ignoreAllKills: true },
+          capture,
+        ),
+        signalProcess: (pid, signal) => {
+          treeSignals.push({ pid, signal });
+          if (signal === "SIGTERM") {
+            queueMicrotask(() => capture.close(null, signal));
+          }
+        },
+      },
+    );
+
+    await assert.rejects(adapter, /timed out/i);
+    assert.deepEqual(treeSignals, [
+      { pid: -4242, signal: "SIGTERM" },
+      { pid: -4242, signal: "SIGKILL" },
+    ]);
+    await assertMissing(capture.options.cwd);
+  });
+});
+
+test("qualified Pi adapter handles asynchronous Windows tree-killer failure privately", async () => {
+  await withFakeGateway(async ({ baseUrl }) => {
+    const capture = {};
+    const adapter = runQualifiedPiAdapter(
+      {
+        phase: "mac-local",
+        baseUrl,
+        piBin: "/fake/pi",
+        qualifiedMaxTokens: 1024,
+        processTimeoutMs: 10,
+      },
+      {
+        platform: "darwin",
+        processPlatform: "win32",
+        sourceEnvironment: { PATH: "/usr/bin:/bin" },
+        spawnProcess: fakeSpawn(
+          { hang: true, pid: 4242, ignoreAllKills: true },
+          capture,
+        ),
+        spawnTreeKiller: () => {
+          const killer = new EventEmitter();
+          killer.unref = () => {};
+          queueMicrotask(() =>
+            killer.emit("error", new Error("PRIVATE TASKKILL ERROR")),
+          );
+          return killer;
+        },
+      },
+    );
+
+    await assert.rejects(
+      adapter,
+      (error) =>
+        /Pi process cleanup failed/i.test(error.message) &&
+        !error.message.includes("PRIVATE"),
+    );
+    assert.deepEqual(capture.kills, []);
+    await assertMissing(capture.options.cwd);
+  });
+});
+
+test("qualified Pi adapter rejects by a terminal deadline and cleans descendant-held pipes", async () => {
+  for (const scenario of [
+    { hang: true, ignoreAllKills: true },
+    { hang: true, descendantKeepsPipes: true },
+  ]) {
+    await withFakeGateway(async ({ baseUrl }) => {
+      const capture = {};
+      const adapter = runQualifiedPiAdapter(
+        {
+          phase: "mac-local",
+          baseUrl,
+          piBin: "/fake/pi",
+          qualifiedMaxTokens: 1024,
+          processTimeoutMs: 10,
+        },
+        {
+          platform: "darwin",
+          sourceEnvironment: { PATH: "/usr/bin:/bin" },
+          spawnProcess: fakeSpawn(scenario, capture),
+        },
+      );
+      const outcome = await observeSettlement(adapter, 1000);
+      if (outcome.status === "watchdog") {
+        capture.close(null, "SIGKILL");
+        await assert.rejects(adapter);
+      }
+
+      assert.equal(outcome.status, "rejected");
+      assert.match(outcome.error.message, /timed out/i);
+      assert.equal(capture.child.stdout.destroyed, true);
+      assert.equal(capture.child.stderr.destroyed, true);
+      await assertMissing(capture.options.cwd);
+    });
+  }
+});
+
+test("live Pi adapter remains blocked until a safe output limit is qualified", async () => {
   await assert.rejects(
     runQualifiedPiAdapter(),
     (error) =>
       error instanceof QualificationRequiredError &&
-      /qualification required/i.test(error.message),
+      /safe output-token limit qualification required/i.test(error.message),
   );
+  for (const invalid of [0, 8192, 1.5, "1024"]) {
+    await assert.rejects(
+      runQualifiedPiAdapter({ qualifiedMaxTokens: invalid }),
+      /qualified output-token limit/i,
+    );
+  }
 });

@@ -1,8 +1,11 @@
 Work only in the current directory and complete this exact task:
 
-1. Read source.txt.
+Make exactly four tool calls and no others, in this exact order: read, bash, write, bash.
+
+1. Use read to read source.txt.
 2. Use bash to run `node verify.mjs --precheck`.
-3. Edit or write result.txt so it contains the sum of the two values from source.txt.
+3. Use write to write result.txt as exactly one `sum=<computed integer>` line followed by exactly one LF, with no spaces, Markdown, or extra line.
 4. Use bash to run `node verify.mjs` as the final verification.
 
+Never use bash before the read. Do not use edit or retry any tool call. Stop after the final verification.
 Do not create, delete, rename, link, or modify any other file.
