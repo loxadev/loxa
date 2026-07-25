@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import {
   cp,
+  link,
   lstat,
   mkdir,
   mkdtemp,
@@ -238,9 +239,15 @@ export function validateReadyStatus(response) {
   if (
     !isPlainObject(response) ||
     response.health !== "ready" ||
-    response.model !== "loxa"
+    response.model !== "loxa" ||
+    !isPlainObject(response.engine) ||
+    response.engine.name !== "llama-cpp" ||
+    typeof response.engine.version !== "string" ||
+    !/^version: 10107 \(c0bc8591e\)(?:\n[^\r\n]*)?$/.test(
+      response.engine.version,
+    )
   ) {
-    fail("status response is not ready for the stable loxa model");
+    fail("status response is not ready for the qualified stable loxa model");
   }
   return true;
 }
@@ -783,6 +790,48 @@ function validateEvidenceDirectory(value) {
   return normalized;
 }
 
+async function writeSanitizedEvidence(evidenceDirectory, evidence) {
+  let directory = repositoryRoot;
+  for (const component of evidenceDirectory.split("/")) {
+    directory = path.join(directory, component);
+    try {
+      await mkdir(directory, { mode: 0o700 });
+    } catch (error) {
+      if (error?.code !== "EEXIST") {
+        throw error;
+      }
+    }
+    const metadata = await lstat(directory);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+      fail("evidence directory is unsafe");
+    }
+  }
+  const destination = path.join(directory, "evidence.json");
+  try {
+    await lstat(destination);
+    fail("evidence artifact already exists");
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      throw error;
+    }
+  }
+  const temporary = path.join(
+    directory,
+    `.evidence-${process.pid}-${randomUUID()}.tmp`,
+  );
+  const bytes = `${JSON.stringify(evidence)}\n`;
+  try {
+    await writeFile(temporary, bytes, {
+      encoding: "utf8",
+      mode: 0o600,
+      flag: "wx",
+    });
+    await link(temporary, destination);
+  } finally {
+    await rm(temporary, { force: true });
+  }
+}
+
 export function parseArguments(argv) {
   if (!Array.isArray(argv) || argv.length > 12) {
     fail("CLI arguments are invalid");
@@ -813,9 +862,10 @@ export function parseArguments(argv) {
     parsed.phase === undefined ||
     parsed.baseUrl === undefined ||
     parsed.piBin === undefined ||
-    parsed.maxTokens === undefined
+    parsed.maxTokens === undefined ||
+    parsed.evidenceDir === undefined
   ) {
-    fail("phase, base URL, Pi binary, and max tokens are required");
+    fail("phase, base URL, Pi binary, max tokens, and evidence directory are required");
   }
   validatePhaseEndpoint(
     parsed.phase,
@@ -830,9 +880,7 @@ export function parseArguments(argv) {
   if (!Number.isSafeInteger(parsed.maxTokens) || parsed.maxTokens >= 8192) {
     fail("max tokens must be an integer between 1 and 8191");
   }
-  if (parsed.evidenceDir !== undefined) {
-    parsed.evidenceDir = validateEvidenceDirectory(parsed.evidenceDir);
-  }
+  parsed.evidenceDir = validateEvidenceDirectory(parsed.evidenceDir);
   return parsed;
 }
 
@@ -1437,6 +1485,10 @@ export async function runQualifiedPiAdapter(
     options.baseUrl,
     options.expectedConfigSha256,
   );
+  const evidenceDirectory =
+    options.evidenceDir === undefined
+      ? undefined
+      : validateEvidenceDirectory(options.evidenceDir);
   const processTimeoutMs = options.processTimeoutMs ?? 120_000;
   if (
     !Number.isSafeInteger(processTimeoutMs) ||
@@ -1576,9 +1628,24 @@ export async function runQualifiedPiAdapter(
       changedPath: "result.txt",
     });
     await validateGatewayAcceptance(parsedEndpoint.toString(), options.signal);
+    const evidence = buildSanitizedEvidence({
+      phase: options.phase,
+      providerConfigSha256,
+      modelsBefore: true,
+      readyBefore: true,
+      toolOrder: true,
+      exactWorkspace: true,
+      verification: true,
+      modelsAfter: true,
+      readyAfter: true,
+    });
+    if (evidenceDirectory !== undefined) {
+      await writeSanitizedEvidence(evidenceDirectory, evidence);
+    }
     return {
       providerConfigSha256,
       semanticTrace,
+      evidence,
     };
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
@@ -1588,7 +1655,8 @@ export async function runQualifiedPiAdapter(
 async function main() {
   try {
     const options = parseArguments(process.argv.slice(2));
-    await runQualifiedPiAdapter(options);
+    const result = await runQualifiedPiAdapter(options);
+    process.stdout.write(`${JSON.stringify(result.evidence)}\n`);
   } catch (error) {
     if (error instanceof QualificationRequiredError) {
       console.error(error.message);
