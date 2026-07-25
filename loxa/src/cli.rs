@@ -3,7 +3,9 @@ use crate::model_commands::{
     bytes_to_gb_string, model_paths, model_status, remove_model_files, remove_user_entry,
     ModelStatus,
 };
-use crate::model_commands::{print_list, pull_model, remove_model, write_unknown_id};
+use crate::model_commands::{
+    print_list, pull_model, remove_model, user_registry_dir, write_unknown_id,
+};
 use clap::Parser;
 use loxa_core::control::auth::ControlToken;
 use loxa_core::control::client::{
@@ -21,7 +23,7 @@ use loxa_core::supervisor::{self, SupervisorError};
 use loxa_node::*;
 use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -193,9 +195,11 @@ pub(crate) fn main() -> ExitCode {
     let paths = NodePaths::detect();
     let diagnostics = matches!(&cli.command, Command::Serve { .. })
         .then(|| install_daemon_diagnostics(&paths.logs_dir));
+    let registry_dir = user_registry_dir();
     let exit_code = run_with_paths_and_diagnostics_health(
         cli,
         &paths,
+        &registry_dir,
         &mut io::stdout(),
         &mut io::stderr(),
         diagnostics.as_ref().map(|bootstrap| bootstrap.health()),
@@ -219,12 +223,24 @@ fn run_with_paths<W: Write, E: Write>(
     mut stdout: W,
     mut stderr: E,
 ) -> ExitCode {
-    run_with_paths_and_diagnostics_health(cli, paths, &mut stdout, &mut stderr, None)
+    let registry_dir = user_registry_dir();
+    run_with_paths_and_registry_dir(cli, paths, &registry_dir, &mut stdout, &mut stderr)
+}
+
+fn run_with_paths_and_registry_dir<W: Write, E: Write>(
+    cli: Cli,
+    paths: &NodePaths,
+    registry_dir: &Path,
+    mut stdout: W,
+    mut stderr: E,
+) -> ExitCode {
+    run_with_paths_and_diagnostics_health(cli, paths, registry_dir, &mut stdout, &mut stderr, None)
 }
 
 fn run_with_paths_and_diagnostics_health<W: Write, E: Write>(
     cli: Cli,
     paths: &NodePaths,
+    registry_dir: &Path,
     mut stdout: W,
     mut stderr: E,
     diagnostics_health: Option<loxa_core::diagnostics::DiagnosticsHealth>,
@@ -243,7 +259,7 @@ fn run_with_paths_and_diagnostics_health<W: Write, E: Write>(
                         &id,
                         quant.as_deref(),
                         &paths.models_dir,
-                        &model_registry_dir(paths),
+                        registry_dir,
                         &mut stdout,
                         &mut stderr,
                     )
@@ -265,7 +281,7 @@ fn run_with_paths_and_diagnostics_health<W: Write, E: Write>(
                     remove_model(
                         &id,
                         &paths.models_dir,
-                        &model_registry_dir(paths),
+                        registry_dir,
                         &mut stdout,
                         &mut stderr,
                     )
@@ -769,14 +785,6 @@ fn offline_rm_with(
     let _admission = supervisor::admit_offline_model_mutation(&paths.state_path)
         .map_err(supervisor_error_to_io)?;
     mutation()
-}
-
-fn model_registry_dir(paths: &NodePaths) -> PathBuf {
-    paths
-        .models_dir
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("registry.d")
 }
 
 fn live_control(paths: &NodePaths) -> io::Result<Option<LiveControlClient>> {
@@ -2936,6 +2944,7 @@ mod tests {
     #[test]
     fn unknown_pull_id_renders_error_and_valid_ids() {
         let temp = TempDir::new("unknown-pull-id");
+        let registry_dir = temp.path().join("registry.d");
         let paths = NodePaths {
             models_dir: temp.path().join("models"),
             state_path: temp.path().join("run").join("managed.json"),
@@ -2950,7 +2959,8 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
-        let exit = run_with_paths(cli, &paths, &mut stdout, &mut stderr);
+        let exit =
+            run_with_paths_and_registry_dir(cli, &paths, &registry_dir, &mut stdout, &mut stderr);
 
         assert_eq!(exit, std::process::ExitCode::from(1));
         assert!(stdout.is_empty());
@@ -2965,6 +2975,7 @@ mod tests {
     #[test]
     fn unknown_rm_id_renders_error_and_valid_ids() {
         let temp = TempDir::new("unknown-rm-id");
+        let registry_dir = temp.path().join("registry.d");
         let paths = NodePaths {
             models_dir: temp.path().join("models"),
             state_path: temp.path().join("run").join("managed.json"),
@@ -2978,7 +2989,8 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
-        let exit = run_with_paths(cli, &paths, &mut stdout, &mut stderr);
+        let exit =
+            run_with_paths_and_registry_dir(cli, &paths, &registry_dir, &mut stdout, &mut stderr);
 
         assert_eq!(exit, std::process::ExitCode::from(1));
         assert!(stdout.is_empty());
@@ -2991,7 +3003,7 @@ mod tests {
     }
 
     #[test]
-    fn offline_rm_uses_the_node_paths_model_and_registry_directories() {
+    fn offline_rm_uses_explicit_model_and_registry_directories() {
         let temp = TempDir::new("isolated-rm");
         let models_dir = temp.path().join("models");
         let registry_dir = temp.path().join("registry.d");
@@ -3020,7 +3032,8 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
-        let exit = run_with_paths(cli, &paths, &mut stdout, &mut stderr);
+        let exit =
+            run_with_paths_and_registry_dir(cli, &paths, &registry_dir, &mut stdout, &mut stderr);
 
         assert_eq!(exit, ExitCode::SUCCESS);
         assert!(stderr.is_empty());
