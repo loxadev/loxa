@@ -324,10 +324,7 @@ test("pre-execution acceptance gate blocks invalid sibling, retry, and result tr
     });
     assert.deepEqual(
       await gate.toolResult({ ...valid[step], toolCallId: "wrong-result", isError: false }),
-      {
-        block: true,
-        reason: "Pi acceptance tool call is not the next exact step.",
-      },
+      { isError: true },
     );
     assert.deepEqual(await gate(valid[step]), {
       block: true,
@@ -339,10 +336,7 @@ test("pre-execution acceptance gate blocks invalid sibling, retry, and result tr
   assert.equal(await errorGate(valid[0]), undefined);
   assert.deepEqual(
     await errorGate.toolResult({ ...valid[0], isError: true }),
-    {
-      block: true,
-      reason: "Pi acceptance tool call is not the next exact step.",
-    },
+    { isError: true },
   );
   assert.deepEqual(await errorGate(valid[0]), {
     block: true,

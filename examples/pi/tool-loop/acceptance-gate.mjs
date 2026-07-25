@@ -59,7 +59,7 @@ export function createAcceptanceGate() {
     ) {
       failed = true;
       pending = undefined;
-      return BLOCKED;
+      return { isError: true };
     }
     pending = undefined;
     step += 1;
