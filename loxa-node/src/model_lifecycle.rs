@@ -1111,7 +1111,7 @@ mod tests {
     }
 
     #[test]
-    fn fixed_pair_plan_accepts_the_real_aggregate_inventory_contract() {
+    fn fixed_pair_inventory_reports_real_metadata_and_aggregate_size() {
         let dir = std::env::temp_dir().join(format!(
             "loxa-plan-inventory-{}",
             loxa_protocol::v2::OperationId::new_v4()

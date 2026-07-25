@@ -21,7 +21,7 @@ use crate::verification_scheduler::{
 };
 use loxa_core::supervisor::ObservedChildExit;
 use loxa_protocol::v2::{DecimalU64, OperationId};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1131,6 +1131,41 @@ struct BlockingVerificationWorkflow {
     cancel_acknowledgement: LifecycleCancelAcknowledgement,
 }
 
+struct PausedResumeWorkflow {
+    completion: mpsc::Sender<LifecycleVerificationCompletion>,
+    resume_entered: mpsc::Sender<()>,
+    cancellation_seen: Arc<AtomicBool>,
+}
+
+impl LifecycleLoadWorkflow for PausedResumeWorkflow {
+    fn submit_load(
+        &mut self,
+        _request: &LifecycleLoadRequest,
+        completion: LifecycleVerificationCompletion,
+    ) -> Result<LifecycleLoadSubmission, LifecycleError> {
+        self.completion.send(completion).unwrap();
+        Ok(LifecycleLoadSubmission::Verifying)
+    }
+
+    fn resume_verified(
+        &mut self,
+        _request: &LifecycleLoadRequest,
+        _evidence: &loxa_core::model_inventory::VerifiedArtifact,
+        cancellation: &MutationCancellation,
+    ) -> Result<LaunchPlan, LifecycleError> {
+        self.resume_entered.send(()).unwrap();
+        while !cancellation.is_cancelled() {
+            std::thread::yield_now();
+        }
+        self.cancellation_seen.store(true, Ordering::SeqCst);
+        Err(LifecycleError::Cancelled)
+    }
+
+    fn cancel(&mut self, _operation_id: &OperationId) -> LifecycleCancelAcknowledgement {
+        LifecycleCancelAcknowledgement::DurablyConfirmed
+    }
+}
+
 impl LifecycleLoadWorkflow for BlockingVerificationWorkflow {
     fn submit_load(
         &mut self,
@@ -1241,6 +1276,77 @@ fn publish_lifecycle_verification(
                 matches: true,
             }),
         })
+        .unwrap();
+}
+
+#[test]
+fn active_cancel_during_verified_resume_prevents_load_readiness_and_publish() {
+    struct CountingGateway(Arc<AtomicUsize>);
+    impl GatewayPublisher for CountingGateway {
+        fn withdraw(&mut self) {}
+        fn publish(&mut self, _: &LaunchPlan, _: &SessionCorrelation) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let dir = TestDir::new("resume-cancel");
+    let path = dir.0.join("model.gguf");
+    std::fs::write(&path, b"artifact").unwrap();
+    let artifact_key = ArtifactKey::from_destination(&path).unwrap();
+    let coordinator = ArtifactMutationCoordinator::new();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let publishes = Arc::new(AtomicUsize::new(0));
+    let cancellation_seen = Arc::new(AtomicBool::new(false));
+    let (completion_tx, completion_rx) = mpsc::channel();
+    let (resume_entered_tx, resume_entered_rx) = mpsc::channel();
+    let lifecycle = ModelLifecycle::new(
+        StableNodeOwner {
+            run_id: "owner-resume-cancel".into(),
+            pid: 93,
+            process_start_time_unix_s: 94,
+            gateway_port: 8093,
+        },
+        TestDriver {
+            events: Arc::clone(&events),
+            live: Arc::new(AtomicUsize::new(0)),
+            ready_entered: None,
+            stop_error: false,
+            panic_stop: false,
+        },
+        CountingGateway(Arc::clone(&publishes)),
+    );
+    let (handle, owner) = LifecycleControllerOwner::start_with_workflow(
+        lifecycle,
+        PausedResumeWorkflow {
+            completion: completion_tx,
+            resume_entered: resume_entered_tx,
+            cancellation_seen: Arc::clone(&cancellation_seen),
+        },
+    )
+    .unwrap();
+    let operation_id = OperationId::new_v4();
+    handle
+        .reserve_normal()
+        .unwrap()
+        .submit(load(operation_id, "loxa", 1))
+        .unwrap();
+    let completion = completion_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    publish_lifecycle_verification(completion, operation_id, &coordinator, &artifact_key);
+    resume_entered_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("resume entered after target verification evidence");
+
+    handle.cancel(operation_id).unwrap();
+    let completion = owner
+        .recv_completion_timeout(Duration::from_secs(1))
+        .expect("cancelled lifecycle completion");
+
+    assert_eq!(completion.result(), &Err(LifecycleError::Cancelled));
+    assert!(cancellation_seen.load(Ordering::SeqCst));
+    assert!(events.lock().unwrap().is_empty());
+    assert_eq!(publishes.load(Ordering::SeqCst), 0);
+    owner
+        .shutdown(Instant::now() + Duration::from_secs(1))
         .unwrap();
 }
 
