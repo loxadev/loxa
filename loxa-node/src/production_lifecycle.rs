@@ -709,7 +709,7 @@ mod tests {
             &plan,
             "loxa-owner-g1",
             11_435,
-            "b10107",
+            "version: 10107 (c0bc8591e)\nbuilt with AppleClang",
         )
         .unwrap();
 
@@ -745,6 +745,37 @@ mod tests {
                 std::ffi::OsString::from("--log-disable"),
             ]
         );
+    }
+
+    #[test]
+    fn managed_fixed_plan_rejects_an_unqualified_runtime_before_spawn() {
+        let plan = LaunchPlan {
+            model_id: "loxa".into(),
+            artifact_path: PathBuf::from("/models/gemma 4 target.gguf"),
+            engine: "llama-cpp".into(),
+            ctx_size: 8_192,
+            jinja: true,
+            speculative: Some(crate::model_lifecycle::SpeculativeLaunchPlan {
+                drafter_path: PathBuf::from("/models/gemma 4 drafter.gguf"),
+                spec_type: "draft-mtp".into(),
+                draft_n_max: 4,
+            }),
+        };
+
+        let error = build_managed_llama_launch_spec(
+            std::path::Path::new("/opt/llama/llama-server"),
+            &plan,
+            "loxa-owner-g1",
+            11_435,
+            "version: 10107 (deadbeef0)",
+        )
+        .expect_err("qualified managed runtime must be rejected before spawn");
+
+        assert!(matches!(
+            error,
+            LifecycleError::StartFailed(ref message)
+                if message == "qualified Gemma 4 MTP requires llama.cpp version: 10107 (c0bc8591e)"
+        ));
     }
 
     #[test]

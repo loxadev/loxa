@@ -3,6 +3,10 @@ use std::ffi::OsString;
 use std::fmt;
 use std::path::Path;
 
+pub const QUALIFIED_LLAMA_CPP_BUILD: &str = "10107";
+pub const QUALIFIED_LLAMA_CPP_COMMIT: &str = "c0bc8591e";
+pub const QUALIFIED_LLAMA_CPP_VERSION_FIRST_LINE: &str = "version: 10107 (c0bc8591e)";
+
 #[derive(Clone, Copy, Debug)]
 pub enum LlamaCppLaunchMode<'a> {
     Unpaired {
@@ -30,6 +34,7 @@ pub struct LlamaCppLaunchInput<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LlamaCppLaunchError {
     InvalidQualifiedProfile { field: &'static str },
+    UnqualifiedRuntimeVersion,
 }
 
 impl fmt::Display for LlamaCppLaunchError {
@@ -41,6 +46,10 @@ impl fmt::Display for LlamaCppLaunchError {
                     "invalid qualified llama.cpp profile field: {field}"
                 )
             }
+            Self::UnqualifiedRuntimeVersion => write!(
+                formatter,
+                "qualified Gemma 4 MTP requires llama.cpp version: {QUALIFIED_LLAMA_CPP_BUILD} ({QUALIFIED_LLAMA_CPP_COMMIT})"
+            ),
         }
     }
 }
@@ -79,6 +88,7 @@ pub fn build_launch_spec(
             spec_type,
             draft_n_max,
         } => {
+            validate_qualified_runtime_version(input.engine_version)?;
             let profile = crate::runtime_profile::runtime_profile("loxa")
                 .expect("qualified Gemma 4 MTP runtime profile");
             validate_qualified_profile(ctx_size, jinja, spec_type, draft_n_max, profile)?;
@@ -118,6 +128,13 @@ pub fn build_launch_spec(
             expected_alias: input.alias.into(),
         },
     })
+}
+
+fn validate_qualified_runtime_version(engine_version: &str) -> Result<(), LlamaCppLaunchError> {
+    match engine_version.lines().next() {
+        Some(QUALIFIED_LLAMA_CPP_VERSION_FIRST_LINE) => Ok(()),
+        _ => Err(LlamaCppLaunchError::UnqualifiedRuntimeVersion),
+    }
 }
 
 fn validate_qualified_profile(
@@ -176,7 +193,7 @@ mod tests {
             target,
             alias: "loxa-run-g2",
             port: 11_436,
-            engine_version: "b10107",
+            engine_version: "version: 10107 (c0bc8591e)\nbuilt with AppleClang",
             mode: LlamaCppLaunchMode::QualifiedGemma4Mtp {
                 drafter,
                 ctx_size,
@@ -362,6 +379,48 @@ mod tests {
                 field: "draft-n-max"
             })
         );
+    }
+
+    #[test]
+    fn qualified_mode_accepts_the_exact_pinned_llama_version_first_line() {
+        let program = Path::new("/opt/llama/llama-server");
+        let target = Path::new("/models/target.gguf");
+        let drafter = Path::new("/models/drafter.gguf");
+
+        assert!(build_launch_spec(qualified_input(
+            program,
+            target,
+            drafter,
+            8_192,
+            true,
+            "draft-mtp",
+            4,
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn qualified_mode_rejects_any_non_exact_llama_version_first_line() {
+        let program = Path::new("/opt/llama/llama-server");
+        let target = Path::new("/models/target.gguf");
+        let drafter = Path::new("/models/drafter.gguf");
+
+        for version in [
+            "version: 10108 (c0bc8591e)",
+            "version: 10107 (deadbeef0)",
+            "version: 10107",
+            "version: 10107 (c0bc8591e) extra",
+            "untrusted version: 10107 (c0bc8591e)",
+            "version: 10108 (deadbeef0)\nversion: 10107 (c0bc8591e)",
+        ] {
+            let mut input = qualified_input(program, target, drafter, 8_192, true, "draft-mtp", 4);
+            input.engine_version = version;
+
+            assert!(matches!(
+                build_launch_spec(input),
+                Err(LlamaCppLaunchError::UnqualifiedRuntimeVersion)
+            ));
+        }
     }
 
     #[test]

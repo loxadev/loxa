@@ -3259,7 +3259,7 @@ mod lifecycle_api_tests {
             model_id: "loxa".into(),
             model_path: PathBuf::from("/models/gemma 4 target.gguf"),
             program: PathBuf::from("/opt/llama/llama-server"),
-            engine_version: "b10107".into(),
+            engine_version: "version: 10107 (c0bc8591e)\nbuilt with AppleClang".into(),
             llama_mode: Some(ResolvedLlamaLaunchMode::QualifiedGemma4Mtp {
                 drafter_path: PathBuf::from("/models/gemma 4 drafter.gguf"),
                 jinja: true,
@@ -3325,6 +3325,21 @@ mod lifecycle_api_tests {
         let error = resolved_fixed_llama_backend()
             .launch_spec(11_435, 4_096, "loxa-direct-g1")
             .expect_err("qualified direct context drift must be rejected");
+
+        assert!(matches!(
+            error,
+            SupervisorError::Io(ref source) if source.kind() == io::ErrorKind::InvalidInput
+        ));
+    }
+
+    #[test]
+    fn direct_fixed_backend_rejects_an_unqualified_runtime_before_launch_spec() {
+        let mut backend = resolved_fixed_llama_backend();
+        backend.engine_version = "version: 10108 (c0bc8591e)".into();
+
+        let error = backend
+            .launch_spec(11_435, 8_192, "loxa-direct-g1")
+            .expect_err("qualified direct runtime must be rejected before a launch spec exists");
 
         assert!(matches!(
             error,
