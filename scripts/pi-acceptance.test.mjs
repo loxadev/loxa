@@ -244,23 +244,32 @@ async function observeSettlement(promise, timeoutMs) {
   }
 }
 
-test("pre-execution acceptance gate permits only the exact four literal tool calls", async () => {
+test("pre-execution acceptance gate advances only after each exact successful tool result", async () => {
   const { createAcceptanceGate } = await import(
     "../examples/pi/tool-loop/acceptance-gate.mjs"
   );
   const gate = createAcceptanceGate();
   const calls = [
-    { toolName: "read", input: { path: "source.txt" } },
-    { toolName: "bash", input: { command: "node verify.mjs --precheck" } },
+    { toolCallId: "read-1", toolName: "read", input: { path: "source.txt" } },
+    { toolCallId: "bash-1", toolName: "bash", input: { command: "node verify.mjs --precheck" } },
     {
+      toolCallId: "write-1",
       toolName: "write",
       input: { path: "result.txt", content: "sum=18\n" },
     },
-    { toolName: "bash", input: { command: "node verify.mjs" } },
+    { toolCallId: "bash-2", toolName: "bash", input: { command: "node verify.mjs" } },
   ];
 
   for (const call of calls) {
     assert.equal(await gate(call), undefined);
+    assert.deepEqual(await gate(calls.at(-1)), {
+      block: true,
+      reason: "Pi acceptance tool call is not the next exact step.",
+    });
+    assert.equal(
+      await gate.toolResult({ ...call, isError: false }),
+      undefined,
+    );
   }
   assert.deepEqual(await gate(calls[3]), {
     block: true,
@@ -268,28 +277,87 @@ test("pre-execution acceptance gate permits only the exact four literal tool cal
   });
 });
 
-test("pre-execution acceptance gate blocks all off-contract literal calls before execution", async () => {
+test("pre-execution acceptance gate blocks invalid sibling, retry, and result transitions at every step", async () => {
   const { createAcceptanceGate } = await import(
     "../examples/pi/tool-loop/acceptance-gate.mjs"
   );
+  const valid = [
+    { toolCallId: "read-1", toolName: "read", input: { path: "source.txt" } },
+    { toolCallId: "bash-1", toolName: "bash", input: { command: "node verify.mjs --precheck" } },
+    { toolCallId: "write-1", toolName: "write", input: { path: "result.txt", content: "sum=18\n" } },
+    { toolCallId: "bash-2", toolName: "bash", input: { command: "node verify.mjs" } },
+  ];
   const rejected = [
-    { toolName: "read", input: { path: "/source.txt" } },
-    { toolName: "read", input: { path: "nested/../source.txt" } },
-    { toolName: "bash", input: { command: "node verify.mjs" } },
+    { toolCallId: "bad-read", toolName: "read", input: { path: "/source.txt" } },
+    { toolCallId: "bad-read", toolName: "read", input: { path: "nested/../source.txt" } },
+    { toolCallId: "bad-bash", toolName: "bash", input: { command: "node verify.mjs" } },
     {
+      toolCallId: "bad-write",
       toolName: "write",
       input: { path: "result.txt", content: "sum=18" },
     },
-    { toolName: "edit", input: { path: "result.txt" } },
+    { toolCallId: "bad-edit", toolName: "edit", input: { path: "result.txt" } },
   ];
 
-  for (const call of rejected) {
+  for (let step = 0; step < valid.length; step += 1) {
     const gate = createAcceptanceGate();
-    assert.deepEqual(await gate(call), {
+    for (const call of valid.slice(0, step)) {
+      assert.equal(await gate(call), undefined);
+      assert.equal(await gate.toolResult({ ...call, isError: false }), undefined);
+    }
+    for (const call of rejected) {
+      if (
+        call.toolName === valid[step].toolName &&
+        JSON.stringify(call.input) === JSON.stringify(valid[step].input)
+      ) {
+        continue;
+      }
+      assert.deepEqual(await gate(call), {
+        block: true,
+        reason: "Pi acceptance tool call is not the next exact step.",
+      });
+    }
+    assert.equal(await gate(valid[step]), undefined);
+    assert.deepEqual(await gate({ ...valid[step], toolCallId: "sibling" }), {
+      block: true,
+      reason: "Pi acceptance tool call is not the next exact step.",
+    });
+    assert.deepEqual(
+      await gate.toolResult({ ...valid[step], toolCallId: "wrong-result", isError: false }),
+      {
+        block: true,
+        reason: "Pi acceptance tool call is not the next exact step.",
+      },
+    );
+    assert.deepEqual(await gate(valid[step]), {
       block: true,
       reason: "Pi acceptance tool call is not the next exact step.",
     });
   }
+
+  const errorGate = createAcceptanceGate();
+  assert.equal(await errorGate(valid[0]), undefined);
+  assert.deepEqual(
+    await errorGate.toolResult({ ...valid[0], isError: true }),
+    {
+      block: true,
+      reason: "Pi acceptance tool call is not the next exact step.",
+    },
+  );
+  assert.deepEqual(await errorGate(valid[0]), {
+    block: true,
+    reason: "Pi acceptance tool call is not the next exact step.",
+  });
+});
+
+test("pre-execution acceptance gate registers tool_call and tool_result handlers", async () => {
+  const { default: acceptanceGate } = await import(
+    "../examples/pi/tool-loop/acceptance-gate.mjs"
+  );
+  const handlers = new Map();
+  acceptanceGate({ on: (event, handler) => handlers.set(event, handler) });
+  assert.equal(typeof handlers.get("tool_call"), "function");
+  assert.equal(typeof handlers.get("tool_result"), "function");
 });
 
 test("committed model examples use the fixed text-only provider contract", async () => {
@@ -953,6 +1021,37 @@ test("qualified Pi executable must resolve absolutely and report exactly version
   }
 });
 
+test("Pi version probe bounds hung and oversized executable output", async () => {
+  const { readPiVersion } = await import("./pi-acceptance.mjs");
+  for (const scenario of [
+    { hang: true },
+    { output: "x".repeat(4097) },
+  ]) {
+    const capture = { kills: [] };
+    const version = readPiVersion("/opt/pi", {
+      spawnProcess: () => {
+        const child = new EventEmitter();
+        child.stdout = new PassThrough();
+        child.kill = (signal) => {
+          capture.kills.push(signal);
+          return true;
+        };
+        queueMicrotask(() => {
+          if (scenario.output !== undefined) {
+            child.stdout.write(scenario.output);
+          }
+        });
+        return child;
+      },
+      timeoutMs: 10,
+      forceKillDelayMs: 0,
+      terminalTimeoutMs: 10,
+    });
+    await assert.rejects(version, /qualified Pi executable verification failed/i);
+    assert.deepEqual(capture.kills, ["SIGTERM", "SIGKILL"]);
+  }
+});
+
 test("Windows taskkill cleanup resolves the system executable and waits for close or error", async () => {
   const { terminateOwnedProcessTree } = await import("./pi-acceptance.mjs");
   for (const terminal of [
@@ -992,6 +1091,65 @@ test("Windows taskkill cleanup resolves the system executable and waits for clos
   }
 });
 
+test("Windows taskkill cleanup terminates a no-event helper by its terminal deadline", async () => {
+  const { terminateOwnedProcessTree } = await import("./pi-acceptance.mjs");
+  const killer = new EventEmitter();
+  const kills = [];
+  killer.unref = () => {};
+  killer.kill = (signal) => {
+    kills.push(signal);
+    return true;
+  };
+  await assert.rejects(
+    terminateOwnedProcessTree({
+      child: { pid: 42, kill: () => assert.fail("fallback must not run") },
+      platform: "win32",
+      signal: "SIGTERM",
+      signalProcess: () => assert.fail("POSIX signal must not run"),
+      spawnTreeKiller: () => killer,
+      taskkillExecutable: "C:\\Windows\\System32\\taskkill.exe",
+      terminalTimeoutMs: 10,
+    }),
+    /Pi process cleanup failed/i,
+  );
+  assert.deepEqual(kills, ["SIGKILL"]);
+});
+
+test("qualified Pi adapter settles and cleans up after Windows taskkill emits no terminal event", async () => {
+  await withFakeGateway(async ({ baseUrl }) => {
+    const capture = {};
+    const adapter = runQualifiedPiAdapter(
+      {
+        phase: "mac-local",
+        baseUrl,
+        piBin: "/fake/pi",
+        qualifiedMaxTokens: 1024,
+        processTimeoutMs: 10,
+      },
+      {
+        platform: "darwin",
+        processPlatform: "win32",
+        taskkillTerminalTimeoutMs: 10,
+        sourceEnvironment: { PATH: "/usr/bin:/bin" },
+        spawnProcess: fakeSpawn(
+          { hang: true, pid: 4242, ignoreAllKills: true },
+          capture,
+        ),
+        spawnTreeKiller: () => {
+          const killer = new EventEmitter();
+          killer.unref = () => {};
+          killer.kill = () => true;
+          return killer;
+        },
+      },
+    );
+    const outcome = await observeSettlement(adapter, 1000);
+    assert.equal(outcome.status, "rejected");
+    assert.match(outcome.error.message, /Pi process cleanup failed/i);
+    await assertMissing(capture.options.cwd);
+  });
+});
+
 test("qualified Pi JSONL maps correlated successful tools to the semantic trace", () => {
   const lines = successfulQualifiedLines();
   lines.splice(
@@ -1009,6 +1167,21 @@ test("qualified Pi JSONL maps correlated successful tools to the semantic trace"
 
   assert.deepEqual(trace, successfulTrace());
   assert.equal(JSON.stringify(trace).includes("private"), false);
+});
+
+test("qualified Pi JSONL rejects concurrent tool starts before the prior result", () => {
+  const lines = successfulQualifiedLines();
+  lines.splice(
+    2,
+    0,
+    JSON.stringify({
+      type: "tool_execution_start",
+      toolCallId: "bash-1",
+      toolName: "bash",
+      args: { command: "node verify.mjs --precheck" },
+    }),
+  );
+  assert.throws(() => adaptQualifiedPiJsonl(lines), /concurrent tool/i);
 });
 
 test("qualified Pi JSONL rejects edit as the canonical third completion", () => {
