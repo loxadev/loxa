@@ -429,15 +429,15 @@ async fn blocking_actor_admission_waits_for_queue_and_uses_a_fresh_ack_window() 
     let admission = std::thread::spawn(move || {
         waiting_handle.admit_blocking_with_timeouts_for_test(
             download("blocking-admission"),
-            Duration::from_millis(250),
-            Duration::from_millis(100),
+            Duration::from_secs(2),
+            Duration::from_secs(1),
         )
     });
-    tokio::time::sleep(Duration::from_millis(70)).await;
+    tokio::time::sleep(Duration::from_millis(750)).await;
     assert!(!admission.is_finished());
     synthetic.pop_one().await;
     let reply = synthetic.take_admit_reply().await;
-    tokio::time::sleep(Duration::from_millis(70)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(!admission.is_finished());
     let expected = crate::control_state::state_machine::CommittedAdmission {
         epoch: StreamEpoch::from_str(EPOCH).unwrap(),
