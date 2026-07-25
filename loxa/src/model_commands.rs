@@ -172,6 +172,8 @@ where
 pub(crate) fn pull_model<W: Write, E: Write>(
     id: &str,
     quant: Option<&str>,
+    models_dir: &Path,
+    registry_dir: &Path,
     stdout: &mut W,
     stderr: &mut E,
 ) -> io::Result<ExitCode> {
@@ -209,7 +211,7 @@ pub(crate) fn pull_model<W: Write, E: Write>(
             min_free_mem_gb: resolved.min_free_mem_gb,
         };
         if registry::find(&entry.id).is_some()
-            || registry::load_user_entries(&user_registry_dir())
+            || registry::load_user_entries(registry_dir)
                 .map_err(io::Error::other)?
                 .iter()
                 .any(|old| old.id == entry.id)
@@ -226,10 +228,9 @@ pub(crate) fn pull_model<W: Write, E: Write>(
             "selected {} ({}, {:.1} GB minimum free RAM)",
             entry.filename, entry.quant, entry.min_free_mem_gb
         )?;
-        return match download::download(&entry, &download::model_dir()) {
+        return match download::download(&entry, models_dir) {
             Ok(path) => {
-                registry::save_user_entry(&user_registry_dir(), &entry)
-                    .map_err(io::Error::other)?;
+                registry::save_user_entry(registry_dir, &entry).map_err(io::Error::other)?;
                 writeln!(stdout, "{}", path.display())?;
                 Ok(ExitCode::SUCCESS)
             }
@@ -244,8 +245,7 @@ pub(crate) fn pull_model<W: Write, E: Write>(
         return Ok(ExitCode::from(1));
     };
 
-    let dir = download::model_dir();
-    match download_registry_entry_with(entry, &dir, download::download) {
+    match download_registry_entry_with(entry, models_dir, download::download) {
         Ok(paths) => {
             for path in paths {
                 writeln!(stdout, "{}", path.display())?;
@@ -369,14 +369,15 @@ fn write_model_list<W: Write>(
 
 pub(crate) fn remove_model<W: Write, E: Write>(
     id: &str,
+    models_dir: &Path,
+    registry_dir: &Path,
     stdout: &mut W,
     stderr: &mut E,
 ) -> io::Result<ExitCode> {
-    let dir = download::model_dir();
     let removed = if let Some(entry) = REGISTRY.iter().find(|entry| entry.id == id) {
-        remove_model_files(entry, &dir)?
+        remove_model_files(entry, models_dir)?
     } else {
-        let Some(removed) = remove_user_entry(id, &user_registry_dir(), &dir)? else {
+        let Some(removed) = remove_user_entry(id, registry_dir, models_dir)? else {
             write_unknown_id(id, stderr)?;
             return Ok(ExitCode::from(1));
         };

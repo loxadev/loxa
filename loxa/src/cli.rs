@@ -21,7 +21,7 @@ use loxa_core::supervisor::{self, SupervisorError};
 use loxa_node::*;
 use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -213,12 +213,6 @@ pub(crate) fn main() -> ExitCode {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-fn run<W: Write, E: Write>(cli: Cli, mut stdout: W, mut stderr: E) -> ExitCode {
-    let paths = NodePaths::detect();
-    run_with_paths(cli, &paths, &mut stdout, &mut stderr)
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
 fn run_with_paths<W: Write, E: Write>(
     cli: Cli,
     paths: &NodePaths,
@@ -245,7 +239,14 @@ fn run_with_paths_and_diagnostics_health<W: Write, E: Write>(
             Command::Pull { id, quant } => match live_control(paths)? {
                 Some(client) => live_pull(&client, &id, quant.as_deref(), &mut stdout),
                 None => offline_pull_with(paths, || {
-                    pull_model(&id, quant.as_deref(), &mut stdout, &mut stderr)
+                    pull_model(
+                        &id,
+                        quant.as_deref(),
+                        &paths.models_dir,
+                        &model_registry_dir(paths),
+                        &mut stdout,
+                        &mut stderr,
+                    )
                 }),
             },
             Command::List => match live_control(paths)? {
@@ -260,7 +261,15 @@ fn run_with_paths_and_diagnostics_health<W: Write, E: Write>(
                     )?;
                     Ok(ExitCode::from(1))
                 }
-                None => offline_rm_with(paths, || remove_model(&id, &mut stdout, &mut stderr)),
+                None => offline_rm_with(paths, || {
+                    remove_model(
+                        &id,
+                        &paths.models_dir,
+                        &model_registry_dir(paths),
+                        &mut stdout,
+                        &mut stderr,
+                    )
+                }),
             },
             Command::Load { id } => match live_control(paths)? {
                 Some(client) => live_operation(&client, client.load(&id), "load", &mut stdout),
@@ -299,10 +308,12 @@ fn run_with_paths_and_diagnostics_health<W: Write, E: Write>(
                 inference_port,
                 engine,
             } => serve_node_cli(
-                model.as_deref(),
-                port,
-                inference_port,
-                engine,
+                ServeNodeCliRequest {
+                    requested_model: model.as_deref(),
+                    port,
+                    inference_port,
+                    engine,
+                },
                 paths,
                 &mut stdout,
                 &mut stderr,
@@ -760,6 +771,14 @@ fn offline_rm_with(
     mutation()
 }
 
+fn model_registry_dir(paths: &NodePaths) -> PathBuf {
+    paths
+        .models_dir
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("registry.d")
+}
+
 fn live_control(paths: &NodePaths) -> io::Result<Option<LiveControlClient>> {
     let runs =
         match supervisor::read_runtime_state(&paths.state_path).map_err(supervisor_error_to_io)? {
@@ -1005,23 +1024,28 @@ fn run_model_cli<W: Write, E: Write>(
     }
 }
 
-fn serve_node_cli<W: Write, E: Write>(
-    requested_model: Option<&str>,
+#[derive(Clone, Copy, Debug)]
+struct ServeNodeCliRequest<'a> {
+    requested_model: Option<&'a str>,
     port: Option<u16>,
     inference_port: Option<u16>,
     engine: RuntimeBackendKind,
+}
+
+fn serve_node_cli<W: Write, E: Write>(
+    request: ServeNodeCliRequest<'_>,
     paths: &NodePaths,
     stdout: &mut W,
     stderr: &mut E,
     diagnostics_health: Option<&loxa_core::diagnostics::DiagnosticsHealth>,
 ) -> io::Result<ExitCode> {
-    validate_cli_serve_request(requested_model, engine, paths)?;
+    validate_cli_serve_request(request.requested_model, request.engine, paths)?;
     let mut events = CliLifecycleSink { stdout, stderr };
     match loxa_node::serve_node_with_diagnostics_health(
-        requested_model,
-        port,
-        inference_port,
-        engine,
+        request.requested_model,
+        request.port,
+        request.inference_port,
+        request.engine,
         paths,
         &mut events,
         diagnostics_health.cloned().unwrap_or_default(),
@@ -2911,6 +2935,12 @@ mod tests {
 
     #[test]
     fn unknown_pull_id_renders_error_and_valid_ids() {
+        let temp = TempDir::new("unknown-pull-id");
+        let paths = NodePaths {
+            models_dir: temp.path().join("models"),
+            state_path: temp.path().join("run").join("managed.json"),
+            logs_dir: temp.path().join("logs"),
+        };
         let cli = Cli {
             command: Command::Pull {
                 id: "missing-model".to_string(),
@@ -2920,7 +2950,7 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
-        let exit = run(cli, &mut stdout, &mut stderr);
+        let exit = run_with_paths(cli, &paths, &mut stdout, &mut stderr);
 
         assert_eq!(exit, std::process::ExitCode::from(1));
         assert!(stdout.is_empty());
@@ -2934,6 +2964,12 @@ mod tests {
 
     #[test]
     fn unknown_rm_id_renders_error_and_valid_ids() {
+        let temp = TempDir::new("unknown-rm-id");
+        let paths = NodePaths {
+            models_dir: temp.path().join("models"),
+            state_path: temp.path().join("run").join("managed.json"),
+            logs_dir: temp.path().join("logs"),
+        };
         let cli = Cli {
             command: Command::Rm {
                 id: "missing-model".to_string(),
@@ -2942,7 +2978,7 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
-        let exit = run(cli, &mut stdout, &mut stderr);
+        let exit = run_with_paths(cli, &paths, &mut stdout, &mut stderr);
 
         assert_eq!(exit, std::process::ExitCode::from(1));
         assert!(stdout.is_empty());
@@ -2952,6 +2988,45 @@ mod tests {
         for entry in REGISTRY {
             assert!(stderr.contains(entry.id));
         }
+    }
+
+    #[test]
+    fn offline_rm_uses_the_node_paths_model_and_registry_directories() {
+        let temp = TempDir::new("isolated-rm");
+        let models_dir = temp.path().join("models");
+        let registry_dir = temp.path().join("registry.d");
+        fs::create_dir_all(&models_dir).unwrap();
+        let entry = registry::UserModelEntry {
+            id: "isolated-model".into(),
+            repo: "owner/repo".into(),
+            revision: "0123456789abcdef0123456789abcdef01234567".into(),
+            filename: "isolated-Q4_K_M.gguf".into(),
+            sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            size_bytes: 100 * 1024 * 1024,
+            license: "apache-2.0".into(),
+            params: "unknown".into(),
+            quant: "Q4_K_M".into(),
+            min_free_mem_gb: 0.1,
+        };
+        let registry_path = registry::save_user_entry(&registry_dir, &entry).unwrap();
+        let model_path = models_dir.join(&entry.filename);
+        fs::write(&model_path, b"model").unwrap();
+        let paths = NodePaths {
+            models_dir,
+            state_path: temp.path().join("run").join("managed.json"),
+            logs_dir: temp.path().join("logs"),
+        };
+        let cli = Cli::try_parse_from(["loxa", "rm", &entry.id]).unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let exit = run_with_paths(cli, &paths, &mut stdout, &mut stderr);
+
+        assert_eq!(exit, ExitCode::SUCCESS);
+        assert!(stderr.is_empty());
+        assert!(String::from_utf8(stdout).unwrap().contains("removed"));
+        assert!(!model_path.exists());
+        assert!(!registry_path.exists());
     }
 
     #[test]
