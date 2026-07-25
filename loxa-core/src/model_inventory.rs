@@ -1,6 +1,7 @@
 //! Non-blocking inventory snapshots for the compiled, verified model recipes.
 
 use crate::registry::{ModelEntry, VerifiedModel, REGISTRY};
+use crate::runtime_profile::runtime_profile;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, Metadata, OpenOptions};
@@ -671,6 +672,7 @@ fn inspect_recipe(
     available_memory_bytes: u64,
     cache: &VerificationCache,
 ) -> VerifiedRecipeInventoryEntry {
+    let profile = runtime_profile(recipe.id);
     let required = (recipe.min_free_mem_gb as f64 * GIB).round() as u64;
     let compatibility = if available_memory_bytes >= required {
         Compatibility {
@@ -693,7 +695,9 @@ fn inspect_recipe(
         revision: recipe.revision.into(),
         filename: recipe.filename.into(),
         sha256: recipe.sha256.into(),
-        size_bytes: recipe.size_bytes,
+        size_bytes: profile
+            .map(|profile| profile.total_size_bytes())
+            .unwrap_or(recipe.size_bytes),
         license: recipe.license.into(),
         params: recipe.params.into(),
         quant: recipe.quant.into(),
@@ -713,16 +717,33 @@ fn artifact_state(
     models_dir: &Path,
     cache: &VerificationCache,
 ) -> ArtifactState {
-    let final_path = models_dir.join(recipe.filename);
+    if let Some(profile) = runtime_profile(recipe.id) {
+        let artifacts = profile
+            .artifacts()
+            .map(|artifact| artifact as &dyn VerifiedModel);
+        return paired_artifact_state(artifacts, models_dir, cache);
+    }
+    single_artifact_state(recipe, models_dir, cache)
+}
+
+fn single_artifact_state(
+    recipe: &dyn VerifiedModel,
+    models_dir: &Path,
+    cache: &VerificationCache,
+) -> ArtifactState {
+    let final_path = models_dir.join(recipe.filename());
     match regular_metadata(&final_path) {
         Ok(Some(metadata)) => {
-            if metadata.len() != recipe.size_bytes {
+            if metadata.len() != recipe.size_bytes() {
                 return ArtifactState::Invalid {
                     reason: ArtifactInvalidReason::SizeMismatch,
                 };
             }
-            return match cache.cached(&final_path, &StableMetadata::from(&metadata), recipe.sha256)
-            {
+            return match cache.cached(
+                &final_path,
+                &StableMetadata::from(&metadata),
+                recipe.sha256(),
+            ) {
                 Some(evidence) if evidence.matches => ArtifactState::Downloaded,
                 Some(_) => ArtifactState::Invalid {
                     reason: ArtifactInvalidReason::ChecksumMismatch,
@@ -739,16 +760,20 @@ fn artifact_state(
             };
         }
     }
-    let part_path = models_dir.join(format!("{}.part", recipe.filename));
+    let part_path = models_dir.join(format!("{}.part", recipe.filename()));
     match regular_metadata(&part_path) {
-        Ok(Some(metadata)) if metadata.len() < recipe.size_bytes => ArtifactState::Partial {
+        Ok(Some(metadata)) if metadata.len() < recipe.size_bytes() => ArtifactState::Partial {
             bytes: metadata.len(),
         },
-        Ok(Some(metadata)) if metadata.len() > recipe.size_bytes => ArtifactState::Invalid {
+        Ok(Some(metadata)) if metadata.len() > recipe.size_bytes() => ArtifactState::Invalid {
             reason: ArtifactInvalidReason::SizeMismatch,
         },
         Ok(Some(metadata)) => {
-            match cache.cached(&part_path, &StableMetadata::from(&metadata), recipe.sha256) {
+            match cache.cached(
+                &part_path,
+                &StableMetadata::from(&metadata),
+                recipe.sha256(),
+            ) {
                 Some(evidence) if !evidence.matches => ArtifactState::Invalid {
                     reason: ArtifactInvalidReason::ChecksumMismatch,
                 },
@@ -761,6 +786,115 @@ fn artifact_state(
         Err(_) => ArtifactState::Invalid {
             reason: ArtifactInvalidReason::Unreadable,
         },
+    }
+}
+
+enum PairedArtifactPresence {
+    Missing,
+    Partial(u64),
+    Final { bytes: u64, verified: bool },
+}
+
+fn paired_artifact_state(
+    artifacts: [&dyn VerifiedModel; 2],
+    models_dir: &Path,
+    cache: &VerificationCache,
+) -> ArtifactState {
+    let mut bytes = 0;
+    let mut any_present = false;
+    let mut all_final = true;
+    let mut all_verified = true;
+
+    for artifact in artifacts {
+        let presence = match paired_artifact_presence(artifact, models_dir, cache) {
+            Ok(presence) => presence,
+            Err(reason) => return ArtifactState::Invalid { reason },
+        };
+        match presence {
+            PairedArtifactPresence::Missing => {
+                all_final = false;
+                all_verified = false;
+            }
+            PairedArtifactPresence::Partial(present) => {
+                any_present = true;
+                all_final = false;
+                all_verified = false;
+                bytes += present;
+            }
+            PairedArtifactPresence::Final {
+                bytes: present,
+                verified,
+            } => {
+                any_present = true;
+                all_verified &= verified;
+                bytes += present;
+            }
+        }
+    }
+
+    if all_final && all_verified {
+        ArtifactState::Downloaded
+    } else if all_final {
+        ArtifactState::Invalid {
+            reason: ArtifactInvalidReason::VerificationRequired,
+        }
+    } else if any_present {
+        ArtifactState::Partial { bytes }
+    } else {
+        ArtifactState::NotDownloaded
+    }
+}
+
+fn paired_artifact_presence(
+    artifact: &dyn VerifiedModel,
+    models_dir: &Path,
+    cache: &VerificationCache,
+) -> Result<PairedArtifactPresence, ArtifactInvalidReason> {
+    let final_path = models_dir.join(artifact.filename());
+    match regular_metadata(&final_path) {
+        Ok(Some(metadata)) => {
+            if metadata.len() != artifact.size_bytes() {
+                return Err(ArtifactInvalidReason::SizeMismatch);
+            }
+            return match cache.cached(
+                &final_path,
+                &StableMetadata::from(&metadata),
+                artifact.sha256(),
+            ) {
+                Some(evidence) if evidence.matches => Ok(PairedArtifactPresence::Final {
+                    bytes: metadata.len(),
+                    verified: true,
+                }),
+                Some(_) => Err(ArtifactInvalidReason::ChecksumMismatch),
+                None => Ok(PairedArtifactPresence::Final {
+                    bytes: metadata.len(),
+                    verified: false,
+                }),
+            };
+        }
+        Ok(None) => {}
+        Err(_) => return Err(ArtifactInvalidReason::Unreadable),
+    }
+
+    let part_path = models_dir.join(format!("{}.part", artifact.filename()));
+    match regular_metadata(&part_path) {
+        Ok(Some(metadata)) if metadata.len() > artifact.size_bytes() => {
+            Err(ArtifactInvalidReason::SizeMismatch)
+        }
+        Ok(Some(metadata)) => {
+            if let Some(evidence) = cache.cached(
+                &part_path,
+                &StableMetadata::from(&metadata),
+                artifact.sha256(),
+            ) {
+                if !evidence.matches {
+                    return Err(ArtifactInvalidReason::ChecksumMismatch);
+                }
+            }
+            Ok(PairedArtifactPresence::Partial(metadata.len()))
+        }
+        Ok(None) => Ok(PairedArtifactPresence::Missing),
+        Err(_) => Err(ArtifactInvalidReason::Unreadable),
     }
 }
 
@@ -1010,15 +1144,26 @@ mod tests {
     }
 
     fn pinned_fixture(bytes: &'static [u8]) -> PinnedArtifact {
+        pinned_named_fixture("pinned-fixture.gguf", bytes)
+    }
+
+    fn pinned_named_fixture(filename: &'static str, bytes: &'static [u8]) -> PinnedArtifact {
         let sha: String = Sha256::digest(bytes)
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
         PinnedArtifact {
-            filename: "pinned-fixture.gguf",
+            filename,
             sha256: Box::leak(sha.into_boxed_str()),
             size_bytes: bytes.len() as u64,
         }
+    }
+
+    fn paired_fixture() -> (PinnedArtifact, PinnedArtifact) {
+        (
+            pinned_named_fixture("target.gguf", b"target"),
+            pinned_named_fixture("drafter.gguf", b"draft"),
+        )
     }
 
     fn fixture(bytes: &'static [u8]) -> ModelEntry {
@@ -1161,6 +1306,103 @@ mod tests {
             )[0]
             .artifact,
             ArtifactState::Partial { bytes: 7 }
+        );
+    }
+
+    #[test]
+    fn fixed_profile_inventory_reports_aggregate_size_and_nothing_present() {
+        let dir = tempdir().unwrap();
+        let cache = VerificationCache::default();
+        let inventory = known_registry_inventory_with_cache(dir.path(), u64::MAX, &cache);
+        let loxa = inventory
+            .iter()
+            .find(|entry| entry.id == "loxa")
+            .expect("loxa inventory entry");
+
+        assert_eq!(loxa.size_bytes, 6_970_065_600);
+        assert_eq!(loxa.artifact, ArtifactState::NotDownloaded);
+    }
+
+    #[test]
+    fn fixed_pair_target_only_is_partial_with_aggregate_bytes_present() {
+        let dir = tempdir().unwrap();
+        let cache = VerificationCache::default();
+        let (target, drafter) = paired_fixture();
+        fs::write(dir.path().join(target.filename()), b"target").unwrap();
+
+        assert_eq!(
+            paired_artifact_state([&target, &drafter], dir.path(), &cache),
+            ArtifactState::Partial { bytes: 6 }
+        );
+    }
+
+    #[test]
+    fn fixed_pair_both_final_files_require_complete_verification_evidence() {
+        let dir = tempdir().unwrap();
+        let cache = VerificationCache::default();
+        let (target, drafter) = paired_fixture();
+        fs::write(dir.path().join(target.filename()), b"target").unwrap();
+        fs::write(dir.path().join(drafter.filename()), b"draft").unwrap();
+
+        assert_eq!(
+            paired_artifact_state([&target, &drafter], dir.path(), &cache),
+            ArtifactState::Invalid {
+                reason: ArtifactInvalidReason::VerificationRequired
+            }
+        );
+    }
+
+    #[test]
+    fn fixed_pair_is_downloaded_only_when_both_artifacts_are_cached_verified() {
+        let dir = tempdir().unwrap();
+        let cache = VerificationCache::default();
+        let (target, drafter) = paired_fixture();
+        fs::write(dir.path().join(target.filename()), b"target").unwrap();
+        fs::write(dir.path().join(drafter.filename()), b"draft").unwrap();
+        assert!(cache.verify_artifact(dir.path(), &target).unwrap().matches);
+        assert!(cache.verify_artifact(dir.path(), &drafter).unwrap().matches);
+
+        assert_eq!(
+            paired_artifact_state([&target, &drafter], dir.path(), &cache),
+            ArtifactState::Downloaded
+        );
+    }
+
+    #[test]
+    fn fixed_pair_reports_cached_drafter_checksum_failure() {
+        let dir = tempdir().unwrap();
+        let cache = VerificationCache::default();
+        let (target, drafter) = paired_fixture();
+        fs::write(dir.path().join(target.filename()), b"target").unwrap();
+        fs::write(dir.path().join(drafter.filename()), b"wrong").unwrap();
+        assert!(!cache.verify_artifact(dir.path(), &drafter).unwrap().matches);
+
+        assert_eq!(
+            paired_artifact_state([&target, &drafter], dir.path(), &cache),
+            ArtifactState::Invalid {
+                reason: ArtifactInvalidReason::ChecksumMismatch
+            }
+        );
+    }
+
+    #[test]
+    fn fixed_pair_with_changed_drafter_identity_requires_reverification() {
+        let dir = tempdir().unwrap();
+        let cache = VerificationCache::default();
+        let (target, drafter) = paired_fixture();
+        fs::write(dir.path().join(target.filename()), b"target").unwrap();
+        let drafter_path = dir.path().join(drafter.filename());
+        fs::write(&drafter_path, b"draft").unwrap();
+        assert!(cache.verify_artifact(dir.path(), &target).unwrap().matches);
+        assert!(cache.verify_artifact(dir.path(), &drafter).unwrap().matches);
+        fs::remove_file(&drafter_path).unwrap();
+        fs::write(&drafter_path, b"draft").unwrap();
+
+        assert_eq!(
+            paired_artifact_state([&target, &drafter], dir.path(), &cache),
+            ArtifactState::Invalid {
+                reason: ArtifactInvalidReason::VerificationRequired
+            }
         );
     }
 

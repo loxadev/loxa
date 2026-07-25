@@ -47,6 +47,16 @@ pub struct LlamaRuntimeProfile {
     pub jinja: bool,
 }
 
+impl LlamaRuntimeProfile {
+    pub fn artifacts(&self) -> [&PinnedArtifact; 2] {
+        [&self.target, &self.drafter]
+    }
+
+    pub const fn total_size_bytes(&self) -> u64 {
+        self.target.size_bytes + self.drafter.size_bytes
+    }
+}
+
 const GEMMA_4_MTP_PROFILE: LlamaRuntimeProfile = LlamaRuntimeProfile {
     model_id: "loxa",
     target: PinnedArtifact {
@@ -138,5 +148,24 @@ mod tests {
         }
 
         assert!(runtime_profile("unknown-model").is_none());
+    }
+
+    #[test]
+    fn qualified_profile_exposes_both_artifacts_and_their_aggregate_size() {
+        let profile = runtime_profile("loxa").expect("loxa profile");
+        let artifacts = profile.artifacts();
+
+        assert_eq!(artifacts.len(), 2);
+        assert_eq!(
+            artifacts
+                .iter()
+                .map(|artifact| artifact.filename())
+                .collect::<Vec<_>>(),
+            vec![
+                "gemma-4-12B-it-qat-UD-Q4_K_XL.gguf",
+                "mtp-gemma-4-12B-it.gguf",
+            ]
+        );
+        assert_eq!(profile.total_size_bytes(), 6_970_065_600);
     }
 }

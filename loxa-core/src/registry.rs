@@ -257,6 +257,18 @@ pub const REGISTRY: &[ModelEntry] = &[
         quant: "Q4_K_M",
         min_free_mem_gb: 5.3,
     },
+    ModelEntry {
+        id: "loxa",
+        repo: "unsloth/gemma-4-12B-it-qat-GGUF",
+        revision: "980b060c40a8539ac159e0501a3e0f66a6365af3",
+        filename: "gemma-4-12B-it-qat-UD-Q4_K_XL.gguf",
+        sha256: "90fd44e29e0d7cffeb0fd00dc73cfdab9ed0b0e95306ecf7821ea634c940c370",
+        size_bytes: 6_716_356_800,
+        license: "apache-2.0",
+        params: "12B",
+        quant: "UD-Q4_K_XL",
+        min_free_mem_gb: 7.2,
+    },
 ];
 
 pub fn find(id: &str) -> Option<&'static ModelEntry> {
@@ -340,12 +352,13 @@ mod tests {
         "gemma-3-4b-it-q4",
         "qwen3-14b-q4",
         "gemma-4-e4b-it-q4",
+        "loxa",
     ];
 
     #[test]
-    fn registry_contains_expected_seven_entries() {
-        assert_eq!(EXPECTED_IDS.len(), 7);
-        assert_eq!(REGISTRY.len(), 7);
+    fn registry_contains_expected_eight_entries() {
+        assert_eq!(EXPECTED_IDS.len(), 8);
+        assert_eq!(REGISTRY.len(), 8);
     }
 
     #[test]
@@ -367,6 +380,14 @@ mod tests {
         let expected_ids = EXPECTED_IDS.iter().copied().collect::<HashSet<_>>();
 
         assert_eq!(actual_ids, expected_ids);
+    }
+
+    #[test]
+    fn existing_compiled_registry_order_is_stable_and_loxa_is_additive() {
+        assert_eq!(
+            REGISTRY.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            EXPECTED_IDS
+        );
     }
 
     #[test]
@@ -397,6 +418,7 @@ mod tests {
                 "gemma-4-e4b-it-q4",
                 "0720adb23527c2cd5ea01d1db067cd960327fdac",
             ),
+            ("loxa", "980b060c40a8539ac159e0501a3e0f66a6365af3"),
         ];
         for (id, revision) in expected {
             let entry = REGISTRY.iter().find(|entry| entry.id == id).unwrap();
@@ -408,6 +430,24 @@ mod tests {
             );
             assert!(entry.revision.bytes().all(|byte| byte.is_ascii_hexdigit()));
         }
+    }
+
+    #[test]
+    fn registry_contains_exact_qualified_loxa_target_metadata() {
+        let entry = find("loxa").expect("compiled loxa entry");
+
+        assert_eq!(entry.repo, "unsloth/gemma-4-12B-it-qat-GGUF");
+        assert_eq!(entry.revision, "980b060c40a8539ac159e0501a3e0f66a6365af3");
+        assert_eq!(entry.filename, "gemma-4-12B-it-qat-UD-Q4_K_XL.gguf");
+        assert_eq!(
+            entry.sha256,
+            "90fd44e29e0d7cffeb0fd00dc73cfdab9ed0b0e95306ecf7821ea634c940c370"
+        );
+        assert_eq!(entry.size_bytes, 6_716_356_800);
+        assert_eq!(entry.license, "apache-2.0");
+        assert_eq!(entry.params, "12B");
+        assert_eq!(entry.quant, "UD-Q4_K_XL");
+        assert_eq!(entry.min_free_mem_gb, 7.2);
     }
 
     #[test]
