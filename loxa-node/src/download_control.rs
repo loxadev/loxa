@@ -4429,29 +4429,25 @@ pub(crate) fn verify_runtime_artifacts(
     cache: &VerificationCache,
     cancellation: &dyn VerificationCancellation,
 ) -> Result<(), LifecycleError> {
-    let profile = loxa_core::runtime_profile::runtime_profile(recipe.id);
-    let drafter = profile
-        .filter(|profile| {
-            recipe.repo == profile.target.repo()
-                && recipe.revision == profile.target.revision()
-                && recipe.filename == profile.target.filename()
-                && recipe.sha256 == profile.target.sha256()
-                && recipe.size_bytes == profile.target.size_bytes()
-        })
-        .map(|profile| &profile.drafter);
-    if profile.is_some() && drafter.is_none() {
+    let artifacts = required_runtime_artifacts(recipe)?;
+    verify_artifact_set(models_dir, artifacts, cache, cancellation)
+}
+
+fn required_runtime_artifacts(
+    recipe: &'static ModelEntry,
+) -> Result<Vec<&'static dyn VerifiedModel>, LifecycleError> {
+    let Some(profile) = loxa_core::runtime_profile::runtime_profile(recipe.id) else {
+        return Ok(vec![recipe]);
+    };
+    let target_matches = recipe.repo == profile.target.repo()
+        && recipe.revision == profile.target.revision()
+        && recipe.filename == profile.target.filename()
+        && recipe.sha256 == profile.target.sha256()
+        && recipe.size_bytes == profile.target.size_bytes();
+    if !target_matches {
         return Err(LifecycleError::ModelNotVerified);
     }
-    verify_artifact_set(
-        models_dir,
-        std::iter::once(recipe as &dyn VerifiedModel).chain(
-            drafter
-                .map(|artifact| artifact as &dyn VerifiedModel)
-                .into_iter(),
-        ),
-        cache,
-        cancellation,
-    )
+    Ok(vec![recipe, &profile.drafter])
 }
 
 fn verify_artifact_set<'a>(
@@ -5344,6 +5340,21 @@ mod tests {
     use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn real_loxa_recipe_selects_exact_target_then_pinned_drafter() {
+        let recipe = registry::find("loxa").expect("fixed loxa registry recipe");
+        let artifacts = required_runtime_artifacts(recipe).expect("paired runtime artifacts");
+        let profile = runtime_profile("loxa").expect("fixed profile");
+
+        assert_eq!(artifacts.len(), 2);
+        assert_eq!(artifacts[0].filename(), recipe.filename);
+        assert_eq!(artifacts[0].sha256(), recipe.sha256);
+        assert_eq!(artifacts[0].size_bytes(), recipe.size_bytes);
+        assert_eq!(artifacts[1].filename(), profile.drafter.filename());
+        assert_eq!(artifacts[1].sha256(), profile.drafter.sha256());
+        assert_eq!(artifacts[1].size_bytes(), profile.drafter.size_bytes());
+    }
 
     #[test]
     fn shared_runtime_verifier_requires_every_artifact() {
@@ -6682,6 +6693,22 @@ mod tests {
     struct GatedRestartVerifier {
         entered: std::sync::mpsc::Sender<()>,
         cache: Arc<VerificationCache>,
+    }
+
+    struct FailingPairedRestartVerifier {
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RestartArtifactVerifier for FailingPairedRestartVerifier {
+        fn verify(
+            &mut self,
+            _: &std::path::Path,
+            recipe: &'static ModelEntry,
+            _: &dyn VerificationCancellation,
+        ) -> Result<(), LifecycleError> {
+            self.calls.lock().unwrap().push(recipe.id.to_owned());
+            Err(LifecycleError::ModelNotVerified)
+        }
     }
 
     impl RestartArtifactVerifier for GatedRestartVerifier {
@@ -8078,6 +8105,66 @@ mod tests {
         assert_eq!(publishes.load(Ordering::SeqCst), 1);
         worker.stop_and_join().unwrap();
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn real_loxa_restart_pair_failure_prevents_replacement_spawn_and_republish() {
+        let recipe = registry::find("loxa").expect("fixed loxa registry recipe");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let publishes = Arc::new(AtomicUsize::new(0));
+        let exit_requested = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut lifecycle = ModelLifecycle::new(
+            crate::model_lifecycle::StableNodeOwner {
+                run_id: "owner".into(),
+                pid: 1,
+                process_start_time_unix_s: 2,
+                gateway_port: 8_080,
+            },
+            RestartProbeDriver {
+                starts: Arc::clone(&starts),
+                exit_requested: Arc::clone(&exit_requested),
+            },
+            CountingGateway(Arc::clone(&publishes)),
+        );
+        lifecycle
+            .load(
+                LaunchPlan {
+                    model_id: recipe.id.into(),
+                    artifact_path: std::path::PathBuf::from(recipe.filename),
+                    engine: "llama-cpp".into(),
+                    ctx_size: 8192,
+                    jinja: true,
+                    speculative: None,
+                },
+                &MutationCancellation::new(),
+            )
+            .unwrap();
+        lifecycle.complete_operation();
+        let baseline_starts = starts.load(Ordering::SeqCst);
+        let baseline_publishes = publishes.load(Ordering::SeqCst);
+        let snapshot = Arc::new(Mutex::new(lifecycle.snapshot()));
+        let mut executor = LifecycleExecutor {
+            lifecycle,
+            snapshot: Arc::clone(&snapshot),
+            models_dir: std::env::temp_dir(),
+            verification_cache: Arc::new(VerificationCache::default()),
+            recipes: REGISTRY,
+            restart_verifier: Box::new(FailingPairedRestartVerifier {
+                calls: Arc::clone(&calls),
+            }),
+        };
+
+        exit_requested.store(true, Ordering::SeqCst);
+        executor.tick();
+
+        assert_eq!(&*calls.lock().unwrap(), &["loxa"]);
+        assert_eq!(starts.load(Ordering::SeqCst), baseline_starts);
+        assert_eq!(publishes.load(Ordering::SeqCst), baseline_publishes);
+        assert_eq!(
+            snapshot.lock().unwrap().status,
+            crate::model_lifecycle::NodeLifecycleStatus::RecoveryRequired
+        );
     }
 
     #[test]
