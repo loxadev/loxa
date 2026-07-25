@@ -7,7 +7,7 @@ use crate::download_scheduler::{
 use crate::lifecycle_controller::{
     LifecycleCancelAcknowledgement, LifecycleCommand, LifecycleControllerHandle,
     LifecycleControllerOwner, LifecycleLoadRequest, LifecycleLoadSubmission, LifecycleLoadWorkflow,
-    LifecycleMailboxInner, LifecycleSubmitError, LIFECYCLE_NORMAL_CAPACITY,
+    LifecycleMailboxInner, LifecycleRestartPlan, LifecycleSubmitError, LIFECYCLE_NORMAL_CAPACITY,
 };
 use crate::model_lifecycle::{
     CandidateSlot, EngineLifecycleDriver, ExactStopFailure, GatewayPublisher, LaunchPlan,
@@ -246,6 +246,220 @@ fn controller_is_the_only_exact_session_owner_and_shutdown_joins_it() {
         .expect("bounded lifecycle join");
     assert_eq!(live.load(Ordering::SeqCst), 0);
     assert_eq!(&*events.lock().unwrap(), &["start", "ready", "stop"]);
+}
+
+struct TickRecoveryDriver {
+    starts: Arc<AtomicUsize>,
+    exit_requested: Arc<AtomicBool>,
+    replacement_ready_entered: mpsc::Sender<()>,
+    replacement_ready_release: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl EngineLifecycleDriver for TickRecoveryDriver {
+    type Session = ();
+
+    fn start(
+        &mut self,
+        owner: &StableNodeOwner,
+        plan: &LaunchPlan,
+        generation: u64,
+        candidate: &mut CandidateSlot<Self::Session>,
+    ) -> Result<(), LifecycleError> {
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        candidate
+            .install(StartedSession {
+                value: (),
+                correlation: SessionCorrelation {
+                    generation,
+                    child_pid: 100 + generation as u32,
+                    child_process_start_time_unix_s: 200 + generation,
+                    server_id: format!("server-{generation}"),
+                    model_id: plan.model_id.clone(),
+                    port: 9000 + generation as u16,
+                    committed_run_id: owner.run_id.clone(),
+                    owner_pid: owner.pid,
+                    owner_process_start_time_unix_s: owner.process_start_time_unix_s,
+                    gateway_port: owner.gateway_port,
+                    generation_alias: format!("loxa-{}-g{generation}", owner.run_id),
+                    engine_version: "test".into(),
+                },
+            })
+            .map_err(|_| LifecycleError::RecoveryRequired {
+                replacement: "candidate slot occupied".into(),
+                rollback: "test driver retained ownership".into(),
+            })
+    }
+
+    fn wait_ready(
+        &mut self,
+        _: &mut StartedSession<Self::Session>,
+        signals: LifecycleSignals<'_>,
+    ) -> Result<(), LifecycleError> {
+        if self.starts.load(Ordering::SeqCst) == 2 {
+            self.replacement_ready_entered.send(()).unwrap();
+            let (released, changed) = &*self.replacement_ready_release;
+            let mut released = released.lock().unwrap();
+            while !*released && !signals.cancellation_requested() && !signals.stop_requested() {
+                let (next, _) = changed
+                    .wait_timeout(released, Duration::from_millis(5))
+                    .unwrap();
+                released = next;
+            }
+        }
+        if signals.cancellation_requested() {
+            Err(LifecycleError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn stop_exact<'a>(
+        &mut self,
+        _: &'a mut StartedSession<Self::Session>,
+    ) -> Result<(), ExactStopFailure<'a, Self::Session>> {
+        Ok(())
+    }
+
+    fn poll_exact(
+        &mut self,
+        _: &mut StartedSession<Self::Session>,
+    ) -> Result<crate::model_lifecycle::ExactSessionStatus, LifecycleError> {
+        Ok(if self.exit_requested.swap(false, Ordering::SeqCst) {
+            crate::model_lifecycle::ExactSessionStatus::Exited
+        } else {
+            crate::model_lifecycle::ExactSessionStatus::Running
+        })
+    }
+}
+
+struct TickRecoveryGateway {
+    withdraws: Arc<AtomicUsize>,
+    publishes: Arc<AtomicUsize>,
+    replacement_published: mpsc::Sender<()>,
+}
+
+impl GatewayPublisher for TickRecoveryGateway {
+    fn withdraw(&mut self) {
+        self.withdraws.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn publish(&mut self, _: &LaunchPlan, _: &SessionCorrelation) {
+        if self.publishes.fetch_add(1, Ordering::SeqCst) == 1 {
+            let _ = self.replacement_published.send(());
+        }
+    }
+}
+
+struct TickRecoveryWorkflow;
+
+impl LifecycleLoadWorkflow for TickRecoveryWorkflow {
+    fn submit_load(
+        &mut self,
+        request: &LifecycleLoadRequest,
+        completion: LifecycleVerificationCompletion,
+    ) -> Result<LifecycleLoadSubmission, LifecycleError> {
+        drop(completion);
+        Ok(LifecycleLoadSubmission::Ready(LaunchPlan {
+            model_id: request.model_id.clone(),
+            artifact_path: request.model_id.clone().into(),
+            engine: "llama-cpp".into(),
+            ctx_size: loxa_core::supervisor::DEFAULT_CTX_TOKENS,
+            jinja: false,
+            speculative: None,
+        }))
+    }
+
+    fn resume_verified(
+        &mut self,
+        _: &LifecycleLoadRequest,
+        _: &loxa_core::model_inventory::VerifiedArtifact,
+        _: &MutationCancellation,
+    ) -> Result<LaunchPlan, LifecycleError> {
+        unreachable!()
+    }
+
+    fn supervision_enabled(&self) -> bool {
+        true
+    }
+
+    fn prepare_restart(
+        &mut self,
+        model_id: &str,
+        _: &MutationCancellation,
+    ) -> Result<LifecycleRestartPlan, LifecycleError> {
+        Ok(LifecycleRestartPlan::unguarded(LaunchPlan {
+            model_id: model_id.to_owned(),
+            artifact_path: model_id.into(),
+            engine: "llama-cpp".into(),
+            ctx_size: loxa_core::supervisor::DEFAULT_CTX_TOKENS,
+            jinja: false,
+            speculative: None,
+        }))
+    }
+}
+
+#[test]
+fn durable_controller_tick_restarts_once_and_withdraws_until_replacement_ready() {
+    let starts = Arc::new(AtomicUsize::new(0));
+    let exit_requested = Arc::new(AtomicBool::new(false));
+    let withdraws = Arc::new(AtomicUsize::new(0));
+    let publishes = Arc::new(AtomicUsize::new(0));
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (published_tx, published_rx) = mpsc::channel();
+    let ready_release = Arc::new((Mutex::new(false), Condvar::new()));
+    let lifecycle = ModelLifecycle::new(
+        StableNodeOwner {
+            run_id: "tick-owner".into(),
+            pid: 1,
+            process_start_time_unix_s: 2,
+            gateway_port: 8080,
+        },
+        TickRecoveryDriver {
+            starts: Arc::clone(&starts),
+            exit_requested: Arc::clone(&exit_requested),
+            replacement_ready_entered: ready_tx,
+            replacement_ready_release: Arc::clone(&ready_release),
+        },
+        TickRecoveryGateway {
+            withdraws: Arc::clone(&withdraws),
+            publishes: Arc::clone(&publishes),
+            replacement_published: published_tx,
+        },
+    );
+    let (handle, owner) =
+        LifecycleControllerOwner::start_with_workflow(lifecycle, TickRecoveryWorkflow).unwrap();
+    let operation_id = OperationId::new_v4();
+    handle
+        .reserve_normal()
+        .unwrap()
+        .submit(load(operation_id, "model", 1))
+        .unwrap();
+    owner
+        .recv_completion_timeout(Duration::from_secs(1))
+        .expect("initial load completion");
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+    assert_eq!(publishes.load(Ordering::SeqCst), 1);
+
+    exit_requested.store(true, Ordering::SeqCst);
+    let replacement_entered = ready_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+    if replacement_entered {
+        assert_eq!(publishes.load(Ordering::SeqCst), 1);
+        assert!(withdraws.load(Ordering::SeqCst) >= 2);
+        let (released, changed) = &*ready_release;
+        *released.lock().unwrap() = true;
+        changed.notify_all();
+    }
+    let restarted = published_rx.recv_timeout(Duration::from_secs(1)).is_ok()
+        && starts.load(Ordering::SeqCst) == 2
+        && publishes.load(Ordering::SeqCst) == 2;
+
+    owner
+        .shutdown(Instant::now() + Duration::from_secs(1))
+        .unwrap();
+    assert!(
+        replacement_entered && restarted,
+        "the idle controller never drove the existing recovery path"
+    );
 }
 
 #[test]

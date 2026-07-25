@@ -59,6 +59,7 @@ struct LifecycleMailboxState {
     fatal: bool,
     fatal_notified: bool,
     active: Option<(OperationId, MutationCancellation)>,
+    supervision: Option<MutationCancellation>,
 }
 
 enum LifecycleNormalEntry {
@@ -178,6 +179,7 @@ impl LifecycleMailboxInner {
                 fatal: false,
                 fatal_notified: false,
                 active: None,
+                supervision: None,
             }),
             changed: Condvar::new(),
             verification: CompletionDestination::new(verification_capacity),
@@ -269,17 +271,23 @@ impl LifecycleMailboxInner {
     }
 
     fn request_owner_shutdown(&self, deadline: Instant) -> Result<(), LifecycleSubmitError> {
-        let active = {
+        let (active, supervision) = {
             let mut state = self
                 .state
                 .lock()
                 .map_err(|_| LifecycleSubmitError::Poisoned)?;
             state.sealed = true;
             state.shutdown = Some(state.shutdown.map_or(deadline, |known| known.min(deadline)));
-            state.active.as_ref().map(|(_, active)| active.clone())
+            (
+                state.active.as_ref().map(|(_, active)| active.clone()),
+                state.supervision.clone(),
+            )
         };
         if let Some(active) = active {
             active.cancel();
+        }
+        if let Some(supervision) = supervision {
+            supervision.cancel();
         }
         self.changed.notify_all();
         Ok(())
@@ -440,10 +448,14 @@ impl LifecycleMailboxInner {
                 .state
                 .lock()
                 .map_err(|_| LifecycleSubmitError::Poisoned)?;
-            (state, _) = self
+            let (next, timeout) = self
                 .changed
-                .wait_timeout(state, Duration::from_millis(10))
+                .wait_timeout(state, crate::actor::IDLE_TICK_INTERVAL)
                 .map_err(|_| LifecycleSubmitError::Poisoned)?;
+            state = next;
+            if timeout.timed_out() {
+                return Ok(MailboxItem::Tick);
+            }
         }
     }
 
@@ -463,15 +475,46 @@ impl LifecycleMailboxInner {
         }
     }
 
+    fn begin_supervision(
+        &self,
+        cancellation: MutationCancellation,
+    ) -> Result<(), LifecycleSubmitError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| LifecycleSubmitError::Poisoned)?;
+        if state.sealed || state.shutdown.is_some() {
+            return Err(LifecycleSubmitError::Stopping);
+        }
+        if state.supervision.is_some() {
+            state.sealed = true;
+            state.fatal = true;
+            return Err(LifecycleSubmitError::Poisoned);
+        }
+        state.supervision = Some(cancellation);
+        Ok(())
+    }
+
+    fn clear_supervision(&self) {
+        let mut state = self.state.lock().expect("lifecycle mailbox poisoned");
+        state.supervision = None;
+    }
+
     fn seal_fatal(&self) {
-        let active = {
+        let (active, supervision) = {
             let mut state = self.state.lock().expect("lifecycle mailbox poisoned");
             state.sealed = true;
             state.fatal = true;
-            state.active.as_ref().map(|(_, active)| active.clone())
+            (
+                state.active.as_ref().map(|(_, active)| active.clone()),
+                state.supervision.clone(),
+            )
         };
         if let Some(active) = active {
             active.cancel();
+        }
+        if let Some(supervision) = supervision {
+            supervision.cancel();
         }
         self.verification.poison_ready();
         self.changed.notify_all();
@@ -485,6 +528,7 @@ impl LifecycleMailboxInner {
 enum MailboxItem {
     Command(LifecycleCommand),
     Verification(RetainedCompletion<LifecycleVerificationOutcome>),
+    Tick,
     Fatal,
 }
 
@@ -600,6 +644,28 @@ pub(crate) enum LifecycleLoadSubmission {
     Verifying,
 }
 
+pub(crate) struct LifecycleRestartPlan {
+    plan: LaunchPlan,
+    _guard: Option<Box<dyn Send>>,
+}
+
+impl LifecycleRestartPlan {
+    pub(crate) fn unguarded(plan: LaunchPlan) -> Self {
+        Self { plan, _guard: None }
+    }
+
+    pub(crate) fn guarded(plan: LaunchPlan, guard: impl Send + 'static) -> Self {
+        Self {
+            plan,
+            _guard: Some(Box::new(guard)),
+        }
+    }
+
+    fn plan(&self) -> &LaunchPlan {
+        &self.plan
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LifecycleCancelAcknowledgement {
     DurablyConfirmed,
@@ -628,6 +694,18 @@ pub(crate) trait LifecycleLoadWorkflow: Send {
         evidence: &VerifiedArtifact,
         cancellation: &MutationCancellation,
     ) -> Result<LaunchPlan, LifecycleError>;
+
+    fn supervision_enabled(&self) -> bool {
+        false
+    }
+
+    fn prepare_restart(
+        &mut self,
+        _model_id: &str,
+        _cancellation: &MutationCancellation,
+    ) -> Result<LifecycleRestartPlan, LifecycleError> {
+        Err(LifecycleError::ModelNotVerified)
+    }
 
     fn cancel(&mut self, _operation_id: &OperationId) -> LifecycleCancelAcknowledgement {
         LifecycleCancelAcknowledgement::Unknown
@@ -775,6 +853,40 @@ impl LifecycleControllerOwner {
                         }
                     };
                     match item {
+                        MailboxItem::Tick => {
+                            if !workflow.supervision_enabled() {
+                                continue;
+                            }
+                            let cancellation = MutationCancellation::new();
+                            if worker_mailbox
+                                .begin_supervision(cancellation.clone())
+                                .is_err()
+                            {
+                                continue;
+                            }
+                            let restart = match lifecycle.poll_ready_session() {
+                                Ok(Some(model_id)) => workflow
+                                    .prepare_restart(&model_id, &cancellation)
+                                    .and_then(|prepared| {
+                                        if cancellation.is_cancelled() {
+                                            return Err(LifecycleError::Cancelled);
+                                        }
+                                        lifecycle.restart_verified(
+                                            prepared.plan().clone(),
+                                            &cancellation,
+                                        )
+                                    }),
+                                Ok(None) => Ok(()),
+                                Err(error) => Err(error),
+                            };
+                            worker_mailbox.clear_supervision();
+                            if let Err(error) = restart {
+                                if !cancellation.is_cancelled() {
+                                    lifecycle.fail_supervision(error);
+                                    worker_mailbox.seal_fatal();
+                                }
+                            }
+                        }
                         MailboxItem::Fatal => {
                             if let Some(pending) = pending_verified_load.take() {
                                 let _ = workflow.cancel(&pending.request.operation_id);
@@ -1185,4 +1297,32 @@ where
         ObservedChildExit::Exhausted { .. } => "restart-budget-exhausted",
         ObservedChildExit::RecoveryRequired => "recovery-required",
     });
+}
+
+#[cfg(test)]
+mod supervision_tick_tests {
+    use super::{LifecycleMailboxInner, LIFECYCLE_NORMAL_CAPACITY};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn idle_mailbox_yields_a_bounded_supervision_tick() {
+        let mailbox = LifecycleMailboxInner::new(LIFECYCLE_NORMAL_CAPACITY);
+        let worker_mailbox = mailbox.clone();
+        let (returned_tx, returned_rx) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let _ = returned_tx.send(worker_mailbox.take_next().is_ok());
+        });
+
+        let timely = returned_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+        if !timely {
+            mailbox
+                .request_owner_shutdown(Instant::now() + Duration::from_secs(1))
+                .unwrap();
+            returned_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        worker.join().unwrap();
+
+        assert!(timely, "an idle mailbox never returned a supervision tick");
+    }
 }

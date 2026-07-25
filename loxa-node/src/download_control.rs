@@ -18,7 +18,7 @@ use crate::download_scheduler::{
 use crate::lifecycle_controller::{
     LifecycleCancelAcknowledgement, LifecycleCommand, LifecycleControllerHandle,
     LifecycleControllerOwner, LifecycleControllerShutdownFailure, LifecycleLoadRequest,
-    LifecycleLoadSubmission, LifecycleLoadWorkflow,
+    LifecycleLoadSubmission, LifecycleLoadWorkflow, LifecycleRestartPlan,
 };
 use crate::model_lifecycle::{
     EngineLifecycleDriver, GatewayPublisher, LaunchPlan, LifecycleError, LifecycleSnapshot,
@@ -1029,6 +1029,7 @@ impl DownloadControl {
         let models_dir = Arc::new(models_dir);
         let durable_mode = control_state.is_some();
         let mut lifecycle_owner = Some(lifecycle);
+        let mut restart_verifier = Some(restart_verifier);
         let verification_cancellation = MutationCancellation::new();
         let lifecycle_snapshot = Arc::new(Mutex::new(
             lifecycle_owner
@@ -1063,7 +1064,7 @@ impl DownloadControl {
                     models_dir: (*models_dir).clone(),
                     verification_cache: Arc::clone(&verification_cache),
                     recipes,
-                    restart_verifier,
+                    restart_verifier: restart_verifier.take().expect("legacy restart verifier"),
                 })),
             };
             let (actor, worker) = NodeActor::spawn(executor);
@@ -1109,6 +1110,7 @@ impl DownloadControl {
                     verification_cache: Arc::clone(&verification_cache),
                     verification: lanes.verification.clone(),
                     artifacts: lanes.artifacts.clone(),
+                    restart_verifier: restart_verifier.take().expect("durable restart verifier"),
                     control_state: Some(control_state.clone()),
                     pending: HashMap::new(),
                     #[cfg(test)]
@@ -1709,6 +1711,7 @@ struct SchedulerLifecycleWorkflow {
     verification_cache: Arc<VerificationCache>,
     verification: VerificationSchedulerHandle,
     artifacts: ArtifactMutationCoordinator,
+    restart_verifier: Box<dyn RestartArtifactVerifier>,
     control_state: Option<ControlStateHandle>,
     pending: HashMap<OperationId, PendingLifecycleVerification>,
     #[cfg(test)]
@@ -1716,6 +1719,45 @@ struct SchedulerLifecycleWorkflow {
 }
 
 impl LifecycleLoadWorkflow for SchedulerLifecycleWorkflow {
+    fn supervision_enabled(&self) -> bool {
+        true
+    }
+
+    fn prepare_restart(
+        &mut self,
+        model_id: &str,
+        cancellation: &MutationCancellation,
+    ) -> Result<LifecycleRestartPlan, LifecycleError> {
+        let recipe = self
+            .catalog
+            .recipe(model_id)
+            .ok_or(LifecycleError::ModelNotVerified)?;
+        let key = self
+            .catalog
+            .download_key(model_id)
+            .map_err(|_| LifecycleError::ModelNotVerified)?;
+        let artifact = self
+            .artifacts
+            .try_acquire_read(key.artifact().clone())
+            .map_err(|_| LifecycleError::ModelNotVerified)?;
+        self.restart_verifier
+            .verify(&self.catalog.models_dir, recipe, cancellation)?;
+        if cancellation.is_cancelled() {
+            return Err(LifecycleError::Cancelled);
+        }
+        let entry = loxa_core::model_inventory::verified_recipe_inventory_with_cache(
+            self.catalog.recipes,
+            &self.catalog.models_dir,
+            loxa_core::model_inventory::current_available_memory_bytes(),
+            &self.verification_cache,
+        )
+        .into_iter()
+        .find(|entry| entry.id == model_id)
+        .ok_or(LifecycleError::ModelNotVerified)?;
+        let plan = LaunchPlan::from_verified_inventory(&entry, &self.catalog.models_dir)?;
+        Ok(LifecycleRestartPlan::guarded(plan, artifact))
+    }
+
     fn submit_load(
         &mut self,
         request: &LifecycleLoadRequest,
@@ -6471,6 +6513,9 @@ mod tests {
             verification_cache: Arc::new(VerificationCache::default()),
             verification,
             artifacts: artifacts.clone(),
+            restart_verifier: Box::new(CacheRestartArtifactVerifier {
+                cache: Arc::new(VerificationCache::default()),
+            }),
             control_state: Some(control.handle.clone()),
             pending: HashMap::new(),
             faults: Arc::new(DurableLaneFaults::default()),
@@ -6564,9 +6609,684 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn scheduler_restart_prepares_verified_plan_and_retains_target_read_lease() {
+        let dir = std::env::temp_dir().join(format!(
+            "loxa-durable-restart-lease-{}",
+            OperationId::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let recipe = Box::leak(Box::new(ModelEntry {
+            id: "restart-lease-model",
+            repo: "owner/repo",
+            revision: "0123456789abcdef0123456789abcdef01234567",
+            filename: "restart-lease-model.gguf",
+            sha256: "770e607624d689265ca6c44884d0807d9b054d23c473c106c72be9de08b7376c",
+            size_bytes: 4,
+            license: "apache-2.0",
+            params: "tiny",
+            quant: "Q4",
+            min_free_mem_gb: 0.0,
+        }));
+        let recipes = std::slice::from_ref(recipe);
+        let artifact_path = dir.join(recipe.filename);
+        std::fs::write(&artifact_path, b"good").unwrap();
+        let artifact_key = ArtifactKey::from_destination(&artifact_path).unwrap();
+        let artifacts = ArtifactMutationCoordinator::new();
+        let (verification, verification_owner) = VerificationSchedulerOwner::start().unwrap();
+        let verification_cache = Arc::new(VerificationCache::default());
+        let mut workflow = SchedulerLifecycleWorkflow {
+            catalog: Arc::new(DurableLaneCatalog {
+                models_dir: Arc::new(dir.clone()),
+                recipes,
+            }),
+            verification_cache: Arc::clone(&verification_cache),
+            verification,
+            artifacts: artifacts.clone(),
+            restart_verifier: Box::new(CacheRestartArtifactVerifier {
+                cache: verification_cache,
+            }),
+            control_state: None,
+            pending: HashMap::new(),
+            faults: Arc::new(DurableLaneFaults::default()),
+        };
+
+        let prepared = workflow
+            .prepare_restart(recipe.id, &MutationCancellation::new())
+            .expect("durable workflow prepares a verified semantic restart plan");
+        assert_eq!(
+            artifacts
+                .try_acquire_mutation(artifact_key.clone())
+                .unwrap_err(),
+            ArtifactAcquireError::Busy,
+            "the target read lease must outlive hashing and plan construction"
+        );
+
+        drop(prepared);
+        assert!(artifacts.try_acquire_mutation(artifact_key).is_ok());
+        verification_owner
+            .shutdown(std::time::Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn production_controller_retains_scheduler_read_lease_through_replacement_readiness() {
+        let dir = std::env::temp_dir().join(format!(
+            "loxa-durable-restart-controller-lease-{}",
+            OperationId::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let recipe = Box::leak(Box::new(ModelEntry {
+            id: "restart-controller-lease",
+            repo: "owner/repo",
+            revision: "0123456789abcdef0123456789abcdef01234567",
+            filename: "restart-controller-lease.gguf",
+            sha256: "770e607624d689265ca6c44884d0807d9b054d23c473c106c72be9de08b7376c",
+            size_bytes: 4,
+            license: "apache-2.0",
+            params: "tiny",
+            quant: "Q4",
+            min_free_mem_gb: 0.0,
+        }));
+        let recipes = std::slice::from_ref(recipe);
+        let artifact_path = dir.join(recipe.filename);
+        std::fs::write(&artifact_path, b"good").unwrap();
+        let artifact_key = ArtifactKey::from_destination(&artifact_path).unwrap();
+        let artifacts = ArtifactMutationCoordinator::new();
+        let verification_cache = Arc::new(VerificationCache::default());
+        let (verification, verification_owner) = VerificationSchedulerOwner::start().unwrap();
+        let workflow = SchedulerLifecycleWorkflow {
+            catalog: Arc::new(DurableLaneCatalog {
+                models_dir: Arc::new(dir.clone()),
+                recipes,
+            }),
+            verification_cache: Arc::clone(&verification_cache),
+            verification,
+            artifacts: artifacts.clone(),
+            restart_verifier: Box::new(CacheRestartArtifactVerifier {
+                cache: verification_cache,
+            }),
+            control_state: None,
+            pending: HashMap::new(),
+            faults: Arc::new(DurableLaneFaults::default()),
+        };
+        let starts = Arc::new(AtomicUsize::new(0));
+        let live_sessions = Arc::new(AtomicUsize::new(0));
+        let exit_requested = Arc::new(AtomicBool::new(false));
+        let (ready_entered_tx, ready_entered_rx) = std::sync::mpsc::channel();
+        let ready_release = Arc::new((Mutex::new(false), Condvar::new()));
+        let withdraws = Arc::new(AtomicUsize::new(0));
+        let publishes = Arc::new(AtomicUsize::new(0));
+        let (withdrawn_tx, withdrawn_rx) = std::sync::mpsc::channel();
+        let (published_tx, published_rx) = std::sync::mpsc::channel();
+        let mut lifecycle = ModelLifecycle::new(
+            crate::model_lifecycle::StableNodeOwner {
+                run_id: "controller-lease-owner".into(),
+                pid: 1,
+                process_start_time_unix_s: 2,
+                gateway_port: 8_080,
+            },
+            DurableRecoveryDriver {
+                starts: Arc::clone(&starts),
+                live_sessions: Arc::clone(&live_sessions),
+                exit_requested: Arc::clone(&exit_requested),
+                replacement_ready: Some((ready_entered_tx, Arc::clone(&ready_release))),
+                recovery_marked: None,
+            },
+            SignalingRecoveryGateway {
+                withdraws,
+                publishes: Arc::clone(&publishes),
+                withdrawn: withdrawn_tx,
+                published: published_tx,
+            },
+        );
+        lifecycle
+            .load(
+                LaunchPlan {
+                    model_id: recipe.id.into(),
+                    artifact_path,
+                    engine: "llama-cpp".into(),
+                    ctx_size: loxa_core::supervisor::DEFAULT_CTX_TOKENS,
+                    jinja: false,
+                    speculative: None,
+                },
+                &MutationCancellation::new(),
+            )
+            .unwrap();
+        lifecycle.complete_operation();
+        assert_eq!(
+            withdrawn_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            1
+        );
+        assert_eq!(
+            published_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            1
+        );
+        let (_handle, owner) =
+            LifecycleControllerOwner::start_with_workflow(lifecycle, workflow).unwrap();
+
+        exit_requested.store(true, Ordering::SeqCst);
+        ready_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("replacement reached readiness");
+        assert_eq!(
+            artifacts
+                .try_acquire_mutation(artifact_key.clone())
+                .unwrap_err(),
+            ArtifactAcquireError::Busy,
+            "controller must retain the workflow guard during replacement readiness"
+        );
+        let (released, changed) = &*ready_release;
+        *released.lock().unwrap() = true;
+        changed.notify_all();
+        assert_eq!(
+            published_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            2
+        );
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+        assert_eq!(publishes.load(Ordering::SeqCst), 2);
+
+        owner
+            .shutdown(std::time::Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(live_sessions.load(Ordering::SeqCst), 0);
+        assert!(artifacts.try_acquire_mutation(artifact_key).is_ok());
+        verification_owner
+            .shutdown(std::time::Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn fixed_profile_drafter_failure_prevents_durable_replacement_spawn_and_publish() {
+        let recipe = registry::find("loxa").expect("fixed loxa recipe");
+        let profile = runtime_profile(recipe.id).expect("fixed paired profile");
+        for reason in ["missing-drafter", "changed-drafter"] {
+            let dir = std::env::temp_dir().join(format!(
+                "loxa-durable-pair-failure-{reason}-{}",
+                OperationId::new_v4()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let artifact_path = dir.join(recipe.filename);
+            let artifact_key = ArtifactKey::from_destination(&artifact_path).unwrap();
+            let artifacts = ArtifactMutationCoordinator::new();
+            let (verification, verification_owner) = VerificationSchedulerOwner::start().unwrap();
+            let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+            let workflow = SchedulerLifecycleWorkflow {
+                catalog: Arc::new(DurableLaneCatalog {
+                    models_dir: Arc::new(dir.clone()),
+                    recipes: REGISTRY,
+                }),
+                verification_cache: Arc::new(VerificationCache::default()),
+                verification,
+                artifacts: artifacts.clone(),
+                restart_verifier: Box::new(ObservedPairedFailureVerifier {
+                    reason,
+                    observed: observed_tx,
+                }),
+                control_state: None,
+                pending: HashMap::new(),
+                faults: Arc::new(DurableLaneFaults::default()),
+            };
+            let starts = Arc::new(AtomicUsize::new(0));
+            let live_sessions = Arc::new(AtomicUsize::new(0));
+            let exit_requested = Arc::new(AtomicBool::new(false));
+            let (recovery_marked_tx, recovery_marked_rx) = std::sync::mpsc::channel();
+            let withdraws = Arc::new(AtomicUsize::new(0));
+            let publishes = Arc::new(AtomicUsize::new(0));
+            let (withdrawn_tx, withdrawn_rx) = std::sync::mpsc::channel();
+            let (published_tx, published_rx) = std::sync::mpsc::channel();
+            let mut lifecycle = ModelLifecycle::new(
+                crate::model_lifecycle::StableNodeOwner {
+                    run_id: format!("paired-failure-{reason}"),
+                    pid: 1,
+                    process_start_time_unix_s: 2,
+                    gateway_port: 8_080,
+                },
+                DurableRecoveryDriver {
+                    starts: Arc::clone(&starts),
+                    live_sessions: Arc::clone(&live_sessions),
+                    exit_requested: Arc::clone(&exit_requested),
+                    replacement_ready: None,
+                    recovery_marked: Some(recovery_marked_tx),
+                },
+                SignalingRecoveryGateway {
+                    withdraws,
+                    publishes: Arc::clone(&publishes),
+                    withdrawn: withdrawn_tx,
+                    published: published_tx,
+                },
+            );
+            lifecycle
+                .load(
+                    LaunchPlan {
+                        model_id: recipe.id.into(),
+                        artifact_path,
+                        engine: "llama-cpp".into(),
+                        ctx_size: 8_192,
+                        jinja: true,
+                        speculative: None,
+                    },
+                    &MutationCancellation::new(),
+                )
+                .unwrap();
+            lifecycle.complete_operation();
+            assert_eq!(
+                withdrawn_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+                1
+            );
+            assert_eq!(
+                published_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+                1
+            );
+            let (_handle, owner) =
+                LifecycleControllerOwner::start_with_workflow(lifecycle, workflow).unwrap();
+
+            exit_requested.store(true, Ordering::SeqCst);
+            let (observed_reason, filenames) = observed_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("paired verifier observed restart");
+            assert_eq!(observed_reason, reason);
+            assert_eq!(
+                filenames,
+                vec![
+                    recipe.filename.to_owned(),
+                    profile.drafter.filename.to_owned()
+                ]
+            );
+            recovery_marked_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("paired verification failure marked recovery");
+            let failure = owner
+                .shutdown(std::time::Instant::now() + Duration::from_secs(2))
+                .expect_err("verification failure seals durable lifecycle authority");
+            failure.into_owner().dispose_fatal_for_test();
+            assert_eq!(starts.load(Ordering::SeqCst), 1);
+            assert_eq!(publishes.load(Ordering::SeqCst), 1);
+            assert_eq!(live_sessions.load(Ordering::SeqCst), 0);
+            assert!(artifacts.try_acquire_mutation(artifact_key).is_ok());
+            verification_owner
+                .shutdown(std::time::Instant::now() + Duration::from_secs(2))
+                .unwrap();
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn durable_controller_uses_only_the_existing_one_shot_restart_budget() {
+        let dir = std::env::temp_dir().join(format!(
+            "loxa-durable-restart-budget-{}",
+            OperationId::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let recipe = Box::leak(Box::new(ModelEntry {
+            id: "restart-budget-model",
+            repo: "owner/repo",
+            revision: "0123456789abcdef0123456789abcdef01234567",
+            filename: "restart-budget-model.gguf",
+            sha256: "770e607624d689265ca6c44884d0807d9b054d23c473c106c72be9de08b7376c",
+            size_bytes: 4,
+            license: "apache-2.0",
+            params: "tiny",
+            quant: "Q4",
+            min_free_mem_gb: 0.0,
+        }));
+        let recipes = std::slice::from_ref(recipe);
+        let artifact_path = dir.join(recipe.filename);
+        std::fs::write(&artifact_path, b"good").unwrap();
+        let artifact_key = ArtifactKey::from_destination(&artifact_path).unwrap();
+        let artifacts = ArtifactMutationCoordinator::new();
+        let verification_cache = Arc::new(VerificationCache::default());
+        let (verification, verification_owner) = VerificationSchedulerOwner::start().unwrap();
+        let workflow = SchedulerLifecycleWorkflow {
+            catalog: Arc::new(DurableLaneCatalog {
+                models_dir: Arc::new(dir.clone()),
+                recipes,
+            }),
+            verification_cache: Arc::clone(&verification_cache),
+            verification,
+            artifacts: artifacts.clone(),
+            restart_verifier: Box::new(CacheRestartArtifactVerifier {
+                cache: verification_cache,
+            }),
+            control_state: None,
+            pending: HashMap::new(),
+            faults: Arc::new(DurableLaneFaults::default()),
+        };
+        let starts = Arc::new(AtomicUsize::new(0));
+        let live_sessions = Arc::new(AtomicUsize::new(0));
+        let exit_requested = Arc::new(AtomicBool::new(false));
+        let (recovery_marked_tx, recovery_marked_rx) = std::sync::mpsc::channel();
+        let publishes = Arc::new(AtomicUsize::new(0));
+        let (withdrawn_tx, withdrawn_rx) = std::sync::mpsc::channel();
+        let (published_tx, published_rx) = std::sync::mpsc::channel();
+        let mut lifecycle = ModelLifecycle::new(
+            crate::model_lifecycle::StableNodeOwner {
+                run_id: "restart-budget-owner".into(),
+                pid: 1,
+                process_start_time_unix_s: 2,
+                gateway_port: 8_080,
+            },
+            DurableRecoveryDriver {
+                starts: Arc::clone(&starts),
+                live_sessions: Arc::clone(&live_sessions),
+                exit_requested: Arc::clone(&exit_requested),
+                replacement_ready: None,
+                recovery_marked: Some(recovery_marked_tx),
+            },
+            SignalingRecoveryGateway {
+                withdraws: Arc::new(AtomicUsize::new(0)),
+                publishes: Arc::clone(&publishes),
+                withdrawn: withdrawn_tx,
+                published: published_tx,
+            },
+        );
+        lifecycle
+            .load(
+                LaunchPlan {
+                    model_id: recipe.id.into(),
+                    artifact_path,
+                    engine: "llama-cpp".into(),
+                    ctx_size: loxa_core::supervisor::DEFAULT_CTX_TOKENS,
+                    jinja: false,
+                    speculative: None,
+                },
+                &MutationCancellation::new(),
+            )
+            .unwrap();
+        lifecycle.complete_operation();
+        assert_eq!(
+            withdrawn_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            1
+        );
+        assert_eq!(
+            published_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            1
+        );
+        let (_handle, owner) =
+            LifecycleControllerOwner::start_with_workflow(lifecycle, workflow).unwrap();
+
+        exit_requested.store(true, Ordering::SeqCst);
+        assert_eq!(
+            withdrawn_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            2
+        );
+        assert_eq!(
+            published_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            2
+        );
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+        assert_eq!(live_sessions.load(Ordering::SeqCst), 1);
+
+        exit_requested.store(true, Ordering::SeqCst);
+        assert_eq!(
+            withdrawn_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            3
+        );
+        recovery_marked_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second exit exhausted the existing restart budget");
+        let failure = owner
+            .shutdown(std::time::Instant::now() + Duration::from_secs(2))
+            .expect_err("exhausted restart budget seals durable lifecycle authority");
+        failure.into_owner().dispose_fatal_for_test();
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+        assert_eq!(publishes.load(Ordering::SeqCst), 2);
+        assert_eq!(live_sessions.load(Ordering::SeqCst), 0);
+        assert!(artifacts.try_acquire_mutation(artifact_key).is_ok());
+        verification_owner
+            .shutdown(std::time::Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn durable_shutdown_cancels_gated_restart_verification_and_releases_ownership() {
+        let dir = std::env::temp_dir().join(format!(
+            "loxa-durable-restart-shutdown-{}",
+            OperationId::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let recipe = Box::leak(Box::new(ModelEntry {
+            id: "restart-shutdown-model",
+            repo: "owner/repo",
+            revision: "0123456789abcdef0123456789abcdef01234567",
+            filename: "restart-shutdown-model.gguf",
+            sha256: "770e607624d689265ca6c44884d0807d9b054d23c473c106c72be9de08b7376c",
+            size_bytes: 4,
+            license: "apache-2.0",
+            params: "tiny",
+            quant: "Q4",
+            min_free_mem_gb: 0.0,
+        }));
+        let recipes = std::slice::from_ref(recipe);
+        let artifact_path = dir.join(recipe.filename);
+        let artifact_key = ArtifactKey::from_destination(&artifact_path).unwrap();
+        let artifacts = ArtifactMutationCoordinator::new();
+        let (verification, verification_owner) = VerificationSchedulerOwner::start().unwrap();
+        let (verification_entered_tx, verification_entered_rx) = std::sync::mpsc::channel();
+        let (cancellation_observed_tx, cancellation_observed_rx) = std::sync::mpsc::channel();
+        let workflow = SchedulerLifecycleWorkflow {
+            catalog: Arc::new(DurableLaneCatalog {
+                models_dir: Arc::new(dir.clone()),
+                recipes,
+            }),
+            verification_cache: Arc::new(VerificationCache::default()),
+            verification,
+            artifacts: artifacts.clone(),
+            restart_verifier: Box::new(CancellationBlockingRestartVerifier {
+                entered: verification_entered_tx,
+                cancellation_observed: cancellation_observed_tx,
+            }),
+            control_state: None,
+            pending: HashMap::new(),
+            faults: Arc::new(DurableLaneFaults::default()),
+        };
+        let starts = Arc::new(AtomicUsize::new(0));
+        let live_sessions = Arc::new(AtomicUsize::new(0));
+        let exit_requested = Arc::new(AtomicBool::new(false));
+        let publishes = Arc::new(AtomicUsize::new(0));
+        let (withdrawn_tx, withdrawn_rx) = std::sync::mpsc::channel();
+        let (published_tx, published_rx) = std::sync::mpsc::channel();
+        let mut lifecycle = ModelLifecycle::new(
+            crate::model_lifecycle::StableNodeOwner {
+                run_id: "restart-shutdown-owner".into(),
+                pid: 1,
+                process_start_time_unix_s: 2,
+                gateway_port: 8_080,
+            },
+            DurableRecoveryDriver {
+                starts: Arc::clone(&starts),
+                live_sessions: Arc::clone(&live_sessions),
+                exit_requested: Arc::clone(&exit_requested),
+                replacement_ready: None,
+                recovery_marked: None,
+            },
+            SignalingRecoveryGateway {
+                withdraws: Arc::new(AtomicUsize::new(0)),
+                publishes: Arc::clone(&publishes),
+                withdrawn: withdrawn_tx,
+                published: published_tx,
+            },
+        );
+        lifecycle
+            .load(
+                LaunchPlan {
+                    model_id: recipe.id.into(),
+                    artifact_path,
+                    engine: "llama-cpp".into(),
+                    ctx_size: loxa_core::supervisor::DEFAULT_CTX_TOKENS,
+                    jinja: false,
+                    speculative: None,
+                },
+                &MutationCancellation::new(),
+            )
+            .unwrap();
+        lifecycle.complete_operation();
+        assert_eq!(
+            withdrawn_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            1
+        );
+        assert_eq!(
+            published_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            1
+        );
+        let (_handle, owner) =
+            LifecycleControllerOwner::start_with_workflow(lifecycle, workflow).unwrap();
+
+        exit_requested.store(true, Ordering::SeqCst);
+        verification_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("restart verification entered");
+        assert_eq!(
+            artifacts
+                .try_acquire_mutation(artifact_key.clone())
+                .unwrap_err(),
+            ArtifactAcquireError::Busy
+        );
+        let started = std::time::Instant::now();
+        owner
+            .shutdown(std::time::Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_millis(500));
+        cancellation_observed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("shutdown cancellation reached restart verifier");
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert_eq!(publishes.load(Ordering::SeqCst), 1);
+        assert_eq!(live_sessions.load(Ordering::SeqCst), 0);
+        assert!(artifacts.try_acquire_mutation(artifact_key).is_ok());
+        verification_owner
+            .shutdown(std::time::Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     struct RestartProbeDriver {
         starts: Arc<AtomicUsize>,
         exit_requested: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    struct DurableRecoveryDriver {
+        starts: Arc<AtomicUsize>,
+        live_sessions: Arc<AtomicUsize>,
+        exit_requested: Arc<AtomicBool>,
+        replacement_ready: Option<(std::sync::mpsc::Sender<()>, Arc<(Mutex<bool>, Condvar)>)>,
+        recovery_marked: Option<std::sync::mpsc::Sender<()>>,
+    }
+
+    impl EngineLifecycleDriver for DurableRecoveryDriver {
+        type Session = ();
+
+        fn start(
+            &mut self,
+            owner: &crate::model_lifecycle::StableNodeOwner,
+            plan: &LaunchPlan,
+            generation: u64,
+            candidate: &mut crate::model_lifecycle::CandidateSlot<()>,
+        ) -> Result<(), LifecycleError> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            self.live_sessions.fetch_add(1, Ordering::SeqCst);
+            candidate
+                .install(crate::model_lifecycle::StartedSession {
+                    value: (),
+                    correlation: crate::model_lifecycle::SessionCorrelation {
+                        generation,
+                        child_pid: 300 + generation as u32,
+                        child_process_start_time_unix_s: 400 + generation,
+                        server_id: format!("durable-recovery-{generation}"),
+                        model_id: plan.model_id.clone(),
+                        port: 9_500 + generation as u16,
+                        committed_run_id: owner.run_id.clone(),
+                        owner_pid: owner.pid,
+                        owner_process_start_time_unix_s: owner.process_start_time_unix_s,
+                        gateway_port: owner.gateway_port,
+                        generation_alias: format!("loxa-{}-g{generation}", owner.run_id),
+                        engine_version: "fixture".into(),
+                    },
+                })
+                .map_err(|_| LifecycleError::RecoveryRequired {
+                    replacement: "candidate slot occupied".into(),
+                    rollback: "test driver retained ownership".into(),
+                })
+        }
+
+        fn wait_ready(
+            &mut self,
+            _: &mut crate::model_lifecycle::StartedSession<()>,
+            signals: crate::model_lifecycle::LifecycleSignals<'_>,
+        ) -> Result<(), LifecycleError> {
+            if self.starts.load(Ordering::SeqCst) == 2 {
+                if let Some((entered, release)) = &self.replacement_ready {
+                    entered.send(()).unwrap();
+                    let (released, changed) = &**release;
+                    let mut released = released.lock().unwrap();
+                    while !*released
+                        && !signals.cancellation_requested()
+                        && !signals.stop_requested()
+                    {
+                        let (next, _) = changed
+                            .wait_timeout(released, Duration::from_millis(5))
+                            .unwrap();
+                        released = next;
+                    }
+                }
+            }
+            if signals.cancellation_requested() || signals.stop_requested() {
+                Err(LifecycleError::Cancelled)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn stop_exact<'a>(
+            &mut self,
+            _: &'a mut crate::model_lifecycle::StartedSession<()>,
+        ) -> Result<(), crate::model_lifecycle::ExactStopFailure<'a, ()>> {
+            self.live_sessions.fetch_sub(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn poll_exact(
+            &mut self,
+            _: &mut crate::model_lifecycle::StartedSession<Self::Session>,
+        ) -> Result<crate::model_lifecycle::ExactSessionStatus, LifecycleError> {
+            Ok(if self.exit_requested.swap(false, Ordering::SeqCst) {
+                crate::model_lifecycle::ExactSessionStatus::Exited
+            } else {
+                crate::model_lifecycle::ExactSessionStatus::Running
+            })
+        }
+
+        fn mark_recovery_required(
+            &mut self,
+            _: &crate::model_lifecycle::StableNodeOwner,
+        ) -> Result<(), LifecycleError> {
+            if let Some(marked) = &self.recovery_marked {
+                let _ = marked.send(());
+            }
+            Ok(())
+        }
+    }
+
+    struct SignalingRecoveryGateway {
+        withdraws: Arc<AtomicUsize>,
+        publishes: Arc<AtomicUsize>,
+        withdrawn: std::sync::mpsc::Sender<usize>,
+        published: std::sync::mpsc::Sender<usize>,
+    }
+
+    impl GatewayPublisher for SignalingRecoveryGateway {
+        fn withdraw(&mut self) {
+            let count = self.withdraws.fetch_add(1, Ordering::SeqCst) + 1;
+            let _ = self.withdrawn.send(count);
+        }
+
+        fn publish(&mut self, _: &LaunchPlan, _: &crate::model_lifecycle::SessionCorrelation) {
+            let count = self.publishes.fetch_add(1, Ordering::SeqCst) + 1;
+            let _ = self.published.send(count);
+        }
     }
 
     impl EngineLifecycleDriver for RestartProbeDriver {
@@ -6699,6 +7419,16 @@ mod tests {
         calls: Arc<Mutex<Vec<String>>>,
     }
 
+    struct ObservedPairedFailureVerifier {
+        reason: &'static str,
+        observed: std::sync::mpsc::Sender<(&'static str, Vec<String>)>,
+    }
+
+    struct CancellationBlockingRestartVerifier {
+        entered: std::sync::mpsc::Sender<()>,
+        cancellation_observed: std::sync::mpsc::Sender<()>,
+    }
+
     impl RestartArtifactVerifier for FailingPairedRestartVerifier {
         fn verify(
             &mut self,
@@ -6708,6 +7438,43 @@ mod tests {
         ) -> Result<(), LifecycleError> {
             self.calls.lock().unwrap().push(recipe.id.to_owned());
             Err(LifecycleError::ModelNotVerified)
+        }
+    }
+
+    impl RestartArtifactVerifier for ObservedPairedFailureVerifier {
+        fn verify(
+            &mut self,
+            _: &std::path::Path,
+            recipe: &'static ModelEntry,
+            _: &dyn VerificationCancellation,
+        ) -> Result<(), LifecycleError> {
+            let artifacts = required_runtime_artifacts(recipe)?;
+            self.observed
+                .send((
+                    self.reason,
+                    artifacts
+                        .into_iter()
+                        .map(|artifact| artifact.filename().to_owned())
+                        .collect(),
+                ))
+                .unwrap();
+            Err(LifecycleError::ModelNotVerified)
+        }
+    }
+
+    impl RestartArtifactVerifier for CancellationBlockingRestartVerifier {
+        fn verify(
+            &mut self,
+            _: &std::path::Path,
+            _: &'static ModelEntry,
+            cancellation: &dyn VerificationCancellation,
+        ) -> Result<(), LifecycleError> {
+            self.entered.send(()).unwrap();
+            while !cancellation.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            self.cancellation_observed.send(()).unwrap();
+            Err(LifecycleError::Cancelled)
         }
     }
 
