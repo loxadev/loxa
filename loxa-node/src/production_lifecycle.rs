@@ -5,11 +5,11 @@ use crate::model_lifecycle::{
     SessionCorrelation, StableNodeOwner, StartedSession,
 };
 use loxa_core::diagnostics::DiagnosticsHealth;
+use loxa_core::engine::llama_cpp::{build_launch_spec, LlamaCppLaunchInput, LlamaCppLaunchMode};
 use loxa_core::engine::{EngineLaunchSpec, ReadinessStrategy};
 use loxa_core::gateway::{EngineTarget, GatewayState};
 use loxa_core::supervisor::{self, ManagedChild, ManagedServer, RunLifecycle};
-use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
@@ -43,6 +43,36 @@ fn install_spawned_candidate(
     });
 
     Ok(())
+}
+
+fn build_managed_llama_launch_spec(
+    program: &Path,
+    plan: &LaunchPlan,
+    alias: &str,
+    port: u16,
+    engine_version: &str,
+) -> Result<EngineLaunchSpec, LifecycleError> {
+    let mode = match &plan.speculative {
+        Some(speculative) => LlamaCppLaunchMode::QualifiedGemma4Mtp {
+            drafter: &speculative.drafter_path,
+            ctx_size: plan.ctx_size,
+            jinja: plan.jinja,
+            spec_type: &speculative.spec_type,
+            draft_n_max: speculative.draft_n_max,
+        },
+        None => LlamaCppLaunchMode::Unpaired {
+            ctx_size: plan.ctx_size,
+        },
+    };
+    build_launch_spec(LlamaCppLaunchInput {
+        program,
+        target: &plan.artifact_path,
+        alias,
+        port,
+        engine_version,
+        mode,
+    })
+    .map_err(|error| LifecycleError::StartFailed(error.to_string()))
 }
 
 pub(crate) struct ProductionEngineDriver {
@@ -297,6 +327,7 @@ impl EngineLifecycleDriver for ProductionEngineDriver {
         let alias = format!("loxa-{}-g{generation}", owner.run_id);
         let program = supervisor::detect_llama_server().map_err(Self::public_error)?;
         let version = supervisor::llama_server_version(&program).map_err(Self::public_error)?;
+        let spec = build_managed_llama_launch_spec(&program, plan, &alias, engine_port, &version)?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(Self::public_error)?
@@ -325,35 +356,6 @@ impl EngineLifecycleDriver for ProductionEngineDriver {
             self.reconcile_childless_owner(owner, &starting)?;
             return Err(LifecycleError::Stopping);
         }
-        let spec = EngineLaunchSpec {
-            program,
-            args: vec![
-                OsString::from("--model"),
-                plan.artifact_path.as_os_str().to_owned(),
-                OsString::from("--alias"),
-                OsString::from(&alias),
-                OsString::from("--host"),
-                OsString::from("127.0.0.1"),
-                OsString::from("--port"),
-                OsString::from(engine_port.to_string()),
-                OsString::from("--ctx-size"),
-                OsString::from(supervisor::DEFAULT_CTX_TOKENS.to_string()),
-                OsString::from("--gpu-layers"),
-                OsString::from("auto"),
-                OsString::from("--flash-attn"),
-                OsString::from("auto"),
-                OsString::from("--metrics"),
-                OsString::from("--log-disable"),
-            ],
-            port: engine_port,
-            engine_name: "llama.cpp".into(),
-            engine_version: version.clone(),
-            runtime_model: plan.artifact_path.display().to_string(),
-            upstream_model: alias.clone(),
-            readiness: ReadinessStrategy::LlamaModelAlias {
-                expected_alias: alias.clone(),
-            },
-        };
         // Prebuild every allocating part of the provisional owner before spawn. After spawn,
         // only infallible scalar reads/assignments and moves occur before the caller-owned slot
         // receives the exact child.
@@ -683,6 +685,110 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn managed_fixed_plan_selects_the_qualified_mtp_launch_mode() {
+        let target = PathBuf::from("/models/gemma 4 target.gguf");
+        let drafter = PathBuf::from("/models/gemma 4 drafter.gguf");
+        let plan = LaunchPlan {
+            model_id: "loxa".into(),
+            artifact_path: target.clone(),
+            engine: "llama-cpp".into(),
+            ctx_size: 8_192,
+            jinja: true,
+            speculative: Some(crate::model_lifecycle::SpeculativeLaunchPlan {
+                drafter_path: drafter.clone(),
+                spec_type: "draft-mtp".into(),
+                draft_n_max: 4,
+            }),
+        };
+
+        let spec = build_managed_llama_launch_spec(
+            std::path::Path::new("/opt/llama/llama-server"),
+            &plan,
+            "loxa-owner-g1",
+            11_435,
+            "b10107",
+        )
+        .unwrap();
+
+        assert_eq!(
+            spec.args,
+            vec![
+                std::ffi::OsString::from("--model"),
+                target.into_os_string(),
+                std::ffi::OsString::from("--alias"),
+                std::ffi::OsString::from("loxa-owner-g1"),
+                std::ffi::OsString::from("--host"),
+                std::ffi::OsString::from("127.0.0.1"),
+                std::ffi::OsString::from("--port"),
+                std::ffi::OsString::from("11435"),
+                std::ffi::OsString::from("--ctx-size"),
+                std::ffi::OsString::from("8192"),
+                std::ffi::OsString::from("--jinja"),
+                std::ffi::OsString::from("--reasoning"),
+                std::ffi::OsString::from("off"),
+                std::ffi::OsString::from("--metrics"),
+                std::ffi::OsString::from("--n-gpu-layers"),
+                std::ffi::OsString::from("all"),
+                std::ffi::OsString::from("--fit"),
+                std::ffi::OsString::from("off"),
+                std::ffi::OsString::from("--spec-draft-model"),
+                drafter.into_os_string(),
+                std::ffi::OsString::from("--spec-type"),
+                std::ffi::OsString::from("draft-mtp"),
+                std::ffi::OsString::from("--spec-draft-n-max"),
+                std::ffi::OsString::from("4"),
+                std::ffi::OsString::from("--n-gpu-layers-draft"),
+                std::ffi::OsString::from("all"),
+                std::ffi::OsString::from("--log-disable"),
+            ]
+        );
+    }
+
+    #[test]
+    fn managed_unpaired_plan_preserves_the_exact_legacy_launch_argv() {
+        let target = PathBuf::from("/models/ordinary.gguf");
+        let plan = LaunchPlan {
+            model_id: "ordinary".into(),
+            artifact_path: target.clone(),
+            engine: "llama-cpp".into(),
+            ctx_size: supervisor::DEFAULT_CTX_TOKENS,
+            jinja: false,
+            speculative: None,
+        };
+
+        let spec = build_managed_llama_launch_spec(
+            std::path::Path::new("/opt/llama/llama-server"),
+            &plan,
+            "loxa-owner-g2",
+            11_436,
+            "legacy",
+        )
+        .unwrap();
+
+        assert_eq!(
+            spec.args,
+            vec![
+                std::ffi::OsString::from("--model"),
+                target.into_os_string(),
+                std::ffi::OsString::from("--alias"),
+                std::ffi::OsString::from("loxa-owner-g2"),
+                std::ffi::OsString::from("--host"),
+                std::ffi::OsString::from("127.0.0.1"),
+                std::ffi::OsString::from("--port"),
+                std::ffi::OsString::from("11436"),
+                std::ffi::OsString::from("--ctx-size"),
+                std::ffi::OsString::from(supervisor::DEFAULT_CTX_TOKENS.to_string()),
+                std::ffi::OsString::from("--gpu-layers"),
+                std::ffi::OsString::from("auto"),
+                std::ffi::OsString::from("--flash-attn"),
+                std::ffi::OsString::from("auto"),
+                std::ffi::OsString::from("--metrics"),
+                std::ffi::OsString::from("--log-disable"),
+            ]
+        );
     }
 
     fn starting(owner: &StableNodeOwner, generation: u32) -> supervisor::ManagedRun {

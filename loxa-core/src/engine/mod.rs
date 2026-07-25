@@ -1,3 +1,4 @@
+pub mod llama_cpp;
 pub mod py_mlx_lm;
 
 use std::ffi::OsString;
