@@ -39,6 +39,15 @@ function isPlainObject(value) {
   );
 }
 
+function isEnvironmentRecord(value) {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    Object.prototype.toString.call(value) === "[object Object]"
+  );
+}
+
 function validateBoundedString(value, label, maximum = MAX_ARGUMENT_LENGTH) {
   if (
     typeof value !== "string" ||
@@ -831,7 +840,7 @@ export function validateIsolatedEnvironment(
   platform = process.platform,
 ) {
   const platformPath = platform === "win32" ? path.win32 : path.posix;
-  if (!isPlainObject(environment) || !platformPath.isAbsolute(cwd)) {
+  if (!isEnvironmentRecord(environment) || !platformPath.isAbsolute(cwd)) {
     fail("Pi bridge environment is invalid");
   }
   const allowed =
@@ -862,6 +871,7 @@ export function validateIsolatedEnvironment(
           "XDG_DATA_HOME",
         ])
       : new Set([
+          "__CF_USER_TEXT_ENCODING",
           "HOME",
           "LANG",
           "LC_ALL",
@@ -881,6 +891,16 @@ export function validateIsolatedEnvironment(
     Object.keys(environment).some((key) => !allowed.has(key))
   ) {
     fail("Pi bridge environment contains an unapproved key");
+  }
+  if (
+    Object.values(environment).some(
+      (value) =>
+        typeof value !== "string" ||
+        value.length > MAX_ARGUMENT_LENGTH ||
+        value.includes("\0"),
+    )
+  ) {
+    fail("Pi bridge environment contains an invalid value");
   }
   const requiredPaths = [
     ["HOME", environment.HOME],
