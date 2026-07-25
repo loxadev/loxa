@@ -45,7 +45,8 @@ use loxa_core::model_inventory::{
     ArtifactInvalidReason, ArtifactState, VerificationCache, VerificationCancellation,
     VerifiedArtifact, VerifiedRecipeInventoryEntry,
 };
-use loxa_core::registry::{ModelEntry, REGISTRY};
+use loxa_core::registry::{ModelEntry, VerifiedModel, REGISTRY};
+use loxa_core::runtime_profile::{runtime_profile, PinnedArtifact};
 use loxa_protocol::v2::{
     DecimalU64, OperationId, V2OperationError, V2OperationErrorCode, V2OperationKind,
     V2OperationProgress, V2OperationStatus, V2PublicError,
@@ -614,7 +615,7 @@ impl DownloadControl {
         match &self.authority {
             AdmissionAuthority::Legacy(_) => self.start(model_id),
             AdmissionAuthority::Durable(durable) => durable
-                .start_download_internal(model_id, recipe.size_bytes, false)
+                .start_download_internal(model_id, required_download_bytes(recipe), false)
                 .await
                 .map(|admission| admission.v1_operation_id),
         }
@@ -1577,6 +1578,7 @@ fn decode_recipe_sha256(value: &str) -> Option<[u8; 32]> {
 struct PendingDownloadVerification {
     waiter: VerificationWaiter,
     recipe: &'static ModelEntry,
+    drafter: Option<&'static PinnedArtifact>,
 }
 
 #[derive(Default)]
@@ -2087,10 +2089,12 @@ impl LaneDownloadExecutor for DurableDownloadLaneExecutor {
             cancellation: cancellation.clone(),
             control_state: self.control_state.clone(),
         };
-        if let Err(error) =
-            self.downloader
-                .download(recipe, &self.catalog.models_dir, &mut observer)
-        {
+        if let Err(error) = download_required_artifacts(
+            self.downloader.as_ref(),
+            recipe,
+            &self.catalog.models_dir,
+            &mut observer,
+        ) {
             if error.artifact_state_uncertain() {
                 artifact.poison();
                 drop(permit);
@@ -2174,10 +2178,14 @@ impl LaneDownloadExecutor for DurableDownloadLaneExecutor {
                 return;
             }
         };
-        if !self
-            .pending
-            .insert(operation_id, PendingDownloadVerification { waiter, recipe })
-        {
+        if !self.pending.insert(
+            operation_id,
+            PendingDownloadVerification {
+                waiter,
+                recipe,
+                drafter: required_drafter(recipe),
+            },
+        ) {
             self.seal();
         }
     }
@@ -2316,6 +2324,7 @@ fn spawn_durable_download_lanes(
                 &worker_control_state,
                 operation_id,
                 pending.recipe,
+                pending.drafter,
                 &worker_catalog.models_dir,
                 &worker_cache,
                 ticket.outcome_mut(),
@@ -2415,6 +2424,7 @@ fn classify_download_completion(
     control_state: &ControlStateHandle,
     operation_id: OperationId,
     recipe: &ModelEntry,
+    drafter: Option<&PinnedArtifact>,
     models_dir: &std::path::Path,
     cache: &VerificationCache,
     outcome: &crate::verification_scheduler::DownloadVerificationOutcome,
@@ -2460,6 +2470,46 @@ fn classify_download_completion(
                         },
                         false,
                     )
+                } else if let Some(drafter) = drafter {
+                    match cache.verify_artifact_with_cancellation(
+                        models_dir,
+                        drafter,
+                        &outcome.ownership.cancellation,
+                    ) {
+                        Ok(evidence)
+                            if evidence.matches
+                                && evidence.size_bytes == drafter.size_bytes()
+                                && evidence.expected_sha256 == drafter.sha256() =>
+                        {
+                            (
+                                Transition::Succeeded {
+                                    operation_id,
+                                    observed_model_id: None,
+                                },
+                                true,
+                            )
+                        }
+                        Ok(_) => (
+                            Transition::Failed {
+                                operation_id,
+                                error: operation_error(
+                                    V2OperationKind::Download,
+                                    "downloaded drafter failed verification",
+                                ),
+                            },
+                            false,
+                        ),
+                        Err(_) => (
+                            Transition::Failed {
+                                operation_id,
+                                error: operation_error(
+                                    V2OperationKind::Download,
+                                    "downloaded drafter could not be verified safely",
+                                ),
+                            },
+                            false,
+                        ),
+                    }
                 } else {
                     (
                         Transition::Succeeded {
@@ -3020,7 +3070,7 @@ impl DurableExecutionControl {
             .catalog
             .recipe(model_id)
             .ok_or(DownloadControlError::Missing)?;
-        if recipe.size_bytes != total_bytes {
+        if required_download_bytes(recipe) != total_bytes {
             return Err(DownloadControlError::Stopping);
         }
         let key = self.catalog.download_key(model_id)?;
@@ -4236,7 +4286,7 @@ trait ArtifactVerifier: Send {
     fn verify(
         &mut self,
         models_dir: &std::path::Path,
-        recipe: &'static ModelEntry,
+        artifact: &'static dyn VerifiedModel,
         cancellation: &MutationCancellation,
     ) -> io::Result<VerifiedArtifact>;
 
@@ -4251,11 +4301,11 @@ impl ArtifactVerifier for CacheArtifactVerifier {
     fn verify(
         &mut self,
         models_dir: &std::path::Path,
-        recipe: &'static ModelEntry,
+        artifact: &'static dyn VerifiedModel,
         cancellation: &MutationCancellation,
     ) -> io::Result<VerifiedArtifact> {
         self.cache
-            .verify_recipe_with_cancellation(models_dir, recipe, cancellation)
+            .verify_artifact_with_cancellation(models_dir, artifact, cancellation)
     }
 
     fn invalidate(&mut self, models_dir: &std::path::Path, recipe: &'static ModelEntry) {
@@ -4269,24 +4319,46 @@ impl VerificationCancellation for MutationCancellation {
     }
 }
 
+impl VerificationCancellation for OperationCancellation {
+    fn is_cancelled(&self) -> bool {
+        self.is_cancel_requested()
+    }
+}
+
 fn verify_existing_recipes(
     models_dir: &std::path::Path,
     recipes: &[ModelEntry],
     cache: &VerificationCache,
     cancellation: &MutationCancellation,
 ) {
+    visit_existing_recipe_artifacts(recipes, cancellation, |artifact| {
+        let _ = cache.verify_artifact_with_cancellation(models_dir, artifact, cancellation);
+    });
+}
+
+fn visit_existing_recipe_artifacts(
+    recipes: &[ModelEntry],
+    cancellation: &dyn VerificationCancellation,
+    mut visit: impl FnMut(&dyn VerifiedModel),
+) {
     for recipe in recipes {
-        if cancellation.is_cancelled() {
-            break;
+        for artifact in std::iter::once(recipe as &dyn VerifiedModel).chain(
+            required_drafter(recipe)
+                .map(|drafter| drafter as &dyn VerifiedModel)
+                .into_iter(),
+        ) {
+            if cancellation.is_cancelled() {
+                return;
+            }
+            visit(artifact);
         }
-        let _ = cache.verify_recipe_with_cancellation(models_dir, recipe, cancellation);
     }
 }
 
 trait ModelDownloader: Send + Sync {
     fn download(
         &self,
-        recipe: &'static loxa_core::registry::ModelEntry,
+        artifact: &'static dyn VerifiedModel,
         models_dir: &std::path::Path,
         observer: &mut dyn DownloadObserver,
     ) -> Result<(), DownloadError>;
@@ -4315,7 +4387,7 @@ struct UncertainFixtureDownloader {
 impl ModelDownloader for UncertainFixtureDownloader {
     fn download(
         &self,
-        _: &ModelEntry,
+        _: &'static dyn VerifiedModel,
         _: &std::path::Path,
         _: &mut dyn DownloadObserver,
     ) -> Result<(), DownloadError> {
@@ -4333,12 +4405,12 @@ struct HardlinkFixtureDownloader;
 impl ModelDownloader for HardlinkFixtureDownloader {
     fn download(
         &self,
-        recipe: &ModelEntry,
+        artifact: &'static dyn VerifiedModel,
         models_dir: &std::path::Path,
         _: &mut dyn DownloadObserver,
     ) -> Result<(), DownloadError> {
         std::fs::create_dir_all(models_dir)?;
-        let final_path = models_dir.join(recipe.filename);
+        let final_path = models_dir.join(artifact.filename());
         std::fs::write(&final_path, b"good")?;
         std::fs::hard_link(&final_path, models_dir.join("post-finalize-hardlink"))?;
         Ok(())
@@ -4348,11 +4420,11 @@ impl ModelDownloader for HardlinkFixtureDownloader {
 impl ModelDownloader for VerifiedDownloader {
     fn download(
         &self,
-        recipe: &'static loxa_core::registry::ModelEntry,
+        artifact: &'static dyn VerifiedModel,
         models_dir: &std::path::Path,
         observer: &mut dyn DownloadObserver,
     ) -> Result<(), DownloadError> {
-        download::download_with_observer(recipe, models_dir, observer).map(|_| ())
+        download::download_with_observer(artifact, models_dir, observer).map(|_| ())
     }
 }
 
@@ -4360,21 +4432,21 @@ impl ModelDownloader for VerifiedDownloader {
 impl ModelDownloader for FixtureDownloader {
     fn download(
         &self,
-        recipe: &'static ModelEntry,
+        artifact: &'static dyn VerifiedModel,
         models_dir: &std::path::Path,
         observer: &mut dyn DownloadObserver,
     ) -> Result<(), DownloadError> {
         std::fs::create_dir_all(models_dir)?;
-        let part = models_dir.join(format!("{}.part", recipe.filename));
+        let part = models_dir.join(format!("{}.part", artifact.filename()));
         std::fs::write(&part, self.bytes)?;
         observer.progress(DownloadProgress {
             downloaded_bytes: self.bytes.len() as u64,
-            total_bytes: recipe.size_bytes,
+            total_bytes: artifact.size_bytes(),
         });
         if observer.is_cancelled() {
             return Err(DownloadError::Cancelled);
         }
-        std::fs::rename(part, models_dir.join(recipe.filename))?;
+        std::fs::rename(part, models_dir.join(artifact.filename()))?;
         Ok(())
     }
 }
@@ -4383,19 +4455,19 @@ impl ModelDownloader for FixtureDownloader {
 impl ModelDownloader for BlockingFixtureDownloader {
     fn download(
         &self,
-        recipe: &'static ModelEntry,
+        artifact: &'static dyn VerifiedModel,
         models_dir: &std::path::Path,
         observer: &mut dyn DownloadObserver,
     ) -> Result<(), DownloadError> {
         std::fs::create_dir_all(models_dir)?;
-        let part = models_dir.join(format!("{}.part", recipe.filename));
+        let part = models_dir.join(format!("{}.part", artifact.filename()));
         let split = self.bytes.len();
         std::fs::write(&part, self.bytes)?;
         observer.progress(DownloadProgress {
             downloaded_bytes: split as u64,
-            total_bytes: recipe.size_bytes,
+            total_bytes: artifact.size_bytes(),
         });
-        self.entered.send(recipe.id.to_owned()).unwrap();
+        self.entered.send(artifact.id().to_owned()).unwrap();
         loop {
             if observer.is_cancelled() {
                 return Err(DownloadError::Cancelled);
@@ -4410,7 +4482,7 @@ impl ModelDownloader for BlockingFixtureDownloader {
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     observer.progress(DownloadProgress {
                         downloaded_bytes: split as u64,
-                        total_bytes: recipe.size_bytes,
+                        total_bytes: artifact.size_bytes(),
                     });
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -4421,11 +4493,76 @@ impl ModelDownloader for BlockingFixtureDownloader {
         std::fs::write(&part, self.bytes)?;
         observer.progress(DownloadProgress {
             downloaded_bytes: self.bytes.len() as u64,
-            total_bytes: recipe.size_bytes,
+            total_bytes: artifact.size_bytes(),
         });
-        std::fs::rename(part, models_dir.join(recipe.filename))?;
+        std::fs::rename(part, models_dir.join(artifact.filename()))?;
         Ok(())
     }
+}
+
+struct AggregateDownloadObserver<'a> {
+    observer: &'a mut dyn DownloadObserver,
+    completed_before_stage: u64,
+    stage_size: u64,
+    total_bytes: u64,
+}
+
+impl AggregateDownloadObserver<'_> {
+    fn finish_stage(&mut self) {
+        self.observer.progress(DownloadProgress {
+            downloaded_bytes: self.completed_before_stage + self.stage_size,
+            total_bytes: self.total_bytes,
+        });
+    }
+}
+
+impl DownloadObserver for AggregateDownloadObserver<'_> {
+    fn is_cancelled(&self) -> bool {
+        self.observer.is_cancelled()
+    }
+
+    fn progress(&mut self, progress: DownloadProgress) {
+        self.observer.progress(DownloadProgress {
+            downloaded_bytes: self.completed_before_stage
+                + progress.downloaded_bytes.min(self.stage_size),
+            total_bytes: self.total_bytes,
+        });
+    }
+}
+
+fn required_drafter(recipe: &ModelEntry) -> Option<&'static PinnedArtifact> {
+    runtime_profile(recipe.id).map(|profile| &profile.drafter)
+}
+
+fn required_download_bytes(recipe: &ModelEntry) -> u64 {
+    required_drafter(recipe)
+        .map(|drafter| recipe.size_bytes.saturating_add(drafter.size_bytes()))
+        .unwrap_or(recipe.size_bytes)
+}
+
+fn download_required_artifacts(
+    downloader: &dyn ModelDownloader,
+    recipe: &'static ModelEntry,
+    models_dir: &std::path::Path,
+    observer: &mut dyn DownloadObserver,
+) -> Result<(), DownloadError> {
+    let Some(drafter) = required_drafter(recipe) else {
+        return downloader.download(recipe, models_dir, observer);
+    };
+    let total_bytes = required_download_bytes(recipe);
+    let mut completed_before_stage = 0;
+    for artifact in [recipe as &dyn VerifiedModel, drafter as &dyn VerifiedModel] {
+        let mut stage = AggregateDownloadObserver {
+            observer,
+            completed_before_stage,
+            stage_size: artifact.size_bytes(),
+            total_bytes,
+        };
+        downloader.download(artifact, models_dir, &mut stage)?;
+        stage.finish_stage();
+        completed_before_stage = completed_before_stage.saturating_add(artifact.size_bytes());
+    }
+    Ok(())
 }
 
 struct OperationObserver<'a> {
@@ -4650,15 +4787,32 @@ impl MutationExecutor for DownloadExecutor {
             cancellation,
             persistence: self.persistence.clone(),
         };
-        let result = self
-            .downloader
-            .download(recipe, &self.models_dir, &mut observer);
+        let result = download_required_artifacts(
+            self.downloader.as_ref(),
+            recipe,
+            &self.models_dir,
+            &mut observer,
+        );
         let verification = match &result {
-            Ok(()) => Some(self.verifier.verify(
-                &self.models_dir,
-                recipe,
-                &self.verification_cancellation,
-            )),
+            Ok(()) => Some(
+                std::iter::once(recipe as &dyn VerifiedModel)
+                    .chain(
+                        required_drafter(recipe)
+                            .map(|drafter| drafter as &dyn VerifiedModel)
+                            .into_iter(),
+                    )
+                    .map(|artifact| {
+                        (
+                            artifact,
+                            self.verifier.verify(
+                                &self.models_dir,
+                                artifact,
+                                &self.verification_cancellation,
+                            ),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            ),
             Err(_) => {
                 self.verifier.invalidate(&self.models_dir, recipe);
                 None
@@ -4675,26 +4829,23 @@ impl MutationExecutor for DownloadExecutor {
             return;
         }
         let terminal_result = match result {
-            Ok(()) => match verification.expect("successful download was verified") {
-                Ok(evidence)
-                    if evidence.matches
-                        && evidence.size_bytes == recipe.size_bytes
-                        && evidence.expected_sha256 == recipe.sha256 =>
-                {
-                    self.persistence.succeeded(id, None).then_some("succeeded")
-                }
-                Ok(_) => self
-                    .persistence
-                    .failed(
-                        id,
-                        V2OperationKind::Download,
-                        "downloaded artifact failed checksum verification",
+            Ok(()) => {
+                let verification = verification.expect("successful download was verified");
+                if verification.iter().all(|(artifact, result)| {
+                    matches!(
+                        result,
+                        Ok(evidence)
+                            if evidence.matches
+                                && evidence.size_bytes == artifact.size_bytes()
+                                && evidence.expected_sha256 == artifact.sha256()
                     )
-                    .then_some("failed"),
-                Err(_) if cancellation.is_cancelled() => {
+                }) {
+                    self.persistence.succeeded(id, None).then_some("succeeded")
+                } else if verification.iter().any(|(_, result)| result.is_err())
+                    && cancellation.is_cancelled()
+                {
                     self.persistence.cancelled(id).then_some("cancelled")
-                }
-                Err(_) => {
+                } else if verification.iter().any(|(_, result)| result.is_err()) {
                     self.verifier.invalidate(&self.models_dir, recipe);
                     self.persistence
                         .failed(
@@ -4703,8 +4854,16 @@ impl MutationExecutor for DownloadExecutor {
                             "downloaded artifact could not be verified safely",
                         )
                         .then_some("failed")
+                } else {
+                    self.persistence
+                        .failed(
+                            id,
+                            V2OperationKind::Download,
+                            "downloaded artifact failed checksum verification",
+                        )
+                        .then_some("failed")
                 }
-            },
+            }
             Err(DownloadError::Cancelled) => self.persistence.cancelled(id).then_some("cancelled"),
             Err(error) => self
                 .persistence
@@ -6074,6 +6233,16 @@ mod tests {
         result: Mutex<Option<Result<(), DownloadError>>>,
     }
 
+    struct ScriptedPairDownloader {
+        calls: Arc<Mutex<Vec<String>>>,
+        outcomes: Mutex<std::collections::VecDeque<Result<(), DownloadError>>>,
+        leave_partial_on_error: bool,
+    }
+
+    struct PassingPairVerifier {
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
     struct ShutdownBlockingDownloader {
         entered: std::sync::mpsc::Sender<()>,
     }
@@ -6140,7 +6309,7 @@ mod tests {
         fn verify(
             &mut self,
             _: &std::path::Path,
-            _: &'static ModelEntry,
+            _: &'static dyn VerifiedModel,
             _: &MutationCancellation,
         ) -> std::io::Result<VerifiedArtifact> {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -6154,13 +6323,13 @@ mod tests {
         fn verify(
             &mut self,
             models_dir: &std::path::Path,
-            recipe: &'static ModelEntry,
+            artifact: &'static dyn VerifiedModel,
             cancellation: &MutationCancellation,
         ) -> std::io::Result<VerifiedArtifact> {
             self.entered.send(()).unwrap();
             self.release.recv().unwrap();
             self.cache
-                .verify_recipe_with_cancellation(models_dir, recipe, cancellation)
+                .verify_artifact_with_cancellation(models_dir, artifact, cancellation)
         }
 
         fn invalidate(&mut self, models_dir: &std::path::Path, recipe: &'static ModelEntry) {
@@ -6178,7 +6347,7 @@ mod tests {
     impl ModelDownloader for FakeDownloader {
         fn download(
             &self,
-            _: &'static loxa_core::registry::ModelEntry,
+            _: &'static dyn VerifiedModel,
             _: &std::path::Path,
             observer: &mut dyn DownloadObserver,
         ) -> Result<(), DownloadError> {
@@ -6198,10 +6367,63 @@ mod tests {
         }
     }
 
+    impl ModelDownloader for ScriptedPairDownloader {
+        fn download(
+            &self,
+            artifact: &'static dyn VerifiedModel,
+            models_dir: &std::path::Path,
+            observer: &mut dyn DownloadObserver,
+        ) -> Result<(), DownloadError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(artifact.filename().to_owned());
+            observer.progress(DownloadProgress {
+                downloaded_bytes: artifact.size_bytes() / 2,
+                total_bytes: artifact.size_bytes(),
+            });
+            let outcome = self
+                .outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("scripted outcome");
+            if outcome.is_err() && self.leave_partial_on_error {
+                std::fs::create_dir_all(models_dir)?;
+                std::fs::write(
+                    models_dir.join(format!("{}.part", artifact.filename())),
+                    b"partial",
+                )?;
+            }
+            outcome
+        }
+    }
+
+    impl ArtifactVerifier for PassingPairVerifier {
+        fn verify(
+            &mut self,
+            _: &std::path::Path,
+            artifact: &'static dyn VerifiedModel,
+            _: &MutationCancellation,
+        ) -> std::io::Result<VerifiedArtifact> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(artifact.filename().to_owned());
+            Ok(VerifiedArtifact {
+                size_bytes: artifact.size_bytes(),
+                expected_sha256: artifact.sha256().to_owned(),
+                matches: true,
+            })
+        }
+
+        fn invalidate(&mut self, _: &std::path::Path, _: &'static ModelEntry) {}
+    }
+
     impl ModelDownloader for ShutdownBlockingDownloader {
         fn download(
             &self,
-            _: &'static loxa_core::registry::ModelEntry,
+            _: &'static dyn VerifiedModel,
             _: &std::path::Path,
             observer: &mut dyn DownloadObserver,
         ) -> Result<(), DownloadError> {
@@ -6211,6 +6433,177 @@ mod tests {
             }
             Err(DownloadError::Cancelled)
         }
+    }
+
+    fn paired_legacy_fixture(
+        outcomes: Vec<Result<(), DownloadError>>,
+        leave_partial_on_error: bool,
+    ) -> (
+        Arc<Mutex<OperationStore>>,
+        String,
+        DownloadExecutor,
+        Arc<Mutex<Vec<String>>>,
+        Arc<Mutex<Vec<String>>>,
+        PathBuf,
+    ) {
+        let recipe = Box::leak(Box::new(ModelEntry {
+            id: "loxa",
+            repo: "owner/repo",
+            revision: "0123456789abcdef0123456789abcdef01234567",
+            filename: "target.gguf",
+            sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            size_bytes: 10,
+            license: "apache-2.0",
+            params: "tiny",
+            quant: "Q4",
+            min_free_mem_gb: 0.1,
+        }));
+        let recipes = std::slice::from_ref(recipe);
+        let operations = Arc::new(Mutex::new(OperationStore::new(32)));
+        let id = operations
+            .lock()
+            .unwrap()
+            .enqueue_unique(OperationKind::Download, Some(recipe.id.into()), 1)
+            .unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let verification_calls = Arc::new(Mutex::new(Vec::new()));
+        let models_dir = std::env::temp_dir().join(format!(
+            "loxa-paired-legacy-{}-{}",
+            std::process::id(),
+            loxa_protocol::v2::StreamEpoch::new_v4()
+        ));
+        let executor = DownloadExecutor {
+            models_dir: models_dir.clone(),
+            persistence: ExecutionPersistence::Legacy(Arc::clone(&operations)),
+            downloader: Box::new(ScriptedPairDownloader {
+                calls: Arc::clone(&calls),
+                outcomes: Mutex::new(outcomes.into()),
+                leave_partial_on_error,
+            }),
+            verification_cancellation: MutationCancellation::new(),
+            verifier: Box::new(PassingPairVerifier {
+                calls: Arc::clone(&verification_calls),
+            }),
+            recipes,
+            lifecycle: None,
+        };
+        (
+            operations,
+            id,
+            executor,
+            calls,
+            verification_calls,
+            models_dir,
+        )
+    }
+
+    #[test]
+    fn fixed_profile_legacy_download_fetches_and_verifies_target_then_drafter_with_aggregate_progress(
+    ) {
+        let (operations, id, mut executor, calls, verification_calls, models_dir) =
+            paired_legacy_fixture(vec![Ok(()), Ok(())], false);
+        let subscription = operations.lock().unwrap().subscribe();
+
+        executor.execute(
+            &id,
+            &Mutation::Download {
+                model_id: "loxa".into(),
+            },
+            &MutationCancellation::new(),
+        );
+
+        let profile = loxa_core::runtime_profile::runtime_profile("loxa").unwrap();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["target.gguf", profile.drafter.filename]
+        );
+        assert_eq!(
+            *verification_calls.lock().unwrap(),
+            vec!["target.gguf", profile.drafter.filename]
+        );
+        let progress = subscription
+            .receiver
+            .try_iter()
+            .filter_map(|event| event.operation.progress)
+            .collect::<Vec<_>>();
+        assert!(progress
+            .windows(2)
+            .all(|pair| pair[0].completed_bytes <= pair[1].completed_bytes));
+        assert!(progress
+            .iter()
+            .all(|progress| { progress.total_bytes == Some(10 + profile.drafter.size_bytes) }));
+        assert_eq!(
+            progress.last().map(|progress| progress.completed_bytes),
+            Some(10 + profile.drafter.size_bytes)
+        );
+        assert_eq!(
+            operations.lock().unwrap().get(&id).unwrap().status,
+            OperationStatus::Succeeded
+        );
+        let _ = std::fs::remove_dir_all(models_dir);
+    }
+
+    #[test]
+    fn fixed_profile_legacy_drafter_failure_cannot_publish_success() {
+        let (operations, id, mut executor, calls, _, models_dir) = paired_legacy_fixture(
+            vec![
+                Ok(()),
+                Err(DownloadError::Io(std::io::Error::other(
+                    "injected drafter failure",
+                ))),
+            ],
+            true,
+        );
+
+        executor.execute(
+            &id,
+            &Mutation::Download {
+                model_id: "loxa".into(),
+            },
+            &MutationCancellation::new(),
+        );
+
+        let profile = loxa_core::runtime_profile::runtime_profile("loxa").unwrap();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["target.gguf", profile.drafter.filename]
+        );
+        assert_eq!(
+            operations.lock().unwrap().get(&id).unwrap().status,
+            OperationStatus::Failed
+        );
+        assert!(models_dir
+            .join(format!("{}.part", profile.drafter.filename))
+            .is_file());
+        let _ = std::fs::remove_dir_all(models_dir);
+    }
+
+    #[test]
+    fn fixed_profile_legacy_drafter_cancellation_remains_resumable() {
+        let (operations, id, mut executor, calls, _, models_dir) =
+            paired_legacy_fixture(vec![Ok(()), Err(DownloadError::Cancelled)], true);
+
+        executor.execute(
+            &id,
+            &Mutation::Download {
+                model_id: "loxa".into(),
+            },
+            &MutationCancellation::new(),
+        );
+
+        let profile = loxa_core::runtime_profile::runtime_profile("loxa").unwrap();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["target.gguf", profile.drafter.filename]
+        );
+        assert_eq!(
+            operations.lock().unwrap().get(&id).unwrap().status,
+            OperationStatus::Cancelled
+        );
+        assert!(models_dir
+            .join(format!("{}.part", profile.drafter.filename))
+            .is_file());
+        let _ = std::fs::remove_dir_all(models_dir);
     }
 
     fn execute_fake(result: Result<(), DownloadError>) -> OperationView {
@@ -6512,6 +6905,58 @@ mod tests {
             ArtifactState::Downloaded
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn restart_scan_visits_fixed_target_then_drafter_with_a_cancellation_check_between_them() {
+        struct CancelAfterFirst {
+            checks: AtomicUsize,
+        }
+
+        impl VerificationCancellation for CancelAfterFirst {
+            fn is_cancelled(&self) -> bool {
+                self.checks.fetch_add(1, Ordering::SeqCst) > 0
+            }
+        }
+
+        let recipe = ModelEntry {
+            id: "loxa",
+            repo: "owner/repo",
+            revision: "0123456789abcdef0123456789abcdef01234567",
+            filename: "target.gguf",
+            sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            size_bytes: 10,
+            license: "apache-2.0",
+            params: "tiny",
+            quant: "Q4",
+            min_free_mem_gb: 0.1,
+        };
+        let mut all = Vec::new();
+        visit_existing_recipe_artifacts(
+            std::slice::from_ref(&recipe),
+            &MutationCancellation::new(),
+            |artifact| all.push(artifact.filename().to_owned()),
+        );
+        assert_eq!(
+            all,
+            vec![
+                "target.gguf",
+                loxa_core::runtime_profile::runtime_profile("loxa")
+                    .unwrap()
+                    .drafter
+                    .filename
+            ]
+        );
+
+        let mut cancelled = Vec::new();
+        visit_existing_recipe_artifacts(
+            std::slice::from_ref(&recipe),
+            &CancelAfterFirst {
+                checks: AtomicUsize::new(0),
+            },
+            |artifact| cancelled.push(artifact.filename().to_owned()),
+        );
+        assert_eq!(cancelled, vec!["target.gguf"]);
     }
 
     #[test]
@@ -7601,7 +8046,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_lifecycle_durable_authority_downloads_without_faking_slot_execution() {
+    async fn no_lifecycle_durable_authority_manages_unpaired_and_fixed_pair_with_one_key_each() {
         let root = std::env::temp_dir().join(format!(
             "loxa-durable-download-only-{}-{}",
             std::process::id(),
@@ -7656,22 +8101,41 @@ mod tests {
             })
             .await
             .unwrap();
-        let recipe = Box::leak(Box::new(ModelEntry {
-            id: "download-only",
-            repo: "owner/repo",
-            revision: "0123456789abcdef0123456789abcdef01234567",
-            filename: "download-only.gguf",
-            sha256: "770e607624d689265ca6c44884d0807d9b054d23c473c106c72be9de08b7376c",
-            size_bytes: 4,
-            license: "apache-2.0",
-            params: "tiny",
-            quant: "Q4",
-            min_free_mem_gb: 0.0,
-        }));
+        let recipes: &'static [ModelEntry] = Box::leak(
+            vec![
+                ModelEntry {
+                    id: "download-only",
+                    repo: "owner/repo",
+                    revision: "0123456789abcdef0123456789abcdef01234567",
+                    filename: "download-only.gguf",
+                    sha256: "770e607624d689265ca6c44884d0807d9b054d23c473c106c72be9de08b7376c",
+                    size_bytes: 4,
+                    license: "apache-2.0",
+                    params: "tiny",
+                    quant: "Q4",
+                    min_free_mem_gb: 0.0,
+                },
+                ModelEntry {
+                    id: "loxa",
+                    repo: "owner/repo",
+                    revision: "0123456789abcdef0123456789abcdef01234567",
+                    filename: "paired-target.gguf",
+                    sha256: "770e607624d689265ca6c44884d0807d9b054d23c473c106c72be9de08b7376c",
+                    size_bytes: 4,
+                    license: "apache-2.0",
+                    params: "tiny",
+                    quant: "Q4",
+                    min_free_mem_gb: 0.0,
+                },
+            ]
+            .into_boxed_slice(),
+        );
+        let unpaired = &recipes[0];
+        let recipe = &recipes[1];
         let (control, worker) = DownloadControl::spawn_durable_fixture_for_test(
             root.join("models"),
             Arc::new(VerificationCache::default()),
-            std::slice::from_ref(recipe),
+            recipes,
             b"good",
             fixture.handle.clone(),
         );
@@ -7704,10 +8168,68 @@ mod tests {
             "unsupported lifecycle commands must not be durably admitted"
         );
         assert_eq!(
-            control.start_download_async(recipe.id).await.unwrap(),
+            control.start_download_async(unpaired.id).await.unwrap(),
             "op-1"
         );
-        assert_eq!(fixture.handle.read_snapshot().unwrap().operations.len(), 1);
+        let unpaired_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let operation = fixture.handle.read_snapshot().unwrap().operations[0].clone();
+            if operation.status == V2OperationStatus::Succeeded {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < unpaired_deadline,
+                "unpaired durable download did not succeed"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let admission = durable
+            .start_download(recipe.id, required_download_bytes(recipe))
+            .await
+            .unwrap();
+        let snapshot = fixture.handle.read_snapshot().unwrap();
+        assert_eq!(snapshot.operations.len(), 2);
+        let paired = snapshot
+            .operations
+            .iter()
+            .find(|operation| operation.operation_id == admission.operation_id)
+            .unwrap();
+        assert_eq!(
+            paired
+                .progress
+                .as_ref()
+                .and_then(|progress| progress.total_bytes)
+                .map(DecimalU64::get),
+            Some(required_download_bytes(recipe))
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let terminal = loop {
+            let snapshot = fixture.handle.read_snapshot().unwrap();
+            let operation = snapshot
+                .operations
+                .iter()
+                .find(|operation| operation.operation_id == admission.operation_id)
+                .unwrap()
+                .clone();
+            if matches!(
+                operation.status,
+                V2OperationStatus::Succeeded
+                    | V2OperationStatus::Failed
+                    | V2OperationStatus::Cancelled
+            ) {
+                break operation;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "durable paired download did not become terminal"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(terminal.status, V2OperationStatus::Failed);
+        assert_eq!(
+            terminal.error.as_ref().map(|error| error.message.as_str()),
+            Some("downloaded drafter failed verification")
+        );
         worker.stop_and_join().unwrap();
         fixture.shutdown().await;
         let _ = std::fs::remove_dir_all(root);
