@@ -7004,7 +7004,7 @@ mod tests {
             published_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
             1
         );
-        let (_handle, owner) =
+        let (handle, owner) =
             LifecycleControllerOwner::start_with_workflow(lifecycle, workflow).unwrap();
 
         exit_requested.store(true, Ordering::SeqCst);
@@ -7027,6 +7027,9 @@ mod tests {
         recovery_marked_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("second exit exhausted the existing restart budget");
+        assert!(
+            handle.wait_until_sealed_for_test(std::time::Instant::now() + Duration::from_secs(1))
+        );
         let failure = owner
             .shutdown(std::time::Instant::now() + Duration::from_secs(2))
             .expect_err("exhausted restart budget seals durable lifecycle authority");
