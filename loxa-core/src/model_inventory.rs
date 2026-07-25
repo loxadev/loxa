@@ -673,7 +673,10 @@ fn inspect_recipe(
     cache: &VerificationCache,
 ) -> VerifiedRecipeInventoryEntry {
     let profile = runtime_profile(recipe.id);
-    let required = (recipe.min_free_mem_gb as f64 * GIB).round() as u64;
+    let min_free_mem_gb = profile
+        .map(|profile| profile.min_free_mem_gb)
+        .unwrap_or(recipe.min_free_mem_gb);
+    let required = (min_free_mem_gb as f64 * GIB).round() as u64;
     let compatibility = if available_memory_bytes >= required {
         Compatibility {
             compatible: true,
@@ -684,7 +687,7 @@ fn inspect_recipe(
             compatible: false,
             reason: format!(
                 "requires {:.1} GiB free memory; {:.1} GiB is available",
-                recipe.min_free_mem_gb,
+                min_free_mem_gb,
                 available_memory_bytes as f64 / GIB
             ),
         }
@@ -701,7 +704,7 @@ fn inspect_recipe(
         license: recipe.license.into(),
         params: recipe.params.into(),
         quant: recipe.quant.into(),
-        min_free_mem_gb: recipe.min_free_mem_gb,
+        min_free_mem_gb,
         artifact: artifact_state(recipe, models_dir, cache),
         compatibility,
         engine: EngineEligibility {
@@ -1321,6 +1324,31 @@ mod tests {
 
         assert_eq!(loxa.size_bytes, 6_970_065_600);
         assert_eq!(loxa.artifact, ArtifactState::NotDownloaded);
+    }
+
+    #[test]
+    fn fixed_profile_inventory_uses_observed_mtp_memory_minimum() {
+        let dir = tempdir().unwrap();
+        let cache = VerificationCache::default();
+        let below_minimum = known_registry_inventory_with_cache(dir.path(), 8_912_057_139, &cache);
+        let loxa = below_minimum
+            .iter()
+            .find(|entry| entry.id == "loxa")
+            .expect("loxa inventory entry");
+
+        assert_eq!(loxa.min_free_mem_gb, 8.4);
+        assert!(!loxa.compatibility.compatible);
+        assert!(loxa.compatibility.reason.contains("requires 8.4 GiB"));
+
+        let at_minimum = known_registry_inventory_with_cache(dir.path(), 9_019_431_322, &cache);
+        assert!(
+            at_minimum
+                .iter()
+                .find(|entry| entry.id == "loxa")
+                .unwrap()
+                .compatibility
+                .compatible
+        );
     }
 
     #[test]
