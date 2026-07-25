@@ -993,14 +993,17 @@ test("CLI atomically retains only sanitized successful evidence and exposes its 
   const failureDir = `target/pi-acceptance/test-cli-failure-${process.pid}`;
   const unsafeDir = `target/pi-acceptance/test-cli-unsafe-${process.pid}`;
   const unsafeArtifactDir = `target/pi-acceptance/test-cli-artifact-${process.pid}`;
+  const occupiedDir = `target/pi-acceptance/test-cli-occupied-${process.pid}`;
   const evidencePath = path.join(repositoryRoot, evidenceDir, "evidence.json");
   const recoveryPath = path.join(repositoryRoot, recoveryDir, "evidence.json");
   const failurePath = path.join(repositoryRoot, failureDir, "evidence.json");
+  const occupiedPath = path.join(repositoryRoot, occupiedDir, "evidence.json");
   await rm(path.join(repositoryRoot, evidenceDir), { recursive: true, force: true });
   await rm(path.join(repositoryRoot, recoveryDir), { recursive: true, force: true });
   await rm(path.join(repositoryRoot, failureDir), { recursive: true, force: true });
   await rm(path.join(repositoryRoot, unsafeDir), { recursive: true, force: true });
   await rm(path.join(repositoryRoot, unsafeArtifactDir), { recursive: true, force: true });
+  await rm(path.join(repositoryRoot, occupiedDir), { recursive: true, force: true });
   await withTempDirectory("pi-cli", async (directory) => {
     const piBin = path.join(directory, "fake-pi");
     await writeFile(
@@ -1144,12 +1147,74 @@ EOF
       assert.equal(unsafe.code, 2);
       await assertMissing(escapedArtifact);
     });
+
+    const retainedEvidence = "existing evidence must remain byte-identical\n";
+    await mkdir(path.dirname(occupiedPath), { recursive: true });
+    await writeFile(occupiedPath, retainedEvidence, { mode: 0o600 });
+    await withFakeGateway(async ({ baseUrl }) => {
+      const occupied = await runCli([
+        "--phase",
+        "mac-local",
+        "--base-url",
+        baseUrl,
+        "--pi-bin",
+        piBin,
+        "--max-tokens",
+        "1024",
+        "--evidence-dir",
+        occupiedDir,
+      ]);
+      assert.equal(occupied.code, 2);
+      assert.equal(occupied.stdout, "");
+      assert.equal(occupied.stderr.includes(retainedEvidence.trim()), false);
+      assert.equal(await readFile(occupiedPath, "utf8"), retainedEvidence);
+      assert.deepEqual(await readdir(path.dirname(occupiedPath)), ["evidence.json"]);
+    });
   });
   await rm(path.join(repositoryRoot, evidenceDir), { recursive: true, force: true });
   await rm(path.join(repositoryRoot, recoveryDir), { recursive: true, force: true });
   await rm(path.join(repositoryRoot, failureDir), { recursive: true, force: true });
   await rm(path.join(repositoryRoot, unsafeDir), { recursive: true, force: true });
   await rm(path.join(repositoryRoot, unsafeArtifactDir), { recursive: true, force: true });
+  await rm(path.join(repositoryRoot, occupiedDir), { recursive: true, force: true });
+});
+
+test("qualified Pi adapter removes its private temp when evidence publication fails", async () => {
+  const evidenceDir = `target/pi-acceptance/test-publish-failure-${process.pid}`;
+  const absoluteEvidenceDir = path.join(repositoryRoot, evidenceDir);
+  await rm(absoluteEvidenceDir, { recursive: true, force: true });
+  try {
+    await withFakeGateway(async ({ baseUrl }) => {
+      await assert.rejects(
+        runQualifiedPiAdapter(
+          {
+            phase: "mac-local",
+            baseUrl,
+            piBin: "/fake/pi",
+            maxTokens: 1024,
+            processTimeoutMs: 1000,
+            evidenceDir,
+          },
+          {
+            platform: "darwin",
+            sourceEnvironment: { PATH: "/usr/bin:/bin" },
+            spawnProcess: fakeSpawn({
+              lines: successfulQualifiedLines(),
+              writeExpectedResult: true,
+            }),
+            publishEvidence: async () => {
+              throw new Error("simulated evidence publication failure");
+            },
+          },
+        ),
+        /simulated evidence publication failure/i,
+      );
+      assert.deepEqual(await readdir(absoluteEvidenceDir), []);
+      await assertMissing(path.join(absoluteEvidenceDir, "evidence.json"));
+    });
+  } finally {
+    await rm(absoluteEvidenceDir, { recursive: true, force: true });
+  }
 });
 
 test("qualified Pi config and argv pin the output field, trusted extension, and no-session mode", async () => {
