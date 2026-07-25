@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::path::Path;
 
-pub const QUALIFIED_LLAMA_CPP_RUNTIME_IDENTITY: &str = "version: 10107 (c0bc8591e)";
+pub const QUALIFIED_LLAMA_CPP_RUNTIME_IDENTITY: &str = "version: 10121 (555881ebc)";
 
 #[derive(Clone, Copy, Debug)]
 pub enum LlamaCppLaunchMode<'a> {
@@ -107,7 +107,7 @@ pub fn build_launch_spec(
                 OsString::from(profile.spec_type),
                 OsString::from("--spec-draft-n-max"),
                 OsString::from(profile.draft_n_max.to_string()),
-                OsString::from("--n-gpu-layers-draft"),
+                OsString::from("--spec-draft-ngl"),
                 OsString::from("all"),
             ]);
         }
@@ -191,7 +191,7 @@ mod tests {
             target,
             alias: "loxa-run-g2",
             port: 11_436,
-            engine_version: "version: 10107 (c0bc8591e)\nbuilt with AppleClang",
+            engine_version: "version: 10121 (555881ebc)\nbuilt with AppleClang",
             mode: LlamaCppLaunchMode::QualifiedGemma4Mtp {
                 drafter,
                 ctx_size,
@@ -244,7 +244,7 @@ mod tests {
     }
 
     #[test]
-    fn qualified_mode_emits_the_exact_ordered_b10107_mtp_argv() {
+    fn qualified_mode_emits_the_exact_ordered_b10121_mtp_argv() {
         let program = Path::new("/opt/llama/llama-server");
         let target = Path::new("/models/gemma 4 target.gguf");
         let drafter = Path::new("/models/gemma 4 drafter.gguf");
@@ -287,7 +287,7 @@ mod tests {
                 OsString::from("draft-mtp"),
                 OsString::from("--spec-draft-n-max"),
                 OsString::from("4"),
-                OsString::from("--n-gpu-layers-draft"),
+                OsString::from("--spec-draft-ngl"),
                 OsString::from("all"),
                 OsString::from("--log-disable"),
             ]
@@ -404,12 +404,13 @@ mod tests {
         let drafter = Path::new("/models/drafter.gguf");
 
         for version in [
-            "version: 10108 (c0bc8591e)",
-            "version: 10107 (deadbeef0)",
-            "version: 10107",
-            "version: 10107 (c0bc8591e) extra",
-            "untrusted version: 10107 (c0bc8591e)",
-            "version: 10108 (deadbeef0)\nversion: 10107 (c0bc8591e)",
+            "version: 10122 (555881ebc)",
+            "version: 10121 (deadbeef0)",
+            "version: 10121",
+            "version: 10121 (555881ebc) extra",
+            "untrusted version: 10121 (555881ebc)",
+            "version: 10122 (deadbeef0)\nversion: 10121 (555881ebc)",
+            "version: 10107 (c0bc8591e)",
         ] {
             let mut input = qualified_input(program, target, drafter, 8_192, true, "draft-mtp", 4);
             input.engine_version = version;
@@ -446,6 +447,7 @@ mod tests {
             "--spec-draft-model",
             "--spec-type",
             "--spec-draft-n-max",
+            "--spec-draft-ngl",
             "--n-gpu-layers-draft",
         ] {
             assert!(!unpaired.args.iter().any(|arg| arg == forbidden));

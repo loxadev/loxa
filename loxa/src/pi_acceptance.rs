@@ -1083,7 +1083,11 @@ mod tests {
     impl FakeRuntime {
         fn ready() -> Self {
             let models = br#"{"data":[{"id":"loxa"}]}"#.to_vec();
-            let status = br#"{"health":"ready","model":"loxa","engine":{"name":"llama-cpp","version":"version: 10107 (c0bc8591e)\nbuilt with AppleClang"}}"#.to_vec();
+            let status = format!(
+                r#"{{"health":"ready","model":"loxa","engine":{{"name":"llama-cpp","version":"{}\nbuilt with AppleClang"}}}}"#,
+                QUALIFIED_LLAMA_CPP_RUNTIME_IDENTITY
+            )
+            .into_bytes();
             Self {
                 gateway: VecDeque::from([models.clone(), status.clone(), models, status]),
                 gateway_urls: Vec::new(),

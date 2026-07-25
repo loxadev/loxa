@@ -709,7 +709,7 @@ mod tests {
             &plan,
             "loxa-owner-g1",
             11_435,
-            "version: 10107 (c0bc8591e)\nbuilt with AppleClang",
+            "version: 10121 (555881ebc)\nbuilt with AppleClang",
         )
         .unwrap();
 
@@ -740,7 +740,7 @@ mod tests {
                 std::ffi::OsString::from("draft-mtp"),
                 std::ffi::OsString::from("--spec-draft-n-max"),
                 std::ffi::OsString::from("4"),
-                std::ffi::OsString::from("--n-gpu-layers-draft"),
+                std::ffi::OsString::from("--spec-draft-ngl"),
                 std::ffi::OsString::from("all"),
                 std::ffi::OsString::from("--log-disable"),
             ]
@@ -767,14 +767,14 @@ mod tests {
             &plan,
             "loxa-owner-g1",
             11_435,
-            "version: 10107 (deadbeef0)",
+            "version: 10121 (deadbeef0)",
         )
         .expect_err("qualified managed runtime must be rejected before spawn");
 
         assert!(matches!(
             error,
             LifecycleError::StartFailed(ref message)
-                if message == "qualified Gemma 4 MTP requires llama.cpp version: 10107 (c0bc8591e)"
+                if message == "qualified Gemma 4 MTP requires llama.cpp version: 10121 (555881ebc)"
         ));
     }
 

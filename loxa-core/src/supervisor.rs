@@ -2439,7 +2439,7 @@ mod tests {
         let program = temp.path().join("qualified-version");
         executable_script(
             &program,
-            "#!/bin/sh\nprintf 'version: 10107 (c0bc8591e)\\r\\ncompiler: test\\n'\n",
+            "#!/bin/sh\nprintf 'version: 10121 (555881ebc)\\r\\ncompiler: test\\n'\n",
         );
 
         let version = llama_server_version(&program).expect("successful version probe");
@@ -2459,7 +2459,7 @@ mod tests {
         let program = temp.path().join("stderr-version");
         executable_script(
             &program,
-            "#!/bin/sh\nprintf 'version: 10107 (c0bc8591e)\\r\\ncompiler: test\\n' >&2\n",
+            "#!/bin/sh\nprintf 'version: 10121 (555881ebc)\\r\\ncompiler: test\\n' >&2\n",
         );
 
         let version = llama_server_version(&program).expect("successful stderr version probe");
