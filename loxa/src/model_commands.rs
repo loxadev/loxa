@@ -1,6 +1,7 @@
 use loxa_core::download;
 use loxa_core::hardware::HardwareReport;
-use loxa_core::registry::{self, ModelEntry, REGISTRY};
+use loxa_core::registry::{self, ModelEntry, VerifiedModel, REGISTRY};
+use loxa_core::runtime_profile::runtime_profile;
 use std::fmt;
 use std::fs;
 use std::io::{self, Write};
@@ -44,6 +45,24 @@ impl fmt::Display for ModelStatus {
 }
 
 pub(crate) fn model_status(entry: &ModelEntry, dir: &Path) -> ModelStatus {
+    if let Some(profile) = runtime_profile(entry.id) {
+        let artifacts = profile.artifacts();
+        let all_final = artifacts
+            .iter()
+            .all(|artifact| dir.join(artifact.filename()).exists());
+        if all_final {
+            return ModelStatus::Downloaded;
+        }
+        let any_present = artifacts.iter().any(|artifact| {
+            dir.join(artifact.filename()).exists()
+                || dir.join(format!("{}.part", artifact.filename())).exists()
+        });
+        return if any_present {
+            ModelStatus::Partial
+        } else {
+            ModelStatus::NotDownloaded
+        };
+    }
     let (final_path, part_path) = model_paths(entry, dir);
     if final_path.exists() {
         ModelStatus::Downloaded
@@ -55,15 +74,49 @@ pub(crate) fn model_status(entry: &ModelEntry, dir: &Path) -> ModelStatus {
 }
 
 pub(crate) fn remove_model_files(entry: &ModelEntry, dir: &Path) -> io::Result<Vec<PathBuf>> {
-    let (final_path, part_path) = model_paths(entry, dir);
     let mut removed = Vec::new();
-    for path in [final_path, part_path] {
+    let paths = if let Some(profile) = runtime_profile(entry.id) {
+        profile
+            .artifacts()
+            .into_iter()
+            .flat_map(|artifact| artifact_paths(artifact, dir))
+            .collect()
+    } else {
+        let (final_path, part_path) = model_paths(entry, dir);
+        vec![final_path, part_path]
+    };
+    for path in paths {
         if path.try_exists()? {
             fs::remove_file(&path)?;
             removed.push(path);
         }
     }
     Ok(removed)
+}
+
+fn artifact_paths(artifact: &dyn VerifiedModel, dir: &Path) -> [PathBuf; 2] {
+    [
+        dir.join(artifact.filename()),
+        dir.join(format!("{}.part", artifact.filename())),
+    ]
+}
+
+fn download_registry_entry_with<F>(
+    entry: &ModelEntry,
+    dir: &Path,
+    mut download_artifact: F,
+) -> Result<Vec<PathBuf>, download::DownloadError>
+where
+    F: FnMut(&dyn VerifiedModel, &Path) -> Result<PathBuf, download::DownloadError>,
+{
+    if let Some(profile) = runtime_profile(entry.id) {
+        return profile
+            .artifacts()
+            .into_iter()
+            .map(|artifact| download_artifact(artifact, dir))
+            .collect();
+    }
+    Ok(vec![download_artifact(entry, dir)?])
 }
 
 pub(crate) fn pull_model<W: Write, E: Write>(
@@ -142,9 +195,11 @@ pub(crate) fn pull_model<W: Write, E: Write>(
     };
 
     let dir = download::model_dir();
-    match download::download(entry, &dir) {
-        Ok(path) => {
-            writeln!(stdout, "{}", path.display())?;
+    match download_registry_entry_with(entry, &dir, download::download) {
+        Ok(paths) => {
+            for path in paths {
+                writeln!(stdout, "{}", path.display())?;
+            }
             Ok(ExitCode::SUCCESS)
         }
         Err(error) => {
@@ -163,13 +218,33 @@ fn user_registry_dir() -> PathBuf {
 
 pub(crate) fn print_list<W: Write>(stdout: &mut W) -> io::Result<ExitCode> {
     let dir = download::model_dir();
+    let user_entries =
+        registry::load_user_entries(&user_registry_dir()).map_err(io::Error::other)?;
+    write_model_list(stdout, &dir, &user_entries)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+fn write_compiled_list<W: Write>(stdout: &mut W, dir: &Path) -> io::Result<()> {
+    write_model_list(stdout, dir, &[])
+}
+
+fn write_model_list<W: Write>(
+    stdout: &mut W,
+    dir: &Path,
+    user_entries: &[registry::UserModelEntry],
+) -> io::Result<()> {
     let rows = REGISTRY
         .iter()
         .map(|entry| {
             (
                 entry,
-                bytes_to_gb_string(entry.size_bytes),
-                model_status(entry, &dir).to_string(),
+                bytes_to_gb_string(
+                    runtime_profile(entry.id)
+                        .map(|profile| profile.total_size_bytes())
+                        .unwrap_or(entry.size_bytes),
+                ),
+                model_status(entry, dir).to_string(),
             )
         })
         .collect::<Vec<_>>();
@@ -223,7 +298,7 @@ pub(crate) fn print_list<W: Write>(stdout: &mut W) -> io::Result<ExitCode> {
             entry.id, entry.params, entry.quant, size, entry.license, status,
         )?;
     }
-    for entry in registry::load_user_entries(&user_registry_dir()).map_err(io::Error::other)? {
+    for entry in user_entries {
         writeln!(
             stdout,
             "{:<id_width$}  {:<params_width$}  {:<quant_width$}  {:>size_width$}  {:<license_width$}  {:<status_width$}",
@@ -232,14 +307,14 @@ pub(crate) fn print_list<W: Write>(stdout: &mut W) -> io::Result<ExitCode> {
             entry.quant,
             bytes_to_gb_string(entry.size_bytes),
             entry.license,
-            if download::model_dir().join(&entry.filename).exists() {
+            if dir.join(&entry.filename).exists() {
                 "downloaded"
             } else {
                 "not downloaded"
             },
         )?;
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(())
 }
 
 pub(crate) fn remove_model<W: Write, E: Write>(
@@ -293,4 +368,158 @@ pub(crate) fn remove_user_entry(
 pub(crate) fn write_unknown_id<W: Write>(id: &str, stderr: &mut W) -> io::Result<()> {
     writeln!(stderr, "unknown model id: {id}")?;
     writeln!(stderr, "valid ids: {}", valid_ids())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use loxa_core::download::DownloadError;
+    use loxa_core::registry::VerifiedModel;
+    use loxa_core::runtime_profile::runtime_profile;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn fixed_pair_status_and_list_use_aggregate_artifacts_and_size() {
+        let temp = TempDir::new("loxa-pair-list");
+        let entry = registry::find("loxa").expect("loxa registry entry");
+        let profile = runtime_profile("loxa").expect("loxa runtime profile");
+        let [target, drafter] = profile.artifacts();
+
+        assert_eq!(model_status(entry, temp.path()), ModelStatus::NotDownloaded);
+
+        fs::write(temp.path().join(target.filename()), b"target").unwrap();
+        assert_eq!(model_status(entry, temp.path()), ModelStatus::Partial);
+
+        fs::remove_file(temp.path().join(target.filename())).unwrap();
+        fs::write(temp.path().join(drafter.filename()), b"drafter").unwrap();
+        assert_eq!(model_status(entry, temp.path()), ModelStatus::Partial);
+
+        fs::write(
+            temp.path().join(format!("{}.part", target.filename())),
+            b"partial",
+        )
+        .unwrap();
+        assert_eq!(model_status(entry, temp.path()), ModelStatus::Partial);
+
+        let mut output = Vec::new();
+        write_compiled_list(&mut output, temp.path()).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        let loxa_row = output
+            .lines()
+            .find(|line| line.starts_with("loxa "))
+            .expect("loxa list row");
+        assert!(loxa_row.contains("6.5"));
+        assert!(loxa_row.contains("partial"));
+
+        fs::remove_file(temp.path().join(format!("{}.part", target.filename()))).unwrap();
+        fs::write(temp.path().join(target.filename()), b"target").unwrap();
+        assert_eq!(model_status(entry, temp.path()), ModelStatus::Downloaded);
+    }
+
+    #[test]
+    fn fixed_pair_pull_downloads_target_then_drafter_and_stops_on_failure() {
+        let temp = TempDir::new("loxa-pair-pull-failure");
+        let entry = registry::find("loxa").expect("loxa registry entry");
+        let mut calls = Vec::new();
+
+        let error = download_registry_entry_with(entry, temp.path(), |artifact, dir| {
+            calls.push(artifact.filename().to_string());
+            if calls.len() == 2 {
+                return Err(DownloadError::Http("drafter failed".into()));
+            }
+            let path = dir.join(artifact.filename());
+            fs::write(&path, b"target").unwrap();
+            Ok(path)
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("drafter failed"));
+        assert_eq!(
+            calls,
+            vec![
+                "gemma-4-12B-it-qat-UD-Q4_K_XL.gguf",
+                "mtp-gemma-4-12B-it.gguf",
+            ]
+        );
+        assert!(temp
+            .path()
+            .join("gemma-4-12B-it-qat-UD-Q4_K_XL.gguf")
+            .exists());
+        assert!(!temp.path().join("mtp-gemma-4-12B-it.gguf").exists());
+    }
+
+    #[test]
+    fn fixed_pair_pull_succeeds_only_after_both_downloads() {
+        let temp = TempDir::new("loxa-pair-pull-success");
+        let entry = registry::find("loxa").expect("loxa registry entry");
+        let mut calls = Vec::new();
+
+        let paths = download_registry_entry_with(entry, temp.path(), |artifact, dir| {
+            calls.push(artifact.filename().to_string());
+            let path = dir.join(artifact.filename());
+            fs::write(&path, artifact.filename().as_bytes()).unwrap();
+            Ok(path)
+        })
+        .unwrap();
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(paths.len(), 2);
+        assert!(paths.iter().all(|path| path.exists()));
+        assert_eq!(
+            paths[1].file_name().unwrap(),
+            std::ffi::OsStr::new("mtp-gemma-4-12B-it.gguf")
+        );
+    }
+
+    #[test]
+    fn fixed_pair_removal_deletes_both_final_and_partial_files() {
+        let temp = TempDir::new("loxa-pair-remove");
+        let entry = registry::find("loxa").expect("loxa registry entry");
+        let profile = runtime_profile("loxa").expect("loxa runtime profile");
+        let expected = profile
+            .artifacts()
+            .into_iter()
+            .flat_map(|artifact| {
+                [
+                    temp.path().join(artifact.filename()),
+                    temp.path().join(format!("{}.part", artifact.filename())),
+                ]
+            })
+            .collect::<Vec<_>>();
+        for path in &expected {
+            fs::write(path, b"bytes").unwrap();
+        }
+
+        let removed = remove_model_files(entry, temp.path()).unwrap();
+
+        assert_eq!(removed, expected);
+        assert!(removed.iter().all(|path| !path.exists()));
+    }
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(prefix: &str) -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path =
+                std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 }
