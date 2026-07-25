@@ -49,13 +49,13 @@ pub(crate) fn model_status(entry: &ModelEntry, dir: &Path) -> ModelStatus {
         let artifacts = profile.artifacts();
         let all_final = artifacts
             .iter()
-            .all(|artifact| dir.join(artifact.filename()).exists());
+            .all(|artifact| exact_regular_final(*artifact, dir));
         if all_final {
             return ModelStatus::Downloaded;
         }
         let any_present = artifacts.iter().any(|artifact| {
-            dir.join(artifact.filename()).exists()
-                || dir.join(format!("{}.part", artifact.filename())).exists()
+            fs::symlink_metadata(dir.join(artifact.filename())).is_ok()
+                || fs::symlink_metadata(dir.join(format!("{}.part", artifact.filename()))).is_ok()
         });
         return if any_present {
             ModelStatus::Partial
@@ -74,17 +74,22 @@ pub(crate) fn model_status(entry: &ModelEntry, dir: &Path) -> ModelStatus {
 }
 
 pub(crate) fn remove_model_files(entry: &ModelEntry, dir: &Path) -> io::Result<Vec<PathBuf>> {
-    let mut removed = Vec::new();
-    let paths = if let Some(profile) = runtime_profile(entry.id) {
-        profile
+    if let Some(profile) = runtime_profile(entry.id) {
+        let paths = profile
             .artifacts()
             .into_iter()
             .flat_map(|artifact| artifact_paths(artifact, dir))
-            .collect()
-    } else {
-        let (final_path, part_path) = model_paths(entry, dir);
-        vec![final_path, part_path]
-    };
+            .collect::<Vec<_>>();
+        let removable = preflight_paired_removal(&paths)?;
+        for path in &removable {
+            fs::remove_file(path)?;
+        }
+        return Ok(removable);
+    }
+
+    let (final_path, part_path) = model_paths(entry, dir);
+    let mut removed = Vec::new();
+    let paths = [final_path, part_path];
     for path in paths {
         if path.try_exists()? {
             fs::remove_file(&path)?;
@@ -92,6 +97,51 @@ pub(crate) fn remove_model_files(entry: &ModelEntry, dir: &Path) -> io::Result<V
         }
     }
     Ok(removed)
+}
+
+fn exact_regular_final(artifact: &dyn VerifiedModel, dir: &Path) -> bool {
+    fs::symlink_metadata(dir.join(artifact.filename())).is_ok_and(|metadata| {
+        metadata.file_type().is_file()
+            && artifact_has_single_link(&metadata)
+            && metadata.len() == artifact.size_bytes()
+    })
+}
+
+#[cfg(unix)]
+fn artifact_has_single_link(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.nlink() == 1
+}
+
+#[cfg(windows)]
+fn artifact_has_single_link(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.number_of_links() == Some(1)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn artifact_has_single_link(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+fn preflight_paired_removal(paths: &[PathBuf]) -> io::Result<Vec<PathBuf>> {
+    let mut removable = Vec::new();
+    for path in paths {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
+                removable.push(path.clone());
+            }
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("refusing to remove unsafe artifact path {}", path.display()),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(removable)
 }
 
 fn artifact_paths(artifact: &dyn VerifiedModel, dir: &Path) -> [PathBuf; 2] {
@@ -412,7 +462,8 @@ mod tests {
         assert!(loxa_row.contains("partial"));
 
         fs::remove_file(temp.path().join(format!("{}.part", target.filename()))).unwrap();
-        fs::write(temp.path().join(target.filename()), b"target").unwrap();
+        write_sparse(&temp.path().join(target.filename()), target.size_bytes());
+        write_sparse(&temp.path().join(drafter.filename()), drafter.size_bytes());
         assert_eq!(model_status(entry, temp.path()), ModelStatus::Downloaded);
     }
 
@@ -494,6 +545,105 @@ mod tests {
 
         assert_eq!(removed, expected);
         assert!(removed.iter().all(|path| !path.exists()));
+    }
+
+    #[test]
+    fn fixed_pair_status_requires_both_exact_regular_final_sizes() {
+        let temp = TempDir::new("loxa-pair-status-exact");
+        let entry = registry::find("loxa").expect("loxa registry entry");
+        let profile = runtime_profile("loxa").expect("loxa runtime profile");
+        let [target, drafter] = profile.artifacts();
+        write_sparse(&temp.path().join(target.filename()), target.size_bytes());
+        write_sparse(&temp.path().join(drafter.filename()), drafter.size_bytes());
+        assert_eq!(model_status(entry, temp.path()), ModelStatus::Downloaded);
+
+        write_sparse(
+            &temp.path().join(drafter.filename()),
+            drafter.size_bytes() - 1,
+        );
+        assert_eq!(model_status(entry, temp.path()), ModelStatus::Partial);
+
+        fs::remove_file(temp.path().join(drafter.filename())).unwrap();
+        fs::create_dir(temp.path().join(drafter.filename())).unwrap();
+        assert_eq!(model_status(entry, temp.path()), ModelStatus::Partial);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fixed_pair_status_rejects_symlink_and_hardlink_finals() {
+        use std::os::unix::fs::symlink;
+
+        let entry = registry::find("loxa").expect("loxa registry entry");
+        let profile = runtime_profile("loxa").expect("loxa runtime profile");
+        let [target, drafter] = profile.artifacts();
+
+        let symlink_temp = TempDir::new("loxa-pair-status-symlink");
+        write_sparse(
+            &symlink_temp.path().join(target.filename()),
+            target.size_bytes(),
+        );
+        let outside = symlink_temp.path().join("outside-drafter.gguf");
+        write_sparse(&outside, drafter.size_bytes());
+        symlink(&outside, symlink_temp.path().join(drafter.filename())).unwrap();
+        assert_eq!(
+            model_status(entry, symlink_temp.path()),
+            ModelStatus::Partial
+        );
+
+        let hardlink_temp = TempDir::new("loxa-pair-status-hardlink");
+        write_sparse(
+            &hardlink_temp.path().join(target.filename()),
+            target.size_bytes(),
+        );
+        let hardlink_source = hardlink_temp.path().join("drafter-source.gguf");
+        write_sparse(&hardlink_source, drafter.size_bytes());
+        fs::hard_link(
+            &hardlink_source,
+            hardlink_temp.path().join(drafter.filename()),
+        )
+        .unwrap();
+        assert_eq!(
+            model_status(entry, hardlink_temp.path()),
+            ModelStatus::Partial
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fixed_pair_removal_deletes_a_dangling_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new("loxa-pair-remove-dangling");
+        let entry = registry::find("loxa").expect("loxa registry entry");
+        let profile = runtime_profile("loxa").expect("loxa runtime profile");
+        let dangling = temp.path().join(profile.drafter.filename());
+        symlink(temp.path().join("missing-target"), &dangling).unwrap();
+
+        let removed = remove_model_files(entry, temp.path()).unwrap();
+
+        assert_eq!(removed, vec![dangling.clone()]);
+        assert!(fs::symlink_metadata(dangling).is_err());
+    }
+
+    #[test]
+    fn fixed_pair_removal_rejects_unsafe_type_before_removing_any_file() {
+        let temp = TempDir::new("loxa-pair-remove-preflight");
+        let entry = registry::find("loxa").expect("loxa registry entry");
+        let profile = runtime_profile("loxa").expect("loxa runtime profile");
+        let target = temp.path().join(profile.target.filename());
+        let unsafe_drafter = temp.path().join(profile.drafter.filename());
+        fs::write(&target, b"target").unwrap();
+        fs::create_dir(&unsafe_drafter).unwrap();
+
+        let error = remove_model_files(entry, temp.path()).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(target.exists());
+        assert!(unsafe_drafter.is_dir());
+    }
+
+    fn write_sparse(path: &Path, size: u64) {
+        fs::File::create(path).unwrap().set_len(size).unwrap();
     }
 
     struct TempDir {

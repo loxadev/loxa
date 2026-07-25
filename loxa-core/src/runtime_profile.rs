@@ -36,7 +36,7 @@ impl VerifiedModel for PinnedArtifact {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LlamaRuntimeProfile {
     pub model_id: &'static str,
     pub target: PinnedArtifact,
@@ -45,6 +45,7 @@ pub struct LlamaRuntimeProfile {
     pub spec_type: &'static str,
     pub draft_n_max: u32,
     pub jinja: bool,
+    pub min_free_mem_gb: f32,
 }
 
 impl LlamaRuntimeProfile {
@@ -79,6 +80,8 @@ const GEMMA_4_MTP_PROFILE: LlamaRuntimeProfile = LlamaRuntimeProfile {
     spec_type: "draft-mtp",
     draft_n_max: 4,
     jinja: true,
+    // Qualified MTP peak was 8.32 GiB; fail closed at the next tenth.
+    min_free_mem_gb: 8.4,
 };
 
 pub fn runtime_profile(model_id: &str) -> Option<&'static LlamaRuntimeProfile> {
@@ -124,6 +127,7 @@ mod tests {
         assert_eq!(profile.spec_type, "draft-mtp");
         assert_eq!(profile.draft_n_max, 4);
         assert!(profile.jinja);
+        assert_eq!(profile.min_free_mem_gb, 8.4);
     }
 
     #[test]

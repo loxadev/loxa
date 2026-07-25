@@ -267,7 +267,7 @@ pub const REGISTRY: &[ModelEntry] = &[
         license: "apache-2.0",
         params: "12B",
         quant: "UD-Q4_K_XL",
-        min_free_mem_gb: 7.2,
+        min_free_mem_gb: 8.4,
     },
 ];
 
@@ -306,6 +306,7 @@ pub fn find(id: &str) -> Option<&'static ModelEntry> {
 #[cfg(test)]
 mod tests {
     use super::{find, load_user_entries, save_user_entry, UserModelEntry, REGISTRY};
+    use crate::runtime_profile::runtime_profile;
     use std::collections::HashSet;
 
     fn user_entry() -> UserModelEntry {
@@ -447,7 +448,11 @@ mod tests {
         assert_eq!(entry.license, "apache-2.0");
         assert_eq!(entry.params, "12B");
         assert_eq!(entry.quant, "UD-Q4_K_XL");
-        assert_eq!(entry.min_free_mem_gb, 7.2);
+        assert_eq!(entry.min_free_mem_gb, 8.4);
+        assert_eq!(
+            entry.min_free_mem_gb,
+            runtime_profile("loxa").unwrap().min_free_mem_gb
+        );
     }
 
     #[test]
@@ -533,8 +538,11 @@ mod tests {
     }
 
     #[test]
-    fn min_free_memory_is_size_plus_fifteen_percent_rounded_to_one_decimal() {
-        for entry in REGISTRY {
+    fn unpaired_min_free_memory_is_size_plus_fifteen_percent_rounded_to_one_decimal() {
+        for entry in REGISTRY
+            .iter()
+            .filter(|entry| runtime_profile(entry.id).is_none())
+        {
             let expected =
                 ((entry.size_bytes as f64 / 1_073_741_824.0) * 1.15 * 10.0).round() / 10.0;
 
