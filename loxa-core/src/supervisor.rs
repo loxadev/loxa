@@ -652,26 +652,43 @@ fn llama_server_version_with_timeout(
     timeout: Duration,
 ) -> Result<String, SupervisorError> {
     let started = Instant::now();
-    let mut child = Command::new(path)
+    let child = Command::new(path)
         .arg("--version")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+    llama_server_version_from_child_with_drain_spawner(
+        VersionProbeChildGuard::new(child),
+        started,
+        timeout,
+        spawn_version_probe_drain,
+    )
+}
+
+fn llama_server_version_from_child_with_drain_spawner<F>(
+    mut child: VersionProbeChildGuard,
+    started: Instant,
+    timeout: Duration,
+    mut spawn_drain: F,
+) -> Result<String, SupervisorError>
+where
+    F: FnMut(Box<dyn Read + Send>) -> io::Result<VersionProbeDrain>,
+{
     let stdout = child
+        .child_mut()
         .stdout
         .take()
         .ok_or(SupervisorError::LlamaServerVersionInvalid)?;
     let stderr = child
+        .child_mut()
         .stderr
         .take()
         .ok_or(SupervisorError::LlamaServerVersionInvalid)?;
     let mut stdout_drain = Some(
-        spawn_version_probe_drain(stdout)
-            .map_err(|_| SupervisorError::LlamaServerVersionInvalid)?,
+        spawn_drain(Box::new(stdout)).map_err(|_| SupervisorError::LlamaServerVersionInvalid)?,
     );
     let mut stderr_drain = Some(
-        spawn_version_probe_drain(stderr)
-            .map_err(|_| SupervisorError::LlamaServerVersionInvalid)?,
+        spawn_drain(Box::new(stderr)).map_err(|_| SupervisorError::LlamaServerVersionInvalid)?,
     );
     let mut stdout_result = None;
     let mut stderr_result = None;
@@ -707,7 +724,7 @@ fn llama_server_version_with_timeout(
         } else if version_probe_drain_failed(stdout_result.as_ref())
             || version_probe_drain_failed(stderr_result.as_ref())
         {
-            stop_version_probe_within_deadline(&mut child, started, timeout);
+            child.terminate_and_reap();
             return Err(SupervisorError::LlamaServerVersionInvalid);
         }
 
@@ -726,8 +743,6 @@ fn llama_server_version_with_timeout(
         }
         Err(SupervisorError::LlamaServerVersionInvalid)
     } else {
-        let _ = child.kill();
-        let _ = child.try_wait();
         Err(SupervisorError::LlamaServerVersionTimeout)
     }
 }
@@ -1623,6 +1638,64 @@ pub fn cleanup_after_ctrl_c<C: ManagedChild + LogDrainingChild>(
 
 type VersionProbeDrain = thread::JoinHandle<io::Result<Vec<u8>>>;
 
+struct VersionProbeChildGuard {
+    child: Option<Child>,
+}
+
+impl VersionProbeChildGuard {
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        self.child
+            .as_mut()
+            .expect("unresolved version probe retains its direct child")
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        let status = self.child_mut().try_wait()?;
+        if status.is_some() {
+            self.child.take();
+        }
+        Ok(status)
+    }
+
+    fn terminate_and_reap(&mut self) {
+        if let Some(child) = self.child.take() {
+            reap_version_probe_child(child);
+        }
+    }
+}
+
+impl Drop for VersionProbeChildGuard {
+    fn drop(&mut self) {
+        self.terminate_and_reap();
+    }
+}
+
+fn reap_version_probe_child(mut child: Child) {
+    let _ = child.kill();
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<Child>(1);
+    match thread::Builder::new()
+        .name("loxa-version-probe-reaper".to_string())
+        .spawn(move || {
+            if let Ok(mut child) = receiver.recv() {
+                let _ = child.wait();
+            }
+        }) {
+        Ok(_) => {
+            if let Err(error) = sender.send(child) {
+                let mut child = error.0;
+                let _ = child.wait();
+            }
+        }
+        Err(_) => {
+            let _ = child.wait();
+        }
+    }
+}
+
 fn spawn_version_probe_drain(reader: impl Read + Send + 'static) -> io::Result<VersionProbeDrain> {
     thread::Builder::new()
         .name("loxa-version-probe-drain".to_string())
@@ -1670,17 +1743,6 @@ fn finish_version_probe(stdout: Vec<u8>, stderr: Vec<u8>) -> Result<String, Supe
         return Ok("unknown".to_string());
     }
     Ok(llama_server_version_first_line(output).to_string())
-}
-
-fn stop_version_probe_within_deadline(child: &mut Child, started: Instant, timeout: Duration) {
-    let _ = child.kill();
-    while started.elapsed() < timeout {
-        if child.try_wait().ok().flatten().is_some() {
-            return;
-        }
-        let remaining = timeout.saturating_sub(started.elapsed());
-        thread::sleep(Duration::from_millis(10).min(remaining));
-    }
 }
 
 fn llama_server_version_first_line(output: &str) -> &str {
@@ -2605,6 +2667,97 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(4),
             "continuous output must settle within the probe deadline"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn llama_version_probe_timeout_reaps_the_direct_child_without_extending_its_deadline() {
+        let _guard = lock_llama_version_probe_test();
+        let temp = tempdir().expect("tempdir");
+        let program = temp.path().join("timeout-version-probe");
+        let pid_path = temp.path().join("probe.pid");
+        executable_script(
+            &program,
+            &format!(
+                "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nwhile :; do sleep 1; done\n",
+                pid_path.display()
+            ),
+        );
+        let started = Instant::now();
+
+        let error = llama_server_version_with_timeout(&program, Duration::from_secs(1))
+            .expect_err("timed out version probe");
+        let elapsed = started.elapsed();
+        let pid = fs::read_to_string(&pid_path)
+            .expect("read version probe pid")
+            .parse::<u32>()
+            .expect("parse version probe pid");
+        let reaping_deadline = Instant::now() + Duration::from_secs(3);
+        while pid_is_alive(pid) && Instant::now() < reaping_deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(matches!(error, SupervisorError::LlamaServerVersionTimeout));
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "probe cleanup must not extend the caller deadline"
+        );
+        assert!(!pid_is_alive(pid), "timed out probe child must be reaped");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_version_probe_child_guard_kills_and_reaps_the_direct_child() {
+        let _guard = lock_llama_version_probe_test();
+        let child = Command::new("/bin/sleep")
+            .arg("30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn guarded child");
+        let pid = child.id();
+        let guard = VersionProbeChildGuard::new(child);
+
+        drop(guard);
+
+        let reaping_deadline = Instant::now() + Duration::from_secs(3);
+        while pid_is_alive(pid) && Instant::now() < reaping_deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!pid_is_alive(pid), "dropped probe guard must reap child");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn llama_version_probe_drain_setup_failure_reaps_the_direct_child() {
+        let _guard = lock_llama_version_probe_test();
+        let child = Command::new("/bin/sleep")
+            .arg("30")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn setup-failure child");
+        let pid = child.id();
+
+        let error = llama_server_version_from_child_with_drain_spawner(
+            VersionProbeChildGuard::new(child),
+            Instant::now(),
+            Duration::from_secs(1),
+            |_reader: Box<dyn Read + Send>| {
+                Err(io::Error::other("injected drain thread setup failure"))
+            },
+        )
+        .expect_err("drain setup failure");
+
+        let reaping_deadline = Instant::now() + Duration::from_secs(3);
+        while pid_is_alive(pid) && Instant::now() < reaping_deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(matches!(error, SupervisorError::LlamaServerVersionInvalid));
+        assert!(
+            !pid_is_alive(pid),
+            "drain setup failure must reap direct child"
         );
     }
 
