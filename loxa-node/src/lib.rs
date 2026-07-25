@@ -1,3 +1,6 @@
+use loxa_core::engine::llama_cpp::{
+    build_launch_spec as build_llama_cpp_launch_spec, LlamaCppLaunchInput, LlamaCppLaunchMode,
+};
 use loxa_core::engine::{py_mlx_lm, EngineLaunchSpec, ReadinessStrategy, RuntimeBackendKind};
 use loxa_core::model_inventory::{VerificationCache, VerificationCancellation};
 use loxa_core::registry::{self, ModelEntry, REGISTRY};
@@ -5,7 +8,6 @@ use loxa_core::supervisor::{
     self, InterruptStatus, LogDrainingChild, ManagedChild, ManagedServer, ObservedChildExit,
     RuntimeStateRead, SupervisorError,
 };
-use std::ffi::OsString;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -446,12 +448,24 @@ struct RunSession<'a> {
 }
 
 #[derive(Clone, Debug)]
+enum ResolvedLlamaLaunchMode {
+    Unpaired,
+    QualifiedGemma4Mtp {
+        drafter_path: PathBuf,
+        jinja: bool,
+        spec_type: String,
+        draft_n_max: u32,
+    },
+}
+
+#[derive(Clone, Debug)]
 struct ResolvedRuntimeBackend {
     kind: RuntimeBackendKind,
     model_id: String,
     model_path: PathBuf,
     program: PathBuf,
     engine_version: String,
+    llama_mode: Option<ResolvedLlamaLaunchMode>,
 }
 
 impl ResolvedRuntimeBackend {
@@ -460,40 +474,53 @@ impl ResolvedRuntimeBackend {
         port: u16,
         ctx_tokens: u32,
         generation_alias: &str,
-    ) -> EngineLaunchSpec {
+    ) -> Result<EngineLaunchSpec, SupervisorError> {
         match self.kind {
-            RuntimeBackendKind::LlamaCpp => EngineLaunchSpec {
-                program: self.program.clone(),
-                args: vec![
-                    OsString::from("--model"),
-                    self.model_path.as_os_str().to_owned(),
-                    OsString::from("--alias"),
-                    OsString::from(generation_alias),
-                    OsString::from("--host"),
-                    OsString::from("127.0.0.1"),
-                    OsString::from("--port"),
-                    OsString::from(port.to_string()),
-                    OsString::from("--ctx-size"),
-                    OsString::from(ctx_tokens.to_string()),
-                    OsString::from("--gpu-layers"),
-                    OsString::from("auto"),
-                    OsString::from("--flash-attn"),
-                    OsString::from("auto"),
-                    OsString::from("--metrics"),
-                    OsString::from("--log-disable"),
-                ],
-                port,
-                engine_name: "llama.cpp".to_string(),
-                engine_version: self.engine_version.clone(),
-                runtime_model: self.model_path.display().to_string(),
-                upstream_model: generation_alias.to_string(),
-                readiness: ReadinessStrategy::LlamaModelAlias {
-                    expected_alias: generation_alias.to_string(),
-                },
-            },
-            RuntimeBackendKind::PyMlxLm => {
-                py_mlx_lm::launch_spec(&self.program, &self.model_path, port, &self.engine_version)
+            RuntimeBackendKind::LlamaCpp => {
+                let mode = match self.llama_mode.as_ref() {
+                    Some(ResolvedLlamaLaunchMode::Unpaired) => LlamaCppLaunchMode::Unpaired {
+                        ctx_size: ctx_tokens,
+                    },
+                    Some(ResolvedLlamaLaunchMode::QualifiedGemma4Mtp {
+                        drafter_path,
+                        jinja,
+                        spec_type,
+                        draft_n_max,
+                    }) => LlamaCppLaunchMode::QualifiedGemma4Mtp {
+                        drafter: drafter_path,
+                        ctx_size: ctx_tokens,
+                        jinja: *jinja,
+                        spec_type,
+                        draft_n_max: *draft_n_max,
+                    },
+                    None => {
+                        return Err(SupervisorError::Io(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "llama.cpp launch mode is unavailable",
+                        )));
+                    }
+                };
+                build_llama_cpp_launch_spec(LlamaCppLaunchInput {
+                    program: &self.program,
+                    target: &self.model_path,
+                    alias: generation_alias,
+                    port,
+                    engine_version: &self.engine_version,
+                    mode,
+                })
+                .map_err(|error| {
+                    SupervisorError::Io(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        error.to_string(),
+                    ))
+                })
             }
+            RuntimeBackendKind::PyMlxLm => Ok(py_mlx_lm::launch_spec(
+                &self.program,
+                &self.model_path,
+                port,
+                &self.engine_version,
+            )),
         }
     }
 
@@ -509,6 +536,46 @@ impl ResolvedRuntimeBackend {
             RuntimeBackendKind::LlamaCpp => &self.model_id,
             RuntimeBackendKind::PyMlxLm => "py-mlx-lm",
         }
+    }
+}
+
+fn resolve_llama_launch_mode(
+    recipe: &'static ModelEntry,
+    models_dir: &Path,
+) -> ResolvedLlamaLaunchMode {
+    match loxa_core::runtime_profile::runtime_profile(recipe.id) {
+        Some(profile) => ResolvedLlamaLaunchMode::QualifiedGemma4Mtp {
+            drafter_path: models_dir.join(profile.drafter.filename),
+            jinja: profile.jinja,
+            spec_type: profile.spec_type.into(),
+            draft_n_max: profile.draft_n_max,
+        },
+        None => ResolvedLlamaLaunchMode::Unpaired,
+    }
+}
+
+fn validate_direct_context_override(
+    kind: RuntimeBackendKind,
+    id: &str,
+    ctx: Option<u32>,
+) -> io::Result<()> {
+    let Some(profile) = (kind == RuntimeBackendKind::LlamaCpp)
+        .then(|| loxa_core::runtime_profile::runtime_profile(id))
+        .flatten()
+    else {
+        return Ok(());
+    };
+    let ctx_size = ctx.unwrap_or(supervisor::DEFAULT_CTX_TOKENS);
+    if ctx_size != profile.ctx_size {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "qualified llama.cpp profile requires context size {}",
+                profile.ctx_size
+            ),
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -569,6 +636,7 @@ fn resolve_runtime_backend_with_fixed_profile_verifier(
                 model_path,
                 program,
                 engine_version,
+                llama_mode: Some(resolve_llama_launch_mode(recipe, models_dir)),
             })
         }
         RuntimeBackendKind::PyMlxLm => {
@@ -588,6 +656,7 @@ fn resolve_runtime_backend_with_fixed_profile_verifier(
                 model_path,
                 program,
                 engine_version,
+                llama_mode: None,
             })
         }
     }
@@ -856,6 +925,7 @@ fn run_model_with_owner_policy(
         port,
         engine,
     } = request;
+    validate_direct_context_override(engine, id, ctx)?;
     let runtime_verification_cache = VerificationCache::default();
     let mut initial_backend = match engine {
         RuntimeBackendKind::LlamaCpp => {
@@ -1019,11 +1089,13 @@ fn run_model_with_owner_policy(
                 (backend, starting, create, Some(reservation))
             };
         let log_path = starting_run.log_path.clone();
-        let spec = backend.launch_spec(
-            starting_run.port,
-            ctx.unwrap_or(supervisor::DEFAULT_CTX_TOKENS),
-            &starting_run.generation_alias,
-        );
+        let spec = backend
+            .launch_spec(
+                starting_run.port,
+                ctx.unwrap_or(supervisor::DEFAULT_CTX_TOKENS),
+                &starting_run.generation_alias,
+            )
+            .map_err(direct_runtime_resolution_error_to_io)?;
         let starting_run = if initial_generation {
             supervisor::create_starting_run(&paths.state_path, starting_run)
                 .map_err(supervisor_error_to_io)?
@@ -3120,6 +3192,185 @@ mod lifecycle_api_tests {
     }
 
     #[test]
+    fn verified_fixed_resolution_derives_the_exact_drafter_for_each_models_directory() {
+        let recipe = registry::find("loxa").expect("fixed recipe");
+
+        let first = resolve_llama_launch_mode(recipe, Path::new("/first model root"));
+        let second = resolve_llama_launch_mode(recipe, Path::new("/second model root"));
+
+        assert!(matches!(
+            first,
+            ResolvedLlamaLaunchMode::QualifiedGemma4Mtp {
+                ref drafter_path,
+                ref spec_type,
+                draft_n_max: 4,
+                jinja: true,
+            } if drafter_path == Path::new("/first model root/mtp-gemma-4-12B-it.gguf")
+                && spec_type == "draft-mtp"
+        ));
+        assert!(matches!(
+            second,
+            ResolvedLlamaLaunchMode::QualifiedGemma4Mtp {
+                ref drafter_path,
+                ..
+            } if drafter_path == Path::new("/second model root/mtp-gemma-4-12B-it.gguf")
+        ));
+        let ordinary = registry::find("gemma-3-4b-it-q4").expect("ordinary recipe");
+        assert!(matches!(
+            resolve_llama_launch_mode(ordinary, Path::new("/ordinary model root")),
+            ResolvedLlamaLaunchMode::Unpaired
+        ));
+    }
+
+    #[test]
+    fn direct_context_validator_rejects_fixed_drift_before_runtime_resolution() {
+        let error =
+            validate_direct_context_override(RuntimeBackendKind::LlamaCpp, "loxa", Some(4_096))
+                .expect_err("fixed direct context drift");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(validate_direct_context_override(
+            RuntimeBackendKind::LlamaCpp,
+            "loxa",
+            Some(8_192)
+        )
+        .is_ok());
+        assert!(
+            validate_direct_context_override(RuntimeBackendKind::LlamaCpp, "loxa", None).is_ok()
+        );
+        assert!(validate_direct_context_override(
+            RuntimeBackendKind::LlamaCpp,
+            "gemma-3-4b-it-q4",
+            Some(4_096)
+        )
+        .is_ok());
+        assert!(
+            validate_direct_context_override(RuntimeBackendKind::PyMlxLm, "loxa", Some(4_096))
+                .is_ok()
+        );
+    }
+
+    fn resolved_fixed_llama_backend() -> ResolvedRuntimeBackend {
+        ResolvedRuntimeBackend {
+            kind: RuntimeBackendKind::LlamaCpp,
+            model_id: "loxa".into(),
+            model_path: PathBuf::from("/models/gemma 4 target.gguf"),
+            program: PathBuf::from("/opt/llama/llama-server"),
+            engine_version: "b10107".into(),
+            llama_mode: Some(ResolvedLlamaLaunchMode::QualifiedGemma4Mtp {
+                drafter_path: PathBuf::from("/models/gemma 4 drafter.gguf"),
+                jinja: true,
+                spec_type: "draft-mtp".into(),
+                draft_n_max: 4,
+            }),
+        }
+    }
+
+    fn resolved_unpaired_llama_backend() -> ResolvedRuntimeBackend {
+        ResolvedRuntimeBackend {
+            kind: RuntimeBackendKind::LlamaCpp,
+            model_id: "gemma-3-4b-it-q4".into(),
+            model_path: PathBuf::from("/models/ordinary model.gguf"),
+            program: PathBuf::from("/opt/llama/llama-server"),
+            engine_version: "legacy".into(),
+            llama_mode: Some(ResolvedLlamaLaunchMode::Unpaired),
+        }
+    }
+
+    #[test]
+    fn direct_fixed_backend_selects_the_verified_drafter_and_qualified_mode() {
+        let spec = resolved_fixed_llama_backend()
+            .launch_spec(11_435, 8_192, "loxa-direct-g1")
+            .unwrap();
+
+        assert_eq!(
+            spec.args,
+            vec![
+                std::ffi::OsString::from("--model"),
+                std::ffi::OsString::from("/models/gemma 4 target.gguf"),
+                std::ffi::OsString::from("--alias"),
+                std::ffi::OsString::from("loxa-direct-g1"),
+                std::ffi::OsString::from("--host"),
+                std::ffi::OsString::from("127.0.0.1"),
+                std::ffi::OsString::from("--port"),
+                std::ffi::OsString::from("11435"),
+                std::ffi::OsString::from("--ctx-size"),
+                std::ffi::OsString::from("8192"),
+                std::ffi::OsString::from("--jinja"),
+                std::ffi::OsString::from("--reasoning"),
+                std::ffi::OsString::from("off"),
+                std::ffi::OsString::from("--metrics"),
+                std::ffi::OsString::from("--n-gpu-layers"),
+                std::ffi::OsString::from("all"),
+                std::ffi::OsString::from("--fit"),
+                std::ffi::OsString::from("off"),
+                std::ffi::OsString::from("--spec-draft-model"),
+                std::ffi::OsString::from("/models/gemma 4 drafter.gguf"),
+                std::ffi::OsString::from("--spec-type"),
+                std::ffi::OsString::from("draft-mtp"),
+                std::ffi::OsString::from("--spec-draft-n-max"),
+                std::ffi::OsString::from("4"),
+                std::ffi::OsString::from("--n-gpu-layers-draft"),
+                std::ffi::OsString::from("all"),
+                std::ffi::OsString::from("--log-disable"),
+            ]
+        );
+    }
+
+    #[test]
+    fn direct_fixed_backend_rejects_conflicting_context_before_spawn() {
+        let error = resolved_fixed_llama_backend()
+            .launch_spec(11_435, 4_096, "loxa-direct-g1")
+            .expect_err("qualified direct context drift must be rejected");
+
+        assert!(matches!(
+            error,
+            SupervisorError::Io(ref source) if source.kind() == io::ErrorKind::InvalidInput
+        ));
+    }
+
+    #[test]
+    fn direct_unpaired_backend_preserves_the_exact_legacy_launch_spec() {
+        let spec = resolved_unpaired_llama_backend()
+            .launch_spec(11_436, 4_096, "loxa-direct-g2")
+            .unwrap();
+
+        assert_eq!(spec.program, Path::new("/opt/llama/llama-server"));
+        assert_eq!(
+            spec.args,
+            vec![
+                std::ffi::OsString::from("--model"),
+                std::ffi::OsString::from("/models/ordinary model.gguf"),
+                std::ffi::OsString::from("--alias"),
+                std::ffi::OsString::from("loxa-direct-g2"),
+                std::ffi::OsString::from("--host"),
+                std::ffi::OsString::from("127.0.0.1"),
+                std::ffi::OsString::from("--port"),
+                std::ffi::OsString::from("11436"),
+                std::ffi::OsString::from("--ctx-size"),
+                std::ffi::OsString::from("4096"),
+                std::ffi::OsString::from("--gpu-layers"),
+                std::ffi::OsString::from("auto"),
+                std::ffi::OsString::from("--flash-attn"),
+                std::ffi::OsString::from("auto"),
+                std::ffi::OsString::from("--metrics"),
+                std::ffi::OsString::from("--log-disable"),
+            ]
+        );
+        assert_eq!(spec.port, 11_436);
+        assert_eq!(spec.engine_name, "llama.cpp");
+        assert_eq!(spec.engine_version, "legacy");
+        assert_eq!(spec.runtime_model, "/models/ordinary model.gguf");
+        assert_eq!(spec.upstream_model, "loxa-direct-g2");
+        assert_eq!(
+            spec.readiness,
+            ReadinessStrategy::LlamaModelAlias {
+                expected_alias: "loxa-direct-g2".into()
+            }
+        );
+    }
+
+    #[test]
     fn python_gateway_metadata_uses_default_model_and_pinned_mlx_identity() {
         let backend = ResolvedRuntimeBackend {
             kind: RuntimeBackendKind::PyMlxLm,
@@ -3127,11 +3378,25 @@ mod lifecycle_api_tests {
             model_path: PathBuf::from("/tmp/mlx model"),
             program: PathBuf::from("/tmp/bin/mlx_lm.server"),
             engine_version: "0.31.3".to_string(),
+            llama_mode: None,
         };
-        let spec = backend.launch_spec(8123, supervisor::DEFAULT_CTX_TOKENS, "ignored-g0");
+        let spec = backend
+            .launch_spec(8123, supervisor::DEFAULT_CTX_TOKENS, "ignored-g0")
+            .unwrap();
 
         let target = gateway_target(&backend, &spec);
 
+        assert_eq!(
+            spec.args,
+            vec![
+                std::ffi::OsString::from("--model"),
+                std::ffi::OsString::from("/tmp/mlx model"),
+                std::ffi::OsString::from("--host"),
+                std::ffi::OsString::from("127.0.0.1"),
+                std::ffi::OsString::from("--port"),
+                std::ffi::OsString::from("8123"),
+            ]
+        );
         assert_eq!(target.backend_alias, "default_model");
         assert_eq!(target.engine, "mlx-lm");
         assert_eq!(target.engine_version, "0.31.3");
