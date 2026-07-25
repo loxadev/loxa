@@ -159,6 +159,22 @@ async function isolatedBridgeOptions(run) {
   }
 }
 
+async function withActualProcessEnvironment(environment, run) {
+  const original = { ...process.env };
+  try {
+    for (const key of Object.keys(process.env)) {
+      delete process.env[key];
+    }
+    Object.assign(process.env, environment);
+    return await run(process.env);
+  } finally {
+    for (const key of Object.keys(process.env)) {
+      delete process.env[key];
+    }
+    Object.assign(process.env, original);
+  }
+}
+
 test("bridge parser accepts only Pi process inputs", () => {
   assert.deepEqual(
     parseBridgeArguments([
@@ -343,6 +359,103 @@ test("bridge consumes only a prebuilt isolated environment", async () => {
   });
 });
 
+test("bridge environment validator accepts Node's actual process.env record", async () => {
+  await isolatedBridgeOptions(async (options) => {
+    await withActualProcessEnvironment(options.environment, (environment) => {
+      assert.notEqual(Object.getPrototypeOf(environment), Object.prototype);
+      assert.equal(
+        validateIsolatedEnvironment(environment, options.cwd, "darwin"),
+        true,
+      );
+    });
+  });
+});
+
+test("bridge default environment accepts actual process.env without spawning Pi", async () => {
+  await isolatedBridgeOptions(async (options) => {
+    const isolatedEnvironment = options.environment;
+    delete options.environment;
+    await withActualProcessEnvironment(isolatedEnvironment, async () => {
+      const capture = {};
+      const result = await runQualifiedPiBridge(options, {
+        platform: "darwin",
+        spawnProcess: fakeSpawn(
+          { lines: successfulQualifiedLines() },
+          capture,
+        ),
+      });
+
+      assert.deepEqual(result, {
+        schemaVersion: 1,
+        toolTrace: successfulTrace(),
+      });
+      assert.equal(capture.options.env.OPENAI_API_KEY, undefined);
+      assert.deepEqual(capture.options.env, isolatedEnvironment);
+    });
+  });
+});
+
+test("bridge accepts macOS-injected text encoding in actual default environment", async () => {
+  await isolatedBridgeOptions(async (options) => {
+    const isolatedEnvironment = {
+      ...options.environment,
+      __CF_USER_TEXT_ENCODING: "0x1F5:0x0:0x0",
+    };
+    delete options.environment;
+    await withActualProcessEnvironment(isolatedEnvironment, async () => {
+      const capture = {};
+      const result = await runQualifiedPiBridge(options, {
+        platform: "darwin",
+        spawnProcess: fakeSpawn(
+          { lines: successfulQualifiedLines() },
+          capture,
+        ),
+      });
+
+      assert.deepEqual(result, {
+        schemaVersion: 1,
+        toolTrace: successfulTrace(),
+      });
+      assert.equal(
+        capture.options.env.__CF_USER_TEXT_ENCODING,
+        "0x1F5:0x0:0x0",
+      );
+    });
+  });
+});
+
+test("bridge environment rejects non-record containers and invalid values", async () => {
+  await isolatedBridgeOptions(async (options) => {
+    for (const environment of [
+      null,
+      Object.assign([], options.environment),
+      Object.assign(new Date(0), options.environment),
+      Object.assign(new Map(), options.environment),
+    ]) {
+      assert.throws(
+        () => validateIsolatedEnvironment(environment, options.cwd, "darwin"),
+        /environment/i,
+      );
+    }
+    for (const mutation of [
+      { PATH: 42 },
+      { LANG: "en_US.UTF-8\0PRIVATE" },
+      { __CF_USER_TEXT_ENCODING: 42 },
+      { __CF_USER_TEXT_ENCODING: "0x1F5:0x0:0x0\0PRIVATE" },
+    ]) {
+      assert.throws(
+        () =>
+          validateIsolatedEnvironment(
+            { ...options.environment, ...mutation },
+            options.cwd,
+            "darwin",
+          ),
+        /environment|invalid/i,
+      );
+    }
+  });
+});
+
 test("bridge accepts the exact Windows profile and rejects extra keys", () => {
   const environment = {
     PATH: String.raw`C:\Windows\System32`,
@@ -376,6 +489,18 @@ test("bridge accepts the exact Windows profile and rejects extra keys", () => {
     () =>
       validateIsolatedEnvironment(
         { ...environment, OPENAI_API_KEY: "must-not-leak" },
+        String.raw`C:\Temp\run\workspace`,
+        "win32",
+      ),
+    /unapproved/i,
+  );
+  assert.throws(
+    () =>
+      validateIsolatedEnvironment(
+        {
+          ...environment,
+          __CF_USER_TEXT_ENCODING: "0x1F5:0x0:0x0",
+        },
         String.raw`C:\Temp\run\workspace`,
         "win32",
       ),
