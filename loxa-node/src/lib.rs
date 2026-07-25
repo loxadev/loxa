@@ -1,4 +1,5 @@
 use loxa_core::engine::{py_mlx_lm, EngineLaunchSpec, ReadinessStrategy, RuntimeBackendKind};
+use loxa_core::model_inventory::VerificationCache;
 use loxa_core::registry::{self, ModelEntry, REGISTRY};
 use loxa_core::supervisor::{
     self, InterruptStatus, LogDrainingChild, ManagedChild, ManagedServer, ObservedChildExit,
@@ -515,10 +516,49 @@ fn resolve_runtime_backend(
     kind: RuntimeBackendKind,
     id: &str,
     models_dir: &Path,
+    verification_cache: &VerificationCache,
+) -> Result<ResolvedRuntimeBackend, SupervisorError> {
+    let mut verify_fixed_profile =
+        |models_dir: &Path, recipe: &'static ModelEntry, cache: &VerificationCache| {
+            download_control::verify_runtime_artifacts(
+                models_dir,
+                recipe,
+                cache,
+                &crate::actor::MutationCancellation::new(),
+            )
+            .map_err(|_| {
+                SupervisorError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "runtime artifacts are not verified",
+                ))
+            })
+        };
+    resolve_runtime_backend_with_fixed_profile_verifier(
+        kind,
+        id,
+        models_dir,
+        verification_cache,
+        &mut verify_fixed_profile,
+    )
+}
+
+fn resolve_runtime_backend_with_fixed_profile_verifier(
+    kind: RuntimeBackendKind,
+    id: &str,
+    models_dir: &Path,
+    verification_cache: &VerificationCache,
+    verify_fixed_profile: &mut dyn FnMut(
+        &Path,
+        &'static ModelEntry,
+        &VerificationCache,
+    ) -> Result<(), SupervisorError>,
 ) -> Result<ResolvedRuntimeBackend, SupervisorError> {
     match kind {
         RuntimeBackendKind::LlamaCpp => {
-            let (_, model_path) = supervisor::resolve_model_path(id, models_dir)?;
+            let (recipe, model_path) = supervisor::resolve_model_path(id, models_dir)?;
+            if loxa_core::runtime_profile::runtime_profile(recipe.id).is_some() {
+                verify_fixed_profile(models_dir, recipe, verification_cache)?;
+            }
             let program = supervisor::detect_llama_server()?;
             let engine_version = supervisor::llama_server_version(&program)?;
             Ok(ResolvedRuntimeBackend {
@@ -772,6 +812,9 @@ fn run_model_with_owner_policy(
         port,
         engine,
     } = request;
+    let runtime_verification_cache = VerificationCache::default();
+    let resolve_backend =
+        || resolve_runtime_backend(engine, id, &paths.models_dir, &runtime_verification_cache);
     let mut initial_backend = match engine {
         RuntimeBackendKind::LlamaCpp => {
             let Some(_) = registry::find(id) else {
@@ -782,10 +825,7 @@ fn run_model_with_owner_policy(
             };
             None
         }
-        RuntimeBackendKind::PyMlxLm => Some(
-            resolve_runtime_backend(engine, id, &paths.models_dir)
-                .map_err(supervisor_error_to_io)?,
-        ),
+        RuntimeBackendKind::PyMlxLm => Some(resolve_backend().map_err(supervisor_error_to_io)?),
     };
 
     ensure_runtime_state_is_mutable(&paths.state_path)?;
@@ -826,7 +866,7 @@ fn run_model_with_owner_policy(
                     run,
                     owner_policy,
                     &signal_guard,
-                    || resolve_runtime_backend(engine, id, &paths.models_dir),
+                    || resolve_backend(),
                     || Ok(()),
                 );
                 let preparation = match preparation {
@@ -859,7 +899,7 @@ fn run_model_with_owner_policy(
                 let backend = match initial_backend
                     .take()
                     .map(Ok)
-                    .unwrap_or_else(|| resolve_runtime_backend(engine, id, &paths.models_dir))
+                    .unwrap_or_else(|| resolve_backend())
                 {
                     Ok(resolved) => resolved,
                     Err(SupervisorError::ModelNotDownloaded(_)) => {
@@ -1343,17 +1383,29 @@ fn select_serve_model(
     if let Some(id) = requested {
         let entry = registry::find(id)
             .ok_or_else(|| ModelSelectionError::UnknownModel { id: id.to_string() })?;
-        if !models_dir.join(entry.filename).is_file() {
+        if !runtime_artifact_finals_exist(models_dir, entry) {
             return Err(ModelSelectionError::NotDownloaded { id: id.to_string() });
         }
         return Ok(entry);
     }
     REGISTRY
         .iter()
-        .find(|entry| models_dir.join(entry.filename).is_file())
+        .find(|entry| runtime_artifact_finals_exist(models_dir, entry))
         .ok_or_else(|| ModelSelectionError::NoDownloadedModels {
             suggested_id: REGISTRY[0].id.to_string(),
         })
+}
+
+fn runtime_artifact_finals_exist(models_dir: &Path, entry: &ModelEntry) -> bool {
+    if !models_dir.join(entry.filename).is_file() {
+        return false;
+    }
+    loxa_core::runtime_profile::runtime_profile(entry.id).is_none_or(|profile| {
+        profile
+            .artifacts()
+            .iter()
+            .all(|artifact| models_dir.join(artifact.filename).is_file())
+    })
 }
 
 fn requested_startup_model<'a>(
@@ -3177,6 +3229,157 @@ mod lifecycle_api_tests {
         );
         assert!(!error.to_string().contains("loxa pull"));
         let _ = std::fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn direct_fixed_pair_rejects_target_only_before_runtime_detection() {
+        let temp = TestDir::new("direct-target-only");
+        let models_dir = temp.0.join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let recipe = registry::find("loxa").expect("fixed runtime recipe");
+        std::fs::write(models_dir.join(recipe.filename), b"unverified target").unwrap();
+
+        let error = resolve_runtime_backend(
+            RuntimeBackendKind::LlamaCpp,
+            recipe.id,
+            &models_dir,
+            &VerificationCache::default(),
+        )
+        .expect_err("target-only fixed profile must fail verification");
+
+        assert!(
+            matches!(
+                error,
+                SupervisorError::Io(ref source)
+                    if source.kind() == io::ErrorKind::InvalidData
+            ),
+            "fixed-profile verification must fail before llama-server detection: {error:?}"
+        );
+    }
+
+    #[test]
+    fn direct_fixed_pair_resolution_rechecks_changed_drafter_with_one_cache() {
+        let temp = TestDir::new("direct-pair-recheck");
+        let models_dir = temp.0.join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let recipe = registry::find("loxa").expect("fixed runtime recipe");
+        let profile =
+            loxa_core::runtime_profile::runtime_profile(recipe.id).expect("fixed runtime profile");
+        std::fs::write(models_dir.join(recipe.filename), b"target sentinel").unwrap();
+        std::fs::write(
+            models_dir.join(profile.drafter.filename),
+            b"drafter generation zero",
+        )
+        .unwrap();
+        let cache = VerificationCache::default();
+        let calls = Cell::new(0_u8);
+        let mut verify = |observed_dir: &Path,
+                          observed_recipe: &'static ModelEntry,
+                          observed_cache: &VerificationCache| {
+            assert_eq!(observed_dir, models_dir);
+            assert_eq!(observed_recipe.id, recipe.id);
+            assert!(std::ptr::eq(observed_cache, &cache));
+            calls.set(calls.get() + 1);
+            let drafter = std::fs::read(models_dir.join(profile.drafter.filename)).unwrap();
+            if drafter == b"drafter generation zero" {
+                Err(SupervisorError::NoFreePort)
+            } else {
+                Err(SupervisorError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "changed drafter",
+                )))
+            }
+        };
+
+        let initial = resolve_runtime_backend_with_fixed_profile_verifier(
+            RuntimeBackendKind::LlamaCpp,
+            recipe.id,
+            &models_dir,
+            &cache,
+            &mut verify,
+        );
+        assert!(matches!(initial, Err(SupervisorError::NoFreePort)));
+
+        std::fs::write(
+            models_dir.join(profile.drafter.filename),
+            b"drafter generation one changed",
+        )
+        .unwrap();
+        let replacement = resolve_runtime_backend_with_fixed_profile_verifier(
+            RuntimeBackendKind::LlamaCpp,
+            recipe.id,
+            &models_dir,
+            &cache,
+            &mut verify,
+        );
+
+        assert!(matches!(
+            replacement,
+            Err(SupervisorError::Io(ref source))
+                if source.kind() == io::ErrorKind::InvalidData
+        ));
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn direct_fixed_profile_verifier_skips_unpaired_and_python_backends() {
+        let temp = TestDir::new("direct-unpaired-python");
+        let models_dir = temp.0.join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let unpaired = REGISTRY
+            .iter()
+            .find(|entry| loxa_core::runtime_profile::runtime_profile(entry.id).is_none())
+            .expect("ordinary unpaired recipe");
+        std::fs::write(models_dir.join(unpaired.filename), b"ordinary target").unwrap();
+        let python_model = temp.0.join("python-model");
+        std::fs::create_dir(&python_model).unwrap();
+        let cache = VerificationCache::default();
+        let calls = Cell::new(0_u8);
+        let mut verify = |_: &Path, _: &'static ModelEntry, _: &VerificationCache| {
+            calls.set(calls.get() + 1);
+            Err(SupervisorError::NoFreePort)
+        };
+
+        let _ = resolve_runtime_backend_with_fixed_profile_verifier(
+            RuntimeBackendKind::LlamaCpp,
+            unpaired.id,
+            &models_dir,
+            &cache,
+            &mut verify,
+        );
+        let _ = resolve_runtime_backend_with_fixed_profile_verifier(
+            RuntimeBackendKind::PyMlxLm,
+            python_model.to_str().unwrap(),
+            &models_dir,
+            &cache,
+            &mut verify,
+        );
+
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn serve_selection_requires_every_fixed_profile_final() {
+        let temp = TestDir::new("selection-target-only");
+        let recipe = registry::find("loxa").expect("fixed runtime recipe");
+        let profile =
+            loxa_core::runtime_profile::runtime_profile(recipe.id).expect("fixed runtime profile");
+        std::fs::write(temp.0.join(recipe.filename), b"target").unwrap();
+
+        assert!(matches!(
+            select_serve_model(&temp.0, Some(recipe.id)),
+            Err(ModelSelectionError::NotDownloaded { ref id }) if id == recipe.id
+        ));
+        assert!(matches!(
+            select_serve_model(&temp.0, None),
+            Err(ModelSelectionError::NoDownloadedModels { .. })
+        ));
+
+        std::fs::write(temp.0.join(profile.drafter.filename), b"drafter").unwrap();
+        assert_eq!(
+            select_serve_model(&temp.0, Some(recipe.id)).map(|entry| entry.id),
+            Ok(recipe.id)
+        );
     }
 
     #[test]
