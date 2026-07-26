@@ -206,6 +206,18 @@ fn validate_unloaded_owner_baseline(baseline: &ManagedRun) -> Result<(), Supervi
     }
 }
 
+fn is_exact_owned_unloaded_generation(run: &ManagedRun) -> bool {
+    run.schema_version == state::RUNTIME_STATE_SCHEMA_VERSION
+        && run.model_id.is_none()
+        && run.lifecycle == RunLifecycle::Unloaded
+        && run.generation_alias == format!("loxa-{}-g{}", run.run_id, run.generation)
+        && run.control_port == Some(run.port)
+        && !run.log_path.as_os_str().is_empty()
+        && run.child_pid.is_none()
+        && run.child_process_start_time_unix_s.is_none()
+        && run.child_pgid.is_none()
+}
+
 fn managed_runs_match_except_monotonic_stop(current: &ManagedRun, expected: &ManagedRun) -> bool {
     if expected.stop_requested && !current.stop_requested {
         return false;
@@ -366,6 +378,48 @@ pub fn finish_exact_unloaded_owner_until(
         return Err(SupervisorError::RunStateConflict(format!(
             "managed run {} generation {} is not childless at terminal transition",
             expected_baseline.run_id, expected_baseline.generation
+        )));
+    }
+    let outcome = if current.stop_requested {
+        ChildlessFinishOutcome::RequestedStop
+    } else {
+        ChildlessFinishOutcome::Finished
+    };
+    state::write_runtime_state(path, &[])?;
+    Ok(outcome)
+}
+
+pub fn finish_owned_unloaded_generation_until(
+    path: &Path,
+    expected_owner: &ManagedRun,
+    deadline: std::time::Instant,
+) -> Result<ChildlessFinishOutcome, SupervisorError> {
+    validate_unloaded_owner_baseline(expected_owner)?;
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let _lock = state::acquire_runtime_state_lock_for_mutation(
+        path,
+        remaining,
+        state::RUNTIME_STATE_LOCK_POLL_INTERVAL.min(remaining),
+    )?;
+    let runs = state::runtime_state_runs_for_mutation(path)?;
+    let [current] = runs.as_slice() else {
+        return Err(SupervisorError::RunStateConflict(format!(
+            "unloaded managed owner {} is not the singular current owner",
+            expected_owner.run_id
+        )));
+    };
+    let same_owner = current.schema_version == expected_owner.schema_version
+        && current.run_id == expected_owner.run_id
+        && current.owner_pid == expected_owner.owner_pid
+        && current.owner_process_start_time_unix_s
+            == expected_owner.owner_process_start_time_unix_s
+        && current.control_port == expected_owner.control_port
+        && current.port == expected_owner.port
+        && current.generation >= expected_owner.generation;
+    if !same_owner || !is_exact_owned_unloaded_generation(current) {
+        return Err(SupervisorError::RunStateConflict(format!(
+            "unloaded managed owner {} is not a safe owned unloaded generation",
+            expected_owner.run_id
         )));
     }
     let outcome = if current.stop_requested {
@@ -699,6 +753,101 @@ mod tests {
             assert_eq!(
                 read_runtime_state(&state_path).expect("read preserved owner"),
                 RuntimeStateRead::Loaded(vec![conflicting])
+            );
+        }
+    }
+
+    #[test]
+    fn owned_advanced_unloaded_generation_finishes_atomically_after_safe_validation() {
+        let temp = tempdir().expect("tempdir");
+        let baseline = unloaded_owner(temp.path(), "advanced-finish");
+        for stopped in [false, true] {
+            let state_path = temp.path().join(format!("managed-{stopped}.json"));
+            let mut advanced = baseline.clone();
+            advanced.stop_requested = stopped;
+            advanced.generation = 2;
+            advanced.generation_alias = format!("loxa-{}-g2", baseline.run_id);
+            advanced.log_path = temp.path().join("advanced-generation.log");
+            write_runtime_state(&state_path, std::slice::from_ref(&advanced))
+                .expect("seed advanced owner");
+
+            let outcome = finish_owned_unloaded_generation_until(
+                &state_path,
+                &baseline,
+                std::time::Instant::now() + Duration::from_secs(2),
+            )
+            .expect("finish exact owned generation");
+            assert_eq!(
+                outcome,
+                if stopped {
+                    ChildlessFinishOutcome::RequestedStop
+                } else {
+                    ChildlessFinishOutcome::Finished
+                }
+            );
+            assert_eq!(
+                read_runtime_state(&state_path).expect("read finished owner"),
+                RuntimeStateRead::Loaded(Vec::new())
+            );
+        }
+    }
+
+    #[test]
+    fn owned_unloaded_generation_finish_rejects_unsafe_foreign_and_nonchildless_state() {
+        let temp = tempdir().expect("tempdir");
+        let baseline = unloaded_owner(temp.path(), "refresh-reject");
+        let cases = [
+            {
+                let mut foreign = baseline.clone();
+                foreign.run_id = "foreign-run".into();
+                foreign.generation_alias = "loxa-foreign-run-g0".into();
+                foreign
+            },
+            {
+                let mut unsafe_alias = baseline.clone();
+                unsafe_alias.generation = 2;
+                unsafe_alias.generation_alias = "loxa-refresh-reject-g1".into();
+                unsafe_alias
+            },
+            {
+                let mut foreign_pid = baseline.clone();
+                foreign_pid.owner_pid += 1;
+                foreign_pid
+            },
+            {
+                let mut foreign_start = baseline.clone();
+                foreign_start.owner_process_start_time_unix_s += 1;
+                foreign_start
+            },
+            {
+                let mut foreign_port = baseline.clone();
+                foreign_port.control_port = Some(8_081);
+                foreign_port.port = 8_081;
+                foreign_port
+            },
+            {
+                let mut child_owned = baseline.clone();
+                child_owned.child_pid = Some(44);
+                child_owned.child_process_start_time_unix_s = Some(55);
+                child_owned
+            },
+        ];
+
+        for (index, current) in cases.into_iter().enumerate() {
+            let state_path = temp.path().join(format!("managed-{index}.json"));
+            write_runtime_state(&state_path, std::slice::from_ref(&current))
+                .expect("seed rejected owner state");
+
+            let error = finish_owned_unloaded_generation_until(
+                &state_path,
+                &baseline,
+                std::time::Instant::now() + Duration::from_secs(2),
+            )
+            .expect_err("unsafe owned generation finish must fail closed");
+            assert!(matches!(error, SupervisorError::RunStateConflict(_)));
+            assert_eq!(
+                read_runtime_state(&state_path).expect("read preserved rejected owner"),
+                RuntimeStateRead::Loaded(vec![current])
             );
         }
     }
