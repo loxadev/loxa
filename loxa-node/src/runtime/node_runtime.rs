@@ -39,6 +39,7 @@ pub(crate) struct NodeOwnerGuard {
     paths: NodePaths,
     baseline: Option<ManagedRun>,
     acquisition_recovery: Option<loxa_core::supervisor::ManagedRecoverySource>,
+    allow_owned_unloaded_generation_finish: bool,
 }
 
 impl NodeOwnerGuard {
@@ -48,6 +49,7 @@ impl NodeOwnerGuard {
             paths,
             baseline: Some(baseline),
             acquisition_recovery: None,
+            allow_owned_unloaded_generation_finish: false,
         }
     }
 
@@ -60,6 +62,7 @@ impl NodeOwnerGuard {
                 paths,
                 baseline: Some(acquisition.claimed_run),
                 acquisition_recovery: Some(acquisition.recovery_source),
+                allow_owned_unloaded_generation_finish: false,
             },
             acquisition.scalar_source,
         )
@@ -77,6 +80,12 @@ impl NodeOwnerGuard {
 
     pub(crate) fn baseline(&self) -> &ManagedRun {
         self.baseline.as_ref().expect("node owner guard armed")
+    }
+
+    fn allow_owned_unloaded_generation_finish_after_stopped_execution(&mut self) {
+        if self.acquisition_recovery.is_none() {
+            self.allow_owned_unloaded_generation_finish = true;
+        }
     }
 
     pub(crate) fn disarm(mut self) {
@@ -129,6 +138,12 @@ impl NodeOwnerGuard {
                             recovery,
                         )
                         .map(|()| loxa_core::supervisor::ChildlessFinishOutcome::Finished)
+                    } else if owner.allow_owned_unloaded_generation_finish {
+                        loxa_core::supervisor::finish_owned_unloaded_generation_until(
+                            &owner.paths.state_path,
+                            baseline,
+                            deadline,
+                        )
                     } else {
                         loxa_core::supervisor::finish_exact_unloaded_owner_until(
                             &owner.paths.state_path,
@@ -817,6 +832,7 @@ impl NodeRuntime {
             self.node_instance_id,
             None,
         );
+        let mut execution_stopped = false;
         let (execution_retained, execution_failed) = match self.download_runtime.take() {
             Some((control, worker)) => match worker.shutdown_staged(
                 control,
@@ -827,7 +843,10 @@ impl NodeRuntime {
                     finalize: deadlines.repository,
                 },
             ) {
-                ExecutionShutdownResult::Stopped => (None, None),
+                ExecutionShutdownResult::Stopped => {
+                    execution_stopped = true;
+                    (None, None)
+                }
                 ExecutionShutdownResult::Failed(summary) => {
                     for message in summary.messages() {
                         diagnostics.push((
@@ -888,6 +907,11 @@ impl NodeRuntime {
             },
             None => (None, None),
         };
+        if execution_stopped {
+            if let Some(owner) = &mut self.owner_guard {
+                owner.allow_owned_unloaded_generation_finish_after_stopped_execution();
+            }
+        }
         let routes_failure = self
             .chat_routes_state
             .take()
@@ -1216,6 +1240,47 @@ mod tests {
         NodeOwnerGuard::new(paths.clone(), baseline)
             .finish()
             .unwrap();
+
+        assert_eq!(
+            managed_servers(&paths).unwrap(),
+            ManagedRunsSnapshot::Runs(Vec::new())
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn owner_guard_finishes_an_owned_advanced_unloaded_generation_only_after_execution_stops() {
+        let root = std::env::temp_dir().join(format!(
+            "loxa-node-owner-refresh-{}-{}",
+            std::process::id(),
+            loxa_protocol::NodeInstanceId::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = NodePaths {
+            models_dir: root.join("models"),
+            state_path: root.join("managed.json"),
+            logs_dir: root.join("logs"),
+        };
+        let baseline = claim_unloaded_owner(&paths, 19_745).unwrap();
+        let mut advanced = baseline.clone();
+        advanced.generation = 2;
+        advanced.generation_alias = format!("loxa-{}-g2", baseline.run_id);
+        advanced.log_path = paths.logs_dir.join("generation-2.log");
+        loxa_core::supervisor::update_runtime_state_run_committed(
+            &paths.state_path,
+            &baseline.identity(),
+            advanced.clone(),
+        )
+        .unwrap()
+        .expect("advance owned unloaded generation");
+        let mut guard = NodeOwnerGuard::new(paths.clone(), baseline.clone());
+
+        guard.allow_owned_unloaded_generation_finish_after_stopped_execution();
+        assert_eq!(guard.baseline(), &baseline);
+        match guard.finish_retained(std::time::Instant::now() + std::time::Duration::from_secs(2)) {
+            Ok(_) => {}
+            Err(failure) => panic!("finish refreshed exact owner: {failure}"),
+        }
 
         assert_eq!(
             managed_servers(&paths).unwrap(),

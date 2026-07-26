@@ -24,11 +24,12 @@ mod teardown;
 
 pub use lifecycle::{
     decide_observed_child_exit, finish_childless_runtime_state_run, finish_exact_unloaded_owner,
-    finish_exact_unloaded_owner_until, finish_owner_teardown_with,
-    prepare_unloaded_owner_for_model, restore_unloaded_owner_after_prepared_run,
-    ChildlessFinishOutcome, InterruptStatus, ObservedChildExit, OwnerTeardownDecision,
-    OwnerTerminalOutcome, PostSpawnCleanupOutcome, PrepareUnloadedOwnerOutcome,
-    PreparedOwnerCleanup, RestoreUnloadedOwnerOutcome, SpawnStartingRunOutcome,
+    finish_exact_unloaded_owner_until, finish_owned_unloaded_generation_until,
+    finish_owner_teardown_with, prepare_unloaded_owner_for_model,
+    restore_unloaded_owner_after_prepared_run, ChildlessFinishOutcome, InterruptStatus,
+    ObservedChildExit, OwnerTeardownDecision, OwnerTerminalOutcome, PostSpawnCleanupOutcome,
+    PrepareUnloadedOwnerOutcome, PreparedOwnerCleanup, RestoreUnloadedOwnerOutcome,
+    SpawnStartingRunOutcome,
 };
 pub use readiness::{
     process_start_time_with_retry, reserve_localhost_port, spawn_chat_completion_readiness_worker,
