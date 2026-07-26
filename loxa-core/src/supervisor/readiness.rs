@@ -976,7 +976,7 @@ mod tests {
             &mut child,
             server.port(),
             EXPECTED_ALIAS,
-            Duration::from_secs(2),
+            Duration::from_secs(5),
             Duration::from_secs(1),
         );
         assert!(

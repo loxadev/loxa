@@ -1417,32 +1417,52 @@ mod tests {
 
     #[test]
     fn inference_listener_releases_both_ports_on_normal_shutdown() {
-        let temp = BuilderTestDir::new("inference-listener-normal-shutdown");
-        let paths = temp.paths();
-        let gateway_listener =
-            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve gateway port");
-        let gateway_port = gateway_listener
-            .local_addr()
-            .expect("gateway address")
-            .port();
-        let inference_listener =
-            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve inference port");
-        let inference_port = inference_listener
-            .local_addr()
-            .expect("inference address")
-            .port();
-        drop(gateway_listener);
-        drop(inference_listener);
+        let mut built = None;
+        for attempt in 0..3 {
+            let temp =
+                BuilderTestDir::new(&format!("inference-listener-normal-shutdown-{attempt}"));
+            let paths = temp.paths();
+            let gateway_listener =
+                std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve gateway port");
+            let gateway_port = gateway_listener
+                .local_addr()
+                .expect("gateway address")
+                .port();
+            let inference_listener =
+                std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve inference port");
+            let inference_port = inference_listener
+                .local_addr()
+                .expect("inference address")
+                .port();
+            drop(gateway_listener);
+            drop(inference_listener);
 
-        let runtime = NodeBuilder::new(
-            None,
-            Some(gateway_port),
-            RuntimeBackendKind::LlamaCpp,
-            &paths,
-        )
-        .with_inference_port(Some(inference_port))
-        .build()
-        .expect("build inference listener");
+            match NodeBuilder::new(
+                None,
+                Some(gateway_port),
+                RuntimeBackendKind::LlamaCpp,
+                &paths,
+            )
+            .with_inference_port(Some(inference_port))
+            .build()
+            {
+                Ok(runtime) => {
+                    built = Some((runtime, temp, gateway_port, inference_port));
+                    break;
+                }
+                Err(NodeBuildError::Ordinary(error))
+                    if matches!(error.kind(), io::ErrorKind::AddrInUse)
+                        || error.to_string() == "no free localhost port available" =>
+                {
+                    // The test must release its reserved ports before NodeBuilder
+                    // can bind them, so a concurrent test can win that race.
+                    continue;
+                }
+                Err(error) => panic!("build inference listener: {error}"),
+            }
+        }
+        let (runtime, _temp, gateway_port, inference_port) =
+            built.expect("build inference listener after bounded port-race retries");
         assert_eq!(runtime.inference_port_for_test(), Some(inference_port));
 
         runtime.shutdown_for_test().expect("shutdown runtime");

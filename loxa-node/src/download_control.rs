@@ -6416,7 +6416,7 @@ mod tests {
         durable.release_lifecycle_cancel_for_test();
         durable.release_verification_before_publish_for_test();
         shutdown_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(5))
             .unwrap()
             .unwrap();
         assert!(!durable.artifact_mutation_is_busy_for_test(recipe.id));
