@@ -2251,6 +2251,13 @@ mod tests {
                     .unwrap();
                 let response = router(state.clone()).oneshot(request).await.unwrap();
                 assert_eq!(response.status(), StatusCode::OK);
+                let mut body = response.into_body().into_data_stream();
+                let started = body
+                    .next()
+                    .await
+                    .expect("turn.started response frame")
+                    .unwrap();
+                assert!(String::from_utf8_lossy(&started).contains("event: turn.started"));
                 history.fail_next_finalize_for_test().await.unwrap();
                 let (turn_id, cancel) = {
                     let active = state.active.state.lock().unwrap();
@@ -2258,7 +2265,7 @@ mod tests {
                     (active.turn_id.clone(), active.cancel.clone())
                 };
                 cancel.send_replace(true);
-                let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                let body = to_bytes(Body::from_stream(body), usize::MAX).await.unwrap();
                 assert!(String::from_utf8_lossy(&body).contains("history_write_failed"));
                 assert_eq!(
                     history.get_turn(turn_id).await.unwrap().state,
