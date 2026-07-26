@@ -204,6 +204,35 @@ test("bridge parser accepts only Pi process inputs", () => {
   }
 });
 
+test("qualified Pi argv appends the acceptance contract as a system prompt and retains the user prompt", () => {
+  const extension = "/opt/acceptance-gate.mjs";
+  const prompt = "Make exactly four tool calls in the required order.";
+
+  assert.deepEqual(buildQualifiedPiArgv(extension, prompt), [
+    "--provider",
+    "loxa",
+    "--model",
+    "loxa",
+    "--mode",
+    "json",
+    "--no-session",
+    "--tools",
+    "read,bash,write",
+    "--no-extensions",
+    "--extension",
+    extension,
+    "--no-skills",
+    "--no-prompt-templates",
+    "--no-context-files",
+    "--no-themes",
+    "--no-approve",
+    "--offline",
+    "--append-system-prompt",
+    prompt,
+    prompt,
+  ]);
+});
+
 test("bridge source contains no gateway fixture config workspace or evidence orchestration", async () => {
   const source = await readFile(new URL("./pi-acceptance.mjs", import.meta.url), "utf8");
   for (const forbidden of [
