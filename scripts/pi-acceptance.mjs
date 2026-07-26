@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 
 const MAX_ARGUMENT_LENGTH = 4096;
 const MAX_TRACE_RECORDS = 10_000;
-const MAX_PI_STDOUT_BYTES = 1024 * 1024;
+const MAX_PI_STDOUT_BYTES = 8 * 1024 * 1024;
 const MAX_PI_STDERR_BYTES = 64 * 1024;
 const MAX_PI_LINE_BYTES = 64 * 1024;
 const MAX_PI_VERSION_STDOUT_BYTES = 4096;
@@ -58,46 +58,6 @@ function validateBoundedString(value, label, maximum = MAX_ARGUMENT_LENGTH) {
     fail(`${label} is invalid`);
   }
   return value;
-}
-
-export function validateSemanticToolTrace(records) {
-  if (
-    !Array.isArray(records) ||
-    records.length !== 4
-  ) {
-    fail("semantic tool trace must contain exactly four records");
-  }
-  for (const record of records) {
-    if (
-      !isPlainObject(record) ||
-      typeof record.tool !== "string" ||
-      record.tool.length > 128 ||
-      typeof record.status !== "string" ||
-      record.status.length > 32 ||
-      (record.stage !== undefined &&
-        (typeof record.stage !== "string" || record.stage.length > 64))
-    ) {
-      fail("semantic tool trace contains an invalid record");
-    }
-  }
-  const required = [
-    (record) => record.tool === "read" && record.status === "success",
-    (record) =>
-      record.tool === "bash" &&
-      record.stage === "precheck" &&
-      record.status === "success",
-    (record) =>
-      record.tool === "write" &&
-      record.status === "success",
-    (record) =>
-      record.tool === "bash" &&
-      record.stage === "verification" &&
-      record.status === "success",
-  ];
-  if (!required.every((matches, index) => matches(records[index]))) {
-    fail("semantic tool trace is missing the exact successful tool loop");
-  }
-  return true;
 }
 
 function validateEventIdentifier(value, label) {
@@ -211,10 +171,10 @@ class QualifiedPiEventAdapter {
       const { toolCallId, toolName } = this.correlate(record);
       this.pending.delete(toolCallId);
       this.completed.add(toolCallId);
-      if (record.isError !== false) {
+      if (typeof record.isError !== "boolean") {
         fail("Pi tool execution failed");
       }
-      this.advanceSemanticTrace(toolName);
+      this.advanceSemanticTrace(toolName, record.isError);
       return;
     }
     fail("unknown Pi JSONL record type");
@@ -235,20 +195,29 @@ class QualifiedPiEventAdapter {
     return { toolCallId, toolName };
   }
 
-  advanceSemanticTrace(toolName) {
+  advanceSemanticTrace(toolName, isError) {
     const expected = [
-      (name) => name === "read",
-      (name) => name === "bash",
-      (name) => name === "write",
-      (name) => name === "bash",
+      { tool: "read", isError: false },
+      { tool: "read", isError: false },
+      { tool: "bash", isError: true },
+      { tool: "write", isError: false },
+      { tool: "bash", isError: false },
     ];
-    if (!expected[this.requiredStep]?.(toolName)) {
-      fail("Pi JSONL must contain exactly four successful tool completions");
+    const required = expected[this.requiredStep];
+    if (
+      required === undefined ||
+      toolName !== required.tool ||
+      isError !== required.isError
+    ) {
+      fail("Pi JSONL must contain the exact five-step repair loop");
     }
-    const record = { tool: toolName, status: "success" };
-    if (this.requiredStep === 1) {
-      record.stage = "precheck";
-    } else if (this.requiredStep === 3) {
+    const record = {
+      tool: toolName,
+      status: isError ? "expected-failure" : "success",
+    };
+    if (this.requiredStep === 2) {
+      record.stage = "failing-verification";
+    } else if (this.requiredStep === 4) {
       record.stage = "verification";
     }
     this.semanticTrace.push(record);
@@ -268,7 +237,9 @@ class QualifiedPiEventAdapter {
     if (this.pending.size !== 0) {
       fail("Pi JSONL ended with a pending tool call");
     }
-    validateSemanticToolTrace(this.semanticTrace);
+    if (this.requiredStep !== 5) {
+      fail("Pi JSONL is missing the exact five-step repair loop");
+    }
     return this.semanticTrace.map((record) => ({ ...record }));
   }
 }
@@ -1096,9 +1067,30 @@ async function main() {
   }
 }
 
-if (
-  process.argv[1] !== undefined &&
-  path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+export async function isMainInvocation(
+  entrypoint,
+  moduleUrl,
+  canonicalize = realpath,
 ) {
+  if (entrypoint === undefined) {
+    return false;
+  }
+  const resolvedEntrypoint = path.resolve(entrypoint);
+  const modulePath = fileURLToPath(moduleUrl);
+  if (resolvedEntrypoint === modulePath) {
+    return true;
+  }
+  try {
+    const [canonicalEntrypoint, canonicalModule] = await Promise.all([
+      canonicalize(resolvedEntrypoint),
+      canonicalize(modulePath),
+    ]);
+    return canonicalEntrypoint === canonicalModule;
+  } catch {
+    return false;
+  }
+}
+
+if (await isMainInvocation(process.argv[1], import.meta.url)) {
   await main();
 }

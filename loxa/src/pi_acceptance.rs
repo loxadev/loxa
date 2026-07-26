@@ -22,6 +22,21 @@ const MAX_BRIDGE_BYTES: usize = 64 * 1024;
 const PI_PROCESS_TIMEOUT_MS: u64 = 120_000;
 const BRIDGE_OUTER_TIMEOUT: Duration = Duration::from_millis(PI_PROCESS_TIMEOUT_MS + 7_000);
 const BRIDGE_CANCEL_GRACE: Duration = Duration::from_secs(1);
+const INDEPENDENT_VERIFIER_TIMEOUT: Duration = Duration::from_secs(10);
+const PI_BRIDGE_SOURCE: &[u8] = include_bytes!("../../scripts/pi-acceptance.mjs");
+const PI_ACCEPTANCE_EXTENSION: &[u8] =
+    include_bytes!("../../examples/pi/tool-loop/acceptance-gate.mjs");
+const PI_INDEPENDENT_VERIFIER: &str =
+    include_str!("../../examples/pi/tool-loop/independent-verify.mjs");
+const PI_ACCEPTANCE_PROMPT: &str = include_str!("../../examples/pi/tool-loop/prompt.txt");
+const PI_FIXTURE_PACKAGE: &[u8] = include_bytes!("../../examples/pi/tool-loop/seed/package.json");
+const PI_FIXTURE_SOURCE: &[u8] =
+    include_bytes!("../../examples/pi/tool-loop/seed/src/merge-ranges.mjs");
+const PI_FIXTURE_VERIFIER: &[u8] =
+    include_bytes!("../../examples/pi/tool-loop/seed/test/verify.mjs");
+#[cfg(test)]
+const PI_EXPECTED_SOURCE: &[u8] =
+    include_bytes!("../../examples/pi/tool-loop/expected/src/merge-ranges.mjs");
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -71,18 +86,23 @@ pub(crate) trait AcceptanceRuntime {
 struct LiveRuntime {
     client: reqwest::blocking::Client,
     bridge: PathBuf,
+    _bridge_directory: tempfile::TempDir,
 }
 
 impl LiveRuntime {
-    fn new(repository_root: &Path) -> io::Result<Self> {
+    fn new() -> io::Result<Self> {
         let client = reqwest::blocking::Client::builder()
             .timeout(GATEWAY_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(io::Error::other)?;
+        let bridge_directory = Builder::new().prefix("loxa-pi-bridge-").tempdir()?;
+        let bridge = bridge_directory.path().join("pi-acceptance.mjs");
+        write_private_file(&bridge, PI_BRIDGE_SOURCE)?;
         Ok(Self {
             client,
-            bridge: repository_root.join("scripts/pi-acceptance.mjs"),
+            bridge,
+            _bridge_directory: bridge_directory,
         })
     }
 }
@@ -436,11 +456,9 @@ struct Compat {
 }
 
 pub(crate) fn run_live(request: PiAcceptanceRequest) -> io::Result<SanitizedEvidence> {
-    let repository_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .ok_or_else(|| io::Error::other("Loxa repository root is unavailable"))?;
-    let mut runtime = LiveRuntime::new(repository_root)?;
-    run_with_runtime(request, repository_root, &mut runtime)
+    let execution_root = std::env::current_dir()?;
+    let mut runtime = LiveRuntime::new()?;
+    run_with_runtime(request, &execution_root, &mut runtime)
 }
 
 pub(crate) fn write_evidence_json(
@@ -473,9 +491,12 @@ pub(crate) fn run_with_runtime(
         fs::create_dir(directory)?;
     }
 
-    let seed = repository_root.join("examples/pi/tool-loop/seed");
+    let seed = temporary_root.join("seed");
+    fs::create_dir(&seed)?;
+    materialize_fixture(&seed)?;
     copy_tree(&seed, &workspace)?;
-    let prompt = fs::read_to_string(repository_root.join("examples/pi/tool-loop/prompt.txt"))?;
+    let authoritative_workspace = snapshot_tree(&workspace)?;
+    let prompt = PI_ACCEPTANCE_PROMPT.to_owned();
     if prompt.is_empty() || prompt.len() > 32 * 1024 || prompt.contains('\0') {
         return Err(invalid("Pi acceptance prompt is invalid"));
     }
@@ -491,20 +512,24 @@ pub(crate) fn run_with_runtime(
     write_private_file(&config_path, &config_bytes)?;
 
     validate_gateway(&endpoint, runtime)?;
+    let extension = temporary_root.join("acceptance-gate.mjs");
+    write_private_file(&extension, PI_ACCEPTANCE_EXTENSION)?;
     let invocation = BridgeInvocation {
         pi_entrypoint: request.pi_entrypoint,
-        extension: repository_root.join("examples/pi/tool-loop/acceptance-gate.mjs"),
+        extension,
         prompt,
         workspace: workspace.clone(),
         environment: isolated_environment(&home, &config_directory, &child_temp),
     };
     let bridge_bytes = runtime.run_bridge(&invocation)?;
     validate_bridge_result(&bridge_bytes)?;
-    validate_exact_workspace(
-        &seed,
-        &workspace,
-        &repository_root.join("examples/pi/tool-loop/expected/result.txt"),
-    )?;
+    validate_exact_workspace_against(&authoritative_workspace, &workspace)?;
+    let verified_workspace = snapshot_tree(&workspace)?;
+    run_independent_verifier(&workspace, PI_INDEPENDENT_VERIFIER, &invocation.environment)?;
+    validate_exact_workspace_against(&authoritative_workspace, &workspace)?;
+    if snapshot_tree(&workspace)? != verified_workspace {
+        return Err(invalid("workspace changed during independent verification"));
+    }
     validate_gateway(&endpoint, runtime)?;
 
     let evidence = SanitizedEvidence {
@@ -817,6 +842,21 @@ fn append_os(base: &std::ffi::OsStr, suffix: &str) -> OsString {
     value
 }
 
+fn materialize_fixture(seed: &Path) -> io::Result<()> {
+    let source_directory = seed.join("src");
+    let test_directory = seed.join("test");
+    fs::create_dir(&source_directory)?;
+    fs::create_dir(&test_directory)?;
+    for (path, bytes) in [
+        (seed.join("package.json"), PI_FIXTURE_PACKAGE),
+        (source_directory.join("merge-ranges.mjs"), PI_FIXTURE_SOURCE),
+        (test_directory.join("verify.mjs"), PI_FIXTURE_VERIFIER),
+    ] {
+        write_private_file(&path, bytes)?;
+    }
+    Ok(())
+}
+
 fn copy_tree(source: &Path, destination: &Path) -> io::Result<()> {
     let metadata = fs::symlink_metadata(source)?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -914,15 +954,22 @@ fn snapshot_tree(root: &Path) -> io::Result<BTreeMap<String, TreeEntry>> {
     Ok(output)
 }
 
-fn validate_exact_workspace(seed: &Path, workspace: &Path, expected: &Path) -> io::Result<()> {
+#[cfg(test)]
+fn validate_exact_workspace(seed: &Path, workspace: &Path) -> io::Result<()> {
     let before = snapshot_tree(seed)?;
+    validate_exact_workspace_against(&before, workspace)
+}
+
+fn validate_exact_workspace_against(
+    before: &BTreeMap<String, TreeEntry>,
+    workspace: &Path,
+) -> io::Result<()> {
     let after = snapshot_tree(workspace)?;
     if before.keys().ne(after.keys()) {
         return Err(invalid("workspace has extra, deleted, or renamed paths"));
     }
-    let expected_bytes = fs::read(expected)?;
     let mut changes = 0;
-    for (path, original) in &before {
+    for (path, original) in before {
         let current = after
             .get(path)
             .ok_or_else(|| invalid("workspace path disappeared"))?;
@@ -935,7 +982,7 @@ fn validate_exact_workspace(seed: &Path, workspace: &Path, expected: &Path) -> i
         }
         if original.bytes != current.bytes {
             changes += 1;
-            if path != "result.txt" || current.bytes != expected_bytes {
+            if path != "src/merge-ranges.mjs" {
                 return Err(invalid("workspace contains an unrelated byte change"));
             }
         }
@@ -948,33 +995,91 @@ fn validate_exact_workspace(seed: &Path, workspace: &Path, expected: &Path) -> i
     Ok(())
 }
 
+fn run_independent_verifier(
+    workspace: &Path,
+    verifier_source: &str,
+    environment: &BTreeMap<String, OsString>,
+) -> io::Result<()> {
+    let mut entropy = [0_u8; 32];
+    getrandom::fill(&mut entropy)
+        .map_err(|_| io::Error::other("independent verifier challenge was unavailable"))?;
+    let challenge = sha256(&entropy);
+    let mut command = Command::new("node");
+    command
+        .args(["--input-type=module", "--eval", verifier_source])
+        .current_dir(workspace)
+        .env_clear()
+        .envs(environment)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command
+        .spawn()
+        .map_err(|_| io::Error::other("independent verifier failed to start"))?;
+    let challenge_result = child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| io::Error::other("independent verifier stdin was unavailable"))
+        .and_then(|stdin| {
+            stdin.write_all(challenge.as_bytes())?;
+            stdin.write_all(b"\n")
+        });
+    child.stdin.take();
+    if challenge_result.is_err() {
+        force_kill_bridge_tree(&mut child);
+        let _ = child.wait();
+        return Err(io::Error::other(
+            "independent verifier challenge delivery failed",
+        ));
+    }
+    let output = wait_for_bridge(child, INDEPENDENT_VERIFIER_TIMEOUT).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            "independent verifier did not terminate safely",
+        )
+    })?;
+    let expected = format!("LOXA_PI_ACCEPTANCE_PASS {challenge}\n");
+    // The challenged verifier writes bytes directly, so the exact LF record is
+    // identical on macOS and Windows and needs no lossy text normalization.
+    if !output.status.success() || output.stdout != expected.as_bytes() || !output.stderr.is_empty()
+    {
+        return Err(io::Error::other(
+            "independent verifier did not produce the exact PASS result",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_bridge_result(bytes: &[u8]) -> io::Result<()> {
     if bytes.len() > MAX_BRIDGE_BYTES {
         return Err(invalid("Pi bridge result exceeded its size limit"));
     }
     let result: BridgeResult =
         serde_json::from_slice(bytes).map_err(|_| invalid("Pi bridge result was invalid"))?;
-    if result.schema_version != 1 || result.tool_trace.len() != 4 {
+    if result.schema_version != 1 || result.tool_trace.len() != 5 {
         return Err(invalid(
-            "Pi bridge result is missing the exact successful tool loop",
+            "Pi bridge result is missing the exact repair tool loop",
         ));
     }
     let expected = [
-        ("read", None),
-        ("bash", Some("precheck")),
-        ("write", None),
-        ("bash", Some("verification")),
+        ("read", "success", None),
+        ("read", "success", None),
+        ("bash", "expected-failure", Some("failing-verification")),
+        ("write", "success", None),
+        ("bash", "success", Some("verification")),
     ];
     if result
         .tool_trace
         .iter()
         .zip(expected)
-        .any(|(record, (tool, stage))| {
-            record.tool != tool || record.status != "success" || record.stage.as_deref() != stage
+        .any(|(record, (tool, status, stage))| {
+            record.tool != tool || record.status != status || record.stage.as_deref() != stage
         })
     {
         return Err(invalid(
-            "Pi bridge result is missing the exact successful tool loop",
+            "Pi bridge result is missing the exact repair tool loop",
         ));
     }
     Ok(())
@@ -1083,6 +1188,9 @@ mod tests {
         temporary_root: Option<PathBuf>,
         temporary_root_is_canonical: bool,
         config_bytes: Option<Vec<u8>>,
+        source_replacement: Vec<u8>,
+        precreate_independent_verifier: bool,
+        mutate_seed_and_workspace: bool,
     }
 
     impl FakeRuntime {
@@ -1100,6 +1208,9 @@ mod tests {
                 temporary_root: None,
                 temporary_root_is_canonical: false,
                 config_bytes: None,
+                source_replacement: PI_EXPECTED_SOURCE.to_vec(),
+                precreate_independent_verifier: false,
+                mutate_seed_and_workspace: false,
             }
         }
     }
@@ -1135,8 +1246,42 @@ mod tests {
                     .expect("config directory"),
             );
             self.config_bytes = Some(fs::read(config_directory.join("models.json"))?);
-            fs::write(invocation.workspace.join("result.txt"), b"sum=18\n")?;
-            Ok(br#"{"schemaVersion":1,"toolTrace":[{"tool":"read","status":"success"},{"tool":"bash","stage":"precheck","status":"success"},{"tool":"write","status":"success"},{"tool":"bash","stage":"verification","status":"success"}]}"#.to_vec())
+            assert_eq!(
+                fs::read(invocation.workspace.join("src/merge-ranges.mjs"))?,
+                PI_FIXTURE_SOURCE
+            );
+            assert_eq!(
+                fs::read(invocation.workspace.join("test/verify.mjs"))?,
+                PI_FIXTURE_VERIFIER
+            );
+            assert_eq!(fs::read(&invocation.extension)?, PI_ACCEPTANCE_EXTENSION);
+            fs::write(
+                invocation.workspace.join("src/merge-ranges.mjs"),
+                &self.source_replacement,
+            )?;
+            if self.precreate_independent_verifier {
+                fs::write(
+                    invocation
+                        .workspace
+                        .parent()
+                        .expect("temporary root")
+                        .join("independent-verify.mjs"),
+                    b"let challenge = \"\";\nprocess.stdin.setEncoding(\"utf8\");\nfor await (const chunk of process.stdin) challenge += chunk;\nprocess.stdout.write(`LOXA_PI_ACCEPTANCE_PASS ${challenge.trim()}\\n`);\n",
+                )?;
+            }
+            if self.mutate_seed_and_workspace {
+                let mutated = b"// bridge-mutated verifier\n";
+                fs::write(
+                    invocation
+                        .workspace
+                        .parent()
+                        .expect("temporary root")
+                        .join("seed/test/verify.mjs"),
+                    mutated,
+                )?;
+                fs::write(invocation.workspace.join("test/verify.mjs"), mutated)?;
+            }
+            Ok(br#"{"schemaVersion":1,"toolTrace":[{"tool":"read","status":"success"},{"tool":"read","status":"success"},{"tool":"bash","stage":"failing-verification","status":"expected-failure"},{"tool":"write","status":"success"},{"tool":"bash","stage":"verification","status":"success"}]}"#.to_vec())
         }
     }
 
@@ -1152,9 +1297,208 @@ mod tests {
     }
 
     #[test]
+    fn live_runtime_materializes_the_bridge_without_a_source_checkout() {
+        let runtime = LiveRuntime::new().unwrap();
+
+        assert!(
+            runtime.bridge.is_file(),
+            "the runnable bridge must be materialized from the binary"
+        );
+    }
+
+    #[test]
+    fn acceptance_materializes_its_fixture_without_a_source_checkout() {
+        let execution_root = tempfile::tempdir().unwrap();
+        fs::write(execution_root.path().join("pi"), b"fake").unwrap();
+
+        let evidence = run_with_runtime(
+            request(execution_root.path(), AcceptancePhase::MacLocal),
+            execution_root.path(),
+            &mut FakeRuntime::ready(),
+        )
+        .expect("embedded acceptance fixture must run without repository files");
+
+        assert!(evidence.exact_workspace);
+        assert!(execution_root
+            .path()
+            .join("target/pi-acceptance/test/evidence.json")
+            .is_file());
+    }
+
+    #[test]
+    fn independent_verifier_rejects_an_early_exit_and_publishes_no_evidence() {
+        let execution_root = tempfile::tempdir().unwrap();
+        fs::write(execution_root.path().join("pi"), b"fake").unwrap();
+        let mut runtime = FakeRuntime::ready();
+        runtime.source_replacement =
+            b"process.exit(0);\nexport function mergeRanges() { return []; }\n".to_vec();
+
+        let error = run_with_runtime(
+            request(execution_root.path(), AcceptancePhase::MacLocal),
+            execution_root.path(),
+            &mut runtime,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("independent verifier"));
+        assert!(!execution_root
+            .path()
+            .join("target/pi-acceptance/test/evidence.json")
+            .exists());
+    }
+
+    #[test]
+    fn independent_verifier_rejects_forged_fixed_success_output() {
+        let execution_root = tempfile::tempdir().unwrap();
+        fs::write(execution_root.path().join("pi"), b"fake").unwrap();
+        let mut runtime = FakeRuntime::ready();
+        runtime.source_replacement = b"process.stdout.write(\"PASS 4 checks\\n\"); process.exit(0);\nexport function mergeRanges() { return []; }\n".to_vec();
+
+        let result = run_with_runtime(
+            request(execution_root.path(), AcceptancePhase::MacLocal),
+            execution_root.path(),
+            &mut runtime,
+        );
+
+        assert!(result.is_err());
+        assert!(!execution_root
+            .path()
+            .join("target/pi-acceptance/test/evidence.json")
+            .exists());
+    }
+
+    #[test]
+    fn bridge_created_sibling_verifier_has_no_authority() {
+        let execution_root = tempfile::tempdir().unwrap();
+        fs::write(execution_root.path().join("pi"), b"fake").unwrap();
+        let mut runtime = FakeRuntime::ready();
+        runtime.precreate_independent_verifier = true;
+        runtime.source_replacement = b"export function mergeRanges() { return []; }\n".to_vec();
+
+        let result = run_with_runtime(
+            request(execution_root.path(), AcceptancePhase::MacLocal),
+            execution_root.path(),
+            &mut runtime,
+        );
+
+        assert!(result.is_err());
+        assert!(!execution_root
+            .path()
+            .join("target/pi-acceptance/test/evidence.json")
+            .exists());
+    }
+
+    #[test]
+    fn bridge_cannot_redefine_the_seed_baseline_with_matching_workspace_bytes() {
+        let execution_root = tempfile::tempdir().unwrap();
+        fs::write(execution_root.path().join("pi"), b"fake").unwrap();
+        let mut runtime = FakeRuntime::ready();
+        runtime.mutate_seed_and_workspace = true;
+
+        let result = run_with_runtime(
+            request(execution_root.path(), AcceptancePhase::MacLocal),
+            execution_root.path(),
+            &mut runtime,
+        );
+
+        assert!(result.is_err());
+        assert!(!execution_root
+            .path()
+            .join("target/pi-acceptance/test/evidence.json")
+            .exists());
+    }
+
+    #[test]
+    fn import_time_workspace_mutation_publishes_no_evidence() {
+        let execution_root = tempfile::tempdir().unwrap();
+        fs::write(execution_root.path().join("pi"), b"fake").unwrap();
+        let mut runtime = FakeRuntime::ready();
+        runtime.source_replacement =
+            b"import { writeFileSync } from \"node:fs\";\nwriteFileSync(\"extra.txt\", \"extra\\n\");\n"
+                .to_vec();
+        runtime
+            .source_replacement
+            .extend_from_slice(PI_EXPECTED_SOURCE);
+
+        let result = run_with_runtime(
+            request(execution_root.path(), AcceptancePhase::MacLocal),
+            execution_root.path(),
+            &mut runtime,
+        );
+
+        assert!(result.is_err());
+        assert!(!execution_root
+            .path()
+            .join("target/pi-acceptance/test/evidence.json")
+            .exists());
+    }
+
+    #[test]
+    fn import_time_source_self_modification_publishes_no_evidence() {
+        let execution_root = tempfile::tempdir().unwrap();
+        fs::write(execution_root.path().join("pi"), b"fake").unwrap();
+        let mut runtime = FakeRuntime::ready();
+        runtime.source_replacement = br#"import { writeFileSync } from "node:fs";
+writeFileSync("src/merge-ranges.mjs", "export function mergeRanges() { return []; }\n");
+"#
+        .to_vec();
+        runtime
+            .source_replacement
+            .extend_from_slice(PI_EXPECTED_SOURCE);
+
+        let result = run_with_runtime(
+            request(execution_root.path(), AcceptancePhase::MacLocal),
+            execution_root.path(),
+            &mut runtime,
+        );
+
+        assert!(result.is_err());
+        assert!(!execution_root
+            .path()
+            .join("target/pi-acceptance/test/evidence.json")
+            .exists());
+    }
+
+    #[test]
+    fn independent_verifier_requires_exact_status_stdout_and_stderr() {
+        let environment = std::env::vars_os()
+            .filter_map(|(key, value)| Some((key.to_str()?.to_string(), value)))
+            .collect::<BTreeMap<_, _>>();
+        let read_challenge = "let challenge = \"\";\nprocess.stdin.setEncoding(\"utf8\");\nfor await (const chunk of process.stdin) challenge += chunk;\nchallenge = challenge.trim();\n";
+        for (body, succeeds) in [
+            (
+                "process.stdout.write(`LOXA_PI_ACCEPTANCE_PASS ${challenge}\\n`);\n",
+                true,
+            ),
+            (
+                "process.stdout.write(`LOXA_PI_ACCEPTANCE_PASS ${challenge}\\nextra\\n`);\n",
+                false,
+            ),
+            (
+                "process.stdout.write(`LOXA_PI_ACCEPTANCE_PASS ${challenge}\\n`); console.error(\"extra\");\n",
+                false,
+            ),
+            (
+                "process.stdout.write(`LOXA_PI_ACCEPTANCE_PASS ${challenge}\\n`); process.exitCode = 1;\n",
+                false,
+            ),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let workspace = root.path().join("workspace");
+            fs::create_dir(&workspace).unwrap();
+            let verifier_source = format!("{read_challenge}{body}");
+
+            assert_eq!(
+                run_independent_verifier(&workspace, &verifier_source, &environment).is_ok(),
+                succeeds,
+                "unexpected verifier result for {body:?}"
+            );
+        }
+    }
+
+    #[test]
     fn rust_owns_fixture_config_gateway_workspace_evidence_and_cleanup() {
         let repository = tempfile::tempdir().unwrap();
-        seed_repository(repository.path());
         let pi = repository.path().join("pi");
         fs::write(&pi, b"fake").unwrap();
         let mut runtime = FakeRuntime::ready();
@@ -1197,7 +1541,6 @@ mod tests {
     #[test]
     fn post_recovery_requires_and_preserves_exact_config_digest() {
         let repository = tempfile::tempdir().unwrap();
-        seed_repository(repository.path());
         fs::write(repository.path().join("pi"), b"fake").unwrap();
         let mut runtime = FakeRuntime::ready();
         let mut first = request(repository.path(), AcceptancePhase::MacLocal);
@@ -1229,7 +1572,6 @@ mod tests {
     #[test]
     fn rejects_endpoint_phase_output_limit_and_unsafe_evidence_inputs() {
         let repository = tempfile::tempdir().unwrap();
-        seed_repository(repository.path());
         fs::write(repository.path().join("pi"), b"fake").unwrap();
 
         let mut bad_endpoint = request(repository.path(), AcceptancePhase::MacLocal);
@@ -1263,7 +1605,6 @@ mod tests {
     #[test]
     fn invalid_bridge_or_runtime_identity_never_publishes_evidence() {
         let repository = tempfile::tempdir().unwrap();
-        seed_repository(repository.path());
         fs::write(repository.path().join("pi"), b"fake").unwrap();
         let mut invalid_bridge = FakeRuntime::ready();
         invalid_bridge.gateway.truncate(2);
@@ -1302,7 +1643,6 @@ mod tests {
     #[test]
     fn evidence_publication_never_overwrites_an_existing_artifact() {
         let repository = tempfile::tempdir().unwrap();
-        seed_repository(repository.path());
         fs::write(repository.path().join("pi"), b"fake").unwrap();
         let directory = repository.path().join("target/pi-acceptance/test");
         fs::create_dir_all(&directory).unwrap();
@@ -1325,9 +1665,9 @@ mod tests {
 
     #[test]
     fn exact_workspace_rejects_extra_and_deleted_paths() {
-        let (directory, seed, workspace, expected) = exact_workspace_fixture();
+        let (directory, seed, workspace) = exact_workspace_fixture();
         fs::write(workspace.join("extra.txt"), b"extra\n").unwrap();
-        assert!(validate_exact_workspace(&seed, &workspace, &expected)
+        assert!(validate_exact_workspace(&seed, &workspace)
             .unwrap_err()
             .to_string()
             .contains("extra, deleted, or renamed"));
@@ -1335,13 +1675,26 @@ mod tests {
         fs::remove_dir_all(&workspace).unwrap();
         fs::create_dir(&workspace).unwrap();
         copy_tree(&seed, &workspace).unwrap();
-        fs::write(workspace.join("result.txt"), b"sum=18\n").unwrap();
-        fs::remove_file(workspace.join("source.txt")).unwrap();
-        assert!(validate_exact_workspace(&seed, &workspace, &expected)
+        fs::write(workspace.join("src/merge-ranges.mjs"), PI_EXPECTED_SOURCE).unwrap();
+        fs::remove_file(workspace.join("test/verify.mjs")).unwrap();
+        assert!(validate_exact_workspace(&seed, &workspace)
             .unwrap_err()
             .to_string()
             .contains("extra, deleted, or renamed"));
         drop(directory);
+    }
+
+    #[test]
+    fn exact_workspace_accepts_an_alternative_source_only_repair() {
+        let (_directory, seed, workspace) = exact_workspace_fixture();
+        fs::write(
+            workspace.join("src/merge-ranges.mjs"),
+            b"export function mergeRanges(ranges) { return ranges.map((range) => [...range]); }\n",
+        )
+        .unwrap();
+
+        validate_exact_workspace(&seed, &workspace)
+            .expect("the final verifier, not hidden source bytes, defines correctness");
     }
 
     #[cfg(unix)]
@@ -1349,56 +1702,58 @@ mod tests {
     fn exact_workspace_rejects_symlink_mode_and_hardlink_changes() {
         use std::os::unix::fs::{symlink, PermissionsExt};
 
-        let (_directory, seed, workspace, expected) = exact_workspace_fixture();
-        fs::remove_file(workspace.join("source.txt")).unwrap();
-        symlink(seed.join("source.txt"), workspace.join("source.txt")).unwrap();
-        assert!(validate_exact_workspace(&seed, &workspace, &expected)
+        let (_directory, seed, workspace) = exact_workspace_fixture();
+        fs::remove_file(workspace.join("test/verify.mjs")).unwrap();
+        symlink(
+            seed.join("test/verify.mjs"),
+            workspace.join("test/verify.mjs"),
+        )
+        .unwrap();
+        assert!(validate_exact_workspace(&seed, &workspace)
             .unwrap_err()
             .to_string()
             .contains("symbolic link"));
 
-        let (_directory, seed, workspace, expected) = exact_workspace_fixture();
-        let source = workspace.join("source.txt");
+        let (_directory, seed, workspace) = exact_workspace_fixture();
+        let source = workspace.join("test/verify.mjs");
         let mut permissions = fs::metadata(&source).unwrap().permissions();
         permissions.set_mode(permissions.mode() ^ 0o100);
         fs::set_permissions(source, permissions).unwrap();
-        assert!(validate_exact_workspace(&seed, &workspace, &expected)
+        assert!(validate_exact_workspace(&seed, &workspace)
             .unwrap_err()
             .to_string()
             .contains("mode change"));
 
-        let (_directory, seed, workspace, expected) = exact_workspace_fixture();
+        let (_directory, seed, workspace) = exact_workspace_fixture();
         fs::hard_link(
-            workspace.join("source.txt"),
-            workspace.join("source-hardlink.txt"),
+            workspace.join("test/verify.mjs"),
+            workspace.join("test/verify-hardlink.mjs"),
         )
         .unwrap();
-        assert!(validate_exact_workspace(&seed, &workspace, &expected)
+        assert!(validate_exact_workspace(&seed, &workspace)
             .unwrap_err()
             .to_string()
             .contains("hard-linked"));
     }
 
-    fn exact_workspace_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+    fn exact_workspace_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let directory = tempfile::tempdir().unwrap();
         let seed = directory.path().join("seed");
         let workspace = directory.path().join("workspace");
-        let expected = directory.path().join("expected.txt");
         fs::create_dir(&seed).unwrap();
         fs::create_dir(&workspace).unwrap();
-        fs::write(seed.join("source.txt"), b"alpha=7\nbeta=11\n").unwrap();
-        fs::write(seed.join("result.txt"), b"sum=pending\n").unwrap();
+        materialize_fixture(&seed).unwrap();
         copy_tree(&seed, &workspace).unwrap();
-        fs::write(workspace.join("result.txt"), b"sum=18\n").unwrap();
-        fs::write(&expected, b"sum=18\n").unwrap();
-        validate_exact_workspace(&seed, &workspace, &expected).unwrap();
-        (directory, seed, workspace, expected)
+        fs::write(workspace.join("src/merge-ranges.mjs"), PI_EXPECTED_SOURCE).unwrap();
+        validate_exact_workspace(&seed, &workspace).unwrap();
+        (directory, seed, workspace)
     }
 
     #[test]
     fn bridge_outer_deadline_has_bounded_cleanup_headroom() {
         assert!(BRIDGE_OUTER_TIMEOUT > Duration::from_millis(PI_PROCESS_TIMEOUT_MS));
         assert!(BRIDGE_OUTER_TIMEOUT <= Duration::from_secs(130));
+        assert!(INDEPENDENT_VERIFIER_TIMEOUT <= Duration::from_secs(10));
     }
 
     #[test]
@@ -1650,27 +2005,5 @@ mod tests {
         assert_eq!(windows["HOMEPATH"], r"\Temp\run\home");
         assert!(!windows.contains_key("SECRET"));
         assert_eq!(windows["APPDATA"], r"C:\Temp\run\home\AppData\Roaming");
-    }
-
-    fn seed_repository(root: &Path) {
-        let seed = root.join("examples/pi/tool-loop/seed");
-        fs::create_dir_all(&seed).unwrap();
-        fs::write(seed.join("source.txt"), b"alpha=7\nbeta=11\n").unwrap();
-        fs::write(seed.join("result.txt"), b"sum=pending\n").unwrap();
-        fs::write(seed.join("verify.mjs"), b"verification").unwrap();
-        fs::create_dir_all(root.join("examples/pi/tool-loop/expected")).unwrap();
-        fs::write(
-            root.join("examples/pi/tool-loop/expected/result.txt"),
-            b"sum=18\n",
-        )
-        .unwrap();
-        fs::write(root.join("examples/pi/tool-loop/prompt.txt"), b"prompt").unwrap();
-        fs::write(
-            root.join("examples/pi/tool-loop/acceptance-gate.mjs"),
-            b"extension",
-        )
-        .unwrap();
-        fs::create_dir_all(root.join("scripts")).unwrap();
-        fs::write(root.join("scripts/pi-acceptance.mjs"), b"bridge").unwrap();
     }
 }

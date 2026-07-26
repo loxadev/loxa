@@ -1,23 +1,148 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import {
+  cp,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   adaptQualifiedPiJsonl,
   buildQualifiedPiArgv,
   createBridgeCancellation,
+  isMainInvocation,
   parseBridgeArguments,
   qualifyPiEntrypoint,
   readPiVersion,
   runQualifiedPiBridge,
   terminateOwnedProcessTree,
   validateIsolatedEnvironment,
-  validateSemanticToolTrace,
 } from "./pi-acceptance.mjs";
+
+test("main invocation compares canonical entrypoint identities", async () => {
+  const root = path.resolve("synthetic-main-identity");
+  const alias = path.join(root, "alias", "pi-acceptance.mjs");
+  const canonical = path.join(root, "canonical", "pi-acceptance.mjs");
+  const realpathFile = async (candidate) =>
+    candidate === alias ? canonical : candidate;
+
+  assert.equal(
+    await isMainInvocation(alias, pathToFileURL(canonical), realpathFile),
+    true,
+  );
+  assert.equal(
+    await isMainInvocation(
+      path.join(root, "other.mjs"),
+      pathToFileURL(canonical),
+      realpathFile,
+    ),
+    false,
+  );
+  assert.equal(
+    await isMainInvocation(undefined, pathToFileURL(canonical), realpathFile),
+    false,
+  );
+});
+
+test("launching the bridge through a filesystem alias still enters main", async (t) => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "loxa-pi-main-test-"));
+  const source = fileURLToPath(new URL("./pi-acceptance.mjs", import.meta.url));
+  const alias = path.join(temporary, "pi-acceptance.mjs");
+  try {
+    try {
+      await symlink(source, alias, "file");
+    } catch (error) {
+      if (process.platform === "win32" && error?.code === "EPERM") {
+        t.skip("creating a file symlink requires an unavailable Windows privilege");
+        return;
+      }
+      throw error;
+    }
+    const result = spawnSync(process.execPath, [alias], {
+      encoding: "utf8",
+      input: "",
+    });
+    assert.equal(result.status, 2);
+    assert.equal(result.stdout, "");
+    assert.equal(result.stderr, "Pi bridge failed.\n");
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+async function snapshotFiles(root, directory = root, output = new Map()) {
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    const absolute = path.join(directory, entry.name);
+    const relative = path.relative(root, absolute).replaceAll("\\", "/");
+    if (entry.isDirectory()) {
+      await snapshotFiles(root, absolute, output);
+    } else {
+      assert.equal(entry.isFile(), true, `unsupported fixture path: ${relative}`);
+      output.set(relative, {
+        bytes: await readFile(absolute),
+        mode: (await stat(absolute)).mode & 0o777,
+      });
+    }
+  }
+  return output;
+}
+
+test("committed fixture starts failing and passes after only the expected source repair", async () => {
+  const repository = path.resolve(import.meta.dirname, "..");
+  const seed = path.join(repository, "examples/pi/tool-loop/seed");
+  const expectedSource = await readFile(
+    path.join(repository, "examples/pi/tool-loop/expected/src/merge-ranges.mjs"),
+  );
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "loxa-pi-fixture-test-"));
+  try {
+    await cp(seed, temporary, { recursive: true });
+    const before = await snapshotFiles(temporary);
+    const failing = spawnSync(process.execPath, ["test/verify.mjs"], {
+      cwd: temporary,
+      encoding: "utf8",
+    });
+    assert.equal(failing.status, 1);
+    assert.match(failing.stderr, /FAIL merge,immutability,validation/);
+
+    await writeFile(
+      path.join(temporary, "src/merge-ranges.mjs"),
+      expectedSource,
+    );
+    const passing = spawnSync(process.execPath, ["test/verify.mjs"], {
+      cwd: temporary,
+      encoding: "utf8",
+    });
+    assert.equal(passing.status, 0);
+    assert.equal(passing.stdout, "PASS 4 checks\n");
+    assert.equal(passing.stderr, "");
+
+    const after = await snapshotFiles(temporary);
+    assert.deepEqual([...after.keys()], [...before.keys()]);
+    const changes = [...after].filter(
+      ([name, entry]) =>
+        !entry.bytes.equals(before.get(name).bytes) ||
+        entry.mode !== before.get(name).mode,
+    );
+    assert.deepEqual(
+      changes.map(([name]) => name),
+      ["src/merge-ranges.mjs"],
+    );
+    assert.deepEqual(changes[0][1].bytes, expectedSource);
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
 
 test("private bridge control channel cancels on a byte or EOF", async () => {
   for (const action of ["byte", "eof"]) {
@@ -38,26 +163,33 @@ test("private bridge control channel cancels on a byte or EOF", async () => {
   }
 });
 
-function successfulTrace(thirdTool = "write") {
+function successfulTrace(writeTool = "write") {
   return [
     { tool: "read", status: "success" },
-    { tool: "bash", stage: "precheck", status: "success" },
-    { tool: thirdTool, status: "success" },
+    { tool: "read", status: "success" },
+    { tool: "bash", stage: "failing-verification", status: "expected-failure" },
+    { tool: writeTool, status: "success" },
     { tool: "bash", stage: "verification", status: "success" },
   ];
 }
 
-function successfulQualifiedLines(thirdTool = "write") {
+function successfulQualifiedLines(writeTool = "write") {
   const calls = [
-    ["read-1", "read", { path: "source.txt" }],
-    ["bash-1", "bash", { command: "node verify.mjs --precheck" }],
-    ["write-1", thirdTool, { path: "result.txt", content: "sum=18\n" }],
-    ["bash-2", "bash", { command: "node verify.mjs" }],
+    ["read-source", "read", { path: "src/merge-ranges.mjs" }, false],
+    ["read-verifier", "read", { path: "test/verify.mjs" }, false],
+    ["bash-failing", "bash", { command: "node test/verify.mjs" }, true],
+    [
+      "write-source",
+      writeTool,
+      { path: "src/merge-ranges.mjs", content: "replacement source\n" },
+      false,
+    ],
+    ["bash-passing", "bash", { command: "node test/verify.mjs" }, false],
   ];
   return [
     JSON.stringify({ type: "session", version: 3 }),
     JSON.stringify({ type: "agent_start" }),
-    ...calls.flatMap(([toolCallId, toolName, args]) => [
+    ...calls.flatMap(([toolCallId, toolName, args, isError]) => [
       JSON.stringify({
         type: "tool_execution_start",
         toolCallId,
@@ -69,12 +201,32 @@ function successfulQualifiedLines(thirdTool = "write") {
         toolCallId,
         toolName,
         result: { content: `private ${toolName} result` },
-        isError: false,
+        isError,
       }),
     ]),
     JSON.stringify({ type: "agent_end" }),
     JSON.stringify({ type: "agent_settled" }),
   ];
+}
+
+function qualifiedLinesAtLeast(minimumBytes) {
+  const lines = successfulQualifiedLines();
+  const lifecycle = JSON.stringify({
+    type: "message_update",
+    privatePayload: "x".repeat(60 * 1024),
+  });
+  const currentBytes = qualifiedJsonlBytes(lines);
+  const lifecycleBytes = Buffer.byteLength(`${lifecycle}\n`);
+  const count = Math.ceil((minimumBytes - currentBytes) / lifecycleBytes);
+  lines.splice(-2, 0, ...Array(count).fill(lifecycle));
+  return lines;
+}
+
+function qualifiedJsonlBytes(lines) {
+  return lines.reduce(
+    (total, line) => total + Buffer.byteLength(line) + 1,
+    0,
+  );
 }
 
 function fakeSpawn(scenario, capture = {}) {
@@ -250,48 +402,8 @@ test("bridge source contains no gateway fixture config workspace or evidence orc
   }
 });
 
-test("committed prompt seed expected result and provider examples retain the qualified contract", async () => {
+test("committed provider examples retain the qualified Pi contract", async () => {
   const repository = path.resolve(import.meta.dirname, "..");
-  const prompt = await readFile(
-    path.join(repository, "examples/pi/tool-loop/prompt.txt"),
-    "utf8",
-  );
-  for (const instruction of [
-    "Make exactly four tool calls and no others, in this exact order: read, bash, write, bash.",
-    "node verify.mjs --precheck",
-    "write result.txt",
-    "node verify.mjs",
-    "Do not use edit or retry any tool call.",
-  ]) {
-    assert.ok(prompt.includes(instruction), `missing prompt contract: ${instruction}`);
-  }
-  assert.equal(
-    await readFile(
-      path.join(repository, "examples/pi/tool-loop/seed/source.txt"),
-      "utf8",
-    ),
-    "alpha=7\nbeta=11\n",
-  );
-  assert.equal(
-    await readFile(
-      path.join(repository, "examples/pi/tool-loop/seed/result.txt"),
-      "utf8",
-    ),
-    "sum=pending\n",
-  );
-  assert.equal(
-    await readFile(
-      path.join(repository, "examples/pi/tool-loop/expected/result.txt"),
-      "utf8",
-    ),
-    "sum=18\n",
-  );
-  const verify = await readFile(
-    path.join(repository, "examples/pi/tool-loop/seed/verify.mjs"),
-    "utf8",
-  );
-  assert.ok(verify.includes('"sum=pending\\n"'));
-  assert.ok(verify.includes('"sum=18\\n"'));
 
   for (const [filename, baseUrl] of [
     ["models.local.json", "http://127.0.0.1:11435/v1"],
@@ -316,18 +428,29 @@ test("committed prompt seed expected result and provider examples retain the qua
   }
 });
 
-test("committed acceptance gate advances only after each exact successful result", async () => {
+test("committed acceptance gate requires the exact failing-then-passing repair loop", async () => {
+  const repository = path.resolve(import.meta.dirname, "..");
+  const expectedSource = await readFile(
+    path.join(repository, "examples/pi/tool-loop/expected/src/merge-ranges.mjs"),
+    "utf8",
+  );
   const { createAcceptanceGate } = await import(
     "../examples/pi/tool-loop/acceptance-gate.mjs"
   );
   const gate = createAcceptanceGate();
   const steps = [
-    ["read-1", "read", { path: "source.txt" }],
-    ["bash-1", "bash", { command: "node verify.mjs --precheck" }],
-    ["write-1", "write", { path: "result.txt", content: "sum=18\n" }],
-    ["bash-2", "bash", { command: "node verify.mjs" }],
+    ["read-source", "read", { path: "src/merge-ranges.mjs" }, false],
+    ["read-verifier", "read", { path: "test/verify.mjs" }, false],
+    ["bash-failing", "bash", { command: "node test/verify.mjs" }, true],
+    [
+      "write-source",
+      "write",
+      { path: "src/merge-ranges.mjs", content: expectedSource },
+      false,
+    ],
+    ["bash-passing", "bash", { command: "node test/verify.mjs" }, false],
   ];
-  for (const [toolCallId, toolName, input] of steps) {
+  for (const [toolCallId, toolName, input, isError] of steps) {
     assert.equal(await gate({ toolCallId, toolName, input }), undefined);
     assert.deepEqual(
       await gate({
@@ -345,7 +468,7 @@ test("committed acceptance gate advances only after each exact successful result
         toolCallId,
         toolName,
         input,
-        isError: false,
+        isError,
       }),
       undefined,
     );
@@ -354,7 +477,7 @@ test("committed acceptance gate advances only after each exact successful result
     await gate({
       toolCallId: "extra",
       toolName: "read",
-      input: { path: "source.txt" },
+      input: { path: "src/merge-ranges.mjs" },
     }),
     {
       block: true,
@@ -562,16 +685,43 @@ test("bridge emits only bounded schema and semantic tool trace", async () => {
   });
 });
 
-test("qualified Pi JSONL maps exact correlated successful tools", () => {
+test("bridge accepts qualified JSONL above 1 MiB and rejects above 8 MiB", async () => {
+  await isolatedBridgeOptions(async (options) => {
+    const acceptedLines = qualifiedLinesAtLeast(1024 * 1024 + 1);
+    assert.ok(qualifiedJsonlBytes(acceptedLines) > 1024 * 1024);
+    assert.deepEqual(
+      await runQualifiedPiBridge(options, {
+        platform: "darwin",
+        spawnProcess: fakeSpawn({ lines: acceptedLines }),
+      }),
+      {
+        schemaVersion: 1,
+        toolTrace: successfulTrace(),
+      },
+    );
+
+    const rejectedLines = qualifiedLinesAtLeast(8 * 1024 * 1024 + 1);
+    assert.ok(qualifiedJsonlBytes(rejectedLines) > 8 * 1024 * 1024);
+    await assert.rejects(
+      runQualifiedPiBridge(options, {
+        platform: "darwin",
+        spawnProcess: fakeSpawn({ lines: rejectedLines }),
+      }),
+      /output limit/i,
+    );
+  });
+});
+
+test("qualified Pi JSONL maps the exact expected-failure repair loop", () => {
   const lines = successfulQualifiedLines();
   lines.splice(
     3,
     0,
     JSON.stringify({
       type: "tool_execution_update",
-      toolCallId: "read-1",
+      toolCallId: "read-source",
       toolName: "read",
-      args: { path: "source.txt" },
+      args: { path: "src/merge-ranges.mjs" },
       partialResult: { content: "private partial result" },
     }),
   );
@@ -585,23 +735,15 @@ test("qualified Pi JSONL rejects concurrency extra tools and edit", () => {
     0,
     JSON.stringify({
       type: "tool_execution_start",
-      toolCallId: "bash-1",
-      toolName: "bash",
-      args: { command: "node verify.mjs --precheck" },
+      toolCallId: "read-verifier",
+      toolName: "read",
+      args: { path: "test/verify.mjs" },
     }),
   );
   assert.throws(() => adaptQualifiedPiJsonl(concurrent), /concurrent tool/i);
   assert.throws(
     () => adaptQualifiedPiJsonl(successfulQualifiedLines("edit")),
     /tool correlation/i,
-  );
-  assert.throws(
-    () =>
-      validateSemanticToolTrace([
-        ...successfulTrace(),
-        { tool: "read", status: "success" },
-      ]),
-    /tool trace/i,
   );
 });
 
@@ -629,6 +771,15 @@ test("qualified Pi JSONL rejects malformed private payloads without leaking them
 });
 
 test("qualified Pi JSONL requires session terminal lifecycle and no pending calls", () => {
+  assert.throws(
+    () =>
+      adaptQualifiedPiJsonl(
+        successfulQualifiedLines().filter(
+          (line) => !JSON.parse(line).toolCallId?.startsWith("write-source"),
+        ),
+      ),
+    /five-step repair loop/i,
+  );
   assert.throws(
     () =>
       adaptQualifiedPiJsonl(

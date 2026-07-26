@@ -4,13 +4,19 @@ const BLOCKED = {
 };
 
 const STEPS = [
-  { toolName: "read", input: { path: "source.txt" } },
-  { toolName: "bash", input: { command: "node verify.mjs --precheck" } },
+  { toolName: "read", input: { path: "src/merge-ranges.mjs" } },
+  { toolName: "read", input: { path: "test/verify.mjs" } },
+  {
+    toolName: "bash",
+    input: { command: "node test/verify.mjs" },
+    expectedError: true,
+  },
   {
     toolName: "write",
-    input: { path: "result.txt", content: "sum=18\n" },
+    input: { path: "src/merge-ranges.mjs" },
+    acceptsContent: true,
   },
-  { toolName: "bash", input: { command: "node verify.mjs" } },
+  { toolName: "bash", input: { command: "node test/verify.mjs" } },
 ];
 
 function matchesExactly(actual, expected) {
@@ -29,6 +35,22 @@ function matchesExactly(actual, expected) {
   );
 }
 
+function matchesStepInput(actual, expected) {
+  if (!expected.acceptsContent) {
+    return matchesExactly(actual, expected.input);
+  }
+  return (
+    actual !== null &&
+    typeof actual === "object" &&
+    !Array.isArray(actual) &&
+    Object.keys(actual).length === 2 &&
+    actual.path === expected.input.path &&
+    typeof actual.content === "string" &&
+    actual.content.length > 0 &&
+    actual.content.length <= 32 * 1024
+  );
+}
+
 export function createAcceptanceGate() {
   let step = 0;
   let pending;
@@ -42,7 +64,7 @@ export function createAcceptanceGate() {
       typeof toolCallId !== "string" ||
       toolCallId.length === 0 ||
       toolName !== expected.toolName ||
-      !matchesExactly(input, expected.input)
+      !matchesStepInput(input, expected)
     ) {
       return BLOCKED;
     }
@@ -52,7 +74,7 @@ export function createAcceptanceGate() {
   gate.toolResult = async ({ toolCallId, toolName, input, isError } = {}) => {
     if (
       pending === undefined ||
-      isError !== false ||
+      isError !== Boolean(STEPS[step].expectedError) ||
       toolCallId !== pending.toolCallId ||
       toolName !== pending.toolName ||
       !matchesExactly(input, pending.input)

@@ -10,6 +10,7 @@ repository.workspace = true
 loxa-core = { path = "../loxa-core" }
 loxa-node = { path = "../loxa-node" }
 clap = { version = "4", features = ["derive"] }
+getrandom = "0.4.3"
 libc = "0.2.186"
 reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "rustls"] }
 serde = { version = "1", features = ["derive"] }
