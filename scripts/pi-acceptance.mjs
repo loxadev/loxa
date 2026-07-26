@@ -311,6 +311,8 @@ export function buildQualifiedPiArgv(extensionPath, prompt) {
     "--no-themes",
     "--no-approve",
     "--offline",
+    "--append-system-prompt",
+    prompt,
     prompt,
   ];
 }
