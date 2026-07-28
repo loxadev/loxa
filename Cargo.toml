@@ -3,8 +3,9 @@ resolver = "2"
 members = ["loxa-core", "loxa-node", "loxa", "loxa-protocol"]
 
 [workspace.package]
-version = "0.1.0-dev"
+version = "0.1.0"
 edition = "2021"
+rust-version = "1.96"
 license = "Apache-2.0"
 authors = ["Muhammad Mahad"]
 repository = "https://github.com/loxadev/loxa"

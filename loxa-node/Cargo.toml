@@ -1,10 +1,15 @@
 [package]
 name = "loxa-node"
-version.workspace = true
+version = "0.1.0"
 edition.workspace = true
+rust-version = "1.96"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+description = "Node server for a private Loxa AI runtime"
+readme = "../README.md"
+include = ["src/**", "tests/**", "Cargo.toml"]
+publish = true
 
 [[bin]]
 name = "loxa-node"
@@ -17,8 +22,8 @@ unsupported-platform-ci = []
 axum = "0.8"
 futures-util = "0.3"
 getrandom = "0.4.3"
-loxa-core = { path = "../loxa-core" }
-loxa-protocol = { path = "../loxa-protocol" }
+loxa-core = { path = "../loxa-core", version = "=0.1.0" }
+loxa-protocol = { path = "../loxa-protocol", version = "=0.1.0" }
 libc = "0.2.186"
 rusqlite = { version = "=0.40.1", default-features = false, features = ["backup", "bundled", "limits"] }
 serde = { version = "1", features = ["derive"] }
@@ -31,6 +36,6 @@ tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["fmt"] }
 
 [dev-dependencies]
-loxa-core = { path = "../loxa-core", features = ["composition-test-support"] }
+loxa-core = { path = "../loxa-core", version = "=0.1.0", features = ["composition-test-support"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
 tower = "0.5"

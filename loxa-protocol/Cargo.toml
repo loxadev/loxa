@@ -1,10 +1,15 @@
 [package]
 name = "loxa-protocol"
-version.workspace = true
+version = "0.1.0"
 edition.workspace = true
+rust-version = "1.96"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+description = "Shared protocol types for Loxa"
+readme = "../README.md"
+include = ["src/**", "tests/**", "Cargo.toml"]
+publish = true
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

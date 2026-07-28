@@ -1,14 +1,19 @@
 [package]
 name = "loxa"
-version.workspace = true
+version = "0.1.0"
 edition.workspace = true
+rust-version = "1.96"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+description = "Command-line tools for managing a private AI node"
+readme = "../README.md"
+include = ["src/**", "tests/**", "Cargo.toml"]
+publish = true
 
 [dependencies]
-loxa-core = { path = "../loxa-core" }
-loxa-node = { path = "../loxa-node" }
+loxa-core = { path = "../loxa-core", version = "=0.1.0" }
+loxa-node = { path = "../loxa-node", version = "=0.1.0" }
 clap = { version = "4", features = ["derive"] }
 getrandom = "0.4.3"
 libc = "0.2.186"
