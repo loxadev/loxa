@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 pub struct AppPaths {
     pub root: PathBuf,
     pub models: PathBuf,
+    pub config: PathBuf,
+    pub runtimes: PathBuf,
+    pub managed_server: PathBuf,
 }
 
 impl AppPaths {
@@ -26,8 +29,12 @@ impl AppPaths {
         if !root.is_absolute() {
             return Err("Loxa home must be an absolute path".into());
         }
+        let runtimes = root.join("runtimes");
         Ok(Self {
             models: root.join("models"),
+            config: root.join("config.json"),
+            managed_server: runtimes.join("llama.cpp/b10121/llama-server"),
+            runtimes,
             root,
         })
     }
@@ -63,6 +70,12 @@ mod tests {
             AppPaths::from_values(Some(Path::new("/custom")), Some(Path::new("/home"))).unwrap();
         assert_eq!(paths.root, Path::new("/custom"));
         assert_eq!(paths.models, Path::new("/custom/models"));
+        assert_eq!(paths.config, Path::new("/custom/config.json"));
+        assert_eq!(paths.runtimes, Path::new("/custom/runtimes"));
+        assert_eq!(
+            paths.managed_server,
+            Path::new("/custom/runtimes/llama.cpp/b10121/llama-server")
+        );
         assert_eq!(
             paths.model_dir("demo").unwrap(),
             Path::new("/custom/models/demo")

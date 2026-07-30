@@ -1,48 +1,176 @@
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::ffi::{OsStr, OsString};
+use std::io::Read as _;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 static RECEIVED_SIGNAL: AtomicI32 = AtomicI32::new(0);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
+const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+const VERSION_OUTPUT_TIMEOUT: Duration = Duration::from_secs(1);
+const MAX_VERSION_OUTPUT: u64 = 4096;
+const MANAGED_VERSION: &str = "version: 10121 (555881ebc)";
 
 pub fn discover_server(
     explicit: Option<&Path>,
     environment: Option<&OsStr>,
+    managed: &Path,
     path: Option<&OsStr>,
 ) -> Result<PathBuf, String> {
     if let Some(server) = explicit {
-        return executable(server)
-            .then(|| server.to_path_buf())
-            .ok_or_else(|| format!("llama-server is not executable: {}", server.display()));
+        validate_candidate(server, "--server")?;
+        return Ok(server.to_path_buf());
     }
     if let Some(server) = environment {
         let server = PathBuf::from(server);
-        return executable(&server)
-            .then_some(server.clone())
-            .ok_or_else(|| format!("LOXA_LLAMA_SERVER is not executable: {}", server.display()));
+        validate_candidate(&server, "LOXA_LLAMA_SERVER")?;
+        return Ok(server);
+    }
+    match std::fs::symlink_metadata(managed) {
+        Ok(_) => {
+            if !executable(managed) {
+                return Err(format!(
+                    "managed llama-server bundle is damaged at {}: runtime is not executable",
+                    managed.display()
+                ));
+            }
+            let first_line = probe_version(managed).map_err(|error| {
+                format!(
+                    "managed llama-server bundle is damaged at {}: {error}",
+                    managed.display()
+                )
+            })?;
+            if first_line != MANAGED_VERSION {
+                return Err(format!(
+                    "managed llama-server bundle is damaged at {}: expected --version first line {MANAGED_VERSION:?}, found {first_line:?}",
+                    managed.display()
+                ));
+            }
+            return Ok(managed.to_path_buf());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "managed llama-server bundle is damaged at {}: {error}",
+                managed.display()
+            ))
+        }
     }
     if let Some(path) = path {
         for dir in std::env::split_paths(path) {
             let candidate = dir.join(executable_name());
-            if executable(&candidate) {
+            if executable(&candidate) && probe_version(&candidate).is_ok() {
                 return Ok(candidate);
             }
         }
     }
-    Err("llama-server not found; use --server or set LOXA_LLAMA_SERVER".into())
+    Err("llama-server not found; install it with `brew install llama.cpp`".into())
 }
 
-pub fn discover_from_process(explicit: Option<&Path>) -> Result<PathBuf, String> {
+pub fn discover_from_process(explicit: Option<&Path>, managed: &Path) -> Result<PathBuf, String> {
     discover_server(
         explicit,
         std::env::var_os("LOXA_LLAMA_SERVER").as_deref(),
+        managed,
         std::env::var_os("PATH").as_deref(),
     )
+}
+
+fn validate_candidate(path: &Path, source: &str) -> Result<(), String> {
+    if !executable(path) {
+        return Err(format!("{source} is not executable: {}", path.display()));
+    }
+    probe_version(path).map(|_| ()).map_err(|error| {
+        format!(
+            "{source} failed --version probe for {}: {error}",
+            path.display()
+        )
+    })
+}
+
+fn probe_version(path: &Path) -> Result<String, String> {
+    probe_version_with_timeout(path, VERSION_PROBE_TIMEOUT)
+}
+
+fn probe_version_with_timeout(path: &Path, timeout: Duration) -> Result<String, String> {
+    let mut child = Command::new(path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "failed to capture --version output".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "failed to capture --version output".to_string())?;
+    let (sender, receiver) = mpsc::sync_channel(2);
+    let stdout_sender = sender.clone();
+    std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let result = stdout
+            .take(MAX_VERSION_OUTPUT)
+            .read_to_end(&mut output)
+            .map(|_| output)
+            .map_err(|error| error.to_string());
+        let _ = stdout_sender.send((false, result));
+    });
+    std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let result = stderr
+            .take(MAX_VERSION_OUTPUT)
+            .read_to_end(&mut output)
+            .map(|_| output)
+            .map_err(|error| error.to_string());
+        let _ = sender.send((true, result));
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("timed out after {} ms", timeout.as_millis()));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    if !status.success() {
+        return Err(format!("{status}"));
+    }
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    for _ in 0..2 {
+        let (is_stderr, output) = receiver
+            .recv_timeout(VERSION_OUTPUT_TIMEOUT)
+            .map_err(|_| "timed out reading --version output".to_string())?;
+        if is_stderr {
+            stderr = output?;
+        } else {
+            stdout = output?;
+        }
+    }
+    let output = if stderr.is_empty() { stdout } else { stderr };
+    Ok(first_line(&output))
+}
+
+fn first_line(output: &[u8]) -> String {
+    String::from_utf8_lossy(output)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string()
 }
 
 pub fn build_args(model: &Path, id: &str, port: u16, ctx: u32) -> Vec<OsString> {
@@ -422,6 +550,15 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn write_version_script(path: &Path, first_line: &str, exit_code: i32) {
+        assert!(!first_line.contains('\''));
+        write_executable_script(
+            path,
+            format!("#!/bin/sh\nprintf '%s\\n' '{first_line}' >&2\nexit {exit_code}\n").as_bytes(),
+        );
+    }
+
+    #[cfg(unix)]
     fn run_with_signal(signal: libc::c_int) -> i32 {
         let dir = tempdir().unwrap();
         let server = dir.path().join("server");
@@ -447,20 +584,7 @@ mod tests {
     }
 
     #[test]
-    fn discovery_argv_and_readiness_are_exact_and_generic() {
-        let dir = tempdir().unwrap();
-        let server = dir.path().join("llama-server");
-        std::fs::write(&server, b"server").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
-        assert_eq!(
-            discover_server(None, Some(server.as_os_str()), None).unwrap(),
-            server
-        );
-
+    fn argv_and_readiness_are_exact_and_generic() {
         let args = build_args(
             std::path::Path::new("/models/model.gguf"),
             "demo",
@@ -491,6 +615,138 @@ mod tests {
             "demo"
         ));
         assert_eq!(STARTUP_TIMEOUT, Duration::from_secs(120));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_uses_explicit_then_environment_then_managed_then_path() {
+        let dir = tempdir().unwrap();
+        let explicit = dir.path().join("explicit");
+        let environment = dir.path().join("environment");
+        let managed = dir.path().join("managed");
+        let path_dir = dir.path().join("path");
+        std::fs::create_dir(&path_dir).unwrap();
+        let path_server = path_dir.join("llama-server");
+        write_version_script(&explicit, "explicit", 0);
+        write_version_script(&environment, "environment", 0);
+        write_version_script(&managed, "version: 10121 (555881ebc)", 0);
+        write_version_script(&path_server, "path", 0);
+        let search_path = std::env::join_paths([&path_dir]).unwrap();
+
+        assert_eq!(
+            discover_server(
+                Some(&explicit),
+                Some(environment.as_os_str()),
+                &managed,
+                Some(search_path.as_os_str()),
+            )
+            .unwrap(),
+            explicit
+        );
+        assert_eq!(
+            discover_server(
+                None,
+                Some(environment.as_os_str()),
+                &managed,
+                Some(search_path.as_os_str()),
+            )
+            .unwrap(),
+            environment
+        );
+        assert_eq!(
+            discover_server(None, None, &managed, Some(search_path.as_os_str())).unwrap(),
+            managed
+        );
+        std::fs::remove_file(&managed).unwrap();
+        assert_eq!(
+            discover_server(None, None, &managed, Some(search_path.as_os_str())).unwrap(),
+            path_server
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_and_environment_candidates_fail_immediately_when_invalid() {
+        let dir = tempdir().unwrap();
+        let missing_explicit = dir.path().join("missing-explicit");
+        let missing_environment = dir.path().join("missing-environment");
+        let failed_explicit = dir.path().join("failed-explicit");
+        let failed_environment = dir.path().join("failed-environment");
+        let managed = dir.path().join("managed");
+        write_version_script(&failed_explicit, "explicit", 1);
+        write_version_script(&failed_environment, "environment", 1);
+        write_version_script(&managed, "version: 10121 (555881ebc)", 0);
+
+        let explicit_error =
+            discover_server(Some(&missing_explicit), None, &managed, None).unwrap_err();
+        assert!(explicit_error.contains("--server"), "{explicit_error}");
+        let explicit_error =
+            discover_server(Some(&failed_explicit), None, &managed, None).unwrap_err();
+        assert!(explicit_error.contains("--server"), "{explicit_error}");
+
+        let environment_error =
+            discover_server(None, Some(missing_environment.as_os_str()), &managed, None)
+                .unwrap_err();
+        assert!(
+            environment_error.contains("LOXA_LLAMA_SERVER"),
+            "{environment_error}"
+        );
+        let environment_error =
+            discover_server(None, Some(failed_environment.as_os_str()), &managed, None)
+                .unwrap_err();
+        assert!(
+            environment_error.contains("LOXA_LLAMA_SERVER"),
+            "{environment_error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_runtime_requires_exact_identity_and_reports_damage() {
+        let dir = tempdir().unwrap();
+        let managed = dir.path().join("managed");
+        std::fs::write(&managed, b"not executable").unwrap();
+
+        let error = discover_server(None, None, &managed, None).unwrap_err();
+        assert!(
+            error.contains("managed llama-server bundle is damaged"),
+            "{error}"
+        );
+        assert!(error.contains("not executable"), "{error}");
+
+        write_version_script(&managed, "version: 10090 (not-the-managed-build)", 0);
+        let error = discover_server(None, None, &managed, None).unwrap_err();
+        assert!(
+            error.contains("managed llama-server bundle is damaged"),
+            "{error}"
+        );
+        assert!(error.contains("version: 10121 (555881ebc)"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_probes_are_bounded() {
+        let dir = tempdir().unwrap();
+        let server = dir.path().join("server");
+        write_executable_script(&server, b"#!/bin/sh\nwhile :; do :; done\n");
+        let started = Instant::now();
+
+        let error = probe_version_with_timeout(&server, Duration::from_millis(50)).unwrap_err();
+
+        assert!(error.contains("timed out"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_runtime_recommends_homebrew_without_environment_setup() {
+        let dir = tempdir().unwrap();
+        let managed = dir.path().join("missing-managed");
+
+        let error = discover_server(None, None, &managed, None).unwrap_err();
+
+        assert!(error.contains("brew install llama.cpp"), "{error}");
+        assert!(!error.contains("LOXA_LLAMA_SERVER"), "{error}");
     }
 
     #[test]

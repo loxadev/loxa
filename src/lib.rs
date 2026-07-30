@@ -1,5 +1,6 @@
 pub mod catalog;
 pub mod cli;
+pub mod config;
 pub mod download;
 pub mod huggingface;
 pub mod paths;
@@ -84,14 +85,20 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
             Ok(0)
         }
         Command::Run(args) => {
+            let config = config::load(&paths.config)?;
+            let ctx = config::resolve_value(args.runtime.ctx, config.ctx, 4096);
+            let port = config::resolve_value(args.runtime.port, config.port, 0);
             let manifest = catalog::load_catalog(&paths.models)?
                 .into_iter()
                 .find(|entry| entry.id == args.id)
                 .ok_or_else(|| format!("unknown model id {}", args.id))?;
             let artifact = manifest.artifact_path(&paths.models);
             download::verify_regular(&artifact, manifest.size, &manifest.sha256)?;
-            let server = runner::discover_from_process(args.server.as_deref())?;
-            runner::run(&server, &artifact, &manifest.id, args.port, args.ctx)
+            let server = runner::discover_from_process(
+                args.runtime.server.as_deref(),
+                &paths.managed_server,
+            )?;
+            runner::run(&server, &artifact, &manifest.id, port, ctx)
         }
     }
 }
