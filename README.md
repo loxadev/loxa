@@ -2,30 +2,35 @@
 
 [![CI](https://github.com/loxadev/loxa/actions/workflows/ci.yml/badge.svg)](https://github.com/loxadev/loxa/actions/workflows/ci.yml)
 
-Loxa is building a reliable private AI node for hardware you already own,
-starting with Apple Silicon Macs.
+Loxa is a small Rust CLI for downloading verified GGUF models from Hugging
+Face and running them locally with `llama-server`.
 
-Running a local model is easy. Keeping it available for everyday use still
-means choosing compatible model files, configuring runtimes, managing server
-processes, monitoring failures, and reconnecting applications whenever the
-setup changes.
+This is an early MVP with three commands:
 
-## What Loxa is solving
+```sh
+loxa pull owner/repository --quant Q4_K_M --name my-model
+loxa list
+loxa run my-model
+```
 
-Loxa is being built to manage that work in one place. It will resolve
-compatible models, run them on user-owned hardware, keep the local runtime
-healthy, and provide one stable endpoint for trusted applications and devices.
+`pull` resolves the requested revision to an immutable Hugging Face commit,
+resumes interrupted transfers, verifies the expected size and SHA-256, and
+publishes the local manifest only after verification. Split GGUF models are not
+supported yet.
 
-The goal is not to build another inference engine or generic chat application.
-Loxa focuses on the management layer around local AI so the node remains
-private, dependable, and easier to operate.
+`run` requires `llama-server` on `PATH`, or an explicit path through
+`LOXA_LLAMA_SERVER` or `--server`. It starts a foreground OpenAI-compatible
+endpoint on `127.0.0.1`; on macOS, Ctrl-C shuts down its owned
+process group.
 
-## Status
+Models are stored under `~/.loxa/models`. Set `LOXA_HOME` to use another
+location.
 
-- **Development:** Early development and not yet a stable release.
-- **Current prototype:** Verified model downloads, a supervised local runtime,
-  and an OpenAI-compatible API.
-- **Platforms:** Apple Silicon first; also builds on Linux.
+Build locally with:
+
+```sh
+cargo build --release --locked
+```
 
 ## License
 

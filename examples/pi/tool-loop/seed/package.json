@@ -1,8 +1,0 @@
-{
-  "name": "loxa-pi-acceptance-fixture",
-  "private": true,
-  "type": "module",
-  "scripts": {
-    "test": "node test/verify.mjs"
-  }
-}

@@ -5,8 +5,6 @@ on:
     paths:
       - Cargo.toml
       - Cargo.lock
-      - "**/Cargo.toml"
-      - loxa-app/src-tauri/Cargo.lock
       - deny.toml
       - rust-toolchain.toml
       - .github/workflows/audit.yml
@@ -15,8 +13,6 @@ on:
     paths:
       - Cargo.toml
       - Cargo.lock
-      - "**/Cargo.toml"
-      - loxa-app/src-tauri/Cargo.lock
       - deny.toml
       - rust-toolchain.toml
       - .github/workflows/audit.yml
@@ -43,18 +39,12 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-
       - name: Install Rust toolchain
         run: rustup toolchain install --profile minimal --no-self-update
-
       - name: Install cargo-deny
         uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2.82.7
         with:
           tool: cargo-deny
           fallback: none
-
-      - name: Check workspace dependencies
+      - name: Check dependencies
         run: cargo deny --locked check --warn unmaintained
-
-      - name: Check desktop dependencies
-        run: cargo deny --manifest-path loxa-app/src-tauri/Cargo.toml --target aarch64-apple-darwin --locked check --warn unmaintained advisories bans sources
