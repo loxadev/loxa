@@ -6,11 +6,21 @@ pub mod download;
 pub mod huggingface;
 pub mod paths;
 pub mod runner;
+mod session;
 
 use catalog::Manifest;
 use clap::Parser;
 use cli::{Cli, Command};
 use paths::{validate_id, AppPaths};
+use std::path::PathBuf;
+
+struct Runnable {
+    server: PathBuf,
+    artifact: PathBuf,
+    id: String,
+    port: u16,
+    ctx: u32,
+}
 
 pub fn run_from_env() -> Result<i32, String> {
     run(Cli::parse(), AppPaths::from_env()?)
@@ -86,22 +96,50 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
             Ok(0)
         }
         Command::Run(args) => {
-            let config = config::load(&paths.config)?;
-            let ctx = config::resolve_value(args.runtime.ctx, config.ctx, 4096);
-            let port = config::resolve_value(args.runtime.port, config.port, 0);
-            let manifest = catalog::load_catalog(&paths.models)?
-                .into_iter()
-                .find(|entry| entry.id == args.id)
-                .ok_or_else(|| format!("unknown model id {}", args.id))?;
-            let artifact = manifest.artifact_path(&paths.models);
-            download::verify_regular(&artifact, manifest.size, &manifest.sha256)?;
-            let server = runner::discover_from_process(
-                args.runtime.server.as_deref(),
-                &paths.managed_server,
-            )?;
-            runner::run(&server, &artifact, &manifest.id, port, ctx)
+            let runnable = resolve_runnable(args, &paths)?;
+            runner::run(
+                &runnable.server,
+                &runnable.artifact,
+                &runnable.id,
+                runnable.port,
+                runnable.ctx,
+            )
+        }
+        Command::Chat(args) => {
+            let runnable = resolve_runnable(args, &paths)?;
+            match runner::start_foreground(
+                &runnable.server,
+                &runnable.artifact,
+                &runnable.id,
+                runnable.port,
+                runnable.ctx,
+            )? {
+                runner::ForegroundStart::Ready(server) => session::run(server, &runnable.id),
+                runner::ForegroundStart::Stopped(code) => Ok(code),
+            }
         }
     }
+}
+
+fn resolve_runnable(args: cli::RunArgs, paths: &AppPaths) -> Result<Runnable, String> {
+    let config = config::load(&paths.config)?;
+    let ctx = config::resolve_value(args.runtime.ctx, config.ctx, 4096);
+    let port = config::resolve_value(args.runtime.port, config.port, 0);
+    let manifest = catalog::load_catalog(&paths.models)?
+        .into_iter()
+        .find(|entry| entry.id == args.id)
+        .ok_or_else(|| format!("unknown model id {}", args.id))?;
+    let artifact = manifest.artifact_path(&paths.models);
+    download::verify_regular(&artifact, manifest.size, &manifest.sha256)?;
+    let server =
+        runner::discover_from_process(args.runtime.server.as_deref(), &paths.managed_server)?;
+    Ok(Runnable {
+        server,
+        artifact,
+        id: manifest.id,
+        port,
+        ctx,
+    })
 }
 
 fn default_id(repo: &str, filename: &str, sha256: &str) -> String {
@@ -129,7 +167,10 @@ fn default_id(repo: &str, filename: &str, sha256: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::default_id;
+    use super::{default_id, run};
+    use crate::cli::Cli;
+    use crate::paths::AppPaths;
+    use clap::Parser;
 
     #[test]
     fn default_id_owns_repo_artifact_and_digest_identity() {
@@ -158,5 +199,17 @@ mod tests {
             "0123456789abcdefaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         );
         assert!(long.ends_with("0123456789abcdef"));
+    }
+
+    #[test]
+    fn chat_with_missing_model_creates_no_config_or_history_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("loxa-home");
+        let paths = AppPaths::from_values(Some(&root), None).unwrap();
+        let error = run(Cli::parse_from(["loxa", "chat", "missing"]), paths.clone()).unwrap_err();
+
+        assert!(error.contains("unknown model id missing"), "{error}");
+        assert!(!paths.config.exists());
+        assert!(!root.exists());
     }
 }

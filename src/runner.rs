@@ -272,8 +272,38 @@ pub fn run(
     requested_port: u16,
     ctx: u32,
 ) -> Result<i32, String> {
+    let mut server = match start_foreground(server, model, id, requested_port, ctx)? {
+        ForegroundStart::Ready(server) => server,
+        ForegroundStart::Stopped(code) => return Ok(code),
+    };
+    println!("ready: http://127.0.0.1:{} (model {id})", server.port());
+    loop {
+        if let Some(code) = server.poll()? {
+            return Ok(code);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+pub(crate) enum ForegroundStart {
+    Ready(ForegroundServer),
+    Stopped(i32),
+}
+
+pub(crate) struct ForegroundServer {
+    server: OwnedServer,
+    signal: &'static AtomicUsize,
+}
+
+pub(crate) fn start_foreground(
+    server: &Path,
+    model: &Path,
+    id: &str,
+    requested_port: u16,
+    ctx: u32,
+) -> Result<ForegroundStart, String> {
     let signal = foreground_signal_flag()?;
-    let outcome = OwnedServer::start(
+    match OwnedServer::start(
         server,
         model,
         id,
@@ -281,22 +311,35 @@ pub fn run(
         ctx,
         STARTUP_TIMEOUT,
         || received_signal(signal),
-    )?;
-    let mut server = match outcome {
-        StartOutcome::Ready(server) => server,
-        StartOutcome::Exited(exit) => return Ok(report_exit(exit)),
-        StartOutcome::Signaled(signal) => return Ok(128 + signal),
-    };
-    println!("ready: http://127.0.0.1:{} (model {id})", server.port());
-    loop {
-        if let Some(exit) = server.try_wait()? {
-            return Ok(report_exit(exit));
+    )? {
+        StartOutcome::Ready(server) => {
+            Ok(ForegroundStart::Ready(ForegroundServer { server, signal }))
         }
-        if let Some(received) = received_signal(signal) {
-            server.terminate()?;
-            return Ok(128 + received);
+        StartOutcome::Exited(exit) => Ok(ForegroundStart::Stopped(report_exit(exit))),
+        StartOutcome::Signaled(signal) => Ok(ForegroundStart::Stopped(128 + signal)),
+    }
+}
+
+impl ForegroundServer {
+    pub(crate) fn port(&self) -> u16 {
+        self.server.port()
+    }
+
+    /// Polls for child exit first, then a foreground signal. Cleanup is complete
+    /// before a status is returned.
+    pub(crate) fn poll(&mut self) -> Result<Option<i32>, String> {
+        if let Some(exit) = self.server.try_wait()? {
+            return Ok(Some(report_exit(exit)));
         }
-        std::thread::sleep(Duration::from_millis(20));
+        if let Some(signal) = received_signal(self.signal) {
+            self.server.terminate()?;
+            return Ok(Some(128 + signal));
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn terminate(&mut self) -> Result<(), String> {
+        self.server.terminate()
     }
 }
 

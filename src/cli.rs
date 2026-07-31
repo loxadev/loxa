@@ -20,6 +20,8 @@ pub enum Command {
     List,
     /// Run a model with llama-server in the foreground.
     Run(RunArgs),
+    /// Chat with a model in the terminal.
+    Chat(RunArgs),
 }
 
 #[derive(Debug, Args)]
@@ -58,13 +60,13 @@ mod tests {
     use clap::{CommandFactory, Parser};
 
     #[test]
-    fn exposes_exactly_pull_list_and_run_with_optional_runtime_arguments() {
+    fn exposes_pull_list_run_and_chat_with_optional_runtime_arguments() {
         let command = Cli::command();
         let names = command
             .get_subcommands()
             .map(|command| command.get_name().to_owned())
             .collect::<Vec<_>>();
-        assert_eq!(names, ["pull", "list", "run"]);
+        assert_eq!(names, ["pull", "list", "run", "chat"]);
 
         let run = command
             .find_subcommand("run")
@@ -94,6 +96,17 @@ mod tests {
                 assert!(args.runtime.server.is_none());
             }
             _ => panic!("expected run"),
+        }
+
+        let cli = Cli::parse_from(["loxa", "chat", "demo"]);
+        match cli.command {
+            Command::Chat(args) => {
+                assert_eq!(args.id, "demo");
+                assert!(args.runtime.ctx.is_none());
+                assert!(args.runtime.port.is_none());
+                assert!(args.runtime.server.is_none());
+            }
+            _ => panic!("expected chat"),
         }
     }
 }
