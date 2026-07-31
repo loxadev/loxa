@@ -133,6 +133,7 @@ pub fn download_with_transport(
     if final_path.exists() {
         reject_non_regular_if_present(&final_path)?;
         if verify_regular(&final_path, spec.size, &spec.sha256).is_ok() {
+            finish_repair(model_dir, &invalid_path, &restart_path)?;
             return Ok(final_path);
         }
         if invalid_path.exists() {
@@ -529,6 +530,25 @@ mod tests {
             b"abcdef"
         );
         assert!(!dir.path().join("model.gguf.invalid").exists());
+    }
+
+    #[test]
+    fn valid_final_completes_interrupted_repair_cleanup() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("model.gguf"), b"abcdef").unwrap();
+        std::fs::write(dir.path().join("model.gguf.invalid"), b"corrupt").unwrap();
+        std::fs::write(dir.path().join("model.gguf.part.restart"), b"stale").unwrap();
+        let transport = FakeTransport {
+            responses: RefCell::new(Vec::new()),
+            offsets: RefCell::new(Vec::new()),
+        };
+
+        let final_path = download_with_transport(&spec(b"abcdef"), dir.path(), &transport).unwrap();
+
+        assert_eq!(std::fs::read(final_path).unwrap(), b"abcdef");
+        assert!(!dir.path().join("model.gguf.invalid").exists());
+        assert!(!dir.path().join("model.gguf.part.restart").exists());
+        assert!(transport.offsets.borrow().is_empty());
     }
 
     #[test]
