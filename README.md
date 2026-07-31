@@ -5,6 +5,13 @@
 Loxa is a small Rust CLI for downloading verified GGUF models from Hugging
 Face and running them locally with `llama-server`.
 
+`run` and `chat` use Loxa's managed `llama-server` when present. Otherwise, if
+`llama-server` is not already on `PATH` on macOS:
+
+```sh
+brew install llama.cpp
+```
+
 Build and try the MVP:
 
 ```sh
@@ -31,13 +38,6 @@ with Ctrl-C, then chat in the terminal:
 resumes interrupted transfers, verifies the expected size and SHA-256, and
 publishes the local manifest only after verification. Split GGUF models are not
 supported yet.
-
-`run` and `chat` use Loxa's managed `llama-server` when present, otherwise
-they use `llama-server` on `PATH`. On macOS, install that fallback with:
-
-```sh
-brew install llama.cpp
-```
 
 Both commands choose a local port automatically and use a 4096-token context.
 To override a default, create `~/.loxa/config.json`, for example:
