@@ -284,12 +284,13 @@ pub fn run(
     )?;
     let mut server = match outcome {
         StartOutcome::Ready(server) => server,
+        StartOutcome::Exited(exit) => return Ok(report_exit(exit)),
         StartOutcome::Signaled(signal) => return Ok(128 + signal),
     };
     println!("ready: http://127.0.0.1:{} (model {id})", server.port());
     loop {
-        if let Some(code) = server.try_wait()? {
-            return Ok(code);
+        if let Some(exit) = server.try_wait()? {
+            return Ok(report_exit(exit));
         }
         if let Some(received) = received_signal(signal) {
             server.terminate()?;
@@ -515,7 +516,21 @@ fn publish_announcement(
 
 enum StartOutcome {
     Ready(OwnedServer),
+    Exited(ServerExit),
     Signaled(i32),
+}
+
+#[derive(Debug)]
+struct ServerExit {
+    code: i32,
+    diagnostic: Option<String>,
+}
+
+fn report_exit(exit: ServerExit) -> i32 {
+    if let Some(diagnostic) = exit.diagnostic {
+        eprintln!("{diagnostic}");
+    }
+    exit.code
 }
 
 pub struct OwnedServer {
@@ -606,9 +621,7 @@ impl OwnedServer {
             {
                 let code = exit_code(status);
                 owned.terminate()?;
-                return Err(owned.with_diagnostic(format!(
-                    "llama-server exited before readiness with status {code}"
-                )));
+                return Ok(StartOutcome::Exited(owned.server_exit(code)));
             }
             if let Some(port) = owned.announced_port {
                 if requested_port != 0 && port != requested_port {
@@ -679,7 +692,7 @@ impl OwnedServer {
         self.port
     }
 
-    pub fn try_wait(&mut self) -> Result<Option<i32>, String> {
+    fn try_wait(&mut self) -> Result<Option<ServerExit>, String> {
         if let Err(error) = self.collect_announcements() {
             self.terminate()
                 .map_err(|cleanup| format!("{error}; cleanup failed: {cleanup}"))?;
@@ -694,13 +707,7 @@ impl OwnedServer {
         };
         let code = exit_code(status);
         self.terminate()?;
-        if code == 0 {
-            Ok(Some(0))
-        } else {
-            Err(self.with_diagnostic(format!(
-                "llama-server exited unexpectedly with status {code}"
-            )))
-        }
+        Ok(Some(self.server_exit(code)))
     }
 
     pub fn terminate(&mut self) -> Result<(), String> {
@@ -718,6 +725,20 @@ impl OwnedServer {
     }
 
     fn with_diagnostic(&self, error: String) -> String {
+        match self.diagnostic() {
+            Some(diagnostic) => format!("{error}: {diagnostic}"),
+            None => error,
+        }
+    }
+
+    fn server_exit(&self, code: i32) -> ServerExit {
+        ServerExit {
+            code,
+            diagnostic: self.diagnostic(),
+        }
+    }
+
+    fn diagnostic(&self) -> Option<String> {
         let tail = if self.stderr_tail.is_empty() {
             &self.stdout_tail
         } else {
@@ -726,9 +747,9 @@ impl OwnedServer {
         let diagnostic = String::from_utf8_lossy(tail);
         let diagnostic = diagnostic.trim();
         if diagnostic.is_empty() {
-            error
+            None
         } else {
-            format!("{error}: {diagnostic}")
+            Some(diagnostic.to_string())
         }
     }
 
@@ -1172,18 +1193,22 @@ mod tests {
         http.join().unwrap();
         std::fs::write(release, b"go").unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
-        let error = loop {
-            match server.try_wait() {
-                Err(error) => break error,
-                Ok(None) => {}
-                Ok(Some(code)) => panic!("unexpected successful exit status {code}"),
+        let exit = loop {
+            match server.try_wait().unwrap() {
+                None => {}
+                Some(exit) => break exit,
             }
             assert!(Instant::now() < deadline, "leader did not exit");
             std::thread::yield_now();
         };
 
-        assert!(error.contains("status 7"), "{error}");
-        assert!(error.contains("fatal: post-ready model crash"), "{error}");
+        assert_eq!(exit.code, 7);
+        assert!(
+            exit.diagnostic
+                .as_deref()
+                .is_some_and(|text| text.contains("fatal: post-ready model crash")),
+            "{exit:?}"
+        );
         assert!(!process_group_exists(group).unwrap());
         assert!(!server.output_readers_owned());
     }
@@ -1478,7 +1503,7 @@ mod tests {
             b"#!/bin/sh\n(\n  trap '' TERM\n  printf ready > \"$2\"\n  while :; do sleep 1; done\n) &\nwhile [ ! -f \"$2\" ]; do :; done\nprintf '%s\\n' \"$$\" > \"$4\"\nprintf 'fatal: model load failed\\n' >&2\nexit 7\n",
         );
 
-        let error = run(&server, &child_ready, group_file.to_str().unwrap(), 0, 1).unwrap_err();
+        let status = run(&server, &child_ready, group_file.to_str().unwrap(), 0, 1).unwrap();
         let group = std::fs::read_to_string(&group_file)
             .unwrap()
             .trim()
@@ -1492,8 +1517,7 @@ mod tests {
             }
         }
 
-        assert!(error.contains("status 7"), "{error}");
-        assert!(error.contains("fatal: model load failed"), "{error}");
+        assert_eq!(status, 7);
         assert!(!survived, "leader status returned while its group survived");
     }
 
@@ -1517,13 +1541,28 @@ mod tests {
             };
             write_executable_script(&server, output.as_bytes());
 
-            let error = run(&server, Path::new("/models/model.gguf"), "demo", 0, 1).unwrap_err();
+            let outcome = OwnedServer::start(
+                &server,
+                Path::new("/models/model.gguf"),
+                "demo",
+                0,
+                1,
+                Duration::from_secs(2),
+                || None,
+            )
+            .unwrap();
+            let exit = match outcome {
+                StartOutcome::Exited(exit) => exit,
+                _ => panic!("expected pre-ready exit"),
+            };
+            let retained = exit.diagnostic.as_deref().unwrap_or_default();
 
-            assert!(error.contains(diagnostic), "{error}");
+            assert_eq!(exit.code, if stream == "stdout" { 8 } else { 9 });
+            assert!(retained.contains(diagnostic), "{retained}");
             assert!(
-                error.len() < 5000,
+                retained.len() <= MAX_DIAGNOSTIC_TAIL,
                 "diagnostic was not capped: {}",
-                error.len()
+                retained.len()
             );
         }
     }
