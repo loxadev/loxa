@@ -29,7 +29,7 @@ pub struct PullArgs {
     pub repo: String,
     #[arg(long)]
     pub revision: Option<String>,
-    #[arg(long = "file")]
+    #[arg(long = "file", conflicts_with = "quant")]
     pub filename: Option<String>,
     #[arg(long)]
     pub quant: Option<String>,
@@ -57,7 +57,7 @@ pub struct RuntimeArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::{CommandFactory, Parser};
+    use clap::{error::ErrorKind, CommandFactory, Parser};
 
     #[test]
     fn exposes_pull_list_run_and_chat_with_optional_runtime_arguments() {
@@ -108,5 +108,21 @@ mod tests {
             }
             _ => panic!("expected chat"),
         }
+    }
+
+    #[test]
+    fn pull_rejects_file_and_quant_together() {
+        let error = Cli::try_parse_from([
+            "loxa",
+            "pull",
+            "owner/repo",
+            "--file",
+            "model.gguf",
+            "--quant",
+            "Q4_K_M",
+        ])
+        .unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
     }
 }
