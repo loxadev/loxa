@@ -265,6 +265,18 @@ pub fn build_args(model: &Path, id: &str, port: u16, ctx: u32) -> Vec<OsString> 
     ]
 }
 
+fn resolve_requested_port(requested: u16) -> Result<u16, String> {
+    if requested != 0 {
+        return Ok(requested);
+    }
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .map_err(|error| format!("failed to choose a local port: {error}"))?;
+    listener
+        .local_addr()
+        .map(|address| address.port())
+        .map_err(|error| format!("failed to read the selected local port: {error}"))
+}
+
 pub fn run(
     server: &Path,
     model: &Path,
@@ -603,6 +615,7 @@ impl OwnedServer {
     where
         F: Fn() -> Option<i32>,
     {
+        let requested_port = resolve_requested_port(requested_port)?;
         let client = readiness_client()?;
         let mut command = Command::new(server);
         command
@@ -1086,9 +1099,17 @@ mod tests {
         assert!(error.contains("too large"), "{error}");
     }
 
+    #[test]
+    fn automatic_port_is_concrete_and_explicit_port_is_preserved() {
+        let automatic = resolve_requested_port(0).unwrap();
+
+        assert_ne!(automatic, 0);
+        assert_eq!(resolve_requested_port(43123).unwrap(), 43123);
+    }
+
     #[cfg(unix)]
     #[test]
-    fn owned_server_passes_native_port_zero_and_owns_both_output_drains() {
+    fn owned_server_passes_runtime_args_and_owns_both_output_drains() {
         let _lock = process_test_lock();
         let dir = tempdir().unwrap();
         let server_path = dir.path().join("server");
@@ -1107,7 +1128,7 @@ mod tests {
             &server_path,
             Path::new("/models/model.gguf"),
             "demo",
-            0,
+            port,
             8192,
             Duration::from_secs(2),
             || None,
@@ -1121,7 +1142,9 @@ mod tests {
 
         assert_eq!(
             std::fs::read_to_string(&argv).unwrap(),
-            "--model\n/models/model.gguf\n--alias\ndemo\n--host\n127.0.0.1\n--port\n0\n--ctx-size\n8192\n--n-gpu-layers\n99\n"
+            format!(
+                "--model\n/models/model.gguf\n--alias\ndemo\n--host\n127.0.0.1\n--port\n{port}\n--ctx-size\n8192\n--n-gpu-layers\n99\n"
+            )
         );
         assert_eq!(server.port(), port);
         assert!(server.output_readers_owned());
@@ -1165,12 +1188,12 @@ mod tests {
                 Err(error) => error,
                 Ok(_) => panic!("server unexpectedly started"),
             };
+            assert!(error.contains(expected), "{error}");
             let group = std::fs::read_to_string(&group_path)
                 .unwrap()
                 .trim()
                 .parse::<i32>()
                 .unwrap();
-            assert!(error.contains(expected), "{error}");
             assert!(!process_group_exists(group).unwrap());
         }
     }
@@ -1222,7 +1245,7 @@ mod tests {
             &server_path,
             Path::new("/models/model.gguf"),
             "demo",
-            0,
+            port,
             1,
             Duration::from_secs(2),
             || None,
