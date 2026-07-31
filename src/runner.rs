@@ -1,12 +1,13 @@
 use reqwest::blocking::Client;
 use serde::Deserialize;
+use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
@@ -14,6 +15,7 @@ const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const VERSION_OUTPUT_TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_VERSION_OUTPUT: u64 = 4096;
 const MAX_MODELS_BODY: usize = 1024 * 1024;
+const MAX_DIAGNOSTIC_TAIL: usize = 4096;
 const MAX_ANNOUNCEMENT_LINE: usize = 8192;
 const MAX_PENDING_ANNOUNCEMENTS: usize = 64;
 const MANAGED_VERSION: &str = "version: 10121 (555881ebc)";
@@ -159,7 +161,12 @@ fn probe_version_with_timeout(
             break status;
         }
         if Instant::now() >= deadline {
-            let _ = terminate_probe(&mut child, group);
+            if let Err(cleanup) = terminate_probe(&mut child, group) {
+                return Err(format!(
+                    "timed out after {} ms; cleanup failed: {cleanup}",
+                    timeout.as_millis()
+                ));
+            }
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
             return Err(format!("timed out after {} ms", timeout.as_millis()));
@@ -174,7 +181,11 @@ fn probe_version_with_timeout(
         let (is_stderr, output) = match output_receiver.recv_timeout(remaining) {
             Ok(output) => output,
             Err(_) => {
-                let _ = terminate_probe(&mut child, group);
+                if let Err(cleanup) = terminate_probe(&mut child, group) {
+                    return Err(format!(
+                        "timed out reading --version output; cleanup failed: {cleanup}"
+                    ));
+                }
                 let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
                 return Err(format!(
@@ -261,7 +272,7 @@ pub fn run(
     requested_port: u16,
     ctx: u32,
 ) -> Result<i32, String> {
-    let signals = SignalSubscription::install()?;
+    let signal = foreground_signal_flag()?;
     let outcome = OwnedServer::start(
         server,
         model,
@@ -269,11 +280,10 @@ pub fn run(
         requested_port,
         ctx,
         STARTUP_TIMEOUT,
-        || signals.received(),
+        || received_signal(signal),
     )?;
     let mut server = match outcome {
         StartOutcome::Ready(server) => server,
-        StartOutcome::Exited(code) => return Ok(code),
         StartOutcome::Signaled(signal) => return Ok(128 + signal),
     };
     println!("ready: http://127.0.0.1:{} (model {id})", server.port());
@@ -281,9 +291,9 @@ pub fn run(
         if let Some(code) = server.try_wait()? {
             return Ok(code);
         }
-        if let Some(signal) = signals.received() {
+        if let Some(received) = received_signal(signal) {
             server.terminate()?;
-            return Ok(128 + signal);
+            return Ok(128 + received);
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -385,79 +395,64 @@ fn models_reader_has_alias(mut reader: impl std::io::Read, id: &str) -> Result<b
 }
 
 #[cfg(unix)]
-struct SignalSubscription {
-    received: Arc<AtomicUsize>,
-    interrupt_id: signal_hook::SigId,
-    terminate_id: signal_hook::SigId,
-}
+static PROCESS_SIGNAL_FLAG: OnceLock<Result<Arc<AtomicUsize>, String>> = OnceLock::new();
 
 #[cfg(unix)]
-impl SignalSubscription {
-    fn install() -> Result<Self, String> {
+fn foreground_signal_flag() -> Result<&'static AtomicUsize, String> {
+    let registration = PROCESS_SIGNAL_FLAG.get_or_init(|| {
         let received = Arc::new(AtomicUsize::new(0));
-        let interrupt_id = signal_hook::flag::register_usize(
+        signal_hook::flag::register_usize(
             libc::SIGINT,
             Arc::clone(&received),
             libc::SIGINT as usize,
         )
         .map_err(|error| error.to_string())?;
-        let terminate_id = match signal_hook::flag::register_usize(
+        signal_hook::flag::register_usize(
             libc::SIGTERM,
             Arc::clone(&received),
             libc::SIGTERM as usize,
-        ) {
-            Ok(id) => id,
-            Err(error) => {
-                signal_hook::low_level::unregister(interrupt_id);
-                return Err(error.to_string());
-            }
-        };
-        Ok(Self {
-            received,
-            interrupt_id,
-            terminate_id,
-        })
-    }
-
-    fn received(&self) -> Option<i32> {
-        match self.received.load(Ordering::SeqCst) {
-            0 => None,
-            signal => i32::try_from(signal).ok(),
-        }
-    }
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(received)
+    });
+    let signal = registration.as_ref().map_err(Clone::clone)?;
+    signal.store(0, Ordering::SeqCst);
+    Ok(signal)
 }
 
 #[cfg(unix)]
-impl Drop for SignalSubscription {
-    fn drop(&mut self) {
-        signal_hook::low_level::unregister(self.terminate_id);
-        signal_hook::low_level::unregister(self.interrupt_id);
+fn received_signal(signal: &AtomicUsize) -> Option<i32> {
+    match signal.load(Ordering::SeqCst) {
+        0 => None,
+        signal => i32::try_from(signal).ok(),
     }
 }
 
 #[cfg(not(unix))]
-struct SignalSubscription;
+static PROCESS_SIGNAL_FLAG: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(not(unix))]
-impl SignalSubscription {
-    fn install() -> Result<Self, String> {
-        Ok(Self)
-    }
-
-    fn received(&self) -> Option<i32> {
-        None
-    }
+fn foreground_signal_flag() -> Result<&'static AtomicUsize, String> {
+    PROCESS_SIGNAL_FLAG.store(0, Ordering::SeqCst);
+    Ok(&PROCESS_SIGNAL_FLAG)
 }
+
+#[cfg(not(unix))]
+fn received_signal(_signal: &AtomicUsize) -> Option<i32> {
+    None
+}
+
+type AnnouncementOutput = (mpsc::SyncSender<Result<u16, String>>, Arc<AtomicBool>);
 
 fn spawn_output_reader<R>(
     mut reader: R,
-    announcements: mpsc::SyncSender<Result<u16, String>>,
-    overflow: Arc<AtomicBool>,
-) -> std::thread::JoinHandle<Result<(), String>>
+    announcement_output: Option<AnnouncementOutput>,
+) -> std::thread::JoinHandle<Result<Vec<u8>, String>>
 where
     R: std::io::Read + Send + 'static,
 {
     std::thread::spawn(move || {
+        let mut diagnostic_tail = VecDeque::with_capacity(MAX_DIAGNOSTIC_TAIL);
         let mut line = Vec::new();
         let mut line_too_long = false;
         let mut buffer = [0_u8; 4096];
@@ -466,20 +461,28 @@ where
                 .read(&mut buffer)
                 .map_err(|error| error.to_string())?;
             if count == 0 {
-                if !line.is_empty() || line_too_long {
-                    publish_announcement(&line, line_too_long, &announcements, overflow.as_ref());
+                if let Some((announcements, overflow)) = &announcement_output {
+                    if !line.is_empty() || line_too_long {
+                        publish_announcement(&line, line_too_long, announcements, overflow);
+                    }
                 }
-                return Ok(());
+                return Ok(diagnostic_tail.into_iter().collect());
             }
             for &byte in &buffer[..count] {
-                if byte == b'\n' {
-                    publish_announcement(&line, line_too_long, &announcements, overflow.as_ref());
-                    line.clear();
-                    line_too_long = false;
-                } else if line.len() < MAX_ANNOUNCEMENT_LINE {
-                    line.push(byte);
-                } else {
-                    line_too_long = true;
+                if diagnostic_tail.len() == MAX_DIAGNOSTIC_TAIL {
+                    diagnostic_tail.pop_front();
+                }
+                diagnostic_tail.push_back(byte);
+                if let Some((announcements, overflow)) = &announcement_output {
+                    if byte == b'\n' {
+                        publish_announcement(&line, line_too_long, announcements, overflow);
+                        line.clear();
+                        line_too_long = false;
+                    } else if line.len() < MAX_ANNOUNCEMENT_LINE {
+                        line.push(byte);
+                    } else {
+                        line_too_long = true;
+                    }
                 }
             }
         }
@@ -512,7 +515,6 @@ fn publish_announcement(
 
 enum StartOutcome {
     Ready(OwnedServer),
-    Exited(i32),
     Signaled(i32),
 }
 
@@ -523,8 +525,10 @@ pub struct OwnedServer {
     announcements: mpsc::Receiver<Result<u16, String>>,
     announcement_overflow: Arc<AtomicBool>,
     announced_port: Option<u16>,
-    stdout_reader: Option<std::thread::JoinHandle<Result<(), String>>>,
-    stderr_reader: Option<std::thread::JoinHandle<Result<(), String>>>,
+    stdout_reader: Option<std::thread::JoinHandle<Result<Vec<u8>, String>>>,
+    stderr_reader: Option<std::thread::JoinHandle<Result<Vec<u8>, String>>>,
+    stdout_tail: Vec<u8>,
+    stderr_tail: Vec<u8>,
 }
 
 impl OwnedServer {
@@ -569,15 +573,10 @@ impl OwnedServer {
             .ok_or_else(|| "failed to capture llama-server stderr".to_string())?;
         let (announcement_sender, announcements) = mpsc::sync_channel(MAX_PENDING_ANNOUNCEMENTS);
         let announcement_overflow = Arc::new(AtomicBool::new(false));
-        let stdout_reader = spawn_output_reader(
-            stdout,
-            announcement_sender.clone(),
-            Arc::clone(&announcement_overflow),
-        );
+        let stdout_reader = spawn_output_reader(stdout, None);
         let stderr_reader = spawn_output_reader(
             stderr,
-            announcement_sender,
-            Arc::clone(&announcement_overflow),
+            Some((announcement_sender, Arc::clone(&announcement_overflow))),
         );
         let mut owned = Self {
             child: Some(child),
@@ -588,6 +587,8 @@ impl OwnedServer {
             announced_port: None,
             stdout_reader: Some(stdout_reader),
             stderr_reader: Some(stderr_reader),
+            stdout_tail: Vec::new(),
+            stderr_tail: Vec::new(),
         };
         let deadline = Instant::now() + timeout;
         loop {
@@ -605,7 +606,9 @@ impl OwnedServer {
             {
                 let code = exit_code(status);
                 owned.terminate()?;
-                return Ok(StartOutcome::Exited(code));
+                return Err(owned.with_diagnostic(format!(
+                    "llama-server exited before readiness with status {code}"
+                )));
             }
             if let Some(port) = owned.announced_port {
                 if requested_port != 0 && port != requested_port {
@@ -646,7 +649,7 @@ impl OwnedServer {
     fn fail_start(mut self, error: String) -> Result<StartOutcome, String> {
         self.terminate()
             .map_err(|cleanup| format!("{error}; cleanup failed: {cleanup}"))?;
-        Err(error)
+        Err(self.with_diagnostic(error))
     }
 
     fn collect_announcements(&mut self) -> Result<(), String> {
@@ -680,7 +683,7 @@ impl OwnedServer {
         if let Err(error) = self.collect_announcements() {
             self.terminate()
                 .map_err(|cleanup| format!("{error}; cleanup failed: {cleanup}"))?;
-            return Err(error);
+            return Err(self.with_diagnostic(error));
         }
         let Some(status) = self
             .child_mut()
@@ -691,7 +694,13 @@ impl OwnedServer {
         };
         let code = exit_code(status);
         self.terminate()?;
-        Ok(Some(code))
+        if code == 0 {
+            Ok(Some(0))
+        } else {
+            Err(self.with_diagnostic(format!(
+                "llama-server exited unexpectedly with status {code}"
+            )))
+        }
     }
 
     pub fn terminate(&mut self) -> Result<(), String> {
@@ -703,28 +712,43 @@ impl OwnedServer {
     }
 
     fn join_output_readers(&mut self) -> Result<(), String> {
-        let mut first_error = None;
-        for reader in [&mut self.stdout_reader, &mut self.stderr_reader] {
-            if let Some(reader) = reader.take() {
-                match reader.join() {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => {
-                        first_error.get_or_insert(error);
-                    }
-                    Err(_) => {
-                        first_error
-                            .get_or_insert_with(|| "llama-server output reader panicked".into());
-                    }
-                }
-            }
+        let stdout = join_output_reader(&mut self.stdout_reader, &mut self.stdout_tail);
+        let stderr = join_output_reader(&mut self.stderr_reader, &mut self.stderr_tail);
+        stdout.and(stderr)
+    }
+
+    fn with_diagnostic(&self, error: String) -> String {
+        let tail = if self.stderr_tail.is_empty() {
+            &self.stdout_tail
+        } else {
+            &self.stderr_tail
+        };
+        let diagnostic = String::from_utf8_lossy(tail);
+        let diagnostic = diagnostic.trim();
+        if diagnostic.is_empty() {
+            error
+        } else {
+            format!("{error}: {diagnostic}")
         }
-        first_error.map_or(Ok(()), Err)
     }
 
     #[cfg(test)]
     fn output_readers_owned(&self) -> bool {
         self.stdout_reader.is_some() || self.stderr_reader.is_some()
     }
+}
+
+fn join_output_reader(
+    reader: &mut Option<std::thread::JoinHandle<Result<Vec<u8>, String>>>,
+    tail: &mut Vec<u8>,
+) -> Result<(), String> {
+    let Some(reader) = reader.take() else {
+        return Ok(());
+    };
+    *tail = reader
+        .join()
+        .map_err(|_| "llama-server output reader panicked".to_string())??;
+    Ok(())
 }
 
 impl Drop for OwnedServer {
@@ -1089,6 +1113,33 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn stdout_listening_line_is_drain_only() {
+        let _lock = process_test_lock();
+        let dir = tempdir().unwrap();
+        let server_path = dir.path().join("server");
+        write_executable_script(
+            &server_path,
+            b"#!/bin/sh\nprintf 'listening on http://127.0.0.1:43123\\n'\nwhile :; do sleep 1; done\n",
+        );
+
+        let error = match OwnedServer::start(
+            &server_path,
+            Path::new("/models/model.gguf"),
+            "demo",
+            0,
+            1,
+            Duration::from_millis(500),
+            || None,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("stdout announcement unexpectedly started the server"),
+        };
+
+        assert!(error.contains("did not announce"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn post_ready_leader_exit_returns_status_after_descendant_cleanup() {
         let _lock = process_test_lock();
         let dir = tempdir().unwrap();
@@ -1098,7 +1149,7 @@ mod tests {
         write_executable_script(
             &server_path,
             format!(
-                "#!/bin/sh\n(trap '' TERM; while :; do sleep 1; done) &\nprintf 'listening on http://127.0.0.1:{port}\\n' >&2\nwhile [ ! -f '{}' ]; do sleep 1; done\nexit 7\n",
+                "#!/bin/sh\n(trap '' TERM; while :; do sleep 1; done) &\nprintf 'listening on http://127.0.0.1:{port}\\n' >&2\nwhile [ ! -f '{}' ]; do sleep 1; done\nprintf 'fatal: post-ready model crash\\n' >&2\nexit 7\n",
                 release.display()
             )
             .as_bytes(),
@@ -1121,15 +1172,18 @@ mod tests {
         http.join().unwrap();
         std::fs::write(release, b"go").unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
-        let code = loop {
-            if let Some(code) = server.try_wait().unwrap() {
-                break code;
+        let error = loop {
+            match server.try_wait() {
+                Err(error) => break error,
+                Ok(None) => {}
+                Ok(Some(code)) => panic!("unexpected successful exit status {code}"),
             }
             assert!(Instant::now() < deadline, "leader did not exit");
             std::thread::yield_now();
         };
 
-        assert_eq!(code, 7);
+        assert!(error.contains("status 7"), "{error}");
+        assert!(error.contains("fatal: post-ready model crash"), "{error}");
         assert!(!process_group_exists(group).unwrap());
         assert!(!server.output_readers_owned());
     }
@@ -1400,6 +1454,19 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn signal_registration_is_reused_and_reset_for_each_foreground_run() {
+        let _lock = process_test_lock();
+        let first = foreground_signal_flag().unwrap();
+        first.store(libc::SIGTERM as usize, Ordering::SeqCst);
+
+        let second = foreground_signal_flag().unwrap();
+
+        assert!(std::ptr::eq(first, second));
+        assert_eq!(second.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn leader_exit_cleans_surviving_process_group_before_returning_status() {
         let _lock = process_test_lock();
         let dir = tempdir().unwrap();
@@ -1408,10 +1475,10 @@ mod tests {
         let group_file = dir.path().join("group");
         write_executable_script(
             &server,
-            b"#!/bin/sh\n(\n  trap '' TERM\n  printf ready > \"$2\"\n  while :; do sleep 1; done\n) &\nwhile [ ! -f \"$2\" ]; do :; done\nprintf '%s\\n' \"$$\" > \"$4\"\nexit 7\n",
+            b"#!/bin/sh\n(\n  trap '' TERM\n  printf ready > \"$2\"\n  while :; do sleep 1; done\n) &\nwhile [ ! -f \"$2\" ]; do :; done\nprintf '%s\\n' \"$$\" > \"$4\"\nprintf 'fatal: model load failed\\n' >&2\nexit 7\n",
         );
 
-        let status = run(&server, &child_ready, group_file.to_str().unwrap(), 0, 1).unwrap();
+        let error = run(&server, &child_ready, group_file.to_str().unwrap(), 0, 1).unwrap_err();
         let group = std::fs::read_to_string(&group_file)
             .unwrap()
             .trim()
@@ -1425,8 +1492,40 @@ mod tests {
             }
         }
 
-        assert_eq!(status, 7);
+        assert!(error.contains("status 7"), "{error}");
+        assert!(error.contains("fatal: model load failed"), "{error}");
         assert!(!survived, "leader status returned while its group survived");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pre_ready_diagnostic_uses_stdout_fallback_and_caps_oversized_output() {
+        let _lock = process_test_lock();
+        for (stream, diagnostic) in [
+            ("stdout", "stdout model failure"),
+            ("stderr", "bounded tail marker"),
+        ] {
+            let dir = tempdir().unwrap();
+            let server = dir.path().join("server");
+            let output = if stream == "stdout" {
+                format!("#!/bin/sh\nprintf '{diagnostic}\\n'\nexit 8\n")
+            } else {
+                format!(
+                    "#!/bin/sh\nprintf '{}{diagnostic}\\n' >&2\nexit 9\n",
+                    "x".repeat(8192)
+                )
+            };
+            write_executable_script(&server, output.as_bytes());
+
+            let error = run(&server, Path::new("/models/model.gguf"), "demo", 0, 1).unwrap_err();
+
+            assert!(error.contains(diagnostic), "{error}");
+            assert!(
+                error.len() < 5000,
+                "diagnostic was not capped: {}",
+                error.len()
+            );
+        }
     }
 
     #[cfg(unix)]
