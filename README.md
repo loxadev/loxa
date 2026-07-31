@@ -31,8 +31,11 @@ The printed loopback URL with `/v1/models` is the readiness check. Stop `run`
 with Ctrl-C, then chat in the terminal:
 
 ```sh
-./target/release/loxa chat smollm2-135m
+./target/release/loxa chat
 ```
+
+With one installed model, Loxa starts it immediately. With several, use the
+arrow-key picker or pass the model directly: `loxa chat smollm2-135m`.
 
 `pull` resolves the requested revision to an immutable Hugging Face commit,
 resumes interrupted transfers, verifies the expected size and SHA-256, and
@@ -46,8 +49,9 @@ To override a default, create `~/.loxa/config.json`, for example:
 {"version":1,"ctx":8192}
 ```
 
-In chat, `/clear` resets the in-memory conversation and `/exit` quits.
-Ctrl-C also shuts down the owned server process.
+In chat, type `/` to browse commands. `/clear` resets the in-memory
+conversation, `/help` shows command help, and `/exit` quits. Ctrl-C also shuts
+down the owned server process.
 
 Models are stored under `~/.loxa/models`. Set `LOXA_HOME` to use another
 location.

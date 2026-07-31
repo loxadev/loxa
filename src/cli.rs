@@ -21,7 +21,7 @@ pub enum Command {
     /// Run a model with llama-server in the foreground.
     Run(RunArgs),
     /// Chat with a model in the terminal.
-    Chat(RunArgs),
+    Chat(ChatArgs),
 }
 
 #[derive(Debug, Args)]
@@ -39,15 +39,26 @@ pub struct PullArgs {
 
 #[derive(Debug, Args)]
 pub struct RunArgs {
+    /// Installed model ID.
     pub id: String,
     #[command(flatten)]
     pub runtime: RuntimeArgs,
 }
 
 #[derive(Debug, Args)]
+pub struct ChatArgs {
+    /// Model ID; omit to choose an installed model.
+    pub id: Option<String>,
+    #[command(flatten)]
+    pub runtime: RuntimeArgs,
+}
+
+#[derive(Debug, Args)]
 pub struct RuntimeArgs {
+    /// Override the context window size.
     #[arg(long)]
     pub ctx: Option<u32>,
+    /// Override the automatic local server port.
     #[arg(long)]
     pub port: Option<u16>,
     #[arg(long, hide = true)]
@@ -101,7 +112,7 @@ mod tests {
         let cli = Cli::parse_from(["loxa", "chat", "demo"]);
         match cli.command {
             Command::Chat(args) => {
-                assert_eq!(args.id, "demo");
+                assert_eq!(args.id.as_deref(), Some("demo"));
                 assert!(args.runtime.ctx.is_none());
                 assert!(args.runtime.port.is_none());
                 assert!(args.runtime.server.is_none());
@@ -124,5 +135,24 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn chat_accepts_an_omitted_model_but_run_does_not() {
+        assert!(Cli::try_parse_from(["loxa", "chat"]).is_ok());
+        assert!(Cli::try_parse_from(["loxa", "run"]).is_err());
+    }
+
+    #[test]
+    fn chat_help_explains_model_selection_and_runtime_overrides() {
+        let help = Cli::command()
+            .find_subcommand_mut("chat")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+
+        assert!(help.contains("omit to choose an installed model"), "{help}");
+        assert!(help.contains("context window"), "{help}");
+        assert!(help.contains("local server port"), "{help}");
     }
 }

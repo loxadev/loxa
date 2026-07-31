@@ -12,6 +12,7 @@ use catalog::Manifest;
 use clap::Parser;
 use cli::{Cli, Command};
 use paths::{validate_id, AppPaths};
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 struct Runnable {
@@ -106,7 +107,36 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
             )
         }
         Command::Chat(args) => {
-            let runnable = resolve_runnable(args, &paths)?;
+            let installed = catalog::load_catalog(&paths.models)?;
+            let mut options = chat_model_options(args.id, &installed)?;
+            ensure_interactive_chat(
+                std::io::stdin().is_terminal(),
+                std::io::stdout().is_terminal(),
+            )?;
+            let id = if options.len() == 1 {
+                options.remove(0)
+            } else {
+                match inquire::Select::new("Choose a model", options)
+                    .with_help_message("↑↓ navigate · enter select · type to filter")
+                    .prompt()
+                {
+                    Ok(id) => id,
+                    Err(inquire::InquireError::OperationCanceled) => return Ok(0),
+                    Err(inquire::InquireError::OperationInterrupted) => return Ok(130),
+                    Err(inquire::InquireError::NotTTY) => return Err(
+                        "model selection requires an interactive terminal; pass `loxa chat <id>`"
+                            .into(),
+                    ),
+                    Err(error) => return Err(format!("model selection failed: {error}")),
+                }
+            };
+            let runnable = resolve_runnable(
+                cli::RunArgs {
+                    id,
+                    runtime: args.runtime,
+                },
+                &paths,
+            )?;
             match runner::start_foreground(
                 &runnable.server,
                 &runnable.artifact,
@@ -118,6 +148,33 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
                 runner::ForegroundStart::Stopped(code) => Ok(code),
             }
         }
+    }
+}
+
+fn chat_model_options(
+    requested: Option<String>,
+    installed: &[Manifest],
+) -> Result<Vec<String>, String> {
+    if let Some(id) = requested {
+        if !installed.iter().any(|model| model.id == id) {
+            return Err(format!("unknown model id {id}"));
+        }
+        return Ok(vec![id]);
+    }
+    if installed.is_empty() {
+        return Err("no models installed; download one with `loxa pull <owner/repo>`".into());
+    }
+    Ok(installed.iter().map(|model| model.id.clone()).collect())
+}
+
+fn ensure_interactive_chat(stdin: bool, stdout: bool) -> Result<(), String> {
+    if stdin && stdout {
+        Ok(())
+    } else {
+        Err(
+            "chat requires an interactive terminal; run `loxa chat <id>` directly in a terminal"
+                .into(),
+        )
     }
 }
 
@@ -167,10 +224,24 @@ fn default_id(repo: &str, filename: &str, sha256: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_id, run};
+    use super::{chat_model_options, default_id, ensure_interactive_chat, run};
+    use crate::catalog::Manifest;
     use crate::cli::Cli;
     use crate::paths::AppPaths;
     use clap::Parser;
+
+    fn manifest(id: &str) -> Manifest {
+        Manifest {
+            version: 1,
+            id: id.into(),
+            repo: "owner/repo".into(),
+            revision: "0".repeat(40),
+            remote_filename: "model-Q4_K_M.gguf".into(),
+            local_filename: "model.gguf".into(),
+            sha256: "a".repeat(64),
+            size: 1,
+        }
+    }
 
     #[test]
     fn default_id_owns_repo_artifact_and_digest_identity() {
@@ -211,5 +282,38 @@ mod tests {
         assert!(error.contains("unknown model id missing"), "{error}");
         assert!(!paths.config.exists());
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn chat_without_models_explains_how_to_pull_one() {
+        let error = chat_model_options(None, &[]).unwrap_err();
+
+        assert!(error.contains("loxa pull"), "{error}");
+    }
+
+    #[test]
+    fn chat_without_id_auto_selects_one_model() {
+        assert_eq!(
+            chat_model_options(None, &[manifest("alpha")]).unwrap(),
+            ["alpha"]
+        );
+    }
+
+    #[test]
+    fn chat_without_id_offers_all_installed_models() {
+        assert_eq!(
+            chat_model_options(None, &[manifest("alpha"), manifest("beta")]).unwrap(),
+            ["alpha", "beta"]
+        );
+    }
+
+    #[test]
+    fn chat_requires_an_interactive_input_and_output() {
+        assert!(ensure_interactive_chat(true, true).is_ok());
+        for (stdin, stdout) in [(false, true), (true, false), (false, false)] {
+            let error = ensure_interactive_chat(stdin, stdout).unwrap_err();
+            assert!(error.contains("interactive terminal"), "{error}");
+            assert!(error.contains("loxa chat <id>"), "{error}");
+        }
     }
 }

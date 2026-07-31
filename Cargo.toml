@@ -8,7 +8,10 @@ repository = "https://github.com/loxadev/loxa"
 description = "Download and run verified Hugging Face GGUF models locally"
 
 [dependencies]
+anstream = "1.0.0"
+anstyle = "1.0.14"
 clap = { version = "4", features = ["derive"] }
+inquire = { version = "0.9.4", default-features = false, features = ["crossterm", "fuzzy"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "json", "rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

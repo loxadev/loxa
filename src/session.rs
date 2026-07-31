@@ -1,14 +1,45 @@
 use crate::chat::{Event, Message, Role, Worker};
 use crate::runner::ForegroundServer;
-use std::io::{BufRead, Write};
+use anstyle::{AnsiColor, Style};
+use inquire::error::{CustomUserError, InquireError};
+use inquire::Text;
+use std::io::Write;
 use std::sync::mpsc;
 use std::time::Duration;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
+const SLASH_COMMANDS: [(&str, &str); 3] = [
+    ("/clear", "Clear conversation history"),
+    ("/help", "Show available commands"),
+    ("/exit", "Exit chat"),
+];
+
+fn slash_suggestions(input: &str) -> Vec<&'static str> {
+    if !input.starts_with('/') {
+        return Vec::new();
+    }
+    SLASH_COMMANDS
+        .iter()
+        .map(|(command, _)| *command)
+        .filter(|command| command.starts_with(input))
+        .collect()
+}
+
+fn autocomplete_slash(input: &str) -> Result<Vec<String>, CustomUserError> {
+    Ok(slash_suggestions(input)
+        .into_iter()
+        .map(str::to_owned)
+        .collect())
+}
+
+fn color(color: AnsiColor) -> Style {
+    Style::new().fg_color(Some(color.into()))
+}
 
 #[derive(Debug, Eq, PartialEq)]
 enum InputAction {
     Ignore,
+    Help,
     Clear,
     Exit,
     Prompt(String),
@@ -28,11 +59,10 @@ impl Session {
         let input = line.trim();
         match input {
             "" => InputAction::Ignore,
+            "/" | "/?" | "/help" => InputAction::Help,
             "/clear" => InputAction::Clear,
             "/exit" => InputAction::Exit,
-            command if command.starts_with('/') => {
-                InputAction::Reject(format!("unknown command {command}"))
-            }
+            command if command.starts_with('/') => InputAction::Reject(command.to_owned()),
             prompt => InputAction::Prompt(prompt.to_owned()),
         }
     }
@@ -64,66 +94,47 @@ impl Session {
 
 enum InputEvent {
     Line(String),
-    Eof,
+    Canceled,
+    Interrupted,
     Error(String),
 }
 
-fn input_events() -> Result<mpsc::Receiver<InputEvent>, String> {
-    let (sender, receiver) = mpsc::sync_channel(1);
-    std::thread::Builder::new()
-        .name("loxa-terminal-input".into())
-        .spawn(move || {
-            let stdin = std::io::stdin();
-            let mut input = stdin.lock();
-            loop {
-                let mut line = String::new();
-                match input.read_line(&mut line) {
-                    Ok(0) => {
-                        let _ = sender.send(InputEvent::Eof);
-                        return;
-                    }
-                    Ok(_) => {
-                        if sender.send(InputEvent::Line(line)).is_err() {
-                            return;
-                        }
-                    }
-                    Err(error) => {
-                        let _ = sender.send(InputEvent::Error(error.to_string()));
-                        return;
-                    }
-                }
-            }
-        })
-        .map_err(|error| error.to_string())?;
-    Ok(receiver)
+fn prompt_input() -> InputEvent {
+    match Text::new("You")
+        .with_placeholder("message or / for commands")
+        .with_autocomplete(autocomplete_slash)
+        .prompt()
+    {
+        Ok(line) => InputEvent::Line(line),
+        Err(InquireError::OperationCanceled) => InputEvent::Canceled,
+        Err(InquireError::OperationInterrupted) => InputEvent::Interrupted,
+        Err(error) => InputEvent::Error(error.to_string()),
+    }
 }
 
 pub(crate) fn run(mut server: ForegroundServer, model: &str) -> Result<i32, String> {
-    let input = input_events()?;
     let mut session = Session::default();
-    println!("Chat ready. Use /clear to reset or /exit to quit.");
+    let ready = color(AnsiColor::Green).bold();
+    let model_style = color(AnsiColor::Cyan).bold();
+    let dim = Style::new().dimmed();
+    anstream::println!("{ready}Ready{ready:#} · {model_style}{model}{model_style:#}");
+    anstream::println!("{dim}Type / for commands · Esc or Ctrl-C to exit{dim:#}");
 
     loop {
-        print!("> ");
-        std::io::stdout()
-            .flush()
-            .map_err(|error| error.to_string())?;
-        let event = loop {
-            if let Some(code) = server.poll()? {
-                return Ok(code);
-            }
-            match input.recv_timeout(POLL_INTERVAL) {
-                Ok(event) => break event,
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break InputEvent::Eof,
-            }
-        };
+        if let Some(code) = server.poll()? {
+            return Ok(code);
+        }
+        let event = prompt_input();
 
         let action = match event {
             InputEvent::Line(line) => Session::classify(Some(&line)),
-            InputEvent::Eof => {
+            InputEvent::Canceled => {
                 println!();
                 Session::classify(None)
+            }
+            InputEvent::Interrupted => {
+                server.terminate()?;
+                return Ok(130);
             }
             InputEvent::Error(error) => {
                 server.terminate()?;
@@ -132,9 +143,18 @@ pub(crate) fn run(mut server: ForegroundServer, model: &str) -> Result<i32, Stri
         };
         let user = match action {
             InputAction::Ignore => continue,
+            InputAction::Help => {
+                let heading = color(AnsiColor::Cyan).bold();
+                anstream::println!("{heading}Available commands{heading:#}");
+                for (command, description) in SLASH_COMMANDS {
+                    anstream::println!("  {heading}{command:<7}{heading:#} {description}");
+                }
+                continue;
+            }
             InputAction::Clear => {
                 session.clear();
-                println!("History cleared.");
+                let success = color(AnsiColor::Green);
+                anstream::println!("{success}Conversation cleared.{success:#}");
                 continue;
             }
             InputAction::Exit => {
@@ -142,13 +162,25 @@ pub(crate) fn run(mut server: ForegroundServer, model: &str) -> Result<i32, Stri
                 return Ok(0);
             }
             InputAction::Reject(error) => {
-                eprintln!("{error}");
+                let error_style = color(AnsiColor::Red).bold();
+                anstream::eprintln!(
+                    "{error_style}Unknown command:{error_style:#} {error}. Type /help for commands."
+                );
                 continue;
             }
             InputAction::Prompt(user) => user,
         };
 
+        if let Some(code) = server.poll()? {
+            return Ok(code);
+        }
+
         let worker = Worker::start(server.port(), model.to_owned(), session.request(&user))?;
+        let assistant = color(AnsiColor::Magenta).bold();
+        anstream::print!("{assistant}Loxa{assistant:#} ");
+        std::io::stdout()
+            .flush()
+            .map_err(|error| error.to_string())?;
         let result = loop {
             match server.poll() {
                 Ok(Some(code)) => {
@@ -182,14 +214,17 @@ pub(crate) fn run(mut server: ForegroundServer, model: &str) -> Result<i32, Stri
         worker.join()?;
         match result {
             Ok(assistant) => session.complete(user, assistant),
-            Err(error) => eprintln!("error: {error}"),
+            Err(error) => {
+                let error_style = color(AnsiColor::Red).bold();
+                anstream::eprintln!("{error_style}Error:{error_style:#} {error}");
+            }
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{InputAction, Session};
+    use super::{slash_suggestions, InputAction, Session};
     use crate::chat::{Message, Role};
 
     #[test]
@@ -227,10 +262,13 @@ mod tests {
         assert_eq!(Session::classify(Some(" \n")), InputAction::Ignore);
         assert_eq!(Session::classify(Some("/clear\n")), InputAction::Clear);
         assert_eq!(Session::classify(Some("/exit\n")), InputAction::Exit);
+        assert_eq!(Session::classify(Some("/\n")), InputAction::Help);
+        assert_eq!(Session::classify(Some("/?\n")), InputAction::Help);
+        assert_eq!(Session::classify(Some("/help\n")), InputAction::Help);
         assert_eq!(Session::classify(None), InputAction::Exit);
         assert_eq!(
             Session::classify(Some("/unknown\n")),
-            InputAction::Reject("unknown command /unknown".into())
+            InputAction::Reject("/unknown".into())
         );
         assert_eq!(
             Session::classify(Some(" hello \n")),
@@ -247,5 +285,12 @@ mod tests {
         assert_eq!(session.history, before);
         session.clear();
         assert!(session.history.is_empty());
+    }
+
+    #[test]
+    fn slash_prefix_shows_matching_commands() {
+        assert_eq!(slash_suggestions("/"), ["/clear", "/help", "/exit"]);
+        assert_eq!(slash_suggestions("/c"), ["/clear"]);
+        assert!(slash_suggestions("hello").is_empty());
     }
 }
