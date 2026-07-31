@@ -66,6 +66,7 @@ pub fn run_from_env() -> Result<i32, String> {
 
 pub fn report_error(error: &str) {
     let danger = ui::danger();
+    let error = ui::sanitize_terminal(error);
     anstream::eprintln!("{danger}Error:{danger:#} {error}");
 }
 

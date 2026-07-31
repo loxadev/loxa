@@ -2,6 +2,16 @@ use anstyle::{AnsiColor, Style};
 use indicatif::ProgressBar;
 use std::time::Duration;
 
+pub(crate) fn sanitize_terminal(text: &str) -> String {
+    text.chars()
+        .map(|character| match character {
+            '\n' | '\t' => character,
+            control if control.is_control() => '\u{fffd}',
+            ordinary => ordinary,
+        })
+        .collect()
+}
+
 pub(crate) fn accent() -> Style {
     Style::new().fg_color(Some(AnsiColor::Cyan.into())).bold()
 }

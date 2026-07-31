@@ -149,7 +149,7 @@ pub fn prepare_pull(model_dir: &Path, manifest: &Manifest) -> Result<(), String>
             ))
         };
     }
-    remove_unidentified_transfer_state(model_dir)?;
+    reject_unidentified_transfer_state(model_dir)?;
     write_manifest_atomic(model_dir, "pending.json", manifest)?;
     Ok(())
 }
@@ -288,20 +288,24 @@ fn write_manifest_atomic(dir: &Path, name: &str, manifest: &Manifest) -> Result<
     Ok(())
 }
 
-fn remove_unidentified_transfer_state(dir: &Path) -> Result<(), String> {
-    let mut removed = false;
+fn reject_unidentified_transfer_state(dir: &Path) -> Result<(), String> {
     for name in [
         "model.gguf",
         "model.gguf.part",
         "model.gguf.part.restart",
         "model.gguf.invalid",
     ] {
-        removed |= remove_regular_if_present(&dir.join(name))?;
-    }
-    if removed {
-        fs::File::open(dir)
-            .and_then(|parent| parent.sync_all())
-            .map_err(|error| error.to_string())?;
+        let path = dir.join(name);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                return Err(format!(
+                    "unidentified transfer state at {}; move or remove the colliding path before retrying",
+                    path.display()
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
     }
     Ok(())
 }
@@ -332,9 +336,9 @@ fn finish_pending(dir: &Path) -> Result<(), String> {
 fn validate_repo(repo: &str) -> Result<(), String> {
     let parts = repo.split('/').collect::<Vec<_>>();
     if parts.len() == 2
-        && parts
-            .iter()
-            .all(|part| !part.is_empty() && *part != "." && *part != "..")
+        && parts.iter().all(|part| {
+            !part.is_empty() && *part != "." && *part != ".." && !part.chars().any(char::is_control)
+        })
     {
         Ok(())
     } else {
@@ -347,6 +351,7 @@ fn validate_filename(filename: &str) -> Result<(), String> {
     if !filename.is_empty()
         && !filename.contains(['/', '\\'])
         && !filename.contains("..")
+        && !filename.chars().any(char::is_control)
         && lower.ends_with(".gguf")
         && !lower.contains("-of-")
     {
@@ -536,10 +541,7 @@ mod tests {
         let model_dir = root.path().join("demo");
         let expected = manifest("demo");
 
-        std::fs::create_dir_all(&model_dir).unwrap();
-        std::fs::write(model_dir.join("model.gguf.part"), b"unidentified").unwrap();
         prepare_pull(&model_dir, &expected).unwrap();
-        assert!(!model_dir.join("model.gguf.part").exists());
         std::fs::write(model_dir.join("model.gguf.part"), b"partial").unwrap();
         assert!(load_catalog(root.path()).unwrap().is_empty());
         prepare_pull(&model_dir, &expected).unwrap();
@@ -558,6 +560,40 @@ mod tests {
         publish_manifest(root.path(), &expected).unwrap();
         assert_eq!(load_catalog(root.path()).unwrap(), vec![expected]);
         assert!(!model_dir.join("pending.json").exists());
+    }
+
+    #[test]
+    fn unidentified_transfer_state_is_refused_without_mutation() {
+        for name in [
+            "model.gguf",
+            "model.gguf.part",
+            "model.gguf.part.restart",
+            "model.gguf.invalid",
+        ] {
+            let root = tempdir().unwrap();
+            let model_dir = root.path().join("demo");
+            let path = model_dir.join(name);
+            std::fs::create_dir_all(&model_dir).unwrap();
+            std::fs::write(&path, b"unidentified bytes").unwrap();
+
+            let error = prepare_pull(&model_dir, &manifest("demo")).unwrap_err();
+
+            assert!(error.contains(&path.display().to_string()), "{error}");
+            assert!(error.contains("move or remove"), "{error}");
+            assert_eq!(std::fs::read(&path).unwrap(), b"unidentified bytes");
+            assert!(!model_dir.join("pending.json").exists());
+        }
+    }
+
+    #[test]
+    fn manifest_rejects_control_characters_in_remote_identity() {
+        let mut invalid_repo = manifest("demo");
+        invalid_repo.repo = "owner/repo\u{1b}".into();
+        assert!(invalid_repo.validate().is_err());
+
+        let mut invalid_filename = manifest("demo");
+        invalid_filename.remote_filename = "demo-\u{85}Q4_K_M.gguf".into();
+        assert!(invalid_filename.validate().is_err());
     }
 
     #[test]

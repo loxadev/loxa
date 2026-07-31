@@ -195,6 +195,7 @@ fn prompt_input(editor: &mut ChatEditor) -> InputEvent {
 }
 
 fn write_assistant_delta(output: &mut impl Write, delta: &str) -> Result<(), String> {
+    let delta = ui::sanitize_terminal(delta);
     output
         .write_all(delta.as_bytes())
         .and_then(|_| output.flush())
@@ -316,6 +317,7 @@ pub(crate) fn run(mut server: ForegroundServer, model: &str) -> Result<i32, Stri
             Ok(assistant) => session.complete(user, assistant),
             Err(error) => {
                 let error_style = ui::danger();
+                let error = ui::sanitize_terminal(&error);
                 anstream::eprintln!("{error_style}Error:{error_style:#} {error}");
             }
         }
@@ -458,12 +460,16 @@ mod tests {
     }
 
     #[test]
-    fn assistant_deltas_are_written_without_a_speaker_label() {
+    fn assistant_output_sanitizes_controls_without_mutating_history() {
         let mut output = Vec::new();
+        let raw = "héllo\n\t\u{1b}\u{7}\r\u{85}";
 
-        write_assistant_delta(&mut output, "hello").unwrap();
-        write_assistant_delta(&mut output, " there").unwrap();
+        write_assistant_delta(&mut output, raw).unwrap();
 
-        assert_eq!(output, b"hello there");
+        assert_eq!(String::from_utf8(output).unwrap(), "héllo\n\t����");
+
+        let mut session = Session::default();
+        session.complete("user".into(), raw.into());
+        assert_eq!(session.request("next")[1].content, raw);
     }
 }

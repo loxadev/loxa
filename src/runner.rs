@@ -602,6 +602,7 @@ pub(crate) struct ServerExit {
 
 pub(crate) fn report_exit(exit: ServerExit) -> i32 {
     if let Some(diagnostic) = exit.diagnostic {
+        let diagnostic = ui::sanitize_terminal(&diagnostic);
         eprintln!("{diagnostic}");
     }
     exit.code

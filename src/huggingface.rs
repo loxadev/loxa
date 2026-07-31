@@ -40,9 +40,9 @@ pub fn parse_repo(input: &str) -> Result<String, String> {
     let repo = input.strip_prefix("hf://").unwrap_or(input);
     let parts = repo.split('/').collect::<Vec<_>>();
     if parts.len() == 2
-        && parts
-            .iter()
-            .all(|part| !part.is_empty() && *part != "." && *part != "..")
+        && parts.iter().all(|part| {
+            !part.is_empty() && *part != "." && *part != ".." && !part.chars().any(char::is_control)
+        })
     {
         Ok(repo.to_string())
     } else {
@@ -148,6 +148,7 @@ pub fn select_from_json(
             let valid = entry.kind == "file"
                 && lower.ends_with(".gguf")
                 && !entry.path.contains(['/', '\\'])
+                && !entry.path.chars().any(char::is_control)
                 && !lower.contains("-of-")
                 && entry.size == lfs.size
                 && validate_hex(&lfs.oid, 64, "LFS SHA-256").is_ok();
@@ -331,6 +332,21 @@ mod tests {
                 .unwrap_err()
                 .contains("ambiguous")
         );
+    }
+
+    #[test]
+    fn remote_repository_and_filename_reject_control_characters() {
+        assert!(parse_repo("owner/repo\u{1b}").is_err());
+
+        let controlled = TREE.replace("demo-Q4_K_M.gguf", "demo-\u{85}Q4_K_M.gguf");
+        assert!(select_from_json(
+            "owner/repo",
+            Some("demo-\u{85}Q4_K_M.gguf"),
+            None,
+            MODEL,
+            &controlled,
+        )
+        .is_err());
     }
 
     #[test]
