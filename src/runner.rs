@@ -11,7 +11,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
-const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const VERSION_OUTPUT_TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_VERSION_OUTPUT: u64 = 4096;
 const MAX_MODELS_BODY: usize = 1024 * 1024;
@@ -1429,6 +1429,23 @@ mod tests {
             "{error}"
         );
         assert!(error.contains("ambiguous"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_runtime_allows_a_slow_cold_version_probe() {
+        let _lock = process_test_lock();
+        let dir = tempdir().unwrap();
+        let managed = dir.path().join("managed");
+        write_executable_script(
+            &managed,
+            b"#!/bin/sh\nsleep 4\nprintf '%s\\n' 'version: 10121 (555881ebc)' >&2\n",
+        );
+
+        assert_eq!(
+            discover_server(None, None, &managed, None).unwrap(),
+            managed
+        );
     }
 
     #[cfg(unix)]
