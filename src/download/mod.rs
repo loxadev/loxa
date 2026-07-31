@@ -5,11 +5,8 @@ use crate::huggingface::ResolvedFile;
 use artifact::download_once;
 #[cfg(test)]
 use artifact::hex;
+use backon::{ExponentialBuilder, RetryableWithContext};
 use indicatif::{ProgressBar, ProgressStyle};
-#[cfg(test)]
-use retry::delay::NoDelay;
-use retry::delay::{jitter, Exponential};
-use retry::{retry, OperationResult};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -17,8 +14,8 @@ pub(crate) use artifact::verify_regular;
 #[cfg(test)]
 pub(crate) use http::artifact_url;
 #[cfg(test)]
-use http::{redirect_target, transient_status, Transfer, TransferError};
-use http::{ReqwestTransport, Transport};
+use http::{redirect_target, transient_status, Transfer};
+use http::{ReqwestTransport, TransferError, Transport};
 
 const MAX_RETRIES: usize = 3;
 
@@ -48,7 +45,6 @@ pub fn download(
     model_dir: &Path,
     token: Option<String>,
 ) -> Result<DownloadOutcome, String> {
-    let transport = ReqwestTransport::new(token)?;
     let progress = ProgressBar::new(file.size);
     let style = ProgressStyle::with_template(
         "{spinner:.green} {msg} [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} {bytes_per_sec} {eta}",
@@ -57,13 +53,13 @@ pub fn download(
     .progress_chars("=>-");
     progress.set_style(style);
     progress.set_message(file.filename.clone());
-    let delays = Exponential::from_millis(250).map(jitter).take(MAX_RETRIES);
-    let result = download_with_transport_progress_and_delays(
-        file,
-        model_dir,
-        &transport,
-        delays,
-        |update| match update {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?;
+    let result = runtime.block_on(async {
+        let transport = ReqwestTransport::new(token)?;
+        download_with_transport_progress_async(file, model_dir, &transport, |update| match update {
             ProgressUpdate::Seed(position) => {
                 progress.set_message(file.filename.clone());
                 progress.set_position(position);
@@ -74,8 +70,9 @@ pub fn download(
                 progress.set_message(format!("Verifying {}", file.filename));
                 progress.tick();
             }
-        },
-    );
+        })
+        .await
+    });
     progress.finish_and_clear();
     result
 }
@@ -96,30 +93,52 @@ fn download_with_transport_progress(
     transport: &impl Transport,
     progress: impl FnMut(ProgressUpdate),
 ) -> Result<DownloadOutcome, String> {
-    download_with_transport_progress_and_delays(
-        spec,
-        model_dir,
-        transport,
-        NoDelay.take(MAX_RETRIES),
-        progress,
-    )
+    test_runtime().block_on(download_with_transport_progress_async(
+        spec, model_dir, transport, progress,
+    ))
 }
 
-fn download_with_transport_progress_and_delays(
+async fn download_with_transport_progress_async(
     spec: &ResolvedFile,
     model_dir: &Path,
     transport: &impl Transport,
-    delays: impl IntoIterator<Item = Duration>,
     mut progress: impl FnMut(ProgressUpdate),
 ) -> Result<DownloadOutcome, String> {
-    retry(delays, || {
-        match download_once(spec, model_dir, transport, &mut progress) {
-            Ok(path) => OperationResult::Ok(path),
-            Err(error) if error.is_retryable() => OperationResult::Retry(error),
-            Err(error) => OperationResult::Err(error),
-        }
-    })
-    .map_err(|error| error.error.into_message())
+    let context = (transport, &mut progress);
+    let (_, result) = (|context| retry_once(spec, model_dir, context))
+        .retry(
+            ExponentialBuilder::default()
+                .with_min_delay(Duration::from_millis(250))
+                .with_jitter()
+                .with_max_times(MAX_RETRIES),
+        )
+        .sleep(tokio::time::sleep)
+        .when(|error: &TransferError| error.is_retryable())
+        .context(context)
+        .await;
+    result.map_err(TransferError::into_message)
+}
+
+async fn retry_once<'a, T, P>(
+    spec: &ResolvedFile,
+    model_dir: &Path,
+    context: (&'a T, &'a mut P),
+) -> ((&'a T, &'a mut P), Result<DownloadOutcome, TransferError>)
+where
+    T: Transport,
+    P: FnMut(ProgressUpdate),
+{
+    let (transport, progress) = context;
+    let result = download_once(spec, model_dir, transport, &mut *progress).await;
+    ((transport, progress), result)
+}
+
+#[cfg(test)]
+fn test_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
 }
 
 #[cfg(test)]

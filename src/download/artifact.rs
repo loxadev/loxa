@@ -1,4 +1,4 @@
-use super::http::{artifact_url, TransferError, Transport};
+use super::http::{artifact_url, Transfer, TransferError, Transport};
 use super::{DownloadOutcome, ProgressUpdate};
 use crate::huggingface::ResolvedFile;
 use reqwest::StatusCode;
@@ -7,7 +7,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
 
-pub(super) fn download_once(
+pub(super) async fn download_once(
     spec: &ResolvedFile,
     model_dir: &Path,
     transport: &impl Transport,
@@ -58,7 +58,9 @@ pub(super) fn download_once(
         finish_repair(model_dir, &invalid_path, &restart_path)?;
         return Ok(DownloadOutcome::Pulled(final_path));
     }
-    let mut transfer = transport.get(&artifact_url(spec)?, (offset > 0).then_some(offset))?;
+    let mut transfer = transport
+        .get(&artifact_url(spec)?, (offset > 0).then_some(offset))
+        .await?;
     let ignored_range = offset > 0 && transfer.status == StatusCode::OK;
     let (target, append) = if ignored_range {
         progress(ProgressUpdate::Seed(0));
@@ -100,13 +102,10 @@ pub(super) fn download_once(
             .map_err(|error| format!("{}: {error}", target.display()))?;
     }
     let progress_offset = if append { offset } else { 0 };
-    let copied = copy_bounded(
-        transfer.reader.as_mut(),
-        &mut output,
-        target,
-        read_limit,
-        |copied| progress(ProgressUpdate::Position(progress_offset + copied)),
-    )?;
+    let copied = copy_bounded(&mut transfer, &mut output, target, read_limit, |copied| {
+        progress(ProgressUpdate::Position(progress_offset + copied))
+    })
+    .await?;
     if copied > expected_written {
         drop(output);
         fs::remove_file(target).map_err(|error| format!("{}: {error}", target.display()))?;
@@ -137,31 +136,32 @@ pub(super) fn download_once(
     Ok(DownloadOutcome::Pulled(final_path))
 }
 
-fn copy_bounded(
-    reader: &mut dyn Read,
+async fn copy_bounded(
+    transfer: &mut Transfer,
     output: &mut File,
     target: &Path,
     limit: u64,
     mut progress: impl FnMut(u64),
 ) -> Result<u64, TransferError> {
     let mut copied = 0;
-    let mut buffer = [0_u8; 64 * 1024];
     while copied < limit {
-        let remaining = (limit - copied).min(buffer.len() as u64) as usize;
-        let read = match reader.read(&mut buffer[..remaining]) {
-            Ok(read) => read,
-            Err(_) => {
+        let remaining = (limit - copied).min(64 * 1024) as usize;
+        let chunk = match transfer.chunk(remaining).await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(error) => {
                 output
                     .sync_all()
-                    .map_err(|error| format!("{}: {error}", target.display()))?;
-                return Err(TransferError::retryable("artifact response body failed"));
+                    .map_err(|sync| format!("{}: {sync}", target.display()))?;
+                return Err(error);
             }
         };
-        if read == 0 {
-            break;
+        if chunk.is_empty() {
+            continue;
         }
+        let read = chunk.len();
         output
-            .write_all(&buffer[..read])
+            .write_all(&chunk[..read])
             .map_err(|error| format!("{}: {error}", target.display()))?;
         copied += read as u64;
         progress(copied);

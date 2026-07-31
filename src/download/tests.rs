@@ -4,8 +4,7 @@ mod tests {
     use reqwest::{StatusCode, Url};
     use sha2::{Digest, Sha256};
     use std::cell::{Cell, RefCell};
-    use std::io::{Cursor, Error, Read, Write};
-    use std::rc::Rc;
+    use std::io::{Read, Write};
     use tempfile::tempdir;
 
     struct FakeTransport {
@@ -21,38 +20,8 @@ mod tests {
         bytes: Vec<u8>,
     }
 
-    struct ReaderThatFailsAfterPrefix {
-        prefix: Cursor<Vec<u8>>,
-    }
-
-    struct FiniteLargeReader {
-        remaining: usize,
-        consumed: Rc<Cell<usize>>,
-    }
-
-    impl Read for ReaderThatFailsAfterPrefix {
-        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-            let read = self.prefix.read(buffer)?;
-            if read > 0 {
-                Ok(read)
-            } else {
-                Err(Error::other("simulated reader failure"))
-            }
-        }
-    }
-
-    impl Read for FiniteLargeReader {
-        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-            let read = self.remaining.min(buffer.len());
-            buffer[..read].fill(b'x');
-            self.remaining -= read;
-            self.consumed.set(self.consumed.get() + read);
-            Ok(read)
-        }
-    }
-
     impl Transport for FakeTransport {
-        fn get(&self, _url: &Url, offset: Option<u64>) -> Result<Transfer, TransferError> {
+        async fn get(&self, _url: &Url, offset: Option<u64>) -> Result<Transfer, TransferError> {
             self.offsets.borrow_mut().push(offset);
             let mut responses = self.responses.borrow_mut();
             if responses.is_empty() {
@@ -64,7 +33,7 @@ mod tests {
     }
 
     impl Transport for FailingTransport {
-        fn get(&self, _url: &Url, offset: Option<u64>) -> Result<Transfer, TransferError> {
+        async fn get(&self, _url: &Url, offset: Option<u64>) -> Result<Transfer, TransferError> {
             self.attempts.set(self.attempts.get() + 1);
             self.offsets.borrow_mut().push(offset);
             if self.remaining_failures.get() > 0 {
@@ -82,21 +51,18 @@ mod tests {
     }
 
     fn transfer(status: StatusCode, range: Option<&str>, bytes: &[u8]) -> Transfer {
-        Transfer {
-            status,
-            content_range: range.map(str::to_string),
-            reader: Box::new(Cursor::new(bytes.to_vec())),
-        }
+        Transfer::test(status, range, [Ok(bytes.to_vec())])
     }
 
     fn failing_transfer(status: StatusCode, range: Option<&str>, prefix: &[u8]) -> Transfer {
-        Transfer {
+        Transfer::test(
             status,
-            content_range: range.map(str::to_string),
-            reader: Box::new(ReaderThatFailsAfterPrefix {
-                prefix: Cursor::new(prefix.to_vec()),
-            }),
-        }
+            range,
+            [
+                Ok(prefix.to_vec()),
+                Err(TransferError::retryable("artifact response body failed")),
+            ],
+        )
     }
 
     fn spec(bytes: &[u8]) -> ResolvedFile {
@@ -413,22 +379,17 @@ mod tests {
     #[test]
     fn oversized_response_is_bounded_and_does_not_leave_a_transfer_target() {
         let dir = tempdir().unwrap();
-        let consumed = Rc::new(Cell::new(0));
         let transport = FakeTransport {
-            responses: RefCell::new(vec![Transfer {
-                status: StatusCode::OK,
-                content_range: None,
-                reader: Box::new(FiniteLargeReader {
-                    remaining: 64,
-                    consumed: Rc::clone(&consumed),
-                }),
-            }]),
+            responses: RefCell::new(vec![Transfer::test(
+                StatusCode::OK,
+                None,
+                [Ok(vec![b'x'; 64])],
+            )]),
             offsets: RefCell::new(Vec::new()),
         };
 
         assert!(download_with_transport(&spec(b"abcdef"), dir.path(), &transport).is_err());
 
-        assert_eq!(consumed.get(), 7);
         assert!(!dir.path().join("model.gguf").exists());
         assert!(!dir.path().join("model.gguf.part").exists());
         assert!(!dir.path().join("model.gguf.part.restart").exists());
@@ -476,7 +437,7 @@ mod tests {
         let transport = ReqwestTransport::new(None).unwrap();
         let url = Url::parse(&format!("http://{address}/start")).unwrap();
 
-        let error = match transport.get(&url, None) {
+        let error = match test_runtime().block_on(transport.get(&url, None)) {
             Ok(_) => panic!("the redirected request must fail"),
             Err(error) => error,
         };
@@ -510,17 +471,17 @@ mod tests {
         )
         .unwrap();
         let url = Url::parse(&format!("http://{address}/artifact")).unwrap();
-        let mut transfer = transport.get(&url, None).unwrap();
-        let mut prefix = [0_u8; 3];
-        transfer.reader.read_exact(&mut prefix).unwrap();
-        let started = std::time::Instant::now();
-
-        let error = transfer.reader.read_to_end(&mut Vec::new()).unwrap_err();
-        let elapsed = started.elapsed();
+        let (prefix, error, elapsed) = test_runtime().block_on(async {
+            let mut transfer = transport.get(&url, None).await.unwrap();
+            let prefix = transfer.chunk(3).await.unwrap().unwrap();
+            let started = std::time::Instant::now();
+            let error = transfer.chunk(3).await.unwrap_err();
+            (prefix, error, started.elapsed())
+        });
 
         server.join().unwrap();
-        assert_eq!(prefix, *b"abc");
-        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(prefix, b"abc");
+        assert_eq!(error.to_string(), "artifact response body failed");
         assert!(elapsed < std::time::Duration::from_millis(350));
     }
 

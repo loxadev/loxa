@@ -2,8 +2,6 @@ use crate::huggingface::{should_attach_token, ResolvedFile};
 use reqwest::header::{CONTENT_RANGE, LOCATION, RANGE};
 use reqwest::{redirect::Policy, StatusCode, Url};
 use std::fmt::{self, Display};
-use std::io::{self, Read};
-use std::rc::Rc;
 use std::time::Duration;
 
 const MAX_REDIRECTS: usize = 5;
@@ -12,7 +10,61 @@ const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 pub(super) struct Transfer {
     pub(super) status: StatusCode,
     pub(super) content_range: Option<String>,
-    pub(super) reader: Box<dyn Read>,
+    response: ResponseBody,
+    pending: Vec<u8>,
+}
+
+impl Transfer {
+    pub(super) async fn chunk(&mut self, limit: usize) -> Result<Option<Vec<u8>>, TransferError> {
+        if !self.pending.is_empty() {
+            return Ok(Some(self.take_pending(limit)));
+        }
+        let chunk = match &mut self.response {
+            ResponseBody::Reqwest(response) => response
+                .chunk()
+                .await
+                .map(|chunk| chunk.map(|chunk| chunk.to_vec()))
+                .map_err(classify_body_error),
+            #[cfg(test)]
+            ResponseBody::Test(chunks) => match chunks.pop_front() {
+                Some(chunk) => chunk.map(Some),
+                None => Ok(None),
+            },
+        }?;
+        match chunk {
+            Some(chunk) if chunk.len() > limit => {
+                self.pending.extend_from_slice(&chunk[limit..]);
+                Ok(Some(chunk[..limit].to_vec()))
+            }
+            Some(chunk) => Ok(Some(chunk)),
+            None => Ok(None),
+        }
+    }
+
+    fn take_pending(&mut self, limit: usize) -> Vec<u8> {
+        let take = self.pending.len().min(limit);
+        self.pending.drain(..take).collect()
+    }
+
+    #[cfg(test)]
+    pub(super) fn test(
+        status: StatusCode,
+        content_range: Option<&str>,
+        chunks: impl IntoIterator<Item = Result<Vec<u8>, TransferError>>,
+    ) -> Self {
+        Self {
+            status,
+            content_range: content_range.map(str::to_string),
+            response: ResponseBody::Test(chunks.into_iter().collect()),
+            pending: Vec::new(),
+        }
+    }
+}
+
+enum ResponseBody {
+    Reqwest(reqwest::Response),
+    #[cfg(test)]
+    Test(std::collections::VecDeque<Result<Vec<u8>, TransferError>>),
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -51,6 +103,8 @@ impl Display for TransferError {
     }
 }
 
+impl std::error::Error for TransferError {}
+
 impl From<String> for TransferError {
     fn from(message: String) -> Self {
         Self::fatal(message)
@@ -64,12 +118,11 @@ impl From<&str> for TransferError {
 }
 
 pub(super) trait Transport {
-    fn get(&self, url: &Url, offset: Option<u64>) -> Result<Transfer, TransferError>;
+    async fn get(&self, url: &Url, offset: Option<u64>) -> Result<Transfer, TransferError>;
 }
 
 pub(super) struct ReqwestTransport {
     client: reqwest::Client,
-    runtime: Rc<tokio::runtime::Runtime>,
     token: Option<String>,
 }
 
@@ -87,30 +140,19 @@ impl ReqwestTransport {
     }
 
     fn build(token: Option<String>, read_timeout: Duration) -> Result<Self, String> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
+        let client = reqwest::Client::builder()
+            .user_agent(concat!("loxa/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(Duration::from_secs(30))
+            .read_timeout(read_timeout)
+            .redirect(Policy::none())
             .build()
             .map_err(|error| error.to_string())?;
-        let client = {
-            let _guard = runtime.enter();
-            reqwest::Client::builder()
-                .user_agent(concat!("loxa/", env!("CARGO_PKG_VERSION")))
-                .connect_timeout(Duration::from_secs(30))
-                .read_timeout(read_timeout)
-                .redirect(Policy::none())
-                .build()
-                .map_err(|error| error.to_string())?
-        };
-        Ok(Self {
-            client,
-            runtime: Rc::new(runtime),
-            token,
-        })
+        Ok(Self { client, token })
     }
 }
 
 impl Transport for ReqwestTransport {
-    fn get(&self, url: &Url, offset: Option<u64>) -> Result<Transfer, TransferError> {
+    async fn get(&self, url: &Url, offset: Option<u64>) -> Result<Transfer, TransferError> {
         let mut current = url.clone();
         for redirect in 0..=MAX_REDIRECTS {
             let mut request = self.client.get(current.clone());
@@ -123,8 +165,13 @@ impl Transport for ReqwestTransport {
                 request = request.header(RANGE, format!("bytes={offset}-"));
             }
             let response = self
-                .runtime
-                .block_on(async { request.send().await })
+                .client
+                .execute(
+                    request
+                        .build()
+                        .map_err(|_| TransferError::fatal("artifact request could not be sent"))?,
+                )
+                .await
                 .map_err(classify_request_error)?;
             if response.status().is_redirection() {
                 if redirect == MAX_REDIRECTS {
@@ -160,7 +207,8 @@ impl Transport for ReqwestTransport {
                     return Ok(Transfer {
                         status,
                         content_range,
-                        reader: Box::new(ResponseReader::new(Rc::clone(&self.runtime), response)),
+                        response: ResponseBody::Reqwest(response),
+                        pending: Vec::new(),
                     });
                 }
                 status if transient_status(status) => {
@@ -176,57 +224,6 @@ impl Transport for ReqwestTransport {
             }
         }
         Err(TransferError::fatal("too many artifact redirects"))
-    }
-}
-
-struct ResponseReader {
-    response: reqwest::Response,
-    runtime: Rc<tokio::runtime::Runtime>,
-    buffered: Vec<u8>,
-    position: usize,
-}
-
-impl ResponseReader {
-    fn new(runtime: Rc<tokio::runtime::Runtime>, response: reqwest::Response) -> Self {
-        Self {
-            response,
-            runtime,
-            buffered: Vec::new(),
-            position: 0,
-        }
-    }
-}
-
-impl Read for ResponseReader {
-    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
-        if output.is_empty() {
-            return Ok(0);
-        }
-        while self.position == self.buffered.len() {
-            let runtime = Rc::clone(&self.runtime);
-            match runtime.block_on(async { self.response.chunk().await }) {
-                Ok(Some(chunk)) if !chunk.is_empty() => {
-                    self.buffered.clear();
-                    self.buffered.extend_from_slice(&chunk);
-                    self.position = 0;
-                }
-                Ok(Some(_)) => continue,
-                Ok(None) => return Ok(0),
-                Err(error) => {
-                    let kind = if error.is_timeout() {
-                        io::ErrorKind::TimedOut
-                    } else {
-                        io::ErrorKind::Other
-                    };
-                    return Err(io::Error::new(kind, "artifact response body failed"));
-                }
-            }
-        }
-        let available = &self.buffered[self.position..];
-        let copied = available.len().min(output.len());
-        output[..copied].copy_from_slice(&available[..copied]);
-        self.position += copied;
-        Ok(copied)
     }
 }
 
@@ -247,6 +244,14 @@ fn classify_request_error(error: reqwest::Error) -> TransferError {
         TransferError::retryable("artifact request failed")
     } else {
         TransferError::fatal("artifact request could not be sent")
+    }
+}
+
+fn classify_body_error(error: reqwest::Error) -> TransferError {
+    if error.is_timeout() || error.is_body() {
+        TransferError::retryable("artifact response body failed")
+    } else {
+        TransferError::fatal("artifact response body failed")
     }
 }
 
