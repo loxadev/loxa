@@ -39,12 +39,14 @@ pub fn discover_server(
                     managed.display()
                 ));
             }
-            let first_line = probe_version(managed).map_err(|error| {
-                format!(
-                    "managed llama-server bundle is damaged at {}: {error}",
-                    managed.display()
-                )
-            })?;
+            let first_line = probe_version(managed)
+                .and_then(managed_version_first_line)
+                .map_err(|error| {
+                    format!(
+                        "managed llama-server bundle is damaged at {}: {error}",
+                        managed.display()
+                    )
+                })?;
             if first_line != MANAGED_VERSION {
                 return Err(format!(
                     "managed llama-server bundle is damaged at {}: expected --version first line {MANAGED_VERSION:?}, found {first_line:?}",
@@ -93,11 +95,20 @@ fn validate_candidate(path: &Path, source: &str) -> Result<(), String> {
     })
 }
 
-fn probe_version(path: &Path) -> Result<String, String> {
+#[derive(Debug)]
+struct VersionProbeOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+fn probe_version(path: &Path) -> Result<VersionProbeOutput, String> {
     probe_version_with_timeout(path, VERSION_PROBE_TIMEOUT)
 }
 
-fn probe_version_with_timeout(path: &Path, timeout: Duration) -> Result<String, String> {
+fn probe_version_with_timeout(
+    path: &Path,
+    timeout: Duration,
+) -> Result<VersionProbeOutput, String> {
     let mut child = Command::new(path)
         .arg("--version")
         .stdin(Stdio::null())
@@ -161,9 +172,13 @@ fn probe_version_with_timeout(path: &Path, timeout: Duration) -> Result<String, 
             stdout = output?;
         }
     }
-    match (stdout.is_empty(), stderr.is_empty()) {
-        (false, true) => Ok(first_line(&stdout)),
-        (true, false) => Ok(first_line(&stderr)),
+    Ok(VersionProbeOutput { stdout, stderr })
+}
+
+fn managed_version_first_line(output: VersionProbeOutput) -> Result<String, String> {
+    match (output.stdout.is_empty(), output.stderr.is_empty()) {
+        (false, true) => Ok(first_line(&output.stdout)),
+        (true, false) => Ok(first_line(&output.stderr)),
         (true, true) => Err("--version produced no output".into()),
         (false, false) => {
             Err("--version output is ambiguous: wrote to both stdout and stderr".into())
@@ -565,6 +580,14 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn write_dual_stream_version_script(path: &Path) {
+        write_executable_script(
+            path,
+            b"#!/bin/sh\nprintf '%s\\n' 'version: usable'\nprintf '%s\\n' 'harmless warning' >&2\n",
+        );
+    }
+
+    #[cfg(unix)]
     fn run_with_signal(signal: libc::c_int) -> i32 {
         let dir = tempdir().unwrap();
         let server = dir.path().join("server");
@@ -664,6 +687,49 @@ mod tests {
             managed
         );
         std::fs::remove_file(&managed).unwrap();
+        assert_eq!(
+            discover_server(None, None, &managed, Some(search_path.as_os_str())).unwrap(),
+            path_server
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_dual_stream_explicit_candidate_is_accepted() {
+        let dir = tempdir().unwrap();
+        let explicit = dir.path().join("explicit");
+        let managed = dir.path().join("missing-managed");
+        write_dual_stream_version_script(&explicit);
+
+        assert_eq!(
+            discover_server(Some(&explicit), None, &managed, None).unwrap(),
+            explicit
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_dual_stream_environment_candidate_is_accepted() {
+        let dir = tempdir().unwrap();
+        let environment = dir.path().join("environment");
+        let managed = dir.path().join("missing-managed");
+        write_dual_stream_version_script(&environment);
+
+        assert_eq!(
+            discover_server(None, Some(environment.as_os_str()), &managed, None).unwrap(),
+            environment
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_dual_stream_path_candidate_is_accepted() {
+        let dir = tempdir().unwrap();
+        let managed = dir.path().join("missing-managed");
+        let path_server = dir.path().join("llama-server");
+        write_dual_stream_version_script(&path_server);
+        let search_path = std::env::join_paths([dir.path()]).unwrap();
+
         assert_eq!(
             discover_server(None, None, &managed, Some(search_path.as_os_str())).unwrap(),
             path_server
