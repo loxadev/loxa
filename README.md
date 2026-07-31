@@ -18,13 +18,13 @@ Build and try the MVP:
 cargo build --release --locked
 ./target/release/loxa pull bartowski/SmolLM2-135M-Instruct-GGUF --quant Q4_K_M --name smollm2-135m
 ./target/release/loxa list
-./target/release/loxa run smollm2-135m
+./target/release/loxa run
 ```
 
 When `run` is ready, it prints:
 
 ```text
-ready: http://127.0.0.1:<automatic-port> (model smollm2-135m)
+Ready http://127.0.0.1:<automatic-port> (model smollm2-135m)
 ```
 
 The printed loopback URL with `/v1/models` is the readiness check. Stop `run`
@@ -34,13 +34,14 @@ with Ctrl-C, then chat in the terminal:
 ./target/release/loxa chat
 ```
 
-With one installed model, Loxa starts it immediately. With several, use the
-arrow-key picker or pass the model directly: `loxa chat smollm2-135m`.
+With one installed model, `run` and `chat` start it immediately. With several,
+use the arrow-key picker or pass the model directly, such as
+`loxa chat smollm2-135m`.
 
-`pull` resolves the requested revision to an immutable Hugging Face commit,
-resumes interrupted transfers, verifies the expected size and SHA-256, and
-publishes the local manifest only after verification. Split GGUF models are not
-supported yet.
+`pull` shows byte progress, resolves the requested revision to an immutable
+Hugging Face commit, resumes interrupted transfers, verifies the expected size
+and SHA-256, and publishes the local manifest only after verification. Split
+GGUF models are not supported yet.
 
 Both commands choose a local port automatically and use a 4096-token context.
 To override a default, create `~/.loxa/config.json`, for example:
