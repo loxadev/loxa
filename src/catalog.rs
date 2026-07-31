@@ -4,23 +4,39 @@ use std::fs::{self, OpenOptions, TryLockError};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-pub struct PullLock {
+pub struct ModelLock {
     _file: fs::File,
 }
 
-impl PullLock {
+impl ModelLock {
     pub fn acquire(model_dir: &Path) -> Result<Self, String> {
         ensure_catalog_directory(model_dir)?;
         let path = model_dir.join(".lock");
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
+        let mut options = OpenOptions::new();
+        options.create(true).truncate(false).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options
             .open(&path)
             .map_err(|error| format!("{}: {error}", path.display()))?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        if !metadata.file_type().is_file() {
+            return Err(format!("unsafe model lock {}", path.display()));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.nlink() != 1 {
+                return Err(format!("unsafe model lock {}", path.display()));
+            }
+        }
         file.try_lock().map_err(|error| match error {
-            TryLockError::WouldBlock => "another pull is already active for this model".into(),
+            TryLockError::WouldBlock => "model is busy in another Loxa command".into(),
             TryLockError::Error(error) => format!("{}: {error}", path.display()),
         })?;
         Ok(Self { _file: file })
@@ -161,6 +177,85 @@ pub fn publish_manifest(models_root: &Path, manifest: &Manifest) -> Result<PathB
     write_manifest_atomic(&dir, "manifest.json", manifest)?;
     finish_pending(&dir)?;
     Ok(final_path)
+}
+
+pub fn remove_model(models_root: &Path, manifest: &Manifest) -> Result<(), String> {
+    manifest.validate()?;
+    let model_dir = models_root.join(&manifest.id);
+    if model_dir.file_name().and_then(|name| name.to_str()) != Some(manifest.id.as_str()) {
+        return Err("model id does not match model directory".into());
+    }
+    let _lock = ModelLock::acquire(&model_dir)?;
+    let current = load_catalog(models_root)?
+        .into_iter()
+        .find(|entry| entry.id == manifest.id)
+        .ok_or_else(|| format!("unknown model id {}", manifest.id))?;
+    if current != *manifest {
+        return Err(format!("model {} changed before removal", manifest.id));
+    }
+
+    const OWNED_ENTRIES: [&str; 9] = [
+        ".lock",
+        "manifest.json",
+        "manifest.json.tmp",
+        "pending.json",
+        "pending.json.tmp",
+        "model.gguf",
+        "model.gguf.part",
+        "model.gguf.part.restart",
+        "model.gguf.invalid",
+    ];
+    for entry in fs::read_dir(&model_dir).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry.file_name();
+        let name = name
+            .to_str()
+            .ok_or_else(|| format!("unexpected model entry {}", entry.path().display()))?;
+        if !OWNED_ENTRIES.contains(&name) {
+            return Err(format!("unexpected model entry {}", entry.path().display()));
+        }
+        if !entry
+            .file_type()
+            .map_err(|error| error.to_string())?
+            .is_file()
+        {
+            return Err(format!("unsafe model entry {}", entry.path().display()));
+        }
+        if name == "pending.json" {
+            let pending: Manifest =
+                serde_json::from_slice(&fs::read(entry.path()).map_err(|error| error.to_string())?)
+                    .map_err(|error| format!("{}: {error}", entry.path().display()))?;
+            pending.validate()?;
+            if pending != *manifest {
+                return Err(format!(
+                    "model {} has recovery state for a different artifact",
+                    manifest.id
+                ));
+            }
+        }
+    }
+
+    for name in [
+        "model.gguf",
+        "model.gguf.part",
+        "model.gguf.part.restart",
+        "model.gguf.invalid",
+        "pending.json",
+        "pending.json.tmp",
+        "manifest.json.tmp",
+    ] {
+        remove_regular_if_present(&model_dir.join(name))?;
+    }
+    fs::File::open(&model_dir)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|error| error.to_string())?;
+    let manifest_path = model_dir.join("manifest.json");
+    fs::remove_file(&manifest_path)
+        .map_err(|error| format!("{}: {error}", manifest_path.display()))?;
+    fs::File::open(&model_dir)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 fn ensure_catalog_directory(dir: &Path) -> Result<(), String> {
@@ -336,23 +431,23 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_second_pull_lock_is_rejected_until_the_first_is_released() {
+    fn a_second_model_lock_is_rejected_until_the_first_is_released() {
         let dir = tempdir().unwrap();
-        let first = PullLock::acquire(dir.path()).unwrap();
-        assert!(PullLock::acquire(dir.path()).is_err());
+        let first = ModelLock::acquire(dir.path()).unwrap();
+        assert!(ModelLock::acquire(dir.path()).is_err());
         drop(first);
-        PullLock::acquire(dir.path()).unwrap();
+        ModelLock::acquire(dir.path()).unwrap();
     }
 
     #[test]
-    fn pull_lock_reports_lock_path_when_lock_is_a_directory() {
+    fn model_lock_reports_lock_path_when_lock_is_a_directory() {
         let root = tempdir().unwrap();
         let model_dir = root.path().join("demo");
         let lock_path = model_dir.join(".lock");
         std::fs::create_dir_all(&lock_path).unwrap();
 
-        let error = match PullLock::acquire(&model_dir) {
-            Ok(_) => panic!("a directory cannot be acquired as a pull lock"),
+        let error = match ModelLock::acquire(&model_dir) {
+            Ok(_) => panic!("a directory cannot be acquired as a model lock"),
             Err(error) => error,
         };
 
@@ -366,7 +461,30 @@ mod tests {
         std::fs::create_dir_all(&model_dir).unwrap();
         std::fs::write(model_dir.join(".lock"), b"stale").unwrap();
 
-        PullLock::acquire(&model_dir).unwrap();
+        ModelLock::acquire(&model_dir).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn symlinked_or_hard_linked_model_lock_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        for link in ["symlink", "hard-link"] {
+            let root = tempdir().unwrap();
+            let model_dir = root.path().join("demo");
+            let outside = root.path().join("outside");
+            std::fs::create_dir_all(&model_dir).unwrap();
+            std::fs::write(&outside, b"keep").unwrap();
+            let lock = model_dir.join(".lock");
+            if link == "symlink" {
+                symlink(&outside, &lock).unwrap();
+            } else {
+                std::fs::hard_link(&outside, &lock).unwrap();
+            }
+
+            assert!(ModelLock::acquire(&model_dir).is_err());
+            assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -387,7 +505,7 @@ mod tests {
         symlink(&outside, &model_dir).unwrap();
         let expected = manifest("demo");
 
-        assert!(PullLock::acquire(&model_dir).is_err());
+        assert!(ModelLock::acquire(&model_dir).is_err());
         assert!(prepare_pull(&model_dir, &expected).is_err());
         assert!(publish_manifest(&models, &expected).is_err());
 
@@ -478,5 +596,114 @@ mod tests {
         assert!(publish_manifest(root.path(), &invalid).is_err());
         assert!(!invalid_dir.join("manifest.json").exists());
         assert!(load_catalog(root.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn removing_a_model_deletes_owned_state_and_keeps_a_stable_lock_anchor() {
+        let root = tempdir().unwrap();
+        let expected = manifest("demo");
+        write_artifact(root.path(), &expected.id);
+        publish_manifest(root.path(), &expected).unwrap();
+        std::fs::write(root.path().join("foreign.gguf"), b"keep").unwrap();
+
+        remove_model(root.path(), &expected).unwrap();
+
+        let model_dir = root.path().join("demo");
+        assert!(model_dir.is_dir());
+        assert!(!model_dir.join("manifest.json").exists());
+        assert!(!model_dir.join("model.gguf").exists());
+        assert!(model_dir.join(".lock").is_file());
+        ModelLock::acquire(&model_dir).unwrap();
+        assert_eq!(
+            std::fs::read(root.path().join("foreign.gguf")).unwrap(),
+            b"keep"
+        );
+        assert!(load_catalog(root.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn removing_a_model_cleans_only_known_recovery_state() {
+        let root = tempdir().unwrap();
+        let expected = manifest("demo");
+        write_artifact(root.path(), &expected.id);
+        publish_manifest(root.path(), &expected).unwrap();
+        let model_dir = root.path().join("demo");
+        for name in [
+            "pending.json.tmp",
+            "manifest.json.tmp",
+            "model.gguf.part",
+            "model.gguf.part.restart",
+            "model.gguf.invalid",
+        ] {
+            std::fs::write(model_dir.join(name), b"recovery").unwrap();
+        }
+        std::fs::write(
+            model_dir.join("pending.json"),
+            serde_json::to_vec(&expected).unwrap(),
+        )
+        .unwrap();
+
+        remove_model(root.path(), &expected).unwrap();
+
+        assert_eq!(
+            std::fs::read_dir(&model_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>(),
+            [".lock"]
+        );
+        assert!(load_catalog(root.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn removing_a_model_refuses_mismatched_pending_state() {
+        let root = tempdir().unwrap();
+        let expected = manifest("demo");
+        write_artifact(root.path(), &expected.id);
+        publish_manifest(root.path(), &expected).unwrap();
+        let mut pending = expected.clone();
+        pending.sha256 = "b".repeat(64);
+        std::fs::write(
+            root.path().join("demo/pending.json"),
+            serde_json::to_vec(&pending).unwrap(),
+        )
+        .unwrap();
+
+        let error = remove_model(root.path(), &expected).unwrap_err();
+
+        assert!(error.contains("different artifact"), "{error}");
+        assert_eq!(load_catalog(root.path()).unwrap(), vec![expected]);
+    }
+
+    #[test]
+    fn removing_a_model_refuses_unexpected_entries_without_mutation() {
+        let root = tempdir().unwrap();
+        let expected = manifest("demo");
+        write_artifact(root.path(), &expected.id);
+        publish_manifest(root.path(), &expected).unwrap();
+        let unexpected = root.path().join("demo/notes.txt");
+        std::fs::write(&unexpected, b"keep").unwrap();
+
+        let error = remove_model(root.path(), &expected).unwrap_err();
+
+        assert!(error.contains("unexpected model entry"), "{error}");
+        assert_eq!(std::fs::read(&unexpected).unwrap(), b"keep");
+        assert_eq!(load_catalog(root.path()).unwrap(), vec![expected]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removing_a_busy_model_is_rejected() {
+        let root = tempdir().unwrap();
+        let expected = manifest("demo");
+        write_artifact(root.path(), &expected.id);
+        publish_manifest(root.path(), &expected).unwrap();
+        let lock = ModelLock::acquire(&root.path().join("demo")).unwrap();
+
+        let error = remove_model(root.path(), &expected).unwrap_err();
+
+        assert!(error.contains("busy"), "{error}");
+        assert_eq!(load_catalog(root.path()).unwrap(), vec![expected]);
+        drop(lock);
     }
 }

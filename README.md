@@ -57,6 +57,9 @@ down the owned server process.
 Models are stored under `~/.loxa/models`. Set `LOXA_HOME` to use another
 location.
 
+Remove a managed model with `loxa rm <id>`. The interactive command asks for
+confirmation; scripts must use an explicit ID and `--yes`.
+
 ## License
 
 Apache-2.0

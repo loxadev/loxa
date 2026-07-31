@@ -18,6 +18,7 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 
 struct Runnable {
+    _model_lock: catalog::ModelLock,
     server: PathBuf,
     artifact: PathBuf,
     id: String,
@@ -61,7 +62,7 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
                 .name
                 .unwrap_or_else(|| default_id(&repo, &resolved.filename, &resolved.sha256));
             let model_dir = paths.model_dir(&id)?;
-            let _pull_lock = catalog::PullLock::acquire(&model_dir)?;
+            let _model_lock = catalog::ModelLock::acquire(&model_dir)?;
             let manifest = Manifest {
                 version: 1,
                 id: id.clone(),
@@ -129,6 +130,46 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
                     &entry.revision[..12]
                 );
             }
+            Ok(0)
+        }
+        Command::Rm(args) => {
+            let installed = catalog::load_catalog(&paths.models)?;
+            if args.id.is_none() && installed.is_empty() {
+                return Err("no models installed".into());
+            }
+            let stdin = std::io::stdin().is_terminal();
+            let stderr = std::io::stderr().is_terminal();
+            if args.id.is_none() && (!stdin || !stderr) {
+                return Err(
+                    "non-interactive removal requires an explicit model ID; pass `loxa rm <id> --yes`"
+                        .into(),
+                );
+            }
+            let id = match select_model("rm", args.id, &installed, stdin, stderr)? {
+                ModelSelection::Selected(id) => id,
+                ModelSelection::Exit(code) => return Ok(code),
+            };
+            let manifest = installed
+                .into_iter()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| format!("unknown model id {id}"))?;
+            if !args.yes {
+                if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+                    return Err(
+                        "removal confirmation requires an interactive terminal; pass --yes".into(),
+                    );
+                }
+                let prompt = format!("Remove {} ({})?", manifest.id, BinaryBytes(manifest.size));
+                match inquire::Confirm::new(&prompt).with_default(false).prompt() {
+                    Ok(true) => {}
+                    Ok(false) | Err(inquire::InquireError::OperationCanceled) => return Ok(0),
+                    Err(inquire::InquireError::OperationInterrupted) => return Ok(130),
+                    Err(error) => return Err(format!("removal confirmation failed: {error}")),
+                }
+            }
+            catalog::remove_model(&paths.models, &manifest)?;
+            let success = ui::success();
+            anstream::println!("{success}Removed{success:#} {}", manifest.id);
             Ok(0)
         }
         Command::Run(args) => {
@@ -263,10 +304,12 @@ fn resolve_runnable(
         .into_iter()
         .find(|entry| entry.id == id)
         .ok_or_else(|| format!("unknown model id {id}"))?;
+    let model_lock = catalog::ModelLock::acquire(&paths.model_dir(&manifest.id)?)?;
     let artifact = manifest.artifact_path(&paths.models);
     download::verify_regular(&artifact, manifest.size, &manifest.sha256)?;
     let server = runner::discover_from_process(runtime.server.as_deref(), &paths.managed_server)?;
     Ok(Runnable {
+        _model_lock: model_lock,
         server,
         artifact,
         id: manifest.id,
@@ -319,6 +362,24 @@ mod tests {
             sha256: "a".repeat(64),
             size: 1,
         }
+    }
+
+    fn install(paths: &AppPaths, id: &str) -> Manifest {
+        let manifest = Manifest {
+            version: 1,
+            id: id.into(),
+            repo: "owner/repo".into(),
+            revision: "0".repeat(40),
+            remote_filename: "model-Q4_K_M.gguf".into(),
+            local_filename: "model.gguf".into(),
+            sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
+            size: 3,
+        };
+        let model_dir = paths.model_dir(id).unwrap();
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("model.gguf"), b"abc").unwrap();
+        crate::catalog::publish_manifest(&paths.models, &manifest).unwrap();
+        manifest
     }
 
     #[test]
@@ -413,5 +474,62 @@ mod tests {
             .unwrap_err();
             assert!(error.contains("loxa run <id>"), "{error}");
         }
+    }
+
+    #[test]
+    fn rm_without_models_reports_an_empty_catalog_without_a_pull_suggestion() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_values(Some(temp.path()), None).unwrap();
+
+        let error = run(Cli::parse_from(["loxa", "rm", "--yes"]), paths).unwrap_err();
+
+        assert_eq!(error, "no models installed");
+    }
+
+    #[test]
+    fn rm_yes_removes_the_selected_managed_model() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_values(Some(temp.path()), None).unwrap();
+        install(&paths, "demo");
+
+        assert_eq!(
+            run(
+                Cli::parse_from(["loxa", "rm", "demo", "--yes"]),
+                paths.clone()
+            )
+            .unwrap(),
+            0
+        );
+        let model_dir = paths.model_dir("demo").unwrap();
+        assert!(model_dir.join(".lock").is_file());
+        assert!(!model_dir.join("manifest.json").exists());
+        assert!(!model_dir.join("model.gguf").exists());
+        assert!(crate::catalog::load_catalog(&paths.models)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn rm_without_yes_is_non_destructive_outside_a_terminal() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_values(Some(temp.path()), None).unwrap();
+        install(&paths, "demo");
+
+        let error = run(Cli::parse_from(["loxa", "rm", "demo"]), paths.clone()).unwrap_err();
+
+        assert!(error.contains("pass --yes"), "{error}");
+        assert!(paths.model_dir("demo").unwrap().exists());
+    }
+
+    #[test]
+    fn noninteractive_rm_yes_still_requires_an_explicit_model_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_values(Some(temp.path()), None).unwrap();
+        install(&paths, "demo");
+
+        let error = run(Cli::parse_from(["loxa", "rm", "--yes"]), paths.clone()).unwrap_err();
+
+        assert!(error.contains("loxa rm <id> --yes"), "{error}");
+        assert!(paths.model_dir("demo").unwrap().exists());
     }
 }
