@@ -163,9 +163,36 @@ pub fn select_from_json(
             return Err(format!("verified file {filename:?} not found"));
         }
     } else if let Some(quant) = quant {
-        candidates.retain(|candidate| quantization(&candidate.0).eq_ignore_ascii_case(quant));
-        if candidates.len() != 1 {
-            return Err(format!("quantization {quant:?} is missing or ambiguous"));
+        let matching = candidates
+            .iter()
+            .filter(|candidate| quantization(&candidate.0).eq_ignore_ascii_case(quant))
+            .collect::<Vec<_>>();
+        match matching.len() {
+            0 => {
+                let mut available = candidates
+                    .iter()
+                    .map(|candidate| quantization(&candidate.0))
+                    .collect::<Vec<_>>();
+                available.sort_unstable();
+                available.dedup();
+                return Err(format!(
+                    "quantization {quant:?} is not available; available quantizations: {}. Retry with --quant <one of these values>.",
+                    available.join(", ")
+                ));
+            }
+            1 => candidates
+                .retain(|candidate| quantization(&candidate.0).eq_ignore_ascii_case(quant)),
+            _ => {
+                let mut filenames = matching
+                    .into_iter()
+                    .map(|candidate| candidate.0.as_str())
+                    .collect::<Vec<_>>();
+                filenames.sort_unstable();
+                return Err(format!(
+                    "quantization {quant:?} matched multiple files: {}. Use --file <filename> to choose one.",
+                    filenames.join(", ")
+                ));
+            }
         }
     } else {
         let q4 = candidates
@@ -303,6 +330,29 @@ mod tests {
             select_from_json("owner/repo", None, None, MODEL, &ambiguous)
                 .unwrap_err()
                 .contains("ambiguous")
+        );
+    }
+
+    #[test]
+    fn missing_quant_lists_available_quantizations() {
+        let error =
+            select_from_json("owner/repo", None, Some("NOT_A_QUANT"), MODEL, TREE).unwrap_err();
+
+        assert_eq!(
+            error,
+            "quantization \"NOT_A_QUANT\" is not available; available quantizations: Q4_K_M, Q8_0. Retry with --quant <one of these values>."
+        );
+    }
+
+    #[test]
+    fn ambiguous_quant_names_matching_files_and_directs_to_file() {
+        let ambiguous = TREE.replace("demo-Q8_0.gguf", "other-Q4_K_M.gguf");
+        let error =
+            select_from_json("owner/repo", None, Some("Q4_K_M"), MODEL, &ambiguous).unwrap_err();
+
+        assert_eq!(
+            error,
+            "quantization \"Q4_K_M\" matched multiple files: demo-Q4_K_M.gguf, other-Q4_K_M.gguf. Use --file <filename> to choose one."
         );
     }
 
