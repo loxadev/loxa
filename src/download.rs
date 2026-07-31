@@ -1,4 +1,5 @@
 use crate::huggingface::{authorized_request, ResolvedFile};
+use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::blocking::Client;
 use reqwest::header::{CONTENT_RANGE, LOCATION, RANGE};
 use reqwest::{redirect::Policy, StatusCode, Url};
@@ -9,6 +10,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const MAX_REDIRECTS: usize = 5;
+
+#[derive(Debug, Eq, PartialEq)]
+enum ProgressUpdate {
+    Seed(u64),
+    Position(u64),
+}
 
 pub struct Transfer {
     pub status: StatusCode,
@@ -110,13 +117,39 @@ pub fn download(
     token: Option<String>,
 ) -> Result<PathBuf, String> {
     let transport = ReqwestTransport::new(token)?;
-    download_with_transport(file, model_dir, &transport)
+    let progress = ProgressBar::new(file.size);
+    let style = ProgressStyle::with_template(
+        "{spinner:.green} {msg} [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} {bytes_per_sec} {eta}",
+    )
+    .map_err(|error| error.to_string())?
+    .progress_chars("=>-");
+    progress.set_style(style);
+    progress.set_message(file.filename.clone());
+    let result =
+        download_with_transport_progress(file, model_dir, &transport, |update| match update {
+            ProgressUpdate::Seed(position) => {
+                progress.set_position(position);
+                progress.reset_eta();
+            }
+            ProgressUpdate::Position(position) => progress.set_position(position),
+        });
+    progress.finish_and_clear();
+    result
 }
 
 pub fn download_with_transport(
     spec: &ResolvedFile,
     model_dir: &Path,
     transport: &impl Transport,
+) -> Result<PathBuf, String> {
+    download_with_transport_progress(spec, model_dir, transport, |_| {})
+}
+
+fn download_with_transport_progress(
+    spec: &ResolvedFile,
+    model_dir: &Path,
+    transport: &impl Transport,
+    mut progress: impl FnMut(ProgressUpdate),
 ) -> Result<PathBuf, String> {
     fs::create_dir_all(model_dir).map_err(|error| error.to_string())?;
     if !fs::symlink_metadata(model_dir)
@@ -134,6 +167,7 @@ pub fn download_with_transport(
         reject_non_regular_if_present(&final_path)?;
         if verify_regular(&final_path, spec.size, &spec.sha256).is_ok() {
             finish_repair(model_dir, &invalid_path, &restart_path)?;
+            progress(ProgressUpdate::Seed(spec.size));
             return Ok(final_path);
         }
         if invalid_path.exists() {
@@ -149,6 +183,7 @@ pub fn download_with_transport(
         fs::remove_file(&part_path).map_err(|error| error.to_string())?;
         offset = 0;
     }
+    progress(ProgressUpdate::Seed(offset));
     if offset == spec.size && offset > 0 {
         sync_transfer_file(&part_path)?;
         if let Err(error) = verify_regular(&part_path, spec.size, &spec.sha256) {
@@ -162,6 +197,7 @@ pub fn download_with_transport(
     let mut transfer = transport.get(&artifact_url(spec)?, (offset > 0).then_some(offset))?;
     let ignored_range = offset > 0 && transfer.status == StatusCode::OK;
     let (target, append) = if ignored_range {
+        progress(ProgressUpdate::Seed(0));
         (&restart_path, false)
     } else {
         if transfer.status == StatusCode::PARTIAL_CONTENT {
@@ -199,7 +235,14 @@ pub fn download_with_transport(
             .set_len(0)
             .map_err(|error| format!("{}: {error}", target.display()))?;
     }
-    let copied = copy_bounded(transfer.reader.as_mut(), &mut output, target, read_limit)?;
+    let progress_offset = if append { offset } else { 0 };
+    let copied = copy_bounded(
+        transfer.reader.as_mut(),
+        &mut output,
+        target,
+        read_limit,
+        |copied| progress(ProgressUpdate::Position(progress_offset + copied)),
+    )?;
     if copied > expected_written {
         drop(output);
         fs::remove_file(target).map_err(|error| format!("{}: {error}", target.display()))?;
@@ -233,6 +276,7 @@ fn copy_bounded(
     output: &mut File,
     target: &Path,
     limit: u64,
+    mut progress: impl FnMut(u64),
 ) -> Result<u64, String> {
     let mut copied = 0;
     let mut buffer = [0_u8; 64 * 1024];
@@ -254,6 +298,7 @@ fn copy_bounded(
             .write_all(&buffer[..read])
             .map_err(|error| format!("{}: {error}", target.display()))?;
         copied += read as u64;
+        progress(copied);
     }
     Ok(copied)
 }
@@ -512,6 +557,32 @@ mod tests {
             .unwrap_err()
             .contains("checksum"));
         assert!(!bad_dir.path().join("model.gguf").exists());
+    }
+
+    #[test]
+    fn progress_reports_existing_and_new_bytes_for_a_resumed_transfer() {
+        let bytes = b"abcdef";
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("model.gguf.part"), b"abc").unwrap();
+        let transport = FakeTransport {
+            responses: RefCell::new(vec![transfer(
+                StatusCode::PARTIAL_CONTENT,
+                Some("bytes 3-5/6"),
+                b"def",
+            )]),
+            offsets: RefCell::new(Vec::new()),
+        };
+        let mut updates = Vec::new();
+
+        download_with_transport_progress(&spec(bytes), dir.path(), &transport, |update| {
+            updates.push(update);
+        })
+        .unwrap();
+
+        assert_eq!(
+            updates,
+            [ProgressUpdate::Seed(3), ProgressUpdate::Position(6)]
+        );
     }
 
     #[test]

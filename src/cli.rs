@@ -26,21 +26,26 @@ pub enum Command {
 
 #[derive(Debug, Args)]
 pub struct PullArgs {
+    /// Hugging Face repository in owner/repo form.
     pub repo: String,
+    /// Branch, tag, or commit to resolve before downloading.
     #[arg(long)]
     pub revision: Option<String>,
+    /// Exact GGUF filename to download.
     #[arg(long = "file", conflicts_with = "quant")]
     pub filename: Option<String>,
+    /// Quantization to select, such as Q4_K_M.
     #[arg(long)]
     pub quant: Option<String>,
+    /// Local model ID used by list, run, and chat.
     #[arg(long)]
     pub name: Option<String>,
 }
 
 #[derive(Debug, Args)]
 pub struct RunArgs {
-    /// Installed model ID.
-    pub id: String,
+    /// Model ID; omit to choose an installed model.
+    pub id: Option<String>,
     #[command(flatten)]
     pub runtime: RuntimeArgs,
 }
@@ -101,7 +106,7 @@ mod tests {
         let cli = Cli::parse_from(["loxa", "run", "demo"]);
         match cli.command {
             Command::Run(args) => {
-                assert_eq!(args.id, "demo");
+                assert_eq!(args.id.as_deref(), Some("demo"));
                 assert!(args.runtime.ctx.is_none());
                 assert!(args.runtime.port.is_none());
                 assert!(args.runtime.server.is_none());
@@ -138,9 +143,9 @@ mod tests {
     }
 
     #[test]
-    fn chat_accepts_an_omitted_model_but_run_does_not() {
+    fn run_and_chat_accept_an_omitted_model() {
         assert!(Cli::try_parse_from(["loxa", "chat"]).is_ok());
-        assert!(Cli::try_parse_from(["loxa", "run"]).is_err());
+        assert!(Cli::try_parse_from(["loxa", "run"]).is_ok());
     }
 
     #[test]

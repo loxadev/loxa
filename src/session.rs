@@ -1,6 +1,6 @@
 use crate::chat::{Event, Message, Role, Worker};
 use crate::runner::ForegroundServer;
-use anstyle::{AnsiColor, Style};
+use crate::ui;
 use inquire::error::{CustomUserError, InquireError};
 use inquire::Text;
 use std::io::Write;
@@ -30,10 +30,6 @@ fn autocomplete_slash(input: &str) -> Result<Vec<String>, CustomUserError> {
         .into_iter()
         .map(str::to_owned)
         .collect())
-}
-
-fn color(color: AnsiColor) -> Style {
-    Style::new().fg_color(Some(color.into()))
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -114,9 +110,9 @@ fn prompt_input() -> InputEvent {
 
 pub(crate) fn run(mut server: ForegroundServer, model: &str) -> Result<i32, String> {
     let mut session = Session::default();
-    let ready = color(AnsiColor::Green).bold();
-    let model_style = color(AnsiColor::Cyan).bold();
-    let dim = Style::new().dimmed();
+    let ready = ui::success();
+    let model_style = ui::accent();
+    let dim = ui::muted();
     anstream::println!("{ready}Ready{ready:#} · {model_style}{model}{model_style:#}");
     anstream::println!("{dim}Type / for commands · Esc or Ctrl-C to exit{dim:#}");
 
@@ -144,7 +140,7 @@ pub(crate) fn run(mut server: ForegroundServer, model: &str) -> Result<i32, Stri
         let user = match action {
             InputAction::Ignore => continue,
             InputAction::Help => {
-                let heading = color(AnsiColor::Cyan).bold();
+                let heading = ui::accent();
                 anstream::println!("{heading}Available commands{heading:#}");
                 for (command, description) in SLASH_COMMANDS {
                     anstream::println!("  {heading}{command:<7}{heading:#} {description}");
@@ -153,7 +149,7 @@ pub(crate) fn run(mut server: ForegroundServer, model: &str) -> Result<i32, Stri
             }
             InputAction::Clear => {
                 session.clear();
-                let success = color(AnsiColor::Green);
+                let success = ui::success();
                 anstream::println!("{success}Conversation cleared.{success:#}");
                 continue;
             }
@@ -162,7 +158,7 @@ pub(crate) fn run(mut server: ForegroundServer, model: &str) -> Result<i32, Stri
                 return Ok(0);
             }
             InputAction::Reject(error) => {
-                let error_style = color(AnsiColor::Red).bold();
+                let error_style = ui::danger();
                 anstream::eprintln!(
                     "{error_style}Unknown command:{error_style:#} {error}. Type /help for commands."
                 );
@@ -176,7 +172,7 @@ pub(crate) fn run(mut server: ForegroundServer, model: &str) -> Result<i32, Stri
         }
 
         let worker = Worker::start(server.port(), model.to_owned(), session.request(&user))?;
-        let assistant = color(AnsiColor::Magenta).bold();
+        let assistant = ui::assistant();
         anstream::print!("{assistant}Loxa{assistant:#} ");
         std::io::stdout()
             .flush()
@@ -215,7 +211,7 @@ pub(crate) fn run(mut server: ForegroundServer, model: &str) -> Result<i32, Stri
         match result {
             Ok(assistant) => session.complete(user, assistant),
             Err(error) => {
-                let error_style = color(AnsiColor::Red).bold();
+                let error_style = ui::danger();
                 anstream::eprintln!("{error_style}Error:{error_style:#} {error}");
             }
         }

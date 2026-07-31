@@ -7,10 +7,12 @@ pub mod huggingface;
 pub mod paths;
 pub mod runner;
 mod session;
+mod ui;
 
 use catalog::Manifest;
 use clap::Parser;
 use cli::{Cli, Command};
+use indicatif::BinaryBytes;
 use paths::{validate_id, AppPaths};
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -25,6 +27,11 @@ struct Runnable {
 
 pub fn run_from_env() -> Result<i32, String> {
     run(Cli::parse(), AppPaths::from_env()?)
+}
+
+pub fn report_error(error: &str) {
+    let danger = ui::danger();
+    anstream::eprintln!("{danger}Error:{danger:#} {error}");
 }
 
 pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
@@ -78,26 +85,65 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
             } else {
                 catalog::prepare_pull(&model_dir, &manifest)?;
             }
-            println!(
-                "pulling {} ({} bytes) as {}",
-                resolved.filename, resolved.size, id
+            let accent = ui::accent();
+            let muted = ui::muted();
+            anstream::println!("{accent}Pulling{accent:#} {id}");
+            anstream::println!(
+                "  {muted}{} · {} · {}@{}{muted:#}",
+                resolved.filename,
+                BinaryBytes(resolved.size),
+                resolved.repo,
+                &resolved.revision[..12]
             );
             download::download(&resolved, &model_dir, token)?;
             catalog::publish_manifest(&paths.models, &manifest)?;
-            println!("pulled {id}");
+            let success = ui::success();
+            anstream::println!("{success}Pulled{success:#} {id}");
             Ok(0)
         }
         Command::List => {
-            for entry in catalog::load_catalog(&paths.models)? {
-                println!(
-                    "{}\t{}@{}\t{}\t{} bytes",
-                    entry.id, entry.repo, entry.revision, entry.remote_filename, entry.size
+            let installed = catalog::load_catalog(&paths.models)?;
+            if installed.is_empty() {
+                let muted = ui::muted();
+                anstream::println!("No models installed.");
+                anstream::println!("{muted}Download one with `loxa pull <owner/repo>`{muted:#}");
+                return Ok(0);
+            }
+            let heading = ui::success();
+            let accent = ui::accent();
+            let muted = ui::muted();
+            anstream::println!(
+                "{heading}Installed models{heading:#} {muted}({}){muted:#}",
+                installed.len()
+            );
+            for entry in installed {
+                anstream::println!(
+                    "\n  {accent}{}{accent:#}  {}",
+                    entry.id,
+                    BinaryBytes(entry.size)
+                );
+                anstream::println!(
+                    "    {muted}{} · {} · {}{muted:#}",
+                    entry.repo,
+                    entry.remote_filename,
+                    &entry.revision[..12]
                 );
             }
             Ok(0)
         }
         Command::Run(args) => {
-            let runnable = resolve_runnable(args, &paths)?;
+            let installed = catalog::load_catalog(&paths.models)?;
+            let id = match select_model(
+                "run",
+                args.id,
+                &installed,
+                std::io::stdin().is_terminal(),
+                std::io::stderr().is_terminal(),
+            )? {
+                ModelSelection::Selected(id) => id,
+                ModelSelection::Exit(code) => return Ok(code),
+            };
+            let runnable = resolve_runnable(id, args.runtime, &paths)?;
             runner::run(
                 &runnable.server,
                 &runnable.artifact,
@@ -108,35 +154,21 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
         }
         Command::Chat(args) => {
             let installed = catalog::load_catalog(&paths.models)?;
-            let mut options = chat_model_options(args.id, &installed)?;
+            let options = model_options(args.id, &installed)?;
             ensure_interactive_chat(
                 std::io::stdin().is_terminal(),
                 std::io::stdout().is_terminal(),
             )?;
-            let id = if options.len() == 1 {
-                options.remove(0)
-            } else {
-                match inquire::Select::new("Choose a model", options)
-                    .with_help_message("↑↓ navigate · enter select · type to filter")
-                    .prompt()
-                {
-                    Ok(id) => id,
-                    Err(inquire::InquireError::OperationCanceled) => return Ok(0),
-                    Err(inquire::InquireError::OperationInterrupted) => return Ok(130),
-                    Err(inquire::InquireError::NotTTY) => return Err(
-                        "model selection requires an interactive terminal; pass `loxa chat <id>`"
-                            .into(),
-                    ),
-                    Err(error) => return Err(format!("model selection failed: {error}")),
-                }
+            let id = match select_model_options(
+                "chat",
+                options,
+                std::io::stdin().is_terminal(),
+                std::io::stderr().is_terminal(),
+            )? {
+                ModelSelection::Selected(id) => id,
+                ModelSelection::Exit(code) => return Ok(code),
             };
-            let runnable = resolve_runnable(
-                cli::RunArgs {
-                    id,
-                    runtime: args.runtime,
-                },
-                &paths,
-            )?;
+            let runnable = resolve_runnable(id, args.runtime, &paths)?;
             match runner::start_foreground(
                 &runnable.server,
                 &runnable.artifact,
@@ -151,10 +183,7 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
     }
 }
 
-fn chat_model_options(
-    requested: Option<String>,
-    installed: &[Manifest],
-) -> Result<Vec<String>, String> {
+fn model_options(requested: Option<String>, installed: &[Manifest]) -> Result<Vec<String>, String> {
     if let Some(id) = requested {
         if !installed.iter().any(|model| model.id == id) {
             return Err(format!("unknown model id {id}"));
@@ -165,6 +194,50 @@ fn chat_model_options(
         return Err("no models installed; download one with `loxa pull <owner/repo>`".into());
     }
     Ok(installed.iter().map(|model| model.id.clone()).collect())
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ModelSelection {
+    Selected(String),
+    Exit(i32),
+}
+
+fn select_model(
+    command: &str,
+    requested: Option<String>,
+    installed: &[Manifest],
+    stdin: bool,
+    stderr: bool,
+) -> Result<ModelSelection, String> {
+    select_model_options(command, model_options(requested, installed)?, stdin, stderr)
+}
+
+fn select_model_options(
+    command: &str,
+    mut options: Vec<String>,
+    stdin: bool,
+    stderr: bool,
+) -> Result<ModelSelection, String> {
+    if options.len() == 1 {
+        return Ok(ModelSelection::Selected(options.remove(0)));
+    }
+    if !stdin || !stderr {
+        return Err(format!(
+            "model selection requires an interactive terminal; pass `loxa {command} <id>`"
+        ));
+    }
+    match inquire::Select::new("Choose a model", options)
+        .with_help_message("↑↓ navigate · enter select · type to filter")
+        .prompt()
+    {
+        Ok(id) => Ok(ModelSelection::Selected(id)),
+        Err(inquire::InquireError::OperationCanceled) => Ok(ModelSelection::Exit(0)),
+        Err(inquire::InquireError::OperationInterrupted) => Ok(ModelSelection::Exit(130)),
+        Err(inquire::InquireError::NotTTY) => Err(format!(
+            "model selection requires an interactive terminal; pass `loxa {command} <id>`"
+        )),
+        Err(error) => Err(format!("model selection failed: {error}")),
+    }
 }
 
 fn ensure_interactive_chat(stdin: bool, stdout: bool) -> Result<(), String> {
@@ -178,18 +251,21 @@ fn ensure_interactive_chat(stdin: bool, stdout: bool) -> Result<(), String> {
     }
 }
 
-fn resolve_runnable(args: cli::RunArgs, paths: &AppPaths) -> Result<Runnable, String> {
+fn resolve_runnable(
+    id: String,
+    runtime: cli::RuntimeArgs,
+    paths: &AppPaths,
+) -> Result<Runnable, String> {
     let config = config::load(&paths.config)?;
-    let ctx = config::resolve_value(args.runtime.ctx, config.ctx, 4096);
-    let port = config::resolve_value(args.runtime.port, config.port, 0);
+    let ctx = config::resolve_value(runtime.ctx, config.ctx, 4096);
+    let port = config::resolve_value(runtime.port, config.port, 0);
     let manifest = catalog::load_catalog(&paths.models)?
         .into_iter()
-        .find(|entry| entry.id == args.id)
-        .ok_or_else(|| format!("unknown model id {}", args.id))?;
+        .find(|entry| entry.id == id)
+        .ok_or_else(|| format!("unknown model id {id}"))?;
     let artifact = manifest.artifact_path(&paths.models);
     download::verify_regular(&artifact, manifest.size, &manifest.sha256)?;
-    let server =
-        runner::discover_from_process(args.runtime.server.as_deref(), &paths.managed_server)?;
+    let server = runner::discover_from_process(runtime.server.as_deref(), &paths.managed_server)?;
     Ok(Runnable {
         server,
         artifact,
@@ -224,7 +300,9 @@ fn default_id(repo: &str, filename: &str, sha256: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{chat_model_options, default_id, ensure_interactive_chat, run};
+    use super::{
+        default_id, ensure_interactive_chat, model_options, run, select_model, ModelSelection,
+    };
     use crate::catalog::Manifest;
     use crate::cli::Cli;
     use crate::paths::AppPaths;
@@ -286,7 +364,7 @@ mod tests {
 
     #[test]
     fn chat_without_models_explains_how_to_pull_one() {
-        let error = chat_model_options(None, &[]).unwrap_err();
+        let error = model_options(None, &[]).unwrap_err();
 
         assert!(error.contains("loxa pull"), "{error}");
     }
@@ -294,7 +372,7 @@ mod tests {
     #[test]
     fn chat_without_id_auto_selects_one_model() {
         assert_eq!(
-            chat_model_options(None, &[manifest("alpha")]).unwrap(),
+            model_options(None, &[manifest("alpha")]).unwrap(),
             ["alpha"]
         );
     }
@@ -302,7 +380,7 @@ mod tests {
     #[test]
     fn chat_without_id_offers_all_installed_models() {
         assert_eq!(
-            chat_model_options(None, &[manifest("alpha"), manifest("beta")]).unwrap(),
+            model_options(None, &[manifest("alpha"), manifest("beta")]).unwrap(),
             ["alpha", "beta"]
         );
     }
@@ -314,6 +392,26 @@ mod tests {
             let error = ensure_interactive_chat(stdin, stdout).unwrap_err();
             assert!(error.contains("interactive terminal"), "{error}");
             assert!(error.contains("loxa chat <id>"), "{error}");
+        }
+    }
+
+    #[test]
+    fn model_selection_only_requires_a_terminal_when_there_are_choices() {
+        assert!(matches!(
+            select_model("run", None, &[manifest("alpha")], false, false).unwrap(),
+            ModelSelection::Selected(id) if id == "alpha"
+        ));
+
+        for (stdin, stderr) in [(false, true), (true, false), (false, false)] {
+            let error = select_model(
+                "run",
+                None,
+                &[manifest("alpha"), manifest("beta")],
+                stdin,
+                stderr,
+            )
+            .unwrap_err();
+            assert!(error.contains("loxa run <id>"), "{error}");
         }
     }
 }

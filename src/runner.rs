@@ -1,3 +1,4 @@
+use crate::ui;
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::collections::VecDeque;
@@ -288,7 +289,13 @@ pub fn run(
         ForegroundStart::Ready(server) => server,
         ForegroundStart::Stopped(code) => return Ok(code),
     };
-    println!("ready: http://127.0.0.1:{} (model {id})", server.port());
+    let success = ui::success();
+    let accent = ui::accent();
+    let muted = ui::muted();
+    anstream::println!(
+        "{success}Ready{success:#} {accent}http://127.0.0.1:{}{accent:#} {muted}(model {id}){muted:#}",
+        server.port()
+    );
     loop {
         if let Some(code) = server.poll()? {
             return Ok(code);
