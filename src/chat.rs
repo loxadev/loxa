@@ -7,6 +7,7 @@ const MAX_EVENT_BYTES: usize = 1024 * 1024;
 const MAX_ASSISTANT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 16 * 1024;
 const EVENT_QUEUE_CAPACITY: usize = 64;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -35,11 +36,20 @@ pub struct Worker {
 
 impl Worker {
     pub fn start(port: u16, model: String, messages: Vec<Message>) -> Result<Self, String> {
+        Self::start_with_request_timeout(port, model, messages, REQUEST_TIMEOUT)
+    }
+
+    fn start_with_request_timeout(
+        port: u16,
+        model: String,
+        messages: Vec<Message>,
+        request_timeout: Duration,
+    ) -> Result<Self, String> {
         let (sender, events) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
         let thread = std::thread::Builder::new()
             .name("loxa-chat-request".into())
             .spawn(move || {
-                if let Err(error) = request(port, &model, &messages, &sender) {
+                if let Err(error) = request(port, &model, &messages, request_timeout, &sender) {
                     let _ = sender.send(Event::Error(error));
                 }
             })
@@ -58,9 +68,10 @@ impl Worker {
         self.events.try_recv()
     }
 
-    pub fn join(mut self) -> Result<(), String> {
-        self.thread
-            .take()
+    pub fn join(self) -> Result<(), String> {
+        let Self { events, thread } = self;
+        drop(events);
+        thread
             .expect("chat worker thread is present")
             .join()
             .map_err(|_| "chat request worker panicked".to_string())
@@ -78,12 +89,14 @@ fn request(
     port: u16,
     model: &str,
     messages: &[Message],
+    request_timeout: Duration,
     sender: &mpsc::SyncSender<Event>,
 ) -> Result<(), String> {
     let client = reqwest::blocking::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(2))
+        .timeout(request_timeout)
         .build()
         .map_err(|error| error.to_string())?;
     let mut response = client
@@ -94,7 +107,16 @@ fn request(
             stream: true,
         })
         .send()
-        .map_err(|error| format!("chat request failed: {error}"))?;
+        .map_err(|error| {
+            if error.is_timeout() {
+                format!(
+                    "chat request timed out after {} ms",
+                    request_timeout.as_millis()
+                )
+            } else {
+                format!("chat request failed: {error}")
+            }
+        })?;
     if !response.status().is_success() {
         return Err(http_error(&mut response));
     }
@@ -163,6 +185,7 @@ where
     let mut buffer = [0_u8; 4096];
     let mut line = Vec::new();
     let mut data = Vec::new();
+    let mut data_seen = false;
     let mut event_bytes = 0_usize;
     let mut assistant = String::new();
 
@@ -172,7 +195,7 @@ where
             .map_err(|error| error.to_string())?;
         if count == 0 {
             if !line.is_empty() {
-                process_line(&line, &mut data, event_limit)?;
+                process_line(&line, &mut data, &mut data_seen, event_limit)?;
             }
             if dispatch(&data, &mut assistant, assistant_limit, &mut emit)? {
                 return Ok(assistant);
@@ -200,16 +223,22 @@ where
                     return Ok(assistant);
                 }
                 data.clear();
+                data_seen = false;
                 event_bytes = 0;
             } else {
-                process_line(&line, &mut data, event_limit)?;
+                process_line(&line, &mut data, &mut data_seen, event_limit)?;
             }
             line.clear();
         }
     }
 }
 
-fn process_line(line: &[u8], data: &mut Vec<u8>, event_limit: usize) -> Result<(), String> {
+fn process_line(
+    line: &[u8],
+    data: &mut Vec<u8>,
+    data_seen: &mut bool,
+    event_limit: usize,
+) -> Result<(), String> {
     if line.starts_with(b":") {
         return Ok(());
     }
@@ -217,9 +246,10 @@ fn process_line(line: &[u8], data: &mut Vec<u8>, event_limit: usize) -> Result<(
         return Ok(());
     };
     let value = value.strip_prefix(b" ").unwrap_or(value);
-    if !data.is_empty() {
+    if *data_seen {
         data.push(b'\n');
     }
+    *data_seen = true;
     data.extend_from_slice(value);
     if data.len() > event_limit {
         return Err(format!(
@@ -462,6 +492,17 @@ mod tests {
     }
 
     #[test]
+    fn preserves_empty_repeated_data_fields() {
+        let error = decode_sse(
+            b"data:\ndata: [DONE]\n\n".as_slice(),
+            |_| -> Result<(), String> { Ok(()) },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("invalid chat SSE JSON"));
+    }
+
+    #[test]
     fn posts_exact_history_and_streams_deltas_before_completion() {
         let response = concat!(
             "HTTP/1.1 200 OK\r\n",
@@ -560,6 +601,57 @@ mod tests {
         server.join().unwrap();
     }
 
+    #[test]
+    fn join_drops_a_full_event_queue_before_waiting_for_the_worker() {
+        let mut response = concat!(
+            "HTTP/1.1 200 OK\r\n",
+            "Content-Type: text/event-stream\r\n",
+            "Connection: close\r\n\r\n"
+        )
+        .as_bytes()
+        .to_vec();
+        for _ in 0..70 {
+            response
+                .extend_from_slice(b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n");
+        }
+        response.extend_from_slice(b"data: [DONE]\n\n");
+        let (port, _request, server) = serve_once(response);
+        let worker = Worker::start(port, "tiny".into(), Vec::new()).unwrap();
+        let (done_sender, done) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done_sender.send(worker.join());
+        });
+
+        assert_eq!(
+            done.recv_timeout(Duration::from_millis(500)).unwrap(),
+            Ok(())
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn accepted_but_stalled_headers_hit_the_request_timeout() {
+        let (port, accepted, release, server) = serve_stalled_headers();
+        let worker = Worker::start_with_request_timeout(
+            port,
+            "tiny".into(),
+            Vec::new(),
+            Duration::from_millis(50),
+        )
+        .unwrap();
+        accepted.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let event = worker.recv_timeout(Duration::from_millis(500));
+        let _ = release.send(());
+        server.join().unwrap();
+        worker.join().unwrap();
+
+        let Event::Error(error) = event.unwrap() else {
+            panic!("expected worker error");
+        };
+        assert!(error.to_ascii_lowercase().contains("timed out"), "{error}");
+    }
+
     fn serve_once(response: Vec<u8>) -> (u16, mpsc::Receiver<String>, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -599,5 +691,33 @@ mod tests {
             stream.write_all(&response).unwrap();
         });
         (port, request, server)
+    }
+
+    fn serve_stalled_headers() -> (
+        u16,
+        mpsc::Receiver<()>,
+        mpsc::Sender<()>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (accepted_sender, accepted) = mpsc::channel();
+        let (release, release_receiver) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let count = stream.read(&mut buffer).unwrap();
+                assert_ne!(count, 0);
+                request.extend_from_slice(&buffer[..count]);
+                if request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            accepted_sender.send(()).unwrap();
+            let _ = release_receiver.recv();
+        });
+        (port, accepted, release, server)
     }
 }
