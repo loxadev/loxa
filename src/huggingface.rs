@@ -209,14 +209,18 @@ pub fn discover_token() -> Option<String> {
 }
 
 pub fn authorized_request(client: &Client, url: Url, token: Option<&str>) -> RequestBuilder {
-    let attach = url.scheme() == "https"
-        && url.host_str() == Some("huggingface.co")
-        && url.port_or_known_default() == Some(443);
+    let attach = should_attach_token(&url);
     let request = client.get(url);
     match (attach, token) {
         (true, Some(token)) => request.bearer_auth(token),
         _ => request,
     }
+}
+
+pub(crate) fn should_attach_token(url: &Url) -> bool {
+    url.scheme() == "https"
+        && url.host_str() == Some("huggingface.co")
+        && url.port_or_known_default() == Some(443)
 }
 
 fn get_text(client: &Client, url: Url, token: Option<&str>) -> Result<String, String> {

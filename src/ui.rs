@@ -1,4 +1,6 @@
 use anstyle::{AnsiColor, Style};
+use indicatif::ProgressBar;
+use std::time::Duration;
 
 pub(crate) fn accent() -> Style {
     Style::new().fg_color(Some(AnsiColor::Cyan.into())).bold()
@@ -16,8 +18,9 @@ pub(crate) fn muted() -> Style {
     Style::new().dimmed()
 }
 
-pub(crate) fn assistant() -> Style {
-    Style::new()
-        .fg_color(Some(AnsiColor::Magenta.into()))
-        .bold()
+pub(crate) fn spinner(message: String) -> ProgressBar {
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_message(message);
+    spinner.enable_steady_tick(Duration::from_millis(80));
+    spinner
 }

@@ -263,6 +263,9 @@ pub fn build_args(model: &Path, id: &str, port: u16, ctx: u32) -> Vec<OsString> 
         ctx.to_string().into(),
         "--n-gpu-layers".into(),
         "99".into(),
+        "--jinja".into(),
+        "--reasoning".into(),
+        "off".into(),
     ]
 }
 
@@ -285,9 +288,12 @@ pub fn run(
     requested_port: u16,
     ctx: u32,
 ) -> Result<i32, String> {
-    let mut server = match start_foreground(server, model, id, requested_port, ctx)? {
+    let starting = ui::spinner(format!("Starting {id}"));
+    let started = start_foreground(server, model, id, requested_port, ctx);
+    starting.finish_and_clear();
+    let mut server = match started? {
         ForegroundStart::Ready(server) => server,
-        ForegroundStart::Stopped(code) => return Ok(code),
+        ForegroundStart::Stopped(exit) => return Ok(report_exit(exit)),
     };
     let success = ui::success();
     let accent = ui::accent();
@@ -297,8 +303,8 @@ pub fn run(
         server.port()
     );
     loop {
-        if let Some(code) = server.poll()? {
-            return Ok(code);
+        if let Some(exit) = server.poll()? {
+            return Ok(report_exit(exit));
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -306,7 +312,7 @@ pub fn run(
 
 pub(crate) enum ForegroundStart {
     Ready(ForegroundServer),
-    Stopped(i32),
+    Stopped(ServerExit),
 }
 
 pub(crate) struct ForegroundServer {
@@ -334,8 +340,11 @@ pub(crate) fn start_foreground(
         StartOutcome::Ready(server) => {
             Ok(ForegroundStart::Ready(ForegroundServer { server, signal }))
         }
-        StartOutcome::Exited(exit) => Ok(ForegroundStart::Stopped(report_exit(exit))),
-        StartOutcome::Signaled(signal) => Ok(ForegroundStart::Stopped(128 + signal)),
+        StartOutcome::Exited(exit) => Ok(ForegroundStart::Stopped(exit)),
+        StartOutcome::Signaled(signal) => Ok(ForegroundStart::Stopped(ServerExit {
+            code: 128 + signal,
+            diagnostic: None,
+        })),
     }
 }
 
@@ -346,13 +355,16 @@ impl ForegroundServer {
 
     /// Polls for child exit first, then a foreground signal. Cleanup is complete
     /// before a status is returned.
-    pub(crate) fn poll(&mut self) -> Result<Option<i32>, String> {
+    pub(crate) fn poll(&mut self) -> Result<Option<ServerExit>, String> {
         if let Some(exit) = self.server.try_wait()? {
-            return Ok(Some(report_exit(exit)));
+            return Ok(Some(exit));
         }
         if let Some(signal) = received_signal(self.signal) {
             self.server.terminate()?;
-            return Ok(Some(128 + signal));
+            return Ok(Some(ServerExit {
+                code: 128 + signal,
+                diagnostic: None,
+            }));
         }
         Ok(None)
     }
@@ -583,12 +595,12 @@ enum StartOutcome {
 }
 
 #[derive(Debug)]
-struct ServerExit {
+pub(crate) struct ServerExit {
     code: i32,
     diagnostic: Option<String>,
 }
 
-fn report_exit(exit: ServerExit) -> i32 {
+pub(crate) fn report_exit(exit: ServerExit) -> i32 {
     if let Some(diagnostic) = exit.diagnostic {
         eprintln!("{diagnostic}");
     }
@@ -1064,7 +1076,10 @@ mod tests {
                 "--ctx-size",
                 "8192",
                 "--n-gpu-layers",
-                "99"
+                "99",
+                "--jinja",
+                "--reasoning",
+                "off"
             ]
             .map(OsStr::new)
         );
@@ -1150,7 +1165,7 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&argv).unwrap(),
             format!(
-                "--model\n/models/model.gguf\n--alias\ndemo\n--host\n127.0.0.1\n--port\n{port}\n--ctx-size\n8192\n--n-gpu-layers\n99\n"
+                "--model\n/models/model.gguf\n--alias\ndemo\n--host\n127.0.0.1\n--port\n{port}\n--ctx-size\n8192\n--n-gpu-layers\n99\n--jinja\n--reasoning\noff\n"
             )
         );
         assert_eq!(server.port(), port);
@@ -1234,7 +1249,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn post_ready_leader_exit_returns_status_after_descendant_cleanup() {
+    fn post_ready_poll_returns_diagnostic_after_descendant_cleanup() {
         let _lock = process_test_lock();
         let dir = tempdir().unwrap();
         let server_path = dir.path().join("server");
@@ -1258,16 +1273,20 @@ mod tests {
             || None,
         )
         .unwrap();
-        let mut server = match outcome {
+        let server = match outcome {
             StartOutcome::Ready(server) => server,
             _ => panic!("server did not become ready"),
         };
         let group = server.group;
+        let mut server = ForegroundServer {
+            server,
+            signal: foreground_signal_flag().unwrap(),
+        };
         http.join().unwrap();
         std::fs::write(release, b"go").unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         let exit = loop {
-            match server.try_wait().unwrap() {
+            match server.poll().unwrap() {
                 None => {}
                 Some(exit) => break exit,
             }
@@ -1283,7 +1302,7 @@ mod tests {
             "{exit:?}"
         );
         assert!(!process_group_exists(group).unwrap());
-        assert!(!server.output_readers_owned());
+        assert!(!server.server.output_readers_owned());
     }
 
     #[cfg(unix)]

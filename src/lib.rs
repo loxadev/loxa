@@ -16,6 +16,10 @@ use indicatif::BinaryBytes;
 use paths::{validate_id, AppPaths};
 use std::io::IsTerminal;
 use std::path::PathBuf;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(unix)]
+use std::sync::Arc;
 
 struct Runnable {
     _model_lock: catalog::ModelLock,
@@ -24,6 +28,36 @@ struct Runnable {
     id: String,
     port: u16,
     ctx: u32,
+}
+
+#[cfg(unix)]
+struct PromptInterrupt {
+    id: signal_hook::SigId,
+    interrupted: Arc<AtomicBool>,
+}
+
+#[cfg(unix)]
+impl PromptInterrupt {
+    fn install() -> Result<Self, String> {
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let id = signal_hook::flag::register(signal_hook::consts::SIGINT, interrupted.clone())
+            .map_err(|error| format!("failed to install prompt interrupt handler: {error}"))?;
+        Ok(Self { id, interrupted })
+    }
+
+    fn received(&self) -> bool {
+        self.interrupted.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PromptInterrupt {
+    fn drop(&mut self) {
+        signal_hook::low_level::unregister(self.id);
+        if self.received() {
+            let _ = dialoguer::console::Term::stderr().show_cursor();
+        }
+    }
 }
 
 pub fn run_from_env() -> Result<i32, String> {
@@ -50,6 +84,7 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|error| error.to_string())?;
+            let resolving = ui::spinner(format!("Resolving {repo}"));
             let resolved = huggingface::resolve(
                 &client,
                 &repo,
@@ -57,7 +92,9 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
                 args.filename.as_deref(),
                 args.quant.as_deref(),
                 token.as_deref(),
-            )?;
+            );
+            resolving.finish_and_clear();
+            let resolved = resolved?;
             let id = args
                 .name
                 .unwrap_or_else(|| default_id(&repo, &resolved.filename, &resolved.sha256));
@@ -88,7 +125,7 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
             }
             let accent = ui::accent();
             let muted = ui::muted();
-            anstream::println!("{accent}Pulling{accent:#} {id}");
+            anstream::println!("{accent}Checking{accent:#} {id}");
             anstream::println!(
                 "  {muted}{} · {} · {}@{}{muted:#}",
                 resolved.filename,
@@ -96,10 +133,23 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
                 resolved.repo,
                 &resolved.revision[..12]
             );
-            download::download(&resolved, &model_dir, token)?;
-            catalog::publish_manifest(&paths.models, &manifest)?;
+            let outcome = download::download(&resolved, &model_dir, token)?;
+            let verifying = ui::spinner(format!("Verifying {id}"));
+            let published = catalog::publish_manifest(&paths.models, &manifest);
+            verifying.finish_and_clear();
+            published?;
             let success = ui::success();
-            anstream::println!("{success}Pulled{success:#} {id}");
+            match outcome {
+                download::DownloadOutcome::Pulled(_) => {
+                    anstream::println!("{success}Pulled{success:#} {id}")
+                }
+                download::DownloadOutcome::AlreadyInstalled(_) => {
+                    let muted = ui::muted();
+                    anstream::println!(
+                        "{success}Verified{success:#} {id} {muted}· already installed{muted:#}"
+                    )
+                }
+            }
             Ok(0)
         }
         Command::List => {
@@ -160,10 +210,26 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
                     );
                 }
                 let prompt = format!("Remove {} ({})?", manifest.id, BinaryBytes(manifest.size));
-                match inquire::Confirm::new(&prompt).with_default(false).prompt() {
-                    Ok(true) => {}
-                    Ok(false) | Err(inquire::InquireError::OperationCanceled) => return Ok(0),
-                    Err(inquire::InquireError::OperationInterrupted) => return Ok(130),
+                #[cfg(unix)]
+                let interrupt = PromptInterrupt::install()?;
+                let result = dialoguer::Confirm::new()
+                    .with_prompt(prompt)
+                    .default(false)
+                    .interact_opt();
+                #[cfg(not(unix))]
+                let _ = dialoguer::console::Term::stderr().show_cursor();
+                #[cfg(unix)]
+                if interrupt.received() {
+                    return Ok(130);
+                }
+                match result {
+                    Ok(Some(true)) => {}
+                    Ok(Some(false)) | Ok(None) => return Ok(0),
+                    Err(dialoguer::Error::IO(error))
+                        if error.kind() == std::io::ErrorKind::Interrupted =>
+                    {
+                        return Ok(130)
+                    }
                     Err(error) => return Err(format!("removal confirmation failed: {error}")),
                 }
             }
@@ -184,7 +250,10 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
                 ModelSelection::Selected(id) => id,
                 ModelSelection::Exit(code) => return Ok(code),
             };
-            let runnable = resolve_runnable(id, args.runtime, &paths)?;
+            let verifying = ui::spinner(format!("Verifying {id}"));
+            let runnable = resolve_runnable(id, args.runtime, &paths);
+            verifying.finish_and_clear();
+            let runnable = runnable?;
             runner::run(
                 &runnable.server,
                 &runnable.artifact,
@@ -209,16 +278,26 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
                 ModelSelection::Selected(id) => id,
                 ModelSelection::Exit(code) => return Ok(code),
             };
-            let runnable = resolve_runnable(id, args.runtime, &paths)?;
-            match runner::start_foreground(
+            let starting = ui::spinner(format!("Starting {id}"));
+            let runnable = resolve_runnable(id, args.runtime, &paths);
+            let runnable = match runnable {
+                Ok(runnable) => runnable,
+                Err(error) => {
+                    starting.finish_and_clear();
+                    return Err(error);
+                }
+            };
+            let started = runner::start_foreground(
                 &runnable.server,
                 &runnable.artifact,
                 &runnable.id,
                 runnable.port,
                 runnable.ctx,
-            )? {
+            );
+            starting.finish_and_clear();
+            match started? {
                 runner::ForegroundStart::Ready(server) => session::run(server, &runnable.id),
-                runner::ForegroundStart::Stopped(code) => Ok(code),
+                runner::ForegroundStart::Stopped(exit) => Ok(runner::report_exit(exit)),
             }
         }
     }
@@ -267,16 +346,25 @@ fn select_model_options(
             "model selection requires an interactive terminal; pass `loxa {command} <id>`"
         ));
     }
-    match inquire::Select::new("Choose a model", options)
-        .with_help_message("↑↓ navigate · enter select · type to filter")
-        .prompt()
-    {
-        Ok(id) => Ok(ModelSelection::Selected(id)),
-        Err(inquire::InquireError::OperationCanceled) => Ok(ModelSelection::Exit(0)),
-        Err(inquire::InquireError::OperationInterrupted) => Ok(ModelSelection::Exit(130)),
-        Err(inquire::InquireError::NotTTY) => Err(format!(
-            "model selection requires an interactive terminal; pass `loxa {command} <id>`"
-        )),
+    #[cfg(unix)]
+    let interrupt = PromptInterrupt::install()?;
+    let result = dialoguer::FuzzySelect::new()
+        .with_prompt("Choose a model (type to filter)")
+        .items(&options)
+        .default(0)
+        .interact_opt();
+    #[cfg(not(unix))]
+    let _ = dialoguer::console::Term::stderr().show_cursor();
+    #[cfg(unix)]
+    if interrupt.received() {
+        return Ok(ModelSelection::Exit(130));
+    }
+    match result {
+        Ok(Some(index)) => Ok(ModelSelection::Selected(options.remove(index))),
+        Ok(None) => Ok(ModelSelection::Exit(0)),
+        Err(dialoguer::Error::IO(error)) if error.kind() == std::io::ErrorKind::Interrupted => {
+            Ok(ModelSelection::Exit(130))
+        }
         Err(error) => Err(format!("model selection failed: {error}")),
     }
 }
