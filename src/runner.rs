@@ -2,18 +2,20 @@ use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::ffi::{OsStr, OsString};
 use std::io::Read as _;
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-static RECEIVED_SIGNAL: AtomicI32 = AtomicI32::new(0);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
-const VERSION_OUTPUT_TIMEOUT: Duration = Duration::from_secs(1);
+const VERSION_OUTPUT_TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_VERSION_OUTPUT: u64 = 4096;
+const MAX_MODELS_BODY: usize = 1024 * 1024;
+const MAX_ANNOUNCEMENT_LINE: usize = 8192;
+const MAX_PENDING_ANNOUNCEMENTS: usize = 64;
 const MANAGED_VERSION: &str = "version: 10121 (555881ebc)";
 
 pub fn discover_server(
@@ -109,13 +111,19 @@ fn probe_version_with_timeout(
     path: &Path,
     timeout: Duration,
 ) -> Result<VersionProbeOutput, String> {
-    let mut child = Command::new(path)
+    let mut command = Command::new(path);
+    command
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| error.to_string())?;
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let group = i32::try_from(child.id()).map_err(|_| "invalid child process id".to_string())?;
     let stdout = child
         .stdout
         .take()
@@ -124,9 +132,9 @@ fn probe_version_with_timeout(
         .stderr
         .take()
         .ok_or_else(|| "failed to capture --version output".to_string())?;
-    let (sender, receiver) = mpsc::sync_channel(2);
-    let stdout_sender = sender.clone();
-    std::thread::spawn(move || {
+    let (output_sender, output_receiver) = mpsc::sync_channel(2);
+    let stdout_sender = output_sender.clone();
+    let stdout_reader = std::thread::spawn(move || {
         let mut output = Vec::new();
         let result = stdout
             .take(MAX_VERSION_OUTPUT)
@@ -135,14 +143,14 @@ fn probe_version_with_timeout(
             .map_err(|error| error.to_string());
         let _ = stdout_sender.send((false, result));
     });
-    std::thread::spawn(move || {
+    let stderr_reader = std::thread::spawn(move || {
         let mut output = Vec::new();
         let result = stderr
             .take(MAX_VERSION_OUTPUT)
             .read_to_end(&mut output)
             .map(|_| output)
             .map_err(|error| error.to_string());
-        let _ = sender.send((true, result));
+        let _ = output_sender.send((true, result));
     });
 
     let deadline = Instant::now() + timeout;
@@ -151,28 +159,63 @@ fn probe_version_with_timeout(
             break status;
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            let _ = terminate_probe(&mut child, group);
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
             return Err(format!("timed out after {} ms", timeout.as_millis()));
         }
         std::thread::sleep(Duration::from_millis(10));
     };
+    let output_deadline = Instant::now() + VERSION_OUTPUT_TIMEOUT;
+    let mut stdout = None;
+    let mut stderr = None;
+    for _ in 0..2 {
+        let remaining = output_deadline.saturating_duration_since(Instant::now());
+        let (is_stderr, output) = match output_receiver.recv_timeout(remaining) {
+            Ok(output) => output,
+            Err(_) => {
+                let _ = terminate_probe(&mut child, group);
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(format!(
+                    "timed out reading --version output after {} ms",
+                    VERSION_OUTPUT_TIMEOUT.as_millis()
+                ));
+            }
+        };
+        if is_stderr {
+            stderr = Some(output);
+        } else {
+            stdout = Some(output);
+        }
+    }
+    stdout_reader
+        .join()
+        .map_err(|_| "--version stdout reader panicked".to_string())?;
+    stderr_reader
+        .join()
+        .map_err(|_| "--version stderr reader panicked".to_string())?;
     if !status.success() {
         return Err(format!("{status}"));
     }
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    for _ in 0..2 {
-        let (is_stderr, output) = receiver
-            .recv_timeout(VERSION_OUTPUT_TIMEOUT)
-            .map_err(|_| "timed out reading --version output".to_string())?;
-        if is_stderr {
-            stderr = output?;
-        } else {
-            stdout = output?;
-        }
-    }
-    Ok(VersionProbeOutput { stdout, stderr })
+    Ok(VersionProbeOutput {
+        stdout: stdout.transpose()?.unwrap_or_default(),
+        stderr: stderr.transpose()?.unwrap_or_default(),
+    })
+}
+
+#[cfg(unix)]
+fn terminate_probe(child: &mut Child, group: i32) -> Result<(), String> {
+    signal_process_group(group, libc::SIGKILL)?;
+    let _ = child.wait().map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn terminate_probe(child: &mut Child, _group: i32) -> Result<(), String> {
+    let _ = child.kill();
+    let _ = child.wait().map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 fn managed_version_first_line(output: VersionProbeOutput) -> Result<String, String> {
@@ -218,77 +261,31 @@ pub fn run(
     requested_port: u16,
     ctx: u32,
 ) -> Result<i32, String> {
-    let reservation =
-        TcpListener::bind(("127.0.0.1", requested_port)).map_err(|error| error.to_string())?;
-    let port = reservation
-        .local_addr()
-        .map_err(|error| error.to_string())?
-        .port();
-    let args = build_args(model, id, port, ctx);
-    let _signal_guard = install_signal_handlers()?;
-    let mut command = Command::new(server);
-    command
-        .args(args)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // SAFETY: setpgid is async-signal-safe and the closure performs no allocation.
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) == 0 {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::last_os_error())
-                }
-            });
-        }
-    }
-    drop(reservation);
-    let mut child = OwnedChild::new(command.spawn().map_err(|error| error.to_string())?);
-    let startup_deadline = Instant::now() + STARTUP_TIMEOUT;
-    let client = readiness_client()?;
+    let signals = SignalSubscription::install()?;
+    let outcome = OwnedServer::start(
+        server,
+        model,
+        id,
+        requested_port,
+        ctx,
+        STARTUP_TIMEOUT,
+        || signals.received(),
+    )?;
+    let mut server = match outcome {
+        StartOutcome::Ready(server) => server,
+        StartOutcome::Exited(code) => return Ok(code),
+        StartOutcome::Signaled(signal) => return Ok(128 + signal),
+    };
+    println!("ready: http://127.0.0.1:{} (model {id})", server.port());
     loop {
-        if let Some(status) = child
-            .child_mut()
-            .try_wait()
-            .map_err(|error| error.to_string())?
-        {
-            let code = exit_code(status);
-            child.terminate()?;
+        if let Some(code) = server.try_wait()? {
             return Ok(code);
         }
-        if let Some(signal) = received_signal() {
-            child.terminate()?;
+        if let Some(signal) = signals.received() {
+            server.terminate()?;
             return Ok(128 + signal);
         }
-        if readiness(&client, port, id) {
-            println!("ready: http://127.0.0.1:{port} (model {id})");
-            break;
-        }
-        if Instant::now() >= startup_deadline {
-            child.terminate()?;
-            return Err("llama-server did not become ready within 120 seconds".into());
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    loop {
-        if let Some(status) = child
-            .child_mut()
-            .try_wait()
-            .map_err(|error| error.to_string())?
-        {
-            let code = exit_code(status);
-            child.terminate()?;
-            return Ok(code);
-        }
-        if let Some(signal) = received_signal() {
-            child.terminate()?;
-            return Ok(128 + signal);
-        }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -302,14 +299,58 @@ fn readiness_client() -> Result<Client, String> {
         .map_err(|error| error.to_string())
 }
 
-fn readiness(client: &Client, port: u16, id: &str) -> bool {
-    client
+fn readiness(client: &Client, port: u16, id: &str) -> Result<bool, String> {
+    let response = match client
         .get(format!("http://127.0.0.1:{port}/v1/models"))
         .send()
-        .ok()
-        .filter(|response| response.status().is_success())
-        .and_then(|response| response.text().ok())
-        .is_some_and(|body| models_body_has_alias(&body, id))
+    {
+        Ok(response) => response,
+        Err(_) => return Ok(false),
+    };
+    if !response.status().is_success() {
+        return Ok(false);
+    }
+    models_reader_has_alias(response, id)
+}
+
+fn validate_announcement_line(line: &str) -> Result<u16, String> {
+    if !line.contains("listening") {
+        return Err("line is not a listening announcement".into());
+    }
+    let candidates = line
+        .split_ascii_whitespace()
+        .map(|part| {
+            part.trim_matches(|character: char| {
+                matches!(character, ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}')
+            })
+        })
+        .filter(|part| part.contains("://"))
+        .collect::<Vec<_>>();
+    if candidates.len() != 1 {
+        return Err(format!(
+            "listening announcement must contain exactly one URL, found {}",
+            candidates.len()
+        ));
+    }
+    let url = reqwest::Url::parse(candidates[0])
+        .map_err(|error| format!("invalid listening URL: {error}"))?;
+    if url.scheme() != "http"
+        || url.host_str() != Some("127.0.0.1")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("listening URL must be an exact loopback HTTP endpoint".into());
+    }
+    let port = url
+        .port()
+        .ok_or_else(|| "listening URL must include an explicit port".to_string())?;
+    if port == 0 {
+        return Err("listening URL port must be nonzero".into());
+    }
+    Ok(port)
 }
 
 #[derive(Deserialize)]
@@ -327,96 +368,408 @@ pub fn models_body_has_alias(body: &str, id: &str) -> bool {
         .is_ok_and(|models| models.data.iter().any(|model| model.id == id))
 }
 
-#[cfg(unix)]
-struct SignalGuard {
-    previous_int: libc::sighandler_t,
-    previous_term: libc::sighandler_t,
+fn models_reader_has_alias(mut reader: impl std::io::Read, id: &str) -> Result<bool, String> {
+    let mut body = Vec::new();
+    reader
+        .by_ref()
+        .take((MAX_MODELS_BODY + 1) as u64)
+        .read_to_end(&mut body)
+        .map_err(|error| error.to_string())?;
+    if body.len() > MAX_MODELS_BODY {
+        return Err(format!(
+            "/v1/models response is too large (limit {MAX_MODELS_BODY} bytes)"
+        ));
+    }
+    let body = std::str::from_utf8(&body).map_err(|error| error.to_string())?;
+    Ok(models_body_has_alias(body, id))
 }
 
 #[cfg(unix)]
-impl Drop for SignalGuard {
-    fn drop(&mut self) {
-        // SAFETY: restores both handler values returned by signal.
-        unsafe {
-            libc::signal(libc::SIGTERM, self.previous_term);
-            libc::signal(libc::SIGINT, self.previous_int);
+struct SignalSubscription {
+    received: Arc<AtomicUsize>,
+    interrupt_id: signal_hook::SigId,
+    terminate_id: signal_hook::SigId,
+}
+
+#[cfg(unix)]
+impl SignalSubscription {
+    fn install() -> Result<Self, String> {
+        let received = Arc::new(AtomicUsize::new(0));
+        let interrupt_id = signal_hook::flag::register_usize(
+            libc::SIGINT,
+            Arc::clone(&received),
+            libc::SIGINT as usize,
+        )
+        .map_err(|error| error.to_string())?;
+        let terminate_id = match signal_hook::flag::register_usize(
+            libc::SIGTERM,
+            Arc::clone(&received),
+            libc::SIGTERM as usize,
+        ) {
+            Ok(id) => id,
+            Err(error) => {
+                signal_hook::low_level::unregister(interrupt_id);
+                return Err(error.to_string());
+            }
+        };
+        Ok(Self {
+            received,
+            interrupt_id,
+            terminate_id,
+        })
+    }
+
+    fn received(&self) -> Option<i32> {
+        match self.received.load(Ordering::SeqCst) {
+            0 => None,
+            signal => i32::try_from(signal).ok(),
         }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SignalSubscription {
+    fn drop(&mut self) {
+        signal_hook::low_level::unregister(self.terminate_id);
+        signal_hook::low_level::unregister(self.interrupt_id);
     }
 }
 
 #[cfg(not(unix))]
-struct SignalGuard;
+struct SignalSubscription;
 
-fn install_signal_handlers() -> Result<SignalGuard, String> {
-    RECEIVED_SIGNAL.store(0, Ordering::SeqCst);
-    #[cfg(unix)]
-    {
-        extern "C" fn handle(signal: libc::c_int) {
-            RECEIVED_SIGNAL.store(signal, Ordering::SeqCst);
-        }
-        // SAFETY: handler only stores to a lock-free atomic and has static lifetime.
-        let handler = handle as *const () as libc::sighandler_t;
-        let previous_int = unsafe { libc::signal(libc::SIGINT, handler) };
-        if previous_int == libc::SIG_ERR {
-            return Err(std::io::Error::last_os_error().to_string());
-        }
-        // SAFETY: handler only stores to a lock-free atomic and has static lifetime.
-        let previous_term = unsafe { libc::signal(libc::SIGTERM, handler) };
-        if previous_term == libc::SIG_ERR {
-            let error = std::io::Error::last_os_error().to_string();
-            // SAFETY: restores the SIGINT handler installed immediately above.
-            unsafe {
-                libc::signal(libc::SIGINT, previous_int);
-            }
-            return Err(error);
-        }
-        Ok(SignalGuard {
-            previous_int,
-            previous_term,
-        })
+#[cfg(not(unix))]
+impl SignalSubscription {
+    fn install() -> Result<Self, String> {
+        Ok(Self)
     }
-    #[cfg(not(unix))]
-    {
-        Ok(SignalGuard)
+
+    fn received(&self) -> Option<i32> {
+        None
     }
 }
 
-fn received_signal() -> Option<i32> {
-    match RECEIVED_SIGNAL.load(Ordering::SeqCst) {
-        0 => None,
-        signal => Some(signal),
+fn spawn_output_reader<R>(
+    mut reader: R,
+    announcements: mpsc::SyncSender<Result<u16, String>>,
+    overflow: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<Result<(), String>>
+where
+    R: std::io::Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let mut line = Vec::new();
+        let mut line_too_long = false;
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let count = reader
+                .read(&mut buffer)
+                .map_err(|error| error.to_string())?;
+            if count == 0 {
+                if !line.is_empty() || line_too_long {
+                    publish_announcement(&line, line_too_long, &announcements, overflow.as_ref());
+                }
+                return Ok(());
+            }
+            for &byte in &buffer[..count] {
+                if byte == b'\n' {
+                    publish_announcement(&line, line_too_long, &announcements, overflow.as_ref());
+                    line.clear();
+                    line_too_long = false;
+                } else if line.len() < MAX_ANNOUNCEMENT_LINE {
+                    line.push(byte);
+                } else {
+                    line_too_long = true;
+                }
+            }
+        }
+    })
+}
+
+fn publish_announcement(
+    line: &[u8],
+    line_too_long: bool,
+    announcements: &mpsc::SyncSender<Result<u16, String>>,
+    overflow: &AtomicBool,
+) {
+    let line = String::from_utf8_lossy(line);
+    if !line.contains("listening") {
+        return;
+    }
+    let announcement = if line_too_long {
+        Err(format!(
+            "listening announcement exceeds {MAX_ANNOUNCEMENT_LINE} bytes"
+        ))
+    } else {
+        validate_announcement_line(&line)
+    };
+    if let Err(mpsc::TrySendError::Full(_) | mpsc::TrySendError::Disconnected(_)) =
+        announcements.try_send(announcement)
+    {
+        overflow.store(true, Ordering::SeqCst);
+    }
+}
+
+enum StartOutcome {
+    Ready(OwnedServer),
+    Exited(i32),
+    Signaled(i32),
+}
+
+pub struct OwnedServer {
+    child: Option<Child>,
+    group: i32,
+    port: u16,
+    announcements: mpsc::Receiver<Result<u16, String>>,
+    announcement_overflow: Arc<AtomicBool>,
+    announced_port: Option<u16>,
+    stdout_reader: Option<std::thread::JoinHandle<Result<(), String>>>,
+    stderr_reader: Option<std::thread::JoinHandle<Result<(), String>>>,
+}
+
+impl OwnedServer {
+    #[allow(clippy::too_many_arguments)]
+    fn start<F>(
+        server: &Path,
+        model: &Path,
+        id: &str,
+        requested_port: u16,
+        ctx: u32,
+        timeout: Duration,
+        signal: F,
+    ) -> Result<StartOutcome, String>
+    where
+        F: Fn() -> Option<i32>,
+    {
+        let client = readiness_client()?;
+        let mut command = Command::new(server);
+        command
+            .args(build_args(model, id, requested_port, ctx))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let mut child = command.spawn().map_err(|error| error.to_string())?;
+        let group = i32::try_from(child.id()).map_err(|_| {
+            let _ = child.kill();
+            let _ = child.wait();
+            "invalid child process id".to_string()
+        })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "failed to capture llama-server stdout".to_string())?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "failed to capture llama-server stderr".to_string())?;
+        let (announcement_sender, announcements) = mpsc::sync_channel(MAX_PENDING_ANNOUNCEMENTS);
+        let announcement_overflow = Arc::new(AtomicBool::new(false));
+        let stdout_reader = spawn_output_reader(
+            stdout,
+            announcement_sender.clone(),
+            Arc::clone(&announcement_overflow),
+        );
+        let stderr_reader = spawn_output_reader(
+            stderr,
+            announcement_sender,
+            Arc::clone(&announcement_overflow),
+        );
+        let mut owned = Self {
+            child: Some(child),
+            group,
+            port: 0,
+            announcements,
+            announcement_overflow,
+            announced_port: None,
+            stdout_reader: Some(stdout_reader),
+            stderr_reader: Some(stderr_reader),
+        };
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Err(error) = owned.collect_announcements() {
+                return owned.fail_start(error);
+            }
+            if let Some(signal) = signal() {
+                owned.terminate()?;
+                return Ok(StartOutcome::Signaled(signal));
+            }
+            if let Some(status) = owned
+                .child_mut()
+                .try_wait()
+                .map_err(|error| error.to_string())?
+            {
+                let code = exit_code(status);
+                owned.terminate()?;
+                return Ok(StartOutcome::Exited(code));
+            }
+            if let Some(port) = owned.announced_port {
+                if requested_port != 0 && port != requested_port {
+                    return owned.fail_start(format!(
+                        "llama-server announced port {port}, expected {requested_port}"
+                    ));
+                }
+                match readiness(&client, port, id) {
+                    Ok(true) => {
+                        if let Err(error) = owned.collect_announcements() {
+                            return owned.fail_start(error);
+                        }
+                        owned.port = port;
+                        return Ok(StartOutcome::Ready(owned));
+                    }
+                    Ok(false) => {}
+                    Err(error) => return owned.fail_start(error),
+                }
+            }
+            if Instant::now() >= deadline {
+                let error = if owned.announced_port.is_none() {
+                    format!(
+                        "llama-server did not announce a listening endpoint within {} ms",
+                        timeout.as_millis()
+                    )
+                } else {
+                    format!(
+                        "llama-server did not become ready within {} ms",
+                        timeout.as_millis()
+                    )
+                };
+                return owned.fail_start(error);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn fail_start(mut self, error: String) -> Result<StartOutcome, String> {
+        self.terminate()
+            .map_err(|cleanup| format!("{error}; cleanup failed: {cleanup}"))?;
+        Err(error)
+    }
+
+    fn collect_announcements(&mut self) -> Result<(), String> {
+        for announcement in self.announcements.try_iter() {
+            let port = announcement?;
+            match self.announced_port {
+                Some(existing) if existing != port => {
+                    return Err(format!(
+                        "conflicting listening announcements: ports {existing} and {port}"
+                    ));
+                }
+                Some(_) => {}
+                None => self.announced_port = Some(port),
+            }
+        }
+        if self.announcement_overflow.load(Ordering::SeqCst) {
+            return Err("llama-server announcement state overflowed".into());
+        }
+        Ok(())
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        self.child.as_mut().expect("owned server child is present")
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub fn try_wait(&mut self) -> Result<Option<i32>, String> {
+        if let Err(error) = self.collect_announcements() {
+            self.terminate()
+                .map_err(|cleanup| format!("{error}; cleanup failed: {cleanup}"))?;
+            return Err(error);
+        }
+        let Some(status) = self
+            .child_mut()
+            .try_wait()
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
+        };
+        let code = exit_code(status);
+        self.terminate()?;
+        Ok(Some(code))
+    }
+
+    pub fn terminate(&mut self) -> Result<(), String> {
+        if let Some(child) = self.child.as_mut() {
+            terminate_owned_group(child, self.group)?;
+            self.child.take();
+        }
+        self.join_output_readers()
+    }
+
+    fn join_output_readers(&mut self) -> Result<(), String> {
+        let mut first_error = None;
+        for reader in [&mut self.stdout_reader, &mut self.stderr_reader] {
+            if let Some(reader) = reader.take() {
+                match reader.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        first_error.get_or_insert(error);
+                    }
+                    Err(_) => {
+                        first_error
+                            .get_or_insert_with(|| "llama-server output reader panicked".into());
+                    }
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    #[cfg(test)]
+    fn output_readers_owned(&self) -> bool {
+        self.stdout_reader.is_some() || self.stderr_reader.is_some()
+    }
+}
+
+impl Drop for OwnedServer {
+    fn drop(&mut self) {
+        let _ = self.terminate();
     }
 }
 
 #[cfg(unix)]
-fn terminate_owned(child: &mut Child) -> Result<(), String> {
-    let group = i32::try_from(child.id()).map_err(|_| "invalid child process id")?;
-    // SAFETY: the negative PID targets only the process group created for this child.
-    unsafe {
-        libc::kill(-group, libc::SIGTERM);
-    }
+fn terminate_owned_group(child: &mut Child, group: i32) -> Result<(), String> {
+    signal_process_group(group, libc::SIGTERM)?;
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         let _ = child.try_wait().map_err(|error| error.to_string())?;
         if !process_group_exists(group)? {
-            child.wait().map_err(|error| error.to_string())?;
+            let _ = child.wait().map_err(|error| error.to_string())?;
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    // SAFETY: the negative PID targets only the exact owned process group.
-    unsafe {
-        libc::kill(-group, libc::SIGKILL);
-    }
-    child.wait().map_err(|error| error.to_string())?;
+    signal_process_group(group, libc::SIGKILL)?;
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         if !process_group_exists(group)? {
+            let _ = child.wait().map_err(|error| error.to_string())?;
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(20));
     }
     Err("owned process group survived SIGKILL".into())
+}
+
+#[cfg(unix)]
+fn signal_process_group(group: i32, signal: i32) -> Result<(), String> {
+    // SAFETY: the negative PID targets only the exact process group created for this child.
+    let result = unsafe { libc::kill(-group, signal) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(error.to_string())
+    }
 }
 
 #[cfg(unix)]
@@ -435,38 +788,14 @@ fn process_group_exists(group: i32) -> Result<bool, String> {
 }
 
 #[cfg(not(unix))]
-fn terminate_owned(child: &mut Child) -> Result<(), String> {
-    child.kill().map_err(|error| error.to_string())?;
-    child.wait().map_err(|error| error.to_string())?;
+fn terminate_owned_group(child: &mut Child, _group: i32) -> Result<(), String> {
+    match child.kill() {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    let _ = child.wait().map_err(|error| error.to_string())?;
     Ok(())
-}
-
-struct OwnedChild {
-    child: Option<Child>,
-}
-
-impl OwnedChild {
-    fn new(child: Child) -> Self {
-        Self { child: Some(child) }
-    }
-
-    fn child_mut(&mut self) -> &mut Child {
-        self.child.as_mut().expect("owned child is present")
-    }
-
-    fn terminate(&mut self) -> Result<(), String> {
-        if let Some(mut child) = self.child.take() {
-            terminate_owned(&mut child)
-        } else {
-            Ok(())
-        }
-    }
-}
-
-impl Drop for OwnedChild {
-    fn drop(&mut self) {
-        let _ = self.terminate();
-    }
 }
 
 fn exit_code(status: std::process::ExitStatus) -> i32 {
@@ -513,6 +842,7 @@ mod tests {
     use super::*;
     use std::ffi::OsStr;
     use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -521,45 +851,10 @@ mod tests {
     static RUN_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[cfg(unix)]
-    struct TestSignalGuard {
-        previous_int: libc::sighandler_t,
-        previous_term: libc::sighandler_t,
-    }
-
-    #[cfg(unix)]
-    impl TestSignalGuard {
-        fn install() -> Self {
-            extern "C" fn keep_test_process_safe(_: libc::c_int) {}
-
-            let handler = keep_test_process_safe as *const () as libc::sighandler_t;
-            // SAFETY: the no-op handler has static lifetime and is restored by this guard.
-            let previous_int = unsafe { libc::signal(libc::SIGINT, handler) };
-            assert_ne!(previous_int, libc::SIG_ERR);
-            // SAFETY: the no-op handler has static lifetime and is restored by this guard.
-            let previous_term = unsafe { libc::signal(libc::SIGTERM, handler) };
-            if previous_term == libc::SIG_ERR {
-                // SAFETY: restores the handler value returned above for SIGINT.
-                unsafe {
-                    libc::signal(libc::SIGINT, previous_int);
-                }
-                panic!("failed to install test SIGTERM handler");
-            }
-            Self {
-                previous_int,
-                previous_term,
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for TestSignalGuard {
-        fn drop(&mut self) {
-            // SAFETY: restores the exact handler values replaced by this guard.
-            unsafe {
-                libc::signal(libc::SIGTERM, self.previous_term);
-                libc::signal(libc::SIGINT, self.previous_int);
-            }
-        }
+    fn process_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        RUN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     #[cfg(unix)]
@@ -587,6 +882,33 @@ mod tests {
         );
     }
 
+    fn serve_models(alias: &'static str) -> (u16, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            assert!(
+                request.starts_with(b"GET /v1/models HTTP/1.1\r\n"),
+                "{}",
+                String::from_utf8_lossy(&request)
+            );
+            let body = format!(r#"{{"data":[{{"id":"{alias}"}}]}}"#);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        (port, server)
+    }
+
     #[cfg(unix)]
     fn run_with_signal(signal: libc::c_int) -> i32 {
         let dir = tempdir().unwrap();
@@ -603,7 +925,7 @@ mod tests {
                 std::thread::yield_now();
             }
             assert!(marker.exists(), "server did not start");
-            // SAFETY: TestSignalGuard and the production guard keep this process safe.
+            // SAFETY: the production signal subscription is installed before the child starts.
             assert_eq!(unsafe { libc::kill(libc::getpid(), signal) }, 0);
         });
 
@@ -646,9 +968,176 @@ mod tests {
         assert_eq!(STARTUP_TIMEOUT, Duration::from_secs(120));
     }
 
+    #[test]
+    fn announcement_validation_accepts_only_an_exact_loopback_http_endpoint() {
+        assert_eq!(
+            validate_announcement_line(
+                "0.00.000.000 I srv  llama_server: listening on http://127.0.0.1:43123",
+            )
+            .unwrap(),
+            43123
+        );
+        assert!(validate_announcement_line("listening on http://0.0.0.0:43123").is_err());
+    }
+
+    #[test]
+    fn models_readiness_body_is_bounded_and_requires_the_exact_alias() {
+        assert!(models_reader_has_alias(
+            std::io::Cursor::new(br#"{"data":[{"id":"demo"}]}"#),
+            "demo",
+        )
+        .unwrap());
+        assert!(!models_reader_has_alias(
+            std::io::Cursor::new(br#"{"data":[{"id":"demo-extra"}]}"#),
+            "demo",
+        )
+        .unwrap());
+
+        let oversized = vec![b' '; MAX_MODELS_BODY + 1];
+        let error = models_reader_has_alias(std::io::Cursor::new(oversized), "demo").unwrap_err();
+        assert!(error.contains("too large"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_server_passes_native_port_zero_and_owns_both_output_drains() {
+        let _lock = process_test_lock();
+        let dir = tempdir().unwrap();
+        let server_path = dir.path().join("server");
+        let argv = dir.path().join("argv");
+        let (port, http) = serve_models("demo");
+        write_executable_script(
+            &server_path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '0.00 I srv: listening on http://127.0.0.1:{port}\\n' >&2\nwhile :; do sleep 1; done\n",
+                argv.display()
+            )
+            .as_bytes(),
+        );
+
+        let outcome = OwnedServer::start(
+            &server_path,
+            Path::new("/models/model.gguf"),
+            "demo",
+            0,
+            8192,
+            Duration::from_secs(2),
+            || None,
+        )
+        .unwrap();
+        let mut server = match outcome {
+            StartOutcome::Ready(server) => server,
+            _ => panic!("server did not become ready"),
+        };
+        http.join().unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&argv).unwrap(),
+            "--model\n/models/model.gguf\n--alias\ndemo\n--host\n127.0.0.1\n--port\n0\n--ctx-size\n8192\n--n-gpu-layers\n99\n"
+        );
+        assert_eq!(server.port(), port);
+        assert!(server.output_readers_owned());
+        server.terminate().unwrap();
+        assert!(!server.output_readers_owned());
+        server.terminate().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_timeout_and_explicit_port_mismatch_clean_the_owned_group() {
+        let _lock = process_test_lock();
+        for (requested_port, announced_port, expected) in [
+            (0, None, "did not announce"),
+            (43124, Some(43123), "expected 43124"),
+        ] {
+            let dir = tempdir().unwrap();
+            let server_path = dir.path().join("server");
+            let group_path = dir.path().join("group");
+            let announcement = announced_port.map_or_else(String::new, |port| {
+                format!("printf 'listening on http://127.0.0.1:{port}\\n' >&2\n")
+            });
+            write_executable_script(
+                &server_path,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$$\" > '{}'\n{announcement}while :; do sleep 1; done\n",
+                    group_path.display()
+                )
+                .as_bytes(),
+            );
+
+            let error = match OwnedServer::start(
+                &server_path,
+                Path::new("/models/model.gguf"),
+                "demo",
+                requested_port,
+                1,
+                Duration::from_millis(500),
+                || None,
+            ) {
+                Err(error) => error,
+                Ok(_) => panic!("server unexpectedly started"),
+            };
+            let group = std::fs::read_to_string(&group_path)
+                .unwrap()
+                .trim()
+                .parse::<i32>()
+                .unwrap();
+            assert!(error.contains(expected), "{error}");
+            assert!(!process_group_exists(group).unwrap());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_ready_leader_exit_returns_status_after_descendant_cleanup() {
+        let _lock = process_test_lock();
+        let dir = tempdir().unwrap();
+        let server_path = dir.path().join("server");
+        let release = dir.path().join("release");
+        let (port, http) = serve_models("demo");
+        write_executable_script(
+            &server_path,
+            format!(
+                "#!/bin/sh\n(trap '' TERM; while :; do sleep 1; done) &\nprintf 'listening on http://127.0.0.1:{port}\\n' >&2\nwhile [ ! -f '{}' ]; do sleep 1; done\nexit 7\n",
+                release.display()
+            )
+            .as_bytes(),
+        );
+        let outcome = OwnedServer::start(
+            &server_path,
+            Path::new("/models/model.gguf"),
+            "demo",
+            0,
+            1,
+            Duration::from_secs(2),
+            || None,
+        )
+        .unwrap();
+        let mut server = match outcome {
+            StartOutcome::Ready(server) => server,
+            _ => panic!("server did not become ready"),
+        };
+        let group = server.group;
+        http.join().unwrap();
+        std::fs::write(release, b"go").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let code = loop {
+            if let Some(code) = server.try_wait().unwrap() {
+                break code;
+            }
+            assert!(Instant::now() < deadline, "leader did not exit");
+            std::thread::yield_now();
+        };
+
+        assert_eq!(code, 7);
+        assert!(!process_group_exists(group).unwrap());
+        assert!(!server.output_readers_owned());
+    }
+
     #[cfg(unix)]
     #[test]
     fn discovery_uses_explicit_then_environment_then_managed_then_path() {
+        let _lock = process_test_lock();
         let dir = tempdir().unwrap();
         let explicit = dir.path().join("explicit");
         let environment = dir.path().join("environment");
@@ -696,6 +1185,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn successful_dual_stream_explicit_candidate_is_accepted() {
+        let _lock = process_test_lock();
         let dir = tempdir().unwrap();
         let explicit = dir.path().join("explicit");
         let managed = dir.path().join("missing-managed");
@@ -710,6 +1200,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn successful_dual_stream_environment_candidate_is_accepted() {
+        let _lock = process_test_lock();
         let dir = tempdir().unwrap();
         let environment = dir.path().join("environment");
         let managed = dir.path().join("missing-managed");
@@ -724,6 +1215,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn successful_dual_stream_path_candidate_is_accepted() {
+        let _lock = process_test_lock();
         let dir = tempdir().unwrap();
         let managed = dir.path().join("missing-managed");
         let path_server = dir.path().join("llama-server");
@@ -739,6 +1231,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn explicit_and_environment_candidates_fail_immediately_when_invalid() {
+        let _lock = process_test_lock();
         let dir = tempdir().unwrap();
         let missing_explicit = dir.path().join("missing-explicit");
         let missing_environment = dir.path().join("missing-environment");
@@ -775,6 +1268,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn managed_runtime_requires_exact_identity_and_reports_damage() {
+        let _lock = process_test_lock();
         let dir = tempdir().unwrap();
         let managed = dir.path().join("managed");
         std::fs::write(&managed, b"not executable").unwrap();
@@ -798,6 +1292,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn managed_runtime_rejects_ambiguous_dual_stream_identity() {
+        let _lock = process_test_lock();
         let dir = tempdir().unwrap();
         let managed = dir.path().join("managed");
         write_executable_script(
@@ -817,15 +1312,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn version_probes_are_bounded() {
+        let _lock = process_test_lock();
         let dir = tempdir().unwrap();
         let server = dir.path().join("server");
-        write_executable_script(&server, b"#!/bin/sh\nwhile :; do :; done\n");
+        write_executable_script(&server, b"#!/bin/sh\n(sleep 2) &\nexit 0\n");
         let started = Instant::now();
 
-        let error = probe_version_with_timeout(&server, Duration::from_millis(50)).unwrap_err();
+        let error = probe_version_with_timeout(&server, VERSION_PROBE_TIMEOUT).unwrap_err();
 
-        assert!(error.contains("timed out"), "{error}");
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(error.contains("timed out reading"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[cfg(unix)]
@@ -883,7 +1379,7 @@ mod tests {
             }
         });
 
-        let ready = readiness(&readiness_client().unwrap(), port, "demo");
+        let ready = readiness(&readiness_client().unwrap(), port, "demo").unwrap();
         stop.store(true, Ordering::SeqCst);
         server.join().unwrap();
 
@@ -894,8 +1390,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn installed_handlers_map_sigterm_and_sigint_to_shell_exit_codes() {
-        let _lock = RUN_TEST_LOCK.lock().unwrap();
-        let _test_signal_guard = TestSignalGuard::install();
+        let _lock = process_test_lock();
 
         let term = run_with_signal(libc::SIGTERM);
         let interrupt = run_with_signal(libc::SIGINT);
@@ -906,7 +1401,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn leader_exit_cleans_surviving_process_group_before_returning_status() {
-        let _lock = RUN_TEST_LOCK.lock().unwrap();
+        let _lock = process_test_lock();
         let dir = tempdir().unwrap();
         let server = dir.path().join("server");
         let child_ready = dir.path().join("child-ready");
@@ -937,6 +1432,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn teardown_waits_for_the_exact_process_group_to_disappear() {
+        let _lock = process_test_lock();
         use std::os::unix::process::CommandExt;
         let dir = tempdir().unwrap();
         let ready = dir.path().join("ready");
@@ -946,15 +1442,7 @@ mod tests {
             .arg("(trap '' TERM; echo ready > \"$1\"; while :; do sleep 1; done) & wait")
             .arg("sh")
             .arg(&ready);
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) == 0 {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::last_os_error())
-                }
-            });
-        }
+        command.process_group(0);
         let mut child = command.spawn().unwrap();
         let pgid = i32::try_from(child.id()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -962,7 +1450,7 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(ready.exists());
-        terminate_owned(&mut child).unwrap();
+        terminate_owned_group(&mut child, pgid).unwrap();
         assert!(!process_group_exists(pgid).unwrap());
     }
 }
