@@ -161,8 +161,14 @@ fn probe_version_with_timeout(path: &Path, timeout: Duration) -> Result<String, 
             stdout = output?;
         }
     }
-    let output = if stderr.is_empty() { stdout } else { stderr };
-    Ok(first_line(&output))
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (false, true) => Ok(first_line(&stdout)),
+        (true, false) => Ok(first_line(&stderr)),
+        (true, true) => Err("--version produced no output".into()),
+        (false, false) => {
+            Err("--version output is ambiguous: wrote to both stdout and stderr".into())
+        }
+    }
 }
 
 fn first_line(output: &[u8]) -> String {
@@ -721,6 +727,25 @@ mod tests {
             "{error}"
         );
         assert!(error.contains("version: 10121 (555881ebc)"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_runtime_rejects_ambiguous_dual_stream_identity() {
+        let dir = tempdir().unwrap();
+        let managed = dir.path().join("managed");
+        write_executable_script(
+            &managed,
+            b"#!/bin/sh\nprintf '%s\\n' 'version: 10090 (wrong)' \nprintf '%s\\n' 'version: 10121 (555881ebc)' >&2\n",
+        );
+
+        let error = discover_server(None, None, &managed, None).unwrap_err();
+
+        assert!(
+            error.contains("managed llama-server bundle is damaged"),
+            "{error}"
+        );
+        assert!(error.contains("ambiguous"), "{error}");
     }
 
     #[cfg(unix)]
