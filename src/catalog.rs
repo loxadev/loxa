@@ -75,15 +75,12 @@ pub fn load_catalog(models_root: &Path) -> Result<Vec<Manifest>, String> {
             .map_err(|error| error.to_string())?
             .is_dir()
         {
-            return Err(format!("unexpected catalog entry {}", path.display()));
+            continue;
         }
         let manifest_path = path.join("manifest.json");
         let metadata = match fs::symlink_metadata(&manifest_path) {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                validate_incomplete_dir(&path)?;
-                continue;
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(format!("{}: {error}", manifest_path.display())),
         };
         if !metadata.file_type().is_file() {
@@ -237,45 +234,6 @@ fn finish_pending(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_incomplete_dir(dir: &Path) -> Result<(), String> {
-    let id = dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| format!("invalid incomplete model directory {}", dir.display()))?;
-    validate_id(id)?;
-    for item in fs::read_dir(dir).map_err(|error| error.to_string())? {
-        let item = item.map_err(|error| error.to_string())?;
-        let name = item
-            .file_name()
-            .to_str()
-            .ok_or_else(|| format!("invalid incomplete model entry {}", item.path().display()))?
-            .to_string();
-        let allowed = matches!(
-            name.as_str(),
-            ".lock"
-                | "pending.json"
-                | "pending.json.tmp"
-                | "manifest.json.tmp"
-                | "model.gguf"
-                | "model.gguf.part"
-                | "model.gguf.part.restart"
-                | "model.gguf.invalid"
-        );
-        if !allowed
-            || !item
-                .file_type()
-                .map_err(|error| error.to_string())?
-                .is_file()
-        {
-            return Err(format!(
-                "unexpected incomplete model entry {}",
-                item.path().display()
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn validate_repo(repo: &str) -> Result<(), String> {
     let parts = repo.split('/').collect::<Vec<_>>();
     if parts.len() == 2
@@ -359,6 +317,21 @@ mod tests {
         invalid = manifest("valid");
         invalid.remote_filename = "part-00001-of-00002.gguf".into();
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn foreign_store_entries_do_not_hide_managed_models() {
+        let root = tempdir().unwrap();
+        let expected = manifest("smollm2-135m");
+        write_artifact(root.path(), &expected.id);
+        publish_manifest(root.path(), &expected).unwrap();
+        std::fs::write(root.path().join("legacy.gguf.part"), b"partial").unwrap();
+        std::fs::write(root.path().join("legacy.gguf"), b"model").unwrap();
+        let foreign = root.path().join("source-checkout");
+        std::fs::create_dir(&foreign).unwrap();
+        std::fs::write(foreign.join("model.safetensors"), b"weights").unwrap();
+
+        assert_eq!(load_catalog(root.path()).unwrap(), vec![expected]);
     }
 
     #[cfg(unix)]
