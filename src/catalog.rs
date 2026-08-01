@@ -4,6 +4,8 @@ use std::fs::{self, OpenOptions, TryLockError};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+pub mod local;
+
 pub struct ModelLock {
     _file: fs::File,
 }
@@ -48,29 +50,90 @@ impl ModelLock {
 pub struct Manifest {
     pub version: u32,
     pub id: String,
-    pub repo: String,
-    pub revision: String,
-    pub remote_filename: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_filename: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<Origin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_filename: Option<String>,
     pub local_filename: String,
     pub sha256: String,
     pub size: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Origin {
+    Local,
+}
+
 impl Manifest {
     pub fn validate(&self) -> Result<(), String> {
         validate_id(&self.id)?;
-        validate_repo(&self.repo)?;
-        validate_hex(&self.revision, 40, "revision")?;
-        validate_filename(&self.remote_filename)?;
         validate_filename(&self.local_filename)?;
         if self.local_filename != "model.gguf" {
             return Err("local filename must be model.gguf".into());
         }
         validate_hex(&self.sha256, 64, "SHA-256")?;
-        if self.version != 1 || self.size == 0 {
-            return Err("invalid manifest version or size".into());
+        if self.size == 0 {
+            return Err("invalid manifest size".into());
         }
-        Ok(())
+        match self.version {
+            1 if self.origin.is_none() && self.source_filename.is_none() => {
+                validate_repo(self.repo.as_deref().ok_or("missing repository")?)?;
+                validate_hex(
+                    self.revision.as_deref().ok_or("missing revision")?,
+                    40,
+                    "revision",
+                )?;
+                validate_filename(
+                    self.remote_filename
+                        .as_deref()
+                        .ok_or("missing remote filename")?,
+                )
+            }
+            2 if self.origin == Some(Origin::Local)
+                && self.repo.is_none()
+                && self.revision.is_none()
+                && self.remote_filename.is_none() =>
+            {
+                validate_filename(
+                    self.source_filename
+                        .as_deref()
+                        .ok_or("missing local source filename")?,
+                )
+            }
+            _ => Err("invalid manifest origin or version".into()),
+        }
+    }
+
+    pub fn description(&self) -> (&str, &str, Option<&str>) {
+        match self.origin {
+            Some(Origin::Local) => (
+                "local file",
+                self.source_filename
+                    .as_deref()
+                    .expect("validated local manifest has source filename"),
+                None,
+            ),
+            None => (
+                self.repo
+                    .as_deref()
+                    .expect("validated HF manifest has repository"),
+                self.remote_filename
+                    .as_deref()
+                    .expect("validated HF manifest has remote filename"),
+                Some(
+                    self.revision
+                        .as_deref()
+                        .expect("validated HF manifest has revision"),
+                ),
+            ),
+        }
     }
 
     pub fn artifact_path(&self, models_root: &Path) -> PathBuf {
@@ -156,13 +219,13 @@ pub fn prepare_pull(model_dir: &Path, manifest: &Manifest) -> Result<(), String>
 
 pub fn publish_manifest(models_root: &Path, manifest: &Manifest) -> Result<PathBuf, String> {
     manifest.validate()?;
-    let dir = models_root.join(&manifest.id);
-    ensure_catalog_directory(&dir)?;
     crate::download::verify_regular(
         &manifest.artifact_path(models_root),
         manifest.size,
         &manifest.sha256,
     )?;
+    let dir = models_root.join(&manifest.id);
+    ensure_catalog_directory(&dir)?;
     let final_path = dir.join("manifest.json");
     if final_path.exists() {
         let existing: Manifest =
@@ -378,9 +441,11 @@ mod tests {
         Manifest {
             version: 1,
             id: id.into(),
-            repo: "owner/repo".into(),
-            revision: "0123456789abcdef0123456789abcdef01234567".into(),
-            remote_filename: "demo-Q4_K_M.gguf".into(),
+            repo: Some("owner/repo".into()),
+            revision: Some("0123456789abcdef0123456789abcdef01234567".into()),
+            remote_filename: Some("demo-Q4_K_M.gguf".into()),
+            origin: None,
+            source_filename: None,
             local_filename: "model.gguf".into(),
             sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
             size: 3,
@@ -415,7 +480,7 @@ mod tests {
         let mut invalid = manifest("../bad");
         assert!(invalid.validate().is_err());
         invalid = manifest("valid");
-        invalid.remote_filename = "part-00001-of-00002.gguf".into();
+        invalid.remote_filename = Some("part-00001-of-00002.gguf".into());
         assert!(invalid.validate().is_err());
     }
 
@@ -588,11 +653,11 @@ mod tests {
     #[test]
     fn manifest_rejects_control_characters_in_remote_identity() {
         let mut invalid_repo = manifest("demo");
-        invalid_repo.repo = "owner/repo\u{1b}".into();
+        invalid_repo.repo = Some("owner/repo\u{1b}".into());
         assert!(invalid_repo.validate().is_err());
 
         let mut invalid_filename = manifest("demo");
-        invalid_filename.remote_filename = "demo-\u{85}Q4_K_M.gguf".into();
+        invalid_filename.remote_filename = Some("demo-\u{85}Q4_K_M.gguf".into());
         assert!(invalid_filename.validate().is_err());
     }
 

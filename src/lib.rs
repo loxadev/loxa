@@ -73,6 +73,7 @@ pub fn report_error(error: &str) {
 
 pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
     runtime::recover_stale(&paths.run)?;
+    catalog::local::recover_pending(&paths.models)?;
     match cli.command {
         Command::Pull(args) => {
             let repo = huggingface::parse_repo(&args.repo)?;
@@ -106,9 +107,11 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
             let manifest = Manifest {
                 version: 1,
                 id: id.clone(),
-                repo: resolved.repo.clone(),
-                revision: resolved.revision.clone(),
-                remote_filename: resolved.filename.clone(),
+                repo: Some(resolved.repo.clone()),
+                revision: Some(resolved.revision.clone()),
+                remote_filename: Some(resolved.filename.clone()),
+                origin: None,
+                source_filename: None,
                 local_filename: "model.gguf".into(),
                 sha256: resolved.sha256.clone(),
                 size: resolved.size,
@@ -157,31 +160,74 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
         }
         Command::List => {
             let installed = catalog::load_catalog(&paths.models)?;
-            if installed.is_empty() {
+            let candidates = local_candidates(&paths, &installed)?;
+            let runnable = runnable_candidates(&candidates);
+            let auxiliaries = auxiliary_candidates(&candidates);
+            if installed.is_empty() && runnable.is_empty() {
                 let muted = ui::muted();
-                anstream::println!("No models installed.");
+                anstream::println!("No runnable models installed.");
                 anstream::println!("{muted}Download one with `loxa pull <owner/repo>`{muted:#}");
-                return Ok(0);
             }
-            let heading = ui::success();
             let accent = ui::accent();
             let muted = ui::muted();
-            anstream::println!(
-                "{heading}Installed models{heading:#} {muted}({}){muted:#}",
-                installed.len()
-            );
-            for entry in installed {
+            if !installed.is_empty() {
+                let heading = ui::success();
                 anstream::println!(
-                    "\n  {accent}{}{accent:#}  {}",
-                    entry.id,
-                    BinaryBytes(entry.size)
+                    "{heading}Installed models{heading:#} {muted}({}){muted:#}",
+                    installed.len()
                 );
+                for entry in installed {
+                    anstream::println!(
+                        "\n  {accent}{}{accent:#}  {}",
+                        entry.id,
+                        BinaryBytes(entry.size)
+                    );
+                    let (source, filename, revision) = entry.description();
+                    if let Some(revision) = revision {
+                        anstream::println!(
+                            "    {muted}{source} · {filename} · {}{muted:#}",
+                            &revision[..12]
+                        );
+                    } else {
+                        anstream::println!("    {muted}Local import · {filename}{muted:#}");
+                    }
+                }
+            }
+            if !runnable.is_empty() {
+                let heading = ui::accent();
                 anstream::println!(
-                    "    {muted}{} · {} · {}{muted:#}",
-                    entry.repo,
-                    entry.remote_filename,
-                    &entry.revision[..12]
+                    "\n{heading}Local GGUF candidates{heading:#} {muted}({} · unverified){muted:#}",
+                    runnable.len()
                 );
+                for candidate in runnable {
+                    anstream::println!(
+                        "\n  {accent}{}{accent:#}  {}",
+                        candidate.id,
+                        BinaryBytes(candidate.size)
+                    );
+                    anstream::println!(
+                        "    {muted}{} · adopt on run or chat{muted:#}",
+                        candidate.filename
+                    );
+                }
+            }
+            if !auxiliaries.is_empty() {
+                let heading = ui::muted();
+                anstream::println!(
+                    "\n{heading}Local GGUF auxiliaries{heading:#} {muted}({} · not runnable){muted:#}",
+                    auxiliaries.len()
+                );
+                for candidate in auxiliaries {
+                    anstream::println!(
+                        "\n  {accent}{}{accent:#}  {}",
+                        candidate.id,
+                        BinaryBytes(candidate.size)
+                    );
+                    anstream::println!(
+                        "    {muted}{} · auxiliary GGUF{muted:#}",
+                        candidate.filename
+                    );
+                }
             }
             Ok(0)
         }
@@ -243,20 +289,30 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
         }
         Command::Run(args) => {
             let installed = catalog::load_catalog(&paths.models)?;
-            let id = match select_model(
+            let candidates = local_candidates(&paths, &installed)?;
+            let candidates = runnable_candidates(&candidates);
+            let id = match select_model_options(
                 "run",
-                args.id,
-                &installed,
+                model_options_with_candidates(args.id, &installed, &candidates)?,
                 std::io::stdin().is_terminal(),
                 std::io::stderr().is_terminal(),
             )? {
                 ModelSelection::Selected(id) => id,
                 ModelSelection::Exit(code) => return Ok(code),
             };
-            let verifying = ui::spinner(format!("Verifying {id}"));
+            let importing = candidates.iter().any(|candidate| candidate.id == id);
+            let verifying = ui::spinner(if importing {
+                format!("Importing and verifying {id}")
+            } else {
+                format!("Verifying {id}")
+            });
             let runnable = resolve_runnable(id, args.runtime, &paths);
             verifying.finish_and_clear();
             let runnable = runnable?;
+            if importing {
+                let success = ui::success();
+                anstream::println!("{success}Imported{success:#} {}", runnable.id);
+            }
             runner::run(
                 &runnable.server,
                 &runnable.artifact,
@@ -268,7 +324,9 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
         }
         Command::Chat(args) => {
             let installed = catalog::load_catalog(&paths.models)?;
-            let options = model_options(args.id, &installed)?;
+            let candidates = local_candidates(&paths, &installed)?;
+            let candidates = runnable_candidates(&candidates);
+            let options = model_options_with_candidates(args.id, &installed, &candidates)?;
             ensure_interactive_chat(
                 std::io::stdin().is_terminal(),
                 std::io::stdout().is_terminal(),
@@ -282,7 +340,12 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
                 ModelSelection::Selected(id) => id,
                 ModelSelection::Exit(code) => return Ok(code),
             };
-            let starting = ui::spinner(format!("Starting {id}"));
+            let importing = candidates.iter().any(|candidate| candidate.id == id);
+            let starting = ui::spinner(if importing {
+                format!("Importing and verifying {id}")
+            } else {
+                format!("Starting {id}")
+            });
             let runnable = resolve_runnable(id, args.runtime, &paths);
             let runnable = match runnable {
                 Ok(runnable) => runnable,
@@ -291,6 +354,12 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
                     return Err(error);
                 }
             };
+            starting.finish_and_clear();
+            if importing {
+                let success = ui::success();
+                anstream::println!("{success}Imported{success:#} {}", runnable.id);
+            }
+            let starting = ui::spinner(format!("Starting {}", runnable.id));
             let started = runner::start_foreground(
                 &runnable.server,
                 &runnable.artifact,
@@ -309,16 +378,60 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
 }
 
 fn model_options(requested: Option<String>, installed: &[Manifest]) -> Result<Vec<String>, String> {
+    model_options_with_candidates(requested, installed, &[])
+}
+
+fn model_options_with_candidates(
+    requested: Option<String>,
+    installed: &[Manifest],
+    candidates: &[catalog::local::Candidate],
+) -> Result<Vec<String>, String> {
     if let Some(id) = requested {
-        if !installed.iter().any(|model| model.id == id) {
+        if !installed.iter().any(|model| model.id == id)
+            && !candidates.iter().any(|candidate| candidate.id == id)
+        {
             return Err(format!("unknown model id {id}"));
         }
         return Ok(vec![id]);
     }
-    if installed.is_empty() {
+    if installed.is_empty() && candidates.is_empty() {
         return Err("no models installed; download one with `loxa pull <owner/repo>`".into());
     }
-    Ok(installed.iter().map(|model| model.id.clone()).collect())
+    let mut options = installed
+        .iter()
+        .map(|model| model.id.clone())
+        .chain(candidates.iter().map(|candidate| candidate.id.clone()))
+        .collect::<Vec<_>>();
+    options.sort();
+    Ok(options)
+}
+
+fn local_candidates(
+    paths: &AppPaths,
+    installed: &[Manifest],
+) -> Result<Vec<catalog::local::Candidate>, String> {
+    Ok(catalog::local::discover(&paths.models)?
+        .into_iter()
+        .filter(|candidate| !installed.iter().any(|model| model.id == candidate.id))
+        .collect())
+}
+
+fn runnable_candidates(candidates: &[catalog::local::Candidate]) -> Vec<catalog::local::Candidate> {
+    candidates
+        .iter()
+        .filter(|candidate| candidate.kind == catalog::local::CandidateKind::Runnable)
+        .cloned()
+        .collect()
+}
+
+fn auxiliary_candidates(
+    candidates: &[catalog::local::Candidate],
+) -> Vec<catalog::local::Candidate> {
+    candidates
+        .iter()
+        .filter(|candidate| candidate.kind == catalog::local::CandidateKind::Auxiliary)
+        .cloned()
+        .collect()
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -393,14 +506,23 @@ fn resolve_runnable(
     let config = config::load(&paths.config)?;
     let ctx = config::resolve_value(runtime.ctx, config.ctx, 4096);
     let port = config::resolve_value(runtime.port, config.port, 0);
-    let manifest = catalog::load_catalog(&paths.models)?
+    let server = runner::discover_from_process(runtime.server.as_deref(), &paths.managed_server)?;
+    let manifest = match catalog::load_catalog(&paths.models)?
         .into_iter()
         .find(|entry| entry.id == id)
-        .ok_or_else(|| format!("unknown model id {id}"))?;
+    {
+        Some(manifest) => manifest,
+        None => {
+            let candidate = catalog::local::discover(&paths.models)?
+                .into_iter()
+                .find(|candidate| candidate.id == id)
+                .ok_or_else(|| format!("unknown model id {id}"))?;
+            catalog::local::adopt(&paths.models, &candidate)?
+        }
+    };
     let model_lock = catalog::ModelLock::acquire(&paths.model_dir(&manifest.id)?)?;
     let artifact = manifest.artifact_path(&paths.models);
     download::verify_regular(&artifact, manifest.size, &manifest.sha256)?;
-    let server = runner::discover_from_process(runtime.server.as_deref(), &paths.managed_server)?;
     Ok(Runnable {
         _model_lock: model_lock,
         server,
@@ -437,10 +559,12 @@ fn default_id(repo: &str, filename: &str, sha256: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_id, ensure_interactive_chat, model_options, run, select_model, ModelSelection,
+        default_id, ensure_interactive_chat, local_candidates, model_options,
+        model_options_with_candidates, resolve_runnable, run, runnable_candidates, select_model,
+        ModelSelection,
     };
     use crate::catalog::Manifest;
-    use crate::cli::Cli;
+    use crate::cli::{Cli, RuntimeArgs};
     use crate::paths::AppPaths;
     use clap::Parser;
 
@@ -448,9 +572,11 @@ mod tests {
         Manifest {
             version: 1,
             id: id.into(),
-            repo: "owner/repo".into(),
-            revision: "0".repeat(40),
-            remote_filename: "model-Q4_K_M.gguf".into(),
+            repo: Some("owner/repo".into()),
+            revision: Some("0".repeat(40)),
+            remote_filename: Some("model-Q4_K_M.gguf".into()),
+            origin: None,
+            source_filename: None,
             local_filename: "model.gguf".into(),
             sha256: "a".repeat(64),
             size: 1,
@@ -461,9 +587,11 @@ mod tests {
         let manifest = Manifest {
             version: 1,
             id: id.into(),
-            repo: "owner/repo".into(),
-            revision: "0".repeat(40),
-            remote_filename: "model-Q4_K_M.gguf".into(),
+            repo: Some("owner/repo".into()),
+            revision: Some("0".repeat(40)),
+            remote_filename: Some("model-Q4_K_M.gguf".into()),
+            origin: None,
+            source_filename: None,
             local_filename: "model.gguf".into(),
             sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
             size: 3,
@@ -540,6 +668,25 @@ mod tests {
     }
 
     #[test]
+    fn target_is_the_only_selectable_candidate_when_mtp_and_partial_files_are_present() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_values(Some(temp.path()), None).unwrap();
+        std::fs::create_dir_all(&paths.models).unwrap();
+        for name in ["Gemma 4.gguf", "mtp-gemma-4.gguf", "Qwen.gguf.part"] {
+            std::fs::write(paths.models.join(name), b"GGUF\x03\0\0\0payload").unwrap();
+        }
+
+        let candidates = local_candidates(&paths, &[]).unwrap();
+        let runnable = runnable_candidates(&candidates);
+
+        assert_eq!(
+            model_options_with_candidates(None, &[], &runnable).unwrap(),
+            ["gemma-4"]
+        );
+        assert!(model_options_with_candidates(Some("mtp-gemma-4".into()), &[], &runnable).is_err());
+    }
+
+    #[test]
     fn chat_requires_an_interactive_input_and_output() {
         assert!(ensure_interactive_chat(true, true).is_ok());
         for (stdin, stdout) in [(false, true), (true, false), (false, false)] {
@@ -567,6 +714,57 @@ mod tests {
             .unwrap_err();
             assert!(error.contains("loxa run <id>"), "{error}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolving_a_selected_local_candidate_adopts_it_before_launch() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_values(Some(temp.path()), None).unwrap();
+        std::fs::create_dir_all(&paths.models).unwrap();
+        let source = paths.models.join("Gemma 4.gguf");
+        std::fs::write(&source, b"GGUF\x03\0\0\0payload").unwrap();
+        let server = temp.path().join("llama-server");
+        std::fs::write(&server, b"#!/bin/sh\nprintf 'version: test\\n'\n").unwrap();
+        std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let runnable = resolve_runnable(
+            "gemma-4".into(),
+            RuntimeArgs {
+                ctx: None,
+                port: None,
+                server: Some(server),
+            },
+            &paths,
+        )
+        .unwrap();
+
+        assert_eq!(runnable.id, "gemma-4");
+        assert!(!source.exists());
+        assert!(paths.models.join("gemma-4/manifest.json").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_explicit_server_does_not_adopt_an_auto_selected_local_candidate() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_values(Some(temp.path()), None).unwrap();
+        std::fs::create_dir_all(&paths.models).unwrap();
+        let source = paths.models.join("Gemma 4.gguf");
+        std::fs::write(&source, b"GGUF\x03\0\0\0payload").unwrap();
+        let server = temp.path().join("missing-llama-server");
+
+        let error = run(
+            Cli::parse_from(["loxa", "run", "--server", server.to_str().unwrap()]),
+            paths.clone(),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("--server is not executable"), "{error}");
+        assert!(source.is_file());
+        assert!(!paths.models.join("gemma-4/manifest.json").exists());
     }
 
     #[test]

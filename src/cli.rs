@@ -16,7 +16,7 @@ pub struct Cli {
 pub enum Command {
     /// Download and verify one single-file GGUF.
     Pull(PullArgs),
-    /// List locally installed models.
+    /// List managed models and local GGUF candidates.
     List,
     /// Remove one locally installed model.
     Rm(RmArgs),
@@ -55,7 +55,7 @@ pub struct PullArgs {
 
 #[derive(Debug, Args)]
 pub struct RunArgs {
-    /// Model ID; omit to choose an installed model.
+    /// Model ID; omit to choose a runnable model.
     pub id: Option<String>,
     #[command(flatten)]
     pub runtime: RuntimeArgs,
@@ -63,7 +63,7 @@ pub struct RunArgs {
 
 #[derive(Debug, Args)]
 pub struct ChatArgs {
-    /// Model ID; omit to choose an installed model.
+    /// Model ID; omit to choose a runnable model.
     pub id: Option<String>,
     #[command(flatten)]
     pub runtime: RuntimeArgs,
@@ -181,7 +181,7 @@ mod tests {
             .render_long_help()
             .to_string();
 
-        assert!(help.contains("omit to choose an installed model"), "{help}");
+        assert!(help.contains("omit to choose a runnable model"), "{help}");
         assert!(help.contains("context window"), "{help}");
         assert!(help.contains("local server port"), "{help}");
     }
