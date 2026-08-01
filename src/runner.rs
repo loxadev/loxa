@@ -6,7 +6,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -287,9 +287,10 @@ pub fn run(
     id: &str,
     requested_port: u16,
     ctx: u32,
+    run_dir: &Path,
 ) -> Result<i32, String> {
     let starting = ui::spinner(format!("Starting {id}"));
-    let started = start_foreground(server, model, id, requested_port, ctx);
+    let started = start_foreground(server, model, id, requested_port, ctx, run_dir);
     starting.finish_and_clear();
     let mut server = match started? {
         ForegroundStart::Ready(server) => server,
@@ -317,7 +318,6 @@ pub(crate) enum ForegroundStart {
 
 pub(crate) struct ForegroundServer {
     server: OwnedServer,
-    signal: &'static AtomicUsize,
 }
 
 pub(crate) fn start_foreground(
@@ -326,20 +326,21 @@ pub(crate) fn start_foreground(
     id: &str,
     requested_port: u16,
     ctx: u32,
+    run_dir: &Path,
 ) -> Result<ForegroundStart, String> {
-    let signal = foreground_signal_flag()?;
-    match OwnedServer::start(
+    install_termination_watcher()?;
+    let ownership = crate::runtime::RuntimeOwnership::acquire(run_dir)?;
+    match OwnedServer::start_with_ownership(
         server,
         model,
         id,
         requested_port,
         ctx,
         STARTUP_TIMEOUT,
-        || received_signal(signal),
+        ownership,
+        || None,
     )? {
-        StartOutcome::Ready(server) => {
-            Ok(ForegroundStart::Ready(ForegroundServer { server, signal }))
-        }
+        StartOutcome::Ready(server) => Ok(ForegroundStart::Ready(ForegroundServer { server })),
         StartOutcome::Exited(exit) => Ok(ForegroundStart::Stopped(exit)),
         StartOutcome::Signaled(signal) => Ok(ForegroundStart::Stopped(ServerExit {
             code: 128 + signal,
@@ -353,18 +354,11 @@ impl ForegroundServer {
         self.server.port()
     }
 
-    /// Polls for child exit first, then a foreground signal. Cleanup is complete
-    /// before a status is returned.
+    /// Polls for child exit. Unix termination signals are handled by the
+    /// process-level watcher so this method never has to wake terminal input.
     pub(crate) fn poll(&mut self) -> Result<Option<ServerExit>, String> {
         if let Some(exit) = self.server.try_wait()? {
             return Ok(Some(exit));
-        }
-        if let Some(signal) = received_signal(self.signal) {
-            self.server.terminate()?;
-            return Ok(Some(ServerExit {
-                code: 128 + signal,
-                diagnostic: None,
-            }));
         }
         Ok(None)
     }
@@ -470,51 +464,99 @@ fn models_reader_has_alias(mut reader: impl std::io::Read, id: &str) -> Result<b
 }
 
 #[cfg(unix)]
-static PROCESS_SIGNAL_FLAG: OnceLock<Result<Arc<AtomicUsize>, String>> = OnceLock::new();
+static PROCESS_SIGNAL_WATCHER: OnceLock<Result<(), String>> = OnceLock::new();
 
 #[cfg(unix)]
-fn foreground_signal_flag() -> Result<&'static AtomicUsize, String> {
-    let registration = PROCESS_SIGNAL_FLAG.get_or_init(|| {
-        let received = Arc::new(AtomicUsize::new(0));
-        signal_hook::flag::register_usize(
-            libc::SIGINT,
-            Arc::clone(&received),
-            libc::SIGINT as usize,
-        )
-        .map_err(|error| error.to_string())?;
-        signal_hook::flag::register_usize(
-            libc::SIGTERM,
-            Arc::clone(&received),
-            libc::SIGTERM as usize,
-        )
-        .map_err(|error| error.to_string())?;
-        Ok(received)
-    });
-    let signal = registration.as_ref().map_err(Clone::clone)?;
-    signal.store(0, Ordering::SeqCst);
-    Ok(signal)
+static ACTIVE_SERVER: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(unix)]
+const STARTING_SERVER: u64 = u64::MAX;
+
+#[cfg(unix)]
+fn install_termination_watcher() -> Result<(), String> {
+    PROCESS_SIGNAL_WATCHER
+        .get_or_init(|| {
+            let mut termination =
+                signal_hook::iterator::Signals::new([libc::SIGINT, libc::SIGTERM, libc::SIGHUP])
+                    .map_err(|error| error.to_string())?;
+            std::thread::Builder::new()
+                .name("loxa-signal".into())
+                .spawn(move || {
+                    for signal in termination.forever() {
+                        let mut active = ACTIVE_SERVER.load(Ordering::SeqCst);
+                        while active == STARTING_SERVER {
+                            std::thread::sleep(Duration::from_millis(10));
+                            active = ACTIVE_SERVER.load(Ordering::SeqCst);
+                        }
+                        if let Some((_pid, group)) = unpack_server_identity(active) {
+                            while crate::runtime::terminate_stale_process_group(group).is_err() {
+                                std::thread::sleep(Duration::from_millis(50));
+                            }
+                        }
+                        std::process::exit(128 + signal);
+                    }
+                })
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+        .copied()
 }
 
 #[cfg(unix)]
-fn received_signal(signal: &AtomicUsize) -> Option<i32> {
-    match signal.load(Ordering::SeqCst) {
-        0 => None,
-        signal => i32::try_from(signal).ok(),
-    }
+fn activate_server(pid: u32, group: i32) {
+    ACTIVE_SERVER.store(pack_server_identity(pid, group), Ordering::SeqCst);
+}
+
+#[cfg(unix)]
+fn mark_server_starting() {
+    ACTIVE_SERVER.store(STARTING_SERVER, Ordering::SeqCst);
+}
+
+#[cfg(unix)]
+fn clear_server_starting() {
+    let _ = ACTIVE_SERVER.compare_exchange(STARTING_SERVER, 0, Ordering::SeqCst, Ordering::SeqCst);
+}
+
+#[cfg(unix)]
+fn deactivate_server(pid: u32, group: i32) {
+    let _ = ACTIVE_SERVER.compare_exchange(
+        pack_server_identity(pid, group),
+        0,
+        Ordering::SeqCst,
+        Ordering::SeqCst,
+    );
+}
+
+#[cfg(unix)]
+fn pack_server_identity(pid: u32, group: i32) -> u64 {
+    debug_assert!(group > 1);
+    (u64::from(pid) << 32) | u64::from(u32::try_from(group).expect("positive process group"))
+}
+
+#[cfg(unix)]
+fn unpack_server_identity(identity: u64) -> Option<(u32, i32)> {
+    let pid = u32::try_from(identity >> 32).ok()?;
+    let group = i32::try_from(identity as u32).ok()?;
+    (pid != 0 && group > 1).then_some((pid, group))
 }
 
 #[cfg(not(unix))]
-static PROCESS_SIGNAL_FLAG: AtomicUsize = AtomicUsize::new(0);
+fn activate_server(_pid: u32, _group: i32) {}
 
 #[cfg(not(unix))]
-fn foreground_signal_flag() -> Result<&'static AtomicUsize, String> {
-    PROCESS_SIGNAL_FLAG.store(0, Ordering::SeqCst);
-    Ok(&PROCESS_SIGNAL_FLAG)
-}
+fn deactivate_server(_pid: u32, _group: i32) {}
 
 #[cfg(not(unix))]
-fn received_signal(_signal: &AtomicUsize) -> Option<i32> {
-    None
+fn mark_server_starting() {}
+
+#[cfg(not(unix))]
+fn clear_server_starting() {}
+
+#[cfg(not(unix))]
+fn install_termination_watcher() -> Result<(), String> {
+    Ok(())
 }
 
 type AnnouncementOutput = (mpsc::SyncSender<Result<u16, String>>, Arc<AtomicBool>);
@@ -612,6 +654,7 @@ pub struct OwnedServer {
     child: Option<Child>,
     group: i32,
     port: u16,
+    runtime: Option<crate::runtime::RuntimeOwnership>,
     announcements: mpsc::Receiver<Result<u16, String>>,
     announcement_overflow: Arc<AtomicBool>,
     announced_port: Option<u16>,
@@ -622,6 +665,7 @@ pub struct OwnedServer {
 }
 
 impl OwnedServer {
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn start<F>(
         server: &Path,
@@ -630,6 +674,58 @@ impl OwnedServer {
         requested_port: u16,
         ctx: u32,
         timeout: Duration,
+        signal: F,
+    ) -> Result<StartOutcome, String>
+    where
+        F: Fn() -> Option<i32>,
+    {
+        Self::start_inner(
+            server,
+            model,
+            id,
+            requested_port,
+            ctx,
+            timeout,
+            None,
+            signal,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_with_ownership<F>(
+        server: &Path,
+        model: &Path,
+        id: &str,
+        requested_port: u16,
+        ctx: u32,
+        timeout: Duration,
+        runtime: crate::runtime::RuntimeOwnership,
+        signal: F,
+    ) -> Result<StartOutcome, String>
+    where
+        F: Fn() -> Option<i32>,
+    {
+        Self::start_inner(
+            server,
+            model,
+            id,
+            requested_port,
+            ctx,
+            timeout,
+            Some(runtime),
+            signal,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_inner<F>(
+        server: &Path,
+        model: &Path,
+        id: &str,
+        requested_port: u16,
+        ctx: u32,
+        timeout: Duration,
+        runtime: Option<crate::runtime::RuntimeOwnership>,
         signal: F,
     ) -> Result<StartOutcome, String>
     where
@@ -648,12 +744,24 @@ impl OwnedServer {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
-        let mut child = command.spawn().map_err(|error| error.to_string())?;
-        let group = i32::try_from(child.id()).map_err(|_| {
-            let _ = child.kill();
-            let _ = child.wait();
-            "invalid child process id".to_string()
-        })?;
+        mark_server_starting();
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                clear_server_starting();
+                return Err(error.to_string());
+            }
+        };
+        let group = match i32::try_from(child.id()) {
+            Ok(group) => group,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                clear_server_starting();
+                return Err("invalid child process id".into());
+            }
+        };
+        activate_server(child.id(), group);
         let stdout = child
             .stdout
             .take()
@@ -673,6 +781,7 @@ impl OwnedServer {
             child: Some(child),
             group,
             port: 0,
+            runtime,
             announcements,
             announcement_overflow,
             announced_port: None,
@@ -681,6 +790,16 @@ impl OwnedServer {
             stdout_tail: Vec::new(),
             stderr_tail: Vec::new(),
         };
+        if let Some(runtime) = owned.runtime.as_mut() {
+            if let Err(error) = runtime.record(
+                owned.child.as_ref().expect("owned child is present").id(),
+                group,
+                id,
+                requested_port,
+            ) {
+                return owned.fail_start(error);
+            }
+        }
         let deadline = Instant::now() + timeout;
         loop {
             if let Err(error) = owned.collect_announcements() {
@@ -788,8 +907,13 @@ impl OwnedServer {
 
     pub fn terminate(&mut self) -> Result<(), String> {
         if let Some(child) = self.child.as_mut() {
+            let pid = child.id();
             terminate_owned_group(child, self.group)?;
+            deactivate_server(pid, self.group);
             self.child.take();
+        }
+        if let Some(runtime) = self.runtime.as_mut() {
+            runtime.clear()?;
         }
         self.join_output_readers()
     }
@@ -856,26 +980,7 @@ impl Drop for OwnedServer {
 
 #[cfg(unix)]
 fn terminate_owned_group(child: &mut Child, group: i32) -> Result<(), String> {
-    signal_process_group(group, libc::SIGTERM)?;
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        let _ = child.try_wait().map_err(|error| error.to_string())?;
-        if !process_group_exists(group)? {
-            let _ = child.wait().map_err(|error| error.to_string())?;
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    signal_process_group(group, libc::SIGKILL)?;
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        if !process_group_exists(group)? {
-            let _ = child.wait().map_err(|error| error.to_string())?;
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    Err("owned process group survived SIGKILL".into())
+    crate::runtime::terminate_process_group(child, group)
 }
 
 #[cfg(unix)]
@@ -894,6 +999,7 @@ fn signal_process_group(group: i32, signal: i32) -> Result<(), String> {
 }
 
 #[cfg(unix)]
+#[cfg(test)]
 fn process_group_exists(group: i32) -> Result<bool, String> {
     // SAFETY: signal 0 probes existence without delivering a signal.
     let result = unsafe { libc::kill(-group, 0) };
@@ -1030,31 +1136,6 @@ mod tests {
         (port, server)
     }
 
-    #[cfg(unix)]
-    fn run_with_signal(signal: libc::c_int) -> i32 {
-        let dir = tempdir().unwrap();
-        let server = dir.path().join("server");
-        let started = dir.path().join("started");
-        write_executable_script(
-            &server,
-            b"#!/bin/sh\nprintf ready > \"$2\"\nsleep 1\nexit 7\n",
-        );
-        let marker = started.clone();
-        let sender = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while !marker.exists() && Instant::now() < deadline {
-                std::thread::yield_now();
-            }
-            assert!(marker.exists(), "server did not start");
-            // SAFETY: the production signal subscription is installed before the child starts.
-            assert_eq!(unsafe { libc::kill(libc::getpid(), signal) }, 0);
-        });
-
-        let code = run(&server, &started, "demo", 0, 1);
-        sender.join().unwrap();
-        code.unwrap()
-    }
-
     #[test]
     fn argv_and_readiness_are_exact_and_generic() {
         let args = build_args(
@@ -1178,6 +1259,45 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn managed_server_publishes_and_clears_its_runtime_lease() {
+        let _lock = process_test_lock();
+        let dir = tempdir().unwrap();
+        let server_path = dir.path().join("server");
+        let run_dir = dir.path().join("run");
+        let (port, http) = serve_models("demo");
+        write_executable_script(
+            &server_path,
+            format!(
+                "#!/bin/sh\nprintf 'listening on http://127.0.0.1:{port}\\n' >&2\nwhile :; do sleep 1; done\n"
+            )
+            .as_bytes(),
+        );
+        let ownership = crate::runtime::RuntimeOwnership::acquire(&run_dir).unwrap();
+
+        let outcome = OwnedServer::start_with_ownership(
+            &server_path,
+            Path::new("/models/model.gguf"),
+            "demo",
+            port,
+            8192,
+            Duration::from_secs(2),
+            ownership,
+            || None,
+        )
+        .unwrap();
+        let mut server = match outcome {
+            StartOutcome::Ready(server) => server,
+            _ => panic!("server did not become ready"),
+        };
+        http.join().unwrap();
+
+        assert!(run_dir.join("foreground.json").is_file());
+        server.terminate().unwrap();
+        assert!(!run_dir.join("foreground.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn startup_timeout_and_explicit_port_mismatch_clean_the_owned_group() {
         let _lock = process_test_lock();
         for (requested_port, announced_port, expected) in [
@@ -1279,10 +1399,7 @@ mod tests {
             _ => panic!("server did not become ready"),
         };
         let group = server.group;
-        let mut server = ForegroundServer {
-            server,
-            signal: foreground_signal_flag().unwrap(),
-        };
+        let mut server = ForegroundServer { server };
         http.join().unwrap();
         std::fs::write(release, b"go").unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -1578,30 +1695,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn installed_handlers_map_sigterm_and_sigint_to_shell_exit_codes() {
-        let _lock = process_test_lock();
-
-        let term = run_with_signal(libc::SIGTERM);
-        let interrupt = run_with_signal(libc::SIGINT);
-
-        assert_eq!((term, interrupt), (143, 130));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn signal_registration_is_reused_and_reset_for_each_foreground_run() {
-        let _lock = process_test_lock();
-        let first = foreground_signal_flag().unwrap();
-        first.store(libc::SIGTERM as usize, Ordering::SeqCst);
-
-        let second = foreground_signal_flag().unwrap();
-
-        assert!(std::ptr::eq(first, second));
-        assert_eq!(second.load(Ordering::SeqCst), 0);
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn leader_exit_cleans_surviving_process_group_before_returning_status() {
         let _lock = process_test_lock();
         let dir = tempdir().unwrap();
@@ -1613,7 +1706,15 @@ mod tests {
             b"#!/bin/sh\n(\n  trap '' TERM\n  printf ready > \"$2\"\n  while :; do sleep 1; done\n) &\nwhile [ ! -f \"$2\" ]; do :; done\nprintf '%s\\n' \"$$\" > \"$4\"\nprintf 'fatal: model load failed\\n' >&2\nexit 7\n",
         );
 
-        let status = run(&server, &child_ready, group_file.to_str().unwrap(), 0, 1).unwrap();
+        let status = run(
+            &server,
+            &child_ready,
+            group_file.to_str().unwrap(),
+            0,
+            1,
+            &dir.path().join("run"),
+        )
+        .unwrap();
         let group = std::fs::read_to_string(&group_file)
             .unwrap()
             .trim()

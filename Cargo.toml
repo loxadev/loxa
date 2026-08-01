@@ -15,7 +15,7 @@ dialoguer = { version = "0.12.0", default-features = false, features = ["fuzzy-s
 indicatif = "0.18.6"
 backon = { version = "1.6.0", default-features = false, features = ["std", "tokio-sleep"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "json", "rustls"] }
-rustyline = { version = "18.0.1", default-features = false }
+rustyline = { version = "18.0.1", default-features = false, features = ["signal-hook"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11.0"
@@ -23,7 +23,8 @@ tokio = { version = "1.52.0", default-features = false, features = ["rt", "time"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.186"
-signal-hook = { version = "0.4.4", default-features = false }
+signal-hook = { version = "0.4.4", default-features = false, features = ["iterator"] }
+sysinfo = { version = "0.39.5", default-features = false, features = ["system"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

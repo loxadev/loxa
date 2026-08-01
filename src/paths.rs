@@ -5,6 +5,7 @@ pub struct AppPaths {
     pub root: PathBuf,
     pub models: PathBuf,
     pub config: PathBuf,
+    pub run: PathBuf,
     pub runtimes: PathBuf,
     pub managed_server: PathBuf,
 }
@@ -33,6 +34,7 @@ impl AppPaths {
         Ok(Self {
             models: root.join("models"),
             config: root.join("config.json"),
+            run: root.join("run"),
             managed_server: runtimes.join("llama.cpp/b10121/llama-server"),
             runtimes,
             root,
@@ -71,6 +73,7 @@ mod tests {
         assert_eq!(paths.root, Path::new("/custom"));
         assert_eq!(paths.models, Path::new("/custom/models"));
         assert_eq!(paths.config, Path::new("/custom/config.json"));
+        assert_eq!(paths.run, Path::new("/custom/run"));
         assert_eq!(paths.runtimes, Path::new("/custom/runtimes"));
         assert_eq!(
             paths.managed_server,

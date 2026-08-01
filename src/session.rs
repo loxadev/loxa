@@ -154,6 +154,7 @@ fn chat_config() -> Config {
         .completion_type(CompletionType::List)
         .completion_show_all_if_ambiguous(true)
         .bracketed_paste(true)
+        .enable_signals(true)
         .build()
 }
 

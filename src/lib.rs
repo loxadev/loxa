@@ -6,6 +6,7 @@ pub mod download;
 pub mod huggingface;
 pub mod paths;
 pub mod runner;
+mod runtime;
 mod session;
 mod ui;
 
@@ -71,6 +72,7 @@ pub fn report_error(error: &str) {
 }
 
 pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
+    runtime::recover_stale(&paths.run)?;
     match cli.command {
         Command::Pull(args) => {
             let repo = huggingface::parse_repo(&args.repo)?;
@@ -261,6 +263,7 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
                 &runnable.id,
                 runnable.port,
                 runnable.ctx,
+                &paths.run,
             )
         }
         Command::Chat(args) => {
@@ -294,6 +297,7 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
                 &runnable.id,
                 runnable.port,
                 runnable.ctx,
+                &paths.run,
             );
             starting.finish_and_clear();
             match started? {
