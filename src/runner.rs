@@ -1300,19 +1300,6 @@ mod tests {
     #[test]
     fn startup_timeout_and_explicit_port_mismatch_clean_the_owned_group() {
         let _lock = process_test_lock();
-        let wait_for_group_marker = |path: &Path| {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            loop {
-                if let Ok(group) = std::fs::read_to_string(path) {
-                    if let Ok(group) = group.trim().parse::<i32>() {
-                        break group;
-                    }
-                }
-                assert!(Instant::now() < deadline, "server fixture did not start");
-                std::thread::yield_now();
-            }
-        };
-
         {
             let dir = tempdir().unwrap();
             let server_path = dir.path().join("server");
@@ -1355,20 +1342,21 @@ mod tests {
         {
             let dir = tempdir().unwrap();
             let server_path = dir.path().join("server");
-            let group_path = dir.path().join("group");
             let release_path = dir.path().join("release");
             write_executable_script(
                 &server_path,
                 format!(
-                    "#!/bin/sh\nprintf '%s\\n' \"$$\" > '{}'\nwhile [ ! -f '{}' ]; do :; done\nprintf 'listening on http://127.0.0.1:43123\\n' >&2\nwhile :; do sleep 1; done\n",
-                    group_path.display(),
+                    "#!/bin/sh\nwhile [ ! -f '{}' ]; do :; done\nprintf 'listening on http://127.0.0.1:43123\\n' >&2\nwhile :; do sleep 1; done\n",
                     release_path.display(),
                 )
                 .as_bytes(),
             );
+            let (group_sender, group_receiver) = mpsc::sync_channel(1);
+            let (release_sender, release) = mpsc::sync_channel(1);
 
             std::thread::scope(|scope| {
-                let start = scope.spawn(|| {
+                let start = scope.spawn(move || {
+                    let first_poll = AtomicBool::new(true);
                     OwnedServer::start(
                         &server_path,
                         Path::new("/models/model.gguf"),
@@ -1376,11 +1364,23 @@ mod tests {
                         43124,
                         1,
                         Duration::from_secs(5),
-                        || None,
+                        || {
+                            if first_poll.swap(false, Ordering::SeqCst) {
+                                let (_, group) =
+                                    unpack_server_identity(ACTIVE_SERVER.load(Ordering::SeqCst))
+                                        .expect("server did not publish its owned process group");
+                                group_sender.send(group).unwrap();
+                                release.recv().unwrap();
+                            }
+                            None
+                        },
                     )
                 });
-                let group = wait_for_group_marker(&group_path);
+                let group = group_receiver
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("server did not reach startup polling");
                 std::fs::write(&release_path, b"release").unwrap();
+                release_sender.send(()).unwrap();
                 let error = match start.join().unwrap() {
                     Err(error) => error,
                     Ok(_) => panic!("server unexpectedly started"),
