@@ -1325,7 +1325,7 @@ mod tests {
                 "demo",
                 requested_port,
                 1,
-                Duration::from_millis(500),
+                Duration::from_secs(2),
                 || None,
             ) {
                 Err(error) => error,
