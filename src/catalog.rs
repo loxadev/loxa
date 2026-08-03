@@ -14,6 +14,10 @@ pub const GEMMA4_MODEL_SIZE: u64 = 6_716_356_800;
 pub const GEMMA4_DRAFT_SHA256: &str =
     "fcb35dea42c71333db904cee11baac525c9ef872818ee3753f6cb156f3c6f4f6";
 pub const GEMMA4_DRAFT_SIZE: u64 = 253_708_800;
+#[cfg(test)]
+pub(crate) const TEST_MTP_PROFILE: &str = "test-mtp-v1";
+#[cfg(test)]
+pub(crate) const TEST_LLAMA_BUILD: &str = "test-build";
 
 pub struct ModelLock {
     _file: fs::File,
@@ -194,11 +198,17 @@ impl Manifest {
             .ok_or("missing bundle artifacts")?;
         let profile = self.profile.as_deref().ok_or("missing bundle profile")?;
         let runtime = self.runtime.as_ref().ok_or("missing qualified runtime")?;
-        if profile != GEMMA4_MTP_PROFILE {
+        let production_profile = profile == GEMMA4_MTP_PROFILE
+            && runtime.engine == "llama.cpp"
+            && runtime.build == GEMMA4_LLAMA_BUILD;
+        #[cfg(test)]
+        let test_profile = profile == TEST_MTP_PROFILE
+            && runtime.engine == "llama.cpp"
+            && runtime.build == TEST_LLAMA_BUILD;
+        #[cfg(not(test))]
+        let test_profile = false;
+        if !production_profile && !test_profile {
             return Err("unknown bundle profile".into());
-        }
-        if runtime.engine != "llama.cpp" || runtime.build != GEMMA4_LLAMA_BUILD {
-            return Err("unqualified bundle runtime".into());
         }
         let mut model = None;
         let mut draft = None;
@@ -221,11 +231,15 @@ impl Manifest {
         {
             return Err("invalid managed bundle filenames".into());
         }
-        if model.sha256 != GEMMA4_MODEL_SHA256 || model.size != GEMMA4_MODEL_SIZE {
+        if production_profile
+            && (model.sha256 != GEMMA4_MODEL_SHA256 || model.size != GEMMA4_MODEL_SIZE)
+        {
             return Err("bundle does not match qualified profile".into());
         }
         if let Some(draft) = draft {
-            if draft.sha256 != GEMMA4_DRAFT_SHA256 || draft.size != GEMMA4_DRAFT_SIZE {
+            if production_profile
+                && (draft.sha256 != GEMMA4_DRAFT_SHA256 || draft.size != GEMMA4_DRAFT_SIZE)
+            {
                 return Err("bundle does not match qualified profile".into());
             }
         }
@@ -424,6 +438,75 @@ pub fn publish_manifest(models_root: &Path, manifest: &Manifest) -> Result<PathB
     publish_manifest_with_verifier(models_root, manifest, |path, size, sha256| {
         crate::download::verify_regular(path, size, sha256)
     })
+}
+
+pub(crate) fn prepare_bundle_upgrade(
+    model_dir: &Path,
+    replacement: &Manifest,
+) -> Result<(), String> {
+    replacement.validate()?;
+    if model_dir.file_name().and_then(|name| name.to_str()) != Some(replacement.id.as_str()) {
+        return Err("bundle manifest id does not match model directory".into());
+    }
+    let pending_path = model_dir.join("bundle.pending.json");
+    if pending_path.exists() {
+        let existing: Manifest = serde_json::from_slice(
+            &fs::read(&pending_path)
+                .map_err(|error| format!("{}: {error}", pending_path.display()))?,
+        )
+        .map_err(|error| format!("{}: {error}", pending_path.display()))?;
+        existing.validate()?;
+        return if existing == *replacement {
+            Ok(())
+        } else {
+            Err(format!(
+                "model {} has a different pending bundle upgrade",
+                replacement.id
+            ))
+        };
+    }
+    write_manifest_atomic(model_dir, "bundle.pending.json", replacement)
+}
+
+pub(crate) fn replace_manifest_atomic(
+    models_root: &Path,
+    expected: &Manifest,
+    replacement: &Manifest,
+) -> Result<PathBuf, String> {
+    replacement.validate()?;
+    for artifact in replacement
+        .artifacts
+        .as_deref()
+        .ok_or("replacement is not a bundle")?
+    {
+        crate::download::verify_regular(
+            &models_root
+                .join(&replacement.id)
+                .join(&artifact.local_filename),
+            artifact.size,
+            &artifact.sha256,
+        )?;
+    }
+    let model_dir = models_root.join(&replacement.id);
+    let manifest_path = model_dir.join("manifest.json");
+    let current: Manifest = serde_json::from_slice(
+        &fs::read(&manifest_path)
+            .map_err(|error| format!("{}: {error}", manifest_path.display()))?,
+    )
+    .map_err(|error| format!("{}: {error}", manifest_path.display()))?;
+    current.validate()?;
+    if current != *expected {
+        return Err(format!(
+            "model {} changed during bundle upgrade",
+            replacement.id
+        ));
+    }
+    write_manifest_atomic(&model_dir, "manifest.json", replacement)?;
+    remove_regular_if_present(&model_dir.join("bundle.pending.json"))?;
+    fs::File::open(&model_dir)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|error| error.to_string())?;
+    Ok(manifest_path)
 }
 
 fn publish_manifest_with_verifier<F>(

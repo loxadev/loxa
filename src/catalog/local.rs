@@ -5,7 +5,14 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+use super::{Artifact, ArtifactProvenance, ArtifactRole, RuntimeQualification};
 use super::{Manifest, Origin};
+
+mod bundle;
+pub use bundle::reconcile_qualified_bundle;
+#[cfg(test)]
+use bundle::{reconcile_with, BundleQualification};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Candidate {
@@ -48,7 +55,7 @@ pub fn discover(models_root: &Path) -> Result<Vec<Candidate>, String> {
                 continue;
             }
         }
-        if !has_supported_gguf_header(&path)? {
+        if !matches!(has_supported_gguf_header(&path), Ok(true)) {
             continue;
         }
         let candidate = Candidate {
@@ -404,6 +411,133 @@ mod tests {
         bytes.extend(version.to_le_bytes());
         bytes.extend(b"payload");
         bytes
+    }
+
+    fn install_local(root: &Path, id: &str, bytes: &[u8]) -> Manifest {
+        let model_dir = root.join(id);
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("model.gguf"), bytes).unwrap();
+        let manifest = Manifest {
+            version: 2,
+            id: id.into(),
+            repo: None,
+            revision: None,
+            remote_filename: None,
+            origin: Some(Origin::Local),
+            source_filename: Some("Gemma-4.gguf".into()),
+            local_filename: "model.gguf".into(),
+            sha256: sha256(&model_dir.join("model.gguf")).unwrap(),
+            size: bytes.len() as u64,
+            artifacts: None,
+            profile: None,
+            runtime: None,
+        };
+        super::super::publish_manifest(root, &manifest).unwrap();
+        manifest
+    }
+
+    #[test]
+    fn exact_pair_is_atomically_upgraded_to_one_bundle() {
+        let root = tempfile::tempdir().unwrap();
+        let target = gguf(3);
+        let mut draft = gguf(3);
+        draft.extend(b"draft");
+        let old = install_local(root.path(), "gemma4", &target);
+        let source = root.path().join("mtp-gemma-4.gguf");
+        std::fs::write(&source, &draft).unwrap();
+        let qualification = BundleQualification::for_test(&target, &draft);
+
+        let upgraded = reconcile_with(root.path(), &qualification)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(upgraded.version, 3);
+        assert_eq!(upgraded.id, old.id);
+        assert!(upgraded.draft_artifact().is_some());
+        assert!(!source.exists());
+        assert_eq!(
+            std::fs::read(root.path().join("gemma4/draft.gguf")).unwrap(),
+            draft
+        );
+        assert_eq!(
+            super::super::load_catalog(root.path()).unwrap(),
+            vec![upgraded]
+        );
+        assert!(!root.path().join("gemma4/bundle.pending.json").exists());
+    }
+
+    #[test]
+    fn mismatch_or_multiple_exact_drafts_are_non_blocking_no_ops() {
+        for drafts in [vec![gguf(2)], vec![gguf(3), gguf(3)]] {
+            let root = tempfile::tempdir().unwrap();
+            let target = gguf(3);
+            let old = install_local(root.path(), "gemma4", &target);
+            let mut qualified = gguf(3);
+            qualified.extend(b"draft");
+            for (index, bytes) in drafts.iter().enumerate() {
+                std::fs::write(
+                    root.path().join(format!("mtp-candidate-{index}.gguf")),
+                    bytes,
+                )
+                .unwrap();
+            }
+            let qualification = if drafts.len() == 1 {
+                BundleQualification::for_test(&target, &qualified)
+            } else {
+                BundleQualification::for_test(&target, &drafts[0])
+            };
+
+            assert_eq!(reconcile_with(root.path(), &qualification).unwrap(), None);
+            assert_eq!(super::super::load_catalog(root.path()).unwrap(), vec![old]);
+            assert!(!root.path().join("gemma4/draft.gguf").exists());
+        }
+    }
+
+    #[test]
+    fn model_only_bundle_is_upgraded_and_complete_bundle_is_idempotent() {
+        let root = tempfile::tempdir().unwrap();
+        let target = gguf(3);
+        let mut draft = gguf(3);
+        draft.extend(b"draft");
+        let old = install_local(root.path(), "gemma4", &target);
+        let qualification = BundleQualification::for_test(&target, &draft);
+        let model_only = Manifest {
+            version: 3,
+            id: old.id.clone(),
+            repo: None,
+            revision: None,
+            remote_filename: None,
+            origin: None,
+            source_filename: None,
+            local_filename: "model.gguf".into(),
+            sha256: qualification.target_sha256.clone(),
+            size: qualification.target_size,
+            artifacts: Some(vec![Artifact {
+                role: ArtifactRole::Model,
+                local_filename: "model.gguf".into(),
+                sha256: qualification.target_sha256.clone(),
+                size: qualification.target_size,
+                provenance: ArtifactProvenance::Local {
+                    source_filename: "Gemma-4.gguf".into(),
+                },
+            }]),
+            profile: Some(qualification.profile.clone()),
+            runtime: Some(RuntimeQualification {
+                engine: "llama.cpp".into(),
+                build: qualification.build.clone(),
+            }),
+        };
+        super::super::replace_manifest_atomic(root.path(), &old, &model_only).unwrap();
+        std::fs::write(root.path().join("mtp-gemma-4.gguf"), &draft).unwrap();
+
+        let complete = reconcile_with(root.path(), &qualification)
+            .unwrap()
+            .unwrap();
+        assert!(complete.draft_artifact().is_some());
+        assert_eq!(
+            reconcile_with(root.path(), &qualification).unwrap(),
+            Some(complete)
+        );
     }
 
     #[test]
