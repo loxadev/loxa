@@ -115,6 +115,9 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
                 local_filename: "model.gguf".into(),
                 sha256: resolved.sha256.clone(),
                 size: resolved.size,
+                artifacts: None,
+                profile: None,
+                runtime: None,
             };
             if model_dir.join("manifest.json").exists() {
                 let existing = catalog::load_catalog(&paths.models)?
@@ -580,6 +583,9 @@ mod tests {
             local_filename: "model.gguf".into(),
             sha256: "a".repeat(64),
             size: 1,
+            artifacts: None,
+            profile: None,
+            runtime: None,
         }
     }
 
@@ -595,6 +601,9 @@ mod tests {
             local_filename: "model.gguf".into(),
             sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
             size: 3,
+            artifacts: None,
+            profile: None,
+            runtime: None,
         };
         let model_dir = paths.model_dir(id).unwrap();
         std::fs::create_dir_all(&model_dir).unwrap();

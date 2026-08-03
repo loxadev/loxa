@@ -118,6 +118,9 @@ pub fn adopt(models_root: &Path, candidate: &Candidate) -> Result<Manifest, Stri
         local_filename: "model.gguf".into(),
         sha256,
         size: candidate.size,
+        artifacts: None,
+        profile: None,
+        runtime: None,
     };
     manifest.validate()?;
 
@@ -535,6 +538,9 @@ mod tests {
             local_filename: "model.gguf".into(),
             sha256: sha256(&source).unwrap(),
             size: bytes.len() as u64,
+            artifacts: None,
+            profile: None,
+            runtime: None,
         };
         let model_dir = root.path().join(&candidate.id);
         super::super::prepare_pull(&model_dir, &manifest).unwrap();

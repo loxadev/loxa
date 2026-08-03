@@ -6,6 +6,15 @@ use std::path::{Path, PathBuf};
 
 pub mod local;
 
+pub const GEMMA4_MTP_PROFILE: &str = "gemma4-mtp-v1";
+pub const GEMMA4_LLAMA_BUILD: &str = "b10121";
+pub const GEMMA4_MODEL_SHA256: &str =
+    "90fd44e29e0d7cffeb0fd00dc73cfdab9ed0b0e95306ecf7821ea634c940c370";
+pub const GEMMA4_MODEL_SIZE: u64 = 6_716_356_800;
+pub const GEMMA4_DRAFT_SHA256: &str =
+    "fcb35dea42c71333db904cee11baac525c9ef872818ee3753f6cb156f3c6f4f6";
+pub const GEMMA4_DRAFT_SIZE: u64 = 253_708_800;
+
 pub struct ModelLock {
     _file: fs::File,
 }
@@ -63,6 +72,57 @@ pub struct Manifest {
     pub local_filename: String,
     pub sha256: String,
     pub size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifacts: Option<Vec<Artifact>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeQualification>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ArtifactRole {
+    Model,
+    Draft,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Artifact {
+    pub role: ArtifactRole,
+    pub local_filename: String,
+    pub sha256: String,
+    pub size: u64,
+    pub provenance: ArtifactProvenance,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ArtifactProvenance {
+    Local {
+        source_filename: String,
+    },
+    HuggingFace {
+        repo: String,
+        revision: String,
+        remote_filename: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeQualification {
+    pub engine: String,
+    pub build: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ArtifactRef<'a> {
+    pub role: ArtifactRole,
+    pub local_filename: &'a str,
+    pub sha256: &'a str,
+    pub size: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -83,7 +143,12 @@ impl Manifest {
             return Err("invalid manifest size".into());
         }
         match self.version {
-            1 if self.origin.is_none() && self.source_filename.is_none() => {
+            1 if self.origin.is_none()
+                && self.source_filename.is_none()
+                && self.artifacts.is_none()
+                && self.profile.is_none()
+                && self.runtime.is_none() =>
+            {
                 validate_repo(self.repo.as_deref().ok_or("missing repository")?)?;
                 validate_hex(
                     self.revision.as_deref().ok_or("missing revision")?,
@@ -99,7 +164,10 @@ impl Manifest {
             2 if self.origin == Some(Origin::Local)
                 && self.repo.is_none()
                 && self.revision.is_none()
-                && self.remote_filename.is_none() =>
+                && self.remote_filename.is_none()
+                && self.artifacts.is_none()
+                && self.profile.is_none()
+                && self.runtime.is_none() =>
             {
                 validate_filename(
                     self.source_filename
@@ -107,11 +175,116 @@ impl Manifest {
                         .ok_or("missing local source filename")?,
                 )
             }
+            3 if self.repo.is_none()
+                && self.revision.is_none()
+                && self.remote_filename.is_none()
+                && self.origin.is_none()
+                && self.source_filename.is_none() =>
+            {
+                self.validate_bundle()
+            }
             _ => Err("invalid manifest origin or version".into()),
         }
     }
 
+    fn validate_bundle(&self) -> Result<(), String> {
+        let artifacts = self
+            .artifacts
+            .as_deref()
+            .ok_or("missing bundle artifacts")?;
+        let profile = self.profile.as_deref().ok_or("missing bundle profile")?;
+        let runtime = self.runtime.as_ref().ok_or("missing qualified runtime")?;
+        if profile != GEMMA4_MTP_PROFILE {
+            return Err("unknown bundle profile".into());
+        }
+        if runtime.engine != "llama.cpp" || runtime.build != GEMMA4_LLAMA_BUILD {
+            return Err("unqualified bundle runtime".into());
+        }
+        let mut model = None;
+        let mut draft = None;
+        for artifact in artifacts {
+            validate_filename(&artifact.local_filename)?;
+            validate_hex(&artifact.sha256, 64, "SHA-256")?;
+            if artifact.size == 0 {
+                return Err("invalid artifact size".into());
+            }
+            validate_provenance(&artifact.provenance)?;
+            match artifact.role {
+                ArtifactRole::Model if model.replace(artifact).is_none() => {}
+                ArtifactRole::Draft if draft.replace(artifact).is_none() => {}
+                _ => return Err("duplicate bundle artifact role".into()),
+            }
+        }
+        let model = model.ok_or("missing model artifact")?;
+        let draft = draft.ok_or("missing draft artifact")?;
+        if artifacts.len() != 2
+            || model.local_filename != "model.gguf"
+            || draft.local_filename != "draft.gguf"
+        {
+            return Err("invalid managed bundle filenames".into());
+        }
+        if model.sha256 != GEMMA4_MODEL_SHA256
+            || model.size != GEMMA4_MODEL_SIZE
+            || draft.sha256 != GEMMA4_DRAFT_SHA256
+            || draft.size != GEMMA4_DRAFT_SIZE
+        {
+            return Err("bundle does not match qualified profile".into());
+        }
+        if self.local_filename != model.local_filename
+            || self.sha256 != model.sha256
+            || self.size != model.size
+        {
+            return Err("bundle primary metadata does not match model artifact".into());
+        }
+        Ok(())
+    }
+
+    pub fn primary_artifact(&self) -> ArtifactRef<'_> {
+        match self.artifacts.as_deref() {
+            Some(artifacts) => artifact_ref(
+                artifacts
+                    .iter()
+                    .find(|artifact| artifact.role == ArtifactRole::Model)
+                    .expect("validated bundle has a model artifact"),
+            ),
+            None => ArtifactRef {
+                role: ArtifactRole::Model,
+                local_filename: &self.local_filename,
+                sha256: &self.sha256,
+                size: self.size,
+            },
+        }
+    }
+
+    pub fn draft_artifact(&self) -> Option<ArtifactRef<'_>> {
+        self.artifacts.as_deref()?.iter().find_map(|artifact| {
+            (artifact.role == ArtifactRole::Draft).then(|| artifact_ref(artifact))
+        })
+    }
+
+    pub fn total_size(&self) -> u64 {
+        self.artifacts.as_deref().map_or(self.size, |artifacts| {
+            artifacts.iter().map(|item| item.size).sum()
+        })
+    }
+
     pub fn description(&self) -> (&str, &str, Option<&str>) {
+        if let Some(artifacts) = self.artifacts.as_deref() {
+            let model = artifacts
+                .iter()
+                .find(|artifact| artifact.role == ArtifactRole::Model)
+                .expect("validated bundle has a model artifact");
+            return match &model.provenance {
+                ArtifactProvenance::Local { source_filename } => {
+                    ("local file", source_filename, None)
+                }
+                ArtifactProvenance::HuggingFace {
+                    repo,
+                    revision,
+                    remote_filename,
+                } => (repo, remote_filename, Some(revision)),
+            };
+        }
         match self.origin {
             Some(Origin::Local) => (
                 "local file",
@@ -137,7 +310,38 @@ impl Manifest {
     }
 
     pub fn artifact_path(&self, models_root: &Path) -> PathBuf {
-        models_root.join(&self.id).join(&self.local_filename)
+        models_root
+            .join(&self.id)
+            .join(self.primary_artifact().local_filename)
+    }
+
+    pub fn draft_path(&self, models_root: &Path) -> Option<PathBuf> {
+        self.draft_artifact()
+            .map(|artifact| models_root.join(&self.id).join(artifact.local_filename))
+    }
+}
+
+fn artifact_ref(artifact: &Artifact) -> ArtifactRef<'_> {
+    ArtifactRef {
+        role: artifact.role,
+        local_filename: &artifact.local_filename,
+        sha256: &artifact.sha256,
+        size: artifact.size,
+    }
+}
+
+fn validate_provenance(provenance: &ArtifactProvenance) -> Result<(), String> {
+    match provenance {
+        ArtifactProvenance::Local { source_filename } => validate_filename(source_filename),
+        ArtifactProvenance::HuggingFace {
+            repo,
+            revision,
+            remote_filename,
+        } => {
+            validate_repo(repo)?;
+            validate_hex(revision, 40, "revision")?;
+            validate_filename(remote_filename)
+        }
     }
 }
 
@@ -219,11 +423,23 @@ pub fn prepare_pull(model_dir: &Path, manifest: &Manifest) -> Result<(), String>
 
 pub fn publish_manifest(models_root: &Path, manifest: &Manifest) -> Result<PathBuf, String> {
     manifest.validate()?;
-    crate::download::verify_regular(
-        &manifest.artifact_path(models_root),
-        manifest.size,
-        &manifest.sha256,
-    )?;
+    if let Some(artifacts) = manifest.artifacts.as_deref() {
+        for artifact in artifacts {
+            crate::download::verify_regular(
+                &models_root
+                    .join(&manifest.id)
+                    .join(&artifact.local_filename),
+                artifact.size,
+                &artifact.sha256,
+            )?;
+        }
+    } else {
+        crate::download::verify_regular(
+            &manifest.artifact_path(models_root),
+            manifest.size,
+            &manifest.sha256,
+        )?;
+    }
     let dir = models_root.join(&manifest.id);
     ensure_catalog_directory(&dir)?;
     let final_path = dir.join("manifest.json");
@@ -449,7 +665,92 @@ mod tests {
             local_filename: "model.gguf".into(),
             sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
             size: 3,
+            artifacts: None,
+            profile: None,
+            runtime: None,
         }
+    }
+
+    fn bundle_manifest(id: &str) -> Manifest {
+        Manifest {
+            version: 3,
+            id: id.into(),
+            repo: None,
+            revision: None,
+            remote_filename: None,
+            origin: None,
+            source_filename: None,
+            local_filename: "model.gguf".into(),
+            sha256: GEMMA4_MODEL_SHA256.into(),
+            size: GEMMA4_MODEL_SIZE,
+            artifacts: Some(vec![
+                Artifact {
+                    role: ArtifactRole::Model,
+                    local_filename: "model.gguf".into(),
+                    sha256: GEMMA4_MODEL_SHA256.into(),
+                    size: GEMMA4_MODEL_SIZE,
+                    provenance: ArtifactProvenance::Local {
+                        source_filename: "gemma-4.gguf".into(),
+                    },
+                },
+                Artifact {
+                    role: ArtifactRole::Draft,
+                    local_filename: "draft.gguf".into(),
+                    sha256: GEMMA4_DRAFT_SHA256.into(),
+                    size: GEMMA4_DRAFT_SIZE,
+                    provenance: ArtifactProvenance::Local {
+                        source_filename: "mtp-gemma-4.gguf".into(),
+                    },
+                },
+            ]),
+            profile: Some(GEMMA4_MTP_PROFILE.into()),
+            runtime: Some(RuntimeQualification {
+                engine: "llama.cpp".into(),
+                build: GEMMA4_LLAMA_BUILD.into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn version_three_bundle_is_validated_and_published_last() {
+        let root = tempdir().unwrap();
+        let expected = bundle_manifest("gemma4");
+        let model_dir = root.path().join("gemma4");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("model.gguf"), b"target").unwrap();
+
+        assert!(publish_manifest(root.path(), &expected).is_err());
+        assert!(!model_dir.join("manifest.json").exists());
+
+        let encoded = serde_json::to_vec_pretty(&expected).unwrap();
+        let decoded: Manifest = serde_json::from_slice(&encoded).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn version_three_bundle_rejects_unqualified_or_unsafe_artifacts() {
+        let valid = bundle_manifest("gemma4");
+        valid.validate().unwrap();
+        assert_eq!(valid.primary_artifact().role, ArtifactRole::Model);
+        assert_eq!(valid.draft_artifact().unwrap().role, ArtifactRole::Draft);
+        assert_eq!(valid.total_size(), GEMMA4_MODEL_SIZE + GEMMA4_DRAFT_SIZE);
+
+        let mut duplicate = valid.clone();
+        duplicate.artifacts.as_mut().unwrap()[1].role = ArtifactRole::Model;
+        assert!(duplicate.validate().is_err());
+
+        let mut traversal = valid.clone();
+        traversal.artifacts.as_mut().unwrap()[1].local_filename = "../draft.gguf".into();
+        assert!(traversal.validate().is_err());
+
+        let mut wrong_profile = valid.clone();
+        wrong_profile.profile = Some("arbitrary".into());
+        assert!(wrong_profile.validate().is_err());
+
+        let mut wrong_build = valid;
+        wrong_build.runtime.as_mut().unwrap().build = "latest".into();
+        assert!(wrong_build.validate().is_err());
     }
 
     fn write_artifact(models_root: &Path, id: &str) {
