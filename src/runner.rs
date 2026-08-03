@@ -328,6 +328,12 @@ pub(crate) fn start_foreground(
     ctx: u32,
     run_dir: &Path,
 ) -> Result<ForegroundStart, String> {
+    tracing::info!(
+        event = "server_starting",
+        model_id = id,
+        requested_port,
+        context_size = ctx
+    );
     install_termination_watcher()?;
     let ownership = crate::runtime::RuntimeOwnership::acquire(run_dir)?;
     match OwnedServer::start_with_ownership(
@@ -340,8 +346,18 @@ pub(crate) fn start_foreground(
         ownership,
         || None,
     )? {
-        StartOutcome::Ready(server) => Ok(ForegroundStart::Ready(ForegroundServer { server })),
-        StartOutcome::Exited(exit) => Ok(ForegroundStart::Stopped(exit)),
+        StartOutcome::Ready(server) => {
+            tracing::info!(event = "server_ready", model_id = id, port = server.port());
+            Ok(ForegroundStart::Ready(ForegroundServer { server }))
+        }
+        StartOutcome::Exited(exit) => {
+            tracing::warn!(
+                event = "server_stopped_before_ready",
+                model_id = id,
+                exit_code = exit.code
+            );
+            Ok(ForegroundStart::Stopped(exit))
+        }
         StartOutcome::Signaled(signal) => Ok(ForegroundStart::Stopped(ServerExit {
             code: 128 + signal,
             diagnostic: None,
@@ -908,9 +924,11 @@ impl OwnedServer {
     pub fn terminate(&mut self) -> Result<(), String> {
         if let Some(child) = self.child.as_mut() {
             let pid = child.id();
+            tracing::info!(event = "server_terminating", pid, port = self.port);
             terminate_owned_group(child, self.group)?;
             deactivate_server(pid, self.group);
             self.child.take();
+            tracing::info!(event = "server_terminated", pid, port = self.port);
         }
         if let Some(runtime) = self.runtime.as_mut() {
             runtime.clear()?;

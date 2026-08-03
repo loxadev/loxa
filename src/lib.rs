@@ -2,6 +2,7 @@ pub mod catalog;
 pub mod chat;
 pub mod cli;
 pub mod config;
+mod diagnostics;
 pub mod download;
 pub mod huggingface;
 pub mod paths;
@@ -62,13 +63,38 @@ impl Drop for PromptInterrupt {
 }
 
 pub fn run_from_env() -> Result<i32, String> {
-    run(Cli::parse(), AppPaths::from_env()?)
+    let cli = Cli::parse();
+    let paths = AppPaths::from_env()?;
+    let _diagnostics = diagnostics::init(&paths.logs).ok();
+    let command = command_name(&cli.command);
+    tracing::info!(event = "cli_startup", command);
+    let result = run(cli, paths);
+    match &result {
+        Ok(code) => tracing::info!(event = "cli_finished", command, exit_code = *code),
+        Err(_) => tracing::error!(event = "cli_failed", command),
+    }
+    result
 }
 
 pub fn report_error(error: &str) {
     let danger = ui::danger();
     let error = ui::sanitize_terminal(error);
     anstream::eprintln!("{danger}Error:{danger:#} {error}");
+    if let Some(path) = diagnostics::active_log_dir() {
+        let muted = ui::muted();
+        let path = ui::sanitize_terminal(&path.display().to_string());
+        anstream::eprintln!("{muted}Diagnostics: {path}{muted:#}");
+    }
+}
+
+fn command_name(command: &Command) -> &'static str {
+    match command {
+        Command::Pull(_) => "pull",
+        Command::List => "list",
+        Command::Rm(_) => "rm",
+        Command::Run(_) => "run",
+        Command::Chat(_) => "chat",
+    }
 }
 
 pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
@@ -142,11 +168,30 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
                 resolved.repo,
                 &resolved.revision[..12]
             );
+            tracing::info!(
+                event = "pull_started",
+                model_id = %id,
+                repo = %resolved.repo,
+                revision = %resolved.revision,
+                size = resolved.size
+            );
             let outcome = download::download(&resolved, &model_dir, token)?;
             let verifying = ui::spinner(format!("Verifying {id}"));
             let published = catalog::publish_manifest(&paths.models, &manifest);
             verifying.finish_and_clear();
             published?;
+            let download_outcome = match &outcome {
+                download::DownloadOutcome::Pulled(_) => "pulled",
+                download::DownloadOutcome::AlreadyInstalled(_) => "already_installed",
+            };
+            tracing::info!(
+                event = "pull_finished",
+                model_id = %id,
+                repo = %resolved.repo,
+                revision = %resolved.revision,
+                size = resolved.size,
+                outcome = download_outcome
+            );
             let success = ui::success();
             match outcome {
                 download::DownloadOutcome::Pulled(_) => {
@@ -395,7 +440,13 @@ fn load_installed_models_with_reconciler<F>(
 where
     F: FnOnce(&Path) -> Result<Option<Manifest>, String>,
 {
-    let _ = reconcile(&paths.models);
+    match reconcile(&paths.models) {
+        Ok(Some(manifest)) => {
+            tracing::info!(event = "bundle_reconciled", model_id = %manifest.id)
+        }
+        Ok(None) => tracing::debug!(event = "bundle_reconciliation_not_needed"),
+        Err(_) => tracing::warn!(event = "bundle_reconciliation_failed"),
+    }
     catalog::load_catalog(&paths.models)
 }
 
@@ -547,7 +598,9 @@ fn resolve_runnable(
                 .into_iter()
                 .find(|candidate| candidate.id == id)
                 .ok_or_else(|| format!("unknown model id {id}"))?;
-            catalog::local::adopt(&paths.models, &candidate)?
+            let manifest = catalog::local::adopt(&paths.models, &candidate)?;
+            tracing::info!(event = "local_model_adopted", model_id = %manifest.id);
+            manifest
         }
     };
     let model_lock = catalog::ModelLock::acquire(&paths.model_dir(&manifest.id)?)?;
