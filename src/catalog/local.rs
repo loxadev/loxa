@@ -12,7 +12,7 @@ use super::{Manifest, Origin};
 mod bundle;
 pub use bundle::reconcile_qualified_bundle;
 #[cfg(test)]
-use bundle::{reconcile_with, BundleQualification};
+use bundle::{reconcile_with, reconcile_with_hook, BundleQualification, UpgradePoint};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Candidate {
@@ -494,6 +494,29 @@ mod tests {
     }
 
     #[test]
+    fn target_without_a_draft_candidate_skips_primary_verification() {
+        let root = tempfile::tempdir().unwrap();
+        let target = gguf(3);
+        let mut draft = gguf(3);
+        draft.extend(b"draft");
+        let old = install_local(root.path(), "gemma4", &target);
+        let qualification = BundleQualification::for_test(&target, &draft);
+        let mut verified_primary = false;
+
+        let result = reconcile_with_hook(root.path(), &qualification, |point| {
+            if point == UpgradePoint::BeforePrimaryVerification {
+                verified_primary = true;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(result, None);
+        assert!(!verified_primary);
+        assert_eq!(super::super::load_catalog(root.path()).unwrap(), vec![old]);
+    }
+
+    #[test]
     fn model_only_bundle_is_upgraded_and_complete_bundle_is_idempotent() {
         let root = tempfile::tempdir().unwrap();
         let target = gguf(3);
@@ -537,6 +560,447 @@ mod tests {
         assert_eq!(
             reconcile_with(root.path(), &qualification).unwrap(),
             Some(complete)
+        );
+    }
+
+    #[test]
+    fn complete_bundle_without_recovery_debris_skips_artifact_reverification() {
+        let root = tempfile::tempdir().unwrap();
+        let target = gguf(3);
+        let mut draft = gguf(3);
+        draft.extend(b"draft");
+        install_local(root.path(), "gemma4", &target);
+        std::fs::write(root.path().join("mtp-gemma-4.gguf"), &draft).unwrap();
+        let qualification = BundleQualification::for_test(&target, &draft);
+        let complete = reconcile_with(root.path(), &qualification)
+            .unwrap()
+            .unwrap();
+        let model_dir = root.path().join("gemma4");
+        assert!(!model_dir.join("bundle.pending.json").exists());
+        std::fs::write(model_dir.join("draft.gguf"), b"corrupt").unwrap();
+
+        assert_eq!(
+            reconcile_with(root.path(), &qualification).unwrap(),
+            Some(complete)
+        );
+    }
+
+    #[test]
+    fn draft_destination_collision_is_a_non_overwriting_no_op() {
+        let root = tempfile::tempdir().unwrap();
+        let target = gguf(3);
+        let mut draft = gguf(3);
+        draft.extend(b"draft");
+        let old = install_local(root.path(), "gemma4", &target);
+        let source = root.path().join("mtp-gemma-4.gguf");
+        std::fs::write(&source, &draft).unwrap();
+        let qualification = BundleQualification::for_test(&target, &draft);
+        let destination = root.path().join("gemma4/draft.gguf");
+
+        let result = reconcile_with_hook(root.path(), &qualification, |point| {
+            if point == UpgradePoint::BeforeDraft {
+                std::fs::write(&destination, b"already-present").unwrap();
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(result, None);
+        assert!(source.is_file());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"already-present");
+        assert_eq!(super::super::load_catalog(root.path()).unwrap(), vec![old]);
+    }
+
+    #[test]
+    fn pending_collision_is_a_non_overwriting_no_op() {
+        let root = tempfile::tempdir().unwrap();
+        let target = gguf(3);
+        let mut draft = gguf(3);
+        draft.extend(b"draft");
+        let old = install_local(root.path(), "gemma4", &target);
+        let source = root.path().join("mtp-gemma-4.gguf");
+        std::fs::write(&source, &draft).unwrap();
+        let qualification = BundleQualification::for_test(&target, &draft);
+        let pending = root.path().join("gemma4/bundle.pending.json");
+
+        let result = reconcile_with_hook(root.path(), &qualification, |point| {
+            if point == UpgradePoint::BeforePending {
+                std::fs::write(&pending, b"not-a-loxa-manifest").unwrap();
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(result, None);
+        assert!(source.is_file());
+        assert_eq!(std::fs::read(&pending).unwrap(), b"not-a-loxa-manifest");
+        assert_eq!(super::super::load_catalog(root.path()).unwrap(), vec![old]);
+    }
+
+    #[test]
+    fn failure_before_draft_claim_preserves_source_and_primary_manifest() {
+        let root = tempfile::tempdir().unwrap();
+        let target = gguf(3);
+        let mut draft = gguf(3);
+        draft.extend(b"draft");
+        let old = install_local(root.path(), "gemma4", &target);
+        let source = root.path().join("mtp-gemma-4.gguf");
+        std::fs::write(&source, &draft).unwrap();
+        let qualification = BundleQualification::for_test(&target, &draft);
+
+        let error = reconcile_with_hook(root.path(), &qualification, |point| {
+            (point == UpgradePoint::BeforeDraft)
+                .then_some("injected stop".to_owned())
+                .map_or(Ok(()), Err)
+        })
+        .unwrap_err();
+
+        assert_eq!(error, "injected stop");
+        assert!(source.is_file());
+        assert!(!root.path().join("gemma4/draft.gguf").exists());
+        assert_eq!(super::super::load_catalog(root.path()).unwrap(), vec![old]);
+    }
+
+    #[test]
+    fn interrupted_draft_claim_is_resumed_without_a_loose_candidate() {
+        let root = tempfile::tempdir().unwrap();
+        let target = gguf(3);
+        let mut draft = gguf(3);
+        draft.extend(b"draft");
+        let old = install_local(root.path(), "gemma4", &target);
+        let source = root.path().join("mtp-gemma-4.gguf");
+        std::fs::write(&source, &draft).unwrap();
+        let qualification = BundleQualification::for_test(&target, &draft);
+
+        let error = reconcile_with_hook(root.path(), &qualification, |point| {
+            (point == UpgradePoint::AfterDraft)
+                .then_some("injected stop after draft claim".to_owned())
+                .map_or(Ok(()), Err)
+        })
+        .unwrap_err();
+
+        assert_eq!(error, "injected stop after draft claim");
+        assert!(!source.exists());
+        assert_eq!(
+            std::fs::read(root.path().join("gemma4/draft.gguf")).unwrap(),
+            draft
+        );
+        assert!(root.path().join("gemma4/bundle.pending.json").is_file());
+        assert_eq!(super::super::load_catalog(root.path()).unwrap(), vec![old]);
+
+        let recovered = reconcile_with(root.path(), &qualification)
+            .unwrap()
+            .expect("the matching pending bundle should be published");
+
+        assert!(recovered.draft_artifact().is_some());
+        assert_eq!(
+            super::super::load_catalog(root.path()).unwrap(),
+            vec![recovered]
+        );
+        assert!(!root.path().join("gemma4/bundle.pending.json").exists());
+    }
+
+    #[test]
+    fn reentry_after_exchange_recovers_a_complete_bundle_and_cleans_matching_debris() {
+        let root = tempfile::tempdir().unwrap();
+        let target = gguf(3);
+        let mut draft = gguf(3);
+        draft.extend(b"draft");
+        let old = install_local(root.path(), "gemma4", &target);
+        let source = root.path().join("mtp-gemma-4.gguf");
+        std::fs::write(&source, &draft).unwrap();
+        let qualification = BundleQualification::for_test(&target, &draft);
+
+        reconcile_with_hook(root.path(), &qualification, |point| {
+            (point == UpgradePoint::AfterDraft)
+                .then_some("stop before publication".to_owned())
+                .map_or(Ok(()), Err)
+        })
+        .unwrap_err();
+        let model_dir = root.path().join("gemma4");
+        let replacement: Manifest =
+            serde_json::from_slice(&std::fs::read(model_dir.join("bundle.pending.json")).unwrap())
+                .unwrap();
+        let exchange_error = super::super::replace_manifest_atomic_with_hook(
+            root.path(),
+            &old,
+            &replacement,
+            |point| {
+                (point == super::super::ManifestPublicationPoint::AfterExchange)
+                    .then_some("simulated crash after exchange".to_owned())
+                    .map_or(Ok(()), Err)
+            },
+        )
+        .unwrap_err();
+        assert_eq!(exchange_error, "simulated crash after exchange");
+        assert!(model_dir.join("bundle.pending.json").is_file());
+        assert!(std::fs::read_dir(&model_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".bundle-manifest-")));
+
+        let recovered = reconcile_with(root.path(), &qualification)
+            .unwrap()
+            .expect("a complete, verified bundle remains runnable after a crash");
+
+        assert_eq!(recovered, replacement);
+        assert!(!model_dir.join("bundle.pending.json").exists());
+        assert!(!std::fs::read_dir(&model_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".bundle-manifest-")));
+        assert_eq!(
+            reconcile_with(root.path(), &qualification).unwrap(),
+            Some(recovered)
+        );
+    }
+
+    #[test]
+    fn complete_recovery_keeps_a_predecessor_temp_with_different_primary_provenance() {
+        let root = tempfile::tempdir().unwrap();
+        let target = gguf(3);
+        let mut draft = gguf(3);
+        draft.extend(b"draft");
+        let mut predecessor = install_local(root.path(), "gemma4", &target);
+        let source = root.path().join("mtp-gemma-4.gguf");
+        std::fs::write(&source, &draft).unwrap();
+        let qualification = BundleQualification::for_test(&target, &draft);
+        let complete = reconcile_with(root.path(), &qualification)
+            .unwrap()
+            .unwrap();
+        predecessor.source_filename = Some("changed-provenance.gguf".into());
+        let temp = root.path().join("gemma4/.bundle-manifest-1-1.tmp");
+        std::fs::write(&temp, serde_json::to_vec_pretty(&predecessor).unwrap()).unwrap();
+
+        assert_eq!(
+            reconcile_with(root.path(), &qualification).unwrap(),
+            Some(complete)
+        );
+        assert!(temp.exists(), "a changed predecessor must not be removed");
+    }
+
+    #[test]
+    fn complete_reentry_verifies_artifacts_before_cleaning_recovery_debris() {
+        let root = tempfile::tempdir().unwrap();
+        let target = gguf(3);
+        let mut draft = gguf(3);
+        draft.extend(b"draft");
+        let old = install_local(root.path(), "gemma4", &target);
+        let source = root.path().join("mtp-gemma-4.gguf");
+        std::fs::write(&source, &draft).unwrap();
+        let qualification = BundleQualification::for_test(&target, &draft);
+        let complete = reconcile_with(root.path(), &qualification)
+            .unwrap()
+            .unwrap();
+        let model_dir = root.path().join("gemma4");
+        let pending = model_dir.join("bundle.pending.json");
+        let predecessor = model_dir.join(".bundle-manifest-1-1.tmp");
+        std::fs::write(&pending, serde_json::to_vec_pretty(&complete).unwrap()).unwrap();
+        std::fs::write(&predecessor, serde_json::to_vec_pretty(&old).unwrap()).unwrap();
+        std::fs::write(model_dir.join("draft.gguf"), b"corrupt").unwrap();
+
+        assert_eq!(reconcile_with(root.path(), &qualification).unwrap(), None);
+        assert!(pending.exists());
+        assert!(predecessor.exists());
+    }
+
+    #[test]
+    fn complete_reentry_cleans_a_matching_replacement_transaction_temp() {
+        let root = tempfile::tempdir().unwrap();
+        let target = gguf(3);
+        let mut draft = gguf(3);
+        draft.extend(b"draft");
+        install_local(root.path(), "gemma4", &target);
+        let source = root.path().join("mtp-gemma-4.gguf");
+        std::fs::write(&source, &draft).unwrap();
+        let qualification = BundleQualification::for_test(&target, &draft);
+        let complete = reconcile_with(root.path(), &qualification)
+            .unwrap()
+            .unwrap();
+        let temp = root.path().join("gemma4/.bundle-manifest-1-1.tmp");
+        std::fs::write(&temp, serde_json::to_vec_pretty(&complete).unwrap()).unwrap();
+
+        assert_eq!(
+            reconcile_with(root.path(), &qualification).unwrap(),
+            Some(complete)
+        );
+        assert!(!temp.exists());
+    }
+
+    #[test]
+    fn removing_a_complete_bundle_removes_its_artifacts_and_matching_transaction_debris() {
+        let root = tempfile::tempdir().unwrap();
+        let target = gguf(3);
+        let mut draft = gguf(3);
+        draft.extend(b"draft");
+        let old = install_local(root.path(), "gemma4", &target);
+        let source = root.path().join("mtp-gemma-4.gguf");
+        std::fs::write(&source, &draft).unwrap();
+        let qualification = BundleQualification::for_test(&target, &draft);
+        let complete = reconcile_with(root.path(), &qualification)
+            .unwrap()
+            .unwrap();
+        let model_dir = root.path().join("gemma4");
+        std::fs::write(
+            model_dir.join("bundle.pending.json"),
+            serde_json::to_vec_pretty(&complete).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            model_dir.join(".bundle-pending-1-1.tmp"),
+            serde_json::to_vec_pretty(&complete).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            model_dir.join(".bundle-manifest-1-1.tmp"),
+            serde_json::to_vec_pretty(&old).unwrap(),
+        )
+        .unwrap();
+
+        super::super::remove_model(root.path(), &complete).unwrap();
+
+        for name in [
+            "model.gguf",
+            "draft.gguf",
+            "manifest.json",
+            "bundle.pending.json",
+            ".bundle-pending-1-1.tmp",
+            ".bundle-manifest-1-1.tmp",
+        ] {
+            assert!(!model_dir.join(name).exists(), "{name} was not removed");
+        }
+        assert!(model_dir.join(".lock").is_file());
+    }
+
+    #[test]
+    fn pending_with_a_different_primary_provenance_is_not_published() {
+        let root = tempfile::tempdir().unwrap();
+        let target = gguf(3);
+        let mut draft = gguf(3);
+        draft.extend(b"draft");
+        let old = install_local(root.path(), "gemma4", &target);
+        let source = root.path().join("mtp-gemma-4.gguf");
+        std::fs::write(&source, &draft).unwrap();
+        let qualification = BundleQualification::for_test(&target, &draft);
+
+        reconcile_with_hook(root.path(), &qualification, |point| {
+            (point == UpgradePoint::AfterDraft)
+                .then_some("injected stop after draft claim".to_owned())
+                .map_or(Ok(()), Err)
+        })
+        .unwrap_err();
+
+        let pending_path = root.path().join("gemma4/bundle.pending.json");
+        let mut pending: Manifest =
+            serde_json::from_slice(&std::fs::read(&pending_path).unwrap()).unwrap();
+        pending
+            .artifacts
+            .as_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|artifact| artifact.role == ArtifactRole::Model)
+            .unwrap()
+            .provenance = ArtifactProvenance::Local {
+            source_filename: "different-target.gguf".into(),
+        };
+        std::fs::write(&pending_path, serde_json::to_vec_pretty(&pending).unwrap()).unwrap();
+
+        assert_eq!(reconcile_with(root.path(), &qualification).unwrap(), None);
+        assert_eq!(super::super::load_catalog(root.path()).unwrap(), vec![old]);
+    }
+
+    #[test]
+    fn abandoned_fixed_bundle_temp_names_do_not_block_a_new_upgrade() {
+        let root = tempfile::tempdir().unwrap();
+        let target = gguf(3);
+        let mut draft = gguf(3);
+        draft.extend(b"draft");
+        install_local(root.path(), "gemma4", &target);
+        let source = root.path().join("mtp-gemma-4.gguf");
+        std::fs::write(&source, &draft).unwrap();
+        let model_dir = root.path().join("gemma4");
+        std::fs::write(model_dir.join("bundle.pending.json.tmp"), b"stale temp").unwrap();
+        std::fs::write(model_dir.join("bundle.manifest.json.tmp"), b"stale temp").unwrap();
+        let qualification = BundleQualification::for_test(&target, &draft);
+
+        let upgraded = reconcile_with(root.path(), &qualification)
+            .unwrap()
+            .expect("stale internal temp names must not block an upgrade");
+
+        assert!(upgraded.draft_artifact().is_some());
+        assert_eq!(
+            super::super::load_catalog(root.path()).unwrap(),
+            vec![upgraded]
+        );
+    }
+
+    #[test]
+    fn manifest_is_published_only_after_the_draft_is_claimed() {
+        let root = tempfile::tempdir().unwrap();
+        let target = gguf(3);
+        let mut draft = gguf(3);
+        draft.extend(b"draft");
+        let old = install_local(root.path(), "gemma4", &target);
+        let source = root.path().join("mtp-gemma-4.gguf");
+        std::fs::write(&source, &draft).unwrap();
+        let qualification = BundleQualification::for_test(&target, &draft);
+        let mut observed_old_manifest = false;
+
+        let upgraded = reconcile_with_hook(root.path(), &qualification, |point| {
+            if point == UpgradePoint::AfterDraft {
+                assert!(!source.exists());
+                assert!(root.path().join("gemma4/draft.gguf").is_file());
+                assert_eq!(
+                    super::super::load_catalog(root.path()).unwrap(),
+                    vec![old.clone()]
+                );
+                observed_old_manifest = true;
+            }
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
+
+        assert!(observed_old_manifest);
+        assert_eq!(
+            super::super::load_catalog(root.path()).unwrap(),
+            vec![upgraded]
+        );
+    }
+
+    #[test]
+    fn changed_manifest_is_not_overwritten_during_bundle_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let target = gguf(3);
+        let mut draft = gguf(3);
+        draft.extend(b"draft");
+        let old = install_local(root.path(), "gemma4", &target);
+        let mut changed = old.clone();
+        changed.source_filename = Some("changed-by-another-writer.gguf".into());
+        let source = root.path().join("mtp-gemma-4.gguf");
+        std::fs::write(&source, &draft).unwrap();
+        let qualification = BundleQualification::for_test(&target, &draft);
+        let manifest_path = root.path().join("gemma4/manifest.json");
+
+        let result = reconcile_with_hook(root.path(), &qualification, |point| {
+            if point == UpgradePoint::AfterDraft {
+                std::fs::write(&manifest_path, serde_json::to_vec_pretty(&changed).unwrap())
+                    .unwrap();
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(result, None);
+        assert_eq!(
+            super::super::load_catalog(root.path()).unwrap(),
+            vec![changed]
         );
     }
 

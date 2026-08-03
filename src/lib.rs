@@ -16,7 +16,7 @@ use cli::{Cli, Command};
 use indicatif::BinaryBytes;
 use paths::{validate_id, AppPaths};
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(unix)]
@@ -120,7 +120,7 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
                 runtime: None,
             };
             if model_dir.join("manifest.json").exists() {
-                let existing = catalog::load_catalog(&paths.models)?
+                let existing = load_installed_models(&paths)?
                     .into_iter()
                     .find(|entry| entry.id == id)
                     .ok_or_else(|| format!("missing manifest for model {id}"))?;
@@ -162,7 +162,7 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
             Ok(0)
         }
         Command::List => {
-            let installed = catalog::load_catalog(&paths.models)?;
+            let installed = load_installed_models(&paths)?;
             let candidates = local_candidates(&paths, &installed)?;
             let runnable = runnable_candidates(&candidates);
             let auxiliaries = auxiliary_candidates(&candidates);
@@ -183,7 +183,7 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
                     anstream::println!(
                         "\n  {accent}{}{accent:#}  {}",
                         entry.id,
-                        BinaryBytes(entry.size)
+                        installed_model_size(&entry)
                     );
                     let (source, filename, revision) = entry.description();
                     if let Some(revision) = revision {
@@ -235,7 +235,7 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
             Ok(0)
         }
         Command::Rm(args) => {
-            let installed = catalog::load_catalog(&paths.models)?;
+            let installed = load_installed_models(&paths)?;
             if args.id.is_none() && installed.is_empty() {
                 return Err("no models installed".into());
             }
@@ -261,7 +261,7 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
                         "removal confirmation requires an interactive terminal; pass --yes".into(),
                     );
                 }
-                let prompt = format!("Remove {} ({})?", manifest.id, BinaryBytes(manifest.size));
+                let prompt = removal_prompt(&manifest);
                 #[cfg(unix)]
                 let interrupt = PromptInterrupt::install()?;
                 let result = dialoguer::Confirm::new()
@@ -291,7 +291,7 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
             Ok(0)
         }
         Command::Run(args) => {
-            let installed = catalog::load_catalog(&paths.models)?;
+            let installed = load_installed_models(&paths)?;
             let candidates = local_candidates(&paths, &installed)?;
             let candidates = runnable_candidates(&candidates);
             let id = match select_model_options(
@@ -326,7 +326,7 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
             )
         }
         Command::Chat(args) => {
-            let installed = catalog::load_catalog(&paths.models)?;
+            let installed = load_installed_models(&paths)?;
             let candidates = local_candidates(&paths, &installed)?;
             let candidates = runnable_candidates(&candidates);
             let options = model_options_with_candidates(args.id, &installed, &candidates)?;
@@ -378,6 +378,33 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
             }
         }
     }
+}
+
+fn installed_model_size(manifest: &Manifest) -> BinaryBytes {
+    BinaryBytes(manifest.total_size())
+}
+
+fn load_installed_models(paths: &AppPaths) -> Result<Vec<Manifest>, String> {
+    load_installed_models_with_reconciler(paths, catalog::local::reconcile_qualified_bundle)
+}
+
+fn load_installed_models_with_reconciler<F>(
+    paths: &AppPaths,
+    reconcile: F,
+) -> Result<Vec<Manifest>, String>
+where
+    F: FnOnce(&Path) -> Result<Option<Manifest>, String>,
+{
+    let _ = reconcile(&paths.models);
+    catalog::load_catalog(&paths.models)
+}
+
+fn removal_prompt(manifest: &Manifest) -> String {
+    format!(
+        "Remove {} ({})?",
+        manifest.id,
+        installed_model_size(manifest)
+    )
 }
 
 fn model_options(requested: Option<String>, installed: &[Manifest]) -> Result<Vec<String>, String> {
@@ -510,7 +537,7 @@ fn resolve_runnable(
     let ctx = config::resolve_value(runtime.ctx, config.ctx, 4096);
     let port = config::resolve_value(runtime.port, config.port, 0);
     let server = runner::discover_from_process(runtime.server.as_deref(), &paths.managed_server)?;
-    let manifest = match catalog::load_catalog(&paths.models)?
+    let manifest = match load_installed_models(paths)?
         .into_iter()
         .find(|entry| entry.id == id)
     {
@@ -562,11 +589,15 @@ fn default_id(repo: &str, filename: &str, sha256: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_id, ensure_interactive_chat, local_candidates, model_options,
-        model_options_with_candidates, resolve_runnable, run, runnable_candidates, select_model,
-        ModelSelection,
+        default_id, ensure_interactive_chat, installed_model_size,
+        load_installed_models_with_reconciler, local_candidates, model_options,
+        model_options_with_candidates, removal_prompt, resolve_runnable, run, runnable_candidates,
+        select_model, ModelSelection,
     };
-    use crate::catalog::Manifest;
+    use crate::catalog::{
+        Artifact, ArtifactProvenance, ArtifactRole, Manifest, RuntimeQualification,
+        TEST_LLAMA_BUILD, TEST_MTP_PROFILE,
+    };
     use crate::cli::{Cli, RuntimeArgs};
     use crate::paths::AppPaths;
     use clap::Parser;
@@ -586,6 +617,46 @@ mod tests {
             artifacts: None,
             profile: None,
             runtime: None,
+        }
+    }
+
+    fn test_bundle(id: &str) -> Manifest {
+        Manifest {
+            version: 3,
+            id: id.into(),
+            repo: None,
+            revision: None,
+            remote_filename: None,
+            origin: None,
+            source_filename: None,
+            local_filename: "model.gguf".into(),
+            sha256: "a".repeat(64),
+            size: 3,
+            artifacts: Some(vec![
+                Artifact {
+                    role: ArtifactRole::Model,
+                    local_filename: "model.gguf".into(),
+                    sha256: "a".repeat(64),
+                    size: 3,
+                    provenance: ArtifactProvenance::Local {
+                        source_filename: "model-source.gguf".into(),
+                    },
+                },
+                Artifact {
+                    role: ArtifactRole::Draft,
+                    local_filename: "draft.gguf".into(),
+                    sha256: "b".repeat(64),
+                    size: 5,
+                    provenance: ArtifactProvenance::Local {
+                        source_filename: "draft-source.gguf".into(),
+                    },
+                },
+            ]),
+            profile: Some(TEST_MTP_PROFILE.into()),
+            runtime: Some(RuntimeQualification {
+                engine: "llama.cpp".into(),
+                build: TEST_LLAMA_BUILD.into(),
+            }),
         }
     }
 
@@ -639,6 +710,35 @@ mod tests {
             "0123456789abcdefaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         );
         assert!(long.ends_with("0123456789abcdef"));
+    }
+
+    #[test]
+    fn completed_bundle_size_is_shown_in_list_and_removal_confirmation() {
+        let bundle = test_bundle("gemma4");
+        bundle.validate().unwrap();
+
+        assert_eq!(installed_model_size(&bundle).to_string(), "8 B");
+        assert_eq!(removal_prompt(&bundle), "Remove gemma4 (8 B)?");
+    }
+
+    #[test]
+    fn installed_model_load_runs_reconciliation_without_blocking_a_valid_catalog() {
+        use std::cell::Cell;
+
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_values(Some(temp.path()), None).unwrap();
+        let installed = install(&paths, "demo");
+        let reconciled = Cell::new(false);
+
+        let loaded = load_installed_models_with_reconciler(&paths, |models_root| {
+            assert_eq!(models_root, paths.models);
+            reconciled.set(true);
+            Err("injected reconciliation failure".into())
+        })
+        .unwrap();
+
+        assert!(reconciled.get());
+        assert_eq!(loaded, vec![installed]);
     }
 
     #[test]

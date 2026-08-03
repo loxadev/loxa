@@ -810,6 +810,7 @@ dependencies = [
  "indicatif",
  "libc",
  "reqwest",
+ "rustix",
  "rustyline",
  "serde",
  "serde_json",

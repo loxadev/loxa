@@ -6,12 +6,20 @@ use sha2::{Digest, Sha256};
 
 #[cfg(test)]
 use super::hex;
-use super::{discover, sha256, Candidate, CandidateKind, FileIdentity};
+use super::{discover, Candidate, CandidateKind, FileIdentity};
 use crate::catalog::{
-    self, Artifact, ArtifactProvenance, ArtifactRole, Manifest, Origin, RuntimeQualification,
-    GEMMA4_DRAFT_SHA256, GEMMA4_DRAFT_SIZE, GEMMA4_LLAMA_BUILD, GEMMA4_MODEL_SHA256,
-    GEMMA4_MODEL_SIZE, GEMMA4_MTP_PROFILE,
+    self, Artifact, ArtifactProvenance, ArtifactRole, BundlePending, Manifest, NoReplaceRename,
+    Origin, RuntimeQualification, GEMMA4_DRAFT_SHA256, GEMMA4_DRAFT_SIZE, GEMMA4_LLAMA_BUILD,
+    GEMMA4_MODEL_SHA256, GEMMA4_MODEL_SIZE, GEMMA4_MTP_PROFILE,
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum UpgradePoint {
+    BeforePrimaryVerification,
+    BeforePending,
+    BeforeDraft,
+    AfterDraft,
+}
 
 pub(super) struct BundleQualification {
     pub(super) profile: String,
@@ -55,6 +63,29 @@ pub(super) fn reconcile_with(
     models_root: &Path,
     qualification: &BundleQualification,
 ) -> Result<Option<Manifest>, String> {
+    reconcile_with_observer(models_root, qualification, |_| Ok(()))
+}
+
+#[cfg(test)]
+pub(super) fn reconcile_with_hook<F>(
+    models_root: &Path,
+    qualification: &BundleQualification,
+    observer: F,
+) -> Result<Option<Manifest>, String>
+where
+    F: FnMut(UpgradePoint) -> Result<(), String>,
+{
+    reconcile_with_observer(models_root, qualification, observer)
+}
+
+fn reconcile_with_observer<F>(
+    models_root: &Path,
+    qualification: &BundleQualification,
+    mut observer: F,
+) -> Result<Option<Manifest>, String>
+where
+    F: FnMut(UpgradePoint) -> Result<(), String>,
+{
     let targets = catalog::load_catalog(models_root)?
         .into_iter()
         .filter(|manifest| qualified_target(manifest, qualification))
@@ -63,70 +94,242 @@ pub(super) fn reconcile_with(
         return Ok(None);
     }
     let expected = targets.into_iter().next().expect("one target exists");
-    if qualified_draft(&expected, qualification) {
-        return Ok(Some(expected));
+    let model_dir = models_root.join(&expected.id);
+    let _lock = catalog::ModelLock::acquire(&model_dir)?;
+    let Some(current) = catalog::load_catalog(models_root)?
+        .into_iter()
+        .find(|manifest| manifest.id == expected.id)
+    else {
+        return Ok(None);
+    };
+    if current != expected || !qualified_target(&current, qualification) {
+        return Ok(None);
     }
-
-    let candidates = discover(models_root)?
+    if qualified_draft(&current, qualification) {
+        if !complete_bundle_needs_recovery_cleanup(&model_dir, &current) {
+            return Ok(Some(current));
+        }
+        if complete_bundle_is_verified(models_root, &current, qualification) {
+            let _ = catalog::cleanup_completed_bundle_debris(&model_dir, &current);
+            return Ok(Some(current));
+        }
+        return Ok(None);
+    }
+    let pending = catalog::bundle_pending(&model_dir);
+    if matches!(pending, BundlePending::UnsafeOrInvalid) {
+        return Ok(None);
+    }
+    let candidate_pool = discover(models_root)?
         .into_iter()
         .filter(|candidate| {
             candidate.kind == CandidateKind::Auxiliary && candidate.size == qualification.draft_size
         })
+        .collect::<Vec<_>>();
+    if matches!(pending, BundlePending::Absent) && candidate_pool.is_empty() {
+        return Ok(None);
+    }
+    observer(UpgradePoint::BeforePrimaryVerification)?;
+    if crate::download::verify_regular(
+        &current.artifact_path(models_root),
+        qualification.target_size,
+        &qualification.target_sha256,
+    )
+    .is_err()
+    {
+        return Ok(None);
+    }
+    match pending {
+        BundlePending::Absent => {}
+        BundlePending::UnsafeOrInvalid => unreachable!("unsafe pending state returned above"),
+        BundlePending::Valid(pending) => {
+            if !matching_pending(&current, &pending, qualification) {
+                return Ok(None);
+            }
+            match managed_draft_state(&model_dir, qualification) {
+                ManagedDraft::Verified => {
+                    return if catalog::replace_manifest_atomic(models_root, &current, &pending)
+                        .unwrap_or(false)
+                    {
+                        Ok(Some(*pending))
+                    } else {
+                        Ok(None)
+                    };
+                }
+                ManagedDraft::UnsafeOrInvalid => return Ok(None),
+                ManagedDraft::Missing => {}
+            }
+        }
+    }
+    let candidates = candidate_pool
+        .into_iter()
         .filter(|candidate| verified_candidate(candidate, qualification))
         .collect::<Vec<_>>();
     if candidates.len() != 1 {
         return Ok(None);
     }
     let candidate = candidates.into_iter().next().expect("one draft exists");
-    let model_dir = models_root.join(&expected.id);
-    let _lock = catalog::ModelLock::acquire(&model_dir)?;
-    let current = catalog::load_catalog(models_root)?
-        .into_iter()
-        .find(|manifest| manifest.id == expected.id)
-        .ok_or_else(|| format!("model {} disappeared during bundle upgrade", expected.id))?;
-    if current != expected || !qualified_target(&current, qualification) {
-        return Err(format!(
-            "model {} changed during bundle upgrade",
-            expected.id
-        ));
-    }
-    crate::download::verify_regular(
-        &current.artifact_path(models_root),
-        qualification.target_size,
-        &qualification.target_sha256,
-    )?;
-    let before = FileIdentity::read(&candidate.path)?;
+    let Ok(before) = FileIdentity::read(&candidate.path) else {
+        return Ok(None);
+    };
     if before.size != qualification.draft_size
-        || sha256(&candidate.path)? != qualification.draft_sha256
-        || FileIdentity::read(&candidate.path)? != before
+        || crate::download::verify_regular(
+            &candidate.path,
+            qualification.draft_size,
+            &qualification.draft_sha256,
+        )
+        .is_err()
+        || !FileIdentity::read(&candidate.path).is_ok_and(|after| after == before)
     {
         return Ok(None);
     }
-    let replacement = bundle_manifest(&current, &candidate, qualification)?;
+    let Ok(replacement) = bundle_manifest(&current, &candidate, qualification) else {
+        return Ok(None);
+    };
     let destination = model_dir.join("draft.gguf");
-    if fs::symlink_metadata(&destination).is_ok() {
+    observer(UpgradePoint::BeforePending)?;
+    if !catalog::prepare_bundle_upgrade(&model_dir, &replacement).unwrap_or(false) {
         return Ok(None);
     }
-    catalog::prepare_bundle_upgrade(&model_dir, &replacement)?;
-    if FileIdentity::read(&candidate.path)? != before {
-        fs::remove_file(model_dir.join("bundle.pending.json"))
-            .map_err(|error| error.to_string())?;
+    if !FileIdentity::read(&candidate.path).is_ok_and(|after| after == before) {
         return Ok(None);
     }
-    fs::rename(&candidate.path, &destination).map_err(|error| {
-        format!(
-            "failed to adopt draft {} into {}: {error}",
-            candidate.path.display(),
-            destination.display()
-        )
-    })?;
-    crate::download::verify_regular(
+    observer(UpgradePoint::BeforeDraft)?;
+    if !matches!(
+        catalog::move_no_replace_and_sync(&candidate.path, &destination),
+        Ok(NoReplaceRename::Renamed)
+    ) {
+        return Ok(None);
+    }
+    if crate::download::verify_regular(
         &destination,
         qualification.draft_size,
         &qualification.draft_sha256,
-    )?;
-    catalog::replace_manifest_atomic(models_root, &current, &replacement)?;
+    )
+    .is_err()
+    {
+        return Ok(None);
+    }
+    observer(UpgradePoint::AfterDraft)?;
+    if !catalog::replace_manifest_atomic(models_root, &current, &replacement).unwrap_or(false) {
+        return Ok(None);
+    }
     Ok(Some(replacement))
+}
+
+fn complete_bundle_needs_recovery_cleanup(model_dir: &Path, complete: &Manifest) -> bool {
+    let Ok(entries) = fs::read_dir(model_dir) else {
+        return true;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return true;
+        };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if catalog::removable_bundle_debris(&entry.path(), name, complete) {
+            return true;
+        }
+    }
+    false
+}
+
+fn complete_bundle_is_verified(
+    models_root: &Path,
+    manifest: &Manifest,
+    qualification: &BundleQualification,
+) -> bool {
+    crate::download::verify_regular(
+        &manifest.artifact_path(models_root),
+        qualification.target_size,
+        &qualification.target_sha256,
+    )
+    .is_ok()
+        && manifest.draft_artifact().is_some_and(|draft| {
+            draft.local_filename == "draft.gguf"
+                && draft.size == qualification.draft_size
+                && draft.sha256 == qualification.draft_sha256
+                && crate::download::verify_regular(
+                    &models_root.join(&manifest.id).join(draft.local_filename),
+                    draft.size,
+                    draft.sha256,
+                )
+                .is_ok()
+        })
+}
+
+fn matching_pending(
+    current: &Manifest,
+    pending: &Manifest,
+    qualification: &BundleQualification,
+) -> bool {
+    current.id == pending.id
+        && current.local_filename == pending.local_filename
+        && current.sha256 == pending.sha256
+        && current.size == pending.size
+        && matching_primary_provenance(current, pending)
+        && qualified_target(pending, qualification)
+        && qualified_draft(pending, qualification)
+}
+
+fn matching_primary_provenance(current: &Manifest, pending: &Manifest) -> bool {
+    let Some(pending_model) = pending.artifacts.as_deref().and_then(|artifacts| {
+        artifacts
+            .iter()
+            .find(|artifact| artifact.role == ArtifactRole::Model)
+    }) else {
+        return false;
+    };
+    match current.version {
+        2 => matches!(
+            &pending_model.provenance,
+            ArtifactProvenance::Local { source_filename }
+                if current.source_filename.as_deref() == Some(source_filename)
+        ),
+        3 => current
+            .artifacts
+            .as_deref()
+            .and_then(|artifacts| {
+                artifacts
+                    .iter()
+                    .find(|artifact| artifact.role == ArtifactRole::Model)
+            })
+            .is_some_and(|current_model| current_model.provenance == pending_model.provenance),
+        _ => false,
+    }
+}
+
+enum ManagedDraft {
+    Missing,
+    Verified,
+    UnsafeOrInvalid,
+}
+
+fn managed_draft_state(model_dir: &Path, qualification: &BundleQualification) -> ManagedDraft {
+    let path = model_dir.join("draft.gguf");
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ManagedDraft::Missing,
+        Err(_) => ManagedDraft::UnsafeOrInvalid,
+        Ok(_) => {
+            let Ok(before) = FileIdentity::read(&path) else {
+                return ManagedDraft::UnsafeOrInvalid;
+            };
+            if before.size == qualification.draft_size
+                && crate::download::verify_regular(
+                    &path,
+                    qualification.draft_size,
+                    &qualification.draft_sha256,
+                )
+                .is_ok()
+                && FileIdentity::read(&path).is_ok_and(|after| after == before)
+            {
+                ManagedDraft::Verified
+            } else {
+                ManagedDraft::UnsafeOrInvalid
+            }
+        }
+    }
 }
 
 fn qualified_target(manifest: &Manifest, qualification: &BundleQualification) -> bool {
@@ -155,12 +358,13 @@ fn qualified_draft(manifest: &Manifest, qualification: &BundleQualification) -> 
 }
 
 fn verified_candidate(candidate: &Candidate, qualification: &BundleQualification) -> bool {
-    let Ok(before) = FileIdentity::read(&candidate.path) else {
-        return false;
-    };
-    before.size == qualification.draft_size
-        && sha256(&candidate.path).is_ok_and(|digest| digest == qualification.draft_sha256)
-        && FileIdentity::read(&candidate.path).is_ok_and(|after| after == before)
+    candidate.size == qualification.draft_size
+        && crate::download::verify_regular(
+            &candidate.path,
+            qualification.draft_size,
+            &qualification.draft_sha256,
+        )
+        .is_ok()
 }
 
 fn bundle_manifest(

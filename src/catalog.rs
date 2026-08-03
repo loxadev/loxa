@@ -5,6 +5,15 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub mod local;
+mod transaction;
+
+pub(crate) use transaction::{
+    bundle_pending, cleanup_completed_bundle_debris, move_no_replace_and_sync,
+    prepare_bundle_upgrade, removable_bundle_debris, replace_manifest_atomic, BundlePending,
+    NoReplaceRename,
+};
+#[cfg(test)]
+pub(crate) use transaction::{replace_manifest_atomic_with_hook, ManifestPublicationPoint};
 
 pub const GEMMA4_MTP_PROFILE: &str = "gemma4-mtp-v1";
 pub const GEMMA4_LLAMA_BUILD: &str = "b10121";
@@ -440,75 +449,6 @@ pub fn publish_manifest(models_root: &Path, manifest: &Manifest) -> Result<PathB
     })
 }
 
-pub(crate) fn prepare_bundle_upgrade(
-    model_dir: &Path,
-    replacement: &Manifest,
-) -> Result<(), String> {
-    replacement.validate()?;
-    if model_dir.file_name().and_then(|name| name.to_str()) != Some(replacement.id.as_str()) {
-        return Err("bundle manifest id does not match model directory".into());
-    }
-    let pending_path = model_dir.join("bundle.pending.json");
-    if pending_path.exists() {
-        let existing: Manifest = serde_json::from_slice(
-            &fs::read(&pending_path)
-                .map_err(|error| format!("{}: {error}", pending_path.display()))?,
-        )
-        .map_err(|error| format!("{}: {error}", pending_path.display()))?;
-        existing.validate()?;
-        return if existing == *replacement {
-            Ok(())
-        } else {
-            Err(format!(
-                "model {} has a different pending bundle upgrade",
-                replacement.id
-            ))
-        };
-    }
-    write_manifest_atomic(model_dir, "bundle.pending.json", replacement)
-}
-
-pub(crate) fn replace_manifest_atomic(
-    models_root: &Path,
-    expected: &Manifest,
-    replacement: &Manifest,
-) -> Result<PathBuf, String> {
-    replacement.validate()?;
-    for artifact in replacement
-        .artifacts
-        .as_deref()
-        .ok_or("replacement is not a bundle")?
-    {
-        crate::download::verify_regular(
-            &models_root
-                .join(&replacement.id)
-                .join(&artifact.local_filename),
-            artifact.size,
-            &artifact.sha256,
-        )?;
-    }
-    let model_dir = models_root.join(&replacement.id);
-    let manifest_path = model_dir.join("manifest.json");
-    let current: Manifest = serde_json::from_slice(
-        &fs::read(&manifest_path)
-            .map_err(|error| format!("{}: {error}", manifest_path.display()))?,
-    )
-    .map_err(|error| format!("{}: {error}", manifest_path.display()))?;
-    current.validate()?;
-    if current != *expected {
-        return Err(format!(
-            "model {} changed during bundle upgrade",
-            replacement.id
-        ));
-    }
-    write_manifest_atomic(&model_dir, "manifest.json", replacement)?;
-    remove_regular_if_present(&model_dir.join("bundle.pending.json"))?;
-    fs::File::open(&model_dir)
-        .and_then(|dir| dir.sync_all())
-        .map_err(|error| error.to_string())?;
-    Ok(manifest_path)
-}
-
 fn publish_manifest_with_verifier<F>(
     models_root: &Path,
     manifest: &Manifest,
@@ -568,24 +508,36 @@ pub fn remove_model(models_root: &Path, manifest: &Manifest) -> Result<(), Strin
         return Err(format!("model {} changed before removal", manifest.id));
     }
 
-    const OWNED_ENTRIES: [&str; 9] = [
+    const OWNED_ENTRIES: [&str; 8] = [
         ".lock",
         "manifest.json",
         "manifest.json.tmp",
         "pending.json",
         "pending.json.tmp",
-        "model.gguf",
         "model.gguf.part",
         "model.gguf.part.restart",
         "model.gguf.invalid",
     ];
+    let declared_artifacts = manifest
+        .artifacts
+        .as_deref()
+        .map(|artifacts| {
+            artifacts
+                .iter()
+                .map(|artifact| artifact.local_filename.as_str())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| vec![manifest.local_filename.as_str()]);
+    let mut remove_after_validation = Vec::new();
     for entry in fs::read_dir(&model_dir).map_err(|error| error.to_string())? {
         let entry = entry.map_err(|error| error.to_string())?;
         let name = entry.file_name();
         let name = name
             .to_str()
             .ok_or_else(|| format!("unexpected model entry {}", entry.path().display()))?;
-        if !OWNED_ENTRIES.contains(&name) {
+        let is_declared_artifact = declared_artifacts.contains(&name);
+        let is_bundle_debris = removable_bundle_debris(&entry.path(), name, manifest);
+        if !OWNED_ENTRIES.contains(&name) && !is_declared_artifact && !is_bundle_debris {
             return Err(format!("unexpected model entry {}", entry.path().display()));
         }
         if !entry
@@ -607,18 +559,13 @@ pub fn remove_model(models_root: &Path, manifest: &Manifest) -> Result<(), Strin
                 ));
             }
         }
+        if name != ".lock" && name != "manifest.json" {
+            remove_after_validation.push(entry.path());
+        }
     }
 
-    for name in [
-        "model.gguf",
-        "model.gguf.part",
-        "model.gguf.part.restart",
-        "model.gguf.invalid",
-        "pending.json",
-        "pending.json.tmp",
-        "manifest.json.tmp",
-    ] {
-        remove_regular_if_present(&model_dir.join(name))?;
+    for path in remove_after_validation {
+        remove_regular_if_present(&path)?;
     }
     fs::File::open(&model_dir)
         .and_then(|dir| dir.sync_all())
@@ -766,6 +713,47 @@ mod tests {
         }
     }
 
+    fn local_manifest(id: &str) -> Manifest {
+        let mut manifest = manifest(id);
+        manifest.version = 2;
+        manifest.repo = None;
+        manifest.revision = None;
+        manifest.remote_filename = None;
+        manifest.origin = Some(Origin::Local);
+        manifest.source_filename = Some("source.gguf".into());
+        manifest
+    }
+
+    fn test_model_bundle(id: &str) -> Manifest {
+        let primary = local_manifest(id);
+        Manifest {
+            version: 3,
+            id: id.into(),
+            repo: None,
+            revision: None,
+            remote_filename: None,
+            origin: None,
+            source_filename: None,
+            local_filename: primary.local_filename.clone(),
+            sha256: primary.sha256.clone(),
+            size: primary.size,
+            artifacts: Some(vec![Artifact {
+                role: ArtifactRole::Model,
+                local_filename: primary.local_filename,
+                sha256: primary.sha256,
+                size: primary.size,
+                provenance: ArtifactProvenance::Local {
+                    source_filename: "source.gguf".into(),
+                },
+            }]),
+            profile: Some(TEST_MTP_PROFILE.into()),
+            runtime: Some(RuntimeQualification {
+                engine: "llama.cpp".into(),
+                build: TEST_LLAMA_BUILD.into(),
+            }),
+        }
+    }
+
     fn bundle_manifest(id: &str) -> Manifest {
         Manifest {
             version: 3,
@@ -859,6 +847,145 @@ mod tests {
         assert_eq!(successful_verifications, ["model.gguf", "draft.gguf"]);
         assert_eq!(published, manifest_path);
         assert!(manifest_path.exists());
+    }
+
+    #[test]
+    fn bundle_publication_keeps_manifest_visible_at_exchange_checkpoints() {
+        let root = tempdir().unwrap();
+        let expected = local_manifest("gemma4");
+        let replacement = test_model_bundle("gemma4");
+        write_artifact(root.path(), "gemma4");
+        publish_manifest(root.path(), &expected).unwrap();
+        let manifest_path = root.path().join("gemma4/manifest.json");
+        let mut observed = Vec::new();
+
+        let published =
+            replace_manifest_atomic_with_hook(root.path(), &expected, &replacement, |point| {
+                assert!(manifest_path.is_file());
+                match point {
+                    ManifestPublicationPoint::BeforeExchange => {
+                        assert_eq!(load_catalog(root.path()).unwrap(), vec![expected.clone()]);
+                    }
+                    ManifestPublicationPoint::AfterExchange => {
+                        assert_eq!(
+                            load_catalog(root.path()).unwrap(),
+                            vec![replacement.clone()]
+                        );
+                    }
+                }
+                observed.push(point);
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(published);
+        assert_eq!(
+            observed,
+            [
+                ManifestPublicationPoint::BeforeExchange,
+                ManifestPublicationPoint::AfterExchange
+            ]
+        );
+        assert_eq!(load_catalog(root.path()).unwrap(), vec![replacement]);
+    }
+
+    #[test]
+    fn artifact_changed_after_initial_verification_restores_the_prior_manifest() {
+        let root = tempdir().unwrap();
+        let expected = local_manifest("gemma4");
+        let replacement = test_model_bundle("gemma4");
+        write_artifact(root.path(), "gemma4");
+        publish_manifest(root.path(), &expected).unwrap();
+        let artifact_path = root.path().join("gemma4/model.gguf");
+
+        let error =
+            replace_manifest_atomic_with_hook(root.path(), &expected, &replacement, |point| {
+                if point == ManifestPublicationPoint::BeforeExchange {
+                    std::fs::write(&artifact_path, b"xyz").unwrap();
+                }
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert!(error.contains("restored the prior manifest"), "{error}");
+        assert_eq!(load_catalog(root.path()).unwrap(), vec![expected]);
+        assert_ne!(
+            load_catalog(root.path()).unwrap(),
+            vec![replacement],
+            "a changed artifact must not publish its qualified replacement"
+        );
+    }
+
+    #[test]
+    fn a_late_manifest_change_is_restored_after_the_exchange_check() {
+        let root = tempdir().unwrap();
+        let expected = local_manifest("gemma4");
+        let replacement = test_model_bundle("gemma4");
+        let mut changed = expected.clone();
+        changed.source_filename = Some("changed-source.gguf".into());
+        write_artifact(root.path(), "gemma4");
+        publish_manifest(root.path(), &expected).unwrap();
+        let manifest_path = root.path().join("gemma4/manifest.json");
+
+        let error =
+            replace_manifest_atomic_with_hook(root.path(), &expected, &replacement, |point| {
+                if point == ManifestPublicationPoint::BeforeExchange {
+                    std::fs::write(&manifest_path, serde_json::to_vec_pretty(&changed).unwrap())
+                        .unwrap();
+                }
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert!(error.contains("restored the prior manifest"), "{error}");
+        assert_eq!(load_catalog(root.path()).unwrap(), vec![changed]);
+        let retained = std::fs::read_dir(root.path().join("gemma4"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".bundle-manifest-")
+            })
+            .expect("rollback keeps the replacement temp for recovery");
+        let retained: Manifest =
+            serde_json::from_slice(&std::fs::read(retained.path()).unwrap()).unwrap();
+        assert_eq!(retained, replacement);
+    }
+
+    #[test]
+    fn a_post_exchange_manifest_change_retains_recovery_state() {
+        let root = tempdir().unwrap();
+        let expected = local_manifest("gemma4");
+        let replacement = test_model_bundle("gemma4");
+        let mut changed = replacement.clone();
+        changed.artifacts.as_mut().unwrap()[0].provenance = ArtifactProvenance::Local {
+            source_filename: "changed-after-exchange.gguf".into(),
+        };
+        write_artifact(root.path(), "gemma4");
+        publish_manifest(root.path(), &expected).unwrap();
+        let manifest_path = root.path().join("gemma4/manifest.json");
+
+        let error =
+            replace_manifest_atomic_with_hook(root.path(), &expected, &replacement, |point| {
+                if point == ManifestPublicationPoint::AfterExchange {
+                    std::fs::write(&manifest_path, serde_json::to_vec_pretty(&changed).unwrap())
+                        .unwrap();
+                }
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert!(error.contains("retained recovery state"), "{error}");
+        assert_eq!(load_catalog(root.path()).unwrap(), vec![changed]);
+        assert!(std::fs::read_dir(root.path().join("gemma4"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".bundle-manifest-")));
     }
 
     #[test]

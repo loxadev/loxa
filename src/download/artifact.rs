@@ -198,11 +198,36 @@ fn finish_repair(model_dir: &Path, invalid_path: &Path, restart_path: &Path) -> 
 }
 
 pub(crate) fn verify_regular(path: &Path, size: u64, sha256: &str) -> Result<(), String> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
-    if !metadata.file_type().is_file() || metadata.len() != size {
-        return Err(format!("invalid model artifact {}", path.display()));
+    verify_regular_with_observer(path, size, sha256, |_| Ok(()))
+}
+
+fn verify_regular_with_observer<F>(
+    path: &Path,
+    size: u64,
+    sha256: &str,
+    mut observer: F,
+) -> Result<(), String>
+where
+    F: FnMut(&Path) -> Result<(), String>,
+{
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
     }
-    let mut file = File::open(path).map_err(|error| error.to_string())?;
+    let mut file = options
+        .open(path)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let opened = RegularIdentity::from_metadata(
+        &file
+            .metadata()
+            .map_err(|error| format!("{}: {error}", path.display()))?,
+        path,
+        size,
+    )?;
+    observer(path)?;
     let mut hash = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
@@ -212,11 +237,86 @@ pub(crate) fn verify_regular(path: &Path, size: u64, sha256: &str) -> Result<(),
         }
         hash.update(&buffer[..read]);
     }
+    let after = RegularIdentity::from_metadata(
+        &file
+            .metadata()
+            .map_err(|error| format!("{}: {error}", path.display()))?,
+        path,
+        size,
+    )?;
+    if after != opened {
+        return Err(format!(
+            "model artifact changed while hashing {}",
+            path.display()
+        ));
+    }
+    let resolved = RegularIdentity::from_metadata(
+        &fs::symlink_metadata(path).map_err(|error| format!("{}: {error}", path.display()))?,
+        path,
+        size,
+    )?;
+    if resolved != opened {
+        return Err(format!(
+            "model artifact changed while hashing {}",
+            path.display()
+        ));
+    }
     let actual = hex(hash.finalize().as_ref());
     if actual != sha256.to_ascii_lowercase() {
         return Err("model artifact checksum mismatch".into());
     }
     Ok(())
+}
+
+#[derive(Eq, PartialEq)]
+struct RegularIdentity {
+    size: u64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    modified_seconds: i64,
+    #[cfg(unix)]
+    modified_nanoseconds: i64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+}
+
+impl RegularIdentity {
+    fn from_metadata(
+        metadata: &std::fs::Metadata,
+        path: &Path,
+        expected_size: u64,
+    ) -> Result<Self, String> {
+        if !metadata.file_type().is_file() || metadata.len() != expected_size {
+            return Err(format!("invalid model artifact {}", path.display()));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.nlink() != 1 {
+                return Err(format!("unsafe model artifact {}", path.display()));
+            }
+            Ok(Self {
+                size: metadata.len(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                modified_seconds: metadata.mtime(),
+                modified_nanoseconds: metadata.mtime_nsec(),
+                changed_seconds: metadata.ctime(),
+                changed_nanoseconds: metadata.ctime_nsec(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {
+                size: metadata.len(),
+            })
+        }
+    }
 }
 
 pub(super) fn hex(bytes: &[u8]) -> String {
@@ -293,5 +393,74 @@ fn validate_content_range(value: Option<&str>, offset: u64, total: u64) -> Resul
         Ok(())
     } else {
         Err("Content-Range does not match requested artifact".into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_regular_rejects_a_hard_link_even_when_its_bytes_match() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.gguf");
+        let linked = root.path().join("linked.gguf");
+        let bytes = b"verified artifact";
+        std::fs::write(&source, bytes).unwrap();
+        std::fs::hard_link(&source, &linked).unwrap();
+        let checksum = hex(Sha256::digest(bytes).as_ref());
+
+        assert!(verify_regular(&linked, bytes.len() as u64, &checksum).is_err());
+        assert_eq!(std::fs::read(source).unwrap(), bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_regular_rejects_a_symlink_even_when_its_target_matches() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.gguf");
+        let linked = root.path().join("linked.gguf");
+        let bytes = b"verified artifact";
+        std::fs::write(&source, bytes).unwrap();
+        symlink(&source, &linked).unwrap();
+        let checksum = hex(Sha256::digest(bytes).as_ref());
+
+        assert!(verify_regular(&linked, bytes.len() as u64, &checksum).is_err());
+        assert_eq!(std::fs::read(source).unwrap(), bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_regular_rejects_an_in_place_rewrite_with_restored_mtime() {
+        use std::os::unix::fs::MetadataExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let artifact = root.path().join("model.gguf");
+        let bytes = b"verified artifact";
+        std::fs::write(&artifact, bytes).unwrap();
+        let original = std::fs::metadata(&artifact).unwrap();
+        let original_modified = original.modified().unwrap();
+        let checksum = hex(Sha256::digest(bytes).as_ref());
+
+        let error =
+            verify_regular_with_observer(&artifact, bytes.len() as u64, &checksum, |path| {
+                std::fs::write(path, bytes).unwrap();
+                OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(original_modified))
+                    .unwrap();
+                let restored = std::fs::metadata(path).unwrap();
+                assert_eq!(restored.mtime(), original.mtime());
+                assert_eq!(restored.mtime_nsec(), original.mtime_nsec());
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert!(error.contains("changed while hashing"), "{error}");
     }
 }
