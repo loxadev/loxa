@@ -490,20 +490,22 @@ pub(crate) fn run_launch(launch: &Launch, run_dir: &Path) -> Result<i32, String>
         ForegroundStart::Ready(server) => server,
         ForegroundStart::Stopped(exit) => return Ok(report_exit(exit)),
     };
-    let success = ui::success();
-    let accent = ui::accent();
-    let muted = ui::muted();
-    anstream::println!(
-        "{success}Ready{success:#} {accent}http://127.0.0.1:{}{accent:#} {muted}(model {}){muted:#}",
-        launch.id,
-        server.port()
-    );
+    anstream::println!("{}", ready_line(server.port(), &launch.id));
     loop {
         if let Some(exit) = server.poll()? {
             return Ok(report_exit(exit));
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn ready_line(port: u16, id: &str) -> String {
+    let success = ui::success();
+    let accent = ui::accent();
+    let muted = ui::muted();
+    format!(
+        "{success}Ready{success:#} {accent}http://127.0.0.1:{port}{accent:#} {muted}(model {id}){muted:#}"
+    )
 }
 
 pub(crate) enum ForegroundStart {
@@ -516,7 +518,7 @@ pub(crate) struct ForegroundServer {
 }
 
 pub(crate) fn start_foreground(launch: &Launch, run_dir: &Path) -> Result<ForegroundStart, String> {
-    install_termination_watcher()?;
+    install_termination_watcher(run_dir)?;
     start_foreground_with(launch, run_dir, process_termination_signal)
 }
 
@@ -541,6 +543,9 @@ where
             Ok(ForegroundStart::Ready(ForegroundServer { server }))
         }
         Ok(StartOutcome::Exited(exit)) => {
+            if let Some(stopped) = stopped_for_signal(&signal) {
+                return Ok(stopped);
+            }
             let Some(primary) = launch.primary_only() else {
                 tracing::warn!(
                     event = "server_stopped_before_ready",
@@ -558,6 +563,18 @@ where
         })),
         Err(error) => Err(error),
     }
+}
+
+fn stopped_for_signal<F>(signal: &F) -> Option<ForegroundStart>
+where
+    F: Fn() -> Option<i32>,
+{
+    signal().map(|signal| {
+        ForegroundStart::Stopped(ServerExit {
+            code: 128 + signal,
+            diagnostic: None,
+        })
+    })
 }
 
 fn start_owned_attempt<F>(
@@ -772,9 +789,10 @@ static ACTIVE_SERVER: AtomicU64 = AtomicU64::new(0);
 const STARTING_SERVER: u64 = u64::MAX;
 
 #[cfg(unix)]
-fn install_termination_watcher() -> Result<(), String> {
+fn install_termination_watcher(run_dir: &Path) -> Result<(), String> {
+    let run_dir = run_dir.to_path_buf();
     PROCESS_SIGNAL_WATCHER
-        .get_or_init(|| {
+        .get_or_init(move || {
             let mut termination =
                 signal_hook::iterator::Signals::new([libc::SIGINT, libc::SIGTERM, libc::SIGHUP])
                     .map_err(|error| error.to_string())?;
@@ -788,9 +806,14 @@ fn install_termination_watcher() -> Result<(), String> {
                             std::thread::sleep(Duration::from_millis(10));
                             active = ACTIVE_SERVER.load(Ordering::SeqCst);
                         }
-                        if let Some((_pid, group)) = unpack_server_identity(active) {
+                        if let Some((pid, group)) = unpack_server_identity(active) {
                             while crate::runtime::terminate_stale_process_group(group).is_err() {
                                 std::thread::sleep(Duration::from_millis(50));
+                            }
+                            if crate::runtime::clear_terminated_owned_lease(&run_dir, pid, group)
+                                .is_err()
+                            {
+                                tracing::warn!(event = "signal_runtime_lease_cleanup_failed");
                             }
                         }
                         std::process::exit(128 + signal);
@@ -885,7 +908,7 @@ fn mark_server_starting() {}
 fn clear_server_starting() {}
 
 #[cfg(not(unix))]
-fn install_termination_watcher() -> Result<(), String> {
+fn install_termination_watcher(_run_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
@@ -1495,6 +1518,29 @@ mod tests {
             "demo"
         ));
         assert_eq!(STARTUP_TIMEOUT, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn ready_line_displays_the_port_before_the_model_id() {
+        let line = ready_line(58922, "gemma-4-12b-it-qat-ud-q4-k-xl");
+
+        assert!(line.contains("http://127.0.0.1:58922"), "{line}");
+        assert!(
+            line.contains("(model gemma-4-12b-it-qat-ud-q4-k-xl)"),
+            "{line}"
+        );
+        assert!(!line.contains("127.0.0.1:gemma-"), "{line}");
+        assert!(!line.contains("(model 58922)"), "{line}");
+    }
+
+    #[test]
+    fn termination_signal_at_fallback_boundary_stops_without_retrying() {
+        let stopped = stopped_for_signal(&|| Some(libc::SIGINT));
+
+        assert!(matches!(
+            stopped,
+            Some(ForegroundStart::Stopped(ServerExit { code: 130, .. }))
+        ));
     }
 
     #[cfg(unix)]

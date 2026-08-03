@@ -4,12 +4,20 @@ use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Child;
+use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 use sysinfo::{Pid, ProcessStatus, ProcessesToUpdate, System};
 
 const LEASE_VERSION: u32 = 1;
 const STOP_TIMEOUT: Duration = Duration::from_secs(2);
+static LEASE_STATE_IO: Mutex<()> = Mutex::new(());
+
+fn lock_lease_state() -> Result<MutexGuard<'static, ()>, String> {
+    LEASE_STATE_IO
+        .lock()
+        .map_err(|_| "runtime lease state lock is poisoned".to_string())
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -102,6 +110,7 @@ impl RuntimeOwnership {
             model_id: model_id.to_owned(),
             port,
         };
+        let _state_guard = lock_lease_state()?;
         write_lease(&self.state_path, &lease)?;
         self.lease = Some(lease);
         Ok(())
@@ -111,6 +120,7 @@ impl RuntimeOwnership {
         let Some(expected) = self.lease.take() else {
             return Ok(());
         };
+        let _state_guard = lock_lease_state()?;
         match read_lease(&self.state_path) {
             Ok(current) if current == expected => fs::remove_file(&self.state_path)
                 .map_err(|error| format!("{}: {error}", self.state_path.display())),
@@ -121,6 +131,40 @@ impl RuntimeOwnership {
             Err(_error) if !self.state_path.exists() => Ok(()),
             Err(error) => Err(error),
         }
+    }
+}
+
+pub(crate) fn clear_terminated_owned_lease(
+    run_dir: &Path,
+    child_pid: u32,
+    child_pgid: i32,
+) -> Result<(), String> {
+    // foreground.lock excludes other Loxa processes; this guard serializes the
+    // signal watcher with publication and cleanup inside the owning process.
+    let _state_guard = lock_lease_state()?;
+    let state_path = run_dir.join("foreground.json");
+    let lease = match read_lease(&state_path) {
+        Ok(lease) => lease,
+        Err(_error) if !state_path.exists() => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let owner_pid = std::process::id();
+    let owner = process_snapshot(owner_pid)?
+        .ok_or_else(|| "failed to identify the Loxa process".to_string())?;
+    if lease.owner_pid != owner_pid
+        || lease.owner_start_time != owner.start_identity
+        || lease.child_pid != child_pid
+        || lease.child_pgid != child_pgid
+    {
+        return Err(format!(
+            "runtime lease changed unexpectedly: {}",
+            state_path.display()
+        ));
+    }
+    match fs::remove_file(&state_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("{}: {error}", state_path.display())),
     }
 }
 
@@ -586,6 +630,67 @@ mod tests {
 
         assert!(wait_until_gone(pid), "exact orphan survived recovery");
         assert!(!dir.path().join("foreground.json").exists());
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn signal_cleanup_removes_the_exact_owned_lease_after_group_termination() {
+        let dir = tempdir().unwrap();
+        let mut child = spawn_sleep();
+        let pid = child.id();
+        let group = i32::try_from(pid).unwrap();
+        let child_snapshot = process_snapshot(pid).unwrap().unwrap();
+        let owner_snapshot = process_snapshot(std::process::id()).unwrap().unwrap();
+        let lease = RuntimeLease {
+            version: LEASE_VERSION,
+            owner_pid: std::process::id(),
+            owner_start_time: owner_snapshot.start_identity,
+            child_pid: pid,
+            child_start_time: child_snapshot.start_identity,
+            child_pgid: group,
+            server: child_snapshot.executable,
+            model_id: "demo".into(),
+            port: 1234,
+        };
+        let state_path = dir.path().join("foreground.json");
+        write_lease(&state_path, &lease).unwrap();
+
+        terminate_stale_process_group(group).unwrap();
+        clear_terminated_owned_lease(dir.path(), pid, group).unwrap();
+
+        assert!(!state_path.exists());
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn signal_cleanup_preserves_a_foreign_lease() {
+        let dir = tempdir().unwrap();
+        let mut child = spawn_sleep();
+        let pid = child.id();
+        let group = i32::try_from(pid).unwrap();
+        let child_snapshot = process_snapshot(pid).unwrap().unwrap();
+        let lease = RuntimeLease {
+            version: LEASE_VERSION,
+            owner_pid: u32::MAX,
+            owner_start_time: 1,
+            child_pid: pid,
+            child_start_time: child_snapshot.start_identity,
+            child_pgid: group,
+            server: child_snapshot.executable,
+            model_id: "demo".into(),
+            port: 1234,
+        };
+        let state_path = dir.path().join("foreground.json");
+        write_lease(&state_path, &lease).unwrap();
+
+        terminate_stale_process_group(group).unwrap();
+        let error = clear_terminated_owned_lease(dir.path(), pid, group).unwrap_err();
+
+        assert!(
+            error.contains("runtime lease changed unexpectedly"),
+            "{error}"
+        );
+        assert!(state_path.exists());
         let _ = child.wait();
     }
 
