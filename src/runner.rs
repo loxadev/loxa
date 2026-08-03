@@ -1300,44 +1300,94 @@ mod tests {
     #[test]
     fn startup_timeout_and_explicit_port_mismatch_clean_the_owned_group() {
         let _lock = process_test_lock();
-        for (requested_port, announced_port, expected) in [
-            (0, None, "did not announce"),
-            (43124, Some(43123), "expected 43124"),
-        ] {
+        let wait_for_group_marker = |path: &Path| {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if let Ok(group) = std::fs::read_to_string(path) {
+                    if let Ok(group) = group.trim().parse::<i32>() {
+                        break group;
+                    }
+                }
+                assert!(Instant::now() < deadline, "server fixture did not start");
+                std::thread::yield_now();
+            }
+        };
+
+        {
+            let dir = tempdir().unwrap();
+            let server_path = dir.path().join("server");
+            write_executable_script(&server_path, b"#!/bin/sh\nwhile :; do sleep 1; done\n");
+            let (group_sender, group_receiver) = mpsc::sync_channel(1);
+            let (release_sender, release) = mpsc::sync_channel(1);
+
+            std::thread::scope(|scope| {
+                let start = scope.spawn(move || {
+                    OwnedServer::start(
+                        &server_path,
+                        Path::new("/models/model.gguf"),
+                        "demo",
+                        0,
+                        1,
+                        Duration::ZERO,
+                        || {
+                            let (_, group) =
+                                unpack_server_identity(ACTIVE_SERVER.load(Ordering::SeqCst))
+                                    .expect("server did not publish its owned process group");
+                            group_sender.send(group).unwrap();
+                            release.recv().unwrap();
+                            None
+                        },
+                    )
+                });
+                let group = group_receiver
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("server did not reach startup polling");
+                release_sender.send(()).unwrap();
+                let error = match start.join().unwrap() {
+                    Err(error) => error,
+                    Ok(_) => panic!("server unexpectedly started"),
+                };
+                assert!(error.contains("did not announce"), "{error}");
+                assert!(!process_group_exists(group).unwrap());
+            });
+        }
+
+        {
             let dir = tempdir().unwrap();
             let server_path = dir.path().join("server");
             let group_path = dir.path().join("group");
-            let announcement = announced_port.map_or_else(String::new, |port| {
-                format!("printf 'listening on http://127.0.0.1:{port}\\n' >&2\n")
-            });
+            let release_path = dir.path().join("release");
             write_executable_script(
                 &server_path,
                 format!(
-                    "#!/bin/sh\nprintf '%s\\n' \"$$\" > '{}'\n{announcement}while :; do sleep 1; done\n",
-                    group_path.display()
+                    "#!/bin/sh\nprintf '%s\\n' \"$$\" > '{}'\nwhile [ ! -f '{}' ]; do :; done\nprintf 'listening on http://127.0.0.1:43123\\n' >&2\nwhile :; do sleep 1; done\n",
+                    group_path.display(),
+                    release_path.display(),
                 )
                 .as_bytes(),
             );
 
-            let error = match OwnedServer::start(
-                &server_path,
-                Path::new("/models/model.gguf"),
-                "demo",
-                requested_port,
-                1,
-                Duration::from_secs(2),
-                || None,
-            ) {
-                Err(error) => error,
-                Ok(_) => panic!("server unexpectedly started"),
-            };
-            assert!(error.contains(expected), "{error}");
-            let group = std::fs::read_to_string(&group_path)
-                .unwrap()
-                .trim()
-                .parse::<i32>()
-                .unwrap();
-            assert!(!process_group_exists(group).unwrap());
+            std::thread::scope(|scope| {
+                let start = scope.spawn(|| {
+                    OwnedServer::start(
+                        &server_path,
+                        Path::new("/models/model.gguf"),
+                        "demo",
+                        43124,
+                        1,
+                        Duration::from_secs(5),
+                        || None,
+                    )
+                });
+                let group = wait_for_group_marker(&group_path);
+                std::fs::write(&release_path, b"release").unwrap();
+                let error = match start.join().unwrap() {
+                    Err(error) => error,
+                    Ok(_) => panic!("server unexpectedly started"),
+                };
+                assert!(error.contains("expected 43124"), "{error}");
+                assert!(!process_group_exists(group).unwrap());
+            });
         }
     }
 
