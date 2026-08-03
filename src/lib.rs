@@ -17,7 +17,7 @@ use cli::{Cli, Command};
 use indicatif::BinaryBytes;
 use paths::{validate_id, AppPaths};
 use std::io::IsTerminal;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(unix)]
@@ -25,11 +25,7 @@ use std::sync::Arc;
 
 struct Runnable {
     _model_lock: catalog::ModelLock,
-    server: PathBuf,
-    artifact: PathBuf,
-    id: String,
-    port: u16,
-    ctx: u32,
+    launch: runner::Launch,
 }
 
 #[cfg(unix)]
@@ -359,16 +355,9 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
             let runnable = runnable?;
             if importing {
                 let success = ui::success();
-                anstream::println!("{success}Imported{success:#} {}", runnable.id);
+                anstream::println!("{success}Imported{success:#} {}", runnable.launch.id);
             }
-            runner::run(
-                &runnable.server,
-                &runnable.artifact,
-                &runnable.id,
-                runnable.port,
-                runnable.ctx,
-                &paths.run,
-            )
+            runner::run_launch(&runnable.launch, &paths.run)
         }
         Command::Chat(args) => {
             let installed = load_installed_models(&paths)?;
@@ -405,20 +394,13 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
             starting.finish_and_clear();
             if importing {
                 let success = ui::success();
-                anstream::println!("{success}Imported{success:#} {}", runnable.id);
+                anstream::println!("{success}Imported{success:#} {}", runnable.launch.id);
             }
-            let starting = ui::spinner(format!("Starting {}", runnable.id));
-            let started = runner::start_foreground(
-                &runnable.server,
-                &runnable.artifact,
-                &runnable.id,
-                runnable.port,
-                runnable.ctx,
-                &paths.run,
-            );
+            let starting = ui::spinner(format!("Starting {}", runnable.launch.id));
+            let started = runner::start_foreground(&runnable.launch, &paths.run);
             starting.finish_and_clear();
             match started? {
-                runner::ForegroundStart::Ready(server) => session::run(server, &runnable.id),
+                runner::ForegroundStart::Ready(server) => session::run(server, &runnable.launch.id),
                 runner::ForegroundStart::Stopped(exit) => Ok(runner::report_exit(exit)),
             }
         }
@@ -587,33 +569,83 @@ fn resolve_runnable(
     let config = config::load(&paths.config)?;
     let ctx = config::resolve_value(runtime.ctx, config.ctx, 4096);
     let port = config::resolve_value(runtime.port, config.port, 0);
-    let server = runner::discover_from_process(runtime.server.as_deref(), &paths.managed_server)?;
-    let manifest = match load_installed_models(paths)?
-        .into_iter()
-        .find(|entry| entry.id == id)
-    {
-        Some(manifest) => manifest,
+    let installed = load_installed_models(paths)?;
+    let installed = installed.into_iter().find(|entry| entry.id == id);
+    let (manifest, profile, server) = match installed {
+        Some(manifest) => {
+            let profile = launch_profile(&manifest, &paths.models)?;
+            let server = runner::discover_from_process(
+                runtime.server.as_deref(),
+                &paths.managed_server,
+                &profile,
+            )?;
+            (manifest, profile, server)
+        }
         None => {
             let candidate = catalog::local::discover(&paths.models)?
                 .into_iter()
                 .find(|candidate| candidate.id == id)
                 .ok_or_else(|| format!("unknown model id {id}"))?;
+            let profile = runner::LaunchProfile::generic();
+            let server = runner::discover_from_process(
+                runtime.server.as_deref(),
+                &paths.managed_server,
+                &profile,
+            )?;
             let manifest = catalog::local::adopt(&paths.models, &candidate)?;
             tracing::info!(event = "local_model_adopted", model_id = %manifest.id);
-            manifest
+            (manifest, profile, server)
         }
     };
     let model_lock = catalog::ModelLock::acquire(&paths.model_dir(&manifest.id)?)?;
     let artifact = manifest.artifact_path(&paths.models);
-    download::verify_regular(&artifact, manifest.size, &manifest.sha256)?;
+    let primary = manifest.primary_artifact();
+    download::verify_regular(&artifact, primary.size, primary.sha256)?;
+    if let Some(draft) = manifest.draft_artifact() {
+        let path = paths.models.join(&manifest.id).join(draft.local_filename);
+        download::verify_regular(&path, draft.size, draft.sha256)?;
+    }
     Ok(Runnable {
         _model_lock: model_lock,
-        server,
-        artifact,
-        id: manifest.id,
-        port,
-        ctx,
+        launch: runner::Launch {
+            server,
+            model: artifact,
+            id: manifest.id,
+            requested_port: port,
+            ctx,
+            profile,
+        },
     })
+}
+
+fn launch_profile(
+    manifest: &Manifest,
+    models_root: &Path,
+) -> Result<runner::LaunchProfile, String> {
+    match (
+        manifest.version,
+        manifest.profile.as_deref(),
+        manifest.runtime.as_ref(),
+    ) {
+        (3, Some(catalog::GEMMA4_MTP_PROFILE), Some(runtime))
+            if runtime.engine == "llama.cpp" && runtime.build == catalog::GEMMA4_LLAMA_BUILD =>
+        {
+            Ok(runner::LaunchProfile::gemma4_mtp(
+                manifest.draft_path(models_root),
+            ))
+        }
+        #[cfg(test)]
+        (3, Some(catalog::TEST_MTP_PROFILE), Some(runtime))
+            if runtime.engine == "llama.cpp" && runtime.build == catalog::TEST_LLAMA_BUILD =>
+        {
+            Ok(runner::LaunchProfile::gemma4_mtp_for_test(
+                manifest.draft_path(models_root),
+                runtime.build.clone(),
+            ))
+        }
+        (1 | 2, None, None) => Ok(runner::LaunchProfile::generic()),
+        _ => Err("unsupported validated runtime profile".into()),
+    }
 }
 
 fn default_id(repo: &str, filename: &str, sha256: &str) -> String {
@@ -683,13 +715,14 @@ mod tests {
             origin: None,
             source_filename: None,
             local_filename: "model.gguf".into(),
-            sha256: "a".repeat(64),
+            sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
             size: 3,
             artifacts: Some(vec![
                 Artifact {
                     role: ArtifactRole::Model,
                     local_filename: "model.gguf".into(),
-                    sha256: "a".repeat(64),
+                    sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+                        .into(),
                     size: 3,
                     provenance: ArtifactProvenance::Local {
                         source_filename: "model-source.gguf".into(),
@@ -698,7 +731,8 @@ mod tests {
                 Artifact {
                     role: ArtifactRole::Draft,
                     local_filename: "draft.gguf".into(),
-                    sha256: "b".repeat(64),
+                    sha256: "7743ce348d9284d677a185f33295b92266cc435a5b5f775029b300066d26693a"
+                        .into(),
                     size: 5,
                     provenance: ArtifactProvenance::Local {
                         source_filename: "draft-source.gguf".into(),
@@ -711,6 +745,16 @@ mod tests {
                 build: TEST_LLAMA_BUILD.into(),
             }),
         }
+    }
+
+    fn install_bundle(paths: &AppPaths, id: &str) -> Manifest {
+        let manifest = test_bundle(id);
+        let model_dir = paths.model_dir(id).unwrap();
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("model.gguf"), b"abc").unwrap();
+        std::fs::write(model_dir.join("draft.gguf"), b"draft").unwrap();
+        crate::catalog::publish_manifest(&paths.models, &manifest).unwrap();
+        manifest
     }
 
     fn install(paths: &AppPaths, id: &str) -> Manifest {
@@ -772,6 +816,69 @@ mod tests {
 
         assert_eq!(installed_model_size(&bundle).to_string(), "8 B");
         assert_eq!(removal_prompt(&bundle), "Remove gemma4 (8 B)?");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn qualified_bundle_rejects_an_unqualified_explicit_runtime() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_values(Some(temp.path()), None).unwrap();
+        install_bundle(&paths, "gemma4");
+        let server = temp.path().join("llama-server");
+        std::fs::write(&server, b"#!/bin/sh\nprintf 'version: wrong-build\\n'\n").unwrap();
+        std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let result = resolve_runnable(
+            "gemma4".into(),
+            RuntimeArgs {
+                ctx: None,
+                port: None,
+                server: Some(server),
+            },
+            &paths,
+        );
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("qualified bundle accepted an unqualified runtime"),
+        };
+
+        assert!(error.contains("test-build"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn qualified_bundle_requires_a_verified_draft_before_launch() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_values(Some(temp.path()), None).unwrap();
+        install_bundle(&paths, "gemma4");
+        std::fs::write(
+            paths.model_dir("gemma4").unwrap().join("draft.gguf"),
+            b"broken",
+        )
+        .unwrap();
+        let server = temp.path().join("llama-server");
+        std::fs::write(&server, b"#!/bin/sh\nprintf 'test-build\\n'\n").unwrap();
+        std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let result = resolve_runnable(
+            "gemma4".into(),
+            RuntimeArgs {
+                ctx: None,
+                port: None,
+                server: Some(server),
+            },
+            &paths,
+        );
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("qualified bundle accepted a damaged draft"),
+        };
+
+        assert!(error.contains("draft.gguf"), "{error}");
     }
 
     #[test]
@@ -903,7 +1010,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(runnable.id, "gemma-4");
+        assert_eq!(runnable.launch.id, "gemma-4");
         assert!(!source.exists());
         assert!(paths.models.join("gemma-4/manifest.json").is_file());
     }

@@ -6,6 +6,8 @@ use std::ffi::{OsStr, OsString};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+#[cfg(unix)]
+use std::sync::atomic::AtomicI32;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, OnceLock};
@@ -21,43 +23,152 @@ const MAX_ANNOUNCEMENT_LINE: usize = 8192;
 const MAX_PENDING_ANNOUNCEMENTS: usize = 64;
 const MANAGED_VERSION: &str = "version: 10121 (555881ebc)";
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum LaunchProfile {
+    Generic,
+    Gemma4Mtp {
+        draft: Option<PathBuf>,
+        #[cfg(test)]
+        test_required_version: Option<String>,
+    },
+}
+
+impl LaunchProfile {
+    pub(crate) fn generic() -> Self {
+        Self::Generic
+    }
+
+    pub(crate) fn gemma4_mtp(draft: Option<PathBuf>) -> Self {
+        Self::Gemma4Mtp {
+            draft,
+            #[cfg(test)]
+            test_required_version: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gemma4_mtp_for_test(draft: Option<PathBuf>, version: String) -> Self {
+        Self::Gemma4Mtp {
+            draft,
+            test_required_version: Some(version),
+        }
+    }
+
+    fn required_version(&self) -> Option<&str> {
+        match self {
+            Self::Generic => None,
+            Self::Gemma4Mtp {
+                #[cfg(test)]
+                test_required_version,
+                ..
+            } => {
+                #[cfg(test)]
+                {
+                    test_required_version.as_deref().or(Some(MANAGED_VERSION))
+                }
+                #[cfg(not(test))]
+                {
+                    Some(MANAGED_VERSION)
+                }
+            }
+        }
+    }
+
+    fn draft(&self) -> Option<&Path> {
+        match self {
+            Self::Generic => None,
+            Self::Gemma4Mtp { draft, .. } => draft.as_deref(),
+        }
+    }
+
+    fn primary_only(&self) -> Option<Self> {
+        match self {
+            Self::Generic => None,
+            Self::Gemma4Mtp { draft: None, .. } => None,
+            Self::Gemma4Mtp { draft: Some(_), .. } => {
+                let mut primary = self.clone();
+                let Self::Gemma4Mtp { draft, .. } = &mut primary else {
+                    unreachable!("matched Gemma MTP profile")
+                };
+                *draft = None;
+                Some(primary)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Launch {
+    pub(crate) server: PathBuf,
+    pub(crate) model: PathBuf,
+    pub(crate) id: String,
+    pub(crate) requested_port: u16,
+    pub(crate) ctx: u32,
+    pub(crate) profile: LaunchProfile,
+}
+
+impl Launch {
+    fn generic(server: &Path, model: &Path, id: &str, requested_port: u16, ctx: u32) -> Self {
+        Self {
+            server: server.to_path_buf(),
+            model: model.to_path_buf(),
+            id: id.into(),
+            requested_port,
+            ctx,
+            profile: LaunchProfile::Generic,
+        }
+    }
+
+    fn primary_only(&self) -> Option<Self> {
+        Some(Self {
+            profile: self.profile.primary_only()?,
+            ..self.clone()
+        })
+    }
+}
+
 pub fn discover_server(
     explicit: Option<&Path>,
     environment: Option<&OsStr>,
     managed: &Path,
     path: Option<&OsStr>,
 ) -> Result<PathBuf, String> {
+    discover_server_with_requirement(explicit, environment, managed, path, None)
+}
+
+pub(crate) fn discover_from_process(
+    explicit: Option<&Path>,
+    managed: &Path,
+    profile: &LaunchProfile,
+) -> Result<PathBuf, String> {
+    discover_server_with_requirement(
+        explicit,
+        std::env::var_os("LOXA_LLAMA_SERVER").as_deref(),
+        managed,
+        std::env::var_os("PATH").as_deref(),
+        profile.required_version(),
+    )
+}
+
+fn discover_server_with_requirement(
+    explicit: Option<&Path>,
+    environment: Option<&OsStr>,
+    managed: &Path,
+    path: Option<&OsStr>,
+    required_version: Option<&str>,
+) -> Result<PathBuf, String> {
     if let Some(server) = explicit {
-        validate_candidate(server, "--server")?;
+        validate_candidate_with_requirement(server, "--server", required_version)?;
         return Ok(server.to_path_buf());
     }
     if let Some(server) = environment {
         let server = PathBuf::from(server);
-        validate_candidate(&server, "LOXA_LLAMA_SERVER")?;
+        validate_candidate_with_requirement(&server, "LOXA_LLAMA_SERVER", required_version)?;
         return Ok(server);
     }
     match std::fs::symlink_metadata(managed) {
         Ok(_) => {
-            if !executable(managed) {
-                return Err(format!(
-                    "managed llama-server bundle is damaged at {}: runtime is not executable",
-                    managed.display()
-                ));
-            }
-            let first_line = probe_version(managed)
-                .and_then(managed_version_first_line)
-                .map_err(|error| {
-                    format!(
-                        "managed llama-server bundle is damaged at {}: {error}",
-                        managed.display()
-                    )
-                })?;
-            if first_line != MANAGED_VERSION {
-                return Err(format!(
-                    "managed llama-server bundle is damaged at {}: expected --version first line {MANAGED_VERSION:?}, found {first_line:?}",
-                    managed.display()
-                ));
-            }
+            validate_managed_candidate(managed)?;
             return Ok(managed.to_path_buf());
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -71,24 +182,55 @@ pub fn discover_server(
     if let Some(path) = path {
         for dir in std::env::split_paths(path) {
             let candidate = dir.join(executable_name());
-            if executable(&candidate) && probe_version(&candidate).is_ok() {
+            let valid = match required_version {
+                Some(expected) => executable(&candidate) && version_matches(&candidate, expected),
+                None => executable(&candidate) && probe_version(&candidate).is_ok(),
+            };
+            if valid {
                 return Ok(candidate);
             }
         }
     }
+    if let Some(expected) = required_version {
+        return Err(format!(
+            "qualified llama-server not found; expected --version first line {expected:?}"
+        ));
+    }
     Err("llama-server not found; install it with `brew install llama.cpp`".into())
 }
 
-pub fn discover_from_process(explicit: Option<&Path>, managed: &Path) -> Result<PathBuf, String> {
-    discover_server(
-        explicit,
-        std::env::var_os("LOXA_LLAMA_SERVER").as_deref(),
-        managed,
-        std::env::var_os("PATH").as_deref(),
-    )
+fn validate_managed_candidate(path: &Path) -> Result<(), String> {
+    if !executable(path) {
+        return Err(format!(
+            "managed llama-server bundle is damaged at {}: runtime is not executable",
+            path.display()
+        ));
+    }
+    let first_line = probe_version(path)
+        .and_then(managed_version_first_line)
+        .map_err(|error| {
+            format!(
+                "managed llama-server bundle is damaged at {}: {error}",
+                path.display()
+            )
+        })?;
+    if first_line != MANAGED_VERSION {
+        return Err(format!(
+            "managed llama-server bundle is damaged at {}: expected --version first line {MANAGED_VERSION:?}, found {first_line:?}",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
-fn validate_candidate(path: &Path, source: &str) -> Result<(), String> {
+fn validate_candidate_with_requirement(
+    path: &Path,
+    source: &str,
+    required_version: Option<&str>,
+) -> Result<(), String> {
+    if let Some(expected) = required_version {
+        return validate_exact_candidate(path, source, expected);
+    }
     if !executable(path) {
         return Err(format!("{source} is not executable: {}", path.display()));
     }
@@ -98,6 +240,33 @@ fn validate_candidate(path: &Path, source: &str) -> Result<(), String> {
             path.display()
         )
     })
+}
+
+fn validate_exact_candidate(path: &Path, source: &str, expected: &str) -> Result<(), String> {
+    if !executable(path) {
+        return Err(format!("{source} is not executable: {}", path.display()));
+    }
+    let first_line = probe_version(path)
+        .and_then(managed_version_first_line)
+        .map_err(|error| {
+            format!(
+                "{source} failed exact --version probe for {}: {error}",
+                path.display()
+            )
+        })?;
+    if first_line == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "{source} must report exact --version first line {expected:?}, found {first_line:?}"
+        ))
+    }
+}
+
+fn version_matches(path: &Path, expected: &str) -> bool {
+    probe_version(path)
+        .and_then(managed_version_first_line)
+        .is_ok_and(|first_line| first_line == expected)
 }
 
 #[derive(Debug)]
@@ -249,24 +418,42 @@ fn first_line(output: &[u8]) -> String {
         .to_string()
 }
 
-pub fn build_args(model: &Path, id: &str, port: u16, ctx: u32) -> Vec<OsString> {
-    vec![
+pub(crate) fn build_args(launch: &Launch, port: u16) -> Vec<OsString> {
+    let mtp = matches!(&launch.profile, LaunchProfile::Gemma4Mtp { .. });
+    let mut args = vec![
         "--model".into(),
-        model.as_os_str().to_owned(),
+        launch.model.as_os_str().to_owned(),
         "--alias".into(),
-        id.into(),
+        launch.id.clone().into(),
         "--host".into(),
         "127.0.0.1".into(),
+        "--cors-origins".into(),
+        "localhost".into(),
+        "--no-ui".into(),
         "--port".into(),
         port.to_string().into(),
         "--ctx-size".into(),
-        ctx.to_string().into(),
+        launch.ctx.to_string().into(),
         "--n-gpu-layers".into(),
-        "99".into(),
-        "--jinja".into(),
-        "--reasoning".into(),
-        "off".into(),
-    ]
+        if mtp { "all" } else { "99" }.into(),
+    ];
+    if mtp {
+        args.extend(["--fit".into(), "off".into()]);
+    }
+    args.extend(["--jinja".into(), "--reasoning".into(), "off".into()]);
+    if let Some(draft) = launch.profile.draft() {
+        args.extend([
+            "--spec-draft-model".into(),
+            draft.as_os_str().to_owned(),
+            "--spec-type".into(),
+            "draft-mtp".into(),
+            "--spec-draft-n-max".into(),
+            "4".into(),
+            "--n-gpu-layers-draft".into(),
+            "all".into(),
+        ]);
+    }
+    args
 }
 
 fn resolve_requested_port(requested: u16) -> Result<u16, String> {
@@ -289,8 +476,15 @@ pub fn run(
     ctx: u32,
     run_dir: &Path,
 ) -> Result<i32, String> {
-    let starting = ui::spinner(format!("Starting {id}"));
-    let started = start_foreground(server, model, id, requested_port, ctx, run_dir);
+    run_launch(
+        &Launch::generic(server, model, id, requested_port, ctx),
+        run_dir,
+    )
+}
+
+pub(crate) fn run_launch(launch: &Launch, run_dir: &Path) -> Result<i32, String> {
+    let starting = ui::spinner(format!("Starting {}", launch.id));
+    let started = start_foreground(launch, run_dir);
     starting.finish_and_clear();
     let mut server = match started? {
         ForegroundStart::Ready(server) => server,
@@ -300,7 +494,8 @@ pub fn run(
     let accent = ui::accent();
     let muted = ui::muted();
     anstream::println!(
-        "{success}Ready{success:#} {accent}http://127.0.0.1:{}{accent:#} {muted}(model {id}){muted:#}",
+        "{success}Ready{success:#} {accent}http://127.0.0.1:{}{accent:#} {muted}(model {}){muted:#}",
+        launch.id,
         server.port()
     );
     loop {
@@ -320,40 +515,113 @@ pub(crate) struct ForegroundServer {
     server: OwnedServer,
 }
 
-pub(crate) fn start_foreground(
-    server: &Path,
-    model: &Path,
-    id: &str,
-    requested_port: u16,
-    ctx: u32,
+pub(crate) fn start_foreground(launch: &Launch, run_dir: &Path) -> Result<ForegroundStart, String> {
+    install_termination_watcher()?;
+    start_foreground_with(launch, run_dir, process_termination_signal)
+}
+
+fn start_foreground_with<F>(
+    launch: &Launch,
     run_dir: &Path,
-) -> Result<ForegroundStart, String> {
+    signal: F,
+) -> Result<ForegroundStart, String>
+where
+    F: Fn() -> Option<i32>,
+{
     tracing::info!(
         event = "server_starting",
-        model_id = id,
-        requested_port,
-        context_size = ctx
+        model_id = %launch.id,
+        requested_port = launch.requested_port,
+        context_size = launch.ctx
     );
-    install_termination_watcher()?;
     let ownership = crate::runtime::RuntimeOwnership::acquire(run_dir)?;
-    match OwnedServer::start_with_ownership(
-        server,
-        model,
-        id,
-        requested_port,
-        ctx,
-        STARTUP_TIMEOUT,
-        ownership,
-        || None,
-    )? {
+    match start_owned_attempt(launch, ownership, &signal) {
+        Ok(StartOutcome::Ready(server)) => {
+            tracing::info!(event = "server_ready", model_id = %launch.id, port = server.port());
+            Ok(ForegroundStart::Ready(ForegroundServer { server }))
+        }
+        Ok(StartOutcome::Exited(exit)) => {
+            let Some(primary) = launch.primary_only() else {
+                tracing::warn!(
+                    event = "server_stopped_before_ready",
+                    model_id = %launch.id,
+                    exit_code = exit.code
+                );
+                return Ok(ForegroundStart::Stopped(exit));
+            };
+            report_mtp_draft_start_failure(launch, "exited", exit.diagnostic.as_deref());
+            start_mtp_primary_retry(&primary, run_dir, &signal)
+        }
+        Ok(StartOutcome::Signaled(signal)) => Ok(ForegroundStart::Stopped(ServerExit {
+            code: 128 + signal,
+            diagnostic: None,
+        })),
+        Err(error) => Err(error),
+    }
+}
+
+fn start_owned_attempt<F>(
+    launch: &Launch,
+    ownership: crate::runtime::RuntimeOwnership,
+    signal: &F,
+) -> Result<StartOutcome, String>
+where
+    F: Fn() -> Option<i32>,
+{
+    OwnedServer::start_with_ownership(launch, STARTUP_TIMEOUT, ownership, signal)
+}
+
+fn report_mtp_draft_start_failure(
+    launch: &Launch,
+    outcome: &'static str,
+    diagnostic: Option<&str>,
+) {
+    tracing::warn!(
+        event = "gemma_mtp_draft_start_failed",
+        model_id = %launch.id,
+        outcome
+    );
+    if let Some(diagnostic) = diagnostic {
+        if tracing::enabled!(target: "loxa::runner", tracing::Level::DEBUG) {
+            tracing::debug!(
+                target: "loxa::runner",
+                event = "gemma_mtp_draft_start_diagnostic",
+                model_id = %launch.id,
+                diagnostic
+            );
+        }
+    }
+    anstream::eprintln!("Warning: MTP draft startup failed; retrying the primary model only.");
+}
+
+fn start_mtp_primary_retry<F>(
+    launch: &Launch,
+    run_dir: &Path,
+    signal: &F,
+) -> Result<ForegroundStart, String>
+where
+    F: Fn() -> Option<i32>,
+{
+    tracing::info!(
+        event = "gemma_mtp_primary_retry",
+        model_id = %launch.id,
+        attempt = 2_u8
+    );
+    let ownership = crate::runtime::RuntimeOwnership::acquire(run_dir)?;
+    match start_owned_attempt(launch, ownership, signal)? {
         StartOutcome::Ready(server) => {
-            tracing::info!(event = "server_ready", model_id = id, port = server.port());
+            tracing::info!(
+                event = "server_ready",
+                model_id = %launch.id,
+                port = server.port(),
+                fallback = "primary_only"
+            );
             Ok(ForegroundStart::Ready(ForegroundServer { server }))
         }
         StartOutcome::Exited(exit) => {
             tracing::warn!(
                 event = "server_stopped_before_ready",
-                model_id = id,
+                model_id = %launch.id,
                 exit_code = exit.code
             );
             Ok(ForegroundStart::Stopped(exit))
@@ -363,6 +631,18 @@ pub(crate) fn start_foreground(
             diagnostic: None,
         })),
     }
+}
+
+#[cfg(test)]
+fn start_foreground_with_signal<F>(
+    launch: &Launch,
+    run_dir: &Path,
+    signal: F,
+) -> Result<ForegroundStart, String>
+where
+    F: Fn() -> Option<i32>,
+{
+    start_foreground_with(launch, run_dir, signal)
 }
 
 impl ForegroundServer {
@@ -483,6 +763,9 @@ fn models_reader_has_alias(mut reader: impl std::io::Read, id: &str) -> Result<b
 static PROCESS_SIGNAL_WATCHER: OnceLock<Result<(), String>> = OnceLock::new();
 
 #[cfg(unix)]
+static PROCESS_TERMINATION_SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+#[cfg(unix)]
 static ACTIVE_SERVER: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(unix)]
@@ -499,6 +782,7 @@ fn install_termination_watcher() -> Result<(), String> {
                 .name("loxa-signal".into())
                 .spawn(move || {
                     for signal in termination.forever() {
+                        PROCESS_TERMINATION_SIGNAL.store(signal, Ordering::SeqCst);
                         let mut active = ACTIVE_SERVER.load(Ordering::SeqCst);
                         while active == STARTING_SERVER {
                             std::thread::sleep(Duration::from_millis(10));
@@ -518,6 +802,36 @@ fn install_termination_watcher() -> Result<(), String> {
         .as_ref()
         .map_err(Clone::clone)
         .copied()
+}
+
+#[cfg(unix)]
+fn process_termination_signal() -> Option<i32> {
+    let signal = PROCESS_TERMINATION_SIGNAL.load(Ordering::SeqCst);
+    (signal != 0).then_some(signal)
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+struct ProcessTerminationSignalReset;
+
+#[cfg(test)]
+#[cfg(unix)]
+impl Drop for ProcessTerminationSignalReset {
+    fn drop(&mut self) {
+        PROCESS_TERMINATION_SIGNAL.store(0, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+fn reset_process_termination_signal_for_test() -> ProcessTerminationSignalReset {
+    PROCESS_TERMINATION_SIGNAL.store(0, Ordering::SeqCst);
+    ProcessTerminationSignalReset
+}
+
+#[cfg(not(unix))]
+fn process_termination_signal() -> Option<i32> {
+    None
 }
 
 #[cfg(unix)]
@@ -695,25 +1009,13 @@ impl OwnedServer {
     where
         F: Fn() -> Option<i32>,
     {
-        Self::start_inner(
-            server,
-            model,
-            id,
-            requested_port,
-            ctx,
-            timeout,
-            None,
-            signal,
-        )
+        let launch = Launch::generic(server, model, id, requested_port, ctx);
+        Self::start_inner(&launch, timeout, None, signal)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn start_with_ownership<F>(
-        server: &Path,
-        model: &Path,
-        id: &str,
-        requested_port: u16,
-        ctx: u32,
+        launch: &Launch,
         timeout: Duration,
         runtime: crate::runtime::RuntimeOwnership,
         signal: F,
@@ -721,25 +1023,12 @@ impl OwnedServer {
     where
         F: Fn() -> Option<i32>,
     {
-        Self::start_inner(
-            server,
-            model,
-            id,
-            requested_port,
-            ctx,
-            timeout,
-            Some(runtime),
-            signal,
-        )
+        Self::start_inner(launch, timeout, Some(runtime), signal)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn start_inner<F>(
-        server: &Path,
-        model: &Path,
-        id: &str,
-        requested_port: u16,
-        ctx: u32,
+        launch: &Launch,
         timeout: Duration,
         runtime: Option<crate::runtime::RuntimeOwnership>,
         signal: F,
@@ -747,11 +1036,11 @@ impl OwnedServer {
     where
         F: Fn() -> Option<i32>,
     {
-        let requested_port = resolve_requested_port(requested_port)?;
+        let requested_port = resolve_requested_port(launch.requested_port)?;
         let client = readiness_client()?;
-        let mut command = Command::new(server);
+        let mut command = Command::new(&launch.server);
         command
-            .args(build_args(model, id, requested_port, ctx))
+            .args(build_args(launch, requested_port))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -810,7 +1099,7 @@ impl OwnedServer {
             if let Err(error) = runtime.record(
                 owned.child.as_ref().expect("owned child is present").id(),
                 group,
-                id,
+                &launch.id,
                 requested_port,
             ) {
                 return owned.fail_start(error);
@@ -840,7 +1129,7 @@ impl OwnedServer {
                         "llama-server announced port {port}, expected {requested_port}"
                     ));
                 }
-                match readiness(&client, port, id) {
+                match readiness(&client, port, &launch.id) {
                     Ok(true) => {
                         if let Err(error) = owned.collect_announcements() {
                             return owned.fail_start(error);
@@ -1154,14 +1443,28 @@ mod tests {
         (port, server)
     }
 
+    #[cfg(unix)]
+    fn test_mtp_launch(server: &Path, port: u16) -> Launch {
+        Launch {
+            server: server.to_path_buf(),
+            model: PathBuf::from("/models/model.gguf"),
+            id: "demo".into(),
+            requested_port: port,
+            ctx: 8192,
+            profile: LaunchProfile::gemma4_mtp(Some(PathBuf::from("/models/draft.gguf"))),
+        }
+    }
+
     #[test]
     fn argv_and_readiness_are_exact_and_generic() {
-        let args = build_args(
+        let launch = Launch::generic(
+            Path::new("/servers/llama-server"),
             std::path::Path::new("/models/model.gguf"),
             "demo",
             1234,
             8192,
         );
+        let args = build_args(&launch, 1234);
         assert_eq!(
             args,
             [
@@ -1171,6 +1474,9 @@ mod tests {
                 "demo",
                 "--host",
                 "127.0.0.1",
+                "--cors-origins",
+                "localhost",
+                "--no-ui",
                 "--port",
                 "1234",
                 "--ctx-size",
@@ -1189,6 +1495,54 @@ mod tests {
             "demo"
         ));
         assert_eq!(STARTUP_TIMEOUT, Duration::from_secs(120));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn argv_is_exact_for_the_known_mtp_profile() {
+        let launch = Launch {
+            server: PathBuf::from("/servers/llama-server"),
+            model: PathBuf::from("/models/model.gguf"),
+            id: "gemma4".into(),
+            requested_port: 1234,
+            ctx: 8192,
+            profile: LaunchProfile::gemma4_mtp(Some(PathBuf::from("/models/draft.gguf"))),
+        };
+
+        assert_eq!(
+            build_args(&launch, 1234),
+            [
+                "--model",
+                "/models/model.gguf",
+                "--alias",
+                "gemma4",
+                "--host",
+                "127.0.0.1",
+                "--cors-origins",
+                "localhost",
+                "--no-ui",
+                "--port",
+                "1234",
+                "--ctx-size",
+                "8192",
+                "--n-gpu-layers",
+                "all",
+                "--fit",
+                "off",
+                "--jinja",
+                "--reasoning",
+                "off",
+                "--spec-draft-model",
+                "/models/draft.gguf",
+                "--spec-type",
+                "draft-mtp",
+                "--spec-draft-n-max",
+                "4",
+                "--n-gpu-layers-draft",
+                "all",
+            ]
+            .map(OsStr::new)
+        );
     }
 
     #[test]
@@ -1265,7 +1619,7 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&argv).unwrap(),
             format!(
-                "--model\n/models/model.gguf\n--alias\ndemo\n--host\n127.0.0.1\n--port\n{port}\n--ctx-size\n8192\n--n-gpu-layers\n99\n--jinja\n--reasoning\noff\n"
+                "--model\n/models/model.gguf\n--alias\ndemo\n--host\n127.0.0.1\n--cors-origins\nlocalhost\n--no-ui\n--port\n{port}\n--ctx-size\n8192\n--n-gpu-layers\n99\n--jinja\n--reasoning\noff\n"
             )
         );
         assert_eq!(server.port(), port);
@@ -1291,18 +1645,17 @@ mod tests {
             .as_bytes(),
         );
         let ownership = crate::runtime::RuntimeOwnership::acquire(&run_dir).unwrap();
-
-        let outcome = OwnedServer::start_with_ownership(
+        let launch = Launch::generic(
             &server_path,
             Path::new("/models/model.gguf"),
             "demo",
             port,
             8192,
-            Duration::from_secs(2),
-            ownership,
-            || None,
-        )
-        .unwrap();
+        );
+
+        let outcome =
+            OwnedServer::start_with_ownership(&launch, Duration::from_secs(2), ownership, || None)
+                .unwrap();
         let mut server = match outcome {
             StartOutcome::Ready(server) => server,
             _ => panic!("server did not become ready"),
@@ -1311,6 +1664,122 @@ mod tests {
 
         assert!(run_dir.join("foreground.json").is_file());
         server.terminate().unwrap();
+        assert!(!run_dir.join("foreground.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mtp_start_failure_retries_once_with_the_primary_and_clears_its_lease() {
+        let _lock = process_test_lock();
+        let dir = tempdir().unwrap();
+        let server_path = dir.path().join("server");
+        let argv = dir.path().join("argv");
+        let run_dir = dir.path().join("run");
+        let (port, http) = serve_models("demo");
+        write_executable_script(
+            &server_path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\ncase \"$*\" in\n  *--spec-draft-model*) printf 'draft startup failed\\n' >&2; exit 42 ;;\nesac\nprintf 'listening on http://127.0.0.1:{port}\\n' >&2\nwhile :; do sleep 1; done\n",
+                argv.display()
+            )
+            .as_bytes(),
+        );
+        let launch = test_mtp_launch(&server_path, port);
+
+        let started = start_foreground_with_signal(&launch, &run_dir, || None).unwrap();
+        let mut server = match started {
+            ForegroundStart::Ready(server) => server,
+            ForegroundStart::Stopped(exit) => panic!("MTP did not retry: {exit:?}"),
+        };
+        http.join().unwrap();
+
+        let argv = std::fs::read_to_string(&argv).unwrap();
+        assert_eq!(argv.lines().filter(|line| *line == "--model").count(), 2);
+        assert_eq!(
+            argv.lines()
+                .filter(|line| *line == "--spec-draft-model")
+                .count(),
+            1
+        );
+        assert!(run_dir.join("foreground.json").is_file());
+        server.terminate().unwrap();
+        assert!(!run_dir.join("foreground.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mtp_start_error_does_not_spawn_a_primary_retry() {
+        let _lock = process_test_lock();
+        let dir = tempdir().unwrap();
+        let server_path = dir.path().join("server");
+        let argv = dir.path().join("argv");
+        let primary = dir.path().join("primary");
+        let run_dir = dir.path().join("run");
+        write_executable_script(
+            &server_path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\ncase \"$*\" in\n  *--spec-draft-model*) printf 'listening on http://0.0.0.0:43123\\n' >&2; while :; do sleep 1; done ;;\n  *) printf primary > '{}'; exit 99 ;;\nesac\n",
+                argv.display(),
+                primary.display(),
+            )
+            .as_bytes(),
+        );
+        let launch = test_mtp_launch(&server_path, 43123);
+
+        let error = match start_foreground_with_signal(&launch, &run_dir, || None) {
+            Err(error) => error,
+            Ok(_) => panic!("MTP startup error unexpectedly retried the primary model"),
+        };
+
+        assert!(error.contains("exact loopback HTTP endpoint"), "{error}");
+        let argv = std::fs::read_to_string(&argv).unwrap();
+        assert_eq!(argv.lines().filter(|line| *line == "--model").count(), 1);
+        assert!(!primary.exists());
+        assert!(!run_dir.join("foreground.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_termination_signal_during_mtp_startup_never_retries() {
+        let _lock = process_test_lock();
+        let _termination_signal = reset_process_termination_signal_for_test();
+        let dir = tempdir().unwrap();
+        let server_path = dir.path().join("server");
+        let argv = dir.path().join("argv");
+        let marker = dir.path().join("started");
+        let run_dir = dir.path().join("run");
+        write_executable_script(
+            &server_path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf started > '{}'\nwhile :; do sleep 1; done\n",
+                argv.display(),
+                marker.display(),
+            )
+            .as_bytes(),
+        );
+        let launch = test_mtp_launch(&server_path, 43123);
+
+        assert_eq!(process_termination_signal(), None);
+        let started = start_foreground_with(&launch, &run_dir, || {
+            if marker.exists() {
+                PROCESS_TERMINATION_SIGNAL.store(libc::SIGINT, Ordering::SeqCst);
+            }
+            process_termination_signal()
+        })
+        .unwrap();
+
+        assert!(matches!(
+            started,
+            ForegroundStart::Stopped(ServerExit { code: 130, .. })
+        ));
+        let argv = std::fs::read_to_string(&argv).unwrap();
+        assert_eq!(argv.lines().filter(|line| *line == "--model").count(), 1);
+        assert_eq!(
+            argv.lines()
+                .filter(|line| *line == "--spec-draft-model")
+                .count(),
+            1
+        );
         assert!(!run_dir.join("foreground.json").exists());
     }
 
