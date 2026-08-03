@@ -216,19 +216,18 @@ impl Manifest {
             }
         }
         let model = model.ok_or("missing model artifact")?;
-        let draft = draft.ok_or("missing draft artifact")?;
-        if artifacts.len() != 2
-            || model.local_filename != "model.gguf"
-            || draft.local_filename != "draft.gguf"
+        if model.local_filename != "model.gguf"
+            || draft.is_some_and(|artifact| artifact.local_filename != "draft.gguf")
         {
             return Err("invalid managed bundle filenames".into());
         }
-        if model.sha256 != GEMMA4_MODEL_SHA256
-            || model.size != GEMMA4_MODEL_SIZE
-            || draft.sha256 != GEMMA4_DRAFT_SHA256
-            || draft.size != GEMMA4_DRAFT_SIZE
-        {
+        if model.sha256 != GEMMA4_MODEL_SHA256 || model.size != GEMMA4_MODEL_SIZE {
             return Err("bundle does not match qualified profile".into());
+        }
+        if let Some(draft) = draft {
+            if draft.sha256 != GEMMA4_DRAFT_SHA256 || draft.size != GEMMA4_DRAFT_SIZE {
+                return Err("bundle does not match qualified profile".into());
+            }
         }
         if self.local_filename != model.local_filename
             || self.sha256 != model.sha256
@@ -422,10 +421,23 @@ pub fn prepare_pull(model_dir: &Path, manifest: &Manifest) -> Result<(), String>
 }
 
 pub fn publish_manifest(models_root: &Path, manifest: &Manifest) -> Result<PathBuf, String> {
+    publish_manifest_with_verifier(models_root, manifest, |path, size, sha256| {
+        crate::download::verify_regular(path, size, sha256)
+    })
+}
+
+fn publish_manifest_with_verifier<F>(
+    models_root: &Path,
+    manifest: &Manifest,
+    mut verify: F,
+) -> Result<PathBuf, String>
+where
+    F: FnMut(&Path, u64, &str) -> Result<(), String>,
+{
     manifest.validate()?;
     if let Some(artifacts) = manifest.artifacts.as_deref() {
         for artifact in artifacts {
-            crate::download::verify_regular(
+            verify(
                 &models_root
                     .join(&manifest.id)
                     .join(&artifact.local_filename),
@@ -434,7 +446,7 @@ pub fn publish_manifest(models_root: &Path, manifest: &Manifest) -> Result<PathB
             )?;
         }
     } else {
-        crate::download::verify_regular(
+        verify(
             &manifest.artifact_path(models_root),
             manifest.size,
             &manifest.sha256,
@@ -712,20 +724,58 @@ mod tests {
     }
 
     #[test]
-    fn version_three_bundle_is_validated_and_published_last() {
-        let root = tempdir().unwrap();
+    fn version_three_bundle_is_validated_and_round_trips() {
         let expected = bundle_manifest("gemma4");
-        let model_dir = root.path().join("gemma4");
-        std::fs::create_dir_all(&model_dir).unwrap();
-        std::fs::write(model_dir.join("model.gguf"), b"target").unwrap();
-
-        assert!(publish_manifest(root.path(), &expected).is_err());
-        assert!(!model_dir.join("manifest.json").exists());
 
         let encoded = serde_json::to_vec_pretty(&expected).unwrap();
         let decoded: Manifest = serde_json::from_slice(&encoded).unwrap();
         decoded.validate().unwrap();
         assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn version_three_bundle_allows_a_qualified_model_without_a_draft() {
+        let mut model_only = bundle_manifest("gemma4");
+        model_only.artifacts.as_mut().unwrap().pop();
+        model_only.validate().unwrap();
+        assert!(model_only.draft_artifact().is_none());
+        assert_eq!(model_only.total_size(), GEMMA4_MODEL_SIZE);
+    }
+
+    #[test]
+    fn version_three_publication_verifies_every_artifact_before_writing_manifest() {
+        let root = tempdir().unwrap();
+        let expected = bundle_manifest("gemma4");
+        let manifest_path = root.path().join("gemma4/manifest.json");
+        let mut failed_verifications = Vec::new();
+
+        let error = publish_manifest_with_verifier(root.path(), &expected, |path, _, _| {
+            assert!(!manifest_path.exists());
+            let filename = path.file_name().unwrap().to_string_lossy().into_owned();
+            failed_verifications.push(filename.clone());
+            if filename == "draft.gguf" {
+                Err("draft verification failed".into())
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+
+        assert_eq!(error, "draft verification failed");
+        assert_eq!(failed_verifications, ["model.gguf", "draft.gguf"]);
+        assert!(!manifest_path.exists());
+
+        let mut successful_verifications = Vec::new();
+        let published = publish_manifest_with_verifier(root.path(), &expected, |path, _, _| {
+            assert!(!manifest_path.exists());
+            successful_verifications.push(path.file_name().unwrap().to_string_lossy().into_owned());
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(successful_verifications, ["model.gguf", "draft.gguf"]);
+        assert_eq!(published, manifest_path);
+        assert!(manifest_path.exists());
     }
 
     #[test]
