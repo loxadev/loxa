@@ -88,7 +88,6 @@ impl NativeMenuTarget {
 
 pub(crate) struct NativeMenuController {
     status_item: Retained<NSStatusItem>,
-    _menu: Retained<NSMenu>,
     _delegate: Retained<NativeMenuDelegate>,
     _target: Retained<NativeMenuTarget>,
 }
@@ -99,6 +98,15 @@ impl NativeMenuController {
         app_handle: AppHandle,
         mtm: MainThreadMarker,
     ) -> Self {
+        // This menu is registered by TrayIconBuilder before its macOS click
+        // target is installed. Replacing it would leave that target tracking a
+        // different menu and make an otherwise valid left click do nothing.
+        let menu = status_item
+            .menu(mtm)
+            .expect("the tray builder must attach its menu before native setup");
+        menu.setTitle(ns_string!("Loxa"));
+        menu.setAutoenablesItems(false);
+
         let button = NSButton::new(mtm);
         button.setTitle(ns_string!(CONTROL_TITLE));
         button.setFrame(NSRect::new(
@@ -124,8 +132,6 @@ impl NativeMenuController {
         let row_item = NSMenuItem::new(mtm);
         row_item.setView(Some(&row));
 
-        let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Loxa"));
-        menu.setAutoenablesItems(false);
         let delegate = NativeMenuDelegate::new(button, mtm);
         menu.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
         menu.addItem(&row_item);
@@ -142,11 +148,13 @@ impl NativeMenuController {
         // SAFETY: NativeMenuTarget implements quit: with the expected Objective-C ABI.
         unsafe { quit_item.setTarget(Some(&target)) };
         menu.addItem(&quit_item);
-        status_item.setMenu(Some(&menu));
+
+        // tray-icon's click target consults this builder-registered NSMenu and
+        // invokes the status button only when it has items.
+        debug_assert!(menu.numberOfItems() > 0);
 
         Self {
             status_item,
-            _menu: menu,
             _delegate: delegate,
             _target: target,
         }

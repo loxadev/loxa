@@ -33,7 +33,12 @@ pub(crate) fn run() {
         .setup(|app| {
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
+            // The macOS tray target only forwards a left click to the status
+            // item when the menu was registered through the tray builder.
+            // NativeMenuController populates this exact NSMenu below.
+            let menu = tauri::menu::Menu::new(app)?;
             let tray = TrayIconBuilder::with_id("loxa")
+                .menu(&menu)
                 .icon(tauri::include_image!("./icons/loxa-template.png"))
                 .icon_as_template(true)
                 .tooltip("Loxa")
