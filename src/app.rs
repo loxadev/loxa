@@ -114,7 +114,6 @@ pub enum RuntimeSnapshot {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeInventorySnapshot {
-    ManagedB10121,
     External,
     Missing,
 }
@@ -153,7 +152,6 @@ impl AppSnapshot {
         bundle: BundleSnapshot,
         budget: Option<ResourceBudget>,
         foreground: ForegroundObservation,
-        managed_runtime_valid: bool,
     ) -> Self {
         let (recommendation, download) = match &bundle {
             BundleSnapshot::Verified(_) | BundleSnapshot::Unavailable(_) => {
@@ -199,7 +197,6 @@ impl AppSnapshot {
             ForegroundObservation::Running(RuntimeProvenance::External) => {
                 RuntimeInventorySnapshot::External
             }
-            _ if managed_runtime_valid => RuntimeInventorySnapshot::ManagedB10121,
             _ => RuntimeInventorySnapshot::Missing,
         };
         Self {
@@ -231,14 +228,7 @@ impl SnapshotReader {
 
     fn observe_with_budget(&mut self, budget: Option<ResourceBudget>) -> AppSnapshot {
         let foreground = self.foreground.observe(&self.paths.managed_server);
-        let managed_runtime_valid =
-            crate::runner::managed_runtime_inventory_is_valid(&self.paths.managed_server);
-        AppSnapshot::from_observation(
-            observe_bundle(&self.paths.models),
-            budget,
-            foreground,
-            managed_runtime_valid,
-        )
+        AppSnapshot::from_observation(observe_bundle(&self.paths.models), budget, foreground)
     }
 }
 
@@ -575,7 +565,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn write_managed_runtime_qualification(server: &Path) {
+    fn write_legacy_managed_runtime_qualification(server: &Path) {
         let bytes = fs::read(server).unwrap();
         let evidence = serde_json::json!({
             "version": 1,
@@ -814,7 +804,6 @@ mod tests {
             BundleSnapshot::Absent,
             Some(enough_budget()),
             ForegroundObservation::Running(RuntimeProvenance::External),
-            true,
         );
         assert_eq!(external.runtime(), RuntimeSnapshot::Running);
         assert_eq!(
@@ -827,19 +816,17 @@ mod tests {
             BundleSnapshot::Absent,
             Some(enough_budget()),
             ForegroundObservation::Running(RuntimeProvenance::Managed),
-            true,
         );
         assert_eq!(managed.runtime(), RuntimeSnapshot::Running);
         assert_eq!(
             managed.runtime_inventory(),
-            RuntimeInventorySnapshot::ManagedB10121
+            RuntimeInventorySnapshot::Missing
         );
 
         let idle = AppSnapshot::from_observation(
             BundleSnapshot::Absent,
             Some(enough_budget()),
             ForegroundObservation::Idle,
-            false,
         );
         assert_eq!(idle.runtime(), RuntimeSnapshot::Idle);
         assert_eq!(idle.runtime_inventory(), RuntimeInventorySnapshot::Missing);
@@ -864,7 +851,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn reader_observation_never_executes_managed_runtime_candidate() {
+    fn reader_observation_never_executes_or_publishes_managed_runtime_evidence() {
         let root = tempdir().unwrap();
         let paths = test_paths(root.path());
         fs::create_dir_all(paths.managed_server.parent().unwrap()).unwrap();
@@ -875,24 +862,28 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(&paths.managed_server, fs::Permissions::from_mode(0o700)).unwrap();
-        write_managed_runtime_qualification(&paths.managed_server);
+        let qualification = paths.managed_server.with_extension("qualification.json");
 
         let mut reader = SnapshotReader::new(paths);
         let snapshot = reader.observe();
 
         assert_eq!(
             snapshot.runtime_inventory(),
-            RuntimeInventorySnapshot::ManagedB10121
+            RuntimeInventorySnapshot::Missing
         );
         assert!(
             !sentinel.exists(),
             "snapshot observation must not execute the managed candidate"
         );
+        assert!(
+            !qualification.exists(),
+            "snapshot observation must not publish managed runtime evidence"
+        );
     }
 
     #[cfg(unix)]
     #[test]
-    fn reader_reports_only_an_exact_managed_b10121_runtime_inventory() {
+    fn reader_ignores_legacy_managed_runtime_evidence() {
         let root = tempdir().unwrap();
         let paths = test_paths(root.path());
         fs::create_dir_all(paths.managed_server.parent().unwrap()).unwrap();
@@ -903,30 +894,20 @@ mod tests {
         .unwrap();
         fs::set_permissions(&paths.managed_server, fs::Permissions::from_mode(0o700)).unwrap();
 
-        let mut reader = SnapshotReader::new(paths.clone());
-        let missing = reader.observe();
+        write_legacy_managed_runtime_qualification(&paths.managed_server);
+        let qualification = paths.managed_server.with_extension("qualification.json");
+        let before = fs::read(&qualification).unwrap();
+
+        let mut reader = SnapshotReader::new(paths);
+        let snapshot = reader.observe();
         assert_eq!(
-            missing.runtime_inventory(),
+            snapshot.runtime_inventory(),
             RuntimeInventorySnapshot::Missing
         );
-
-        write_managed_runtime_qualification(&paths.managed_server);
-        let managed = reader.observe();
         assert_eq!(
-            managed.runtime_inventory(),
-            RuntimeInventorySnapshot::ManagedB10121
-        );
-
-        fs::write(
-            &paths.managed_server,
-            b"#!/bin/sh\nprintf '%s\\n' 'version: 10090 (stale)'\n",
-        )
-        .unwrap();
-        fs::set_permissions(&paths.managed_server, fs::Permissions::from_mode(0o700)).unwrap();
-        let missing = reader.observe();
-        assert_eq!(
-            missing.runtime_inventory(),
-            RuntimeInventorySnapshot::Missing
+            fs::read(qualification).unwrap(),
+            before,
+            "snapshot observation must leave legacy evidence untouched"
         );
     }
 

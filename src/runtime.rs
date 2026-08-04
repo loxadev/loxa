@@ -141,6 +141,14 @@ enum ForegroundLockProtocol {
     Traditional,
 }
 
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum ForegroundLockMode {
+    Automatic,
+    #[cfg(test)]
+    TraditionalOnly,
+}
+
 fn foreground_lock_is_held(path: &Path) -> Result<bool, String> {
     foreground_lock_is_held_with_after_open(path, || {})
 }
@@ -205,13 +213,23 @@ fn foreground_lock_is_held_from_file(_file: &File) -> Result<bool, String> {
     Err("foreground lock observation is unsupported on this platform".into())
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn try_acquire_foreground_lock(file: &File) -> Result<ForegroundLockProtocol, TryLockError> {
-    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
-    match set_foreground_lock_with_command(file, libc::F_OFD_SETLK) {
-        Ok(()) => return Ok(ForegroundLockProtocol::OpenFileDescription),
-        Err(error) if ofd_lock_command_is_unsupported(&error) => {}
-        Err(error) => return Err(as_try_lock_error(error)),
+    try_acquire_foreground_lock_with_mode(file, ForegroundLockMode::Automatic)
+}
+
+#[cfg(unix)]
+fn try_acquire_foreground_lock_with_mode(
+    file: &File,
+    mode: ForegroundLockMode,
+) -> Result<ForegroundLockProtocol, TryLockError> {
+    if matches!(mode, ForegroundLockMode::Automatic) {
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+        match set_foreground_lock_with_command(file, libc::F_OFD_SETLK) {
+            Ok(()) => return Ok(ForegroundLockProtocol::OpenFileDescription),
+            Err(error) if ofd_lock_command_is_unsupported(&error) => {}
+            Err(error) => return Err(as_try_lock_error(error)),
+        }
     }
 
     set_foreground_lock_with_command(file, libc::F_SETLK)
@@ -356,48 +374,209 @@ struct ProcessSnapshot {
     command: Vec<OsString>,
 }
 
-pub(crate) struct RuntimeOwnership {
-    _lock: File,
+enum ForegroundLockAcquireError {
+    WouldBlock,
+    Error(String),
+}
+
+#[cfg(test)]
+struct ForegroundLockTestHook {
+    after_file_close: Option<Box<dyn FnOnce() + Send>>,
+}
+
+#[cfg(not(test))]
+struct ForegroundLockTestHook;
+
+impl ForegroundLockTestHook {
+    fn none() -> Self {
+        #[cfg(test)]
+        {
+            Self {
+                after_file_close: None,
+            }
+        }
+        #[cfg(not(test))]
+        {
+            Self
+        }
+    }
+
+    #[cfg(test)]
+    fn after_file_close(after_file_close: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            after_file_close: Some(Box::new(after_file_close)),
+        }
+    }
+
+    fn run_after_file_close(&mut self) {
+        #[cfg(test)]
+        if let Some(after_file_close) = self.after_file_close.take() {
+            after_file_close();
+        }
+    }
+}
+
+struct ForegroundLock {
+    file: Option<File>,
     #[cfg(unix)]
-    // This drops after `_lock`, so a traditional-lock fallback cannot be queried
-    // through another local descriptor while its owner is still live.
-    _local_traditional_lock: Option<LocalForegroundLock>,
+    local_traditional_lock: Option<LocalForegroundLock>,
+    test_hook: ForegroundLockTestHook,
+}
+
+impl ForegroundLock {
+    fn acquire(path: &Path) -> Result<Self, ForegroundLockAcquireError> {
+        #[cfg(unix)]
+        {
+            Self::acquire_with_mode(
+                path,
+                ForegroundLockMode::Automatic,
+                ForegroundLockTestHook::none(),
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            let file = open_lock(path).map_err(ForegroundLockAcquireError::Error)?;
+            file.try_lock().map_err(|error| {
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    ForegroundLockAcquireError::WouldBlock
+                } else {
+                    ForegroundLockAcquireError::Error(format!("{}: {error}", path.display()))
+                }
+            })?;
+            Ok(Self {
+                file: Some(file),
+                test_hook: ForegroundLockTestHook::none(),
+            })
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    fn acquire_forced_traditional(path: &Path) -> Result<Self, ForegroundLockAcquireError> {
+        Self::acquire_with_mode(
+            path,
+            ForegroundLockMode::TraditionalOnly,
+            ForegroundLockTestHook::none(),
+        )
+    }
+
+    #[cfg(all(test, unix))]
+    fn acquire_forced_traditional_with_after_file_close(
+        path: &Path,
+        after_file_close: impl FnOnce() + Send + 'static,
+    ) -> Result<Self, ForegroundLockAcquireError> {
+        Self::acquire_with_mode(
+            path,
+            ForegroundLockMode::TraditionalOnly,
+            ForegroundLockTestHook::after_file_close(after_file_close),
+        )
+    }
+
+    #[cfg(unix)]
+    fn acquire_with_mode(
+        path: &Path,
+        mode: ForegroundLockMode,
+        test_hook: ForegroundLockTestHook,
+    ) -> Result<Self, ForegroundLockAcquireError> {
+        let mut local_lock =
+            LocalForegroundLock::reserve(path).map_err(map_local_foreground_lock_error)?;
+        let file = open_lock(path).map_err(ForegroundLockAcquireError::Error)?;
+        local_lock
+            .bind_to_file(&file)
+            .map_err(map_local_foreground_lock_error)?;
+        let protocol =
+            try_acquire_foreground_lock_with_mode(&file, mode).map_err(|error| match error {
+                TryLockError::WouldBlock => ForegroundLockAcquireError::WouldBlock,
+                TryLockError::Error(error) => {
+                    ForegroundLockAcquireError::Error(format!("{}: {error}", path.display()))
+                }
+            })?;
+        let local_traditional_lock = if protocol == ForegroundLockProtocol::Traditional {
+            Some(local_lock)
+        } else {
+            local_lock.release();
+            None
+        };
+        Ok(Self {
+            file: Some(file),
+            local_traditional_lock,
+            test_hook,
+        })
+    }
+}
+
+impl Drop for ForegroundLock {
+    fn drop(&mut self) {
+        // A traditional POSIX record lock is process-scoped and any close of a
+        // descriptor for this file can release it. Keep the in-process
+        // reservation until this descriptor has definitely closed.
+        drop(self.file.take());
+        self.test_hook.run_after_file_close();
+        #[cfg(unix)]
+        drop(self.local_traditional_lock.take());
+    }
+}
+
+#[cfg(unix)]
+fn map_local_foreground_lock_error(error: String) -> ForegroundLockAcquireError {
+    if error == "another Loxa runtime is active" {
+        ForegroundLockAcquireError::WouldBlock
+    } else {
+        ForegroundLockAcquireError::Error(error)
+    }
+}
+
+pub(crate) struct RuntimeOwnership {
+    _foreground_lock: ForegroundLock,
     state_path: PathBuf,
     lease: Option<RuntimeLease>,
 }
 
 impl RuntimeOwnership {
     pub(crate) fn acquire(run_dir: &Path) -> Result<Self, String> {
+        Self::acquire_with_lock(run_dir, ForegroundLock::acquire)
+    }
+
+    #[cfg(all(test, unix))]
+    fn acquire_forced_traditional(run_dir: &Path) -> Result<Self, String> {
+        Self::acquire_with_lock(run_dir, ForegroundLock::acquire_forced_traditional)
+    }
+
+    #[cfg(all(test, unix))]
+    fn acquire_forced_traditional_with_after_file_close(
+        run_dir: &Path,
+        after_file_close: impl FnOnce() + Send + 'static,
+    ) -> Result<Self, String> {
+        Self::acquire_with_lock(run_dir, |lock_path| {
+            ForegroundLock::acquire_forced_traditional_with_after_file_close(
+                lock_path,
+                after_file_close,
+            )
+        })
+    }
+
+    fn acquire_with_lock(
+        run_dir: &Path,
+        acquire_lock: impl FnOnce(&Path) -> Result<ForegroundLock, ForegroundLockAcquireError>,
+    ) -> Result<Self, String> {
         ensure_directory(run_dir)?;
         let lock_path = run_dir.join("foreground.lock");
         #[cfg(unix)]
         let operation = lock_local_foreground_operation()?;
-        #[cfg(unix)]
-        let mut local_lock = LocalForegroundLock::reserve(&lock_path)?;
-        let lock = open_lock(&lock_path)?;
-        #[cfg(unix)]
-        local_lock.bind_to_file(&lock)?;
-        let _protocol = try_acquire_foreground_lock(&lock).map_err(|error| match error {
-            TryLockError::WouldBlock => "another Loxa runtime is active".into(),
-            TryLockError::Error(error) => format!("{}: {error}", lock_path.display()),
+        let foreground_lock = acquire_lock(&lock_path).map_err(|error| match error {
+            ForegroundLockAcquireError::WouldBlock => "another Loxa runtime is active".into(),
+            ForegroundLockAcquireError::Error(error) => error,
         })?;
-        #[cfg(unix)]
-        let local_traditional_lock = if _protocol == ForegroundLockProtocol::Traditional {
-            Some(local_lock)
-        } else {
-            local_lock.release();
-            None
-        };
+
+        let state_path = run_dir.join("foreground.json");
+        // Keep `operation` until the fallible reconciliation has completed.
+        // On an error or panic, `foreground_lock` drops first, which closes the
+        // traditional descriptor before releasing its local reservation.
+        reconcile_state(&state_path)?;
         #[cfg(unix)]
         drop(operation);
 
-        let state_path = run_dir.join("foreground.json");
-        reconcile_state(&state_path)?;
-
         Ok(Self {
-            _lock: lock,
-            #[cfg(unix)]
-            _local_traditional_lock: local_traditional_lock,
+            _foreground_lock: foreground_lock,
             state_path,
             lease: None,
         })
@@ -499,24 +678,17 @@ pub(crate) fn recover_stale(run_dir: &Path) -> Result<(), String> {
     if LocalForegroundLock::is_held(&lock_path)? {
         return Ok(());
     }
-    #[cfg(unix)]
-    let mut local_lock = LocalForegroundLock::reserve(&lock_path)?;
-    let lock = open_lock(&lock_path)?;
-    #[cfg(unix)]
-    local_lock.bind_to_file(&lock)?;
-    let _protocol = match try_acquire_foreground_lock(&lock) {
-        Ok(protocol) => protocol,
-        Err(TryLockError::WouldBlock) => return Ok(()),
-        Err(TryLockError::Error(error)) => return Err(format!("{}: {error}", lock_path.display())),
+    let foreground_lock = match ForegroundLock::acquire(&lock_path) {
+        Ok(lock) => lock,
+        Err(ForegroundLockAcquireError::WouldBlock) => return Ok(()),
+        Err(ForegroundLockAcquireError::Error(error)) => return Err(error),
     };
-    #[cfg(unix)]
-    if _protocol == ForegroundLockProtocol::OpenFileDescription {
-        local_lock.release();
-    }
+    reconcile_state(&run_dir.join("foreground.json"))?;
+    reconcile_legacy_state(&run_dir.join("managed.json"))?;
+    drop(foreground_lock);
     #[cfg(unix)]
     drop(operation);
-    reconcile_state(&run_dir.join("foreground.json"))?;
-    reconcile_legacy_state(&run_dir.join("managed.json"))
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1257,6 +1429,75 @@ mod tests {
         assert!(
             !foreground_contender_acquires(&alias),
             "an alias observation must not release traditional ownership"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn traditional_fallback_reconciliation_failure_preserves_the_next_owner_lock() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("foreground.json");
+        let lock_path = dir.path().join("foreground.lock");
+        fs::write(&state_path, b"not valid runtime state").unwrap();
+
+        let (closed_tx, closed_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_first_tx, release_first_rx) = std::sync::mpsc::sync_channel(0);
+        let first_dir = dir.path().to_path_buf();
+        let first_lock_path = lock_path.clone();
+        let first = thread::spawn(move || {
+            RuntimeOwnership::acquire_forced_traditional_with_after_file_close(
+                &first_dir,
+                move || {
+                    assert!(
+                        LocalForegroundLock::is_held(&first_lock_path).unwrap(),
+                        "the traditional reservation must survive until after its descriptor closes"
+                    );
+                    assert!(
+                        LOCAL_FOREGROUND_LOCK_OPERATIONS.try_lock().is_err(),
+                        "the operation guard must cover reconciliation unwind"
+                    );
+                    closed_tx.send(()).unwrap();
+                    release_first_rx.recv().unwrap();
+                },
+            )
+        });
+
+        closed_rx.recv().unwrap();
+
+        let (second_attempt_tx, second_attempt_rx) = std::sync::mpsc::sync_channel(0);
+        let (second_ready_tx, second_ready_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_second_tx, release_second_rx) = std::sync::mpsc::sync_channel(0);
+        let second_dir = dir.path().to_path_buf();
+        let second = thread::spawn(move || {
+            second_attempt_tx.send(()).unwrap();
+            let ownership = RuntimeOwnership::acquire_forced_traditional(&second_dir).unwrap();
+            second_ready_tx.send(()).unwrap();
+            release_second_rx.recv().unwrap();
+            drop(ownership);
+        });
+        second_attempt_rx.recv().unwrap();
+
+        fs::remove_file(&state_path).unwrap();
+        release_first_tx.send(()).unwrap();
+        let first_result = first.join().unwrap();
+        assert!(
+            first_result.is_err(),
+            "first acquisition unexpectedly succeeded"
+        );
+        let first_error = first_result.err().unwrap();
+        assert!(first_error.contains("foreground.json"), "{first_error}");
+
+        second_ready_rx.recv().unwrap();
+        assert!(
+            !foreground_contender_acquires(dir.path()),
+            "the next traditional owner must stay exclusive to child contenders"
+        );
+
+        release_second_tx.send(()).unwrap();
+        second.join().unwrap();
+        assert!(
+            foreground_contender_acquires(dir.path()),
+            "dropping the next traditional owner must release the lifecycle lock"
         );
     }
 
