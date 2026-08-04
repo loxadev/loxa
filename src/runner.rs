@@ -223,6 +223,10 @@ fn validate_managed_candidate(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+pub(crate) fn managed_runtime_is_valid(path: &Path) -> bool {
+    validate_managed_candidate(path).is_ok()
+}
+
 fn validate_candidate_with_requirement(
     path: &Path,
     source: &str,

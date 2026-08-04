@@ -29,7 +29,7 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 libc = "0.2.186"
 rustix = { version = "1.1.4", default-features = false, features = ["fs", "std"] }
 signal-hook = { version = "0.4.4", default-features = false, features = ["iterator"] }
-sysinfo = { version = "0.39.5", default-features = false, features = ["system"] }
+sysinfo = { version = "0.39.5", default-features = false, features = ["disk", "system"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

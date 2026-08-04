@@ -7,10 +7,11 @@ use std::process::Child;
 use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
-use sysinfo::{Pid, ProcessStatus, ProcessesToUpdate, System};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System, UpdateKind};
 
 const LEASE_VERSION: u32 = 1;
 const STOP_TIMEOUT: Duration = Duration::from_secs(2);
+const OBSERVER_TEARDOWN_GRACE: Duration = Duration::from_millis(500);
 static LEASE_STATE_IO: Mutex<()> = Mutex::new(());
 
 fn lock_lease_state() -> Result<MutexGuard<'static, ()>, String> {
@@ -31,6 +32,176 @@ struct RuntimeLease {
     server: PathBuf,
     model_id: String,
     port: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeProvenance {
+    Managed,
+    External,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ForegroundObservation {
+    Idle,
+    Starting,
+    Running(RuntimeProvenance),
+    Stopping,
+    Error,
+}
+
+pub(crate) struct ForegroundObserver {
+    run_dir: PathBuf,
+    previously_running: bool,
+    mismatch_started: Option<Instant>,
+}
+
+impl ForegroundObserver {
+    pub(crate) fn new(run_dir: PathBuf) -> Self {
+        Self {
+            run_dir,
+            previously_running: false,
+            mismatch_started: None,
+        }
+    }
+
+    pub(crate) fn observe(&mut self, managed_server: &Path) -> ForegroundObservation {
+        let lock_path = self.run_dir.join("foreground.lock");
+        let lease_path = self.run_dir.join("foreground.json");
+        match foreground_lock_is_held(&lock_path) {
+            Ok(false) => {
+                self.previously_running = false;
+                self.mismatch_started = None;
+                if lease_is_absent(&lease_path) {
+                    ForegroundObservation::Idle
+                } else {
+                    ForegroundObservation::Error
+                }
+            }
+            Err(_) => {
+                self.previously_running = false;
+                self.mismatch_started = None;
+                ForegroundObservation::Error
+            }
+            Ok(true) => match read_observed_lease(&lease_path) {
+                ObservedLease::Absent | ObservedLease::Invalid => {
+                    self.mismatch_started = None;
+                    if self.previously_running {
+                        ForegroundObservation::Stopping
+                    } else {
+                        ForegroundObservation::Starting
+                    }
+                }
+                ObservedLease::Valid(lease) => {
+                    match exact_live_provenance(&lease, managed_server) {
+                        Ok(Some(provenance)) => {
+                            self.previously_running = true;
+                            self.mismatch_started = None;
+                            ForegroundObservation::Running(provenance)
+                        }
+                        Ok(None) | Err(_) if self.previously_running => {
+                            let started = self.mismatch_started.get_or_insert_with(Instant::now);
+                            if started.elapsed() < OBSERVER_TEARDOWN_GRACE {
+                                ForegroundObservation::Stopping
+                            } else {
+                                self.previously_running = false;
+                                ForegroundObservation::Error
+                            }
+                        }
+                        Ok(None) | Err(_) => ForegroundObservation::Error,
+                    }
+                }
+            },
+        }
+    }
+}
+
+enum ObservedLease {
+    Absent,
+    Invalid,
+    Valid(RuntimeLease),
+}
+
+fn foreground_lock_is_held(path: &Path) -> Result<bool, String> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        return Err(format!("unsafe runtime lock {}", path.display()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(format!("unsafe runtime lock {}", path.display()));
+        }
+    }
+    match file.try_lock() {
+        Ok(()) => Ok(false),
+        Err(TryLockError::WouldBlock) => Ok(true),
+        Err(TryLockError::Error(error)) => Err(format!("{}: {error}", path.display())),
+    }
+}
+
+fn lease_is_absent(path: &Path) -> bool {
+    matches!(
+        fs::symlink_metadata(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+fn read_observed_lease(path: &Path) -> ObservedLease {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ObservedLease::Absent,
+        Err(_) => ObservedLease::Invalid,
+        Ok(_) => match read_lease(path) {
+            Ok(lease) => ObservedLease::Valid(lease),
+            Err(_) => ObservedLease::Invalid,
+        },
+    }
+}
+
+fn exact_live_provenance(
+    lease: &RuntimeLease,
+    managed_server: &Path,
+) -> Result<Option<RuntimeProvenance>, String> {
+    let Some(owner) = process_snapshot(lease.owner_pid)? else {
+        return Ok(None);
+    };
+    if owner.start_identity != lease.owner_start_time {
+        return Ok(None);
+    }
+    let Some(child) = process_snapshot(lease.child_pid)? else {
+        return Ok(None);
+    };
+    if child.start_identity != lease.child_start_time
+        || child.executable != lease.server
+        || process_group(lease.child_pid)? != lease.child_pgid
+        || !command_has_unique_option(&child.command, "--alias", OsStr::new(&lease.model_id))
+        || !command_has_unique_option(
+            &child.command,
+            "--port",
+            OsStr::new(&lease.port.to_string()),
+        )
+    {
+        return Ok(None);
+    }
+    Ok(Some(if child.executable == managed_server {
+        RuntimeProvenance::Managed
+    } else {
+        RuntimeProvenance::External
+    }))
 }
 
 #[derive(Deserialize)]
@@ -399,7 +570,13 @@ fn write_lease(path: &Path, lease: &RuntimeLease) -> Result<(), String> {
 fn process_snapshot(pid: u32) -> Result<Option<ProcessSnapshot>, String> {
     let pid = Pid::from_u32(pid);
     let mut system = System::new();
-    system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing()
+            .with_cmd(UpdateKind::OnlyIfNotSet)
+            .with_exe(UpdateKind::OnlyIfNotSet),
+    );
     let Some(process) = system.process(pid) else {
         return Ok(None);
     };
@@ -583,6 +760,9 @@ fn process_group_has_live_members(group: i32) -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::{RuntimeInventorySnapshot, RuntimeSnapshot, SnapshotReader};
+    use crate::paths::AppPaths;
+    use std::fs::OpenOptions;
     use std::os::unix::process::CommandExt;
     use std::process::{Child, Command};
     use std::thread;
@@ -594,6 +774,221 @@ mod tests {
         command.arg("60");
         command.process_group(0);
         command.spawn().unwrap()
+    }
+
+    fn spawn_observable_server(model_id: &str, port: u16) -> Child {
+        let mut command = Command::new("/bin/bash");
+        command
+            .arg("-c")
+            .arg("while :; do sleep 60; done")
+            .arg("--alias")
+            .arg(model_id)
+            .arg("--port")
+            .arg(port.to_string())
+            .process_group(0);
+        command.spawn().unwrap()
+    }
+
+    fn observed_lease(child: &Child, model_id: &str, port: u16) -> RuntimeLease {
+        let child_pid = child.id();
+        let child = process_snapshot(child_pid).unwrap().unwrap();
+        let owner = process_snapshot(std::process::id()).unwrap().unwrap();
+        RuntimeLease {
+            version: LEASE_VERSION,
+            owner_pid: std::process::id(),
+            owner_start_time: owner.start_identity,
+            child_pid,
+            child_start_time: child.start_identity,
+            child_pgid: i32::try_from(child_pid).unwrap(),
+            server: child.executable,
+            model_id: model_id.into(),
+            port,
+        }
+    }
+
+    fn hold_foreground_lock(run_dir: &Path) -> File {
+        fs::create_dir_all(run_dir).unwrap();
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(run_dir.join("foreground.lock"))
+            .unwrap();
+        lock.try_lock().unwrap();
+        lock
+    }
+
+    #[test]
+    fn foreground_observer_distinguishes_cold_start_running_stopping_and_idle_without_mutation() {
+        let dir = tempdir().unwrap();
+        let mut observer = ForegroundObserver::new(dir.path().to_path_buf());
+        let managed = Path::new("/managed/llama-server");
+        let lock = hold_foreground_lock(dir.path());
+        assert_eq!(observer.observe(managed), ForegroundObservation::Starting);
+
+        let mut child = spawn_observable_server("demo", 43123);
+        let lease = observed_lease(&child, "demo", 43123);
+        let state_path = dir.path().join("foreground.json");
+        write_lease(&state_path, &lease).unwrap();
+        let before = fs::read(&state_path).unwrap();
+        let owner = process_snapshot(lease.owner_pid).unwrap().unwrap();
+        let observed_child = process_snapshot(lease.child_pid).unwrap().unwrap();
+        assert_eq!(owner.start_identity, lease.owner_start_time);
+        assert_eq!(observed_child.start_identity, lease.child_start_time);
+        assert_eq!(observed_child.executable, lease.server);
+        assert_eq!(process_group(lease.child_pid).unwrap(), lease.child_pgid);
+        assert!(command_has_unique_option(
+            &observed_child.command,
+            "--alias",
+            OsStr::new("demo")
+        ));
+        assert!(command_has_unique_option(
+            &observed_child.command,
+            "--port",
+            OsStr::new("43123")
+        ));
+        assert_eq!(
+            observer.observe(managed),
+            ForegroundObservation::Running(RuntimeProvenance::External)
+        );
+        assert_eq!(fs::read(&state_path).unwrap(), before);
+        assert!(dir.path().join("foreground.lock").is_file());
+
+        fs::remove_file(&state_path).unwrap();
+        assert_eq!(observer.observe(managed), ForegroundObservation::Stopping);
+        drop(lock);
+        assert_eq!(observer.observe(managed), ForegroundObservation::Idle);
+        let group = i32::try_from(child.id()).unwrap();
+        terminate_process_group(&mut child, group).unwrap();
+    }
+
+    #[test]
+    fn foreground_observer_treats_lease_lock_contradictions_and_malformed_leases_conservatively() {
+        let managed = Path::new("/managed/llama-server");
+        let mut child = spawn_observable_server("demo", 43123);
+        let lease = observed_lease(&child, "demo", 43123);
+
+        let contradictory = tempdir().unwrap();
+        write_lease(&contradictory.path().join("foreground.json"), &lease).unwrap();
+        let mut contradictory_observer =
+            ForegroundObserver::new(contradictory.path().to_path_buf());
+        assert_eq!(
+            contradictory_observer.observe(managed),
+            ForegroundObservation::Error
+        );
+        assert!(contradictory.path().join("foreground.json").is_file());
+
+        let malformed = tempdir().unwrap();
+        let _lock = hold_foreground_lock(malformed.path());
+        let malformed_path = malformed.path().join("foreground.json");
+        let bytes = b"Authorization: Bearer secret";
+        fs::write(&malformed_path, bytes).unwrap();
+        let mut malformed_observer = ForegroundObserver::new(malformed.path().to_path_buf());
+        assert_eq!(
+            malformed_observer.observe(managed),
+            ForegroundObservation::Starting
+        );
+        assert_eq!(fs::read(&malformed_path).unwrap(), bytes);
+        let group = i32::try_from(child.id()).unwrap();
+        terminate_process_group(&mut child, group).unwrap();
+    }
+
+    #[test]
+    fn foreground_observer_requires_every_live_identity_and_allows_only_teardown_grace() {
+        let managed = Path::new("/managed/llama-server");
+        let mut child = spawn_observable_server("demo", 43123);
+        let lease = observed_lease(&child, "demo", 43123);
+
+        for mismatch in [
+            {
+                let mut mismatch = lease.clone();
+                mismatch.owner_start_time = mismatch.owner_start_time.saturating_add(1);
+                mismatch
+            },
+            {
+                let mut mismatch = lease.clone();
+                mismatch.child_start_time = mismatch.child_start_time.saturating_add(1);
+                mismatch
+            },
+            {
+                let mut mismatch = lease.clone();
+                mismatch.child_pgid = -1;
+                mismatch
+            },
+            {
+                let mut mismatch = lease.clone();
+                mismatch.server = PathBuf::from("/other/llama-server");
+                mismatch
+            },
+            {
+                let mut mismatch = lease.clone();
+                mismatch.model_id = "other".into();
+                mismatch
+            },
+            {
+                let mut mismatch = lease.clone();
+                mismatch.port = 43124;
+                mismatch
+            },
+        ] {
+            let dir = tempdir().unwrap();
+            let _lock = hold_foreground_lock(dir.path());
+            fs::write(
+                dir.path().join("foreground.json"),
+                serde_json::to_vec_pretty(&mismatch).unwrap(),
+            )
+            .unwrap();
+            let mut observer = ForegroundObserver::new(dir.path().to_path_buf());
+            assert_ne!(
+                observer.observe(managed),
+                ForegroundObservation::Running(RuntimeProvenance::External),
+                "mismatch unexpectedly became Running: {mismatch:?}"
+            );
+        }
+
+        let grace = tempdir().unwrap();
+        let _lock = hold_foreground_lock(grace.path());
+        let state_path = grace.path().join("foreground.json");
+        write_lease(&state_path, &lease).unwrap();
+        let mut observer = ForegroundObserver::new(grace.path().to_path_buf());
+        assert_eq!(
+            observer.observe(managed),
+            ForegroundObservation::Running(RuntimeProvenance::External)
+        );
+        let mut wrong_port = lease;
+        wrong_port.port = 43124;
+        write_lease(&state_path, &wrong_port).unwrap();
+        assert_eq!(observer.observe(managed), ForegroundObservation::Stopping);
+        thread::sleep(Duration::from_millis(510));
+        assert_eq!(observer.observe(managed), ForegroundObservation::Error);
+        let group = i32::try_from(child.id()).unwrap();
+        terminate_process_group(&mut child, group).unwrap();
+    }
+
+    #[test]
+    fn snapshot_reader_surfaces_only_an_exact_external_foreground_runtime() {
+        let root = tempdir().unwrap();
+        let paths = AppPaths::from_values(Some(root.path()), None).unwrap();
+        let lock = hold_foreground_lock(&paths.run);
+        let mut child = spawn_observable_server("demo", 43123);
+        let lease = observed_lease(&child, "demo", 43123);
+        let lease_path = paths.run.join("foreground.json");
+        write_lease(&lease_path, &lease).unwrap();
+        let before = fs::read(&lease_path).unwrap();
+
+        let mut reader = SnapshotReader::new(paths);
+        let snapshot = reader.observe();
+
+        assert_eq!(snapshot.runtime(), RuntimeSnapshot::Running);
+        assert_eq!(
+            snapshot.runtime_inventory(),
+            RuntimeInventorySnapshot::External
+        );
+        assert_eq!(fs::read(&lease_path).unwrap(), before);
+        drop(lock);
+        let group = i32::try_from(child.id()).unwrap();
+        terminate_process_group(&mut child, group).unwrap();
     }
 
     fn wait_until_gone(pid: u32) -> bool {

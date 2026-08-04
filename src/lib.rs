@@ -1,3 +1,4 @@
+pub mod app;
 pub mod catalog;
 pub mod chat;
 pub mod cli;
