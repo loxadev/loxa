@@ -9,6 +9,7 @@ pub mod huggingface;
 pub mod paths;
 pub mod runner;
 mod runtime;
+mod safe_file;
 mod session;
 mod ui;
 

@@ -1,9 +1,11 @@
 use crate::ui;
 use reqwest::blocking::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
-use std::io::Read as _;
+use std::fs::{self, OpenOptions};
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 #[cfg(unix)]
@@ -22,6 +24,8 @@ const MAX_DIAGNOSTIC_TAIL: usize = 4096;
 const MAX_ANNOUNCEMENT_LINE: usize = 8192;
 const MAX_PENDING_ANNOUNCEMENTS: usize = 64;
 const MANAGED_VERSION: &str = "version: 10121 (555881ebc)";
+const MANAGED_RUNTIME_QUALIFICATION_VERSION: u32 = 1;
+static MANAGED_RUNTIME_QUALIFICATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum LaunchProfile {
@@ -133,7 +137,7 @@ pub fn discover_server(
     managed: &Path,
     path: Option<&OsStr>,
 ) -> Result<PathBuf, String> {
-    discover_server_with_requirement(explicit, environment, managed, path, None)
+    discover_server_with_requirement(explicit, environment, managed, path, None, false)
 }
 
 pub(crate) fn discover_from_process(
@@ -147,6 +151,7 @@ pub(crate) fn discover_from_process(
         managed,
         std::env::var_os("PATH").as_deref(),
         profile.required_version(),
+        true,
     )
 }
 
@@ -156,6 +161,7 @@ fn discover_server_with_requirement(
     managed: &Path,
     path: Option<&OsStr>,
     required_version: Option<&str>,
+    record_managed_qualification: bool,
 ) -> Result<PathBuf, String> {
     if let Some(server) = explicit {
         validate_candidate_with_requirement(server, "--server", required_version)?;
@@ -169,6 +175,9 @@ fn discover_server_with_requirement(
     match std::fs::symlink_metadata(managed) {
         Ok(_) => {
             validate_managed_candidate(managed)?;
+            if record_managed_qualification {
+                let _ = record_managed_runtime_qualification(managed);
+            }
             return Ok(managed.to_path_buf());
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -223,8 +232,138 @@ fn validate_managed_candidate(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn managed_runtime_is_valid(path: &Path) -> bool {
-    validate_managed_candidate(path).is_ok()
+pub(crate) fn managed_runtime_inventory_is_valid(path: &Path) -> bool {
+    let Ok(qualification) = read_managed_runtime_qualification(path) else {
+        return false;
+    };
+    if qualification.version != MANAGED_RUNTIME_QUALIFICATION_VERSION
+        || qualification.build != crate::catalog::GEMMA4_LLAMA_BUILD
+        || qualification.managed_version != MANAGED_VERSION
+        || qualification.size == 0
+        || !is_sha256(&qualification.sha256)
+    {
+        return false;
+    }
+    match managed_runtime_fingerprint(path) {
+        Ok(fingerprint) => {
+            fingerprint.size == qualification.size && fingerprint.sha256 == qualification.sha256
+        }
+        Err(_) => false,
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedRuntimeQualification {
+    version: u32,
+    build: String,
+    managed_version: String,
+    sha256: String,
+    size: u64,
+}
+
+#[derive(Eq, PartialEq)]
+struct ManagedRuntimeFingerprint {
+    size: u64,
+    sha256: String,
+}
+
+fn managed_runtime_qualification_path(path: &Path) -> PathBuf {
+    path.with_extension("qualification.json")
+}
+
+fn record_managed_runtime_qualification(path: &Path) -> Result<(), String> {
+    let fingerprint = managed_runtime_fingerprint(path)?;
+    let qualification = ManagedRuntimeQualification {
+        version: MANAGED_RUNTIME_QUALIFICATION_VERSION,
+        build: crate::catalog::GEMMA4_LLAMA_BUILD.into(),
+        managed_version: MANAGED_VERSION.into(),
+        sha256: fingerprint.sha256,
+        size: fingerprint.size,
+    };
+    let bytes = serde_json::to_vec(&qualification).map_err(|error| error.to_string())?;
+    let destination = managed_runtime_qualification_path(path);
+    let mut attempts = 0;
+    while attempts < 16 {
+        attempts += 1;
+        let sequence = MANAGED_RUNTIME_QUALIFICATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temporary = destination.with_extension(format!(
+            "qualification-{}-{sequence}.json.tmp",
+            std::process::id()
+        ));
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = match options.open(&temporary) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("{}: {error}", temporary.display())),
+        };
+        file.write_all(&bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| format!("{}: {error}", temporary.display()))?;
+        fs::rename(&temporary, &destination)
+            .map_err(|error| format!("{}: {error}", destination.display()))?;
+        return Ok(());
+    }
+    Err("could not allocate managed runtime qualification evidence".into())
+}
+
+fn read_managed_runtime_qualification(path: &Path) -> Result<ManagedRuntimeQualification, String> {
+    let qualification_path = managed_runtime_qualification_path(path);
+    let bytes = crate::safe_file::read_regular_file(&qualification_path)
+        .map_err(|error| format!("{}: {error}", qualification_path.display()))?;
+    serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+}
+
+fn managed_runtime_fingerprint(path: &Path) -> Result<ManagedRuntimeFingerprint, String> {
+    let (mut file, opened) = crate::safe_file::open_regular_file(path)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return Err(format!(
+                "managed runtime is not executable: {}",
+                path.display()
+            ));
+        }
+    }
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    crate::safe_file::ensure_descriptor_matches_path(&file, &opened, path)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    Ok(ManagedRuntimeFingerprint {
+        size: opened.size(),
+        sha256: hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    })
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value.bytes().all(|byte| {
+            byte.is_ascii_digit() || (byte.is_ascii_lowercase() && byte.is_ascii_hexdigit())
+        })
 }
 
 fn validate_candidate_with_requirement(
@@ -2241,6 +2380,24 @@ mod tests {
             "{error}"
         );
         assert!(error.contains("version: 10121 (555881ebc)"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_launch_admission_records_pure_inventory_evidence() {
+        let _lock = process_test_lock();
+        let dir = tempdir().unwrap();
+        let managed = dir.path().join("managed");
+        write_version_script(&managed, "version: 10121 (555881ebc)", 0);
+
+        assert_eq!(
+            discover_from_process(None, &managed, &LaunchProfile::gemma4_mtp(None)).unwrap(),
+            managed
+        );
+        assert!(managed_runtime_inventory_is_valid(&managed));
+
+        write_version_script(&managed, "version: 10090 (stale)", 0);
+        assert!(!managed_runtime_inventory_is_valid(&managed));
     }
 
     #[cfg(unix)]

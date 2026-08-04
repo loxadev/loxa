@@ -1,6 +1,6 @@
 use super::{ArtifactProvenance, ArtifactRole, Manifest};
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -340,36 +340,10 @@ fn write_bundle_manifest_temp(
 }
 
 fn read_regular_manifest(path: &Path) -> Result<Option<Manifest>, String> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let mut file = match options.open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    let bytes = match crate::safe_file::read_regular_file(path) {
+        Ok(bytes) => bytes,
         Err(_) => return Ok(None),
     };
-    let metadata = match file.metadata() {
-        Ok(metadata) => metadata,
-        Err(_) => return Ok(None),
-    };
-    if !metadata.file_type().is_file() {
-        return Ok(None);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if metadata.nlink() != 1 {
-            return Ok(None);
-        }
-    }
-    let mut bytes = Vec::new();
-    if file.read_to_end(&mut bytes).is_err() {
-        return Ok(None);
-    }
     let manifest: Manifest = match serde_json::from_slice(&bytes) {
         Ok(manifest) => manifest,
         Err(_) => return Ok(None),

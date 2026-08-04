@@ -3,6 +3,8 @@ use crate::runtime::{ForegroundObservation, ForegroundObserver, RuntimeProvenanc
 use std::fs;
 use std::path::Path;
 #[cfg(unix)]
+use std::path::PathBuf;
+#[cfg(unix)]
 use sysinfo::{Disks, System};
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -230,7 +232,7 @@ impl SnapshotReader {
     fn observe_with_budget(&mut self, budget: Option<ResourceBudget>) -> AppSnapshot {
         let foreground = self.foreground.observe(&self.paths.managed_server);
         let managed_runtime_valid =
-            crate::runner::managed_runtime_is_valid(&self.paths.managed_server);
+            crate::runner::managed_runtime_inventory_is_valid(&self.paths.managed_server);
         AppSnapshot::from_observation(
             observe_bundle(&self.paths.models),
             budget,
@@ -245,18 +247,40 @@ fn resource_budget_for_destination(destination: &Path) -> Option<ResourceBudget>
     let mut system = System::new();
     system.refresh_memory();
     let physical_memory_bytes = system.total_memory();
-    let destination = destination.ancestors().find(|path| path.is_dir())?;
+    let destination = existing_destination_ancestor(destination)?;
     let disks = Disks::new_with_refreshed_list();
-    let destination_free_bytes = disks
-        .list()
-        .iter()
-        .filter(|disk| destination.starts_with(disk.mount_point()))
-        .max_by_key(|disk| disk.mount_point().components().count())
-        .map(|disk| disk.available_space())?;
+    let destination_free_bytes = destination_free_bytes_for_mounts(
+        &destination,
+        disks
+            .list()
+            .iter()
+            .map(|disk| (disk.mount_point(), disk.available_space())),
+    )?;
     Some(ResourceBudget::new(
         physical_memory_bytes,
         destination_free_bytes,
     ))
+}
+
+#[cfg(unix)]
+fn existing_destination_ancestor(destination: &Path) -> Option<PathBuf> {
+    destination
+        .ancestors()
+        .find(|path| path.is_dir())?
+        .canonicalize()
+        .ok()
+}
+
+#[cfg(unix)]
+fn destination_free_bytes_for_mounts<'a>(
+    destination: &Path,
+    mounts: impl IntoIterator<Item = (&'a Path, u64)>,
+) -> Option<u64> {
+    mounts
+        .into_iter()
+        .filter(|(mount_point, _)| destination.starts_with(mount_point))
+        .max_by_key(|(mount_point, _)| mount_point.components().count())
+        .map(|(_, available_space)| available_space)
 }
 
 #[cfg(not(unix))]
@@ -282,10 +306,6 @@ fn observe_bundle(models_root: &Path) -> BundleSnapshot {
         Ok(false) => {}
         Err(_) => return BundleSnapshot::Unavailable(BundleUnavailableReason::Invalid),
     }
-    if !target_manifest_is_safe(&model_dir) {
-        return BundleSnapshot::Unavailable(BundleUnavailableReason::Invalid);
-    }
-
     let catalog = match catalog::load_catalog(models_root) {
         Ok(catalog) => catalog,
         Err(_) => return BundleSnapshot::Unavailable(BundleUnavailableReason::Invalid),
@@ -409,27 +429,6 @@ fn target_directory_is_clean(model_dir: &Path) -> bool {
     })
 }
 
-fn target_manifest_is_safe(model_dir: &Path) -> bool {
-    let manifest = model_dir.join("manifest.json");
-    let metadata = match fs::symlink_metadata(&manifest) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
-        Err(_) => return false,
-    };
-    if !metadata.file_type().is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        metadata.nlink() == 1
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RecommendationUnavailableReason {
     InsufficientMemory,
@@ -484,6 +483,8 @@ impl ResourceBudget {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::{destination_free_bytes_for_mounts, existing_destination_ancestor};
     use super::{
         AppSnapshot, BundleSnapshot, BundleUnavailableReason, DownloadSnapshot, PartialBundle,
         PausedDownload, RecommendationAvailability, RecommendationSnapshot,
@@ -573,6 +574,23 @@ mod tests {
         ResourceBudget::new(4 * GIB + REQUIRED_MEMORY_BYTES, REQUIRED_DISK_BYTES)
     }
 
+    #[cfg(unix)]
+    fn write_managed_runtime_qualification(server: &Path) {
+        let bytes = fs::read(server).unwrap();
+        let evidence = serde_json::json!({
+            "version": 1,
+            "build": "b10121",
+            "managed_version": "version: 10121 (555881ebc)",
+            "sha256": sha256(&bytes),
+            "size": bytes.len(),
+        });
+        fs::write(
+            server.with_extension("qualification.json"),
+            serde_json::to_vec(&evidence).unwrap(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn resource_budget_reserves_macos_memory_and_exact_bundle_capacity() {
         let available = ResourceBudget::new(4 * GIB + REQUIRED_MEMORY_BYTES, REQUIRED_DISK_BYTES);
@@ -601,6 +619,51 @@ mod tests {
 
         assert_eq!(TARGET_AND_DRAFT_BYTES * 105 / 100, REQUIRED_MEMORY_BYTES);
         assert_eq!(TARGET_AND_DRAFT_BYTES + GIB, REQUIRED_DISK_BYTES);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn destination_volume_selector_uses_the_resolved_symlink_backing_mount() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().unwrap();
+        let backing = root.path().join("backing-volume");
+        let link = root.path().join("models-link");
+        fs::create_dir_all(&backing).unwrap();
+        symlink(&backing, &link).unwrap();
+
+        let resolved = existing_destination_ancestor(&link.join("future/models")).unwrap();
+        let root_mount = root.path().canonicalize().unwrap();
+        let backing_mount = backing.canonicalize().unwrap();
+        assert_eq!(resolved, backing_mount);
+
+        assert_eq!(
+            destination_free_bytes_for_mounts(
+                &resolved,
+                [
+                    (root_mount.as_path(), 1_u64),
+                    (backing_mount.as_path(), 2_u64),
+                ],
+            ),
+            Some(2)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn destination_volume_selector_uses_the_deepest_component_mount() {
+        assert_eq!(
+            destination_free_bytes_for_mounts(
+                Path::new("/volumes/models/cache"),
+                [
+                    (Path::new("/"), 1_u64),
+                    (Path::new("/volumes"), 2_u64),
+                    (Path::new("/volumes/models"), 3_u64),
+                    (Path::new("/volumes/models-other"), 4_u64),
+                ],
+            ),
+            Some(3)
+        );
     }
 
     #[test]
@@ -801,6 +864,34 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn reader_observation_never_executes_managed_runtime_candidate() {
+        let root = tempdir().unwrap();
+        let paths = test_paths(root.path());
+        fs::create_dir_all(paths.managed_server.parent().unwrap()).unwrap();
+        let sentinel = paths.managed_server.with_extension("ran");
+        fs::write(
+            &paths.managed_server,
+            b"#!/bin/sh\n: > \"$0.ran\"\nprintf '%s\\n' 'version: 10121 (555881ebc)'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&paths.managed_server, fs::Permissions::from_mode(0o700)).unwrap();
+        write_managed_runtime_qualification(&paths.managed_server);
+
+        let mut reader = SnapshotReader::new(paths);
+        let snapshot = reader.observe();
+
+        assert_eq!(
+            snapshot.runtime_inventory(),
+            RuntimeInventorySnapshot::ManagedB10121
+        );
+        assert!(
+            !sentinel.exists(),
+            "snapshot observation must not execute the managed candidate"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn reader_reports_only_an_exact_managed_b10121_runtime_inventory() {
         let root = tempdir().unwrap();
         let paths = test_paths(root.path());
@@ -813,6 +904,13 @@ mod tests {
         fs::set_permissions(&paths.managed_server, fs::Permissions::from_mode(0o700)).unwrap();
 
         let mut reader = SnapshotReader::new(paths.clone());
+        let missing = reader.observe();
+        assert_eq!(
+            missing.runtime_inventory(),
+            RuntimeInventorySnapshot::Missing
+        );
+
+        write_managed_runtime_qualification(&paths.managed_server);
         let managed = reader.observe();
         assert_eq!(
             managed.runtime_inventory(),

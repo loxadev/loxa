@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::Write;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::{Mutex, MutexGuard};
@@ -147,11 +149,58 @@ fn foreground_lock_is_held(path: &Path) -> Result<bool, String> {
             return Err(format!("unsafe runtime lock {}", path.display()));
         }
     }
-    match file.try_lock() {
-        Ok(()) => Ok(false),
-        Err(TryLockError::WouldBlock) => Ok(true),
-        Err(TryLockError::Error(error)) => Err(format!("{}: {error}", path.display())),
+    foreground_lock_is_held_from_file(&file)
+}
+
+#[cfg(unix)]
+fn foreground_lock_is_held_from_file(file: &File) -> Result<bool, String> {
+    let mut lock = foreground_record_lock();
+    // SAFETY: `lock` is a valid writable `libc::flock` with a whole-file write
+    // range, and `file` remains open for the duration of this query.
+    let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut lock) };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error().to_string());
     }
+    Ok(lock.l_type != libc::F_UNLCK as libc::c_short)
+}
+
+#[cfg(not(unix))]
+fn foreground_lock_is_held_from_file(_file: &File) -> Result<bool, String> {
+    Err("foreground lock observation is unsupported on this platform".into())
+}
+
+#[cfg(unix)]
+fn try_acquire_foreground_lock(file: &File) -> Result<(), TryLockError> {
+    let mut lock = foreground_record_lock();
+    // SAFETY: `lock` is a valid writable `libc::flock` with a whole-file write
+    // range, and `file` remains open while the process owns the record lock.
+    let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &mut lock) };
+    if result == -1 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            Err(TryLockError::WouldBlock)
+        } else {
+            Err(TryLockError::Error(error))
+        }
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(unix))]
+fn try_acquire_foreground_lock(file: &File) -> Result<(), TryLockError> {
+    file.try_lock()
+}
+
+#[cfg(unix)]
+fn foreground_record_lock() -> libc::flock {
+    // SAFETY: all fields are initialized below before use by `fcntl`.
+    let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+    lock.l_type = libc::F_WRLCK as libc::c_short;
+    lock.l_whence = libc::SEEK_SET as libc::c_short;
+    lock.l_start = 0;
+    lock.l_len = 0;
+    lock
 }
 
 fn lease_is_absent(path: &Path) -> bool {
@@ -240,7 +289,7 @@ impl RuntimeOwnership {
         ensure_directory(run_dir)?;
         let lock_path = run_dir.join("foreground.lock");
         let lock = open_lock(&lock_path)?;
-        lock.try_lock().map_err(|error| match error {
+        try_acquire_foreground_lock(&lock).map_err(|error| match error {
             TryLockError::WouldBlock => "another Loxa runtime is active".into(),
             TryLockError::Error(error) => format!("{}: {error}", lock_path.display()),
         })?;
@@ -346,7 +395,7 @@ pub(crate) fn recover_stale(run_dir: &Path) -> Result<(), String> {
     ensure_directory(run_dir)?;
     let lock_path = run_dir.join("foreground.lock");
     let lock = open_lock(&lock_path)?;
-    match lock.try_lock() {
+    match try_acquire_foreground_lock(&lock) {
         Ok(()) => {
             reconcile_state(&run_dir.join("foreground.json"))?;
             reconcile_legacy_state(&run_dir.join("managed.json"))
@@ -532,19 +581,13 @@ fn read_lease(path: &Path) -> Result<RuntimeLease, String> {
 }
 
 fn read_regular_file(path: &Path) -> Result<Vec<u8>, String> {
-    let metadata =
-        fs::symlink_metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    if !metadata.file_type().is_file() {
-        return Err(format!("unsafe runtime lease {}", path.display()));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if metadata.nlink() != 1 {
-            return Err(format!("unsafe runtime lease {}", path.display()));
+    crate::safe_file::read_regular_file(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::InvalidData {
+            format!("unsafe runtime lease {}", path.display())
+        } else {
+            format!("{}: {error}", path.display())
         }
-    }
-    fs::read(path).map_err(|error| format!("{}: {error}", path.display()))
+    })
 }
 
 fn write_lease(path: &Path, lease: &RuntimeLease) -> Result<(), String> {
@@ -762,9 +805,8 @@ mod tests {
     use super::*;
     use crate::app::{RuntimeInventorySnapshot, RuntimeSnapshot, SnapshotReader};
     use crate::paths::AppPaths;
-    use std::fs::OpenOptions;
     use std::os::unix::process::CommandExt;
-    use std::process::{Child, Command};
+    use std::process::{Child, Command, Stdio};
     use std::thread;
     use std::time::{Duration, Instant};
     use tempfile::tempdir;
@@ -806,17 +848,96 @@ mod tests {
         }
     }
 
-    fn hold_foreground_lock(run_dir: &Path) -> File {
+    struct ForegroundLockHolder {
+        child: Child,
+        release: PathBuf,
+    }
+
+    impl Drop for ForegroundLockHolder {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.release, b"release");
+            let _ = self.child.wait();
+        }
+    }
+
+    fn wait_for_path(path: &Path, description: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {description}: {}",
+                path.display()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn hold_foreground_lock(run_dir: &Path) -> ForegroundLockHolder {
         fs::create_dir_all(run_dir).unwrap();
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(run_dir.join("foreground.lock"))
+        let ready = run_dir.join("foreground-lock.ready");
+        let release = run_dir.join("foreground-lock.release");
+        let child = Command::new(std::env::current_exe().unwrap())
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("runtime::tests::foreground_record_lock_holder_process")
+            .env("LOXA_FOREGROUND_LOCK_PATH", run_dir.join("foreground.lock"))
+            .env("LOXA_FOREGROUND_LOCK_READY", &ready)
+            .env("LOXA_FOREGROUND_LOCK_RELEASE", &release)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
             .unwrap();
-        lock.try_lock().unwrap();
-        lock
+        wait_for_path(&ready, "foreground lock holder");
+        ForegroundLockHolder { child, release }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore]
+    fn foreground_record_lock_holder_process() {
+        let path = PathBuf::from(std::env::var_os("LOXA_FOREGROUND_LOCK_PATH").unwrap());
+        let ready = PathBuf::from(std::env::var_os("LOXA_FOREGROUND_LOCK_READY").unwrap());
+        let release = PathBuf::from(std::env::var_os("LOXA_FOREGROUND_LOCK_RELEASE").unwrap());
+        let lock = open_lock(&path).unwrap();
+        try_acquire_foreground_lock(&lock).unwrap();
+        fs::write(ready, b"ready").unwrap();
+        wait_for_path(&release, "foreground lock release");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn foreground_lock_query_never_owns_an_available_lock() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("foreground.lock");
+        drop(open_lock(&path).unwrap());
+
+        assert!(!foreground_lock_is_held(&path).unwrap());
+
+        let _holder = hold_foreground_lock(dir.path());
+        let contender = open_lock(&path).unwrap();
+        assert!(matches!(
+            try_acquire_foreground_lock(&contender),
+            Err(TryLockError::WouldBlock)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn foreground_observer_reports_a_real_contending_owner_without_acquiring_the_lock() {
+        let dir = tempdir().unwrap();
+        let _holder = hold_foreground_lock(dir.path());
+        let mut observer = ForegroundObserver::new(dir.path().to_path_buf());
+
+        assert_eq!(
+            observer.observe(Path::new("/managed/llama-server")),
+            ForegroundObservation::Starting
+        );
+
+        let contender = open_lock(&dir.path().join("foreground.lock")).unwrap();
+        assert!(matches!(
+            try_acquire_foreground_lock(&contender),
+            Err(TryLockError::WouldBlock)
+        ));
     }
 
     #[test]

@@ -424,22 +424,13 @@ pub fn load_catalog(models_root: &Path) -> Result<Vec<Manifest>, String> {
             continue;
         }
         let manifest_path = path.join("manifest.json");
-        let metadata = match fs::symlink_metadata(&manifest_path) {
-            Ok(metadata) => metadata,
+        let bytes = match crate::safe_file::read_regular_file(&manifest_path) {
+            Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(format!("{}: {error}", manifest_path.display())),
         };
-        if !metadata.file_type().is_file() {
-            return Err(format!(
-                "manifest is not a regular file: {}",
-                manifest_path.display()
-            ));
-        }
-        let manifest: Manifest = serde_json::from_slice(
-            &fs::read(&manifest_path)
-                .map_err(|error| format!("{}: {error}", manifest_path.display()))?,
-        )
-        .map_err(|error| format!("{}: {error}", manifest_path.display()))?;
+        let manifest: Manifest = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("{}: {error}", manifest_path.display()))?;
         manifest.validate()?;
         if path.file_name().and_then(|name| name.to_str()) != Some(manifest.id.as_str()) {
             return Err(format!("manifest id does not match {}", path.display()));
