@@ -61,7 +61,12 @@ impl Drop for PromptInterrupt {
 pub fn run_from_env() -> Result<i32, String> {
     let cli = Cli::parse();
     let paths = AppPaths::from_env()?;
-    let _diagnostics = diagnostics::init(&paths.logs).ok();
+    let _diagnostics = diagnostics::init(&paths.logs).map_err(|error| {
+        format!(
+            "failed to initialize diagnostics at {}: {error}",
+            paths.logs.display()
+        )
+    })?;
     let command = command_name(&cli.command);
     tracing::info!(event = "cli_startup", command);
     let result = run(cli, paths);

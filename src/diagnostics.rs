@@ -22,14 +22,8 @@ pub(crate) fn init(log_dir: &Path) -> Result<Diagnostics, String> {
     prepare_directory(log_dir)?;
     reject_unowned_daily_entries(log_dir)?;
 
-    let (mut filter, invalid_source) = selected_filter(|name| std::env::var(name).ok());
-    if invalid_source.is_some() {
-        filter = filter.add_directive(
-            "loxa::diagnostics=warn"
-                .parse()
-                .expect("static diagnostics directive is valid"),
-        );
-    }
+    let filter = selected_filter(|name| std::env::var(name).ok())
+        .map_err(|source| format!("invalid diagnostics log filter in {source}"))?;
     let appender = RetainedDailyWriter::new(log_dir)?;
     let (writer, guard) = NonBlockingBuilder::default().lossy(false).finish(appender);
     let layer = tracing_subscriber::fmt::layer()
@@ -49,13 +43,6 @@ pub(crate) fn init(log_dir: &Path) -> Result<Diagnostics, String> {
         .map_err(|error| format!("failed to initialize diagnostics: {error}"))?;
 
     let _ = ACTIVE_LOG_DIR.set(log_dir.to_path_buf());
-    if let Some(source) = invalid_source {
-        tracing::warn!(
-            event = "invalid_log_filter",
-            source,
-            "ignored invalid log filter"
-        );
-    }
     Ok(Diagnostics { _guard: guard })
 }
 
@@ -162,26 +149,16 @@ fn prepare_directory(log_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn selected_filter<F>(mut read: F) -> (EnvFilter, Option<&'static str>)
+fn selected_filter<F>(mut read: F) -> Result<EnvFilter, &'static str>
 where
     F: FnMut(&str) -> Option<String>,
 {
-    let mut invalid_source = None;
     for name in ["LOXA_LOG", "RUST_LOG"] {
         if let Some(value) = read(name) {
-            match EnvFilter::try_new(value) {
-                Ok(filter) => return (filter, invalid_source),
-                Err(_) => {
-                    invalid_source.get_or_insert(if name == "LOXA_LOG" {
-                        "LOXA_LOG"
-                    } else {
-                        "RUST_LOG"
-                    });
-                }
-            }
+            return EnvFilter::try_new(value).map_err(|_| name);
         }
     }
-    (EnvFilter::new(DEFAULT_FILTER), invalid_source)
+    Ok(EnvFilter::new(DEFAULT_FILTER))
 }
 
 fn prune_daily_logs(log_dir: &Path, keep: usize) -> Result<(), String> {
@@ -337,27 +314,38 @@ mod tests {
     }
 
     #[test]
-    fn filter_precedence_and_invalid_fallback_are_deterministic() {
-        let (filter, invalid) = selected_filter(|name| match name {
+    fn filter_precedence_uses_the_highest_priority_present_filter() {
+        let filter = selected_filter(|name| match name {
             "LOXA_LOG" => Some("loxa=debug".into()),
             "RUST_LOG" => Some("loxa=trace".into()),
             _ => None,
-        });
+        })
+        .expect("valid highest-priority filter");
         assert_eq!(filter.to_string(), "loxa=debug");
-        assert_eq!(invalid, None);
 
-        let (filter, invalid) =
-            selected_filter(|name| (name == "LOXA_LOG").then_some("not a[filter".into()));
+        let filter = selected_filter(|name| (name == "RUST_LOG").then_some("loxa=trace".into()))
+            .expect("valid RUST_LOG filter");
+        assert_eq!(filter.to_string(), "loxa=trace");
+
+        let filter = selected_filter(|_| None).expect("default filter");
         assert_eq!(filter.to_string(), DEFAULT_FILTER);
-        assert_eq!(invalid, Some("LOXA_LOG"));
+    }
 
-        let (filter, invalid) = selected_filter(|name| match name {
+    #[test]
+    fn invalid_selected_filter_fails_without_falling_through() {
+        let error = selected_filter(|name| match name {
             "LOXA_LOG" => Some("not a[filter".into()),
             "RUST_LOG" => Some("loxa=trace".into()),
             _ => None,
-        });
-        assert_eq!(filter.to_string(), "loxa=trace");
-        assert_eq!(invalid, Some("LOXA_LOG"));
+        })
+        .unwrap_err();
+
+        assert_eq!(error, "LOXA_LOG");
+
+        let error = selected_filter(|name| (name == "RUST_LOG").then_some("not a[filter".into()))
+            .unwrap_err();
+
+        assert_eq!(error, "RUST_LOG");
     }
 
     #[test]
