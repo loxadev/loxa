@@ -174,10 +174,7 @@ fn discover_server_with_requirement(
     }
     match std::fs::symlink_metadata(managed) {
         Ok(_) => {
-            validate_managed_candidate(managed)?;
-            if record_managed_qualification {
-                let _ = record_managed_runtime_qualification(managed);
-            }
+            admit_managed_candidate(managed, record_managed_qualification)?;
             return Ok(managed.to_path_buf());
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -232,6 +229,36 @@ fn validate_managed_candidate(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn admit_managed_candidate(path: &Path, record_qualification: bool) -> Result<(), String> {
+    admit_managed_candidate_with_after_probe(path, record_qualification, || {})
+}
+
+fn admit_managed_candidate_with_after_probe(
+    path: &Path,
+    record_qualification: bool,
+    after_probe: impl FnOnce(),
+) -> Result<(), String> {
+    let before = if record_qualification {
+        managed_runtime_fingerprint(path).ok()
+    } else {
+        None
+    };
+
+    validate_managed_candidate(path)?;
+    after_probe();
+
+    let Some(before) = before else {
+        return Ok(());
+    };
+    let Ok(after) = managed_runtime_fingerprint(path) else {
+        return Ok(());
+    };
+    if before == after {
+        let _ = record_managed_runtime_qualification(path, &after);
+    }
+    Ok(())
+}
+
 pub(crate) fn managed_runtime_inventory_is_valid(path: &Path) -> bool {
     let Ok(qualification) = read_managed_runtime_qualification(path) else {
         return false;
@@ -264,6 +291,7 @@ struct ManagedRuntimeQualification {
 
 #[derive(Eq, PartialEq)]
 struct ManagedRuntimeFingerprint {
+    identity: crate::safe_file::RegularFileIdentity,
     size: u64,
     sha256: String,
 }
@@ -272,13 +300,15 @@ fn managed_runtime_qualification_path(path: &Path) -> PathBuf {
     path.with_extension("qualification.json")
 }
 
-fn record_managed_runtime_qualification(path: &Path) -> Result<(), String> {
-    let fingerprint = managed_runtime_fingerprint(path)?;
+fn record_managed_runtime_qualification(
+    path: &Path,
+    fingerprint: &ManagedRuntimeFingerprint,
+) -> Result<(), String> {
     let qualification = ManagedRuntimeQualification {
         version: MANAGED_RUNTIME_QUALIFICATION_VERSION,
         build: crate::catalog::GEMMA4_LLAMA_BUILD.into(),
         managed_version: MANAGED_VERSION.into(),
-        sha256: fingerprint.sha256,
+        sha256: fingerprint.sha256.clone(),
         size: fingerprint.size,
     };
     let bytes = serde_json::to_vec(&qualification).map_err(|error| error.to_string())?;
@@ -349,8 +379,10 @@ fn managed_runtime_fingerprint(path: &Path) -> Result<ManagedRuntimeFingerprint,
     }
     crate::safe_file::ensure_descriptor_matches_path(&file, &opened, path)
         .map_err(|error| format!("{}: {error}", path.display()))?;
+    let size = opened.size();
     Ok(ManagedRuntimeFingerprint {
-        size: opened.size(),
+        identity: opened,
+        size,
         sha256: hasher
             .finalize()
             .iter()
@@ -2398,6 +2430,35 @@ mod tests {
 
         write_version_script(&managed, "version: 10090 (stale)", 0);
         assert!(!managed_runtime_inventory_is_valid(&managed));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_admission_does_not_publish_evidence_for_a_post_probe_replacement() {
+        let _lock = process_test_lock();
+        let dir = tempdir().unwrap();
+        let managed = dir.path().join("managed");
+        let replacement = dir.path().join("replacement");
+        write_version_script(&managed, "version: 10121 (555881ebc)", 0);
+        write_version_script(&replacement, "version: 10121 (555881ebc)", 0);
+        let qualification = managed_runtime_qualification_path(&managed);
+
+        let result = admit_managed_candidate_with_after_probe(&managed, true, || {
+            std::fs::rename(&replacement, &managed).unwrap();
+        });
+
+        assert!(
+            result.is_ok(),
+            "evidence binding must not change launch admission"
+        );
+        assert!(
+            !qualification.exists(),
+            "a replacement after the probe must not receive qualification evidence"
+        );
+        assert!(
+            !managed_runtime_inventory_is_valid(&managed),
+            "an unprobed replacement must not be accepted by inventory"
+        );
     }
 
     #[cfg(unix)]

@@ -15,11 +15,22 @@ const LEASE_VERSION: u32 = 1;
 const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const OBSERVER_TEARDOWN_GRACE: Duration = Duration::from_millis(500);
 static LEASE_STATE_IO: Mutex<()> = Mutex::new(());
+#[cfg(unix)]
+static LOCAL_FOREGROUND_LOCKS: Mutex<Vec<LocalForegroundLockKey>> = Mutex::new(Vec::new());
+#[cfg(unix)]
+static LOCAL_FOREGROUND_LOCK_OPERATIONS: Mutex<()> = Mutex::new(());
 
 fn lock_lease_state() -> Result<MutexGuard<'static, ()>, String> {
     LEASE_STATE_IO
         .lock()
         .map_err(|_| "runtime lease state lock is poisoned".to_string())
+}
+
+#[cfg(unix)]
+fn lock_local_foreground_operation() -> Result<MutexGuard<'static, ()>, String> {
+    LOCAL_FOREGROUND_LOCK_OPERATIONS
+        .lock()
+        .map_err(|_| "local foreground lock operation is poisoned".to_string())
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -123,7 +134,31 @@ enum ObservedLease {
     Valid(RuntimeLease),
 }
 
+#[cfg(unix)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ForegroundLockProtocol {
+    OpenFileDescription,
+    Traditional,
+}
+
 fn foreground_lock_is_held(path: &Path) -> Result<bool, String> {
+    foreground_lock_is_held_with_after_open(path, || {})
+}
+
+fn foreground_lock_is_held_with_after_open(
+    path: &Path,
+    after_open: impl FnOnce(),
+) -> Result<bool, String> {
+    #[cfg(unix)]
+    // Keep a traditional-lock query descriptor's whole lifetime ordered with a
+    // same-process fallback acquisition. Otherwise a query opened just before
+    // acquisition could close just after it and release that record lock.
+    let _operation = lock_local_foreground_operation()?;
+    #[cfg(unix)]
+    if LocalForegroundLock::is_held(path)? {
+        return Ok(true);
+    }
+
     let mut options = OpenOptions::new();
     options.read(true).write(true);
     #[cfg(unix)]
@@ -149,19 +184,20 @@ fn foreground_lock_is_held(path: &Path) -> Result<bool, String> {
             return Err(format!("unsafe runtime lock {}", path.display()));
         }
     }
+    after_open();
     foreground_lock_is_held_from_file(&file)
 }
 
 #[cfg(unix)]
 fn foreground_lock_is_held_from_file(file: &File) -> Result<bool, String> {
-    let mut lock = foreground_record_lock();
-    // SAFETY: `lock` is a valid writable `libc::flock` with a whole-file write
-    // range, and `file` remains open for the duration of this query.
-    let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut lock) };
-    if result == -1 {
-        return Err(std::io::Error::last_os_error().to_string());
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+    match foreground_lock_is_held_with_command(file, libc::F_OFD_GETLK) {
+        Ok(held) => return Ok(held),
+        Err(error) if ofd_lock_command_is_unsupported(&error) => {}
+        Err(error) => return Err(error.to_string()),
     }
-    Ok(lock.l_type != libc::F_UNLCK as libc::c_short)
+
+    foreground_lock_is_held_with_command(file, libc::F_GETLK).map_err(|error| error.to_string())
 }
 
 #[cfg(not(unix))]
@@ -170,21 +206,17 @@ fn foreground_lock_is_held_from_file(_file: &File) -> Result<bool, String> {
 }
 
 #[cfg(unix)]
-fn try_acquire_foreground_lock(file: &File) -> Result<(), TryLockError> {
-    let mut lock = foreground_record_lock();
-    // SAFETY: `lock` is a valid writable `libc::flock` with a whole-file write
-    // range, and `file` remains open while the process owns the record lock.
-    let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &mut lock) };
-    if result == -1 {
-        let error = std::io::Error::last_os_error();
-        if error.kind() == std::io::ErrorKind::WouldBlock {
-            Err(TryLockError::WouldBlock)
-        } else {
-            Err(TryLockError::Error(error))
-        }
-    } else {
-        Ok(())
+fn try_acquire_foreground_lock(file: &File) -> Result<ForegroundLockProtocol, TryLockError> {
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+    match set_foreground_lock_with_command(file, libc::F_OFD_SETLK) {
+        Ok(()) => return Ok(ForegroundLockProtocol::OpenFileDescription),
+        Err(error) if ofd_lock_command_is_unsupported(&error) => {}
+        Err(error) => return Err(as_try_lock_error(error)),
     }
+
+    set_foreground_lock_with_command(file, libc::F_SETLK)
+        .map(|()| ForegroundLockProtocol::Traditional)
+        .map_err(as_try_lock_error)
 }
 
 #[cfg(not(unix))]
@@ -201,6 +233,52 @@ fn foreground_record_lock() -> libc::flock {
     lock.l_start = 0;
     lock.l_len = 0;
     lock
+}
+
+#[cfg(unix)]
+fn foreground_lock_is_held_with_command(
+    file: &File,
+    command: libc::c_int,
+) -> std::io::Result<bool> {
+    let mut lock = foreground_record_lock();
+    // SAFETY: `lock` is a valid writable `libc::flock` with a whole-file write
+    // range, and `file` remains open for the duration of this query.
+    let result = unsafe { libc::fcntl(file.as_raw_fd(), command, &mut lock) };
+    if result == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(lock.l_type != libc::F_UNLCK as libc::c_short)
+    }
+}
+
+#[cfg(unix)]
+fn set_foreground_lock_with_command(file: &File, command: libc::c_int) -> std::io::Result<()> {
+    let mut lock = foreground_record_lock();
+    // SAFETY: `lock` is a valid writable `libc::flock` with a whole-file write
+    // range, and `file` remains open while the process owns the record lock.
+    let result = unsafe { libc::fcntl(file.as_raw_fd(), command, &mut lock) };
+    if result == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn as_try_lock_error(error: std::io::Error) -> TryLockError {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        TryLockError::WouldBlock
+    } else {
+        TryLockError::Error(error)
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+fn ofd_lock_command_is_unsupported(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(code) if code == libc::EINVAL || code == libc::ENOTSUP
+    ) || error.kind() == std::io::ErrorKind::Unsupported
 }
 
 fn lease_is_absent(path: &Path) -> bool {
@@ -280,6 +358,10 @@ struct ProcessSnapshot {
 
 pub(crate) struct RuntimeOwnership {
     _lock: File,
+    #[cfg(unix)]
+    // This drops after `_lock`, so a traditional-lock fallback cannot be queried
+    // through another local descriptor while its owner is still live.
+    _local_traditional_lock: Option<LocalForegroundLock>,
     state_path: PathBuf,
     lease: Option<RuntimeLease>,
 }
@@ -288,17 +370,34 @@ impl RuntimeOwnership {
     pub(crate) fn acquire(run_dir: &Path) -> Result<Self, String> {
         ensure_directory(run_dir)?;
         let lock_path = run_dir.join("foreground.lock");
+        #[cfg(unix)]
+        let operation = lock_local_foreground_operation()?;
+        #[cfg(unix)]
+        let mut local_lock = LocalForegroundLock::reserve(&lock_path)?;
         let lock = open_lock(&lock_path)?;
-        try_acquire_foreground_lock(&lock).map_err(|error| match error {
+        #[cfg(unix)]
+        local_lock.bind_to_file(&lock)?;
+        let _protocol = try_acquire_foreground_lock(&lock).map_err(|error| match error {
             TryLockError::WouldBlock => "another Loxa runtime is active".into(),
             TryLockError::Error(error) => format!("{}: {error}", lock_path.display()),
         })?;
+        #[cfg(unix)]
+        let local_traditional_lock = if _protocol == ForegroundLockProtocol::Traditional {
+            Some(local_lock)
+        } else {
+            local_lock.release();
+            None
+        };
+        #[cfg(unix)]
+        drop(operation);
 
         let state_path = run_dir.join("foreground.json");
         reconcile_state(&state_path)?;
 
         Ok(Self {
             _lock: lock,
+            #[cfg(unix)]
+            _local_traditional_lock: local_traditional_lock,
             state_path,
             lease: None,
         })
@@ -394,14 +493,161 @@ pub(crate) fn recover_stale(run_dir: &Path) -> Result<(), String> {
     }
     ensure_directory(run_dir)?;
     let lock_path = run_dir.join("foreground.lock");
+    #[cfg(unix)]
+    let operation = lock_local_foreground_operation()?;
+    #[cfg(unix)]
+    if LocalForegroundLock::is_held(&lock_path)? {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    let mut local_lock = LocalForegroundLock::reserve(&lock_path)?;
     let lock = open_lock(&lock_path)?;
-    match try_acquire_foreground_lock(&lock) {
-        Ok(()) => {
-            reconcile_state(&run_dir.join("foreground.json"))?;
-            reconcile_legacy_state(&run_dir.join("managed.json"))
+    #[cfg(unix)]
+    local_lock.bind_to_file(&lock)?;
+    let _protocol = match try_acquire_foreground_lock(&lock) {
+        Ok(protocol) => protocol,
+        Err(TryLockError::WouldBlock) => return Ok(()),
+        Err(TryLockError::Error(error)) => return Err(format!("{}: {error}", lock_path.display())),
+    };
+    #[cfg(unix)]
+    if _protocol == ForegroundLockProtocol::OpenFileDescription {
+        local_lock.release();
+    }
+    #[cfg(unix)]
+    drop(operation);
+    reconcile_state(&run_dir.join("foreground.json"))?;
+    reconcile_legacy_state(&run_dir.join("managed.json"))
+}
+
+#[cfg(unix)]
+struct LocalForegroundLock {
+    key: Option<LocalForegroundLockKey>,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Eq, PartialEq)]
+struct LocalForegroundLockKey {
+    path: PathBuf,
+    identity: Option<LocalForegroundLockIdentity>,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct LocalForegroundLockIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+impl LocalForegroundLockKey {
+    fn from_path(path: &Path) -> Self {
+        let identity = fs::symlink_metadata(path)
+            .ok()
+            .and_then(|metadata| foreground_lock_identity(&metadata));
+        Self {
+            path: path.to_path_buf(),
+            identity,
         }
-        Err(TryLockError::WouldBlock) => Ok(()),
-        Err(TryLockError::Error(error)) => Err(format!("{}: {error}", lock_path.display())),
+    }
+
+    fn conflicts_with(&self, other: &Self) -> bool {
+        self.path == other.path
+            || matches!(
+                (self.identity, other.identity),
+                (Some(left), Some(right)) if left == right
+            )
+    }
+}
+
+#[cfg(unix)]
+fn foreground_lock_identity(metadata: &fs::Metadata) -> Option<LocalForegroundLockIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    if !metadata.file_type().is_file() {
+        return None;
+    }
+    Some(LocalForegroundLockIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(unix)]
+impl LocalForegroundLock {
+    fn reserve(path: &Path) -> Result<Self, String> {
+        let key = LocalForegroundLockKey::from_path(path);
+        let mut held = LOCAL_FOREGROUND_LOCKS
+            .lock()
+            .map_err(|_| "local foreground lock registry is poisoned".to_string())?;
+        if held.iter().any(|existing| existing.conflicts_with(&key)) {
+            return Err("another Loxa runtime is active".into());
+        }
+        held.push(key.clone());
+        Ok(Self { key: Some(key) })
+    }
+
+    fn bind_to_file(&mut self, file: &File) -> Result<(), String> {
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("runtime lock metadata: {error}"))?;
+        let identity =
+            foreground_lock_identity(&metadata).ok_or_else(|| "unsafe runtime lock".to_string())?;
+        let path = self
+            .key
+            .as_ref()
+            .ok_or_else(|| "local foreground lock reservation is missing".to_string())?
+            .path
+            .clone();
+        let bound = LocalForegroundLockKey {
+            path,
+            identity: Some(identity),
+        };
+        let mut held = LOCAL_FOREGROUND_LOCKS
+            .lock()
+            .map_err(|_| "local foreground lock registry is poisoned".to_string())?;
+        let index = held
+            .iter()
+            .position(|existing| self.key.as_ref() == Some(existing))
+            .ok_or_else(|| "local foreground lock reservation is missing".to_string())?;
+        if held
+            .iter()
+            .enumerate()
+            .any(|(other, existing)| other != index && existing.conflicts_with(&bound))
+        {
+            return Err("another Loxa runtime is active".into());
+        }
+        held[index] = bound.clone();
+        self.key = Some(bound);
+        Ok(())
+    }
+
+    fn is_held(path: &Path) -> Result<bool, String> {
+        let candidate = LocalForegroundLockKey::from_path(path);
+        LOCAL_FOREGROUND_LOCKS
+            .lock()
+            .map(|held| {
+                held.iter()
+                    .any(|existing| existing.conflicts_with(&candidate))
+            })
+            .map_err(|_| "local foreground lock registry is poisoned".to_string())
+    }
+
+    fn release(&mut self) {
+        let Some(key) = self.key.take() else {
+            return;
+        };
+        if let Ok(mut held) = LOCAL_FOREGROUND_LOCKS.lock() {
+            if let Some(index) = held.iter().position(|existing| existing == &key) {
+                held.swap_remove(index);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for LocalForegroundLock {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -891,6 +1137,23 @@ mod tests {
         ForegroundLockHolder { child, release }
     }
 
+    fn foreground_contender_acquires(run_dir: &Path) -> bool {
+        fs::create_dir_all(run_dir).unwrap();
+        let result = run_dir.join("foreground-contender.result");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("runtime::tests::foreground_record_lock_contender_process")
+            .env("LOXA_FOREGROUND_LOCK_PATH", run_dir.join("foreground.lock"))
+            .env("LOXA_FOREGROUND_LOCK_RESULT", &result)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+        fs::read(&result).unwrap() == b"acquired"
+    }
+
     #[cfg(unix)]
     #[test]
     #[ignore]
@@ -902,6 +1165,21 @@ mod tests {
         try_acquire_foreground_lock(&lock).unwrap();
         fs::write(ready, b"ready").unwrap();
         wait_for_path(&release, "foreground lock release");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore]
+    fn foreground_record_lock_contender_process() {
+        let path = PathBuf::from(std::env::var_os("LOXA_FOREGROUND_LOCK_PATH").unwrap());
+        let result = PathBuf::from(std::env::var_os("LOXA_FOREGROUND_LOCK_RESULT").unwrap());
+        let lock = open_lock(&path).unwrap();
+        let outcome = match try_acquire_foreground_lock(&lock) {
+            Ok(_) => b"acquired".as_slice(),
+            Err(TryLockError::WouldBlock) => b"blocked".as_slice(),
+            Err(TryLockError::Error(error)) => panic!("unexpected contender error: {error}"),
+        };
+        fs::write(result, outcome).unwrap();
     }
 
     #[cfg(unix)]
@@ -919,6 +1197,67 @@ mod tests {
             try_acquire_foreground_lock(&contender),
             Err(TryLockError::WouldBlock)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn foreground_query_holds_its_local_operation_guard_while_open() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("foreground.lock");
+        drop(open_lock(&path).unwrap());
+
+        assert!(!foreground_lock_is_held_with_after_open(&path, || {
+            assert!(
+                LOCAL_FOREGROUND_LOCK_OPERATIONS.try_lock().is_err(),
+                "the query's descriptor lifetime must be serialized with local acquisition"
+            );
+        })
+        .unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_process_observation_keeps_foreground_owner_exclusive() {
+        let dir = tempdir().unwrap();
+        let ownership = RuntimeOwnership::acquire(dir.path()).unwrap();
+        recover_stale(dir.path()).unwrap();
+        let mut observer = ForegroundObserver::new(dir.path().to_path_buf());
+
+        let observation = observer.observe(Path::new("/managed/llama-server"));
+        let contender_acquired = foreground_contender_acquires(dir.path());
+        assert_eq!(
+            (observation, contender_acquired),
+            (ForegroundObservation::Starting, false),
+            "an in-process observation must neither hide nor release lifecycle ownership"
+        );
+
+        drop(ownership);
+        assert!(
+            foreground_contender_acquires(dir.path()),
+            "dropping ownership must release the lifecycle lock"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn traditional_lock_fallback_isolates_parent_symlink_aliases() {
+        let dir = tempdir().unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(dir.path(), &alias).unwrap();
+        let path = dir.path().join("foreground.lock");
+        let mut local_lock = LocalForegroundLock::reserve(&path).unwrap();
+        let lock = open_lock(&path).unwrap();
+        local_lock.bind_to_file(&lock).unwrap();
+        set_foreground_lock_with_command(&lock, libc::F_SETLK).unwrap();
+
+        assert!(
+            foreground_lock_is_held(&alias.join("foreground.lock")).unwrap(),
+            "the fallback must not open and close an alias of its own lock"
+        );
+        assert!(
+            !foreground_contender_acquires(&alias),
+            "an alias observation must not release traditional ownership"
+        );
     }
 
     #[cfg(unix)]
