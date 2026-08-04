@@ -91,3 +91,23 @@ fn invalid_primary_filter_stops_the_command_without_leaking_its_value() {
     assert!(stderr.contains("LOXA_LOG"), "{stderr}");
     assert!(!stderr.contains("not a[filter"), "{stderr}");
 }
+
+#[cfg(unix)]
+#[test]
+fn non_unicode_primary_filter_stops_the_command_without_falling_through() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let home = tempdir().expect("temporary Loxa home");
+    let output = Command::new(env!("CARGO_BIN_EXE_loxa"))
+        .arg("list")
+        .env("LOXA_HOME", home.path())
+        .env("LOXA_LOG", OsString::from_vec(vec![0xff]))
+        .env("RUST_LOG", "loxa=trace")
+        .output()
+        .expect("run loxa list");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{output:?}");
+    assert!(stderr.contains("LOXA_LOG"), "{stderr}");
+}

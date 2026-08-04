@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -22,7 +23,7 @@ pub(crate) fn init(log_dir: &Path) -> Result<Diagnostics, String> {
     prepare_directory(log_dir)?;
     reject_unowned_daily_entries(log_dir)?;
 
-    let filter = selected_filter(|name| std::env::var(name).ok())
+    let filter = selected_filter(|name| std::env::var_os(name))
         .map_err(|source| format!("invalid diagnostics log filter in {source}"))?;
     let appender = RetainedDailyWriter::new(log_dir)?;
     let (writer, guard) = NonBlockingBuilder::default().lossy(false).finish(appender);
@@ -151,10 +152,11 @@ fn prepare_directory(log_dir: &Path) -> Result<(), String> {
 
 fn selected_filter<F>(mut read: F) -> Result<EnvFilter, &'static str>
 where
-    F: FnMut(&str) -> Option<String>,
+    F: FnMut(&str) -> Option<OsString>,
 {
     for name in ["LOXA_LOG", "RUST_LOG"] {
         if let Some(value) = read(name) {
+            let value = value.into_string().map_err(|_| name)?;
             return EnvFilter::try_new(value).map_err(|_| name);
         }
     }
