@@ -1,0 +1,7 @@
+#![deny(unsafe_op_in_unsafe_fn)]
+
+mod app;
+
+fn main() {
+    app::run();
+}

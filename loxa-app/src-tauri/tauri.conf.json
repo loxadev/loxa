@@ -1,0 +1,25 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Loxa",
+  "version": "0.1.0",
+  "identifier": "dev.loxa.menu",
+  "app": {
+    "windows": []
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app"],
+    "icon": [
+      "icons/AppIcon.appiconset/icon_16x16.png",
+      "icons/AppIcon.appiconset/icon_16x16@2x.png",
+      "icons/AppIcon.appiconset/icon_32x32.png",
+      "icons/AppIcon.appiconset/icon_32x32@2x.png",
+      "icons/AppIcon.appiconset/icon_128x128.png",
+      "icons/AppIcon.appiconset/icon_128x128@2x.png",
+      "icons/AppIcon.appiconset/icon_256x256.png",
+      "icons/AppIcon.appiconset/icon_256x256@2x.png",
+      "icons/AppIcon.appiconset/icon_512x512.png",
+      "icons/AppIcon.appiconset/icon_512x512@2x.png"
+    ]
+  }
+}

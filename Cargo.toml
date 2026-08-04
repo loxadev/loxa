@@ -35,3 +35,6 @@ sysinfo = { version = "0.39.5", default-features = false, features = ["system"] 
 tempfile = "3.27.0"
 
 [workspace]
+members = ["loxa-app/src-tauri"]
+default-members = ["."]
+resolver = "2"

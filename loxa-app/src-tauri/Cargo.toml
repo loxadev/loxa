@@ -1,0 +1,34 @@
+[package]
+name = "loxa-app"
+version = "0.1.0"
+description = "Loxa native menu-bar companion"
+authors = ["Muhammad Mahad"]
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/loxadev/loxa"
+build = "build.rs"
+
+[build-dependencies]
+tauri-build = { version = "=2.6.3", features = [] }
+
+[dependencies]
+tauri = { version = "=2.11.5", features = ["tray-icon"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+dispatch2 = { version = "=0.3.1", default-features = false, features = ["objc2", "std"] }
+objc2 = "=0.6.4"
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = [
+  "NSAccessibilityProtocols",
+  "NSButton",
+  "NSControl",
+  "NSMenu",
+  "NSMenuItem",
+  "NSResponder",
+  "NSStatusItem",
+  "NSView",
+] }
+objc2-foundation = { version = "=0.3.2", default-features = false, features = [
+  "NSGeometry",
+  "NSObject",
+  "NSString",
+] }
