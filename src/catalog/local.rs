@@ -436,6 +436,29 @@ mod tests {
         manifest
     }
 
+    fn install_legacy_hugging_face(root: &Path, id: &str, bytes: &[u8]) -> Manifest {
+        let model_dir = root.join(id);
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("model.gguf"), bytes).unwrap();
+        let manifest = Manifest {
+            version: 1,
+            id: id.into(),
+            repo: Some("google/gemma-4-12b-it-qat".into()),
+            revision: Some("0123456789abcdef0123456789abcdef01234567".into()),
+            remote_filename: Some("gemma-4-12b-it-Q4_K_M.gguf".into()),
+            origin: None,
+            source_filename: None,
+            local_filename: "model.gguf".into(),
+            sha256: sha256(&model_dir.join("model.gguf")).unwrap(),
+            size: bytes.len() as u64,
+            artifacts: None,
+            profile: None,
+            runtime: None,
+        };
+        super::super::publish_manifest(root, &manifest).unwrap();
+        manifest
+    }
+
     #[test]
     fn exact_pair_is_atomically_upgraded_to_one_bundle() {
         let root = tempfile::tempdir().unwrap();
@@ -464,6 +487,43 @@ mod tests {
             vec![upgraded]
         );
         assert!(!root.path().join("gemma4/bundle.pending.json").exists());
+    }
+
+    #[test]
+    fn legacy_v1_target_is_reconciled_with_hugging_face_provenance() {
+        let root = tempfile::tempdir().unwrap();
+        let target = gguf(3);
+        let mut draft = gguf(3);
+        draft.extend(b"draft");
+        install_legacy_hugging_face(root.path(), "gemma4", &target);
+        let source = root.path().join("mtp-gemma-4.gguf");
+        std::fs::write(&source, &draft).unwrap();
+        let qualification = BundleQualification::for_test(&target, &draft);
+
+        let upgraded = reconcile_with(root.path(), &qualification)
+            .unwrap()
+            .expect("the exact legacy target and draft should be reconciled");
+
+        let model = upgraded
+            .artifacts
+            .as_deref()
+            .unwrap()
+            .iter()
+            .find(|artifact| artifact.role == ArtifactRole::Model)
+            .unwrap();
+        assert_eq!(
+            model.provenance,
+            ArtifactProvenance::HuggingFace {
+                repo: "google/gemma-4-12b-it-qat".into(),
+                revision: "0123456789abcdef0123456789abcdef01234567".into(),
+                remote_filename: "gemma-4-12b-it-Q4_K_M.gguf".into(),
+            }
+        );
+        assert!(!source.exists());
+        assert_eq!(
+            super::super::load_catalog(root.path()).unwrap(),
+            vec![upgraded]
+        );
     }
 
     #[test]

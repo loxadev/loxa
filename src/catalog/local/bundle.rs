@@ -282,6 +282,16 @@ fn matching_primary_provenance(current: &Manifest, pending: &Manifest) -> bool {
         return false;
     };
     match current.version {
+        1 => matches!(
+            &pending_model.provenance,
+            ArtifactProvenance::HuggingFace {
+                repo,
+                revision,
+                remote_filename,
+            } if current.repo.as_deref() == Some(repo.as_str())
+                && current.revision.as_deref() == Some(revision.as_str())
+                && current.remote_filename.as_deref() == Some(remote_filename.as_str())
+        ),
         2 => matches!(
             &pending_model.provenance,
             ArtifactProvenance::Local { source_filename }
@@ -338,6 +348,7 @@ fn qualified_target(manifest: &Manifest, qualification: &BundleQualification) ->
         return false;
     }
     match manifest.version {
+        1 => true,
         2 => manifest.origin == Some(Origin::Local),
         3 => {
             manifest.profile.as_deref() == Some(qualification.profile.as_str())
@@ -373,6 +384,20 @@ fn bundle_manifest(
     qualification: &BundleQualification,
 ) -> Result<Manifest, String> {
     let model_provenance = match current.version {
+        1 => ArtifactProvenance::HuggingFace {
+            repo: current
+                .repo
+                .clone()
+                .ok_or("missing Hugging Face repository")?,
+            revision: current
+                .revision
+                .clone()
+                .ok_or("missing Hugging Face revision")?,
+            remote_filename: current
+                .remote_filename
+                .clone()
+                .ok_or("missing Hugging Face filename")?,
+        },
         2 => ArtifactProvenance::Local {
             source_filename: current
                 .source_filename
