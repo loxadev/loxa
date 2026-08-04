@@ -598,15 +598,13 @@ fn report_mtp_draft_start_failure(
         model_id = %launch.id,
         outcome
     );
-    if let Some(diagnostic) = diagnostic {
-        if tracing::enabled!(target: "loxa::runner", tracing::Level::DEBUG) {
-            tracing::debug!(
-                target: "loxa::runner",
-                event = "gemma_mtp_draft_start_diagnostic",
-                model_id = %launch.id,
-                diagnostic
-            );
-        }
+    if diagnostic.is_some() && tracing::enabled!(target: "loxa::runner", tracing::Level::DEBUG) {
+        tracing::debug!(
+            target: "loxa::runner",
+            event = "gemma_mtp_draft_start_diagnostic",
+            model_id = %launch.id,
+            diagnostic_present = true
+        );
     }
     anstream::eprintln!("Warning: MTP draft startup failed; retrying the primary model only.");
 }
@@ -1401,7 +1399,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::atomic::AtomicBool;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
 
     #[cfg(unix)]
@@ -1412,6 +1410,20 @@ mod tests {
         RUN_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[derive(Clone)]
+    struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     #[cfg(unix)]
@@ -1711,6 +1723,72 @@ mod tests {
         assert!(run_dir.join("foreground.json").is_file());
         server.terminate().unwrap();
         assert!(!run_dir.join("foreground.json").exists());
+    }
+
+    #[test]
+    fn mtp_draft_child_diagnostics_never_enter_debug_structured_output() {
+        let sensitive_markers = [
+            "LOXA_TEST_PROMPT_MARKER",
+            "LOXA_TEST_RESPONSE_MARKER",
+            "LOXA_TEST_TOKEN_MARKER",
+            "LOXA_TEST_AUTHORIZATION_MARKER",
+            "LOXA_TEST_BODY_MARKER",
+        ];
+        let diagnostic = format!(
+            "prompt={} response={} token={} authorization={} body={}",
+            sensitive_markers[0],
+            sensitive_markers[1],
+            sensitive_markers[2],
+            sensitive_markers[3],
+            sensitive_markers[4],
+        );
+        let launch = Launch {
+            server: PathBuf::from("/servers/llama-server"),
+            model: PathBuf::from("/models/model.gguf"),
+            id: "demo".into(),
+            requested_port: 1234,
+            ctx: 8192,
+            profile: LaunchProfile::gemma4_mtp(Some(PathBuf::from("/models/draft.gguf"))),
+        };
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || SharedLogWriter(writer.clone()))
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            report_mtp_draft_start_failure(&launch, "exited", Some(&diagnostic));
+        });
+
+        let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        let events = output
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+
+        for marker in sensitive_markers {
+            assert!(
+                !output.contains(marker),
+                "debug structured output leaked {marker}"
+            );
+        }
+
+        let failure = events
+            .iter()
+            .find(|event| event["event"] == "gemma_mtp_draft_start_failed")
+            .expect("MTP failure classification event");
+        assert_eq!(failure["outcome"], "exited");
+
+        let diagnostic = events
+            .iter()
+            .find(|event| event["event"] == "gemma_mtp_draft_start_diagnostic")
+            .expect("MTP diagnostic-presence event");
+        assert_eq!(diagnostic["diagnostic_present"], true);
+        assert!(diagnostic.get("diagnostic").is_none(), "{diagnostic}");
     }
 
     #[cfg(unix)]
