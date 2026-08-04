@@ -1,17 +1,14 @@
-#[path = "menu/macos/mod.rs"]
-mod macos_menu;
-
 use std::sync::Mutex;
 
 use dispatch2::MainThreadBound;
 use objc2::MainThreadMarker;
-use tauri::tray::{TrayIcon, TrayIconBuilder};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, RunEvent, Wry};
 
-use macos_menu::NativeMenuController;
+use crate::menu::macos::NativePopoverController;
 
 struct NativeShell {
-    controller: MainThreadBound<NativeMenuController>,
+    controller: MainThreadBound<NativePopoverController>,
     tray: TrayIcon<Wry>,
 }
 
@@ -33,15 +30,24 @@ pub(crate) fn run() {
         .setup(|app| {
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
-            // The macOS tray target only forwards a left click to the status
-            // item when the menu was registered through the tray builder.
-            // NativeMenuController populates this exact NSMenu below.
-            let menu = tauri::menu::Menu::new(app)?;
             let tray = TrayIconBuilder::with_id("loxa")
-                .menu(&menu)
                 .icon(tauri::include_image!("./icons/loxa-template.png"))
                 .icon_as_template(true)
                 .tooltip("Loxa")
+                .on_tray_icon_event(|tray, event| {
+                    // tray-icon owns the status-button hit target on macOS;
+                    // route its native release event to the AppKit popover.
+                    if matches!(
+                        event,
+                        TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            ..
+                        }
+                    ) {
+                        toggle_native_popover_from_tray(tray.app_handle().clone());
+                    }
+                })
                 .build(app)?;
             let app_handle = app.handle().clone();
             let controller = tray.with_inner_tray_icon(move |inner| {
@@ -52,7 +58,7 @@ pub(crate) fn run() {
                     .expect("the macOS tray icon must expose an NSStatusItem");
 
                 MainThreadBound::new(
-                    NativeMenuController::attach(status_item, app_handle, mtm),
+                    NativePopoverController::attach(status_item, app_handle, mtm),
                     mtm,
                 )
             })?;
@@ -87,3 +93,25 @@ fn teardown_native_shell(app_handle: &AppHandle) {
         shell.teardown();
     }
 }
+
+fn toggle_native_popover_from_tray(app_handle: AppHandle) {
+    let main_thread_handle = app_handle.clone();
+    let _ = main_thread_handle.run_on_main_thread(move || {
+        let mtm = MainThreadMarker::new()
+            .expect("Tauri must toggle the native popover on the main thread");
+        let Some(state) = app_handle.try_state::<NativeShellState>() else {
+            return;
+        };
+        let shell = state
+            .0
+            .lock()
+            .expect("native shell state mutex must not be poisoned");
+        if let Some(shell) = shell.as_ref() {
+            shell.controller.get(mtm).toggle(mtm);
+        }
+    });
+}
+
+#[cfg(test)]
+#[path = "menu/presentation_tests.rs"]
+mod presentation_tests;
