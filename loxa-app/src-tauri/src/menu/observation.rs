@@ -1,8 +1,10 @@
 #![cfg_attr(all(debug_assertions, not(test)), allow(dead_code))]
 
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(not(any(test, debug_assertions)))]
 use std::sync::mpsc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[cfg(not(any(test, debug_assertions)))]
@@ -283,11 +285,15 @@ fn run_worker<S: SnapshotSource>(
     mut source: Result<S, String>,
     request_receiver: Receiver<WorkerRequest>,
     message_sender: Sender<ObservationMessage>,
+    stopping: &AtomicBool,
 ) {
     while let Ok(request) = request_receiver.recv() {
         match request {
             WorkerRequest::Stop => break,
             WorkerRequest::Observe => {
+                if stopping.load(Ordering::Acquire) {
+                    break;
+                }
                 let message = match &mut source {
                     Ok(source) => ObservationMessage::Snapshot(source.snapshot()),
                     Err(error) => ObservationMessage::Error(error.clone()),
@@ -304,6 +310,7 @@ pub(crate) struct ObservationClient {
     request_sender: Option<Sender<WorkerRequest>>,
     receiver: Option<Receiver<ObservationMessage>>,
     admission: RefreshAdmission,
+    stopping: Arc<AtomicBool>,
 }
 
 impl ObservationClient {
@@ -312,6 +319,8 @@ impl ObservationClient {
         let (request_sender, request_receiver) = mpsc::channel();
         let (message_sender, receiver) = mpsc::channel();
         let worker_sender = message_sender.clone();
+        let stopping = Arc::new(AtomicBool::new(false));
+        let worker_stopping = Arc::clone(&stopping);
         let spawn = std::thread::Builder::new()
             .name("loxa-menu-observation".to_owned())
             .spawn(move || {
@@ -319,6 +328,7 @@ impl ObservationClient {
                     AppService::from_env().map(AppSnapshotSource),
                     request_receiver,
                     worker_sender,
+                    &worker_stopping,
                 );
             });
 
@@ -333,6 +343,7 @@ impl ObservationClient {
             request_sender: Some(request_sender),
             receiver: Some(receiver),
             admission: RefreshAdmission::new(),
+            stopping,
         };
         client.request_startup();
         client
@@ -378,6 +389,7 @@ impl ObservationClient {
     }
 
     pub(crate) fn shutdown(&mut self) {
+        self.stopping.store(true, Ordering::Release);
         self.admission.close();
         self.receiver.take();
         if let Some(sender) = self.request_sender.take() {
@@ -394,6 +406,7 @@ impl ObservationClient {
             request_sender: Some(request_sender),
             receiver: Some(receiver),
             admission: RefreshAdmission::new(),
+            stopping: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -454,7 +467,7 @@ fn drain_observations(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc};
     use std::time::{Duration, Instant};
 
@@ -609,6 +622,7 @@ mod tests {
             }),
             request_receiver,
             message_sender,
+            &AtomicBool::new(false),
         );
 
         assert_eq!(reads.load(Ordering::SeqCst), 1);
@@ -626,11 +640,36 @@ mod tests {
             Err("set LOXA_HOME, HOME, or USERPROFILE".to_owned()),
             request_receiver,
             message_sender,
+            &AtomicBool::new(false),
         );
         assert_eq!(
             message_receiver.recv().unwrap(),
             ObservationMessage::Error("set LOXA_HOME, HOME, or USERPROFILE".to_owned())
         );
+    }
+
+    #[test]
+    fn shutdown_requested_before_worker_dispatch_skips_a_queued_observation() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let stopping = Arc::new(AtomicBool::new(true));
+        let (request_sender, request_receiver) = mpsc::channel();
+        let (message_sender, message_receiver) = mpsc::channel();
+        request_sender.send(WorkerRequest::Observe).unwrap();
+        drop(request_sender);
+
+        run_worker(
+            Ok(StopSensitiveReader {
+                reads: reads.clone(),
+                stopping: stopping.clone(),
+                snapshot: Fixture::Installed.snapshot(),
+            }),
+            request_receiver,
+            message_sender,
+            &stopping,
+        );
+
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+        assert!(message_receiver.try_recv().is_err());
     }
 
     #[test]
@@ -641,6 +680,7 @@ mod tests {
 
         client.shutdown();
 
+        assert!(client.stopping.load(Ordering::Acquire));
         assert_eq!(request_receiver.recv().unwrap(), WorkerRequest::Stop);
         assert!(message_sender
             .send(ObservationMessage::Snapshot(Fixture::Empty.snapshot()))
@@ -678,6 +718,23 @@ mod tests {
 
     impl SnapshotSource for FakeReader {
         fn snapshot(&mut self) -> MenuSnapshot {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.snapshot.clone()
+        }
+    }
+
+    struct StopSensitiveReader {
+        reads: Arc<AtomicUsize>,
+        stopping: Arc<AtomicBool>,
+        snapshot: MenuSnapshot,
+    }
+
+    impl SnapshotSource for StopSensitiveReader {
+        fn snapshot(&mut self) -> MenuSnapshot {
+            assert!(
+                !self.stopping.load(Ordering::SeqCst),
+                "snapshot started after stop was requested"
+            );
             self.reads.fetch_add(1, Ordering::SeqCst);
             self.snapshot.clone()
         }

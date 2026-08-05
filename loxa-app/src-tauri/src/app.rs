@@ -25,6 +25,31 @@ impl NativeShell {
 
 struct NativeShellState(Mutex<Option<NativeShell>>);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeShellLifecycleEvent {
+    QuitRequested,
+    ExitRequested,
+}
+
+fn dispatch_native_shell_lifecycle(
+    event: NativeShellLifecycleEvent,
+    request_exit: impl FnOnce(),
+    teardown: impl FnOnce(),
+) {
+    match event {
+        NativeShellLifecycleEvent::QuitRequested => request_exit(),
+        NativeShellLifecycleEvent::ExitRequested => teardown(),
+    }
+}
+
+pub(crate) fn request_native_shell_exit(app_handle: &AppHandle) {
+    dispatch_native_shell_lifecycle(
+        NativeShellLifecycleEvent::QuitRequested,
+        || app_handle.exit(0),
+        || teardown_native_shell(app_handle),
+    );
+}
+
 pub(crate) fn run() {
     let app = tauri::Builder::default()
         .setup(|app| {
@@ -74,12 +99,16 @@ pub(crate) fn run() {
 
     app.run(|app_handle, event| {
         if matches!(event, RunEvent::ExitRequested { .. }) {
-            teardown_native_shell(app_handle);
+            dispatch_native_shell_lifecycle(
+                NativeShellLifecycleEvent::ExitRequested,
+                || {},
+                || teardown_native_shell(app_handle),
+            );
         }
     });
 }
 
-pub(crate) fn teardown_native_shell(app_handle: &AppHandle) {
+fn teardown_native_shell(app_handle: &AppHandle) {
     let shell = {
         let state = app_handle.state::<NativeShellState>();
         let mut state = state
@@ -115,3 +144,31 @@ fn toggle_native_popover_from_tray(app_handle: AppHandle) {
 #[cfg(test)]
 #[path = "menu/presentation_tests.rs"]
 mod presentation_tests;
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use std::cell::RefCell;
+
+    use super::{dispatch_native_shell_lifecycle, NativeShellLifecycleEvent};
+
+    #[test]
+    fn quit_requests_exit_without_synchronous_native_teardown() {
+        let events = RefCell::new(Vec::new());
+
+        dispatch_native_shell_lifecycle(
+            NativeShellLifecycleEvent::QuitRequested,
+            || events.borrow_mut().push("request exit"),
+            || events.borrow_mut().push("teardown"),
+        );
+
+        assert_eq!(events.into_inner(), ["request exit"]);
+
+        let events = RefCell::new(Vec::new());
+        dispatch_native_shell_lifecycle(
+            NativeShellLifecycleEvent::ExitRequested,
+            || events.borrow_mut().push("request exit"),
+            || events.borrow_mut().push("teardown"),
+        );
+        assert_eq!(events.into_inner(), ["teardown"]);
+    }
+}

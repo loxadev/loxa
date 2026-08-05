@@ -264,9 +264,7 @@ define_class!(
 
         #[unsafe(method(quit:))]
         fn quit(&self, _sender: Option<&AnyObject>) {
-            let app_handle = self.ivars().app_handle.clone();
-            crate::app::teardown_native_shell(&app_handle);
-            app_handle.exit(0);
+            crate::app::request_native_shell_exit(&self.ivars().app_handle);
         }
     }
 );
