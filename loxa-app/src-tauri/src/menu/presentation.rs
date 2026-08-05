@@ -308,6 +308,7 @@ pub(crate) enum MenuSection {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RecommendationRow {
     sizes: Option<(u64, u64)>,
+    quantization: Option<&'static str>,
     availability: RecommendationAvailability,
 }
 
@@ -326,10 +327,9 @@ impl RecommendationRow {
 
     pub(crate) fn subtitle(&self) -> Option<String> {
         self.sizes.map(|(target_bytes, draft_bytes)| {
-            format!(
-                "12B · MTP · {}",
-                format_human_size(target_bytes.saturating_add(draft_bytes))
-            )
+            let size = format_human_size(target_bytes.saturating_add(draft_bytes));
+            let quantization = quantization_segment(self.quantization);
+            format!("12B · {quantization}MTP · {size}")
         })
     }
 
@@ -362,6 +362,7 @@ impl RecommendationRow {
 pub(crate) struct InstalledRow {
     target_bytes: u64,
     draft_bytes: u64,
+    quantization: Option<&'static str>,
     active_runtime: bool,
 }
 
@@ -371,10 +372,9 @@ impl InstalledRow {
     }
 
     pub(crate) fn subtitle(&self) -> String {
-        format!(
-            "MTP · {}",
-            format_human_size(self.target_bytes.saturating_add(self.draft_bytes))
-        )
+        let size = format_human_size(self.target_bytes.saturating_add(self.draft_bytes));
+        let quantization = quantization_segment(self.quantization);
+        format!("{quantization}MTP · {size}")
     }
 
     pub(crate) fn size_detail(&self) -> String {
@@ -533,6 +533,8 @@ const FIXTURE_TARGET_BYTES: u64 = 6_716_356_800;
 const FIXTURE_DRAFT_BYTES: u64 = 253_708_800;
 #[cfg(any(test, debug_assertions))]
 const FIXTURE_TOTAL_BYTES: u64 = FIXTURE_TARGET_BYTES + FIXTURE_DRAFT_BYTES;
+#[cfg(any(test, debug_assertions))]
+const FIXTURE_QUANTIZATION: &str = "Q4_K_M";
 
 #[cfg(any(test, debug_assertions))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -720,7 +722,7 @@ impl Fixture {
             ),
         };
 
-        MenuSnapshot::new(bundle, recommendation, download, runtime, inventory)
+        MenuSnapshot::new_fixture(bundle, recommendation, download, runtime, inventory)
             .expect("every built-in fixture is canonical")
     }
 }
@@ -763,6 +765,42 @@ impl MenuSnapshot {
         runtime: Runtime,
         runtime_inventory: RuntimeInventory,
     ) -> Result<Self, &'static str> {
+        Self::compose(
+            bundle,
+            recommendation,
+            download,
+            runtime,
+            runtime_inventory,
+            None,
+        )
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    fn new_fixture(
+        bundle: Bundle,
+        recommendation: Recommendation,
+        download: Download,
+        runtime: Runtime,
+        runtime_inventory: RuntimeInventory,
+    ) -> Result<Self, &'static str> {
+        Self::compose(
+            bundle,
+            recommendation,
+            download,
+            runtime,
+            runtime_inventory,
+            Some(FIXTURE_QUANTIZATION),
+        )
+    }
+
+    fn compose(
+        bundle: Bundle,
+        recommendation: Recommendation,
+        download: Download,
+        runtime: Runtime,
+        runtime_inventory: RuntimeInventory,
+        quantization: Option<&'static str>,
+    ) -> Result<Self, &'static str> {
         let body = match (bundle, recommendation, download) {
             (
                 Bundle::Absent,
@@ -773,11 +811,13 @@ impl MenuSnapshot {
                 Download::Idle,
             ) => MenuBody::CleanAbsence(RecommendationRow {
                 sizes: Some((target_bytes, draft_bytes)),
+                quantization,
                 availability: RecommendationAvailability::Eligible,
             }),
             (Bundle::Absent, Recommendation::Unavailable { reason, sizes }, Download::Idle) => {
                 MenuBody::CleanAbsence(RecommendationRow {
                     sizes,
+                    quantization,
                     availability: RecommendationAvailability::Unavailable(reason),
                 })
             }
@@ -791,6 +831,7 @@ impl MenuSnapshot {
             ) => MenuBody::Verified(InstalledRow {
                 target_bytes,
                 draft_bytes,
+                quantization,
                 active_runtime: matches!(runtime, Runtime::Running),
             }),
             (Bundle::Recovery(reason), Recommendation::Hidden, Download::Idle) => {
@@ -1078,6 +1119,10 @@ fn format_bytes(bytes: u64) -> String {
         output.push(digit);
     }
     output
+}
+
+fn quantization_segment(quantization: Option<&str>) -> String {
+    quantization.map_or_else(String::new, |value| format!("{value} · "))
 }
 
 fn format_human_size(bytes: u64) -> String {

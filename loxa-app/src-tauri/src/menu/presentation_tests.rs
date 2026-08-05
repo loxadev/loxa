@@ -8,34 +8,28 @@ const TARGET_BYTES: u64 = 6_716_356_800;
 const DRAFT_BYTES: u64 = 253_708_800;
 
 #[test]
-fn live_available_mapper_omits_unknown_quantization() {
-    let snapshot = MenuSnapshot::new(
-        Bundle::Absent,
-        Recommendation::available(TARGET_BYTES, DRAFT_BYTES),
-        Download::Idle,
-        Runtime::Idle,
-        RuntimeInventory::Missing,
-    )
-    .expect("a live available recommendation is canonical");
-
+fn recommendation_fixture_retains_its_quantization_metadata() {
     assert_eq!(
-        snapshot.recommendation_row().unwrap().subtitle().as_deref(),
-        Some("12B · MTP · 7.0 GB")
+        Fixture::Empty
+            .snapshot()
+            .recommendation_row()
+            .unwrap()
+            .subtitle()
+            .as_deref(),
+        Some("12B · Q4_K_M · MTP · 7.0 GB")
     );
 }
 
 #[test]
-fn live_verified_mapper_omits_unknown_quantization() {
-    let snapshot = MenuSnapshot::new(
-        Bundle::verified(TARGET_BYTES, DRAFT_BYTES),
-        Recommendation::Hidden,
-        Download::Idle,
-        Runtime::Idle,
-        RuntimeInventory::Missing,
-    )
-    .expect("a live verified bundle is canonical");
-
-    assert_eq!(snapshot.installed_row().unwrap().subtitle(), "MTP · 7.0 GB");
+fn installed_fixture_retains_its_quantization_metadata() {
+    assert_eq!(
+        Fixture::Installed
+            .snapshot()
+            .installed_row()
+            .unwrap()
+            .subtitle(),
+        "Q4_K_M · MTP · 7.0 GB"
+    );
 }
 
 #[test]

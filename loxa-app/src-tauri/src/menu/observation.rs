@@ -491,6 +491,9 @@ mod tests {
     };
     use crate::menu::presentation::{Fixture, MenuSnapshot};
 
+    const TARGET_BYTES: u64 = 6_716_356_800;
+    const DRAFT_BYTES: u64 = 253_708_800;
+
     fn assert_send_static<T: Send + 'static>() {}
 
     #[test]
@@ -533,6 +536,41 @@ mod tests {
         assert!(!transfer.has_fixture_action());
 
         let _mapper: fn(AppSnapshot) -> MenuSnapshot = map_app_snapshot;
+    }
+
+    #[test]
+    fn live_available_mapper_omits_unknown_quantization() {
+        let snapshot = map_core_snapshot(CoreObservation {
+            bundle: CoreBundle::Absent,
+            recommendation: CoreRecommendation::Available {
+                target_bytes: TARGET_BYTES,
+                draft_bytes: DRAFT_BYTES,
+            },
+            download: CoreDownload::Idle,
+            runtime: super::CoreRuntime::Idle,
+            runtime_inventory: super::CoreRuntimeInventory::Missing,
+        });
+
+        assert_eq!(
+            snapshot.recommendation_row().unwrap().subtitle().as_deref(),
+            Some("12B · MTP · 7.0 GB")
+        );
+    }
+
+    #[test]
+    fn live_verified_mapper_omits_unknown_quantization() {
+        let snapshot = map_core_snapshot(CoreObservation {
+            bundle: CoreBundle::Verified {
+                target_bytes: TARGET_BYTES,
+                draft_bytes: DRAFT_BYTES,
+            },
+            recommendation: CoreRecommendation::Hidden,
+            download: CoreDownload::Idle,
+            runtime: super::CoreRuntime::Idle,
+            runtime_inventory: super::CoreRuntimeInventory::Missing,
+        });
+
+        assert_eq!(snapshot.installed_row().unwrap().subtitle(), "MTP · 7.0 GB");
     }
 
     #[test]
