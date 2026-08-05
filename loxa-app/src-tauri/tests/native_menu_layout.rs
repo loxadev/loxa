@@ -10,6 +10,13 @@ mod menu {
     }
 
     pub(crate) mod macos {
+        pub(crate) mod timer {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/menu/macos/timer.rs"
+            ));
+        }
+
         pub(crate) mod rows {
             include!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -87,6 +94,56 @@ mod menu {
                 }
             }
         }
+
+        pub(crate) fn assert_native_timer_contract(mtm: objc2::MainThreadMarker) {
+            use std::cell::Cell;
+            use std::rc::Rc;
+
+            use objc2::rc::Weak;
+            use objc2_foundation::NSObject;
+
+            use timer::{weak_callback, ObservationTimer};
+
+            let ticks = Rc::new(Cell::new(0));
+            let observed = NSObject::new();
+            let callback_ticks = ticks.clone();
+            let mut timer = ObservationTimer::schedule(
+                3_600.0,
+                weak_callback(&observed, move |_| {
+                    callback_ticks.set(callback_ticks.get() + 1)
+                }),
+                mtm,
+            );
+            let timer_handle = timer.timer.as_ref().unwrap().clone();
+            timer_handle.fire();
+            assert_eq!(ticks.get(), 1);
+            drop(observed);
+            timer_handle.fire();
+            assert_eq!(ticks.get(), 1);
+            timer.shutdown();
+
+            let ticks = Rc::new(Cell::new(0));
+            let observed = NSObject::new();
+            let observed_weak = Weak::from_retained(&observed);
+            let callback_ticks = ticks.clone();
+            let mut timer = ObservationTimer::schedule(
+                3_600.0,
+                weak_callback(&observed, move |_| {
+                    callback_ticks.set(callback_ticks.get() + 1)
+                }),
+                mtm,
+            );
+            let timer_handle = timer.timer.as_ref().unwrap().clone();
+            let target_weak = Weak::from_retained(timer.callback_target.as_ref().unwrap());
+            timer_handle.fire();
+            assert_eq!(ticks.get(), 1);
+            timer.shutdown();
+            assert!(!timer_handle.isValid());
+            assert!(target_weak.load().is_none());
+            assert!(observed_weak.load().is_some());
+            timer_handle.fire();
+            assert_eq!(ticks.get(), 1);
+        }
     }
 }
 
@@ -95,6 +152,7 @@ fn main() {
     let mtm = objc2::MainThreadMarker::new()
         .expect("native popover layout coverage must run on the main thread");
     menu::macos::rows::assert_native_layout_contract(mtm);
+    menu::macos::assert_native_timer_contract(mtm);
 }
 
 #[cfg(not(target_os = "macos"))]

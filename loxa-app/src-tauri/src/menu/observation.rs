@@ -1,9 +1,7 @@
 #![cfg_attr(all(debug_assertions, not(test)), allow(dead_code))]
 
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(not(any(test, debug_assertions)))]
-use std::sync::mpsc;
-use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -316,26 +314,38 @@ pub(crate) struct ObservationClient {
 impl ObservationClient {
     #[cfg(not(any(test, debug_assertions)))]
     pub(crate) fn start() -> Self {
+        Self::assemble(|request_receiver, message_sender, stopping| {
+            std::thread::Builder::new()
+                .name("loxa-menu-observation".to_owned())
+                .spawn(move || {
+                    run_worker(
+                        AppService::from_env().map(AppSnapshotSource),
+                        request_receiver,
+                        message_sender,
+                        &stopping,
+                    );
+                })
+                .map(|_| ())
+                .map_err(|error| format!("Failed to start the observation worker: {error}"))
+        })
+    }
+
+    fn assemble(
+        spawn: impl FnOnce(
+            Receiver<WorkerRequest>,
+            Sender<ObservationMessage>,
+            Arc<AtomicBool>,
+        ) -> Result<(), String>,
+    ) -> Self {
         let (request_sender, request_receiver) = mpsc::channel();
         let (message_sender, receiver) = mpsc::channel();
-        let worker_sender = message_sender.clone();
         let stopping = Arc::new(AtomicBool::new(false));
-        let worker_stopping = Arc::clone(&stopping);
-        let spawn = std::thread::Builder::new()
-            .name("loxa-menu-observation".to_owned())
-            .spawn(move || {
-                run_worker(
-                    AppService::from_env().map(AppSnapshotSource),
-                    request_receiver,
-                    worker_sender,
-                    &worker_stopping,
-                );
-            });
-
-        if let Err(error) = spawn {
-            let _ = message_sender.send(ObservationMessage::Error(format!(
-                "Failed to start the observation worker: {error}"
-            )));
+        if let Err(error) = spawn(
+            request_receiver,
+            message_sender.clone(),
+            Arc::clone(&stopping),
+        ) {
+            let _ = message_sender.send(ObservationMessage::Error(error));
         }
         drop(message_sender);
 
@@ -349,7 +359,6 @@ impl ObservationClient {
         client
     }
 
-    #[cfg(not(any(test, debug_assertions)))]
     fn request_startup(&mut self) {
         if self.admission.admit_startup() {
             self.send_observation_request();
@@ -467,6 +476,8 @@ fn drain_observations(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc};
     use std::time::{Duration, Instant};
@@ -709,6 +720,29 @@ mod tests {
     #[test]
     fn observation_messages_are_owned_send_values() {
         assert_send_static::<ObservationMessage>();
+    }
+
+    #[test]
+    fn production_assembly_sends_exactly_one_startup_request() {
+        let captured_requests = Rc::new(RefCell::new(None));
+        let spawn_requests = captured_requests.clone();
+        let client = ObservationClient::assemble(move |requests, _messages, _stopping| {
+            *spawn_requests.borrow_mut() = Some(requests);
+            Ok(())
+        });
+        let requests = captured_requests
+            .borrow_mut()
+            .take()
+            .expect("the worker receiver must be handed to the spawner");
+
+        assert_eq!(requests.try_recv(), Ok(WorkerRequest::Observe));
+        assert_eq!(
+            requests.try_recv(),
+            Err(mpsc::TryRecvError::Empty),
+            "production assembly must enqueue only its one initial observation"
+        );
+
+        assert!(client.admission.in_flight);
     }
 
     struct FakeReader {

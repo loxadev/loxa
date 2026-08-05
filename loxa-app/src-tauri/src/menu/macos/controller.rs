@@ -6,20 +6,18 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use objc2::rc::Retained;
-#[cfg(not(any(test, debug_assertions)))]
-use objc2::rc::Weak;
-use objc2::runtime::{AnyObject, ProtocolObject};
+use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSAccessibility, NSPopover, NSPopoverBehavior, NSPopoverDelegate, NSStatusItem,
     NSViewController,
 };
-#[cfg(not(any(test, debug_assertions)))]
-use objc2_foundation::NSTimer;
 use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSRectEdge, NSString};
 use tauri::AppHandle;
 
 use super::rows::{Actions, MenuRows, PopoverContent};
+#[cfg(not(any(test, debug_assertions)))]
+use super::timer::{weak_callback, ObservationTimer};
 #[cfg(not(any(test, debug_assertions)))]
 use crate::menu::observation::{ObservationClient, ObservationMessage};
 #[cfg(any(test, debug_assertions))]
@@ -328,76 +326,6 @@ impl NativePopoverTarget {
     }
 }
 
-#[cfg(not(any(test, debug_assertions)))]
-struct NativePopoverTimerTargetIvars {
-    target: Weak<NativePopoverTarget>,
-}
-
-#[cfg(not(any(test, debug_assertions)))]
-define_class!(
-    // SAFETY: NSObject has no subclassing requirements, and this class has no Drop implementation.
-    #[unsafe(super = NSObject)]
-    #[thread_kind = MainThreadOnly]
-    #[ivars = NativePopoverTimerTargetIvars]
-    struct NativePopoverTimerTarget;
-
-    // SAFETY: NSObjectProtocol has no safety requirements.
-    unsafe impl NSObjectProtocol for NativePopoverTimerTarget {}
-
-    impl NativePopoverTimerTarget {
-        #[unsafe(method(drainObservation:))]
-        fn drain_observation(&self, _timer: Option<&NSTimer>) {
-            if let Some(target) = self.ivars().target.load() {
-                target.drain_observations();
-            }
-        }
-    }
-);
-
-#[cfg(not(any(test, debug_assertions)))]
-impl NativePopoverTimerTarget {
-    fn new(target: &Retained<NativePopoverTarget>, mtm: MainThreadMarker) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(NativePopoverTimerTargetIvars {
-            target: Weak::from_retained(target),
-        });
-
-        // SAFETY: NSObject's init selector has the expected signature.
-        unsafe { msg_send![super(this), init] }
-    }
-}
-
-trait Invalidatable {
-    fn invalidate(&self);
-}
-
-#[cfg(not(any(test, debug_assertions)))]
-impl Invalidatable for Retained<NSTimer> {
-    fn invalidate(&self) {
-        NSTimer::invalidate(self);
-    }
-}
-
-struct TimerRetention<T, C> {
-    timer: Option<T>,
-    callback_target: Option<C>,
-}
-
-impl<T: Invalidatable, C> TimerRetention<T, C> {
-    fn new(timer: T, callback_target: C) -> Self {
-        Self {
-            timer: Some(timer),
-            callback_target: Some(callback_target),
-        }
-    }
-
-    fn shutdown(&mut self) {
-        if let Some(timer) = self.timer.take() {
-            timer.invalidate();
-        }
-        self.callback_target.take();
-    }
-}
-
 pub(crate) struct NativePopoverController {
     status_item: Retained<NSStatusItem>,
     _popover: Retained<NSPopover>,
@@ -405,7 +333,7 @@ pub(crate) struct NativePopoverController {
     _delegate: Retained<NativePopoverDelegate>,
     _target: Retained<NativePopoverTarget>,
     #[cfg(not(any(test, debug_assertions)))]
-    timer: TimerRetention<Retained<NSTimer>, Retained<NativePopoverTimerTarget>>,
+    timer: ObservationTimer,
 }
 
 impl NativePopoverController {
@@ -444,21 +372,11 @@ impl NativePopoverController {
         popover.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
 
         #[cfg(not(any(test, debug_assertions)))]
-        let timer = {
-            let callback_target = NativePopoverTimerTarget::new(&target, mtm);
-            // SAFETY: the retained callback target implements drainObservation:
-            // and the timer is retained and invalidated on the main thread.
-            let timer = unsafe {
-                NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
-                    0.25,
-                    &callback_target,
-                    sel!(drainObservation:),
-                    None,
-                    true,
-                )
-            };
-            TimerRetention::new(timer, callback_target)
-        };
+        let timer = ObservationTimer::schedule(
+            0.25,
+            weak_callback(&target, NativePopoverTarget::drain_observations),
+            mtm,
+        );
 
         Self {
             status_item,
@@ -485,7 +403,16 @@ impl Drop for NativePopoverController {
     }
 }
 
+struct ProductionActionSelectors {
+    quit: Sel,
+}
+
+fn production_action_selectors() -> ProductionActionSelectors {
+    ProductionActionSelectors { quit: sel!(quit:) }
+}
+
 fn action_selectors() -> Actions {
+    let ProductionActionSelectors { quit } = production_action_selectors();
     Actions {
         #[cfg(any(test, debug_assertions))]
         start: sel!(startFixture:),
@@ -501,7 +428,7 @@ fn action_selectors() -> Actions {
         keep_partial: sel!(keepPartialFixture:),
         #[cfg(any(test, debug_assertions))]
         discard_partial: sel!(discardPartialFixture:),
-        quit: sel!(quit:),
+        quit,
     }
 }
 
@@ -516,46 +443,14 @@ fn selected_fixture() -> Fixture {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-    use std::rc::Rc;
+    use objc2::sel;
 
-    use super::{Invalidatable, TimerRetention};
+    use super::{production_action_selectors, ProductionActionSelectors};
 
     #[test]
-    fn retained_timer_invalidates_before_its_callback_target_is_dropped() {
-        let events = Rc::new(RefCell::new(Vec::new()));
-        let mut timer = TimerRetention::new(
-            RecordingTimer(events.clone()),
-            RecordingCallback(events.clone()),
-        );
+    fn production_actions_expose_quit_without_fixture_selectors() {
+        let ProductionActionSelectors { quit } = production_action_selectors();
 
-        timer.shutdown();
-
-        assert_eq!(
-            events.borrow().as_slice(),
-            ["invalidate", "timer drop", "callback drop"]
-        );
-    }
-
-    struct RecordingTimer(Rc<RefCell<Vec<&'static str>>>);
-
-    impl Invalidatable for RecordingTimer {
-        fn invalidate(&self) {
-            self.0.borrow_mut().push("invalidate");
-        }
-    }
-
-    impl Drop for RecordingTimer {
-        fn drop(&mut self) {
-            self.0.borrow_mut().push("timer drop");
-        }
-    }
-
-    struct RecordingCallback(Rc<RefCell<Vec<&'static str>>>);
-
-    impl Drop for RecordingCallback {
-        fn drop(&mut self) {
-            self.0.borrow_mut().push("callback drop");
-        }
+        assert_eq!(quit, sel!(quit:));
     }
 }
