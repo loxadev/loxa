@@ -79,7 +79,7 @@ pub(crate) fn run() {
     });
 }
 
-fn teardown_native_shell(app_handle: &AppHandle) {
+pub(crate) fn teardown_native_shell(app_handle: &AppHandle) {
     let shell = {
         let state = app_handle.state::<NativeShellState>();
         let mut state = state

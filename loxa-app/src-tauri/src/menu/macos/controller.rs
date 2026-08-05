@@ -1,18 +1,30 @@
+#![cfg_attr(all(debug_assertions, not(test)), allow(dead_code))]
+
 use std::cell::RefCell;
 use std::rc::Rc;
+#[cfg(not(any(test, debug_assertions)))]
+use std::time::Instant;
 
 use objc2::rc::Retained;
+#[cfg(not(any(test, debug_assertions)))]
+use objc2::rc::Weak;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSAccessibility, NSPopover, NSPopoverBehavior, NSPopoverDelegate, NSStatusItem,
     NSViewController,
 };
+#[cfg(not(any(test, debug_assertions)))]
+use objc2_foundation::NSTimer;
 use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSRectEdge, NSString};
 use tauri::AppHandle;
 
 use super::rows::{Actions, MenuRows, PopoverContent};
-use crate::menu::presentation::{Fixture, InlineCancelState, MenuAction, MenuSnapshot, MenuUpdate};
+#[cfg(not(any(test, debug_assertions)))]
+use crate::menu::observation::{ObservationClient, ObservationMessage};
+#[cfg(any(test, debug_assertions))]
+use crate::menu::presentation::{Fixture, InlineCancelState, MenuAction};
+use crate::menu::presentation::{MenuSnapshot, MenuUpdate};
 
 struct NativePopoverState {
     status_item: Retained<NSStatusItem>,
@@ -20,7 +32,10 @@ struct NativePopoverState {
     content_view_controller: Retained<NSViewController>,
     snapshot: MenuSnapshot,
     rendered: Option<MenuSnapshot>,
+    #[cfg(any(test, debug_assertions))]
     cancel: InlineCancelState,
+    #[cfg(not(any(test, debug_assertions)))]
+    observation: ObservationClient,
     rows: Option<MenuRows>,
 }
 
@@ -29,15 +44,22 @@ impl NativePopoverState {
         status_item: Retained<NSStatusItem>,
         popover: Retained<NSPopover>,
         content_view_controller: Retained<NSViewController>,
-        fixture: Fixture,
+        #[cfg(any(test, debug_assertions))] fixture: Fixture,
     ) -> Self {
+        #[cfg(any(test, debug_assertions))]
+        let snapshot = fixture.snapshot();
+        #[cfg(not(any(test, debug_assertions)))]
+        let snapshot = MenuSnapshot::loading();
         Self {
             status_item,
             popover,
             content_view_controller,
-            snapshot: fixture.snapshot(),
+            snapshot,
             rendered: None,
+            #[cfg(any(test, debug_assertions))]
             cancel: InlineCancelState::default(),
+            #[cfg(not(any(test, debug_assertions)))]
+            observation: ObservationClient::start(),
             rows: None,
         }
     }
@@ -47,7 +69,10 @@ impl NativePopoverState {
             MenuUpdate::Rebuild => self.rebuild(target, actions, mtm),
             MenuUpdate::UpdateRetainedRows => {
                 if let Some(rows) = &mut self.rows {
+                    #[cfg(any(test, debug_assertions))]
                     rows.update(&self.snapshot, &self.cancel);
+                    #[cfg(not(any(test, debug_assertions)))]
+                    rows.update(&self.snapshot);
                 } else {
                     self.rebuild(target, actions, mtm);
                 }
@@ -65,12 +90,16 @@ impl NativePopoverState {
     }
 
     fn popover_closed(&mut self) {
-        self.cancel.reset();
-        if let Some(rows) = &mut self.rows {
-            rows.update_cancel_controls(&self.cancel);
+        #[cfg(any(test, debug_assertions))]
+        {
+            self.cancel.reset();
+            if let Some(rows) = &mut self.rows {
+                rows.update_cancel_controls(&self.cancel);
+            }
         }
     }
 
+    #[cfg(any(test, debug_assertions))]
     fn apply_fixture_action(&mut self, action: MenuAction) -> bool {
         let Some(snapshot) = self.snapshot.apply_fixture_action(action) else {
             return false;
@@ -80,6 +109,7 @@ impl NativePopoverState {
         true
     }
 
+    #[cfg(any(test, debug_assertions))]
     fn show_cancel_confirmation(&mut self) {
         if let Some(rows) = &mut self.rows {
             rows.show_cancel_confirmation(&mut self.cancel);
@@ -88,11 +118,13 @@ impl NativePopoverState {
         }
     }
 
+    #[cfg(any(test, debug_assertions))]
     fn keep_partial_fixture(&mut self) {
         self.cancel.keep_partial();
         self.update_cancel_controls();
     }
 
+    #[cfg(any(test, debug_assertions))]
     fn discard_partial_fixture(&mut self) -> bool {
         if !self.cancel.discard_partial() {
             return false;
@@ -104,10 +136,33 @@ impl NativePopoverState {
         true
     }
 
+    #[cfg(any(test, debug_assertions))]
     fn update_cancel_controls(&mut self) {
         if let Some(rows) = &mut self.rows {
             rows.update_cancel_controls(&self.cancel);
         }
+    }
+
+    fn popover_opened(&mut self) {
+        #[cfg(not(any(test, debug_assertions)))]
+        self.observation.request_popover_open(Instant::now());
+    }
+
+    #[cfg(not(any(test, debug_assertions)))]
+    fn drain_observations(&mut self, target: &AnyObject, actions: Actions, mtm: MainThreadMarker) {
+        let Some(message) = self.observation.drain(Instant::now()) else {
+            return;
+        };
+        self.snapshot = match message {
+            ObservationMessage::Snapshot(snapshot) => snapshot,
+            ObservationMessage::Error(error) => MenuSnapshot::error(error),
+        };
+        self.render(target, actions, mtm);
+    }
+
+    fn shutdown(&mut self) {
+        #[cfg(not(any(test, debug_assertions)))]
+        self.observation.shutdown();
     }
 }
 
@@ -160,36 +215,43 @@ define_class!(
     unsafe impl NSObjectProtocol for NativePopoverTarget {}
 
     impl NativePopoverTarget {
+        #[cfg(any(test, debug_assertions))]
         #[unsafe(method(startFixture:))]
         fn start_fixture(&self, _sender: Option<&AnyObject>) {
             self.apply_action(MenuAction::Start);
         }
 
+        #[cfg(any(test, debug_assertions))]
         #[unsafe(method(pauseFixture:))]
         fn pause_fixture(&self, _sender: Option<&AnyObject>) {
             self.apply_action(MenuAction::Pause);
         }
 
+        #[cfg(any(test, debug_assertions))]
         #[unsafe(method(resumeFixture:))]
         fn resume_fixture(&self, _sender: Option<&AnyObject>) {
             self.apply_action(MenuAction::Resume);
         }
 
+        #[cfg(any(test, debug_assertions))]
         #[unsafe(method(retryFixture:))]
         fn retry_fixture(&self, _sender: Option<&AnyObject>) {
             self.apply_action(MenuAction::Retry);
         }
 
+        #[cfg(any(test, debug_assertions))]
         #[unsafe(method(showCancelConfirmation:))]
         fn show_cancel_confirmation(&self, _sender: Option<&AnyObject>) {
             self.ivars().state.borrow_mut().show_cancel_confirmation();
         }
 
+        #[cfg(any(test, debug_assertions))]
         #[unsafe(method(keepPartialFixture:))]
         fn keep_partial_fixture(&self, _sender: Option<&AnyObject>) {
             self.ivars().state.borrow_mut().keep_partial_fixture();
         }
 
+        #[cfg(any(test, debug_assertions))]
         #[unsafe(method(discardPartialFixture:))]
         fn discard_partial_fixture(&self, _sender: Option<&AnyObject>) {
             let mtm = MainThreadMarker::new()
@@ -202,7 +264,9 @@ define_class!(
 
         #[unsafe(method(quit:))]
         fn quit(&self, _sender: Option<&AnyObject>) {
-            self.ivars().app_handle.exit(0);
+            let app_handle = self.ivars().app_handle.clone();
+            crate::app::teardown_native_shell(&app_handle);
+            app_handle.exit(0);
         }
     }
 );
@@ -219,6 +283,7 @@ impl NativePopoverTarget {
         unsafe { msg_send![super(this), init] }
     }
 
+    #[cfg(any(test, debug_assertions))]
     fn apply_action(&self, action: MenuAction) {
         let mtm =
             MainThreadMarker::new().expect("AppKit must send popover actions on the main thread");
@@ -242,10 +307,96 @@ impl NativePopoverTarget {
             return;
         }
 
+        self.ivars().state.borrow_mut().popover_opened();
+
         let button = status_item
             .button(mtm)
             .expect("the macOS status item must expose its button");
         popover.showRelativeToRect_ofView_preferredEdge(button.bounds(), &button, NSRectEdge::MinY);
+    }
+
+    #[cfg(not(any(test, debug_assertions)))]
+    fn drain_observations(&self) {
+        let mtm =
+            MainThreadMarker::new().expect("AppKit must drain observations on the main thread");
+        self.ivars()
+            .state
+            .borrow_mut()
+            .drain_observations(self, action_selectors(), mtm);
+    }
+
+    fn shutdown(&self) {
+        self.ivars().state.borrow_mut().shutdown();
+    }
+}
+
+#[cfg(not(any(test, debug_assertions)))]
+struct NativePopoverTimerTargetIvars {
+    target: Weak<NativePopoverTarget>,
+}
+
+#[cfg(not(any(test, debug_assertions)))]
+define_class!(
+    // SAFETY: NSObject has no subclassing requirements, and this class has no Drop implementation.
+    #[unsafe(super = NSObject)]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = NativePopoverTimerTargetIvars]
+    struct NativePopoverTimerTarget;
+
+    // SAFETY: NSObjectProtocol has no safety requirements.
+    unsafe impl NSObjectProtocol for NativePopoverTimerTarget {}
+
+    impl NativePopoverTimerTarget {
+        #[unsafe(method(drainObservation:))]
+        fn drain_observation(&self, _timer: Option<&NSTimer>) {
+            if let Some(target) = self.ivars().target.load() {
+                target.drain_observations();
+            }
+        }
+    }
+);
+
+#[cfg(not(any(test, debug_assertions)))]
+impl NativePopoverTimerTarget {
+    fn new(target: &Retained<NativePopoverTarget>, mtm: MainThreadMarker) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(NativePopoverTimerTargetIvars {
+            target: Weak::from_retained(target),
+        });
+
+        // SAFETY: NSObject's init selector has the expected signature.
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+trait Invalidatable {
+    fn invalidate(&self);
+}
+
+#[cfg(not(any(test, debug_assertions)))]
+impl Invalidatable for Retained<NSTimer> {
+    fn invalidate(&self) {
+        NSTimer::invalidate(self);
+    }
+}
+
+struct TimerRetention<T, C> {
+    timer: Option<T>,
+    callback_target: Option<C>,
+}
+
+impl<T: Invalidatable, C> TimerRetention<T, C> {
+    fn new(timer: T, callback_target: C) -> Self {
+        Self {
+            timer: Some(timer),
+            callback_target: Some(callback_target),
+        }
+    }
+
+    fn shutdown(&mut self) {
+        if let Some(timer) = self.timer.take() {
+            timer.invalidate();
+        }
+        self.callback_target.take();
     }
 }
 
@@ -255,6 +406,8 @@ pub(crate) struct NativePopoverController {
     _content_view_controller: Retained<NSViewController>,
     _delegate: Retained<NativePopoverDelegate>,
     _target: Retained<NativePopoverTarget>,
+    #[cfg(not(any(test, debug_assertions)))]
+    timer: TimerRetention<Retained<NSTimer>, Retained<NativePopoverTimerTarget>>,
 }
 
 impl NativePopoverController {
@@ -277,11 +430,13 @@ impl NativePopoverController {
         let content_view_controller = NSViewController::new(mtm);
         popover.setContentViewController(Some(&content_view_controller));
 
+        #[cfg(any(test, debug_assertions))]
         let fixture = selected_fixture();
         let state = Rc::new(RefCell::new(NativePopoverState::new(
             status_item.clone(),
             popover.clone(),
             content_view_controller.clone(),
+            #[cfg(any(test, debug_assertions))]
             fixture,
         )));
         let target = NativePopoverTarget::new(app_handle, state.clone(), mtm);
@@ -290,12 +445,31 @@ impl NativePopoverController {
         let delegate = NativePopoverDelegate::new(state, mtm);
         popover.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
 
+        #[cfg(not(any(test, debug_assertions)))]
+        let timer = {
+            let callback_target = NativePopoverTimerTarget::new(&target, mtm);
+            // SAFETY: the retained callback target implements drainObservation:
+            // and the timer is retained and invalidated on the main thread.
+            let timer = unsafe {
+                NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+                    0.25,
+                    &callback_target,
+                    sel!(drainObservation:),
+                    None,
+                    true,
+                )
+            };
+            TimerRetention::new(timer, callback_target)
+        };
+
         Self {
             status_item,
             _popover: popover,
             _content_view_controller: content_view_controller,
             _delegate: delegate,
             _target: target,
+            #[cfg(not(any(test, debug_assertions)))]
+            timer,
         }
     }
 
@@ -306,24 +480,34 @@ impl NativePopoverController {
 
 impl Drop for NativePopoverController {
     fn drop(&mut self) {
+        #[cfg(not(any(test, debug_assertions)))]
+        self.timer.shutdown();
+        self._target.shutdown();
         self.status_item.setMenu(None);
     }
 }
 
 fn action_selectors() -> Actions {
     Actions {
+        #[cfg(any(test, debug_assertions))]
         start: sel!(startFixture:),
+        #[cfg(any(test, debug_assertions))]
         pause: sel!(pauseFixture:),
+        #[cfg(any(test, debug_assertions))]
         resume: sel!(resumeFixture:),
+        #[cfg(any(test, debug_assertions))]
         retry: sel!(retryFixture:),
+        #[cfg(any(test, debug_assertions))]
         cancel: sel!(showCancelConfirmation:),
+        #[cfg(any(test, debug_assertions))]
         keep_partial: sel!(keepPartialFixture:),
+        #[cfg(any(test, debug_assertions))]
         discard_partial: sel!(discardPartialFixture:),
         quit: sel!(quit:),
     }
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(test, debug_assertions))]
 fn selected_fixture() -> Fixture {
     std::env::var("LOXA_MENU_FIXTURE")
         .ok()
@@ -332,7 +516,48 @@ fn selected_fixture() -> Fixture {
         .unwrap_or(Fixture::Empty)
 }
 
-#[cfg(not(debug_assertions))]
-fn selected_fixture() -> Fixture {
-    Fixture::Empty
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use super::{Invalidatable, TimerRetention};
+
+    #[test]
+    fn retained_timer_invalidates_before_its_callback_target_is_dropped() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut timer = TimerRetention::new(
+            RecordingTimer(events.clone()),
+            RecordingCallback(events.clone()),
+        );
+
+        timer.shutdown();
+
+        assert_eq!(
+            events.borrow().as_slice(),
+            ["invalidate", "timer drop", "callback drop"]
+        );
+    }
+
+    struct RecordingTimer(Rc<RefCell<Vec<&'static str>>>);
+
+    impl Invalidatable for RecordingTimer {
+        fn invalidate(&self) {
+            self.0.borrow_mut().push("invalidate");
+        }
+    }
+
+    impl Drop for RecordingTimer {
+        fn drop(&mut self) {
+            self.0.borrow_mut().push("timer drop");
+        }
+    }
+
+    struct RecordingCallback(Rc<RefCell<Vec<&'static str>>>);
+
+    impl Drop for RecordingCallback {
+        fn drop(&mut self) {
+            self.0.borrow_mut().push("callback drop");
+        }
+    }
 }

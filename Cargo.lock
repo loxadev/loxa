@@ -2071,6 +2071,7 @@ name = "loxa-app"
 version = "0.1.0"
 dependencies = [
  "dispatch2",
+ "loxa",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",

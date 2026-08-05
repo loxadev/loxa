@@ -1,4 +1,5 @@
 use crate::catalog::{self, BundlePending, Manifest};
+use crate::paths::AppPaths;
 use crate::runtime::{ForegroundObservation, ForegroundObserver, RuntimeProvenance};
 use std::fs;
 use std::path::Path;
@@ -229,6 +230,26 @@ impl SnapshotReader {
     fn observe_with_budget(&mut self, budget: Option<ResourceBudget>) -> AppSnapshot {
         let foreground = self.foreground.observe(&self.paths.managed_server);
         AppSnapshot::from_observation(observe_bundle(&self.paths.models), budget, foreground)
+    }
+}
+
+pub struct AppService {
+    reader: SnapshotReader,
+}
+
+impl AppService {
+    pub fn from_paths(paths: AppPaths) -> Self {
+        Self {
+            reader: SnapshotReader::new(paths),
+        }
+    }
+
+    pub fn from_env() -> Result<Self, String> {
+        Ok(Self::from_paths(AppPaths::from_env()?))
+    }
+
+    pub fn snapshot(&mut self) -> AppSnapshot {
+        self.reader.observe()
     }
 }
 
@@ -476,8 +497,8 @@ mod tests {
     #[cfg(unix)]
     use super::{destination_free_bytes_for_mounts, existing_destination_ancestor};
     use super::{
-        AppSnapshot, BundleSnapshot, BundleUnavailableReason, DownloadSnapshot, PartialBundle,
-        PausedDownload, RecommendationAvailability, RecommendationSnapshot,
+        AppService, AppSnapshot, BundleSnapshot, BundleUnavailableReason, DownloadSnapshot,
+        PartialBundle, PausedDownload, RecommendationAvailability, RecommendationSnapshot,
         RecommendationUnavailableReason, RecommendedBundle, ResourceBudget,
         RuntimeInventorySnapshot, RuntimeSnapshot, SnapshotReader, VerifiedBundle,
     };
@@ -770,6 +791,18 @@ mod tests {
         assert_send_sync::<PausedDownload>();
         assert_send_sync::<RuntimeSnapshot>();
         assert_send_sync::<RuntimeInventorySnapshot>();
+    }
+
+    #[test]
+    fn app_service_from_paths_observes_like_the_wrapped_snapshot_reader() {
+        let root = tempdir().unwrap();
+        let paths = test_paths(root.path());
+        let mut reader = SnapshotReader::new(paths.clone());
+        let mut service = AppService::from_paths(paths);
+
+        assert_eq!(service.snapshot(), reader.observe());
+
+        let _: fn() -> Result<AppService, String> = AppService::from_env;
     }
 
     #[test]

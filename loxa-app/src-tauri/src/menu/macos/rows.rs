@@ -11,9 +11,9 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{NSInteger, NSPoint, NSRect, NSSize, NSString};
 
-use crate::menu::presentation::{
-    InlineCancelState, MenuAction, MenuLayout, MenuSnapshot, RecommendationRow, TransferRow,
-};
+#[cfg(any(test, debug_assertions))]
+use crate::menu::presentation::{InlineCancelState, MenuAction};
+use crate::menu::presentation::{MenuLayout, MenuSnapshot, RecommendationRow, TransferRow};
 
 const ROW_WIDTH: f64 = MenuLayout::BASE_WIDTH;
 const CONTENT_INSET: f64 = MenuLayout::OUTER_PADDING + MenuLayout::INNER_PADDING;
@@ -26,12 +26,19 @@ const FINAL_CONTENT_SPACER_HEIGHT: f64 = 4.0;
 
 #[derive(Clone, Copy)]
 pub(super) struct Actions {
+    #[cfg(any(test, debug_assertions))]
     pub(super) start: Sel,
+    #[cfg(any(test, debug_assertions))]
     pub(super) pause: Sel,
+    #[cfg(any(test, debug_assertions))]
     pub(super) resume: Sel,
+    #[cfg(any(test, debug_assertions))]
     pub(super) retry: Sel,
+    #[cfg(any(test, debug_assertions))]
     pub(super) cancel: Sel,
+    #[cfg(any(test, debug_assertions))]
     pub(super) keep_partial: Sel,
+    #[cfg(any(test, debug_assertions))]
     pub(super) discard_partial: Sel,
     pub(super) quit: Sel,
 }
@@ -65,7 +72,17 @@ impl MenuRows {
         layout.add(&header.root, HEADER_HEIGHT);
         layout.add_separator(mtm);
 
-        let body = if let Some(recommendation) = snapshot.recommendation_row() {
+        let body = if snapshot.is_loading() {
+            layout.add(&section_header("Status", mtm), SECTION_HEIGHT);
+            let row = StatusNativeRow::build("Loading Loxa status…", mtm);
+            layout.add(&row.root, 56.0);
+            BodyRows::Status(row)
+        } else if let Some(error) = snapshot.error_message() {
+            layout.add(&section_header("Status", mtm), SECTION_HEIGHT);
+            let row = StatusNativeRow::build(error, mtm);
+            layout.add(&row.root, 56.0);
+            BodyRows::Status(row)
+        } else if let Some(recommendation) = snapshot.recommendation_row() {
             layout.add(&section_header("Installed", mtm), SECTION_HEIGHT);
             layout.add(&empty_installed_row(mtm), MenuLayout::model_row_height());
             layout.add_separator(mtm);
@@ -73,7 +90,7 @@ impl MenuRows {
                 &section_header("Recommended for this Mac", mtm),
                 SECTION_HEIGHT,
             );
-            let row = RecommendationNativeRow::build(recommendation, target, actions.start, mtm);
+            let row = RecommendationNativeRow::build(recommendation, target, actions, mtm);
             layout.add(&row.root, 56.0);
             BodyRows::Recommendation(row)
         } else if let Some(installed) = snapshot.installed_row() {
@@ -122,10 +139,21 @@ impl MenuRows {
         }
     }
 
-    pub(super) fn update(&mut self, snapshot: &MenuSnapshot, cancel: &InlineCancelState) {
+    pub(super) fn update(
+        &mut self,
+        snapshot: &MenuSnapshot,
+        #[cfg(any(test, debug_assertions))] cancel: &InlineCancelState,
+    ) {
         self.header.update(snapshot);
         self.footer.update(snapshot);
         match &mut self.body {
+            BodyRows::Status(row) => {
+                if snapshot.is_loading() {
+                    row.update("Loading Loxa status…");
+                } else if let Some(error) = snapshot.error_message() {
+                    row.update(error);
+                }
+            }
             BodyRows::Recommendation(row) => {
                 if let Some(recommendation) = snapshot.recommendation_row() {
                     row.update(recommendation);
@@ -144,18 +172,21 @@ impl MenuRows {
             BodyRows::Transfer(row) => {
                 if let Some(transfer) = snapshot.transfer_row() {
                     row.update(transfer);
+                    #[cfg(any(test, debug_assertions))]
                     row.update_cancel_controls(cancel);
                 }
             }
         }
     }
 
+    #[cfg(any(test, debug_assertions))]
     pub(super) fn update_cancel_controls(&mut self, cancel: &InlineCancelState) {
         if let BodyRows::Transfer(row) = &mut self.body {
             row.update_cancel_controls(cancel);
         }
     }
 
+    #[cfg(any(test, debug_assertions))]
     pub(super) fn show_cancel_confirmation(&mut self, cancel: &mut InlineCancelState) {
         cancel.activate_cancel();
         self.update_cancel_controls(cancel);
@@ -221,6 +252,7 @@ fn content_height(snapshot: &MenuSnapshot) -> f64 {
 }
 
 enum BodyRows {
+    Status(StatusNativeRow),
     Recommendation(RecommendationNativeRow),
     Installed(InstalledNativeRow),
     Recovery(RecoveryNativeRow),
@@ -231,6 +263,7 @@ enum BodyRows {
 impl BodyRows {
     fn action_buttons(&self) -> Vec<Retained<NSButton>> {
         match self {
+            Self::Status(_) => Vec::new(),
             Self::Recommendation(row) => row.action_buttons(),
             Self::Transfer(row) => row.action_buttons(),
             Self::Installed(_) | Self::Recovery(_) => Vec::new(),
@@ -346,6 +379,30 @@ impl RecoveryNativeRow {
     }
 }
 
+struct StatusNativeRow {
+    root: Retained<NSView>,
+    detail: Retained<NSTextField>,
+}
+
+impl StatusNativeRow {
+    fn build(detail: &str, mtm: MainThreadMarker) -> Self {
+        let root = row_shell(56.0, mtm);
+        let labels = vertical_stack(mtm);
+        labels.addArrangedSubview(&primary_label("Loxa status", mtm));
+        let detail_label = secondary_label(detail, mtm);
+        labels.addArrangedSubview(&detail_label);
+        pin_to_content(&root, &labels);
+        Self {
+            root,
+            detail: detail_label,
+        }
+    }
+
+    fn update(&mut self, detail: &str) {
+        set_label(&self.detail, detail);
+    }
+}
+
 struct RecommendationNativeRow {
     root: Retained<NSView>,
     subtitle: Retained<NSTextField>,
@@ -358,10 +415,14 @@ impl RecommendationNativeRow {
     fn build(
         recommendation: &RecommendationRow,
         target: Option<&AnyObject>,
-        start: Sel,
+        actions: Actions,
         mtm: MainThreadMarker,
     ) -> Self {
-        let root = if recommendation.action().is_some() {
+        #[cfg(any(test, debug_assertions))]
+        let actionable = recommendation.action().is_some();
+        #[cfg(not(any(test, debug_assertions)))]
+        let actionable = false;
+        let root = if actionable {
             hover_row_shell(56.0, mtm).into_super()
         } else {
             row_shell(56.0, mtm)
@@ -370,12 +431,9 @@ impl RecommendationNativeRow {
         let icon = icon_container("sparkles", None, mtm);
         let labels = vertical_stack(mtm);
         labels.addArrangedSubview(&primary_label("Gemma 4", mtm));
-        let subtitle = secondary_label(&recommendation.subtitle(), mtm);
-        set_label_with_detail(
-            &subtitle,
-            &recommendation.subtitle(),
-            &recommendation.size_detail(),
-        );
+        let subtitle_text = recommendation.subtitle();
+        let subtitle = secondary_label(subtitle_text.as_deref().unwrap_or(""), mtm);
+        apply_recommendation_size(&subtitle, recommendation);
         labels.addArrangedSubview(&subtitle);
         let availability = secondary_label(
             recommendation
@@ -389,12 +447,13 @@ impl RecommendationNativeRow {
 
         #[cfg(test)]
         let mut action_button = None;
-        if recommendation.action().is_some() {
+        #[cfg(any(test, debug_assertions))]
+        if actionable {
             let button = icon_button(
                 "arrow.down.circle",
                 "Download Gemma 4 12B",
                 target,
-                start,
+                actions.start,
                 mtm,
             );
             #[cfg(test)]
@@ -403,6 +462,8 @@ impl RecommendationNativeRow {
             }
             stack.addArrangedSubview(&button);
         }
+        #[cfg(not(any(test, debug_assertions)))]
+        let _ = (target, actions);
         pin_to_content(&root, &stack);
 
         Self {
@@ -415,11 +476,7 @@ impl RecommendationNativeRow {
     }
 
     fn update(&mut self, recommendation: &RecommendationRow) {
-        set_label_with_detail(
-            &self.subtitle,
-            &recommendation.subtitle(),
-            &recommendation.size_detail(),
-        );
+        apply_recommendation_size(&self.subtitle, recommendation);
         set_label(
             &self.availability,
             recommendation
@@ -440,9 +497,12 @@ struct TransferNativeRow {
     progress_text: Retained<NSTextField>,
     progress: Retained<NSProgressIndicator>,
     #[cfg(test)]
-    primary_button: Retained<NSButton>,
+    primary_button: Option<Retained<NSButton>>,
+    #[cfg(any(test, debug_assertions))]
     cancel_button: Retained<NSButton>,
+    #[cfg(any(test, debug_assertions))]
     keep_button: Retained<NSButton>,
+    #[cfg(any(test, debug_assertions))]
     discard_button: Retained<NSButton>,
 }
 
@@ -453,12 +513,28 @@ impl TransferNativeRow {
         actions: Actions,
         mtm: MainThreadMarker,
     ) -> Self {
-        let root = hover_row_shell(MenuLayout::transfer_row_height(), mtm).into_super();
+        #[cfg(any(test, debug_assertions))]
+        let root = if transfer.has_fixture_action() {
+            hover_row_shell(MenuLayout::transfer_row_height(), mtm).into_super()
+        } else {
+            row_shell(MenuLayout::transfer_row_height(), mtm)
+        };
+        #[cfg(not(any(test, debug_assertions)))]
+        let root = row_shell(MenuLayout::transfer_row_height(), mtm);
         let stack = vertical_stack(mtm);
         let title_row = horizontal_stack(mtm);
         title_row.addArrangedSubview(&primary_label("Gemma 4 12B", mtm));
-        let primary = primary_action_button(transfer.primary_action(), target, actions, mtm);
-        title_row.addArrangedSubview(&primary);
+        #[cfg(test)]
+        let mut primary_button = None;
+        #[cfg(any(test, debug_assertions))]
+        if transfer.has_fixture_action() {
+            let primary = primary_action_button(transfer.primary_action(), target, actions, mtm);
+            #[cfg(test)]
+            {
+                primary_button = Some(primary.clone());
+            }
+            title_row.addArrangedSubview(&primary);
+        }
         stack.addArrangedSubview(&title_row);
 
         let phase = secondary_label(transfer.phase_label(), mtm);
@@ -483,7 +559,9 @@ impl TransferNativeRow {
         stack.addArrangedSubview(&progress);
         stack.addArrangedSubview(&progress_text);
 
+        #[cfg(any(test, debug_assertions))]
         let action_row = horizontal_stack(mtm);
+        #[cfg(any(test, debug_assertions))]
         let cancel_button = text_button(
             MenuAction::Cancel
                 .confirmation_label()
@@ -495,6 +573,7 @@ impl TransferNativeRow {
             actions.cancel,
             mtm,
         );
+        #[cfg(any(test, debug_assertions))]
         let keep_button = text_button(
             MenuAction::KeepPartial
                 .confirmation_label()
@@ -506,6 +585,7 @@ impl TransferNativeRow {
             actions.keep_partial,
             mtm,
         );
+        #[cfg(any(test, debug_assertions))]
         let discard_button = text_button(
             MenuAction::DiscardPartial
                 .confirmation_label()
@@ -517,12 +597,17 @@ impl TransferNativeRow {
             actions.discard_partial,
             mtm,
         );
-        keep_button.setHidden(true);
-        discard_button.setHidden(true);
-        action_row.addArrangedSubview(&cancel_button);
-        action_row.addArrangedSubview(&keep_button);
-        action_row.addArrangedSubview(&discard_button);
-        stack.addArrangedSubview(&action_row);
+        #[cfg(any(test, debug_assertions))]
+        if transfer.has_fixture_action() {
+            keep_button.setHidden(true);
+            discard_button.setHidden(true);
+            action_row.addArrangedSubview(&cancel_button);
+            action_row.addArrangedSubview(&keep_button);
+            action_row.addArrangedSubview(&discard_button);
+            stack.addArrangedSubview(&action_row);
+        }
+        #[cfg(not(any(test, debug_assertions)))]
+        let _ = (target, actions);
         pin_to_content(&root, &stack);
 
         Self {
@@ -531,9 +616,12 @@ impl TransferNativeRow {
             progress_text,
             progress,
             #[cfg(test)]
-            primary_button: primary.clone(),
+            primary_button,
+            #[cfg(any(test, debug_assertions))]
             cancel_button,
+            #[cfg(any(test, debug_assertions))]
             keep_button,
+            #[cfg(any(test, debug_assertions))]
             discard_button,
         }
     }
@@ -548,6 +636,7 @@ impl TransferNativeRow {
         self.progress.setDoubleValue(transfer.progress_fraction());
     }
 
+    #[cfg(any(test, debug_assertions))]
     fn update_cancel_controls(&mut self, cancel: &InlineCancelState) {
         let confirming = cancel
             .visible_actions()
@@ -560,7 +649,9 @@ impl TransferNativeRow {
     #[cfg(test)]
     fn action_buttons(&self) -> Vec<Retained<NSButton>> {
         vec![
-            self.primary_button.clone(),
+            self.primary_button
+                .clone()
+                .expect("fixture transfer rows retain their primary action"),
             self.cancel_button.clone(),
             self.keep_button.clone(),
             self.discard_button.clone(),
@@ -908,6 +999,7 @@ fn add_centered_icon_image(container: &NSBox, image: &NSImageView) {
     );
 }
 
+#[cfg(any(test, debug_assertions))]
 fn primary_action_button(
     action: MenuAction,
     target: Option<&AnyObject>,
@@ -923,6 +1015,7 @@ fn primary_action_button(
     icon_button(symbol, label, target, selector, mtm)
 }
 
+#[cfg(any(test, debug_assertions))]
 fn icon_button(
     symbol: &str,
     accessibility_label: &str,
@@ -1008,6 +1101,22 @@ fn set_label_with_detail(label: &NSTextField, text: &str, detail: &str) {
     set_label(label, text);
     label.setToolTip(Some(&NSString::from_str(detail)));
     label.setAccessibilityLabel(Some(&NSString::from_str(&format!("{text}; {detail}"))));
+}
+
+fn apply_recommendation_size(label: &NSTextField, recommendation: &RecommendationRow) {
+    match (recommendation.subtitle(), recommendation.size_detail()) {
+        (Some(text), Some(detail)) => {
+            set_label_with_detail(label, &text, &detail);
+            label.setHidden(false);
+        }
+        (None, None) => {
+            set_label(label, "");
+            label.setToolTip(None);
+            label.setAccessibilityLabel(None);
+            label.setHidden(true);
+        }
+        _ => unreachable!("recommendation size text and detail stay paired"),
+    }
 }
 
 fn footer_text(snapshot: &MenuSnapshot) -> String {

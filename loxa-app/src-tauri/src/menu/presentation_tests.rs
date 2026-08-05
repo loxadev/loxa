@@ -8,6 +8,22 @@ const TARGET_BYTES: u64 = 6_716_356_800;
 const DRAFT_BYTES: u64 = 253_708_800;
 
 #[test]
+fn loading_and_setup_error_are_owned_menu_states_not_fixture_snapshots() {
+    let loading = MenuSnapshot::loading();
+    assert!(loading.is_loading());
+    assert_eq!(loading.runtime_label(), "Loading");
+    assert_eq!(loading.error_message(), None);
+
+    let error = MenuSnapshot::error("set LOXA_HOME, HOME, or USERPROFILE".to_owned());
+    assert!(!error.is_loading());
+    assert_eq!(error.runtime_label(), "Runtime: Unavailable");
+    assert_eq!(
+        error.error_message(),
+        Some("set LOXA_HOME, HOME, or USERPROFILE")
+    );
+}
+
+#[test]
 fn clean_absence_composes_a_recommended_bundle_with_a_start_action() {
     let snapshot = MenuSnapshot::new(
         Bundle::Absent,
@@ -32,8 +48,14 @@ fn clean_absence_composes_a_recommended_bundle_with_a_start_action() {
         .recommendation_row()
         .expect("clean absence renders its one recommendation row");
     assert_eq!(recommendation.action(), Some(MenuAction::Start));
-    assert_eq!(recommendation.subtitle(), "12B · Q4_K_M · MTP · 7.0 GB");
-    assert_eq!(recommendation.size_detail(), "6,970,065,600 bytes");
+    assert_eq!(
+        recommendation.subtitle().as_deref(),
+        Some("12B · Q4_K_M · MTP · 7.0 GB")
+    );
+    assert_eq!(
+        recommendation.size_detail().as_deref(),
+        Some("6,970,065,600 bytes")
+    );
 }
 
 #[test]
@@ -48,8 +70,14 @@ fn visible_download_sizes_use_decimal_units_but_keep_exact_byte_details() {
     )
     .expect("an eligible fixture is canonical");
     let recommendation = recommended.recommendation_row().unwrap();
-    assert_eq!(recommendation.subtitle(), "12B · Q4_K_M · MTP · 7.0 GB");
-    assert_eq!(recommendation.size_detail(), "6,970,065,600 bytes");
+    assert_eq!(
+        recommendation.subtitle().as_deref(),
+        Some("12B · Q4_K_M · MTP · 7.0 GB")
+    );
+    assert_eq!(
+        recommendation.size_detail().as_deref(),
+        Some("6,970,065,600 bytes")
+    );
 
     let downloading = MenuSnapshot::new(
         Bundle::Partial,
@@ -189,8 +217,14 @@ fn clean_ineligible_absence_keeps_the_recommendation_visible_but_disabled() {
         let recommendation = snapshot.recommendation_row().unwrap();
         assert_eq!(recommendation.action(), None);
         assert_eq!(recommendation.disabled_reason(), Some(expected_detail));
-        assert_eq!(recommendation.subtitle(), "12B · Q4_K_M · MTP · 7.0 GB");
-        assert_eq!(recommendation.size_detail(), "6,970,065,600 bytes");
+        assert_eq!(
+            recommendation.subtitle().as_deref(),
+            Some("12B · Q4_K_M · MTP · 7.0 GB")
+        );
+        assert_eq!(
+            recommendation.size_detail().as_deref(),
+            Some("6,970,065,600 bytes")
+        );
     }
 }
 
@@ -205,7 +239,7 @@ fn partial_download_fixtures_keep_exact_progress_and_offer_the_matching_action()
             "1.2 GB of 7.0 GB",
         ),
         (
-            Download::paused(2_345_678_901, total_bytes, DownloadPhase::Draft),
+            Download::fixture_paused(2_345_678_901, total_bytes, DownloadPhase::Draft),
             MenuAction::Resume,
             "Paused during MTP draft",
             "2.3 GB of 7.0 GB",
@@ -398,7 +432,7 @@ fn progress_updates_retained_rows_while_action_or_section_changes_rebuild() {
     let paused = MenuSnapshot::new(
         Bundle::Partial,
         Recommendation::Hidden,
-        Download::paused(2, total_bytes, DownloadPhase::Draft),
+        Download::fixture_paused(2, total_bytes, DownloadPhase::Draft),
         Runtime::Running,
         RuntimeInventory::External,
     )
