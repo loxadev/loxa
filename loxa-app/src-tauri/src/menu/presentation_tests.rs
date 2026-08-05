@@ -8,6 +8,37 @@ const TARGET_BYTES: u64 = 6_716_356_800;
 const DRAFT_BYTES: u64 = 253_708_800;
 
 #[test]
+fn live_available_mapper_omits_unknown_quantization() {
+    let snapshot = MenuSnapshot::new(
+        Bundle::Absent,
+        Recommendation::available(TARGET_BYTES, DRAFT_BYTES),
+        Download::Idle,
+        Runtime::Idle,
+        RuntimeInventory::Missing,
+    )
+    .expect("a live available recommendation is canonical");
+
+    assert_eq!(
+        snapshot.recommendation_row().unwrap().subtitle().as_deref(),
+        Some("12B · MTP · 7.0 GB")
+    );
+}
+
+#[test]
+fn live_verified_mapper_omits_unknown_quantization() {
+    let snapshot = MenuSnapshot::new(
+        Bundle::verified(TARGET_BYTES, DRAFT_BYTES),
+        Recommendation::Hidden,
+        Download::Idle,
+        Runtime::Idle,
+        RuntimeInventory::Missing,
+    )
+    .expect("a live verified bundle is canonical");
+
+    assert_eq!(snapshot.installed_row().unwrap().subtitle(), "MTP · 7.0 GB");
+}
+
+#[test]
 fn loading_and_setup_error_are_owned_menu_states_not_fixture_snapshots() {
     let loading = MenuSnapshot::loading();
     assert!(loading.is_loading());
@@ -50,7 +81,7 @@ fn clean_absence_composes_a_recommended_bundle_with_a_start_action() {
     assert_eq!(recommendation.action(), Some(MenuAction::Start));
     assert_eq!(
         recommendation.subtitle().as_deref(),
-        Some("12B · Q4_K_M · MTP · 7.0 GB")
+        Some("12B · MTP · 7.0 GB")
     );
     assert_eq!(
         recommendation.size_detail().as_deref(),
@@ -72,7 +103,7 @@ fn visible_download_sizes_use_decimal_units_but_keep_exact_byte_details() {
     let recommendation = recommended.recommendation_row().unwrap();
     assert_eq!(
         recommendation.subtitle().as_deref(),
-        Some("12B · Q4_K_M · MTP · 7.0 GB")
+        Some("12B · MTP · 7.0 GB")
     );
     assert_eq!(
         recommendation.size_detail().as_deref(),
@@ -118,7 +149,7 @@ fn verified_bundle_hides_recommendation_and_surfaces_active_runtime() {
     let installed = snapshot
         .installed_row()
         .expect("the verified bundle has exactly one installed row");
-    assert_eq!(installed.subtitle(), "Q4_K_M · MTP · 7.0 GB");
+    assert_eq!(installed.subtitle(), "MTP · 7.0 GB");
     assert_eq!(installed.size_detail(), "6,970,065,600 bytes");
     assert_eq!(installed.runtime_note(), Some("Active runtime"));
     assert_eq!(snapshot.footer().label("0.1.0"), "Loxa 0.1.0");
@@ -219,7 +250,7 @@ fn clean_ineligible_absence_keeps_the_recommendation_visible_but_disabled() {
         assert_eq!(recommendation.disabled_reason(), Some(expected_detail));
         assert_eq!(
             recommendation.subtitle().as_deref(),
-            Some("12B · Q4_K_M · MTP · 7.0 GB")
+            Some("12B · MTP · 7.0 GB")
         );
         assert_eq!(
             recommendation.size_detail().as_deref(),

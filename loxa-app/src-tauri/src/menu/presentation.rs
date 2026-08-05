@@ -327,7 +327,7 @@ impl RecommendationRow {
     pub(crate) fn subtitle(&self) -> Option<String> {
         self.sizes.map(|(target_bytes, draft_bytes)| {
             format!(
-                "12B · Q4_K_M · MTP · {}",
+                "12B · MTP · {}",
                 format_human_size(target_bytes.saturating_add(draft_bytes))
             )
         })
@@ -372,7 +372,7 @@ impl InstalledRow {
 
     pub(crate) fn subtitle(&self) -> String {
         format!(
-            "Q4_K_M · MTP · {}",
+            "MTP · {}",
             format_human_size(self.target_bytes.saturating_add(self.draft_bytes))
         )
     }
