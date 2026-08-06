@@ -514,7 +514,7 @@ pub(crate) enum ForegroundStart {
 }
 
 pub(crate) struct ForegroundServer {
-    server: OwnedServer,
+    server: Box<OwnedServer>,
 }
 
 pub(crate) fn start_foreground(launch: &Launch, run_dir: &Path) -> Result<ForegroundStart, String> {
@@ -797,7 +797,7 @@ fn install_termination_watcher(run_dir: &Path) -> Result<(), String> {
             std::thread::Builder::new()
                 .name("loxa-signal".into())
                 .spawn(move || {
-                    for signal in termination.forever() {
+                    if let Some(signal) = termination.forever().next() {
                         PROCESS_TERMINATION_SIGNAL.store(signal, Ordering::SeqCst);
                         let mut active = ACTIVE_SERVER.load(Ordering::SeqCst);
                         while active == STARTING_SERVER {
@@ -982,7 +982,7 @@ fn publish_announcement(
 }
 
 enum StartOutcome {
-    Ready(OwnedServer),
+    Ready(Box<OwnedServer>),
     Exited(ServerExit),
     Signaled(i32),
 }
@@ -1156,7 +1156,7 @@ impl OwnedServer {
                             return owned.fail_start(error);
                         }
                         owned.port = port;
-                        return Ok(StartOutcome::Ready(owned));
+                        return Ok(StartOutcome::Ready(Box::new(owned)));
                     }
                     Ok(false) => {}
                     Err(error) => return owned.fail_start(error),
