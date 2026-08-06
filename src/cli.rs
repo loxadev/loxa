@@ -1,4 +1,4 @@
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -57,6 +57,12 @@ pub struct RmArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("artifact_selector")
+        .required(true)
+        .multiple(false)
+        .args(["filename", "quant"])
+))]
 pub struct PullArgs {
     /// Hugging Face repository in owner/repo form.
     pub repo: String,
@@ -64,7 +70,7 @@ pub struct PullArgs {
     #[arg(long)]
     pub revision: Option<String>,
     /// Exact GGUF filename to download.
-    #[arg(long = "file", conflicts_with = "quant")]
+    #[arg(long = "file")]
     pub filename: Option<String>,
     /// Quantization to select, such as Q4_K_M.
     #[arg(long)]
@@ -162,7 +168,28 @@ mod tests {
     }
 
     #[test]
-    fn pull_rejects_file_and_quant_together() {
+    fn pull_requires_one_explicit_artifact_selector() {
+        let error = Cli::try_parse_from(["loxa", "pull", "owner/repo"]).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+
+        let cli = Cli::parse_from(["loxa", "pull", "owner/repo", "--file", "model.gguf"]);
+        match cli.command {
+            Command::Pull(args) => {
+                assert_eq!(args.filename.as_deref(), Some("model.gguf"));
+                assert!(args.quant.is_none());
+            }
+            _ => panic!("expected pull"),
+        }
+
+        let cli = Cli::parse_from(["loxa", "pull", "owner/repo", "--quant", "Q4_K_M"]);
+        match cli.command {
+            Command::Pull(args) => {
+                assert!(args.filename.is_none());
+                assert_eq!(args.quant.as_deref(), Some("Q4_K_M"));
+            }
+            _ => panic!("expected pull"),
+        }
+
         let error = Cli::try_parse_from([
             "loxa",
             "pull",
@@ -175,6 +202,31 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn pull_help_matches_frozen_command_surface_exactly() {
+        let error = Cli::try_parse_from(["loxa", "pull", "--help"]).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::DisplayHelp);
+
+        assert_eq!(
+            error.to_string(),
+            concat!(
+                "Download and verify one single-file GGUF\n",
+                "\n",
+                "Usage: loxa pull [OPTIONS] <--file <FILENAME>|--quant <QUANT>> <REPO>\n",
+                "\n",
+                "Arguments:\n",
+                "  <REPO>  Hugging Face repository in owner/repo form\n",
+                "\n",
+                "Options:\n",
+                "      --revision <REVISION>  Branch, tag, or commit to resolve before downloading\n",
+                "      --file <FILENAME>      Exact GGUF filename to download\n",
+                "      --quant <QUANT>        Quantization to select, such as Q4_K_M\n",
+                "      --name <NAME>          Local model ID used by list, rm, run, and chat\n",
+                "  -h, --help                 Print help\n",
+            )
+        );
     }
 
     #[test]

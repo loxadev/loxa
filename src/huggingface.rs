@@ -1001,6 +1001,9 @@ fn select_from_plan(
     filename: Option<&str>,
     quant: Option<&str>,
 ) -> Result<ResolvedFile, String> {
+    if filename.is_none() && quant.is_none() {
+        return Err("GGUF selection requires --file or --quant".into());
+    }
     let mut candidates = plan
         .candidates()
         .iter()
@@ -1045,17 +1048,6 @@ fn select_from_plan(
                     filenames.join(", ")
                 ));
             }
-        }
-    } else {
-        let q4 = candidates
-            .iter()
-            .filter(|candidate| quantization(candidate.path()).eq_ignore_ascii_case("Q4_K_M"))
-            .count();
-        if q4 == 1 {
-            candidates
-                .retain(|candidate| quantization(candidate.path()).eq_ignore_ascii_case("Q4_K_M"));
-        } else if candidates.len() != 1 {
-            return Err("GGUF selection is ambiguous; use --file or --quant".into());
         }
     }
     Ok(candidates.remove(0))
@@ -1335,7 +1327,7 @@ mod tests {
     }
 
     #[test]
-    fn pins_and_selects_without_silently_choosing_ambiguity() {
+    fn pins_and_preserves_explicit_file_and_quant_selection() {
         let plan = inspected_plan(TREE);
         let exact = select_from_plan(&plan, Some("demo-Q8_0.gguf"), None).unwrap();
         assert_eq!(exact.revision, "0123456789abcdef0123456789abcdef01234567");
@@ -1343,13 +1335,45 @@ mod tests {
 
         let quant = select_from_plan(&plan, None, Some("q8_0")).unwrap();
         assert_eq!(quant.filename, "demo-Q8_0.gguf");
-        let default = select_from_plan(&plan, None, None).unwrap();
-        assert_eq!(default.filename, "demo-Q4_K_M.gguf");
+    }
 
-        let ambiguous = inspected_plan(&TREE.replace("demo-Q4_K_M.gguf", "demo-Q5_K_M.gguf"));
-        assert!(select_from_plan(&ambiguous, None, None)
-            .unwrap_err()
-            .contains("ambiguous"));
+    #[test]
+    fn omitted_selection_rejects_zero_eligible_identities() {
+        let tree = serde_json::json!([
+            {
+                "type": "file",
+                "path": "split-00001-of-00002.gguf",
+                "size": 2,
+                "lfs": {"oid": "c".repeat(64), "size": 2}
+            }
+        ])
+        .to_string();
+        let error = select_from_plan(&inspected_plan(&tree), None, None).unwrap_err();
+
+        assert_eq!(error, "GGUF selection requires --file or --quant");
+    }
+
+    #[test]
+    fn omitted_selection_rejects_one_eligible_non_q4_file() {
+        let tree = serde_json::json!([
+            {
+                "type": "file",
+                "path": "demo-Q8_0.gguf",
+                "size": 8,
+                "lfs": {"oid": "b".repeat(64), "size": 8}
+            }
+        ])
+        .to_string();
+        let error = select_from_plan(&inspected_plan(&tree), None, None).unwrap_err();
+
+        assert_eq!(error, "GGUF selection requires --file or --quant");
+    }
+
+    #[test]
+    fn omitted_selection_rejects_unique_q4_among_multiple_eligible_files() {
+        let error = select_from_plan(&inspected_plan(TREE), None, None).unwrap_err();
+
+        assert_eq!(error, "GGUF selection requires --file or --quant");
     }
 
     #[test]
@@ -1404,17 +1428,13 @@ mod tests {
     }
 
     #[test]
-    fn mixed_case_gguf_extension_preserves_explicit_quant_and_default_selection() {
+    fn mixed_case_gguf_extension_preserves_explicit_quant_selection() {
         let plan = inspected_plan(&TREE.replace("demo-Q4_K_M.gguf", "model-Q4_K_M.GgUf"));
 
         assert_eq!(
             select_from_plan(&plan, None, Some("Q4_K_M"))
                 .unwrap()
                 .path(),
-            "model-Q4_K_M.GgUf"
-        );
-        assert_eq!(
-            select_from_plan(&plan, None, None).unwrap().path(),
             "model-Q4_K_M.GgUf"
         );
     }
@@ -1504,7 +1524,7 @@ mod tests {
 
         let selected = resolve_with_transport(
             InspectRepository::new("owner/repo".into(), None),
-            None,
+            Some("demo-Q4_K_M.gguf"),
             None,
             &mut transport,
         )
@@ -1524,28 +1544,63 @@ mod tests {
     }
 
     #[test]
-    fn legacy_explicit_auxiliary_file_is_rejected_by_shared_policy() {
-        let oid = "a".repeat(64);
+    fn explicit_file_rejects_ineligible_packaging_and_case_mismatch() {
         let tree = serde_json::json!([
-            {"type":"file","path":"model-draft.gguf","size":4,"lfs":{"oid":oid,"size":4}},
-            {"type":"file","path":"mtp-model.gguf","size":4,"lfs":{"oid":"b".repeat(64),"size":4}},
-            {"type":"file","path":"model-mmproj.gguf","size":4,"lfs":{"oid":"c".repeat(64),"size":4}},
-            {"type":"file","path":"drafting-model.gguf","size":4,"lfs":{"oid":"d".repeat(64),"size":4}},
-            {"type":"file","path":"redraft.gguf","size":4,"lfs":{"oid":"e".repeat(64),"size":4}}
+            {"type":"file","path":"Model-Q4_K_M.gguf","size":4,"lfs":{"oid":"a".repeat(64),"size":4}},
+            {"type":"file","path":"model-draft.gguf","size":4,"lfs":{"oid":"b".repeat(64),"size":4}},
+            {"type":"file","path":"nested/model.gguf","size":4,"lfs":{"oid":"c".repeat(64),"size":4}},
+            {"type":"file","path":"model-00001-of-00002.gguf","size":4,"lfs":{"oid":"d".repeat(64),"size":4}},
+            {"type":"file","path":"../unsafe.gguf","size":4,"lfs":{"oid":"e".repeat(64),"size":4}},
+            {"type":"directory","path":"directory.gguf","size":4,"lfs":{"oid":"f".repeat(64),"size":4}},
+            {"type":"file","path":"missing-size.gguf","lfs":{"oid":"1".repeat(64),"size":4}},
+            {"type":"file","path":"missing-identity.gguf","size":4},
+            {"type":"file","path":"size-mismatch.gguf","size":4,"lfs":{"oid":"2".repeat(64),"size":3}},
+            {"type":"file","path":"zero-size.gguf","size":0,"lfs":{"oid":"3".repeat(64),"size":0}},
+            {"type":"file","path":"invalid-hash.gguf","size":4,"lfs":{"oid":"not-a-sha","size":4}}
         ])
         .to_string();
         let plan = inspected_plan(&tree);
 
-        for path in ["model-draft.gguf", "mtp-model.gguf", "model-mmproj.gguf"] {
+        for path in [
+            "model-draft.gguf",
+            "nested/model.gguf",
+            "model-00001-of-00002.gguf",
+            "../unsafe.gguf",
+            "directory.gguf",
+            "missing-size.gguf",
+            "missing-identity.gguf",
+            "size-mismatch.gguf",
+            "zero-size.gguf",
+            "invalid-hash.gguf",
+            "model-Q4_K_M.gguf",
+        ] {
             assert_eq!(
                 select_from_plan(&plan, Some(path), None).unwrap_err(),
                 format!("verified file {path:?} not found")
             );
         }
-        for path in ["drafting-model.gguf", "redraft.gguf"] {
+    }
+
+    #[test]
+    fn explicit_selectors_preserve_zero_eligible_plan_error() {
+        let tree = serde_json::json!([
+            {
+                "type": "file",
+                "path": "split-00001-of-00002.gguf",
+                "size": 2,
+                "lfs": {"oid": "c".repeat(64), "size": 2}
+            }
+        ])
+        .to_string();
+        let plan = inspected_plan(&tree);
+
+        for (filename, quant) in [
+            (Some("split-00001-of-00002.gguf"), None),
+            (None, Some("Q4_K_M")),
+        ] {
             assert_eq!(
-                select_from_plan(&plan, Some(path), None).unwrap().path(),
-                path
+                select_from_plan(&plan, filename, quant).unwrap_err(),
+                "repository has no verified single-file GGUF"
             );
         }
     }

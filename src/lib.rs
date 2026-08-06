@@ -446,7 +446,9 @@ where
             if installed.is_empty() && runnable.is_empty() {
                 let muted = ui::muted();
                 anstream::println!("No runnable models installed.");
-                anstream::println!("{muted}Download one with `loxa pull <owner/repo>`{muted:#}");
+                anstream::println!(
+                    "{muted}Choose a GGUF with `loxa inspect <owner/repo>`, then download it with `loxa pull <owner/repo> --file <filename>`.{muted:#}"
+                );
             }
             let accent = ui::accent();
             let muted = ui::muted();
@@ -694,7 +696,7 @@ fn model_options_with_candidates(
         return Ok(vec![id]);
     }
     if installed.is_empty() && candidates.is_empty() {
-        return Err("no models installed; download one with `loxa pull <owner/repo>`".into());
+        return Err("no models installed; choose a GGUF with `loxa inspect <owner/repo>`, then download it with `loxa pull <owner/repo> --file <filename>`".into());
     }
     let mut options = installed
         .iter()
@@ -1643,12 +1645,28 @@ mod tests {
         let paths = AppPaths::from_values(Some(temp.path()), None).unwrap();
         let invalid_name = "invalid/name";
         let canonical_error = run(
-            Cli::parse_from(["loxa", "pull", "owner/repo", "--name", invalid_name]),
+            Cli::parse_from([
+                "loxa",
+                "pull",
+                "owner/repo",
+                "--file",
+                "model.gguf",
+                "--name",
+                invalid_name,
+            ]),
             paths.clone(),
         )
         .unwrap_err();
         let wrapped_error = run(
-            Cli::parse_from(["loxa", "pull", "hf://owner/repo", "--name", invalid_name]),
+            Cli::parse_from([
+                "loxa",
+                "pull",
+                "hf://owner/repo",
+                "--file",
+                "model.gguf",
+                "--name",
+                invalid_name,
+            ]),
             paths.clone(),
         )
         .unwrap_err();
@@ -1658,7 +1676,15 @@ mod tests {
 
         for repo in ["hf://owner", "https://huggingface.co/owner/repo"] {
             let error = run(
-                Cli::parse_from(["loxa", "pull", repo, "--name", invalid_name]),
+                Cli::parse_from([
+                    "loxa",
+                    "pull",
+                    repo,
+                    "--file",
+                    "model.gguf",
+                    "--name",
+                    invalid_name,
+                ]),
                 paths.clone(),
             )
             .unwrap_err();
@@ -1774,7 +1800,10 @@ mod tests {
     fn chat_without_models_explains_how_to_pull_one() {
         let error = model_options(None, &[]).unwrap_err();
 
-        assert!(error.contains("loxa pull"), "{error}");
+        assert_eq!(
+            error,
+            "no models installed; choose a GGUF with `loxa inspect <owner/repo>`, then download it with `loxa pull <owner/repo> --file <filename>`"
+        );
     }
 
     #[test]
