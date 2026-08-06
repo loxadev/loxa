@@ -4,6 +4,58 @@ pub mod chat;
 pub mod cli;
 pub mod config;
 mod diagnostics;
+pub mod discovery;
+#[cfg(test)]
+mod discovery_public_contract_tests {
+    use crate::app::AppService;
+    use crate::discovery::{
+        ArtifactCandidate, AuxiliaryRole, CandidateDisposition, DiscoveryError, DiscoveryErrorKind,
+        GatedStatus, InspectRepository, ModelSearchHit, ModelSearchPage, RepositoryPlan,
+        SearchModels, UnsupportedPackagingReason,
+    };
+    use crate::huggingface::ResolvedFile;
+
+    #[test]
+    fn discovery_public_contract_has_exact_owned_accessors() {
+        let search = SearchModels::new("two words".into());
+        assert_eq!(search.query(), "two words");
+        let inspect = InspectRepository::new("owner/repo".into(), Some("main".into()));
+        assert_eq!(inspect.repo(), "owner/repo");
+        assert_eq!(inspect.revision(), Some("main"));
+
+        let _: fn(&ModelSearchPage) -> &[ModelSearchHit] = ModelSearchPage::hits;
+        let _: fn(&ModelSearchHit) -> &str = ModelSearchHit::repo;
+        let _: fn(&ModelSearchHit) -> GatedStatus = ModelSearchHit::gated;
+        let _: fn(&ModelSearchHit) -> Option<u64> = ModelSearchHit::downloads;
+        let _: fn(&RepositoryPlan) -> &str = RepositoryPlan::repo;
+        let _: fn(&RepositoryPlan) -> &str = RepositoryPlan::commit;
+        let _: fn(&RepositoryPlan) -> &[ArtifactCandidate] = RepositoryPlan::candidates;
+        let _: fn(&ArtifactCandidate) -> &str = ArtifactCandidate::display_path;
+        let _: fn(&ArtifactCandidate) -> Option<u64> = ArtifactCandidate::size;
+        let _: fn(&ArtifactCandidate) -> Option<&ResolvedFile> = ArtifactCandidate::identity;
+        let _: fn(&ArtifactCandidate) -> CandidateDisposition = ArtifactCandidate::disposition;
+        let _: fn(&DiscoveryError) -> DiscoveryErrorKind = DiscoveryError::kind;
+        let _: fn(&AppService, SearchModels) -> Result<ModelSearchPage, DiscoveryError> =
+            AppService::search_models;
+        let _: fn(&AppService, InspectRepository) -> Result<RepositoryPlan, DiscoveryError> =
+            AppService::inspect_repository;
+
+        assert_eq!(GatedStatus::Unknown, GatedStatus::Unknown);
+        assert_eq!(AuxiliaryRole::Mtp, AuxiliaryRole::Mtp);
+        assert_eq!(
+            CandidateDisposition::UnsupportedPackaging(UnsupportedPackagingReason::Auxiliary(
+                AuxiliaryRole::Draft
+            )),
+            CandidateDisposition::UnsupportedPackaging(UnsupportedPackagingReason::Auxiliary(
+                AuxiliaryRole::Draft
+            ))
+        );
+        assert_eq!(
+            DiscoveryErrorKind::RevisionNotFound,
+            DiscoveryErrorKind::RevisionNotFound
+        );
+    }
+}
 pub mod download;
 pub mod huggingface;
 pub mod paths;
@@ -105,7 +157,8 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
     catalog::local::recover_pending(&paths.models)?;
     match cli.command {
         Command::Pull(args) => {
-            let repo = huggingface::parse_repo(&args.repo)?;
+            let repo = discovery::normalize_legacy_pull_repository(&args.repo)
+                .map_err(|_| "repository must be exactly owner/repo".to_string())?;
             if let Some(name) = args.name.as_deref() {
                 validate_id(name)?;
             }
@@ -814,6 +867,35 @@ mod tests {
             "0123456789abcdefaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         );
         assert!(long.ends_with("0123456789abcdef"));
+    }
+
+    #[test]
+    fn pull_normalizes_only_hf_wrapper_before_existing_local_validation() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_values(Some(temp.path()), None).unwrap();
+        let invalid_name = "invalid/name";
+        let canonical_error = run(
+            Cli::parse_from(["loxa", "pull", "owner/repo", "--name", invalid_name]),
+            paths.clone(),
+        )
+        .unwrap_err();
+        let wrapped_error = run(
+            Cli::parse_from(["loxa", "pull", "hf://owner/repo", "--name", invalid_name]),
+            paths.clone(),
+        )
+        .unwrap_err();
+
+        assert_eq!(canonical_error, "invalid model id \"invalid/name\"");
+        assert_eq!(wrapped_error, canonical_error);
+
+        for repo in ["hf://owner", "https://huggingface.co/owner/repo"] {
+            let error = run(
+                Cli::parse_from(["loxa", "pull", repo, "--name", invalid_name]),
+                paths.clone(),
+            )
+            .unwrap_err();
+            assert_eq!(error, "repository must be exactly owner/repo", "{repo}");
+        }
     }
 
     #[test]

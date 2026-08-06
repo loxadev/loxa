@@ -1,4 +1,7 @@
 use crate::catalog::{self, BundlePending, Manifest};
+use crate::discovery::{
+    DiscoveryError, InspectRepository, ModelSearchPage, RepositoryPlan, SearchModels,
+};
 use crate::paths::AppPaths;
 use crate::runtime::{ForegroundObservation, ForegroundObserver, RuntimeProvenance};
 use std::fs;
@@ -250,6 +253,17 @@ impl AppService {
 
     pub fn snapshot(&mut self) -> AppSnapshot {
         self.reader.observe()
+    }
+
+    pub fn search_models(&self, request: SearchModels) -> Result<ModelSearchPage, DiscoveryError> {
+        crate::huggingface::search_models(request)
+    }
+
+    pub fn inspect_repository(
+        &self,
+        request: InspectRepository,
+    ) -> Result<RepositoryPlan, DiscoveryError> {
+        crate::huggingface::inspect_repository(request)
     }
 }
 
@@ -506,6 +520,7 @@ mod tests {
         Artifact, ArtifactProvenance, ArtifactRole, Manifest, RuntimeQualification,
         TEST_LLAMA_BUILD, TEST_MTP_PROFILE,
     };
+    use crate::discovery::{DiscoveryErrorKind, GatedStatus, InspectRepository, SearchModels};
     use crate::paths::AppPaths;
     use crate::runtime::{ForegroundObservation, RuntimeProvenance};
     use sha2::{Digest, Sha256};
@@ -513,6 +528,8 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+    use std::path::PathBuf;
+    use std::process::Command;
     use tempfile::tempdir;
 
     const MIB: u64 = 1024 * 1024;
@@ -579,6 +596,32 @@ mod tests {
 
     fn test_paths(root: &Path) -> AppPaths {
         AppPaths::from_values(Some(root), None).unwrap()
+    }
+
+    fn snapshot_tree(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+        fn visit(root: &Path, path: &Path, snapshot: &mut Vec<(PathBuf, Option<Vec<u8>>)>) {
+            if !path.exists() {
+                return;
+            }
+            let relative = path.strip_prefix(root).unwrap().to_path_buf();
+            if path.is_dir() {
+                snapshot.push((relative, None));
+                let mut entries = fs::read_dir(path)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .collect::<Vec<_>>();
+                entries.sort();
+                for entry in entries {
+                    visit(root, &entry, snapshot);
+                }
+            } else {
+                snapshot.push((relative, Some(fs::read(path).unwrap())));
+            }
+        }
+
+        let mut snapshot = Vec::new();
+        visit(root, root, &mut snapshot);
+        snapshot
     }
 
     fn enough_budget() -> ResourceBudget {
@@ -794,15 +837,215 @@ mod tests {
     }
 
     #[test]
-    fn app_service_from_paths_observes_like_the_wrapped_snapshot_reader() {
+    fn app_service_discovery_preserves_from_paths_from_env_and_snapshot() {
         let root = tempdir().unwrap();
         let paths = test_paths(root.path());
         let mut reader = SnapshotReader::new(paths.clone());
         let mut service = AppService::from_paths(paths);
 
         assert_eq!(service.snapshot(), reader.observe());
+        let page = service
+            .search_models(SearchModels::new("owner/repo".into()))
+            .unwrap();
+        assert_eq!(page.hits().len(), 1);
+        assert_eq!(page.hits()[0].repo(), "owner/repo");
+        assert_eq!(service.snapshot(), reader.observe());
 
         let _: fn() -> Result<AppService, String> = AppService::from_env;
+    }
+
+    #[test]
+    fn app_service_search_and_inspection_delegate_to_the_exact_core() {
+        let root = tempdir().unwrap();
+        let service = AppService::from_paths(test_paths(root.path()));
+        let search = SearchModels::new("owner/repo".into());
+        assert_eq!(
+            service.search_models(search.clone()).unwrap(),
+            crate::huggingface::search_models(search).unwrap()
+        );
+
+        let inspect = InspectRepository::new("invalid".into(), None);
+        assert_eq!(
+            service
+                .inspect_repository(inspect.clone())
+                .unwrap_err()
+                .kind(),
+            crate::huggingface::inspect_repository(inspect)
+                .unwrap_err()
+                .kind()
+        );
+    }
+
+    #[test]
+    fn exact_app_service_input_returns_without_a_transport_request() {
+        let root = tempdir().unwrap();
+        let service = AppService::from_paths(test_paths(root.path()));
+
+        let page = service
+            .search_models(SearchModels::new("hf://owner/repo".into()))
+            .unwrap();
+
+        assert_eq!(page.hits().len(), 1);
+        assert_eq!(page.hits()[0].repo(), "owner/repo");
+        assert_eq!(page.hits()[0].downloads(), None);
+    }
+
+    #[test]
+    fn app_service_errors_and_results_are_terminal_safe() {
+        let root = tempdir().unwrap();
+        let service = AppService::from_paths(test_paths(root.path()));
+
+        let error = service
+            .inspect_repository(InspectRepository::new("owner/\u{1b}[31mrepo".into(), None))
+            .unwrap_err();
+
+        assert_eq!(error.kind(), DiscoveryErrorKind::InvalidRepository);
+        assert_eq!(error.to_string(), "Hugging Face discovery request failed");
+        assert!(!format!("{error:?}").contains("31m"));
+    }
+
+    #[test]
+    fn app_service_discovery_child() {
+        let Some(root) = std::env::var_os("LOXA_APP_DISCOVERY_CHILD_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let loxa_root = root.join("loxa-root");
+        let hf_home = root.join("hf-home");
+        let cwd = root.join("cwd");
+        let before = (
+            snapshot_tree(&loxa_root),
+            snapshot_tree(&hf_home),
+            snapshot_tree(&cwd),
+        );
+
+        let service = AppService::from_env().unwrap();
+        assert_eq!(service.reader.paths.root, loxa_root);
+        assert_eq!(
+            service
+                .search_models(SearchModels::new("owner/repo".into()))
+                .unwrap()
+                .hits()[0]
+                .repo(),
+            "owner/repo"
+        );
+        let error = service
+            .inspect_repository(InspectRepository::new("invalid".into(), None))
+            .unwrap_err();
+        assert_eq!(error.kind(), DiscoveryErrorKind::InvalidRepository);
+
+        assert!(!loxa_root.exists());
+        assert_eq!(
+            before,
+            (
+                snapshot_tree(&loxa_root),
+                snapshot_tree(&hf_home),
+                snapshot_tree(&cwd),
+            )
+        );
+    }
+
+    #[test]
+    fn app_service_discovery_creates_no_local_state_or_process() {
+        let root = tempdir().unwrap();
+        let loxa_root = root.path().join("loxa-root");
+        let hf_home = root.path().join("hf-home");
+        let home = root.path().join("home");
+        let cwd = root.path().join("cwd");
+        fs::create_dir_all(&hf_home).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&cwd).unwrap();
+        let before = (
+            snapshot_tree(&loxa_root),
+            snapshot_tree(&hf_home),
+            snapshot_tree(&cwd),
+        );
+
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        child
+            .arg("--exact")
+            .arg("app::tests::app_service_discovery_child")
+            .arg("--nocapture")
+            .current_dir(&cwd)
+            .env("LOXA_APP_DISCOVERY_CHILD_ROOT", root.path())
+            .env("LOXA_HOME", &loxa_root)
+            .env("HF_HOME", &hf_home)
+            .env("HOME", &home);
+        for name in [
+            "HF_HUB_DISABLE_IMPLICIT_TOKEN",
+            "HF_TOKEN",
+            "HF_TOKEN_PATH",
+            "USERPROFILE",
+        ] {
+            child.env_remove(name);
+        }
+        assert!(child.status().unwrap().success());
+
+        assert!(!loxa_root.exists());
+        assert_eq!(
+            before,
+            (
+                snapshot_tree(&loxa_root),
+                snapshot_tree(&hf_home),
+                snapshot_tree(&cwd),
+            )
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn live_hugging_face_discovery() {
+        let query = std::env::var("LOXA_LIVE_HF_QUERY")
+            .expect("set LOXA_LIVE_HF_QUERY for the ignored Hugging Face smoke test");
+        let repo = std::env::var("LOXA_LIVE_HF_REPO")
+            .expect("set LOXA_LIVE_HF_REPO for the ignored Hugging Face smoke test");
+        let root = tempdir().unwrap();
+        let loxa_root = root.path().join("absent-loxa-root");
+        let service = AppService::from_paths(test_paths(&loxa_root));
+
+        assert!(!loxa_root.exists());
+        let search = service
+            .search_models(SearchModels::new(query))
+            .expect("keyword discovery should succeed");
+        assert!(!search.hits().is_empty());
+        assert!(search.hits().iter().all(|hit| !hit.repo().is_empty()));
+
+        let exact = service
+            .search_models(SearchModels::new(repo.clone()))
+            .expect("exact repository routing should succeed locally");
+        assert!(exact.hits().len() == 1);
+        let exact_hit = &exact.hits()[0];
+        assert!(exact_hit.repo() == repo);
+        assert!(exact_hit.gated() == GatedStatus::Unknown);
+        assert!(exact_hit.downloads().is_none());
+
+        let plan = service
+            .inspect_repository(InspectRepository::new(repo, None))
+            .expect("repository inspection should succeed");
+        assert!(plan.commit().len() == 40);
+        assert!(plan.commit().bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(plan.commit().bytes().all(|byte| !byte.is_ascii_uppercase()));
+        let candidate = plan
+            .candidates()
+            .iter()
+            .find(|candidate| candidate.identity().is_some())
+            .expect("inspection should return one eligible candidate");
+        let identity = candidate.identity().expect("eligible identity");
+        assert!(candidate.display_path() == identity.path());
+        assert!(candidate.size() == Some(identity.size()));
+        assert!(identity.repo() == plan.repo());
+        assert!(identity.commit() == plan.commit());
+        assert!(identity.sha256().len() == 64);
+        assert!(identity
+            .sha256()
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit()));
+        assert!(identity
+            .sha256()
+            .bytes()
+            .all(|byte| !byte.is_ascii_uppercase()));
+        assert!(identity.size() > 0);
+        assert!(!loxa_root.exists());
     }
 
     #[test]
