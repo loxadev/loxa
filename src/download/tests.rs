@@ -1,6 +1,6 @@
 mod tests {
     use super::*;
-    use crate::huggingface::ResolvedFile;
+    use crate::huggingface::{test_resolved_file, ResolvedFile};
     use reqwest::{StatusCode, Url};
     use sha2::{Digest, Sha256};
     use std::cell::{Cell, RefCell};
@@ -66,13 +66,7 @@ mod tests {
     }
 
     fn spec(bytes: &[u8]) -> ResolvedFile {
-        ResolvedFile {
-            repo: "owner/repo".into(),
-            revision: "0123456789abcdef0123456789abcdef01234567".into(),
-            filename: "model.gguf".into(),
-            sha256: hex(Sha256::digest(bytes).as_ref()),
-            size: bytes.len() as u64,
-        }
+        test_resolved_file(hex(Sha256::digest(bytes).as_ref()), bytes.len() as u64)
     }
 
     #[test]

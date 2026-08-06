@@ -45,14 +45,14 @@ pub fn download(
     model_dir: &Path,
     token: Option<String>,
 ) -> Result<DownloadOutcome, String> {
-    let progress = ProgressBar::new(file.size);
+    let progress = ProgressBar::new(file.size());
     let style = ProgressStyle::with_template(
         "{spinner:.green} {msg} [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} {bytes_per_sec} {eta}",
     )
     .map_err(|error| error.to_string())?
     .progress_chars("=>-");
     progress.set_style(style);
-    progress.set_message(file.filename.clone());
+    progress.set_message(file.path().to_owned());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -61,13 +61,13 @@ pub fn download(
         let transport = ReqwestTransport::new(token)?;
         download_with_transport_progress_async(file, model_dir, &transport, |update| match update {
             ProgressUpdate::Seed(position) => {
-                progress.set_message(file.filename.clone());
+                progress.set_message(file.path().to_owned());
                 progress.set_position(position);
                 progress.reset_eta();
             }
             ProgressUpdate::Position(position) => progress.set_position(position),
             ProgressUpdate::Verifying => {
-                progress.set_message(format!("Verifying {}", file.filename));
+                progress.set_message(format!("Verifying {}", file.path()));
                 progress.tick();
             }
         })

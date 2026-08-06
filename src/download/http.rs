@@ -229,13 +229,13 @@ impl Transport for ReqwestTransport {
 
 pub(crate) fn artifact_url(file: &ResolvedFile) -> Result<Url, String> {
     let (owner, repo) = file
-        .repo
+        .repo()
         .split_once('/')
         .ok_or_else(|| "repository must be owner/repo".to_string())?;
     let mut url = Url::parse("https://huggingface.co").map_err(|error| error.to_string())?;
     url.path_segments_mut()
         .map_err(|_| "invalid Hugging Face origin")?
-        .extend([owner, repo, "resolve", &file.revision, &file.filename]);
+        .extend([owner, repo, "resolve", file.commit(), file.path()]);
     Ok(url)
 }
 

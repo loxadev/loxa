@@ -29,6 +29,13 @@ pub enum CandidateKind {
     Auxiliary,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AuxiliaryRole {
+    Mtp,
+    Draft,
+    Mmproj,
+}
+
 pub fn discover(models_root: &Path) -> Result<Vec<Candidate>, String> {
     if !models_root.exists() {
         return Ok(Vec::new());
@@ -288,15 +295,24 @@ fn candidate_id(filename: &str) -> Option<String> {
     (!id.is_empty() && id.len() <= 120).then(|| id.to_owned())
 }
 
-fn classify(filename: &str) -> CandidateKind {
-    let auxiliary = filename
+pub(crate) fn auxiliary_role(filename: &str) -> Option<AuxiliaryRole> {
+    filename
         .split(|character: char| !character.is_ascii_alphanumeric())
-        .any(|part| {
-            part.eq_ignore_ascii_case("mtp")
-                || part.eq_ignore_ascii_case("draft")
-                || part.eq_ignore_ascii_case("mmproj")
-        });
-    if auxiliary {
+        .find_map(|token| {
+            if token.eq_ignore_ascii_case("mtp") {
+                Some(AuxiliaryRole::Mtp)
+            } else if token.eq_ignore_ascii_case("draft") {
+                Some(AuxiliaryRole::Draft)
+            } else if token.eq_ignore_ascii_case("mmproj") {
+                Some(AuxiliaryRole::Mmproj)
+            } else {
+                None
+            }
+        })
+}
+
+fn classify(filename: &str) -> CandidateKind {
+    if auxiliary_role(filename).is_some() {
         CandidateKind::Auxiliary
     } else {
         CandidateKind::Runnable
@@ -1176,6 +1192,29 @@ mod tests {
                 .count(),
             6
         );
+    }
+
+    #[test]
+    fn auxiliary_role_scans_exact_ascii_tokens_from_left_to_right() {
+        assert_eq!(
+            auxiliary_role("model-MtP-draft.mmproj.gguf"),
+            Some(AuxiliaryRole::Mtp)
+        );
+        assert_eq!(
+            auxiliary_role("model.DRAFT-mmproj.gguf"),
+            Some(AuxiliaryRole::Draft)
+        );
+        assert_eq!(
+            auxiliary_role("model_mmproj.gguf"),
+            Some(AuxiliaryRole::Mmproj)
+        );
+        for filename in [
+            "drafting-model.gguf",
+            "redraft-model.gguf",
+            "ordinary-model.gguf",
+        ] {
+            assert_eq!(auxiliary_role(filename), None, "{filename}");
+        }
     }
 
     #[test]

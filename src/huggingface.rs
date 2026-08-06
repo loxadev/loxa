@@ -9,11 +9,44 @@ const HF_ORIGIN: &str = "https://huggingface.co";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedFile {
-    pub repo: String,
-    pub revision: String,
-    pub filename: String,
-    pub sha256: String,
-    pub size: u64,
+    repo: String,
+    revision: String,
+    filename: String,
+    sha256: String,
+    size: u64,
+}
+
+impl ResolvedFile {
+    pub fn repo(&self) -> &str {
+        &self.repo
+    }
+
+    pub fn commit(&self) -> &str {
+        &self.revision
+    }
+
+    pub fn path(&self) -> &str {
+        &self.filename
+    }
+
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_resolved_file(sha256: String, size: u64) -> ResolvedFile {
+    ResolvedFile {
+        repo: "owner/repo".into(),
+        revision: "0123456789abcdef0123456789abcdef01234567".into(),
+        filename: "model.gguf".into(),
+        sha256,
+        size,
+    }
 }
 
 #[derive(Deserialize)]
@@ -332,6 +365,23 @@ mod tests {
                 .unwrap_err()
                 .contains("ambiguous")
         );
+    }
+
+    #[test]
+    fn resolved_file_semantic_accessors_are_exact() {
+        let file = ResolvedFile {
+            repo: "owner/repo".into(),
+            revision: "0123456789abcdef0123456789abcdef01234567".into(),
+            filename: "model-Q4_K_M.gguf".into(),
+            sha256: "a".repeat(64),
+            size: 42,
+        };
+
+        assert_eq!(file.repo(), "owner/repo");
+        assert_eq!(file.commit(), "0123456789abcdef0123456789abcdef01234567");
+        assert_eq!(file.path(), "model-Q4_K_M.gguf");
+        assert_eq!(file.sha256(), "a".repeat(64));
+        assert_eq!(file.size(), 42);
     }
 
     #[test]

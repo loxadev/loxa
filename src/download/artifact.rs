@@ -28,9 +28,9 @@ pub(super) async fn download_once(
     if final_path.exists() {
         reject_non_regular_if_present(&final_path)?;
         progress(ProgressUpdate::Verifying);
-        if verify_regular(&final_path, spec.size, &spec.sha256).is_ok() {
+        if verify_regular(&final_path, spec.size(), spec.sha256()).is_ok() {
             finish_repair(model_dir, &invalid_path, &restart_path)?;
-            progress(ProgressUpdate::Seed(spec.size));
+            progress(ProgressUpdate::Seed(spec.size()));
             return Ok(DownloadOutcome::AlreadyInstalled(final_path));
         }
         if invalid_path.exists() {
@@ -42,15 +42,15 @@ pub(super) async fn download_once(
     reject_unsafe_transfer_if_present(&restart_path)?;
     reject_non_regular_if_present(&invalid_path)?;
     let mut offset = fs::metadata(&part_path).map(|meta| meta.len()).unwrap_or(0);
-    if offset > spec.size {
+    if offset > spec.size() {
         fs::remove_file(&part_path).map_err(|error| error.to_string())?;
         offset = 0;
     }
     progress(ProgressUpdate::Seed(offset));
-    if offset == spec.size && offset > 0 {
+    if offset == spec.size() && offset > 0 {
         sync_transfer_file(&part_path)?;
         progress(ProgressUpdate::Verifying);
-        if let Err(error) = verify_regular(&part_path, spec.size, &spec.sha256) {
+        if let Err(error) = verify_regular(&part_path, spec.size(), spec.sha256()) {
             fs::remove_file(&part_path).map_err(|remove| remove.to_string())?;
             return Err(error.into());
         }
@@ -67,16 +67,16 @@ pub(super) async fn download_once(
         (&restart_path, false)
     } else {
         if transfer.status == StatusCode::PARTIAL_CONTENT {
-            validate_content_range(transfer.content_range.as_deref(), offset, spec.size)?;
+            validate_content_range(transfer.content_range.as_deref(), offset, spec.size())?;
         } else if transfer.status != StatusCode::OK || offset > 0 {
             return Err(format!("unexpected artifact HTTP {}", transfer.status).into());
         }
         (&part_path, offset > 0)
     };
     let expected_written = if append {
-        spec.size - offset
+        spec.size() - offset
     } else {
-        spec.size
+        spec.size()
     };
     let read_limit = expected_written
         .checked_add(1)
@@ -123,7 +123,7 @@ pub(super) async fn download_once(
         )));
     }
     progress(ProgressUpdate::Verifying);
-    if let Err(error) = verify_regular(target, spec.size, &spec.sha256) {
+    if let Err(error) = verify_regular(target, spec.size(), spec.sha256()) {
         fs::remove_file(target).map_err(|remove| remove.to_string())?;
         return Err(error.into());
     }

@@ -130,20 +130,20 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
             let resolved = resolved?;
             let id = args
                 .name
-                .unwrap_or_else(|| default_id(&repo, &resolved.filename, &resolved.sha256));
+                .unwrap_or_else(|| default_id(&repo, resolved.path(), resolved.sha256()));
             let model_dir = paths.model_dir(&id)?;
             let _model_lock = catalog::ModelLock::acquire(&model_dir)?;
             let manifest = Manifest {
                 version: 1,
                 id: id.clone(),
-                repo: Some(resolved.repo.clone()),
-                revision: Some(resolved.revision.clone()),
-                remote_filename: Some(resolved.filename.clone()),
+                repo: Some(resolved.repo().to_owned()),
+                revision: Some(resolved.commit().to_owned()),
+                remote_filename: Some(resolved.path().to_owned()),
                 origin: None,
                 source_filename: None,
                 local_filename: "model.gguf".into(),
-                sha256: resolved.sha256.clone(),
-                size: resolved.size,
+                sha256: resolved.sha256().to_owned(),
+                size: resolved.size(),
                 artifacts: None,
                 profile: None,
                 runtime: None,
@@ -166,17 +166,17 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
             anstream::println!("{accent}Checking{accent:#} {id}");
             anstream::println!(
                 "  {muted}{} · {} · {}@{}{muted:#}",
-                resolved.filename,
-                BinaryBytes(resolved.size),
-                resolved.repo,
-                &resolved.revision[..12]
+                resolved.path(),
+                BinaryBytes(resolved.size()),
+                resolved.repo(),
+                &resolved.commit()[..12]
             );
             tracing::info!(
                 event = "pull_started",
                 model_id = %id,
-                repo = %resolved.repo,
-                revision = %resolved.revision,
-                size = resolved.size
+                repo = %resolved.repo(),
+                revision = %resolved.commit(),
+                size = resolved.size()
             );
             let outcome = download::download(&resolved, &model_dir, token)?;
             let verifying = ui::spinner(format!("Verifying {id}"));
@@ -190,9 +190,9 @@ pub fn run(cli: Cli, paths: AppPaths) -> Result<i32, String> {
             tracing::info!(
                 event = "pull_finished",
                 model_id = %id,
-                repo = %resolved.repo,
-                revision = %resolved.revision,
-                size = resolved.size,
+                repo = %resolved.repo(),
+                revision = %resolved.commit(),
+                size = resolved.size(),
                 outcome = download_outcome
             );
             let success = ui::success();
