@@ -66,7 +66,6 @@ mod session;
 mod ui;
 
 use catalog::Manifest;
-use clap::Parser;
 use cli::{Cli, Command};
 use indicatif::BinaryBytes;
 use paths::{validate_id, AppPaths};
@@ -113,7 +112,7 @@ impl Drop for PromptInterrupt {
 }
 
 pub fn run_from_env() -> Result<i32, String> {
-    let cli = Cli::parse();
+    let cli = cli::parse_checked();
     let paths = AppPaths::from_env()?;
     let _diagnostics = diagnostics::init(&paths.logs).map_err(|error| {
         format!(
@@ -216,8 +215,9 @@ fn format_search_results(page: &discovery::ModelSearchPage) -> String {
             .map_or_else(|| "Unknown".to_owned(), |downloads| downloads.to_string());
         writeln!(
             output,
-            "\n{}\n  Access: {access}\n  Downloads: {downloads}",
-            hit.repo()
+            "\n{}\n  Access: {access}\n  Downloads: {downloads}\n  Inspect: loxa inspect {}",
+            hit.repo(),
+            hit.repo(),
         )
         .expect("writing to a String cannot fail");
     }
@@ -230,12 +230,16 @@ where
         discovery::InspectRepository,
     ) -> Result<discovery::RepositoryPlan, discovery::DiscoveryError>,
 {
+    let requested_revision = args.revision.clone();
     let plan = operation(discovery::InspectRepository::new(args.repo, args.revision))
         .map_err(|error| discovery_error_message(error.kind()).to_owned())?;
-    Ok(format_repository_plan(&plan))
+    Ok(format_repository_plan(&plan, requested_revision.as_deref()))
 }
 
-fn format_repository_plan(plan: &discovery::RepositoryPlan) -> String {
+fn format_repository_plan(
+    plan: &discovery::RepositoryPlan,
+    requested_revision: Option<&str>,
+) -> String {
     use std::fmt::Write as _;
 
     let candidates = plan.candidates();
@@ -267,9 +271,84 @@ fn format_repository_plan(plan: &discovery::RepositoryPlan) -> String {
         if let Some(identity) = candidate.identity() {
             writeln!(output, "  SHA-256: {}", identity.sha256())
                 .expect("writing to a String cannot fail");
+            if candidate.disposition()
+                == discovery::CandidateDisposition::EligibleForDownloadAndLocalValidation
+            {
+                writeln!(
+                    output,
+                    "  Pull: {}",
+                    inspection_pull_command(plan.repo(), identity.path(), requested_revision)
+                )
+                .expect("writing to a String cannot fail");
+            }
         }
     }
     output
+}
+
+fn inspection_pull_command(repo: &str, filename: &str, requested_revision: Option<&str>) -> String {
+    let revision = requested_revision
+        .map(|revision| format!(" --revision={}", cli::shell_quote(revision)))
+        .unwrap_or_default();
+    if let Some(reference) = cli::compact_file_reference(repo, filename) {
+        format!("loxa pull {}{revision}", cli::shell_quote(&reference))
+    } else {
+        format!(
+            "loxa pull {repo} --file={}{revision}",
+            cli::shell_quote(filename)
+        )
+    }
+}
+
+fn execute_pull_resolution<F>(
+    args: &cli::PullInput,
+    operation: F,
+) -> Result<huggingface::ResolvedFile, String>
+where
+    F: FnOnce(
+        &str,
+        Option<&str>,
+        Option<&str>,
+        Option<&str>,
+    ) -> Result<huggingface::ResolvedFile, huggingface::ResolveError>,
+{
+    operation(
+        &args.repo,
+        args.revision.as_deref(),
+        args.filename.as_deref(),
+        args.quant.as_deref(),
+    )
+    .map_err(|error| match error {
+        huggingface::ResolveError::Discovery(error) => error.to_string(),
+        huggingface::ResolveError::Selection(error) => {
+            let revision = args
+                .revision
+                .as_deref()
+                .map(|revision| format!(" --revision={}", cli::shell_quote(revision)))
+                .unwrap_or_default();
+            format!(
+                "{error}\n\nInspect every eligible GGUF:\n  loxa inspect {}{revision}",
+                args.repo
+            )
+        }
+    })
+}
+
+fn print_pull_completion(id: &str, outcome: &download::DownloadOutcome) {
+    let success = ui::success();
+    match outcome {
+        download::DownloadOutcome::Pulled(_) => {
+            anstream::println!("{success}Pulled{success:#} {id}")
+        }
+        download::DownloadOutcome::AlreadyInstalled(_) => {
+            let muted = ui::muted();
+            anstream::println!(
+                "{success}Verified{success:#} {id} {muted}· already installed{muted:#}"
+            );
+        }
+    }
+    let muted = ui::muted();
+    anstream::println!("{muted}Run: loxa run {id}{muted:#}");
 }
 
 fn packaging_label(disposition: discovery::CandidateDisposition) -> &'static str {
@@ -316,6 +395,7 @@ fn run_with_recovery<F>(cli: Cli, paths: AppPaths, recovery: F) -> Result<i32, S
 where
     F: FnOnce(&AppPaths) -> Result<(), String>,
 {
+    cli::preflight(&cli).map_err(|error| error.to_string())?;
     if !matches!(&cli.command, Command::Search(_) | Command::Inspect(_)) {
         recovery(&paths)?;
     }
@@ -333,8 +413,7 @@ where
             Ok(0)
         }
         Command::Pull(args) => {
-            let repo = discovery::normalize_legacy_pull_repository(&args.repo)
-                .map_err(|_| "repository must be exactly owner/repo".to_string())?;
+            let args = cli::parse_pull_input(&args).map_err(|error| error.to_string())?;
             if let Some(name) = args.name.as_deref() {
                 validate_id(name)?;
             }
@@ -346,17 +425,13 @@ where
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|error| error.to_string())?;
-            let resolving = ui::spinner(format!("Resolving {repo}"));
-            let resolved = huggingface::resolve(
-                &client,
-                &repo,
-                args.revision.as_deref(),
-                args.filename.as_deref(),
-                args.quant.as_deref(),
-                token.as_deref(),
-            );
+            let resolving = ui::spinner(format!("Resolving {}", args.repo));
+            let resolved = execute_pull_resolution(&args, |repo, revision, filename, quant| {
+                huggingface::resolve(&client, repo, revision, filename, quant, token.as_deref())
+            });
             resolving.finish_and_clear();
             let resolved = resolved?;
+            let repo = args.repo;
             let id = args
                 .name
                 .unwrap_or_else(|| default_id(&repo, resolved.path(), resolved.sha256()));
@@ -424,18 +499,7 @@ where
                 size = resolved.size(),
                 outcome = download_outcome
             );
-            let success = ui::success();
-            match outcome {
-                download::DownloadOutcome::Pulled(_) => {
-                    anstream::println!("{success}Pulled{success:#} {id}")
-                }
-                download::DownloadOutcome::AlreadyInstalled(_) => {
-                    let muted = ui::muted();
-                    anstream::println!(
-                        "{success}Verified{success:#} {id} {muted}· already installed{muted:#}"
-                    )
-                }
-            }
+            print_pull_completion(&id, &outcome);
             Ok(0)
         }
         Command::List => {
@@ -913,16 +977,16 @@ fn default_id(repo: &str, filename: &str, sha256: &str) -> String {
 mod tests {
     use super::{
         default_id, discovery_error_message, ensure_interactive_chat, execute_inspect,
-        execute_search, installed_model_size, load_installed_models_with_reconciler,
-        local_candidates, model_options, model_options_with_candidates, removal_prompt,
-        resolve_runnable, run, run_with_recovery, runnable_candidates, select_model,
-        ModelSelection,
+        execute_pull_resolution, execute_search, installed_model_size,
+        load_installed_models_with_reconciler, local_candidates, model_options,
+        model_options_with_candidates, print_pull_completion, removal_prompt, resolve_runnable,
+        run, run_with_recovery, runnable_candidates, select_model, ModelSelection,
     };
     use crate::catalog::{
         Artifact, ArtifactProvenance, ArtifactRole, Manifest, RuntimeQualification,
         TEST_LLAMA_BUILD, TEST_MTP_PROFILE,
     };
-    use crate::cli::{Cli, InspectArgs, RuntimeArgs, SearchArgs};
+    use crate::cli::{Cli, Command, InspectArgs, PullArgs, RuntimeArgs, SearchArgs};
     use crate::discovery::{
         ArtifactCandidate, AuxiliaryRole, CandidateDisposition, DiscoveryError, DiscoveryErrorKind,
         GatedStatus, ModelSearchHit, ModelSearchPage, RepositoryPlan, UnsupportedPackagingReason,
@@ -1140,7 +1204,7 @@ mod tests {
     }
 
     #[test]
-    fn search_execution_preserves_all_hits_and_exact_gating_labels() {
+    fn search_results_include_one_neutral_inspect_command_per_hit() {
         let output = execute_search(
             SearchArgs {
                 query: "gemma".into(),
@@ -1172,24 +1236,36 @@ mod tests {
                 "owner/public\n",
                 "  Access: Public\n",
                 "  Downloads: 1200\n",
+                "  Inspect: loxa inspect owner/public\n",
                 "\n",
                 "owner/automatic\n",
                 "  Access: Automatic approval\n",
                 "  Downloads: 7\n",
+                "  Inspect: loxa inspect owner/automatic\n",
                 "\n",
                 "owner/manual\n",
                 "  Access: Manual approval\n",
                 "  Downloads: 0\n",
+                "  Inspect: loxa inspect owner/manual\n",
                 "\n",
                 "owner/unknown\n",
                 "  Access: Unknown\n",
                 "  Downloads: Unknown\n",
+                "  Inspect: loxa inspect owner/unknown\n",
             )
         );
+        assert_eq!(output.matches("  Inspect: loxa inspect ").count(), 4);
+        let lower = output.to_ascii_lowercase();
+        for excluded in ["recommended", "best", "fits", "compatible"] {
+            assert!(
+                !lower.contains(excluded),
+                "unexpected {excluded} in {output}"
+            );
+        }
     }
 
     #[test]
-    fn search_execution_displays_a_sole_hit_without_action_or_compatibility_guidance() {
+    fn search_execution_displays_a_sole_hit_with_only_neutral_inspect_guidance() {
         let output = execute_search(
             SearchArgs {
                 query: "owner/sole".into(),
@@ -1212,16 +1288,10 @@ mod tests {
                 "owner/sole\n",
                 "  Access: Public\n",
                 "  Downloads: Unknown\n",
+                "  Inspect: loxa inspect owner/sole\n",
             )
         );
-        for excluded in [
-            "loxa pull",
-            "loxa inspect",
-            "compatible",
-            "Compatible",
-            "recommend",
-            "best",
-        ] {
+        for excluded in ["loxa pull", "compatible", "Compatible", "recommend", "best"] {
             assert!(
                 !output.contains(excluded),
                 "unexpected {excluded} in {output}"
@@ -1336,13 +1406,191 @@ mod tests {
                 "  Size: 4512345678 bytes\n",
                 "  Packaging: Eligible for download and local validation\n",
                 "  SHA-256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+                "  Pull: loxa pull 'hf.co/owner/repo:model.gguf'\n",
             )
         );
         assert!(output.contains(&sha256));
     }
 
+    fn eligible_candidate(repo: &str, path: &str, size: u64) -> ArtifactCandidate {
+        ArtifactCandidate::new(
+            path.into(),
+            Some(size),
+            Some(crate::huggingface::test_resolved_file_for(
+                repo,
+                path,
+                "a".repeat(64),
+                size,
+            )),
+            CandidateDisposition::EligibleForDownloadAndLocalValidation,
+        )
+    }
+
     #[test]
-    fn inspection_execution_preserves_multiple_eligible_candidates_without_guidance() {
+    fn inspection_execution_prints_exact_commands_in_candidate_order_without_claims() {
+        let output = execute_inspect(
+            InspectArgs {
+                repo: "owner/repo".into(),
+                revision: None,
+            },
+            |_| {
+                Ok(RepositoryPlan::new(
+                    "owner/repo".into(),
+                    "0123456789abcdef0123456789abcdef01234567".into(),
+                    vec![
+                        eligible_candidate("owner/repo", "first-Q4_K_M.gguf", 10),
+                        ArtifactCandidate::new(
+                            "unsupported.gguf".into(),
+                            Some(15),
+                            Some(crate::huggingface::test_resolved_file_for(
+                                "owner/repo",
+                                "unsupported.gguf",
+                                "b".repeat(64),
+                                15,
+                            )),
+                            CandidateDisposition::UnsupportedPackaging(
+                                UnsupportedPackagingReason::Auxiliary(AuxiliaryRole::Draft),
+                            ),
+                        ),
+                        eligible_candidate("owner/repo", "second-Q4_K_M.gguf", 20),
+                    ],
+                ))
+            },
+        )
+        .unwrap();
+
+        let first = "  Pull: loxa pull 'hf.co/owner/repo:first-Q4_K_M.gguf'";
+        let second = "  Pull: loxa pull 'hf.co/owner/repo:second-Q4_K_M.gguf'";
+        let first_position = output.find(first).expect("first exact pull command");
+        let second_position = output.find(second).expect("second exact pull command");
+        assert!(first_position < second_position, "{output}");
+        assert_eq!(output.matches("  Pull:").count(), 2, "{output}");
+        assert!(!output.contains("hf.co/owner/repo:unsupported.gguf"));
+        assert!(
+            output.contains("Runtime compatibility: Unknown (local validation not run)"),
+            "{output}"
+        );
+        let lower = output.to_ascii_lowercase();
+        for excluded in ["recommended", "best", "fits", "compatible"] {
+            assert!(
+                !lower.contains(excluded),
+                "unexpected {excluded} in {output}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn shell_argv(command: &str, directory: &std::path::Path) -> Vec<String> {
+        let script = format!("set -- {command}; printf '%s\\n' \"$@\"");
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .current_dir(directory)
+            .output()
+            .expect("evaluate fixture-generated command words");
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stderr, b"");
+        String::from_utf8(output.stdout)
+            .expect("UTF-8 shell argv")
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inspection_execution_shell_commands_round_trip_without_evaluation() {
+        let temp = tempfile::tempdir().unwrap();
+        let filename = "-model ' $(touch compact-dollar) `touch compact-backtick`:tag.gguf";
+        let revision = "-release ' $(touch revision-dollar) `touch revision-backtick`";
+        let output = execute_inspect(
+            InspectArgs {
+                repo: "owner/repo".into(),
+                revision: Some(revision.into()),
+            },
+            |_| {
+                Ok(RepositoryPlan::new(
+                    "owner/repo".into(),
+                    "0123456789abcdef0123456789abcdef01234567".into(),
+                    vec![eligible_candidate("owner/repo", filename, 42)],
+                ))
+            },
+        )
+        .unwrap();
+
+        let command = output
+            .lines()
+            .find_map(|line| line.strip_prefix("  Pull: "))
+            .expect("copyable pull command");
+        let argv = shell_argv(command, temp.path());
+        assert_eq!(argv.len(), 4, "{argv:?}");
+        assert_eq!(argv[0], "loxa");
+        assert_eq!(argv[1], "pull");
+        assert_eq!(argv[2], format!("hf.co/owner/repo:{filename}"));
+        assert_eq!(argv[3], format!("--revision={revision}"));
+        for marker in [
+            "compact-dollar",
+            "compact-backtick",
+            "revision-dollar",
+            "revision-backtick",
+        ] {
+            assert!(!temp.path().join(marker).exists(), "created {marker}");
+        }
+
+        let parsed = Cli::try_parse_from(argv).unwrap();
+        let Command::Pull(args) = parsed.command else {
+            panic!("expected pull command");
+        };
+        let normalized = crate::cli::parse_pull_input(&args).unwrap();
+        assert_eq!(normalized.filename.as_deref(), Some(filename));
+        assert_eq!(normalized.revision.as_deref(), Some(revision));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inspection_execution_compact_and_legacy_fallback_round_trip_exact_filenames() {
+        let fallback = format!("{}.gguf", "x".repeat(251));
+        assert_eq!(fallback.len(), 256);
+        let output = execute_inspect(
+            InspectArgs {
+                repo: "owner/repo".into(),
+                revision: None,
+            },
+            |_| {
+                Ok(RepositoryPlan::new(
+                    "owner/repo".into(),
+                    "0123456789abcdef0123456789abcdef01234567".into(),
+                    vec![
+                        eligible_candidate("owner/repo", "model?#.gguf", 1),
+                        eligible_candidate("owner/repo", &fallback, 2),
+                    ],
+                ))
+            },
+        )
+        .unwrap();
+
+        let commands = output
+            .lines()
+            .filter_map(|line| line.strip_prefix("  Pull: "))
+            .collect::<Vec<_>>();
+        assert_eq!(commands.len(), 2, "{output}");
+        assert!(commands[0].contains("'hf.co/owner/repo:model?#.gguf'"));
+        assert!(commands[1].contains("owner/repo --file="));
+
+        for (command, expected_filename) in commands.into_iter().zip(["model?#.gguf", &fallback]) {
+            let directory = tempfile::tempdir().unwrap();
+            let argv = shell_argv(command, directory.path());
+            let parsed = Cli::try_parse_from(argv).unwrap();
+            let Command::Pull(args) = parsed.command else {
+                panic!("expected pull command");
+            };
+            let normalized = crate::cli::parse_pull_input(&args).unwrap();
+            assert_eq!(normalized.filename.as_deref(), Some(expected_filename));
+            assert_eq!(normalized.revision, None);
+        }
+    }
+
+    #[test]
+    fn inspection_execution_omits_pull_commands_without_candidate_identity() {
         let output = execute_inspect(
             InspectArgs {
                 repo: "owner/repo".into(),
@@ -1639,6 +1887,257 @@ mod tests {
         assert_eq!(calls.get(), 1);
     }
 
+    fn pull_cli(
+        repo: &str,
+        revision: Option<&str>,
+        filename: Option<&str>,
+        quant: Option<&str>,
+    ) -> Cli {
+        Cli {
+            command: Command::Pull(PullArgs {
+                repo: repo.into(),
+                revision: revision.map(str::to_owned),
+                filename: filename.map(str::to_owned),
+                quant: quant.map(str::to_owned),
+                name: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn pull_preflight_rejects_missing_selection_before_recovery_with_actionable_revision() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_values(Some(temp.path()), None).unwrap();
+        let calls = std::cell::Cell::new(0);
+
+        let error = run_with_recovery(
+            pull_cli("owner/repo", Some("release candidate"), None, None),
+            paths,
+            |_| {
+                calls.set(calls.get() + 1);
+                Err("injected recovery must not run".into())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(calls.get(), 0);
+        for expected in [
+            "no GGUF was selected for owner/repo",
+            "loxa inspect owner/repo --revision='release candidate'",
+            "loxa pull owner/repo --file <FILENAME> --revision='release candidate'",
+            "loxa pull owner/repo --quant <QUANT> --revision='release candidate'",
+            "loxa pull hf.co/owner/repo:<FILENAME-or-QUANT> --revision='release candidate'",
+        ] {
+            assert!(error.contains(expected), "missing {expected:?} in {error}");
+        }
+    }
+
+    #[test]
+    fn pull_preflight_rejects_conflicting_and_malformed_inputs_before_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_values(Some(temp.path()), None).unwrap();
+        let cases = [
+            pull_cli("owner/repo", None, Some("model.gguf"), Some("Q4_K_M")),
+            pull_cli("hf.co/owner/repo:Q4_K_M", None, Some("model.gguf"), None),
+            pull_cli("hf.co/owner/repo:", None, None, None),
+            pull_cli("owner/extra/repo", None, Some("model.gguf"), None),
+            pull_cli(
+                "owner/repo",
+                Some("release\u{202e}UNSAFE"),
+                Some("model.gguf"),
+                None,
+            ),
+            pull_cli("owner/\u{202e}repo\nUNSAFE", None, Some("model.gguf"), None),
+        ];
+
+        for cli in cases {
+            let calls = std::cell::Cell::new(0);
+            let error = run_with_recovery(cli, paths.clone(), |_| {
+                calls.set(calls.get() + 1);
+                Err("injected recovery must not run".into())
+            })
+            .unwrap_err();
+
+            assert_eq!(calls.get(), 0, "{error}");
+            assert!(!error.contains("UNSAFE"), "{error:?}");
+            assert!(!error.contains('\u{202e}'), "{error:?}");
+            assert!(!error.contains("injected recovery"), "{error:?}");
+        }
+    }
+
+    fn normalized_pull_for_selection(
+        filename: Option<&str>,
+        quant: Option<&str>,
+        revision: Option<&str>,
+    ) -> crate::cli::PullInput {
+        crate::cli::parse_pull_input(&PullArgs {
+            repo: "owner/repo".into(),
+            revision: revision.map(str::to_owned),
+            filename: filename.map(str::to_owned),
+            quant: quant.map(str::to_owned),
+            name: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn missing_quant_selection_error_preserves_labels_and_appends_inspect() {
+        let args = normalized_pull_for_selection(None, Some("NOT_A_QUANT"), None);
+        let error = execute_pull_resolution(&args, |repo, revision, filename, quant| {
+            assert_eq!(repo, "owner/repo");
+            assert_eq!(revision, None);
+            assert_eq!(filename, None);
+            assert_eq!(quant, Some("NOT_A_QUANT"));
+            Err(crate::huggingface::ResolveError::Selection(
+                crate::huggingface::SelectionError::QuantUnavailable {
+                    requested: "NOT_A_QUANT".into(),
+                    available: vec!["Q4_K_M".into(), "Q8_0".into()],
+                },
+            ))
+        })
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            concat!(
+                "quantization \"NOT_A_QUANT\" is not available; available quantizations: Q4_K_M, Q8_0. Retry with --quant <one of these values>.\n",
+                "\n",
+                "Inspect every eligible GGUF:\n",
+                "  loxa inspect owner/repo",
+            )
+        );
+    }
+
+    #[test]
+    fn ambiguous_quant_selection_error_preserves_filenames_and_revision_inspect() {
+        let args = normalized_pull_for_selection(None, Some("Q4_K_M"), Some("release candidate"));
+        let error = execute_pull_resolution(&args, |_, _, _, _| {
+            Err(crate::huggingface::ResolveError::Selection(
+                crate::huggingface::SelectionError::AmbiguousQuant {
+                    requested: "Q4_K_M".into(),
+                    filenames: vec!["first-Q4_K_M.gguf".into(), "second-Q4_K_M.gguf".into()],
+                },
+            ))
+        })
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            concat!(
+                "quantization \"Q4_K_M\" matched multiple files: first-Q4_K_M.gguf, second-Q4_K_M.gguf. Use --file <filename> to choose one.\n",
+                "\n",
+                "Inspect every eligible GGUF:\n",
+                "  loxa inspect owner/repo --revision='release candidate'",
+            )
+        );
+    }
+
+    #[test]
+    fn missing_exact_file_selection_error_appends_only_safe_inspect_guidance() {
+        let args = normalized_pull_for_selection(Some("missing.gguf"), None, None);
+        let error = execute_pull_resolution(&args, |_, _, _, _| {
+            Err(crate::huggingface::ResolveError::Selection(
+                crate::huggingface::SelectionError::FileNotFound("missing.gguf".into()),
+            ))
+        })
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            concat!(
+                "verified file \"missing.gguf\" not found\n",
+                "\n",
+                "Inspect every eligible GGUF:\n",
+                "  loxa inspect owner/repo",
+            )
+        );
+        for character in error.chars() {
+            assert!(
+                !character.is_control() || character == '\n',
+                "unsafe character in {error:?}"
+            );
+            assert!(
+                !crate::huggingface::unsafe_presentation_character(character) || character == '\n',
+                "unsafe presentation character in {error:?}"
+            );
+        }
+        for secret in ["REMOTE_BODY", "HF_TOKEN", "token path"] {
+            assert!(!error.contains(secret), "{error}");
+        }
+    }
+
+    #[test]
+    fn discovery_failures_never_gain_selection_recovery_guidance() {
+        let args = normalized_pull_for_selection(Some("model.gguf"), None, None);
+        for kind in [
+            DiscoveryErrorKind::AuthenticationRequired,
+            DiscoveryErrorKind::RateLimited,
+            DiscoveryErrorKind::DeadlineExceeded,
+            DiscoveryErrorKind::MalformedResponse,
+        ] {
+            let error = execute_pull_resolution(&args, |_, _, _, _| {
+                Err(crate::huggingface::ResolveError::Discovery(
+                    DiscoveryError::new(kind),
+                ))
+            })
+            .unwrap_err();
+
+            assert_eq!(error, "Hugging Face discovery request failed", "{kind:?}");
+            assert!(!error.contains("loxa inspect"), "{kind:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn pull_completion_prints_observable_status_and_run_guidance_once() {
+        const CHILD_OUTCOME: &str = "LOXA_PULL_COMPLETION_TEST_OUTCOME";
+        if let Ok(outcome) = std::env::var(CHILD_OUTCOME) {
+            let outcome = match outcome.as_str() {
+                "pulled" => crate::download::DownloadOutcome::Pulled("model.gguf".into()),
+                "already-installed" => {
+                    crate::download::DownloadOutcome::AlreadyInstalled("model.gguf".into())
+                }
+                unexpected => panic!("unexpected child outcome {unexpected:?}"),
+            };
+            print_pull_completion("demo-model", &outcome);
+            return;
+        }
+
+        for (outcome, status) in [
+            ("pulled", "Pulled demo-model"),
+            (
+                "already-installed",
+                "Verified demo-model · already installed",
+            ),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::pull_completion_prints_observable_status_and_run_guidance_once",
+                    "--nocapture",
+                ])
+                .env(CHILD_OUTCOME, outcome)
+                .env("NO_COLOR", "1")
+                .current_dir(root.path())
+                .output()
+                .expect("capture pull completion output");
+
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(output.stderr, b"");
+            let stdout = String::from_utf8(output.stdout).expect("UTF-8 completion output");
+            assert!(stdout.contains(status), "{stdout:?}");
+            assert_eq!(
+                stdout.matches("Run: loxa run demo-model").count(),
+                1,
+                "{stdout:?}"
+            );
+            assert!(
+                root.path().read_dir().unwrap().next().is_none(),
+                "completion guidance created local state"
+            );
+        }
+    }
+
     #[test]
     fn pull_normalizes_only_hf_wrapper_before_existing_local_validation() {
         let temp = tempfile::tempdir().unwrap();
@@ -1674,6 +2173,18 @@ mod tests {
         assert_eq!(canonical_error, "invalid model id \"invalid/name\"");
         assert_eq!(wrapped_error, canonical_error);
 
+        for compact in [
+            "hf.co/owner/repo:Q4_K_M",
+            "huggingface.co/owner/repo:model.GgUf",
+        ] {
+            let error = run(
+                Cli::parse_from(["loxa", "pull", compact, "--name", invalid_name]),
+                paths.clone(),
+            )
+            .unwrap_err();
+            assert_eq!(error, canonical_error, "{compact}");
+        }
+
         for repo in ["hf://owner", "https://huggingface.co/owner/repo"] {
             let error = run(
                 Cli::parse_from([
@@ -1688,7 +2199,10 @@ mod tests {
                 paths.clone(),
             )
             .unwrap_err();
-            assert_eq!(error, "repository must be exactly owner/repo", "{repo}");
+            assert!(
+                error.contains("repository must be exactly owner/repo"),
+                "{repo}: {error}"
+            );
         }
     }
 

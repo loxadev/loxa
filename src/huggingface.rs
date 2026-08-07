@@ -9,6 +9,7 @@ use reqwest::{redirect::Policy, StatusCode, Url};
 use serde::{de::DeserializeOwned, Deserialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
+use std::fmt;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -112,6 +113,22 @@ pub(crate) fn test_resolved_file(sha256: String, size: u64) -> ResolvedFile {
         repo: "owner/repo".into(),
         revision: "0123456789abcdef0123456789abcdef01234567".into(),
         filename: "model.gguf".into(),
+        sha256,
+        size,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_resolved_file_for(
+    repo: &str,
+    path: &str,
+    sha256: String,
+    size: u64,
+) -> ResolvedFile {
+    ResolvedFile {
+        repo: repo.into(),
+        revision: "0123456789abcdef0123456789abcdef01234567".into(),
+        filename: path.into(),
         sha256,
         size,
     }
@@ -384,7 +401,7 @@ fn safe_display_path(path: &str) -> String {
     }
 }
 
-fn unsafe_presentation_character(character: char) -> bool {
+pub(crate) fn unsafe_presentation_character(character: char) -> bool {
     character.is_control()
         || matches!(
             character,
@@ -971,6 +988,70 @@ struct RootTreeLfs {
     size: Option<u64>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SelectionError {
+    MissingSelection,
+    NoEligibleFiles,
+    FileNotFound(String),
+    QuantUnavailable {
+        requested: String,
+        available: Vec<String>,
+    },
+    AmbiguousQuant {
+        requested: String,
+        filenames: Vec<String>,
+    },
+}
+
+impl fmt::Display for SelectionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingSelection => formatter.write_str("GGUF selection requires --file or --quant"),
+            Self::NoEligibleFiles => {
+                formatter.write_str("repository has no verified single-file GGUF")
+            }
+            Self::FileNotFound(filename) => {
+                write!(formatter, "verified file {filename:?} not found")
+            }
+            Self::QuantUnavailable {
+                requested,
+                available,
+            } => write!(
+                formatter,
+                "quantization {requested:?} is not available; available quantizations: {}. Retry with --quant <one of these values>.",
+                available.join(", ")
+            ),
+            Self::AmbiguousQuant {
+                requested,
+                filenames,
+            } => write!(
+                formatter,
+                "quantization {requested:?} matched multiple files: {}. Use --file <filename> to choose one.",
+                filenames.join(", ")
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SelectionError {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ResolveError {
+    Discovery(DiscoveryError),
+    Selection(SelectionError),
+}
+
+impl fmt::Display for ResolveError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Discovery(error) => error.fmt(formatter),
+            Self::Selection(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for ResolveError {}
+
 pub(crate) fn resolve(
     client: &Client,
     repo: &str,
@@ -978,7 +1059,7 @@ pub(crate) fn resolve(
     filename: Option<&str>,
     quant: Option<&str>,
     token: Option<&str>,
-) -> Result<ResolvedFile, String> {
+) -> Result<ResolvedFile, ResolveError> {
     let request = InspectRepository::new(repo.into(), revision.map(str::to_owned));
     let mut transport =
         ReqwestDiscoveryTransport::with_client(client.clone(), token.map(str::to_owned));
@@ -990,19 +1071,19 @@ fn resolve_with_transport<T: DiscoveryTransport>(
     filename: Option<&str>,
     quant: Option<&str>,
     transport: &mut T,
-) -> Result<ResolvedFile, String> {
+) -> Result<ResolvedFile, ResolveError> {
     let plan =
-        inspect_repository_with_transport(request, transport).map_err(|error| error.to_string())?;
-    select_from_plan(&plan, filename, quant)
+        inspect_repository_with_transport(request, transport).map_err(ResolveError::Discovery)?;
+    select_from_plan(&plan, filename, quant).map_err(ResolveError::Selection)
 }
 
 fn select_from_plan(
     plan: &RepositoryPlan,
     filename: Option<&str>,
     quant: Option<&str>,
-) -> Result<ResolvedFile, String> {
+) -> Result<ResolvedFile, SelectionError> {
     if filename.is_none() && quant.is_none() {
-        return Err("GGUF selection requires --file or --quant".into());
+        return Err(SelectionError::MissingSelection);
     }
     let mut candidates = plan
         .candidates()
@@ -1010,12 +1091,12 @@ fn select_from_plan(
         .filter_map(|candidate| candidate.identity().cloned())
         .collect::<Vec<_>>();
     if candidates.is_empty() {
-        return Err("repository has no verified single-file GGUF".into());
+        return Err(SelectionError::NoEligibleFiles);
     }
     if let Some(filename) = filename {
         candidates.retain(|candidate| candidate.path() == filename);
         if candidates.len() != 1 {
-            return Err(format!("verified file {filename:?} not found"));
+            return Err(SelectionError::FileNotFound(filename.into()));
         }
     } else if let Some(quant) = quant {
         let matching = candidates
@@ -1026,27 +1107,27 @@ fn select_from_plan(
             0 => {
                 let mut available = candidates
                     .iter()
-                    .map(|candidate| quantization(candidate.path()))
+                    .map(|candidate| quantization(candidate.path()).to_owned())
                     .collect::<Vec<_>>();
                 available.sort_unstable();
                 available.dedup();
-                return Err(format!(
-                    "quantization {quant:?} is not available; available quantizations: {}. Retry with --quant <one of these values>.",
-                    available.join(", ")
-                ));
+                return Err(SelectionError::QuantUnavailable {
+                    requested: quant.into(),
+                    available,
+                });
             }
             1 => candidates
                 .retain(|candidate| quantization(candidate.path()).eq_ignore_ascii_case(quant)),
             _ => {
                 let mut filenames = matching
                     .into_iter()
-                    .map(|candidate| candidate.path())
+                    .map(|candidate| candidate.path().to_owned())
                     .collect::<Vec<_>>();
                 filenames.sort_unstable();
-                return Err(format!(
-                    "quantization {quant:?} matched multiple files: {}. Use --file <filename> to choose one.",
-                    filenames.join(", ")
-                ));
+                return Err(SelectionError::AmbiguousQuant {
+                    requested: quant.into(),
+                    filenames,
+                });
             }
         }
     }
@@ -1350,7 +1431,10 @@ mod tests {
         .to_string();
         let error = select_from_plan(&inspected_plan(&tree), None, None).unwrap_err();
 
-        assert_eq!(error, "GGUF selection requires --file or --quant");
+        assert_eq!(
+            error.to_string(),
+            "GGUF selection requires --file or --quant"
+        );
     }
 
     #[test]
@@ -1366,14 +1450,20 @@ mod tests {
         .to_string();
         let error = select_from_plan(&inspected_plan(&tree), None, None).unwrap_err();
 
-        assert_eq!(error, "GGUF selection requires --file or --quant");
+        assert_eq!(
+            error.to_string(),
+            "GGUF selection requires --file or --quant"
+        );
     }
 
     #[test]
     fn omitted_selection_rejects_unique_q4_among_multiple_eligible_files() {
         let error = select_from_plan(&inspected_plan(TREE), None, None).unwrap_err();
 
-        assert_eq!(error, "GGUF selection requires --file or --quant");
+        assert_eq!(
+            error.to_string(),
+            "GGUF selection requires --file or --quant"
+        );
     }
 
     #[test]
@@ -1411,7 +1501,7 @@ mod tests {
         let error = select_from_plan(&inspected_plan(TREE), None, Some("NOT_A_QUANT")).unwrap_err();
 
         assert_eq!(
-            error,
+            error.to_string(),
             "quantization \"NOT_A_QUANT\" is not available; available quantizations: Q4_K_M, Q8_0. Retry with --quant <one of these values>."
         );
     }
@@ -1422,7 +1512,7 @@ mod tests {
         let error = select_from_plan(&ambiguous, None, Some("Q4_K_M")).unwrap_err();
 
         assert_eq!(
-            error,
+            error.to_string(),
             "quantization \"Q4_K_M\" matched multiple files: demo-Q4_K_M.gguf, other-Q4_K_M.gguf. Use --file <filename> to choose one."
         );
     }
@@ -1544,6 +1634,65 @@ mod tests {
     }
 
     #[test]
+    fn compact_pull_and_flag_forms_resolve_to_the_same_resolved_file() {
+        for (reference, filename, quant) in [
+            (
+                "hf.co/owner/repo:demo-Q4_K_M.gguf",
+                Some("demo-Q4_K_M.gguf"),
+                None,
+            ),
+            ("huggingface.co/owner/repo:q4_k_m", None, Some("q4_k_m")),
+        ] {
+            let compact = crate::cli::parse_pull_input(&crate::cli::PullArgs {
+                repo: reference.into(),
+                revision: None,
+                filename: None,
+                quant: None,
+                name: None,
+            })
+            .unwrap();
+            let responses = || {
+                vec![
+                    FakeDiscoveryTransport::json_response(StatusCode::OK, MODEL),
+                    FakeDiscoveryTransport::json_response(StatusCode::OK, TREE),
+                ]
+            };
+            let mut compact_transport = FakeDiscoveryTransport::queued(responses());
+            let mut flag_transport = FakeDiscoveryTransport::queued(responses());
+
+            let compact_resolved = resolve_with_transport(
+                InspectRepository::new(compact.repo, compact.revision),
+                compact.filename.as_deref(),
+                compact.quant.as_deref(),
+                &mut compact_transport,
+            )
+            .unwrap();
+            let flag_resolved = resolve_with_transport(
+                InspectRepository::new("owner/repo".into(), None),
+                filename,
+                quant,
+                &mut flag_transport,
+            )
+            .unwrap();
+
+            assert_eq!(compact_resolved, flag_resolved, "{reference}");
+            assert_eq!(
+                compact_transport.requests.len(),
+                flag_transport.requests.len()
+            );
+            for (compact_request, flag_request) in compact_transport
+                .requests
+                .iter()
+                .zip(&flag_transport.requests)
+            {
+                assert_eq!(compact_request.url, flag_request.url);
+                assert_eq!(compact_request.timeout, flag_request.timeout);
+                assert_eq!(compact_request.authorization, flag_request.authorization);
+            }
+        }
+    }
+
+    #[test]
     fn explicit_file_rejects_ineligible_packaging_and_case_mismatch() {
         let tree = serde_json::json!([
             {"type":"file","path":"Model-Q4_K_M.gguf","size":4,"lfs":{"oid":"a".repeat(64),"size":4}},
@@ -1575,7 +1724,9 @@ mod tests {
             "model-Q4_K_M.gguf",
         ] {
             assert_eq!(
-                select_from_plan(&plan, Some(path), None).unwrap_err(),
+                select_from_plan(&plan, Some(path), None)
+                    .unwrap_err()
+                    .to_string(),
                 format!("verified file {path:?} not found")
             );
         }
@@ -1599,7 +1750,9 @@ mod tests {
             (None, Some("Q4_K_M")),
         ] {
             assert_eq!(
-                select_from_plan(&plan, filename, quant).unwrap_err(),
+                select_from_plan(&plan, filename, quant)
+                    .unwrap_err()
+                    .to_string(),
                 "repository has no verified single-file GGUF"
             );
         }

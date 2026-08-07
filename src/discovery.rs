@@ -325,10 +325,12 @@ pub(crate) fn validate_inspect_request(
     Ok((repo, revision))
 }
 
-fn validate_revision(revision: &str) -> Result<String, DiscoveryError> {
+pub(crate) fn validate_revision(revision: &str) -> Result<String, DiscoveryError> {
     if !(1..=256).contains(&revision.len())
         || matches!(revision, "." | "..")
-        || revision.chars().any(char::is_control)
+        || revision
+            .chars()
+            .any(crate::huggingface::unsafe_presentation_character)
     {
         return Err(DiscoveryError::new(DiscoveryErrorKind::InvalidRevision));
     }
@@ -557,7 +559,15 @@ mod tests {
             ("owner/repo".into(), Some(maximum))
         );
 
-        for revision in ["", &"r".repeat(257), "branch\0name", "branch\u{1f}name"] {
+        for revision in [
+            "",
+            &"r".repeat(257),
+            "branch\0name",
+            "branch\u{1f}name",
+            "branch\u{061c}name",
+            "branch\u{202e}name",
+            "branch\u{2066}name",
+        ] {
             let request = InspectRepository::new("owner/repo".into(), Some(revision.into()));
             assert_eq!(
                 validate_inspect_request(&request).unwrap_err().kind(),

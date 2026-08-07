@@ -7,6 +7,27 @@ use tempfile::tempdir;
 
 const OWNERSHIP_EVENT: &str = "log_initialized";
 
+#[test]
+fn inspect_help_explains_branch_tag_resolution_without_creating_state() {
+    let root = tempdir().expect("temporary process environment");
+    let loxa_home = root.path().join("loxa-home");
+    let output = Command::new(env!("CARGO_BIN_EXE_loxa"))
+        .args(["inspect", "--help"])
+        .env("LOXA_HOME", &loxa_home)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("run loxa inspect help");
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(output.stderr, b"");
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 help");
+    assert!(
+        stdout.contains("branches/tags resolve again when pulled"),
+        "{stdout}"
+    );
+    assert!(!loxa_home.exists(), "help initialized local state");
+}
+
 fn owned_daily_log_events(home: &Path) -> Vec<Value> {
     let log_dir = home.join("logs");
     let mut entries = fs::read_dir(&log_dir)
@@ -75,7 +96,7 @@ fn assert_only_normal_logs(home: &Path) {
 }
 
 #[test]
-fn exact_repository_search_prints_frozen_stdout_and_logs_only_command_name() {
+fn search_cli_prints_copyable_inspect_commands_and_logs_only_command_name() {
     let home = tempdir().expect("temporary Loxa home");
     let token_marker = "UNIQUE_DISCOVERY_TOKEN_URL_BODY_MARKER";
     let output = Command::new(env!("CARGO_BIN_EXE_loxa"))
@@ -101,6 +122,7 @@ fn exact_repository_search_prints_frozen_stdout_and_logs_only_command_name() {
             "owner/repo\n",
             "  Access: Unknown\n",
             "  Downloads: Unknown\n",
+            "  Inspect: loxa inspect owner/repo\n",
         )
     );
     assert_eq!(output.stderr, b"");

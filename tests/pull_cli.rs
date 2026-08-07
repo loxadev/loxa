@@ -33,6 +33,64 @@ fn controlled_command(root: &Path) -> Command {
     command
 }
 
+fn selectorless_stderr(repo: &str) -> String {
+    selectorless_stderr_with_revision(repo, "")
+}
+
+fn selectorless_stderr_with_revision(repo: &str, revision: &str) -> String {
+    format!(
+        concat!(
+            "error: no GGUF was selected for {repo}\n",
+            "\n",
+            "Inspect every eligible GGUF:\n",
+            "  loxa inspect {repo}{revision}\n",
+            "\n",
+            "Then choose exactly one:\n",
+            "  loxa pull {repo} --file <FILENAME>{revision}\n",
+            "  loxa pull {repo} --quant <QUANT>{revision}\n",
+            "  loxa pull hf.co/{repo}:<FILENAME-or-QUANT>{revision}\n",
+            "\n",
+            "Usage: loxa pull <OWNER/REPO> (--file <FILENAME>|--quant <QUANT>) [OPTIONS]\n",
+            "       loxa pull <HF.CO/OWNER/REPO:FILE-OR-QUANT> [OPTIONS]\n",
+            "\n",
+            "For more information, try '--help'.\n",
+        ),
+        repo = repo,
+        revision = revision,
+    )
+}
+
+fn assert_selectorless_host_failure(args: &[&str], revision: &str) {
+    let temp = tempdir().expect("temporary process environment");
+    let output = controlled_command(temp.path())
+        .args(args)
+        .output()
+        .expect("run selector-less host-form loxa pull");
+
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert_eq!(output.stdout, b"");
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+    assert_eq!(
+        stderr,
+        selectorless_stderr_with_revision("owner/repo", revision)
+    );
+    if !revision.is_empty() {
+        assert_eq!(
+            stderr.matches(revision).count(),
+            4,
+            "revision was not preserved on inspect and every retry: {stderr}"
+        );
+    }
+    assert!(
+        temp.path()
+            .read_dir()
+            .expect("temporary environment directory")
+            .next()
+            .is_none(),
+        "selector-less host-form pull created local state"
+    );
+}
+
 #[test]
 fn selectorless_pull_fails_before_local_or_remote_work() {
     let temp = tempdir().expect("temporary process environment");
@@ -46,16 +104,71 @@ fn selectorless_pull_fails_before_local_or_remote_work() {
     assert_eq!(output.stdout, b"");
     assert_eq!(
         String::from_utf8(output.stderr).expect("UTF-8 stderr"),
-        concat!(
-            "error: the following required arguments were not provided:\n",
-            "  <--file <FILENAME>|--quant <QUANT>>\n",
-            "\n",
-            "Usage: loxa pull <--file <FILENAME>|--quant <QUANT>> <REPO>\n",
-            "\n",
-            "For more information, try '--help'.\n",
-        )
+        selectorless_stderr("unmistakable-owner/unmistakable-repo")
     );
     assert!(!loxa_home.exists(), "parser rejection created LOXA_HOME");
+}
+
+#[test]
+fn selectorless_pull_wins_before_missing_or_relative_app_paths() {
+    for relative_home in [None, Some("relative-loxa-home")] {
+        let temp = tempdir().expect("temporary process environment");
+        let mut command = controlled_command(temp.path());
+        command
+            .env_remove("LOXA_HOME")
+            .env_remove("HOME")
+            .env_remove("USERPROFILE");
+        if let Some(relative_home) = relative_home {
+            command.env("LOXA_HOME", relative_home);
+        }
+
+        let output = command
+            .args(["pull", "owner/repo"])
+            .output()
+            .expect("run selector-less loxa pull with unusable paths");
+
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert_eq!(output.stdout, b"");
+        assert_eq!(
+            String::from_utf8(output.stderr).expect("UTF-8 stderr"),
+            selectorless_stderr("owner/repo")
+        );
+        assert!(
+            temp.path()
+                .read_dir()
+                .expect("temporary environment directory")
+                .next()
+                .is_none(),
+            "selector-less pull created local state"
+        );
+    }
+}
+
+#[test]
+fn recognized_hosts_without_selector_use_canonical_guidance_without_state() {
+    for reference in ["hf.co/owner/repo", "huggingface.co/owner/repo"] {
+        assert_selectorless_host_failure(&["pull", reference], "");
+    }
+}
+
+#[test]
+fn recognized_hosts_with_empty_selector_use_canonical_guidance_without_state() {
+    for reference in ["hf.co/owner/repo:", "huggingface.co/owner/repo:"] {
+        assert_selectorless_host_failure(&["pull", reference], "");
+    }
+}
+
+#[test]
+fn selectorless_host_preserves_quoted_revision_on_inspect_and_every_retry() {
+    assert_selectorless_host_failure(
+        &[
+            "pull",
+            "huggingface.co/owner/repo",
+            "--revision",
+            "release candidate",
+        ],
+        " --revision='release candidate'",
+    );
 }
 
 #[test]
