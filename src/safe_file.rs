@@ -3,6 +3,37 @@ use std::io::{self, Read};
 use std::path::Path;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DirectoryIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(not(unix))]
+    _private: (),
+}
+
+impl DirectoryIdentity {
+    fn from_metadata(metadata: &fs::Metadata, path: &Path) -> io::Result<Self> {
+        if !metadata.file_type().is_dir() {
+            return Err(unsafe_file_error(path, "expected a directory"));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            Ok(Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self { _private: () })
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RegularFileIdentity {
     size: u64,
     #[cfg(unix)]
@@ -45,6 +76,36 @@ pub(crate) fn read_regular_file(path: &Path) -> io::Result<Vec<u8>> {
     read_regular_file_with_after_open(path, || {})
 }
 
+pub(crate) fn open_directory(path: &Path) -> io::Result<(File, DirectoryIdentity)> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    }
+    let file = options.open(path)?;
+    let identity = DirectoryIdentity::from_metadata(&file.metadata()?, path)?;
+    Ok((file, identity))
+}
+
+pub(crate) fn ensure_directory_descriptor_matches_path(
+    file: &File,
+    opened: &DirectoryIdentity,
+    path: &Path,
+) -> io::Result<()> {
+    let after = DirectoryIdentity::from_metadata(&file.metadata()?, path)?;
+    if &after != opened {
+        return Err(changed_while_open(path, "directory"));
+    }
+    let resolved = DirectoryIdentity::from_metadata(&fs::symlink_metadata(path)?, path)?;
+    if &resolved != opened {
+        return Err(changed_while_open(path, "directory"));
+    }
+    Ok(())
+}
+
 pub(crate) fn open_regular_file(path: &Path) -> io::Result<(File, RegularFileIdentity)> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -55,8 +116,29 @@ pub(crate) fn open_regular_file(path: &Path) -> io::Result<(File, RegularFileIde
         options.custom_flags(libc::O_NOFOLLOW);
     }
     let file = options.open(path)?;
-    let identity = RegularFileIdentity::from_metadata(&file.metadata()?, path)?;
+    let identity = regular_file_identity(&file, path)?;
     Ok((file, identity))
+}
+
+pub(crate) fn regular_file_identity(file: &File, path: &Path) -> io::Result<RegularFileIdentity> {
+    RegularFileIdentity::from_metadata(&file.metadata()?, path)
+}
+
+pub(crate) fn ensure_regular_descriptors_match(
+    opened_file: &File,
+    opened: &RegularFileIdentity,
+    resolved_file: &File,
+    path: &Path,
+) -> io::Result<()> {
+    let after = regular_file_identity(opened_file, path)?;
+    if &after != opened {
+        return Err(changed_while_open(path, "file"));
+    }
+    let resolved = regular_file_identity(resolved_file, path)?;
+    if &resolved != opened {
+        return Err(changed_while_open(path, "file"));
+    }
+    Ok(())
 }
 
 pub(crate) fn ensure_descriptor_matches_path(
@@ -98,6 +180,13 @@ fn changed_while_reading(path: &Path) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
         format!("file changed while reading {}", path.display()),
+    )
+}
+
+fn changed_while_open(path: &Path, kind: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("{kind} changed while open {}", path.display()),
     )
 }
 
