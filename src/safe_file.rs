@@ -42,6 +42,14 @@ pub(crate) struct RegularFileIdentity {
     inode: u64,
     #[cfg(unix)]
     links: u64,
+    #[cfg(unix)]
+    modified_seconds: i64,
+    #[cfg(unix)]
+    modified_nanoseconds: i64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
 }
 
 impl RegularFileIdentity {
@@ -61,6 +69,10 @@ impl RegularFileIdentity {
                 device: metadata.dev(),
                 inode: metadata.ino(),
                 links: metadata.nlink(),
+                modified_seconds: metadata.mtime(),
+                modified_nanoseconds: metadata.mtime_nsec(),
+                changed_seconds: metadata.ctime(),
+                changed_nanoseconds: metadata.ctime_nsec(),
             })
         }
         #[cfg(not(unix))]
@@ -88,6 +100,10 @@ pub(crate) fn open_directory(path: &Path) -> io::Result<(File, DirectoryIdentity
     let file = options.open(path)?;
     let identity = DirectoryIdentity::from_metadata(&file.metadata()?, path)?;
     Ok((file, identity))
+}
+
+pub(crate) fn directory_identity(file: &File, path: &Path) -> io::Result<DirectoryIdentity> {
+    DirectoryIdentity::from_metadata(&file.metadata()?, path)
 }
 
 pub(crate) fn ensure_directory_descriptor_matches_path(

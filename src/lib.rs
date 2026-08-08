@@ -56,7 +56,7 @@ mod discovery_public_contract_tests {
         );
     }
 }
-pub mod download;
+mod download;
 pub mod huggingface;
 pub mod paths;
 pub mod runner;

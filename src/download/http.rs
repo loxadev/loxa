@@ -2,14 +2,44 @@ use crate::huggingface::{should_attach_token, ResolvedFile};
 use reqwest::header::{CONTENT_RANGE, LOCATION, RANGE};
 use reqwest::{redirect::Policy, StatusCode, Url};
 use std::fmt::{self, Display};
+use std::future::Future;
 use std::time::Duration;
 
 const MAX_REDIRECTS: usize = 5;
 const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+pub(super) enum WaitOutcome<T> {
+    Ready(T),
+    Paused,
+}
+
+pub(super) async fn wait_with_pause<F>(
+    future: F,
+    should_pause: &impl Fn() -> bool,
+) -> WaitOutcome<F::Output>
+where
+    F: Future,
+{
+    let mut future = std::pin::pin!(future);
+    loop {
+        if should_pause() {
+            return WaitOutcome::Paused;
+        }
+        if let Ok(value) = tokio::time::timeout(CONTROL_POLL_INTERVAL, &mut future).await {
+            return if should_pause() {
+                WaitOutcome::Paused
+            } else {
+                WaitOutcome::Ready(value)
+            };
+        }
+    }
+}
 
 pub(super) struct Transfer {
     pub(super) status: StatusCode,
     pub(super) content_range: Option<String>,
+    location: Option<String>,
     response: ResponseBody,
     pending: Vec<u8>,
 }
@@ -28,6 +58,11 @@ impl Transfer {
             #[cfg(test)]
             ResponseBody::Test(chunks) => match chunks.pop_front() {
                 Some(chunk) => chunk.map(Some),
+                None => Ok(None),
+            },
+            #[cfg(test)]
+            ResponseBody::TestFutures(futures) => match futures.pop_front() {
+                Some(future) => future.await,
                 None => Ok(None),
             },
         }?;
@@ -55,22 +90,66 @@ impl Transfer {
         Self {
             status,
             content_range: content_range.map(str::to_string),
+            location: None,
             response: ResponseBody::Test(chunks.into_iter().collect()),
+            pending: Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_redirect(status: StatusCode, location: &str) -> Self {
+        Self {
+            status,
+            content_range: None,
+            location: Some(location.to_owned()),
+            response: ResponseBody::Test(Default::default()),
+            pending: Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_future(
+        status: StatusCode,
+        content_range: Option<&str>,
+        future: impl Future<Output = Result<Option<Vec<u8>>, TransferError>> + 'static,
+    ) -> Self {
+        Self::test_futures(status, content_range, [Box::pin(future) as TestChunkFuture])
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_futures(
+        status: StatusCode,
+        content_range: Option<&str>,
+        futures: impl IntoIterator<Item = TestChunkFuture>,
+    ) -> Self {
+        Self {
+            status,
+            content_range: content_range.map(str::to_string),
+            location: None,
+            response: ResponseBody::TestFutures(futures.into_iter().collect()),
             pending: Vec::new(),
         }
     }
 }
 
+#[cfg(test)]
+pub(super) type TestChunkFuture =
+    std::pin::Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, TransferError>> + 'static>>;
+
 enum ResponseBody {
     Reqwest(reqwest::Response),
     #[cfg(test)]
     Test(std::collections::VecDeque<Result<Vec<u8>, TransferError>>),
+    #[cfg(test)]
+    TestFutures(std::collections::VecDeque<TestChunkFuture>),
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub(super) struct TransferError {
     message: String,
     retryable: bool,
+    paused: bool,
+    retained_bytes: Option<u64>,
 }
 
 impl TransferError {
@@ -78,6 +157,8 @@ impl TransferError {
         Self {
             message: message.into(),
             retryable: true,
+            paused: false,
+            retained_bytes: None,
         }
     }
 
@@ -85,11 +166,30 @@ impl TransferError {
         Self {
             message: message.into(),
             retryable: false,
+            paused: false,
+            retained_bytes: None,
+        }
+    }
+
+    pub(super) fn paused(retained_bytes: u64) -> Self {
+        Self {
+            message: "artifact transfer paused".into(),
+            retryable: false,
+            paused: true,
+            retained_bytes: Some(retained_bytes),
         }
     }
 
     pub(super) fn is_retryable(&self) -> bool {
         self.retryable
+    }
+
+    pub(super) fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    pub(super) fn retained_bytes(&self) -> Option<u64> {
+        self.retained_bytes
     }
 
     pub(super) fn into_message(self) -> String {
@@ -118,7 +218,12 @@ impl From<&str> for TransferError {
 }
 
 pub(super) trait Transport {
-    async fn get(&self, url: &Url, offset: Option<u64>) -> Result<Transfer, TransferError>;
+    async fn get(
+        &self,
+        url: &Url,
+        offset: Option<u64>,
+        should_pause: &impl Fn() -> bool,
+    ) -> Result<Transfer, TransferError>;
 }
 
 pub(super) struct ReqwestTransport {
@@ -149,82 +254,116 @@ impl ReqwestTransport {
             .map_err(|error| error.to_string())?;
         Ok(Self { client, token })
     }
+
+    async fn request_once(&self, url: Url, offset: Option<u64>) -> Result<Transfer, TransferError> {
+        let mut request = self.client.get(url.clone());
+        if should_attach_token(&url) {
+            if let Some(token) = self.token.as_deref() {
+                request = request.bearer_auth(token);
+            }
+        }
+        if let Some(offset) = offset {
+            request = request.header(RANGE, format!("bytes={offset}-"));
+        }
+        let response = self
+            .client
+            .execute(
+                request
+                    .build()
+                    .map_err(|_| TransferError::fatal("artifact request could not be sent"))?,
+            )
+            .await
+            .map_err(classify_request_error)?;
+        if response.status().is_redirection() {
+            let location = response
+                .headers()
+                .get(LOCATION)
+                .ok_or_else(|| TransferError::fatal("artifact redirect omitted Location"))?
+                .to_str()
+                .map_err(|_| TransferError::fatal("invalid artifact redirect"))?
+                .to_owned();
+            return Ok(Transfer {
+                status: response.status(),
+                content_range: None,
+                location: Some(location),
+                response: ResponseBody::Reqwest(response),
+                pending: Vec::new(),
+            });
+        }
+        match response.status() {
+            StatusCode::UNAUTHORIZED => Err(TransferError::fatal(
+                "Hugging Face authentication token is missing or invalid",
+            )),
+            StatusCode::FORBIDDEN => Err(TransferError::fatal(
+                "Hugging Face access denied; check gated model access",
+            )),
+            status if status.is_success() => {
+                let content_range = response
+                    .headers()
+                    .get(CONTENT_RANGE)
+                    .map(|value| value.to_str().map(str::to_string))
+                    .transpose()
+                    .map_err(|_| TransferError::fatal("invalid Content-Range"))?;
+                Ok(Transfer {
+                    status,
+                    content_range,
+                    location: None,
+                    response: ResponseBody::Reqwest(response),
+                    pending: Vec::new(),
+                })
+            }
+            status if transient_status(status) => Err(TransferError::retryable(format!(
+                "artifact server returned HTTP {status}"
+            ))),
+            status => Err(TransferError::fatal(format!(
+                "artifact server returned HTTP {status}"
+            ))),
+        }
+    }
 }
 
 impl Transport for ReqwestTransport {
-    async fn get(&self, url: &Url, offset: Option<u64>) -> Result<Transfer, TransferError> {
-        let mut current = url.clone();
-        for redirect in 0..=MAX_REDIRECTS {
-            let mut request = self.client.get(current.clone());
-            if should_attach_token(&current) {
-                if let Some(token) = self.token.as_deref() {
-                    request = request.bearer_auth(token);
-                }
-            }
-            if let Some(offset) = offset {
-                request = request.header(RANGE, format!("bytes={offset}-"));
-            }
-            let response = self
-                .client
-                .execute(
-                    request
-                        .build()
-                        .map_err(|_| TransferError::fatal("artifact request could not be sent"))?,
-                )
-                .await
-                .map_err(classify_request_error)?;
-            if response.status().is_redirection() {
-                if redirect == MAX_REDIRECTS {
-                    return Err(TransferError::fatal("too many artifact redirects"));
-                }
-                let location = response
-                    .headers()
-                    .get(LOCATION)
-                    .ok_or_else(|| TransferError::fatal("artifact redirect omitted Location"))?
-                    .to_str()
-                    .map_err(|_| TransferError::fatal("invalid artifact redirect"))?;
-                current = redirect_target(&current, location)?;
-                continue;
-            }
-            match response.status() {
-                StatusCode::UNAUTHORIZED => {
-                    return Err(TransferError::fatal(
-                        "Hugging Face authentication token is missing or invalid",
-                    ));
-                }
-                StatusCode::FORBIDDEN => {
-                    return Err(TransferError::fatal(
-                        "Hugging Face access denied; check gated model access",
-                    ));
-                }
-                status if status.is_success() => {
-                    let content_range = response
-                        .headers()
-                        .get(CONTENT_RANGE)
-                        .map(|value| value.to_str().map(str::to_string))
-                        .transpose()
-                        .map_err(|_| TransferError::fatal("invalid Content-Range"))?;
-                    return Ok(Transfer {
-                        status,
-                        content_range,
-                        response: ResponseBody::Reqwest(response),
-                        pending: Vec::new(),
-                    });
-                }
-                status if transient_status(status) => {
-                    return Err(TransferError::retryable(format!(
-                        "artifact server returned HTTP {status}"
-                    )));
-                }
-                status => {
-                    return Err(TransferError::fatal(format!(
-                        "artifact server returned HTTP {status}"
-                    )));
-                }
-            }
-        }
-        Err(TransferError::fatal("too many artifact redirects"))
+    async fn get(
+        &self,
+        url: &Url,
+        offset: Option<u64>,
+        should_pause: &impl Fn() -> bool,
+    ) -> Result<Transfer, TransferError> {
+        follow_redirects(url.clone(), offset, should_pause, |current, offset| {
+            self.request_once(current, offset)
+        })
+        .await
     }
+}
+
+pub(super) async fn follow_redirects<F, Fut>(
+    mut current: Url,
+    offset: Option<u64>,
+    should_pause: &impl Fn() -> bool,
+    mut execute: F,
+) -> Result<Transfer, TransferError>
+where
+    F: FnMut(Url, Option<u64>) -> Fut,
+    Fut: Future<Output = Result<Transfer, TransferError>>,
+{
+    for redirect in 0..=MAX_REDIRECTS {
+        if should_pause() {
+            return Err(TransferError::paused(0));
+        }
+        let transfer = execute(current.clone(), offset).await?;
+        if !transfer.status.is_redirection() {
+            return Ok(transfer);
+        }
+        if redirect == MAX_REDIRECTS {
+            return Err(TransferError::fatal("too many artifact redirects"));
+        }
+        let location = transfer
+            .location
+            .as_deref()
+            .ok_or_else(|| TransferError::fatal("artifact redirect omitted Location"))?;
+        current = redirect_target(&current, location)?;
+    }
+    Err(TransferError::fatal("too many artifact redirects"))
 }
 
 pub(crate) fn artifact_url(file: &ResolvedFile) -> Result<Url, String> {
