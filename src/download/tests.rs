@@ -708,7 +708,7 @@ mod tests {
         let error =
             download_with_transport(&spec(bytes), exhausted_dir.path(), &exhausted).unwrap_err();
 
-        assert_eq!(error, "transient request failure");
+        assert_eq!(error, "artifact response body failed");
         assert_eq!(exhausted.attempts.get(), 4);
 
         let fatal_dir = tempdir().unwrap();
@@ -722,8 +722,50 @@ mod tests {
 
         let error = download_with_transport(&spec(bytes), fatal_dir.path(), &fatal).unwrap_err();
 
-        assert_eq!(error, "fatal request failure");
+        assert_eq!(error, "artifact response body failed");
         assert_eq!(fatal.attempts.get(), 1);
+    }
+
+    #[test]
+    fn no_part_fatal_and_exhausted_request_failures_return_typed_zero_prefix_recovery() {
+        for (retryable, expected_attempts, expected_retries) in
+            [(false, 1_usize, 0_usize), (true, 4, 3)]
+        {
+            let dir = tempdir().unwrap();
+            let transport = FailingTransport {
+                remaining_failures: Cell::new(usize::MAX),
+                retryable,
+                attempts: Cell::new(0),
+                offsets: RefCell::new(Vec::new()),
+                bytes: b"abcdef".to_vec(),
+            };
+            let retry_notifications = Cell::new(0);
+
+            let failure = download_with_transport_controlled(
+                &spec(b"abcdef"),
+                dir.path(),
+                &transport,
+                || false,
+                |_| {},
+                RetryWait {
+                    observer: |_| {
+                        retry_notifications.set(retry_notifications.get() + 1);
+                    },
+                    sleep: |_| std::future::ready(()),
+                },
+                perform_artifact_operation,
+            )
+            .unwrap_err();
+
+            assert_eq!(failure, DownloadFailure::Remote { retained_bytes: 0 });
+            assert_eq!(transport.attempts.get(), expected_attempts);
+            assert_eq!(retry_notifications.get(), expected_retries);
+            assert_eq!(
+                &*transport.offsets.borrow(),
+                &std::iter::repeat_n(None, expected_attempts).collect::<Vec<_>>()
+            );
+            assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
+        }
     }
 
     #[test]
@@ -4843,7 +4885,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_eq!(request_error.into_message(), "transient request failure");
+        assert_eq!(request_error.into_message(), "artifact response body failed");
         assert_eq!(request_transport.attempts.get(), 4);
         assert_eq!(
             &*request_transport.offsets.borrow(),
@@ -4946,7 +4988,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_eq!(fatal_error.into_message(), "fatal request failure");
+        assert_eq!(fatal_error.into_message(), "artifact response body failed");
         assert_eq!(fatal_transport.attempts.get(), 1);
         assert_eq!(&*fatal_transport.offsets.borrow(), &[None]);
         assert_eq!(fatal_notifications.get(), 0);

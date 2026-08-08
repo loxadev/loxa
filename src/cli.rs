@@ -25,6 +25,8 @@ pub enum Command {
     List,
     /// Remove one locally installed model.
     Rm(RmArgs),
+    /// Discard one incomplete model transfer.
+    Discard(DiscardArgs),
     /// Run a model with llama-server in the foreground.
     Run(RunArgs),
     /// Chat with a model in the terminal.
@@ -53,6 +55,16 @@ pub struct RmArgs {
     pub id: Option<String>,
     /// Remove without an interactive confirmation.
     #[arg(long, short = 'y')]
+    pub yes: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct DiscardArgs {
+    /// Model ID whose incomplete transfer should be discarded.
+    #[arg(value_name = "ID")]
+    pub id: String,
+    /// Discard without an interactive confirmation.
+    #[arg(long)]
     pub yes: bool,
 }
 
@@ -110,11 +122,12 @@ pub(crate) fn parse_checked() -> Cli {
 }
 
 pub(crate) fn preflight(cli: &Cli) -> Result<(), clap::Error> {
-    let Command::Pull(args) = &cli.command else {
-        return Ok(());
-    };
-
-    parse_pull_input(args).map(|_| ())
+    match &cli.command {
+        Command::Pull(args) => parse_pull_input(args).map(|_| ()),
+        Command::Discard(args) => crate::paths::validate_id(&args.id)
+            .map_err(|_| clap::Error::raw(ErrorKind::ValueValidation, "invalid model ID")),
+        _ => Ok(()),
+    }
 }
 
 pub(crate) fn parse_pull_input(args: &PullArgs) -> Result<PullInput, clap::Error> {
@@ -330,7 +343,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             names,
-            ["search", "inspect", "pull", "list", "rm", "run", "chat"]
+            ["search", "inspect", "pull", "list", "rm", "discard", "run", "chat"]
         );
 
         let run = command

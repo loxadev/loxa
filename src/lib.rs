@@ -152,6 +152,8 @@ use cli::{Cli, Command};
 use indicatif::BinaryBytes;
 use paths::{validate_id, AppPaths};
 use std::io::IsTerminal;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::Path;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -193,6 +195,156 @@ impl Drop for PromptInterrupt {
     }
 }
 
+#[cfg(unix)]
+struct DiscardPromptInterrupt {
+    id: signal_hook::SigId,
+    interrupted: Arc<AtomicBool>,
+    wake_read: std::fs::File,
+    _wake_write: std::fs::File,
+}
+
+#[cfg(unix)]
+impl DiscardPromptInterrupt {
+    fn install() -> Result<Self, String> {
+        let mut descriptors = [-1; 2];
+        if unsafe { libc::pipe(descriptors.as_mut_ptr()) } == -1 {
+            return Err("failed to install discard interrupt handler".into());
+        }
+        let wake_read = unsafe { std::fs::File::from_raw_fd(descriptors[0]) };
+        let wake_write = unsafe { std::fs::File::from_raw_fd(descriptors[1]) };
+        for descriptor in [&wake_read, &wake_write] {
+            let flags = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFL) };
+            if flags == -1
+                || unsafe {
+                    libc::fcntl(
+                        descriptor.as_raw_fd(),
+                        libc::F_SETFL,
+                        flags | libc::O_NONBLOCK,
+                    )
+                } == -1
+            {
+                return Err("failed to install discard interrupt handler".into());
+            }
+        }
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let signal_flag = interrupted.clone();
+        let wake_descriptor = wake_write.as_raw_fd();
+        let id = unsafe {
+            signal_hook::low_level::register(signal_hook::consts::SIGINT, move || {
+                signal_flag.store(true, Ordering::SeqCst);
+                let byte = 1_u8;
+                let _ = libc::write(wake_descriptor, (&byte as *const u8).cast(), 1);
+            })
+        }
+        .map_err(|_| "failed to install discard interrupt handler".to_string())?;
+        Ok(Self {
+            id,
+            interrupted,
+            wake_read,
+            _wake_write: wake_write,
+        })
+    }
+
+    fn confirm(&self, model_id: &str) -> Result<Option<bool>, String> {
+        use std::io::Write;
+
+        eprint!("Discard incomplete download {model_id}? [y/N] ");
+        std::io::stderr()
+            .flush()
+            .map_err(|_| "discard confirmation failed".to_string())?;
+        loop {
+            let mut descriptors = [
+                libc::pollfd {
+                    fd: libc::STDIN_FILENO,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: self.wake_read.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            let result = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, -1) };
+            if result == -1 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err("discard confirmation failed".into());
+            }
+            if self.interrupted.load(Ordering::SeqCst) || descriptors[1].revents != 0 {
+                eprintln!();
+                return Ok(None);
+            }
+            if descriptors[0].revents != 0 {
+                let mut answer = String::new();
+                std::io::stdin()
+                    .read_line(&mut answer)
+                    .map_err(|_| "discard confirmation failed".to_string())?;
+                return Ok(Some(matches!(
+                    answer.trim().to_ascii_lowercase().as_str(),
+                    "y" | "yes"
+                )));
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for DiscardPromptInterrupt {
+    fn drop(&mut self) {
+        signal_hook::low_level::unregister(self.id);
+    }
+}
+
+#[cfg(unix)]
+struct ScopedTransferInterrupt {
+    handle: signal_hook::iterator::Handle,
+    listener: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl ScopedTransferInterrupt {
+    fn install(control: app::TransferControl) -> Result<Self, ()> {
+        let mut signals =
+            signal_hook::iterator::Signals::new([signal_hook::consts::SIGINT]).map_err(|_| ())?;
+        let handle = signals.handle();
+        let listener = std::thread::spawn(move || {
+            for _ in signals.forever() {
+                control.request_pause();
+            }
+        });
+        Ok(Self {
+            handle,
+            listener: Some(listener),
+        })
+    }
+
+    fn close_and_join(&mut self) {
+        self.handle.close();
+        if let Some(listener) = self.listener.take() {
+            let _ = listener.join();
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ScopedTransferInterrupt {
+    fn drop(&mut self) {
+        self.close_and_join();
+    }
+}
+
+#[cfg(not(unix))]
+struct ScopedTransferInterrupt;
+
+#[cfg(not(unix))]
+impl ScopedTransferInterrupt {
+    fn install(_: app::TransferControl) -> Result<Self, ()> {
+        Ok(Self)
+    }
+}
+
 pub fn run_from_env() -> Result<i32, String> {
     let cli = cli::parse_checked();
     let paths = AppPaths::from_env()?;
@@ -230,6 +382,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Pull(_) => "pull",
         Command::List => "list",
         Command::Rm(_) => "rm",
+        Command::Discard(_) => "discard",
         Command::Run(_) => "run",
         Command::Chat(_) => "chat",
     }
@@ -382,6 +535,313 @@ fn inspection_pull_command(repo: &str, filename: &str, requested_revision: Optio
     }
 }
 
+#[derive(Debug)]
+enum PullAdapterError {
+    Resolution(app::ResolveArtifactError),
+    Interrupt,
+    Transfer {
+        error: app::TransferError,
+        model_id: String,
+        total_bytes: u64,
+    },
+}
+
+fn pull_adapter_with<R, T, P>(
+    args: cli::PullInput,
+    resolve: R,
+    transfer: T,
+    mut progress: P,
+) -> Result<app::TransferResult, PullAdapterError>
+where
+    R: FnOnce(
+        app::ResolveArtifactRequest,
+    ) -> Result<huggingface::ResolvedFile, app::ResolveArtifactError>,
+    T: FnOnce(
+        app::TransferSelected,
+        app::TransferControl,
+        &mut dyn FnMut(app::TransferProgress),
+    ) -> Result<app::TransferResult, app::TransferError>,
+    P: FnMut(&str, &str, &app::TransferProgress),
+{
+    let request = match (args.filename, args.quant) {
+        (Some(filename), None) => {
+            app::ResolveArtifactRequest::exact_file(args.repo, args.revision, filename)
+        }
+        (None, Some(quant)) => {
+            app::ResolveArtifactRequest::unique_quant(args.repo, args.revision, quant)
+        }
+        _ => unreachable!("PullInput has exactly one selector"),
+    };
+    let artifact = resolve(request).map_err(PullAdapterError::Resolution)?;
+    let control = app::TransferControl::new();
+    let interrupt = ScopedTransferInterrupt::install(control.clone())
+        .map_err(|()| PullAdapterError::Interrupt)?;
+    let model_id = args
+        .name
+        .clone()
+        .unwrap_or_else(|| default_id(artifact.repo(), artifact.path(), artifact.sha256()));
+    let total_bytes = artifact.size();
+    let artifact_path = artifact.path().to_owned();
+    let selected = app::TransferSelected::new(artifact, args.name);
+    let mut forward_progress = |update: app::TransferProgress| {
+        progress(&artifact_path, &model_id, &update);
+    };
+    let result = transfer(selected, control, &mut forward_progress);
+    drop(interrupt);
+    result.map_err(|error| PullAdapterError::Transfer {
+        error,
+        model_id,
+        total_bytes,
+    })
+}
+
+fn ordinary_pull_command(args: &cli::PullInput) -> String {
+    let mut command = format!("loxa pull {}", cli::shell_quote(&args.repo));
+    if let Some(filename) = args.filename.as_deref() {
+        command.push_str(&format!(" --file={}", cli::shell_quote(filename)));
+    } else if let Some(quant) = args.quant.as_deref() {
+        command.push_str(&format!(" --quant={}", cli::shell_quote(quant)));
+    }
+    if let Some(revision) = args.revision.as_deref() {
+        command.push_str(&format!(" --revision={}", cli::shell_quote(revision)));
+    }
+    if let Some(name) = args.name.as_deref() {
+        command.push_str(&format!(" --name={}", cli::shell_quote(name)));
+    }
+    command
+}
+
+fn recovery_command(artifact: &huggingface::ResolvedFile, model_id: &str) -> String {
+    format!(
+        "loxa pull {} --file={} --revision={} --name={}",
+        cli::shell_quote(artifact.repo()),
+        cli::shell_quote(artifact.path()),
+        cli::shell_quote(artifact.commit()),
+        cli::shell_quote(model_id),
+    )
+}
+
+#[derive(Clone, Copy)]
+struct RecoveryNotice<'a> {
+    model_id: &'a str,
+    artifact: &'a huggingface::ResolvedFile,
+    retained_bytes: u64,
+    discardable: bool,
+}
+
+fn recovery_actions(recovery: &RecoveryNotice<'_>) -> String {
+    let mut output = format!(
+        "Resume: {}",
+        recovery_command(recovery.artifact, recovery.model_id)
+    );
+    if recovery.discardable {
+        output.push_str(&format!(
+            "\nDiscard: loxa discard {}",
+            cli::shell_quote(recovery.model_id)
+        ));
+    } else {
+        output.push_str("\nInstalled or repair evidence was retained; discard is unavailable.");
+    }
+    output
+}
+
+fn format_paused(recovery: &RecoveryNotice<'_>) -> String {
+    format!(
+        "Paused {} · {} / {} bytes retained\n{}",
+        recovery.model_id,
+        recovery.retained_bytes,
+        recovery.artifact.size(),
+        recovery_actions(recovery),
+    )
+}
+
+fn format_resumable_failure(heading: &str, recovery: &RecoveryNotice<'_>) -> String {
+    format!(
+        "{heading}\n{} / {} bytes retained\n{}",
+        recovery.retained_bytes,
+        recovery.artifact.size(),
+        recovery_actions(recovery),
+    )
+}
+
+fn format_insufficient_disk(
+    model_id: &str,
+    _total_bytes: u64,
+    required: u64,
+    available: u64,
+    recovery: Option<&RecoveryNotice<'_>>,
+    ordinary_command: &str,
+) -> String {
+    let mut output = format!(
+        concat!(
+            "Not enough disk space to transfer {model_id}.\n",
+            "Required available: {required} bytes\n",
+            "Available now:      {available} bytes\n",
+            "Shortfall:          {shortfall} bytes\n",
+        ),
+        model_id = model_id,
+        required = required,
+        available = available,
+        shortfall = required.saturating_sub(available),
+    );
+    if let Some(recovery) = recovery {
+        output.push_str(&format!(
+            "{} / {} bytes retained\n{}",
+            recovery.retained_bytes,
+            recovery.artifact.size(),
+            recovery_actions(recovery),
+        ));
+    } else {
+        output.push_str(&format!(
+            "No artifact bytes were downloaded. Free space and rerun: {ordinary_command}"
+        ));
+    }
+    output
+}
+
+#[derive(Default)]
+struct PlainProgressRenderer {
+    phases: [bool; 3],
+}
+
+impl PlainProgressRenderer {
+    fn line(
+        &mut self,
+        artifact_path: &str,
+        model_id: &str,
+        phase: app::TransferPhase,
+        transferred: u64,
+        total: u64,
+    ) -> Option<String> {
+        let index = match phase {
+            app::TransferPhase::Transferring => 0,
+            app::TransferPhase::Verifying => 1,
+            app::TransferPhase::Publishing => 2,
+        };
+        if std::mem::replace(&mut self.phases[index], true) {
+            return None;
+        }
+        Some(match phase {
+            app::TransferPhase::Transferring => {
+                format!("Downloading {artifact_path}  {transferred} / {total}")
+            }
+            app::TransferPhase::Verifying => format!("Verifying {artifact_path}"),
+            app::TransferPhase::Publishing => format!("Publishing {model_id}"),
+        })
+    }
+}
+
+fn completion_output(id: &str, disposition: app::TransferDisposition) -> Option<String> {
+    let status = match disposition {
+        app::TransferDisposition::Installed => format!("Pulled {id}"),
+        app::TransferDisposition::AlreadyInstalled => {
+            format!("Verified {id} · already installed")
+        }
+        app::TransferDisposition::Paused | app::TransferDisposition::Interrupted => return None,
+    };
+    Some(format!("{status}\nRun: loxa run {id}\n"))
+}
+
+fn static_transfer_error_message(kind: app::transfer::TransferErrorKind) -> &'static str {
+    use app::transfer::TransferErrorKind;
+
+    match kind {
+        TransferErrorKind::InvalidModelId => "Invalid model ID.",
+        TransferErrorKind::Busy => "Another transfer is already using this model.",
+        TransferErrorKind::UnsafeLocalState => {
+            "Local model state is unsafe; no files were changed."
+        }
+        TransferErrorKind::ArtifactConflict => {
+            "This model ID already refers to a different artifact."
+        }
+        TransferErrorKind::CapacityUnavailable => {
+            "Destination disk capacity could not be determined."
+        }
+        TransferErrorKind::CapacityOverflow => {
+            "Destination disk capacity could not be calculated safely."
+        }
+        TransferErrorKind::CatalogManifestTooLarge => {
+            "Selected artifact metadata exceeds Loxa's 4,194,304-byte catalog limit."
+        }
+        TransferErrorKind::InsufficientDisk => "Insufficient disk space.",
+        TransferErrorKind::Remote => "Artifact transfer failed.",
+        TransferErrorKind::Integrity => "Artifact integrity verification failed.",
+        TransferErrorKind::DiskExhausted => {
+            "The destination ran out of disk space during transfer."
+        }
+        TransferErrorKind::Durability => "Artifact durability could not be confirmed.",
+        TransferErrorKind::Publication => "Artifact publication failed.",
+        TransferErrorKind::NoIncompleteTransfer => "No incomplete transfer exists.",
+        TransferErrorKind::CompletionWon => "The artifact completed before this action.",
+        TransferErrorKind::IncompleteTransferChanged => {
+            "The incomplete transfer changed; rerun the command."
+        }
+    }
+}
+
+fn discard_error_message(error: &app::TransferError, model_id: &str) -> String {
+    use app::transfer::TransferErrorKind;
+
+    match error.kind() {
+        TransferErrorKind::NoIncompleteTransfer => {
+            format!(
+                "No incomplete transfer exists for {}.",
+                cli::shell_quote(model_id)
+            )
+        }
+        TransferErrorKind::IncompleteTransferChanged => format!(
+            "The incomplete transfer changed. Rerun: loxa discard {}",
+            cli::shell_quote(model_id)
+        ),
+        TransferErrorKind::CompletionWon => format!(
+            "The artifact is installed. Remove it separately with: loxa rm {}",
+            cli::shell_quote(model_id)
+        ),
+        kind => static_transfer_error_message(kind).into(),
+    }
+}
+
+fn recovery_from_error(error: &app::TransferError) -> Option<RecoveryNotice<'_>> {
+    Some(RecoveryNotice {
+        model_id: error.recovery_model_id()?,
+        artifact: error.recovery_artifact()?,
+        retained_bytes: error.retained_bytes()?,
+        discardable: error.discardable(),
+    })
+}
+
+fn format_transfer_error(
+    error: &app::TransferError,
+    model_id: &str,
+    total_bytes: u64,
+    ordinary_command: &str,
+) -> String {
+    let recovery = recovery_from_error(error);
+    match error.kind() {
+        app::transfer::TransferErrorKind::InsufficientDisk => {
+            let (Some(required), Some(available)) =
+                (error.required_available_bytes(), error.available_bytes())
+            else {
+                return static_transfer_error_message(error.kind()).into();
+            };
+            format_insufficient_disk(
+                recovery.map_or(model_id, |facts| facts.model_id),
+                total_bytes,
+                required,
+                available,
+                recovery.as_ref(),
+                ordinary_command,
+            )
+        }
+        kind if recovery.is_some() => {
+            let recovery = recovery.expect("checked above");
+            format_resumable_failure(static_transfer_error_message(kind), &recovery)
+        }
+        kind => static_transfer_error_message(kind).into(),
+    }
+}
+
+#[cfg(test)]
 fn execute_pull_resolution<F>(
     args: &cli::PullInput,
     operation: F,
@@ -416,21 +876,10 @@ where
     })
 }
 
-fn print_pull_completion(id: &str, outcome: &download::DownloadOutcome) {
-    let success = ui::success();
-    match outcome {
-        download::DownloadOutcome::Pulled(_) => {
-            anstream::println!("{success}Pulled{success:#} {id}")
-        }
-        download::DownloadOutcome::AlreadyInstalled(_) => {
-            let muted = ui::muted();
-            anstream::println!(
-                "{success}Verified{success:#} {id} {muted}· already installed{muted:#}"
-            );
-        }
+fn print_pull_completion(id: &str, disposition: app::TransferDisposition) {
+    if let Some(output) = completion_output(id, disposition) {
+        anstream::print!("{output}");
     }
-    let muted = ui::muted();
-    anstream::println!("{muted}Run: loxa run {id}{muted:#}");
 }
 
 fn packaging_label(disposition: discovery::CandidateDisposition) -> &'static str {
@@ -478,7 +927,10 @@ where
     F: FnOnce(&AppPaths) -> Result<(), String>,
 {
     cli::preflight(&cli).map_err(|error| error.to_string())?;
-    if !matches!(&cli.command, Command::Search(_) | Command::Inspect(_)) {
+    if !matches!(
+        &cli.command,
+        Command::Search(_) | Command::Inspect(_) | Command::Discard(_)
+    ) {
         recovery(&paths)?;
     }
     match cli.command {
@@ -499,90 +951,67 @@ where
             if let Some(name) = args.name.as_deref() {
                 validate_id(name)?;
             }
-            let token = huggingface::discover_token();
-            let client = reqwest::blocking::Client::builder()
-                .user_agent(concat!("loxa/", env!("CARGO_PKG_VERSION")))
-                .connect_timeout(std::time::Duration::from_secs(30))
-                .timeout(std::time::Duration::from_secs(30))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .map_err(|error| error.to_string())?;
-            let resolving = ui::spinner(format!("Resolving {}", args.repo));
-            let resolved = execute_pull_resolution(&args, |repo, revision, filename, quant| {
-                huggingface::resolve(&client, repo, revision, filename, quant, token.as_deref())
-            });
-            resolving.finish_and_clear();
-            let resolved = resolved?;
-            let repo = args.repo;
-            let id = args
-                .name
-                .unwrap_or_else(|| default_id(&repo, resolved.path(), resolved.sha256()));
-            let model_dir = paths.model_dir(&id)?;
-            let _model_lock = catalog::ModelLock::acquire(&model_dir)?;
-            let manifest = Manifest {
-                version: 1,
-                id: id.clone(),
-                repo: Some(resolved.repo().to_owned()),
-                revision: Some(resolved.commit().to_owned()),
-                remote_filename: Some(resolved.path().to_owned()),
-                origin: None,
-                source_filename: None,
-                local_filename: "model.gguf".into(),
-                sha256: resolved.sha256().to_owned(),
-                size: resolved.size(),
-                artifacts: None,
-                profile: None,
-                runtime: None,
-            };
-            if model_dir.join("manifest.json").exists() {
-                let existing = load_installed_models(&paths)?
-                    .into_iter()
-                    .find(|entry| entry.id == id)
-                    .ok_or_else(|| format!("missing manifest for model {id}"))?;
-                if existing != manifest {
-                    return Err(format!(
-                        "model id {id} already refers to a different artifact"
+            let ordinary_command = ordinary_pull_command(&args);
+            let service = app::AppService::from_paths(paths);
+            let mut renderer = PlainProgressRenderer::default();
+            let result = pull_adapter_with(
+                args,
+                |request| service.resolve_artifact(request),
+                |selected, control, progress| {
+                    service.transfer_selected(selected, control, progress)
+                },
+                |artifact, model_id, update| {
+                    if let Some(line) = renderer.line(
+                        artifact,
+                        model_id,
+                        update.phase(),
+                        update.transferred_bytes(),
+                        update.total_bytes(),
+                    ) {
+                        anstream::eprintln!("{line}");
+                    }
+                },
+            );
+            let result = match result {
+                Ok(result) => result,
+                Err(PullAdapterError::Resolution(error)) => return Err(error.to_string()),
+                Err(PullAdapterError::Interrupt) => {
+                    return Err("failed to install transfer interrupt handler".into());
+                }
+                Err(PullAdapterError::Transfer {
+                    error,
+                    model_id,
+                    total_bytes,
+                }) => {
+                    return Err(format_transfer_error(
+                        &error,
+                        &model_id,
+                        total_bytes,
+                        &ordinary_command,
                     ));
                 }
-            } else {
-                catalog::prepare_pull(&model_dir, &manifest)?;
-            }
-            let accent = ui::accent();
-            let muted = ui::muted();
-            anstream::println!("{accent}Checking{accent:#} {id}");
-            anstream::println!(
-                "  {muted}{} · {} · {}@{}{muted:#}",
-                resolved.path(),
-                BinaryBytes(resolved.size()),
-                resolved.repo(),
-                &resolved.commit()[..12]
-            );
-            tracing::info!(
-                event = "pull_started",
-                model_id = %id,
-                repo = %resolved.repo(),
-                revision = %resolved.commit(),
-                size = resolved.size()
-            );
-            let outcome = download::download(&resolved, &model_dir, token)?;
-            let verifying = ui::spinner(format!("Verifying {id}"));
-            let published = catalog::publish_manifest(&paths.models, &manifest);
-            verifying.finish_and_clear();
-            published?;
-            let download_outcome = match &outcome {
-                download::DownloadOutcome::Pulled(_) => "pulled",
-                download::DownloadOutcome::AlreadyInstalled(_) => "already_installed",
             };
-            tracing::info!(
-                event = "pull_finished",
-                model_id = %id,
-                repo = %resolved.repo(),
-                revision = %resolved.commit(),
-                size = resolved.size(),
-                outcome = download_outcome
-            );
-            print_pull_completion(&id, &outcome);
-            Ok(0)
+            match result.disposition() {
+                app::TransferDisposition::Installed
+                | app::TransferDisposition::AlreadyInstalled => {
+                    print_pull_completion(result.model_id(), result.disposition());
+                    Ok(0)
+                }
+                app::TransferDisposition::Paused => {
+                    let recovery = RecoveryNotice {
+                        model_id: result.model_id(),
+                        artifact: result.artifact(),
+                        retained_bytes: result.retained_bytes().unwrap_or(0),
+                        discardable: result.discardable(),
+                    };
+                    anstream::eprintln!("{}", format_paused(&recovery));
+                    Ok(130)
+                }
+                app::TransferDisposition::Interrupted => {
+                    anstream::eprintln!("Interrupted before transfer began");
+                    Ok(130)
+                }
+            }
         }
         Command::List => {
             let installed = load_installed_models(&paths)?;
@@ -713,6 +1142,45 @@ where
             catalog::remove_model(&paths.models, &manifest)?;
             let success = ui::success();
             anstream::println!("{success}Removed{success:#} {}", manifest.id);
+            Ok(0)
+        }
+        Command::Discard(args) => {
+            if !args.yes && (!std::io::stdin().is_terminal() || !std::io::stderr().is_terminal()) {
+                return Err("non-interactive discard requires --yes".into());
+            }
+            let service = app::AppService::from_paths(paths);
+            let requested_id = args.id;
+            let candidate = service
+                .prepare_discard(requested_id.clone())
+                .map_err(|error| discard_error_message(&error, &requested_id))?;
+            let model_id = candidate.model_id().to_owned();
+            if !args.yes {
+                #[cfg(unix)]
+                match DiscardPromptInterrupt::install()?.confirm(&model_id)? {
+                    Some(true) => {}
+                    Some(false) => return Ok(0),
+                    None => return Ok(130),
+                }
+                #[cfg(not(unix))]
+                match dialoguer::Confirm::new()
+                    .with_prompt(format!("Discard incomplete download {model_id}?"))
+                    .default(false)
+                    .interact_opt()
+                {
+                    Ok(Some(true)) => {}
+                    Ok(Some(false)) | Ok(None) => return Ok(0),
+                    Err(dialoguer::Error::IO(error))
+                        if error.kind() == std::io::ErrorKind::Interrupted =>
+                    {
+                        return Ok(130)
+                    }
+                    Err(_) => return Err("discard confirmation failed".into()),
+                }
+            }
+            service
+                .discard_transfer(candidate)
+                .map_err(|error| discard_error_message(&error, &model_id))?;
+            anstream::println!("Discarded incomplete download {model_id}");
             Ok(0)
         }
         Command::Run(args) => {
@@ -1058,11 +1526,14 @@ fn default_id(repo: &str, filename: &str, sha256: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_id, discovery_error_message, ensure_interactive_chat, execute_inspect,
-        execute_pull_resolution, execute_search, installed_model_size,
+        completion_output, default_id, discovery_error_message, ensure_interactive_chat,
+        execute_inspect, execute_pull_resolution, execute_search, format_insufficient_disk,
+        format_paused, format_resumable_failure, installed_model_size,
         load_installed_models_with_reconciler, local_candidates, model_options,
-        model_options_with_candidates, print_pull_completion, removal_prompt, resolve_runnable,
-        run, run_with_recovery, runnable_candidates, select_model, ModelSelection,
+        model_options_with_candidates, ordinary_pull_command, print_pull_completion,
+        pull_adapter_with, recovery_command, removal_prompt, resolve_runnable, run,
+        run_with_recovery, runnable_candidates, select_model, static_transfer_error_message,
+        ModelSelection, PlainProgressRenderer, RecoveryNotice,
     };
     use crate::catalog::{
         Artifact, ArtifactProvenance, ArtifactRole, Manifest, RuntimeQualification,
@@ -1987,6 +2458,944 @@ mod tests {
     }
 
     #[test]
+    fn pull_adapter_resolves_once_then_transfers_the_exact_returned_value_once() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_values(Some(root.path()), None).unwrap();
+        let service = crate::app::AppService::from_paths(paths.clone());
+        let artifact = crate::huggingface::test_resolved_file_for(
+            "owner/repo",
+            "exact.gguf",
+            "bef57ec7f53a6d40beb640a780a639c83bc29ac8a9816f1fc6c5c6dcd93c4721".into(),
+            6,
+        );
+        let installed = Manifest {
+            version: 1,
+            id: "demo".into(),
+            repo: Some(artifact.repo().into()),
+            revision: Some(artifact.commit().into()),
+            remote_filename: Some(artifact.path().into()),
+            origin: None,
+            source_filename: None,
+            local_filename: "model.gguf".into(),
+            sha256: artifact.sha256().into(),
+            size: artifact.size(),
+            artifacts: None,
+            profile: None,
+            runtime: None,
+        };
+        let model_dir = paths.model_dir("demo").unwrap();
+        let lock = crate::catalog::ModelLock::acquire_for_transfer(&model_dir).unwrap();
+        drop(lock);
+        std::fs::write(
+            model_dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&installed).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(model_dir.join("model.gguf"), b"abcdef").unwrap();
+
+        let calls = std::cell::RefCell::new(Vec::new());
+        let result = pull_adapter_with(
+            crate::cli::parse_pull_input(&PullArgs {
+                repo: "owner/repo".into(),
+                revision: Some("moving-branch".into()),
+                filename: Some("exact.gguf".into()),
+                quant: None,
+                name: Some("demo".into()),
+            })
+            .unwrap(),
+            |_| {
+                calls.borrow_mut().push("resolve");
+                Ok(artifact.clone())
+            },
+            |selected, control, progress| {
+                calls.borrow_mut().push("transfer");
+                service.transfer_selected(selected, control, progress)
+            },
+            |_, _, _| {},
+        )
+        .unwrap();
+
+        assert_eq!(&*calls.borrow(), &["resolve", "transfer"]);
+        assert_eq!(result.artifact(), &artifact);
+        assert_eq!(result.model_id(), "demo");
+    }
+
+    #[cfg(unix)]
+    fn kill_and_reap_sigint_child(child: &mut std::process::Child) -> String {
+        let kill = child.kill();
+        let wait = child.wait();
+        format!("kill={kill:?}; wait={wait:?}")
+    }
+
+    #[cfg(unix)]
+    fn wait_for_sigint_path(path: &std::path::Path, child: &mut std::process::Child) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !path.exists() {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    use std::io::Read as _;
+
+                    let mut stdout = String::new();
+                    let mut stderr = String::new();
+                    child
+                        .stdout
+                        .take()
+                        .unwrap()
+                        .read_to_string(&mut stdout)
+                        .unwrap();
+                    child
+                        .stderr
+                        .take()
+                        .unwrap()
+                        .read_to_string(&mut stderr)
+                        .unwrap();
+                    panic!(
+                        "SIGINT child exited before handshake: {status}; stdout={stdout:?}; stderr={stderr:?}"
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let cleanup = kill_and_reap_sigint_child(child);
+                    panic!("SIGINT child handshake poll failed: {error}; {cleanup}");
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                let cleanup = kill_and_reap_sigint_child(child);
+                panic!("SIGINT child handshake timed out; {cleanup}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait_for_sigint_child_with<P>(
+        mut child: std::process::Child,
+        mut poll: P,
+    ) -> std::process::Output
+    where
+        P: FnMut(&mut std::process::Child) -> std::io::Result<Option<std::process::ExitStatus>>,
+    {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match poll(&mut child) {
+                Ok(Some(_)) => return child.wait_with_output().unwrap(),
+                Ok(None) => {}
+                Err(error) => {
+                    let cleanup = kill_and_reap_sigint_child(&mut child);
+                    panic!("SIGINT child poll failed: {error}; {cleanup}");
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!("SIGINT child timed out and was killed: {output:?}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait_for_sigint_child(child: std::process::Child) -> std::process::Output {
+        wait_for_sigint_child_with(child, std::process::Child::try_wait)
+    }
+
+    #[cfg(unix)]
+    fn run_sigint_child(scenario: &str) -> (tempfile::TempDir, std::process::Output) {
+        let root = tempfile::tempdir().unwrap();
+        let scenario_path = root.path().join("scenario");
+        let handshake = root.path().join("handshake");
+        let release = root.path().join("release");
+        std::fs::write(&scenario_path, scenario).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::selected_transfer_sigint_child_helper",
+                "--nocapture",
+            ])
+            .env("LOXA_SIGINT_SCENARIO_PATH", &scenario_path)
+            .env("LOXA_SIGINT_HANDSHAKE", &handshake)
+            .env("LOXA_SIGINT_RELEASE", &release)
+            .env("LOXA_HOME", root.path().join("loxa-home"))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        wait_for_sigint_path(&handshake, &mut child);
+        let signal_count = if scenario == "repeated" { 3 } else { 1 };
+        for _ in 0..signal_count {
+            assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+        }
+        std::fs::write(release, b"continue").unwrap();
+        let output = wait_for_sigint_child(child);
+        (root, output)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sigint_handshake_timeout_kills_and_reaps_child() {
+        let root = tempfile::tempdir().unwrap();
+        let scenario_path = root.path().join("scenario");
+        let handshake = root.path().join("never-created-handshake");
+        std::fs::write(&scenario_path, "handshake-timeout").unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::selected_transfer_sigint_child_helper",
+                "--nocapture",
+            ])
+            .env("LOXA_SIGINT_SCENARIO_PATH", &scenario_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            wait_for_sigint_path(&handshake, &mut child);
+        }));
+        assert!(result.is_err());
+        let reaped = child.try_wait().is_ok_and(|status| status.is_some());
+        if !reaped {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(reaped, "handshake timeout left its child running");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sigint_child_poll_error_kills_and_reaps_child() {
+        let root = tempfile::tempdir().unwrap();
+        let scenario_path = root.path().join("scenario");
+        std::fs::write(&scenario_path, "handshake-timeout").unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::selected_transfer_sigint_child_helper",
+                "--nocapture",
+            ])
+            .env("LOXA_SIGINT_SCENARIO_PATH", &scenario_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id() as libc::pid_t;
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            wait_for_sigint_child_with(child, |_| {
+                Err(std::io::Error::other("injected child poll failure"))
+            });
+        }));
+        assert!(result.is_err());
+        let still_running = unsafe { libc::kill(pid, 0) } == 0;
+        if still_running {
+            assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        }
+        assert!(!still_running, "poll error left its child running");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_transfer_sigint_child_helper() {
+        let Some(scenario_path) = std::env::var_os("LOXA_SIGINT_SCENARIO_PATH") else {
+            return;
+        };
+        let scenario = std::fs::read_to_string(scenario_path).unwrap();
+        if scenario == "handshake-timeout" {
+            loop {
+                std::thread::park();
+            }
+        }
+        let handshake = std::path::PathBuf::from(
+            std::env::var_os("LOXA_SIGINT_HANDSHAKE").expect("handshake path"),
+        );
+        let release = std::path::PathBuf::from(
+            std::env::var_os("LOXA_SIGINT_RELEASE").expect("release path"),
+        );
+        let paths = AppPaths::from_values(
+            std::env::var_os("LOXA_HOME")
+                .as_deref()
+                .map(std::path::Path::new),
+            None,
+        )
+        .unwrap();
+        let service = crate::app::AppService::from_paths(paths.clone());
+        let artifact = crate::huggingface::test_resolved_file_for(
+            "owner/repo",
+            "exact.gguf",
+            "bef57ec7f53a6d40beb640a780a639c83bc29ac8a9816f1fc6c5c6dcd93c4721".into(),
+            6,
+        );
+        if scenario == "old-control" {
+            let manifest = Manifest {
+                version: 1,
+                id: "demo".into(),
+                repo: Some(artifact.repo().into()),
+                revision: Some(artifact.commit().into()),
+                remote_filename: Some(artifact.path().into()),
+                origin: None,
+                source_filename: None,
+                local_filename: "model.gguf".into(),
+                sha256: artifact.sha256().into(),
+                size: artifact.size(),
+                artifacts: None,
+                profile: None,
+                runtime: None,
+            };
+            let model_dir = paths.model_dir("demo").unwrap();
+            let lock = crate::catalog::ModelLock::acquire_for_transfer(&model_dir).unwrap();
+            drop(lock);
+            std::fs::write(
+                model_dir.join("manifest.json"),
+                serde_json::to_vec_pretty(&manifest).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(model_dir.join("model.gguf"), b"abcdef").unwrap();
+
+            let old_control = crate::app::TransferControl::new();
+            drop(super::ScopedTransferInterrupt::install(old_control.clone()).unwrap());
+            let prompt = super::PromptInterrupt::install().unwrap();
+            std::fs::write(&handshake, b"ready").unwrap();
+            while !release.exists() {
+                std::thread::yield_now();
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !prompt.received() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "SIGINT was not observed"
+                );
+                std::thread::yield_now();
+            }
+            drop(prompt);
+            let result = service
+                .transfer_selected(
+                    crate::app::TransferSelected::new(artifact, Some("demo".into())),
+                    old_control,
+                    |_| {},
+                )
+                .unwrap();
+            assert_eq!(
+                result.disposition(),
+                crate::app::TransferDisposition::AlreadyInstalled
+            );
+            return;
+        }
+        if matches!(scenario.as_str(), "verification" | "repeated" | "late") {
+            let model_dir = paths.model_dir("demo").unwrap();
+            let manifest = Manifest {
+                version: 1,
+                id: "demo".into(),
+                repo: Some(artifact.repo().into()),
+                revision: Some(artifact.commit().into()),
+                remote_filename: Some(artifact.path().into()),
+                origin: None,
+                source_filename: None,
+                local_filename: "model.gguf".into(),
+                sha256: artifact.sha256().into(),
+                size: artifact.size(),
+                artifacts: None,
+                profile: None,
+                runtime: None,
+            };
+            crate::catalog::prepare_pull(&model_dir, &manifest).unwrap();
+            std::fs::write(model_dir.join("model.gguf.part"), b"abcdef").unwrap();
+        }
+        let result = pull_adapter_with(
+            crate::cli::parse_pull_input(&PullArgs {
+                repo: "owner/repo".into(),
+                revision: Some("main".into()),
+                filename: Some("exact.gguf".into()),
+                quant: None,
+                name: Some("demo".into()),
+            })
+            .unwrap(),
+            |_| Ok(artifact),
+            |selected, control, progress| {
+                if scenario == "before" {
+                    std::fs::write(&handshake, b"ready").unwrap();
+                    while !release.exists() {
+                        std::thread::yield_now();
+                    }
+                    return service.transfer_selected(selected, control, progress);
+                }
+                let handshake_phase = if scenario == "late" {
+                    crate::app::TransferPhase::Publishing
+                } else {
+                    crate::app::TransferPhase::Verifying
+                };
+                service.transfer_selected(selected, control, |update| {
+                    if update.phase() == handshake_phase && !handshake.exists() {
+                        std::fs::write(&handshake, b"ready").unwrap();
+                        while !release.exists() {
+                            std::thread::yield_now();
+                        }
+                    }
+                    progress(update);
+                })
+            },
+            |_, _, _| {},
+        )
+        .unwrap();
+        match scenario.as_str() {
+            "before" => {
+                assert_eq!(
+                    result.disposition(),
+                    crate::app::TransferDisposition::Interrupted
+                );
+                assert_eq!(result.retained_bytes(), None);
+                eprintln!("Interrupted before transfer began");
+                std::process::exit(130);
+            }
+            "verification" | "repeated" => {
+                assert_eq!(
+                    result.disposition(),
+                    crate::app::TransferDisposition::Paused
+                );
+                assert_eq!(result.retained_bytes(), Some(6));
+                let recovery = RecoveryNotice {
+                    model_id: result.model_id(),
+                    artifact: result.artifact(),
+                    retained_bytes: 6,
+                    discardable: result.discardable(),
+                };
+                eprintln!("{}", format_paused(&recovery));
+                std::process::exit(130);
+            }
+            "late" => {
+                assert_eq!(
+                    result.disposition(),
+                    crate::app::TransferDisposition::Installed
+                );
+                print_pull_completion(result.model_id(), result.disposition());
+            }
+            _ => panic!("unknown SIGINT scenario {scenario:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sigint_before_mutable_transfer_exits_130_without_retained_claim() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let (_root, output) = run_sigint_child("before");
+        assert_eq!(output.status.code(), Some(130), "{output:?}");
+        assert_eq!(output.status.signal(), None, "{output:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("Interrupted before transfer began"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("bytes retained"), "{stderr}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sigint_during_verification_exits_130_only_after_durable_pause_barrier() {
+        let (root, output) = run_sigint_child("verification");
+        assert_eq!(output.status.code(), Some(130), "{output:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("Paused demo · 6 / 6 bytes retained"),
+            "{stderr}"
+        );
+        let model_dir = root.path().join("loxa-home/models/demo");
+        assert_eq!(
+            std::fs::read(model_dir.join("model.gguf.part")).unwrap(),
+            b"abcdef"
+        );
+        assert!(!model_dir.join("model.gguf").exists());
+        assert!(model_dir.join("pending.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repeated_sigint_is_idempotent_and_cannot_bypass_sync_or_join() {
+        let (root, output) = run_sigint_child("repeated");
+        assert_eq!(output.status.code(), Some(130), "{output:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(
+            stderr.matches("Paused demo · 6 / 6 bytes retained").count(),
+            1
+        );
+        let model_dir = root.path().join("loxa-home/models/demo");
+        assert_eq!(
+            std::fs::read(model_dir.join("model.gguf.part")).unwrap(),
+            b"abcdef"
+        );
+        assert!(!model_dir.join("model.gguf").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sigint_after_completion_fence_allows_normal_installed_completion() {
+        let (root, output) = run_sigint_child("late");
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            stdout.contains("Pulled demo\nRun: loxa run demo"),
+            "{stdout}"
+        );
+        let model_dir = root.path().join("loxa-home/models/demo");
+        assert_eq!(
+            std::fs::read(model_dir.join("model.gguf")).unwrap(),
+            b"abcdef"
+        );
+        assert!(!model_dir.join("model.gguf.part").exists());
+        assert!(model_dir.join("manifest.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scoped_pause_listener_closes_and_joins_on_success_error_pause_and_panic_unwind() {
+        fn artifact() -> crate::huggingface::ResolvedFile {
+            crate::huggingface::test_resolved_file_for(
+                "owner/repo",
+                "exact.gguf",
+                "bef57ec7f53a6d40beb640a780a639c83bc29ac8a9816f1fc6c5c6dcd93c4721".into(),
+                6,
+            )
+        }
+        fn input() -> crate::cli::PullInput {
+            crate::cli::parse_pull_input(&PullArgs {
+                repo: "owner/repo".into(),
+                revision: Some("main".into()),
+                filename: Some("exact.gguf".into()),
+                quant: None,
+                name: Some("demo".into()),
+            })
+            .unwrap()
+        }
+
+        let success_root = tempfile::tempdir().unwrap();
+        let success_paths = AppPaths::from_values(Some(success_root.path()), None).unwrap();
+        let success_artifact = artifact();
+        let success_manifest = Manifest {
+            version: 1,
+            id: "demo".into(),
+            repo: Some(success_artifact.repo().into()),
+            revision: Some(success_artifact.commit().into()),
+            remote_filename: Some(success_artifact.path().into()),
+            origin: None,
+            source_filename: None,
+            local_filename: "model.gguf".into(),
+            sha256: success_artifact.sha256().into(),
+            size: success_artifact.size(),
+            artifacts: None,
+            profile: None,
+            runtime: None,
+        };
+        let success_dir = success_paths.model_dir("demo").unwrap();
+        let lock = crate::catalog::ModelLock::acquire_for_transfer(&success_dir).unwrap();
+        drop(lock);
+        std::fs::write(
+            success_dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&success_manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(success_dir.join("model.gguf"), b"abcdef").unwrap();
+        let success_service = crate::app::AppService::from_paths(success_paths);
+        assert_eq!(
+            pull_adapter_with(
+                input(),
+                |_| Ok(success_artifact),
+                |selected, control, progress| {
+                    success_service.transfer_selected(selected, control, progress)
+                },
+                |_, _, _| {},
+            )
+            .unwrap()
+            .disposition(),
+            crate::app::TransferDisposition::AlreadyInstalled
+        );
+
+        let error_root = tempfile::tempdir().unwrap();
+        let error_paths = AppPaths::from_values(Some(error_root.path()), None).unwrap();
+        let error_dir = error_paths.model_dir("demo").unwrap();
+        let _busy_lock = crate::catalog::ModelLock::acquire_for_transfer(&error_dir).unwrap();
+        let error_service = crate::app::AppService::from_paths(error_paths);
+        let error = match pull_adapter_with(
+            input(),
+            |_| Ok(artifact()),
+            |selected, control, progress| {
+                error_service.transfer_selected(selected, control, progress)
+            },
+            |_, _, _| {},
+        ) {
+            Ok(_) => panic!("busy transfer unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            super::PullAdapterError::Transfer { error, .. }
+                if error.kind() == crate::app::transfer::TransferErrorKind::Busy
+        ));
+
+        let pause_root = tempfile::tempdir().unwrap();
+        let pause_paths = AppPaths::from_values(Some(pause_root.path()), None).unwrap();
+        let pause_artifact = artifact();
+        let pause_manifest = Manifest {
+            version: 1,
+            id: "demo".into(),
+            repo: Some(pause_artifact.repo().into()),
+            revision: Some(pause_artifact.commit().into()),
+            remote_filename: Some(pause_artifact.path().into()),
+            origin: None,
+            source_filename: None,
+            local_filename: "model.gguf".into(),
+            sha256: pause_artifact.sha256().into(),
+            size: pause_artifact.size(),
+            artifacts: None,
+            profile: None,
+            runtime: None,
+        };
+        let pause_dir = pause_paths.model_dir("demo").unwrap();
+        crate::catalog::prepare_pull(&pause_dir, &pause_manifest).unwrap();
+        std::fs::write(pause_dir.join("model.gguf.part"), b"abcdef").unwrap();
+        let pause_service = crate::app::AppService::from_paths(pause_paths);
+        let paused = pull_adapter_with(
+            input(),
+            |_| Ok(pause_artifact),
+            |selected, control, progress| {
+                let pause = control.clone();
+                pause_service.transfer_selected(selected, control, |update| {
+                    if update.phase() == crate::app::TransferPhase::Verifying {
+                        pause.request_pause();
+                    }
+                    progress(update);
+                })
+            },
+            |_, _, _| {},
+        )
+        .unwrap();
+        assert_eq!(
+            paused.disposition(),
+            crate::app::TransferDisposition::Paused
+        );
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = pull_adapter_with(
+                input(),
+                |_| Ok(artifact()),
+                |_, _, _| -> Result<crate::app::TransferResult, crate::app::TransferError> {
+                    panic!("injected transfer panic")
+                },
+                |_, _, _| {},
+            );
+        }));
+        assert!(panic.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn old_signal_control_cannot_pause_a_later_activation() {
+        let (_root, output) = run_sigint_child("old-control");
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+    }
+
+    #[test]
+    fn ordinary_pull_and_clean_disk_retry_preserve_the_users_optional_revision() {
+        let input = crate::cli::parse_pull_input(&PullArgs {
+            repo: "owner/repo".into(),
+            revision: Some("moving branch".into()),
+            filename: Some("exact.gguf".into()),
+            quant: None,
+            name: Some("demo".into()),
+        })
+        .unwrap();
+        let command = ordinary_pull_command(&input);
+        assert_eq!(
+            command,
+            "loxa pull 'owner/repo' --file='exact.gguf' --revision='moving branch' --name='demo'"
+        );
+        assert_eq!(
+            format_insufficient_disk("demo", 6, 100, 40, None, &command),
+            concat!(
+                "Not enough disk space to transfer demo.\n",
+                "Required available: 100 bytes\n",
+                "Available now:      40 bytes\n",
+                "Shortfall:          60 bytes\n",
+                "No artifact bytes were downloaded. Free space and rerun: ",
+                "loxa pull 'owner/repo' --file='exact.gguf' --revision='moving branch' --name='demo'",
+            )
+        );
+    }
+
+    #[test]
+    fn pause_and_resumable_error_commands_pin_full_commit_exact_file_and_same_id() {
+        let artifact = crate::huggingface::test_resolved_file_for(
+            "owner/repo",
+            "exact.gguf",
+            "a".repeat(64),
+            6,
+        );
+        let recovery = RecoveryNotice {
+            model_id: "demo",
+            artifact: &artifact,
+            retained_bytes: 3,
+            discardable: true,
+        };
+        assert_eq!(
+            format_paused(&recovery),
+            concat!(
+                "Paused demo · 3 / 6 bytes retained\n",
+                "Resume: loxa pull 'owner/repo' --file='exact.gguf' ",
+                "--revision='0123456789abcdef0123456789abcdef01234567' --name='demo'\n",
+                "Discard: loxa discard 'demo'",
+            )
+        );
+
+        let zero_prefix = RecoveryNotice {
+            retained_bytes: 0,
+            ..recovery
+        };
+        assert_eq!(
+            format_resumable_failure(
+                static_transfer_error_message(crate::app::transfer::TransferErrorKind::Remote),
+                &zero_prefix,
+            ),
+            concat!(
+                "Artifact transfer failed.\n",
+                "0 / 6 bytes retained\n",
+                "Resume: loxa pull 'owner/repo' --file='exact.gguf' ",
+                "--revision='0123456789abcdef0123456789abcdef01234567' --name='demo'\n",
+                "Discard: loxa discard 'demo'",
+            )
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_commands_shell_round_trip_hostile_complete_words_without_evaluation() {
+        let temp = tempfile::tempdir().unwrap();
+        let hostile = "-model ' $(touch recovery-dollar) `touch recovery-backtick`.gguf";
+        let artifact =
+            crate::huggingface::test_resolved_file_for("owner/repo", hostile, "a".repeat(64), 6);
+        let command = recovery_command(&artifact, "demo");
+        let argv = shell_argv(&command, temp.path());
+        assert_eq!(
+            argv,
+            [
+                "loxa",
+                "pull",
+                "owner/repo",
+                "--file=-model ' $(touch recovery-dollar) `touch recovery-backtick`.gguf",
+                "--revision=0123456789abcdef0123456789abcdef01234567",
+                "--name=demo",
+            ]
+        );
+        assert!(!temp.path().join("recovery-dollar").exists());
+        assert!(!temp.path().join("recovery-backtick").exists());
+    }
+
+    #[test]
+    fn insufficient_disk_prints_exact_required_available_shortfall_and_no_reservation_claim() {
+        let output = format_insufficient_disk(
+            "demo",
+            6,
+            8192,
+            4096,
+            None,
+            "loxa pull 'owner/repo' --quant='Q4_K_M'",
+        );
+        assert_eq!(
+            output,
+            concat!(
+                "Not enough disk space to transfer demo.\n",
+                "Required available: 8192 bytes\n",
+                "Available now:      4096 bytes\n",
+                "Shortfall:          4096 bytes\n",
+                "No artifact bytes were downloaded. Free space and rerun: ",
+                "loxa pull 'owner/repo' --quant='Q4_K_M'",
+            )
+        );
+        for excluded in ["reserved", "compatible", "fits", "will run"] {
+            assert!(!output.to_ascii_lowercase().contains(excluded), "{output}");
+        }
+    }
+
+    #[test]
+    fn resume_disk_error_prints_exact_retained_bytes_and_only_safe_discard_guidance() {
+        let artifact = crate::huggingface::test_resolved_file_for(
+            "owner/repo",
+            "exact.gguf",
+            "a".repeat(64),
+            6,
+        );
+        let safe = RecoveryNotice {
+            model_id: "demo",
+            artifact: &artifact,
+            retained_bytes: 3,
+            discardable: true,
+        };
+        assert_eq!(
+            format_resumable_failure("Disk space was exhausted while transferring demo.", &safe),
+            concat!(
+                "Disk space was exhausted while transferring demo.\n",
+                "3 / 6 bytes retained\n",
+                "Resume: loxa pull 'owner/repo' --file='exact.gguf' ",
+                "--revision='0123456789abcdef0123456789abcdef01234567' --name='demo'\n",
+                "Discard: loxa discard 'demo'",
+            )
+        );
+
+        let repair = RecoveryNotice {
+            discardable: false,
+            ..safe
+        };
+        let repair_output =
+            format_resumable_failure("Disk space was exhausted while transferring demo.", &repair);
+        assert!(!repair_output.contains("loxa discard"), "{repair_output}");
+        assert!(
+            repair_output
+                .ends_with("Installed or repair evidence was retained; discard is unavailable."),
+            "{repair_output}"
+        );
+    }
+
+    #[test]
+    fn non_tty_progress_emits_at_most_one_plain_line_per_phase_without_ansi_or_cursor_controls() {
+        let mut renderer = PlainProgressRenderer::default();
+        let updates = [
+            (crate::app::TransferPhase::Transferring, 1, 6),
+            (crate::app::TransferPhase::Transferring, 4, 6),
+            (crate::app::TransferPhase::Verifying, 6, 6),
+            (crate::app::TransferPhase::Verifying, 6, 6),
+            (crate::app::TransferPhase::Publishing, 6, 6),
+            (crate::app::TransferPhase::Publishing, 6, 6),
+        ];
+        let output = updates
+            .into_iter()
+            .filter_map(|(phase, transferred, total)| {
+                renderer.line("exact.gguf", "demo", phase, transferred, total)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            output,
+            "Downloading exact.gguf  1 / 6\nVerifying exact.gguf\nPublishing demo"
+        );
+        for control in ['\u{1b}', '\r', '\u{8}'] {
+            assert!(!output.contains(control), "{output:?}");
+        }
+    }
+
+    #[test]
+    fn completion_output_preserves_pulled_verified_and_optional_run_guidance_without_compatibility_claims(
+    ) {
+        for (disposition, expected) in [
+            (
+                crate::app::TransferDisposition::Installed,
+                "Pulled demo\nRun: loxa run demo\n",
+            ),
+            (
+                crate::app::TransferDisposition::AlreadyInstalled,
+                "Verified demo · already installed\nRun: loxa run demo\n",
+            ),
+        ] {
+            let output = completion_output("demo", disposition).unwrap();
+            assert_eq!(output, expected);
+            let words = output
+                .split(|character: char| !character.is_ascii_alphanumeric())
+                .map(str::to_ascii_lowercase)
+                .collect::<Vec<_>>();
+            for excluded in ["compatible", "supported", "ready", "recommended", "fits"] {
+                assert!(!words.iter().any(|word| word == excluded), "{output}");
+            }
+        }
+    }
+
+    #[test]
+    fn transfer_error_mapping_is_static_exhaustive_and_redacted() {
+        use crate::app::transfer::TransferErrorKind;
+
+        let cases = [
+            (TransferErrorKind::InvalidModelId, "Invalid model ID."),
+            (
+                TransferErrorKind::Busy,
+                "Another transfer is already using this model.",
+            ),
+            (
+                TransferErrorKind::UnsafeLocalState,
+                "Local model state is unsafe; no files were changed.",
+            ),
+            (
+                TransferErrorKind::ArtifactConflict,
+                "This model ID already refers to a different artifact.",
+            ),
+            (
+                TransferErrorKind::CapacityUnavailable,
+                "Destination disk capacity could not be determined.",
+            ),
+            (
+                TransferErrorKind::CapacityOverflow,
+                "Destination disk capacity could not be calculated safely.",
+            ),
+            (
+                TransferErrorKind::CatalogManifestTooLarge,
+                "Selected artifact metadata exceeds Loxa's 4,194,304-byte catalog limit.",
+            ),
+            (
+                TransferErrorKind::InsufficientDisk,
+                "Insufficient disk space.",
+            ),
+            (TransferErrorKind::Remote, "Artifact transfer failed."),
+            (
+                TransferErrorKind::Integrity,
+                "Artifact integrity verification failed.",
+            ),
+            (
+                TransferErrorKind::DiskExhausted,
+                "The destination ran out of disk space during transfer.",
+            ),
+            (
+                TransferErrorKind::Durability,
+                "Artifact durability could not be confirmed.",
+            ),
+            (
+                TransferErrorKind::Publication,
+                "Artifact publication failed.",
+            ),
+            (
+                TransferErrorKind::NoIncompleteTransfer,
+                "No incomplete transfer exists.",
+            ),
+            (
+                TransferErrorKind::CompletionWon,
+                "The artifact completed before this action.",
+            ),
+            (
+                TransferErrorKind::IncompleteTransferChanged,
+                "The incomplete transfer changed; rerun the command.",
+            ),
+        ];
+        for (kind, expected) in cases {
+            let output = static_transfer_error_message(kind);
+            assert_eq!(output, expected);
+            for secret in [
+                "https://evil.invalid",
+                "HF_TOKEN",
+                "/private/model",
+                "\u{1b}",
+            ] {
+                assert!(!output.contains(secret));
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_manifest_too_large_maps_to_the_exact_static_cli_text() {
+        assert_eq!(
+            static_transfer_error_message(
+                crate::app::transfer::TransferErrorKind::CatalogManifestTooLarge
+            ),
+            "Selected artifact metadata exceeds Loxa's 4,194,304-byte catalog limit."
+        );
+    }
+
+    #[test]
     fn pull_preflight_rejects_missing_selection_before_recovery_with_actionable_revision() {
         let temp = tempfile::tempdir().unwrap();
         let paths = AppPaths::from_values(Some(temp.path()), None).unwrap();
@@ -2174,13 +3583,11 @@ mod tests {
         const CHILD_OUTCOME: &str = "LOXA_PULL_COMPLETION_TEST_OUTCOME";
         if let Ok(outcome) = std::env::var(CHILD_OUTCOME) {
             let outcome = match outcome.as_str() {
-                "pulled" => crate::download::DownloadOutcome::Pulled("model.gguf".into()),
-                "already-installed" => {
-                    crate::download::DownloadOutcome::AlreadyInstalled("model.gguf".into())
-                }
+                "pulled" => crate::app::TransferDisposition::Installed,
+                "already-installed" => crate::app::TransferDisposition::AlreadyInstalled,
                 unexpected => panic!("unexpected child outcome {unexpected:?}"),
             };
-            print_pull_completion("demo-model", &outcome);
+            print_pull_completion("demo-model", outcome);
             return;
         }
 

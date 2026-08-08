@@ -967,12 +967,17 @@ fn repair_pause_omits_discard_when_installed_authority_exists() {
     assert!(!result.discardable());
 }
 
-fn mapped_pending_failure(failure: DownloadFailure) -> (TransferError, ResolvedFile) {
+fn mapped_pending_failure_with_part(
+    failure: DownloadFailure,
+    part: Option<&[u8]>,
+) -> (TransferError, ResolvedFile) {
     let root = tempfile::tempdir().unwrap();
     let service = test_service(root.path());
     let artifact = test_artifact(b"abcdef");
     let model_dir = seed_pending(root.path(), "demo", &artifact);
-    std::fs::write(model_dir.join("model.gguf.part"), b"abc").unwrap();
+    if let Some(part) = part {
+        std::fs::write(model_dir.join("model.gguf.part"), part).unwrap();
+    }
     let result = transfer_selected_with(
         &service,
         TransferSelected::new(artifact.clone(), Some("demo".into())),
@@ -987,6 +992,10 @@ fn mapped_pending_failure(failure: DownloadFailure) -> (TransferError, ResolvedF
         Err(error) => error,
     };
     (error, artifact)
+}
+
+fn mapped_pending_failure(failure: DownloadFailure) -> (TransferError, ResolvedFile) {
+    mapped_pending_failure_with_part(failure, Some(b"abc"))
 }
 
 #[test]
@@ -1076,21 +1085,31 @@ fn installed_or_invalid_integrity_authority_maps_to_non_discardable_public_recov
 
 #[test]
 fn resumable_remote_and_disk_errors_attach_only_proven_exact_recovery() {
-    for (failure, kind) in [
+    for (failure, kind, retained_bytes, part) in [
+        (
+            DownloadFailure::Remote { retained_bytes: 0 },
+            TransferErrorKind::Remote,
+            0,
+            None,
+        ),
         (
             DownloadFailure::Remote { retained_bytes: 3 },
             TransferErrorKind::Remote,
+            3,
+            Some(b"abc".as_slice()),
         ),
         (
             DownloadFailure::DiskExhausted { retained_bytes: 3 },
             TransferErrorKind::DiskExhausted,
+            3,
+            Some(b"abc".as_slice()),
         ),
     ] {
-        let (error, artifact) = mapped_pending_failure(failure);
+        let (error, artifact) = mapped_pending_failure_with_part(failure, part);
         assert_eq!(error.kind(), kind);
         assert_eq!(error.recovery_model_id(), Some("demo"));
         assert_eq!(error.recovery_artifact(), Some(&artifact));
-        assert_eq!(error.retained_bytes(), Some(3));
+        assert_eq!(error.retained_bytes(), Some(retained_bytes));
         assert!(error.discardable());
         assert_eq!(error.required_available_bytes(), None);
         assert_eq!(error.available_bytes(), None);

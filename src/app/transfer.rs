@@ -538,41 +538,34 @@ impl TransferError {
         self
     }
 
-    #[allow(dead_code)]
     pub(crate) fn kind(&self) -> TransferErrorKind {
         self.kind
     }
 
-    #[allow(dead_code)]
     pub(crate) fn required_available_bytes(&self) -> Option<u64> {
         self.required_available_bytes
     }
 
-    #[allow(dead_code)]
     pub(crate) fn available_bytes(&self) -> Option<u64> {
         self.available_bytes
     }
 
-    #[allow(dead_code)]
     pub(crate) fn recovery_model_id(&self) -> Option<&str> {
         self.recovery
             .as_deref()
             .map(|recovery| recovery.model_id.as_str())
     }
 
-    #[allow(dead_code)]
     pub(crate) fn recovery_artifact(&self) -> Option<&ResolvedFile> {
         self.recovery.as_deref().map(|recovery| &recovery.artifact)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn retained_bytes(&self) -> Option<u64> {
         self.recovery
             .as_deref()
             .map(|recovery| recovery.retained_bytes)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn discardable(&self) -> bool {
         self.recovery
             .as_deref()
@@ -1047,7 +1040,6 @@ pub(crate) struct DiscardCandidate {
 }
 
 impl DiscardCandidate {
-    #[allow(dead_code)]
     pub(crate) fn model_id(&self) -> &str {
         &self.model_id
     }
@@ -1089,7 +1081,6 @@ impl AppService {
         )
     }
 
-    #[allow(dead_code)]
     pub(crate) fn prepare_discard(
         &self,
         model_id: String,
@@ -1140,7 +1131,6 @@ impl AppService {
         })
     }
 
-    #[allow(dead_code)]
     pub(crate) fn discard_transfer(
         &self,
         candidate: DiscardCandidate,

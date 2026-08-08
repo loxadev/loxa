@@ -8,7 +8,6 @@ use crate::safe_file::{DirectoryIdentity, RegularFileIdentity};
 use artifact::hex;
 use artifact::{download_once, prove_existing_part_for_pause, ArtifactTransferError};
 use backon::{BackoffBuilder, ExponentialBuilder};
-use indicatif::{ProgressBar, ProgressStyle};
 use std::fs::File;
 use std::future::Future;
 use std::io::Write;
@@ -215,6 +214,7 @@ pub(crate) enum DownloadFailure {
     },
 }
 
+#[cfg(test)]
 impl DownloadFailure {
     fn into_message(self) -> String {
         match self {
@@ -233,52 +233,6 @@ impl AsRef<Path> for DownloadOutcome {
             Self::Pulled(path) | Self::AlreadyInstalled(path) => path,
         }
     }
-}
-
-pub fn download(
-    file: &ResolvedFile,
-    model_dir: &Path,
-    token: Option<String>,
-) -> Result<DownloadOutcome, String> {
-    let progress = ProgressBar::new(file.size());
-    let style = ProgressStyle::with_template(
-        "{spinner:.green} {msg} [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} {bytes_per_sec} {eta}",
-    )
-    .map_err(|error| error.to_string())?
-    .progress_chars("=>-");
-    progress.set_style(style);
-    progress.set_message(file.path().to_owned());
-    let result = download_controlled(
-        file,
-        model_dir,
-        token,
-        || false,
-        |update| match update {
-            ProgressUpdate::Transferring {
-                transferred,
-                total: _,
-            } => {
-                progress.set_message(file.path().to_owned());
-                progress.set_position(transferred);
-                progress.reset_eta();
-            }
-            ProgressUpdate::Verifying {
-                transferred,
-                total: _,
-            } => {
-                progress.set_message(format!("Verifying {}", file.path()));
-                progress.set_position(transferred);
-                progress.tick();
-            }
-        },
-    )
-    .map_err(DownloadFailure::into_message)
-    .and_then(|outcome| match outcome {
-        DownloadTerminalOutcome::Complete(outcome) => Ok(outcome),
-        DownloadTerminalOutcome::Paused { .. } => Err("artifact transfer paused".into()),
-    });
-    progress.finish_and_clear();
-    result
 }
 
 pub(crate) fn download_controlled(
@@ -470,10 +424,10 @@ where
                     });
                 }
                 if !error.is_retryable() {
-                    return Err(DownloadFailure::Legacy(error.into_message()));
+                    return Err(DownloadFailure::Remote { retained_bytes: 0 });
                 }
                 let Some(delay) = backoff.next() else {
-                    return Err(DownloadFailure::Legacy(error.into_message()));
+                    return Err(DownloadFailure::Remote { retained_bytes: 0 });
                 };
                 retry_observer(delay);
                 if matches!(
