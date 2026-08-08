@@ -1,17 +1,24 @@
-#![cfg_attr(all(debug_assertions, not(test)), allow(dead_code))]
-
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-#[cfg(not(any(test, debug_assertions)))]
-use loxa::app::AppService;
+use loxa::app::TransferControl;
+#[cfg(not(test))]
+use loxa::app::{
+    AppService, ResolveArtifactRequest, TransferDisposition, TransferPhase, TransferProgress,
+    TransferSelected,
+};
 use loxa::app::{
     AppSnapshot, BundleSnapshot, BundleUnavailableReason, DownloadSnapshot, RecommendationSnapshot,
     RecommendationUnavailableReason, RuntimeInventorySnapshot, RuntimeSnapshot,
 };
+#[cfg(not(test))]
+use loxa::discovery::{CandidateDisposition, InspectRepository, SearchModels};
 
+use crate::menu::catalog::{
+    CandidateItem, CatalogEvent, CatalogTransferDisposition, RepositoryItem, TransferStage,
+};
 use crate::menu::presentation::{
     Bundle, Download, MenuSnapshot, Recommendation, RecommendationUnavailableReason as MenuReason,
     RecoveryReason, Runtime, RuntimeInventory,
@@ -253,87 +260,299 @@ impl RefreshAdmission {
         self.accepting = false;
     }
 
-    #[cfg(any(test, not(debug_assertions)))]
     fn is_shutting_down(&self) -> bool {
         !self.accepting
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WorkerRequest {
+enum BackendRequest {
     Observe,
+    Search {
+        generation: u64,
+        query: String,
+    },
+    Inspect {
+        generation: u64,
+        repo: String,
+    },
+    Transfer {
+        generation: u64,
+        repo: String,
+        revision: String,
+        path: String,
+        control: TransferControl,
+    },
     Stop,
 }
 
-trait SnapshotSource {
-    fn snapshot(&mut self) -> MenuSnapshot;
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum BackendMessage {
+    Observation(ObservationMessage),
+    Catalog(CatalogEvent),
 }
 
-#[cfg(not(any(test, debug_assertions)))]
-struct AppSnapshotSource(AppService);
-
-#[cfg(not(any(test, debug_assertions)))]
-impl SnapshotSource for AppSnapshotSource {
-    fn snapshot(&mut self) -> MenuSnapshot {
-        map_app_snapshot(self.0.snapshot())
-    }
+struct InspectedRepository {
+    repo: String,
+    revision: String,
+    candidates: Vec<CandidateItem>,
 }
 
-fn run_worker<S: SnapshotSource>(
-    mut source: Result<S, String>,
-    request_receiver: Receiver<WorkerRequest>,
-    message_sender: Sender<ObservationMessage>,
-    stopping: &AtomicBool,
-) {
-    while let Ok(request) = request_receiver.recv() {
-        match request {
-            WorkerRequest::Stop => break,
-            WorkerRequest::Observe => {
-                if stopping.load(Ordering::Acquire) {
-                    break;
-                }
-                let message = match &mut source {
-                    Ok(source) => ObservationMessage::Snapshot(source.snapshot()),
-                    Err(error) => ObservationMessage::Error(error.clone()),
-                };
-                if message_sender.send(message).is_err() {
-                    break;
-                }
-            }
+impl InspectedRepository {
+    fn new(repo: String, revision: String, candidates: Vec<CandidateItem>) -> Self {
+        Self {
+            repo,
+            revision,
+            candidates,
         }
     }
 }
 
-pub(crate) struct ObservationClient {
-    request_sender: Option<Sender<WorkerRequest>>,
-    receiver: Option<Receiver<ObservationMessage>>,
+trait BackendSource {
+    fn snapshot(&mut self) -> MenuSnapshot;
+    fn search(&mut self, query: String) -> Result<Vec<RepositoryItem>, String>;
+    fn inspect(&mut self, repo: String) -> Result<InspectedRepository, String>;
+    fn transfer(
+        &mut self,
+        repo: String,
+        revision: String,
+        path: String,
+        control: TransferControl,
+        progress: &mut dyn FnMut(TransferStage, u64, u64),
+    ) -> Result<CatalogTransferDisposition, String>;
+}
+
+#[cfg(not(test))]
+struct AppBackend(AppService);
+
+#[cfg(not(test))]
+impl BackendSource for AppBackend {
+    fn snapshot(&mut self) -> MenuSnapshot {
+        map_app_snapshot(self.0.snapshot())
+    }
+
+    fn search(&mut self, query: String) -> Result<Vec<RepositoryItem>, String> {
+        let page = self
+            .0
+            .search_models(SearchModels::new(query))
+            .map_err(|error| error.to_string())?;
+        Ok(page
+            .hits()
+            .iter()
+            .map(|hit| {
+                let access = match hit.gated() {
+                    loxa::discovery::GatedStatus::Public => None,
+                    loxa::discovery::GatedStatus::AutomaticApproval => {
+                        Some("Gated · automatic approval")
+                    }
+                    loxa::discovery::GatedStatus::ManualApproval => Some("Gated · manual approval"),
+                    loxa::discovery::GatedStatus::Unknown => Some("Access unknown"),
+                };
+                let downloads = hit
+                    .downloads()
+                    .map(|downloads| format!("{downloads} downloads"));
+                let detail = match (downloads, access) {
+                    (Some(downloads), Some(access)) => Some(format!("{downloads} · {access}")),
+                    (Some(downloads), None) => Some(downloads),
+                    (None, Some(access)) => Some(access.into()),
+                    (None, None) => None,
+                };
+                RepositoryItem::new(hit.repo().into(), detail)
+            })
+            .collect())
+    }
+
+    fn inspect(&mut self, repo: String) -> Result<InspectedRepository, String> {
+        let plan = self
+            .0
+            .inspect_repository(InspectRepository::new(repo, None))
+            .map_err(|error| error.to_string())?;
+        let candidates = plan
+            .candidates()
+            .iter()
+            .filter(|candidate| {
+                matches!(
+                    candidate.disposition(),
+                    CandidateDisposition::EligibleForDownloadAndLocalValidation
+                ) && candidate.identity().is_some()
+            })
+            .map(|candidate| CandidateItem::new(candidate.display_path().into(), candidate.size()))
+            .collect();
+        Ok(InspectedRepository::new(
+            plan.repo().into(),
+            plan.commit().into(),
+            candidates,
+        ))
+    }
+
+    fn transfer(
+        &mut self,
+        repo: String,
+        revision: String,
+        path: String,
+        control: TransferControl,
+        progress: &mut dyn FnMut(TransferStage, u64, u64),
+    ) -> Result<CatalogTransferDisposition, String> {
+        let artifact = self
+            .0
+            .resolve_artifact(ResolveArtifactRequest::exact_file(
+                repo,
+                Some(revision),
+                path,
+            ))
+            .map_err(|error| error.to_string())?;
+        let result = self
+            .0
+            .transfer_selected(
+                TransferSelected::new(artifact, None),
+                control,
+                |update: TransferProgress| {
+                    let stage = match update.phase() {
+                        TransferPhase::Transferring => TransferStage::Transferring,
+                        TransferPhase::Verifying => TransferStage::Verifying,
+                        TransferPhase::Publishing => TransferStage::Publishing,
+                    };
+                    progress(stage, update.transferred_bytes(), update.total_bytes());
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(match result.disposition() {
+            TransferDisposition::Installed => CatalogTransferDisposition::Installed,
+            TransferDisposition::AlreadyInstalled => CatalogTransferDisposition::AlreadyInstalled,
+            TransferDisposition::Paused => CatalogTransferDisposition::Paused,
+            TransferDisposition::Interrupted => CatalogTransferDisposition::Interrupted,
+        })
+    }
+}
+
+fn run_backend_worker<B: BackendSource>(
+    mut source: Result<B, String>,
+    request_receiver: Receiver<BackendRequest>,
+    message_sender: Sender<BackendMessage>,
+    stopping: &AtomicBool,
+) {
+    while let Ok(request) = request_receiver.recv() {
+        if matches!(request, BackendRequest::Stop) || stopping.load(Ordering::Acquire) {
+            break;
+        }
+        let message = match request {
+            BackendRequest::Observe => Some(BackendMessage::Observation(match &mut source {
+                Ok(source) => ObservationMessage::Snapshot(source.snapshot()),
+                Err(error) => ObservationMessage::Error(error.clone()),
+            })),
+            BackendRequest::Search { generation, query } => {
+                Some(BackendMessage::Catalog(match &mut source {
+                    Ok(source) => match source.search(query) {
+                        Ok(repositories) => CatalogEvent::Repositories {
+                            generation,
+                            repositories,
+                        },
+                        Err(message) => CatalogEvent::Failed {
+                            generation,
+                            message,
+                        },
+                    },
+                    Err(message) => CatalogEvent::Failed {
+                        generation,
+                        message: message.clone(),
+                    },
+                }))
+            }
+            BackendRequest::Inspect { generation, repo } => {
+                Some(BackendMessage::Catalog(match &mut source {
+                    Ok(source) => match source.inspect(repo) {
+                        Ok(inspection) => CatalogEvent::Candidates {
+                            generation,
+                            repo: inspection.repo,
+                            revision: inspection.revision,
+                            candidates: inspection.candidates,
+                        },
+                        Err(message) => CatalogEvent::Failed {
+                            generation,
+                            message,
+                        },
+                    },
+                    Err(message) => CatalogEvent::Failed {
+                        generation,
+                        message: message.clone(),
+                    },
+                }))
+            }
+            BackendRequest::Transfer {
+                generation,
+                repo,
+                revision,
+                path,
+                control,
+            } => {
+                let terminal = match &mut source {
+                    Ok(source) => {
+                        let mut progress = |stage, transferred_bytes, total_bytes| {
+                            let _ = message_sender.send(BackendMessage::Catalog(
+                                CatalogEvent::Progress {
+                                    generation,
+                                    stage,
+                                    transferred_bytes,
+                                    total_bytes,
+                                },
+                            ));
+                        };
+                        match source.transfer(repo, revision, path, control, &mut progress) {
+                            Ok(disposition) => CatalogEvent::Completed {
+                                generation,
+                                disposition,
+                            },
+                            Err(message) => CatalogEvent::Failed {
+                                generation,
+                                message,
+                            },
+                        }
+                    }
+                    Err(message) => CatalogEvent::Failed {
+                        generation,
+                        message: message.clone(),
+                    },
+                };
+                Some(BackendMessage::Catalog(terminal))
+            }
+            BackendRequest::Stop => None,
+        };
+        if message.is_some_and(|message| message_sender.send(message).is_err()) {
+            break;
+        }
+    }
+}
+
+pub(crate) struct BackendClient {
+    request_sender: Option<Sender<BackendRequest>>,
+    receiver: Option<Receiver<BackendMessage>>,
     admission: RefreshAdmission,
+    active_transfer: Option<(u64, TransferControl)>,
     stopping: Arc<AtomicBool>,
 }
 
-impl ObservationClient {
-    #[cfg(not(any(test, debug_assertions)))]
+impl BackendClient {
+    #[cfg(not(test))]
     pub(crate) fn start() -> Self {
         Self::assemble(|request_receiver, message_sender, stopping| {
             std::thread::Builder::new()
-                .name("loxa-menu-observation".to_owned())
+                .name("loxa-menu-backend".to_owned())
                 .spawn(move || {
-                    run_worker(
-                        AppService::from_env().map(AppSnapshotSource),
+                    run_backend_worker(
+                        AppService::from_env().map(AppBackend),
                         request_receiver,
                         message_sender,
                         &stopping,
                     );
                 })
                 .map(|_| ())
-                .map_err(|error| format!("Failed to start the observation worker: {error}"))
+                .map_err(|error| format!("Failed to start the menu backend: {error}"))
         })
     }
 
     fn assemble(
         spawn: impl FnOnce(
-            Receiver<WorkerRequest>,
-            Sender<ObservationMessage>,
+            Receiver<BackendRequest>,
+            Sender<BackendMessage>,
             Arc<AtomicBool>,
         ) -> Result<(), String>,
     ) -> Self {
@@ -345,7 +564,9 @@ impl ObservationClient {
             message_sender.clone(),
             Arc::clone(&stopping),
         ) {
-            let _ = message_sender.send(ObservationMessage::Error(error));
+            let _ = message_sender.send(BackendMessage::Observation(ObservationMessage::Error(
+                error,
+            )));
         }
         drop(message_sender);
 
@@ -353,462 +574,143 @@ impl ObservationClient {
             request_sender: Some(request_sender),
             receiver: Some(receiver),
             admission: RefreshAdmission::new(),
+            active_transfer: None,
             stopping,
         };
-        client.request_startup();
-        client
-    }
-
-    fn request_startup(&mut self) {
-        if self.admission.admit_startup() {
-            self.send_observation_request();
+        if client.admission.admit_startup() {
+            let _ = client.send(BackendRequest::Observe);
         }
+        client
     }
 
     pub(crate) fn request_popover_open(&mut self, now: Instant) -> bool {
         if !self.admission.admit_popover(now) {
             return false;
         }
-        self.send_observation_request();
+        self.send(BackendRequest::Observe)
+    }
+
+    pub(crate) fn dispatch(&mut self, command: crate::menu::catalog::CatalogCommand) -> bool {
+        let request = match command {
+            crate::menu::catalog::CatalogCommand::Search { generation, query } => {
+                BackendRequest::Search { generation, query }
+            }
+            crate::menu::catalog::CatalogCommand::Inspect { generation, repo } => {
+                BackendRequest::Inspect { generation, repo }
+            }
+            crate::menu::catalog::CatalogCommand::Transfer {
+                generation,
+                repo,
+                revision,
+                path,
+            } => {
+                if self.active_transfer.is_some() {
+                    return false;
+                }
+                let control = TransferControl::new();
+                self.active_transfer = Some((generation, control.clone()));
+                BackendRequest::Transfer {
+                    generation,
+                    repo,
+                    revision,
+                    path,
+                    control,
+                }
+            }
+        };
+        if self.send(request) {
+            true
+        } else {
+            self.active_transfer = None;
+            false
+        }
+    }
+
+    pub(crate) fn request_pause(&self, generation: u64) -> bool {
+        let Some((active_generation, control)) = &self.active_transfer else {
+            return false;
+        };
+        if *active_generation != generation {
+            return false;
+        }
+        control.request_pause();
         true
     }
 
-    fn send_observation_request(&mut self) {
-        let Some(sender) = self.request_sender.as_ref() else {
-            return;
+    pub(crate) fn drain(&mut self, now: Instant) -> Vec<BackendMessage> {
+        let mut messages = Vec::new();
+        let mut disconnected = false;
+        let Some(receiver) = self.receiver.as_ref() else {
+            return messages;
         };
-        let _ = sender.send(WorkerRequest::Observe);
-    }
-
-    #[cfg(any(test, not(debug_assertions)))]
-    pub(crate) fn drain(&mut self, now: Instant) -> Option<ObservationMessage> {
-        let drained = {
-            let receiver = self.receiver.as_ref()?;
-            drain_observations(receiver, self.admission.is_shutting_down())?
-        };
-        if drained.completed {
-            self.admission.complete(&drained.message, now);
+        loop {
+            match receiver.try_recv() {
+                Ok(message) => {
+                    if let BackendMessage::Observation(observation) = &message {
+                        self.admission.complete(observation, now);
+                    }
+                    if let BackendMessage::Catalog(
+                        event @ (CatalogEvent::Completed { .. } | CatalogEvent::Failed { .. }),
+                    ) = &message
+                    {
+                        if self
+                            .active_transfer
+                            .as_ref()
+                            .is_some_and(|(generation, _)| *generation == event.generation())
+                        {
+                            self.active_transfer = None;
+                        }
+                    }
+                    messages.push(message);
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
         }
-        if drained.disconnected {
+        if disconnected {
+            if !self.admission.is_shutting_down()
+                && !matches!(
+                    messages.last(),
+                    Some(BackendMessage::Observation(ObservationMessage::Error(_)))
+                )
+            {
+                messages.push(BackendMessage::Observation(ObservationMessage::Error(
+                    "The menu backend disconnected".into(),
+                )));
+            }
             self.admission.close();
             self.receiver.take();
             self.request_sender.take();
         }
-        Some(drained.message)
+        messages
     }
 
     pub(crate) fn shutdown(&mut self) {
         self.stopping.store(true, Ordering::Release);
         self.admission.close();
+        if let Some((_, control)) = self.active_transfer.take() {
+            control.request_pause();
+        }
         self.receiver.take();
         if let Some(sender) = self.request_sender.take() {
-            let _ = sender.send(WorkerRequest::Stop);
+            let _ = sender.send(BackendRequest::Stop);
         }
     }
 
-    #[cfg(test)]
-    fn from_parts_for_test(
-        request_sender: Sender<WorkerRequest>,
-        receiver: Receiver<ObservationMessage>,
-    ) -> Self {
-        Self {
-            request_sender: Some(request_sender),
-            receiver: Some(receiver),
-            admission: RefreshAdmission::new(),
-            stopping: Arc::new(AtomicBool::new(false)),
+    fn send(&mut self, request: BackendRequest) -> bool {
+        if self.stopping.load(Ordering::Acquire) {
+            return false;
         }
+        let Some(sender) = self.request_sender.as_ref() else {
+            return false;
+        };
+        sender.send(request).is_ok()
     }
-}
-
-#[derive(Debug, Eq, PartialEq)]
-struct DrainedObservation {
-    message: ObservationMessage,
-    completed: bool,
-    disconnected: bool,
-}
-
-fn drain_observations(
-    receiver: &Receiver<ObservationMessage>,
-    shutting_down: bool,
-) -> Option<DrainedObservation> {
-    let mut pending = None;
-    let mut completed = false;
-    loop {
-        match receiver.try_recv() {
-            Ok(ObservationMessage::Snapshot(snapshot)) => {
-                completed = true;
-                if !matches!(pending, Some(ObservationMessage::Error(_))) {
-                    pending = Some(ObservationMessage::Snapshot(snapshot));
-                }
-            }
-            Ok(ObservationMessage::Error(error)) => {
-                completed = true;
-                pending = Some(ObservationMessage::Error(error));
-            }
-            Err(TryRecvError::Empty) => break,
-            Err(TryRecvError::Disconnected) => {
-                if !shutting_down {
-                    return Some(DrainedObservation {
-                        message: match pending {
-                            Some(ObservationMessage::Error(error)) => {
-                                ObservationMessage::Error(error)
-                            }
-                            Some(ObservationMessage::Snapshot(_)) | None => {
-                                ObservationMessage::Error(
-                                    "The observation worker disconnected".to_owned(),
-                                )
-                            }
-                        },
-                        completed,
-                        disconnected: true,
-                    });
-                }
-                break;
-            }
-        }
-    }
-    pending.map(|message| DrainedObservation {
-        message,
-        completed,
-        disconnected: false,
-    })
 }
 
 #[cfg(test)]
-mod tests {
-    use std::cell::RefCell;
-    use std::rc::Rc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{mpsc, Arc};
-    use std::time::{Duration, Instant};
-
-    use loxa::app::AppSnapshot;
-
-    use super::{
-        drain_observations, map_app_snapshot, map_core_snapshot, run_worker, CoreBundle,
-        CoreDownload, CoreObservation, CoreRecommendation, CoreRecommendationUnavailableReason,
-        ObservationClient, ObservationMessage, RefreshAdmission, SnapshotSource, WorkerRequest,
-    };
-    use crate::menu::presentation::{Fixture, MenuSnapshot};
-
-    const TARGET_BYTES: u64 = 6_716_356_800;
-    const DRAFT_BYTES: u64 = 253_708_800;
-
-    fn assert_send_static<T: Send + 'static>() {}
-
-    #[test]
-    fn mapper_keeps_idle_paused_and_sizeless_unavailable_truthful() {
-        let idle = map_core_snapshot(CoreObservation {
-            bundle: CoreBundle::Absent,
-            recommendation: CoreRecommendation::Unavailable(
-                CoreRecommendationUnavailableReason::Unavailable,
-            ),
-            download: CoreDownload::Idle,
-            runtime: super::CoreRuntime::Idle,
-            runtime_inventory: super::CoreRuntimeInventory::Missing,
-        });
-        let unavailable = idle
-            .recommendation_row()
-            .expect("a core unavailable recommendation remains visible");
-        assert_eq!(unavailable.subtitle(), None);
-        assert_eq!(unavailable.size_detail(), None);
-        assert_eq!(
-            unavailable.disabled_reason(),
-            Some("Unavailable on this Mac")
-        );
-        assert!(idle.transfer_row().is_none());
-
-        let paused = map_core_snapshot(CoreObservation {
-            bundle: CoreBundle::Partial,
-            recommendation: CoreRecommendation::Hidden,
-            download: CoreDownload::Paused {
-                completed_bytes: 3,
-                total_bytes: 5,
-            },
-            runtime: super::CoreRuntime::Running,
-            runtime_inventory: super::CoreRuntimeInventory::External,
-        });
-        let transfer = paused
-            .transfer_row()
-            .expect("a core paused download remains a transfer row");
-        assert_eq!(transfer.phase_label(), "Paused");
-        assert_eq!(transfer.progress_detail(), "3 of 5 bytes");
-        assert!(!transfer.has_fixture_action());
-
-        let _mapper: fn(AppSnapshot) -> MenuSnapshot = map_app_snapshot;
-    }
-
-    #[test]
-    fn live_available_mapper_omits_unknown_quantization() {
-        let snapshot = map_core_snapshot(CoreObservation {
-            bundle: CoreBundle::Absent,
-            recommendation: CoreRecommendation::Available {
-                target_bytes: TARGET_BYTES,
-                draft_bytes: DRAFT_BYTES,
-            },
-            download: CoreDownload::Idle,
-            runtime: super::CoreRuntime::Idle,
-            runtime_inventory: super::CoreRuntimeInventory::Missing,
-        });
-
-        assert_eq!(
-            snapshot.recommendation_row().unwrap().subtitle().as_deref(),
-            Some("12B · MTP · 7.0 GB")
-        );
-    }
-
-    #[test]
-    fn live_verified_mapper_omits_unknown_quantization() {
-        let snapshot = map_core_snapshot(CoreObservation {
-            bundle: CoreBundle::Verified {
-                target_bytes: TARGET_BYTES,
-                draft_bytes: DRAFT_BYTES,
-            },
-            recommendation: CoreRecommendation::Hidden,
-            download: CoreDownload::Idle,
-            runtime: super::CoreRuntime::Idle,
-            runtime_inventory: super::CoreRuntimeInventory::Missing,
-        });
-
-        assert_eq!(snapshot.installed_row().unwrap().subtitle(), "MTP · 7.0 GB");
-    }
-
-    #[test]
-    fn refresh_admission_observes_once_then_gates_popover_requests_on_completed_freshness() {
-        let started = Instant::now();
-        let mut admission = RefreshAdmission::new();
-
-        assert!(admission.admit_startup());
-        assert!(!admission.admit_startup());
-        assert!(!admission.admit_popover(started + Duration::from_secs(60)));
-
-        admission.complete(
-            &ObservationMessage::Snapshot(Fixture::Empty.snapshot()),
-            started,
-        );
-        assert!(!admission.admit_popover(started + Duration::from_secs(59)));
-        assert!(admission.admit_popover(started + Duration::from_secs(60)));
-        assert!(!admission.admit_popover(started + Duration::from_secs(120)));
-
-        admission.complete(
-            &ObservationMessage::Error("LOXA_HOME is invalid".to_owned()),
-            started + Duration::from_secs(60),
-        );
-        assert!(!admission.admit_popover(started + Duration::from_secs(119)));
-        assert!(admission.admit_popover(started + Duration::from_secs(120)));
-    }
-
-    #[test]
-    fn receiver_drain_coalesces_snapshots_preserves_errors_and_handles_disconnects() {
-        let (sender, receiver) = mpsc::channel();
-        sender
-            .send(ObservationMessage::Snapshot(Fixture::Empty.snapshot()))
-            .unwrap();
-        sender
-            .send(ObservationMessage::Snapshot(Fixture::Installed.snapshot()))
-            .unwrap();
-        sender
-            .send(ObservationMessage::Error("setup failed".to_owned()))
-            .unwrap();
-        sender
-            .send(ObservationMessage::Snapshot(Fixture::Running.snapshot()))
-            .unwrap();
-
-        assert_eq!(
-            drain_observations(&receiver, false).map(|drained| drained.message),
-            Some(ObservationMessage::Error("setup failed".to_owned()))
-        );
-
-        let (sender, receiver) = mpsc::channel();
-        sender
-            .send(ObservationMessage::Snapshot(Fixture::Empty.snapshot()))
-            .unwrap();
-        sender
-            .send(ObservationMessage::Snapshot(Fixture::Installed.snapshot()))
-            .unwrap();
-        assert_eq!(
-            drain_observations(&receiver, false).map(|drained| drained.message),
-            Some(ObservationMessage::Snapshot(Fixture::Installed.snapshot()))
-        );
-
-        let (sender, receiver) = mpsc::channel::<ObservationMessage>();
-        drop(sender);
-        assert_eq!(
-            drain_observations(&receiver, false).map(|drained| drained.message),
-            Some(ObservationMessage::Error(
-                "The observation worker disconnected".to_owned()
-            ))
-        );
-        assert_eq!(drain_observations(&receiver, true), None);
-
-        let (sender, receiver) = mpsc::channel();
-        sender
-            .send(ObservationMessage::Error("setup failed".to_owned()))
-            .unwrap();
-        drop(sender);
-        let drained = drain_observations(&receiver, false)
-            .expect("an explicit setup error remains visible after disconnect");
-        assert_eq!(
-            drained.message,
-            ObservationMessage::Error("setup failed".to_owned())
-        );
-        assert!(drained.completed);
-        assert!(drained.disconnected);
-    }
-
-    #[test]
-    fn worker_reads_only_admitted_requests_and_checks_stop_between_reads() {
-        let reads = Arc::new(AtomicUsize::new(0));
-        let (request_sender, request_receiver) = mpsc::channel();
-        let (message_sender, message_receiver) = mpsc::channel();
-        request_sender.send(WorkerRequest::Observe).unwrap();
-        request_sender.send(WorkerRequest::Stop).unwrap();
-
-        run_worker(
-            Ok(FakeReader {
-                reads: reads.clone(),
-                snapshot: Fixture::Installed.snapshot(),
-            }),
-            request_receiver,
-            message_sender,
-            &AtomicBool::new(false),
-        );
-
-        assert_eq!(reads.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            message_receiver.recv().unwrap(),
-            ObservationMessage::Snapshot(Fixture::Installed.snapshot())
-        );
-        assert!(message_receiver.try_recv().is_err());
-
-        let (request_sender, request_receiver) = mpsc::channel();
-        let (message_sender, message_receiver) = mpsc::channel();
-        request_sender.send(WorkerRequest::Observe).unwrap();
-        request_sender.send(WorkerRequest::Stop).unwrap();
-        run_worker::<FakeReader>(
-            Err("set LOXA_HOME, HOME, or USERPROFILE".to_owned()),
-            request_receiver,
-            message_sender,
-            &AtomicBool::new(false),
-        );
-        assert_eq!(
-            message_receiver.recv().unwrap(),
-            ObservationMessage::Error("set LOXA_HOME, HOME, or USERPROFILE".to_owned())
-        );
-    }
-
-    #[test]
-    fn shutdown_requested_before_worker_dispatch_skips_a_queued_observation() {
-        let reads = Arc::new(AtomicUsize::new(0));
-        let stopping = Arc::new(AtomicBool::new(true));
-        let (request_sender, request_receiver) = mpsc::channel();
-        let (message_sender, message_receiver) = mpsc::channel();
-        request_sender.send(WorkerRequest::Observe).unwrap();
-        drop(request_sender);
-
-        run_worker(
-            Ok(StopSensitiveReader {
-                reads: reads.clone(),
-                stopping: stopping.clone(),
-                snapshot: Fixture::Installed.snapshot(),
-            }),
-            request_receiver,
-            message_sender,
-            &stopping,
-        );
-
-        assert_eq!(reads.load(Ordering::SeqCst), 0);
-        assert!(message_receiver.try_recv().is_err());
-    }
-
-    #[test]
-    fn shutdown_closes_admission_drops_the_receiver_and_signals_stop_without_joining() {
-        let (request_sender, request_receiver) = mpsc::channel();
-        let (message_sender, message_receiver) = mpsc::channel();
-        let mut client = ObservationClient::from_parts_for_test(request_sender, message_receiver);
-
-        client.shutdown();
-
-        assert!(client.stopping.load(Ordering::Acquire));
-        assert_eq!(request_receiver.recv().unwrap(), WorkerRequest::Stop);
-        assert!(message_sender
-            .send(ObservationMessage::Snapshot(Fixture::Empty.snapshot()))
-            .is_err());
-        assert!(!client.request_popover_open(Instant::now()));
-    }
-
-    #[test]
-    fn unexpected_disconnect_renders_an_error_without_advancing_freshness() {
-        let (request_sender, _request_receiver) = mpsc::channel();
-        let (message_sender, message_receiver) = mpsc::channel();
-        let mut client = ObservationClient::from_parts_for_test(request_sender, message_receiver);
-        let now = Instant::now();
-        drop(message_sender);
-
-        assert_eq!(
-            client.drain(now),
-            Some(ObservationMessage::Error(
-                "The observation worker disconnected".to_owned()
-            ))
-        );
-        assert_eq!(client.admission.last_completed, None);
-        assert!(!client.admission.accepting);
-    }
-
-    #[test]
-    fn observation_messages_are_owned_send_values() {
-        assert_send_static::<ObservationMessage>();
-    }
-
-    #[test]
-    fn production_assembly_sends_exactly_one_startup_request() {
-        let captured_requests = Rc::new(RefCell::new(None));
-        let spawn_requests = captured_requests.clone();
-        let client = ObservationClient::assemble(move |requests, _messages, _stopping| {
-            *spawn_requests.borrow_mut() = Some(requests);
-            Ok(())
-        });
-        let requests = captured_requests
-            .borrow_mut()
-            .take()
-            .expect("the worker receiver must be handed to the spawner");
-
-        assert_eq!(requests.try_recv(), Ok(WorkerRequest::Observe));
-        assert_eq!(
-            requests.try_recv(),
-            Err(mpsc::TryRecvError::Empty),
-            "production assembly must enqueue only its one initial observation"
-        );
-
-        assert!(client.admission.in_flight);
-    }
-
-    struct FakeReader {
-        reads: Arc<AtomicUsize>,
-        snapshot: MenuSnapshot,
-    }
-
-    impl SnapshotSource for FakeReader {
-        fn snapshot(&mut self) -> MenuSnapshot {
-            self.reads.fetch_add(1, Ordering::SeqCst);
-            self.snapshot.clone()
-        }
-    }
-
-    struct StopSensitiveReader {
-        reads: Arc<AtomicUsize>,
-        stopping: Arc<AtomicBool>,
-        snapshot: MenuSnapshot,
-    }
-
-    impl SnapshotSource for StopSensitiveReader {
-        fn snapshot(&mut self) -> MenuSnapshot {
-            assert!(
-                !self.stopping.load(Ordering::SeqCst),
-                "snapshot started after stop was requested"
-            );
-            self.reads.fetch_add(1, Ordering::SeqCst);
-            self.snapshot.clone()
-        }
-    }
-}
+#[path = "observation_tests.rs"]
+mod tests;

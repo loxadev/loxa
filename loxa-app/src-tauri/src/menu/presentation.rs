@@ -46,7 +46,7 @@ impl Recommendation {
         }
     }
 
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     pub(crate) fn unavailable(
         reason: RecommendationUnavailableReason,
         target_bytes: u64,
@@ -58,7 +58,6 @@ impl Recommendation {
         }
     }
 
-    #[cfg_attr(all(debug_assertions, not(test)), allow(dead_code))]
     pub(crate) fn unavailable_without_size(reason: RecommendationUnavailableReason) -> Self {
         Self::Unavailable {
             reason,
@@ -77,18 +76,17 @@ pub(crate) enum RecommendationUnavailableReason {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Download {
     Idle,
-    #[cfg_attr(all(debug_assertions, not(test)), allow(dead_code))]
     Paused(TransferProgress),
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     Active(FixtureTransferProgress),
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     FixturePaused(FixtureTransferProgress),
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     Failed(FixtureTransferProgress),
 }
 
 impl Download {
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     pub(crate) fn active(completed_bytes: u64, total_bytes: u64, phase: DownloadPhase) -> Self {
         Self::Active(FixtureTransferProgress::new(
             completed_bytes,
@@ -97,7 +95,6 @@ impl Download {
         ))
     }
 
-    #[cfg_attr(all(debug_assertions, not(test)), allow(dead_code))]
     pub(crate) fn paused(completed_bytes: u64, total_bytes: u64) -> Self {
         Self::Paused(TransferProgress {
             completed_bytes,
@@ -105,7 +102,7 @@ impl Download {
         })
     }
 
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     pub(crate) fn fixture_paused(
         completed_bytes: u64,
         total_bytes: u64,
@@ -118,7 +115,7 @@ impl Download {
         ))
     }
 
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     pub(crate) fn failed(completed_bytes: u64, total_bytes: u64, phase: DownloadPhase) -> Self {
         Self::Failed(FixtureTransferProgress::new(
             completed_bytes,
@@ -128,7 +125,7 @@ impl Download {
     }
 }
 
-#[cfg(any(test, debug_assertions))]
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DownloadPhase {
     Preparing,
@@ -144,14 +141,14 @@ pub(crate) struct TransferProgress {
     total_bytes: u64,
 }
 
-#[cfg(any(test, debug_assertions))]
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FixtureTransferProgress {
     progress: TransferProgress,
     phase: DownloadPhase,
 }
 
-#[cfg(any(test, debug_assertions))]
+#[cfg(test)]
 impl FixtureTransferProgress {
     fn new(completed_bytes: u64, total_bytes: u64, phase: DownloadPhase) -> Self {
         Self {
@@ -219,13 +216,13 @@ pub(crate) enum Runtime {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RuntimeInventory {
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     Managed,
     Missing,
     External,
 }
 
-#[cfg(any(test, debug_assertions))]
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MenuAction {
     Start,
@@ -237,7 +234,7 @@ pub(crate) enum MenuAction {
     DiscardPartial,
 }
 
-#[cfg(any(test, debug_assertions))]
+#[cfg(test)]
 impl MenuAction {
     pub(crate) fn confirmation_label(self) -> Option<&'static str> {
         match self {
@@ -258,13 +255,13 @@ impl MenuAction {
     }
 }
 
-#[cfg(any(test, debug_assertions))]
+#[cfg(test)]
 #[derive(Default)]
 pub(crate) struct InlineCancelState {
     confirming: bool,
 }
 
-#[cfg(any(test, debug_assertions))]
+#[cfg(test)]
 impl InlineCancelState {
     pub(crate) fn activate_cancel(&mut self) {
         self.confirming = true;
@@ -319,7 +316,7 @@ enum RecommendationAvailability {
 }
 
 impl RecommendationRow {
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     pub(crate) fn action(&self) -> Option<MenuAction> {
         matches!(self.availability, RecommendationAvailability::Eligible)
             .then_some(MenuAction::Start)
@@ -402,11 +399,11 @@ pub(crate) struct RecoveryRow {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TransferState {
     Paused,
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     Active,
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     FixturePaused,
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     Failed,
 }
 
@@ -414,12 +411,12 @@ enum TransferState {
 pub(crate) struct TransferRow {
     state: TransferState,
     progress: TransferProgress,
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     phase: Option<DownloadPhase>,
 }
 
 impl TransferRow {
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     pub(crate) fn primary_action(&self) -> MenuAction {
         match self.state {
             TransferState::Active => MenuAction::Pause,
@@ -429,7 +426,7 @@ impl TransferRow {
         }
     }
 
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     pub(crate) fn has_fixture_action(&self) -> bool {
         !matches!(self.state, TransferState::Paused)
     }
@@ -437,7 +434,7 @@ impl TransferRow {
     pub(crate) fn phase_label(&self) -> &'static str {
         match self.state {
             TransferState::Paused => "Paused",
-            #[cfg(any(test, debug_assertions))]
+            #[cfg(test)]
             TransferState::Active => match self.phase.expect("fixtures always have a phase") {
                 DownloadPhase::Preparing => "Preparing",
                 DownloadPhase::Target => "Downloading target",
@@ -445,7 +442,7 @@ impl TransferRow {
                 DownloadPhase::Verifying => "Verifying",
                 DownloadPhase::Publishing => "Publishing",
             },
-            #[cfg(any(test, debug_assertions))]
+            #[cfg(test)]
             TransferState::FixturePaused => match self.phase.expect("fixtures always have a phase")
             {
                 DownloadPhase::Preparing => "Paused during preparation",
@@ -454,7 +451,7 @@ impl TransferRow {
                 DownloadPhase::Verifying => "Paused during verification",
                 DownloadPhase::Publishing => "Paused during publishing",
             },
-            #[cfg(any(test, debug_assertions))]
+            #[cfg(test)]
             TransferState::Failed => match self.phase.expect("fixtures always have a phase") {
                 DownloadPhase::Preparing => "Preparation failed",
                 DownloadPhase::Target => "Target download failed",
@@ -503,9 +500,7 @@ impl Footer {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum MenuBody {
-    #[cfg_attr(all(debug_assertions, not(test)), allow(dead_code))]
     Loading,
-    #[cfg_attr(all(debug_assertions, not(test)), allow(dead_code))]
     Error(String),
     CleanAbsence(RecommendationRow),
     Verified(InstalledRow),
@@ -527,16 +522,16 @@ pub(crate) enum MenuUpdate {
     UpdateRetainedRows,
 }
 
-#[cfg(any(test, debug_assertions))]
+#[cfg(test)]
 const FIXTURE_TARGET_BYTES: u64 = 6_716_356_800;
-#[cfg(any(test, debug_assertions))]
+#[cfg(test)]
 const FIXTURE_DRAFT_BYTES: u64 = 253_708_800;
-#[cfg(any(test, debug_assertions))]
+#[cfg(test)]
 const FIXTURE_TOTAL_BYTES: u64 = FIXTURE_TARGET_BYTES + FIXTURE_DRAFT_BYTES;
-#[cfg(any(test, debug_assertions))]
+#[cfg(test)]
 const FIXTURE_QUANTIZATION: &str = "Q4_K_M";
 
-#[cfg(any(test, debug_assertions))]
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Fixture {
     Empty,
@@ -560,7 +555,7 @@ pub(crate) enum Fixture {
     Error,
 }
 
-#[cfg(any(test, debug_assertions))]
+#[cfg(test)]
 impl Fixture {
     pub(crate) fn parse(name: &str) -> Option<Self> {
         match name {
@@ -727,7 +722,7 @@ impl Fixture {
     }
 }
 
-#[cfg(any(test, debug_assertions))]
+#[cfg(test)]
 fn partial_fixture(
     download: Download,
 ) -> (Bundle, Recommendation, Download, Runtime, RuntimeInventory) {
@@ -749,11 +744,11 @@ enum MenuComposition {
     Installed,
     Recovery,
     PausedTransfer,
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     ActiveTransfer,
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     FixturePausedTransfer,
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     FailedTransfer,
 }
 
@@ -775,7 +770,7 @@ impl MenuSnapshot {
         )
     }
 
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     fn new_fixture(
         bundle: Bundle,
         recommendation: Recommendation,
@@ -840,18 +835,18 @@ impl MenuSnapshot {
             (Bundle::Partial, Recommendation::Hidden, Download::Paused(progress)) => {
                 MenuBody::Partial(transfer_row(TransferState::Paused, progress)?)
             }
-            #[cfg(any(test, debug_assertions))]
+            #[cfg(test)]
             (Bundle::Partial, Recommendation::Hidden, Download::Active(progress)) => {
                 MenuBody::Partial(fixture_transfer_row(TransferState::Active, progress)?)
             }
-            #[cfg(any(test, debug_assertions))]
+            #[cfg(test)]
             (Bundle::Partial, Recommendation::Hidden, Download::FixturePaused(progress)) => {
                 MenuBody::Partial(fixture_transfer_row(
                     TransferState::FixturePaused,
                     progress,
                 )?)
             }
-            #[cfg(any(test, debug_assertions))]
+            #[cfg(test)]
             (Bundle::Partial, Recommendation::Hidden, Download::Failed(progress)) => {
                 MenuBody::Partial(fixture_transfer_row(TransferState::Failed, progress)?)
             }
@@ -868,7 +863,6 @@ impl MenuSnapshot {
         })
     }
 
-    #[cfg_attr(all(debug_assertions, not(test)), allow(dead_code))]
     pub(crate) fn loading() -> Self {
         Self {
             body: MenuBody::Loading,
@@ -878,7 +872,6 @@ impl MenuSnapshot {
         }
     }
 
-    #[cfg_attr(all(debug_assertions, not(test)), allow(dead_code))]
     pub(crate) fn error(error: String) -> Self {
         Self {
             body: MenuBody::Error(error),
@@ -1005,7 +998,7 @@ impl MenuSnapshot {
         }
     }
 
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     pub(crate) fn apply_fixture_action(&self, action: MenuAction) -> Option<Self> {
         let download = match (&self.body, action) {
             (MenuBody::CleanAbsence(row), MenuAction::Start)
@@ -1073,11 +1066,11 @@ impl MenuSnapshot {
             MenuBody::Recovery(_) => MenuComposition::Recovery,
             MenuBody::Partial(row) => match row.state {
                 TransferState::Paused => MenuComposition::PausedTransfer,
-                #[cfg(any(test, debug_assertions))]
+                #[cfg(test)]
                 TransferState::Active => MenuComposition::ActiveTransfer,
-                #[cfg(any(test, debug_assertions))]
+                #[cfg(test)]
                 TransferState::FixturePaused => MenuComposition::FixturePausedTransfer,
-                #[cfg(any(test, debug_assertions))]
+                #[cfg(test)]
                 TransferState::Failed => MenuComposition::FailedTransfer,
             },
         }
@@ -1094,12 +1087,12 @@ fn transfer_row(
     Ok(TransferRow {
         state,
         progress,
-        #[cfg(any(test, debug_assertions))]
+        #[cfg(test)]
         phase: None,
     })
 }
 
-#[cfg(any(test, debug_assertions))]
+#[cfg(test)]
 fn fixture_transfer_row(
     state: TransferState,
     progress: FixtureTransferProgress,

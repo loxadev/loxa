@@ -2,6 +2,10 @@
 
 #[cfg(target_os = "macos")]
 mod menu {
+    pub(crate) mod catalog {
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/menu/catalog.rs"));
+    }
+
     pub(crate) mod presentation {
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -10,6 +14,13 @@ mod menu {
     }
 
     pub(crate) mod macos {
+        pub(crate) mod catalog_rows {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/menu/macos/catalog_rows.rs"
+            ));
+        }
+
         pub(crate) mod rows {
             include!(concat!(
                 env!("CARGO_MANIFEST_DIR"),

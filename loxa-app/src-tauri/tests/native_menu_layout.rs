@@ -2,6 +2,10 @@
 
 #[cfg(target_os = "macos")]
 mod menu {
+    pub(crate) mod catalog {
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/menu/catalog.rs"));
+    }
+
     pub(crate) mod presentation {
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -10,6 +14,13 @@ mod menu {
     }
 
     pub(crate) mod macos {
+        pub(crate) mod catalog_rows {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/menu/macos/catalog_rows.rs"
+            ));
+        }
+
         pub(crate) mod timer {
             include!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -23,22 +34,30 @@ mod menu {
                 "/src/menu/macos/rows.rs"
             ));
             use crate::menu::presentation::Fixture;
+            use objc2::runtime::NSObjectProtocol;
             use objc2::sel;
-            use objc2_app_kit::NSEventModifierFlags;
+            use objc2::ClassType;
+            use objc2_app_kit::{NSEventModifierFlags, NSSearchField};
 
             pub(crate) fn assert_native_layout_contract(mtm: MainThreadMarker) {
                 for (name, fixture, expected_height, expected_action_button_count) in [
-                    ("recommendation", Fixture::Empty, 300.0, 1),
-                    ("installed", Fixture::Installed, 223.0, 0),
-                    ("recovery", Fixture::Invalid, 223.0, 0),
-                    ("transfer", Fixture::Downloading, 283.0, 4),
+                    ("recommendation", Fixture::Empty, 393.0, 1),
+                    ("installed", Fixture::Installed, 316.0, 0),
+                    ("recovery", Fixture::Invalid, 316.0, 0),
+                    ("transfer", Fixture::Downloading, 376.0, 4),
                 ] {
                     let PopoverContent {
                         view,
                         quit_button,
                         action_buttons,
                         ..
-                    } = MenuRows::build(&fixture.snapshot(), None, layout_fixture_actions(), mtm);
+                    } = MenuRows::build(
+                        &fixture.snapshot(),
+                        &crate::menu::catalog::CatalogState::default(),
+                        None,
+                        layout_fixture_actions(),
+                        mtm,
+                    );
                     view.layoutSubtreeIfNeeded();
 
                     assert_eq!(view.frame().size.width, 300.0, "{name} width");
@@ -79,10 +98,28 @@ mod menu {
                         "{name} Quit modifier"
                     );
                 }
+
+                let search = MenuRows::build(
+                    &Fixture::Empty.snapshot(),
+                    &crate::menu::catalog::CatalogState::default(),
+                    None,
+                    layout_fixture_actions(),
+                    mtm,
+                );
+                assert_eq!(
+                    count_search_fields(&search.view),
+                    1,
+                    "the native product menu must contain exactly one NSSearchField"
+                );
             }
 
             fn layout_fixture_actions() -> Actions {
                 Actions {
+                    search: sel!(fixtureNoop:),
+                    repository: sel!(fixtureNoop:),
+                    candidate: sel!(fixtureNoop:),
+                    transfer: sel!(fixtureNoop:),
+                    pause_transfer: sel!(fixtureNoop:),
                     start: sel!(fixtureNoop:),
                     pause: sel!(fixtureNoop:),
                     resume: sel!(fixtureNoop:),
@@ -92,6 +129,15 @@ mod menu {
                     discard_partial: sel!(fixtureNoop:),
                     quit: sel!(fixtureNoop:),
                 }
+            }
+
+            fn count_search_fields(view: &NSView) -> usize {
+                usize::from(view.isKindOfClass(NSSearchField::class()))
+                    + view
+                        .subviews()
+                        .iter()
+                        .map(|child| count_search_fields(&child))
+                        .sum::<usize>()
             }
         }
 

@@ -11,7 +11,9 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{NSInteger, NSPoint, NSRect, NSSize, NSString};
 
-#[cfg(any(test, debug_assertions))]
+use super::catalog_rows::{self, CatalogActions};
+use crate::menu::catalog::CatalogState;
+#[cfg(test)]
 use crate::menu::presentation::{InlineCancelState, MenuAction};
 use crate::menu::presentation::{MenuLayout, MenuSnapshot, RecommendationRow, TransferRow};
 
@@ -26,19 +28,24 @@ const FINAL_CONTENT_SPACER_HEIGHT: f64 = 4.0;
 
 #[derive(Clone, Copy)]
 pub(super) struct Actions {
-    #[cfg(any(test, debug_assertions))]
+    pub(super) search: Sel,
+    pub(super) repository: Sel,
+    pub(super) candidate: Sel,
+    pub(super) transfer: Sel,
+    pub(super) pause_transfer: Sel,
+    #[cfg(test)]
     pub(super) start: Sel,
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     pub(super) pause: Sel,
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     pub(super) resume: Sel,
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     pub(super) retry: Sel,
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     pub(super) cancel: Sel,
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     pub(super) keep_partial: Sel,
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     pub(super) discard_partial: Sel,
     pub(super) quit: Sel,
 }
@@ -63,13 +70,29 @@ pub(super) struct PopoverContent {
 impl MenuRows {
     pub(super) fn build(
         snapshot: &MenuSnapshot,
+        catalog: &CatalogState,
         target: Option<&AnyObject>,
         actions: Actions,
         mtm: MainThreadMarker,
     ) -> PopoverContent {
-        let mut layout = ContentLayout::new(content_height(snapshot), mtm);
+        let mut layout = ContentLayout::new(content_height(snapshot, catalog), mtm);
         let header = HeaderRow::build(snapshot, mtm);
         layout.add(&header.root, HEADER_HEIGHT);
+        layout.add_separator(mtm);
+
+        let catalog_content = catalog_rows::build(
+            catalog,
+            target,
+            CatalogActions {
+                search: actions.search,
+                repository: actions.repository,
+                candidate: actions.candidate,
+                transfer: actions.transfer,
+                pause: actions.pause_transfer,
+            },
+            mtm,
+        );
+        layout.add(&catalog_content.view, catalog_content.height);
         layout.add_separator(mtm);
 
         let body = if snapshot.is_loading() {
@@ -113,7 +136,9 @@ impl MenuRows {
         };
 
         #[cfg(test)]
-        let action_buttons = body.action_buttons();
+        let mut action_buttons = body.action_buttons();
+        #[cfg(test)]
+        action_buttons.extend(catalog_content.action_buttons);
 
         layout.add_separator(mtm);
         let footer = FooterRow::build(snapshot, mtm);
@@ -142,7 +167,7 @@ impl MenuRows {
     pub(super) fn update(
         &mut self,
         snapshot: &MenuSnapshot,
-        #[cfg(any(test, debug_assertions))] cancel: &InlineCancelState,
+        #[cfg(test)] cancel: &InlineCancelState,
     ) {
         self.header.update(snapshot);
         self.footer.update(snapshot);
@@ -172,21 +197,21 @@ impl MenuRows {
             BodyRows::Transfer(row) => {
                 if let Some(transfer) = snapshot.transfer_row() {
                     row.update(transfer);
-                    #[cfg(any(test, debug_assertions))]
+                    #[cfg(test)]
                     row.update_cancel_controls(cancel);
                 }
             }
         }
     }
 
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     pub(super) fn update_cancel_controls(&mut self, cancel: &InlineCancelState) {
         if let BodyRows::Transfer(row) = &mut self.body {
             row.update_cancel_controls(cancel);
         }
     }
 
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     pub(super) fn show_cancel_confirmation(&mut self, cancel: &mut InlineCancelState) {
         cancel.activate_cancel();
         self.update_cancel_controls(cancel);
@@ -234,9 +259,12 @@ impl ContentLayout {
     }
 }
 
-fn content_height(snapshot: &MenuSnapshot) -> f64 {
-    let common =
-        HEADER_HEIGHT + 2.0 * FOOTER_HEIGHT + 3.0 * SEPARATOR_HEIGHT + FINAL_CONTENT_SPACER_HEIGHT;
+fn content_height(snapshot: &MenuSnapshot, catalog: &CatalogState) -> f64 {
+    let common = HEADER_HEIGHT
+        + 2.0 * FOOTER_HEIGHT
+        + 4.0 * SEPARATOR_HEIGHT
+        + FINAL_CONTENT_SPACER_HEIGHT
+        + catalog_rows::content_height(catalog);
     if snapshot.recommendation_row().is_some() {
         common
             + SECTION_HEIGHT
@@ -418,9 +446,9 @@ impl RecommendationNativeRow {
         actions: Actions,
         mtm: MainThreadMarker,
     ) -> Self {
-        #[cfg(any(test, debug_assertions))]
+        #[cfg(test)]
         let actionable = recommendation.action().is_some();
-        #[cfg(not(any(test, debug_assertions)))]
+        #[cfg(not(test))]
         let actionable = false;
         let root = if actionable {
             hover_row_shell(56.0, mtm).into_super()
@@ -447,7 +475,7 @@ impl RecommendationNativeRow {
 
         #[cfg(test)]
         let mut action_button = None;
-        #[cfg(any(test, debug_assertions))]
+        #[cfg(test)]
         if actionable {
             let button = icon_button(
                 "arrow.down.circle",
@@ -462,7 +490,7 @@ impl RecommendationNativeRow {
             }
             stack.addArrangedSubview(&button);
         }
-        #[cfg(not(any(test, debug_assertions)))]
+        #[cfg(not(test))]
         let _ = (target, actions);
         pin_to_content(&root, &stack);
 
@@ -498,11 +526,11 @@ struct TransferNativeRow {
     progress: Retained<NSProgressIndicator>,
     #[cfg(test)]
     primary_button: Option<Retained<NSButton>>,
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     cancel_button: Retained<NSButton>,
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     keep_button: Retained<NSButton>,
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     discard_button: Retained<NSButton>,
 }
 
@@ -513,20 +541,20 @@ impl TransferNativeRow {
         actions: Actions,
         mtm: MainThreadMarker,
     ) -> Self {
-        #[cfg(any(test, debug_assertions))]
+        #[cfg(test)]
         let root = if transfer.has_fixture_action() {
             hover_row_shell(MenuLayout::transfer_row_height(), mtm).into_super()
         } else {
             row_shell(MenuLayout::transfer_row_height(), mtm)
         };
-        #[cfg(not(any(test, debug_assertions)))]
+        #[cfg(not(test))]
         let root = row_shell(MenuLayout::transfer_row_height(), mtm);
         let stack = vertical_stack(mtm);
         let title_row = horizontal_stack(mtm);
         title_row.addArrangedSubview(&primary_label("Gemma 4 12B", mtm));
         #[cfg(test)]
         let mut primary_button = None;
-        #[cfg(any(test, debug_assertions))]
+        #[cfg(test)]
         if transfer.has_fixture_action() {
             let primary = primary_action_button(transfer.primary_action(), target, actions, mtm);
             #[cfg(test)]
@@ -559,9 +587,9 @@ impl TransferNativeRow {
         stack.addArrangedSubview(&progress);
         stack.addArrangedSubview(&progress_text);
 
-        #[cfg(any(test, debug_assertions))]
+        #[cfg(test)]
         let action_row = horizontal_stack(mtm);
-        #[cfg(any(test, debug_assertions))]
+        #[cfg(test)]
         let cancel_button = text_button(
             MenuAction::Cancel
                 .confirmation_label()
@@ -573,7 +601,7 @@ impl TransferNativeRow {
             actions.cancel,
             mtm,
         );
-        #[cfg(any(test, debug_assertions))]
+        #[cfg(test)]
         let keep_button = text_button(
             MenuAction::KeepPartial
                 .confirmation_label()
@@ -585,7 +613,7 @@ impl TransferNativeRow {
             actions.keep_partial,
             mtm,
         );
-        #[cfg(any(test, debug_assertions))]
+        #[cfg(test)]
         let discard_button = text_button(
             MenuAction::DiscardPartial
                 .confirmation_label()
@@ -597,7 +625,7 @@ impl TransferNativeRow {
             actions.discard_partial,
             mtm,
         );
-        #[cfg(any(test, debug_assertions))]
+        #[cfg(test)]
         if transfer.has_fixture_action() {
             keep_button.setHidden(true);
             discard_button.setHidden(true);
@@ -606,7 +634,7 @@ impl TransferNativeRow {
             action_row.addArrangedSubview(&discard_button);
             stack.addArrangedSubview(&action_row);
         }
-        #[cfg(not(any(test, debug_assertions)))]
+        #[cfg(not(test))]
         let _ = (target, actions);
         pin_to_content(&root, &stack);
 
@@ -617,11 +645,11 @@ impl TransferNativeRow {
             progress,
             #[cfg(test)]
             primary_button,
-            #[cfg(any(test, debug_assertions))]
+            #[cfg(test)]
             cancel_button,
-            #[cfg(any(test, debug_assertions))]
+            #[cfg(test)]
             keep_button,
-            #[cfg(any(test, debug_assertions))]
+            #[cfg(test)]
             discard_button,
         }
     }
@@ -636,7 +664,7 @@ impl TransferNativeRow {
         self.progress.setDoubleValue(transfer.progress_fraction());
     }
 
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     fn update_cancel_controls(&mut self, cancel: &InlineCancelState) {
         let confirming = cancel
             .visible_actions()
@@ -999,7 +1027,7 @@ fn add_centered_icon_image(container: &NSBox, image: &NSImageView) {
     );
 }
 
-#[cfg(any(test, debug_assertions))]
+#[cfg(test)]
 fn primary_action_button(
     action: MenuAction,
     target: Option<&AnyObject>,
@@ -1015,7 +1043,7 @@ fn primary_action_button(
     icon_button(symbol, label, target, selector, mtm)
 }
 
-#[cfg(any(test, debug_assertions))]
+#[cfg(test)]
 fn icon_button(
     symbol: &str,
     accessibility_label: &str,

@@ -1,26 +1,25 @@
-#![cfg_attr(all(debug_assertions, not(test)), allow(dead_code))]
-
 use std::cell::RefCell;
 use std::rc::Rc;
-#[cfg(not(any(test, debug_assertions)))]
 use std::time::Instant;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSAccessibility, NSPopover, NSPopoverBehavior, NSPopoverDelegate, NSStatusItem,
-    NSViewController,
+    NSAccessibility, NSButton, NSPopover, NSPopoverBehavior, NSPopoverDelegate, NSSearchField,
+    NSStatusItem, NSViewController,
 };
 use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSRectEdge, NSString};
 use tauri::AppHandle;
 
 use super::rows::{Actions, MenuRows, PopoverContent};
-#[cfg(not(any(test, debug_assertions)))]
+#[cfg(not(test))]
 use super::timer::{weak_callback, ObservationTimer};
-#[cfg(not(any(test, debug_assertions)))]
-use crate::menu::observation::{ObservationClient, ObservationMessage};
-#[cfg(any(test, debug_assertions))]
+use crate::menu::catalog::{CatalogEvent, CatalogState};
+use crate::menu::observation::BackendClient;
+#[cfg(not(test))]
+use crate::menu::observation::{BackendMessage, ObservationMessage};
+#[cfg(test)]
 use crate::menu::presentation::{Fixture, InlineCancelState, MenuAction};
 use crate::menu::presentation::{MenuSnapshot, MenuUpdate};
 
@@ -30,10 +29,11 @@ struct NativePopoverState {
     content_view_controller: Retained<NSViewController>,
     snapshot: MenuSnapshot,
     rendered: Option<MenuSnapshot>,
-    #[cfg(any(test, debug_assertions))]
+    catalog: CatalogState,
+    rendered_catalog: Option<CatalogState>,
+    #[cfg(test)]
     cancel: InlineCancelState,
-    #[cfg(not(any(test, debug_assertions)))]
-    observation: ObservationClient,
+    backend: Option<BackendClient>,
     rows: Option<MenuRows>,
 }
 
@@ -42,11 +42,11 @@ impl NativePopoverState {
         status_item: Retained<NSStatusItem>,
         popover: Retained<NSPopover>,
         content_view_controller: Retained<NSViewController>,
-        #[cfg(any(test, debug_assertions))] fixture: Fixture,
+        #[cfg(test)] fixture: Fixture,
     ) -> Self {
-        #[cfg(any(test, debug_assertions))]
+        #[cfg(test)]
         let snapshot = fixture.snapshot();
-        #[cfg(not(any(test, debug_assertions)))]
+        #[cfg(not(test))]
         let snapshot = MenuSnapshot::loading();
         Self {
             status_item,
@@ -54,22 +54,37 @@ impl NativePopoverState {
             content_view_controller,
             snapshot,
             rendered: None,
-            #[cfg(any(test, debug_assertions))]
+            catalog: CatalogState::default(),
+            rendered_catalog: None,
+            #[cfg(test)]
             cancel: InlineCancelState::default(),
-            #[cfg(not(any(test, debug_assertions)))]
-            observation: ObservationClient::start(),
+            backend: {
+                #[cfg(test)]
+                {
+                    None
+                }
+                #[cfg(not(test))]
+                {
+                    Some(BackendClient::start())
+                }
+            },
             rows: None,
         }
     }
 
     fn render(&mut self, target: &AnyObject, actions: Actions, mtm: MainThreadMarker) {
-        match self.snapshot.update_from(self.rendered.as_ref()) {
-            MenuUpdate::Rebuild => self.rebuild(target, actions, mtm),
-            MenuUpdate::UpdateRetainedRows => {
+        let catalog_changed = self.rendered_catalog.as_ref() != Some(&self.catalog);
+        match (
+            catalog_changed,
+            self.snapshot.update_from(self.rendered.as_ref()),
+        ) {
+            (true, _) => self.rebuild(target, actions, mtm),
+            (false, MenuUpdate::Rebuild) => self.rebuild(target, actions, mtm),
+            (false, MenuUpdate::UpdateRetainedRows) => {
                 if let Some(rows) = &mut self.rows {
-                    #[cfg(any(test, debug_assertions))]
+                    #[cfg(test)]
                     rows.update(&self.snapshot, &self.cancel);
-                    #[cfg(not(any(test, debug_assertions)))]
+                    #[cfg(not(test))]
                     rows.update(&self.snapshot);
                 } else {
                     self.rebuild(target, actions, mtm);
@@ -77,18 +92,19 @@ impl NativePopoverState {
             }
         }
         self.rendered = Some(self.snapshot.clone());
+        self.rendered_catalog = Some(self.catalog.clone());
     }
 
     fn rebuild(&mut self, target: &AnyObject, actions: Actions, mtm: MainThreadMarker) {
         let PopoverContent { view, rows, .. } =
-            MenuRows::build(&self.snapshot, Some(target), actions, mtm);
+            MenuRows::build(&self.snapshot, &self.catalog, Some(target), actions, mtm);
         self.popover.setContentSize(view.frame().size);
         self.content_view_controller.setView(&view);
         self.rows = Some(rows);
     }
 
     fn popover_closed(&mut self) {
-        #[cfg(any(test, debug_assertions))]
+        #[cfg(test)]
         {
             self.cancel.reset();
             if let Some(rows) = &mut self.rows {
@@ -97,7 +113,7 @@ impl NativePopoverState {
         }
     }
 
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     fn apply_fixture_action(&mut self, action: MenuAction) -> bool {
         let Some(snapshot) = self.snapshot.apply_fixture_action(action) else {
             return false;
@@ -107,7 +123,7 @@ impl NativePopoverState {
         true
     }
 
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     fn show_cancel_confirmation(&mut self) {
         if let Some(rows) = &mut self.rows {
             rows.show_cancel_confirmation(&mut self.cancel);
@@ -116,13 +132,13 @@ impl NativePopoverState {
         }
     }
 
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     fn keep_partial_fixture(&mut self) {
         self.cancel.keep_partial();
         self.update_cancel_controls();
     }
 
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     fn discard_partial_fixture(&mut self) -> bool {
         if !self.cancel.discard_partial() {
             return false;
@@ -134,7 +150,7 @@ impl NativePopoverState {
         true
     }
 
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     fn update_cancel_controls(&mut self) {
         if let Some(rows) = &mut self.rows {
             rows.update_cancel_controls(&self.cancel);
@@ -142,25 +158,61 @@ impl NativePopoverState {
     }
 
     fn popover_opened(&mut self) {
-        #[cfg(not(any(test, debug_assertions)))]
-        self.observation.request_popover_open(Instant::now());
+        if let Some(backend) = &mut self.backend {
+            backend.request_popover_open(Instant::now());
+        }
     }
 
-    #[cfg(not(any(test, debug_assertions)))]
-    fn drain_observations(&mut self, target: &AnyObject, actions: Actions, mtm: MainThreadMarker) {
-        let Some(message) = self.observation.drain(Instant::now()) else {
+    #[cfg(not(test))]
+    fn drain_backend(&mut self, target: &AnyObject, actions: Actions, mtm: MainThreadMarker) {
+        let Some(backend) = &mut self.backend else {
             return;
         };
-        self.snapshot = match message {
-            ObservationMessage::Snapshot(snapshot) => snapshot,
-            ObservationMessage::Error(error) => MenuSnapshot::error(error),
-        };
+        let messages = backend.drain(Instant::now());
+        if messages.is_empty() {
+            return;
+        }
+        for message in messages {
+            match message {
+                BackendMessage::Observation(ObservationMessage::Snapshot(snapshot)) => {
+                    self.snapshot = snapshot;
+                }
+                BackendMessage::Observation(ObservationMessage::Error(error)) => {
+                    self.snapshot = MenuSnapshot::error(error.clone());
+                    let _ = self.catalog.apply(CatalogEvent::Failed {
+                        generation: self.catalog.generation(),
+                        message: error,
+                    });
+                }
+                BackendMessage::Catalog(event) => {
+                    let _ = self.catalog.apply(event);
+                }
+            }
+        }
         self.render(target, actions, mtm);
     }
 
     fn shutdown(&mut self) {
-        #[cfg(not(any(test, debug_assertions)))]
-        self.observation.shutdown();
+        if let Some(backend) = &mut self.backend {
+            backend.shutdown();
+        }
+    }
+
+    fn dispatch_catalog(&mut self, command: Option<crate::menu::catalog::CatalogCommand>) {
+        let Some(command) = command else {
+            return;
+        };
+        let generation = command.generation();
+        if !self
+            .backend
+            .as_mut()
+            .is_some_and(|backend| backend.dispatch(command))
+        {
+            let _ = self.catalog.apply(CatalogEvent::Failed {
+                generation,
+                message: "The menu backend is unavailable".into(),
+            });
+        }
     }
 }
 
@@ -213,43 +265,107 @@ define_class!(
     unsafe impl NSObjectProtocol for NativePopoverTarget {}
 
     impl NativePopoverTarget {
-        #[cfg(any(test, debug_assertions))]
+        #[unsafe(method(submitSearch:))]
+        fn submit_search(&self, sender: Option<&NSSearchField>) {
+            let query = sender
+                .map(|field| field.stringValue().to_string())
+                .unwrap_or_default();
+            let mtm = MainThreadMarker::new()
+                .expect("AppKit must submit menu searches on the main thread");
+            let mut state = self.ivars().state.borrow_mut();
+            let command = state.catalog.submit_search(&query);
+            state.dispatch_catalog(command);
+            state.render(self, action_selectors(), mtm);
+        }
+
+        #[unsafe(method(inspectRepository:))]
+        fn inspect_repository(&self, sender: Option<&NSButton>) {
+            let Some(index) = sender.and_then(|button| usize::try_from(button.tag()).ok()) else {
+                return;
+            };
+            let mtm = MainThreadMarker::new()
+                .expect("AppKit must select repositories on the main thread");
+            let mut state = self.ivars().state.borrow_mut();
+            let command = state.catalog.inspect_repository(index);
+            state.dispatch_catalog(command);
+            state.render(self, action_selectors(), mtm);
+        }
+
+        #[unsafe(method(selectCandidate:))]
+        fn select_candidate(&self, sender: Option<&NSButton>) {
+            let Some(index) = sender.and_then(|button| usize::try_from(button.tag()).ok()) else {
+                return;
+            };
+            let mtm = MainThreadMarker::new()
+                .expect("AppKit must select GGUF candidates on the main thread");
+            let mut state = self.ivars().state.borrow_mut();
+            if state.catalog.select_candidate(index) {
+                state.render(self, action_selectors(), mtm);
+            }
+        }
+
+        #[unsafe(method(transferSelected:))]
+        fn transfer_selected(&self, _sender: Option<&NSButton>) {
+            let mtm = MainThreadMarker::new()
+                .expect("AppKit must start transfers on the main thread");
+            let mut state = self.ivars().state.borrow_mut();
+            let command = state.catalog.start_transfer();
+            state.dispatch_catalog(command);
+            state.render(self, action_selectors(), mtm);
+        }
+
+        #[unsafe(method(pauseTransfer:))]
+        fn pause_transfer(&self, _sender: Option<&NSButton>) {
+            let mtm = MainThreadMarker::new()
+                .expect("AppKit must pause transfers on the main thread");
+            let mut state = self.ivars().state.borrow_mut();
+            let generation = state.catalog.generation();
+            let requested = state
+                .backend
+                .as_ref()
+                .is_some_and(|backend| backend.request_pause(generation));
+            if requested && state.catalog.request_pause() {
+                state.render(self, action_selectors(), mtm);
+            }
+        }
+
+        #[cfg(test)]
         #[unsafe(method(startFixture:))]
         fn start_fixture(&self, _sender: Option<&AnyObject>) {
             self.apply_action(MenuAction::Start);
         }
 
-        #[cfg(any(test, debug_assertions))]
+        #[cfg(test)]
         #[unsafe(method(pauseFixture:))]
         fn pause_fixture(&self, _sender: Option<&AnyObject>) {
             self.apply_action(MenuAction::Pause);
         }
 
-        #[cfg(any(test, debug_assertions))]
+        #[cfg(test)]
         #[unsafe(method(resumeFixture:))]
         fn resume_fixture(&self, _sender: Option<&AnyObject>) {
             self.apply_action(MenuAction::Resume);
         }
 
-        #[cfg(any(test, debug_assertions))]
+        #[cfg(test)]
         #[unsafe(method(retryFixture:))]
         fn retry_fixture(&self, _sender: Option<&AnyObject>) {
             self.apply_action(MenuAction::Retry);
         }
 
-        #[cfg(any(test, debug_assertions))]
+        #[cfg(test)]
         #[unsafe(method(showCancelConfirmation:))]
         fn show_cancel_confirmation(&self, _sender: Option<&AnyObject>) {
             self.ivars().state.borrow_mut().show_cancel_confirmation();
         }
 
-        #[cfg(any(test, debug_assertions))]
+        #[cfg(test)]
         #[unsafe(method(keepPartialFixture:))]
         fn keep_partial_fixture(&self, _sender: Option<&AnyObject>) {
             self.ivars().state.borrow_mut().keep_partial_fixture();
         }
 
-        #[cfg(any(test, debug_assertions))]
+        #[cfg(test)]
         #[unsafe(method(discardPartialFixture:))]
         fn discard_partial_fixture(&self, _sender: Option<&AnyObject>) {
             let mtm = MainThreadMarker::new()
@@ -279,7 +395,7 @@ impl NativePopoverTarget {
         unsafe { msg_send![super(this), init] }
     }
 
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     fn apply_action(&self, action: MenuAction) {
         let mtm =
             MainThreadMarker::new().expect("AppKit must send popover actions on the main thread");
@@ -311,14 +427,14 @@ impl NativePopoverTarget {
         popover.showRelativeToRect_ofView_preferredEdge(button.bounds(), &button, NSRectEdge::MinY);
     }
 
-    #[cfg(not(any(test, debug_assertions)))]
-    fn drain_observations(&self) {
+    #[cfg(not(test))]
+    fn drain_backend(&self) {
         let mtm =
-            MainThreadMarker::new().expect("AppKit must drain observations on the main thread");
+            MainThreadMarker::new().expect("AppKit must drain backend events on the main thread");
         self.ivars()
             .state
             .borrow_mut()
-            .drain_observations(self, action_selectors(), mtm);
+            .drain_backend(self, action_selectors(), mtm);
     }
 
     fn shutdown(&self) {
@@ -332,7 +448,7 @@ pub(crate) struct NativePopoverController {
     _content_view_controller: Retained<NSViewController>,
     _delegate: Retained<NativePopoverDelegate>,
     _target: Retained<NativePopoverTarget>,
-    #[cfg(not(any(test, debug_assertions)))]
+    #[cfg(not(test))]
     timer: ObservationTimer,
 }
 
@@ -356,13 +472,13 @@ impl NativePopoverController {
         let content_view_controller = NSViewController::new(mtm);
         popover.setContentViewController(Some(&content_view_controller));
 
-        #[cfg(any(test, debug_assertions))]
+        #[cfg(test)]
         let fixture = selected_fixture();
         let state = Rc::new(RefCell::new(NativePopoverState::new(
             status_item.clone(),
             popover.clone(),
             content_view_controller.clone(),
-            #[cfg(any(test, debug_assertions))]
+            #[cfg(test)]
             fixture,
         )));
         let target = NativePopoverTarget::new(app_handle, state.clone(), mtm);
@@ -371,10 +487,10 @@ impl NativePopoverController {
         let delegate = NativePopoverDelegate::new(state, mtm);
         popover.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
 
-        #[cfg(not(any(test, debug_assertions)))]
+        #[cfg(not(test))]
         let timer = ObservationTimer::schedule(
             0.25,
-            weak_callback(&target, NativePopoverTarget::drain_observations),
+            weak_callback(&target, NativePopoverTarget::drain_backend),
             mtm,
         );
 
@@ -384,7 +500,7 @@ impl NativePopoverController {
             _content_view_controller: content_view_controller,
             _delegate: delegate,
             _target: target,
-            #[cfg(not(any(test, debug_assertions)))]
+            #[cfg(not(test))]
             timer,
         }
     }
@@ -396,7 +512,7 @@ impl NativePopoverController {
 
 impl Drop for NativePopoverController {
     fn drop(&mut self) {
-        #[cfg(not(any(test, debug_assertions)))]
+        #[cfg(not(test))]
         self.timer.shutdown();
         self._target.shutdown();
         self.status_item.setMenu(None);
@@ -404,35 +520,59 @@ impl Drop for NativePopoverController {
 }
 
 struct ProductionActionSelectors {
+    search: Sel,
+    repository: Sel,
+    candidate: Sel,
+    transfer: Sel,
+    pause: Sel,
     quit: Sel,
 }
 
 fn production_action_selectors() -> ProductionActionSelectors {
-    ProductionActionSelectors { quit: sel!(quit:) }
+    ProductionActionSelectors {
+        search: sel!(submitSearch:),
+        repository: sel!(inspectRepository:),
+        candidate: sel!(selectCandidate:),
+        transfer: sel!(transferSelected:),
+        pause: sel!(pauseTransfer:),
+        quit: sel!(quit:),
+    }
 }
 
 fn action_selectors() -> Actions {
-    let ProductionActionSelectors { quit } = production_action_selectors();
+    let ProductionActionSelectors {
+        search,
+        repository,
+        candidate,
+        transfer,
+        pause,
+        quit,
+    } = production_action_selectors();
     Actions {
-        #[cfg(any(test, debug_assertions))]
+        search,
+        repository,
+        candidate,
+        transfer,
+        pause_transfer: pause,
+        #[cfg(test)]
         start: sel!(startFixture:),
-        #[cfg(any(test, debug_assertions))]
+        #[cfg(test)]
         pause: sel!(pauseFixture:),
-        #[cfg(any(test, debug_assertions))]
+        #[cfg(test)]
         resume: sel!(resumeFixture:),
-        #[cfg(any(test, debug_assertions))]
+        #[cfg(test)]
         retry: sel!(retryFixture:),
-        #[cfg(any(test, debug_assertions))]
+        #[cfg(test)]
         cancel: sel!(showCancelConfirmation:),
-        #[cfg(any(test, debug_assertions))]
+        #[cfg(test)]
         keep_partial: sel!(keepPartialFixture:),
-        #[cfg(any(test, debug_assertions))]
+        #[cfg(test)]
         discard_partial: sel!(discardPartialFixture:),
         quit,
     }
 }
 
-#[cfg(any(test, debug_assertions))]
+#[cfg(test)]
 fn selected_fixture() -> Fixture {
     std::env::var("LOXA_MENU_FIXTURE")
         .ok()
@@ -443,14 +583,44 @@ fn selected_fixture() -> Fixture {
 
 #[cfg(test)]
 mod tests {
-    use objc2::sel;
+    use objc2::{sel, ClassType};
 
-    use super::{production_action_selectors, ProductionActionSelectors};
+    use super::{production_action_selectors, NativePopoverTarget, ProductionActionSelectors};
 
     #[test]
-    fn production_actions_expose_quit_without_fixture_selectors() {
-        let ProductionActionSelectors { quit } = production_action_selectors();
+    fn production_target_exposes_catalog_and_transfer_actions() {
+        let class = NativePopoverTarget::class();
 
+        for action in [
+            sel!(submitSearch:),
+            sel!(inspectRepository:),
+            sel!(selectCandidate:),
+            sel!(transferSelected:),
+            sel!(pauseTransfer:),
+        ] {
+            assert!(
+                class.instance_method(action).is_some(),
+                "production target is missing {action}"
+            );
+        }
+    }
+
+    #[test]
+    fn production_actions_expose_catalog_transfer_and_quit_selectors() {
+        let ProductionActionSelectors {
+            search,
+            repository,
+            candidate,
+            transfer,
+            pause,
+            quit,
+        } = production_action_selectors();
+
+        assert_eq!(search, sel!(submitSearch:));
+        assert_eq!(repository, sel!(inspectRepository:));
+        assert_eq!(candidate, sel!(selectCandidate:));
+        assert_eq!(transfer, sel!(transferSelected:));
+        assert_eq!(pause, sel!(pauseTransfer:));
         assert_eq!(quit, sel!(quit:));
     }
 }
