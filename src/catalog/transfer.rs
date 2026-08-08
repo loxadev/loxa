@@ -19,7 +19,6 @@ pub(crate) enum CatalogTransferState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub(crate) struct CatalogTransferPlan {
     state: CatalogTransferState,
     pending_temp: Option<RegularFileIdentity>,
@@ -27,14 +26,12 @@ pub(crate) struct CatalogTransferPlan {
 }
 
 impl CatalogTransferPlan {
-    #[allow(dead_code)]
     pub(crate) fn state(&self) -> CatalogTransferState {
         self.state
     }
 }
 
 #[derive(Eq, PartialEq)]
-#[allow(dead_code)]
 pub(crate) struct CatalogDiscardFacts {
     pending: Manifest,
     pending_identity: RegularFileIdentity,
@@ -50,7 +47,6 @@ pub(crate) enum CatalogDiscardError {
     UnsafeLocalState,
 }
 
-#[allow(dead_code)]
 pub(crate) fn plan_discard(
     lock: &ModelLock,
     expected_model_id: &str,
@@ -109,7 +105,6 @@ fn plan_discard_with_manifest_read_observer(
     })
 }
 
-#[allow(dead_code)]
 pub(crate) fn plan_transfer(lock: &ModelLock, expected: &Manifest) -> CatalogTransferPlan {
     plan_transfer_with_temp_open_observer(lock, expected, |_| {})
 }
@@ -128,7 +123,6 @@ pub(crate) enum CatalogMutationError {
     Durability,
 }
 
-#[allow(dead_code)]
 pub(crate) fn remove_pending_last(
     lock: &ModelLock,
     facts: CatalogDiscardFacts,
@@ -161,7 +155,6 @@ fn remove_pending_last_inner(
     Ok(())
 }
 
-#[allow(dead_code)]
 pub(crate) fn recover_admitted_catalog_temps(
     lock: &ModelLock,
     plan: &CatalogTransferPlan,
@@ -224,7 +217,6 @@ fn recover_admitted_catalog_temps_inner(
     Ok(())
 }
 
-#[allow(dead_code)]
 pub(crate) fn recover_installed_completion(
     lock: &ModelLock,
     expected: &Manifest,

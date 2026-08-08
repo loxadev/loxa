@@ -112,7 +112,6 @@ impl ArtifactDiscardFacts {
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn plan_artifact_discard(
     directory: &File,
     model_dir: &Path,
@@ -120,7 +119,6 @@ pub(crate) fn plan_artifact_discard(
     plan::plan_artifact_discard_inner(directory, model_dir)
 }
 
-#[allow(dead_code)]
 pub(crate) fn discard_artifact_bytes(
     directory: &File,
     model_dir: &Path,

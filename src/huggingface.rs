@@ -1066,6 +1066,25 @@ pub(crate) fn resolve(
     resolve_with_transport(request, filename, quant, &mut transport)
 }
 
+pub(crate) fn resolve_selected(
+    repo: &str,
+    revision: Option<&str>,
+    filename: Option<&str>,
+    quant: Option<&str>,
+) -> Result<ResolvedFile, ResolveError> {
+    let client = Client::builder()
+        .user_agent(concat!("loxa/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(30))
+        .redirect(Policy::none())
+        .build()
+        .map_err(|_| {
+            ResolveError::Discovery(DiscoveryError::new(DiscoveryErrorKind::RemoteUnavailable))
+        })?;
+    let token = discover_token();
+    resolve(&client, repo, revision, filename, quant, token.as_deref())
+}
+
 fn resolve_with_transport<T: DiscoveryTransport>(
     request: InspectRepository,
     filename: Option<&str>,

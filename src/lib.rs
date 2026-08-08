@@ -56,6 +56,88 @@ mod discovery_public_contract_tests {
         );
     }
 }
+#[cfg(test)]
+mod selected_transfer_public_contract_tests {
+    use crate::app::transfer::{DiscardCandidate, TransferErrorKind};
+    use crate::app::{
+        AppService, ResolveArtifactError, ResolveArtifactRequest, TransferControl,
+        TransferDisposition, TransferError, TransferPhase, TransferProgress, TransferResult,
+        TransferSelected,
+    };
+    use crate::huggingface::ResolvedFile;
+
+    fn assert_send_static<T: Send + 'static>() {}
+    fn assert_clone_send_sync_static<T: Clone + Send + Sync + 'static>() {}
+    fn assert_error<T: std::error::Error + Send + 'static>() {}
+
+    #[test]
+    fn selected_transfer_public_contract_compiles_the_approved_owned_values() {
+        assert_send_static::<ResolveArtifactRequest>();
+        assert_send_static::<TransferSelected>();
+        assert_send_static::<TransferProgress>();
+        assert_send_static::<TransferResult>();
+        assert_clone_send_sync_static::<TransferControl>();
+        assert_error::<ResolveArtifactError>();
+        assert_error::<TransferError>();
+
+        let _: fn(String, Option<String>, String) -> ResolveArtifactRequest =
+            ResolveArtifactRequest::exact_file;
+        let _: fn(String, Option<String>, String) -> ResolveArtifactRequest =
+            ResolveArtifactRequest::unique_quant;
+        let _: fn(ResolvedFile, Option<String>) -> TransferSelected = TransferSelected::new;
+        let _: fn() -> TransferControl = TransferControl::new;
+        let _: fn(&TransferControl) = TransferControl::request_pause;
+        let _: fn(&TransferProgress) -> TransferPhase = TransferProgress::phase;
+        let _: fn(&TransferProgress) -> u64 = TransferProgress::transferred_bytes;
+        let _: fn(&TransferProgress) -> u64 = TransferProgress::total_bytes;
+        let _: fn(&TransferResult) -> &str = TransferResult::model_id;
+        let _: fn(&TransferResult) -> &ResolvedFile = TransferResult::artifact;
+        let _: fn(&TransferResult) -> TransferDisposition = TransferResult::disposition;
+        let _: fn(&TransferResult) -> Option<u64> = TransferResult::retained_bytes;
+        let _: fn(&TransferResult) -> bool = TransferResult::discardable;
+        let _: fn(&DiscardCandidate) -> &str = DiscardCandidate::model_id;
+        let _: fn(&TransferError) -> TransferErrorKind = TransferError::kind;
+        let _: fn(&TransferError) -> Option<u64> = TransferError::required_available_bytes;
+        let _: fn(&TransferError) -> Option<u64> = TransferError::available_bytes;
+        let _: fn(&TransferError) -> Option<&str> = TransferError::recovery_model_id;
+        let _: fn(&TransferError) -> Option<&ResolvedFile> = TransferError::recovery_artifact;
+        let _: fn(&TransferError) -> Option<u64> = TransferError::retained_bytes;
+        let _: fn(&TransferError) -> bool = TransferError::discardable;
+
+        fn service_signatures(
+            service: &AppService,
+            resolve: ResolveArtifactRequest,
+            selected: TransferSelected,
+            control: TransferControl,
+            candidate: DiscardCandidate,
+        ) {
+            let _: Result<ResolvedFile, ResolveArtifactError> = service.resolve_artifact(resolve);
+            let _: Result<TransferResult, TransferError> =
+                service.transfer_selected(selected, control, |_: TransferProgress| {});
+            let _: Result<DiscardCandidate, TransferError> =
+                service.prepare_discard("model".into());
+            let _: Result<(), TransferError> = service.discard_transfer(candidate);
+        }
+        let _ = service_signatures;
+
+        assert_eq!(TransferPhase::Transferring, TransferPhase::Transferring);
+        assert_eq!(TransferPhase::Verifying, TransferPhase::Verifying);
+        assert_eq!(TransferPhase::Publishing, TransferPhase::Publishing);
+        assert_eq!(
+            TransferDisposition::Installed,
+            TransferDisposition::Installed
+        );
+        assert_eq!(
+            TransferDisposition::AlreadyInstalled,
+            TransferDisposition::AlreadyInstalled
+        );
+        assert_eq!(TransferDisposition::Paused, TransferDisposition::Paused);
+        assert_eq!(
+            TransferDisposition::Interrupted,
+            TransferDisposition::Interrupted
+        );
+    }
+}
 mod download;
 pub mod huggingface;
 pub mod paths;

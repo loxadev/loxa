@@ -11,6 +11,13 @@ use std::path::PathBuf;
 #[cfg(unix)]
 use sysinfo::{Disks, System};
 
+pub(crate) mod transfer;
+
+pub use transfer::{
+    ResolveArtifactError, ResolveArtifactRequest, TransferControl, TransferDisposition,
+    TransferError, TransferPhase, TransferProgress, TransferResult, TransferSelected,
+};
+
 const GIB: u64 = 1024 * 1024 * 1024;
 const MACOS_MEMORY_RESERVE_BYTES: u64 = 4 * GIB;
 const MEMORY_OVERHEAD_PERCENT: u64 = 5;

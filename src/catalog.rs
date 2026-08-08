@@ -82,12 +82,10 @@ impl ModelLock {
         Self::acquire_with_after_open(model_dir, || {})
     }
 
-    #[allow(dead_code)]
     pub(crate) fn acquire_existing(model_dir: &Path) -> Result<Self, ModelLockError> {
         Self::acquire_inner(model_dir, false, || {}).map_err(|failure| failure.kind)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn acquire_for_transfer(model_dir: &Path) -> Result<Self, ModelLockError> {
         Self::acquire_inner(model_dir, true, || {}).map_err(|failure| failure.kind)
     }

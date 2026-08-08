@@ -33,7 +33,6 @@ struct ArtifactEntry {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub(crate) struct ArtifactTransferPlan {
     state: ArtifactTransferState,
     final_entry: Option<ArtifactEntry>,
@@ -42,7 +41,6 @@ pub(crate) struct ArtifactTransferPlan {
     invalid: Option<ArtifactEntry>,
 }
 
-#[allow(dead_code)]
 impl ArtifactTransferPlan {
     pub(crate) fn state(&self) -> ArtifactTransferState {
         self.state
@@ -65,7 +63,6 @@ impl ArtifactTransferPlan {
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn plan_artifact_transfer(
     directory: &File,
     model_dir: &Path,
