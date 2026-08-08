@@ -1,4 +1,4 @@
-use crate::chat::{Event, Message, Role, Worker};
+use crate::chat::{Event, Message, PromptProgress, Role, Timing, Worker};
 use crate::runner::{report_exit, ForegroundServer};
 use crate::ui;
 use rustyline::completion::Completer;
@@ -10,7 +10,7 @@ use rustyline::validate::{ValidationContext, ValidationResult, Validator};
 use rustyline::{CompletionType, Config, Context, Editor, Helper};
 use std::io::Write;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const SLASH_COMMANDS: [(&str, &str); 3] = [
@@ -203,7 +203,75 @@ fn write_assistant_delta(output: &mut impl Write, delta: &str) -> Result<(), Str
         .map_err(|error| error.to_string())
 }
 
-pub(crate) fn run(mut server: ForegroundServer, model: &str) -> Result<i32, String> {
+fn processing_message(progress: &PromptProgress) -> String {
+    format!(
+        "Processing prompt… {}/{} tokens ({} cached, {} ms)",
+        progress.processed, progress.total, progress.cache, progress.time_ms
+    )
+}
+
+fn total_prompt_tokens(timing: &Timing) -> i64 {
+    i64::from(timing.prompt_n) + i64::from(timing.cache_n.max(0))
+}
+
+fn format_timing(timing: &Timing) -> Option<String> {
+    if timing.prompt_n < 0
+        || timing.predicted_n < 0
+        || (timing.prompt_n == 0 && timing.predicted_n == 0)
+    {
+        return None;
+    }
+    if !timing.prompt_ms.is_finite()
+        || !timing.predicted_ms.is_finite()
+        || timing.prompt_ms < 0.0
+        || timing.predicted_ms < 0.0
+    {
+        return None;
+    }
+    let cached = if timing.cache_n >= 0 {
+        format!(" ({} cached)", timing.cache_n)
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "Prompt: {} tokens{cached} in {:.0} ms · Generated: {} tokens in {:.0} ms",
+        total_prompt_tokens(timing),
+        timing.prompt_ms,
+        timing.predicted_n,
+        timing.predicted_ms
+    ))
+}
+
+fn report_timing(timing: &Timing) {
+    if timing.cache_n >= 0 {
+        tracing::info!(
+            event = "chat_timing",
+            prompt_tokens = total_prompt_tokens(timing),
+            cached_tokens = timing.cache_n,
+            prompt_ms = timing.prompt_ms,
+            generated_tokens = timing.predicted_n,
+            generation_ms = timing.predicted_ms,
+        );
+    } else {
+        tracing::info!(
+            event = "chat_timing",
+            prompt_tokens = total_prompt_tokens(timing),
+            prompt_ms = timing.prompt_ms,
+            generated_tokens = timing.predicted_n,
+            generation_ms = timing.predicted_ms,
+        );
+    }
+    if let Some(summary) = format_timing(timing) {
+        let dim = ui::muted();
+        anstream::println!("{dim}{summary}{dim:#}");
+    }
+}
+
+pub(crate) fn run(
+    mut server: ForegroundServer,
+    model: &str,
+    max_tokens: u32,
+) -> Result<i32, String> {
     let mut session = Session::default();
     let mut editor = new_editor()?;
     let ready = ui::success();
@@ -269,9 +337,16 @@ pub(crate) fn run(mut server: ForegroundServer, model: &str) -> Result<i32, Stri
             return Ok(report_exit(exit));
         }
 
-        let worker = Worker::start(server.port(), model.to_owned(), session.request(&user))?;
-        let thinking = ui::spinner("Thinking".into());
+        let request_started = Instant::now();
+        let worker = Worker::start(
+            server.port(),
+            model.to_owned(),
+            session.request(&user),
+            max_tokens,
+        )?;
+        let thinking = ui::spinner("Processing prompt…".into());
         let mut waiting = true;
+        let mut timing = None;
         let mut output = std::io::stdout();
         let result = loop {
             match server.poll() {
@@ -290,13 +365,23 @@ pub(crate) fn run(mut server: ForegroundServer, model: &str) -> Result<i32, Stri
                 }
             }
             match worker.recv_timeout(POLL_INTERVAL) {
+                Ok(Event::PromptProgress(progress)) => {
+                    if waiting {
+                        thinking.set_message(processing_message(&progress));
+                    }
+                }
                 Ok(Event::Delta(delta)) => {
                     if waiting {
                         thinking.finish_and_clear();
                         waiting = false;
+                        tracing::info!(
+                            event = "chat_first_token",
+                            elapsed_ms = request_started.elapsed().as_millis(),
+                        );
                     }
                     write_assistant_delta(&mut output, &delta)?;
                 }
+                Ok(Event::Timing(value)) => timing = Some(value),
                 Ok(Event::Complete(assistant)) => {
                     thinking.finish_and_clear();
                     break Ok(assistant);
@@ -315,7 +400,12 @@ pub(crate) fn run(mut server: ForegroundServer, model: &str) -> Result<i32, Stri
         writeln!(output).map_err(|error| error.to_string())?;
         worker.join()?;
         match result {
-            Ok(assistant) => session.complete(user, assistant),
+            Ok(assistant) => {
+                session.complete(user, assistant);
+                if let Some(timing) = timing.as_ref() {
+                    report_timing(timing);
+                }
+            }
             Err(error) => {
                 let error_style = ui::danger();
                 let error = ui::sanitize_terminal(&error);
@@ -328,13 +418,27 @@ pub(crate) fn run(mut server: ForegroundServer, model: &str) -> Result<i32, Stri
 #[cfg(test)]
 mod tests {
     use super::{
-        chat_config, continues_on_next_line, remove_line_continuations, slash_suggestions,
-        write_assistant_delta, ChatHelper, InputAction, Session,
+        chat_config, continues_on_next_line, format_timing, processing_message,
+        remove_line_continuations, report_timing, slash_suggestions, write_assistant_delta,
+        ChatHelper, InputAction, Session,
     };
-    use crate::chat::{Message, Role};
+    use crate::chat::{Message, PromptProgress, Role, Timing};
     use rustyline::completion::Completer as _;
     use rustyline::history::{DefaultHistory, History};
     use rustyline::Context;
+
+    #[derive(Clone)]
+    struct SharedLogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedLogWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            std::io::Write::write(&mut *self.0.lock().unwrap(), buffer)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn two_successful_turns_are_sent_in_order() {
@@ -472,5 +576,75 @@ mod tests {
         let mut session = Session::default();
         session.complete("user".into(), raw.into());
         assert_eq!(session.request("next")[1].content, raw);
+    }
+
+    #[test]
+    fn prompt_processing_and_final_timing_are_truthful_without_prompt_text() {
+        assert_eq!(
+            processing_message(&PromptProgress {
+                total: 12,
+                cache: 5,
+                processed: 9,
+                time_ms: 42,
+            }),
+            "Processing prompt… 9/12 tokens (5 cached, 42 ms)"
+        );
+        assert_eq!(
+            format_timing(&Timing {
+                cache_n: 0,
+                prompt_n: 12,
+                prompt_ms: 42.0,
+                predicted_n: 2,
+                predicted_ms: 7.0,
+            })
+            .as_deref(),
+            Some("Prompt: 12 tokens (0 cached) in 42 ms · Generated: 2 tokens in 7 ms")
+        );
+    }
+
+    #[test]
+    fn cached_prompt_timing_reports_the_total_prompt_tokens() {
+        let timing = Timing {
+            cache_n: 236,
+            prompt_n: 1,
+            prompt_ms: 3.0,
+            predicted_n: 2,
+            predicted_ms: 4.0,
+        };
+        assert_eq!(
+            format_timing(&timing).as_deref(),
+            Some("Prompt: 237 tokens (236 cached) in 3 ms · Generated: 2 tokens in 4 ms")
+        );
+
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_ansi(false)
+            .with_writer(move || SharedLogWriter(writer.clone()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || report_timing(&timing));
+        let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        let event: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+
+        assert_eq!(event["event"], "chat_timing");
+        assert_eq!(event["prompt_tokens"], 237);
+        assert_eq!(event["cached_tokens"], 236);
+    }
+
+    #[test]
+    fn timing_omits_an_unknown_signed_cache_count() {
+        assert_eq!(
+            format_timing(&Timing {
+                cache_n: -1,
+                prompt_n: 3,
+                prompt_ms: 9.0,
+                predicted_n: 2,
+                predicted_ms: 4.0,
+            })
+            .as_deref(),
+            Some("Prompt: 3 tokens in 9 ms · Generated: 2 tokens in 4 ms")
+        );
     }
 }

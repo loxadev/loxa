@@ -13,7 +13,7 @@ use reqwest::StatusCode;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub(super) enum ArtifactTransferError {
     RemoteBeforeBody(TransferError),
@@ -280,7 +280,7 @@ pub(super) async fn download_once(
             Some((part, part_identity)),
             should_pause,
         ) {
-            Ok(VerificationOutcome::Verified) => {}
+            Ok(VerificationOutcome::Verified(_)) => {}
             Ok(VerificationOutcome::Interrupted) => {
                 let retained_bytes = durable_part_barrier(
                     &directory,
@@ -600,7 +600,7 @@ pub(super) async fn download_once(
         Some((&output, &staging_identity)),
         should_pause,
     ) {
-        Ok(VerificationOutcome::Verified) => {}
+        Ok(VerificationOutcome::Verified(_)) => {}
         Ok(VerificationOutcome::Interrupted) => {
             let retained_bytes = normalize_durable_prefix(
                 ignored_range,
@@ -2069,17 +2069,60 @@ fn ensure_discard_entry(
     }
 }
 
-pub(crate) fn verify_regular(path: &Path, size: u64, sha256: &str) -> Result<(), String> {
+#[derive(Debug)]
+pub(crate) struct VerifiedRegularFile {
+    file: File,
+    identity: RegularFileIdentity,
+    path: PathBuf,
+}
+
+impl VerifiedRegularFile {
+    pub(crate) fn revalidate_for(&self, expected_path: &Path) -> Result<fs::Metadata, String> {
+        if self.path != expected_path {
+            return Err("verified model artifact path mismatch".into());
+        }
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let resolved = options
+            .open(expected_path)
+            .map_err(|error| format!("{}: {error}", expected_path.display()))?;
+        ensure_regular_descriptors_match(&self.file, &self.identity, &resolved, expected_path)
+            .map_err(|_| {
+                format!(
+                    "model artifact changed after hashing {}",
+                    expected_path.display()
+                )
+            })?;
+        self.file
+            .metadata()
+            .map_err(|error| format!("{}: {error}", expected_path.display()))
+    }
+}
+
+pub(crate) fn verify_regular_captured(
+    path: &Path,
+    size: u64,
+    sha256: &str,
+) -> Result<VerifiedRegularFile, String> {
     match verify_regular_with_observer(path, size, sha256, None, &|| false, |_| Ok(()))? {
-        VerificationOutcome::Verified => Ok(()),
+        VerificationOutcome::Verified(verified) => Ok(verified),
         VerificationOutcome::Interrupted => Err("artifact verification interrupted".into()),
         VerificationOutcome::ChecksumMismatch => Err("model artifact checksum mismatch".into()),
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) fn verify_regular(path: &Path, size: u64, sha256: &str) -> Result<(), String> {
+    verify_regular_captured(path, size, sha256).map(|_| ())
+}
+
+#[derive(Debug)]
 enum VerificationOutcome {
-    Verified,
+    Verified(VerifiedRegularFile),
     Interrupted,
     ChecksumMismatch,
 }
@@ -2157,7 +2200,11 @@ where
     if actual != sha256.to_ascii_lowercase() {
         return Ok(VerificationOutcome::ChecksumMismatch);
     }
-    Ok(VerificationOutcome::Verified)
+    Ok(VerificationOutcome::Verified(VerifiedRegularFile {
+        file,
+        identity: opened,
+        path: path.to_owned(),
+    }))
 }
 
 pub(super) fn hex(bytes: &[u8]) -> String {

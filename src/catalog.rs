@@ -670,12 +670,14 @@ pub fn remove_model(models_root: &Path, manifest: &Manifest) -> Result<(), Strin
         return Err(format!("model {} changed before removal", manifest.id));
     }
 
-    const OWNED_ENTRIES: [&str; 8] = [
+    const OWNED_ENTRIES: [&str; 10] = [
         ".lock",
         "manifest.json",
         "manifest.json.tmp",
         "pending.json",
         "pending.json.tmp",
+        "verification-receipt.json",
+        ".verification-receipt.json.tmp",
         "model.gguf.part",
         "model.gguf.part.restart",
         "model.gguf.invalid",

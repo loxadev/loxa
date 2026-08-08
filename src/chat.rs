@@ -1,33 +1,13 @@
-use serde::{Deserialize, Serialize};
-use std::io::Read;
+mod protocol;
+
+pub use protocol::{Event, Message, PromptProgress, Role, Timing};
+
+use protocol::{decode_sse, http_error, Request};
 use std::sync::mpsc;
 use std::time::Duration;
 
-const MAX_EVENT_BYTES: usize = 1024 * 1024;
-const MAX_ASSISTANT_BYTES: usize = 16 * 1024 * 1024;
-const MAX_ERROR_BODY_BYTES: usize = 16 * 1024;
 const EVENT_QUEUE_CAPACITY: usize = 64;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Role {
-    User,
-    Assistant,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct Message {
-    pub role: Role,
-    pub content: String,
-}
-
-#[derive(Debug, Eq, PartialEq)]
-pub enum Event {
-    Delta(String),
-    Complete(String),
-    Error(String),
-}
 
 pub struct Worker {
     events: mpsc::Receiver<Event>,
@@ -35,21 +15,34 @@ pub struct Worker {
 }
 
 impl Worker {
-    pub fn start(port: u16, model: String, messages: Vec<Message>) -> Result<Self, String> {
-        Self::start_with_request_timeout(port, model, messages, REQUEST_TIMEOUT)
+    pub fn start(
+        port: u16,
+        model: String,
+        messages: Vec<Message>,
+        max_tokens: u32,
+    ) -> Result<Self, String> {
+        Self::start_with_request_timeout(port, model, messages, max_tokens, REQUEST_TIMEOUT)
     }
 
     fn start_with_request_timeout(
         port: u16,
         model: String,
         messages: Vec<Message>,
+        max_tokens: u32,
         request_timeout: Duration,
     ) -> Result<Self, String> {
         let (sender, events) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
         let thread = std::thread::Builder::new()
             .name("loxa-chat-request".into())
             .spawn(move || {
-                if let Err(error) = request(port, &model, &messages, request_timeout, &sender) {
+                if let Err(error) = request(
+                    port,
+                    &model,
+                    &messages,
+                    max_tokens,
+                    request_timeout,
+                    &sender,
+                ) {
                     let _ = sender.send(Event::Error(error));
                 }
             })
@@ -78,17 +71,11 @@ impl Worker {
     }
 }
 
-#[derive(Serialize)]
-struct Request<'a> {
-    model: &'a str,
-    messages: &'a [Message],
-    stream: bool,
-}
-
 fn request(
     port: u16,
     model: &str,
     messages: &[Message],
+    max_tokens: u32,
     request_timeout: Duration,
     sender: &mpsc::SyncSender<Event>,
 ) -> Result<(), String> {
@@ -101,11 +88,7 @@ fn request(
         .map_err(|error| error.to_string())?;
     let mut response = client
         .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
-        .json(&Request {
-            model,
-            messages,
-            stream: true,
-        })
+        .json(&Request::new(model, messages, max_tokens))
         .send()
         .map_err(|error| {
             if error.is_timeout() {
@@ -120,9 +103,9 @@ fn request(
     if !response.status().is_success() {
         return Err(http_error(&mut response));
     }
-    let assistant = decode_sse(&mut response, |delta| {
+    let assistant = decode_sse(&mut response, |event| {
         sender
-            .send(Event::Delta(delta))
+            .send(event)
             .map_err(|_| "chat event receiver closed".to_string())
     })?;
     sender
@@ -130,377 +113,14 @@ fn request(
         .map_err(|_| "chat event receiver closed".to_string())
 }
 
-fn http_error(response: &mut reqwest::blocking::Response) -> String {
-    let status = response.status();
-    let mut body = Vec::new();
-    if let Err(error) = response
-        .take((MAX_ERROR_BODY_BYTES + 1) as u64)
-        .read_to_end(&mut body)
-    {
-        return format!("llama-server returned HTTP {status}: failed to read error body: {error}");
-    }
-    if body.len() > MAX_ERROR_BODY_BYTES {
-        return format!(
-            "llama-server returned HTTP {status}: error body exceeds {MAX_ERROR_BODY_BYTES} bytes"
-        );
-    }
-    if let Ok(envelope) = serde_json::from_slice::<ErrorEnvelope>(&body) {
-        return format!(
-            "llama-server returned HTTP {status}: {}",
-            envelope.error.message
-        );
-    }
-    let body = String::from_utf8_lossy(&body);
-    let body = body.trim();
-    if body.is_empty() {
-        format!("llama-server returned HTTP {status}")
-    } else {
-        format!("llama-server returned HTTP {status}: {body}")
-    }
-}
-
-#[derive(Deserialize)]
-struct ErrorEnvelope {
-    error: ApiError,
-}
-
-fn decode_sse<R, F>(reader: R, emit: F) -> Result<String, String>
-where
-    R: Read,
-    F: FnMut(String) -> Result<(), String>,
-{
-    decode_sse_with_limits(reader, MAX_EVENT_BYTES, MAX_ASSISTANT_BYTES, emit)
-}
-
-fn decode_sse_with_limits<R, F>(
-    mut reader: R,
-    event_limit: usize,
-    assistant_limit: usize,
-    mut emit: F,
-) -> Result<String, String>
-where
-    R: Read,
-    F: FnMut(String) -> Result<(), String>,
-{
-    let mut buffer = [0_u8; 4096];
-    let mut line = Vec::new();
-    let mut data = Vec::new();
-    let mut data_seen = false;
-    let mut event_bytes = 0_usize;
-    let mut assistant = String::new();
-
-    loop {
-        let count = reader
-            .read(&mut buffer)
-            .map_err(|error| error.to_string())?;
-        if count == 0 {
-            if !line.is_empty() {
-                process_line(&line, &mut data, &mut data_seen, event_limit)?;
-            }
-            if dispatch(&data, &mut assistant, assistant_limit, &mut emit)? {
-                return Ok(assistant);
-            }
-            return Err("chat stream ended before [DONE]".into());
-        }
-        for &byte in &buffer[..count] {
-            event_bytes = event_bytes
-                .checked_add(1)
-                .ok_or_else(|| "chat SSE event is too large".to_string())?;
-            if event_bytes > event_limit {
-                return Err(format!(
-                    "chat SSE event is too large (limit {event_limit} bytes)"
-                ));
-            }
-            if byte != b'\n' {
-                line.push(byte);
-                continue;
-            }
-            if line.last() == Some(&b'\r') {
-                line.pop();
-            }
-            if line.is_empty() {
-                if dispatch(&data, &mut assistant, assistant_limit, &mut emit)? {
-                    return Ok(assistant);
-                }
-                data.clear();
-                data_seen = false;
-                event_bytes = 0;
-            } else {
-                process_line(&line, &mut data, &mut data_seen, event_limit)?;
-            }
-            line.clear();
-        }
-    }
-}
-
-fn process_line(
-    line: &[u8],
-    data: &mut Vec<u8>,
-    data_seen: &mut bool,
-    event_limit: usize,
-) -> Result<(), String> {
-    if line.starts_with(b":") {
-        return Ok(());
-    }
-    let Some(value) = line.strip_prefix(b"data:") else {
-        return Ok(());
-    };
-    let value = value.strip_prefix(b" ").unwrap_or(value);
-    if *data_seen {
-        data.push(b'\n');
-    }
-    *data_seen = true;
-    data.extend_from_slice(value);
-    if data.len() > event_limit {
-        return Err(format!(
-            "chat SSE event is too large (limit {event_limit} bytes)"
-        ));
-    }
-    Ok(())
-}
-
-#[derive(Deserialize)]
-struct StreamPayload {
-    #[serde(default)]
-    choices: Vec<Choice>,
-    error: Option<ApiError>,
-}
-
-#[derive(Deserialize)]
-struct Choice {
-    delta: Delta,
-}
-
-#[derive(Deserialize)]
-struct Delta {
-    content: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ApiError {
-    message: String,
-}
-
-fn dispatch<F>(
-    data: &[u8],
-    assistant: &mut String,
-    assistant_limit: usize,
-    emit: &mut F,
-) -> Result<bool, String>
-where
-    F: FnMut(String) -> Result<(), String>,
-{
-    if data.is_empty() {
-        return Ok(false);
-    }
-    if data == b"[DONE]" {
-        return Ok(true);
-    }
-    let payload: StreamPayload =
-        serde_json::from_slice(data).map_err(|error| format!("invalid chat SSE JSON: {error}"))?;
-    if let Some(error) = payload.error {
-        return Err(format!("llama-server chat error: {}", error.message));
-    }
-    if let Some(content) = payload
-        .choices
-        .into_iter()
-        .next()
-        .and_then(|choice| choice.delta.content)
-        .filter(|content| !content.is_empty())
-    {
-        if assistant.len().saturating_add(content.len()) > assistant_limit {
-            return Err(format!(
-                "assistant response is too large (limit {assistant_limit} bytes)"
-            ));
-        }
-        emit(content.clone())?;
-        assistant.push_str(&content);
-    }
-    Ok(false)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        decode_sse, decode_sse_with_limits, Event, Message, Role, Worker, MAX_ERROR_BODY_BYTES,
-        MAX_EVENT_BYTES,
-    };
-    use std::io::{self, Read, Write};
+    use super::protocol::MAX_ERROR_BODY_BYTES;
+    use super::{Event, Message, Role, Worker};
+    use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc;
     use std::time::Duration;
-
-    struct Fragmented {
-        bytes: Vec<u8>,
-        chunks: Vec<usize>,
-        offset: usize,
-        chunk: usize,
-    }
-
-    impl Fragmented {
-        fn new(bytes: &[u8], chunks: &[usize]) -> Self {
-            Self {
-                bytes: bytes.to_vec(),
-                chunks: chunks.to_vec(),
-                offset: 0,
-                chunk: 0,
-            }
-        }
-    }
-
-    impl Read for Fragmented {
-        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
-            if self.offset == self.bytes.len() {
-                return Ok(0);
-            }
-            let requested = self.chunks[self.chunk % self.chunks.len()];
-            self.chunk += 1;
-            let count = requested
-                .min(output.len())
-                .min(self.bytes.len() - self.offset);
-            output[..count].copy_from_slice(&self.bytes[self.offset..self.offset + count]);
-            self.offset += count;
-            Ok(count)
-        }
-    }
-
-    #[test]
-    fn decodes_fragmented_utf8_crlf_comments_and_repeated_data() {
-        let body = concat!(
-            ": ping\r\n\r\n",
-            "data: {\"choices\":[{\"delta\":\r\n",
-            "data: {\"content\":\"hé\"}}]}\r\n\r\n",
-            "data: {\"choices\":[{\"delta\":{\"content\":\"llo\"}}]}\n\n",
-            "data: [DONE]\r\n\r\n"
-        );
-        let mut deltas = Vec::new();
-
-        let complete = decode_sse(
-            Fragmented::new(body.as_bytes(), &[1, 2, 3, 1, 5]),
-            |delta| {
-                deltas.push(delta);
-                Ok(())
-            },
-        )
-        .unwrap();
-
-        assert_eq!(deltas, ["hé", "llo"]);
-        assert_eq!(complete, "héllo");
-    }
-
-    #[test]
-    fn ignores_role_only_empty_and_usage_events() {
-        let body = concat!(
-            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":null}}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{\"content\":\"\"}}]}\n\n",
-            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1}}\n\n",
-            "data: [DONE]\n\n"
-        );
-        let mut deltas = Vec::new();
-
-        let complete = decode_sse(body.as_bytes(), |delta| {
-            deltas.push(delta);
-            Ok(())
-        })
-        .unwrap();
-
-        assert!(deltas.is_empty());
-        assert!(complete.is_empty());
-    }
-
-    #[test]
-    fn rejects_malformed_json_server_error_and_eof_before_done() {
-        let malformed = decode_sse(
-            b"data: {not-json}\n\n".as_slice(),
-            |_| -> Result<(), String> { Ok(()) },
-        )
-        .unwrap_err();
-        assert!(malformed.contains("invalid chat SSE JSON"));
-
-        let server_error = decode_sse(
-            b"data: {\"error\":{\"code\":500,\"message\":\"generation failed\",\"type\":\"server_error\"}}\n\n"
-                .as_slice(),
-            |_| -> Result<(), String> { Ok(()) },
-        )
-        .unwrap_err();
-        assert!(server_error.contains("generation failed"));
-
-        let eof = decode_sse(
-            b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n".as_slice(),
-            |_| -> Result<(), String> { Ok(()) },
-        )
-        .unwrap_err();
-        assert_eq!(eof, "chat stream ended before [DONE]");
-    }
-
-    #[test]
-    fn rejects_an_event_over_the_explicit_bound() {
-        let body = vec![b'a'; MAX_EVENT_BYTES + 1];
-        let error = decode_sse(body.as_slice(), |_| -> Result<(), String> { Ok(()) }).unwrap_err();
-        assert!(error.contains("chat SSE event is too large"));
-        assert!(error.contains(&MAX_EVENT_BYTES.to_string()));
-    }
-
-    #[test]
-    fn accepts_done_at_eof_without_a_final_blank_line() {
-        let complete = decode_sse(b"data: [DONE]".as_slice(), |_| -> Result<(), String> {
-            Ok(())
-        })
-        .unwrap();
-        assert!(complete.is_empty());
-    }
-
-    #[test]
-    fn reads_only_the_first_choice_delta() {
-        let body = concat!(
-            "data: {\"choices\":[",
-            "{\"delta\":{\"content\":\"first\"}},",
-            "{\"delta\":{\"content\":\"ignored\"}}",
-            "]}\n\n",
-            "data: [DONE]\n\n"
-        );
-        let mut deltas = Vec::new();
-
-        let complete = decode_sse(body.as_bytes(), |delta| {
-            deltas.push(delta);
-            Ok(())
-        })
-        .unwrap();
-
-        assert_eq!(deltas, ["first"]);
-        assert_eq!(complete, "first");
-    }
-
-    #[test]
-    fn bounds_completed_assistant_before_emitting_overflowing_delta() {
-        let body = concat!(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"abc\"}}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{\"content\":\"def\"}}]}\n\n",
-            "data: [DONE]\n\n"
-        );
-        let mut deltas = Vec::new();
-
-        let error = decode_sse_with_limits(body.as_bytes(), 256, 5, |delta| {
-            deltas.push(delta);
-            Ok(())
-        })
-        .unwrap_err();
-
-        assert_eq!(deltas, ["abc"]);
-        assert!(error.contains("assistant response is too large"));
-        assert!(error.contains('5'));
-    }
-
-    #[test]
-    fn preserves_empty_repeated_data_fields() {
-        let error = decode_sse(
-            b"data:\ndata: [DONE]\n\n".as_slice(),
-            |_| -> Result<(), String> { Ok(()) },
-        )
-        .unwrap_err();
-
-        assert!(error.contains("invalid chat SSE JSON"));
-    }
 
     #[test]
     fn posts_exact_history_and_streams_deltas_before_completion() {
@@ -530,6 +150,7 @@ mod tests {
                     content: "Again".into(),
                 },
             ],
+            512,
         )
         .unwrap();
 
@@ -552,7 +173,69 @@ mod tests {
         assert!(head.starts_with("POST /v1/chat/completions HTTP/1.1\r\n"));
         assert_eq!(
             body,
-            "{\"model\":\"tiny\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"},{\"role\":\"assistant\",\"content\":\"Earlier\"},{\"role\":\"user\",\"content\":\"Again\"}],\"stream\":true}"
+            "{\"model\":\"tiny\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"},{\"role\":\"assistant\",\"content\":\"Earlier\"},{\"role\":\"user\",\"content\":\"Again\"}],\"stream\":true,\"max_tokens\":512,\"cache_prompt\":true,\"return_progress\":true,\"timings_per_token\":true,\"stream_options\":{\"include_usage\":true}}"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn posts_bounded_cached_request_and_surfaces_progress_and_timing() {
+        let response = concat!(
+            "HTTP/1.1 200 OK\r\n",
+            "Content-Type: text/event-stream\r\n",
+            "Connection: close\r\n\r\n",
+            "data: {\"prompt_progress\":{\"total\":3,\"cache\":1,\"processed\":2,\"time_ms\":9}}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n",
+            "data: {\"timings\":{\"cache_n\":1,\"prompt_n\":3,\"prompt_ms\":9.0,\"predicted_n\":2,\"predicted_ms\":4.0}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (port, request, server) = serve_once(response.as_bytes().to_vec());
+        let worker = Worker::start(
+            port,
+            "tiny".into(),
+            vec![Message {
+                role: Role::User,
+                content: "Hello".into(),
+            }],
+            7,
+        )
+        .unwrap();
+
+        let Event::PromptProgress(progress) = worker.recv_timeout(Duration::from_secs(2)).unwrap()
+        else {
+            panic!("expected prompt progress");
+        };
+        assert_eq!(
+            (
+                progress.total,
+                progress.cache,
+                progress.processed,
+                progress.time_ms
+            ),
+            (3, 1, 2, 9)
+        );
+        assert_eq!(
+            worker.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::Delta("OK".into())
+        );
+        let Event::Timing(timing) = worker.recv_timeout(Duration::from_secs(2)).unwrap() else {
+            panic!("expected final timing");
+        };
+        assert_eq!(
+            (timing.cache_n, timing.prompt_n, timing.predicted_n),
+            (1, 3, 2)
+        );
+        assert_eq!(
+            worker.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::Complete("OK".into())
+        );
+        worker.join().unwrap();
+
+        let request = request.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (_, body) = request.split_once("\r\n\r\n").unwrap();
+        assert_eq!(
+            body,
+            "{\"model\":\"tiny\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}],\"stream\":true,\"max_tokens\":7,\"cache_prompt\":true,\"return_progress\":true,\"timings_per_token\":true,\"stream_options\":{\"include_usage\":true}}"
         );
         server.join().unwrap();
     }
@@ -567,7 +250,7 @@ mod tests {
             "{\"error\":{\"message\":\"model is unavailable\",\"type\":\"invalid\"}}"
         );
         let (port, _request, server) = serve_once(response.as_bytes().to_vec());
-        let worker = Worker::start(port, "tiny".into(), Vec::new()).unwrap();
+        let worker = Worker::start(port, "tiny".into(), Vec::new(), 512).unwrap();
 
         let Event::Error(error) = worker.recv_timeout(Duration::from_secs(2)).unwrap() else {
             panic!("expected worker error");
@@ -590,7 +273,7 @@ mod tests {
         .chain(body)
         .collect();
         let (port, _request, server) = serve_once(response);
-        let worker = Worker::start(port, "tiny".into(), Vec::new()).unwrap();
+        let worker = Worker::start(port, "tiny".into(), Vec::new(), 512).unwrap();
 
         let Event::Error(error) = worker.recv_timeout(Duration::from_secs(2)).unwrap() else {
             panic!("expected worker error");
@@ -616,7 +299,7 @@ mod tests {
         }
         response.extend_from_slice(b"data: [DONE]\n\n");
         let (port, _request, server) = serve_once(response);
-        let worker = Worker::start(port, "tiny".into(), Vec::new()).unwrap();
+        let worker = Worker::start(port, "tiny".into(), Vec::new(), 512).unwrap();
         let (done_sender, done) = mpsc::channel();
         std::thread::spawn(move || {
             let _ = done_sender.send(worker.join());
@@ -636,6 +319,7 @@ mod tests {
             port,
             "tiny".into(),
             Vec::new(),
+            512,
             Duration::from_millis(50),
         )
         .unwrap();

@@ -14,7 +14,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub(crate) use artifact::verify_regular;
+pub(crate) use artifact::{verify_regular, verify_regular_captured, VerifiedRegularFile};
 #[cfg(test)]
 pub(crate) use http::artifact_url;
 #[cfg(test)]

@@ -313,6 +313,13 @@ pub struct RunArgs {
 pub struct ChatArgs {
     /// Model ID; omit to choose a runnable model.
     pub id: Option<String>,
+    /// Maximum response tokens to generate.
+    #[arg(
+        long,
+        default_value_t = 512,
+        value_parser = clap::value_parser!(u32).range(1..=i64::from(i32::MAX))
+    )]
+    pub max_tokens: u32,
     #[command(flatten)]
     pub runtime: RuntimeArgs,
 }
@@ -630,6 +637,38 @@ mod tests {
     fn run_and_chat_accept_an_omitted_model() {
         assert!(Cli::try_parse_from(["loxa", "chat"]).is_ok());
         assert!(Cli::try_parse_from(["loxa", "run"]).is_ok());
+    }
+
+    #[test]
+    fn chat_accepts_a_positive_max_tokens_override_and_rejects_zero() {
+        let cli = Cli::try_parse_from(["loxa", "chat"]).unwrap();
+        let Command::Chat(args) = cli.command else {
+            panic!("expected chat arguments");
+        };
+        assert_eq!(args.max_tokens, 512);
+
+        let cli = Cli::try_parse_from(["loxa", "chat", "demo", "--max-tokens", "7"]).unwrap();
+        let Command::Chat(args) = cli.command else {
+            panic!("expected chat arguments");
+        };
+        assert_eq!(args.max_tokens, 7);
+
+        let error = Cli::try_parse_from(["loxa", "chat", "demo", "--max-tokens", "0"]).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn chat_max_tokens_matches_b10121_signed_integer_limit() {
+        let cli =
+            Cli::try_parse_from(["loxa", "chat", "demo", "--max-tokens", "2147483647"]).unwrap();
+        let Command::Chat(args) = cli.command else {
+            panic!("expected chat arguments");
+        };
+        assert_eq!(args.max_tokens, 2_147_483_647);
+
+        let error = Cli::try_parse_from(["loxa", "chat", "demo", "--max-tokens", "2147483648"])
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::ValueValidation);
     }
 
     #[test]

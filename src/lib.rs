@@ -141,6 +141,7 @@ mod selected_transfer_public_contract_tests {
 mod download;
 pub mod huggingface;
 pub mod paths;
+mod runnable;
 pub mod runner;
 mod runtime;
 mod safe_file;
@@ -151,6 +152,7 @@ use catalog::Manifest;
 use cli::{Cli, Command};
 use indicatif::BinaryBytes;
 use paths::{validate_id, AppPaths};
+use runnable::resolve_runnable;
 use std::io::IsTerminal;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -159,11 +161,6 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(unix)]
 use std::sync::Arc;
-
-struct Runnable {
-    _model_lock: catalog::ModelLock,
-    launch: runner::Launch,
-}
 
 #[cfg(unix)]
 struct PromptInterrupt {
@@ -1212,6 +1209,7 @@ where
             runner::run_launch(&runnable.launch, &paths.run)
         }
         Command::Chat(args) => {
+            let max_tokens = args.max_tokens;
             let installed = load_installed_models(&paths)?;
             let candidates = local_candidates(&paths, &installed)?;
             let candidates = runnable_candidates(&candidates);
@@ -1252,7 +1250,9 @@ where
             let started = runner::start_foreground(&runnable.launch, &paths.run);
             starting.finish_and_clear();
             match started? {
-                runner::ForegroundStart::Ready(server) => session::run(server, &runnable.launch.id),
+                runner::ForegroundStart::Ready(server) => {
+                    session::run(server, &runnable.launch.id, max_tokens)
+                }
                 runner::ForegroundStart::Stopped(exit) => Ok(runner::report_exit(exit)),
             }
         }
@@ -1410,93 +1410,6 @@ fn ensure_interactive_chat(stdin: bool, stdout: bool) -> Result<(), String> {
             "chat requires an interactive terminal; run `loxa chat <id>` directly in a terminal"
                 .into(),
         )
-    }
-}
-
-fn resolve_runnable(
-    id: String,
-    runtime: cli::RuntimeArgs,
-    paths: &AppPaths,
-) -> Result<Runnable, String> {
-    let config = config::load(&paths.config)?;
-    let ctx = config::resolve_value(runtime.ctx, config.ctx, 4096);
-    let port = config::resolve_value(runtime.port, config.port, 0);
-    let installed = load_installed_models(paths)?;
-    let installed = installed.into_iter().find(|entry| entry.id == id);
-    let (manifest, profile, server) = match installed {
-        Some(manifest) => {
-            let profile = launch_profile(&manifest, &paths.models)?;
-            let server = runner::discover_from_process(
-                runtime.server.as_deref(),
-                &paths.managed_server,
-                &profile,
-            )?;
-            (manifest, profile, server)
-        }
-        None => {
-            let candidate = catalog::local::discover(&paths.models)?
-                .into_iter()
-                .find(|candidate| candidate.id == id)
-                .ok_or_else(|| format!("unknown model id {id}"))?;
-            let profile = runner::LaunchProfile::generic();
-            let server = runner::discover_from_process(
-                runtime.server.as_deref(),
-                &paths.managed_server,
-                &profile,
-            )?;
-            let manifest = catalog::local::adopt(&paths.models, &candidate)?;
-            tracing::info!(event = "local_model_adopted", model_id = %manifest.id);
-            (manifest, profile, server)
-        }
-    };
-    let model_lock = catalog::ModelLock::acquire(&paths.model_dir(&manifest.id)?)?;
-    let artifact = manifest.artifact_path(&paths.models);
-    let primary = manifest.primary_artifact();
-    download::verify_regular(&artifact, primary.size, primary.sha256)?;
-    if let Some(draft) = manifest.draft_artifact() {
-        let path = paths.models.join(&manifest.id).join(draft.local_filename);
-        download::verify_regular(&path, draft.size, draft.sha256)?;
-    }
-    Ok(Runnable {
-        _model_lock: model_lock,
-        launch: runner::Launch {
-            server,
-            model: artifact,
-            id: manifest.id,
-            requested_port: port,
-            ctx,
-            profile,
-        },
-    })
-}
-
-fn launch_profile(
-    manifest: &Manifest,
-    models_root: &Path,
-) -> Result<runner::LaunchProfile, String> {
-    match (
-        manifest.version,
-        manifest.profile.as_deref(),
-        manifest.runtime.as_ref(),
-    ) {
-        (3, Some(catalog::GEMMA4_MTP_PROFILE), Some(runtime))
-            if runtime.engine == "llama.cpp" && runtime.build == catalog::GEMMA4_LLAMA_BUILD =>
-        {
-            Ok(runner::LaunchProfile::gemma4_mtp(
-                manifest.draft_path(models_root),
-            ))
-        }
-        #[cfg(test)]
-        (3, Some(catalog::TEST_MTP_PROFILE), Some(runtime))
-            if runtime.engine == "llama.cpp" && runtime.build == catalog::TEST_LLAMA_BUILD =>
-        {
-            Ok(runner::LaunchProfile::gemma4_mtp_for_test(
-                manifest.draft_path(models_root),
-                runtime.build.clone(),
-            ))
-        }
-        (1 | 2, None, None) => Ok(runner::LaunchProfile::generic()),
-        _ => Err("unsupported validated runtime profile".into()),
     }
 }
 
@@ -3765,6 +3678,114 @@ mod tests {
         };
 
         assert!(error.contains("draft.gguf"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_model_launch_writes_a_receipt_for_future_admission() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_values(Some(temp.path()), None).unwrap();
+        install(&paths, "demo");
+        let server = temp.path().join("llama-server");
+        std::fs::write(&server, b"#!/bin/sh\nprintf 'version: test\\n'\n").unwrap();
+        std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let runnable = resolve_runnable(
+            "demo".into(),
+            RuntimeArgs {
+                ctx: None,
+                port: None,
+                server: Some(server),
+            },
+            &paths,
+        )
+        .unwrap();
+
+        assert_eq!(runnable.launch.id, "demo");
+        assert!(
+            paths
+                .model_dir("demo")
+                .unwrap()
+                .join("verification-receipt.json")
+                .is_file(),
+            "a successful full verification must refresh the receipt"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn receipt_records_the_manifest_and_filesystem_identities_it_will_recheck() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_values(Some(temp.path()), None).unwrap();
+        let manifest = install(&paths, "demo");
+        let server = temp.path().join("llama-server");
+        std::fs::write(&server, b"#!/bin/sh\nprintf 'version: test\\n'\n").unwrap();
+        std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        resolve_runnable(
+            "demo".into(),
+            RuntimeArgs {
+                ctx: None,
+                port: None,
+                server: Some(server),
+            },
+            &paths,
+        )
+        .unwrap();
+
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                paths
+                    .model_dir("demo")
+                    .unwrap()
+                    .join("verification-receipt.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(receipt["version"], 1);
+        assert_eq!(receipt["manifest"]["primary_sha256"], manifest.sha256);
+        assert_eq!(receipt["manifest"]["primary_size"], manifest.size);
+        assert_eq!(receipt["primary"]["size"], manifest.size);
+        assert!(receipt["directory"]["device"].is_u64());
+        assert!(receipt["directory"]["inode"].is_u64());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_removal_deletes_its_generated_verification_receipt() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_values(Some(temp.path()), None).unwrap();
+        let manifest = install(&paths, "demo");
+        let server = temp.path().join("llama-server");
+        std::fs::write(&server, b"#!/bin/sh\nprintf 'version: test\\n'\n").unwrap();
+        std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let model_dir = paths.model_dir("demo").unwrap();
+
+        drop(
+            resolve_runnable(
+                "demo".into(),
+                RuntimeArgs {
+                    ctx: None,
+                    port: None,
+                    server: Some(server),
+                },
+                &paths,
+            )
+            .unwrap(),
+        );
+        assert!(model_dir.join("verification-receipt.json").is_file());
+
+        crate::catalog::remove_model(&paths.models, &manifest).unwrap();
+
+        assert!(!model_dir.join("verification-receipt.json").exists());
+        assert!(!model_dir.join("manifest.json").exists());
     }
 
     #[test]
