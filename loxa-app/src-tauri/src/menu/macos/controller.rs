@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Instant;
 
-use objc2::rc::Retained;
+use objc2::rc::{Retained, Weak};
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
@@ -12,6 +12,7 @@ use objc2_app_kit::{
 use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSRectEdge, NSString};
 use tauri::AppHandle;
 
+use super::installed_rows::{self, InstalledAction};
 use super::rows::{Actions, MenuRows, PopoverContent};
 #[cfg(not(test))]
 use super::timer::{weak_callback, ObservationTimer};
@@ -32,7 +33,7 @@ struct NativePopoverState {
     rendered: Option<MenuSnapshot>,
     catalog: CatalogState,
     rendered_catalog: Option<CatalogState>,
-    installed: InstalledState,
+    installed: Rc<RefCell<InstalledState>>,
     rendered_installed: Option<InstalledState>,
     #[cfg(test)]
     cancel: InlineCancelState,
@@ -59,7 +60,7 @@ impl NativePopoverState {
             rendered: None,
             catalog: CatalogState::default(),
             rendered_catalog: None,
-            installed: InstalledState::default(),
+            installed: Rc::new(RefCell::new(InstalledState::default())),
             rendered_installed: None,
             #[cfg(test)]
             cancel: InlineCancelState::default(),
@@ -79,7 +80,7 @@ impl NativePopoverState {
 
     fn render(&mut self, target: &AnyObject, actions: Actions, mtm: MainThreadMarker) {
         let catalog_changed = self.rendered_catalog.as_ref() != Some(&self.catalog);
-        let installed_changed = self.rendered_installed.as_ref() != Some(&self.installed);
+        let installed_changed = self.rendered_installed.as_ref() != Some(&*self.installed.borrow());
         match (
             catalog_changed || installed_changed,
             self.snapshot.update_from(self.rendered.as_ref()),
@@ -99,25 +100,38 @@ impl NativePopoverState {
         }
         self.rendered = Some(self.snapshot.clone());
         self.rendered_catalog = Some(self.catalog.clone());
-        self.rendered_installed = Some(self.installed.clone());
+        self.rendered_installed = Some(self.installed.borrow().clone());
     }
 
     fn rebuild(&mut self, target: &AnyObject, actions: Actions, mtm: MainThreadMarker) {
-        let PopoverContent { view, rows, .. } =
-            MenuRows::build(&self.snapshot, &self.catalog, Some(target), actions, mtm);
+        let search_focus = self.rows.as_ref().and_then(MenuRows::capture_search_focus);
+        let PopoverContent { view, rows, .. } = {
+            let installed = self.installed.borrow();
+            MenuRows::build(
+                &self.snapshot,
+                &self.catalog,
+                &installed,
+                Some(target),
+                actions,
+                mtm,
+            )
+        };
         self.popover.setContentSize(view.frame().size);
         self.content_view_controller.setView(&view);
+        if let Some(search_focus) = search_focus {
+            rows.restore_search_focus(search_focus);
+        }
         self.rows = Some(rows);
     }
 
-    fn popover_closed(&mut self) {
+    fn popover_closed(&mut self, target: &AnyObject, actions: Actions, mtm: MainThreadMarker) {
+        self.installed.borrow_mut().reset_feedback();
+        self.rendered_installed = None;
         #[cfg(test)]
         {
             self.cancel.reset();
-            if let Some(rows) = &mut self.rows {
-                rows.update_cancel_controls(&self.cancel);
-            }
         }
+        self.render(target, actions, mtm);
     }
 
     #[cfg(test)]
@@ -195,8 +209,8 @@ impl NativePopoverState {
                     result,
                     pinned_model_id,
                 } => match result {
-                    Ok(items) => self.installed.replace(items, pinned_model_id),
-                    Err(error) => self.installed.fail(error),
+                    Ok(items) => self.installed.borrow_mut().replace(items, pinned_model_id),
+                    Err(error) => self.installed.borrow_mut().fail(error),
                 },
                 BackendMessage::Catalog(event) => {
                     let _ = self.catalog.apply(event);
@@ -231,7 +245,7 @@ impl NativePopoverState {
 }
 
 struct NativePopoverDelegateIvars {
-    state: Rc<RefCell<NativePopoverState>>,
+    target: Weak<NativePopoverTarget>,
 }
 
 define_class!(
@@ -249,14 +263,21 @@ define_class!(
         #[allow(non_snake_case)]
         #[unsafe(method(popoverDidClose:))]
         fn popoverDidClose(&self, _notification: &NSNotification) {
-            self.ivars().state.borrow_mut().popover_closed();
+            let Some(target) = self.ivars().target.load() else {
+                return;
+            };
+            let mtm = MainThreadMarker::new()
+                .expect("AppKit must close the native popover on the main thread");
+            target.popover_closed(mtm);
         }
     }
 );
 
 impl NativePopoverDelegate {
-    fn new(state: Rc<RefCell<NativePopoverState>>, mtm: MainThreadMarker) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(NativePopoverDelegateIvars { state });
+    fn new(target: &Retained<NativePopoverTarget>, mtm: MainThreadMarker) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(NativePopoverDelegateIvars {
+            target: Weak::from_retained(target),
+        });
 
         // SAFETY: NSObject's init selector has the expected signature.
         unsafe { msg_send![super(this), init] }
@@ -343,6 +364,41 @@ define_class!(
             }
         }
 
+        #[unsafe(method(selectInstalled:))]
+        fn select_installed(&self, sender: Option<&NSButton>) {
+            let Some(index) = sender.and_then(|button| usize::try_from(button.tag()).ok()) else {
+                return;
+            };
+            let installed = self.ivars().state.borrow().installed.clone();
+            let model_id = installed
+                .borrow()
+                .visible_items()
+                .get(index)
+                .map(|item| item.id().to_owned());
+            let Some(model_id) = model_id else {
+                return;
+            };
+            if !installed.borrow_mut().select(&model_id) {
+                return;
+            }
+            let mtm = MainThreadMarker::new()
+                .expect("AppKit must select installed models on the main thread");
+            self.ivars()
+                .state
+                .borrow_mut()
+                .render(self, action_selectors(), mtm);
+        }
+
+        #[unsafe(method(copyInstalledCommand:))]
+        fn copy_installed_command(&self, _sender: Option<&NSButton>) {
+            self.perform_installed_action(InstalledAction::CopyChatCommand);
+        }
+
+        #[unsafe(method(revealInstalled:))]
+        fn reveal_installed(&self, _sender: Option<&NSButton>) {
+            self.perform_installed_action(InstalledAction::RevealInFinder);
+        }
+
         #[cfg(test)]
         #[unsafe(method(startFixture:))]
         fn start_fixture(&self, _sender: Option<&AnyObject>) {
@@ -417,6 +473,24 @@ impl NativePopoverTarget {
         if state.apply_fixture_action(action) {
             state.render(self, action_selectors(), mtm);
         }
+    }
+
+    fn perform_installed_action(&self, action: InstalledAction) {
+        let installed = self.ivars().state.borrow().installed.clone();
+        installed_rows::dispatch_native_selected_action(&installed, action);
+        let mtm = MainThreadMarker::new()
+            .expect("AppKit must perform installed actions on the main thread");
+        self.ivars()
+            .state
+            .borrow_mut()
+            .render(self, action_selectors(), mtm);
+    }
+
+    fn popover_closed(&self, mtm: MainThreadMarker) {
+        self.ivars()
+            .state
+            .borrow_mut()
+            .popover_closed(self, action_selectors(), mtm);
     }
 
     fn toggle(&self, mtm: MainThreadMarker) {
@@ -498,7 +572,7 @@ impl NativePopoverController {
         let target = NativePopoverTarget::new(app_handle, state.clone(), mtm);
         state.borrow_mut().render(&target, action_selectors(), mtm);
 
-        let delegate = NativePopoverDelegate::new(state, mtm);
+        let delegate = NativePopoverDelegate::new(&target, mtm);
         popover.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
 
         #[cfg(not(test))]
@@ -539,6 +613,9 @@ struct ProductionActionSelectors {
     candidate: Sel,
     transfer: Sel,
     pause: Sel,
+    installed_select: Sel,
+    installed_copy: Sel,
+    installed_reveal: Sel,
     quit: Sel,
 }
 
@@ -549,6 +626,9 @@ fn production_action_selectors() -> ProductionActionSelectors {
         candidate: sel!(selectCandidate:),
         transfer: sel!(transferSelected:),
         pause: sel!(pauseTransfer:),
+        installed_select: sel!(selectInstalled:),
+        installed_copy: sel!(copyInstalledCommand:),
+        installed_reveal: sel!(revealInstalled:),
         quit: sel!(quit:),
     }
 }
@@ -560,6 +640,9 @@ fn action_selectors() -> Actions {
         candidate,
         transfer,
         pause,
+        installed_select,
+        installed_copy,
+        installed_reveal,
         quit,
     } = production_action_selectors();
     Actions {
@@ -568,6 +651,9 @@ fn action_selectors() -> Actions {
         candidate,
         transfer,
         pause_transfer: pause,
+        installed_select,
+        installed_copy,
+        installed_reveal,
         #[cfg(test)]
         start: sel!(startFixture:),
         #[cfg(test)]
@@ -611,6 +697,9 @@ mod tests {
             sel!(selectCandidate:),
             sel!(transferSelected:),
             sel!(pauseTransfer:),
+            sel!(selectInstalled:),
+            sel!(copyInstalledCommand:),
+            sel!(revealInstalled:),
         ] {
             assert!(
                 class.instance_method(action).is_some(),
@@ -627,6 +716,9 @@ mod tests {
             candidate,
             transfer,
             pause,
+            installed_select,
+            installed_copy,
+            installed_reveal,
             quit,
         } = production_action_selectors();
 
@@ -635,6 +727,9 @@ mod tests {
         assert_eq!(candidate, sel!(selectCandidate:));
         assert_eq!(transfer, sel!(transferSelected:));
         assert_eq!(pause, sel!(pauseTransfer:));
+        assert_eq!(installed_select, sel!(selectInstalled:));
+        assert_eq!(installed_copy, sel!(copyInstalledCommand:));
+        assert_eq!(installed_reveal, sel!(revealInstalled:));
         assert_eq!(quit, sel!(quit:));
     }
 }

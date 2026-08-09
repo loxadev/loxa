@@ -1,9 +1,16 @@
-#![allow(dead_code)]
+#![allow(dead_code, unused_imports)]
 
 #[cfg(target_os = "macos")]
 mod menu {
     pub(crate) mod catalog {
         include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/menu/catalog.rs"));
+    }
+
+    pub(crate) mod installed {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/menu/installed.rs"
+        ));
     }
 
     pub(crate) mod presentation {
@@ -18,6 +25,13 @@ mod menu {
             include!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/src/menu/macos/catalog_rows.rs"
+            ));
+        }
+
+        pub(crate) mod installed_rows {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/menu/macos/installed_rows.rs"
             ));
         }
 
@@ -62,7 +76,7 @@ mod menu {
                 let hover_bounds = row.hover_bounds();
                 assert_eq!(hover_bounds.origin.x, 5.0);
                 assert_eq!(hover_bounds.origin.y, 0.0);
-                assert_eq!(hover_bounds.size.width, 290.0);
+                assert_eq!(hover_bounds.size.width, 350.0);
                 assert_eq!(hover_bounds.size.height, 44.0);
 
                 let passive = row_shell(44.0, mtm);

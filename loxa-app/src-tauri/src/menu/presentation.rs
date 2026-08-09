@@ -164,7 +164,7 @@ impl FixtureTransferProgress {
 pub(crate) struct MenuLayout;
 
 impl MenuLayout {
-    pub(crate) const BASE_WIDTH: f64 = 300.0;
+    pub(crate) const BASE_WIDTH: f64 = 360.0;
     pub(crate) const MAX_WIDTH: f64 = 400.0;
     pub(crate) const OUTER_PADDING: f64 = 5.0;
     pub(crate) const INNER_PADDING: f64 = 8.0;

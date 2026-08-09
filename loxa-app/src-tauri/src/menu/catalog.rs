@@ -158,6 +158,20 @@ enum CatalogStatus {
     Error(String),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CatalogMode {
+    Idle,
+    Hint,
+    Searching,
+    Repositories,
+    Inspecting,
+    Candidates,
+    Selected,
+    Transferring,
+    Completed,
+    Error,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CatalogState {
     generation: u64,
@@ -206,10 +220,77 @@ impl CatalogState {
         self.selected.and_then(|index| self.candidates.get(index))
     }
 
+    pub(crate) fn mode(&self) -> CatalogMode {
+        match self.status {
+            CatalogStatus::Idle => CatalogMode::Idle,
+            CatalogStatus::InvalidQuery => CatalogMode::Hint,
+            CatalogStatus::Searching => CatalogMode::Searching,
+            CatalogStatus::Repositories => CatalogMode::Repositories,
+            CatalogStatus::Inspecting(_) => CatalogMode::Inspecting,
+            CatalogStatus::Candidates => CatalogMode::Candidates,
+            CatalogStatus::Selected(_) => CatalogMode::Selected,
+            CatalogStatus::Resolving(_)
+            | CatalogStatus::Progress { .. }
+            | CatalogStatus::PauseRequested => CatalogMode::Transferring,
+            CatalogStatus::Completed(_) => CatalogMode::Completed,
+            CatalogStatus::Error(_) => CatalogMode::Error,
+        }
+    }
+
+    pub(crate) fn owns_main_region(&self) -> bool {
+        matches!(
+            self.mode(),
+            CatalogMode::Searching
+                | CatalogMode::Repositories
+                | CatalogMode::Inspecting
+                | CatalogMode::Candidates
+                | CatalogMode::Selected
+                | CatalogMode::Transferring
+        )
+    }
+
+    pub(crate) fn browser_heading(&self) -> Option<&'static str> {
+        match self.mode() {
+            CatalogMode::Searching | CatalogMode::Repositories => Some("Models"),
+            CatalogMode::Inspecting | CatalogMode::Candidates | CatalogMode::Selected => {
+                Some("Choose a GGUF file")
+            }
+            CatalogMode::Idle
+            | CatalogMode::Hint
+            | CatalogMode::Transferring
+            | CatalogMode::Completed
+            | CatalogMode::Error => None,
+        }
+    }
+
+    pub(crate) fn browser_status(&self) -> Option<String> {
+        match self.mode() {
+            CatalogMode::Idle | CatalogMode::Selected => None,
+            CatalogMode::Hint
+            | CatalogMode::Searching
+            | CatalogMode::Transferring
+            | CatalogMode::Completed
+            | CatalogMode::Error => Some(self.status_label()),
+            CatalogMode::Repositories if self.repositories.is_empty() => Some(self.status_label()),
+            CatalogMode::Repositories => None,
+            CatalogMode::Inspecting => Some("Loading files…".into()),
+            CatalogMode::Candidates if self.candidates.is_empty() => Some(self.status_label()),
+            CatalogMode::Candidates => None,
+        }
+    }
+
+    pub(crate) fn shows_repository_rows(&self) -> bool {
+        self.mode() == CatalogMode::Repositories
+    }
+
+    pub(crate) fn shows_candidate_rows(&self) -> bool {
+        matches!(self.mode(), CatalogMode::Candidates | CatalogMode::Selected)
+    }
+
     pub(crate) fn status_label(&self) -> String {
         match &self.status {
             CatalogStatus::Idle => "Search Hugging Face".into(),
-            CatalogStatus::InvalidQuery => "Enter at least 2 characters".into(),
+            CatalogStatus::InvalidQuery => "Type at least 2 characters".into(),
             CatalogStatus::Searching => "Searching Hugging Face…".into(),
             CatalogStatus::Repositories => {
                 if self.repositories.is_empty() {
@@ -226,7 +307,7 @@ impl CatalogState {
                     "Choose a GGUF file".into()
                 }
             }
-            CatalogStatus::Selected(path) => format!("Selected {path}"),
+            CatalogStatus::Selected(_) => "Ready to download".into(),
             CatalogStatus::Resolving(path) => format!("Preparing {path}…"),
             CatalogStatus::Progress {
                 stage,
@@ -263,8 +344,6 @@ impl CatalogState {
         matches!(self.status, CatalogStatus::Selected(_)) && self.selected_candidate().is_some()
     }
 
-    // Task 3 native rows consume this surface.
-    #[allow(dead_code)]
     pub(crate) fn transfer_action_label(&self) -> Option<String> {
         if !self.can_transfer() {
             return None;
@@ -289,9 +368,17 @@ impl CatalogState {
             return None;
         }
         let query = query.trim();
-        if !(2..=128).contains(&query.len()) || query.chars().any(char::is_control) {
+        if query.is_empty() {
+            self.generation = self.generation.saturating_add(1);
             self.clear_results();
             self.query.clear();
+            self.status = CatalogStatus::Idle;
+            return None;
+        }
+        if query.chars().count() < 2 || query.len() > 128 || query.chars().any(char::is_control) {
+            self.generation = self.generation.saturating_add(1);
+            self.clear_results();
+            self.query = query.into();
             self.status = CatalogStatus::InvalidQuery;
             return None;
         }
@@ -625,6 +712,79 @@ mod tests {
     }
 
     #[test]
+    fn compact_browsing_modes_have_one_heading_and_hide_results_during_transfer() {
+        use super::CatalogMode;
+
+        let mut state = CatalogState::default();
+        assert_eq!(state.mode(), CatalogMode::Idle);
+        assert!(!state.owns_main_region());
+        assert_eq!(state.browser_heading(), None);
+
+        let generation = state.submit_search("models").unwrap().generation();
+        assert_eq!(state.mode(), CatalogMode::Searching);
+        assert!(state.owns_main_region());
+        assert_eq!(state.browser_heading(), Some("Models"));
+
+        assert!(state.apply(CatalogEvent::Repositories {
+            generation,
+            repositories: repositories(1),
+        }));
+        assert_eq!(state.mode(), CatalogMode::Repositories);
+        assert_eq!(state.browser_heading(), Some("Models"));
+        assert!(state.shows_repository_rows());
+
+        assert!(state.inspect_repository(0).is_some());
+        assert_eq!(state.mode(), CatalogMode::Inspecting);
+        assert_eq!(state.browser_heading(), Some("Choose a GGUF file"));
+        assert_eq!(state.browser_status().as_deref(), Some("Loading files…"));
+
+        assert!(state.apply(CatalogEvent::Candidates {
+            generation,
+            repo: "owner/model-0".into(),
+            revision: "0123456789abcdef0123456789abcdef01234567".into(),
+            candidates: vec![CandidateItem::new(
+                "a-very-long-model-file-name-q4-k-m.gguf".into(),
+                Some(88_200_000),
+            )],
+        }));
+        assert_eq!(state.mode(), CatalogMode::Candidates);
+        assert_eq!(state.browser_heading(), Some("Choose a GGUF file"));
+        assert!(state.shows_candidate_rows());
+        assert!(state.select_candidate(0));
+        assert_eq!(state.mode(), CatalogMode::Selected);
+        assert_eq!(state.status_label(), "Ready to download");
+        assert_eq!(
+            state.transfer_action_label().as_deref(),
+            Some("Download 88.2 MB")
+        );
+
+        assert!(state.start_transfer().is_some());
+        assert_eq!(state.mode(), CatalogMode::Transferring);
+        assert!(state.owns_main_region());
+        assert!(!state.shows_repository_rows());
+        assert!(!state.shows_candidate_rows());
+    }
+
+    #[test]
+    fn terminal_catalog_error_stays_compact_without_owning_the_main_region() {
+        use super::CatalogMode;
+
+        let mut state = CatalogState::default();
+        let generation = state.submit_search("models").unwrap().generation();
+        assert!(state.apply(CatalogEvent::Failed {
+            generation,
+            message: "Catalog search failed".into(),
+        }));
+
+        assert_eq!(state.mode(), CatalogMode::Error);
+        assert!(!state.owns_main_region());
+        assert_eq!(
+            state.browser_status().as_deref(),
+            Some("Catalog search failed")
+        );
+    }
+
+    #[test]
     fn transfer_requires_an_explicit_choice_and_reports_progress_pause_and_already_installed() {
         use super::{CatalogCommand, CatalogTransferDisposition, TransferStage};
 
@@ -637,7 +797,7 @@ mod tests {
             Some("model-1.gguf")
         );
         assert!(state.can_transfer());
-        assert_eq!(state.status_label(), "Selected model-1.gguf");
+        assert_eq!(state.status_label(), "Ready to download");
 
         let transfer = state
             .start_transfer()
@@ -725,12 +885,57 @@ mod tests {
     }
 
     #[test]
+    fn short_or_empty_edits_stay_local_and_invalidate_older_results_and_errors() {
+        use super::CatalogCommand;
+
+        let mut state = CatalogState::default();
+        let first = state
+            .submit_search("old query")
+            .expect("two or more characters dispatch")
+            .generation();
+
+        assert_eq!(state.submit_search("x"), None);
+        assert_eq!(state.query(), "x");
+        assert_eq!(state.status_label(), "Type at least 2 characters");
+        assert_eq!(state.generation(), first + 1);
+        assert!(!state.apply(CatalogEvent::Repositories {
+            generation: first,
+            repositories: repositories(1),
+        }));
+        assert!(state.repositories().is_empty());
+
+        let second = state
+            .submit_search("new query")
+            .expect("a later valid edit dispatches")
+            .generation();
+        assert_eq!(state.submit_search("   "), None);
+        assert_eq!(state.query(), "");
+        assert_eq!(state.status_label(), "Search Hugging Face");
+        assert_eq!(state.generation(), second + 1);
+        assert!(!state.apply(CatalogEvent::Failed {
+            generation: second,
+            message: "stale failure".into(),
+        }));
+        assert_eq!(state.status_label(), "Search Hugging Face");
+
+        assert_eq!(
+            state.submit_search("go"),
+            Some(CatalogCommand::Search {
+                generation: second + 2,
+                query: "go".into(),
+            })
+        );
+        assert_eq!(state.query(), "go");
+    }
+
+    #[test]
     fn invalid_search_is_a_deterministic_local_error() {
         let mut state = CatalogState::default();
 
         assert_eq!(state.submit_search(" x "), None);
-        assert_eq!(state.generation(), 0);
-        assert_eq!(state.status_label(), "Enter at least 2 characters");
+        assert_eq!(state.generation(), 1);
+        assert_eq!(state.query(), "x");
+        assert_eq!(state.status_label(), "Type at least 2 characters");
         assert!(state.repositories().is_empty());
         assert!(state.candidates().is_empty());
     }

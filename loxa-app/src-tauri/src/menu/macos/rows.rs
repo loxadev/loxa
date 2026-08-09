@@ -12,6 +12,7 @@ use objc2_app_kit::{
 use objc2_foundation::{NSInteger, NSPoint, NSRect, NSSize, NSString};
 
 use super::catalog_rows::{self, CatalogActions};
+use super::installed_rows::{self, InstalledActions};
 use crate::menu::catalog::CatalogState;
 #[cfg(test)]
 use crate::menu::presentation::{InlineCancelState, MenuAction};
@@ -33,6 +34,9 @@ pub(super) struct Actions {
     pub(super) candidate: Sel,
     pub(super) transfer: Sel,
     pub(super) pause_transfer: Sel,
+    pub(super) installed_select: Sel,
+    pub(super) installed_copy: Sel,
+    pub(super) installed_reveal: Sel,
     #[cfg(test)]
     pub(super) start: Sel,
     #[cfg(test)]
@@ -52,6 +56,7 @@ pub(super) struct Actions {
 
 pub(super) struct MenuRows {
     header: HeaderRow,
+    catalog: catalog_rows::CatalogContent,
     body: BodyRows,
     footer: FooterRow,
 }
@@ -71,11 +76,12 @@ impl MenuRows {
     pub(super) fn build(
         snapshot: &MenuSnapshot,
         catalog: &CatalogState,
+        installed: &crate::menu::installed::InstalledState,
         target: Option<&AnyObject>,
         actions: Actions,
         mtm: MainThreadMarker,
     ) -> PopoverContent {
-        let mut layout = ContentLayout::new(content_height(snapshot, catalog), mtm);
+        let mut layout = ContentLayout::new(content_height(snapshot, catalog, installed), mtm);
         let header = HeaderRow::build(snapshot, mtm);
         layout.add(&header.root, HEADER_HEIGHT);
         layout.add_separator(mtm);
@@ -95,7 +101,9 @@ impl MenuRows {
         layout.add(&catalog_content.view, catalog_content.height);
         layout.add_separator(mtm);
 
-        let body = if snapshot.is_loading() {
+        let body = if catalog.owns_main_region() {
+            BodyRows::Catalog
+        } else if snapshot.is_loading() {
             layout.add(&section_header("Status", mtm), SECTION_HEIGHT);
             let row = StatusNativeRow::build("Loading Loxa status…", mtm);
             layout.add(&row.root, 56.0);
@@ -105,6 +113,49 @@ impl MenuRows {
             let row = StatusNativeRow::build(error, mtm);
             layout.add(&row.root, 56.0);
             BodyRows::Status(row)
+        } else if let Some(recovery) = snapshot.recovery_row() {
+            layout.add(&section_header("Installed", mtm), SECTION_HEIGHT);
+            let row = RecoveryNativeRow::build(recovery.detail(), mtm);
+            layout.add(&row.root, 56.0);
+            BodyRows::Recovery(row)
+        } else if let Some(transfer) = snapshot.transfer_row() {
+            layout.add(&section_header("Downloading", mtm), SECTION_HEIGHT);
+            let row = TransferNativeRow::build(transfer, target, actions, mtm);
+            layout.add(&row.root, MenuLayout::transfer_row_height());
+            BodyRows::Transfer(row)
+        } else if inventory_is_primary(snapshot, installed) {
+            layout.add(&section_header("Installed", mtm), SECTION_HEIGHT);
+            let inventory = installed_rows::build(
+                installed,
+                target,
+                InstalledActions {
+                    select: actions.installed_select,
+                    copy: actions.installed_copy,
+                    reveal: actions.installed_reveal,
+                },
+                mtm,
+            );
+            layout.add(&inventory.view, inventory.height);
+            if let Some(recommendation) = snapshot.recommendation_row() {
+                layout.add_separator(mtm);
+                layout.add(
+                    &section_header("Recommended for this Mac", mtm),
+                    SECTION_HEIGHT,
+                );
+                let recommendation =
+                    RecommendationNativeRow::build(recommendation, target, actions, mtm);
+                layout.add(&recommendation.root, 56.0);
+                BodyRows::InventoryRecommendation {
+                    #[cfg(test)]
+                    inventory,
+                    recommendation,
+                }
+            } else {
+                BodyRows::Inventory {
+                    #[cfg(test)]
+                    inventory,
+                }
+            }
         } else if let Some(recommendation) = snapshot.recommendation_row() {
             layout.add(&section_header("Installed", mtm), SECTION_HEIGHT);
             layout.add(&empty_installed_row(mtm), MenuLayout::model_row_height());
@@ -116,21 +167,24 @@ impl MenuRows {
             let row = RecommendationNativeRow::build(recommendation, target, actions, mtm);
             layout.add(&row.root, 56.0);
             BodyRows::Recommendation(row)
-        } else if let Some(installed) = snapshot.installed_row() {
+        } else if let Some(snapshot_installed) = snapshot.installed_row() {
             layout.add(&section_header("Installed", mtm), SECTION_HEIGHT);
-            let row = InstalledNativeRow::build(installed, mtm);
+            let row = InstalledNativeRow::build(snapshot_installed, mtm);
             layout.add(&row.root, 56.0);
+            if installed.error_message().is_some() {
+                let inventory_error = installed_rows::build(
+                    installed,
+                    target,
+                    InstalledActions {
+                        select: actions.installed_select,
+                        copy: actions.installed_copy,
+                        reveal: actions.installed_reveal,
+                    },
+                    mtm,
+                );
+                layout.add(&inventory_error.view, inventory_error.height);
+            }
             BodyRows::Installed(row)
-        } else if let Some(recovery) = snapshot.recovery_row() {
-            layout.add(&section_header("Installed", mtm), SECTION_HEIGHT);
-            let row = RecoveryNativeRow::build(recovery.detail(), mtm);
-            layout.add(&row.root, 56.0);
-            BodyRows::Recovery(row)
-        } else if let Some(transfer) = snapshot.transfer_row() {
-            layout.add(&section_header("Downloading", mtm), SECTION_HEIGHT);
-            let row = TransferNativeRow::build(transfer, target, actions, mtm);
-            layout.add(&row.root, MenuLayout::transfer_row_height());
-            BodyRows::Transfer(row)
         } else {
             unreachable!("every menu snapshot has exactly one body row")
         };
@@ -138,7 +192,7 @@ impl MenuRows {
         #[cfg(test)]
         let mut action_buttons = body.action_buttons();
         #[cfg(test)]
-        action_buttons.extend(catalog_content.action_buttons);
+        action_buttons.extend(catalog_content.action_buttons.iter().cloned());
 
         layout.add_separator(mtm);
         let footer = FooterRow::build(snapshot, mtm);
@@ -154,6 +208,7 @@ impl MenuRows {
             view: layout.finish(),
             rows: Self {
                 header,
+                catalog: catalog_content,
                 body,
                 footer,
             },
@@ -162,6 +217,14 @@ impl MenuRows {
             #[cfg(test)]
             action_buttons,
         }
+    }
+
+    pub(super) fn capture_search_focus(&self) -> Option<catalog_rows::SearchFocus> {
+        self.catalog.capture_search_focus()
+    }
+
+    pub(super) fn restore_search_focus(&self, focus: catalog_rows::SearchFocus) {
+        self.catalog.restore_search_focus(focus);
     }
 
     pub(super) fn update(
@@ -201,6 +264,12 @@ impl MenuRows {
                     row.update_cancel_controls(cancel);
                 }
             }
+            BodyRows::InventoryRecommendation { recommendation, .. } => {
+                if let Some(row) = snapshot.recommendation_row() {
+                    recommendation.update(row);
+                }
+            }
+            BodyRows::Catalog | BodyRows::Inventory { .. } => {}
         }
     }
 
@@ -259,29 +328,72 @@ impl ContentLayout {
     }
 }
 
-fn content_height(snapshot: &MenuSnapshot, catalog: &CatalogState) -> f64 {
+fn content_height(
+    snapshot: &MenuSnapshot,
+    catalog: &CatalogState,
+    installed: &crate::menu::installed::InstalledState,
+) -> f64 {
     let common = HEADER_HEIGHT
         + 2.0 * FOOTER_HEIGHT
         + 4.0 * SEPARATOR_HEIGHT
         + FINAL_CONTENT_SPACER_HEIGHT
         + catalog_rows::content_height(catalog);
-    if snapshot.recommendation_row().is_some() {
+    if catalog.owns_main_region() {
+        common
+    } else if snapshot.is_loading()
+        || snapshot.error_message().is_some()
+        || snapshot.recovery_row().is_some()
+    {
+        common + SECTION_HEIGHT + 56.0
+    } else if snapshot.transfer_row().is_some() {
+        common + SECTION_HEIGHT + MenuLayout::transfer_row_height()
+    } else if inventory_is_primary(snapshot, installed) {
+        let inventory = SECTION_HEIGHT + installed_rows::content_height(installed);
+        if snapshot.recommendation_row().is_some() {
+            common + inventory + SEPARATOR_HEIGHT + SECTION_HEIGHT + 56.0
+        } else {
+            common + inventory
+        }
+    } else if snapshot.recommendation_row().is_some() {
         common
             + SECTION_HEIGHT
             + MenuLayout::model_row_height()
             + SEPARATOR_HEIGHT
             + SECTION_HEIGHT
             + 56.0
-    } else if snapshot.transfer_row().is_some() {
-        common + SECTION_HEIGHT + MenuLayout::transfer_row_height()
     } else {
-        common + SECTION_HEIGHT + 56.0
+        common
+            + SECTION_HEIGHT
+            + 56.0
+            + if installed.error_message().is_some() {
+                installed_rows::content_height(installed)
+            } else {
+                0.0
+            }
     }
 }
 
+fn inventory_is_primary(
+    snapshot: &MenuSnapshot,
+    installed: &crate::menu::installed::InstalledState,
+) -> bool {
+    !installed.visible_items().is_empty()
+        || (installed.error_message().is_some() && snapshot.installed_row().is_none())
+}
+
 enum BodyRows {
+    Catalog,
     Status(StatusNativeRow),
     Recommendation(RecommendationNativeRow),
+    Inventory {
+        #[cfg(test)]
+        inventory: installed_rows::InstalledContent,
+    },
+    InventoryRecommendation {
+        #[cfg(test)]
+        inventory: installed_rows::InstalledContent,
+        recommendation: RecommendationNativeRow,
+    },
     Installed(InstalledNativeRow),
     Recovery(RecoveryNativeRow),
     Transfer(TransferNativeRow),
@@ -291,10 +403,18 @@ enum BodyRows {
 impl BodyRows {
     fn action_buttons(&self) -> Vec<Retained<NSButton>> {
         match self {
-            Self::Status(_) => Vec::new(),
+            Self::Catalog | Self::Status(_) | Self::Installed(_) | Self::Recovery(_) => Vec::new(),
             Self::Recommendation(row) => row.action_buttons(),
             Self::Transfer(row) => row.action_buttons(),
-            Self::Installed(_) | Self::Recovery(_) => Vec::new(),
+            Self::Inventory { inventory } => inventory.action_buttons.clone(),
+            Self::InventoryRecommendation {
+                inventory,
+                recommendation,
+            } => {
+                let mut buttons = inventory.action_buttons.clone();
+                buttons.extend(recommendation.action_buttons());
+                buttons
+            }
         }
     }
 }
@@ -715,6 +835,7 @@ impl QuitRow {
     fn build(target: Option<&AnyObject>, quit: Sel, mtm: MainThreadMarker) -> Self {
         let root = row_shell(FOOTER_HEIGHT, mtm);
         let button = text_button("Quit Loxa", "Quit Loxa", target, quit, mtm);
+        button.setRefusesFirstResponder(true);
         button.setKeyEquivalent(&NSString::from_str("q"));
         button.setKeyEquivalentModifierMask(objc2_app_kit::NSEventModifierFlags::Command);
         pin_to_content(&root, &button);
@@ -900,7 +1021,7 @@ fn row_shell(height: f64, mtm: MainThreadMarker) -> Retained<NSView> {
     debug_assert_eq!(
         MenuLayout::content_width(width),
         width - 2.0 * CONTENT_INSET,
-        "the 300 pt shell and native content inset must stay in lockstep"
+        "the menu shell and native content inset must stay in lockstep"
     );
     NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, width, height))
 }
@@ -910,7 +1031,7 @@ fn hover_row_shell(height: f64, mtm: MainThreadMarker) -> Retained<HoverRowView>
     debug_assert_eq!(
         MenuLayout::content_width(width),
         width - 2.0 * CONTENT_INSET,
-        "the 300 pt shell and native content inset must stay in lockstep"
+        "the menu shell and native content inset must stay in lockstep"
     );
     HoverRowView::new(rect(0.0, 0.0, width, height), mtm)
 }
@@ -1054,7 +1175,7 @@ fn icon_button(
     let button = NSButton::new(mtm);
     button.setTitle(&NSString::from_str(""));
     button.setBordered(false);
-    button.setRefusesFirstResponder(true);
+    button.setRefusesFirstResponder(false);
     button.setToolTip(Some(&NSString::from_str(accessibility_label)));
     button.setAccessibilityLabel(Some(&NSString::from_str(accessibility_label)));
     if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
@@ -1085,7 +1206,7 @@ fn text_button(
     let button = NSButton::new(mtm);
     button.setControlSize(NSControlSize::Small);
     button.setTitle(&NSString::from_str(title));
-    button.setRefusesFirstResponder(true);
+    button.setRefusesFirstResponder(false);
     button.setToolTip(Some(&NSString::from_str(accessibility_label)));
     button.setAccessibilityLabel(Some(&NSString::from_str(accessibility_label)));
     // SAFETY: all selectors are implemented by the retained NativePopoverTarget.

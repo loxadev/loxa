@@ -18,6 +18,11 @@ name = "native_menu_layout"
 path = "tests/native_menu_layout.rs"
 harness = false
 
+[[test]]
+name = "native_menu_search_focus"
+path = "tests/native_menu_search_focus.rs"
+harness = false
+
 [build-dependencies]
 tauri-build = { version = "=2.6.3", features = [] }
 
@@ -44,6 +49,8 @@ objc2-app-kit = { version = "=0.3.2", default-features = false, features = [
   "NSLayoutAnchor",
   "NSLayoutConstraint",
   "NSPopover",
+  "NSParagraphStyle",
+  "NSPasteboard",
   "NSProgressIndicator",
   "NSResponder",
   "NSSearchField",
@@ -56,10 +63,14 @@ objc2-app-kit = { version = "=0.3.2", default-features = false, features = [
   "NSViewController",
   "NSUserInterfaceLayout",
   "NSView",
+  "NSWindow",
+  "NSWorkspace",
 ] }
 objc2-foundation = { version = "=0.3.2", default-features = false, features = [
+  "NSArray",
   "NSGeometry",
   "NSObject",
   "NSString",
   "NSTimer",
+  "NSURL",
 ] }

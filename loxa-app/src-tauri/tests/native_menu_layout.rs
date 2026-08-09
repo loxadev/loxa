@@ -1,9 +1,21 @@
-#![allow(dead_code)]
+#![allow(dead_code, unused_imports)]
+
+#[cfg(target_os = "macos")]
+mod app {
+    pub(crate) fn request_native_shell_exit(_app_handle: &tauri::AppHandle) {}
+}
 
 #[cfg(target_os = "macos")]
 mod menu {
     pub(crate) mod catalog {
         include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/menu/catalog.rs"));
+    }
+
+    pub(crate) mod installed {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/menu/installed.rs"
+        ));
     }
 
     pub(crate) mod presentation {
@@ -13,11 +25,42 @@ mod menu {
         ));
     }
 
+    pub(crate) mod observation {
+        use std::time::Instant;
+
+        use crate::menu::catalog::CatalogCommand;
+
+        pub(crate) struct BackendClient;
+
+        impl BackendClient {
+            pub(crate) fn request_popover_open(&mut self, _now: Instant) -> bool {
+                false
+            }
+
+            pub(crate) fn dispatch(&mut self, _command: CatalogCommand) -> bool {
+                false
+            }
+
+            pub(crate) fn shutdown(&mut self) {}
+
+            pub(crate) fn request_pause(&self, _generation: u64) -> bool {
+                false
+            }
+        }
+    }
+
     pub(crate) mod macos {
         pub(crate) mod catalog_rows {
             include!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/src/menu/macos/catalog_rows.rs"
+            ));
+        }
+
+        pub(crate) mod installed_rows {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/menu/macos/installed_rows.rs"
             ));
         }
 
@@ -33,18 +76,22 @@ mod menu {
                 env!("CARGO_MANIFEST_DIR"),
                 "/src/menu/macos/rows.rs"
             ));
+            use crate::menu::catalog::{CandidateItem, CatalogEvent, RepositoryItem};
+            use crate::menu::installed::{
+                InstalledFeedback, InstalledInventoryError, InstalledItem, InstalledState,
+            };
             use crate::menu::presentation::Fixture;
             use objc2::runtime::NSObjectProtocol;
             use objc2::sel;
             use objc2::ClassType;
-            use objc2_app_kit::{NSEventModifierFlags, NSSearchField};
+            use objc2_app_kit::{NSEventModifierFlags, NSLineBreakMode, NSSearchField};
 
             pub(crate) fn assert_native_layout_contract(mtm: MainThreadMarker) {
                 for (name, fixture, expected_height, expected_action_button_count) in [
-                    ("recommendation", Fixture::Empty, 393.0, 1),
-                    ("installed", Fixture::Installed, 316.0, 0),
-                    ("recovery", Fixture::Invalid, 316.0, 0),
-                    ("transfer", Fixture::Downloading, 376.0, 4),
+                    ("recommendation", Fixture::Empty, 349.0, 1),
+                    ("installed", Fixture::Installed, 272.0, 0),
+                    ("recovery", Fixture::Invalid, 272.0, 0),
+                    ("transfer", Fixture::Downloading, 332.0, 4),
                 ] {
                     let PopoverContent {
                         view,
@@ -54,13 +101,14 @@ mod menu {
                     } = MenuRows::build(
                         &fixture.snapshot(),
                         &crate::menu::catalog::CatalogState::default(),
+                        &InstalledState::default(),
                         None,
                         layout_fixture_actions(),
                         mtm,
                     );
                     view.layoutSubtreeIfNeeded();
 
-                    assert_eq!(view.frame().size.width, 300.0, "{name} width");
+                    assert_eq!(view.frame().size.width, 360.0, "{name} width");
                     assert_eq!(view.frame().size.height, expected_height, "{name} height");
                     // SAFETY: MenuRows::build adds the retained Quit button to
                     // its retained row before returning this content view.
@@ -77,16 +125,20 @@ mod menu {
                         expected_action_button_count,
                         "{name} actionable button count"
                     );
-                    for button in action_buttons.iter().chain(std::iter::once(&quit_button)) {
+                    for button in &action_buttons {
                         assert!(
-                            button.refusesFirstResponder(),
-                            "{name} actionable buttons must refuse first responder"
+                            !button.refusesFirstResponder(),
+                            "{name} actionable buttons must accept keyboard focus"
                         );
                         assert!(
                             !button.isHighlighted(),
                             "{name} actionable buttons must start neutral"
                         );
                     }
+                    assert!(
+                        quit_button.refusesFirstResponder(),
+                        "{name} Quit keeps its passive key-equivalent behavior"
+                    );
                     assert_eq!(
                         quit_button.keyEquivalent().to_string(),
                         "q",
@@ -102,6 +154,7 @@ mod menu {
                 let search = MenuRows::build(
                     &Fixture::Empty.snapshot(),
                     &crate::menu::catalog::CatalogState::default(),
+                    &InstalledState::default(),
                     None,
                     layout_fixture_actions(),
                     mtm,
@@ -111,6 +164,310 @@ mod menu {
                     1,
                     "the native product menu must contain exactly one NSSearchField"
                 );
+                let search_field = find_search_field(&search.view)
+                    .expect("the native product menu must retain its search field");
+                assert!(
+                    !search_field.sendsWholeSearchString(),
+                    "typing must use AppKit's delayed edit action without Return"
+                );
+                assert!(
+                    !search_field.sendsSearchStringImmediately(),
+                    "live search must use AppKit's native delay"
+                );
+
+                assert_catalog_browsing_contract(mtm);
+                assert_installed_rows_and_priority(mtm);
+                assert_empty_inventory_error_is_rendered(mtm);
+                assert_known_installed_row_outlives_cold_inventory_error(mtm);
+                super::controller::assert_feedback_close_rebuild_contract(mtm);
+            }
+
+            fn assert_catalog_browsing_contract(mtm: MainThreadMarker) {
+                let mut catalog = CatalogState::default();
+                let generation = catalog.submit_search("bartowski").unwrap().generation();
+                let searching = catalog_rows::build(&catalog, None, catalog_fixture_actions(), mtm);
+                assert_eq!(searching.view.frame().size.width, 360.0);
+                assert!(text_values(&searching.view).contains(&"Models".into()));
+
+                let repository = "bartowski/a-very-long-model-identifier-for-middle-truncation";
+                assert!(catalog.apply(CatalogEvent::Repositories {
+                    generation,
+                    repositories: vec![RepositoryItem::new(
+                        repository.into(),
+                        Some("42 downloads".into()),
+                    )],
+                }));
+                let repositories =
+                    catalog_rows::build(&catalog, None, catalog_fixture_actions(), mtm);
+                assert_eq!(repositories.action_buttons.len(), 1);
+                assert!(!repositories.action_buttons[0].refusesFirstResponder());
+                assert_eq!(
+                    repositories.primary_labels[0].stringValue().to_string(),
+                    repository
+                );
+                assert_eq!(
+                    repositories.secondary_labels[0].stringValue().to_string(),
+                    "42 downloads"
+                );
+                assert_eq!(
+                    repositories.primary_labels[0]
+                        .cell()
+                        .expect("repository title has a native text cell")
+                        .lineBreakMode(),
+                    NSLineBreakMode::ByTruncatingMiddle
+                );
+                assert_eq!(
+                    repositories.primary_labels[0].alignment(),
+                    NSTextAlignment::Left
+                );
+                assert_eq!(
+                    repositories.primary_labels[0]
+                        .toolTip()
+                        .map(|value| value.to_string()),
+                    Some(repository.into())
+                );
+                assert_eq!(
+                    repositories.primary_labels[0].textColor(),
+                    Some(NSColor::labelColor())
+                );
+                assert!(count_image_views(&repositories.view) >= 1);
+
+                assert!(catalog.inspect_repository(0).is_some());
+                let inspecting =
+                    catalog_rows::build(&catalog, None, catalog_fixture_actions(), mtm);
+                let inspecting_text = text_values(&inspecting.view);
+                assert!(inspecting_text.contains(&"Choose a GGUF file".into()));
+                assert!(inspecting_text.contains(&"Loading files…".into()));
+
+                let candidate = "a-very-long-model-file-name-q4-k-m.gguf";
+                assert!(catalog.apply(CatalogEvent::Candidates {
+                    generation,
+                    repo: repository.into(),
+                    revision: "0123456789abcdef0123456789abcdef01234567".into(),
+                    candidates: vec![CandidateItem::new(candidate.into(), Some(88_200_000))],
+                }));
+                assert!(catalog.select_candidate(0));
+                let selected = catalog_rows::build(&catalog, None, catalog_fixture_actions(), mtm);
+                assert_eq!(
+                    selected.primary_labels[0].stringValue().to_string(),
+                    candidate
+                );
+                assert_eq!(
+                    selected.secondary_labels[0].stringValue().to_string(),
+                    "88.2 MB"
+                );
+                assert_eq!(
+                    selected.action_buttons.last().unwrap().title().to_string(),
+                    "Download 88.2 MB"
+                );
+                assert!(!text_values(&selected.view)
+                    .iter()
+                    .any(|text| text.starts_with("Selected ")));
+                assert!(count_image_views(&selected.view) >= 2);
+
+                assert!(catalog.start_transfer().is_some());
+                let transferring =
+                    catalog_rows::build(&catalog, None, catalog_fixture_actions(), mtm);
+                assert!(transferring.primary_labels.is_empty());
+                assert!(!text_values(&transferring.view).contains(&candidate.into()));
+            }
+
+            fn assert_installed_rows_and_priority(mtm: MainThreadMarker) {
+                let mut installed = InstalledState::default();
+                installed.replace(
+                    [
+                        "foxtrot", "alpha", "bravo", "charlie", "delta", "echo", "golf",
+                    ]
+                    .into_iter()
+                    .map(|id| InstalledItem::new(id.into(), format!("{id}-q4.gguf"), 88_200_000))
+                    .collect(),
+                    Some("foxtrot".into()),
+                );
+                assert!(installed.select("foxtrot"));
+                installed.fail(InstalledInventoryError::RefreshFailed);
+                let rows = super::installed_rows::build(
+                    &installed,
+                    None,
+                    installed_fixture_actions(),
+                    mtm,
+                );
+                assert_eq!(rows.view.frame().size.width, 360.0);
+                assert_eq!(rows.row_buttons.len(), 5);
+                assert_eq!(
+                    rows.primary_labels[0].stringValue().to_string(),
+                    "foxtrot-q4"
+                );
+                assert_eq!(
+                    rows.secondary_labels[0].stringValue().to_string(),
+                    "foxtrot · 88.2 MB"
+                );
+                assert_eq!(
+                    rows.action_buttons
+                        .iter()
+                        .map(|button| button.title().to_string())
+                        .collect::<Vec<_>>(),
+                    ["Copy chat command", "Reveal in Finder"]
+                );
+                assert!(rows
+                    .row_buttons
+                    .iter()
+                    .chain(rows.action_buttons.iter())
+                    .all(|button| !button.refusesFirstResponder()));
+                assert!(rows.row_buttons[0]
+                    .accessibilityLabel()
+                    .map(|label| label.to_string())
+                    .is_some_and(|label| label.contains("selected; actions expanded")));
+                let text = text_values(&rows.view);
+                assert!(text.contains(&"2 more installed".into()));
+                assert!(text.contains(&"Could not refresh installed models".into()));
+                assert!(count_image_views(&rows.view) >= 6);
+
+                let one = {
+                    let mut state = InstalledState::default();
+                    state.replace(
+                        vec![InstalledItem::new(
+                            "alpha".into(),
+                            "alpha-q4.gguf".into(),
+                            88_200_000,
+                        )],
+                        None,
+                    );
+                    state
+                };
+                let idle = CatalogState::default();
+                let installed_menu = MenuRows::build(
+                    &Fixture::Installed.snapshot(),
+                    &idle,
+                    &one,
+                    None,
+                    layout_fixture_actions(),
+                    mtm,
+                );
+                let installed_text = text_values(&installed_menu.view);
+                assert!(installed_text.contains(&"alpha-q4".into()));
+                assert!(!installed_text
+                    .iter()
+                    .any(|text| text.starts_with("Gemma 4 12B ·")));
+
+                for (snapshot, expected) in [
+                    (MenuSnapshot::loading(), "Loading Loxa status…"),
+                    (Fixture::Invalid.snapshot(), "Managed bundle needs recovery"),
+                    (Fixture::Paused.snapshot(), "Paused"),
+                ] {
+                    let content = MenuRows::build(
+                        &snapshot,
+                        &idle,
+                        &one,
+                        None,
+                        layout_fixture_actions(),
+                        mtm,
+                    );
+                    let text = text_values(&content.view);
+                    assert!(
+                        text.iter().any(|text| text.starts_with(expected)),
+                        "expected {expected:?} in {text:?}"
+                    );
+                    assert!(!text.contains(&"alpha-q4".into()));
+                }
+
+                let recommended = MenuRows::build(
+                    &Fixture::Empty.snapshot(),
+                    &idle,
+                    &one,
+                    None,
+                    layout_fixture_actions(),
+                    mtm,
+                );
+                let recommended_text = text_values(&recommended.view);
+                assert!(recommended_text.contains(&"alpha-q4".into()));
+                assert!(recommended_text.contains(&"Recommended for this Mac".into()));
+
+                let mut failed_catalog = CatalogState::default();
+                let generation = failed_catalog
+                    .submit_search("models")
+                    .expect("the failure fixture starts active catalog work")
+                    .generation();
+                assert!(failed_catalog.apply(CatalogEvent::Failed {
+                    generation,
+                    message: "Catalog search failed".into(),
+                }));
+                for (snapshot, expected) in [
+                    (MenuSnapshot::loading(), "Loading Loxa status…"),
+                    (
+                        MenuSnapshot::error("Core unavailable".into()),
+                        "Core unavailable",
+                    ),
+                    (Fixture::Invalid.snapshot(), "Managed bundle needs recovery"),
+                    (Fixture::Paused.snapshot(), "Paused"),
+                ] {
+                    let content = MenuRows::build(
+                        &snapshot,
+                        &failed_catalog,
+                        &one,
+                        None,
+                        layout_fixture_actions(),
+                        mtm,
+                    );
+                    let text = text_values(&content.view);
+                    assert!(text.contains(&"Catalog search failed".into()));
+                    assert!(
+                        text.iter().any(|text| text.starts_with(expected)),
+                        "terminal catalog error hid {expected:?} in {text:?}"
+                    );
+                    assert!(!text.contains(&"alpha-q4".into()));
+                }
+
+                let mut active = CatalogState::default();
+                assert!(active.submit_search("models").is_some());
+                let browsing = MenuRows::build(
+                    &MenuSnapshot::loading(),
+                    &active,
+                    &one,
+                    None,
+                    layout_fixture_actions(),
+                    mtm,
+                );
+                let browsing_text = text_values(&browsing.view);
+                assert!(browsing_text.contains(&"Models".into()));
+                assert!(!browsing_text.contains(&"Loading Loxa status…".into()));
+                assert!(!browsing_text.contains(&"alpha-q4".into()));
+            }
+
+            fn assert_empty_inventory_error_is_rendered(mtm: MainThreadMarker) {
+                let mut installed = InstalledState::default();
+                installed.fail(InstalledInventoryError::RefreshFailed);
+                let content = MenuRows::build(
+                    &Fixture::Empty.snapshot(),
+                    &CatalogState::default(),
+                    &installed,
+                    None,
+                    layout_fixture_actions(),
+                    mtm,
+                );
+                let text = visible_text_values(&content.view);
+
+                assert!(text.contains(&"Could not refresh installed models".into()));
+                assert!(text.contains(&"Recommended for this Mac".into()));
+            }
+
+            fn assert_known_installed_row_outlives_cold_inventory_error(mtm: MainThreadMarker) {
+                let mut installed = InstalledState::default();
+                installed.fail(InstalledInventoryError::RefreshFailed);
+                let content = MenuRows::build(
+                    &Fixture::Installed.snapshot(),
+                    &CatalogState::default(),
+                    &installed,
+                    None,
+                    layout_fixture_actions(),
+                    mtm,
+                );
+                let text = visible_text_values(&content.view);
+
+                assert!(
+                    text.contains(&"Gemma 4 12B · Verified".into()),
+                    "cold inventory failure hid the known installed bundle in {text:?}"
+                );
+                assert!(text.contains(&"Could not refresh installed models".into()));
             }
 
             fn layout_fixture_actions() -> Actions {
@@ -120,6 +477,9 @@ mod menu {
                     candidate: sel!(fixtureNoop:),
                     transfer: sel!(fixtureNoop:),
                     pause_transfer: sel!(fixtureNoop:),
+                    installed_select: sel!(fixtureNoop:),
+                    installed_copy: sel!(fixtureNoop:),
+                    installed_reveal: sel!(fixtureNoop:),
                     start: sel!(fixtureNoop:),
                     pause: sel!(fixtureNoop:),
                     resume: sel!(fixtureNoop:),
@@ -131,6 +491,24 @@ mod menu {
                 }
             }
 
+            fn catalog_fixture_actions() -> catalog_rows::CatalogActions {
+                catalog_rows::CatalogActions {
+                    search: sel!(fixtureNoop:),
+                    repository: sel!(fixtureNoop:),
+                    candidate: sel!(fixtureNoop:),
+                    transfer: sel!(fixtureNoop:),
+                    pause: sel!(fixtureNoop:),
+                }
+            }
+
+            fn installed_fixture_actions() -> super::installed_rows::InstalledActions {
+                super::installed_rows::InstalledActions {
+                    select: sel!(fixtureNoop:),
+                    copy: sel!(fixtureNoop:),
+                    reveal: sel!(fixtureNoop:),
+                }
+            }
+
             fn count_search_fields(view: &NSView) -> usize {
                 usize::from(view.isKindOfClass(NSSearchField::class()))
                     + view
@@ -138,6 +516,122 @@ mod menu {
                         .iter()
                         .map(|child| count_search_fields(&child))
                         .sum::<usize>()
+            }
+
+            fn find_search_field(view: &NSView) -> Option<Retained<NSSearchField>> {
+                for child in view.subviews() {
+                    match child.downcast::<NSSearchField>() {
+                        Ok(search) => return Some(search),
+                        Err(child) => {
+                            if let Some(search) = find_search_field(&child) {
+                                return Some(search);
+                            }
+                        }
+                    }
+                }
+                None
+            }
+
+            fn text_values(view: &NSView) -> Vec<String> {
+                let mut fields = Vec::new();
+                collect_text_fields(view, &mut fields);
+                fields
+                    .into_iter()
+                    .map(|field| field.stringValue().to_string())
+                    .collect()
+            }
+
+            pub(super) fn visible_text_values(view: &NSView) -> Vec<String> {
+                let mut fields = Vec::new();
+                collect_text_fields(view, &mut fields);
+                fields
+                    .into_iter()
+                    .filter(|field| !field.isHidden())
+                    .map(|field| field.stringValue().to_string())
+                    .collect()
+            }
+
+            fn collect_text_fields(view: &NSView, fields: &mut Vec<Retained<NSTextField>>) {
+                for child in view.subviews() {
+                    match child.downcast::<NSTextField>() {
+                        Ok(field) => fields.push(field),
+                        Err(child) => collect_text_fields(&child, fields),
+                    }
+                }
+            }
+
+            fn count_image_views(view: &NSView) -> usize {
+                use objc2_app_kit::NSImageView;
+
+                view.subviews()
+                    .into_iter()
+                    .map(|child| match child.downcast::<NSImageView>() {
+                        Ok(_) => 1,
+                        Err(child) => count_image_views(&child),
+                    })
+                    .sum()
+            }
+        }
+
+        #[allow(clippy::items_after_test_module)] // The included source owns its unit-test module.
+        pub(crate) mod controller {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/menu/macos/controller.rs"
+            ));
+
+            use objc2::AnyThread as _;
+
+            pub(crate) fn assert_feedback_close_rebuild_contract(mtm: MainThreadMarker) {
+                // SAFETY: this inert status item is only retained to satisfy the
+                // controller state shape; the native geometry test never displays it.
+                let status_item: Retained<NSStatusItem> =
+                    unsafe { msg_send![NSStatusItem::alloc(), init] };
+                let popover = NSPopover::new(mtm);
+                let content_view_controller = NSViewController::new(mtm);
+                popover.setContentViewController(Some(&content_view_controller));
+                let mut state = NativePopoverState::new(
+                    status_item,
+                    popover.clone(),
+                    content_view_controller.clone(),
+                    Fixture::Installed,
+                );
+                state.installed.borrow_mut().replace(
+                    vec![crate::menu::installed::InstalledItem::new(
+                        "alpha".into(),
+                        "alpha-q4.gguf".into(),
+                        88_200_000,
+                    )],
+                    None,
+                );
+                assert!(state.installed.borrow_mut().select("alpha"));
+                assert!(state.installed.borrow_mut().apply_feedback(
+                    "alpha",
+                    Some(crate::menu::installed::InstalledFeedback::ChatCommandCopied),
+                ));
+                let target = NSObject::new();
+                state.render(&target, action_selectors(), mtm);
+
+                let expanded_frame_height = content_view_controller.view().frame().size.height;
+                let expanded_popover_height = popover.contentSize().height;
+                assert_eq!(expanded_frame_height, expanded_popover_height);
+                assert!(
+                    super::rows::visible_text_values(&content_view_controller.view())
+                        .contains(&"Chat command copied".into())
+                );
+
+                state.popover_closed(&target, action_selectors(), mtm);
+                state.popover_opened();
+
+                let compact_frame_height = content_view_controller.view().frame().size.height;
+                let compact_popover_height = popover.contentSize().height;
+                assert_eq!(expanded_frame_height - compact_frame_height, 24.0);
+                assert_eq!(compact_frame_height, compact_popover_height);
+                assert_eq!(state.installed.borrow().feedback_message(), None);
+                assert!(
+                    !super::rows::visible_text_values(&content_view_controller.view())
+                        .contains(&"Chat command copied".into())
+                );
             }
         }
 

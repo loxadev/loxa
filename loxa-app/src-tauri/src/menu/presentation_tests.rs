@@ -333,10 +333,10 @@ fn transfer_progress_fraction_uses_the_authoritative_exact_bytes() {
 
 #[test]
 fn layout_clamps_row_width_and_preserves_the_native_content_geometry() {
-    assert_eq!(MenuLayout::width_for(240.0), 300.0);
-    assert_eq!(MenuLayout::width_for(344.0), 344.0);
+    assert_eq!(MenuLayout::width_for(240.0), 360.0);
+    assert_eq!(MenuLayout::width_for(344.0), 360.0);
     assert_eq!(MenuLayout::width_for(480.0), 400.0);
-    assert_eq!(MenuLayout::content_width(300.0), 274.0);
+    assert_eq!(MenuLayout::content_width(360.0), 334.0);
     assert_eq!(MenuLayout::VERTICAL_PADDING, 4.0);
     assert_eq!(MenuLayout::HOVER_RADIUS, 6.0);
     assert_eq!(MenuLayout::model_row_height(), 40.0);

@@ -20,14 +20,10 @@ impl InstalledItem {
         &self.id
     }
 
-    // Task 3 native rows consume this surface.
-    #[allow(dead_code)]
     pub(crate) fn display_name(&self) -> &str {
         &self.display_name
     }
 
-    // Task 3 native rows consume this surface.
-    #[allow(dead_code)]
     pub(crate) fn total_bytes(&self) -> u64 {
         self.total_bytes
     }
@@ -46,12 +42,30 @@ impl InstalledInventoryError {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InstalledFeedback {
+    ChatCommandCopied,
+    CopyFailed,
+    RevealFailed,
+}
+
+impl InstalledFeedback {
+    fn message(self) -> &'static str {
+        match self {
+            Self::ChatCommandCopied => "Chat command copied",
+            Self::CopyFailed => "Could not copy the chat command",
+            Self::RevealFailed => "Could not reveal this model",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct InstalledState {
     items: Vec<InstalledItem>,
     selected_model_id: Option<String>,
     pinned_model_id: Option<String>,
     error: Option<InstalledInventoryError>,
+    feedback: Option<InstalledFeedback>,
 }
 
 impl InstalledState {
@@ -61,10 +75,14 @@ impl InstalledState {
         pinned_model_id: Option<String>,
     ) {
         items.sort_by(|left, right| left.id().cmp(right.id()));
+        let previous_selection = self.selected_model_id.clone();
         self.selected_model_id = self
             .selected_model_id
             .take()
             .filter(|selected| items.iter().any(|item| item.id() == selected));
+        if self.selected_model_id != previous_selection {
+            self.feedback = None;
+        }
         self.pinned_model_id =
             pinned_model_id.filter(|pinned| items.iter().any(|item| item.id() == pinned));
         self.items = items;
@@ -80,8 +98,6 @@ impl InstalledState {
         &self.items
     }
 
-    // Task 3 native rows consume this surface.
-    #[allow(dead_code)]
     pub(crate) fn visible_items(&self) -> Vec<&InstalledItem> {
         let pinned = self
             .pinned_model_id
@@ -98,33 +114,48 @@ impl InstalledState {
             .collect()
     }
 
-    // Task 3 native rows consume this surface.
-    #[allow(dead_code)]
     pub(crate) fn remaining_count(&self) -> usize {
         self.items.len().saturating_sub(MAX_VISIBLE_ITEMS)
     }
 
-    // Task 3 native rows consume this surface.
-    #[allow(dead_code)]
     pub(crate) fn select(&mut self, model_id: &str) -> bool {
         if !self.items.iter().any(|item| item.id() == model_id) {
             return false;
         }
-        self.selected_model_id = Some(model_id.into());
+        if self.selected_model_id.as_deref() != Some(model_id) {
+            self.feedback = None;
+            self.selected_model_id = Some(model_id.into());
+        }
         true
     }
 
-    // Task 3 native rows consume this surface.
-    #[allow(dead_code)]
     pub(crate) fn selected(&self) -> Option<&InstalledItem> {
         let selected = self.selected_model_id.as_deref()?;
         self.items.iter().find(|item| item.id() == selected)
     }
 
-    // Task 3 native rows consume this surface.
-    #[allow(dead_code)]
     pub(crate) fn error_message(&self) -> Option<&'static str> {
         self.error.map(InstalledInventoryError::message)
+    }
+
+    pub(crate) fn apply_feedback(
+        &mut self,
+        model_id: &str,
+        feedback: Option<InstalledFeedback>,
+    ) -> bool {
+        if self.selected().map(InstalledItem::id) != Some(model_id) {
+            return false;
+        }
+        self.feedback = feedback;
+        true
+    }
+
+    pub(crate) fn reset_feedback(&mut self) {
+        self.feedback = None;
+    }
+
+    pub(crate) fn feedback_message(&self) -> Option<&'static str> {
+        self.feedback.map(InstalledFeedback::message)
     }
 }
 
