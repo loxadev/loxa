@@ -184,6 +184,34 @@ mod menu {
                     );
                 }
 
+                let running = Fixture::Running
+                    .snapshot()
+                    .with_running_port(43123)
+                    .unwrap();
+                let runtime = MenuRows::build(
+                    &running,
+                    &crate::menu::catalog::CatalogState::default(),
+                    &crate::menu::incomplete::IncompleteState::default(),
+                    &InstalledState::default(),
+                    None,
+                    layout_fixture_actions(),
+                    mtm,
+                );
+                let runtime_text = visible_text_values(&runtime.view);
+                assert!(
+                    runtime_text.contains(&"API · 127.0.0.1:43123".into()),
+                    "running header omitted its loopback endpoint: {runtime_text:?}"
+                );
+                assert_eq!(runtime.action_buttons.len(), 1);
+                assert_eq!(
+                    runtime.action_buttons[0]
+                        .accessibilityLabel()
+                        .map(|label| label.to_string()),
+                    Some("Copy API curl command".into())
+                );
+                assert!(runtime.action_buttons[0].image().is_some());
+                assert!(!runtime.action_buttons[0].refusesFirstResponder());
+
                 let search = MenuRows::build(
                     &Fixture::Empty.snapshot(),
                     &crate::menu::catalog::CatalogState::default(),
@@ -748,6 +776,7 @@ mod menu {
 
             fn layout_fixture_actions() -> Actions {
                 Actions {
+                    runtime_copy: sel!(fixtureNoop:),
                     search: sel!(fixtureNoop:),
                     repository: sel!(fixtureNoop:),
                     candidate: sel!(fixtureNoop:),

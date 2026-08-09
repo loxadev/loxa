@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use loxa::app::TransferControl;
 #[cfg(not(test))]
@@ -27,8 +27,6 @@ use crate::menu::presentation::{
     Bundle, Download, MenuSnapshot, Recommendation, RecommendationUnavailableReason as MenuReason,
     RecoveryReason, Runtime, RuntimeInventory,
 };
-
-const FRESHNESS: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CoreBundle {
@@ -88,6 +86,7 @@ struct CoreObservation {
     recommendation: CoreRecommendation,
     download: CoreDownload,
     runtime: CoreRuntime,
+    runtime_port: Option<u16>,
     runtime_inventory: CoreRuntimeInventory,
 }
 
@@ -139,6 +138,7 @@ impl From<AppSnapshot> for CoreObservation {
             RuntimeSnapshot::Stopping => CoreRuntime::Stopping,
             RuntimeSnapshot::Error => CoreRuntime::Error,
         };
+        let runtime_port = snapshot.runtime_port();
         let runtime_inventory = match snapshot.runtime_inventory() {
             RuntimeInventorySnapshot::External => CoreRuntimeInventory::External,
             RuntimeInventorySnapshot::Missing => CoreRuntimeInventory::Missing,
@@ -149,6 +149,7 @@ impl From<AppSnapshot> for CoreObservation {
             recommendation,
             download,
             runtime,
+            runtime_port,
             runtime_inventory,
         }
     }
@@ -208,8 +209,14 @@ fn map_core_snapshot(snapshot: CoreObservation) -> MenuSnapshot {
         CoreRuntimeInventory::Missing => RuntimeInventory::Missing,
     };
 
-    MenuSnapshot::new(bundle, recommendation, download, runtime, runtime_inventory)
-        .expect("core app snapshots always map to canonical menu snapshots")
+    let menu = MenuSnapshot::new(bundle, recommendation, download, runtime, runtime_inventory)
+        .expect("core app snapshots always map to canonical menu snapshots");
+    match snapshot.runtime_port {
+        Some(port) => menu
+            .with_running_port(port)
+            .expect("core running snapshots carry a nonzero validated port"),
+        None => menu,
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -219,16 +226,16 @@ pub(crate) enum ObservationMessage {
 }
 
 pub(crate) struct RefreshAdmission {
-    last_completed: Option<Instant>,
     in_flight: bool,
+    pending_popover: bool,
     accepting: bool,
 }
 
 impl RefreshAdmission {
     fn new() -> Self {
         Self {
-            last_completed: None,
             in_flight: false,
+            pending_popover: false,
             accepting: true,
         }
     }
@@ -241,27 +248,30 @@ impl RefreshAdmission {
         true
     }
 
-    fn admit_popover(&mut self, now: Instant) -> bool {
-        if !self.accepting || self.in_flight {
+    fn admit_popover(&mut self, _now: Instant) -> bool {
+        if !self.accepting {
             return false;
         }
-        let Some(last_completed) = self.last_completed else {
-            return false;
-        };
-        if now.saturating_duration_since(last_completed) < FRESHNESS {
+        if self.in_flight {
+            self.pending_popover = true;
             return false;
         }
         self.in_flight = true;
         true
     }
 
-    fn complete(&mut self, _message: &ObservationMessage, now: Instant) {
+    fn complete(&mut self, _now: Instant) -> bool {
         self.in_flight = false;
-        self.last_completed = Some(now);
+        if self.accepting && std::mem::take(&mut self.pending_popover) {
+            self.in_flight = true;
+            return true;
+        }
+        false
     }
 
     fn close(&mut self) {
         self.accepting = false;
+        self.pending_popover = false;
     }
 
     fn is_shutting_down(&self) -> bool {
@@ -270,7 +280,9 @@ impl RefreshAdmission {
 }
 
 enum BackendRequest {
-    Observe,
+    Observe {
+        completion: Sender<()>,
+    },
     Search {
         generation: u64,
         query: String,
@@ -637,12 +649,16 @@ fn run_backend_worker<B: BackendSource>(
         if matches!(request, BackendRequest::Stop) || stopping.load(Ordering::Acquire) {
             break;
         }
+        let mut observation_completion = None;
         let messages = match request {
-            BackendRequest::Observe => vec![
-                observation_message(&mut source),
-                installed_message(&mut source, None),
-                incomplete_message(&mut source),
-            ],
+            BackendRequest::Observe { completion } => {
+                observation_completion = Some(completion);
+                vec![
+                    observation_message(&mut source),
+                    installed_message(&mut source, None),
+                    incomplete_message(&mut source),
+                ]
+            }
             BackendRequest::Search { generation, query } => {
                 vec![BackendMessage::Catalog(match &mut source {
                     Ok(source) => match source.search(query) {
@@ -789,6 +805,9 @@ fn run_backend_worker<B: BackendSource>(
                 return;
             }
         }
+        if let Some(completion) = observation_completion {
+            let _ = completion.send(());
+        }
     }
 }
 
@@ -796,6 +815,7 @@ pub(crate) struct BackendClient {
     request_sender: Option<Sender<BackendRequest>>,
     receiver: Option<Receiver<BackendMessage>>,
     admission: RefreshAdmission,
+    observation_completion: Option<Receiver<()>>,
     active_transfer: Option<(u64, TransferControl)>,
     stopping: Arc<AtomicBool>,
 }
@@ -844,11 +864,12 @@ impl BackendClient {
             request_sender: Some(request_sender),
             receiver: Some(receiver),
             admission: RefreshAdmission::new(),
+            observation_completion: None,
             active_transfer: None,
             stopping,
         };
         if client.admission.admit_startup() {
-            let _ = client.send(BackendRequest::Observe);
+            let _ = client.send_observation();
         }
         client
     }
@@ -857,7 +878,7 @@ impl BackendClient {
         if !self.admission.admit_popover(now) {
             return false;
         }
-        self.send(BackendRequest::Observe)
+        self.send_observation()
     }
 
     pub(crate) fn dispatch(&mut self, command: crate::menu::catalog::CatalogCommand) -> bool {
@@ -932,9 +953,6 @@ impl BackendClient {
         loop {
             match receiver.try_recv() {
                 Ok(message) => {
-                    if let BackendMessage::Observation(observation) = &message {
-                        self.admission.complete(observation, now);
-                    }
                     if let BackendMessage::Catalog(
                         event @ (CatalogEvent::Completed { .. } | CatalogEvent::Failed { .. }),
                     ) = &message
@@ -956,6 +974,16 @@ impl BackendClient {
                 }
             }
         }
+        let observation_completed = self
+            .observation_completion
+            .as_ref()
+            .is_some_and(|completion| completion.try_recv().is_ok());
+        if observation_completed {
+            self.observation_completion.take();
+            if self.admission.complete(now) && !self.send_observation() {
+                self.admission.close();
+            }
+        }
         if disconnected {
             if !self.admission.is_shutting_down()
                 && !matches!(
@@ -968,6 +996,7 @@ impl BackendClient {
                 )));
             }
             self.admission.close();
+            self.observation_completion.take();
             self.receiver.take();
             self.request_sender.take();
         }
@@ -977,6 +1006,7 @@ impl BackendClient {
     pub(crate) fn shutdown(&mut self) {
         self.stopping.store(true, Ordering::Release);
         self.admission.close();
+        self.observation_completion.take();
         if let Some((_, control)) = self.active_transfer.take() {
             control.request_pause();
         }
@@ -994,6 +1024,15 @@ impl BackendClient {
             return false;
         };
         sender.send(request).is_ok()
+    }
+
+    fn send_observation(&mut self) -> bool {
+        let (completion, receiver) = mpsc::channel();
+        if !self.send(BackendRequest::Observe { completion }) {
+            return false;
+        }
+        self.observation_completion = Some(receiver);
+        true
     }
 }
 

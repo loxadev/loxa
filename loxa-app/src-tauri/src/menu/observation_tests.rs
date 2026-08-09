@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -31,6 +31,7 @@ fn mapper_keeps_live_absent_and_paused_states_truthful() {
         ),
         download: CoreDownload::Idle,
         runtime: super::CoreRuntime::Idle,
+        runtime_port: None,
         runtime_inventory: super::CoreRuntimeInventory::Missing,
     });
     assert_eq!(
@@ -46,29 +47,99 @@ fn mapper_keeps_live_absent_and_paused_states_truthful() {
             total_bytes: 5,
         },
         runtime: super::CoreRuntime::Running,
+        runtime_port: Some(43123),
         runtime_inventory: super::CoreRuntimeInventory::External,
     });
     assert_eq!(
         paused.transfer_row().unwrap().progress_detail(),
         "3 of 5 bytes"
     );
+    assert_eq!(
+        paused.runtime_api_label().as_deref(),
+        Some("API · 127.0.0.1:43123")
+    );
 }
 
 #[test]
-fn refresh_admission_observes_startup_then_uses_completed_freshness() {
+fn refresh_admission_requests_each_completed_reopen_and_coalesces_in_flight() {
     let started = Instant::now();
     let mut admission = RefreshAdmission::new();
+
     assert!(admission.admit_startup());
     assert!(!admission.admit_startup());
-    assert!(!admission.admit_popover(started + Duration::from_secs(60)));
-    admission.complete(
-        &ObservationMessage::Snapshot(Fixture::Empty.snapshot()),
-        started,
-    );
-    assert!(!admission.admit_popover(started + Duration::from_secs(59)));
-    assert!(admission.admit_popover(started + Duration::from_secs(60)));
+    assert!(!admission.admit_popover(started + Duration::from_millis(1)));
+
+    let startup_completed = started + Duration::from_millis(2);
+    assert!(admission.complete(startup_completed));
+    assert!(!admission.admit_popover(startup_completed + Duration::from_millis(2)));
+    assert!(!admission.admit_popover(startup_completed + Duration::from_millis(3)));
+
+    let reopen_completed = startup_completed + Duration::from_millis(4);
+    assert!(admission.complete(reopen_completed));
+
+    assert!(!admission.complete(reopen_completed + Duration::from_millis(1)));
+    assert!(admission.admit_popover(reopen_completed + Duration::from_millis(2)));
+    assert!(!admission.complete(reopen_completed + Duration::from_millis(3)));
     admission.close();
     assert!(admission.is_shutting_down());
+    assert!(!admission.admit_startup());
+    assert!(!admission.admit_popover(reopen_completed + Duration::from_millis(4)));
+}
+
+#[test]
+fn popover_open_during_startup_queues_a_fresh_observation_after_startup_finishes() {
+    let (startup_started_sender, startup_started_receiver) = mpsc::channel();
+    let (release_startup_sender, release_startup_receiver) = mpsc::channel();
+    let (worker_handle_sender, worker_handle_receiver) = mpsc::channel();
+    let snapshot_count = Arc::new(AtomicUsize::new(0));
+    let worker_snapshot_count = Arc::clone(&snapshot_count);
+    let mut client = BackendClient::assemble(move |requests, messages, stopping| {
+        let worker = std::thread::Builder::new()
+            .name("loxa-menu-startup-refresh-test".into())
+            .spawn(move || {
+                run_backend_worker(
+                    Ok(StartupRefreshBackend {
+                        snapshot_count: worker_snapshot_count,
+                        startup_started: startup_started_sender,
+                        release_startup: Some(release_startup_receiver),
+                    }),
+                    requests,
+                    messages,
+                    &stopping,
+                );
+            })
+            .map_err(|error| error.to_string())?;
+        worker_handle_sender
+            .send(worker)
+            .map_err(|error| error.to_string())
+    });
+    let worker = worker_handle_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the startup refresh worker must start");
+
+    assert_eq!(
+        startup_started_receiver.recv_timeout(Duration::from_secs(2)),
+        Ok(())
+    );
+    assert!(
+        !client.request_popover_open(Instant::now()),
+        "the open must coalesce while startup observation is in flight"
+    );
+    release_startup_sender.send(()).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while snapshot_count.load(Ordering::Acquire) < 2 || client.admission.in_flight {
+        let _ = client.drain(Instant::now());
+        assert!(
+            Instant::now() < deadline,
+            "the coalesced popover open must trigger one fresh observation"
+        );
+        std::thread::yield_now();
+    }
+
+    client.shutdown();
+    worker.join().unwrap();
+    assert_eq!(snapshot_count.load(Ordering::Acquire), 2);
 }
 
 #[test]
@@ -208,7 +279,10 @@ fn worker_refreshes_inventory_immediately_after_installed_and_already_installed(
         };
         let (request_sender, request_receiver) = mpsc::channel();
         let (message_sender, message_receiver) = mpsc::channel();
-        request_sender.send(BackendRequest::Observe).unwrap();
+        let (completion, _completion_receiver) = mpsc::channel();
+        request_sender
+            .send(BackendRequest::Observe { completion })
+            .unwrap();
         request_sender
             .send(BackendRequest::Transfer {
                 generation: 11,
@@ -272,7 +346,10 @@ fn worker_refreshes_inventory_immediately_after_installed_and_already_installed(
 fn worker_drops_the_completion_pin_when_terminal_inventory_refresh_fails() {
     let (request_sender, request_receiver) = mpsc::channel();
     let (message_sender, message_receiver) = mpsc::channel();
-    request_sender.send(BackendRequest::Observe).unwrap();
+    let (completion, _completion_receiver) = mpsc::channel();
+    request_sender
+        .send(BackendRequest::Observe { completion })
+        .unwrap();
     request_sender
         .send(BackendRequest::Transfer {
             generation: 12,
@@ -329,7 +406,10 @@ fn worker_drops_the_completion_pin_when_terminal_inventory_refresh_fails() {
 fn worker_maps_inventory_failures_to_the_closed_sanitized_error() {
     let (request_sender, request_receiver) = mpsc::channel();
     let (message_sender, message_receiver) = mpsc::channel();
-    request_sender.send(BackendRequest::Observe).unwrap();
+    let (completion, _completion_receiver) = mpsc::channel();
+    request_sender
+        .send(BackendRequest::Observe { completion })
+        .unwrap();
     request_sender.send(BackendRequest::Stop).unwrap();
 
     run_backend_worker(
@@ -474,6 +554,7 @@ fn worker_prepares_before_confirmation_keeps_without_consuming_and_discards_the_
             operations: operations.clone(),
             fail_inventory: false,
             refresh_barrier: None,
+            snapshot_count: 0,
         }),
         request_receiver,
         message_sender,
@@ -536,16 +617,27 @@ struct DiscardBackend {
     operations: Arc<Mutex<Vec<String>>>,
     fail_inventory: bool,
     refresh_barrier: Option<RefreshBarrier>,
+    snapshot_count: usize,
 }
 
 struct RefreshBarrier {
+    after_snapshot: usize,
     started: mpsc::Sender<()>,
     release: mpsc::Receiver<()>,
 }
 
 impl BackendSource for DiscardBackend {
     fn snapshot(&mut self) -> MenuSnapshot {
-        if let Some(barrier) = self.refresh_barrier.take() {
+        self.snapshot_count += 1;
+        let should_block = self
+            .refresh_barrier
+            .as_ref()
+            .is_some_and(|barrier| barrier.after_snapshot == self.snapshot_count);
+        if should_block {
+            let barrier = self
+                .refresh_barrier
+                .take()
+                .expect("the selected snapshot has one refresh barrier");
             let _ = barrier.started.send(());
             let _ = barrier.release.recv_timeout(Duration::from_secs(2));
         }
@@ -634,6 +726,7 @@ fn successful_discard_is_delivered_before_a_failed_inventory_refresh() {
             operations: Arc::new(Mutex::new(Vec::new())),
             fail_inventory: true,
             refresh_barrier: None,
+            snapshot_count: 0,
         }),
         request_receiver,
         message_sender,
@@ -675,9 +768,11 @@ fn discard_completion_crosses_the_channel_before_refresh_starts() {
                 operations: Arc::new(Mutex::new(Vec::new())),
                 fail_inventory: false,
                 refresh_barrier: Some(RefreshBarrier {
+                    after_snapshot: 1,
                     started: refresh_started_sender,
                     release: release_refresh_receiver,
                 }),
+                snapshot_count: 0,
             }),
             request_receiver,
             message_sender,
@@ -719,7 +814,127 @@ fn discard_completion_crosses_the_channel_before_refresh_starts() {
     );
 }
 
+#[test]
+fn discard_observation_interleaving_keeps_popover_observation_in_flight() {
+    let (reopen_started_sender, reopen_started_receiver) = mpsc::channel();
+    let (release_reopen_sender, release_reopen_receiver) = mpsc::channel();
+    let (worker_handle_sender, worker_handle_receiver) = mpsc::channel();
+    let mut client = BackendClient::assemble(move |requests, messages, stopping| {
+        let worker = std::thread::Builder::new()
+            .name("loxa-menu-discard-interleaving-test".into())
+            .spawn(move || {
+                run_backend_worker(
+                    Ok(DiscardBackend {
+                        prepared: None,
+                        operations: Arc::new(Mutex::new(Vec::new())),
+                        fail_inventory: false,
+                        refresh_barrier: Some(RefreshBarrier {
+                            after_snapshot: 3,
+                            started: reopen_started_sender,
+                            release: release_reopen_receiver,
+                        }),
+                        snapshot_count: 0,
+                    }),
+                    requests,
+                    messages,
+                    &stopping,
+                );
+            })
+            .map_err(|error| error.to_string())?;
+        worker_handle_sender
+            .send(worker)
+            .map_err(|error| error.to_string())
+    });
+    let worker = worker_handle_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the interleaving worker must start");
+
+    let startup_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let _ = client.drain(Instant::now());
+        if !client.admission.in_flight {
+            break;
+        }
+        assert!(
+            Instant::now() < startup_deadline,
+            "the startup observation must complete"
+        );
+        std::thread::yield_now();
+    }
+
+    assert!(client.prepare_discard("alpha".into()));
+    assert!(client.confirm_discard("alpha".into()));
+    assert!(client.request_popover_open(Instant::now()));
+    assert_eq!(
+        reopen_started_receiver.recv_timeout(Duration::from_secs(2)),
+        Ok(())
+    );
+
+    let interleaved_messages = client.drain(Instant::now());
+    assert!(interleaved_messages.iter().any(|message| matches!(
+        message,
+        BackendMessage::DiscardCompleted {
+            model_id,
+            result: Ok(())
+        } if model_id == "alpha"
+    )));
+    assert!(interleaved_messages
+        .iter()
+        .any(|message| matches!(message, BackendMessage::Observation(_))));
+    let second_reopen_was_coalesced = !client.request_popover_open(Instant::now());
+
+    client.shutdown();
+    let _ = release_reopen_sender.send(());
+    worker.join().unwrap();
+
+    assert!(
+        second_reopen_was_coalesced,
+        "a discard-generated observation must not complete the admitted popover observation"
+    );
+}
+
 struct FakeBackend;
+
+struct StartupRefreshBackend {
+    snapshot_count: Arc<AtomicUsize>,
+    startup_started: mpsc::Sender<()>,
+    release_startup: Option<mpsc::Receiver<()>>,
+}
+
+impl BackendSource for StartupRefreshBackend {
+    fn snapshot(&mut self) -> MenuSnapshot {
+        let observation = self.snapshot_count.fetch_add(1, Ordering::AcqRel) + 1;
+        if observation == 1 {
+            let _ = self.startup_started.send(());
+            let release = self
+                .release_startup
+                .take()
+                .expect("only the startup observation is blocked");
+            let _ = release.recv_timeout(Duration::from_secs(2));
+        }
+        Fixture::Empty.snapshot()
+    }
+
+    fn installed_models(&mut self) -> Result<Vec<InstalledItem>, InstalledInventoryError> {
+        Ok(Vec::new())
+    }
+
+    fn search(&mut self, _query: String) -> Result<Vec<RepositoryItem>, String> {
+        Err("search is outside this test".into())
+    }
+
+    fn inspect(&mut self, _repo: String) -> Result<InspectedRepository, String> {
+        Err("inspection is outside this test".into())
+    }
+
+    fn transfer(
+        &mut self,
+        _transfer: BackendTransfer,
+        _progress: &mut dyn FnMut(TransferStage, u64, u64),
+    ) -> Result<TransferCompletion, String> {
+        Err("transfer is outside this test".into())
+    }
+}
 
 impl BackendSource for FakeBackend {
     fn snapshot(&mut self) -> MenuSnapshot {

@@ -378,6 +378,8 @@ fn candidate_row(
     action: Sel,
     mtm: MainThreadMarker,
 ) -> ResultRow {
+    let (leading_symbol, trailing_symbol) =
+        candidate_icon_symbols(candidate.is_installed(), selected);
     let size = candidate
         .size()
         .map(format_bytes)
@@ -400,17 +402,28 @@ fn candidate_row(
     result_row(
         candidate.path(),
         &detail,
-        "doc",
-        if selected {
-            "checkmark.circle.fill"
-        } else {
-            "chevron.right"
-        },
+        leading_symbol,
+        trailing_symbol,
         &accessibility_label,
         index,
         target,
         action,
         mtm,
+    )
+}
+
+fn candidate_icon_symbols(installed: bool, selected: bool) -> (&'static str, &'static str) {
+    (
+        if installed {
+            "checkmark.circle.fill"
+        } else {
+            "doc"
+        },
+        if selected {
+            "checkmark.circle.fill"
+        } else {
+            "chevron.right"
+        },
     )
 }
 
@@ -580,4 +593,27 @@ fn image_view(
 
 fn rect(x: f64, y: f64, width: f64, height: f64) -> NSRect {
     NSRect::new(NSPoint::new(x, y), NSSize::new(width, height))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::candidate_icon_symbols;
+
+    #[test]
+    fn candidate_icon_matrix_keeps_installation_and_selection_independent() {
+        assert_eq!(
+            [
+                candidate_icon_symbols(false, false),
+                candidate_icon_symbols(false, true),
+                candidate_icon_symbols(true, false),
+                candidate_icon_symbols(true, true),
+            ],
+            [
+                ("doc", "chevron.right"),
+                ("doc", "checkmark.circle.fill"),
+                ("checkmark.circle.fill", "chevron.right"),
+                ("checkmark.circle.fill", "checkmark.circle.fill"),
+            ]
+        );
+    }
 }

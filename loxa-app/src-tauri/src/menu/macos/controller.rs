@@ -6,8 +6,8 @@ use objc2::rc::{Retained, Weak};
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSAccessibility, NSButton, NSPopover, NSPopoverBehavior, NSPopoverDelegate, NSSearchField,
-    NSStatusItem, NSViewController,
+    NSAccessibility, NSButton, NSPasteboard, NSPasteboardTypeString, NSPopover, NSPopoverBehavior,
+    NSPopoverDelegate, NSSearchField, NSStatusItem, NSViewController,
 };
 use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSRectEdge, NSString};
 use tauri::AppHandle;
@@ -283,6 +283,25 @@ impl NativePopoverState {
     }
 }
 
+fn copy_runtime_curl_with<Copy>(snapshot: &MenuSnapshot, copy: Copy) -> bool
+where
+    Copy: FnOnce(&str) -> bool,
+{
+    snapshot
+        .runtime_curl_command()
+        .is_some_and(|command| copy(&command))
+}
+
+fn copy_runtime_curl_to_pasteboard(snapshot: &MenuSnapshot) -> bool {
+    copy_runtime_curl_with(snapshot, |command| {
+        let pasteboard = NSPasteboard::generalPasteboard();
+        pasteboard.clearContents();
+        // SAFETY: AppKit initializes this immutable standard pasteboard type.
+        let string_type = unsafe { NSPasteboardTypeString };
+        pasteboard.setString_forType(&NSString::from_str(command), string_type)
+    })
+}
+
 struct NativePopoverDelegateIvars {
     target: Weak<NativePopoverTarget>,
 }
@@ -339,6 +358,12 @@ define_class!(
     unsafe impl NSObjectProtocol for NativePopoverTarget {}
 
     impl NativePopoverTarget {
+        #[unsafe(method(copyRuntimeCurl:))]
+        fn copy_runtime_curl(&self, _sender: Option<&NSButton>) {
+            let snapshot = self.ivars().state.borrow().snapshot.clone();
+            let _ = copy_runtime_curl_to_pasteboard(&snapshot);
+        }
+
         #[unsafe(method(submitSearch:))]
         fn submit_search(&self, sender: Option<&NSSearchField>) {
             let query = sender
@@ -709,6 +734,7 @@ impl Drop for NativePopoverController {
 }
 
 struct ProductionActionSelectors {
+    runtime_copy: Sel,
     search: Sel,
     repository: Sel,
     candidate: Sel,
@@ -725,6 +751,7 @@ struct ProductionActionSelectors {
 
 fn production_action_selectors() -> ProductionActionSelectors {
     ProductionActionSelectors {
+        runtime_copy: sel!(copyRuntimeCurl:),
         search: sel!(submitSearch:),
         repository: sel!(inspectRepository:),
         candidate: sel!(selectCandidate:),
@@ -742,6 +769,7 @@ fn production_action_selectors() -> ProductionActionSelectors {
 
 fn action_selectors() -> Actions {
     let ProductionActionSelectors {
+        runtime_copy,
         search,
         repository,
         candidate,
@@ -756,6 +784,7 @@ fn action_selectors() -> Actions {
         quit,
     } = production_action_selectors();
     Actions {
+        runtime_copy,
         search,
         repository,
         candidate,
@@ -798,13 +827,40 @@ fn selected_fixture() -> Fixture {
 mod tests {
     use objc2::{sel, ClassType};
 
-    use super::{production_action_selectors, NativePopoverTarget, ProductionActionSelectors};
+    use super::{
+        copy_runtime_curl_with, production_action_selectors, NativePopoverTarget,
+        ProductionActionSelectors,
+    };
+    use crate::menu::presentation::Fixture;
+
+    #[test]
+    fn runtime_copy_dispatches_the_exact_curl_only_for_a_running_endpoint() {
+        let running = Fixture::Running
+            .snapshot()
+            .with_running_port(43123)
+            .unwrap();
+        let mut copied = None;
+        assert!(copy_runtime_curl_with(&running, |command| {
+            copied = Some(command.to_owned());
+            true
+        }));
+        assert_eq!(
+            copied.as_deref(),
+            Some("curl http://127.0.0.1:43123/v1/models")
+        );
+
+        assert!(!copy_runtime_curl_with(
+            &Fixture::Installed.snapshot(),
+            |_| panic!("idle snapshots must not reach the clipboard")
+        ));
+    }
 
     #[test]
     fn production_target_exposes_catalog_and_transfer_actions() {
         let class = NativePopoverTarget::class();
 
         for action in [
+            sel!(copyRuntimeCurl:),
             sel!(submitSearch:),
             sel!(inspectRepository:),
             sel!(selectCandidate:),
@@ -827,6 +883,7 @@ mod tests {
     #[test]
     fn production_actions_expose_catalog_transfer_and_quit_selectors() {
         let ProductionActionSelectors {
+            runtime_copy,
             search,
             repository,
             candidate,
@@ -841,6 +898,7 @@ mod tests {
             quit,
         } = production_action_selectors();
 
+        assert_eq!(runtime_copy, sel!(copyRuntimeCurl:));
         assert_eq!(search, sel!(submitSearch:));
         assert_eq!(repository, sel!(inspectRepository:));
         assert_eq!(candidate, sel!(selectCandidate:));

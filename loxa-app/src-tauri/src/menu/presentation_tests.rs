@@ -36,12 +36,12 @@ fn installed_fixture_retains_its_quantization_metadata() {
 fn loading_and_setup_error_are_owned_menu_states_not_fixture_snapshots() {
     let loading = MenuSnapshot::loading();
     assert!(loading.is_loading());
-    assert_eq!(loading.runtime_label(), "Loading");
+    assert_eq!(loading.runtime_label(), "Inference: Loading");
     assert_eq!(loading.error_message(), None);
 
     let error = MenuSnapshot::error("set LOXA_HOME, HOME, or USERPROFILE".to_owned());
     assert!(!error.is_loading());
-    assert_eq!(error.runtime_label(), "Runtime: Unavailable");
+    assert_eq!(error.runtime_label(), "Inference: Unavailable");
     assert_eq!(
         error.error_message(),
         Some("set LOXA_HOME, HOME, or USERPROFILE")
@@ -417,11 +417,11 @@ fn completed_fixture_is_an_installed_snapshot() {
 #[test]
 fn header_runtime_labels_are_safe_and_complete_for_each_runtime_state() {
     for (runtime, expected) in [
-        (Runtime::Idle, "Runtime: Stopped"),
-        (Runtime::Starting, "Runtime: Starting"),
-        (Runtime::Running, "Runtime: Running"),
-        (Runtime::Stopping, "Runtime: Stopping"),
-        (Runtime::Error, "Runtime: Error"),
+        (Runtime::Idle, "Inference: Idle"),
+        (Runtime::Starting, "Inference: Starting"),
+        (Runtime::Running, "Inference: Running"),
+        (Runtime::Stopping, "Inference: Stopping"),
+        (Runtime::Error, "Inference: Error"),
     ] {
         let snapshot = MenuSnapshot::new(
             Bundle::Absent,
@@ -433,6 +433,40 @@ fn header_runtime_labels_are_safe_and_complete_for_each_runtime_state() {
         .unwrap();
         assert_eq!(snapshot.runtime_label(), expected);
     }
+}
+
+#[test]
+fn running_header_exposes_the_validated_loopback_port_and_copyable_curl() {
+    let running = MenuSnapshot::new(
+        Bundle::Absent,
+        Recommendation::available(TARGET_BYTES, DRAFT_BYTES),
+        Download::Idle,
+        Runtime::Running,
+        RuntimeInventory::External,
+    )
+    .unwrap()
+    .with_running_port(43123)
+    .unwrap();
+
+    assert_eq!(
+        running.runtime_api_label().as_deref(),
+        Some("API · 127.0.0.1:43123")
+    );
+    assert_eq!(
+        running.runtime_curl_command().as_deref(),
+        Some("curl http://127.0.0.1:43123/v1/models")
+    );
+
+    let idle = MenuSnapshot::new(
+        Bundle::Absent,
+        Recommendation::available(TARGET_BYTES, DRAFT_BYTES),
+        Download::Idle,
+        Runtime::Idle,
+        RuntimeInventory::Missing,
+    )
+    .unwrap();
+    assert_eq!(idle.runtime_api_label(), None);
+    assert_eq!(idle.runtime_curl_command(), None);
 }
 
 #[test]
@@ -609,7 +643,7 @@ fn every_named_fixture_maps_to_its_exact_static_presentation() {
     let expectations = [
         Expectation {
             name: "empty",
-            runtime: "Runtime: Stopped",
+            runtime: "Inference: Idle",
             body: ExpectedBody::Recommendation("Ready to download"),
             phase: None,
             action: Some(MenuAction::Start),
@@ -617,7 +651,7 @@ fn every_named_fixture_maps_to_its_exact_static_presentation() {
         },
         Expectation {
             name: "low-memory",
-            runtime: "Runtime: Stopped",
+            runtime: "Inference: Idle",
             body: ExpectedBody::Recommendation("Insufficient memory"),
             phase: None,
             action: None,
@@ -625,7 +659,7 @@ fn every_named_fixture_maps_to_its_exact_static_presentation() {
         },
         Expectation {
             name: "low-disk",
-            runtime: "Runtime: Stopped",
+            runtime: "Inference: Idle",
             body: ExpectedBody::Recommendation("Insufficient disk space"),
             phase: None,
             action: None,
@@ -633,7 +667,7 @@ fn every_named_fixture_maps_to_its_exact_static_presentation() {
         },
         Expectation {
             name: "unavailable",
-            runtime: "Runtime: Stopped",
+            runtime: "Inference: Idle",
             body: ExpectedBody::Recommendation("Unavailable on this Mac"),
             phase: None,
             action: None,
@@ -641,7 +675,7 @@ fn every_named_fixture_maps_to_its_exact_static_presentation() {
         },
         Expectation {
             name: "installed",
-            runtime: "Runtime: Stopped",
+            runtime: "Inference: Idle",
             body: ExpectedBody::Installed("Verified"),
             phase: None,
             action: None,
@@ -649,7 +683,7 @@ fn every_named_fixture_maps_to_its_exact_static_presentation() {
         },
         Expectation {
             name: "completed",
-            runtime: "Runtime: Stopped",
+            runtime: "Inference: Idle",
             body: ExpectedBody::Installed("Verified"),
             phase: None,
             action: None,
@@ -657,7 +691,7 @@ fn every_named_fixture_maps_to_its_exact_static_presentation() {
         },
         Expectation {
             name: "running",
-            runtime: "Runtime: Running",
+            runtime: "Inference: Running",
             body: ExpectedBody::Installed("Verified"),
             phase: None,
             action: None,
@@ -665,7 +699,7 @@ fn every_named_fixture_maps_to_its_exact_static_presentation() {
         },
         Expectation {
             name: "invalid",
-            runtime: "Runtime: Error",
+            runtime: "Inference: Error",
             body: ExpectedBody::Recovery("Verify the managed bundle before trying again."),
             phase: None,
             action: None,
@@ -673,7 +707,7 @@ fn every_named_fixture_maps_to_its_exact_static_presentation() {
         },
         Expectation {
             name: "busy",
-            runtime: "Runtime: Stopped",
+            runtime: "Inference: Idle",
             body: ExpectedBody::Recovery("Another Loxa process is updating this bundle."),
             phase: None,
             action: None,
@@ -681,7 +715,7 @@ fn every_named_fixture_maps_to_its_exact_static_presentation() {
         },
         Expectation {
             name: "preparing",
-            runtime: "Runtime: Stopped",
+            runtime: "Inference: Idle",
             body: ExpectedBody::Transfer,
             phase: Some("Preparing"),
             action: Some(MenuAction::Pause),
@@ -689,7 +723,7 @@ fn every_named_fixture_maps_to_its_exact_static_presentation() {
         },
         Expectation {
             name: "downloading",
-            runtime: "Runtime: Stopped",
+            runtime: "Inference: Idle",
             body: ExpectedBody::Transfer,
             phase: Some("Downloading target"),
             action: Some(MenuAction::Pause),
@@ -697,7 +731,7 @@ fn every_named_fixture_maps_to_its_exact_static_presentation() {
         },
         Expectation {
             name: "draft",
-            runtime: "Runtime: Stopped",
+            runtime: "Inference: Idle",
             body: ExpectedBody::Transfer,
             phase: Some("Downloading MTP draft"),
             action: Some(MenuAction::Pause),
@@ -705,7 +739,7 @@ fn every_named_fixture_maps_to_its_exact_static_presentation() {
         },
         Expectation {
             name: "verifying",
-            runtime: "Runtime: Stopped",
+            runtime: "Inference: Idle",
             body: ExpectedBody::Transfer,
             phase: Some("Verifying"),
             action: Some(MenuAction::Pause),
@@ -713,7 +747,7 @@ fn every_named_fixture_maps_to_its_exact_static_presentation() {
         },
         Expectation {
             name: "publishing",
-            runtime: "Runtime: Stopped",
+            runtime: "Inference: Idle",
             body: ExpectedBody::Transfer,
             phase: Some("Publishing"),
             action: Some(MenuAction::Pause),
@@ -721,7 +755,7 @@ fn every_named_fixture_maps_to_its_exact_static_presentation() {
         },
         Expectation {
             name: "paused",
-            runtime: "Runtime: Stopped",
+            runtime: "Inference: Idle",
             body: ExpectedBody::Transfer,
             phase: Some("Paused during MTP draft"),
             action: Some(MenuAction::Resume),
@@ -729,7 +763,7 @@ fn every_named_fixture_maps_to_its_exact_static_presentation() {
         },
         Expectation {
             name: "failed",
-            runtime: "Runtime: Stopped",
+            runtime: "Inference: Idle",
             body: ExpectedBody::Transfer,
             phase: Some("Verification failed"),
             action: Some(MenuAction::Retry),
@@ -737,7 +771,7 @@ fn every_named_fixture_maps_to_its_exact_static_presentation() {
         },
         Expectation {
             name: "starting",
-            runtime: "Runtime: Starting",
+            runtime: "Inference: Starting",
             body: ExpectedBody::Recommendation("Ready to download"),
             phase: None,
             action: Some(MenuAction::Start),
@@ -745,7 +779,7 @@ fn every_named_fixture_maps_to_its_exact_static_presentation() {
         },
         Expectation {
             name: "stopping",
-            runtime: "Runtime: Stopping",
+            runtime: "Inference: Stopping",
             body: ExpectedBody::Recommendation("Ready to download"),
             phase: None,
             action: Some(MenuAction::Start),
@@ -753,7 +787,7 @@ fn every_named_fixture_maps_to_its_exact_static_presentation() {
         },
         Expectation {
             name: "error",
-            runtime: "Runtime: Error",
+            runtime: "Inference: Error",
             body: ExpectedBody::Recommendation("Ready to download"),
             phase: None,
             action: Some(MenuAction::Start),

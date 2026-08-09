@@ -140,6 +140,7 @@ pub struct AppSnapshot {
     recommendation: RecommendationSnapshot,
     download: DownloadSnapshot,
     runtime: RuntimeSnapshot,
+    runtime_port: Option<u16>,
     runtime_inventory: RuntimeInventorySnapshot,
 }
 
@@ -158,6 +159,10 @@ impl AppSnapshot {
 
     pub fn runtime(&self) -> RuntimeSnapshot {
         self.runtime
+    }
+
+    pub fn runtime_port(&self) -> Option<u16> {
+        self.runtime_port
     }
 
     pub fn runtime_inventory(&self) -> RuntimeInventorySnapshot {
@@ -205,21 +210,26 @@ impl AppSnapshot {
         let runtime = match foreground {
             ForegroundObservation::Idle => RuntimeSnapshot::Idle,
             ForegroundObservation::Starting => RuntimeSnapshot::Starting,
-            ForegroundObservation::Running(_) => RuntimeSnapshot::Running,
+            ForegroundObservation::Running(_, _) => RuntimeSnapshot::Running,
             ForegroundObservation::Stopping => RuntimeSnapshot::Stopping,
             ForegroundObservation::Error => RuntimeSnapshot::Error,
         };
         let runtime_inventory = match foreground {
-            ForegroundObservation::Running(RuntimeProvenance::External) => {
+            ForegroundObservation::Running(RuntimeProvenance::External, _) => {
                 RuntimeInventorySnapshot::External
             }
             _ => RuntimeInventorySnapshot::Missing,
+        };
+        let runtime_port = match foreground {
+            ForegroundObservation::Running(_, port) => Some(port),
+            _ => None,
         };
         Self {
             bundle,
             recommendation,
             download,
             runtime,
+            runtime_port,
             runtime_inventory,
         }
     }
@@ -1280,9 +1290,10 @@ mod tests {
         let external = AppSnapshot::from_observation(
             BundleSnapshot::Absent,
             Some(enough_budget()),
-            ForegroundObservation::Running(RuntimeProvenance::External),
+            ForegroundObservation::Running(RuntimeProvenance::External, 43123),
         );
         assert_eq!(external.runtime(), RuntimeSnapshot::Running);
+        assert_eq!(external.runtime_port(), Some(43123));
         assert_eq!(
             external.runtime_inventory(),
             RuntimeInventorySnapshot::External
@@ -1292,9 +1303,10 @@ mod tests {
         let managed = AppSnapshot::from_observation(
             BundleSnapshot::Absent,
             Some(enough_budget()),
-            ForegroundObservation::Running(RuntimeProvenance::Managed),
+            ForegroundObservation::Running(RuntimeProvenance::Managed, 43124),
         );
         assert_eq!(managed.runtime(), RuntimeSnapshot::Running);
+        assert_eq!(managed.runtime_port(), Some(43124));
         assert_eq!(
             managed.runtime_inventory(),
             RuntimeInventorySnapshot::Missing
@@ -1306,6 +1318,7 @@ mod tests {
             ForegroundObservation::Idle,
         );
         assert_eq!(idle.runtime(), RuntimeSnapshot::Idle);
+        assert_eq!(idle.runtime_port(), None);
         assert_eq!(idle.runtime_inventory(), RuntimeInventorySnapshot::Missing);
     }
 

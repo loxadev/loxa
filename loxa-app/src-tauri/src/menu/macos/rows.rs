@@ -31,6 +31,7 @@ const FINAL_CONTENT_SPACER_HEIGHT: f64 = 4.0;
 
 #[derive(Clone, Copy)]
 pub(super) struct Actions {
+    pub(super) runtime_copy: Sel,
     pub(super) search: Sel,
     pub(super) repository: Sel,
     pub(super) candidate: Sel,
@@ -92,7 +93,7 @@ impl MenuRows {
             content_height(snapshot, catalog, incomplete, installed),
             mtm,
         );
-        let header = HeaderRow::build(snapshot, mtm);
+        let header = HeaderRow::build(snapshot, target, actions, mtm);
         layout.add(&header.root, HEADER_HEIGHT);
         layout.add_separator(mtm);
 
@@ -220,6 +221,10 @@ impl MenuRows {
 
         #[cfg(test)]
         let mut action_buttons = body.action_buttons();
+        #[cfg(test)]
+        if let Some(button) = header.action_button() {
+            action_buttons.push(button);
+        }
         #[cfg(test)]
         action_buttons.extend(catalog_content.action_buttons.iter().cloned());
         #[cfg(test)]
@@ -495,27 +500,68 @@ impl BodyRows {
 struct HeaderRow {
     root: Retained<NSView>,
     runtime_label: Retained<NSTextField>,
+    api_label: Retained<NSTextField>,
+    copy_button: Retained<NSButton>,
 }
 
 impl HeaderRow {
-    fn build(snapshot: &MenuSnapshot, mtm: MainThreadMarker) -> Self {
+    fn build(
+        snapshot: &MenuSnapshot,
+        target: Option<&AnyObject>,
+        actions: Actions,
+        mtm: MainThreadMarker,
+    ) -> Self {
         let root = row_shell(HEADER_HEIGHT, mtm);
         let stack = vertical_stack(mtm);
         let title = primary_label("Loxa", mtm);
+        let runtime = horizontal_stack(mtm);
         let runtime_label = secondary_label(snapshot.runtime_label(), mtm);
+        let api_text = snapshot.runtime_api_label();
+        let api_label = secondary_label(api_text.as_deref().unwrap_or(""), mtm);
+        let copy_button = icon_button(
+            "doc.on.doc",
+            "Copy API curl command",
+            target,
+            actions.runtime_copy,
+            mtm,
+        );
+        let endpoint_hidden = api_text.is_none();
+        api_label.setHidden(endpoint_hidden);
+        copy_button.setHidden(endpoint_hidden);
 
         stack.addArrangedSubview(&title);
-        stack.addArrangedSubview(&runtime_label);
+        runtime.addArrangedSubview(&runtime_label);
+        runtime.addArrangedSubview(&api_label);
+        runtime.addArrangedSubview(&copy_button);
+        stack.addArrangedSubview(&runtime);
         pin_to_content(&root, &stack);
 
         Self {
             root,
             runtime_label,
+            api_label,
+            copy_button,
         }
     }
 
     fn update(&mut self, snapshot: &MenuSnapshot) {
         set_label(&self.runtime_label, snapshot.runtime_label());
+        match snapshot.runtime_api_label() {
+            Some(label) => {
+                set_label(&self.api_label, &label);
+                self.api_label.setHidden(false);
+                self.copy_button.setHidden(false);
+            }
+            None => {
+                self.api_label.setHidden(true);
+                self.copy_button.setHidden(true);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn action_button(&self) -> Option<Retained<NSButton>> {
+        (!self.copy_button.isHidden()).then(|| self.copy_button.clone())
     }
 }
 
@@ -1237,7 +1283,6 @@ fn primary_action_button(
     icon_button(symbol, label, target, selector, mtm)
 }
 
-#[cfg(test)]
 fn icon_button(
     symbol: &str,
     accessibility_label: &str,

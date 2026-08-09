@@ -512,6 +512,7 @@ enum MenuBody {
 pub(crate) struct MenuSnapshot {
     body: MenuBody,
     runtime: Option<Runtime>,
+    runtime_port: Option<u16>,
     runtime_inventory: Option<RuntimeInventory>,
     footer: Footer,
 }
@@ -856,6 +857,7 @@ impl MenuSnapshot {
         Ok(Self {
             body,
             runtime: Some(runtime),
+            runtime_port: None,
             runtime_inventory: Some(runtime_inventory),
             footer: Footer {
                 inventory: Some(runtime_inventory),
@@ -867,6 +869,7 @@ impl MenuSnapshot {
         Self {
             body: MenuBody::Loading,
             runtime: None,
+            runtime_port: None,
             runtime_inventory: None,
             footer: Footer { inventory: None },
         }
@@ -876,6 +879,7 @@ impl MenuSnapshot {
         Self {
             body: MenuBody::Error(error),
             runtime: None,
+            runtime_port: None,
             runtime_inventory: None,
             footer: Footer { inventory: None },
         }
@@ -973,21 +977,39 @@ impl MenuSnapshot {
 
     pub(crate) fn runtime_label(&self) -> &'static str {
         match &self.body {
-            MenuBody::Loading => "Loading",
-            MenuBody::Error(_) => "Runtime: Unavailable",
+            MenuBody::Loading => "Inference: Loading",
+            MenuBody::Error(_) => "Inference: Unavailable",
             MenuBody::CleanAbsence(_)
             | MenuBody::Verified(_)
             | MenuBody::Recovery(_)
             | MenuBody::Partial(_) => {
                 match self.runtime.expect("observed snapshots have runtime state") {
-                    Runtime::Idle => "Runtime: Stopped",
-                    Runtime::Starting => "Runtime: Starting",
-                    Runtime::Running => "Runtime: Running",
-                    Runtime::Stopping => "Runtime: Stopping",
-                    Runtime::Error => "Runtime: Error",
+                    Runtime::Idle => "Inference: Idle",
+                    Runtime::Starting => "Inference: Starting",
+                    Runtime::Running => "Inference: Running",
+                    Runtime::Stopping => "Inference: Stopping",
+                    Runtime::Error => "Inference: Error",
                 }
             }
         }
+    }
+
+    pub(crate) fn with_running_port(mut self, port: u16) -> Result<Self, &'static str> {
+        if self.runtime != Some(Runtime::Running) || port == 0 {
+            return Err("runtime port requires a running inference process");
+        }
+        self.runtime_port = Some(port);
+        Ok(self)
+    }
+
+    pub(crate) fn runtime_api_label(&self) -> Option<String> {
+        self.runtime_port
+            .map(|port| format!("API · 127.0.0.1:{port}"))
+    }
+
+    pub(crate) fn runtime_curl_command(&self) -> Option<String> {
+        self.runtime_port
+            .map(|port| format!("curl http://127.0.0.1:{port}/v1/models"))
     }
 
     pub(crate) fn update_from(&self, previous: Option<&Self>) -> MenuUpdate {

@@ -57,7 +57,7 @@ pub(crate) enum RuntimeProvenance {
 pub(crate) enum ForegroundObservation {
     Idle,
     Starting,
-    Running(RuntimeProvenance),
+    Running(RuntimeProvenance, u16),
     Stopping,
     Error,
 }
@@ -109,7 +109,7 @@ impl ForegroundObserver {
                         Ok(Some(provenance)) => {
                             self.previously_running = true;
                             self.mismatch_started = None;
-                            ForegroundObservation::Running(provenance)
+                            ForegroundObservation::Running(provenance, lease.port)
                         }
                         Ok(None) | Err(_) if self.previously_running => {
                             let started = self.mismatch_started.get_or_insert_with(Instant::now);
@@ -1551,7 +1551,7 @@ mod tests {
         ));
         assert_eq!(
             observer.observe(managed),
-            ForegroundObservation::Running(RuntimeProvenance::External)
+            ForegroundObservation::Running(RuntimeProvenance::External, 43123)
         );
         assert_eq!(fs::read(&state_path).unwrap(), before);
         assert!(dir.path().join("foreground.lock").is_file());
@@ -1643,7 +1643,7 @@ mod tests {
             let mut observer = ForegroundObserver::new(dir.path().to_path_buf());
             assert_ne!(
                 observer.observe(managed),
-                ForegroundObservation::Running(RuntimeProvenance::External),
+                ForegroundObservation::Running(RuntimeProvenance::External, 43123),
                 "mismatch unexpectedly became Running: {mismatch:?}"
             );
         }
@@ -1655,7 +1655,7 @@ mod tests {
         let mut observer = ForegroundObserver::new(grace.path().to_path_buf());
         assert_eq!(
             observer.observe(managed),
-            ForegroundObservation::Running(RuntimeProvenance::External)
+            ForegroundObservation::Running(RuntimeProvenance::External, 43123)
         );
         let mut wrong_port = lease;
         wrong_port.port = 43124;
