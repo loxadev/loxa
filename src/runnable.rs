@@ -1,12 +1,61 @@
 use crate::catalog::Manifest;
 use crate::paths::AppPaths;
+use crate::runtime_fingerprint::RuntimeFingerprint;
 use crate::{catalog, cli, config, load_installed_models, runner, verification};
 use std::path::Path;
 use std::time::Instant;
 
+#[allow(
+    dead_code,
+    reason = "persistent host ownership is added by the follow-on task"
+)]
 pub(crate) struct Runnable {
     _model_lock: catalog::ModelLock,
-    pub(crate) launch: runner::Launch,
+    launch: runner::Launch,
+    fingerprint: RuntimeFingerprint,
+}
+
+#[allow(
+    dead_code,
+    reason = "persistent host ownership is added by the follow-on task"
+)]
+impl Runnable {
+    fn new(
+        model_lock: catalog::ModelLock,
+        launch: runner::Launch,
+        fingerprint: RuntimeFingerprint,
+    ) -> Self {
+        Self {
+            _model_lock: model_lock,
+            launch,
+            fingerprint,
+        }
+    }
+
+    pub(crate) fn launch(&self) -> &runner::Launch {
+        &self.launch
+    }
+
+    pub(crate) fn fingerprint(&self) -> &RuntimeFingerprint {
+        &self.fingerprint
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        model_lock: catalog::ModelLock,
+        launch: runner::Launch,
+        fingerprint: RuntimeFingerprint,
+    ) -> Self {
+        Self::new(model_lock, launch, fingerprint)
+    }
+
+    pub(crate) fn primary_only(&mut self) -> Option<()> {
+        let launch = self.launch.primary_only()?;
+        let fingerprint = self.fingerprint.primary_only()?;
+        self.launch = launch;
+        self.fingerprint = fingerprint;
+        Some(())
+    }
 }
 
 enum AdmissionSource {
@@ -61,44 +110,108 @@ pub(crate) fn resolve_runnable(
             (manifest, model_lock, verification::Admission::Verified)
         }
         AdmissionSource::Installed(manifest) => {
-            let model_dir = paths.model_dir(&manifest.id)?;
-            let artifact = manifest.artifact_path(&paths.models);
-            let draft = manifest
-                .draft_artifact()
-                .map(|draft| paths.models.join(&manifest.id).join(draft.local_filename));
-            let model_lock = catalog::ModelLock::acquire(&model_dir)?;
-            let admission = verification::verify_or_refresh(
-                &model_lock,
-                &model_dir,
-                &manifest,
-                &artifact,
-                draft.as_deref(),
-                || verification::verify_artifacts(&manifest, &artifact, draft.as_deref()),
-            )?;
+            let (model_lock, admission) = admit_installed(&manifest, paths)?;
             (manifest, model_lock, admission)
         }
     };
-    tracing::info!(
-        event = "model_admission_complete",
-        model_id = %manifest.id,
-        result = match admission {
-            verification::Admission::ReceiptHit => "receipt_hit",
-            verification::Admission::Verified => "verified",
-        },
-        elapsed_ms = admission_started.elapsed().as_millis() as u64,
-    );
+    report_admission(&manifest.id, admission, admission_started);
     let artifact = manifest.artifact_path(&paths.models);
-    Ok(Runnable {
-        _model_lock: model_lock,
-        launch: runner::Launch {
+    let policy = runner::LaunchPolicy::Foreground;
+    let fingerprint = RuntimeFingerprint::from_manifest(
+        &manifest,
+        ctx,
+        profile.effective_profile(),
+        policy.sleep_idle_seconds(),
+    )?;
+    Ok(Runnable::new(
+        model_lock,
+        runner::Launch {
             server,
             model: artifact,
             id: manifest.id,
             requested_port: port,
             ctx,
             profile,
+            policy,
         },
-    })
+        fingerprint,
+    ))
+}
+
+#[allow(
+    dead_code,
+    reason = "persistent host ownership is added by the follow-on task"
+)]
+pub(crate) fn resolve_managed_runnable(
+    manifest: Manifest,
+    paths: &AppPaths,
+) -> Result<Runnable, String> {
+    let installed = catalog::load_catalog(&paths.models)?;
+    if !installed.iter().any(|candidate| candidate == &manifest) {
+        return Err(format!("model {} is not installed", manifest.id));
+    }
+
+    let config = config::load(&paths.config)?;
+    let ctx = config::resolve_value(None, config.ctx, 4096);
+    let profile = launch_profile(&manifest, &paths.models)?;
+    let server = runner::validate_managed_server(&paths.managed_server)?;
+    let admission_started = Instant::now();
+    let (model_lock, admission) = admit_installed(&manifest, paths)?;
+    report_admission(&manifest.id, admission, admission_started);
+    let artifact = manifest.artifact_path(&paths.models);
+    let policy = runner::LaunchPolicy::PersistentApp;
+    let fingerprint = RuntimeFingerprint::from_manifest(
+        &manifest,
+        ctx,
+        profile.effective_profile(),
+        policy.sleep_idle_seconds(),
+    )?;
+    Ok(Runnable::new(
+        model_lock,
+        runner::Launch {
+            server,
+            model: artifact,
+            id: manifest.id,
+            requested_port: 0,
+            ctx,
+            profile,
+            policy,
+        },
+        fingerprint,
+    ))
+}
+
+fn admit_installed(
+    manifest: &Manifest,
+    paths: &AppPaths,
+) -> Result<(catalog::ModelLock, verification::Admission), String> {
+    let model_dir = paths.model_dir(&manifest.id)?;
+    let artifact = manifest.artifact_path(&paths.models);
+    let draft = manifest
+        .draft_artifact()
+        .map(|draft| paths.models.join(&manifest.id).join(draft.local_filename));
+    let model_lock = catalog::ModelLock::acquire(&model_dir)?;
+    let admission = verification::verify_or_refresh(
+        &model_lock,
+        &model_dir,
+        manifest,
+        &artifact,
+        draft.as_deref(),
+        || verification::verify_artifacts(manifest, &artifact, draft.as_deref()),
+    )?;
+    Ok((model_lock, admission))
+}
+
+fn report_admission(id: &str, admission: verification::Admission, started: Instant) {
+    tracing::info!(
+        event = "model_admission_complete",
+        model_id = %id,
+        result = match admission {
+            verification::Admission::ReceiptHit => "receipt_hit",
+            verification::Admission::Verified => "verified",
+        },
+        elapsed_ms = started.elapsed().as_millis() as u64,
+    );
 }
 
 fn launch_profile(
@@ -133,11 +246,14 @@ fn launch_profile(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::catalog::{Artifact, ArtifactProvenance, ArtifactRole, Manifest, ModelLock};
     use crate::download;
+    use crate::runtime_fingerprint::{EffectiveProfile, RuntimeFingerprint};
     use crate::verification::{refresh_verified, verify_or_refresh, VerifiedArtifacts};
     use sha2::{Digest, Sha256};
     use std::cell::Cell;
+    use std::ffi::OsStr;
     use std::fmt::Write as _;
     use std::path::Path;
     use tempfile::tempdir;
@@ -203,6 +319,324 @@ mod tests {
             primary: verified_file(primary),
             draft: draft.map(verified_file),
         }
+    }
+
+    #[cfg(unix)]
+    fn install_manifest(paths: &AppPaths) -> Manifest {
+        install_exact_manifest(paths, manifest())
+    }
+
+    #[cfg(unix)]
+    fn install_exact_manifest(paths: &AppPaths, manifest: Manifest) -> Manifest {
+        let model_dir = paths.model_dir(&manifest.id).unwrap();
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("model.gguf"), b"abc").unwrap();
+        catalog::publish_manifest(&paths.models, &manifest).unwrap();
+        manifest
+    }
+
+    #[cfg(unix)]
+    fn install_managed_server(paths: &AppPaths) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::create_dir_all(paths.managed_server.parent().unwrap()).unwrap();
+        std::fs::write(
+            &paths.managed_server,
+            b"#!/bin/sh\nprintf 'version: 10121 (555881ebc)\\n' >&2\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &paths.managed_server,
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_admission_uses_only_installed_model_managed_runtime_and_persistent_config() {
+        let root = tempdir().unwrap();
+        let paths = AppPaths::from_values(Some(root.path()), None).unwrap();
+        let manifest = install_manifest(&paths);
+        install_managed_server(&paths);
+        std::fs::write(&paths.config, br#"{"version":1,"ctx":8192,"port":43123}"#).unwrap();
+
+        let _: fn(Manifest, &AppPaths) -> Result<Runnable, String> = resolve_managed_runnable;
+        let runnable = resolve_managed_runnable(manifest.clone(), &paths).unwrap();
+
+        assert_eq!(runnable.launch().server, paths.managed_server);
+        assert_eq!(runnable.launch().ctx, 8192);
+        assert_eq!(runnable.launch().requested_port, 0);
+        assert_eq!(
+            runnable.launch().policy,
+            runner::LaunchPolicy::PersistentApp
+        );
+        assert_eq!(runnable.fingerprint().sleep_policy(), Some(300));
+        drop(runnable);
+
+        std::fs::remove_file(&paths.config).unwrap();
+        let defaults = resolve_managed_runnable(manifest, &paths).unwrap();
+        assert_eq!(defaults.launch().ctx, 4096);
+        assert_eq!(defaults.launch().requested_port, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_admission_preserves_configured_zero_context() {
+        let root = tempdir().unwrap();
+        let paths = AppPaths::from_values(Some(root.path()), None).unwrap();
+        let manifest = install_manifest(&paths);
+        install_managed_server(&paths);
+        std::fs::write(&paths.config, br#"{"version":1,"ctx":0}"#).unwrap();
+
+        let runnable = resolve_managed_runnable(manifest, &paths).unwrap();
+        let fingerprint = serde_json::to_value(runnable.fingerprint()).unwrap();
+
+        assert_eq!(runnable.launch().ctx, 0);
+        assert_eq!(fingerprint["effective_context"], 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn foreground_admission_preserves_cli_zero_context() {
+        let root = tempdir().unwrap();
+        let paths = AppPaths::from_values(Some(root.path()), None).unwrap();
+        let manifest = install_manifest(&paths);
+        install_managed_server(&paths);
+
+        let runnable = resolve_runnable(
+            manifest.id,
+            cli::RuntimeArgs {
+                ctx: Some(0),
+                port: None,
+                server: Some(paths.managed_server.clone()),
+            },
+            &paths,
+        )
+        .unwrap();
+        let fingerprint = serde_json::to_value(runnable.fingerprint()).unwrap();
+
+        assert_eq!(runnable.launch().ctx, 0);
+        assert_eq!(fingerprint["effective_context"], 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_admission_canonicalizes_an_uppercase_manifest_digest() {
+        let root = tempdir().unwrap();
+        let paths = AppPaths::from_values(Some(root.path()), None).unwrap();
+        let mut manifest = manifest();
+        manifest.sha256.make_ascii_uppercase();
+        let manifest = install_exact_manifest(&paths, manifest);
+        install_managed_server(&paths);
+
+        let runnable = resolve_managed_runnable(manifest, &paths).unwrap();
+        let fingerprint = serde_json::to_value(runnable.fingerprint()).unwrap();
+
+        assert_eq!(
+            fingerprint["primary"]["sha256"],
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_admission_ignores_environment_and_path_runtime_candidates() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempdir().unwrap();
+        let paths = AppPaths::from_values(Some(root.path()), None).unwrap();
+        install_manifest(&paths);
+        install_managed_server(&paths);
+        let environment = root.path().join("environment-server");
+        let path_dir = root.path().join("path-bin");
+        let path_server = path_dir.join("llama-server");
+        std::fs::create_dir(&path_dir).unwrap();
+        for candidate in [&environment, &path_server] {
+            std::fs::write(
+                candidate,
+                b"#!/bin/sh\nprintf 'version: alternative\\n' >&2\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(candidate, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let executable = std::env::current_exe().unwrap();
+        let cases = [
+            (Some(environment.as_os_str()), OsStr::new("")),
+            (None, path_dir.as_os_str()),
+        ];
+        for (environment, path) in cases {
+            let mut child = std::process::Command::new(&executable);
+            child
+                .arg("--exact")
+                .arg("runnable::tests::managed_admission_environment_child")
+                .arg("--nocapture")
+                .env("LOXA_MANAGED_ADMISSION_CHILD", "1")
+                .env("LOXA_HOME", root.path())
+                .env("PATH", path);
+            match environment {
+                Some(environment) => {
+                    child.env("LOXA_LLAMA_SERVER", environment);
+                }
+                None => {
+                    child.env_remove("LOXA_LLAMA_SERVER");
+                }
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_admission_environment_child() {
+        if std::env::var_os("LOXA_MANAGED_ADMISSION_CHILD").is_none() {
+            return;
+        }
+        let paths = AppPaths::from_env().unwrap();
+        let manifest = catalog::load_catalog(&paths.models).unwrap().remove(0);
+
+        let runnable = resolve_managed_runnable(manifest, &paths).unwrap();
+
+        assert_eq!(runnable.launch().server, paths.managed_server);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_admission_receipt_hit_keeps_fingerprint_and_model_lock() {
+        use std::os::unix::fs::MetadataExt;
+
+        let root = tempdir().unwrap();
+        let paths = AppPaths::from_values(Some(root.path()), None).unwrap();
+        let manifest = install_manifest(&paths);
+        install_managed_server(&paths);
+        let model_dir = paths.model_dir(&manifest.id).unwrap();
+        let receipt = model_dir.join("verification-receipt.json");
+
+        let first = resolve_managed_runnable(manifest.clone(), &paths).unwrap();
+        let fingerprint = first.fingerprint().clone();
+        assert!(
+            ModelLock::acquire(&model_dir).is_err(),
+            "Runnable must retain the model lock"
+        );
+        let receipt_inode = std::fs::metadata(&receipt).unwrap().ino();
+        drop(first);
+        drop(ModelLock::acquire(&model_dir).unwrap());
+
+        let second = resolve_managed_runnable(manifest, &paths).unwrap();
+
+        assert_eq!(second.fingerprint(), &fingerprint);
+        assert_eq!(
+            std::fs::metadata(&receipt).unwrap().ino(),
+            receipt_inode,
+            "an unchanged receipt hit must not rewrite or rehash the artifact"
+        );
+        assert!(ModelLock::acquire(&model_dir).is_err());
+        drop(second);
+        drop(ModelLock::acquire(&model_dir).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_admission_refuses_a_loose_local_candidate_without_adopting_it() {
+        let root = tempdir().unwrap();
+        let paths = AppPaths::from_values(Some(root.path()), None).unwrap();
+        std::fs::create_dir_all(&paths.models).unwrap();
+        let loose = paths.models.join("Demo.gguf");
+        std::fs::write(&loose, b"GGUF\x03\0\0\0payload").unwrap();
+        install_managed_server(&paths);
+
+        let error = match resolve_managed_runnable(manifest(), &paths) {
+            Err(error) => error,
+            Ok(_) => panic!("loose local candidate was admitted as an installed model"),
+        };
+
+        assert!(error.contains("not installed"), "{error}");
+        assert!(loose.is_file());
+        assert!(!paths.models.join("demo/manifest.json").exists());
+    }
+
+    #[test]
+    fn fingerprint_is_exact_and_changes_with_artifact_profile_or_context() {
+        let manifest = manifest();
+        let fingerprint = RuntimeFingerprint::from_manifest(
+            &manifest,
+            4096,
+            EffectiveProfile::Generic,
+            Some(300),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&fingerprint).unwrap(),
+            serde_json::json!({
+                "schema_version": 1,
+                "model_id": "demo",
+                "effective_context": 4096,
+                "effective_profile": "generic",
+                "sleep_policy": 300,
+                "primary": {
+                    "local_filename": "model.gguf",
+                    "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+                    "size": 3
+                },
+                "draft": null
+            })
+        );
+
+        let mut changed_artifact = manifest.clone();
+        changed_artifact.sha256 = "f".repeat(64);
+        assert_ne!(
+            fingerprint,
+            RuntimeFingerprint::from_manifest(
+                &changed_artifact,
+                4096,
+                EffectiveProfile::Generic,
+                Some(300),
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            fingerprint,
+            RuntimeFingerprint::from_manifest(
+                &manifest,
+                8192,
+                EffectiveProfile::Generic,
+                Some(300),
+            )
+            .unwrap()
+        );
+        let mut changed_profile = serde_json::to_value(&fingerprint).unwrap();
+        changed_profile["effective_profile"] = serde_json::json!("primary_only");
+        assert_ne!(
+            fingerprint,
+            serde_json::from_value::<RuntimeFingerprint>(changed_profile).unwrap()
+        );
+    }
+
+    #[test]
+    fn mtp_primary_only_fingerprint_drops_draft_and_keeps_persistent_sleep_policy() {
+        let fingerprint = RuntimeFingerprint::from_manifest(
+            &bundle_manifest(),
+            8192,
+            EffectiveProfile::Gemma4Mtp,
+            Some(300),
+        )
+        .unwrap();
+
+        let primary_only = fingerprint.primary_only().unwrap();
+
+        assert_eq!(
+            primary_only.effective_profile(),
+            EffectiveProfile::PrimaryOnly
+        );
+        assert!(primary_only.draft().is_none());
+        assert_eq!(primary_only.sleep_policy(), Some(300));
     }
 
     #[cfg(unix)]

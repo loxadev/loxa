@@ -1,3 +1,4 @@
+use crate::runtime_fingerprint::EffectiveProfile;
 use crate::ui;
 use reqwest::blocking::Client;
 use serde::Deserialize;
@@ -22,6 +23,22 @@ const MAX_DIAGNOSTIC_TAIL: usize = 4096;
 const MAX_ANNOUNCEMENT_LINE: usize = 8192;
 const MAX_PENDING_ANNOUNCEMENTS: usize = 64;
 const MANAGED_VERSION: &str = "version: 10121 (555881ebc)";
+const PERSISTENT_SLEEP_IDLE_SECONDS: u64 = 300;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LaunchPolicy {
+    Foreground,
+    PersistentApp,
+}
+
+impl LaunchPolicy {
+    pub(crate) fn sleep_idle_seconds(self) -> Option<u64> {
+        match self {
+            Self::Foreground => None,
+            Self::PersistentApp => Some(PERSISTENT_SLEEP_IDLE_SECONDS),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum LaunchProfile {
@@ -89,6 +106,14 @@ impl LaunchProfile {
         }
     }
 
+    pub(crate) fn effective_profile(&self) -> EffectiveProfile {
+        match self {
+            Self::Generic => EffectiveProfile::Generic,
+            Self::Gemma4Mtp { draft: Some(_), .. } => EffectiveProfile::Gemma4Mtp,
+            Self::Gemma4Mtp { draft: None, .. } => EffectiveProfile::PrimaryOnly,
+        }
+    }
+
     fn primary_only(&self) -> Option<Self> {
         match self {
             Self::Generic => None,
@@ -113,6 +138,7 @@ pub(crate) struct Launch {
     pub(crate) requested_port: u16,
     pub(crate) ctx: u32,
     pub(crate) profile: LaunchProfile,
+    pub(crate) policy: LaunchPolicy,
 }
 
 impl Launch {
@@ -124,10 +150,11 @@ impl Launch {
             requested_port,
             ctx,
             profile: LaunchProfile::Generic,
+            policy: LaunchPolicy::Foreground,
         }
     }
 
-    fn primary_only(&self) -> Option<Self> {
+    pub(crate) fn primary_only(&self) -> Option<Self> {
         Some(Self {
             profile: self.profile.primary_only()?,
             ..self.clone()
@@ -156,6 +183,15 @@ pub(crate) fn discover_from_process(
         std::env::var_os("PATH").as_deref(),
         profile.required_version(),
     )
+}
+
+#[allow(
+    dead_code,
+    reason = "managed admission is wired by the follow-on host task"
+)]
+pub(crate) fn validate_managed_server(path: &Path) -> Result<PathBuf, String> {
+    validate_managed_candidate(path)?;
+    Ok(path.to_path_buf())
 }
 
 fn discover_server_with_requirement(
@@ -461,6 +497,9 @@ pub(crate) fn build_args(launch: &Launch, port: u16) -> Vec<OsString> {
             "all".into(),
         ]);
     }
+    if let Some(seconds) = launch.policy.sleep_idle_seconds() {
+        args.extend(["--sleep-idle-seconds".into(), seconds.to_string().into()]);
+    }
     args
 }
 
@@ -521,13 +560,166 @@ pub(crate) enum ForegroundStart {
     Stopped(ServerExit),
 }
 
+#[allow(
+    dead_code,
+    reason = "persistent startup is wired by the follow-on host task"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StartupInterruption {
+    Cancelled,
+}
+
+#[allow(
+    dead_code,
+    reason = "persistent startup is wired by the follow-on host task"
+)]
+pub(crate) enum PersistentStart {
+    Ready(Box<PersistentServer>),
+    Stopped(ServerExit),
+    Interrupted(StartupInterruption),
+}
+
 pub(crate) struct ForegroundServer {
     server: Box<OwnedServer>,
+}
+
+#[allow(
+    dead_code,
+    reason = "persistent startup is wired by the follow-on host task"
+)]
+pub(crate) struct PersistentServer {
+    server: Box<OwnedServer>,
+    runnable: crate::runnable::Runnable,
 }
 
 pub(crate) fn start_foreground(launch: &Launch, run_dir: &Path) -> Result<ForegroundStart, String> {
     install_termination_watcher(run_dir)?;
     start_foreground_with(launch, run_dir, process_termination_signal)
+}
+
+#[allow(
+    dead_code,
+    reason = "persistent startup is wired by the follow-on host task"
+)]
+pub(crate) fn start_persistent<F>(
+    mut runnable: crate::runnable::Runnable,
+    run_dir: &Path,
+    cancelled: F,
+) -> Result<PersistentStart, String>
+where
+    F: Fn() -> bool,
+{
+    if cancelled() {
+        return Ok(persistent_interrupted());
+    }
+    let launch_started = Instant::now();
+    tracing::info!(
+        event = "server_starting",
+        model_id = %runnable.launch().id,
+        requested_port = runnable.launch().requested_port,
+        context_size = runnable.launch().ctx
+    );
+    let ownership = crate::runtime::RuntimeOwnership::acquire(run_dir)?;
+    if cancelled() {
+        return Ok(persistent_interrupted());
+    }
+    match start_persistent_attempt(runnable.launch(), ownership, &cancelled)? {
+        StartOutcome::Ready(server) => {
+            finish_persistent_ready(server, runnable, launch_started, false, &cancelled)
+        }
+        StartOutcome::Exited(exit) => {
+            if cancelled() {
+                return Ok(persistent_interrupted());
+            }
+            if runnable.primary_only().is_none() {
+                tracing::warn!(
+                    event = "server_stopped_before_ready",
+                    model_id = %runnable.launch().id,
+                    exit_code = exit.code
+                );
+                return Ok(PersistentStart::Stopped(exit));
+            }
+            report_mtp_draft_start_failure(runnable.launch(), "exited", exit.diagnostic.as_deref());
+            if cancelled() {
+                return Ok(persistent_interrupted());
+            }
+            tracing::info!(
+                event = "gemma_mtp_primary_retry",
+                model_id = %runnable.launch().id,
+                attempt = 2_u8
+            );
+            let ownership = crate::runtime::RuntimeOwnership::acquire(run_dir)?;
+            if cancelled() {
+                return Ok(persistent_interrupted());
+            }
+            match start_persistent_attempt(runnable.launch(), ownership, &cancelled)? {
+                StartOutcome::Ready(server) => {
+                    finish_persistent_ready(server, runnable, launch_started, true, &cancelled)
+                }
+                StartOutcome::Exited(exit) => Ok(PersistentStart::Stopped(exit)),
+                StartOutcome::Interrupted(interruption) => {
+                    Ok(PersistentStart::Interrupted(interruption))
+                }
+                StartOutcome::Signaled(_) => {
+                    Err("persistent startup returned an invalid signal interruption".into())
+                }
+            }
+        }
+        StartOutcome::Interrupted(interruption) => Ok(PersistentStart::Interrupted(interruption)),
+        StartOutcome::Signaled(_) => {
+            Err("persistent startup returned an invalid signal interruption".into())
+        }
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "persistent startup is wired by the follow-on host task"
+)]
+fn persistent_interrupted() -> PersistentStart {
+    PersistentStart::Interrupted(StartupInterruption::Cancelled)
+}
+
+#[allow(
+    dead_code,
+    reason = "persistent startup is wired by the follow-on host task"
+)]
+fn finish_persistent_ready<F>(
+    mut server: Box<OwnedServer>,
+    runnable: crate::runnable::Runnable,
+    launch_started: Instant,
+    fallback: bool,
+    cancelled: &F,
+) -> Result<PersistentStart, String>
+where
+    F: Fn() -> bool,
+{
+    if cancelled() {
+        server.terminate()?;
+        return Ok(persistent_interrupted());
+    }
+    if fallback {
+        tracing::info!(
+            event = "server_ready",
+            model_id = %runnable.launch().id,
+            port = server.port(),
+            elapsed_ms = launch_started.elapsed().as_millis() as u64,
+            effective_profile = runnable.launch().profile.effective_name(),
+            fallback = "primary_only",
+        );
+    } else {
+        tracing::info!(
+            event = "server_ready",
+            model_id = %runnable.launch().id,
+            port = server.port(),
+            elapsed_ms = launch_started.elapsed().as_millis() as u64,
+            effective_profile = runnable.launch().profile.effective_name(),
+        );
+    }
+    Ok(PersistentStart::Ready(Box::new(PersistentServer {
+        server,
+        runnable,
+    })))
 }
 
 fn start_foreground_with<F>(
@@ -576,6 +768,9 @@ where
             code: 128 + signal,
             diagnostic: None,
         })),
+        Ok(StartOutcome::Interrupted(_)) => {
+            Err("foreground startup returned an invalid cancellation interruption".into())
+        }
         Err(error) => Err(error),
     }
 }
@@ -601,6 +796,21 @@ where
     F: Fn() -> Option<i32>,
 {
     OwnedServer::start_with_ownership(launch, STARTUP_TIMEOUT, ownership, signal)
+}
+
+#[allow(
+    dead_code,
+    reason = "persistent startup is wired by the follow-on host task"
+)]
+fn start_persistent_attempt<F>(
+    launch: &Launch,
+    ownership: crate::runtime::RuntimeOwnership,
+    cancelled: &F,
+) -> Result<StartOutcome, String>
+where
+    F: Fn() -> bool,
+{
+    OwnedServer::start_with_persistent_ownership(launch, STARTUP_TIMEOUT, ownership, cancelled)
 }
 
 fn report_mtp_draft_start_failure(
@@ -663,6 +873,9 @@ where
             code: 128 + signal,
             diagnostic: None,
         })),
+        StartOutcome::Interrupted(_) => {
+            Err("foreground startup returned an invalid cancellation interruption".into())
+        }
     }
 }
 
@@ -690,6 +903,28 @@ impl ForegroundServer {
             return Ok(Some(exit));
         }
         Ok(None)
+    }
+
+    pub(crate) fn terminate(&mut self) -> Result<(), String> {
+        self.server.terminate()
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "persistent startup is wired by the follow-on host task"
+)]
+impl PersistentServer {
+    pub(crate) fn port(&self) -> u16 {
+        self.server.port()
+    }
+
+    pub(crate) fn fingerprint(&self) -> &crate::runtime_fingerprint::RuntimeFingerprint {
+        self.runnable.fingerprint()
+    }
+
+    pub(crate) fn poll(&mut self) -> Result<Option<ServerExit>, String> {
+        self.server.try_wait()
     }
 
     pub(crate) fn terminate(&mut self) -> Result<(), String> {
@@ -1003,6 +1238,40 @@ enum StartOutcome {
     Ready(Box<OwnedServer>),
     Exited(ServerExit),
     Signaled(i32),
+    Interrupted(StartupInterruption),
+}
+
+#[allow(
+    dead_code,
+    reason = "persistent startup is wired by the follow-on host task"
+)]
+#[derive(Clone, Copy)]
+enum StartupStop {
+    Signal(i32),
+    Interrupted(StartupInterruption),
+}
+
+impl From<StartupStop> for StartOutcome {
+    fn from(stop: StartupStop) -> Self {
+        match stop {
+            StartupStop::Signal(signal) => Self::Signaled(signal),
+            StartupStop::Interrupted(interruption) => Self::Interrupted(interruption),
+        }
+    }
+}
+
+fn requested_start_outcome<F>(
+    server: &mut OwnedServer,
+    stop: &F,
+) -> Result<Option<StartOutcome>, String>
+where
+    F: Fn() -> Option<StartupStop>,
+{
+    let Some(stop) = stop() else {
+        return Ok(None);
+    };
+    server.terminate()?;
+    Ok(Some(stop.into()))
 }
 
 #[derive(Debug)]
@@ -1049,7 +1318,7 @@ impl OwnedServer {
         F: Fn() -> Option<i32>,
     {
         let launch = Launch::generic(server, model, id, requested_port, ctx);
-        Self::start_inner(&launch, timeout, None, signal)
+        Self::start_inner(&launch, timeout, None, || signal().map(StartupStop::Signal))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1062,7 +1331,27 @@ impl OwnedServer {
     where
         F: Fn() -> Option<i32>,
     {
-        Self::start_inner(launch, timeout, Some(runtime), signal)
+        Self::start_inner(launch, timeout, Some(runtime), || {
+            signal().map(StartupStop::Signal)
+        })
+    }
+
+    #[allow(
+        dead_code,
+        reason = "persistent startup is wired by the follow-on host task"
+    )]
+    fn start_with_persistent_ownership<F>(
+        launch: &Launch,
+        timeout: Duration,
+        runtime: crate::runtime::RuntimeOwnership,
+        cancelled: &F,
+    ) -> Result<StartOutcome, String>
+    where
+        F: Fn() -> bool,
+    {
+        Self::start_inner(launch, timeout, Some(runtime), || {
+            cancelled().then_some(StartupStop::Interrupted(StartupInterruption::Cancelled))
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1070,10 +1359,10 @@ impl OwnedServer {
         launch: &Launch,
         timeout: Duration,
         runtime: Option<crate::runtime::RuntimeOwnership>,
-        signal: F,
+        stop: F,
     ) -> Result<StartOutcome, String>
     where
-        F: Fn() -> Option<i32>,
+        F: Fn() -> Option<StartupStop>,
     {
         let requested_port = resolve_requested_port(launch.requested_port)?;
         let client = readiness_client()?;
@@ -1144,14 +1433,18 @@ impl OwnedServer {
                 return owned.fail_start(error);
             }
         }
+        if launch.policy == LaunchPolicy::PersistentApp {
+            if let Some(outcome) = requested_start_outcome(&mut owned, &stop)? {
+                return Ok(outcome);
+            }
+        }
         let deadline = Instant::now() + timeout;
         loop {
             if let Err(error) = owned.collect_announcements() {
                 return owned.fail_start(error);
             }
-            if let Some(signal) = signal() {
-                owned.terminate()?;
-                return Ok(StartOutcome::Signaled(signal));
+            if let Some(outcome) = requested_start_outcome(&mut owned, &stop)? {
+                return Ok(outcome);
             }
             if let Some(status) = owned
                 .child_mut()
@@ -1174,6 +1467,11 @@ impl OwnedServer {
                             return owned.fail_start(error);
                         }
                         owned.port = port;
+                        if launch.policy == LaunchPolicy::PersistentApp {
+                            if let Some(outcome) = requested_start_outcome(&mut owned, &stop)? {
+                                return Ok(outcome);
+                            }
+                        }
                         return Ok(StartOutcome::Ready(Box::new(owned)));
                     }
                     Ok(false) => {}
@@ -1413,10 +1711,13 @@ fn executable_name() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::{Artifact, ArtifactProvenance, ArtifactRole, Manifest};
+    use crate::runnable::Runnable;
+    use crate::runtime_fingerprint::RuntimeFingerprint;
     use std::ffi::OsStr;
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
 
@@ -1470,6 +1771,16 @@ mod tests {
     }
 
     fn serve_models(alias: &'static str) -> (u16, std::thread::JoinHandle<()>) {
+        serve_models_with_ready_action(alias, || {})
+    }
+
+    fn serve_models_with_ready_action<F>(
+        alias: &'static str,
+        ready: F,
+    ) -> (u16, std::thread::JoinHandle<()>)
+    where
+        F: FnOnce() + Send + 'static,
+    {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = std::thread::spawn(move || {
@@ -1485,6 +1796,7 @@ mod tests {
                 "{}",
                 String::from_utf8_lossy(&request)
             );
+            ready();
             let body = format!(r#"{{"data":[{{"id":"{alias}"}}]}}"#);
             write!(
                 stream,
@@ -1505,6 +1817,188 @@ mod tests {
             requested_port: port,
             ctx: 8192,
             profile: LaunchProfile::gemma4_mtp(Some(PathBuf::from("/models/draft.gguf"))),
+            policy: LaunchPolicy::Foreground,
+        }
+    }
+
+    #[cfg(unix)]
+    fn persistent_runnable(root: &Path, server: &Path, port: u16) -> Runnable {
+        let model_dir = root.join("models/demo");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        let manifest = Manifest {
+            version: 1,
+            id: "demo".into(),
+            repo: Some("owner/repo".into()),
+            revision: Some("0".repeat(40)),
+            remote_filename: Some("model.gguf".into()),
+            origin: None,
+            source_filename: None,
+            local_filename: "model.gguf".into(),
+            sha256: "a".repeat(64),
+            size: 1,
+            artifacts: None,
+            profile: None,
+            runtime: None,
+        };
+        let policy = LaunchPolicy::PersistentApp;
+        let launch = Launch {
+            server: server.to_path_buf(),
+            model: model_dir.join("model.gguf"),
+            id: manifest.id.clone(),
+            requested_port: port,
+            ctx: 4096,
+            profile: LaunchProfile::generic(),
+            policy,
+        };
+        let fingerprint = RuntimeFingerprint::from_manifest(
+            &manifest,
+            launch.ctx,
+            launch.profile.effective_profile(),
+            policy.sleep_idle_seconds(),
+        )
+        .unwrap();
+        Runnable::for_test(
+            crate::catalog::ModelLock::acquire(&model_dir).unwrap(),
+            launch,
+            fingerprint,
+        )
+    }
+
+    #[cfg(unix)]
+    fn persistent_mtp_runnable(root: &Path, server: &Path, port: u16) -> Runnable {
+        let model_dir = root.join("models/demo");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        let manifest = Manifest {
+            version: 3,
+            id: "demo".into(),
+            repo: None,
+            revision: None,
+            remote_filename: None,
+            origin: None,
+            source_filename: None,
+            local_filename: "model.gguf".into(),
+            sha256: "a".repeat(64),
+            size: 1,
+            artifacts: Some(vec![
+                Artifact {
+                    role: ArtifactRole::Model,
+                    local_filename: "model.gguf".into(),
+                    sha256: "a".repeat(64),
+                    size: 1,
+                    provenance: ArtifactProvenance::Local {
+                        source_filename: "model-source.gguf".into(),
+                    },
+                },
+                Artifact {
+                    role: ArtifactRole::Draft,
+                    local_filename: "draft.gguf".into(),
+                    sha256: "b".repeat(64),
+                    size: 1,
+                    provenance: ArtifactProvenance::Local {
+                        source_filename: "draft-source.gguf".into(),
+                    },
+                },
+            ]),
+            profile: Some(crate::catalog::TEST_MTP_PROFILE.into()),
+            runtime: Some(crate::catalog::RuntimeQualification {
+                engine: "llama.cpp".into(),
+                build: crate::catalog::TEST_LLAMA_BUILD.into(),
+            }),
+        };
+        let policy = LaunchPolicy::PersistentApp;
+        let launch = Launch {
+            server: server.to_path_buf(),
+            model: model_dir.join("model.gguf"),
+            id: manifest.id.clone(),
+            requested_port: port,
+            ctx: 8192,
+            profile: LaunchProfile::gemma4_mtp(Some(model_dir.join("draft.gguf"))),
+            policy,
+        };
+        let fingerprint = RuntimeFingerprint::from_manifest(
+            &manifest,
+            launch.ctx,
+            launch.profile.effective_profile(),
+            policy.sleep_idle_seconds(),
+        )
+        .unwrap();
+        Runnable::for_test(
+            crate::catalog::ModelLock::acquire(&model_dir).unwrap(),
+            launch,
+            fingerprint,
+        )
+    }
+
+    #[cfg(unix)]
+    fn write_persistent_test_server(path: &Path, announced: &Path, ready: &Path) {
+        let executable = std::env::current_exe().unwrap();
+        for value in [executable.as_path(), announced, ready] {
+            assert!(!value.to_string_lossy().contains('\''));
+        }
+        write_executable_script(
+            path,
+            format!(
+                "#!/bin/sh\nport=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = '--port' ]; then shift; port=\"$1\"; fi\n  shift\ndone\nexport LOXA_PERSISTENT_SERVER_CHILD=1\nexport LOXA_PERSISTENT_SERVER_PORT=\"$port\"\nexport LOXA_PERSISTENT_ANNOUNCED='{}'\nexport LOXA_PERSISTENT_READY='{}'\nexec '{}' --exact runner::tests::persistent_server_child --nocapture\n",
+                announced.display(),
+                ready.display(),
+                executable.display(),
+            )
+            .as_bytes(),
+        );
+    }
+
+    #[cfg(unix)]
+    fn write_mtp_persistent_test_server(path: &Path, argv: &Path, announced: &Path, ready: &Path) {
+        let executable = std::env::current_exe().unwrap();
+        for value in [executable.as_path(), argv, announced, ready] {
+            assert!(!value.to_string_lossy().contains('\''));
+        }
+        write_executable_script(
+            path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\ncase \"$*\" in\n  *--spec-draft-model*) printf 'draft startup failed\\n' >&2; exit 42 ;;\nesac\nport=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = '--port' ]; then shift; port=\"$1\"; fi\n  shift\ndone\nexport LOXA_PERSISTENT_SERVER_CHILD=1\nexport LOXA_PERSISTENT_SERVER_PORT=\"$port\"\nexport LOXA_PERSISTENT_ANNOUNCED='{}'\nexport LOXA_PERSISTENT_READY='{}'\nexec '{}' --exact runner::tests::persistent_server_child --nocapture\n",
+                argv.display(),
+                announced.display(),
+                ready.display(),
+                executable.display(),
+            )
+            .as_bytes(),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_server_child() {
+        if std::env::var_os("LOXA_PERSISTENT_SERVER_CHILD").is_none() {
+            return;
+        }
+        let port = std::env::var("LOXA_PERSISTENT_SERVER_PORT")
+            .unwrap()
+            .parse::<u16>()
+            .unwrap();
+        let announced = PathBuf::from(std::env::var_os("LOXA_PERSISTENT_ANNOUNCED").unwrap());
+        let ready = PathBuf::from(std::env::var_os("LOXA_PERSISTENT_READY").unwrap());
+        let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        eprintln!("test server listening on http://127.0.0.1:{port}");
+        std::fs::write(announced, b"announced").unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !request.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).unwrap();
+            request.push(byte[0]);
+        }
+        std::fs::write(ready, b"ready").unwrap();
+        let body = r#"{"data":[{"id":"demo"}]}"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        drop(stream);
+        loop {
+            std::thread::park();
         }
     }
 
@@ -1551,6 +2045,346 @@ mod tests {
     }
 
     #[test]
+    fn persistent_argv_adds_one_sleep_policy_without_changing_foreground_or_fallback() {
+        let foreground = Launch::generic(
+            Path::new("/servers/llama-server"),
+            Path::new("/models/model.gguf"),
+            "demo",
+            1234,
+            8192,
+        );
+        let persistent = Launch {
+            policy: LaunchPolicy::PersistentApp,
+            ..foreground.clone()
+        };
+        let foreground_mtp = Launch {
+            profile: LaunchProfile::gemma4_mtp(Some(PathBuf::from("/models/draft.gguf"))),
+            ..foreground.clone()
+        };
+        let foreground_fallback = foreground_mtp.primary_only().unwrap();
+
+        let persistent_args = build_args(&persistent, 1234);
+        let sleep_positions = persistent_args
+            .iter()
+            .enumerate()
+            .filter_map(|(index, argument)| (argument == "--sleep-idle-seconds").then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(sleep_positions.len(), 1);
+        assert_eq!(persistent_args[sleep_positions[0] + 1], "300");
+
+        for launch in [&foreground, &foreground_mtp, &foreground_fallback] {
+            assert!(
+                !build_args(launch, 1234)
+                    .iter()
+                    .any(|argument| argument == "--sleep-idle-seconds"),
+                "foreground launch policy gained a persistent sleep argument"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn foreground_does_not_repoll_the_signal_callback_after_readiness() {
+        let _lock = process_test_lock();
+        let dir = tempdir().unwrap();
+        let server = dir.path().join("server");
+        let ready = dir.path().join("ready");
+        let run_dir = dir.path().join("run");
+        let ready_for_server = ready.clone();
+        let (port, http) = serve_models_with_ready_action("demo", move || {
+            std::fs::write(ready_for_server, b"ready").unwrap();
+        });
+        write_executable_script(
+            &server,
+            format!(
+                "#!/bin/sh\nprintf 'listening on http://127.0.0.1:{port}\\n' >&2\nwhile :; do sleep 1; done\n"
+            )
+            .as_bytes(),
+        );
+        let launch = Launch::generic(&server, Path::new("/models/model.gguf"), "demo", port, 4096);
+        let polls_after_ready = AtomicUsize::new(0);
+
+        let started = start_foreground_with_signal(&launch, &run_dir, || {
+            ready.exists().then(|| {
+                polls_after_ready.fetch_add(1, Ordering::SeqCst);
+                libc::SIGINT
+            })
+        })
+        .unwrap();
+        http.join().unwrap();
+
+        let mut foreground = match started {
+            ForegroundStart::Ready(server) => server,
+            ForegroundStart::Stopped(exit) => {
+                panic!("post-readiness signal poll changed parent behavior: {exit:?}")
+            }
+        };
+        assert_eq!(polls_after_ready.load(Ordering::SeqCst), 0);
+        foreground.terminate().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_cancellation_before_spawn_and_after_ownership_is_closed() {
+        let _lock = process_test_lock();
+        for cancel_on_call in [1, 2] {
+            let dir = tempdir().unwrap();
+            let server = dir.path().join("server");
+            let spawned = dir.path().join("spawned");
+            let run_dir = dir.path().join("run");
+            write_executable_script(
+                &server,
+                format!("#!/bin/sh\nprintf spawned > '{}'\n", spawned.display()).as_bytes(),
+            );
+            let runnable = persistent_runnable(dir.path(), &server, 0);
+            let calls = AtomicUsize::new(0);
+
+            let started = start_persistent(runnable, &run_dir, || {
+                calls.fetch_add(1, Ordering::SeqCst) + 1 == cancel_on_call
+            })
+            .unwrap();
+
+            assert!(matches!(
+                started,
+                PersistentStart::Interrupted(StartupInterruption::Cancelled)
+            ));
+            assert_eq!(calls.load(Ordering::SeqCst), cancel_on_call);
+            assert!(!spawned.exists());
+            assert!(!run_dir.join("foreground.json").exists());
+            drop(crate::runtime::RuntimeOwnership::acquire(&run_dir).unwrap());
+            drop(crate::catalog::ModelLock::acquire(&dir.path().join("models/demo")).unwrap());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_cancellation_after_lease_cleans_group_listener_and_ownership() {
+        let _lock = process_test_lock();
+        let dir = tempdir().unwrap();
+        let server = dir.path().join("server");
+        let run_dir = dir.path().join("run");
+        let port = resolve_requested_port(0).unwrap();
+        write_executable_script(&server, b"#!/bin/sh\nwhile :; do sleep 1; done\n");
+        let runnable = persistent_runnable(dir.path(), &server, port);
+        let group = Mutex::new(None);
+
+        let started = start_persistent(runnable, &run_dir, || {
+            if let Some((_, active_group)) =
+                unpack_server_identity(ACTIVE_SERVER.load(Ordering::SeqCst))
+            {
+                *group.lock().unwrap() = Some(active_group);
+            }
+            run_dir.join("foreground.json").is_file()
+        })
+        .unwrap();
+
+        assert!(matches!(
+            started,
+            PersistentStart::Interrupted(StartupInterruption::Cancelled)
+        ));
+        let group = group.into_inner().unwrap().expect("owned process group");
+        assert!(!process_group_exists(group).unwrap());
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
+        assert!(!run_dir.join("foreground.json").exists());
+        drop(crate::runtime::RuntimeOwnership::acquire(&run_dir).unwrap());
+        drop(crate::catalog::ModelLock::acquire(&dir.path().join("models/demo")).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_cancellation_after_announcement_closes_the_child_listener() {
+        let _lock = process_test_lock();
+        let dir = tempdir().unwrap();
+        let server = dir.path().join("server");
+        let announced = dir.path().join("announced");
+        let ready = dir.path().join("ready");
+        let run_dir = dir.path().join("run");
+        let port = resolve_requested_port(0).unwrap();
+        write_persistent_test_server(&server, &announced, &ready);
+        let runnable = persistent_runnable(dir.path(), &server, port);
+        let group = Mutex::new(None);
+
+        let started = start_persistent(runnable, &run_dir, || {
+            if let Some((_, active_group)) =
+                unpack_server_identity(ACTIVE_SERVER.load(Ordering::SeqCst))
+            {
+                *group.lock().unwrap() = Some(active_group);
+            }
+            announced.is_file()
+        })
+        .unwrap();
+
+        assert!(matches!(
+            started,
+            PersistentStart::Interrupted(StartupInterruption::Cancelled)
+        ));
+        let group = group.into_inner().unwrap().expect("owned process group");
+        assert!(!process_group_exists(group).unwrap());
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
+        assert!(!run_dir.join("foreground.json").exists());
+        assert!(
+            !ready.exists(),
+            "readiness must not race past announcement cancellation"
+        );
+        drop(crate::runtime::RuntimeOwnership::acquire(&run_dir).unwrap());
+        drop(crate::catalog::ModelLock::acquire(&dir.path().join("models/demo")).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_cancellation_after_readiness_cleans_every_owned_resource() {
+        let _lock = process_test_lock();
+        let dir = tempdir().unwrap();
+        let server = dir.path().join("server");
+        let announced = dir.path().join("announced");
+        let ready = dir.path().join("ready");
+        let run_dir = dir.path().join("run");
+        let port = resolve_requested_port(0).unwrap();
+        write_persistent_test_server(&server, &announced, &ready);
+        let runnable = persistent_runnable(dir.path(), &server, port);
+        let group = Mutex::new(None);
+
+        let started = start_persistent(runnable, &run_dir, || {
+            if let Some((_, active_group)) =
+                unpack_server_identity(ACTIVE_SERVER.load(Ordering::SeqCst))
+            {
+                *group.lock().unwrap() = Some(active_group);
+            }
+            ready.is_file()
+        })
+        .unwrap();
+
+        assert!(matches!(
+            started,
+            PersistentStart::Interrupted(StartupInterruption::Cancelled)
+        ));
+        assert!(announced.is_file());
+        assert!(ready.is_file());
+        let group = group.into_inner().unwrap().expect("owned process group");
+        assert!(!process_group_exists(group).unwrap());
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
+        assert!(!run_dir.join("foreground.json").exists());
+        drop(crate::runtime::RuntimeOwnership::acquire(&run_dir).unwrap());
+        drop(crate::catalog::ModelLock::acquire(&dir.path().join("models/demo")).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_cancellation_at_mtp_retry_never_spawns_the_primary() {
+        let _lock = process_test_lock();
+        let dir = tempdir().unwrap();
+        let server = dir.path().join("server");
+        let argv = dir.path().join("argv");
+        let primary = dir.path().join("primary");
+        let run_dir = dir.path().join("run");
+        write_executable_script(
+            &server,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\ncase \"$*\" in\n  *--spec-draft-model*) exit 42 ;;\nesac\nprintf primary > '{}'\nwhile :; do sleep 1; done\n",
+                argv.display(),
+                primary.display(),
+            )
+            .as_bytes(),
+        );
+        let runnable = persistent_mtp_runnable(dir.path(), &server, 0);
+        let saw_child = AtomicBool::new(false);
+        let group = Mutex::new(None);
+
+        let started = start_persistent(runnable, &run_dir, || {
+            if let Some((_, active_group)) =
+                unpack_server_identity(ACTIVE_SERVER.load(Ordering::SeqCst))
+            {
+                saw_child.store(true, Ordering::SeqCst);
+                *group.lock().unwrap() = Some(active_group);
+                false
+            } else {
+                saw_child.load(Ordering::SeqCst) && argv.is_file()
+            }
+        })
+        .unwrap();
+
+        assert!(matches!(
+            started,
+            PersistentStart::Interrupted(StartupInterruption::Cancelled)
+        ));
+        let argv = std::fs::read_to_string(&argv).unwrap();
+        assert_eq!(argv.lines().filter(|line| *line == "--model").count(), 1);
+        assert_eq!(
+            argv.lines()
+                .filter(|line| *line == "--spec-draft-model")
+                .count(),
+            1
+        );
+        assert!(!primary.exists());
+        let group = group.into_inner().unwrap().expect("owned process group");
+        assert!(!process_group_exists(group).unwrap());
+        assert!(!run_dir.join("foreground.json").exists());
+        drop(crate::runtime::RuntimeOwnership::acquire(&run_dir).unwrap());
+        drop(crate::catalog::ModelLock::acquire(&dir.path().join("models/demo")).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_mtp_fallback_transforms_fingerprint_and_keeps_sleep_policy() {
+        let _lock = process_test_lock();
+        let dir = tempdir().unwrap();
+        let server = dir.path().join("server");
+        let argv = dir.path().join("argv");
+        let announced = dir.path().join("announced");
+        let ready = dir.path().join("ready");
+        let run_dir = dir.path().join("run");
+        write_mtp_persistent_test_server(&server, &argv, &announced, &ready);
+        let runnable = persistent_mtp_runnable(dir.path(), &server, 0);
+
+        let started = start_persistent(runnable, &run_dir, || false).unwrap();
+        let mut server = match started {
+            PersistentStart::Ready(server) => server,
+            PersistentStart::Stopped(exit) => panic!("persistent MTP fallback stopped: {exit:?}"),
+            PersistentStart::Interrupted(interruption) => {
+                panic!("persistent MTP fallback was interrupted: {interruption:?}")
+            }
+        };
+        let port = server.port();
+
+        assert_eq!(
+            server.fingerprint().effective_profile(),
+            EffectiveProfile::PrimaryOnly
+        );
+        assert!(server.fingerprint().draft().is_none());
+        assert_eq!(server.fingerprint().sleep_policy(), Some(300));
+        assert!(server.poll().unwrap().is_none());
+        let argv = std::fs::read_to_string(&argv).unwrap();
+        let argv = argv.lines().collect::<Vec<_>>();
+        assert_eq!(
+            argv.iter()
+                .filter(|argument| **argument == "--sleep-idle-seconds")
+                .count(),
+            2,
+            "both persistent MTP attempts need exactly one sleep policy"
+        );
+        for index in argv
+            .iter()
+            .enumerate()
+            .filter_map(|(index, argument)| (*argument == "--sleep-idle-seconds").then_some(index))
+        {
+            assert_eq!(argv[index + 1], "300");
+        }
+        assert_eq!(
+            argv.iter()
+                .filter(|argument| **argument == "--spec-draft-model")
+                .count(),
+            1
+        );
+        server.terminate().unwrap();
+        drop(server);
+
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
+        assert!(!run_dir.join("foreground.json").exists());
+        drop(crate::runtime::RuntimeOwnership::acquire(&run_dir).unwrap());
+        drop(crate::catalog::ModelLock::acquire(&dir.path().join("models/demo")).unwrap());
+    }
+
+    #[test]
     fn ready_line_displays_the_port_before_the_model_id() {
         let line = ready_line(58922, "gemma-4-12b-it-qat-ud-q4-k-xl");
 
@@ -1583,6 +2417,7 @@ mod tests {
             requested_port: 1234,
             ctx: 8192,
             profile: LaunchProfile::gemma4_mtp(Some(PathBuf::from("/models/draft.gguf"))),
+            policy: LaunchPolicy::Foreground,
         };
 
         assert_eq!(
@@ -1767,6 +2602,7 @@ mod tests {
             requested_port: 1234,
             ctx: 8192,
             profile: LaunchProfile::gemma4_mtp(Some(PathBuf::from("/models/draft.gguf"))),
+            policy: LaunchPolicy::Foreground,
         };
         let output = Arc::new(Mutex::new(Vec::new()));
         let writer = output.clone();

@@ -144,6 +144,7 @@ pub mod paths;
 mod runnable;
 pub mod runner;
 mod runtime;
+mod runtime_fingerprint;
 mod safe_file;
 mod session;
 mod ui;
@@ -1214,9 +1215,9 @@ where
             let runnable = runnable?;
             if importing {
                 let success = ui::success();
-                anstream::println!("{success}Imported{success:#} {}", runnable.launch.id);
+                anstream::println!("{success}Imported{success:#} {}", runnable.launch().id);
             }
-            runner::run_launch(&runnable.launch, &paths.run)
+            runner::run_launch(runnable.launch(), &paths.run)
         }
         Command::Chat(args) => {
             let max_tokens = args.max_tokens;
@@ -1254,14 +1255,14 @@ where
             starting.finish_and_clear();
             if importing {
                 let success = ui::success();
-                anstream::println!("{success}Imported{success:#} {}", runnable.launch.id);
+                anstream::println!("{success}Imported{success:#} {}", runnable.launch().id);
             }
-            let starting = ui::spinner(format!("Starting {}", runnable.launch.id));
-            let started = runner::start_foreground(&runnable.launch, &paths.run);
+            let starting = ui::spinner(format!("Starting {}", runnable.launch().id));
+            let started = runner::start_foreground(runnable.launch(), &paths.run);
             starting.finish_and_clear();
             match started? {
                 runner::ForegroundStart::Ready(server) => {
-                    session::run(server, &runnable.launch.id, max_tokens)
+                    session::run(server, &runnable.launch().id, max_tokens)
                 }
                 runner::ForegroundStart::Stopped(exit) => Ok(runner::report_exit(exit)),
             }
@@ -3797,7 +3798,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(runnable.launch.id, "demo");
+        assert_eq!(runnable.launch().id, "demo");
         assert!(
             paths
                 .model_dir("demo")
@@ -4014,7 +4015,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(runnable.launch.id, "gemma-4");
+        assert_eq!(runnable.launch().id, "gemma-4");
         assert!(!source.exists());
         assert!(paths.models.join("gemma-4/manifest.json").is_file());
     }
