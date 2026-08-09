@@ -22,11 +22,21 @@ impl RepositoryItem {
 pub(crate) struct CandidateItem {
     path: String,
     size: Option<u64>,
+    installed_model_id: Option<String>,
 }
 
 impl CandidateItem {
     pub(crate) fn new(path: String, size: Option<u64>) -> Self {
-        Self { path, size }
+        Self {
+            path,
+            size,
+            installed_model_id: None,
+        }
+    }
+
+    pub(crate) fn with_installed_model_id(mut self, model_id: String) -> Self {
+        self.installed_model_id = Some(model_id);
+        self
     }
 
     pub(crate) fn path(&self) -> &str {
@@ -35,6 +45,23 @@ impl CandidateItem {
 
     pub(crate) fn size(&self) -> Option<u64> {
         self.size
+    }
+
+    pub(crate) fn installed_model_id(&self) -> Option<&str> {
+        self.installed_model_id.as_deref()
+    }
+
+    pub(crate) fn is_installed(&self) -> bool {
+        self.installed_model_id().is_some()
+    }
+
+    fn transfer_action_label(&self) -> String {
+        if self.is_installed() {
+            return "Check installed".into();
+        }
+        self.size
+            .map(|bytes| format!("Download {}", format_size(bytes)))
+            .unwrap_or_else(|| "Download".into())
     }
 }
 
@@ -234,6 +261,15 @@ impl CatalogState {
 
     pub(crate) fn can_transfer(&self) -> bool {
         matches!(self.status, CatalogStatus::Selected(_)) && self.selected_candidate().is_some()
+    }
+
+    // Task 3 native rows consume this surface.
+    #[allow(dead_code)]
+    pub(crate) fn transfer_action_label(&self) -> Option<String> {
+        if !self.can_transfer() {
+            return None;
+        }
+        Some(self.selected_candidate()?.transfer_action_label())
     }
 
     pub(crate) fn can_pause(&self) -> bool {
@@ -439,6 +475,18 @@ impl CatalogTransferDisposition {
     }
 }
 
+fn format_size(bytes: u64) -> String {
+    const MB: f64 = 1_000_000.0;
+    const GB: f64 = 1_000_000_000.0;
+    if bytes >= 1_000_000_000 {
+        format!("{:.1} GB", bytes as f64 / GB)
+    } else if bytes >= 1_000_000 {
+        format!("{:.1} MB", bytes as f64 / MB)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CandidateItem, CatalogEvent, CatalogState, RepositoryItem};
@@ -461,6 +509,10 @@ mod tests {
     }
 
     fn ready_candidates() -> CatalogState {
+        ready_with_candidates(candidates(3))
+    }
+
+    fn ready_with_candidates(candidates: Vec<CandidateItem>) -> CatalogState {
         let mut state = CatalogState::default();
         let search = state
             .submit_search("models")
@@ -477,9 +529,50 @@ mod tests {
             generation: inspect.generation(),
             repo: "owner/model-1".into(),
             revision: "0123456789abcdef0123456789abcdef01234567".into(),
-            candidates: candidates(3),
+            candidates,
         }));
         state
+    }
+
+    #[test]
+    fn installed_candidate_keeps_explicit_descriptor_bound_transfer_with_check_action() {
+        use super::CatalogCommand;
+
+        let mut installed = ready_with_candidates(vec![CandidateItem::new(
+            "model-q4.gguf".into(),
+            Some(88_200_000),
+        )
+        .with_installed_model_id("custom-model".into())]);
+        assert!(installed.candidates()[0].is_installed());
+        assert_eq!(
+            installed.candidates()[0].installed_model_id(),
+            Some("custom-model")
+        );
+        assert!(installed.select_candidate(0));
+        assert_eq!(
+            installed.transfer_action_label().as_deref(),
+            Some("Check installed")
+        );
+        assert_eq!(
+            installed.start_transfer(),
+            Some(CatalogCommand::Transfer {
+                generation: 1,
+                repo: "owner/model-1".into(),
+                revision: "0123456789abcdef0123456789abcdef01234567".into(),
+                path: "model-q4.gguf".into(),
+            })
+        );
+
+        let mut ordinary = ready_with_candidates(vec![CandidateItem::new(
+            "model-q4.gguf".into(),
+            Some(88_200_000),
+        )]);
+        assert!(!ordinary.candidates()[0].is_installed());
+        assert!(ordinary.select_candidate(0));
+        assert_eq!(
+            ordinary.transfer_action_label().as_deref(),
+            Some("Download 88.2 MB")
+        );
     }
 
     #[test]

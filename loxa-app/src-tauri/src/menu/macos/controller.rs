@@ -16,6 +16,7 @@ use super::rows::{Actions, MenuRows, PopoverContent};
 #[cfg(not(test))]
 use super::timer::{weak_callback, ObservationTimer};
 use crate::menu::catalog::{CatalogEvent, CatalogState};
+use crate::menu::installed::InstalledState;
 use crate::menu::observation::BackendClient;
 #[cfg(not(test))]
 use crate::menu::observation::{BackendMessage, ObservationMessage};
@@ -31,6 +32,8 @@ struct NativePopoverState {
     rendered: Option<MenuSnapshot>,
     catalog: CatalogState,
     rendered_catalog: Option<CatalogState>,
+    installed: InstalledState,
+    rendered_installed: Option<InstalledState>,
     #[cfg(test)]
     cancel: InlineCancelState,
     backend: Option<BackendClient>,
@@ -56,6 +59,8 @@ impl NativePopoverState {
             rendered: None,
             catalog: CatalogState::default(),
             rendered_catalog: None,
+            installed: InstalledState::default(),
+            rendered_installed: None,
             #[cfg(test)]
             cancel: InlineCancelState::default(),
             backend: {
@@ -74,8 +79,9 @@ impl NativePopoverState {
 
     fn render(&mut self, target: &AnyObject, actions: Actions, mtm: MainThreadMarker) {
         let catalog_changed = self.rendered_catalog.as_ref() != Some(&self.catalog);
+        let installed_changed = self.rendered_installed.as_ref() != Some(&self.installed);
         match (
-            catalog_changed,
+            catalog_changed || installed_changed,
             self.snapshot.update_from(self.rendered.as_ref()),
         ) {
             (true, _) => self.rebuild(target, actions, mtm),
@@ -93,6 +99,7 @@ impl NativePopoverState {
         }
         self.rendered = Some(self.snapshot.clone());
         self.rendered_catalog = Some(self.catalog.clone());
+        self.rendered_installed = Some(self.installed.clone());
     }
 
     fn rebuild(&mut self, target: &AnyObject, actions: Actions, mtm: MainThreadMarker) {
@@ -184,6 +191,13 @@ impl NativePopoverState {
                         message: error,
                     });
                 }
+                BackendMessage::Installed {
+                    result,
+                    pinned_model_id,
+                } => match result {
+                    Ok(items) => self.installed.replace(items, pinned_model_id),
+                    Err(error) => self.installed.fail(error),
+                },
                 BackendMessage::Catalog(event) => {
                     let _ = self.catalog.apply(event);
                 }

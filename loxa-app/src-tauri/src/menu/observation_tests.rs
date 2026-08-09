@@ -10,11 +10,13 @@ use super::{
     map_app_snapshot, map_core_snapshot, run_backend_worker, BackendClient, BackendMessage,
     BackendRequest, BackendSource, CoreBundle, CoreDownload, CoreObservation, CoreRecommendation,
     CoreRecommendationUnavailableReason, InspectedRepository, ObservationMessage, RefreshAdmission,
+    TransferCompletion,
 };
 use crate::menu::catalog::{
     CandidateItem, CatalogCommand, CatalogEvent, CatalogTransferDisposition, RepositoryItem,
     TransferStage,
 };
+use crate::menu::installed::{InstalledInventoryError, InstalledItem};
 use crate::menu::presentation::{Fixture, MenuSnapshot};
 
 #[test]
@@ -124,6 +126,161 @@ fn worker_routes_search_inspection_and_exact_transfer_as_owned_events() {
                 generation: 7,
                 disposition: CatalogTransferDisposition::AlreadyInstalled,
             }),
+            BackendMessage::Installed {
+                result: Ok(vec![installed_item("new-model", 42)]),
+                pinned_model_id: Some("new-model".into()),
+            },
+        ]
+    );
+}
+
+#[test]
+fn worker_refreshes_inventory_immediately_after_installed_and_already_installed() {
+    for disposition in [
+        CatalogTransferDisposition::Installed,
+        CatalogTransferDisposition::AlreadyInstalled,
+    ] {
+        let initial_inventory = if disposition == CatalogTransferDisposition::AlreadyInstalled {
+            vec![
+                installed_item("old-model", 41),
+                installed_item("new-model", 42),
+            ]
+        } else {
+            vec![installed_item("old-model", 41)]
+        };
+        let (request_sender, request_receiver) = mpsc::channel();
+        let (message_sender, message_receiver) = mpsc::channel();
+        request_sender.send(BackendRequest::Observe).unwrap();
+        request_sender
+            .send(BackendRequest::Transfer {
+                generation: 11,
+                repo: "owner/model".into(),
+                revision: expected_revision(),
+                path: "model-q4.gguf".into(),
+                control: TransferControl::new(),
+            })
+            .unwrap();
+        request_sender.send(BackendRequest::Stop).unwrap();
+
+        run_backend_worker(
+            Ok(RefreshBackend {
+                disposition,
+                inventory_reads: 0,
+                fail_on_refresh: false,
+            }),
+            request_receiver,
+            message_sender,
+            &AtomicBool::new(false),
+        );
+
+        assert_eq!(
+            message_receiver.into_iter().collect::<Vec<_>>(),
+            [
+                BackendMessage::Observation(ObservationMessage::Snapshot(
+                    Fixture::Empty.snapshot(),
+                )),
+                BackendMessage::Installed {
+                    result: Ok(initial_inventory),
+                    pinned_model_id: None,
+                },
+                BackendMessage::Catalog(CatalogEvent::Progress {
+                    generation: 11,
+                    stage: TransferStage::Transferring,
+                    transferred_bytes: 0,
+                    total_bytes: 42,
+                }),
+                BackendMessage::Catalog(CatalogEvent::Completed {
+                    generation: 11,
+                    disposition,
+                }),
+                BackendMessage::Installed {
+                    result: Ok(vec![
+                        installed_item("old-model", 41),
+                        installed_item("new-model", 42),
+                    ]),
+                    pinned_model_id: Some("new-model".into()),
+                },
+            ],
+            "terminal disposition {disposition:?} must refresh without admission delay"
+        );
+    }
+}
+
+#[test]
+fn worker_drops_the_completion_pin_when_terminal_inventory_refresh_fails() {
+    let (request_sender, request_receiver) = mpsc::channel();
+    let (message_sender, message_receiver) = mpsc::channel();
+    request_sender.send(BackendRequest::Observe).unwrap();
+    request_sender
+        .send(BackendRequest::Transfer {
+            generation: 12,
+            repo: "owner/model".into(),
+            revision: expected_revision(),
+            path: "model-q4.gguf".into(),
+            control: TransferControl::new(),
+        })
+        .unwrap();
+    request_sender.send(BackendRequest::Stop).unwrap();
+
+    run_backend_worker(
+        Ok(RefreshBackend {
+            disposition: CatalogTransferDisposition::Installed,
+            inventory_reads: 0,
+            fail_on_refresh: true,
+        }),
+        request_receiver,
+        message_sender,
+        &AtomicBool::new(false),
+    );
+
+    assert_eq!(
+        message_receiver.into_iter().collect::<Vec<_>>(),
+        [
+            BackendMessage::Observation(ObservationMessage::Snapshot(Fixture::Empty.snapshot())),
+            BackendMessage::Installed {
+                result: Ok(vec![installed_item("old-model", 41)]),
+                pinned_model_id: None,
+            },
+            BackendMessage::Catalog(CatalogEvent::Progress {
+                generation: 12,
+                stage: TransferStage::Transferring,
+                transferred_bytes: 0,
+                total_bytes: 42,
+            }),
+            BackendMessage::Catalog(CatalogEvent::Completed {
+                generation: 12,
+                disposition: CatalogTransferDisposition::Installed,
+            }),
+            BackendMessage::Installed {
+                result: Err(InstalledInventoryError::RefreshFailed),
+                pinned_model_id: None,
+            },
+        ]
+    );
+}
+
+#[test]
+fn worker_maps_inventory_failures_to_the_closed_sanitized_error() {
+    let (request_sender, request_receiver) = mpsc::channel();
+    let (message_sender, message_receiver) = mpsc::channel();
+    request_sender.send(BackendRequest::Observe).unwrap();
+    request_sender.send(BackendRequest::Stop).unwrap();
+
+    run_backend_worker(
+        Ok(FailingInventoryBackend),
+        request_receiver,
+        message_sender,
+        &AtomicBool::new(false),
+    );
+
+    assert_eq!(
+        message_receiver.into_iter().collect::<Vec<_>>(),
+        [
+            BackendMessage::Observation(ObservationMessage::Snapshot(Fixture::Empty.snapshot())),
+            BackendMessage::Installed {
+                result: Err(InstalledInventoryError::RefreshFailed),
+                pinned_model_id: None,
+            },
         ]
     );
 }
@@ -211,11 +368,19 @@ fn candidate() -> CandidateItem {
     CandidateItem::new("model-q4.gguf".into(), Some(42))
 }
 
+fn installed_item(id: &str, total_bytes: u64) -> InstalledItem {
+    InstalledItem::new(id.into(), format!("{id}.gguf"), total_bytes)
+}
+
 struct FakeBackend;
 
 impl BackendSource for FakeBackend {
     fn snapshot(&mut self) -> MenuSnapshot {
         Fixture::Empty.snapshot()
+    }
+
+    fn installed_models(&mut self) -> Result<Vec<InstalledItem>, InstalledInventoryError> {
+        Ok(vec![installed_item("new-model", 42)])
     }
 
     fn search(&mut self, query: String) -> Result<Vec<RepositoryItem>, String> {
@@ -243,14 +408,100 @@ impl BackendSource for FakeBackend {
         path: String,
         _control: TransferControl,
         progress: &mut dyn FnMut(TransferStage, u64, u64),
-    ) -> Result<CatalogTransferDisposition, String> {
+    ) -> Result<TransferCompletion, String> {
         if (repo.as_str(), revision.as_str(), path.as_str())
             != ("owner/model", expected_revision().as_str(), "model-q4.gguf")
         {
             return Err("worker changed the explicit artifact choice".into());
         }
         progress(TransferStage::Transferring, 0, 42);
-        Ok(CatalogTransferDisposition::AlreadyInstalled)
+        Ok(TransferCompletion::new(
+            CatalogTransferDisposition::AlreadyInstalled,
+            "new-model".into(),
+        ))
+    }
+}
+
+struct RefreshBackend {
+    disposition: CatalogTransferDisposition,
+    inventory_reads: usize,
+    fail_on_refresh: bool,
+}
+
+impl BackendSource for RefreshBackend {
+    fn snapshot(&mut self) -> MenuSnapshot {
+        Fixture::Empty.snapshot()
+    }
+
+    fn installed_models(&mut self) -> Result<Vec<InstalledItem>, InstalledInventoryError> {
+        self.inventory_reads += 1;
+        match self.inventory_reads {
+            2 if self.fail_on_refresh => Err(InstalledInventoryError::RefreshFailed),
+            1 if self.disposition == CatalogTransferDisposition::AlreadyInstalled => Ok(vec![
+                installed_item("old-model", 41),
+                installed_item("new-model", 42),
+            ]),
+            1 => Ok(vec![installed_item("old-model", 41)]),
+            2 => Ok(vec![
+                installed_item("old-model", 41),
+                installed_item("new-model", 42),
+            ]),
+            _ => Err(InstalledInventoryError::RefreshFailed),
+        }
+    }
+
+    fn search(&mut self, _query: String) -> Result<Vec<RepositoryItem>, String> {
+        Err("search is outside this test".into())
+    }
+
+    fn inspect(&mut self, _repo: String) -> Result<InspectedRepository, String> {
+        Err("inspection is outside this test".into())
+    }
+
+    fn transfer(
+        &mut self,
+        _repo: String,
+        _revision: String,
+        _path: String,
+        _control: TransferControl,
+        progress: &mut dyn FnMut(TransferStage, u64, u64),
+    ) -> Result<TransferCompletion, String> {
+        progress(TransferStage::Transferring, 0, 42);
+        Ok(TransferCompletion::new(
+            self.disposition,
+            "new-model".into(),
+        ))
+    }
+}
+
+struct FailingInventoryBackend;
+
+impl BackendSource for FailingInventoryBackend {
+    fn snapshot(&mut self) -> MenuSnapshot {
+        Fixture::Empty.snapshot()
+    }
+
+    fn installed_models(&mut self) -> Result<Vec<InstalledItem>, InstalledInventoryError> {
+        Err(InstalledInventoryError::RefreshFailed)
+    }
+
+    fn search(&mut self, _query: String) -> Result<Vec<RepositoryItem>, String> {
+        Err("search is outside this test".into())
+    }
+
+    fn inspect(&mut self, _repo: String) -> Result<InspectedRepository, String> {
+        Err("inspection is outside this test".into())
+    }
+
+    fn transfer(
+        &mut self,
+        _repo: String,
+        _revision: String,
+        _path: String,
+        _control: TransferControl,
+        _progress: &mut dyn FnMut(TransferStage, u64, u64),
+    ) -> Result<TransferCompletion, String> {
+        Err("transfer is outside this test".into())
     }
 }
 
@@ -261,6 +512,10 @@ struct ThreadBackend {
 impl BackendSource for ThreadBackend {
     fn snapshot(&mut self) -> MenuSnapshot {
         Fixture::Empty.snapshot()
+    }
+
+    fn installed_models(&mut self) -> Result<Vec<InstalledItem>, InstalledInventoryError> {
+        Ok(Vec::new())
     }
 
     fn search(&mut self, _query: String) -> Result<Vec<RepositoryItem>, String> {
@@ -281,7 +536,7 @@ impl BackendSource for ThreadBackend {
         _path: String,
         _control: TransferControl,
         _progress: &mut dyn FnMut(TransferStage, u64, u64),
-    ) -> Result<CatalogTransferDisposition, String> {
+    ) -> Result<TransferCompletion, String> {
         Err("transfer is outside this test".into())
     }
 }

@@ -19,6 +19,7 @@ use loxa::discovery::{CandidateDisposition, InspectRepository, SearchModels};
 use crate::menu::catalog::{
     CandidateItem, CatalogEvent, CatalogTransferDisposition, RepositoryItem, TransferStage,
 };
+use crate::menu::installed::{InstalledInventoryError, InstalledItem};
 use crate::menu::presentation::{
     Bundle, Download, MenuSnapshot, Recommendation, RecommendationUnavailableReason as MenuReason,
     RecoveryReason, Runtime, RuntimeInventory,
@@ -288,6 +289,10 @@ enum BackendRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BackendMessage {
     Observation(ObservationMessage),
+    Installed {
+        result: Result<Vec<InstalledItem>, InstalledInventoryError>,
+        pinned_model_id: Option<String>,
+    },
     Catalog(CatalogEvent),
 }
 
@@ -307,8 +312,23 @@ impl InspectedRepository {
     }
 }
 
+struct TransferCompletion {
+    disposition: CatalogTransferDisposition,
+    model_id: String,
+}
+
+impl TransferCompletion {
+    fn new(disposition: CatalogTransferDisposition, model_id: String) -> Self {
+        Self {
+            disposition,
+            model_id,
+        }
+    }
+}
+
 trait BackendSource {
     fn snapshot(&mut self) -> MenuSnapshot;
+    fn installed_models(&mut self) -> Result<Vec<InstalledItem>, InstalledInventoryError>;
     fn search(&mut self, query: String) -> Result<Vec<RepositoryItem>, String>;
     fn inspect(&mut self, repo: String) -> Result<InspectedRepository, String>;
     fn transfer(
@@ -318,7 +338,7 @@ trait BackendSource {
         path: String,
         control: TransferControl,
         progress: &mut dyn FnMut(TransferStage, u64, u64),
-    ) -> Result<CatalogTransferDisposition, String>;
+    ) -> Result<TransferCompletion, String>;
 }
 
 #[cfg(not(test))]
@@ -328,6 +348,24 @@ struct AppBackend(AppService);
 impl BackendSource for AppBackend {
     fn snapshot(&mut self) -> MenuSnapshot {
         map_app_snapshot(self.0.snapshot())
+    }
+
+    fn installed_models(&mut self) -> Result<Vec<InstalledItem>, InstalledInventoryError> {
+        self.0
+            .installed_models()
+            .map(|models| {
+                models
+                    .into_iter()
+                    .map(|model| {
+                        InstalledItem::new(
+                            model.id().into(),
+                            model.display_name().into(),
+                            model.total_bytes(),
+                        )
+                    })
+                    .collect()
+            })
+            .map_err(|_| InstalledInventoryError::RefreshFailed)
     }
 
     fn search(&mut self, query: String) -> Result<Vec<RepositoryItem>, String> {
@@ -366,16 +404,31 @@ impl BackendSource for AppBackend {
             .0
             .inspect_repository(InspectRepository::new(repo, None))
             .map_err(|error| error.to_string())?;
+        let installed = self
+            .0
+            .installed_models()
+            .map_err(|_| InstalledInventoryError::RefreshFailed.message().to_owned())?;
         let candidates = plan
             .candidates()
             .iter()
-            .filter(|candidate| {
-                matches!(
+            .filter_map(|candidate| {
+                if !matches!(
                     candidate.disposition(),
                     CandidateDisposition::EligibleForDownloadAndLocalValidation
-                ) && candidate.identity().is_some()
+                ) {
+                    return None;
+                }
+                let identity = candidate.identity()?;
+                let installed_model_id = installed
+                    .iter()
+                    .find(|summary| summary.matches_remote(identity))
+                    .map(|summary| summary.id().to_owned());
+                let item = CandidateItem::new(candidate.display_path().into(), candidate.size());
+                Some(match installed_model_id {
+                    Some(model_id) => item.with_installed_model_id(model_id),
+                    None => item,
+                })
             })
-            .map(|candidate| CandidateItem::new(candidate.display_path().into(), candidate.size()))
             .collect();
         Ok(InspectedRepository::new(
             plan.repo().into(),
@@ -391,7 +444,7 @@ impl BackendSource for AppBackend {
         path: String,
         control: TransferControl,
         progress: &mut dyn FnMut(TransferStage, u64, u64),
-    ) -> Result<CatalogTransferDisposition, String> {
+    ) -> Result<TransferCompletion, String> {
         let artifact = self
             .0
             .resolve_artifact(ResolveArtifactRequest::exact_file(
@@ -415,12 +468,35 @@ impl BackendSource for AppBackend {
                 },
             )
             .map_err(|error| error.to_string())?;
-        Ok(match result.disposition() {
+        let disposition = match result.disposition() {
             TransferDisposition::Installed => CatalogTransferDisposition::Installed,
             TransferDisposition::AlreadyInstalled => CatalogTransferDisposition::AlreadyInstalled,
             TransferDisposition::Paused => CatalogTransferDisposition::Paused,
             TransferDisposition::Interrupted => CatalogTransferDisposition::Interrupted,
-        })
+        };
+        Ok(TransferCompletion::new(
+            disposition,
+            result.model_id().into(),
+        ))
+    }
+}
+
+fn installed_message<B: BackendSource>(
+    source: &mut Result<B, String>,
+    pinned_model_id: Option<String>,
+) -> BackendMessage {
+    let result = match source {
+        Ok(source) => source.installed_models(),
+        Err(_) => Err(InstalledInventoryError::RefreshFailed),
+    };
+    let pinned_model_id = if result.is_ok() {
+        pinned_model_id
+    } else {
+        None
+    };
+    BackendMessage::Installed {
+        pinned_model_id,
+        result,
     }
 }
 
@@ -435,10 +511,16 @@ fn run_backend_worker<B: BackendSource>(
             break;
         }
         let message = match request {
-            BackendRequest::Observe => Some(BackendMessage::Observation(match &mut source {
-                Ok(source) => ObservationMessage::Snapshot(source.snapshot()),
-                Err(error) => ObservationMessage::Error(error.clone()),
-            })),
+            BackendRequest::Observe => {
+                let observation = BackendMessage::Observation(match &mut source {
+                    Ok(source) => ObservationMessage::Snapshot(source.snapshot()),
+                    Err(error) => ObservationMessage::Error(error.clone()),
+                });
+                if message_sender.send(observation).is_err() {
+                    break;
+                }
+                Some(installed_message(&mut source, None))
+            }
             BackendRequest::Search { generation, query } => {
                 Some(BackendMessage::Catalog(match &mut source {
                     Ok(source) => match source.search(query) {
@@ -484,7 +566,7 @@ fn run_backend_worker<B: BackendSource>(
                 path,
                 control,
             } => {
-                let terminal = match &mut source {
+                let (terminal, pinned_model_id) = match &mut source {
                     Ok(source) => {
                         let mut progress = |stage, transferred_bytes, total_bytes| {
                             let _ = message_sender.send(BackendMessage::Catalog(
@@ -497,22 +579,45 @@ fn run_backend_worker<B: BackendSource>(
                             ));
                         };
                         match source.transfer(repo, revision, path, control, &mut progress) {
-                            Ok(disposition) => CatalogEvent::Completed {
-                                generation,
+                            Ok(TransferCompletion {
                                 disposition,
-                            },
-                            Err(message) => CatalogEvent::Failed {
-                                generation,
-                                message,
-                            },
+                                model_id,
+                            }) => (
+                                CatalogEvent::Completed {
+                                    generation,
+                                    disposition,
+                                },
+                                matches!(
+                                    disposition,
+                                    CatalogTransferDisposition::Installed
+                                        | CatalogTransferDisposition::AlreadyInstalled
+                                )
+                                .then_some(model_id),
+                            ),
+                            Err(message) => (
+                                CatalogEvent::Failed {
+                                    generation,
+                                    message,
+                                },
+                                None,
+                            ),
                         }
                     }
-                    Err(message) => CatalogEvent::Failed {
-                        generation,
-                        message: message.clone(),
-                    },
+                    Err(message) => (
+                        CatalogEvent::Failed {
+                            generation,
+                            message: message.clone(),
+                        },
+                        None,
+                    ),
                 };
-                Some(BackendMessage::Catalog(terminal))
+                if message_sender
+                    .send(BackendMessage::Catalog(terminal))
+                    .is_err()
+                {
+                    break;
+                }
+                pinned_model_id.map(|model_id| installed_message(&mut source, Some(model_id)))
             }
             BackendRequest::Stop => None,
         };
