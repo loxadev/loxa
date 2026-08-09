@@ -310,12 +310,13 @@ fn empty_activity_is_unknown_without_calling_http() {
     let mut host = ApiRuntimeHost::new(paths);
     let requests = Cell::new(0_u8);
 
-    let activity = host.activity_with(|_| {
+    let probe = host.probe_with(|_| {
         requests.set(requests.get() + 1);
         ApiRuntimeActivity::Loaded
     });
 
-    assert_eq!(activity, ApiRuntimeActivity::Unknown);
+    assert_eq!(probe, ApiRuntimeProbe::Stopped);
+    assert_eq!(host.activity(), ApiRuntimeActivity::Unknown);
     assert_eq!(requests.get(), 0);
 }
 
@@ -348,6 +349,7 @@ fn public_host_contract_is_owned_sendable_and_narrow() {
     ) -> Result<ApiStartOutcome, ApiStartError> = ApiRuntimeHost::start;
     let _: fn(&mut ApiRuntimeHost) -> Result<ApiStopOutcome, ApiStopError> = ApiRuntimeHost::stop;
     let _: fn(&mut ApiRuntimeHost) -> ApiRuntimeActivity = ApiRuntimeHost::activity;
+    let _: fn(&mut ApiRuntimeHost) -> ApiRuntimeProbe = ApiRuntimeHost::probe;
     let _: fn(&ApiRuntimeEndpoint) -> &str = ApiRuntimeEndpoint::model_id;
     let _: fn(&ApiRuntimeEndpoint) -> u16 = ApiRuntimeEndpoint::port;
 }
@@ -884,7 +886,7 @@ fn activity_timeout_is_unknown_and_remains_bounded() {
 
 #[cfg(unix)]
 #[test]
-fn activity_checks_the_exact_child_before_and_after_the_probe() {
+fn dead_child_probe_distinguishes_clean_stop_from_retryable_cleanup_failure() {
     let _guard = process_test_lock();
 
     let pre = InstalledFixture::new();
@@ -894,17 +896,20 @@ fn activity_checks_the_exact_child_before_and_after_the_probe() {
         .unwrap();
     let requests_before = pre.props_request_count();
     kill_child(child_pid(&pre.paths));
-    assert_eq!(pre_host.activity(), ApiRuntimeActivity::Unknown);
+    assert_eq!(pre_host.probe(), ApiRuntimeProbe::Stopped);
     assert_eq!(pre.props_request_count(), requests_before);
-    assert_eq!(pre_host.activity(), ApiRuntimeActivity::Unknown);
-    assert_eq!(pre.props_request_count(), requests_before);
-    assert_eq!(pre_host.stop().unwrap(), ApiStopOutcome::Stopped);
+    assert_eq!(pre_host.endpoint(), None);
+    assert!(!pre.paths.run.join("foreground.json").exists());
+    drop(RuntimeOwnership::acquire(&pre.paths.run).unwrap());
+    drop(ModelLock::acquire(&pre.model_dir("demo")).unwrap());
+    assert_eq!(pre_host.stop().unwrap(), ApiStopOutcome::AlreadyStopped);
 
     let post = InstalledFixture::new();
     let mut post_host = ApiRuntimeHost::new(post.paths.clone());
     post_host
         .start("demo", &ApiStartCancellation::new())
         .unwrap();
+    let endpoint = post_host.endpoint().unwrap();
     let pid = child_pid(&post.paths);
     let lease_path = post.paths.run.join("foreground.json");
     let original_lease = fs::read(&lease_path).unwrap();
@@ -915,18 +920,40 @@ fn activity_checks_the_exact_child_before_and_after_the_probe() {
         .checked_add(1)
         .unwrap());
     assert_eq!(
-        post_host.activity_with(|_| {
+        post_host.probe_with(|_| {
             fs::write(&lease_path, serde_json::to_vec(&changed_lease).unwrap()).unwrap();
             kill_child(pid);
             ApiRuntimeActivity::Loaded
         }),
-        ApiRuntimeActivity::Unknown
+        ApiRuntimeProbe::CleanupFailed
     );
-    assert_eq!(post_host.activity(), ApiRuntimeActivity::Unknown);
+    assert_eq!(post_host.endpoint(), Some(endpoint));
     assert!(lease_path.exists());
     assert!(RuntimeOwnership::acquire(&post.paths.run).is_err());
     assert!(ModelLock::acquire(&post.model_dir("demo")).is_err());
     fs::write(&lease_path, original_lease).unwrap();
     assert_eq!(post_host.stop().unwrap(), ApiStopOutcome::Stopped);
     assert!(!lease_path.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn live_child_props_failure_stays_ready_unknown_and_retains_exact_ownership() {
+    let _guard = process_test_lock();
+    let fixture = InstalledFixture::new();
+    let mut host = ApiRuntimeHost::new(fixture.paths.clone());
+    host.start("demo", &ApiStartCancellation::new()).unwrap();
+    let endpoint = host.endpoint().unwrap();
+    fixture.set_mode("missing");
+
+    assert_eq!(
+        host.probe(),
+        ApiRuntimeProbe::Activity(ApiRuntimeActivity::Unknown)
+    );
+    assert_eq!(host.endpoint(), Some(endpoint));
+    assert!(fixture.paths.run.join("foreground.json").exists());
+    assert!(RuntimeOwnership::acquire(&fixture.paths.run).is_err());
+    assert!(ModelLock::acquire(&fixture.model_dir("demo")).is_err());
+
+    assert_eq!(host.stop().unwrap(), ApiStopOutcome::Stopped);
 }

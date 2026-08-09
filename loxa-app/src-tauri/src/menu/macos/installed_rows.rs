@@ -11,6 +11,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{NSArray, NSInteger, NSPoint, NSRect, NSSize, NSString, NSURL};
 
+use crate::menu::api_presentation::{ApiPresentation, ApiPrimaryAction, ApiPrimaryActionKind};
 use crate::menu::installed::{InstalledFeedback, InstalledItem, InstalledState};
 use crate::menu::presentation::MenuLayout;
 use crate::menu::progress::format_bytes;
@@ -25,6 +26,8 @@ const ICON_SIZE: f64 = 16.0;
 #[derive(Clone, Copy)]
 pub(super) struct InstalledActions {
     pub(super) select: Sel,
+    pub(super) api_start: Sel,
+    pub(super) api_stop: Sel,
     pub(super) copy: Sel,
     pub(super) reveal: Sel,
 }
@@ -45,17 +48,15 @@ pub(super) struct InstalledContent {
     pub(super) secondary_labels: Vec<Retained<NSTextField>>,
 }
 
-pub(super) fn content_height(state: &InstalledState) -> f64 {
-    let row_count = state.visible_items().len() as f64;
-    let selected_is_visible = state.selected().is_some_and(|selected| {
-        state
-            .visible_items()
-            .iter()
-            .any(|item| item.id() == selected.id())
-    });
+pub(super) fn content_height(state: &InstalledState, api: &ApiPresentation) -> f64 {
+    let visible = state.visible_items_for(api.active_model_id());
+    let row_count = visible.len() as f64;
+    let selected_is_visible = state
+        .selected()
+        .is_some_and(|selected| visible.iter().any(|item| item.id() == selected.id()));
     ROW_HEIGHT * row_count
         + if selected_is_visible {
-            ACTION_HEIGHT
+            2.0 * ACTION_HEIGHT
         } else {
             0.0
         }
@@ -78,11 +79,12 @@ pub(super) fn content_height(state: &InstalledState) -> f64 {
 
 pub(super) fn build(
     state: &InstalledState,
+    api: &ApiPresentation,
     target: Option<&AnyObject>,
     actions: InstalledActions,
     mtm: MainThreadMarker,
 ) -> InstalledContent {
-    let height = content_height(state);
+    let height = content_height(state, api);
     let root = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, WIDTH, height));
     let mut next_y = height;
     #[cfg(test)]
@@ -95,7 +97,11 @@ pub(super) fn build(
     let mut secondary_labels = Vec::new();
 
     let selected_id = state.selected().map(InstalledItem::id);
-    for (index, item) in state.visible_items().into_iter().enumerate() {
+    for (index, item) in state
+        .visible_items_for(api.active_model_id())
+        .into_iter()
+        .enumerate()
+    {
         let selected = selected_id == Some(item.id());
         let result = installed_row(item, selected, index, target, actions.select, mtm);
         result
@@ -109,6 +115,15 @@ pub(super) fn build(
             secondary_labels.push(result.secondary);
         }
         if selected {
+            let primary_action = api.primary_action(item.id());
+            let primary_row = row(&mut next_y, ACTION_HEIGHT, mtm);
+            let primary = api_primary_button(primary_action, target, actions, mtm);
+            primary.setFrame(rect(INSET, 4.0, WIDTH - 2.0 * INSET, 28.0));
+            primary_row.addSubview(&primary);
+            root.addSubview(&primary_row);
+            #[cfg(test)]
+            action_buttons.push(primary);
+
             let action_row = row(&mut next_y, ACTION_HEIGHT, mtm);
             let available_width = WIDTH - 2.0 * INSET;
             let copy = text_button(
@@ -166,6 +181,22 @@ pub(super) fn build(
         #[cfg(test)]
         secondary_labels,
     }
+}
+
+fn api_primary_button(
+    action: ApiPrimaryAction,
+    target: Option<&AnyObject>,
+    actions: InstalledActions,
+    mtm: MainThreadMarker,
+) -> Retained<NSButton> {
+    let selector = match action.kind() {
+        ApiPrimaryActionKind::Start => actions.api_start,
+        ApiPrimaryActionKind::Stop => actions.api_stop,
+    };
+    let accessibility_label = action.disabled_reason().unwrap_or(action.title());
+    let button = text_button(action.title(), accessibility_label, target, selector, mtm);
+    button.setEnabled(action.is_enabled());
+    button
 }
 
 struct InstalledRow {

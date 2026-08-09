@@ -7,6 +7,37 @@ mod app {
 
 #[cfg(target_os = "macos")]
 mod menu {
+    pub(crate) mod api_presentation {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/api_presentation.rs"
+        ));
+    }
+
+    pub(crate) mod api_runtime {
+        pub(crate) struct ApiRuntimeController;
+
+        impl ApiRuntimeController {
+            pub(crate) fn request_probe(&mut self) -> bool {
+                false
+            }
+
+            pub(crate) fn drain(&mut self) -> bool {
+                false
+            }
+
+            pub(crate) fn prepare_shutdown(&mut self) -> bool {
+                false
+            }
+
+            pub(crate) fn shutdown_and_join(&mut self) -> Result<(), ()> {
+                Ok(())
+            }
+
+            pub(crate) fn mark_unavailable_after_exit_failure(&mut self) {}
+        }
+    }
+
     pub(crate) mod catalog {
         include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/menu/catalog.rs"));
     }
@@ -53,6 +84,14 @@ mod menu {
             }
 
             pub(crate) fn shutdown(&mut self) {}
+
+            pub(crate) fn pause_active_transfer(&self) -> bool {
+                false
+            }
+
+            pub(crate) fn shutdown_and_join(&mut self) -> Result<(), ()> {
+                Ok(())
+            }
 
             pub(crate) fn request_pause(&self, _generation: u64) -> bool {
                 false
@@ -120,29 +159,31 @@ mod menu {
 
             pub(crate) fn assert_native_layout_contract(mtm: MainThreadMarker) {
                 for (name, fixture, expected_height, expected_action_button_count) in [
-                    ("recommendation", Fixture::Empty, 349.0, 1),
-                    ("installed", Fixture::Installed, 272.0, 0),
-                    ("recovery", Fixture::Invalid, 272.0, 0),
-                    ("transfer", Fixture::Downloading, 332.0, 4),
+                    ("recommendation", Fixture::Empty, 369.0, 1),
+                    ("installed", Fixture::Installed, 292.0, 0),
+                    ("recovery", Fixture::Invalid, 292.0, 0),
+                    ("transfer", Fixture::Downloading, 352.0, 4),
                 ] {
                     let PopoverContent {
                         view,
+                        rows,
                         quit_button,
                         action_buttons,
                         ..
                     } = MenuRows::build(
                         &fixture.snapshot(),
+                        &ApiPresentation::idle(),
                         &crate::menu::catalog::CatalogState::default(),
                         &crate::menu::incomplete::IncompleteState::default(),
                         &InstalledState::default(),
-                        None,
-                        layout_fixture_actions(),
+                        ActionBindings::new(None, layout_fixture_actions()),
                         mtm,
                     );
                     view.layoutSubtreeIfNeeded();
 
                     assert_eq!(view.frame().size.width, 360.0, "{name} width");
                     assert_eq!(view.frame().size.height, expected_height, "{name} height");
+                    assert_eq!(rows.header.root.frame().size.height, 72.0, "{name} header");
                     // SAFETY: MenuRows::build adds the retained Quit button to
                     // its retained row before returning this content view.
                     let quit_row = unsafe { quit_button.superview() }
@@ -184,17 +225,19 @@ mod menu {
                     );
                 }
 
-                let running = Fixture::Running
-                    .snapshot()
-                    .with_running_port(43123)
-                    .unwrap();
-                let runtime = MenuRows::build(
+                let running = Fixture::Running.snapshot();
+                let ready = ApiPresentation::ready(
+                    "demo",
+                    43123,
+                    loxa::api_runtime::ApiRuntimeActivity::Loaded,
+                );
+                let mut runtime = MenuRows::build(
                     &running,
+                    &ready,
                     &crate::menu::catalog::CatalogState::default(),
                     &crate::menu::incomplete::IncompleteState::default(),
                     &InstalledState::default(),
-                    None,
-                    layout_fixture_actions(),
+                    ActionBindings::new(None, layout_fixture_actions()),
                     mtm,
                 );
                 runtime.view.layoutSubtreeIfNeeded();
@@ -233,6 +276,35 @@ mod menu {
                 let button_frame = copy_button.frame();
                 assert_eq!(button_frame.size, NSSize::new(28.0, 28.0));
                 let button_ptr = Retained::as_ptr(&runtime.rows.header.copy_button);
+                let phase_ptr = Retained::as_ptr(&runtime.rows.header.phase_label);
+                let detail_ptr = Retained::as_ptr(&runtime.rows.header.detail_label);
+
+                let sleeping = ApiPresentation::ready(
+                    "demo",
+                    43123,
+                    loxa::api_runtime::ApiRuntimeActivity::Sleeping,
+                );
+                runtime.rows.update(
+                    &running,
+                    &sleeping,
+                    &crate::menu::presentation::InlineCancelState::default(),
+                );
+                assert_eq!(
+                    runtime.rows.header.phase_label.stringValue().to_string(),
+                    "API: Ready · Model sleeping"
+                );
+                assert_eq!(
+                    Retained::as_ptr(&runtime.rows.header.phase_label),
+                    phase_ptr
+                );
+                assert_eq!(
+                    Retained::as_ptr(&runtime.rows.header.detail_label),
+                    detail_ptr
+                );
+                assert_eq!(
+                    Retained::as_ptr(&runtime.rows.header.copy_button),
+                    button_ptr
+                );
 
                 runtime.rows.update_runtime_curl_copy_feedback(true);
                 runtime.view.layoutSubtreeIfNeeded();
@@ -283,11 +355,11 @@ mod menu {
 
                 let search = MenuRows::build(
                     &Fixture::Empty.snapshot(),
+                    &ApiPresentation::idle(),
                     &crate::menu::catalog::CatalogState::default(),
                     &crate::menu::incomplete::IncompleteState::default(),
                     &InstalledState::default(),
-                    None,
-                    layout_fixture_actions(),
+                    ActionBindings::new(None, layout_fixture_actions()),
                     mtm,
                 );
                 assert_eq!(
@@ -305,6 +377,31 @@ mod menu {
                     !search_field.sendsSearchStringImmediately(),
                     "live search must use AppKit's native delay"
                 );
+
+                let stale_observation = Fixture::Running
+                    .snapshot()
+                    .with_running_port(49999)
+                    .unwrap();
+                let authoritative_idle = MenuRows::build(
+                    &stale_observation,
+                    &ApiPresentation::idle(),
+                    &crate::menu::catalog::CatalogState::default(),
+                    &crate::menu::incomplete::IncompleteState::default(),
+                    &InstalledState::default(),
+                    ActionBindings::new(None, layout_fixture_actions()),
+                    mtm,
+                );
+                assert_eq!(
+                    authoritative_idle
+                        .rows
+                        .header
+                        .phase_label
+                        .stringValue()
+                        .to_string(),
+                    "API: Idle"
+                );
+                assert!(authoritative_idle.rows.header.detail_label.isHidden());
+                assert!(authoritative_idle.rows.header.copy_button.isHidden());
 
                 assert_catalog_browsing_contract(mtm);
                 assert_installed_rows_and_priority(mtm);
@@ -532,6 +629,7 @@ mod menu {
                 installed.fail(InstalledInventoryError::RefreshFailed);
                 let rows = super::installed_rows::build(
                     &installed,
+                    &ApiPresentation::idle(),
                     None,
                     installed_fixture_actions(),
                     mtm,
@@ -551,8 +649,10 @@ mod menu {
                         .iter()
                         .map(|button| button.title().to_string())
                         .collect::<Vec<_>>(),
-                    ["Copy chat command", "Reveal in Finder"]
+                    ["Start API", "Copy chat command", "Reveal in Finder"]
                 );
+                assert_eq!(rows.action_buttons[0].frame().origin.x, 16.0);
+                assert_eq!(rows.action_buttons[0].frame().size.width, 328.0);
                 assert!(rows
                     .row_buttons
                     .iter()
@@ -566,6 +666,49 @@ mod menu {
                 assert!(text.contains(&"2 more installed".into()));
                 assert!(text.contains(&"Could not refresh installed models".into()));
                 assert!(count_image_views(&rows.view) >= 6);
+
+                let ready = ApiPresentation::ready(
+                    "golf",
+                    43123,
+                    loxa::api_runtime::ApiRuntimeActivity::Sleeping,
+                );
+                assert!(installed.select("golf"));
+                let active = super::installed_rows::build(
+                    &installed,
+                    &ready,
+                    None,
+                    installed_fixture_actions(),
+                    mtm,
+                );
+                assert_eq!(
+                    active.secondary_labels[0].stringValue().to_string(),
+                    "golf · 88.2 MB"
+                );
+                assert_eq!(active.action_buttons[0].title().to_string(), "Stop API");
+                assert!(active.action_buttons[0].isEnabled());
+
+                assert!(installed.select("alpha"));
+                let blocked = super::installed_rows::build(
+                    &installed,
+                    &ready,
+                    None,
+                    installed_fixture_actions(),
+                    mtm,
+                );
+                let start = &blocked.action_buttons[0];
+                assert_eq!(start.title().to_string(), "Start API");
+                assert!(!start.isEnabled());
+                assert_eq!(
+                    start
+                        .accessibilityLabel()
+                        .map(|label| label.to_string())
+                        .as_deref(),
+                    Some("Stop the current API first")
+                );
+                assert_eq!(
+                    start.toolTip().map(|label| label.to_string()).as_deref(),
+                    Some("Stop the current API first")
+                );
 
                 let one = {
                     let mut state = InstalledState::default();
@@ -582,11 +725,11 @@ mod menu {
                 let idle = CatalogState::default();
                 let installed_menu = MenuRows::build(
                     &Fixture::Installed.snapshot(),
+                    &ApiPresentation::idle(),
                     &idle,
                     &crate::menu::incomplete::IncompleteState::default(),
                     &one,
-                    None,
-                    layout_fixture_actions(),
+                    ActionBindings::new(None, layout_fixture_actions()),
                     mtm,
                 );
                 let installed_text = text_values(&installed_menu.view);
@@ -602,11 +745,11 @@ mod menu {
                 ] {
                     let content = MenuRows::build(
                         &snapshot,
+                        &ApiPresentation::idle(),
                         &idle,
                         &crate::menu::incomplete::IncompleteState::default(),
                         &one,
-                        None,
-                        layout_fixture_actions(),
+                        ActionBindings::new(None, layout_fixture_actions()),
                         mtm,
                     );
                     let text = text_values(&content.view);
@@ -619,11 +762,11 @@ mod menu {
 
                 let recommended = MenuRows::build(
                     &Fixture::Empty.snapshot(),
+                    &ApiPresentation::idle(),
                     &idle,
                     &crate::menu::incomplete::IncompleteState::default(),
                     &one,
-                    None,
-                    layout_fixture_actions(),
+                    ActionBindings::new(None, layout_fixture_actions()),
                     mtm,
                 );
                 let recommended_text = text_values(&recommended.view);
@@ -650,11 +793,11 @@ mod menu {
                 ] {
                     let content = MenuRows::build(
                         &snapshot,
+                        &ApiPresentation::idle(),
                         &failed_catalog,
                         &crate::menu::incomplete::IncompleteState::default(),
                         &one,
-                        None,
-                        layout_fixture_actions(),
+                        ActionBindings::new(None, layout_fixture_actions()),
                         mtm,
                     );
                     let text = text_values(&content.view);
@@ -670,11 +813,11 @@ mod menu {
                 assert!(active.submit_search("models").is_some());
                 let browsing = MenuRows::build(
                     &MenuSnapshot::loading(),
+                    &ApiPresentation::idle(),
                     &active,
                     &crate::menu::incomplete::IncompleteState::default(),
                     &one,
-                    None,
-                    layout_fixture_actions(),
+                    ActionBindings::new(None, layout_fixture_actions()),
                     mtm,
                 );
                 let browsing_text = text_values(&browsing.view);
@@ -779,11 +922,11 @@ mod menu {
 
                 let menu = MenuRows::build(
                     &Fixture::Installed.snapshot(),
+                    &ApiPresentation::idle(),
                     &CatalogState::default(),
                     &incomplete,
                     &InstalledState::default(),
-                    None,
-                    layout_fixture_actions(),
+                    ActionBindings::new(None, layout_fixture_actions()),
                     mtm,
                 );
                 assert!(visible_text_values(&menu.view).contains(&"Incomplete downloads".into()));
@@ -792,11 +935,11 @@ mod menu {
                 assert!(browsing.submit_search("models").is_some());
                 let menu = MenuRows::build(
                     &Fixture::Installed.snapshot(),
+                    &ApiPresentation::idle(),
                     &browsing,
                     &incomplete,
                     &InstalledState::default(),
-                    None,
-                    layout_fixture_actions(),
+                    ActionBindings::new(None, layout_fixture_actions()),
                     mtm,
                 );
                 let text = visible_text_values(&menu.view);
@@ -809,11 +952,11 @@ mod menu {
                 installed.fail(InstalledInventoryError::RefreshFailed);
                 let content = MenuRows::build(
                     &Fixture::Empty.snapshot(),
+                    &ApiPresentation::idle(),
                     &CatalogState::default(),
                     &crate::menu::incomplete::IncompleteState::default(),
                     &installed,
-                    None,
-                    layout_fixture_actions(),
+                    ActionBindings::new(None, layout_fixture_actions()),
                     mtm,
                 );
                 let text = visible_text_values(&content.view);
@@ -827,11 +970,11 @@ mod menu {
                 installed.fail(InstalledInventoryError::RefreshFailed);
                 let content = MenuRows::build(
                     &Fixture::Installed.snapshot(),
+                    &ApiPresentation::idle(),
                     &CatalogState::default(),
                     &crate::menu::incomplete::IncompleteState::default(),
                     &installed,
-                    None,
-                    layout_fixture_actions(),
+                    ActionBindings::new(None, layout_fixture_actions()),
                     mtm,
                 );
                 let text = visible_text_values(&content.view);
@@ -846,6 +989,8 @@ mod menu {
             fn layout_fixture_actions() -> Actions {
                 Actions {
                     runtime_copy: sel!(fixtureNoop:),
+                    api_start: sel!(fixtureNoop:),
+                    api_stop: sel!(fixtureNoop:),
                     search: sel!(fixtureNoop:),
                     repository: sel!(fixtureNoop:),
                     candidate: sel!(fixtureNoop:),
@@ -881,6 +1026,8 @@ mod menu {
             fn installed_fixture_actions() -> super::installed_rows::InstalledActions {
                 super::installed_rows::InstalledActions {
                     select: sel!(fixtureNoop:),
+                    api_start: sel!(fixtureNoop:),
+                    api_stop: sel!(fixtureNoop:),
                     copy: sel!(fixtureNoop:),
                     reveal: sel!(fixtureNoop:),
                 }
@@ -1126,10 +1273,11 @@ mod menu {
             pub(crate) fn assert_runtime_copy_feedback_lifecycle(mtm: MainThreadMarker) {
                 let content_view_controller = NSViewController::new(mtm);
                 let mut state = native_state(content_view_controller, Fixture::Running, mtm);
-                state.snapshot = Fixture::Running
-                    .snapshot()
-                    .with_running_port(43123)
-                    .unwrap();
+                state.api = crate::menu::api_presentation::ApiPresentation::ready(
+                    "demo",
+                    43123,
+                    loxa::api_runtime::ApiRuntimeActivity::Loaded,
+                );
                 let target = NSObject::new();
                 let started_at = Instant::now();
                 let command = "curl http://127.0.0.1:43123/v1/models";
@@ -1142,11 +1290,11 @@ mod menu {
                 assert!(state.runtime_curl_copy_feedback.is_none());
 
                 assert!(state.arm_runtime_curl_copy_feedback(command.into(), Instant::now()));
-                state.snapshot = Fixture::Installed.snapshot();
+                state.api = crate::menu::api_presentation::ApiPresentation::idle();
                 state.render(&target, action_selectors(), mtm);
                 assert!(
                     state.runtime_curl_copy_feedback.is_none(),
-                    "an idle snapshot must clear copied-runtime feedback immediately"
+                    "an idle API must clear copied-runtime feedback immediately"
                 );
             }
 
@@ -1163,16 +1311,22 @@ mod menu {
                     .as_ref()
                     .expect("the initial render retains its rows")
                     .search_field();
+                outgoing.setStringValue(&NSString::from_str("  bartowski/qwen  "));
                 controller.arm_delayed_action(outgoing);
 
-                let generation = state
-                    .catalog
-                    .submit_search("bartowski")
-                    .expect("a valid query forces a result-layout rebuild")
-                    .generation();
-                assert_eq!(generation, 1);
                 let _borrow = target.ivars().borrow.borrow_mut();
+                state.api = crate::menu::api_presentation::ApiPresentation::stopping("demo");
                 state.render(&target, actions, mtm);
+
+                assert_eq!(
+                    state.dispatched_catalog,
+                    [crate::menu::catalog::CatalogCommand::Search {
+                        generation: 1,
+                        query: "bartowski/qwen".into(),
+                    }],
+                    "a rebuild must admit the delayed search exactly once before detaching it"
+                );
+                assert_eq!(state.catalog.query(), "bartowski/qwen");
 
                 assert_eq!(
                     target.ivars().calls.get(),
@@ -1189,11 +1343,28 @@ mod menu {
                     .as_ref()
                     .expect("the replacement retains its rows")
                     .search_field();
+                assert_eq!(replacement.stringValue().to_string(), "  bartowski/qwen  ");
                 assert_eq!(replacement.action(), Some(sel!(delayedSearch:)));
                 assert!(replacement.target().is_some_and(|installed| {
                     Retained::as_ptr(&installed).cast::<()>()
                         == Retained::as_ptr(&target).cast::<()>()
                 }));
+
+                controller.arm_delayed_action(replacement);
+                state.api = crate::menu::api_presentation::ApiPresentation::ready(
+                    "demo",
+                    43123,
+                    loxa::api_runtime::ApiRuntimeActivity::Loaded,
+                );
+                state.render(&target, actions, mtm);
+                assert_eq!(
+                    state.dispatched_catalog.len(),
+                    1,
+                    "a normalized query already admitted by the catalog must not duplicate"
+                );
+                assert_eq!(state.catalog.generation(), 1);
+                assert_eq!(target.ivars().calls.get(), 0);
+                assert_eq!(target.ivars().borrow_conflicts.get(), 0);
             }
 
             pub(crate) fn assert_progress_updates_retain_active_search(mtm: MainThreadMarker) {

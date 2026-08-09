@@ -1,5 +1,3 @@
-use std::cell::RefCell;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -12,6 +10,10 @@ use super::{
     BackendClient, BackendMessage, BackendRequest, BackendSource, BackendTransfer, CoreBundle,
     CoreDownload, CoreObservation, CoreRecommendation, CoreRecommendationUnavailableReason,
     InspectedRepository, ObservationMessage, RefreshAdmission, TransferCompletion,
+};
+use crate::menu::api_runtime::{
+    run_runtime_worker, ApiEndpoint, ApiRuntimeController, ApiRuntimePhase, RuntimeHost,
+    RuntimeHostStart,
 };
 use crate::menu::catalog::{
     CandidateItem, CandidateTransferIntent, CatalogCommand, CatalogEvent,
@@ -90,11 +92,10 @@ fn refresh_admission_requests_each_completed_reopen_and_coalesces_in_flight() {
 fn popover_open_during_startup_queues_a_fresh_observation_after_startup_finishes() {
     let (startup_started_sender, startup_started_receiver) = mpsc::channel();
     let (release_startup_sender, release_startup_receiver) = mpsc::channel();
-    let (worker_handle_sender, worker_handle_receiver) = mpsc::channel();
     let snapshot_count = Arc::new(AtomicUsize::new(0));
     let worker_snapshot_count = Arc::clone(&snapshot_count);
     let mut client = BackendClient::assemble(move |requests, messages, stopping| {
-        let worker = std::thread::Builder::new()
+        std::thread::Builder::new()
             .name("loxa-menu-startup-refresh-test".into())
             .spawn(move || {
                 run_backend_worker(
@@ -108,14 +109,8 @@ fn popover_open_during_startup_queues_a_fresh_observation_after_startup_finishes
                     &stopping,
                 );
             })
-            .map_err(|error| error.to_string())?;
-        worker_handle_sender
-            .send(worker)
             .map_err(|error| error.to_string())
     });
-    let worker = worker_handle_receiver
-        .recv_timeout(Duration::from_secs(2))
-        .expect("the startup refresh worker must start");
 
     assert_eq!(
         startup_started_receiver.recv_timeout(Duration::from_secs(2)),
@@ -137,8 +132,7 @@ fn popover_open_during_startup_queues_a_fresh_observation_after_startup_finishes
         std::thread::yield_now();
     }
 
-    client.shutdown();
-    worker.join().unwrap();
+    assert_eq!(client.shutdown_and_join(), Ok(()));
     assert_eq!(snapshot_count.load(Ordering::Acquire), 2);
 }
 
@@ -251,7 +245,6 @@ fn candidate_command_and_worker_retain_the_exact_inspected_artifact_value() {
                     &stopping,
                 );
             })
-            .map(|_| ())
             .map_err(|error| error.to_string())
     });
 
@@ -447,7 +440,6 @@ fn backend_client_dispatches_catalog_work_on_its_spawned_thread() {
                     &stopping,
                 );
             })
-            .map(|_| ())
             .map_err(|error| error.to_string())
     });
 
@@ -464,11 +456,11 @@ fn backend_client_dispatches_catalog_work_on_its_spawned_thread() {
 
 #[test]
 fn backend_client_pauses_only_the_exact_active_generation() {
-    let captured_requests = Rc::new(RefCell::new(None));
-    let spawn_requests = captured_requests.clone();
-    let mut client = BackendClient::assemble(move |requests, _messages, _stopping| {
-        *spawn_requests.borrow_mut() = Some(requests);
-        Ok(())
+    let mut client = BackendClient::assemble(move |requests, messages, stopping| {
+        std::thread::Builder::new()
+            .name("loxa-menu-pause-generation-test".into())
+            .spawn(move || run_backend_worker(Ok(FakeBackend), requests, messages, &stopping))
+            .map_err(|error| error.to_string())
     });
     assert!(client.dispatch(CatalogCommand::Transfer {
         generation: 9,
@@ -485,15 +477,21 @@ fn backend_client_pauses_only_the_exact_active_generation() {
 
 #[test]
 fn backend_client_drains_owned_catalog_events() {
-    let mut client = BackendClient::assemble(|_requests, messages, _stopping| {
-        messages
-            .send(BackendMessage::Catalog(CatalogEvent::Repositories {
-                generation: 4,
-                repositories: vec![repository()],
-            }))
+    let (sent, sent_receiver) = mpsc::channel();
+    let mut client = BackendClient::assemble(move |_requests, messages, _stopping| {
+        std::thread::Builder::new()
+            .name("loxa-menu-drain-test".into())
+            .spawn(move || {
+                let _ = messages.send(BackendMessage::Catalog(CatalogEvent::Repositories {
+                    generation: 4,
+                    repositories: vec![repository()],
+                }));
+                let _ = sent.send(());
+            })
             .map_err(|error| error.to_string())
     });
 
+    assert_eq!(sent_receiver.recv_timeout(Duration::from_secs(2)), Ok(()));
     let messages = client.drain(Instant::now());
     assert_eq!(
         messages.first(),
@@ -818,9 +816,8 @@ fn discard_completion_crosses_the_channel_before_refresh_starts() {
 fn discard_observation_interleaving_keeps_popover_observation_in_flight() {
     let (reopen_started_sender, reopen_started_receiver) = mpsc::channel();
     let (release_reopen_sender, release_reopen_receiver) = mpsc::channel();
-    let (worker_handle_sender, worker_handle_receiver) = mpsc::channel();
     let mut client = BackendClient::assemble(move |requests, messages, stopping| {
-        let worker = std::thread::Builder::new()
+        std::thread::Builder::new()
             .name("loxa-menu-discard-interleaving-test".into())
             .spawn(move || {
                 run_backend_worker(
@@ -840,14 +837,8 @@ fn discard_observation_interleaving_keeps_popover_observation_in_flight() {
                     &stopping,
                 );
             })
-            .map_err(|error| error.to_string())?;
-        worker_handle_sender
-            .send(worker)
             .map_err(|error| error.to_string())
     });
-    let worker = worker_handle_receiver
-        .recv_timeout(Duration::from_secs(2))
-        .expect("the interleaving worker must start");
 
     let startup_deadline = Instant::now() + Duration::from_secs(2);
     loop {
@@ -883,9 +874,8 @@ fn discard_observation_interleaving_keeps_popover_observation_in_flight() {
         .any(|message| matches!(message, BackendMessage::Observation(_))));
     let second_reopen_was_coalesced = !client.request_popover_open(Instant::now());
 
-    client.shutdown();
     let _ = release_reopen_sender.send(());
-    worker.join().unwrap();
+    assert_eq!(client.shutdown_and_join(), Ok(()));
 
     assert!(
         second_reopen_was_coalesced,
@@ -1108,6 +1098,516 @@ impl BackendSource for FailingInventoryBackend {
 
 struct ThreadBackend {
     thread_sender: mpsc::Sender<std::thread::ThreadId>,
+}
+
+#[test]
+fn backend_direct_pause_retains_control_and_shutdown_wakes_joins_and_is_idempotent() {
+    let exited = Arc::new(AtomicBool::new(false));
+    let worker_exited = Arc::clone(&exited);
+    let mut client = BackendClient::assemble(move |requests, messages, stopping| {
+        std::thread::Builder::new()
+            .name("loxa-menu-joinable-backend-test".into())
+            .spawn(move || {
+                run_backend_worker(Ok(FakeBackend), requests, messages, &stopping);
+                worker_exited.store(true, Ordering::Release);
+            })
+            .map_err(|error| error.to_string())
+    });
+    assert!(client.dispatch(CatalogCommand::Transfer {
+        generation: 41,
+        repo: "owner/model".into(),
+        revision: expected_revision(),
+        path: "model-q4.gguf".into(),
+        artifact: None,
+        intent: CandidateTransferIntent::InspectedInstalled("custom-model".into()),
+    }));
+
+    assert!(client.pause_active_transfer());
+    assert!(
+        client.request_pause(41),
+        "direct exit pause must not remove the tracked exact control"
+    );
+    assert_eq!(client.shutdown_and_join(), Ok(()));
+    assert!(exited.load(Ordering::Acquire));
+    assert_eq!(client.shutdown_and_join(), Ok(()));
+}
+
+#[test]
+fn backend_shutdown_keeps_its_receiver_until_the_worker_finishes() {
+    let final_send_succeeded = Arc::new(AtomicBool::new(false));
+    let worker_final_send = Arc::clone(&final_send_succeeded);
+    let saw_stop = Arc::new(AtomicBool::new(false));
+    let worker_saw_stop = Arc::clone(&saw_stop);
+    let (worker_finishing, worker_finishing_receiver) = mpsc::channel();
+    let (release_worker, release_worker_receiver) = mpsc::channel();
+    let mut client = BackendClient::assemble(move |requests, messages, _stopping| {
+        std::thread::Builder::new()
+            .name("loxa-menu-shutdown-order-test".into())
+            .spawn(move || {
+                while let Ok(request) = requests.recv_timeout(Duration::from_secs(2)) {
+                    if matches!(request, BackendRequest::Stop) {
+                        worker_saw_stop.store(true, Ordering::Release);
+                        worker_final_send.store(
+                            messages
+                                .send(BackendMessage::Incomplete(Ok(Vec::new())))
+                                .is_ok(),
+                            Ordering::Release,
+                        );
+                        let _ = worker_finishing.send(());
+                        let _ = release_worker_receiver.recv_timeout(Duration::from_secs(2));
+                        return;
+                    }
+                }
+            })
+            .map_err(|error| error.to_string())
+    });
+
+    let (shutdown_done, shutdown_done_receiver) = mpsc::channel();
+    let shutdown = std::thread::spawn(move || {
+        let result = client.shutdown_and_join();
+        let _ = shutdown_done.send(result);
+        client
+    });
+    assert_eq!(
+        worker_finishing_receiver.recv_timeout(Duration::from_secs(2)),
+        Ok(())
+    );
+    assert_eq!(
+        shutdown_done_receiver.recv_timeout(Duration::from_millis(50)),
+        Err(mpsc::RecvTimeoutError::Timeout),
+        "shutdown must wait for the exact worker to finish"
+    );
+    assert!(saw_stop.load(Ordering::Acquire));
+    assert!(
+        final_send_succeeded.load(Ordering::Acquire),
+        "receiver ownership must outlive the joined worker"
+    );
+    release_worker.send(()).unwrap();
+    assert_eq!(
+        shutdown_done_receiver.recv_timeout(Duration::from_secs(2)),
+        Ok(Ok(()))
+    );
+    let mut client = shutdown.join().unwrap();
+    assert_eq!(client.shutdown_and_join(), Ok(()));
+}
+
+#[test]
+fn backend_shutdown_joins_an_already_exited_worker_and_handles_spawn_failure() {
+    let exited = Arc::new(AtomicBool::new(false));
+    let worker_exited = Arc::clone(&exited);
+    let mut exited_client = BackendClient::assemble(move |_requests, _messages, _stopping| {
+        std::thread::Builder::new()
+            .name("loxa-menu-already-exited-test".into())
+            .spawn(move || worker_exited.store(true, Ordering::Release))
+            .map_err(|error| error.to_string())
+    });
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !exited.load(Ordering::Acquire) {
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    let _ = exited_client.drain(Instant::now());
+    assert_eq!(exited_client.shutdown_and_join(), Ok(()));
+    assert_eq!(exited_client.shutdown_and_join(), Ok(()));
+
+    let mut spawn_failed = BackendClient::assemble(|_requests, _messages, _stopping| {
+        Err("spawn failed with /private/path".into())
+    });
+    assert_eq!(spawn_failed.shutdown_and_join(), Ok(()));
+    assert!(!spawn_failed.dispatch(CatalogCommand::Search {
+        generation: 1,
+        query: "never sent".into(),
+    }));
+}
+
+struct BlockedSearchBackend {
+    entered: Option<mpsc::Sender<()>>,
+    release: Option<mpsc::Receiver<()>>,
+}
+
+impl BackendSource for BlockedSearchBackend {
+    fn snapshot(&mut self) -> MenuSnapshot {
+        Fixture::Empty.snapshot()
+    }
+
+    fn installed_models(&mut self) -> Result<Vec<InstalledItem>, InstalledInventoryError> {
+        Ok(Vec::new())
+    }
+
+    fn search(&mut self, _query: String) -> Result<Vec<RepositoryItem>, String> {
+        if let Some(entered) = self.entered.take() {
+            let _ = entered.send(());
+        }
+        if let Some(release) = self.release.take() {
+            let _ = release.recv_timeout(Duration::from_secs(2));
+        }
+        Ok(vec![repository()])
+    }
+
+    fn inspect(&mut self, _repo: String) -> Result<InspectedRepository, String> {
+        Err("inspection is outside this test".into())
+    }
+
+    fn transfer(
+        &mut self,
+        _transfer: BackendTransfer,
+        _progress: &mut dyn FnMut(TransferStage, u64, u64),
+    ) -> Result<TransferCompletion, String> {
+        Err("transfer is outside this test".into())
+    }
+}
+
+struct IndependentRuntimeHost {
+    endpoint: Option<ApiEndpoint>,
+    stop_calls: Arc<AtomicUsize>,
+    stop_seen: mpsc::Sender<()>,
+    remaining_failures: Arc<AtomicUsize>,
+}
+
+impl RuntimeHost for IndependentRuntimeHost {
+    fn endpoint(&self) -> Option<ApiEndpoint> {
+        self.endpoint.clone()
+    }
+
+    fn start(
+        &mut self,
+        model_id: &str,
+        _cancellation: &loxa::api_runtime::ApiStartCancellation,
+    ) -> RuntimeHostStart {
+        let endpoint = ApiEndpoint::new(model_id.into(), 43125);
+        self.endpoint = Some(endpoint.clone());
+        RuntimeHostStart::Ready(endpoint)
+    }
+
+    fn stop(&mut self) -> Result<(), ()> {
+        self.stop_calls.fetch_add(1, Ordering::AcqRel);
+        let _ = self.stop_seen.send(());
+        if self
+            .remaining_failures
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(());
+        }
+        self.endpoint = None;
+        Ok(())
+    }
+
+    fn activity(&mut self) -> loxa::api_runtime::ApiRuntimeActivity {
+        loxa::api_runtime::ApiRuntimeActivity::Unknown
+    }
+}
+
+fn independent_runtime_controller(
+    stop_failures: usize,
+) -> (ApiRuntimeController, mpsc::Receiver<()>, Arc<AtomicUsize>) {
+    let (stop_seen, stop_receiver) = mpsc::channel();
+    let stop_calls = Arc::new(AtomicUsize::new(0));
+    let host = IndependentRuntimeHost {
+        endpoint: None,
+        stop_calls: Arc::clone(&stop_calls),
+        stop_seen,
+        remaining_failures: Arc::new(AtomicUsize::new(stop_failures)),
+    };
+    let controller = ApiRuntimeController::assemble(move |requests, messages| {
+        std::thread::Builder::new()
+            .name("loxa-menu-api-runtime-independent-test".into())
+            .spawn(move || run_runtime_worker(Ok(host), requests, messages))
+            .map_err(|_| ())
+    });
+    (controller, stop_receiver, stop_calls)
+}
+
+fn drain_runtime_until(
+    controller: &mut ApiRuntimeController,
+    predicate: impl Fn(&ApiRuntimePhase) -> bool,
+) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !predicate(controller.phase()) {
+        controller.drain();
+        assert!(Instant::now() < deadline, "runtime controller timed out");
+        std::thread::yield_now();
+    }
+}
+
+fn blocked_catalog_client() -> (BackendClient, mpsc::Receiver<()>, mpsc::Sender<()>) {
+    let (entered, entered_receiver) = mpsc::channel();
+    let (release, release_receiver) = mpsc::channel();
+    let mut client = BackendClient::assemble(move |requests, messages, stopping| {
+        std::thread::Builder::new()
+            .name("loxa-menu-blocked-catalog-test".into())
+            .spawn(move || {
+                run_backend_worker(
+                    Ok(BlockedSearchBackend {
+                        entered: Some(entered),
+                        release: Some(release_receiver),
+                    }),
+                    requests,
+                    messages,
+                    &stopping,
+                );
+            })
+            .map_err(|error| error.to_string())
+    });
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while client.admission.in_flight {
+        let _ = client.drain(Instant::now());
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    assert!(client.dispatch(CatalogCommand::Search {
+        generation: 91,
+        query: "blocked".into(),
+    }));
+    (client, entered_receiver, release)
+}
+
+#[test]
+fn runtime_stop_completes_while_the_catalog_worker_is_blocked() {
+    let (mut backend, catalog_entered, release_catalog) = blocked_catalog_client();
+    assert_eq!(catalog_entered.recv_timeout(Duration::from_secs(2)), Ok(()));
+    let (mut runtime, stop_seen, stop_calls) = independent_runtime_controller(0);
+    assert!(runtime.request_start("demo".into()));
+    drain_runtime_until(&mut runtime, |phase| {
+        matches!(phase, ApiRuntimePhase::Ready { .. })
+    });
+
+    assert!(runtime.request_stop());
+    assert_eq!(
+        stop_seen.recv_timeout(Duration::from_millis(250)),
+        Ok(()),
+        "runtime Stop must not be routed through the blocked catalog worker"
+    );
+    drain_runtime_until(&mut runtime, |phase| matches!(phase, ApiRuntimePhase::Idle));
+    assert_eq!(stop_calls.load(Ordering::Acquire), 1);
+
+    release_catalog.send(()).unwrap();
+    assert_eq!(runtime.shutdown_and_join(), Ok(()));
+    assert_eq!(backend.shutdown_and_join(), Ok(()));
+}
+
+#[test]
+fn failed_runtime_cleanup_retains_runtime_without_stopping_the_catalog_backend() {
+    let (mut backend, catalog_entered, release_catalog) = blocked_catalog_client();
+    assert_eq!(catalog_entered.recv_timeout(Duration::from_secs(2)), Ok(()));
+    let (mut runtime, stop_seen, stop_calls) = independent_runtime_controller(1);
+    assert!(runtime.request_start("demo".into()));
+    drain_runtime_until(&mut runtime, |phase| {
+        matches!(phase, ApiRuntimePhase::Ready { .. })
+    });
+
+    assert!(runtime.request_stop());
+    assert_eq!(stop_seen.recv_timeout(Duration::from_millis(250)), Ok(()));
+    drain_runtime_until(&mut runtime, |phase| {
+        matches!(phase, ApiRuntimePhase::CleanupFailed)
+    });
+    let runtime_authority = (
+        runtime.phase().clone(),
+        runtime.active_model_id().map(str::to_owned),
+        runtime.owned_endpoint().cloned(),
+    );
+    assert!(
+        backend.request_popover_open(Instant::now()),
+        "the generic observation must queue behind the blocked catalog request"
+    );
+    release_catalog.send(()).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut catalog_completed = false;
+    let mut generic_observation_drained = false;
+    while !(catalog_completed && generic_observation_drained) {
+        for message in backend.drain(Instant::now()) {
+            catalog_completed |= matches!(
+                message,
+                BackendMessage::Catalog(CatalogEvent::Repositories { generation: 91, .. })
+            );
+            generic_observation_drained |= matches!(message, BackendMessage::Observation(_));
+        }
+        assert!(
+            Instant::now() < deadline,
+            "catalog worker was stopped by runtime failure"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        (
+            runtime.phase().clone(),
+            runtime.active_model_id().map(str::to_owned),
+            runtime.owned_endpoint().cloned(),
+        ),
+        runtime_authority,
+        "generic observation delivery must not overwrite the runtime controller authority"
+    );
+    assert!(runtime.request_stop());
+    assert_eq!(stop_seen.recv_timeout(Duration::from_secs(2)), Ok(()));
+    drain_runtime_until(&mut runtime, |phase| matches!(phase, ApiRuntimePhase::Idle));
+    assert_eq!(stop_calls.load(Ordering::Acquire), 2);
+
+    assert_eq!(runtime.shutdown_and_join(), Ok(()));
+    assert_eq!(backend.shutdown_and_join(), Ok(()));
+}
+
+struct AuthorityRuntimeHost {
+    endpoint: Option<ApiEndpoint>,
+    start_entered: mpsc::Sender<()>,
+    release_start: mpsc::Receiver<()>,
+    activity_entered: mpsc::Sender<()>,
+    release_activity: mpsc::Receiver<()>,
+    stop_entered: mpsc::Sender<()>,
+    release_stop: mpsc::Receiver<()>,
+    remaining_stop_failures: usize,
+}
+
+impl RuntimeHost for AuthorityRuntimeHost {
+    fn endpoint(&self) -> Option<ApiEndpoint> {
+        self.endpoint.clone()
+    }
+
+    fn start(
+        &mut self,
+        model_id: &str,
+        _cancellation: &loxa::api_runtime::ApiStartCancellation,
+    ) -> RuntimeHostStart {
+        let _ = self.start_entered.send(());
+        let _ = self.release_start.recv_timeout(Duration::from_secs(2));
+        let endpoint = ApiEndpoint::new(model_id.into(), 43126);
+        self.endpoint = Some(endpoint.clone());
+        RuntimeHostStart::Ready(endpoint)
+    }
+
+    fn stop(&mut self) -> Result<(), ()> {
+        if self.endpoint.is_none() {
+            return Ok(());
+        }
+        let _ = self.stop_entered.send(());
+        let _ = self.release_stop.recv_timeout(Duration::from_secs(2));
+        if self.remaining_stop_failures > 0 {
+            self.remaining_stop_failures -= 1;
+            return Err(());
+        }
+        self.endpoint = None;
+        Ok(())
+    }
+
+    fn activity(&mut self) -> loxa::api_runtime::ApiRuntimeActivity {
+        let _ = self.activity_entered.send(());
+        let _ = self.release_activity.recv_timeout(Duration::from_secs(2));
+        loxa::api_runtime::ApiRuntimeActivity::Loaded
+    }
+}
+
+fn runtime_authority(
+    runtime: &ApiRuntimeController,
+) -> (ApiRuntimePhase, Option<String>, Option<ApiEndpoint>) {
+    (
+        runtime.phase().clone(),
+        runtime.active_model_id().map(str::to_owned),
+        runtime.owned_endpoint().cloned(),
+    )
+}
+
+fn drain_one_generic_observation(backend: &mut BackendClient) {
+    assert!(backend.request_popover_open(Instant::now()));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut observed = false;
+    while !observed || backend.admission.in_flight {
+        observed |= backend
+            .drain(Instant::now())
+            .iter()
+            .any(|message| matches!(message, BackendMessage::Observation(_)));
+        assert!(Instant::now() < deadline, "generic observation timed out");
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn generic_observations_never_replace_the_runtime_controller_authority() {
+    let mut backend = BackendClient::assemble(|requests, messages, stopping| {
+        std::thread::Builder::new()
+            .name("loxa-menu-generic-observation-test".into())
+            .spawn(move || run_backend_worker(Ok(FakeBackend), requests, messages, &stopping))
+            .map_err(|error| error.to_string())
+    });
+    let startup_deadline = Instant::now() + Duration::from_secs(2);
+    while backend.admission.in_flight {
+        let _ = backend.drain(Instant::now());
+        assert!(Instant::now() < startup_deadline);
+        std::thread::yield_now();
+    }
+
+    let (start_entered, start_receiver) = mpsc::channel();
+    let (release_start, release_start_receiver) = mpsc::channel();
+    let (activity_entered, activity_receiver) = mpsc::channel();
+    let (release_activity, release_activity_receiver) = mpsc::channel();
+    let (stop_entered, stop_receiver) = mpsc::channel();
+    let (release_stop, release_stop_receiver) = mpsc::channel();
+    let host = AuthorityRuntimeHost {
+        endpoint: None,
+        start_entered,
+        release_start: release_start_receiver,
+        activity_entered,
+        release_activity: release_activity_receiver,
+        stop_entered,
+        release_stop: release_stop_receiver,
+        remaining_stop_failures: 1,
+    };
+    let mut runtime = ApiRuntimeController::assemble(move |requests, messages| {
+        std::thread::Builder::new()
+            .name("loxa-menu-api-runtime-authority-test".into())
+            .spawn(move || run_runtime_worker(Ok(host), requests, messages))
+            .map_err(|_| ())
+    });
+
+    assert!(runtime.request_start("demo".into()));
+    assert_eq!(start_receiver.recv_timeout(Duration::from_secs(2)), Ok(()));
+    let starting = runtime_authority(&runtime);
+    drain_one_generic_observation(&mut backend);
+    assert_eq!(runtime_authority(&runtime), starting);
+
+    release_start.send(()).unwrap();
+    assert_eq!(
+        activity_receiver.recv_timeout(Duration::from_secs(2)),
+        Ok(())
+    );
+    drain_runtime_until(&mut runtime, |phase| {
+        matches!(phase, ApiRuntimePhase::Ready { .. })
+    });
+    let ready = runtime_authority(&runtime);
+    drain_one_generic_observation(&mut backend);
+    assert_eq!(runtime_authority(&runtime), ready);
+    release_activity.send(()).unwrap();
+    drain_runtime_until(&mut runtime, |phase| {
+        matches!(
+            phase,
+            ApiRuntimePhase::Ready {
+                activity: loxa::api_runtime::ApiRuntimeActivity::Loaded,
+                ..
+            }
+        )
+    });
+
+    assert!(runtime.request_stop());
+    assert_eq!(stop_receiver.recv_timeout(Duration::from_secs(2)), Ok(()));
+    let stopping = runtime_authority(&runtime);
+    drain_one_generic_observation(&mut backend);
+    assert_eq!(runtime_authority(&runtime), stopping);
+    release_stop.send(()).unwrap();
+    drain_runtime_until(&mut runtime, |phase| {
+        matches!(phase, ApiRuntimePhase::CleanupFailed)
+    });
+
+    let cleanup_failed = runtime_authority(&runtime);
+    drain_one_generic_observation(&mut backend);
+    assert_eq!(runtime_authority(&runtime), cleanup_failed);
+    assert!(runtime.request_stop());
+    assert_eq!(stop_receiver.recv_timeout(Duration::from_secs(2)), Ok(()));
+    release_stop.send(()).unwrap();
+    drain_runtime_until(&mut runtime, |phase| matches!(phase, ApiRuntimePhase::Idle));
+
+    assert_eq!(runtime.shutdown_and_join(), Ok(()));
+    assert_eq!(backend.shutdown_and_join(), Ok(()));
 }
 
 impl BackendSource for ThreadBackend {

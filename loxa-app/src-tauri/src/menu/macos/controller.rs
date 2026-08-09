@@ -13,10 +13,16 @@ use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSRectEdge, N
 use tauri::AppHandle;
 
 use super::installed_rows::{self, InstalledAction};
-use super::rows::{Actions, MenuRows, PopoverContent};
+use super::rows::{ActionBindings, Actions, MenuRows, PopoverContent};
 #[cfg(not(test))]
 use super::timer::{weak_callback, ObservationTimer};
-use crate::menu::catalog::{CatalogEvent, CatalogState};
+use crate::menu::api_presentation::ApiPresentation;
+#[cfg(not(test))]
+use crate::menu::api_presentation::ApiPrimaryActionKind;
+use crate::menu::api_runtime::ApiRuntimeController;
+#[cfg(not(test))]
+use crate::menu::catalog::CatalogEvent;
+use crate::menu::catalog::CatalogState;
 use crate::menu::incomplete::{DiscardFailure, IncompleteState};
 use crate::menu::installed::InstalledState;
 use crate::menu::observation::BackendClient;
@@ -35,12 +41,47 @@ struct RuntimeCurlCopyFeedback {
     expires_at: Instant,
 }
 
+pub(crate) struct NativeExitResources {
+    runtime: ApiRuntimeController,
+    backend: BackendClient,
+}
+
+impl NativeExitResources {
+    pub(crate) fn shutdown_runtime(&mut self) -> Result<(), ()> {
+        self.runtime.shutdown_and_join().map_err(|_| ())
+    }
+
+    pub(crate) fn shutdown_backend(&mut self) -> Result<(), ()> {
+        if self.backend.shutdown_and_join().is_ok() {
+            return Ok(());
+        }
+        self.runtime.mark_unavailable_after_exit_failure();
+        Err(())
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn exit_resources_for_test(
+    runtime: ApiRuntimeController,
+    backend: BackendClient,
+) -> NativeExitResources {
+    NativeExitResources { runtime, backend }
+}
+
+#[cfg(test)]
+pub(crate) fn exit_resources_api(resources: &NativeExitResources) -> ApiPresentation {
+    ApiPresentation::from_controller(&resources.runtime)
+}
+
 struct NativePopoverState {
     status_item: Retained<NSStatusItem>,
     popover: Retained<NSPopover>,
     content_view_controller: Retained<NSViewController>,
     snapshot: MenuSnapshot,
     rendered: Option<MenuSnapshot>,
+    api: ApiPresentation,
+    rendered_api: Option<ApiPresentation>,
+    api_runtime: Option<ApiRuntimeController>,
     runtime_curl_copy_feedback: Option<RuntimeCurlCopyFeedback>,
     catalog: CatalogState,
     rendered_catalog: Option<CatalogState>,
@@ -50,6 +91,8 @@ struct NativePopoverState {
     rendered_incomplete: Option<IncompleteState>,
     #[cfg(test)]
     cancel: InlineCancelState,
+    #[cfg(test)]
+    dispatched_catalog: Vec<crate::menu::catalog::CatalogCommand>,
     backend: Option<BackendClient>,
     rows: Option<MenuRows>,
 }
@@ -65,12 +108,32 @@ impl NativePopoverState {
         let snapshot = fixture.snapshot();
         #[cfg(not(test))]
         let snapshot = MenuSnapshot::loading();
+        #[cfg(test)]
+        let api = ApiPresentation::idle();
+        #[cfg(not(test))]
+        let (api_runtime, api) = {
+            let controller = ApiRuntimeController::start();
+            let presentation = ApiPresentation::from_controller(&controller);
+            (controller, presentation)
+        };
         Self {
             status_item,
             popover,
             content_view_controller,
             snapshot,
             rendered: None,
+            api,
+            rendered_api: None,
+            api_runtime: {
+                #[cfg(test)]
+                {
+                    None
+                }
+                #[cfg(not(test))]
+                {
+                    Some(api_runtime)
+                }
+            },
             runtime_curl_copy_feedback: None,
             catalog: CatalogState::default(),
             rendered_catalog: None,
@@ -80,6 +143,8 @@ impl NativePopoverState {
             rendered_incomplete: None,
             #[cfg(test)]
             cancel: InlineCancelState::default(),
+            #[cfg(test)]
+            dispatched_catalog: Vec::new(),
             backend: {
                 #[cfg(test)]
                 {
@@ -101,6 +166,10 @@ impl NativePopoverState {
         let incomplete_changed =
             self.rendered_incomplete.as_ref() != Some(&*self.incomplete.borrow());
         let snapshot_update = self.snapshot.update_from(self.rendered.as_ref());
+        let api_can_update_retained = self
+            .rendered_api
+            .as_ref()
+            .is_some_and(|previous| self.api.can_update_retained_from(previous));
         let catalog_updated_in_place = catalog_changed
             && !installed_changed
             && !incomplete_changed
@@ -112,6 +181,7 @@ impl NativePopoverState {
             });
         let requires_rebuild = installed_changed
             || incomplete_changed
+            || !api_can_update_retained
             || snapshot_update == MenuUpdate::Rebuild
             || (catalog_changed && !catalog_updated_in_place)
             || self.rows.is_none();
@@ -119,14 +189,15 @@ impl NativePopoverState {
             self.rebuild(target, actions, mtm);
         } else if let Some(rows) = &mut self.rows {
             #[cfg(test)]
-            rows.update(&self.snapshot, &self.cancel);
+            rows.update(&self.snapshot, &self.api, &self.cancel);
             #[cfg(not(test))]
-            rows.update(&self.snapshot);
+            rows.update(&self.snapshot, &self.api);
         }
         if let Some(rows) = &self.rows {
             rows.update_runtime_curl_copy_feedback(self.runtime_curl_copy_feedback.is_some());
         }
         self.rendered = Some(self.snapshot.clone());
+        self.rendered_api = Some(self.api.clone());
         self.rendered_catalog = Some(self.catalog.clone());
         self.rendered_installed = Some(self.installed.borrow().clone());
         self.rendered_incomplete = Some(self.incomplete.borrow().clone());
@@ -134,16 +205,25 @@ impl NativePopoverState {
 
     fn rebuild(&mut self, target: &AnyObject, actions: Actions, mtm: MainThreadMarker) {
         let search_focus = self.rows.as_ref().and_then(MenuRows::capture_search_focus);
+        if let Some(query) = search_focus
+            .as_ref()
+            .map(super::catalog_rows::SearchFocus::normalized_query)
+            .filter(|query| *query != self.catalog.query())
+        {
+            self.cancel_incomplete_discard();
+            let command = self.catalog.submit_search(query);
+            self.dispatch_catalog(command);
+        }
         let PopoverContent { view, rows, .. } = {
             let incomplete = self.incomplete.borrow();
             let installed = self.installed.borrow();
             MenuRows::build(
                 &self.snapshot,
+                &self.api,
                 &self.catalog,
                 &incomplete,
                 &installed,
-                Some(target),
-                actions,
+                ActionBindings::new(Some(target), actions),
                 mtm,
             )
         };
@@ -226,42 +306,54 @@ impl NativePopoverState {
         if let Some(backend) = &mut self.backend {
             backend.request_popover_open(Instant::now());
         }
+        let _ = request_runtime_probe(self.api_runtime.as_mut());
     }
 
     fn arm_runtime_curl_copy_feedback(&mut self, command: String, now: Instant) -> bool {
         arm_runtime_curl_copy_feedback(
             &mut self.runtime_curl_copy_feedback,
-            &self.snapshot,
+            &self.api,
             command,
             now,
         )
     }
 
     fn reconcile_runtime_curl_copy_feedback(&mut self, now: Instant) -> bool {
-        reconcile_runtime_curl_copy_feedback(
-            &mut self.runtime_curl_copy_feedback,
-            &self.snapshot,
-            now,
-        )
+        reconcile_runtime_curl_copy_feedback(&mut self.runtime_curl_copy_feedback, &self.api, now)
+    }
+
+    fn take_exit_resources(&mut self) -> Option<NativeExitResources> {
+        if self.api_runtime.is_none() || self.backend.is_none() {
+            return None;
+        }
+        self.cancel_incomplete_discard();
+        let runtime = self.api_runtime.as_mut().expect("checked above");
+        let _ = runtime.prepare_shutdown();
+        self.api = ApiPresentation::from_controller(runtime);
+        let backend = self.backend.as_ref().expect("checked above");
+        let _ = backend.pause_active_transfer();
+        Some(NativeExitResources {
+            runtime: self.api_runtime.take().expect("checked above"),
+            backend: self.backend.take().expect("checked above"),
+        })
+    }
+
+    fn restore_exit_resources(&mut self, resources: NativeExitResources) {
+        self.api = ApiPresentation::from_controller(&resources.runtime);
+        self.api_runtime = Some(resources.runtime);
+        self.backend = Some(resources.backend);
     }
 
     #[cfg(not(test))]
     fn drain_backend(&mut self, target: &AnyObject, actions: Actions, mtm: MainThreadMarker) {
         let now = Instant::now();
         let feedback_changed = self.reconcile_runtime_curl_copy_feedback(now);
-        let Some(backend) = &mut self.backend else {
-            if feedback_changed {
-                self.render(target, actions, mtm);
-            }
-            return;
-        };
-        let messages = backend.drain(now);
-        if messages.is_empty() {
-            if feedback_changed {
-                self.render(target, actions, mtm);
-            }
-            return;
-        }
+        let api_changed = drain_runtime_controller(self.api_runtime.as_mut(), &mut self.api);
+        let messages = self
+            .backend
+            .as_mut()
+            .map_or_else(Vec::new, |backend| backend.drain(now));
+        let backend_changed = !messages.is_empty();
         for message in messages {
             match message {
                 BackendMessage::Observation(ObservationMessage::Snapshot(snapshot)) => {
@@ -296,13 +388,8 @@ impl NativePopoverState {
                 }
             }
         }
-        self.render(target, actions, mtm);
-    }
-
-    fn shutdown(&mut self) {
-        self.cancel_incomplete_discard();
-        if let Some(backend) = &mut self.backend {
-            backend.shutdown();
+        if feedback_changed || api_changed || backend_changed {
+            self.render(target, actions, mtm);
         }
     }
 
@@ -310,7 +397,13 @@ impl NativePopoverState {
         let Some(command) = command else {
             return;
         };
+        #[cfg(test)]
+        {
+            self.dispatched_catalog.push(command);
+        }
+        #[cfg(not(test))]
         let generation = command.generation();
+        #[cfg(not(test))]
         if !self
             .backend
             .as_mut()
@@ -324,14 +417,32 @@ impl NativePopoverState {
     }
 }
 
+pub(super) fn request_runtime_probe(controller: Option<&mut ApiRuntimeController>) -> bool {
+    controller.is_some_and(ApiRuntimeController::request_probe)
+}
+
+pub(super) fn drain_runtime_controller(
+    controller: Option<&mut ApiRuntimeController>,
+    api: &mut ApiPresentation,
+) -> bool {
+    let Some(controller) = controller else {
+        return false;
+    };
+    if !controller.drain() {
+        return false;
+    }
+    *api = ApiPresentation::from_controller(controller);
+    true
+}
+
 fn arm_runtime_curl_copy_feedback(
     feedback: &mut Option<RuntimeCurlCopyFeedback>,
-    snapshot: &MenuSnapshot,
+    api: &ApiPresentation,
     command: String,
     now: Instant,
 ) -> bool {
-    let changed = reconcile_runtime_curl_copy_feedback(feedback, snapshot, now);
-    if snapshot.runtime_curl_command().as_deref() != Some(command.as_str()) {
+    let changed = reconcile_runtime_curl_copy_feedback(feedback, api, now);
+    if api.curl_command() != Some(command.as_str()) {
         return changed;
     }
 
@@ -346,12 +457,11 @@ fn arm_runtime_curl_copy_feedback(
 
 fn reconcile_runtime_curl_copy_feedback(
     feedback: &mut Option<RuntimeCurlCopyFeedback>,
-    snapshot: &MenuSnapshot,
+    api: &ApiPresentation,
     now: Instant,
 ) -> bool {
     let should_clear = feedback.as_ref().is_some_and(|feedback| {
-        now >= feedback.expires_at
-            || snapshot.runtime_curl_command().as_deref() != Some(feedback.command.as_str())
+        now >= feedback.expires_at || api.curl_command() != Some(feedback.command.as_str())
     });
     if should_clear {
         *feedback = None;
@@ -359,16 +469,16 @@ fn reconcile_runtime_curl_copy_feedback(
     should_clear
 }
 
-fn copy_runtime_curl_with<Copy>(snapshot: &MenuSnapshot, copy: Copy) -> Option<String>
+fn copy_runtime_curl_with<Copy>(api: &ApiPresentation, copy: Copy) -> Option<String>
 where
     Copy: FnOnce(&str) -> bool,
 {
-    let command = snapshot.runtime_curl_command()?;
-    copy(&command).then_some(command)
+    let command = api.curl_command()?;
+    copy(command).then(|| command.to_owned())
 }
 
-fn copy_runtime_curl_to_pasteboard(snapshot: &MenuSnapshot) -> Option<String> {
-    copy_runtime_curl_with(snapshot, |command| {
+fn copy_runtime_curl_to_pasteboard(api: &ApiPresentation) -> Option<String> {
+    copy_runtime_curl_with(api, |command| {
         let pasteboard = NSPasteboard::generalPasteboard();
         pasteboard.clearContents();
         // SAFETY: AppKit initializes this immutable standard pasteboard type.
@@ -435,8 +545,8 @@ define_class!(
     impl NativePopoverTarget {
         #[unsafe(method(copyRuntimeCurl:))]
         fn copy_runtime_curl(&self, _sender: Option<&NSButton>) {
-            let snapshot = self.ivars().state.borrow().snapshot.clone();
-            let Some(command) = copy_runtime_curl_to_pasteboard(&snapshot) else {
+            let api = self.ivars().state.borrow().api.clone();
+            let Some(command) = copy_runtime_curl_to_pasteboard(&api) else {
                 return;
             };
 
@@ -521,10 +631,13 @@ define_class!(
             let Some(index) = sender.and_then(|button| usize::try_from(button.tag()).ok()) else {
                 return;
             };
-            let installed = self.ivars().state.borrow().installed.clone();
+            let (installed, active_model_id) = {
+                let state = self.ivars().state.borrow();
+                (state.installed.clone(), state.api.active_model_id().map(str::to_owned))
+            };
             let model_id = installed
                 .borrow()
-                .visible_items()
+                .visible_items_for(active_model_id.as_deref())
                 .get(index)
                 .map(|item| item.id().to_owned());
             let Some(model_id) = model_id else {
@@ -607,6 +720,18 @@ define_class!(
         #[unsafe(method(revealInstalled:))]
         fn reveal_installed(&self, _sender: Option<&NSButton>) {
             self.perform_installed_action(InstalledAction::RevealInFinder);
+        }
+
+        #[unsafe(method(startApi:))]
+        fn start_api(&self, _sender: Option<&NSButton>) {
+            #[cfg(not(test))]
+            self.perform_api_action(ApiPrimaryActionKind::Start);
+        }
+
+        #[unsafe(method(stopApi:))]
+        fn stop_api(&self, _sender: Option<&NSButton>) {
+            #[cfg(not(test))]
+            self.perform_api_action(ApiPrimaryActionKind::Stop);
         }
 
         #[cfg(test)]
@@ -696,6 +821,36 @@ impl NativePopoverTarget {
             .render(self, action_selectors(), mtm);
     }
 
+    #[cfg(not(test))]
+    fn perform_api_action(&self, requested: ApiPrimaryActionKind) {
+        let mtm =
+            MainThreadMarker::new().expect("AppKit must perform API actions on the main thread");
+        let mut state = self.ivars().state.borrow_mut();
+        let selected_model_id = state
+            .installed
+            .borrow()
+            .selected()
+            .map(|item| item.id().to_owned());
+        let Some(selected_model_id) = selected_model_id else {
+            return;
+        };
+        let action = state.api.primary_action(&selected_model_id);
+        if !action.is_enabled() || action.kind() != requested {
+            return;
+        }
+        let Some(controller) = state.api_runtime.as_mut() else {
+            return;
+        };
+        let accepted = match requested {
+            ApiPrimaryActionKind::Start => controller.request_start(selected_model_id),
+            ApiPrimaryActionKind::Stop => controller.request_stop(),
+        };
+        if accepted {
+            state.api = ApiPresentation::from_controller(controller);
+            state.render(self, action_selectors(), mtm);
+        }
+    }
+
     fn popover_closed(&self, mtm: MainThreadMarker) {
         self.ivars()
             .state
@@ -735,8 +890,25 @@ impl NativePopoverTarget {
             .drain_backend(self, action_selectors(), mtm);
     }
 
-    fn shutdown(&self) {
-        self.ivars().state.borrow_mut().shutdown();
+    fn take_exit_resources(&self) -> Option<NativeExitResources> {
+        self.ivars().state.borrow_mut().take_exit_resources()
+    }
+
+    fn render_current_state(&self, mtm: MainThreadMarker) {
+        self.ivars()
+            .state
+            .borrow_mut()
+            .render(self, action_selectors(), mtm);
+    }
+
+    fn restore_exit_resources(&self, resources: NativeExitResources, mtm: MainThreadMarker) {
+        {
+            self.ivars()
+                .state
+                .borrow_mut()
+                .restore_exit_resources(resources);
+        }
+        self.render_current_state(mtm);
     }
 }
 
@@ -806,19 +978,36 @@ impl NativePopoverController {
     pub(crate) fn toggle(&self, mtm: MainThreadMarker) {
         self._target.toggle(mtm);
     }
+
+    pub(crate) fn prepare_exit(&mut self, mtm: MainThreadMarker) -> Option<NativeExitResources> {
+        let resources = self._target.take_exit_resources();
+        if resources.is_some() {
+            self._target.render_current_state(mtm);
+        }
+        resources
+    }
+
+    pub(crate) fn restore_exit(&mut self, resources: NativeExitResources, mtm: MainThreadMarker) {
+        self._target.restore_exit_resources(resources, mtm);
+    }
 }
 
 impl Drop for NativePopoverController {
     fn drop(&mut self) {
         #[cfg(not(test))]
         self.timer.shutdown();
-        self._target.shutdown();
+        if let Some(mut resources) = self._target.take_exit_resources() {
+            let _ = resources.shutdown_runtime();
+            let _ = resources.shutdown_backend();
+        }
         self.status_item.setMenu(None);
     }
 }
 
 struct ProductionActionSelectors {
     runtime_copy: Sel,
+    api_start: Sel,
+    api_stop: Sel,
     search: Sel,
     repository: Sel,
     candidate: Sel,
@@ -836,6 +1025,8 @@ struct ProductionActionSelectors {
 fn production_action_selectors() -> ProductionActionSelectors {
     ProductionActionSelectors {
         runtime_copy: sel!(copyRuntimeCurl:),
+        api_start: sel!(startApi:),
+        api_stop: sel!(stopApi:),
         search: sel!(submitSearch:),
         repository: sel!(inspectRepository:),
         candidate: sel!(selectCandidate:),
@@ -854,6 +1045,8 @@ fn production_action_selectors() -> ProductionActionSelectors {
 fn action_selectors() -> Actions {
     let ProductionActionSelectors {
         runtime_copy,
+        api_start,
+        api_stop,
         search,
         repository,
         candidate,
@@ -869,6 +1062,8 @@ fn action_selectors() -> Actions {
     } = production_action_selectors();
     Actions {
         runtime_copy,
+        api_start,
+        api_stop,
         search,
         repository,
         candidate,
@@ -911,20 +1106,22 @@ fn selected_fixture() -> Fixture {
 mod tests {
     use std::time::{Duration, Instant};
 
+    use loxa::api_runtime::ApiRuntimeActivity;
     use objc2::{sel, ClassType};
 
     use super::{
         arm_runtime_curl_copy_feedback, copy_runtime_curl_with, production_action_selectors,
         reconcile_runtime_curl_copy_feedback, NativePopoverTarget, ProductionActionSelectors,
     };
-    use crate::menu::presentation::Fixture;
+    use crate::menu::api_presentation::ApiPresentation;
+
+    fn ready(port: u16) -> ApiPresentation {
+        ApiPresentation::ready("demo", port, ApiRuntimeActivity::Loaded)
+    }
 
     #[test]
     fn runtime_copy_dispatches_the_exact_curl_only_for_a_running_endpoint() {
-        let running = Fixture::Running
-            .snapshot()
-            .with_running_port(43123)
-            .unwrap();
+        let running = ready(43123);
         let copied = copy_runtime_curl_with(&running, |_| true);
         assert_eq!(
             copied.as_deref(),
@@ -932,7 +1129,7 @@ mod tests {
         );
 
         assert_eq!(
-            copy_runtime_curl_with(&Fixture::Installed.snapshot(), |_| panic!(
+            copy_runtime_curl_with(&ApiPresentation::idle(), |_| panic!(
                 "idle snapshots must not reach the clipboard"
             )),
             None
@@ -941,10 +1138,7 @@ mod tests {
 
     #[test]
     fn runtime_copy_feedback_expires_at_exactly_1500_milliseconds() {
-        let running = Fixture::Running
-            .snapshot()
-            .with_running_port(43123)
-            .unwrap();
+        let running = ready(43123);
         let started_at = Instant::now();
         let mut feedback = None;
 
@@ -974,10 +1168,7 @@ mod tests {
 
     #[test]
     fn repeated_runtime_copy_success_restarts_the_full_feedback_window() {
-        let running = Fixture::Running
-            .snapshot()
-            .with_running_port(43123)
-            .unwrap();
+        let running = ready(43123);
         let started_at = Instant::now();
         let restarted_at = started_at + Duration::from_millis(900);
         let command = "curl http://127.0.0.1:43123/v1/models";
@@ -1009,10 +1200,7 @@ mod tests {
 
     #[test]
     fn runtime_copy_feedback_clears_when_the_runtime_disappears() {
-        let running = Fixture::Running
-            .snapshot()
-            .with_running_port(43123)
-            .unwrap();
+        let running = ready(43123);
         let started_at = Instant::now();
         let mut feedback = None;
 
@@ -1025,7 +1213,7 @@ mod tests {
 
         assert!(reconcile_runtime_curl_copy_feedback(
             &mut feedback,
-            &Fixture::Installed.snapshot(),
+            &ApiPresentation::idle(),
             started_at,
         ));
         assert!(feedback.is_none());
@@ -1033,14 +1221,8 @@ mod tests {
 
     #[test]
     fn runtime_copy_feedback_rejects_a_replaced_endpoint() {
-        let first = Fixture::Running
-            .snapshot()
-            .with_running_port(43123)
-            .unwrap();
-        let replacement = Fixture::Running
-            .snapshot()
-            .with_running_port(43124)
-            .unwrap();
+        let first = ready(43123);
+        let replacement = ready(43124);
         let started_at = Instant::now();
         let command = "curl http://127.0.0.1:43123/v1/models";
         let mut feedback = None;
@@ -1068,10 +1250,7 @@ mod tests {
 
     #[test]
     fn failed_runtime_pasteboard_write_never_arms_feedback() {
-        let running = Fixture::Running
-            .snapshot()
-            .with_running_port(43123)
-            .unwrap();
+        let running = ready(43123);
         let mut feedback = None;
 
         let copied = copy_runtime_curl_with(&running, |_| false);
@@ -1089,6 +1268,8 @@ mod tests {
 
         for action in [
             sel!(copyRuntimeCurl:),
+            sel!(startApi:),
+            sel!(stopApi:),
             sel!(submitSearch:),
             sel!(inspectRepository:),
             sel!(selectCandidate:),
@@ -1112,6 +1293,8 @@ mod tests {
     fn production_actions_expose_catalog_transfer_and_quit_selectors() {
         let ProductionActionSelectors {
             runtime_copy,
+            api_start,
+            api_stop,
             search,
             repository,
             candidate,
@@ -1127,6 +1310,8 @@ mod tests {
         } = production_action_selectors();
 
         assert_eq!(runtime_copy, sel!(copyRuntimeCurl:));
+        assert_eq!(api_start, sel!(startApi:));
+        assert_eq!(api_stop, sel!(stopApi:));
         assert_eq!(search, sel!(submitSearch:));
         assert_eq!(repository, sel!(inspectRepository:));
         assert_eq!(candidate, sel!(selectCandidate:));

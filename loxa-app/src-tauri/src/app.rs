@@ -3,9 +3,9 @@ use std::sync::Mutex;
 use dispatch2::MainThreadBound;
 use objc2::MainThreadMarker;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager, RunEvent, Wry};
+use tauri::{AppHandle, ExitRequestApi, Manager, RunEvent, Wry};
 
-use crate::menu::macos::NativePopoverController;
+use crate::menu::macos::{NativeExitResources, NativePopoverController};
 
 struct NativeShell {
     controller: MainThreadBound<NativePopoverController>,
@@ -25,6 +25,11 @@ impl NativeShell {
 
 struct NativeShellState(Mutex<Option<NativeShell>>);
 
+struct NativeExitAttempt {
+    shell: NativeShell,
+    resources: NativeExitResources,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativeShellLifecycleEvent {
     QuitRequested,
@@ -42,11 +47,27 @@ fn dispatch_native_shell_lifecycle(
     }
 }
 
+fn run_exit_transaction<Resource>(
+    mut resource: Resource,
+    shutdown_runtime: impl FnOnce(&mut Resource) -> Result<(), ()>,
+    shutdown_backend: impl FnOnce(&mut Resource) -> Result<(), ()>,
+    finish: impl FnOnce(Resource),
+) -> Result<(), Resource> {
+    if shutdown_runtime(&mut resource).is_err() {
+        return Err(resource);
+    }
+    if shutdown_backend(&mut resource).is_err() {
+        return Err(resource);
+    }
+    finish(resource);
+    Ok(())
+}
+
 pub(crate) fn request_native_shell_exit(app_handle: &AppHandle) {
     dispatch_native_shell_lifecycle(
         NativeShellLifecycleEvent::QuitRequested,
         || app_handle.exit(0),
-        || teardown_native_shell(app_handle),
+        || {},
     );
 }
 
@@ -99,17 +120,17 @@ pub(crate) fn run() {
         .expect("failed to build the Loxa native menu-bar application");
 
     app.run(|app_handle, event| {
-        if matches!(event, RunEvent::ExitRequested { .. }) {
+        if let RunEvent::ExitRequested { api, .. } = event {
             dispatch_native_shell_lifecycle(
                 NativeShellLifecycleEvent::ExitRequested,
                 || {},
-                || teardown_native_shell(app_handle),
+                || handle_exit_requested(app_handle, &api),
             );
         }
     });
 }
 
-fn teardown_native_shell(app_handle: &AppHandle) {
+fn handle_exit_requested(app_handle: &AppHandle, api: &ExitRequestApi) {
     let shell = {
         let state = app_handle.state::<NativeShellState>();
         let mut state = state
@@ -119,9 +140,47 @@ fn teardown_native_shell(app_handle: &AppHandle) {
         state.take()
     };
 
-    if let Some(shell) = shell {
-        shell.teardown();
+    let Some(mut shell) = shell else {
+        api.prevent_exit();
+        return;
+    };
+    let mtm =
+        MainThreadMarker::new().expect("Tauri must deliver native shell exit on the main thread");
+    let Some(resources) = shell.controller.get_mut(mtm).prepare_exit(mtm) else {
+        restore_native_shell(app_handle, shell);
+        api.prevent_exit();
+        return;
+    };
+    let attempt = NativeExitAttempt { shell, resources };
+    let result = run_exit_transaction(
+        attempt,
+        |attempt| attempt.resources.shutdown_runtime(),
+        |attempt| attempt.resources.shutdown_backend(),
+        |attempt| {
+            let removed = app_handle.remove_tray_by_id("loxa");
+            drop(removed);
+            attempt.shell.teardown();
+        },
+    );
+    if let Err(mut attempt) = result {
+        attempt
+            .shell
+            .controller
+            .get_mut(mtm)
+            .restore_exit(attempt.resources, mtm);
+        restore_native_shell(app_handle, attempt.shell);
+        api.prevent_exit();
     }
+}
+
+fn restore_native_shell(app_handle: &AppHandle, shell: NativeShell) {
+    let state = app_handle.state::<NativeShellState>();
+    let mut state = state
+        .0
+        .lock()
+        .expect("native shell state mutex must not be poisoned");
+    debug_assert!(state.is_none());
+    *state = Some(shell);
 }
 
 fn toggle_native_popover_from_tray(app_handle: AppHandle) {
@@ -148,9 +207,13 @@ mod presentation_tests;
 
 #[cfg(test)]
 mod lifecycle_tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
+    use std::sync::Mutex;
 
-    use super::{dispatch_native_shell_lifecycle, NativeShellLifecycleEvent};
+    use super::{dispatch_native_shell_lifecycle, run_exit_transaction, NativeShellLifecycleEvent};
+    use crate::menu::api_runtime::idle_controller_for_exit_test;
+    use crate::menu::macos::{exit_resources_api, exit_resources_for_test};
+    use crate::menu::observation::backend_client_panicking_on_shutdown;
 
     #[test]
     fn quit_requests_exit_without_synchronous_native_teardown() {
@@ -171,5 +234,138 @@ mod lifecycle_tests {
             || events.borrow_mut().push("teardown"),
         );
         assert_eq!(events.into_inner(), ["teardown"]);
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct ExitFixture {
+        shell_id: u8,
+        runtime_id: u8,
+        backend_id: u8,
+    }
+
+    #[test]
+    fn exit_transaction_joins_in_order_with_no_mutex_or_refcell_borrow_held() {
+        let events = RefCell::new(Vec::new());
+        let shell_mutex = Mutex::new(());
+        let native_state = RefCell::new(());
+
+        let result = run_exit_transaction(
+            ExitFixture {
+                shell_id: 1,
+                runtime_id: 2,
+                backend_id: 3,
+            },
+            |fixture| {
+                assert_eq!(fixture.runtime_id, 2);
+                assert!(shell_mutex.try_lock().is_ok());
+                assert!(native_state.try_borrow_mut().is_ok());
+                events.borrow_mut().push("runtime join");
+                Ok(())
+            },
+            |fixture| {
+                assert_eq!(fixture.backend_id, 3);
+                assert!(shell_mutex.try_lock().is_ok());
+                assert!(native_state.try_borrow_mut().is_ok());
+                events.borrow_mut().push("backend join");
+                Ok(())
+            },
+            |fixture| {
+                assert_eq!(fixture.shell_id, 1);
+                events.borrow_mut().push("remove tray");
+            },
+        );
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            events.into_inner(),
+            ["runtime join", "backend join", "remove tray"]
+        );
+    }
+
+    #[test]
+    fn cleanup_failure_restores_exact_resources_blocks_teardown_and_retries() {
+        let events = RefCell::new(Vec::new());
+        let fixture = ExitFixture {
+            shell_id: 7,
+            runtime_id: 8,
+            backend_id: 9,
+        };
+        let failed = run_exit_transaction(
+            fixture,
+            |_| {
+                events.borrow_mut().push("runtime failed");
+                Err(())
+            },
+            |_| panic!("backend must not join after runtime cleanup failure"),
+            |_| panic!("tray must not be removed after runtime cleanup failure"),
+        )
+        .expect_err("runtime cleanup failure must block exit");
+        assert_eq!(
+            failed,
+            ExitFixture {
+                shell_id: 7,
+                runtime_id: 8,
+                backend_id: 9,
+            }
+        );
+
+        let retry = run_exit_transaction(
+            failed,
+            |_| {
+                events.borrow_mut().push("runtime retry");
+                Ok(())
+            },
+            |_| {
+                events.borrow_mut().push("backend retry");
+                Ok(())
+            },
+            |_| events.borrow_mut().push("remove tray"),
+        );
+        assert_eq!(retry, Ok(()));
+        assert_eq!(
+            events.into_inner(),
+            [
+                "runtime failed",
+                "runtime retry",
+                "backend retry",
+                "remove tray"
+            ]
+        );
+    }
+
+    #[test]
+    fn backend_join_failure_is_unavailable_then_an_idempotent_retry_can_exit() {
+        let prevented = Cell::new(0);
+        let tray_removals = Cell::new(0);
+        let resources = exit_resources_for_test(
+            idle_controller_for_exit_test(),
+            backend_client_panicking_on_shutdown(),
+        );
+        let failed = run_exit_transaction(
+            resources,
+            |resources| resources.shutdown_runtime(),
+            |resources| resources.shutdown_backend(),
+            |_| tray_removals.set(tray_removals.get() + 1),
+        )
+        .expect_err("backend join failure must prevent exit");
+        prevented.set(prevented.get() + 1);
+
+        let api = exit_resources_api(&failed);
+        assert_eq!(api.phase_label(), "API: Unavailable");
+        assert_eq!(api.detail_label(), Some("Quit and reopen Loxa."));
+        let start = api.primary_action("demo");
+        assert_eq!(start.title(), "Start API");
+        assert!(!start.is_enabled());
+        assert_eq!(tray_removals.get(), 0);
+
+        assert!(run_exit_transaction(
+            failed,
+            |resources| resources.shutdown_runtime(),
+            |resources| resources.shutdown_backend(),
+            |_| tray_removals.set(tray_removals.get() + 1),
+        )
+        .is_ok());
+        assert_eq!(prevented.get(), 1);
+        assert_eq!(tray_removals.get(), 1);
     }
 }

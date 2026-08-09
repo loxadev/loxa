@@ -975,6 +975,7 @@ impl MenuSnapshot {
         &self.footer
     }
 
+    #[cfg(test)]
     pub(crate) fn runtime_label(&self) -> &'static str {
         match &self.body {
             MenuBody::Loading => "Inference: Loading",
@@ -1002,11 +1003,13 @@ impl MenuSnapshot {
         Ok(self)
     }
 
+    #[cfg(test)]
     pub(crate) fn runtime_api_label(&self) -> Option<String> {
         self.runtime_port
             .map(|port| format!("API · 127.0.0.1:{port}"))
     }
 
+    #[cfg(test)]
     pub(crate) fn runtime_curl_command(&self) -> Option<String> {
         self.runtime_port
             .map(|port| format!("curl http://127.0.0.1:{port}/v1/models"))

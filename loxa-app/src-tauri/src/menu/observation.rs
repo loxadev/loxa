@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::Instant;
 
 use loxa::app::TransferControl;
@@ -818,7 +819,11 @@ pub(crate) struct BackendClient {
     observation_completion: Option<Receiver<()>>,
     active_transfer: Option<(u64, TransferControl)>,
     stopping: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BackendShutdownError;
 
 impl BackendClient {
     #[cfg(not(test))]
@@ -834,7 +839,6 @@ impl BackendClient {
                         &stopping,
                     );
                 })
-                .map(|_| ())
                 .map_err(|error| format!("Failed to start the menu backend: {error}"))
         })
     }
@@ -844,20 +848,24 @@ impl BackendClient {
             Receiver<BackendRequest>,
             Sender<BackendMessage>,
             Arc<AtomicBool>,
-        ) -> Result<(), String>,
+        ) -> Result<JoinHandle<()>, String>,
     ) -> Self {
         let (request_sender, request_receiver) = mpsc::channel();
         let (message_sender, receiver) = mpsc::channel();
         let stopping = Arc::new(AtomicBool::new(false));
-        if let Err(error) = spawn(
+        let worker = match spawn(
             request_receiver,
             message_sender.clone(),
             Arc::clone(&stopping),
         ) {
-            let _ = message_sender.send(BackendMessage::Observation(ObservationMessage::Error(
-                error,
-            )));
-        }
+            Ok(worker) => Some(worker),
+            Err(error) => {
+                let _ = message_sender.send(BackendMessage::Observation(
+                    ObservationMessage::Error(error),
+                ));
+                None
+            }
+        };
         drop(message_sender);
 
         let mut client = Self {
@@ -867,6 +875,7 @@ impl BackendClient {
             observation_completion: None,
             active_transfer: None,
             stopping,
+            worker,
         };
         if client.admission.admit_startup() {
             let _ = client.send_observation();
@@ -928,6 +937,14 @@ impl BackendClient {
         if *active_generation != generation {
             return false;
         }
+        control.request_pause();
+        true
+    }
+
+    pub(crate) fn pause_active_transfer(&self) -> bool {
+        let Some((_, control)) = &self.active_transfer else {
+            return false;
+        };
         control.request_pause();
         true
     }
@@ -1003,17 +1020,34 @@ impl BackendClient {
         messages
     }
 
-    pub(crate) fn shutdown(&mut self) {
+    pub(crate) fn shutdown_and_join(&mut self) -> Result<(), BackendShutdownError> {
         self.stopping.store(true, Ordering::Release);
         self.admission.close();
         self.observation_completion.take();
-        if let Some((_, control)) = self.active_transfer.take() {
-            control.request_pause();
-        }
-        self.receiver.take();
-        if let Some(sender) = self.request_sender.take() {
+        self.pause_active_transfer();
+        if let Some(sender) = self.request_sender.as_ref() {
             let _ = sender.send(BackendRequest::Stop);
         }
+        let Some(worker) = self.worker.take() else {
+            self.active_transfer.take();
+            self.request_sender.take();
+            self.receiver.take();
+            return Ok(());
+        };
+        let joined = worker.join().is_ok();
+        self.active_transfer.take();
+        self.request_sender.take();
+        self.receiver.take();
+        if joined {
+            Ok(())
+        } else {
+            Err(BackendShutdownError)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shutdown(&mut self) {
+        let _ = self.shutdown_and_join();
     }
 
     fn send(&mut self, request: BackendRequest) -> bool {
@@ -1034,6 +1068,22 @@ impl BackendClient {
         self.observation_completion = Some(receiver);
         true
     }
+}
+
+#[cfg(test)]
+pub(crate) fn backend_client_panicking_on_shutdown() -> BackendClient {
+    BackendClient::assemble(|requests, _messages, _stopping| {
+        std::thread::Builder::new()
+            .name("loxa-menu-backend-panic-test".into())
+            .spawn(move || loop {
+                match requests.recv() {
+                    Ok(BackendRequest::Stop) => panic!("injected backend shutdown panic"),
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            })
+            .map_err(|error| error.to_string())
+    })
 }
 
 #[cfg(test)]

@@ -47,9 +47,14 @@ pub(super) struct CatalogContent {
 }
 
 pub(super) struct SearchFocus {
-    window: Retained<NSWindow>,
     text: String,
-    selected_range: NSRange,
+    focused: Option<(Retained<NSWindow>, NSRange)>,
+}
+
+impl SearchFocus {
+    pub(super) fn normalized_query(&self) -> &str {
+        self.text.trim()
+    }
 }
 
 struct TransferCard {
@@ -61,22 +66,27 @@ struct TransferCard {
 
 impl CatalogContent {
     pub(super) fn capture_search_focus(&self) -> Option<SearchFocus> {
-        let editor = self.search.currentEditor()?;
-        let window = self.search.window()?;
+        let focused = self
+            .search
+            .currentEditor()
+            .zip(self.search.window())
+            .map(|(editor, window)| (window, editor.selectedRange()));
         Some(SearchFocus {
-            window,
             text: self.search.stringValue().to_string(),
-            selected_range: editor.selectedRange(),
+            focused,
         })
     }
 
     pub(super) fn restore_search_focus(&self, focus: SearchFocus) {
         self.search.setStringValue(&NSString::from_str(&focus.text));
-        if !focus.window.makeFirstResponder(Some(&self.search)) {
+        let Some((window, selected_range)) = focus.focused else {
+            return;
+        };
+        if !window.makeFirstResponder(Some(&self.search)) {
             return;
         }
         if let Some(editor) = self.search.currentEditor() {
-            editor.setSelectedRange(focus.selected_range);
+            editor.setSelectedRange(selected_range);
         }
     }
 

@@ -99,15 +99,23 @@ impl InstalledState {
     }
 
     pub(crate) fn visible_items(&self) -> Vec<&InstalledItem> {
+        self.visible_items_for(None)
+    }
+
+    pub(crate) fn visible_items_for(&self, active_model_id: Option<&str>) -> Vec<&InstalledItem> {
+        let active = active_model_id.and_then(|id| self.items.iter().find(|item| item.id() == id));
         let pinned = self
             .pinned_model_id
             .as_deref()
-            .and_then(|id| self.items.iter().find(|item| item.id() == id));
-        pinned
+            .and_then(|id| self.items.iter().find(|item| item.id() == id))
+            .filter(|item| Some(item.id()) != active_model_id);
+        active
             .into_iter()
+            .chain(pinned)
             .chain(
                 self.items
                     .iter()
+                    .filter(|item| Some(item.id()) != active_model_id)
                     .filter(|item| Some(item.id()) != self.pinned_model_id.as_deref()),
             )
             .take(MAX_VISIBLE_ITEMS)
@@ -235,5 +243,24 @@ mod tests {
         assert_eq!(state.selected(), None);
         assert_eq!(state.visible_items()[0].display_name(), "foxtrot.gguf");
         assert_eq!(state.visible_items()[0].total_bytes(), 42);
+    }
+
+    #[test]
+    fn active_model_beyond_the_default_cap_is_first_and_stays_addressable() {
+        let mut state = InstalledState::default();
+        state.replace(
+            ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"]
+                .into_iter()
+                .map(item)
+                .collect(),
+            Some("bravo".into()),
+        );
+
+        let visible = state.visible_items_for(Some("foxtrot"));
+        assert_eq!(
+            visible.iter().map(|item| item.id()).collect::<Vec<_>>(),
+            ["foxtrot", "bravo", "alpha", "charlie", "delta"]
+        );
+        assert_eq!(visible.len(), 5);
     }
 }

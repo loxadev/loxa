@@ -81,6 +81,31 @@ mod menu {
                 draft,
                 "an unsent draft must survive an unavoidable result rebuild"
             );
+
+            let unfocused = catalog_rows::build(&state, None, fixture_actions(), mtm);
+            let unfocused_window = unsafe { NSWindow::init(NSWindow::alloc(mtm)) };
+            unfocused_window.setContentView(Some(&unfocused.view));
+            let unfocused_draft = "draft without blue focus";
+            unfocused
+                .search
+                .setStringValue(&NSString::from_str(unfocused_draft));
+            assert!(unfocused.search.currentEditor().is_none());
+            let preserved = unfocused
+                .capture_search_focus()
+                .expect("an unfocused search field must still preserve its draft");
+
+            let unfocused_replacement = catalog_rows::build(&state, None, fixture_actions(), mtm);
+            unfocused_window.setContentView(Some(&unfocused_replacement.view));
+            unfocused_replacement.restore_search_focus(preserved);
+
+            assert_eq!(
+                unfocused_replacement.search.stringValue().to_string(),
+                unfocused_draft
+            );
+            assert!(
+                unfocused_replacement.search.currentEditor().is_none(),
+                "restoring an unfocused draft must not create blue focus"
+            );
         }
 
         fn fixture_actions() -> catalog_rows::CatalogActions {

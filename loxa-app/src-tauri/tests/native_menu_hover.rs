@@ -2,6 +2,33 @@
 
 #[cfg(target_os = "macos")]
 mod menu {
+    pub(crate) mod api_presentation {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/api_presentation.rs"
+        ));
+    }
+
+    pub(crate) mod api_runtime {
+        pub(crate) struct ApiRuntimeController;
+
+        impl ApiRuntimeController {
+            pub(crate) fn request_probe(&mut self) -> bool {
+                false
+            }
+
+            pub(crate) fn prepare_shutdown(&mut self) -> bool {
+                false
+            }
+
+            pub(crate) fn shutdown_and_join(&mut self) -> Result<(), ()> {
+                Ok(())
+            }
+
+            pub(crate) fn mark_unavailable_after_exit_failure(&mut self) {}
+        }
+    }
+
     pub(crate) mod catalog {
         include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/menu/catalog.rs"));
     }

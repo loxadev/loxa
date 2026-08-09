@@ -14,6 +14,7 @@ use objc2_foundation::{NSEdgeInsets, NSInteger, NSPoint, NSRect, NSSize, NSStrin
 use super::catalog_rows::{self, CatalogActions};
 use super::incomplete_rows::{self, IncompleteActions};
 use super::installed_rows::{self, InstalledActions};
+use crate::menu::api_presentation::ApiPresentation;
 use crate::menu::catalog::CatalogState;
 use crate::menu::incomplete::IncompleteState;
 #[cfg(test)]
@@ -23,7 +24,7 @@ use crate::menu::presentation::{MenuLayout, MenuSnapshot, RecommendationRow, Tra
 const ROW_WIDTH: f64 = MenuLayout::BASE_WIDTH;
 const CONTENT_INSET: f64 = MenuLayout::OUTER_PADDING + MenuLayout::INNER_PADDING;
 const SECTION_HEIGHT: f64 = 28.0;
-const HEADER_HEIGHT: f64 = 52.0;
+const HEADER_HEIGHT: f64 = 72.0;
 const FOOTER_HEIGHT: f64 = 28.0;
 const SEPARATOR_HEIGHT: f64 = 9.0;
 const ICON_IMAGE_SIZE: f64 = 16.0;
@@ -32,6 +33,8 @@ const FINAL_CONTENT_SPACER_HEIGHT: f64 = 4.0;
 #[derive(Clone, Copy)]
 pub(super) struct Actions {
     pub(super) runtime_copy: Sel,
+    pub(super) api_start: Sel,
+    pub(super) api_stop: Sel,
     pub(super) search: Sel,
     pub(super) repository: Sel,
     pub(super) candidate: Sel,
@@ -60,6 +63,17 @@ pub(super) struct Actions {
     pub(super) quit: Sel,
 }
 
+pub(super) struct ActionBindings<'a> {
+    target: Option<&'a AnyObject>,
+    actions: Actions,
+}
+
+impl<'a> ActionBindings<'a> {
+    pub(super) fn new(target: Option<&'a AnyObject>, actions: Actions) -> Self {
+        Self { target, actions }
+    }
+}
+
 pub(super) struct MenuRows {
     header: HeaderRow,
     catalog: catalog_rows::CatalogContent,
@@ -82,18 +96,19 @@ pub(super) struct PopoverContent {
 impl MenuRows {
     pub(super) fn build(
         snapshot: &MenuSnapshot,
+        api: &ApiPresentation,
         catalog: &CatalogState,
         incomplete: &IncompleteState,
         installed: &crate::menu::installed::InstalledState,
-        target: Option<&AnyObject>,
-        actions: Actions,
+        bindings: ActionBindings<'_>,
         mtm: MainThreadMarker,
     ) -> PopoverContent {
+        let ActionBindings { target, actions } = bindings;
         let mut layout = ContentLayout::new(
-            content_height(snapshot, catalog, incomplete, installed),
+            content_height(snapshot, api, catalog, incomplete, installed),
             mtm,
         );
-        let header = HeaderRow::build(snapshot, target, actions, mtm);
+        let header = HeaderRow::build(api, target, actions, mtm);
         layout.add(&header.root, HEADER_HEIGHT);
         layout.add_separator(mtm);
 
@@ -157,9 +172,12 @@ impl MenuRows {
             layout.add(&section_header("Installed", mtm), SECTION_HEIGHT);
             let inventory = installed_rows::build(
                 installed,
+                api,
                 target,
                 InstalledActions {
                     select: actions.installed_select,
+                    api_start: actions.api_start,
+                    api_stop: actions.api_stop,
                     copy: actions.installed_copy,
                     reveal: actions.installed_reveal,
                 },
@@ -204,9 +222,12 @@ impl MenuRows {
             if installed.error_message().is_some() {
                 let inventory_error = installed_rows::build(
                     installed,
+                    api,
                     target,
                     InstalledActions {
                         select: actions.installed_select,
+                        api_start: actions.api_start,
+                        api_stop: actions.api_stop,
                         copy: actions.installed_copy,
                         reveal: actions.installed_reveal,
                     },
@@ -291,9 +312,10 @@ impl MenuRows {
     pub(super) fn update(
         &mut self,
         snapshot: &MenuSnapshot,
+        api: &ApiPresentation,
         #[cfg(test)] cancel: &InlineCancelState,
     ) {
-        self.header.update(snapshot);
+        self.header.update(api);
         self.footer.update(snapshot);
         match &mut self.body {
             BodyRows::Status(row) => {
@@ -391,6 +413,7 @@ impl ContentLayout {
 
 fn content_height(
     snapshot: &MenuSnapshot,
+    api: &ApiPresentation,
     catalog: &CatalogState,
     incomplete: &IncompleteState,
     installed: &crate::menu::installed::InstalledState,
@@ -415,7 +438,7 @@ fn content_height(
     } else if snapshot.transfer_row().is_some() {
         common + SECTION_HEIGHT + MenuLayout::transfer_row_height()
     } else if inventory_is_primary(snapshot, installed) {
-        let inventory = SECTION_HEIGHT + installed_rows::content_height(installed);
+        let inventory = SECTION_HEIGHT + installed_rows::content_height(installed, api);
         if snapshot.recommendation_row().is_some() {
             common + incomplete_height + inventory + SEPARATOR_HEIGHT + SECTION_HEIGHT + 56.0
         } else {
@@ -435,7 +458,7 @@ fn content_height(
             + SECTION_HEIGHT
             + 56.0
             + if installed.error_message().is_some() {
-                installed_rows::content_height(installed)
+                installed_rows::content_height(installed, api)
             } else {
                 0.0
             }
@@ -503,14 +526,14 @@ impl BodyRows {
 
 struct HeaderRow {
     root: Retained<NSView>,
-    runtime_label: Retained<NSTextField>,
-    api_label: Retained<NSTextField>,
+    phase_label: Retained<NSTextField>,
+    detail_label: Retained<NSTextField>,
     copy_button: Retained<NSButton>,
 }
 
 impl HeaderRow {
     fn build(
-        snapshot: &MenuSnapshot,
+        api: &ApiPresentation,
         target: Option<&AnyObject>,
         actions: Actions,
         mtm: MainThreadMarker,
@@ -518,45 +541,42 @@ impl HeaderRow {
         let root = row_shell(HEADER_HEIGHT, mtm);
         let stack = vertical_stack(mtm);
         let title = primary_label("Loxa", mtm);
-        let runtime = horizontal_stack(mtm);
-        let runtime_label = secondary_label(snapshot.runtime_label(), mtm);
-        let api_text = snapshot.runtime_api_label();
-        let api_label = secondary_label(api_text.as_deref().unwrap_or(""), mtm);
+        let phase_label = secondary_label(api.phase_label(), mtm);
+        let detail = horizontal_stack(mtm);
+        let detail_label = secondary_label(api.detail_label().unwrap_or(""), mtm);
         let (copy_symbol, copy_label) = runtime_curl_copy_button_content(false);
         let copy_button =
             runtime_curl_copy_button(copy_symbol, copy_label, target, actions.runtime_copy, mtm);
-        let endpoint_hidden = api_text.is_none();
-        api_label.setHidden(endpoint_hidden);
-        copy_button.setHidden(endpoint_hidden);
+        detail_label.setHidden(api.detail_label().is_none());
+        copy_button.setHidden(api.curl_command().is_none());
 
         stack.addArrangedSubview(&title);
-        runtime.addArrangedSubview(&runtime_label);
-        runtime.addArrangedSubview(&api_label);
-        runtime.addArrangedSubview(&copy_button);
-        stack.addArrangedSubview(&runtime);
+        stack.addArrangedSubview(&phase_label);
+        detail.addArrangedSubview(&detail_label);
+        detail.addArrangedSubview(&copy_button);
+        stack.addArrangedSubview(&detail);
         pin_to_content(&root, &stack);
 
         Self {
             root,
-            runtime_label,
-            api_label,
+            phase_label,
+            detail_label,
             copy_button,
         }
     }
 
-    fn update(&mut self, snapshot: &MenuSnapshot) {
-        set_label(&self.runtime_label, snapshot.runtime_label());
-        match snapshot.runtime_api_label() {
+    fn update(&mut self, api: &ApiPresentation) {
+        set_label(&self.phase_label, api.phase_label());
+        match api.detail_label() {
             Some(label) => {
-                set_label(&self.api_label, &label);
-                self.api_label.setHidden(false);
-                self.copy_button.setHidden(false);
+                set_label(&self.detail_label, label);
+                self.detail_label.setHidden(false);
             }
             None => {
-                self.api_label.setHidden(true);
-                self.copy_button.setHidden(true);
+                self.detail_label.setHidden(true);
             }
         }
+        self.copy_button.setHidden(api.curl_command().is_none());
     }
 
     fn update_runtime_curl_copy_feedback(&self, copied: bool) {

@@ -94,6 +94,19 @@ pub enum ApiRuntimeActivity {
     Unknown,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApiRuntimeProbe {
+    Activity(ApiRuntimeActivity),
+    Stopped,
+    CleanupFailed,
+}
+
+enum OwnedRuntimePoll {
+    Running(u16),
+    Stopped,
+    CleanupFailed,
+}
+
 pub struct ApiRuntimeHost {
     paths: AppPaths,
     runtime: Option<Box<PersistentServer>>,
@@ -212,24 +225,45 @@ impl ApiRuntimeHost {
     }
 
     pub fn activity(&mut self) -> ApiRuntimeActivity {
-        self.activity_with(probe_activity)
+        match self.probe() {
+            ApiRuntimeProbe::Activity(activity) => activity,
+            ApiRuntimeProbe::Stopped | ApiRuntimeProbe::CleanupFailed => {
+                ApiRuntimeActivity::Unknown
+            }
+        }
     }
 
-    fn activity_with(
-        &mut self,
-        probe: impl FnOnce(u16) -> ApiRuntimeActivity,
-    ) -> ApiRuntimeActivity {
-        let Some(runtime) = self.runtime.as_mut() else {
-            return ApiRuntimeActivity::Unknown;
+    pub fn probe(&mut self) -> ApiRuntimeProbe {
+        self.probe_with(probe_activity)
+    }
+
+    fn probe_with(&mut self, probe: impl FnOnce(u16) -> ApiRuntimeActivity) -> ApiRuntimeProbe {
+        let port = match self.poll_owned_runtime() {
+            OwnedRuntimePoll::Running(port) => port,
+            OwnedRuntimePoll::Stopped => return ApiRuntimeProbe::Stopped,
+            OwnedRuntimePoll::CleanupFailed => return ApiRuntimeProbe::CleanupFailed,
         };
-        if !matches!(runtime.poll(), Ok(None)) {
-            return ApiRuntimeActivity::Unknown;
+        let activity = probe(port);
+        match self.poll_owned_runtime() {
+            OwnedRuntimePoll::Running(_) => ApiRuntimeProbe::Activity(activity),
+            OwnedRuntimePoll::Stopped => ApiRuntimeProbe::Stopped,
+            OwnedRuntimePoll::CleanupFailed => ApiRuntimeProbe::CleanupFailed,
         }
-        let activity = probe(runtime.port());
-        if !matches!(runtime.poll(), Ok(None)) {
-            return ApiRuntimeActivity::Unknown;
+    }
+
+    fn poll_owned_runtime(&mut self) -> OwnedRuntimePoll {
+        let (port, result) = match self.runtime.as_mut() {
+            Some(runtime) => (runtime.port(), runtime.poll()),
+            None => return OwnedRuntimePoll::Stopped,
+        };
+        match result {
+            Ok(None) => OwnedRuntimePoll::Running(port),
+            Ok(Some(_exit)) => {
+                self.runtime.take();
+                OwnedRuntimePoll::Stopped
+            }
+            Err(_) => OwnedRuntimePoll::CleanupFailed,
         }
-        activity
     }
 
     fn terminate_runtime(&mut self, runtime: &mut PersistentServer) -> Result<(), ApiStopError> {
