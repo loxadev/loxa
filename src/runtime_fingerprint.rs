@@ -148,9 +148,46 @@ impl RuntimeFingerprint {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[allow(
+        dead_code,
+        reason = "persistent attachment is consumed by the follow-on session task"
+    )]
+    pub(crate) fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    #[allow(
+        dead_code,
+        reason = "persistent attachment is consumed by the follow-on session task"
+    )]
+    pub(crate) fn effective_context(&self) -> u32 {
+        self.effective_context
+    }
+
+    #[allow(
+        dead_code,
+        reason = "persistent attachment is consumed by the follow-on session task"
+    )]
     pub(crate) fn effective_profile(&self) -> EffectiveProfile {
         self.effective_profile
+    }
+
+    #[allow(
+        dead_code,
+        reason = "persistent attachment is consumed by the follow-on session task"
+    )]
+    pub(crate) fn primary_local_filename(&self) -> &str {
+        &self.primary.local_filename
+    }
+
+    #[allow(
+        dead_code,
+        reason = "persistent attachment is consumed by the follow-on session task"
+    )]
+    pub(crate) fn draft_local_filename(&self) -> Option<&str> {
+        self.draft
+            .as_ref()
+            .map(|artifact| artifact.local_filename.as_str())
     }
 
     #[cfg(test)]

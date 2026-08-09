@@ -138,6 +138,13 @@ pub(crate) enum ForegroundObservation {
     Error,
 }
 
+mod attachment;
+#[allow(
+    unused_imports,
+    reason = "persistent attachment is consumed by the follow-on session task"
+)]
+pub(crate) use attachment::{lookup_persistent_runtime, AttachedRuntime, PersistentRuntimeLookup};
+
 pub(crate) struct ForegroundObserver {
     run_dir: PathBuf,
     previously_running: bool,

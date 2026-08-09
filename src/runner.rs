@@ -1,4 +1,4 @@
-use crate::runtime_fingerprint::EffectiveProfile;
+use crate::runtime_fingerprint::{EffectiveProfile, RuntimeFingerprint};
 use crate::ui;
 use reqwest::blocking::Client;
 use serde::Deserialize;
@@ -503,6 +503,45 @@ pub(crate) fn build_args(launch: &Launch, port: u16) -> Vec<OsString> {
     args
 }
 
+#[allow(
+    dead_code,
+    reason = "persistent attachment is consumed by the follow-on session task"
+)]
+pub(crate) fn build_persistent_args_for_fingerprint(
+    models_root: &Path,
+    fingerprint: &RuntimeFingerprint,
+    port: u16,
+) -> Result<Vec<OsString>, String> {
+    fingerprint.validate_persistent_lease(fingerprint.model_id())?;
+    if port == 0 {
+        return Err("persistent runtime port must be nonzero".into());
+    }
+    let model_dir = models_root.join(fingerprint.model_id());
+    let profile = match fingerprint.effective_profile() {
+        EffectiveProfile::Generic => LaunchProfile::generic(),
+        EffectiveProfile::Gemma4Mtp => LaunchProfile::gemma4_mtp(Some(
+            model_dir.join(
+                fingerprint
+                    .draft_local_filename()
+                    .ok_or_else(|| "MTP runtime fingerprint is missing its draft".to_string())?,
+            ),
+        )),
+        EffectiveProfile::PrimaryOnly => LaunchProfile::gemma4_mtp(None),
+    };
+    Ok(build_args(
+        &Launch {
+            server: PathBuf::new(),
+            model: model_dir.join(fingerprint.primary_local_filename()),
+            id: fingerprint.model_id().to_owned(),
+            requested_port: port,
+            ctx: fingerprint.effective_context(),
+            profile,
+            policy: LaunchPolicy::PersistentApp,
+        },
+        port,
+    ))
+}
+
 fn resolve_requested_port(requested: u16) -> Result<u16, String> {
     if requested != 0 {
         return Ok(requested);
@@ -960,6 +999,14 @@ fn readiness(client: &Client, port: u16, id: &str) -> Result<bool, String> {
         return Ok(false);
     }
     models_reader_has_alias(response, id)
+}
+
+#[allow(
+    dead_code,
+    reason = "persistent attachment is consumed by the follow-on session task"
+)]
+pub(crate) fn probe_model_alias(port: u16, id: &str) -> Result<bool, String> {
+    readiness(&readiness_client()?, port, id)
 }
 
 fn validate_announcement_line(line: &str) -> Result<u16, String> {
@@ -2067,6 +2114,144 @@ mod tests {
             "demo"
         ));
         assert_eq!(STARTUP_TIMEOUT, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn attachment_argv_rebuilds_each_persistent_profile_from_the_exact_fingerprint() {
+        let models = Path::new("/models");
+        let generic: crate::runtime_fingerprint::RuntimeFingerprint =
+            serde_json::from_value(serde_json::json!({
+                "schema_version": 1,
+                "model_id": "demo",
+                "effective_context": 4096,
+                "effective_profile": "generic",
+                "sleep_policy": 300,
+                "primary": {
+                    "local_filename": "model.gguf",
+                    "sha256": "a".repeat(64),
+                    "size": 7,
+                },
+                "draft": null,
+            }))
+            .unwrap();
+        let mtp: crate::runtime_fingerprint::RuntimeFingerprint =
+            serde_json::from_value(serde_json::json!({
+                "schema_version": 1,
+                "model_id": "demo",
+                "effective_context": 8192,
+                "effective_profile": "gemma4_mtp",
+                "sleep_policy": 300,
+                "primary": {
+                    "local_filename": "model.gguf",
+                    "sha256": "a".repeat(64),
+                    "size": 7,
+                },
+                "draft": {
+                    "local_filename": "draft.gguf",
+                    "sha256": "b".repeat(64),
+                    "size": 5,
+                },
+            }))
+            .unwrap();
+        let primary_only = mtp.primary_only().unwrap();
+
+        let generic_expected = [
+            "--model",
+            "/models/demo/model.gguf",
+            "--alias",
+            "demo",
+            "--host",
+            "127.0.0.1",
+            "--cors-origins",
+            "localhost",
+            "--no-ui",
+            "--port",
+            "43123",
+            "--ctx-size",
+            "4096",
+            "--n-gpu-layers",
+            "99",
+            "--jinja",
+            "--reasoning",
+            "off",
+            "--sleep-idle-seconds",
+            "300",
+        ]
+        .map(OsString::from)
+        .to_vec();
+        let mtp_expected = [
+            "--model",
+            "/models/demo/model.gguf",
+            "--alias",
+            "demo",
+            "--host",
+            "127.0.0.1",
+            "--cors-origins",
+            "localhost",
+            "--no-ui",
+            "--port",
+            "43124",
+            "--ctx-size",
+            "8192",
+            "--n-gpu-layers",
+            "all",
+            "--fit",
+            "off",
+            "--jinja",
+            "--reasoning",
+            "off",
+            "--spec-draft-model",
+            "/models/demo/draft.gguf",
+            "--spec-type",
+            "draft-mtp",
+            "--spec-draft-n-max",
+            "4",
+            "--n-gpu-layers-draft",
+            "all",
+            "--sleep-idle-seconds",
+            "300",
+        ]
+        .map(OsString::from)
+        .to_vec();
+        let primary_expected = [
+            "--model",
+            "/models/demo/model.gguf",
+            "--alias",
+            "demo",
+            "--host",
+            "127.0.0.1",
+            "--cors-origins",
+            "localhost",
+            "--no-ui",
+            "--port",
+            "43125",
+            "--ctx-size",
+            "8192",
+            "--n-gpu-layers",
+            "all",
+            "--fit",
+            "off",
+            "--jinja",
+            "--reasoning",
+            "off",
+            "--sleep-idle-seconds",
+            "300",
+        ]
+        .map(OsString::from)
+        .to_vec();
+
+        assert_eq!(
+            build_persistent_args_for_fingerprint(models, &generic, 43123).unwrap(),
+            generic_expected
+        );
+        assert_eq!(
+            build_persistent_args_for_fingerprint(models, &mtp, 43124).unwrap(),
+            mtp_expected
+        );
+        assert_eq!(
+            build_persistent_args_for_fingerprint(models, &primary_only, 43125).unwrap(),
+            primary_expected
+        );
     }
 
     #[test]
