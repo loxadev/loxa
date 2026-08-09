@@ -1099,6 +1099,8 @@ where
         transferred_bytes: artifact.size(),
         total_bytes: artifact.size(),
     });
+    lock.revalidate()
+        .map_err(|_| TransferError::terminal(TransferErrorKind::Publication))?;
     if catalog::publish_manifest(&service.reader.paths.models, &manifest).is_err() {
         return Err(publication_error_after_final_audit(
             &lock, &model_dir, &model_id, &artifact,

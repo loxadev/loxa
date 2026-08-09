@@ -105,6 +105,29 @@ pub(crate) fn adopt_captured(
     models_root: &Path,
     candidate: &Candidate,
 ) -> Result<CapturedAdoption, String> {
+    adopt_captured_inner(models_root, candidate, || {})
+}
+
+#[cfg(test)]
+fn adopt_captured_with_before_prepare<F>(
+    models_root: &Path,
+    candidate: &Candidate,
+    before_prepare: F,
+) -> Result<CapturedAdoption, String>
+where
+    F: FnMut(),
+{
+    adopt_captured_inner(models_root, candidate, before_prepare)
+}
+
+fn adopt_captured_inner<F>(
+    models_root: &Path,
+    candidate: &Candidate,
+    mut before_prepare: F,
+) -> Result<CapturedAdoption, String>
+where
+    F: FnMut(),
+{
     let current = discover(models_root)?
         .into_iter()
         .find(|entry| entry.id == candidate.id && entry.path == candidate.path)
@@ -174,6 +197,8 @@ pub(crate) fn adopt_captured(
     )
     .map_err(|error| format!("{}: {error}", models_root.display()))?;
     verified.proves(&candidate.path, candidate.size, &manifest.sha256)?;
+    before_prepare();
+    model_lock.revalidate_for(&model_dir)?;
     super::prepare_pull(&model_dir, &manifest)?;
     let destination = manifest.artifact_path(models_root);
     model_lock.revalidate_for(&model_dir)?;
@@ -1277,6 +1302,34 @@ mod tests {
         assert_eq!(result, super::super::NoReplaceRename::Exists);
         assert_eq!(std::fs::read(&source).unwrap(), b"trusted");
         assert_eq!(std::fs::read(&destination).unwrap(), b"sentinel");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adoption_refuses_a_model_directory_swap_before_pending_prepare() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("Gemma 4.gguf");
+        std::fs::write(&source, gguf(3)).unwrap();
+        let candidate = discover(root.path()).unwrap().pop().unwrap();
+        let model_dir = root.path().join(&candidate.id);
+        let moved_dir = root.path().join("moved-model");
+        let callback_model_dir = model_dir.clone();
+        let callback_moved_dir = moved_dir.clone();
+
+        let result = adopt_captured_with_before_prepare(root.path(), &candidate, move || {
+            std::fs::rename(&callback_model_dir, &callback_moved_dir).unwrap();
+            std::fs::create_dir(&callback_model_dir).unwrap();
+            std::fs::write(callback_model_dir.join("witness"), b"replacement witness").unwrap();
+        });
+
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read(model_dir.join("witness")).unwrap(),
+            b"replacement witness"
+        );
+        assert!(!model_dir.join("pending.json").exists());
+        assert!(!moved_dir.join("pending.json").exists());
+        assert!(source.is_file());
     }
 
     #[test]

@@ -1259,6 +1259,8 @@ mod tests {
             .retain(|artifact| artifact.role == ArtifactRole::Model);
         let model_dir = paths.models.join(&manifest.id);
         fs::create_dir_all(&model_dir).unwrap();
+        let lock = crate::catalog::ModelLock::acquire(&model_dir).unwrap();
+        drop(lock);
         fs::write(model_dir.join("model.gguf"), b"test target").unwrap();
         crate::catalog::publish_manifest(&paths.models, &manifest).unwrap();
 

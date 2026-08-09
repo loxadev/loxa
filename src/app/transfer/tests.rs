@@ -1541,6 +1541,62 @@ fn valid_final_publish_only_checks_control_before_publication_fence() {
 }
 
 #[test]
+fn publishing_callback_directory_swap_is_refused_without_mutating_either_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let service = test_service(root.path());
+    let artifact = test_artifact(b"abcdef");
+    let model_dir = seed_pending(root.path(), "demo", &artifact);
+    let moved_dir = root.path().join("models/moved-demo");
+    std::fs::write(model_dir.join("model.gguf"), b"abcdef").unwrap();
+    let pending = std::fs::read(model_dir.join("pending.json")).unwrap();
+    let callback_model_dir = model_dir.clone();
+    let callback_moved_dir = moved_dir.clone();
+    let callback_pending = pending.clone();
+
+    let result = transfer_selected_with(
+        &service,
+        TransferSelected::new(artifact, Some("demo".into())),
+        TransferControl::new(),
+        move |progress| {
+            if progress.phase() == TransferPhase::Publishing {
+                std::fs::rename(&callback_model_dir, &callback_moved_dir).unwrap();
+                std::fs::create_dir(&callback_model_dir).unwrap();
+                std::fs::write(callback_model_dir.join("witness"), b"replacement witness").unwrap();
+                std::fs::write(callback_model_dir.join("model.gguf"), b"abcdef").unwrap();
+                std::fs::write(callback_model_dir.join("pending.json"), &callback_pending).unwrap();
+            }
+        },
+        |_| Ok((u64::MAX, 1)),
+        || panic!("valid-final publication must not look up a token"),
+        |_, _, _, _, _| panic!("valid-final publication must not call downloader"),
+    );
+
+    let error = match result {
+        Ok(_) => panic!("directory swap must refuse publication"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), TransferErrorKind::Publication);
+    assert_eq!(
+        std::fs::read(model_dir.join("witness")).unwrap(),
+        b"replacement witness"
+    );
+    assert_eq!(
+        std::fs::read(model_dir.join("model.gguf")).unwrap(),
+        b"abcdef"
+    );
+    assert_eq!(
+        std::fs::read(model_dir.join("pending.json")).unwrap(),
+        pending
+    );
+    assert!(!model_dir.join("manifest.json").exists());
+    assert_eq!(
+        std::fs::read(moved_dir.join("pending.json")).unwrap(),
+        std::fs::read(model_dir.join("pending.json")).unwrap()
+    );
+    assert!(!moved_dir.join("manifest.json").exists());
+}
+
+#[test]
 fn publication_failure_is_typed_publication_not_paused() {
     let root = tempfile::tempdir().unwrap();
     let service = test_service(root.path());
