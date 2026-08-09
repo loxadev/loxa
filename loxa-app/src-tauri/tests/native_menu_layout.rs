@@ -197,6 +197,7 @@ mod menu {
                     layout_fixture_actions(),
                     mtm,
                 );
+                runtime.view.layoutSubtreeIfNeeded();
                 let runtime_text = visible_text_values(&runtime.view);
                 assert!(
                     runtime_text.contains(&"API · 127.0.0.1:43123".into()),
@@ -209,8 +210,76 @@ mod menu {
                         .map(|label| label.to_string()),
                     Some("Copy API curl command".into())
                 );
-                assert!(runtime.action_buttons[0].image().is_some());
-                assert!(!runtime.action_buttons[0].refusesFirstResponder());
+                let copy_button = &runtime.action_buttons[0];
+                assert_eq!(
+                    copy_button.toolTip().map(|label| label.to_string()),
+                    Some("Copy API curl command".into())
+                );
+                assert!(copy_button.image().is_some());
+                assert!(!copy_button.refusesFirstResponder());
+                assert_eq!(
+                    runtime_curl_copy_button_content(false),
+                    ("doc.on.doc", "Copy API curl command")
+                );
+
+                let content_frame = runtime.view.frame();
+                let first_button_frame = copy_button.frame();
+                runtime.view.layoutSubtreeIfNeeded();
+                assert_eq!(
+                    copy_button.frame(),
+                    first_button_frame,
+                    "unchanged runtime content must have stable button geometry"
+                );
+                let button_frame = copy_button.frame();
+                assert_eq!(button_frame.size, NSSize::new(28.0, 28.0));
+                let button_ptr = Retained::as_ptr(&runtime.rows.header.copy_button);
+
+                runtime.rows.update_runtime_curl_copy_feedback(true);
+                runtime.view.layoutSubtreeIfNeeded();
+
+                assert_eq!(
+                    runtime_curl_copy_button_content(true),
+                    ("checkmark", "Curl copied")
+                );
+                assert_eq!(
+                    copy_button
+                        .accessibilityLabel()
+                        .map(|label| label.to_string()),
+                    Some("Curl copied".into())
+                );
+                assert_eq!(
+                    copy_button.toolTip().map(|label| label.to_string()),
+                    Some("Curl copied".into())
+                );
+                assert!(copy_button.image().is_some());
+                assert_eq!(
+                    Retained::as_ptr(&runtime.rows.header.copy_button),
+                    button_ptr,
+                    "feedback must reuse the retained runtime copy button"
+                );
+                assert_eq!(runtime.view.frame(), content_frame);
+                assert_eq!(copy_button.frame(), button_frame);
+
+                runtime.rows.update_runtime_curl_copy_feedback(false);
+                runtime.view.layoutSubtreeIfNeeded();
+
+                assert_eq!(
+                    copy_button
+                        .accessibilityLabel()
+                        .map(|label| label.to_string()),
+                    Some("Copy API curl command".into())
+                );
+                assert_eq!(
+                    copy_button.toolTip().map(|label| label.to_string()),
+                    Some("Copy API curl command".into())
+                );
+                assert!(copy_button.image().is_some());
+                assert_eq!(
+                    Retained::as_ptr(&runtime.rows.header.copy_button),
+                    button_ptr
+                );
+                assert_eq!(runtime.view.frame(), content_frame);
+                assert_eq!(copy_button.frame(), button_frame);
 
                 let search = MenuRows::build(
                     &Fixture::Empty.snapshot(),
@@ -1054,6 +1123,33 @@ mod menu {
                 );
             }
 
+            pub(crate) fn assert_runtime_copy_feedback_lifecycle(mtm: MainThreadMarker) {
+                let content_view_controller = NSViewController::new(mtm);
+                let mut state = native_state(content_view_controller, Fixture::Running, mtm);
+                state.snapshot = Fixture::Running
+                    .snapshot()
+                    .with_running_port(43123)
+                    .unwrap();
+                let target = NSObject::new();
+                let started_at = Instant::now();
+                let command = "curl http://127.0.0.1:43123/v1/models";
+
+                assert!(state.arm_runtime_curl_copy_feedback(command.into(), started_at));
+                state.render(&target, action_selectors(), mtm);
+                assert!(state.runtime_curl_copy_feedback.is_some());
+
+                state.popover_closed(&target, action_selectors(), mtm);
+                assert!(state.runtime_curl_copy_feedback.is_none());
+
+                assert!(state.arm_runtime_curl_copy_feedback(command.into(), Instant::now()));
+                state.snapshot = Fixture::Installed.snapshot();
+                state.render(&target, action_selectors(), mtm);
+                assert!(
+                    state.runtime_curl_copy_feedback.is_none(),
+                    "an idle snapshot must clear copied-runtime feedback immediately"
+                );
+            }
+
             pub(crate) fn assert_rebuild_detaches_outgoing_search_action(mtm: MainThreadMarker) {
                 let target = SearchActionTarget::new(mtm);
                 let controller = ReplacementController::new(mtm);
@@ -1299,6 +1395,7 @@ fn main() {
     let mtm = objc2::MainThreadMarker::new()
         .expect("native popover layout coverage must run on the main thread");
     menu::macos::rows::assert_native_layout_contract(mtm);
+    menu::macos::controller::assert_runtime_copy_feedback_lifecycle(mtm);
     menu::macos::controller::assert_progress_updates_retain_active_search(mtm);
     menu::macos::controller::assert_rebuild_detaches_outgoing_search_action(mtm);
     menu::macos::assert_native_timer_contract(mtm);

@@ -9,7 +9,7 @@ use objc2_app_kit::{
     NSStackView, NSTextAlignment, NSTextField, NSTrackingArea, NSTrackingAreaOptions,
     NSUserInterfaceLayoutOrientation, NSView,
 };
-use objc2_foundation::{NSInteger, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{NSEdgeInsets, NSInteger, NSPoint, NSRect, NSSize, NSString};
 
 use super::catalog_rows::{self, CatalogActions};
 use super::incomplete_rows::{self, IncompleteActions};
@@ -278,6 +278,10 @@ impl MenuRows {
         self.catalog.update_transfer(previous, current)
     }
 
+    pub(super) fn update_runtime_curl_copy_feedback(&self, copied: bool) {
+        self.header.update_runtime_curl_copy_feedback(copied);
+    }
+
     #[cfg(test)]
     #[allow(dead_code)] // Read by the include-based native integration harness.
     pub(super) fn search_field(&self) -> Retained<objc2_app_kit::NSSearchField> {
@@ -518,13 +522,9 @@ impl HeaderRow {
         let runtime_label = secondary_label(snapshot.runtime_label(), mtm);
         let api_text = snapshot.runtime_api_label();
         let api_label = secondary_label(api_text.as_deref().unwrap_or(""), mtm);
-        let copy_button = icon_button(
-            "doc.on.doc",
-            "Copy API curl command",
-            target,
-            actions.runtime_copy,
-            mtm,
-        );
+        let (copy_symbol, copy_label) = runtime_curl_copy_button_content(false);
+        let copy_button =
+            runtime_curl_copy_button(copy_symbol, copy_label, target, actions.runtime_copy, mtm);
         let endpoint_hidden = api_text.is_none();
         api_label.setHidden(endpoint_hidden);
         copy_button.setHidden(endpoint_hidden);
@@ -559,9 +559,22 @@ impl HeaderRow {
         }
     }
 
+    fn update_runtime_curl_copy_feedback(&self, copied: bool) {
+        let (symbol, label) = runtime_curl_copy_button_content(copied);
+        set_icon_button_content(&self.copy_button, symbol, label);
+    }
+
     #[cfg(test)]
     fn action_button(&self) -> Option<Retained<NSButton>> {
         (!self.copy_button.isHidden()).then(|| self.copy_button.clone())
+    }
+}
+
+fn runtime_curl_copy_button_content(copied: bool) -> (&'static str, &'static str) {
+    if copied {
+        ("checkmark", "Curl copied")
+    } else {
+        ("doc.on.doc", "Copy API curl command")
     }
 }
 
@@ -716,12 +729,12 @@ impl RecommendationNativeRow {
         let mut action_button = None;
         #[cfg(test)]
         if actionable {
-            let button = icon_button(
+            let button = configure_icon_button(
+                NSButton::new(mtm),
                 "arrow.down.circle",
                 "Download Gemma 4 12B",
                 target,
                 actions.start,
-                mtm,
             );
             #[cfg(test)]
             {
@@ -1280,28 +1293,65 @@ fn primary_action_button(
         MenuAction::Retry => ("arrow.clockwise", "Retry download", selectors.retry),
         _ => unreachable!("only transfer actions have a primary control"),
     };
-    icon_button(symbol, label, target, selector, mtm)
+    configure_icon_button(NSButton::new(mtm), symbol, label, target, selector)
 }
 
-fn icon_button(
+define_class!(
+    // SAFETY: NSButton has no subclassing requirements, and this class has no Drop implementation.
+    #[unsafe(super(NSButton))]
+    #[name = "LoxaRuntimeCurlCopyButton"]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = ()]
+    struct RuntimeCurlCopyButton;
+
+    impl RuntimeCurlCopyButton {
+        #[unsafe(method(alignmentRectInsets))]
+        fn alignment_rect_insets(&self) -> NSEdgeInsets {
+            NSEdgeInsets {
+                top: 0.0,
+                left: 0.0,
+                bottom: 0.0,
+                right: 0.0,
+            }
+        }
+    }
+);
+
+impl RuntimeCurlCopyButton {
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(());
+        // SAFETY: NSButton's init selector has the expected signature.
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+fn runtime_curl_copy_button(
     symbol: &str,
     accessibility_label: &str,
     target: Option<&AnyObject>,
     selector: Sel,
     mtm: MainThreadMarker,
 ) -> Retained<NSButton> {
-    let button = NSButton::new(mtm);
+    configure_icon_button(
+        RuntimeCurlCopyButton::new(mtm).into_super(),
+        symbol,
+        accessibility_label,
+        target,
+        selector,
+    )
+}
+
+fn configure_icon_button(
+    button: Retained<NSButton>,
+    symbol: &str,
+    accessibility_label: &str,
+    target: Option<&AnyObject>,
+    selector: Sel,
+) -> Retained<NSButton> {
     button.setTitle(&NSString::from_str(""));
     button.setBordered(false);
     button.setRefusesFirstResponder(false);
-    button.setToolTip(Some(&NSString::from_str(accessibility_label)));
-    button.setAccessibilityLabel(Some(&NSString::from_str(accessibility_label)));
-    if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-        &NSString::from_str(symbol),
-        Some(&NSString::from_str(accessibility_label)),
-    ) {
-        button.setImage(Some(&image));
-    }
+    set_icon_button_content(&button, symbol, accessibility_label);
     button.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
     button.setTranslatesAutoresizingMaskIntoConstraints(false);
     activate(button.widthAnchor().constraintEqualToConstant(28.0));
@@ -1312,6 +1362,17 @@ fn icon_button(
         button.setAction(Some(selector));
     }
     button
+}
+
+fn set_icon_button_content(button: &NSButton, symbol: &str, accessibility_label: &str) {
+    let label = NSString::from_str(accessibility_label);
+    button.setToolTip(Some(&label));
+    button.setAccessibilityLabel(Some(&label));
+    let symbol = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+        &NSString::from_str(symbol),
+        Some(&label),
+    );
+    button.setImage(symbol.as_deref());
 }
 
 fn text_button(

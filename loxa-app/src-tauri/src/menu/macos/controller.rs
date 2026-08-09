@@ -26,12 +26,22 @@ use crate::menu::observation::{BackendMessage, ObservationMessage};
 use crate::menu::presentation::{Fixture, InlineCancelState, MenuAction};
 use crate::menu::presentation::{MenuSnapshot, MenuUpdate};
 
+const RUNTIME_CURL_COPY_FEEDBACK_DURATION: std::time::Duration =
+    std::time::Duration::from_millis(1_500);
+
+#[derive(Debug, Eq, PartialEq)]
+struct RuntimeCurlCopyFeedback {
+    command: String,
+    expires_at: Instant,
+}
+
 struct NativePopoverState {
     status_item: Retained<NSStatusItem>,
     popover: Retained<NSPopover>,
     content_view_controller: Retained<NSViewController>,
     snapshot: MenuSnapshot,
     rendered: Option<MenuSnapshot>,
+    runtime_curl_copy_feedback: Option<RuntimeCurlCopyFeedback>,
     catalog: CatalogState,
     rendered_catalog: Option<CatalogState>,
     installed: Rc<RefCell<InstalledState>>,
@@ -61,6 +71,7 @@ impl NativePopoverState {
             content_view_controller,
             snapshot,
             rendered: None,
+            runtime_curl_copy_feedback: None,
             catalog: CatalogState::default(),
             rendered_catalog: None,
             installed: Rc::new(RefCell::new(InstalledState::default())),
@@ -84,6 +95,7 @@ impl NativePopoverState {
     }
 
     fn render(&mut self, target: &AnyObject, actions: Actions, mtm: MainThreadMarker) {
+        self.reconcile_runtime_curl_copy_feedback(Instant::now());
         let catalog_changed = self.rendered_catalog.as_ref() != Some(&self.catalog);
         let installed_changed = self.rendered_installed.as_ref() != Some(&*self.installed.borrow());
         let incomplete_changed =
@@ -110,6 +122,9 @@ impl NativePopoverState {
             rows.update(&self.snapshot, &self.cancel);
             #[cfg(not(test))]
             rows.update(&self.snapshot);
+        }
+        if let Some(rows) = &self.rows {
+            rows.update_runtime_curl_copy_feedback(self.runtime_curl_copy_feedback.is_some());
         }
         self.rendered = Some(self.snapshot.clone());
         self.rendered_catalog = Some(self.catalog.clone());
@@ -144,6 +159,7 @@ impl NativePopoverState {
     }
 
     fn popover_closed(&mut self, target: &AnyObject, actions: Actions, mtm: MainThreadMarker) {
+        self.runtime_curl_copy_feedback = None;
         self.installed.borrow_mut().reset_feedback();
         self.rendered_installed = None;
         self.cancel_incomplete_discard();
@@ -212,13 +228,38 @@ impl NativePopoverState {
         }
     }
 
+    fn arm_runtime_curl_copy_feedback(&mut self, command: String, now: Instant) -> bool {
+        arm_runtime_curl_copy_feedback(
+            &mut self.runtime_curl_copy_feedback,
+            &self.snapshot,
+            command,
+            now,
+        )
+    }
+
+    fn reconcile_runtime_curl_copy_feedback(&mut self, now: Instant) -> bool {
+        reconcile_runtime_curl_copy_feedback(
+            &mut self.runtime_curl_copy_feedback,
+            &self.snapshot,
+            now,
+        )
+    }
+
     #[cfg(not(test))]
     fn drain_backend(&mut self, target: &AnyObject, actions: Actions, mtm: MainThreadMarker) {
+        let now = Instant::now();
+        let feedback_changed = self.reconcile_runtime_curl_copy_feedback(now);
         let Some(backend) = &mut self.backend else {
+            if feedback_changed {
+                self.render(target, actions, mtm);
+            }
             return;
         };
-        let messages = backend.drain(Instant::now());
+        let messages = backend.drain(now);
         if messages.is_empty() {
+            if feedback_changed {
+                self.render(target, actions, mtm);
+            }
             return;
         }
         for message in messages {
@@ -283,16 +324,50 @@ impl NativePopoverState {
     }
 }
 
-fn copy_runtime_curl_with<Copy>(snapshot: &MenuSnapshot, copy: Copy) -> bool
+fn arm_runtime_curl_copy_feedback(
+    feedback: &mut Option<RuntimeCurlCopyFeedback>,
+    snapshot: &MenuSnapshot,
+    command: String,
+    now: Instant,
+) -> bool {
+    let changed = reconcile_runtime_curl_copy_feedback(feedback, snapshot, now);
+    if snapshot.runtime_curl_command().as_deref() != Some(command.as_str()) {
+        return changed;
+    }
+
+    let next = RuntimeCurlCopyFeedback {
+        command,
+        expires_at: now + RUNTIME_CURL_COPY_FEEDBACK_DURATION,
+    };
+    let changed = changed || feedback.as_ref() != Some(&next);
+    *feedback = Some(next);
+    changed
+}
+
+fn reconcile_runtime_curl_copy_feedback(
+    feedback: &mut Option<RuntimeCurlCopyFeedback>,
+    snapshot: &MenuSnapshot,
+    now: Instant,
+) -> bool {
+    let should_clear = feedback.as_ref().is_some_and(|feedback| {
+        now >= feedback.expires_at
+            || snapshot.runtime_curl_command().as_deref() != Some(feedback.command.as_str())
+    });
+    if should_clear {
+        *feedback = None;
+    }
+    should_clear
+}
+
+fn copy_runtime_curl_with<Copy>(snapshot: &MenuSnapshot, copy: Copy) -> Option<String>
 where
     Copy: FnOnce(&str) -> bool,
 {
-    snapshot
-        .runtime_curl_command()
-        .is_some_and(|command| copy(&command))
+    let command = snapshot.runtime_curl_command()?;
+    copy(&command).then_some(command)
 }
 
-fn copy_runtime_curl_to_pasteboard(snapshot: &MenuSnapshot) -> bool {
+fn copy_runtime_curl_to_pasteboard(snapshot: &MenuSnapshot) -> Option<String> {
     copy_runtime_curl_with(snapshot, |command| {
         let pasteboard = NSPasteboard::generalPasteboard();
         pasteboard.clearContents();
@@ -361,7 +436,16 @@ define_class!(
         #[unsafe(method(copyRuntimeCurl:))]
         fn copy_runtime_curl(&self, _sender: Option<&NSButton>) {
             let snapshot = self.ivars().state.borrow().snapshot.clone();
-            let _ = copy_runtime_curl_to_pasteboard(&snapshot);
+            let Some(command) = copy_runtime_curl_to_pasteboard(&snapshot) else {
+                return;
+            };
+
+            let mtm = MainThreadMarker::new()
+                .expect("AppKit must copy runtime commands on the main thread");
+            let mut state = self.ivars().state.borrow_mut();
+            if state.arm_runtime_curl_copy_feedback(command, Instant::now()) {
+                state.render(self, action_selectors(), mtm);
+            }
         }
 
         #[unsafe(method(submitSearch:))]
@@ -825,11 +909,13 @@ fn selected_fixture() -> Fixture {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use objc2::{sel, ClassType};
 
     use super::{
-        copy_runtime_curl_with, production_action_selectors, NativePopoverTarget,
-        ProductionActionSelectors,
+        arm_runtime_curl_copy_feedback, copy_runtime_curl_with, production_action_selectors,
+        reconcile_runtime_curl_copy_feedback, NativePopoverTarget, ProductionActionSelectors,
     };
     use crate::menu::presentation::Fixture;
 
@@ -839,20 +925,162 @@ mod tests {
             .snapshot()
             .with_running_port(43123)
             .unwrap();
-        let mut copied = None;
-        assert!(copy_runtime_curl_with(&running, |command| {
-            copied = Some(command.to_owned());
-            true
-        }));
+        let copied = copy_runtime_curl_with(&running, |_| true);
         assert_eq!(
             copied.as_deref(),
             Some("curl http://127.0.0.1:43123/v1/models")
         );
 
-        assert!(!copy_runtime_curl_with(
-            &Fixture::Installed.snapshot(),
-            |_| panic!("idle snapshots must not reach the clipboard")
+        assert_eq!(
+            copy_runtime_curl_with(&Fixture::Installed.snapshot(), |_| panic!(
+                "idle snapshots must not reach the clipboard"
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn runtime_copy_feedback_expires_at_exactly_1500_milliseconds() {
+        let running = Fixture::Running
+            .snapshot()
+            .with_running_port(43123)
+            .unwrap();
+        let started_at = Instant::now();
+        let mut feedback = None;
+
+        assert!(arm_runtime_curl_copy_feedback(
+            &mut feedback,
+            &running,
+            "curl http://127.0.0.1:43123/v1/models".into(),
+            started_at,
         ));
+        assert_eq!(
+            feedback.as_ref().map(|value| value.expires_at),
+            Some(started_at + Duration::from_millis(1_500))
+        );
+        assert!(!reconcile_runtime_curl_copy_feedback(
+            &mut feedback,
+            &running,
+            started_at + Duration::from_millis(1_499),
+        ));
+        assert!(feedback.is_some());
+        assert!(reconcile_runtime_curl_copy_feedback(
+            &mut feedback,
+            &running,
+            started_at + Duration::from_millis(1_500),
+        ));
+        assert!(feedback.is_none());
+    }
+
+    #[test]
+    fn repeated_runtime_copy_success_restarts_the_full_feedback_window() {
+        let running = Fixture::Running
+            .snapshot()
+            .with_running_port(43123)
+            .unwrap();
+        let started_at = Instant::now();
+        let restarted_at = started_at + Duration::from_millis(900);
+        let command = "curl http://127.0.0.1:43123/v1/models";
+        let mut feedback = None;
+
+        assert!(arm_runtime_curl_copy_feedback(
+            &mut feedback,
+            &running,
+            command.into(),
+            started_at,
+        ));
+        assert!(arm_runtime_curl_copy_feedback(
+            &mut feedback,
+            &running,
+            command.into(),
+            restarted_at,
+        ));
+        assert_eq!(
+            feedback.as_ref().map(|value| value.expires_at),
+            Some(restarted_at + Duration::from_millis(1_500))
+        );
+        assert!(!reconcile_runtime_curl_copy_feedback(
+            &mut feedback,
+            &running,
+            started_at + Duration::from_millis(1_500),
+        ));
+        assert!(feedback.is_some());
+    }
+
+    #[test]
+    fn runtime_copy_feedback_clears_when_the_runtime_disappears() {
+        let running = Fixture::Running
+            .snapshot()
+            .with_running_port(43123)
+            .unwrap();
+        let started_at = Instant::now();
+        let mut feedback = None;
+
+        assert!(arm_runtime_curl_copy_feedback(
+            &mut feedback,
+            &running,
+            "curl http://127.0.0.1:43123/v1/models".into(),
+            started_at,
+        ));
+
+        assert!(reconcile_runtime_curl_copy_feedback(
+            &mut feedback,
+            &Fixture::Installed.snapshot(),
+            started_at,
+        ));
+        assert!(feedback.is_none());
+    }
+
+    #[test]
+    fn runtime_copy_feedback_rejects_a_replaced_endpoint() {
+        let first = Fixture::Running
+            .snapshot()
+            .with_running_port(43123)
+            .unwrap();
+        let replacement = Fixture::Running
+            .snapshot()
+            .with_running_port(43124)
+            .unwrap();
+        let started_at = Instant::now();
+        let command = "curl http://127.0.0.1:43123/v1/models";
+        let mut feedback = None;
+
+        assert!(arm_runtime_curl_copy_feedback(
+            &mut feedback,
+            &first,
+            command.into(),
+            started_at,
+        ));
+        assert!(reconcile_runtime_curl_copy_feedback(
+            &mut feedback,
+            &replacement,
+            started_at + Duration::from_millis(1),
+        ));
+        assert!(feedback.is_none());
+        assert!(!arm_runtime_curl_copy_feedback(
+            &mut feedback,
+            &replacement,
+            command.into(),
+            started_at + Duration::from_millis(2),
+        ));
+        assert!(feedback.is_none());
+    }
+
+    #[test]
+    fn failed_runtime_pasteboard_write_never_arms_feedback() {
+        let running = Fixture::Running
+            .snapshot()
+            .with_running_port(43123)
+            .unwrap();
+        let mut feedback = None;
+
+        let copied = copy_runtime_curl_with(&running, |_| false);
+        if let Some(command) = copied {
+            let _ =
+                arm_runtime_curl_copy_feedback(&mut feedback, &running, command, Instant::now());
+        }
+
+        assert!(feedback.is_none());
     }
 
     #[test]
