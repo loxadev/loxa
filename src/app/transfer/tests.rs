@@ -387,6 +387,11 @@ fn combined_plan_covers_all_six_capacity_rows_and_exact_local_states() {
             CapacityPlan::InstalledRepairRequest,
         ),
         (
+            Catalog::Installed,
+            Artifact::Fresh,
+            CapacityPlan::InstalledRepairRequest,
+        ),
+        (
             Catalog::MatchingPending,
             Artifact::ValidFinal,
             CapacityPlan::PendingPublish,
@@ -425,7 +430,6 @@ fn combined_plan_refuses_different_malformed_unsafe_local_bundle_and_unidentifie
         (Catalog::Unsafe, Artifact::Fresh),
         (Catalog::Fresh, Artifact::Unsafe),
         (Catalog::Fresh, Artifact::RequestCapable),
-        (Catalog::Installed, Artifact::Fresh),
         (Catalog::Installed, Artifact::ValidFinalRepairDebris),
         (
             Catalog::InstalledCompletionDebris,
@@ -709,50 +713,61 @@ fn alternate_reuse_scan_to_lock_change_fails_before_artifact_hash_or_transfer_wo
 }
 
 #[test]
-fn alternate_reuse_refuses_installed_artifact_repair_before_transfer_work() {
+fn alternate_reuse_refuses_missing_and_corrupt_installed_artifact_repair() {
     use std::cell::Cell;
 
-    let root = tempfile::tempdir().unwrap();
-    let service = test_service(root.path());
-    let artifact = test_artifact(b"abcdef");
-    let installed = exact_manifest("custom-model".into(), &artifact);
-    seed_published_remote(root.path(), &installed, b"ghijkl");
-    let model_dir = root.path().join("models/custom-model");
-    let progress_calls = Cell::new(0);
-    let capacity_calls = Cell::new(0);
-    let token_calls = Cell::new(0);
-    let download_calls = Cell::new(0);
+    for (label, final_bytes) in [("missing", None), ("corrupt", Some(b"ghijkl".as_slice()))] {
+        let root = tempfile::tempdir().unwrap();
+        let service = test_service(root.path());
+        let artifact = test_artifact(b"abcdef");
+        let installed = exact_manifest("custom-model".into(), &artifact);
+        let model_dir = root.path().join("models/custom-model");
+        let lock = crate::catalog::ModelLock::acquire_for_transfer(&model_dir).unwrap();
+        drop(lock);
+        std::fs::write(
+            model_dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&installed).unwrap(),
+        )
+        .unwrap();
+        if let Some(bytes) = final_bytes {
+            std::fs::write(model_dir.join("model.gguf"), bytes).unwrap();
+        }
+        let progress_calls = Cell::new(0);
+        let capacity_calls = Cell::new(0);
+        let token_calls = Cell::new(0);
+        let download_calls = Cell::new(0);
 
-    let result = transfer_selected_with(
-        &service,
-        TransferSelected::new(artifact, None),
-        TransferControl::new(),
-        |_| progress_calls.set(progress_calls.get() + 1),
-        |_| {
-            capacity_calls.set(capacity_calls.get() + 1);
-            Ok((u64::MAX, 1))
-        },
-        || {
-            token_calls.set(token_calls.get() + 1);
-            None
-        },
-        |_, _, _, _, _| {
-            download_calls.set(download_calls.get() + 1);
-            Err(DownloadFailure::Durability)
-        },
-    );
-    let error = match result {
-        Ok(_) => panic!("alternate installed repair must refuse"),
-        Err(error) => error,
-    };
+        let result = transfer_selected_with(
+            &service,
+            TransferSelected::new(artifact, None),
+            TransferControl::new(),
+            |_| progress_calls.set(progress_calls.get() + 1),
+            |_| {
+                capacity_calls.set(capacity_calls.get() + 1);
+                Ok((u64::MAX, 1))
+            },
+            || {
+                token_calls.set(token_calls.get() + 1);
+                None
+            },
+            |_, _, _, _, _| {
+                download_calls.set(download_calls.get() + 1);
+                Err(DownloadFailure::Durability)
+            },
+        );
+        let error = match result {
+            Ok(_) => panic!("alternate {label} repair must refuse"),
+            Err(error) => error,
+        };
 
-    assert_eq!(error.kind(), TransferErrorKind::UnsafeLocalState);
-    assert_eq!(progress_calls.get(), 0);
-    assert_eq!(capacity_calls.get(), 0);
-    assert_eq!(token_calls.get(), 0);
-    assert_eq!(download_calls.get(), 0);
-    assert!(model_dir.join("manifest.json").exists());
-    assert!(!model_dir.join("pending.json").exists());
+        assert_eq!(error.kind(), TransferErrorKind::UnsafeLocalState, "{label}");
+        assert_eq!(progress_calls.get(), 0, "{label}");
+        assert_eq!(capacity_calls.get(), 0, "{label}");
+        assert_eq!(token_calls.get(), 0, "{label}");
+        assert_eq!(download_calls.get(), 0, "{label}");
+        assert!(model_dir.join("manifest.json").exists(), "{label}");
+        assert!(!model_dir.join("pending.json").exists(), "{label}");
+    }
 }
 
 #[test]
@@ -1618,7 +1633,7 @@ fn clean_installed_is_read_only_already_installed_without_capacity_probe() {
 
     let result = transfer_selected_with(
         &service,
-        TransferSelected::new(artifact, Some("demo".into())),
+        TransferSelected::for_installed(artifact, "demo".into()),
         TransferControl::new(),
         |_| progress_calls.set(progress_calls.get() + 1),
         |_| panic!("zero-requirement clean install must not probe capacity"),
@@ -1631,6 +1646,145 @@ fn clean_installed_is_read_only_already_installed_without_capacity_probe() {
     assert_eq!(progress_calls.get(), 0);
     #[cfg(unix)]
     assert_eq!(exact_directory_snapshot(&model_dir), before);
+}
+
+#[test]
+fn inspected_installed_intent_refuses_stale_directory_or_manifest_before_transfer_work() {
+    use std::cell::Cell;
+
+    for label in ["directory-removed", "manifest-removed", "manifest-replaced"] {
+        let root = tempfile::tempdir().unwrap();
+        let service = test_service(root.path());
+        let artifact = test_artifact(b"abcdef");
+        let model_dir = root.path().join("models/custom-model");
+        let lock = crate::catalog::ModelLock::acquire_for_transfer(&model_dir).unwrap();
+        drop(lock);
+        std::fs::write(
+            model_dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&exact_manifest("custom-model".into(), &artifact)).unwrap(),
+        )
+        .unwrap();
+        if label != "manifest-removed" {
+            std::fs::write(model_dir.join("model.gguf"), b"abcdef").unwrap();
+        }
+
+        let inspected = service.installed_models().unwrap();
+        assert_eq!(inspected.len(), 1);
+        assert_eq!(inspected[0].id(), "custom-model");
+        assert!(inspected[0].matches_remote(&artifact));
+
+        match label {
+            "directory-removed" => std::fs::remove_dir_all(&model_dir).unwrap(),
+            "manifest-removed" => std::fs::remove_file(model_dir.join("manifest.json")).unwrap(),
+            "manifest-replaced" => {
+                let replacement = test_artifact(b"ghijkl");
+                std::fs::write(
+                    model_dir.join("manifest.json"),
+                    serde_json::to_vec_pretty(&exact_manifest("custom-model".into(), &replacement))
+                        .unwrap(),
+                )
+                .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        #[cfg(unix)]
+        let before = model_dir
+            .exists()
+            .then(|| exact_directory_snapshot(&model_dir));
+        let progress_calls = Cell::new(0);
+        let capacity_calls = Cell::new(0);
+        let token_calls = Cell::new(0);
+        let download_calls = Cell::new(0);
+
+        let result = transfer_selected_with(
+            &service,
+            TransferSelected::for_installed(artifact, "custom-model".into()),
+            TransferControl::new(),
+            |_| progress_calls.set(progress_calls.get() + 1),
+            |_| {
+                capacity_calls.set(capacity_calls.get() + 1);
+                Ok((u64::MAX, 1))
+            },
+            || {
+                token_calls.set(token_calls.get() + 1);
+                None
+            },
+            |_, _, _, _, _| {
+                download_calls.set(download_calls.get() + 1);
+                Err(DownloadFailure::Durability)
+            },
+        );
+        let error = match result {
+            Ok(_) => panic!("stale inspected-installed {label} manifest must refuse"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), TransferErrorKind::UnsafeLocalState, "{label}");
+        assert_eq!(progress_calls.get(), 0, "{label}");
+        assert_eq!(capacity_calls.get(), 0, "{label}");
+        assert_eq!(token_calls.get(), 0, "{label}");
+        assert_eq!(download_calls.get(), 0, "{label}");
+        assert!(!model_dir.join("pending.json").exists(), "{label}");
+        #[cfg(unix)]
+        match before {
+            Some(before) => assert_eq!(exact_directory_snapshot(&model_dir), before, "{label}"),
+            None => assert!(!model_dir.exists(), "{label}"),
+        }
+    }
+}
+
+#[test]
+fn inspected_installed_intent_retains_missing_and_corrupt_artifact_repair() {
+    use std::cell::Cell;
+
+    for (label, initial_bytes) in [("missing", None), ("corrupt", Some(b"ghijkl".as_slice()))] {
+        let root = tempfile::tempdir().unwrap();
+        let service = test_service(root.path());
+        let artifact = test_artifact(b"abcdef");
+        let model_dir = root.path().join("models/custom-model");
+        let lock = crate::catalog::ModelLock::acquire_for_transfer(&model_dir).unwrap();
+        drop(lock);
+        std::fs::write(
+            model_dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&exact_manifest("custom-model".into(), &artifact)).unwrap(),
+        )
+        .unwrap();
+        if let Some(bytes) = initial_bytes {
+            std::fs::write(model_dir.join("model.gguf"), bytes).unwrap();
+        }
+        let download_calls = Cell::new(0);
+
+        let result = transfer_selected_with(
+            &service,
+            TransferSelected::for_installed(artifact, "custom-model".into()),
+            TransferControl::new(),
+            |_| {},
+            |_| Ok((u64::MAX, 1)),
+            || None,
+            |_, destination, _, _, _| {
+                download_calls.set(download_calls.get() + 1);
+                let final_path = destination.join("model.gguf");
+                std::fs::write(&final_path, b"abcdef").unwrap();
+                Ok(DownloadTerminalOutcome::Complete(
+                    crate::download::DownloadOutcome::Pulled(final_path),
+                ))
+            },
+        )
+        .unwrap_or_else(|error| panic!("{label} repair failed: {error:?}"));
+
+        assert_eq!(result.model_id(), "custom-model", "{label}");
+        assert_eq!(
+            result.disposition(),
+            TransferDisposition::AlreadyInstalled,
+            "{label}"
+        );
+        assert_eq!(download_calls.get(), 1, "{label}");
+        assert_eq!(
+            std::fs::read(model_dir.join("model.gguf")).unwrap(),
+            b"abcdef",
+            "{label}"
+        );
+    }
 }
 
 #[test]

@@ -13,6 +13,7 @@ use objc2_foundation::{NSArray, NSInteger, NSPoint, NSRect, NSSize, NSString, NS
 
 use crate::menu::installed::{InstalledFeedback, InstalledItem, InstalledState};
 use crate::menu::presentation::MenuLayout;
+use crate::menu::progress::format_bytes;
 
 const WIDTH: f64 = MenuLayout::BASE_WIDTH;
 const INSET: f64 = 16.0;
@@ -201,7 +202,7 @@ fn installed_row(
     primary.setToolTip(Some(&NSString::from_str(item.display_name())));
     view.addSubview(&primary);
 
-    let secondary_text = format!("{} · {}", item.id(), format_size(item.total_bytes()));
+    let secondary_text = format!("{} · {}", item.id(), format_bytes(item.total_bytes()));
     let secondary = secondary_label(&secondary_text, mtm);
     secondary.setFrame(rect(label_x, 8.0, label_width, 16.0));
     view.addSubview(&secondary);
@@ -349,18 +350,6 @@ fn image_view(symbol: &str, mtm: MainThreadMarker) -> Retained<NSImageView> {
     image_view
 }
 
-fn format_size(bytes: u64) -> String {
-    const MB: f64 = 1_000_000.0;
-    const GB: f64 = 1_000_000_000.0;
-    if bytes >= 1_000_000_000 {
-        format!("{:.1} GB", bytes as f64 / GB)
-    } else if bytes >= 1_000_000 {
-        format!("{:.1} MB", bytes as f64 / MB)
-    } else {
-        format!("{bytes} bytes")
-    }
-}
-
 fn rect(x: f64, y: f64, width: f64, height: f64) -> NSRect {
     NSRect::new(NSPoint::new(x, y), NSSize::new(width, height))
 }
@@ -427,16 +416,13 @@ pub(super) fn dispatch_selected_action<Resolve, SafeDirectory, Copy, Reveal>(
     };
 
     let feedback = match action {
-        InstalledAction::CopyChatCommand => match resolve_model_dir(&model_id) {
-            Ok(_) => {
-                let command = format!("loxa chat '{model_id}'");
-                match copy(&command) {
-                    Ok(()) => Some(InstalledFeedback::ChatCommandCopied),
-                    Err(()) => Some(InstalledFeedback::CopyFailed),
-                }
+        InstalledAction::CopyChatCommand => {
+            let command = format!("loxa chat '{model_id}'");
+            match copy(&command) {
+                Ok(()) => Some(InstalledFeedback::ChatCommandCopied),
+                Err(()) => Some(InstalledFeedback::CopyFailed),
             }
-            Err(()) => Some(InstalledFeedback::CopyFailed),
-        },
+        }
         InstalledAction::RevealInFinder => match resolve_model_dir(&model_id) {
             Ok(path) if is_safe_directory(&path) => match reveal(&path) {
                 Ok(()) => None,
@@ -485,6 +471,30 @@ mod tests {
             |_| panic!("copy must not inspect a model directory"),
             |command| {
                 state.borrow_mut().reset_feedback();
+                *copied.borrow_mut() = Some(command.into());
+                Ok(())
+            },
+            |_| panic!("copy must not invoke Finder"),
+        );
+
+        assert_eq!(copied.into_inner().as_deref(), Some("loxa chat 'alpha'"));
+        assert_eq!(
+            state.borrow().feedback_message(),
+            Some("Chat command copied")
+        );
+    }
+
+    #[test]
+    fn copy_action_succeeds_when_model_directory_resolution_would_fail() {
+        let state = selected_state();
+        let copied = RefCell::new(None::<String>);
+
+        dispatch_selected_action(
+            &state,
+            InstalledAction::CopyChatCommand,
+            |_| Err(()),
+            |_| panic!("copy must not inspect a model directory"),
+            |command| {
                 *copied.borrow_mut() = Some(command.into());
                 Ok(())
             },

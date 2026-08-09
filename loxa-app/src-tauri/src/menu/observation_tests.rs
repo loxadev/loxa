@@ -5,16 +5,17 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use loxa::app::{AppSnapshot, TransferControl};
+use loxa::huggingface::ResolvedFile;
 
 use super::{
     map_app_snapshot, map_core_snapshot, run_backend_worker, BackendClient, BackendMessage,
-    BackendRequest, BackendSource, CoreBundle, CoreDownload, CoreObservation, CoreRecommendation,
-    CoreRecommendationUnavailableReason, InspectedRepository, ObservationMessage, RefreshAdmission,
-    TransferCompletion,
+    BackendRequest, BackendSource, BackendTransfer, CoreBundle, CoreDownload, CoreObservation,
+    CoreRecommendation, CoreRecommendationUnavailableReason, InspectedRepository,
+    ObservationMessage, RefreshAdmission, TransferCompletion,
 };
 use crate::menu::catalog::{
-    CandidateItem, CatalogCommand, CatalogEvent, CatalogTransferDisposition, RepositoryItem,
-    TransferStage,
+    CandidateItem, CandidateTransferIntent, CatalogCommand, CatalogEvent,
+    CatalogTransferDisposition, RepositoryItem, TransferStage,
 };
 use crate::menu::installed::{InstalledInventoryError, InstalledItem};
 use crate::menu::presentation::{Fixture, MenuSnapshot};
@@ -91,6 +92,8 @@ fn worker_routes_search_inspection_and_exact_transfer_as_owned_events() {
             repo: "owner/model".into(),
             revision: expected_revision(),
             path: "model-q4.gguf".into(),
+            artifact: None,
+            intent: CandidateTransferIntent::InspectedInstalled("custom-model".into()),
             control: TransferControl::new(),
         })
         .unwrap();
@@ -135,6 +138,59 @@ fn worker_routes_search_inspection_and_exact_transfer_as_owned_events() {
 }
 
 #[test]
+fn candidate_command_and_worker_retain_the_exact_inspected_artifact_value() {
+    let expected = loxa::huggingface::test_resolved_file_for(
+        "owner/model",
+        "model-q4.gguf",
+        "ab".repeat(32),
+        42,
+    );
+    let mut catalog = crate::menu::catalog::CatalogState::default();
+    let search = catalog.submit_search("model").unwrap();
+    assert!(catalog.apply(CatalogEvent::Repositories {
+        generation: search.generation(),
+        repositories: vec![repository()],
+    }));
+    let inspect = catalog.inspect_repository(0).unwrap();
+    assert!(catalog.apply(CatalogEvent::Candidates {
+        generation: inspect.generation(),
+        repo: "owner/model".into(),
+        revision: expected_revision(),
+        candidates: vec![CandidateItem::from_resolved(
+            "model-q4.gguf".into(),
+            Some(42),
+            expected.clone(),
+        )
+        .with_installed_model_id("custom-model".into())],
+    }));
+    assert!(catalog.select_candidate(0));
+    let command = catalog.start_transfer().unwrap();
+
+    let (artifact_sender, artifact_receiver) = mpsc::channel();
+    let mut client = BackendClient::assemble(move |requests, messages, stopping| {
+        std::thread::Builder::new()
+            .name("loxa-menu-artifact-test-backend".into())
+            .spawn(move || {
+                run_backend_worker(
+                    Ok(ArtifactCaptureBackend { artifact_sender }),
+                    requests,
+                    messages,
+                    &stopping,
+                );
+            })
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    });
+
+    assert!(client.dispatch(command));
+    let received = artifact_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the worker must receive the inspected artifact");
+    assert_eq!(received, Some(expected));
+    client.shutdown();
+}
+
+#[test]
 fn worker_refreshes_inventory_immediately_after_installed_and_already_installed() {
     for disposition in [
         CatalogTransferDisposition::Installed,
@@ -157,6 +213,8 @@ fn worker_refreshes_inventory_immediately_after_installed_and_already_installed(
                 repo: "owner/model".into(),
                 revision: expected_revision(),
                 path: "model-q4.gguf".into(),
+                artifact: None,
+                intent: CandidateTransferIntent::New,
                 control: TransferControl::new(),
             })
             .unwrap();
@@ -217,6 +275,8 @@ fn worker_drops_the_completion_pin_when_terminal_inventory_refresh_fails() {
             repo: "owner/model".into(),
             revision: expected_revision(),
             path: "model-q4.gguf".into(),
+            artifact: None,
+            intent: CandidateTransferIntent::New,
             control: TransferControl::new(),
         })
         .unwrap();
@@ -328,6 +388,8 @@ fn backend_client_pauses_only_the_exact_active_generation() {
         repo: "owner/model".into(),
         revision: expected_revision(),
         path: "model-q4.gguf".into(),
+        artifact: None,
+        intent: CandidateTransferIntent::New,
     }));
     assert!(!client.request_pause(8));
     assert!(client.request_pause(9));
@@ -403,21 +465,66 @@ impl BackendSource for FakeBackend {
 
     fn transfer(
         &mut self,
-        repo: String,
-        revision: String,
-        path: String,
-        _control: TransferControl,
+        transfer: BackendTransfer,
         progress: &mut dyn FnMut(TransferStage, u64, u64),
     ) -> Result<TransferCompletion, String> {
+        let BackendTransfer {
+            repo,
+            revision,
+            path,
+            artifact,
+            intent,
+            control,
+        } = transfer;
+        let _ = (artifact, control);
         if (repo.as_str(), revision.as_str(), path.as_str())
             != ("owner/model", expected_revision().as_str(), "model-q4.gguf")
         {
             return Err("worker changed the explicit artifact choice".into());
         }
+        if intent != CandidateTransferIntent::InspectedInstalled("custom-model".into()) {
+            return Err("worker dropped the inspected-installed transfer intent".into());
+        }
         progress(TransferStage::Transferring, 0, 42);
         Ok(TransferCompletion::new(
             CatalogTransferDisposition::AlreadyInstalled,
             "new-model".into(),
+        ))
+    }
+}
+
+struct ArtifactCaptureBackend {
+    artifact_sender: mpsc::Sender<Option<ResolvedFile>>,
+}
+
+impl BackendSource for ArtifactCaptureBackend {
+    fn snapshot(&mut self) -> MenuSnapshot {
+        Fixture::Empty.snapshot()
+    }
+
+    fn installed_models(&mut self) -> Result<Vec<InstalledItem>, InstalledInventoryError> {
+        Ok(Vec::new())
+    }
+
+    fn search(&mut self, _query: String) -> Result<Vec<RepositoryItem>, String> {
+        Err("search is outside this test".into())
+    }
+
+    fn inspect(&mut self, _repo: String) -> Result<InspectedRepository, String> {
+        Err("inspection is outside this test".into())
+    }
+
+    fn transfer(
+        &mut self,
+        transfer: BackendTransfer,
+        _progress: &mut dyn FnMut(TransferStage, u64, u64),
+    ) -> Result<TransferCompletion, String> {
+        self.artifact_sender
+            .send(transfer.artifact)
+            .map_err(|error| error.to_string())?;
+        Ok(TransferCompletion::new(
+            CatalogTransferDisposition::AlreadyInstalled,
+            "custom-model".into(),
         ))
     }
 }
@@ -460,10 +567,7 @@ impl BackendSource for RefreshBackend {
 
     fn transfer(
         &mut self,
-        _repo: String,
-        _revision: String,
-        _path: String,
-        _control: TransferControl,
+        _transfer: BackendTransfer,
         progress: &mut dyn FnMut(TransferStage, u64, u64),
     ) -> Result<TransferCompletion, String> {
         progress(TransferStage::Transferring, 0, 42);
@@ -495,10 +599,7 @@ impl BackendSource for FailingInventoryBackend {
 
     fn transfer(
         &mut self,
-        _repo: String,
-        _revision: String,
-        _path: String,
-        _control: TransferControl,
+        _transfer: BackendTransfer,
         _progress: &mut dyn FnMut(TransferStage, u64, u64),
     ) -> Result<TransferCompletion, String> {
         Err("transfer is outside this test".into())
@@ -531,10 +632,7 @@ impl BackendSource for ThreadBackend {
 
     fn transfer(
         &mut self,
-        _repo: String,
-        _revision: String,
-        _path: String,
-        _control: TransferControl,
+        _transfer: BackendTransfer,
         _progress: &mut dyn FnMut(TransferStage, u64, u64),
     ) -> Result<TransferCompletion, String> {
         Err("transfer is outside this test".into())

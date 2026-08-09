@@ -30,6 +30,9 @@ tauri-build = { version = "=2.6.3", features = [] }
 loxa = { path = "../.." }
 tauri = { version = "=2.11.5", features = ["tray-icon"] }
 
+[dev-dependencies]
+loxa = { path = "../..", features = ["test-support"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 dispatch2 = { version = "=0.3.1", default-features = false, features = ["objc2", "std"] }
 objc2 = "=0.6.4"

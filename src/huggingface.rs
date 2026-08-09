@@ -118,13 +118,8 @@ pub(crate) fn test_resolved_file(sha256: String, size: u64) -> ResolvedFile {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn test_resolved_file_for(
-    repo: &str,
-    path: &str,
-    sha256: String,
-    size: u64,
-) -> ResolvedFile {
+#[cfg(any(test, feature = "test-support"))]
+fn resolved_file_for_test(repo: &str, path: &str, sha256: String, size: u64) -> ResolvedFile {
     ResolvedFile {
         repo: repo.into(),
         revision: "0123456789abcdef0123456789abcdef01234567".into(),
@@ -132,6 +127,22 @@ pub(crate) fn test_resolved_file_for(
         sha256,
         size,
     }
+}
+
+#[cfg(all(test, not(feature = "test-support")))]
+pub(crate) fn test_resolved_file_for(
+    repo: &str,
+    path: &str,
+    sha256: String,
+    size: u64,
+) -> ResolvedFile {
+    resolved_file_for_test(repo, path, sha256, size)
+}
+
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn test_resolved_file_for(repo: &str, path: &str, sha256: String, size: u64) -> ResolvedFile {
+    resolved_file_for_test(repo, path, sha256, size)
 }
 
 struct TransportRequest {

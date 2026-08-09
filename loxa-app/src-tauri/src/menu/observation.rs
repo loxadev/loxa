@@ -6,8 +6,7 @@ use std::time::{Duration, Instant};
 use loxa::app::TransferControl;
 #[cfg(not(test))]
 use loxa::app::{
-    AppService, ResolveArtifactRequest, TransferDisposition, TransferPhase, TransferProgress,
-    TransferSelected,
+    AppService, TransferDisposition, TransferPhase, TransferProgress, TransferSelected,
 };
 use loxa::app::{
     AppSnapshot, BundleSnapshot, BundleUnavailableReason, DownloadSnapshot, RecommendationSnapshot,
@@ -15,9 +14,11 @@ use loxa::app::{
 };
 #[cfg(not(test))]
 use loxa::discovery::{CandidateDisposition, InspectRepository, SearchModels};
+use loxa::huggingface::ResolvedFile;
 
 use crate::menu::catalog::{
-    CandidateItem, CatalogEvent, CatalogTransferDisposition, RepositoryItem, TransferStage,
+    CandidateItem, CandidateTransferIntent, CatalogEvent, CatalogTransferDisposition,
+    RepositoryItem, TransferStage,
 };
 use crate::menu::installed::{InstalledInventoryError, InstalledItem};
 use crate::menu::presentation::{
@@ -281,6 +282,8 @@ enum BackendRequest {
         repo: String,
         revision: String,
         path: String,
+        artifact: Option<ResolvedFile>,
+        intent: CandidateTransferIntent,
         control: TransferControl,
     },
     Stop,
@@ -317,6 +320,15 @@ struct TransferCompletion {
     model_id: String,
 }
 
+struct BackendTransfer {
+    repo: String,
+    revision: String,
+    path: String,
+    artifact: Option<ResolvedFile>,
+    intent: CandidateTransferIntent,
+    control: TransferControl,
+}
+
 impl TransferCompletion {
     fn new(disposition: CatalogTransferDisposition, model_id: String) -> Self {
         Self {
@@ -333,10 +345,7 @@ trait BackendSource {
     fn inspect(&mut self, repo: String) -> Result<InspectedRepository, String>;
     fn transfer(
         &mut self,
-        repo: String,
-        revision: String,
-        path: String,
-        control: TransferControl,
+        transfer: BackendTransfer,
         progress: &mut dyn FnMut(TransferStage, u64, u64),
     ) -> Result<TransferCompletion, String>;
 }
@@ -418,12 +427,16 @@ impl BackendSource for AppBackend {
                 ) {
                     return None;
                 }
-                let identity = candidate.identity()?;
+                let identity = candidate.identity()?.clone();
                 let installed_model_id = installed
                     .iter()
-                    .find(|summary| summary.matches_remote(identity))
+                    .find(|summary| summary.matches_remote(&identity))
                     .map(|summary| summary.id().to_owned());
-                let item = CandidateItem::new(candidate.display_path().into(), candidate.size());
+                let item = CandidateItem::from_resolved(
+                    candidate.display_path().into(),
+                    candidate.size(),
+                    identity,
+                );
                 Some(match installed_model_id {
                     Some(model_id) => item.with_installed_model_id(model_id),
                     None => item,
@@ -439,34 +452,35 @@ impl BackendSource for AppBackend {
 
     fn transfer(
         &mut self,
-        repo: String,
-        revision: String,
-        path: String,
-        control: TransferControl,
+        transfer: BackendTransfer,
         progress: &mut dyn FnMut(TransferStage, u64, u64),
     ) -> Result<TransferCompletion, String> {
-        let artifact = self
-            .0
-            .resolve_artifact(ResolveArtifactRequest::exact_file(
-                repo,
-                Some(revision),
-                path,
-            ))
-            .map_err(|error| error.to_string())?;
+        let BackendTransfer {
+            repo,
+            revision,
+            path,
+            artifact,
+            intent,
+            control,
+        } = transfer;
+        let _ = (repo, revision, path);
+        let artifact = artifact.ok_or_else(|| "Selected artifact is unavailable".to_owned())?;
+        let request = match intent {
+            CandidateTransferIntent::New => TransferSelected::new(artifact, None),
+            CandidateTransferIntent::InspectedInstalled(model_id) => {
+                TransferSelected::for_installed(artifact, model_id)
+            }
+        };
         let result = self
             .0
-            .transfer_selected(
-                TransferSelected::new(artifact, None),
-                control,
-                |update: TransferProgress| {
-                    let stage = match update.phase() {
-                        TransferPhase::Transferring => TransferStage::Transferring,
-                        TransferPhase::Verifying => TransferStage::Verifying,
-                        TransferPhase::Publishing => TransferStage::Publishing,
-                    };
-                    progress(stage, update.transferred_bytes(), update.total_bytes());
-                },
-            )
+            .transfer_selected(request, control, |update: TransferProgress| {
+                let stage = match update.phase() {
+                    TransferPhase::Transferring => TransferStage::Transferring,
+                    TransferPhase::Verifying => TransferStage::Verifying,
+                    TransferPhase::Publishing => TransferStage::Publishing,
+                };
+                progress(stage, update.transferred_bytes(), update.total_bytes());
+            })
             .map_err(|error| error.to_string())?;
         let disposition = match result.disposition() {
             TransferDisposition::Installed => CatalogTransferDisposition::Installed,
@@ -564,6 +578,8 @@ fn run_backend_worker<B: BackendSource>(
                 repo,
                 revision,
                 path,
+                artifact,
+                intent,
                 control,
             } => {
                 let (terminal, pinned_model_id) = match &mut source {
@@ -578,7 +594,17 @@ fn run_backend_worker<B: BackendSource>(
                                 },
                             ));
                         };
-                        match source.transfer(repo, revision, path, control, &mut progress) {
+                        match source.transfer(
+                            BackendTransfer {
+                                repo,
+                                revision,
+                                path,
+                                artifact,
+                                intent,
+                                control,
+                            },
+                            &mut progress,
+                        ) {
                             Ok(TransferCompletion {
                                 disposition,
                                 model_id,
@@ -708,6 +734,8 @@ impl BackendClient {
                 repo,
                 revision,
                 path,
+                artifact,
+                intent,
             } => {
                 if self.active_transfer.is_some() {
                     return false;
@@ -719,6 +747,8 @@ impl BackendClient {
                     repo,
                     revision,
                     path,
+                    artifact,
+                    intent,
                     control,
                 }
             }

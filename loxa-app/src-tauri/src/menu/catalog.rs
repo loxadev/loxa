@@ -1,6 +1,8 @@
 use std::time::Instant;
 
-use crate::menu::progress::{TransferEstimate, TransferReadout};
+use loxa::huggingface::ResolvedFile;
+
+use crate::menu::progress::{format_bytes, TransferEstimate, TransferReadout};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RepositoryItem {
@@ -27,14 +29,26 @@ pub(crate) struct CandidateItem {
     path: String,
     size: Option<u64>,
     installed_model_id: Option<String>,
+    artifact: Option<ResolvedFile>,
 }
 
 impl CandidateItem {
+    #[cfg(test)]
     pub(crate) fn new(path: String, size: Option<u64>) -> Self {
         Self {
             path,
             size,
             installed_model_id: None,
+            artifact: None,
+        }
+    }
+
+    pub(crate) fn from_resolved(path: String, size: Option<u64>, artifact: ResolvedFile) -> Self {
+        Self {
+            path,
+            size,
+            installed_model_id: None,
+            artifact: Some(artifact),
         }
     }
 
@@ -59,14 +73,24 @@ impl CandidateItem {
         self.installed_model_id().is_some()
     }
 
+    fn artifact(&self) -> Option<&ResolvedFile> {
+        self.artifact.as_ref()
+    }
+
     fn transfer_action_label(&self) -> String {
         if self.is_installed() {
             return "Check installed".into();
         }
         self.size
-            .map(|bytes| format!("Download {}", format_size(bytes)))
+            .map(|bytes| format!("Download {}", format_bytes(bytes)))
             .unwrap_or_else(|| "Download".into())
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CandidateTransferIntent {
+    New,
+    InspectedInstalled(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -84,6 +108,8 @@ pub(crate) enum CatalogCommand {
         repo: String,
         revision: String,
         path: String,
+        artifact: Option<ResolvedFile>,
+        intent: CandidateTransferIntent,
     },
 }
 
@@ -438,7 +464,14 @@ impl CatalogState {
         }
         let repo = self.repo.clone()?;
         let revision = self.revision.clone()?;
-        let path = self.selected_candidate()?.path.clone();
+        let selected = self.selected_candidate()?;
+        let path = selected.path.clone();
+        let artifact = selected.artifact().cloned();
+        let intent = selected
+            .installed_model_id
+            .clone()
+            .map(CandidateTransferIntent::InspectedInstalled)
+            .unwrap_or(CandidateTransferIntent::New);
         self.reset_transfer_progress();
         self.progress_readout = Some(TransferReadout::message(format!("Preparing {path}…")));
         self.status = CatalogStatus::Resolving(path.clone());
@@ -447,6 +480,8 @@ impl CatalogState {
             repo,
             revision,
             path,
+            artifact,
+            intent,
         })
     }
 
@@ -582,23 +617,13 @@ impl CatalogTransferDisposition {
     }
 }
 
-fn format_size(bytes: u64) -> String {
-    const MB: f64 = 1_000_000.0;
-    const GB: f64 = 1_000_000_000.0;
-    if bytes >= 1_000_000_000 {
-        format!("{:.1} GB", bytes as f64 / GB)
-    } else if bytes >= 1_000_000 {
-        format!("{:.1} MB", bytes as f64 / MB)
-    } else {
-        format!("{bytes} bytes")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{CandidateItem, CatalogEvent, CatalogState, RepositoryItem};
+    use super::{
+        CandidateItem, CandidateTransferIntent, CatalogEvent, CatalogState, RepositoryItem,
+    };
 
     fn repositories(count: usize) -> Vec<RepositoryItem> {
         (0..count)
@@ -662,14 +687,24 @@ mod tests {
             installed.transfer_action_label().as_deref(),
             Some("Check installed")
         );
+        let Some(CatalogCommand::Transfer {
+            generation,
+            repo,
+            revision,
+            path,
+            intent,
+            ..
+        }) = installed.start_transfer()
+        else {
+            panic!("the installed candidate must retain its transfer command");
+        };
+        assert_eq!(generation, 1);
+        assert_eq!(repo, "owner/model-1");
+        assert_eq!(revision, "0123456789abcdef0123456789abcdef01234567");
+        assert_eq!(path, "model-q4.gguf");
         assert_eq!(
-            installed.start_transfer(),
-            Some(CatalogCommand::Transfer {
-                generation: 1,
-                repo: "owner/model-1".into(),
-                revision: "0123456789abcdef0123456789abcdef01234567".into(),
-                path: "model-q4.gguf".into(),
-            })
+            intent,
+            CandidateTransferIntent::InspectedInstalled("custom-model".into())
         );
 
         let mut ordinary = ready_with_candidates(vec![CandidateItem::new(
@@ -681,6 +716,20 @@ mod tests {
         assert_eq!(
             ordinary.transfer_action_label().as_deref(),
             Some("Download 88.2 MB")
+        );
+    }
+
+    #[test]
+    fn candidate_transfer_action_uses_decimal_sizes_below_one_megabyte() {
+        let mut state = ready_with_candidates(vec![CandidateItem::new(
+            "small-q4.gguf".into(),
+            Some(500_000),
+        )]);
+
+        assert!(state.select_candidate(0));
+        assert_eq!(
+            state.transfer_action_label().as_deref(),
+            Some("Download 500.0 KB")
         );
     }
 
@@ -831,6 +880,8 @@ mod tests {
                 repo: "owner/model-1".into(),
                 revision: "0123456789abcdef0123456789abcdef01234567".into(),
                 path: "model-1.gguf".into(),
+                artifact: None,
+                intent: CandidateTransferIntent::New,
             }
         );
         assert_eq!(state.status_label(), "Preparing model-1.gguf…");

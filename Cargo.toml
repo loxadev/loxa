@@ -7,6 +7,9 @@ authors = ["Muhammad Mahad"]
 repository = "https://github.com/loxadev/loxa"
 description = "Download and run verified Hugging Face GGUF models locally"
 
+[features]
+test-support = []
+
 [dependencies]
 anstream = "1.0.0"
 anstyle = "1.0.14"

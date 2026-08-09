@@ -103,14 +103,26 @@ fn resolve_artifact_with(
 
 pub struct TransferSelected {
     artifact: ResolvedFile,
-    requested_model_id: Option<String>,
+    intent: TransferIntent,
+}
+
+enum TransferIntent {
+    Requested(Option<String>),
+    InspectedInstalled(String),
 }
 
 impl TransferSelected {
     pub fn new(artifact: ResolvedFile, requested_model_id: Option<String>) -> Self {
         Self {
             artifact,
-            requested_model_id,
+            intent: TransferIntent::Requested(requested_model_id),
+        }
+    }
+
+    pub fn for_installed(artifact: ResolvedFile, model_id: String) -> Self {
+        Self {
+            artifact,
+            intent: TransferIntent::InspectedInstalled(model_id),
         }
     }
 }
@@ -266,7 +278,9 @@ fn combine_plans(
         (Catalog::InstalledCompletionDebris, Artifact::ValidFinal) => {
             Ok(CapacityPlan::InstalledCleanup)
         }
-        (Catalog::Installed, Artifact::InstalledRepair) => Ok(CapacityPlan::InstalledRepairRequest),
+        (Catalog::Installed, Artifact::Fresh | Artifact::InstalledRepair) => {
+            Ok(CapacityPlan::InstalledRepairRequest)
+        }
         (Catalog::MatchingPending, Artifact::ValidFinal | Artifact::CompletePart) => {
             Ok(CapacityPlan::PendingPublish)
         }
@@ -894,10 +908,11 @@ where
     L: FnOnce(&str),
 {
     let (request, after_alternate_lookup) = request_and_observer;
-    let TransferSelected {
-        artifact,
-        requested_model_id,
-    } = request;
+    let TransferSelected { artifact, intent } = request;
+    let (requested_model_id, requires_existing_catalog) = match intent {
+        TransferIntent::Requested(model_id) => (model_id, false),
+        TransferIntent::InspectedInstalled(model_id) => (Some(model_id), true),
+    };
     let (model_id, chosen_by_alternate_reuse) = match requested_model_id {
         Some(model_id) => (model_id, false),
         None => match installed::exact_remote_model_id(&service.reader.paths.models, &artifact)
@@ -930,7 +945,7 @@ where
         .paths
         .model_dir(&model_id)
         .map_err(|_| TransferError::terminal(TransferErrorKind::InvalidModelId))?;
-    let lock_result = if chosen_by_alternate_reuse {
+    let lock_result = if chosen_by_alternate_reuse || requires_existing_catalog {
         catalog::ModelLock::acquire_existing(&model_dir)
     } else {
         catalog::ModelLock::acquire_for_transfer(&model_dir)
@@ -945,7 +960,7 @@ where
     })?;
     let catalog_plan = catalog::transfer::plan_transfer(&lock, &manifest);
     let catalog_state = catalog_plan.state();
-    if chosen_by_alternate_reuse
+    if (chosen_by_alternate_reuse || requires_existing_catalog)
         && !matches!(
             catalog_state,
             crate::catalog::transfer::CatalogTransferState::Installed

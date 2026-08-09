@@ -10,6 +10,7 @@ use objc2_foundation::{NSInteger, NSPoint, NSRange, NSRect, NSSize, NSString};
 
 use crate::menu::catalog::{CandidateItem, CatalogMode, CatalogState, RepositoryItem};
 use crate::menu::presentation::MenuLayout;
+use crate::menu::progress::format_bytes;
 
 const WIDTH: f64 = MenuLayout::BASE_WIDTH;
 const INSET: f64 = 16.0;
@@ -305,13 +306,25 @@ fn candidate_row(
     action: Sel,
     mtm: MainThreadMarker,
 ) -> ResultRow {
-    let mut detail = candidate
+    let size = candidate
         .size()
-        .map(format_size)
+        .map(format_bytes)
         .unwrap_or_else(|| "Size unknown".into());
-    if candidate.is_installed() {
-        detail.push_str(" · Installed");
-    }
+    let detail = if candidate.is_installed() {
+        format!("{size} · Installed")
+    } else {
+        size.clone()
+    };
+    let accessibility_label = format!(
+        "{}; {size}; {}; {}",
+        candidate.path(),
+        if candidate.is_installed() {
+            "Installed"
+        } else {
+            "Not installed"
+        },
+        if selected { "selected" } else { "not selected" }
+    );
     result_row(
         candidate.path(),
         &detail,
@@ -321,7 +334,7 @@ fn candidate_row(
         } else {
             "chevron.right"
         },
-        candidate.path(),
+        &accessibility_label,
         index,
         target,
         action,
@@ -491,18 +504,6 @@ fn image_view(
         image_view.setAccessibilityElement(false);
     }
     image_view
-}
-
-fn format_size(bytes: u64) -> String {
-    const MB: f64 = 1_000_000.0;
-    const GB: f64 = 1_000_000_000.0;
-    if bytes >= 1_000_000_000 {
-        format!("{:.1} GB", bytes as f64 / GB)
-    } else if bytes >= 1_000_000 {
-        format!("{:.1} MB", bytes as f64 / MB)
-    } else {
-        format!("{bytes} bytes")
-    }
 }
 
 fn rect(x: f64, y: f64, width: f64, height: f64) -> NSRect {

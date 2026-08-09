@@ -249,7 +249,8 @@ mod menu {
                     generation,
                     repo: repository.into(),
                     revision: "0123456789abcdef0123456789abcdef01234567".into(),
-                    candidates: vec![CandidateItem::new(candidate.into(), Some(88_200_000))],
+                    candidates: vec![CandidateItem::new(candidate.into(), Some(500_000))
+                        .with_installed_model_id("custom-model".into())],
                 }));
                 assert!(catalog.select_candidate(0));
                 let selected = catalog_rows::build(&catalog, None, catalog_fixture_actions(), mtm);
@@ -258,12 +259,22 @@ mod menu {
                     candidate
                 );
                 assert_eq!(
+                    selected.action_buttons[0]
+                        .accessibilityLabel()
+                        .map(|label| label.to_string())
+                        .as_deref(),
+                    Some("a-very-long-model-file-name-q4-k-m.gguf; 500.0 KB; Installed; selected")
+                );
+                assert!(all_image_views(&selected.view)
+                    .iter()
+                    .all(|image| !image.isAccessibilityElement()));
+                assert_eq!(
                     selected.secondary_labels[0].stringValue().to_string(),
-                    "88.2 MB"
+                    "500.0 KB · Installed"
                 );
                 assert_eq!(
                     selected.action_buttons.last().unwrap().title().to_string(),
-                    "Download 88.2 MB"
+                    "Check installed"
                 );
                 assert!(!text_values(&selected.view)
                     .iter()
@@ -380,7 +391,13 @@ mod menu {
                         "foxtrot", "alpha", "bravo", "charlie", "delta", "echo", "golf",
                     ]
                     .into_iter()
-                    .map(|id| InstalledItem::new(id.into(), format!("{id}-q4.gguf"), 88_200_000))
+                    .map(|id| {
+                        InstalledItem::new(
+                            id.into(),
+                            format!("{id}-q4.gguf"),
+                            if id == "foxtrot" { 500_000 } else { 88_200_000 },
+                        )
+                    })
                     .collect(),
                     Some("foxtrot".into()),
                 );
@@ -400,7 +417,7 @@ mod menu {
                 );
                 assert_eq!(
                     rows.secondary_labels[0].stringValue().to_string(),
-                    "foxtrot · 88.2 MB"
+                    "foxtrot · 500.0 KB"
                 );
                 assert_eq!(
                     rows.action_buttons
@@ -679,6 +696,19 @@ mod menu {
                         Err(child) => count_image_views(&child),
                     })
                     .sum()
+            }
+
+            fn all_image_views(view: &NSView) -> Vec<Retained<objc2_app_kit::NSImageView>> {
+                use objc2_app_kit::NSImageView;
+
+                let mut images = Vec::new();
+                for child in view.subviews() {
+                    match child.downcast::<NSImageView>() {
+                        Ok(image) => images.push(image),
+                        Err(child) => images.extend(all_image_views(&child)),
+                    }
+                }
+                images
             }
         }
 
