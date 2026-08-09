@@ -17,7 +17,8 @@ use std::time::Duration;
 #[cfg(test)]
 pub(crate) use artifact::{content_hash_count, reset_content_hash_count};
 pub(crate) use artifact::{
-    hash_local_gguf_captured, verify_regular, verify_regular_captured, VerifiedRegularFile,
+    hash_local_gguf_captured, verify_regular, verify_regular_captured,
+    verify_regular_captured_cancellable, CapturedVerification, VerifiedRegularFile,
 };
 #[cfg(test)]
 pub(crate) use http::artifact_url;

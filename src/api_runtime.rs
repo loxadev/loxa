@@ -172,9 +172,13 @@ impl ApiRuntimeHost {
             .into_iter()
             .find(|manifest| manifest.id == model_id)
             .ok_or(ApiStartError::ModelUnavailable)?;
-        let runnable = crate::runnable::resolve_managed_runnable_for_host(manifest, &self.paths)
+        let runnable =
+            crate::runnable::resolve_managed_runnable_for_host(manifest, &self.paths, &|| {
+                cancellation.is_cancelled()
+            })
             .map_err(|error| match error {
                 crate::runnable::ManagedRunnableError::Conflict => ApiStartError::Conflict,
+                crate::runnable::ManagedRunnableError::Cancelled => ApiStartError::Cancelled,
                 crate::runnable::ManagedRunnableError::ModelUnavailable(_diagnostic) => {
                     ApiStartError::ModelUnavailable
                 }

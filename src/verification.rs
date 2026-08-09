@@ -15,6 +15,11 @@ pub(crate) enum Admission {
     Verified,
 }
 
+pub(crate) enum CancellableAdmission {
+    Admitted(Admission),
+    Cancelled,
+}
+
 pub(crate) fn verify_or_refresh<F>(
     model_lock: &ModelLock,
     model_dir: &Path,
@@ -63,6 +68,62 @@ pub(crate) fn verify_artifacts(
         _ => return Err("verified draft artifact mismatch".into()),
     };
     Ok(VerifiedArtifacts { primary, draft })
+}
+
+pub(crate) fn verify_or_refresh_cancellable(
+    model_lock: &ModelLock,
+    model_dir: &Path,
+    manifest: &Manifest,
+    primary_path: &Path,
+    draft_path: Option<&Path>,
+    cancelled: &impl Fn() -> bool,
+) -> Result<CancellableAdmission, String> {
+    if receipt::matches(model_lock, model_dir, manifest, primary_path, draft_path)? {
+        return Ok(CancellableAdmission::Admitted(Admission::ReceiptHit));
+    }
+    receipt::discard(model_lock, model_dir)?;
+    let primary_artifact = manifest.primary_artifact();
+    let primary = match download::verify_regular_captured_cancellable(
+        primary_path,
+        primary_artifact.size,
+        primary_artifact.sha256,
+        cancelled,
+    )? {
+        download::CapturedVerification::Verified(primary) => primary,
+        download::CapturedVerification::Cancelled => return Ok(CancellableAdmission::Cancelled),
+    };
+    let draft = match (manifest.draft_artifact(), draft_path) {
+        (Some(artifact), Some(path)) => {
+            match download::verify_regular_captured_cancellable(
+                path,
+                artifact.size,
+                artifact.sha256,
+                cancelled,
+            )? {
+                download::CapturedVerification::Verified(draft) => Some(draft),
+                download::CapturedVerification::Cancelled => {
+                    return Ok(CancellableAdmission::Cancelled)
+                }
+            }
+        }
+        (None, None) => None,
+        _ => return Err("verified draft artifact mismatch".into()),
+    };
+    if cancelled() {
+        return Ok(CancellableAdmission::Cancelled);
+    }
+    refresh_verified(
+        model_lock,
+        manifest,
+        primary_path,
+        &primary,
+        draft_path.zip(draft.as_ref()),
+    )?;
+    if cancelled() {
+        receipt::discard(model_lock, model_dir)?;
+        return Ok(CancellableAdmission::Cancelled);
+    }
+    Ok(CancellableAdmission::Admitted(Admission::Verified))
 }
 
 pub(crate) fn refresh_verified(

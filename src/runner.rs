@@ -649,6 +649,7 @@ where
     if cancelled() {
         return Ok(persistent_interrupted());
     }
+    install_termination_watcher(run_dir).map_err(PersistentStartError::Failed)?;
     let launch_started = Instant::now();
     tracing::info!(
         event = "server_starting",
@@ -2089,6 +2090,120 @@ mod tests {
         loop {
             std::thread::park();
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_signal_owner_child() {
+        let Some(root) = std::env::var_os("LOXA_PERSISTENT_SIGNAL_OWNER_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let server = root.join("server");
+        let announced = root.join("announced");
+        let ready = root.join("ready");
+        let run_dir = root.join("run");
+        let owner_ready = root.join("owner-ready");
+        write_persistent_test_server(&server, &announced, &ready);
+        let runnable = persistent_runnable(&root, &server, 0);
+
+        let runtime = match start_persistent(runnable, &run_dir, || false).unwrap() {
+            PersistentStart::Ready(runtime) => runtime,
+            _ => panic!("persistent signal owner did not become ready"),
+        };
+        std::fs::write(owner_ready, b"ready").unwrap();
+        std::hint::black_box(&runtime);
+        loop {
+            std::thread::park();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sigterm_of_persistent_owner_cleans_the_exact_group_lease_and_locks() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let _lock = process_test_lock();
+        let root = tempdir().unwrap();
+        let owner_ready = root.path().join("owner-ready");
+        let run_dir = root.path().join("run");
+        let lease_path = run_dir.join("foreground.json");
+        let mut owner = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runner::tests::persistent_signal_owner_child",
+                "--nocapture",
+            ])
+            .env("LOXA_PERSISTENT_SIGNAL_OWNER_ROOT", root.path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let handshake_deadline = Instant::now() + Duration::from_secs(5);
+        while !owner_ready.is_file() {
+            if let Some(status) = owner.try_wait().unwrap() {
+                let output = owner.wait_with_output().unwrap();
+                panic!("persistent owner exited before ready: {status}; {output:?}");
+            }
+            if Instant::now() >= handshake_deadline {
+                let _ = owner.kill();
+                let output = owner.wait_with_output().unwrap();
+                panic!("persistent owner readiness timed out: {output:?}");
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let lease: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&lease_path).unwrap()).unwrap();
+        let child_pid = lease["child_pid"].as_u64().unwrap() as u32;
+        let child_group = lease["child_pgid"].as_i64().unwrap() as i32;
+        assert_eq!(
+            unsafe { libc::kill(owner.id() as libc::pid_t, libc::SIGTERM) },
+            0
+        );
+
+        let exit_deadline = Instant::now() + Duration::from_secs(5);
+        let output = loop {
+            match owner.try_wait().unwrap() {
+                Some(_) => break owner.wait_with_output().unwrap(),
+                None if Instant::now() < exit_deadline => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                None => {
+                    let _ = owner.kill();
+                    let output = owner.wait_with_output().unwrap();
+                    let _ = crate::runtime::terminate_stale_process_group(child_group);
+                    let _ = crate::runtime::RuntimeOwnership::acquire(&run_dir);
+                    panic!("persistent owner SIGTERM timed out: {output:?}");
+                }
+            }
+        };
+        let group_survived = process_group_exists(child_group).unwrap();
+        let child_survived = unsafe { libc::kill(child_pid as libc::pid_t, 0) } == 0;
+        let lease_survived = lease_path.exists();
+        if group_survived {
+            crate::runtime::terminate_stale_process_group(child_group).unwrap();
+        }
+        let recovered_ownership = crate::runtime::RuntimeOwnership::acquire(&run_dir).unwrap();
+
+        assert_eq!(
+            output.status.code(),
+            Some(128 + libc::SIGTERM),
+            "{output:?}"
+        );
+        assert_eq!(output.status.signal(), None, "{output:?}");
+        assert!(
+            !child_survived,
+            "persistent server child survived owner SIGTERM"
+        );
+        assert!(
+            !group_survived,
+            "persistent server group survived owner SIGTERM"
+        );
+        assert!(!lease_survived, "persistent lease survived owner SIGTERM");
+        drop(recovered_ownership);
+        drop(crate::catalog::ModelLock::acquire(&root.path().join("models/demo")).unwrap());
     }
 
     #[test]

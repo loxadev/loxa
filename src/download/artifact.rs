@@ -2170,9 +2170,26 @@ pub(crate) fn verify_regular_captured(
     size: u64,
     sha256: &str,
 ) -> Result<VerifiedRegularFile, String> {
-    match verify_regular_with_observer(path, size, sha256, None, &|| false, |_| Ok(()))? {
-        VerificationOutcome::Verified(verified) => Ok(verified),
-        VerificationOutcome::Interrupted => Err("artifact verification interrupted".into()),
+    match verify_regular_captured_cancellable(path, size, sha256, &|| false)? {
+        CapturedVerification::Verified(verified) => Ok(verified),
+        CapturedVerification::Cancelled => Err("artifact verification interrupted".into()),
+    }
+}
+
+pub(crate) enum CapturedVerification {
+    Verified(VerifiedRegularFile),
+    Cancelled,
+}
+
+pub(crate) fn verify_regular_captured_cancellable(
+    path: &Path,
+    size: u64,
+    sha256: &str,
+    cancelled: &impl Fn() -> bool,
+) -> Result<CapturedVerification, String> {
+    match verify_regular_with_observer(path, size, sha256, None, cancelled, |_| Ok(()))? {
+        VerificationOutcome::Verified(verified) => Ok(CapturedVerification::Verified(verified)),
+        VerificationOutcome::Interrupted => Ok(CapturedVerification::Cancelled),
         VerificationOutcome::ChecksumMismatch => Err("model artifact checksum mismatch".into()),
     }
 }

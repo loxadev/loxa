@@ -84,6 +84,7 @@ enum AdmissionSource {
 
 pub(crate) enum ManagedRunnableError {
     Conflict,
+    Cancelled,
     ModelUnavailable(String),
     StartupFailed(String),
 }
@@ -93,6 +94,7 @@ impl ManagedRunnableError {
     fn into_message(self) -> String {
         match self {
             Self::Conflict => "model is busy in another Loxa command".into(),
+            Self::Cancelled => "model admission was cancelled".into(),
             Self::ModelUnavailable(message) | Self::StartupFailed(message) => message,
         }
     }
@@ -178,12 +180,14 @@ pub(crate) fn resolve_managed_runnable(
     manifest: Manifest,
     paths: &AppPaths,
 ) -> Result<Runnable, String> {
-    resolve_managed_runnable_for_host(manifest, paths).map_err(ManagedRunnableError::into_message)
+    resolve_managed_runnable_for_host(manifest, paths, &|| false)
+        .map_err(ManagedRunnableError::into_message)
 }
 
 pub(crate) fn resolve_managed_runnable_for_host(
     manifest: Manifest,
     paths: &AppPaths,
+    cancelled: &impl Fn() -> bool,
 ) -> Result<Runnable, ManagedRunnableError> {
     let installed =
         catalog::load_catalog(&paths.models).map_err(ManagedRunnableError::ModelUnavailable)?;
@@ -203,7 +207,7 @@ pub(crate) fn resolve_managed_runnable_for_host(
     let server = runner::validate_managed_server(&paths.managed_server)
         .map_err(ManagedRunnableError::StartupFailed)?;
     let admission_started = Instant::now();
-    let (model_lock, admission) = admit_installed_for_host(&manifest, paths)?;
+    let (model_lock, admission) = admit_installed_for_host(&manifest, paths, cancelled)?;
     report_admission(&manifest.id, admission, admission_started);
     let artifact = manifest.artifact_path(&paths.models);
     let policy = runner::LaunchPolicy::PersistentApp;
@@ -290,6 +294,7 @@ fn admit_installed(
 fn admit_installed_for_host(
     manifest: &Manifest,
     paths: &AppPaths,
+    cancelled: &impl Fn() -> bool,
 ) -> Result<(catalog::ModelLock, verification::Admission), ManagedRunnableError> {
     let model_dir = paths
         .model_dir(&manifest.id)
@@ -307,15 +312,21 @@ fn admit_installed_for_host(
                 )
             }
         })?;
-    let admission = verification::verify_or_refresh(
+    let admission = verification::verify_or_refresh_cancellable(
         &model_lock,
         &model_dir,
         manifest,
         &artifact,
         draft.as_deref(),
-        || verification::verify_artifacts(manifest, &artifact, draft.as_deref()),
+        cancelled,
     )
     .map_err(ManagedRunnableError::ModelUnavailable)?;
+    let admission = match admission {
+        verification::CancellableAdmission::Admitted(admission) => admission,
+        verification::CancellableAdmission::Cancelled => {
+            return Err(ManagedRunnableError::Cancelled)
+        }
+    };
     Ok((model_lock, admission))
 }
 
@@ -481,7 +492,7 @@ mod tests {
         // This is the removal race after the host's final catalog snapshot.
         std::fs::remove_dir_all(&model_dir).unwrap();
 
-        let result = admit_installed_for_host(&manifest, &paths);
+        let result = admit_installed_for_host(&manifest, &paths, &|| false);
 
         assert!(matches!(
             result,
@@ -669,7 +680,10 @@ mod tests {
         drop(first);
         drop(ModelLock::acquire(&model_dir).unwrap());
 
-        let second = resolve_managed_runnable(manifest, &paths).unwrap();
+        let second = match resolve_managed_runnable_for_host(manifest, &paths, &|| true) {
+            Ok(runnable) => runnable,
+            Err(_) => panic!("an unchanged receipt hit consulted cancellation during hashing"),
+        };
 
         assert_eq!(second.fingerprint(), &fingerprint);
         assert_eq!(
@@ -680,6 +694,51 @@ mod tests {
         assert!(ModelLock::acquire(&model_dir).is_err());
         drop(second);
         drop(ModelLock::acquire(&model_dir).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_admission_cancellation_during_hash_is_typed_and_publishes_no_receipt() {
+        for (cancel_on_poll, label) in [(2, "mid-hash"), (5, "before receipt publication")] {
+            let root = tempdir().unwrap();
+            let paths = AppPaths::from_values(Some(root.path()), None).unwrap();
+            let mut bytes = vec![0x5a; 3 * 64 * 1024];
+            bytes[..8].copy_from_slice(b"GGUF\x03\0\0\0");
+            let mut digest = String::with_capacity(64);
+            for byte in Sha256::digest(&bytes) {
+                write!(&mut digest, "{byte:02x}").unwrap();
+            }
+            let mut manifest = manifest();
+            manifest.size = bytes.len() as u64;
+            manifest.sha256 = digest;
+            let model_dir = paths.model_dir(&manifest.id).unwrap();
+            std::fs::create_dir_all(&model_dir).unwrap();
+            std::fs::write(model_dir.join("model.gguf"), bytes).unwrap();
+            catalog::publish_manifest(&paths.models, &manifest).unwrap();
+            drop(ModelLock::acquire(&model_dir).unwrap());
+            install_managed_server(&paths);
+            let receipt = model_dir.join("verification-receipt.json");
+            std::fs::write(&receipt, b"stale").unwrap();
+            let polls = Cell::new(0_usize);
+            let receipt_was_published = Cell::new(false);
+
+            let result = resolve_managed_runnable_for_host(manifest, &paths, &|| {
+                receipt_was_published.set(receipt_was_published.get() || receipt.exists());
+                let next = polls.get() + 1;
+                polls.set(next);
+                next == cancel_on_poll
+            });
+
+            assert!(
+                matches!(result, Err(ManagedRunnableError::Cancelled)),
+                "{label}"
+            );
+            assert_eq!(polls.get(), cancel_on_poll, "{label}");
+            assert!(!receipt_was_published.get(), "{label}");
+            assert!(!receipt.exists(), "{label}");
+            assert!(!paths.run.join("foreground.json").exists(), "{label}");
+            drop(ModelLock::acquire(&model_dir).unwrap());
+        }
     }
 
     #[cfg(unix)]

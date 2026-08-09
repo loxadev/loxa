@@ -706,6 +706,55 @@ fn cancellation_after_admission_before_spawn_releases_the_model_lock() {
 
 #[cfg(unix)]
 #[test]
+fn cancellation_during_first_verification_is_typed_and_never_spawns_or_publishes() {
+    let _guard = process_test_lock();
+    let fixture = InstalledFixture::new();
+    let model_dir = fixture.model_dir("demo");
+    let artifact = model_dir.join("model.gguf");
+    let mut bytes = vec![0x5a; 16 * 1024 * 1024];
+    bytes[..8].copy_from_slice(b"GGUF\x03\0\0\0");
+    let digest = Sha256::digest(&bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let mut manifest: Manifest =
+        serde_json::from_slice(&fs::read(model_dir.join("manifest.json")).unwrap()).unwrap();
+    manifest.size = bytes.len() as u64;
+    manifest.sha256 = digest;
+    fs::write(&artifact, bytes).unwrap();
+    fs::write(
+        model_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    let receipt = model_dir.join("verification-receipt.json");
+    fs::write(&receipt, b"stale").unwrap();
+    let cancellation = ApiStartCancellation::new();
+    let canceller = cancellation.clone();
+    let receipt_for_canceller = receipt.clone();
+    let waiter = thread::spawn(move || {
+        wait_for(Duration::from_secs(5), || !receipt_for_canceller.exists());
+        canceller.cancel();
+    });
+    let mut host = ApiRuntimeHost::new(fixture.paths.clone());
+
+    let result = host.start("demo", &cancellation);
+    waiter.join().unwrap();
+
+    assert_eq!(result, Err(ApiStartError::Cancelled));
+    assert_eq!(host.endpoint(), None);
+    assert_eq!(fixture.launch_count(), 0);
+    assert!(
+        !receipt.exists(),
+        "cancelled verification published a receipt"
+    );
+    assert!(!fixture.paths.run.join("foreground.json").exists());
+    drop(ModelLock::acquire(&model_dir).unwrap());
+    drop(RuntimeOwnership::acquire(&fixture.paths.run).unwrap());
+}
+
+#[cfg(unix)]
+#[test]
 fn cancellation_while_startup_owns_a_lease_cleans_every_resource() {
     let _guard = process_test_lock();
     let fixture = InstalledFixture::new();
