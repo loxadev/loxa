@@ -499,10 +499,6 @@ pub(crate) fn build_args(launch: &Launch, port: u16) -> Vec<OsString> {
     args
 }
 
-#[allow(
-    dead_code,
-    reason = "persistent attachment is consumed by the follow-on session task"
-)]
 pub(crate) fn build_persistent_args_for_fingerprint(
     models_root: &Path,
     fingerprint: &RuntimeFingerprint,
@@ -1011,10 +1007,6 @@ fn readiness(client: &Client, port: u16, id: &str) -> Result<bool, String> {
     models_reader_has_alias(response, id)
 }
 
-#[allow(
-    dead_code,
-    reason = "persistent attachment is consumed by the follow-on session task"
-)]
 pub(crate) fn probe_model_alias(port: u16, id: &str) -> Result<bool, String> {
     readiness(&readiness_client()?, port, id)
 }

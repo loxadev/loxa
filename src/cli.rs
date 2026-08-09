@@ -658,6 +658,31 @@ mod tests {
     }
 
     #[test]
+    fn chat_preserves_explicit_runtime_defaults_for_attachment_conflict_detection() {
+        let cli = Cli::parse_from([
+            "loxa",
+            "chat",
+            "demo",
+            "--ctx",
+            "4096",
+            "--port",
+            "0",
+            "--server",
+            "/managed/llama-server",
+        ]);
+        let Command::Chat(args) = cli.command else {
+            panic!("expected chat arguments");
+        };
+
+        assert_eq!(args.runtime.ctx, Some(4096));
+        assert_eq!(args.runtime.port, Some(0));
+        assert_eq!(
+            args.runtime.server.as_deref(),
+            Some(std::path::Path::new("/managed/llama-server"))
+        );
+    }
+
+    #[test]
     fn chat_max_tokens_matches_b10121_signed_integer_limit() {
         let cli =
             Cli::try_parse_from(["loxa", "chat", "demo", "--max-tokens", "2147483647"]).unwrap();

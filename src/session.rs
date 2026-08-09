@@ -1,5 +1,6 @@
 use crate::chat::{Event, Message, PromptProgress, Role, Timing, Worker};
-use crate::runner::{report_exit, ForegroundServer};
+use crate::runner::ForegroundServer;
+use crate::runtime::AttachedRuntime;
 use crate::ui;
 use rustyline::completion::Completer;
 use rustyline::error::ReadlineError;
@@ -11,6 +12,10 @@ use rustyline::{CompletionType, Config, Context, Editor, Helper};
 use std::io::Write;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
+
+mod runtime;
+
+pub(crate) use runtime::{route_chat, ChatRoute};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const SLASH_COMMANDS: [(&str, &str); 3] = [
@@ -195,7 +200,7 @@ fn prompt_input(editor: &mut ChatEditor) -> InputEvent {
     }
 }
 
-fn write_assistant_delta(output: &mut impl Write, delta: &str) -> Result<(), String> {
+fn write_assistant_delta(output: &mut (impl Write + ?Sized), delta: &str) -> Result<(), String> {
     let delta = ui::sanitize_terminal(delta);
     output
         .write_all(delta.as_bytes())
@@ -267,13 +272,79 @@ fn report_timing(timing: &Timing) {
     }
 }
 
-pub(crate) fn run(
-    mut server: ForegroundServer,
-    model: &str,
+pub(crate) fn run(server: ForegroundServer, model: &str, max_tokens: u32) -> Result<i32, String> {
+    run_runtime(
+        runtime::ChatRuntime::owned(server, model.to_owned()),
+        max_tokens,
+    )
+}
+
+pub(crate) fn run_attached(attached: AttachedRuntime, max_tokens: u32) -> Result<i32, String> {
+    run_runtime(runtime::ChatRuntime::attached(attached), max_tokens)
+}
+
+fn run_runtime(runtime: runtime::ChatRuntime, max_tokens: u32) -> Result<i32, String> {
+    runtime::with_runtime_teardown(runtime, |runtime| run_session(runtime, max_tokens))
+}
+
+fn run_session(runtime: &mut runtime::ChatRuntime, max_tokens: u32) -> Result<i32, String> {
+    let mut editor = new_editor()?;
+    let mut output = std::io::stdout();
+    run_session_loop(
+        runtime,
+        max_tokens,
+        || prompt_input(&mut editor),
+        &mut output,
+        Worker::start,
+    )
+}
+
+#[cfg(test)]
+fn run_session_with_input(
+    runtime: &mut runtime::ChatRuntime,
     max_tokens: u32,
+    input: impl FnMut() -> InputEvent,
+) -> Result<i32, String> {
+    let mut output = std::io::sink();
+    run_session_loop(runtime, max_tokens, input, &mut output, Worker::start)
+}
+
+#[cfg(test)]
+fn run_session_with_seams(
+    runtime: &mut runtime::ChatRuntime,
+    max_tokens: u32,
+    input: impl FnMut() -> InputEvent,
+    output: &mut dyn Write,
+    start_worker: impl FnMut(u16, String, Vec<Message>, u32) -> Result<Worker, String>,
+) -> Result<i32, String> {
+    run_session_loop(runtime, max_tokens, input, output, start_worker)
+}
+
+#[cfg(test)]
+pub(crate) fn run_attached_exit_for_test(attached: AttachedRuntime) -> Result<i32, String> {
+    let runtime = runtime::ChatRuntime::attached(attached);
+    runtime::with_runtime_teardown(runtime, |runtime| {
+        let mut input = Some(InputEvent::Line("/exit".into()));
+        let mut output = std::io::sink();
+        run_session_with_seams(
+            runtime,
+            1,
+            || input.take().expect("one injected /exit"),
+            &mut output,
+            |_, _, _, _| -> Result<Worker, String> { panic!("/exit must not start a chat Worker") },
+        )
+    })
+}
+
+fn run_session_loop(
+    runtime: &mut runtime::ChatRuntime,
+    max_tokens: u32,
+    mut input: impl FnMut() -> InputEvent,
+    output: &mut dyn Write,
+    mut start_worker: impl FnMut(u16, String, Vec<Message>, u32) -> Result<Worker, String>,
 ) -> Result<i32, String> {
     let mut session = Session::default();
-    let mut editor = new_editor()?;
+    let model = runtime.model_id().to_owned();
     let ready = ui::success();
     let model_style = ui::accent();
     let dim = ui::muted();
@@ -283,10 +354,10 @@ pub(crate) fn run(
     );
 
     loop {
-        if let Some(exit) = server.poll()? {
-            return Ok(report_exit(exit));
+        if let Some(code) = runtime.poll()? {
+            return Ok(code);
         }
-        let event = prompt_input(&mut editor);
+        let event = input();
 
         let action = match event {
             InputEvent::Line(line) => Session::classify(Some(&line)),
@@ -294,12 +365,8 @@ pub(crate) fn run(
                 println!();
                 Session::classify(None)
             }
-            InputEvent::Interrupted => {
-                server.terminate()?;
-                return Ok(130);
-            }
+            InputEvent::Interrupted => return Ok(130),
             InputEvent::Error(error) => {
-                server.terminate()?;
                 return Err(format!("failed to read terminal input: {error}"));
             }
         };
@@ -319,10 +386,7 @@ pub(crate) fn run(
                 anstream::println!("{success}Conversation cleared.{success:#}");
                 continue;
             }
-            InputAction::Exit => {
-                server.terminate()?;
-                return Ok(0);
-            }
+            InputAction::Exit => return Ok(0),
             InputAction::Reject(error) => {
                 let error_style = ui::danger();
                 anstream::eprintln!(
@@ -333,32 +397,31 @@ pub(crate) fn run(
             InputAction::Prompt(user) => user,
         };
 
-        if let Some(exit) = server.poll()? {
-            return Ok(report_exit(exit));
+        let messages = session.request(&user);
+        let request_started = Instant::now();
+        if let Some(code) = runtime.poll()? {
+            return Ok(code);
         }
 
-        let request_started = Instant::now();
-        let worker = Worker::start(
-            server.port(),
-            model.to_owned(),
-            session.request(&user),
-            max_tokens,
-        )?;
+        let worker = start_worker(runtime.port(), model.to_owned(), messages, max_tokens)?;
         let thinking = ui::spinner("Processing prompt…".into());
         let mut waiting = true;
         let mut timing = None;
-        let mut output = std::io::stdout();
         let result = loop {
-            match server.poll() {
-                Ok(Some(exit)) => {
+            match runtime.poll() {
+                Ok(Some(code)) => {
                     thinking.finish_and_clear();
                     worker.join()?;
-                    return Ok(report_exit(exit));
+                    return Ok(code);
                 }
                 Ok(None) => {}
                 Err(error) => {
                     thinking.finish_and_clear();
-                    let cleanup = server.terminate();
+                    if runtime.is_attached() {
+                        worker.detach_bounded();
+                        return Err(error);
+                    }
+                    let cleanup = runtime.terminate_owned();
                     worker.join()?;
                     cleanup?;
                     return Err(error);
@@ -379,7 +442,7 @@ pub(crate) fn run(
                             elapsed_ms = request_started.elapsed().as_millis(),
                         );
                     }
-                    write_assistant_delta(&mut output, &delta)?;
+                    write_assistant_delta(output, &delta)?;
                 }
                 Ok(Event::Timing(value)) => timing = Some(value),
                 Ok(Event::Complete(assistant)) => {

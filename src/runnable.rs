@@ -11,6 +11,33 @@ pub(crate) struct Runnable {
     fingerprint: RuntimeFingerprint,
 }
 
+pub(crate) struct PersistentFingerprintCandidates(Vec<RuntimeFingerprint>);
+
+struct ManagedPersistentPlan {
+    ctx: u32,
+    profile: runner::LaunchProfile,
+    candidates: PersistentFingerprintCandidates,
+}
+
+enum ManagedPersistentPlanError {
+    Config(String),
+    Model(String),
+}
+
+impl ManagedPersistentPlanError {
+    fn into_message(self) -> String {
+        match self {
+            Self::Config(message) | Self::Model(message) => message,
+        }
+    }
+}
+
+impl PersistentFingerprintCandidates {
+    pub(crate) fn as_slice(&self) -> &[RuntimeFingerprint] {
+        &self.0
+    }
+}
+
 impl Runnable {
     fn new(
         model_lock: catalog::ModelLock,
@@ -167,10 +194,12 @@ pub(crate) fn resolve_managed_runnable_for_host(
         )));
     }
 
-    let config = config::load(&paths.config).map_err(ManagedRunnableError::StartupFailed)?;
-    let ctx = config::resolve_value(None, config.ctx, 4096);
-    let profile =
-        launch_profile(&manifest, &paths.models).map_err(ManagedRunnableError::ModelUnavailable)?;
+    let plan = managed_persistent_plan(&manifest, paths).map_err(|error| match error {
+        ManagedPersistentPlanError::Config(message) => ManagedRunnableError::StartupFailed(message),
+        ManagedPersistentPlanError::Model(message) => {
+            ManagedRunnableError::ModelUnavailable(message)
+        }
+    })?;
     let server = runner::validate_managed_server(&paths.managed_server)
         .map_err(ManagedRunnableError::StartupFailed)?;
     let admission_started = Instant::now();
@@ -178,13 +207,16 @@ pub(crate) fn resolve_managed_runnable_for_host(
     report_admission(&manifest.id, admission, admission_started);
     let artifact = manifest.artifact_path(&paths.models);
     let policy = runner::LaunchPolicy::PersistentApp;
-    let fingerprint = RuntimeFingerprint::from_manifest(
-        &manifest,
+    let ManagedPersistentPlan {
         ctx,
-        profile.effective_profile(),
-        policy.sleep_idle_seconds(),
-    )
-    .map_err(ManagedRunnableError::ModelUnavailable)?;
+        profile,
+        candidates,
+    } = plan;
+    let fingerprint = candidates
+        .0
+        .into_iter()
+        .next()
+        .expect("managed persistent plan always has an exact fingerprint");
     Ok(Runnable::new(
         model_lock,
         runner::Launch {
@@ -198,6 +230,40 @@ pub(crate) fn resolve_managed_runnable_for_host(
         },
         fingerprint,
     ))
+}
+
+pub(crate) fn expected_persistent_fingerprints(
+    manifest: &Manifest,
+    paths: &AppPaths,
+) -> Result<PersistentFingerprintCandidates, String> {
+    managed_persistent_plan(manifest, paths)
+        .map(|plan| plan.candidates)
+        .map_err(ManagedPersistentPlanError::into_message)
+}
+
+fn managed_persistent_plan(
+    manifest: &Manifest,
+    paths: &AppPaths,
+) -> Result<ManagedPersistentPlan, ManagedPersistentPlanError> {
+    let config = config::load(&paths.config).map_err(ManagedPersistentPlanError::Config)?;
+    let ctx = config::resolve_value(None, config.ctx, 4096);
+    let profile =
+        launch_profile(manifest, &paths.models).map_err(ManagedPersistentPlanError::Model)?;
+    let fingerprint = RuntimeFingerprint::from_manifest(
+        manifest,
+        ctx,
+        profile.effective_profile(),
+        runner::LaunchPolicy::PersistentApp.sleep_idle_seconds(),
+    )
+    .map_err(ManagedPersistentPlanError::Model)?;
+    let fallback = fingerprint.primary_only();
+    let mut candidates = vec![fingerprint];
+    candidates.extend(fallback);
+    Ok(ManagedPersistentPlan {
+        ctx,
+        profile,
+        candidates: PersistentFingerprintCandidates(candidates),
+    })
 }
 
 fn admit_installed(
@@ -711,6 +777,44 @@ mod tests {
         );
         assert!(primary_only.draft().is_none());
         assert_eq!(primary_only.sleep_policy(), Some(300));
+    }
+
+    #[test]
+    fn expected_persistent_fingerprints_use_managed_config_without_locking_or_reading_artifacts() {
+        let root = tempdir().unwrap();
+        let paths = AppPaths::from_values(Some(root.path()), None).unwrap();
+        let mut manifest = bundle_manifest();
+        manifest.profile = Some(crate::catalog::TEST_MTP_PROFILE.into());
+        manifest.runtime = Some(crate::catalog::RuntimeQualification {
+            engine: "llama.cpp".into(),
+            build: crate::catalog::TEST_LLAMA_BUILD.into(),
+        });
+        let model_dir = paths.model_dir(&manifest.id).unwrap();
+        std::fs::create_dir_all(&model_dir).unwrap();
+        let _busy = ModelLock::acquire(&model_dir).unwrap();
+        std::fs::write(&paths.config, br#"{"version":1,"ctx":8192}"#).unwrap();
+
+        let candidates = expected_persistent_fingerprints(&manifest, &paths).unwrap();
+        let candidates = candidates.as_slice();
+
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(
+            candidates[0].effective_profile(),
+            EffectiveProfile::Gemma4Mtp
+        );
+        assert_eq!(
+            candidates[1].effective_profile(),
+            EffectiveProfile::PrimaryOnly
+        );
+        assert_eq!(candidates[0].effective_context(), 8192);
+        assert_eq!(candidates[1].effective_context(), 8192);
+        assert_eq!(candidates[0].sleep_policy(), Some(300));
+        assert_eq!(candidates[1].sleep_policy(), Some(300));
+        assert!(candidates[0].draft().is_some());
+        assert!(candidates[1].draft().is_none());
+        assert!(!model_dir.join("verification-receipt.json").exists());
+        assert!(!model_dir.join("model.gguf").exists());
+        assert!(!model_dir.join("draft.gguf").exists());
     }
 
     #[cfg(unix)]

@@ -28,6 +28,26 @@ fn fingerprint_value() -> serde_json::Value {
     })
 }
 
+fn mtp_fingerprint_value() -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "model_id": "demo",
+        "effective_context": 8192,
+        "effective_profile": "gemma4_mtp",
+        "sleep_policy": 300,
+        "primary": {
+            "local_filename": "model.gguf",
+            "sha256": "a".repeat(64),
+            "size": 7,
+        },
+        "draft": {
+            "local_filename": "draft.gguf",
+            "sha256": "b".repeat(64),
+            "size": 5,
+        },
+    })
+}
+
 fn lease_value(version: u32) -> serde_json::Value {
     serde_json::json!({
         "version": version,
@@ -69,6 +89,40 @@ fn generic_attachment_args(models_root: &Path, port: u16) -> Vec<OsString> {
 }
 
 #[cfg(unix)]
+fn primary_only_attachment_args(models_root: &Path, port: u16) -> Vec<OsString> {
+    vec![
+        OsString::from("--model"),
+        models_root.join("demo/model.gguf").into_os_string(),
+        OsString::from("--alias"),
+        OsString::from("demo"),
+        OsString::from("--host"),
+        OsString::from("127.0.0.1"),
+        OsString::from("--cors-origins"),
+        OsString::from("localhost"),
+        OsString::from("--no-ui"),
+        OsString::from("--port"),
+        OsString::from(port.to_string()),
+        OsString::from("--ctx-size"),
+        OsString::from("8192"),
+        OsString::from("--n-gpu-layers"),
+        OsString::from("all"),
+        OsString::from("--fit"),
+        OsString::from("off"),
+        OsString::from("--jinja"),
+        OsString::from("--reasoning"),
+        OsString::from("off"),
+        OsString::from("--sleep-idle-seconds"),
+        OsString::from("300"),
+    ]
+}
+
+#[cfg(unix)]
+fn mtp_attachment_args(models_root: &Path, port: u16) -> Vec<OsString> {
+    let mtp: RuntimeFingerprint = serde_json::from_value(mtp_fingerprint_value()).unwrap();
+    crate::runner::build_persistent_args_for_fingerprint(models_root, &mtp, port).unwrap()
+}
+
+#[cfg(unix)]
 struct RecordedPersistentRuntime {
     root: TempDir,
     models_root: PathBuf,
@@ -87,10 +141,21 @@ impl RecordedPersistentRuntime {
     }
 
     fn with_args(port: u16, build_args: impl FnOnce(&Path, u16) -> Vec<OsString>) -> Self {
+        Self::with_fingerprint(
+            port,
+            serde_json::from_value(fingerprint_value()).unwrap(),
+            build_args,
+        )
+    }
+
+    fn with_fingerprint(
+        port: u16,
+        fingerprint: RuntimeFingerprint,
+        build_args: impl FnOnce(&Path, u16) -> Vec<OsString>,
+    ) -> Self {
         let root = tempdir().unwrap();
         let models_root = root.path().join("models");
         let managed_server = PathBuf::from("/usr/bin/yes");
-        let fingerprint: RuntimeFingerprint = serde_json::from_value(fingerprint_value()).unwrap();
         let mut command = Command::new(&managed_server);
         command
             .args(build_args(&models_root, port))
@@ -178,46 +243,48 @@ fn test_attachment_identity(
     command.extend(attached.expected_argv.iter().cloned());
     validate_attachment_identity_with(
         attached,
-        move |pid| {
-            let mut process = process_snapshot(pid)?;
-            let Some(snapshot) = &mut process else {
-                return Ok(None);
-            };
-            if pid == owner_pid && matches!(mutation, AttachmentIdentityMutation::OwnerStart) {
-                snapshot.start_identity = snapshot.start_identity.wrapping_add(1);
+        move |system, observed_owner_pid, observed_child_pid| {
+            assert_eq!(observed_owner_pid, owner_pid);
+            assert_eq!(observed_child_pid, child_pid);
+            let (mut owner, mut child) =
+                refresh_attachment_processes(system, owner_pid, child_pid)?;
+            if let Some(owner) = &mut owner {
+                if matches!(mutation, AttachmentIdentityMutation::OwnerStart) {
+                    owner.start_identity = owner.start_identity.wrapping_add(1);
+                }
             }
-            if pid == child_pid {
-                snapshot.command = command.clone();
+            if let Some(child) = &mut child {
+                child.command = command.clone();
                 match mutation {
                     AttachmentIdentityMutation::ChildStart => {
-                        snapshot.start_identity = snapshot.start_identity.wrapping_add(1);
+                        child.start_identity = child.start_identity.wrapping_add(1);
                     }
                     AttachmentIdentityMutation::Executable => {
-                        snapshot.executable = PathBuf::from("/usr/bin/false");
+                        child.executable = PathBuf::from("/usr/bin/false");
                     }
                     AttachmentIdentityMutation::ModelPath => {
-                        replace_option_value(&mut snapshot.command, "--model", "/other.gguf");
+                        replace_option_value(&mut child.command, "--model", "/other.gguf");
                     }
                     AttachmentIdentityMutation::Host => {
-                        replace_option_value(&mut snapshot.command, "--host", "0.0.0.0");
+                        replace_option_value(&mut child.command, "--host", "0.0.0.0");
                     }
                     AttachmentIdentityMutation::Port => {
-                        replace_option_value(&mut snapshot.command, "--port", "43124");
+                        replace_option_value(&mut child.command, "--port", "43124");
                     }
                     AttachmentIdentityMutation::Alias => {
-                        replace_option_value(&mut snapshot.command, "--alias", "other");
+                        replace_option_value(&mut child.command, "--alias", "other");
                     }
                     AttachmentIdentityMutation::Context => {
-                        replace_option_value(&mut snapshot.command, "--ctx-size", "8192");
+                        replace_option_value(&mut child.command, "--ctx-size", "8192");
                     }
                     AttachmentIdentityMutation::ExtraArgument => {
-                        snapshot.command.push(OsString::from("--extra"));
+                        child.command.push(OsString::from("--extra"));
                     }
                     AttachmentIdentityMutation::MissingSleepPair => {
-                        snapshot.command.truncate(snapshot.command.len() - 2);
+                        child.command.truncate(child.command.len() - 2);
                     }
                     AttachmentIdentityMutation::DuplicateSleepPair => {
-                        snapshot.command.extend([
+                        child.command.extend([
                             OsString::from("--sleep-idle-seconds"),
                             OsString::from("300"),
                         ]);
@@ -227,7 +294,7 @@ fn test_attachment_identity(
                     | AttachmentIdentityMutation::ProcessGroup => {}
                 }
             }
-            Ok(process)
+            Ok((owner, child))
         },
         move |pid| {
             if pid == child_pid {
@@ -262,7 +329,7 @@ fn exact_persistent_runtime_returns_an_opaque_revalidatable_attachment() {
         fixture.run_dir(),
         &fixture.models_root,
         &fixture.managed_server,
-        &fixture.fingerprint,
+        std::slice::from_ref(&fixture.fingerprint),
         exact_test_attachment_identity,
         |port, model_id| {
             assert_eq!(port, 43123);
@@ -277,6 +344,267 @@ fn exact_persistent_runtime_returns_an_opaque_revalidatable_attachment() {
     assert_eq!(attached.port(), fixture.port);
     assert_eq!(attached.model_id(), "demo");
     exact_test_attachment_identity(&attached).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn attached_exit_preserves_real_owner_process_lock_model_lock_lease_and_listener() {
+    fn assert_listener_round_trip(listener: &std::net::TcpListener) {
+        let address = listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(address).unwrap();
+        let (server, peer) = listener.accept().unwrap();
+        assert_eq!(client.local_addr().unwrap(), peer);
+        assert_eq!(server.local_addr().unwrap(), address);
+    }
+
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let listener_address = listener.local_addr().unwrap();
+    let mut fixture = RecordedPersistentRuntime::generic(listener_address.port());
+    let model_dir = fixture.models_root.join("demo");
+    fs::create_dir_all(&model_dir).unwrap();
+    let _model_lock = crate::catalog::ModelLock::acquire(&model_dir).unwrap();
+    let lease_before = fs::read(fixture.lease_path()).unwrap();
+    let readiness_server = serve_attachment_http_once(
+        listener.try_clone().unwrap(),
+        AttachmentHttpReply::Bytes(http_response(
+            "200 OK",
+            "Content-Type: application/json\r\n",
+            br#"{"data":[{"id":"demo"}]}"#,
+        )),
+    );
+    let lookup = lookup_persistent_runtime_with_probe(
+        fixture.run_dir(),
+        &fixture.models_root,
+        &fixture.managed_server,
+        std::slice::from_ref(&fixture.fingerprint),
+        exact_test_attachment_identity,
+        crate::runner::probe_model_alias,
+    );
+    readiness_server.join().unwrap();
+    let PersistentRuntimeLookup::Attached(mut attached) = lookup else {
+        panic!("exact persistent fixture did not attach")
+    };
+    assert_eq!(attached.port(), listener_address.port());
+    assert_eq!(attached.model_id(), "demo");
+    attached.normalize_bsd_yes_argv_for_test();
+
+    assert_eq!(crate::session::run_attached_exit_for_test(attached), Ok(0));
+
+    assert!(fixture.child.try_wait().unwrap().is_none());
+    assert_eq!(
+        process_group(fixture.child.id()).unwrap(),
+        fixture.child_pgid
+    );
+    assert_eq!(fs::read(fixture.lease_path()).unwrap(), lease_before);
+    assert!(foreground_lock_is_held(&fixture.run_dir().join("foreground.lock")).unwrap());
+    assert!(matches!(
+        crate::catalog::ModelLock::acquire_existing(&model_dir).err(),
+        Some(crate::catalog::ModelLockError::Busy)
+    ));
+    assert_eq!(listener.local_addr().unwrap(), listener_address);
+    assert_listener_round_trip(&listener);
+}
+
+#[cfg(unix)]
+#[test]
+fn each_revalidation_uses_one_reused_owner_child_batch_and_rejects_either_replacement() {
+    #[derive(Clone, Copy)]
+    enum Replacement {
+        None,
+        Owner,
+        Child,
+    }
+
+    let fixture = RecordedPersistentRuntime::generic(43123);
+    let attached = attached_from_fixture(&fixture);
+    let refreshes = Cell::new(0);
+    let system_address = Cell::new(None);
+
+    assert_eq!(
+        attachment_process_refresh_kind().cmd(),
+        sysinfo::UpdateKind::Always
+    );
+    assert_eq!(
+        attachment_process_refresh_kind().exe(),
+        sysinfo::UpdateKind::Always
+    );
+
+    for (replacement, should_succeed) in [
+        (Replacement::None, true),
+        (Replacement::Owner, false),
+        (Replacement::Child, false),
+    ] {
+        let result = validate_attachment_identity_with(
+            &attached,
+            |system, owner_pid, child_pid| {
+                refreshes.set(refreshes.get() + 1);
+                let address = system as *mut sysinfo::System as usize;
+                if let Some(expected) = system_address.get() {
+                    assert_eq!(address, expected, "revalidation replaced its System");
+                } else {
+                    system_address.set(Some(address));
+                }
+                let (mut owner, mut child) =
+                    refresh_attachment_processes(system, owner_pid, child_pid)?;
+                if let Some(child) = &mut child {
+                    child.command =
+                        std::iter::once(attached.expected_managed_server.clone().into())
+                            .chain(attached.expected_argv.iter().cloned())
+                            .collect();
+                }
+                match replacement {
+                    Replacement::Owner => {
+                        owner.as_mut().unwrap().start_identity =
+                            owner.as_ref().unwrap().start_identity.wrapping_add(1);
+                    }
+                    Replacement::Child => {
+                        child.as_mut().unwrap().start_identity =
+                            child.as_ref().unwrap().start_identity.wrapping_add(1);
+                    }
+                    Replacement::None => {}
+                }
+                Ok((owner, child))
+            },
+            |_| Ok(attached.expected_lease.child_pgid),
+        );
+        assert_eq!(result.is_ok(), should_succeed);
+    }
+
+    assert_eq!(refreshes.get(), 3, "one batch per revalidation");
+}
+
+#[cfg(unix)]
+#[test]
+fn one_lookup_attaches_the_exact_mtp_candidate_at_index_zero() {
+    let mtp: RuntimeFingerprint = serde_json::from_value(mtp_fingerprint_value()).unwrap();
+    let primary_only = mtp.primary_only().unwrap();
+    let fixture =
+        RecordedPersistentRuntime::with_fingerprint(43123, mtp.clone(), mtp_attachment_args);
+    let identity_probes = Cell::new(0);
+    let http_probes = Cell::new(0);
+    let candidates = [mtp.clone(), primary_only];
+
+    let lookup = lookup_persistent_runtime_with_probe(
+        fixture.run_dir(),
+        &fixture.models_root,
+        &fixture.managed_server,
+        &candidates,
+        |attached| {
+            identity_probes.set(identity_probes.get() + 1);
+            exact_test_attachment_identity(attached)
+        },
+        |port, model_id| {
+            http_probes.set(http_probes.get() + 1);
+            assert_eq!(port, 43123);
+            assert_eq!(model_id, "demo");
+            Ok(true)
+        },
+    );
+
+    let PersistentRuntimeLookup::Attached(attached) = lookup else {
+        panic!("exact Gemma4Mtp candidate at index zero did not attach")
+    };
+    assert_eq!(identity_probes.get(), 2);
+    assert_eq!(http_probes.get(), 1);
+    let observed = attached.expected_lease.fingerprint.as_ref().unwrap();
+    assert_eq!(observed, &mtp);
+    assert_eq!(observed.effective_profile(), EffectiveProfile::Gemma4Mtp);
+    let expected_draft_pair = [
+        OsString::from("--spec-draft-model"),
+        fixture.models_root.join("demo/draft.gguf").into_os_string(),
+    ];
+    assert!(attached
+        .expected_argv
+        .windows(expected_draft_pair.len())
+        .any(|window| window == expected_draft_pair));
+}
+
+#[cfg(unix)]
+#[test]
+fn one_lookup_attaches_the_exact_primary_only_fallback_candidate() {
+    let mtp: RuntimeFingerprint = serde_json::from_value(mtp_fingerprint_value()).unwrap();
+    let primary_only = mtp.primary_only().unwrap();
+    let fixture = RecordedPersistentRuntime::with_fingerprint(
+        43123,
+        primary_only.clone(),
+        primary_only_attachment_args,
+    );
+    let probes = Cell::new(0);
+    let candidates = [mtp, primary_only];
+
+    let lookup = lookup_persistent_runtime_with_probe(
+        fixture.run_dir(),
+        &fixture.models_root,
+        &fixture.managed_server,
+        &candidates,
+        exact_test_attachment_identity,
+        |port, model_id| {
+            probes.set(probes.get() + 1);
+            assert_eq!(port, 43123);
+            assert_eq!(model_id, "demo");
+            Ok(true)
+        },
+    );
+
+    let PersistentRuntimeLookup::Attached(attached) = lookup else {
+        panic!("exact PrimaryOnly fallback did not attach")
+    };
+    assert_eq!(probes.get(), 1);
+    assert!(!attached
+        .expected_argv
+        .iter()
+        .any(|argument| argument == "--spec-draft-model"));
+}
+
+#[cfg(unix)]
+#[test]
+fn candidate_lookup_rejects_empty_duplicate_unpaired_and_singleton_specialized_sets_before_any_probe(
+) {
+    let fixture = RecordedPersistentRuntime::generic(43123);
+    let exact = fixture.fingerprint.clone();
+    let mut changed = serde_json::to_value(&exact).unwrap();
+    changed["effective_context"] = serde_json::json!(8192);
+    let changed: RuntimeFingerprint = serde_json::from_value(changed).unwrap();
+    let mtp: RuntimeFingerprint = serde_json::from_value(mtp_fingerprint_value()).unwrap();
+    let primary_only = mtp.primary_only().unwrap();
+    assert!(!expected_fingerprints_are_closed(std::slice::from_ref(
+        &mtp
+    )));
+    assert!(!expected_fingerprints_are_closed(std::slice::from_ref(
+        &primary_only
+    )));
+
+    for (name, candidates) in [
+        ("empty", Vec::new()),
+        ("duplicate", vec![exact.clone(), exact.clone()]),
+        ("unpaired", vec![exact, changed]),
+        ("singleton Gemma4Mtp", vec![mtp]),
+        ("singleton PrimaryOnly", vec![primary_only]),
+    ] {
+        let identity_probes = Cell::new(0);
+        let http_probes = Cell::new(0);
+        let lookup = lookup_persistent_runtime_with_probe(
+            fixture.run_dir(),
+            &fixture.models_root,
+            &fixture.managed_server,
+            &candidates,
+            |_| {
+                identity_probes.set(identity_probes.get() + 1);
+                Ok(())
+            },
+            |_, _| {
+                http_probes.set(http_probes.get() + 1);
+                Ok(true)
+            },
+        );
+
+        assert!(
+            matches!(lookup, PersistentRuntimeLookup::ActiveButNotAttachable),
+            "accepted {name}"
+        );
+        assert_eq!(identity_probes.get(), 0, "identity-probed {name}");
+        assert_eq!(http_probes.get(), 0, "HTTP-probed {name}");
+    }
 }
 
 #[cfg(unix)]
@@ -303,7 +631,7 @@ fn every_process_or_complete_argv_identity_failure_makes_zero_http_calls() {
             fixture.run_dir(),
             &fixture.models_root,
             &fixture.managed_server,
-            &fixture.fingerprint,
+            std::slice::from_ref(&fixture.fingerprint),
             |attached| test_attachment_identity(attached, mutation),
             |_, _| {
                 calls.set(calls.get() + 1);
@@ -330,7 +658,7 @@ fn nonpersistent_malformed_external_or_mismatched_state_is_active_without_probin
             fixture.run_dir(),
             &fixture.models_root,
             managed_server,
-            expected,
+            std::slice::from_ref(expected),
             |_| panic!("prevalidation mismatch reached process identity"),
             |_, _| panic!("prevalidation mismatch reached HTTP"),
         );
@@ -402,7 +730,7 @@ fn nonpersistent_malformed_external_or_mismatched_state_is_active_without_probin
             fixture.run_dir(),
             &fixture.models_root,
             &fixture.managed_server,
-            &expected,
+            std::slice::from_ref(&expected),
             |_| panic!("{name} mismatch reached process identity"),
             |_, _| panic!("{name} mismatch reached HTTP"),
         );
@@ -497,7 +825,7 @@ fn bounded_readiness_probe_accepts_only_the_exact_alias_response() {
         fixture.run_dir(),
         &fixture.models_root,
         &fixture.managed_server,
-        &fixture.fingerprint,
+        std::slice::from_ref(&fixture.fingerprint),
         exact_test_attachment_identity,
         crate::runner::probe_model_alias,
     );
@@ -564,7 +892,7 @@ fn readiness_rejects_wrong_alias_redirect_invalid_oversized_and_timeout_response
             fixture.run_dir(),
             &fixture.models_root,
             &fixture.managed_server,
-            &fixture.fingerprint,
+            std::slice::from_ref(&fixture.fingerprint),
             exact_test_attachment_identity,
             crate::runner::probe_model_alias,
         );
@@ -583,7 +911,7 @@ fn attached_from_fixture(fixture: &RecordedPersistentRuntime) -> AttachedRuntime
         fixture.run_dir(),
         &fixture.models_root,
         &fixture.managed_server,
-        &fixture.fingerprint,
+        std::slice::from_ref(&fixture.fingerprint),
         exact_test_attachment_identity,
         |_, _| Ok(true),
     );
@@ -603,7 +931,7 @@ fn post_probe_identity_pass_rejects_mid_probe_lease_or_process_replacement() {
         lease_replaced.run_dir(),
         &lease_replaced.models_root,
         &lease_replaced.managed_server,
-        &lease_replaced.fingerprint,
+        std::slice::from_ref(&lease_replaced.fingerprint),
         |attached| {
             identity_calls.set(identity_calls.get() + 1);
             exact_test_attachment_identity(attached)
@@ -633,7 +961,7 @@ fn post_probe_identity_pass_rejects_mid_probe_lease_or_process_replacement() {
         &run_dir,
         &models_root,
         &managed_server,
-        &fingerprint,
+        std::slice::from_ref(&fingerprint),
         |attached| {
             process_identity_calls.set(process_identity_calls.get() + 1);
             exact_test_attachment_identity(attached)
@@ -670,7 +998,7 @@ fn copied_alias_on_a_rebound_port_fails_identity_before_http() {
         fixture.run_dir(),
         &fixture.models_root,
         &fixture.managed_server,
-        &fixture.fingerprint,
+        std::slice::from_ref(&fixture.fingerprint),
         exact_test_attachment_identity,
         |_, _| {
             http_calls.set(http_calls.get() + 1);
@@ -768,22 +1096,54 @@ fn persistent_lookup_reports_no_runtime_only_without_a_held_lock_or_lease() {
     let expected: RuntimeFingerprint = serde_json::from_value(fingerprint_value()).unwrap();
 
     assert!(matches!(
-        lookup_persistent_runtime(dir.path(), &models, managed_server, &expected),
+        lookup_persistent_runtime(
+            dir.path(),
+            &models,
+            managed_server,
+            std::slice::from_ref(&expected),
+        ),
         PersistentRuntimeLookup::NoRuntime
     ));
 
     let ownership = RuntimeOwnership::acquire(dir.path()).unwrap();
     assert!(matches!(
-        lookup_persistent_runtime(dir.path(), &models, managed_server, &expected),
+        lookup_persistent_runtime(
+            dir.path(),
+            &models,
+            managed_server,
+            std::slice::from_ref(&expected),
+        ),
         PersistentRuntimeLookup::ActiveButNotAttachable
     ));
     drop(ownership);
 
     fs::write(dir.path().join("foreground.json"), b"not JSON").unwrap();
     assert!(matches!(
-        lookup_persistent_runtime(dir.path(), &models, managed_server, &expected),
+        lookup_persistent_runtime(
+            dir.path(),
+            &models,
+            managed_server,
+            std::slice::from_ref(&expected),
+        ),
         PersistentRuntimeLookup::ActiveButNotAttachable
     ));
+}
+
+#[test]
+fn read_only_presence_lookup_classifies_any_lock_or_lease_state_as_active() {
+    let dir = tempdir().unwrap();
+
+    assert_eq!(
+        lookup_runtime_presence(dir.path()),
+        RuntimePresence::NoRuntime
+    );
+
+    let ownership = RuntimeOwnership::acquire(dir.path()).unwrap();
+    assert_eq!(lookup_runtime_presence(dir.path()), RuntimePresence::Active);
+    drop(ownership);
+
+    fs::write(dir.path().join("foreground.json"), b"not JSON").unwrap();
+    assert_eq!(lookup_runtime_presence(dir.path()), RuntimePresence::Active);
 }
 
 #[test]

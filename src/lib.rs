@@ -1240,6 +1240,16 @@ where
                 ModelSelection::Exit(code) => return Ok(code),
             };
             let importing = candidates.iter().any(|candidate| candidate.id == id);
+            match session::route_chat(
+                installed.iter().find(|manifest| manifest.id == id),
+                &args.runtime,
+                &paths,
+            )? {
+                session::ChatRoute::Attached(attached) => {
+                    return session::run_attached(attached, max_tokens);
+                }
+                session::ChatRoute::Foreground => {}
+            }
             let starting = ui::spinner(if importing {
                 format!("Importing and verifying {id}")
             } else {
@@ -1528,6 +1538,50 @@ mod tests {
     };
     use crate::paths::AppPaths;
     use clap::Parser;
+    use sha2::{Digest as _, Sha256};
+
+    #[test]
+    fn chat_routes_before_runnable_resolution_and_run_arm_is_base_exact() {
+        let source = include_str!("lib.rs");
+        let run_start = source
+            .find("        Command::Run(args) => {")
+            .expect("Run command arm");
+        let chat_start = source[run_start..]
+            .find("        Command::Chat(args) => {")
+            .map(|offset| run_start + offset)
+            .expect("Chat command arm");
+        let run_arm = &source[run_start..chat_start];
+        let run_digest = Sha256::digest(run_arm.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(
+            run_digest, "747d97cd59f5a72c86c278b6c9a2e83532d57d2fe1b011a0cd6dd8378f586929",
+            "the Run arm must stay byte-identical to base 6525d132"
+        );
+        assert!(!run_arm.contains("route_chat"));
+
+        let chat_end = source[chat_start..]
+            .find("\n    }\n}\n\nfn installed_model_size")
+            .map(|offset| chat_start + offset)
+            .expect("end of command dispatch");
+        let chat_arm = &source[chat_start..chat_end];
+        let route = chat_arm.find("session::route_chat(").expect("chat route");
+        let resolve = chat_arm
+            .find("resolve_runnable(id, args.runtime, &paths)")
+            .expect("foreground runnable resolution");
+        assert!(
+            route < resolve,
+            "chat must route before verification/adoption"
+        );
+        assert_eq!(chat_arm.matches("session::route_chat(").count(), 1);
+        assert_eq!(
+            chat_arm
+                .matches("resolve_runnable(id, args.runtime, &paths)")
+                .count(),
+            1
+        );
+    }
 
     #[test]
     fn incomplete_list_copy_is_human_readable_shell_safe_and_leaves_foreign_parts_untouched() {

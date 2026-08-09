@@ -69,6 +69,44 @@ impl Worker {
             .join()
             .map_err(|_| "chat request worker panicked".to_string())
     }
+
+    /// Detach only when an attached runtime loses identity mid-request.
+    /// The request thread is not cancelled, but remains bounded by `REQUEST_TIMEOUT`.
+    pub(crate) fn detach_bounded(self) {
+        let Self { events, thread } = self;
+        drop(events);
+        drop(thread);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_session_test(events_to_send: Vec<Event>, panic_on_join: bool) -> Self {
+        let (sender, events) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
+        let thread = std::thread::spawn(move || {
+            for event in events_to_send {
+                if sender.send(event).is_err() {
+                    return;
+                }
+            }
+            assert!(!panic_on_join, "injected chat worker panic");
+        });
+        Self {
+            events,
+            thread: Some(thread),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_session_test_thread(work: impl FnOnce() + Send + 'static) -> Self {
+        let (sender, events) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
+        let thread = std::thread::spawn(move || {
+            work();
+            drop(sender);
+        });
+        Self {
+            events,
+            thread: Some(thread),
+        }
+    }
 }
 
 fn request(

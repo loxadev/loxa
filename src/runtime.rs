@@ -139,11 +139,10 @@ pub(crate) enum ForegroundObservation {
 }
 
 mod attachment;
-#[allow(
-    unused_imports,
-    reason = "persistent attachment is consumed by the follow-on session task"
-)]
-pub(crate) use attachment::{lookup_persistent_runtime, AttachedRuntime, PersistentRuntimeLookup};
+pub(crate) use attachment::{
+    lookup_persistent_runtime, lookup_runtime_presence, AttachedRuntime, PersistentRuntimeLookup,
+    RuntimePresence,
+};
 
 pub(crate) struct ForegroundObserver {
     run_dir: PathBuf,
@@ -1262,6 +1261,13 @@ fn process_snapshot(pid: u32) -> Result<Option<ProcessSnapshot>, String> {
             .with_cmd(UpdateKind::OnlyIfNotSet)
             .with_exe(UpdateKind::OnlyIfNotSet),
     );
+    process_snapshot_from_refreshed_system(&system, pid)
+}
+
+fn process_snapshot_from_refreshed_system(
+    system: &System,
+    pid: Pid,
+) -> Result<Option<ProcessSnapshot>, String> {
     let Some(process) = system.process(pid) else {
         return Ok(None);
     };
