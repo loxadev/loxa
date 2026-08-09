@@ -1,7 +1,8 @@
+use crate::runtime_fingerprint::RuntimeFingerprint;
 use serde::{Deserialize, Serialize};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions, TryLockError};
-use std::io::Write;
+use std::io::{Read as _, Write};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -11,7 +12,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System, UpdateKind};
 
-const LEASE_VERSION: u32 = 1;
+const LEGACY_LEASE_VERSION: u32 = 1;
+const LEASE_VERSION: u32 = 2;
 const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const OBSERVER_TEARDOWN_GRACE: Duration = Duration::from_millis(500);
 static LEASE_STATE_IO: Mutex<()> = Mutex::new(());
@@ -33,9 +35,41 @@ fn lock_local_foreground_operation() -> Result<MutexGuard<'static, ()>, String> 
         .map_err(|_| "local foreground lock operation is poisoned".to_string())
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum LeaseOwnerMode {
+    Foreground,
+    PersistentApp,
+}
+
+pub(crate) enum RuntimeLeasePublication<'a> {
+    Foreground,
+    PersistentApp(&'a RuntimeFingerprint),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct RuntimeLease {
+    version: u32,
+    owner_mode: Option<LeaseOwnerMode>,
+    fingerprint: Option<RuntimeFingerprint>,
+    owner_pid: u32,
+    owner_start_time: u64,
+    child_pid: u32,
+    child_start_time: u64,
+    child_pgid: i32,
+    server: PathBuf,
+    model_id: String,
+    port: u16,
+}
+
+#[derive(Deserialize)]
+struct LeaseVersion {
+    version: u32,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeLeaseV1 {
     version: u32,
     owner_pid: u32,
     owner_start_time: u64,
@@ -45,6 +79,48 @@ struct RuntimeLease {
     server: PathBuf,
     model_id: String,
     port: u16,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeLeaseV2 {
+    version: u32,
+    owner_mode: LeaseOwnerMode,
+    #[serde(deserialize_with = "deserialize_explicit_fingerprint")]
+    fingerprint: Option<RuntimeFingerprint>,
+    owner_pid: u32,
+    owner_start_time: u64,
+    child_pid: u32,
+    child_start_time: u64,
+    child_pgid: i32,
+    server: PathBuf,
+    model_id: String,
+    port: u16,
+}
+
+fn deserialize_explicit_fingerprint<'de, D>(
+    deserializer: D,
+) -> Result<Option<RuntimeFingerprint>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::deserialize(deserializer)
+}
+
+impl RuntimeLease {
+    #[cfg(test)]
+    fn owner_mode(&self) -> Option<LeaseOwnerMode> {
+        self.owner_mode
+    }
+
+    fn persistent_fingerprint(&self) -> Option<&RuntimeFingerprint> {
+        match (self.version, self.owner_mode, self.fingerprint.as_ref()) {
+            (LEASE_VERSION, Some(LeaseOwnerMode::PersistentApp), Some(fingerprint)) => {
+                Some(fingerprint)
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -131,7 +207,7 @@ impl ForegroundObserver {
 enum ObservedLease {
     Absent,
     Invalid,
-    Valid(RuntimeLease),
+    Valid(Box<RuntimeLease>),
 }
 
 #[cfg(unix)]
@@ -311,7 +387,7 @@ fn read_observed_lease(path: &Path) -> ObservedLease {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => ObservedLease::Absent,
         Err(_) => ObservedLease::Invalid,
         Ok(_) => match read_lease(path) {
-            Ok(lease) => ObservedLease::Valid(lease),
+            Ok(lease) => ObservedLease::Valid(Box::new(lease)),
             Err(_) => ObservedLease::Invalid,
         },
     }
@@ -588,6 +664,7 @@ impl RuntimeOwnership {
         child_pgid: i32,
         model_id: &str,
         port: u16,
+        publication: RuntimeLeasePublication<'_>,
     ) -> Result<(), String> {
         let owner_pid = std::process::id();
         let owner = process_snapshot(owner_pid)?
@@ -597,8 +674,17 @@ impl RuntimeOwnership {
         if process_group(child_pid)? != child_pgid {
             return Err("llama-server process group identity changed".into());
         }
+        let (owner_mode, fingerprint) = match publication {
+            RuntimeLeasePublication::Foreground => (LeaseOwnerMode::Foreground, None),
+            RuntimeLeasePublication::PersistentApp(fingerprint) => {
+                fingerprint.validate_persistent_lease(model_id)?;
+                (LeaseOwnerMode::PersistentApp, Some(fingerprint.clone()))
+            }
+        };
         let lease = RuntimeLease {
             version: LEASE_VERSION,
+            owner_mode: Some(owner_mode),
+            fingerprint,
             owner_pid,
             owner_start_time: owner.start_identity,
             child_pid,
@@ -904,10 +990,17 @@ fn reconcile_legacy_state(state_path: &Path) -> Result<(), String> {
 }
 
 fn reconcile_state(state_path: &Path) -> Result<(), String> {
-    if !state_path.exists() {
+    if lease_is_absent(state_path) {
         return Ok(());
     }
-    let stale = read_lease(state_path)?;
+    let bytes = read_regular_file(state_path)?;
+    let stale = match decode_lease(&bytes) {
+        Ok(lease) => lease,
+        Err(_) => {
+            return fs::remove_file(state_path)
+                .map_err(|error| format!("{}: {error}", state_path.display()))
+        }
+    };
     reconcile(&stale)?;
     fs::remove_file(state_path).map_err(|error| format!("{}: {error}", state_path.display()))
 }
@@ -933,7 +1026,13 @@ fn reconcile(lease: &RuntimeLease) -> Result<(), String> {
 }
 
 fn validate_lease(lease: &RuntimeLease) -> Result<(), String> {
-    if lease.version != LEASE_VERSION
+    let version_and_owner_are_valid = matches!(
+        (lease.version, lease.owner_mode, lease.fingerprint.as_ref()),
+        (LEGACY_LEASE_VERSION, None, None)
+            | (LEASE_VERSION, Some(LeaseOwnerMode::Foreground), None)
+            | (LEASE_VERSION, Some(LeaseOwnerMode::PersistentApp), Some(_))
+    );
+    if !version_and_owner_are_valid
         || lease.owner_pid == 0
         || lease.child_pid == 0
         || lease.child_pgid <= 1
@@ -945,6 +1044,8 @@ fn validate_lease(lease: &RuntimeLease) -> Result<(), String> {
         || lease.port == 0
     {
         Err("invalid runtime lease".into())
+    } else if let Some(fingerprint) = lease.persistent_fingerprint() {
+        fingerprint.validate_persistent_lease(&lease.model_id)
     } else {
         Ok(())
     }
@@ -992,26 +1093,84 @@ fn open_lock(path: &Path) -> Result<File, String> {
 }
 
 fn read_lease(path: &Path) -> Result<RuntimeLease, String> {
-    let lease: RuntimeLease = serde_json::from_slice(&read_regular_file(path)?)
-        .map_err(|error| format!("{}: {error}", path.display()))?;
+    decode_lease(&read_regular_file(path)?).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+fn decode_lease(bytes: &[u8]) -> Result<RuntimeLease, String> {
+    let version: LeaseVersion = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+    let lease = match version.version {
+        LEGACY_LEASE_VERSION => {
+            let lease: RuntimeLeaseV1 =
+                serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+            RuntimeLease {
+                version: lease.version,
+                owner_mode: None,
+                fingerprint: None,
+                owner_pid: lease.owner_pid,
+                owner_start_time: lease.owner_start_time,
+                child_pid: lease.child_pid,
+                child_start_time: lease.child_start_time,
+                child_pgid: lease.child_pgid,
+                server: lease.server,
+                model_id: lease.model_id,
+                port: lease.port,
+            }
+        }
+        LEASE_VERSION => {
+            let lease: RuntimeLeaseV2 =
+                serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+            RuntimeLease {
+                version: lease.version,
+                owner_mode: Some(lease.owner_mode),
+                fingerprint: lease.fingerprint,
+                owner_pid: lease.owner_pid,
+                owner_start_time: lease.owner_start_time,
+                child_pid: lease.child_pid,
+                child_start_time: lease.child_start_time,
+                child_pgid: lease.child_pgid,
+                server: lease.server,
+                model_id: lease.model_id,
+                port: lease.port,
+            }
+        }
+        _ => return Err("unsupported runtime lease version".into()),
+    };
     validate_lease(&lease)?;
     Ok(lease)
 }
 
 fn read_regular_file(path: &Path) -> Result<Vec<u8>, String> {
-    crate::safe_file::read_regular_file(path).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::InvalidData {
-            format!("unsafe runtime lease {}", path.display())
-        } else {
-            format!("{}: {error}", path.display())
-        }
-    })
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|error| map_runtime_lease_read_error(path, error))?;
+    let opened = crate::safe_file::regular_file_identity(&file, path)
+        .map_err(|error| map_runtime_lease_read_error(path, error))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| map_runtime_lease_read_error(path, error))?;
+    crate::safe_file::ensure_descriptor_matches_path(&file, &opened, path)
+        .map_err(|error| map_runtime_lease_read_error(path, error))?;
+    Ok(bytes)
+}
+
+fn map_runtime_lease_read_error(path: &Path, error: std::io::Error) -> String {
+    if error.kind() == std::io::ErrorKind::InvalidData {
+        format!("unsafe runtime lease {}", path.display())
+    } else {
+        format!("{}: {error}", path.display())
+    }
 }
 
 fn write_lease(path: &Path, lease: &RuntimeLease) -> Result<(), String> {
-    validate_lease(lease)?;
     let temporary = path.with_extension("json.tmp");
-    let bytes = serde_json::to_vec_pretty(lease).map_err(|error| error.to_string())?;
+    let bytes = encode_v2_lease(lease)?;
     let mut options = OpenOptions::new();
     options.create(true).truncate(true).write(true);
     #[cfg(unix)]
@@ -1026,6 +1185,30 @@ fn write_lease(path: &Path, lease: &RuntimeLease) -> Result<(), String> {
         .and_then(|_| file.sync_all())
         .map_err(|error| format!("{}: {error}", temporary.display()))?;
     fs::rename(&temporary, path).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+fn encode_v2_lease(lease: &RuntimeLease) -> Result<Vec<u8>, String> {
+    validate_lease(lease)?;
+    if lease.version != LEASE_VERSION {
+        return Err("legacy runtime leases cannot be published".into());
+    }
+    let owner_mode = lease
+        .owner_mode
+        .ok_or_else(|| "v2 runtime lease owner mode is missing".to_string())?;
+    let wire = RuntimeLeaseV2 {
+        version: lease.version,
+        owner_mode,
+        fingerprint: lease.fingerprint.clone(),
+        owner_pid: lease.owner_pid,
+        owner_start_time: lease.owner_start_time,
+        child_pid: lease.child_pid,
+        child_start_time: lease.child_start_time,
+        child_pgid: lease.child_pgid,
+        server: lease.server.clone(),
+        model_id: lease.model_id.clone(),
+        port: lease.port,
+    };
+    serde_json::to_vec_pretty(&wire).map_err(|error| error.to_string())
 }
 
 fn process_snapshot(pid: u32) -> Result<Option<ProcessSnapshot>, String> {
@@ -1229,6 +1412,239 @@ mod tests {
     use std::time::{Duration, Instant};
     use tempfile::tempdir;
 
+    fn fingerprint_value() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "model_id": "demo",
+            "effective_context": 4096,
+            "effective_profile": "generic",
+            "sleep_policy": 300,
+            "primary": {
+                "local_filename": "model.gguf",
+                "sha256": "a".repeat(64),
+                "size": 7,
+            },
+            "draft": null,
+        })
+    }
+
+    fn lease_value(version: u32) -> serde_json::Value {
+        serde_json::json!({
+            "version": version,
+            "owner_pid": 11,
+            "owner_start_time": 12,
+            "child_pid": 13,
+            "child_start_time": 14,
+            "child_pgid": 13,
+            "server": "/bin/llama-server",
+            "model_id": "demo",
+            "port": 43123,
+        })
+    }
+
+    #[test]
+    fn v2_wire_roundtrip_is_strict_and_requires_explicit_attachment_state() {
+        let mut expected = lease_value(2);
+        expected["owner_mode"] = serde_json::json!("persistent_app");
+        expected["fingerprint"] = fingerprint_value();
+
+        let lease = decode_lease(&serde_json::to_vec(&expected).unwrap()).unwrap();
+        assert_eq!(lease.owner_mode(), Some(LeaseOwnerMode::PersistentApp));
+        assert_eq!(
+            serde_json::to_value(lease.persistent_fingerprint().unwrap()).unwrap(),
+            expected["fingerprint"]
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&encode_v2_lease(&lease).unwrap()).unwrap(),
+            expected
+        );
+
+        let mut missing_owner_mode = expected.clone();
+        missing_owner_mode
+            .as_object_mut()
+            .unwrap()
+            .remove("owner_mode");
+        let mut missing_fingerprint = expected.clone();
+        missing_fingerprint
+            .as_object_mut()
+            .unwrap()
+            .remove("fingerprint");
+        let mut unknown_lease_field = expected.clone();
+        unknown_lease_field["unexpected"] = serde_json::json!(true);
+        let mut unknown_fingerprint_field = expected.clone();
+        unknown_fingerprint_field["fingerprint"]["unexpected"] = serde_json::json!(true);
+        let mut unsupported_version = expected.clone();
+        unsupported_version["version"] = serde_json::json!(3);
+        let mut unknown_owner_mode = expected.clone();
+        unknown_owner_mode["owner_mode"] = serde_json::json!("background");
+        let mut persistent_without_fingerprint = expected.clone();
+        persistent_without_fingerprint["fingerprint"] = serde_json::Value::Null;
+        let mut foreground_with_fingerprint = expected.clone();
+        foreground_with_fingerprint["owner_mode"] = serde_json::json!("foreground");
+        let mut mismatched_model = expected.clone();
+        mismatched_model["fingerprint"]["model_id"] = serde_json::json!("other");
+        let mut wrong_sleep_policy = expected.clone();
+        wrong_sleep_policy["fingerprint"]["sleep_policy"] = serde_json::Value::Null;
+        let mut v1_with_v2_fields = lease_value(LEGACY_LEASE_VERSION);
+        v1_with_v2_fields["owner_mode"] = serde_json::json!("persistent_app");
+        v1_with_v2_fields["fingerprint"] = fingerprint_value();
+
+        for (name, invalid) in [
+            ("missing owner mode", missing_owner_mode),
+            ("missing fingerprint", missing_fingerprint),
+            ("unknown lease field", unknown_lease_field),
+            ("unknown fingerprint field", unknown_fingerprint_field),
+            ("unsupported version", unsupported_version),
+            ("unknown owner mode", unknown_owner_mode),
+            (
+                "persistent owner without fingerprint",
+                persistent_without_fingerprint,
+            ),
+            (
+                "foreground owner with fingerprint",
+                foreground_with_fingerprint,
+            ),
+            ("fingerprint for another model", mismatched_model),
+            (
+                "persistent fingerprint without sleep policy",
+                wrong_sleep_policy,
+            ),
+            ("v1 state carrying v2 fields", v1_with_v2_fields),
+        ] {
+            assert!(
+                decode_lease(&serde_json::to_vec(&invalid).unwrap()).is_err(),
+                "accepted {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn exclusive_recovery_discards_untrusted_regular_state_without_using_embedded_identities() {
+        let mut child = spawn_sleep();
+        let pid = child.id();
+        let group = i32::try_from(pid).unwrap();
+        let snapshot = process_snapshot(pid).unwrap().unwrap();
+        let mut v1 = lease_value(LEGACY_LEASE_VERSION);
+        v1["owner_pid"] = serde_json::json!(u32::MAX);
+        v1["owner_start_time"] = serde_json::json!(1);
+        v1["child_pid"] = serde_json::json!(pid);
+        v1["child_start_time"] = serde_json::json!(snapshot.start_identity);
+        v1["child_pgid"] = serde_json::json!(group);
+        v1["server"] = serde_json::json!(snapshot.executable);
+        let mut v2 = v1.clone();
+        v2["version"] = serde_json::json!(LEASE_VERSION);
+        v2["owner_mode"] = serde_json::json!("foreground");
+        v2["fingerprint"] = serde_json::Value::Null;
+
+        let mut unsupported = v2.clone();
+        unsupported["version"] = serde_json::json!(77);
+        let mut malformed_v1 = v1;
+        malformed_v1["owner_mode"] = serde_json::json!("persistent_app");
+        let mut malformed_v2 = v2;
+        malformed_v2.as_object_mut().unwrap().remove("owner_mode");
+        let cases = [
+            ("malformed JSON", b"not JSON".to_vec()),
+            (
+                "unsupported version",
+                serde_json::to_vec(&unsupported).unwrap(),
+            ),
+            ("malformed v1", serde_json::to_vec(&malformed_v1).unwrap()),
+            ("malformed v2", serde_json::to_vec(&malformed_v2).unwrap()),
+        ];
+
+        for (name, bytes) in cases {
+            let dir = tempdir().unwrap();
+            let state_path = dir.path().join("foreground.json");
+            fs::write(&state_path, bytes).unwrap();
+
+            let ownership = RuntimeOwnership::acquire(dir.path())
+                .unwrap_or_else(|error| panic!("{name} blocked exclusive recovery: {error}"));
+
+            assert!(!state_path.exists(), "{name} survived exclusive recovery");
+            assert!(
+                process_snapshot(pid).unwrap().is_some(),
+                "{name} caused an embedded process identity to be signaled"
+            );
+            drop(ownership);
+        }
+
+        terminate_process_group(&mut child, group).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy, Debug)]
+    enum UnsafeLeaseEntry {
+        Symlink,
+        HardLink,
+        Directory,
+        Fifo,
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exclusive_recovery_rejects_unsafe_filesystem_objects_without_waiting() {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+
+        for kind in [
+            UnsafeLeaseEntry::Symlink,
+            UnsafeLeaseEntry::HardLink,
+            UnsafeLeaseEntry::Directory,
+            UnsafeLeaseEntry::Fifo,
+        ] {
+            let dir = tempdir().unwrap();
+            let state_path = dir.path().join("foreground.json");
+            let witness = dir.path().join("witness");
+            let result = dir.path().join("unsafe-acquisition.result");
+            fs::write(&witness, b"witness").unwrap();
+            match kind {
+                UnsafeLeaseEntry::Symlink => {
+                    std::os::unix::fs::symlink(&witness, &state_path).unwrap()
+                }
+                UnsafeLeaseEntry::HardLink => fs::hard_link(&witness, &state_path).unwrap(),
+                UnsafeLeaseEntry::Directory => fs::create_dir(&state_path).unwrap(),
+                UnsafeLeaseEntry::Fifo => {
+                    let path = std::ffi::CString::new(state_path.as_os_str().as_bytes()).unwrap();
+                    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+                }
+            }
+
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .arg("--ignored")
+                .arg("--exact")
+                .arg("runtime::tests::unsafe_lease_acquisition_child")
+                .env("LOXA_UNSAFE_LEASE_RUN_DIR", dir.path())
+                .env("LOXA_UNSAFE_LEASE_RESULT", &result)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    let _ = child.wait();
+                    panic!("unsafe {kind:?} lease blocked during acquisition");
+                }
+                thread::sleep(Duration::from_millis(10));
+            };
+
+            assert!(status.success(), "unsafe {kind:?} helper failed");
+            assert_eq!(fs::read(&result).unwrap(), b"error", "accepted {kind:?}");
+            assert_eq!(fs::read(&witness).unwrap(), b"witness");
+            let metadata = fs::symlink_metadata(&state_path).unwrap();
+            match kind {
+                UnsafeLeaseEntry::Symlink => assert!(metadata.file_type().is_symlink()),
+                UnsafeLeaseEntry::HardLink => assert_eq!(metadata.nlink(), 2),
+                UnsafeLeaseEntry::Directory => assert!(metadata.file_type().is_dir()),
+                UnsafeLeaseEntry::Fifo => assert!(metadata.file_type().is_fifo()),
+            }
+        }
+    }
+
     fn spawn_sleep() -> Child {
         let mut command = Command::new("/bin/sleep");
         command.arg("60");
@@ -1255,6 +1671,8 @@ mod tests {
         let owner = process_snapshot(std::process::id()).unwrap().unwrap();
         RuntimeLease {
             version: LEASE_VERSION,
+            owner_mode: Some(LeaseOwnerMode::Foreground),
+            fingerprint: None,
             owner_pid: std::process::id(),
             owner_start_time: owner.start_identity,
             child_pid,
@@ -1264,6 +1682,43 @@ mod tests {
             model_id: model_id.into(),
             port,
         }
+    }
+
+    fn write_lease_fixture(path: &Path, lease: &RuntimeLease) {
+        let bytes = if lease.version == LEGACY_LEASE_VERSION {
+            serde_json::to_vec_pretty(&RuntimeLeaseV1 {
+                version: lease.version,
+                owner_pid: lease.owner_pid,
+                owner_start_time: lease.owner_start_time,
+                child_pid: lease.child_pid,
+                child_start_time: lease.child_start_time,
+                child_pgid: lease.child_pgid,
+                server: lease.server.clone(),
+                model_id: lease.model_id.clone(),
+                port: lease.port,
+            })
+            .unwrap()
+        } else {
+            encode_v2_lease_fixture(lease)
+        };
+        fs::write(path, bytes).unwrap();
+    }
+
+    fn encode_v2_lease_fixture(lease: &RuntimeLease) -> Vec<u8> {
+        serde_json::to_vec_pretty(&RuntimeLeaseV2 {
+            version: lease.version,
+            owner_mode: lease.owner_mode.unwrap(),
+            fingerprint: lease.fingerprint.clone(),
+            owner_pid: lease.owner_pid,
+            owner_start_time: lease.owner_start_time,
+            child_pid: lease.child_pid,
+            child_start_time: lease.child_start_time,
+            child_pgid: lease.child_pgid,
+            server: lease.server.clone(),
+            model_id: lease.model_id.clone(),
+            port: lease.port,
+        })
+        .unwrap()
     }
 
     struct ForegroundLockHolder {
@@ -1356,6 +1811,20 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[ignore]
+    fn unsafe_lease_acquisition_child() {
+        let run_dir = PathBuf::from(std::env::var_os("LOXA_UNSAFE_LEASE_RUN_DIR").unwrap());
+        let result = PathBuf::from(std::env::var_os("LOXA_UNSAFE_LEASE_RESULT").unwrap());
+        let outcome = if RuntimeOwnership::acquire(&run_dir).is_err() {
+            b"error".as_slice()
+        } else {
+            b"acquired".as_slice()
+        };
+        fs::write(result, outcome).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn foreground_lock_query_never_owns_an_available_lock() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("foreground.lock");
@@ -1438,7 +1907,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let state_path = dir.path().join("foreground.json");
         let lock_path = dir.path().join("foreground.lock");
-        fs::write(&state_path, b"not valid runtime state").unwrap();
+        let witness = dir.path().join("unsafe-state-witness");
+        fs::write(&witness, b"not valid runtime state").unwrap();
+        std::os::unix::fs::symlink(&witness, &state_path).unwrap();
 
         let (closed_tx, closed_rx) = std::sync::mpsc::sync_channel(0);
         let (release_first_tx, release_first_rx) = std::sync::mpsc::sync_channel(0);
@@ -1565,6 +2036,129 @@ mod tests {
     }
 
     #[test]
+    fn live_v1_remains_observable_but_never_attachable_or_rewritten() {
+        let dir = tempdir().unwrap();
+        let _lock = hold_foreground_lock(dir.path());
+        let mut child = spawn_observable_server("demo", 43123);
+        let mut lease = observed_lease(&child, "demo", 43123);
+        lease.version = LEGACY_LEASE_VERSION;
+        lease.owner_mode = None;
+        lease.fingerprint = None;
+        let state_path = dir.path().join("foreground.json");
+        write_lease_fixture(&state_path, &lease);
+        let before = fs::read(&state_path).unwrap();
+
+        let decoded = read_lease(&state_path).unwrap();
+        assert_eq!(decoded.owner_mode(), None);
+        assert!(decoded.persistent_fingerprint().is_none());
+        assert!(encode_v2_lease(&decoded).is_err());
+        let mut observer = ForegroundObserver::new(dir.path().to_path_buf());
+        assert_eq!(
+            observer.observe(Path::new("/managed/llama-server")),
+            ForegroundObservation::Running(RuntimeProvenance::External, 43123)
+        );
+        assert_eq!(fs::read(&state_path).unwrap(), before);
+
+        let group = i32::try_from(child.id()).unwrap();
+        terminate_process_group(&mut child, group).unwrap();
+    }
+
+    #[test]
+    fn live_v1_and_v2_owner_matrix_blocks_takeover_without_rewriting() {
+        let mut child = spawn_observable_server("demo", 43123);
+        let base = observed_lease(&child, "demo", 43123);
+        let fingerprint: RuntimeFingerprint = serde_json::from_value(fingerprint_value()).unwrap();
+        let cases = [
+            ("v1", LEGACY_LEASE_VERSION, None, None),
+            (
+                "v2 foreground",
+                LEASE_VERSION,
+                Some(LeaseOwnerMode::Foreground),
+                None,
+            ),
+            (
+                "v2 persistent",
+                LEASE_VERSION,
+                Some(LeaseOwnerMode::PersistentApp),
+                Some(fingerprint),
+            ),
+        ];
+
+        for (name, version, owner_mode, fingerprint) in cases {
+            let dir = tempdir().unwrap();
+            let state_path = dir.path().join("foreground.json");
+            let lease = RuntimeLease {
+                version,
+                owner_mode,
+                fingerprint,
+                ..base.clone()
+            };
+            write_lease_fixture(&state_path, &lease);
+            let before = fs::read(&state_path).unwrap();
+
+            let error = match RuntimeOwnership::acquire(dir.path()) {
+                Ok(_) => panic!("{name} live owner allowed a takeover"),
+                Err(error) => error,
+            };
+
+            assert!(
+                error.contains("another Loxa runtime owns"),
+                "{name}: {error}"
+            );
+            assert_eq!(fs::read(&state_path).unwrap(), before, "rewrote {name}");
+            assert!(
+                process_snapshot(child.id()).unwrap().is_some(),
+                "{name} live child was signaled"
+            );
+        }
+
+        let group = i32::try_from(child.id()).unwrap();
+        terminate_process_group(&mut child, group).unwrap();
+    }
+
+    #[test]
+    fn held_lock_preserves_malformed_and_unsupported_v1_v2_state() {
+        let mut unsupported = lease_value(91);
+        unsupported["owner_mode"] = serde_json::json!("persistent_app");
+        unsupported["fingerprint"] = fingerprint_value();
+        let mut malformed_v1 = lease_value(LEGACY_LEASE_VERSION);
+        malformed_v1["unexpected"] = serde_json::json!(true);
+        let mut malformed_v2 = lease_value(LEASE_VERSION);
+        malformed_v2["owner_mode"] = serde_json::json!("foreground");
+        let cases = [
+            ("malformed JSON", b"not JSON".to_vec()),
+            (
+                "unsupported version",
+                serde_json::to_vec(&unsupported).unwrap(),
+            ),
+            ("malformed v1", serde_json::to_vec(&malformed_v1).unwrap()),
+            ("malformed v2", serde_json::to_vec(&malformed_v2).unwrap()),
+        ];
+
+        for (name, bytes) in cases {
+            let dir = tempdir().unwrap();
+            let _lock = hold_foreground_lock(dir.path());
+            let state_path = dir.path().join("foreground.json");
+            fs::write(&state_path, &bytes).unwrap();
+
+            recover_stale(dir.path()).unwrap();
+            let mut observer = ForegroundObserver::new(dir.path().to_path_buf());
+            assert_eq!(
+                observer.observe(Path::new("/managed/llama-server")),
+                ForegroundObservation::Starting,
+                "{name} changed observation"
+            );
+            assert_eq!(fs::read(&state_path).unwrap(), bytes, "rewrote {name}");
+            let error = match RuntimeOwnership::acquire(dir.path()) {
+                Ok(_) => panic!("{name} bypassed a held lifecycle lock"),
+                Err(error) => error,
+            };
+            assert!(error.contains("another Loxa runtime is active"), "{error}");
+            assert_eq!(fs::read(&state_path).unwrap(), bytes, "rewrote {name}");
+        }
+    }
+
+    #[test]
     fn foreground_observer_treats_lease_lock_contradictions_and_malformed_leases_conservatively() {
         let managed = Path::new("/managed/llama-server");
         let mut child = spawn_observable_server("demo", 43123);
@@ -1637,7 +2231,7 @@ mod tests {
             let _lock = hold_foreground_lock(dir.path());
             fs::write(
                 dir.path().join("foreground.json"),
-                serde_json::to_vec_pretty(&mismatch).unwrap(),
+                encode_v2_lease_fixture(&mismatch),
             )
             .unwrap();
             let mut observer = ForegroundObserver::new(dir.path().to_path_buf());
@@ -1705,28 +2299,50 @@ mod tests {
 
     #[test]
     fn general_recovery_stops_an_exact_orphaned_child() {
-        let dir = tempdir().unwrap();
-        let mut child = spawn_sleep();
-        let pid = child.id();
-        let snapshot = process_snapshot(pid).unwrap().unwrap();
-        let lease = RuntimeLease {
-            version: 1,
-            owner_pid: u32::MAX,
-            owner_start_time: 1,
-            child_pid: pid,
-            child_start_time: snapshot.start_identity,
-            child_pgid: i32::try_from(pid).unwrap(),
-            server: snapshot.executable,
-            model_id: "demo".into(),
-            port: 1234,
-        };
-        write_lease(&dir.path().join("foreground.json"), &lease).unwrap();
+        let persistent: RuntimeFingerprint = serde_json::from_value(fingerprint_value()).unwrap();
+        for (name, version, owner_mode, fingerprint) in [
+            ("v1", LEGACY_LEASE_VERSION, None, None),
+            (
+                "v2 foreground",
+                LEASE_VERSION,
+                Some(LeaseOwnerMode::Foreground),
+                None,
+            ),
+            (
+                "v2 persistent",
+                LEASE_VERSION,
+                Some(LeaseOwnerMode::PersistentApp),
+                Some(persistent),
+            ),
+        ] {
+            let dir = tempdir().unwrap();
+            let mut child = spawn_sleep();
+            let pid = child.id();
+            let snapshot = process_snapshot(pid).unwrap().unwrap();
+            let lease = RuntimeLease {
+                version,
+                owner_mode,
+                fingerprint,
+                owner_pid: u32::MAX,
+                owner_start_time: 1,
+                child_pid: pid,
+                child_start_time: snapshot.start_identity,
+                child_pgid: i32::try_from(pid).unwrap(),
+                server: snapshot.executable,
+                model_id: "demo".into(),
+                port: 1234,
+            };
+            write_lease_fixture(&dir.path().join("foreground.json"), &lease);
 
-        recover_stale(dir.path()).unwrap();
+            recover_stale(dir.path()).unwrap();
 
-        assert!(wait_until_gone(pid), "exact orphan survived recovery");
-        assert!(!dir.path().join("foreground.json").exists());
-        let _ = child.wait();
+            assert!(
+                wait_until_gone(pid),
+                "exact {name} orphan survived recovery"
+            );
+            assert!(!dir.path().join("foreground.json").exists());
+            let _ = child.wait();
+        }
     }
 
     #[test]
@@ -1739,6 +2355,8 @@ mod tests {
         let owner_snapshot = process_snapshot(std::process::id()).unwrap().unwrap();
         let lease = RuntimeLease {
             version: LEASE_VERSION,
+            owner_mode: Some(LeaseOwnerMode::Foreground),
+            fingerprint: None,
             owner_pid: std::process::id(),
             owner_start_time: owner_snapshot.start_identity,
             child_pid: pid,
@@ -1767,6 +2385,8 @@ mod tests {
         let child_snapshot = process_snapshot(pid).unwrap().unwrap();
         let lease = RuntimeLease {
             version: LEASE_VERSION,
+            owner_mode: Some(LeaseOwnerMode::Foreground),
+            fingerprint: None,
             owner_pid: u32::MAX,
             owner_start_time: 1,
             child_pid: pid,
@@ -1792,32 +2412,36 @@ mod tests {
 
     #[test]
     fn acquiring_runtime_never_signals_a_reused_process_identity() {
-        let dir = tempdir().unwrap();
-        let mut child = spawn_sleep();
-        let pid = child.id();
-        let snapshot = process_snapshot(pid).unwrap().unwrap();
-        let lease = RuntimeLease {
-            version: 1,
-            owner_pid: u32::MAX,
-            owner_start_time: 1,
-            child_pid: pid,
-            child_start_time: snapshot.start_identity.saturating_add(1),
-            child_pgid: i32::try_from(pid).unwrap(),
-            server: snapshot.executable,
-            model_id: "demo".into(),
-            port: 1234,
-        };
-        write_lease(&dir.path().join("foreground.json"), &lease).unwrap();
+        for version in [LEGACY_LEASE_VERSION, LEASE_VERSION] {
+            let dir = tempdir().unwrap();
+            let mut child = spawn_sleep();
+            let pid = child.id();
+            let snapshot = process_snapshot(pid).unwrap().unwrap();
+            let lease = RuntimeLease {
+                version,
+                owner_mode: (version == LEASE_VERSION).then_some(LeaseOwnerMode::Foreground),
+                fingerprint: None,
+                owner_pid: u32::MAX,
+                owner_start_time: 1,
+                child_pid: pid,
+                child_start_time: snapshot.start_identity.saturating_add(1),
+                child_pgid: i32::try_from(pid).unwrap(),
+                server: snapshot.executable,
+                model_id: "demo".into(),
+                port: 1234,
+            };
+            write_lease_fixture(&dir.path().join("foreground.json"), &lease);
 
-        let ownership = RuntimeOwnership::acquire(dir.path()).unwrap();
+            let ownership = RuntimeOwnership::acquire(dir.path()).unwrap();
 
-        assert!(
-            process_snapshot(pid).unwrap().is_some(),
-            "reused PID was signaled"
-        );
-        assert!(!dir.path().join("foreground.json").exists());
-        terminate_process_group(&mut child, i32::try_from(pid).unwrap()).unwrap();
-        drop(ownership);
+            assert!(
+                process_snapshot(pid).unwrap().is_some(),
+                "reused PID in v{version} state was signaled"
+            );
+            assert!(!dir.path().join("foreground.json").exists());
+            terminate_process_group(&mut child, i32::try_from(pid).unwrap()).unwrap();
+            drop(ownership);
+        }
     }
 
     #[test]

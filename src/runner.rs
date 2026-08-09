@@ -623,7 +623,7 @@ where
     if cancelled() {
         return Ok(persistent_interrupted());
     }
-    match start_persistent_attempt(runnable.launch(), ownership, &cancelled)? {
+    match start_persistent_attempt(&runnable, ownership, &cancelled)? {
         StartOutcome::Ready(server) => {
             finish_persistent_ready(server, runnable, launch_started, false, &cancelled)
         }
@@ -652,7 +652,7 @@ where
             if cancelled() {
                 return Ok(persistent_interrupted());
             }
-            match start_persistent_attempt(runnable.launch(), ownership, &cancelled)? {
+            match start_persistent_attempt(&runnable, ownership, &cancelled)? {
                 StartOutcome::Ready(server) => {
                     finish_persistent_ready(server, runnable, launch_started, true, &cancelled)
                 }
@@ -803,14 +803,20 @@ where
     reason = "persistent startup is wired by the follow-on host task"
 )]
 fn start_persistent_attempt<F>(
-    launch: &Launch,
+    runnable: &crate::runnable::Runnable,
     ownership: crate::runtime::RuntimeOwnership,
     cancelled: &F,
 ) -> Result<StartOutcome, String>
 where
     F: Fn() -> bool,
 {
-    OwnedServer::start_with_persistent_ownership(launch, STARTUP_TIMEOUT, ownership, cancelled)
+    OwnedServer::start_with_persistent_ownership(
+        runnable.launch(),
+        runnable.fingerprint(),
+        STARTUP_TIMEOUT,
+        ownership,
+        cancelled,
+    )
 }
 
 fn report_mtp_draft_start_failure(
@@ -1331,9 +1337,12 @@ impl OwnedServer {
     where
         F: Fn() -> Option<i32>,
     {
-        Self::start_inner(launch, timeout, Some(runtime), || {
-            signal().map(StartupStop::Signal)
-        })
+        Self::start_inner(
+            launch,
+            timeout,
+            Some((runtime, crate::runtime::RuntimeLeasePublication::Foreground)),
+            || signal().map(StartupStop::Signal),
+        )
     }
 
     #[allow(
@@ -1342,6 +1351,7 @@ impl OwnedServer {
     )]
     fn start_with_persistent_ownership<F>(
         launch: &Launch,
+        fingerprint: &crate::runtime_fingerprint::RuntimeFingerprint,
         timeout: Duration,
         runtime: crate::runtime::RuntimeOwnership,
         cancelled: &F,
@@ -1349,16 +1359,25 @@ impl OwnedServer {
     where
         F: Fn() -> bool,
     {
-        Self::start_inner(launch, timeout, Some(runtime), || {
-            cancelled().then_some(StartupStop::Interrupted(StartupInterruption::Cancelled))
-        })
+        Self::start_inner(
+            launch,
+            timeout,
+            Some((
+                runtime,
+                crate::runtime::RuntimeLeasePublication::PersistentApp(fingerprint),
+            )),
+            || cancelled().then_some(StartupStop::Interrupted(StartupInterruption::Cancelled)),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
     fn start_inner<F>(
         launch: &Launch,
         timeout: Duration,
-        runtime: Option<crate::runtime::RuntimeOwnership>,
+        runtime: Option<(
+            crate::runtime::RuntimeOwnership,
+            crate::runtime::RuntimeLeasePublication<'_>,
+        )>,
         stop: F,
     ) -> Result<StartOutcome, String>
     where
@@ -1410,6 +1429,10 @@ impl OwnedServer {
             stderr,
             Some((announcement_sender, Arc::clone(&announcement_overflow))),
         );
+        let (runtime, publication) = match runtime {
+            Some((runtime, publication)) => (Some(runtime), Some(publication)),
+            None => (None, None),
+        };
         let mut owned = Self {
             child: Some(child),
             group,
@@ -1424,11 +1447,13 @@ impl OwnedServer {
             stderr_tail: Vec::new(),
         };
         if let Some(runtime) = owned.runtime.as_mut() {
+            let publication = publication.expect("owned runtime publication is present");
             if let Err(error) = runtime.record(
                 owned.child.as_ref().expect("owned child is present").id(),
                 group,
                 &launch.id,
                 requested_port,
+                publication,
             ) {
                 return owned.fail_start(error);
             }
@@ -2270,6 +2295,41 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn persistent_publication_carries_the_exact_whole_fingerprint() {
+        let _lock = process_test_lock();
+        let dir = tempdir().unwrap();
+        let server = dir.path().join("server");
+        let announced = dir.path().join("announced");
+        let ready = dir.path().join("ready");
+        let run_dir = dir.path().join("run");
+        write_persistent_test_server(&server, &announced, &ready);
+        let runnable = persistent_runnable(dir.path(), &server, 0);
+        let expected_fingerprint = serde_json::to_value(runnable.fingerprint()).unwrap();
+
+        let started = start_persistent(runnable, &run_dir, || false).unwrap();
+        let mut server = match started {
+            PersistentStart::Ready(server) => server,
+            PersistentStart::Stopped(exit) => panic!("persistent server stopped: {exit:?}"),
+            PersistentStart::Interrupted(interruption) => {
+                panic!("persistent server was interrupted: {interruption:?}")
+            }
+        };
+        let lease: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(run_dir.join("foreground.json")).unwrap())
+                .unwrap();
+
+        assert_eq!(lease["version"], 2);
+        assert_eq!(lease["owner_mode"], "persistent_app");
+        assert_eq!(lease["fingerprint"], expected_fingerprint);
+        assert_eq!(lease["fingerprint"]["sleep_policy"], 300);
+        assert_eq!(lease["model_id"], lease["fingerprint"]["model_id"]);
+
+        server.terminate().unwrap();
+        assert!(!run_dir.join("foreground.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn persistent_cancellation_at_mtp_retry_never_spawns_the_primary() {
         let _lock = process_test_lock();
         let dir = tempdir().unwrap();
@@ -2352,6 +2412,17 @@ mod tests {
         );
         assert!(server.fingerprint().draft().is_none());
         assert_eq!(server.fingerprint().sleep_policy(), Some(300));
+        let lease: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(run_dir.join("foreground.json")).unwrap())
+                .unwrap();
+        assert_eq!(lease["owner_mode"], "persistent_app");
+        assert_eq!(
+            lease["fingerprint"],
+            serde_json::to_value(server.fingerprint()).unwrap()
+        );
+        assert_eq!(lease["fingerprint"]["effective_profile"], "primary_only");
+        assert_eq!(lease["fingerprint"]["draft"], serde_json::Value::Null);
+        assert_eq!(lease["fingerprint"]["sleep_policy"], 300);
         assert!(server.poll().unwrap().is_none());
         let argv = std::fs::read_to_string(&argv).unwrap();
         let argv = argv.lines().collect::<Vec<_>>();
@@ -2573,7 +2644,12 @@ mod tests {
         };
         http.join().unwrap();
 
-        assert!(run_dir.join("foreground.json").is_file());
+        let lease: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(run_dir.join("foreground.json")).unwrap())
+                .unwrap();
+        assert_eq!(lease["version"], 2);
+        assert_eq!(lease["owner_mode"], "foreground");
+        assert_eq!(lease["fingerprint"], serde_json::Value::Null);
         server.terminate().unwrap();
         assert!(!run_dir.join("foreground.json").exists());
     }

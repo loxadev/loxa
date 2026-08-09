@@ -77,10 +77,6 @@ impl<'de> Deserialize<'de> for RuntimeFingerprint {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "fingerprint comparison is wired by the follow-on host task"
-)]
 impl RuntimeFingerprint {
     fn validate(&self) -> Result<(), String> {
         if self.schema_version != FINGERPRINT_SCHEMA_VERSION {
@@ -141,14 +137,28 @@ impl RuntimeFingerprint {
         Some(primary_only)
     }
 
+    pub(crate) fn validate_persistent_lease(&self, model_id: &str) -> Result<(), String> {
+        self.validate()?;
+        if self.model_id != model_id {
+            return Err("runtime lease model contradicts its fingerprint".into());
+        }
+        if self.sleep_policy != Some(300) {
+            return Err("persistent runtime fingerprint requires sleep policy 300".into());
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn effective_profile(&self) -> EffectiveProfile {
         self.effective_profile
     }
 
+    #[cfg(test)]
     pub(crate) fn sleep_policy(&self) -> Option<u64> {
         self.sleep_policy
     }
 
+    #[cfg(test)]
     pub(crate) fn draft(&self) -> Option<&ArtifactFingerprint> {
         self.draft.as_ref()
     }
