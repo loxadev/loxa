@@ -8,7 +8,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{NSInteger, NSPoint, NSRange, NSRect, NSSize, NSString};
 
-use crate::menu::catalog::{CandidateItem, CatalogState, RepositoryItem};
+use crate::menu::catalog::{CandidateItem, CatalogMode, CatalogState, RepositoryItem};
 use crate::menu::presentation::MenuLayout;
 
 const WIDTH: f64 = MenuLayout::BASE_WIDTH;
@@ -17,6 +17,7 @@ const SEARCH_HEIGHT: f64 = 40.0;
 const SECTION_HEIGHT: f64 = 28.0;
 const RESULT_HEIGHT: f64 = 48.0;
 const STATUS_HEIGHT: f64 = 44.0;
+const TRANSFER_CARD_HEIGHT: f64 = 104.0;
 const ACTION_HEIGHT: f64 = 36.0;
 const ICON_SIZE: f64 = 16.0;
 
@@ -86,7 +87,11 @@ pub(super) fn content_height(state: &CatalogState) -> f64 {
         } else {
             0.0
         }
-        + state.browser_status().map_or(0.0, |_| STATUS_HEIGHT)
+        + if state.mode() == CatalogMode::Transferring {
+            TRANSFER_CARD_HEIGHT
+        } else {
+            state.browser_status().map_or(0.0, |_| STATUS_HEIGHT)
+        }
 }
 
 pub(super) fn build(
@@ -190,29 +195,41 @@ pub(super) fn build(
         action_buttons.push(transfer);
     }
 
-    if let Some(status_text) = state.browser_status() {
-        let status_row = row(&mut next_y, STATUS_HEIGHT, mtm);
-        let status_width = if state.can_pause() {
-            WIDTH - 2.0 * INSET - 72.0
-        } else {
-            WIDTH - 2.0 * INSET
-        };
-        let status = secondary_label(&status_text, mtm);
-        status.setFrame(rect(INSET, 6.0, status_width, 18.0));
-        status.setToolTip(Some(&NSString::from_str(&status_text)));
-        status_row.addSubview(&status);
+    if state.mode() == CatalogMode::Transferring {
+        let transfer_row = row(&mut next_y, TRANSFER_CARD_HEIGHT, mtm);
+        let title = primary_label("Downloading model", mtm);
+        title.setFrame(rect(INSET, 80.0, WIDTH - 2.0 * INSET, 18.0));
+        transfer_row.addSubview(&title);
+
+        let readout = state.progress_readout();
+        let headline_text = readout
+            .map(|readout| readout.headline().to_owned())
+            .unwrap_or_else(|| state.status_label());
+        let headline = secondary_label(&headline_text, mtm);
+        headline.setFrame(rect(INSET, 58.0, WIDTH - 2.0 * INSET, 18.0));
+        headline.setToolTip(Some(&NSString::from_str(&headline_text)));
+        transfer_row.addSubview(&headline);
+
+        if let Some(detail_text) = readout.and_then(|readout| readout.detail()) {
+            let detail = secondary_label(detail_text, mtm);
+            detail.setFrame(rect(INSET, 40.0, WIDTH - 2.0 * INSET, 16.0));
+            detail.setToolTip(Some(&NSString::from_str(detail_text)));
+            transfer_row.addSubview(&detail);
+        }
+
         if let Some(fraction) = state.progress_fraction() {
             let progress = NSProgressIndicator::initWithFrame(
                 NSProgressIndicator::alloc(mtm),
-                rect(INSET, 28.0, status_width, 8.0),
+                rect(INSET, 30.0, WIDTH - 2.0 * INSET, 8.0),
             );
             progress.setIndeterminate(false);
             progress.setMinValue(0.0);
             progress.setMaxValue(1.0);
             progress.setDoubleValue(fraction);
             progress.setStyle(NSProgressIndicatorStyle::Bar);
-            status_row.addSubview(&progress);
+            transfer_row.addSubview(&progress);
         }
+
         if state.can_pause() {
             let pause = text_button(
                 "Pause",
@@ -221,11 +238,18 @@ pub(super) fn build(
                 actions.pause,
                 mtm,
             );
-            pause.setFrame(rect(WIDTH - INSET - 64.0, 8.0, 64.0, 28.0));
-            status_row.addSubview(&pause);
+            pause.setFrame(rect(WIDTH - INSET - 64.0, 2.0, 64.0, 28.0));
+            transfer_row.addSubview(&pause);
             #[cfg(test)]
             action_buttons.push(pause);
         }
+        root.addSubview(&transfer_row);
+    } else if let Some(status_text) = state.browser_status() {
+        let status_row = row(&mut next_y, STATUS_HEIGHT, mtm);
+        let status = secondary_label(&status_text, mtm);
+        status.setFrame(rect(INSET, 6.0, WIDTH - 2.0 * INSET, 18.0));
+        status.setToolTip(Some(&NSString::from_str(&status_text)));
+        status_row.addSubview(&status);
         root.addSubview(&status_row);
     }
 

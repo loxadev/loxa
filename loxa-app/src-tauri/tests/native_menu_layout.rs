@@ -25,6 +25,10 @@ mod menu {
         ));
     }
 
+    pub(crate) mod progress {
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/menu/progress.rs"));
+    }
+
     pub(crate) mod observation {
         use std::time::Instant;
 
@@ -85,6 +89,7 @@ mod menu {
             use objc2::sel;
             use objc2::ClassType;
             use objc2_app_kit::{NSEventModifierFlags, NSLineBreakMode, NSSearchField};
+            use std::time::{Duration, Instant};
 
             pub(crate) fn assert_native_layout_contract(mtm: MainThreadMarker) {
                 for (name, fixture, expected_height, expected_action_button_count) in [
@@ -266,10 +271,106 @@ mod menu {
                 assert!(count_image_views(&selected.view) >= 2);
 
                 assert!(catalog.start_transfer().is_some());
-                let transferring =
+                let resolving = catalog_rows::build(&catalog, None, catalog_fixture_actions(), mtm);
+                let resolving_text = text_values(&resolving.view);
+                assert!(resolving_text.contains(&"Downloading model".into()));
+                assert!(resolving_text.contains(&format!("Preparing {candidate}…")));
+                assert!(resolving.primary_labels.is_empty());
+                assert!(!resolving_text.contains(&candidate.into()));
+                assert_eq!(
+                    resolving
+                        .action_buttons
+                        .iter()
+                        .map(|button| button.title().to_string())
+                        .collect::<Vec<_>>(),
+                    ["Pause"]
+                );
+
+                let start = Instant::now();
+                assert!(catalog.apply_at(
+                    CatalogEvent::Progress {
+                        generation,
+                        stage: crate::menu::catalog::TransferStage::Transferring,
+                        transferred_bytes: 15_900_000,
+                        total_bytes: 88_200_000,
+                    },
+                    start,
+                ));
+                let first_progress =
                     catalog_rows::build(&catalog, None, catalog_fixture_actions(), mtm);
-                assert!(transferring.primary_labels.is_empty());
-                assert!(!text_values(&transferring.view).contains(&candidate.into()));
+                let first_text = text_values(&first_progress.view);
+                assert!(first_text.contains(&"Downloading model".into()));
+                assert!(first_text.contains(&"18% · 15.9 MB of 88.2 MB".into()));
+                assert!(!first_text.iter().any(|text| text.contains("/s")));
+                assert!(first_progress.primary_labels.is_empty());
+
+                assert!(catalog.apply_at(
+                    CatalogEvent::Progress {
+                        generation,
+                        stage: crate::menu::catalog::TransferStage::Transferring,
+                        transferred_bytes: 20_900_000,
+                        total_bytes: 88_200_000,
+                    },
+                    start + Duration::from_secs(1),
+                ));
+                let measured = catalog_rows::build(&catalog, None, catalog_fixture_actions(), mtm);
+                let measured_text = text_values(&measured.view);
+                assert!(!measured_text.contains(&"18% · 15.9 MB of 88.2 MB".into()));
+                assert!(measured_text.contains(&"24% · 20.9 MB of 88.2 MB".into()));
+                assert!(measured_text.contains(&"5.0 MB/s · 14s remaining".into()));
+                assert!(measured.primary_labels.is_empty());
+                assert!(!measured_text.contains(&candidate.into()));
+                let headline = find_text_field(&measured.view, "24% · 20.9 MB of 88.2 MB")
+                    .expect("the transfer card must render its human progress headline");
+                let detail = find_text_field(&measured.view, "5.0 MB/s · 14s remaining")
+                    .expect("the transfer card must render its measured speed and ETA");
+                let pause = measured
+                    .action_buttons
+                    .iter()
+                    .find(|button| button.title().to_string() == "Pause")
+                    .expect("resolving and progress retain the exact Pause action");
+                assert_eq!(headline.frame().size.width, 328.0);
+                assert_eq!(detail.frame().size.width, 328.0);
+                assert!(
+                    detail.frame().origin.y >= pause.frame().origin.y + pause.frame().size.height,
+                    "full-width progress labels must sit above the separate Pause control"
+                );
+
+                for (stage, expected) in [
+                    (
+                        crate::menu::catalog::TransferStage::Verifying,
+                        "Verifying download…",
+                    ),
+                    (
+                        crate::menu::catalog::TransferStage::Publishing,
+                        "Finishing installation…",
+                    ),
+                ] {
+                    assert!(catalog.apply_at(
+                        CatalogEvent::Progress {
+                            generation,
+                            stage,
+                            transferred_bytes: 88_200_000,
+                            total_bytes: 88_200_000,
+                        },
+                        start + Duration::from_secs(2),
+                    ));
+                    let content =
+                        catalog_rows::build(&catalog, None, catalog_fixture_actions(), mtm);
+                    let text = text_values(&content.view);
+                    assert!(text.contains(&expected.into()));
+                    assert!(!text.iter().any(|text| text.contains("/s")));
+                    assert!(content.primary_labels.is_empty());
+                }
+
+                assert!(catalog.request_pause());
+                let pausing = catalog_rows::build(&catalog, None, catalog_fixture_actions(), mtm);
+                let pausing_text = text_values(&pausing.view);
+                assert!(pausing_text.contains(&"Downloading model".into()));
+                assert!(pausing_text.contains(&"Pausing transfer…".into()));
+                assert!(!pausing_text.iter().any(|text| text.contains("/s")));
+                assert!(pausing.primary_labels.is_empty());
+                assert!(pausing.action_buttons.is_empty());
             }
 
             fn assert_installed_rows_and_priority(mtm: MainThreadMarker) {
@@ -530,6 +631,14 @@ mod menu {
                     }
                 }
                 None
+            }
+
+            fn find_text_field(view: &NSView, text: &str) -> Option<Retained<NSTextField>> {
+                let mut fields = Vec::new();
+                collect_text_fields(view, &mut fields);
+                fields
+                    .into_iter()
+                    .find(|field| field.stringValue().to_string() == text)
             }
 
             fn text_values(view: &NSView) -> Vec<String> {

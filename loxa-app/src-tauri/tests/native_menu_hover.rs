@@ -20,6 +20,10 @@ mod menu {
         ));
     }
 
+    pub(crate) mod progress {
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/menu/progress.rs"));
+    }
+
     pub(crate) mod macos {
         pub(crate) mod catalog_rows {
             include!(concat!(

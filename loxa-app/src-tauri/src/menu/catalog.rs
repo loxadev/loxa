@@ -1,3 +1,7 @@
+use std::time::Instant;
+
+use crate::menu::progress::{TransferEstimate, TransferReadout};
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RepositoryItem {
     repo: String,
@@ -182,6 +186,8 @@ pub(crate) struct CatalogState {
     candidates: Vec<CandidateItem>,
     selected: Option<usize>,
     status: CatalogStatus,
+    transfer_estimate: TransferEstimate,
+    progress_readout: Option<TransferReadout>,
 }
 
 impl Default for CatalogState {
@@ -195,6 +201,8 @@ impl Default for CatalogState {
             candidates: Vec::new(),
             selected: None,
             status: CatalogStatus::Idle,
+            transfer_estimate: TransferEstimate::default(),
+            progress_readout: None,
         }
     }
 }
@@ -309,17 +317,11 @@ impl CatalogState {
             }
             CatalogStatus::Selected(_) => "Ready to download".into(),
             CatalogStatus::Resolving(path) => format!("Preparing {path}…"),
-            CatalogStatus::Progress {
-                stage,
-                transferred_bytes,
-                total_bytes,
-            } => format!(
-                "{} {} of {} bytes",
-                stage.label(),
-                transferred_bytes,
-                total_bytes
-            ),
-            CatalogStatus::PauseRequested => "Pausing transfer…".into(),
+            CatalogStatus::Progress { .. } | CatalogStatus::PauseRequested => self
+                .progress_readout
+                .as_ref()
+                .map(|readout| readout.headline().into())
+                .unwrap_or_else(|| "Transfer in progress…".into()),
             CatalogStatus::Completed(disposition) => disposition.label().into(),
             CatalogStatus::Error(message) => message.clone(),
         }
@@ -338,6 +340,10 @@ impl CatalogState {
             return Some(0.0);
         }
         Some((transferred_bytes.min(total_bytes) as f64) / (total_bytes as f64))
+    }
+
+    pub(crate) fn progress_readout(&self) -> Option<&TransferReadout> {
+        self.progress_readout.as_ref()
     }
 
     pub(crate) fn can_transfer(&self) -> bool {
@@ -367,6 +373,7 @@ impl CatalogState {
         ) {
             return None;
         }
+        self.reset_transfer_progress();
         let query = query.trim();
         if query.is_empty() {
             self.generation = self.generation.saturating_add(1);
@@ -432,6 +439,8 @@ impl CatalogState {
         let repo = self.repo.clone()?;
         let revision = self.revision.clone()?;
         let path = self.selected_candidate()?.path.clone();
+        self.reset_transfer_progress();
+        self.progress_readout = Some(TransferReadout::message(format!("Preparing {path}…")));
         self.status = CatalogStatus::Resolving(path.clone());
         Some(CatalogCommand::Transfer {
             generation: self.generation,
@@ -445,11 +454,16 @@ impl CatalogState {
         if !self.can_pause() {
             return false;
         }
+        self.progress_readout = Some(TransferReadout::message("Pausing transfer…"));
         self.status = CatalogStatus::PauseRequested;
         true
     }
 
     pub(crate) fn apply(&mut self, event: CatalogEvent) -> bool {
+        self.apply_at(event, Instant::now())
+    }
+
+    pub(crate) fn apply_at(&mut self, event: CatalogEvent, now: Instant) -> bool {
         if event.generation() != self.generation {
             return false;
         }
@@ -457,6 +471,7 @@ impl CatalogState {
             CatalogEvent::Repositories { repositories, .. }
                 if matches!(self.status, CatalogStatus::Searching) =>
             {
+                self.reset_transfer_progress();
                 self.repositories = repositories.into_iter().take(MAX_VISIBLE_RESULTS).collect();
                 self.repo = None;
                 self.revision = None;
@@ -472,6 +487,7 @@ impl CatalogState {
             } if matches!(self.status, CatalogStatus::Inspecting(_))
                 && self.repo.as_deref() == Some(repo.as_str()) =>
             {
+                self.reset_transfer_progress();
                 self.repo = Some(repo);
                 self.revision = Some(revision);
                 self.candidates = candidates.into_iter().take(MAX_VISIBLE_RESULTS).collect();
@@ -488,6 +504,13 @@ impl CatalogState {
                 CatalogStatus::Resolving(_) | CatalogStatus::Progress { .. }
             ) =>
             {
+                self.progress_readout = Some(self.transfer_estimate.update(
+                    self.generation,
+                    stage,
+                    transferred_bytes,
+                    total_bytes,
+                    now,
+                ));
                 self.status = CatalogStatus::Progress {
                     stage,
                     transferred_bytes,
@@ -502,6 +525,7 @@ impl CatalogState {
                         | CatalogStatus::PauseRequested
                 ) =>
             {
+                self.reset_transfer_progress();
                 self.repositories.clear();
                 self.candidates.clear();
                 self.selected = None;
@@ -510,6 +534,7 @@ impl CatalogState {
             CatalogEvent::Failed { message, .. }
                 if !matches!(self.status, CatalogStatus::Completed(_)) =>
             {
+                self.reset_transfer_progress();
                 self.repositories.clear();
                 self.candidates.clear();
                 self.selected = None;
@@ -518,6 +543,11 @@ impl CatalogState {
             _ => return false,
         }
         true
+    }
+
+    fn reset_transfer_progress(&mut self) {
+        self.transfer_estimate.reset();
+        self.progress_readout = None;
     }
 
     fn clear_results(&mut self) {
@@ -537,16 +567,6 @@ impl CatalogEvent {
             | Self::Progress { generation, .. }
             | Self::Completed { generation, .. }
             | Self::Failed { generation, .. } => *generation,
-        }
-    }
-}
-
-impl TransferStage {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Transferring => "Downloading",
-            Self::Verifying => "Verifying",
-            Self::Publishing => "Publishing",
         }
     }
 }
@@ -576,6 +596,8 @@ fn format_size(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::{CandidateItem, CatalogEvent, CatalogState, RepositoryItem};
 
     fn repositories(count: usize) -> Vec<RepositoryItem> {
@@ -812,6 +834,9 @@ mod tests {
             }
         );
         assert_eq!(state.status_label(), "Preparing model-1.gguf…");
+        let resolving = state.progress_readout().unwrap();
+        assert_eq!(resolving.headline(), "Preparing model-1.gguf…");
+        assert_eq!(resolving.detail(), None);
 
         assert!(state.apply(CatalogEvent::Progress {
             generation: 1,
@@ -830,7 +855,103 @@ mod tests {
         }));
         assert_eq!(state.status_label(), "Already installed");
         assert_eq!(state.progress_fraction(), None);
+        assert!(state.progress_readout().is_none());
         assert!(!state.can_pause());
+    }
+
+    #[test]
+    fn progress_readout_uses_literal_time_and_current_session_delta() {
+        use super::TransferStage;
+
+        let start = Instant::now();
+        let mut state = ready_candidates();
+        assert!(state.select_candidate(0));
+        assert!(state.start_transfer().is_some());
+
+        assert!(state.apply_at(
+            CatalogEvent::Progress {
+                generation: 1,
+                stage: TransferStage::Transferring,
+                transferred_bytes: 15_900_000,
+                total_bytes: 88_200_000,
+            },
+            start,
+        ));
+        let first = state
+            .progress_readout()
+            .expect("active transfer progress has a compact readout");
+        assert_eq!(first.headline(), "18% · 15.9 MB of 88.2 MB");
+        assert_eq!(first.detail(), None);
+
+        assert!(state.apply_at(
+            CatalogEvent::Progress {
+                generation: 1,
+                stage: TransferStage::Transferring,
+                transferred_bytes: 20_900_000,
+                total_bytes: 88_200_000,
+            },
+            start + Duration::from_secs(1),
+        ));
+        assert_eq!(
+            state
+                .progress_readout()
+                .and_then(|readout| readout.detail()),
+            Some("5.0 MB/s · 14s remaining")
+        );
+    }
+
+    #[test]
+    fn zero_total_static_stages_and_pause_have_truthful_readouts() {
+        use super::TransferStage;
+
+        let start = Instant::now();
+        let mut state = ready_candidates();
+        assert!(state.select_candidate(0));
+        assert!(state.start_transfer().is_some());
+
+        assert!(state.apply_at(
+            CatalogEvent::Progress {
+                generation: 1,
+                stage: TransferStage::Transferring,
+                transferred_bytes: 500_000,
+                total_bytes: 0,
+            },
+            start,
+        ));
+        let unknown_total = state.progress_readout().unwrap();
+        assert_eq!(unknown_total.headline(), "Downloading · 500.0 KB");
+        assert_eq!(unknown_total.detail(), None);
+
+        assert!(state.apply_at(
+            CatalogEvent::Progress {
+                generation: 1,
+                stage: TransferStage::Verifying,
+                transferred_bytes: 88_200_000,
+                total_bytes: 88_200_000,
+            },
+            start + Duration::from_secs(1),
+        ));
+        let verifying = state.progress_readout().unwrap();
+        assert_eq!(verifying.headline(), "Verifying download…");
+        assert_eq!(verifying.detail(), None);
+
+        assert!(state.apply_at(
+            CatalogEvent::Progress {
+                generation: 1,
+                stage: TransferStage::Publishing,
+                transferred_bytes: 88_200_000,
+                total_bytes: 88_200_000,
+            },
+            start + Duration::from_secs(2),
+        ));
+        let publishing = state.progress_readout().unwrap();
+        assert_eq!(publishing.headline(), "Finishing installation…");
+        assert_eq!(publishing.detail(), None);
+
+        assert!(state.request_pause());
+        let pausing = state.progress_readout().unwrap();
+        assert_eq!(pausing.headline(), "Pausing transfer…");
+        assert_eq!(pausing.detail(), None);
     }
 
     #[test]
@@ -945,9 +1066,9 @@ mod tests {
         use super::{CatalogTransferDisposition, TransferStage};
 
         for (stage, expected) in [
-            (TransferStage::Transferring, "Downloading 1 of 2 bytes"),
-            (TransferStage::Verifying, "Verifying 1 of 2 bytes"),
-            (TransferStage::Publishing, "Publishing 1 of 2 bytes"),
+            (TransferStage::Transferring, "50% · 1 bytes of 2 bytes"),
+            (TransferStage::Verifying, "Verifying download…"),
+            (TransferStage::Publishing, "Finishing installation…"),
         ] {
             let mut state = ready_candidates();
             assert!(state.select_candidate(0));
