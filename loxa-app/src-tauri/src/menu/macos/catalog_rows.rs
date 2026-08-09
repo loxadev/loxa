@@ -35,6 +35,7 @@ pub(super) struct CatalogContent {
     pub(super) view: Retained<NSView>,
     pub(super) height: f64,
     pub(super) search: Retained<NSSearchField>,
+    transfer_card: Option<TransferCard>,
     #[cfg(test)]
     pub(super) action_buttons: Vec<Retained<NSButton>>,
     #[cfg(test)]
@@ -47,7 +48,15 @@ pub(super) struct CatalogContent {
 
 pub(super) struct SearchFocus {
     window: Retained<NSWindow>,
+    text: String,
     selected_range: NSRange,
+}
+
+struct TransferCard {
+    headline: Retained<NSTextField>,
+    detail: Option<Retained<NSTextField>>,
+    progress: Option<Retained<NSProgressIndicator>>,
+    pause: Option<Retained<NSButton>>,
 }
 
 impl CatalogContent {
@@ -56,17 +65,65 @@ impl CatalogContent {
         let window = self.search.window()?;
         Some(SearchFocus {
             window,
+            text: self.search.stringValue().to_string(),
             selected_range: editor.selectedRange(),
         })
     }
 
     pub(super) fn restore_search_focus(&self, focus: SearchFocus) {
+        self.search.setStringValue(&NSString::from_str(&focus.text));
         if !focus.window.makeFirstResponder(Some(&self.search)) {
             return;
         }
         if let Some(editor) = self.search.currentEditor() {
             editor.setSelectedRange(focus.selected_range);
         }
+    }
+
+    pub(super) fn prepare_for_replacement(&self) {
+        // NSSearchField may still have a delayed edit action queued while it is
+        // first responder. Detach that outgoing target/action pair before AppKit
+        // removes the control so replacement cannot synchronously re-enter Loxa.
+        unsafe {
+            self.search.setAction(None);
+            self.search.setTarget(None);
+        }
+    }
+
+    pub(super) fn update_transfer(&self, previous: &CatalogState, current: &CatalogState) -> bool {
+        if previous.generation() != current.generation()
+            || previous.mode() != CatalogMode::Transferring
+            || current.mode() != CatalogMode::Transferring
+        {
+            return false;
+        }
+        let Some(card) = &self.transfer_card else {
+            return false;
+        };
+        let readout = current.progress_readout();
+        let detail = readout.and_then(|readout| readout.detail());
+        let fraction = current.progress_fraction();
+        if card.detail.is_some() != detail.is_some()
+            || card.progress.is_some() != fraction.is_some()
+            || card.pause.is_some() != current.can_pause()
+        {
+            return false;
+        }
+
+        let headline = readout
+            .map(|readout| readout.headline().to_owned())
+            .unwrap_or_else(|| current.status_label());
+        card.headline.setStringValue(&NSString::from_str(&headline));
+        card.headline
+            .setToolTip(Some(&NSString::from_str(&headline)));
+        if let (Some(label), Some(detail)) = (&card.detail, detail) {
+            label.setStringValue(&NSString::from_str(detail));
+            label.setToolTip(Some(&NSString::from_str(detail)));
+        }
+        if let (Some(progress), Some(fraction)) = (&card.progress, fraction) {
+            progress.setDoubleValue(fraction);
+        }
+        true
     }
 }
 
@@ -110,6 +167,7 @@ pub(super) fn build(
     let mut primary_labels = Vec::new();
     #[cfg(test)]
     let mut secondary_labels = Vec::new();
+    let mut transfer_card = None;
 
     let search_row = row(&mut next_y, SEARCH_HEIGHT, mtm);
     let search = NSSearchField::new(mtm);
@@ -211,14 +269,17 @@ pub(super) fn build(
         headline.setToolTip(Some(&NSString::from_str(&headline_text)));
         transfer_row.addSubview(&headline);
 
-        if let Some(detail_text) = readout.and_then(|readout| readout.detail()) {
-            let detail = secondary_label(detail_text, mtm);
-            detail.setFrame(rect(INSET, 40.0, WIDTH - 2.0 * INSET, 16.0));
-            detail.setToolTip(Some(&NSString::from_str(detail_text)));
-            transfer_row.addSubview(&detail);
-        }
+        let detail = readout
+            .and_then(|readout| readout.detail())
+            .map(|detail_text| {
+                let detail = secondary_label(detail_text, mtm);
+                detail.setFrame(rect(INSET, 40.0, WIDTH - 2.0 * INSET, 16.0));
+                detail.setToolTip(Some(&NSString::from_str(detail_text)));
+                transfer_row.addSubview(&detail);
+                detail
+            });
 
-        if let Some(fraction) = state.progress_fraction() {
+        let progress = state.progress_fraction().map(|fraction| {
             let progress = NSProgressIndicator::initWithFrame(
                 NSProgressIndicator::alloc(mtm),
                 rect(INSET, 30.0, WIDTH - 2.0 * INSET, 8.0),
@@ -229,9 +290,10 @@ pub(super) fn build(
             progress.setDoubleValue(fraction);
             progress.setStyle(NSProgressIndicatorStyle::Bar);
             transfer_row.addSubview(&progress);
-        }
+            progress
+        });
 
-        if state.can_pause() {
+        let pause = if state.can_pause() {
             let pause = text_button(
                 "Pause",
                 "Pause this model download",
@@ -242,8 +304,17 @@ pub(super) fn build(
             pause.setFrame(rect(WIDTH - INSET - 64.0, 2.0, 64.0, 28.0));
             transfer_row.addSubview(&pause);
             #[cfg(test)]
-            action_buttons.push(pause);
-        }
+            action_buttons.push(pause.clone());
+            Some(pause)
+        } else {
+            None
+        };
+        transfer_card = Some(TransferCard {
+            headline,
+            detail,
+            progress,
+            pause,
+        });
         root.addSubview(&transfer_row);
     } else if let Some(status_text) = state.browser_status() {
         let status_row = row(&mut next_y, STATUS_HEIGHT, mtm);
@@ -259,6 +330,7 @@ pub(super) fn build(
         view: root,
         height,
         search,
+        transfer_card,
         #[cfg(test)]
         action_buttons,
         #[cfg(test)]

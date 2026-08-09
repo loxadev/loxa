@@ -81,22 +81,26 @@ impl NativePopoverState {
     fn render(&mut self, target: &AnyObject, actions: Actions, mtm: MainThreadMarker) {
         let catalog_changed = self.rendered_catalog.as_ref() != Some(&self.catalog);
         let installed_changed = self.rendered_installed.as_ref() != Some(&*self.installed.borrow());
-        match (
-            catalog_changed || installed_changed,
-            self.snapshot.update_from(self.rendered.as_ref()),
-        ) {
-            (true, _) => self.rebuild(target, actions, mtm),
-            (false, MenuUpdate::Rebuild) => self.rebuild(target, actions, mtm),
-            (false, MenuUpdate::UpdateRetainedRows) => {
-                if let Some(rows) = &mut self.rows {
-                    #[cfg(test)]
-                    rows.update(&self.snapshot, &self.cancel);
-                    #[cfg(not(test))]
-                    rows.update(&self.snapshot);
-                } else {
-                    self.rebuild(target, actions, mtm);
-                }
-            }
+        let snapshot_update = self.snapshot.update_from(self.rendered.as_ref());
+        let catalog_updated_in_place = catalog_changed
+            && !installed_changed
+            && snapshot_update == MenuUpdate::UpdateRetainedRows
+            && self.rows.as_ref().is_some_and(|rows| {
+                self.rendered_catalog
+                    .as_ref()
+                    .is_some_and(|previous| rows.update_catalog_transfer(previous, &self.catalog))
+            });
+        let requires_rebuild = installed_changed
+            || snapshot_update == MenuUpdate::Rebuild
+            || (catalog_changed && !catalog_updated_in_place)
+            || self.rows.is_none();
+        if requires_rebuild {
+            self.rebuild(target, actions, mtm);
+        } else if let Some(rows) = &mut self.rows {
+            #[cfg(test)]
+            rows.update(&self.snapshot, &self.cancel);
+            #[cfg(not(test))]
+            rows.update(&self.snapshot);
         }
         self.rendered = Some(self.snapshot.clone());
         self.rendered_catalog = Some(self.catalog.clone());
@@ -116,6 +120,9 @@ impl NativePopoverState {
                 mtm,
             )
         };
+        if let Some(rows) = &self.rows {
+            rows.prepare_for_replacement();
+        }
         self.popover.setContentSize(view.frame().size);
         self.content_view_controller.setView(&view);
         if let Some(search_focus) = search_focus {

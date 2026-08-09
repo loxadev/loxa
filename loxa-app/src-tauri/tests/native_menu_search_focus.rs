@@ -28,7 +28,7 @@ mod menu {
         pub(crate) fn assert_search_focus_survives_result_rebuild(mtm: objc2::MainThreadMarker) {
             use objc2::MainThreadOnly;
             use objc2_app_kit::NSWindow;
-            use objc2_foundation::NSRange;
+            use objc2_foundation::{NSRange, NSString};
 
             use crate::menu::catalog::{CatalogEvent, CatalogState, RepositoryItem};
 
@@ -44,6 +44,8 @@ mod menu {
                 window.makeFirstResponder(Some(&first.search)),
                 "the test window must begin editing the product search field"
             );
+            let draft = "bartowski/qwen";
+            first.search.setStringValue(&NSString::from_str(draft));
             let selected = NSRange::new(2, 4);
             first
                 .search
@@ -73,6 +75,11 @@ mod menu {
                     .selectedRange(),
                 selected,
                 "the replacement field editor must retain the nontrivial selection"
+            );
+            assert_eq!(
+                replacement.search.stringValue().to_string(),
+                draft,
+                "an unsent draft must survive an unavoidable result rebuild"
             );
         }
 

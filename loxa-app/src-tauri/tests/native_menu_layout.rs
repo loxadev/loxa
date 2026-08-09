@@ -719,7 +719,98 @@ mod menu {
                 "/src/menu/macos/controller.rs"
             ));
 
+            use std::cell::Cell;
+            use std::time::Duration;
+
             use objc2::AnyThread as _;
+            use objc2_app_kit::{NSProgressIndicator, NSView, NSWindow};
+            use objc2_foundation::NSRange;
+
+            struct SearchActionTargetIvars {
+                borrow: RefCell<()>,
+                calls: Cell<usize>,
+                borrow_conflicts: Cell<usize>,
+            }
+
+            define_class!(
+                #[unsafe(super = NSObject)]
+                #[name = "LoxaSearchActionTargetFixture"]
+                #[thread_kind = MainThreadOnly]
+                #[ivars = SearchActionTargetIvars]
+                struct SearchActionTarget;
+
+                unsafe impl NSObjectProtocol for SearchActionTarget {}
+
+                impl SearchActionTarget {
+                    #[unsafe(method(delayedSearch:))]
+                    fn delayed_search(&self, _sender: Option<&NSSearchField>) {
+                        let ivars = self.ivars();
+                        ivars.calls.set(ivars.calls.get() + 1);
+                        if ivars.borrow.try_borrow_mut().is_err() {
+                            ivars
+                                .borrow_conflicts
+                                .set(ivars.borrow_conflicts.get() + 1);
+                        }
+                    }
+                }
+            );
+
+            impl SearchActionTarget {
+                fn new(mtm: MainThreadMarker) -> Retained<Self> {
+                    let this = Self::alloc(mtm).set_ivars(SearchActionTargetIvars {
+                        borrow: RefCell::new(()),
+                        calls: Cell::new(0),
+                        borrow_conflicts: Cell::new(0),
+                    });
+                    // SAFETY: NSObject's init selector has the expected signature.
+                    unsafe { msg_send![super(this), init] }
+                }
+            }
+
+            struct ReplacementControllerIvars {
+                outgoing_search: RefCell<Option<Retained<NSSearchField>>>,
+            }
+
+            define_class!(
+                #[unsafe(super(NSViewController))]
+                #[name = "LoxaReplacementControllerFixture"]
+                #[thread_kind = MainThreadOnly]
+                #[ivars = ReplacementControllerIvars]
+                struct ReplacementController;
+
+                unsafe impl NSObjectProtocol for ReplacementController {}
+
+                impl ReplacementController {
+                    #[unsafe(method(setView:))]
+                    fn set_view(&self, view: &NSView) {
+                        if let Some(search) = self.ivars().outgoing_search.borrow().as_ref() {
+                            let action = search.action();
+                            let target = search.target();
+                            // SAFETY: the fixture only forwards the exact target/action pair
+                            // installed by the product search field.
+                            unsafe {
+                                search.sendAction_to(action, target.as_deref());
+                            }
+                        }
+                        // SAFETY: NSViewController implements setView: with this exact ABI.
+                        unsafe { msg_send![super(self), setView: view] }
+                    }
+                }
+            );
+
+            impl ReplacementController {
+                fn new(mtm: MainThreadMarker) -> Retained<Self> {
+                    let this = Self::alloc(mtm).set_ivars(ReplacementControllerIvars {
+                        outgoing_search: RefCell::new(None),
+                    });
+                    // SAFETY: NSViewController's init selector has the expected signature.
+                    unsafe { msg_send![super(this), init] }
+                }
+
+                fn arm_delayed_action(&self, search: Retained<NSSearchField>) {
+                    *self.ivars().outgoing_search.borrow_mut() = Some(search);
+                }
+            }
 
             pub(crate) fn assert_feedback_close_rebuild_contract(mtm: MainThreadMarker) {
                 // SAFETY: this inert status item is only retained to satisfy the
@@ -771,6 +862,193 @@ mod menu {
                     !super::rows::visible_text_values(&content_view_controller.view())
                         .contains(&"Chat command copied".into())
                 );
+            }
+
+            pub(crate) fn assert_rebuild_detaches_outgoing_search_action(mtm: MainThreadMarker) {
+                let target = SearchActionTarget::new(mtm);
+                let controller = ReplacementController::new(mtm);
+                let controller_base = controller.clone().into_super();
+                let mut state = native_state(controller_base, Fixture::Installed, mtm);
+                let mut actions = action_selectors();
+                actions.search = sel!(delayedSearch:);
+                state.render(&target, actions, mtm);
+                let outgoing = state
+                    .rows
+                    .as_ref()
+                    .expect("the initial render retains its rows")
+                    .search_field();
+                controller.arm_delayed_action(outgoing);
+
+                let generation = state
+                    .catalog
+                    .submit_search("bartowski")
+                    .expect("a valid query forces a result-layout rebuild")
+                    .generation();
+                assert_eq!(generation, 1);
+                let _borrow = target.ivars().borrow.borrow_mut();
+                state.render(&target, actions, mtm);
+
+                assert_eq!(
+                    target.ivars().calls.get(),
+                    0,
+                    "replacing an outgoing search field must not deliver its delayed action"
+                );
+                assert_eq!(
+                    target.ivars().borrow_conflicts.get(),
+                    0,
+                    "replacement must not re-enter an already borrowed menu target"
+                );
+                let replacement = state
+                    .rows
+                    .as_ref()
+                    .expect("the replacement retains its rows")
+                    .search_field();
+                assert_eq!(replacement.action(), Some(sel!(delayedSearch:)));
+                assert!(replacement.target().is_some_and(|installed| {
+                    Retained::as_ptr(&installed).cast::<()>()
+                        == Retained::as_ptr(&target).cast::<()>()
+                }));
+            }
+
+            pub(crate) fn assert_progress_updates_retain_active_search(mtm: MainThreadMarker) {
+                let controller = NSViewController::new(mtm);
+                let mut state = native_state(controller.clone(), Fixture::Installed, mtm);
+                let (catalog, progress_start) = transferring_catalog();
+                state.catalog = catalog;
+                let target = NSObject::new();
+                state.render(&target, action_selectors(), mtm);
+
+                let window = unsafe { NSWindow::init(NSWindow::alloc(mtm)) };
+                window.setContentView(Some(&controller.view()));
+                let before_search = state
+                    .rows
+                    .as_ref()
+                    .expect("the first progress render retains its rows")
+                    .search_field();
+                assert!(window.makeFirstResponder(Some(&before_search)));
+                before_search.setStringValue(&NSString::from_str("draft search text"));
+                let before_editor = before_search
+                    .currentEditor()
+                    .expect("the active search owns a field editor");
+                let selected = NSRange::new(3, 6);
+                before_editor.setSelectedRange(selected);
+
+                let generation = state.catalog.generation();
+                assert!(state.catalog.apply_at(
+                    crate::menu::catalog::CatalogEvent::Progress {
+                        generation,
+                        stage: crate::menu::catalog::TransferStage::Transferring,
+                        transferred_bytes: 25_900_000,
+                        total_bytes: 88_200_000,
+                    },
+                    progress_start + Duration::from_secs(2),
+                ));
+                state.render(&target, action_selectors(), mtm);
+
+                let after_search = state
+                    .rows
+                    .as_ref()
+                    .expect("the updated progress render retains its rows")
+                    .search_field();
+                let after_editor = after_search
+                    .currentEditor()
+                    .expect("the retained search keeps its field editor");
+                assert!(
+                    std::ptr::eq(&*before_search, &*after_search),
+                    "same-shape progress must retain the exact NSSearchField"
+                );
+                assert!(
+                    std::ptr::eq(&*before_editor, &*after_editor),
+                    "same-shape progress must retain the exact field editor"
+                );
+                assert_eq!(after_search.stringValue().to_string(), "draft search text");
+                assert_eq!(after_editor.selectedRange(), selected);
+                assert_eq!(after_search.action(), Some(sel!(submitSearch:)));
+                assert!(after_search.target().is_some_and(|installed| {
+                    Retained::as_ptr(&installed).cast::<()>()
+                        == Retained::as_ptr(&target).cast::<()>()
+                }));
+
+                let view = controller.view();
+                let visible = super::rows::visible_text_values(&view);
+                assert!(visible.contains(&"29% · 25.9 MB of 88.2 MB".into()));
+                assert!(
+                    visible.contains(&"5.0 MB/s · 13s remaining".into()),
+                    "visible transfer text: {visible:?}"
+                );
+                assert_eq!(
+                    progress_value(&view),
+                    Some(25_900_000.0 / 88_200_000.0),
+                    "the retained progress indicator must receive the latest fraction"
+                );
+            }
+
+            fn native_state(
+                content_view_controller: Retained<NSViewController>,
+                fixture: Fixture,
+                mtm: MainThreadMarker,
+            ) -> NativePopoverState {
+                // SAFETY: this inert status item is only retained to satisfy the
+                // controller state shape; the fixture never displays it.
+                let status_item: Retained<NSStatusItem> =
+                    unsafe { msg_send![NSStatusItem::alloc(), init] };
+                let popover = NSPopover::new(mtm);
+                popover.setContentViewController(Some(&content_view_controller));
+                NativePopoverState::new(status_item, popover, content_view_controller, fixture)
+            }
+
+            fn transferring_catalog() -> (crate::menu::catalog::CatalogState, Instant) {
+                use crate::menu::catalog::{CandidateItem, CatalogEvent, RepositoryItem};
+
+                let mut catalog = crate::menu::catalog::CatalogState::default();
+                let generation = catalog.submit_search("models").unwrap().generation();
+                assert!(catalog.apply(CatalogEvent::Repositories {
+                    generation,
+                    repositories: vec![RepositoryItem::new("owner/model".into(), None)],
+                }));
+                let inspect = catalog.inspect_repository(0).unwrap();
+                assert!(catalog.apply(CatalogEvent::Candidates {
+                    generation: inspect.generation(),
+                    repo: "owner/model".into(),
+                    revision: "0123456789abcdef0123456789abcdef01234567".into(),
+                    candidates: vec![CandidateItem::new("model-q4.gguf".into(), Some(88_200_000),)],
+                }));
+                assert!(catalog.select_candidate(0));
+                assert!(catalog.start_transfer().is_some());
+                let progress_start = Instant::now();
+                assert!(catalog.apply_at(
+                    CatalogEvent::Progress {
+                        generation,
+                        stage: crate::menu::catalog::TransferStage::Transferring,
+                        transferred_bytes: 15_900_000,
+                        total_bytes: 88_200_000,
+                    },
+                    progress_start,
+                ));
+                assert!(catalog.apply_at(
+                    CatalogEvent::Progress {
+                        generation,
+                        stage: crate::menu::catalog::TransferStage::Transferring,
+                        transferred_bytes: 20_900_000,
+                        total_bytes: 88_200_000,
+                    },
+                    progress_start + Duration::from_secs(1),
+                ));
+                (catalog, progress_start)
+            }
+
+            fn progress_value(view: &NSView) -> Option<f64> {
+                for child in view.subviews() {
+                    match child.downcast::<NSProgressIndicator>() {
+                        Ok(progress) => return Some(progress.doubleValue()),
+                        Err(child) => {
+                            if let Some(value) = progress_value(&child) {
+                                return Some(value);
+                            }
+                        }
+                    }
+                }
+                None
             }
         }
 
@@ -831,6 +1109,8 @@ fn main() {
     let mtm = objc2::MainThreadMarker::new()
         .expect("native popover layout coverage must run on the main thread");
     menu::macos::rows::assert_native_layout_contract(mtm);
+    menu::macos::controller::assert_progress_updates_retain_active_search(mtm);
+    menu::macos::controller::assert_rebuild_detaches_outgoing_search_action(mtm);
     menu::macos::assert_native_timer_contract(mtm);
 }
 

@@ -227,6 +227,24 @@ impl MenuRows {
         self.catalog.restore_search_focus(focus);
     }
 
+    pub(super) fn prepare_for_replacement(&self) {
+        self.catalog.prepare_for_replacement();
+    }
+
+    pub(super) fn update_catalog_transfer(
+        &self,
+        previous: &CatalogState,
+        current: &CatalogState,
+    ) -> bool {
+        self.catalog.update_transfer(previous, current)
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)] // Read by the include-based native integration harness.
+    pub(super) fn search_field(&self) -> Retained<objc2_app_kit::NSSearchField> {
+        self.catalog.search.clone()
+    }
+
     pub(super) fn update(
         &mut self,
         snapshot: &MenuSnapshot,
