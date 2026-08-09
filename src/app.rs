@@ -370,27 +370,35 @@ fn published_bundle_snapshot(models_root: &Path, manifest: &Manifest) -> BundleS
         return BundleSnapshot::Unavailable(BundleUnavailableReason::Invalid);
     };
     let primary = manifest.primary_artifact();
-    if crate::download::verify_regular(
-        &models_root.join(&manifest.id).join(primary.local_filename),
-        primary.size,
-        primary.sha256,
+    let model_dir = models_root.join(&manifest.id);
+    let model_lock = match catalog::ModelLock::acquire_existing(&model_dir) {
+        Ok(model_lock) => model_lock,
+        Err(catalog::ModelLockError::Busy) => {
+            return BundleSnapshot::Unavailable(BundleUnavailableReason::Busy);
+        }
+        Err(catalog::ModelLockError::Missing | catalog::ModelLockError::UnsafeLocalState) => {
+            return BundleSnapshot::Unavailable(BundleUnavailableReason::Invalid);
+        }
+    };
+    let primary_path = model_dir.join(primary.local_filename);
+    let draft_path = manifest
+        .draft_artifact()
+        .map(|draft| model_dir.join(draft.local_filename));
+    if crate::verification::verify_or_refresh(
+        &model_lock,
+        &model_dir,
+        manifest,
+        &primary_path,
+        draft_path.as_deref(),
+        || crate::verification::verify_artifacts(manifest, &primary_path, draft_path.as_deref()),
     )
     .is_err()
     {
         return BundleSnapshot::Unavailable(BundleUnavailableReason::Invalid);
     }
-    let Some(draft) = manifest.draft_artifact() else {
+    let Some(_draft) = manifest.draft_artifact() else {
         return partial_from_bytes(primary.size, bundle.total_bytes());
     };
-    if crate::download::verify_regular(
-        &models_root.join(&manifest.id).join(draft.local_filename),
-        draft.size,
-        draft.sha256,
-    )
-    .is_err()
-    {
-        return BundleSnapshot::Unavailable(BundleUnavailableReason::Invalid);
-    }
     BundleSnapshot::Verified(VerifiedBundle {
         target_bytes: bundle.target_bytes,
         draft_bytes: bundle.draft_bytes,
@@ -524,10 +532,11 @@ mod tests {
     #[cfg(unix)]
     use super::{destination_free_bytes_for_mounts, existing_destination_ancestor};
     use super::{
-        AppService, AppSnapshot, BundleSnapshot, BundleUnavailableReason, DownloadSnapshot,
-        InstalledModelSummary, PartialBundle, PausedDownload, RecommendationAvailability,
-        RecommendationSnapshot, RecommendationUnavailableReason, RecommendedBundle, ResourceBudget,
-        RuntimeInventorySnapshot, RuntimeSnapshot, SnapshotReader, VerifiedBundle,
+        observe_bundle, AppService, AppSnapshot, BundleSnapshot, BundleUnavailableReason,
+        DownloadSnapshot, InstalledModelSummary, PartialBundle, PausedDownload,
+        RecommendationAvailability, RecommendationSnapshot, RecommendationUnavailableReason,
+        RecommendedBundle, ResourceBudget, RuntimeInventorySnapshot, RuntimeSnapshot,
+        SnapshotReader, VerifiedBundle,
     };
     use crate::catalog::{
         Artifact, ArtifactProvenance, ArtifactRole, Manifest, Origin, RuntimeQualification,
@@ -603,6 +612,7 @@ mod tests {
     fn write_bundle_artifacts(models_root: &Path, manifest: &Manifest) {
         let model_dir = models_root.join(&manifest.id);
         fs::create_dir_all(&model_dir).unwrap();
+        fs::write(model_dir.join(".lock"), b"").unwrap();
         fs::write(model_dir.join("model.gguf"), b"test target").unwrap();
         fs::write(model_dir.join("draft.gguf"), b"test draft").unwrap();
     }
@@ -847,6 +857,60 @@ mod tests {
         assert_send_sync::<PausedDownload>();
         assert_send_sync::<RuntimeSnapshot>();
         assert_send_sync::<RuntimeInventorySnapshot>();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn published_snapshot_verifies_missing_receipt_once_then_uses_metadata_only() {
+        let root = tempdir().unwrap();
+        let paths = test_paths(root.path());
+        let manifest = test_bundle_manifest();
+        write_bundle_artifacts(&paths.models, &manifest);
+        crate::catalog::publish_manifest(&paths.models, &manifest).unwrap();
+        crate::download::reset_content_hash_count();
+
+        assert!(matches!(
+            observe_bundle(&paths.models),
+            BundleSnapshot::Verified(_)
+        ));
+        assert_eq!(crate::download::content_hash_count(), 2);
+
+        assert!(matches!(
+            observe_bundle(&paths.models),
+            BundleSnapshot::Verified(_)
+        ));
+        assert_eq!(crate::download::content_hash_count(), 2);
+
+        let primary = paths.models.join(&manifest.id).join("model.gguf");
+        let replacement = paths.models.join(&manifest.id).join("replacement.gguf");
+        fs::write(&replacement, b"bad target!").unwrap();
+        fs::rename(&replacement, &primary).unwrap();
+        assert_eq!(
+            observe_bundle(&paths.models),
+            BundleSnapshot::Unavailable(BundleUnavailableReason::Invalid)
+        );
+        assert_eq!(crate::download::content_hash_count(), 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn published_snapshot_reports_a_held_runtime_lock_as_busy_without_hashing() {
+        let root = tempdir().unwrap();
+        let paths = test_paths(root.path());
+        let manifest = test_bundle_manifest();
+        write_bundle_artifacts(&paths.models, &manifest);
+        crate::catalog::publish_manifest(&paths.models, &manifest).unwrap();
+        let model_dir = paths.models.join(&manifest.id);
+        let runtime_lock = crate::catalog::ModelLock::acquire(&model_dir).unwrap();
+        crate::download::reset_content_hash_count();
+
+        assert_eq!(
+            super::published_bundle_snapshot(&paths.models, &manifest),
+            BundleSnapshot::Unavailable(BundleUnavailableReason::Busy)
+        );
+        assert_eq!(crate::download::content_hash_count(), 0);
+        assert!(!model_dir.join("verification-receipt.json").exists());
+        drop(runtime_lock);
     }
 
     #[test]

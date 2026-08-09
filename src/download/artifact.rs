@@ -15,6 +15,11 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+thread_local! {
+    static CONTENT_HASH_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub(super) enum ArtifactTransferError {
     RemoteBeforeBody(TransferError),
     Transfer(TransferError),
@@ -2074,9 +2079,14 @@ pub(crate) struct VerifiedRegularFile {
     file: File,
     identity: RegularFileIdentity,
     path: PathBuf,
+    sha256: String,
 }
 
 impl VerifiedRegularFile {
+    pub(crate) fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
     pub(crate) fn revalidate_for(&self, expected_path: &Path) -> Result<fs::Metadata, String> {
         if self.path != expected_path {
             return Err("verified model artifact path mismatch".into());
@@ -2102,6 +2112,57 @@ impl VerifiedRegularFile {
             .metadata()
             .map_err(|error| format!("{}: {error}", expected_path.display()))
     }
+
+    pub(crate) fn proves(
+        &self,
+        expected_path: &Path,
+        expected_size: u64,
+        expected_sha256: &str,
+    ) -> Result<(), String> {
+        if self.sha256 != expected_sha256.to_ascii_lowercase() {
+            return Err("verified model artifact checksum proof mismatch".into());
+        }
+        let metadata = self.revalidate_for(expected_path)?;
+        if metadata.len() != expected_size {
+            return Err(format!(
+                "invalid model artifact {}",
+                expected_path.display()
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn rebind_after_rename(mut self, destination: &Path) -> Result<Self, String> {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let resolved = options
+            .open(destination)
+            .map_err(|error| format!("{}: {error}", destination.display()))?;
+        let current = regular_file_identity(&self.file, destination)
+            .map_err(|error| format!("{}: {error}", destination.display()))?;
+        if !self.identity.same_file_after_rename(&current) {
+            return Err(format!(
+                "model artifact changed while moving {}",
+                destination.display()
+            ));
+        }
+        ensure_regular_descriptors_match(&self.file, &current, &resolved, destination).map_err(
+            |_| {
+                format!(
+                    "model artifact changed after moving {}",
+                    destination.display()
+                )
+            },
+        )?;
+        self.identity = current;
+        self.path = destination.to_owned();
+        Ok(self)
+    }
 }
 
 pub(crate) fn verify_regular_captured(
@@ -2118,6 +2179,45 @@ pub(crate) fn verify_regular_captured(
 
 pub(crate) fn verify_regular(path: &Path, size: u64, sha256: &str) -> Result<(), String> {
     verify_regular_captured(path, size, sha256).map(|_| ())
+}
+
+pub(crate) fn hash_local_gguf_captured(
+    directory: &File,
+    directory_identity: &DirectoryIdentity,
+    directory_path: &Path,
+    path: &Path,
+    size: u64,
+) -> Result<VerifiedRegularFile, String> {
+    if path.parent() != Some(directory_path) {
+        return Err(format!("unsafe local GGUF candidate {}", path.display()));
+    }
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("unsafe local GGUF candidate {}", path.display()))?;
+    ensure_directory_descriptor_matches_path(directory, directory_identity, directory_path)
+        .map_err(|error| format!("{}: {error}", directory_path.display()))?;
+    let mut file = open_regular_entry(directory, name, path)?;
+    let opened = regular_file_identity(&file, path).map_err(|error| error.to_string())?;
+    if file.metadata().map_err(|error| error.to_string())?.len() != size || size <= 8 {
+        return Err(format!("unsafe local GGUF candidate {}", path.display()));
+    }
+    let actual = hash_descriptor(&mut file, path, true, &|| false)?
+        .ok_or_else(|| "artifact verification interrupted".to_string())?;
+    let resolved = open_regular_entry(directory, name, path)?;
+    ensure_regular_descriptors_match(&file, &opened, &resolved, path).map_err(|_| {
+        format!(
+            "local GGUF candidate changed while hashing {}",
+            path.display()
+        )
+    })?;
+    ensure_directory_descriptor_matches_path(directory, directory_identity, directory_path)
+        .map_err(|error| format!("{}: {error}", directory_path.display()))?;
+    Ok(VerifiedRegularFile {
+        file,
+        identity: opened,
+        path: path.to_owned(),
+        sha256: actual,
+    })
 }
 
 #[derive(Debug)]
@@ -2172,18 +2272,9 @@ where
             .map_err(|_| format!("model artifact changed before hashing {}", path.display()))?;
     }
     observer(path)?;
-    let mut hash = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        if should_pause() {
-            return Ok(VerificationOutcome::Interrupted);
-        }
-        let read = file.read(&mut buffer).map_err(|error| error.to_string())?;
-        if read == 0 {
-            break;
-        }
-        hash.update(&buffer[..read]);
-    }
+    let Some(actual) = hash_descriptor(&mut file, path, false, should_pause)? else {
+        return Ok(VerificationOutcome::Interrupted);
+    };
     let mut resolved_options = OpenOptions::new();
     resolved_options.read(true);
     #[cfg(unix)]
@@ -2196,7 +2287,6 @@ where
         .map_err(|error| format!("{}: {error}", path.display()))?;
     ensure_regular_descriptors_match(&file, &opened, &resolved, path)
         .map_err(|_| format!("model artifact changed while hashing {}", path.display()))?;
-    let actual = hex(hash.finalize().as_ref());
     if actual != sha256.to_ascii_lowercase() {
         return Ok(VerificationOutcome::ChecksumMismatch);
     }
@@ -2204,7 +2294,89 @@ where
         file,
         identity: opened,
         path: path.to_owned(),
+        sha256: actual,
     }))
+}
+
+fn hash_descriptor(
+    file: &mut File,
+    path: &Path,
+    require_gguf: bool,
+    should_pause: &impl Fn() -> bool,
+) -> Result<Option<String>, String> {
+    #[cfg(test)]
+    CONTENT_HASH_COUNT.with(|count| count.set(count.get() + 1));
+    let mut hash = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut first = true;
+    loop {
+        if should_pause() {
+            return Ok(None);
+        }
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        if first && require_gguf {
+            if read < 8 {
+                return Err(format!("unsupported GGUF header {}", path.display()));
+            }
+            let version = u32::from_le_bytes(
+                buffer[4..8]
+                    .try_into()
+                    .expect("GGUF version prefix has four bytes"),
+            );
+            if &buffer[..4] != b"GGUF" || !matches!(version, 2 | 3) {
+                return Err(format!("unsupported GGUF header {}", path.display()));
+            }
+        }
+        first = false;
+        hash.update(&buffer[..read]);
+    }
+    Ok(Some(hex(hash.finalize().as_ref())))
+}
+
+#[cfg(test)]
+pub(crate) fn reset_content_hash_count() {
+    CONTENT_HASH_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn content_hash_count() -> usize {
+    CONTENT_HASH_COUNT.with(std::cell::Cell::get)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn open_regular_entry(
+    directory: &File,
+    name: &std::ffi::OsStr,
+    path: &Path,
+) -> Result<File, String> {
+    use rustix::fs::{openat, Mode, OFlags};
+
+    let descriptor = openat(
+        directory,
+        name,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(|error| format!("{}: {error}", path.display()))?;
+    Ok(File::from(descriptor))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn open_regular_entry(
+    _directory: &File,
+    _name: &std::ffi::OsStr,
+    path: &Path,
+) -> Result<File, String> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    options
+        .open(path)
+        .map_err(|error| format!("{}: {error}", path.display()))
 }
 
 pub(super) fn hex(bytes: &[u8]) -> String {
@@ -2287,6 +2459,96 @@ fn validate_content_range(value: Option<&str>, offset: u64, total: u64) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn captured_verification_is_bound_to_the_canonical_digest_and_size() {
+        let root = tempfile::tempdir().unwrap();
+        let artifact = root.path().join("model.gguf");
+        let bytes = b"verified artifact";
+        std::fs::write(&artifact, bytes).unwrap();
+        let checksum = hex(Sha256::digest(bytes).as_ref());
+        let verified = verify_regular_captured(&artifact, bytes.len() as u64, &checksum).unwrap();
+
+        assert!(verified
+            .proves(&artifact, bytes.len() as u64, &checksum)
+            .is_ok());
+        assert!(verified
+            .proves(&artifact, bytes.len() as u64 + 1, &checksum)
+            .is_err());
+        assert!(verified
+            .proves(&artifact, bytes.len() as u64, &"f".repeat(64))
+            .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_verification_can_rebind_only_the_same_file_after_rename() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.gguf");
+        let destination = root.path().join("destination.gguf");
+        let bytes = b"verified artifact";
+        std::fs::write(&source, bytes).unwrap();
+        let checksum = hex(Sha256::digest(bytes).as_ref());
+        let verified = verify_regular_captured(&source, bytes.len() as u64, &checksum).unwrap();
+
+        std::fs::rename(&source, &destination).unwrap();
+        let rebound = verified.rebind_after_rename(&destination).unwrap();
+
+        assert!(rebound
+            .proves(&destination, bytes.len() as u64, &checksum)
+            .is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_verification_rejects_source_or_destination_substitution() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.gguf");
+        let destination = root.path().join("destination.gguf");
+        let bytes = b"verified artifact";
+        std::fs::write(&source, bytes).unwrap();
+        let checksum = hex(Sha256::digest(bytes).as_ref());
+        let verified = verify_regular_captured(&source, bytes.len() as u64, &checksum).unwrap();
+        let replacement = root.path().join("replacement.gguf");
+        std::fs::write(&replacement, bytes).unwrap();
+        std::fs::rename(&replacement, &source).unwrap();
+        assert!(verified
+            .proves(&source, bytes.len() as u64, &checksum)
+            .is_err());
+
+        let verified = verify_regular_captured(&source, bytes.len() as u64, &checksum).unwrap();
+        std::fs::rename(&source, &destination).unwrap();
+        std::fs::write(&source, bytes).unwrap();
+        std::fs::rename(&source, &destination).unwrap();
+        assert!(verified.rebind_after_rename(&destination).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_hash_rejects_a_swapped_source_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let models = root.path().join("models");
+        let moved = root.path().join("moved-models");
+        std::fs::create_dir(&models).unwrap();
+        let source = models.join("model.gguf");
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend(3_u32.to_le_bytes());
+        bytes.extend(b"payload");
+        std::fs::write(&source, &bytes).unwrap();
+        let (directory, identity) = open_directory(&models).unwrap();
+        std::fs::rename(&models, &moved).unwrap();
+        std::fs::create_dir(&models).unwrap();
+        std::fs::write(&source, &bytes).unwrap();
+
+        assert!(hash_local_gguf_captured(
+            &directory,
+            &identity,
+            &models,
+            &source,
+            bytes.len() as u64,
+        )
+        .is_err());
+    }
 
     #[cfg(unix)]
     #[test]

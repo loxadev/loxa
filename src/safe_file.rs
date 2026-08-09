@@ -82,6 +82,22 @@ impl RegularFileIdentity {
             })
         }
     }
+
+    pub(crate) fn same_file_after_rename(&self, current: &Self) -> bool {
+        #[cfg(unix)]
+        {
+            self.size == current.size
+                && self.device == current.device
+                && self.inode == current.inode
+                && self.links == current.links
+                && self.modified_seconds == current.modified_seconds
+                && self.modified_nanoseconds == current.modified_nanoseconds
+        }
+        #[cfg(not(unix))]
+        {
+            self == current
+        }
+    }
 }
 
 pub(crate) fn read_regular_file(path: &Path) -> io::Result<Vec<u8>> {

@@ -81,6 +81,14 @@ impl LaunchProfile {
         }
     }
 
+    fn effective_name(&self) -> &'static str {
+        match self {
+            Self::Generic => "generic",
+            Self::Gemma4Mtp { draft: Some(_), .. } => "gemma4_mtp",
+            Self::Gemma4Mtp { draft: None, .. } => "gemma4_primary",
+        }
+    }
+
     fn primary_only(&self) -> Option<Self> {
         match self {
             Self::Generic => None,
@@ -530,6 +538,7 @@ fn start_foreground_with<F>(
 where
     F: Fn() -> Option<i32>,
 {
+    let launch_started = Instant::now();
     tracing::info!(
         event = "server_starting",
         model_id = %launch.id,
@@ -539,7 +548,13 @@ where
     let ownership = crate::runtime::RuntimeOwnership::acquire(run_dir)?;
     match start_owned_attempt(launch, ownership, &signal) {
         Ok(StartOutcome::Ready(server)) => {
-            tracing::info!(event = "server_ready", model_id = %launch.id, port = server.port());
+            tracing::info!(
+                event = "server_ready",
+                model_id = %launch.id,
+                port = server.port(),
+                elapsed_ms = launch_started.elapsed().as_millis() as u64,
+                effective_profile = launch.profile.effective_name(),
+            );
             Ok(ForegroundStart::Ready(ForegroundServer { server }))
         }
         Ok(StartOutcome::Exited(exit)) => {
@@ -555,7 +570,7 @@ where
                 return Ok(ForegroundStart::Stopped(exit));
             };
             report_mtp_draft_start_failure(launch, "exited", exit.diagnostic.as_deref());
-            start_mtp_primary_retry(&primary, run_dir, &signal)
+            start_mtp_primary_retry(&primary, run_dir, &signal, launch_started)
         }
         Ok(StartOutcome::Signaled(signal)) => Ok(ForegroundStart::Stopped(ServerExit {
             code: 128 + signal,
@@ -613,6 +628,7 @@ fn start_mtp_primary_retry<F>(
     launch: &Launch,
     run_dir: &Path,
     signal: &F,
+    launch_started: Instant,
 ) -> Result<ForegroundStart, String>
 where
     F: Fn() -> Option<i32>,
@@ -629,7 +645,9 @@ where
                 event = "server_ready",
                 model_id = %launch.id,
                 port = server.port(),
-                fallback = "primary_only"
+                elapsed_ms = launch_started.elapsed().as_millis() as u64,
+                effective_profile = launch.profile.effective_name(),
+                fallback = "primary_only",
             );
             Ok(ForegroundStart::Ready(ForegroundServer { server }))
         }

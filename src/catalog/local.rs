@@ -9,6 +9,12 @@ use sha2::{Digest, Sha256};
 use super::{Artifact, ArtifactProvenance, ArtifactRole, RuntimeQualification};
 use super::{Manifest, Origin};
 
+pub(crate) struct CapturedAdoption {
+    pub(crate) manifest: Manifest,
+    pub(crate) model_lock: super::ModelLock,
+    pub(crate) verified: crate::download::VerifiedRegularFile,
+}
+
 mod bundle;
 pub use bundle::reconcile_qualified_bundle;
 #[cfg(test)]
@@ -92,6 +98,13 @@ pub fn discover(models_root: &Path) -> Result<Vec<Candidate>, String> {
 }
 
 pub fn adopt(models_root: &Path, candidate: &Candidate) -> Result<Manifest, String> {
+    adopt_captured(models_root, candidate).map(|adoption| adoption.manifest)
+}
+
+pub(crate) fn adopt_captured(
+    models_root: &Path,
+    candidate: &Candidate,
+) -> Result<CapturedAdoption, String> {
     let current = discover(models_root)?
         .into_iter()
         .find(|entry| entry.id == candidate.id && entry.path == candidate.path)
@@ -113,14 +126,21 @@ pub fn adopt(models_root: &Path, candidate: &Candidate) -> Result<Manifest, Stri
             candidate.id
         ));
     }
-    let before = FileIdentity::read(&candidate.path)?;
-    let sha256 = sha256(&candidate.path)?;
-    if FileIdentity::read(&candidate.path)? != before {
-        return Err(format!(
-            "local GGUF candidate {} changed while hashing",
-            candidate.id
-        ));
+    if candidate.path.parent() != Some(models_root)
+        || candidate.path.file_name().and_then(|name| name.to_str())
+            != Some(candidate.filename.as_str())
+    {
+        return Err(format!("unsafe local GGUF candidate {}", candidate.id));
     }
+    let (source_directory, source_directory_identity) =
+        crate::safe_file::open_directory(models_root).map_err(|error| error.to_string())?;
+    let verified = crate::download::hash_local_gguf_captured(
+        &source_directory,
+        &source_directory_identity,
+        models_root,
+        &candidate.path,
+        candidate.size,
+    )?;
     let manifest = Manifest {
         version: 2,
         id: candidate.id.clone(),
@@ -130,7 +150,7 @@ pub fn adopt(models_root: &Path, candidate: &Candidate) -> Result<Manifest, Stri
         origin: Some(Origin::Local),
         source_filename: Some(candidate.filename.clone()),
         local_filename: "model.gguf".into(),
-        sha256,
+        sha256: verified.sha256().into(),
         size: candidate.size,
         artifacts: None,
         profile: None,
@@ -145,35 +165,103 @@ pub fn adopt(models_root: &Path, candidate: &Candidate) -> Result<Manifest, Stri
         return Err(format!("model id {} is already installed", manifest.id));
     }
     let model_dir = models_root.join(&manifest.id);
-    let _lock = super::ModelLock::acquire(&model_dir)?;
+    let model_lock = super::ModelLock::acquire(&model_dir)?;
     ensure_empty_adoption_directory(&model_dir)?;
-    if FileIdentity::read(&candidate.path)? != before {
-        return Err(format!(
-            "local GGUF candidate {} changed before adoption",
-            candidate.id
-        ));
-    }
+    crate::safe_file::ensure_directory_descriptor_matches_path(
+        &source_directory,
+        &source_directory_identity,
+        models_root,
+    )
+    .map_err(|error| format!("{}: {error}", models_root.display()))?;
+    verified.proves(&candidate.path, candidate.size, &manifest.sha256)?;
     super::prepare_pull(&model_dir, &manifest)?;
     let destination = manifest.artifact_path(models_root);
-    if fs::symlink_metadata(&destination).is_ok() {
-        return Err(format!("model id {} has an existing artifact", manifest.id));
+    model_lock.revalidate_for(&model_dir)?;
+    verified.proves(&candidate.path, candidate.size, &manifest.sha256)?;
+    match rename_no_replace_at(
+        &source_directory,
+        candidate
+            .path
+            .file_name()
+            .expect("candidate has a filename"),
+        model_lock.model_directory(),
+        destination
+            .file_name()
+            .expect("validated manifest has an artifact filename"),
+        &candidate.path,
+        &destination,
+    )? {
+        super::NoReplaceRename::Renamed => {}
+        super::NoReplaceRename::Exists => {
+            return Err(format!("model id {} has an existing artifact", manifest.id));
+        }
     }
-    if FileIdentity::read(&candidate.path)? != before {
-        fs::remove_file(model_dir.join("pending.json")).map_err(|error| error.to_string())?;
-        return Err(format!(
-            "local GGUF candidate {} changed before adoption",
-            candidate.id
-        ));
-    }
-    fs::rename(&candidate.path, &destination).map_err(|error| {
-        format!(
+    model_lock
+        .model_directory()
+        .sync_all()
+        .map_err(|error| error.to_string())?;
+    source_directory
+        .sync_all()
+        .map_err(|error| error.to_string())?;
+    model_lock.revalidate_for(&model_dir)?;
+    crate::safe_file::ensure_directory_descriptor_matches_path(
+        &source_directory,
+        &source_directory_identity,
+        models_root,
+    )
+    .map_err(|error| format!("{}: {error}", models_root.display()))?;
+    let verified = verified.rebind_after_rename(&destination)?;
+    super::publish_manifest_verified(models_root, &manifest, &model_lock, &verified)?;
+    Ok(CapturedAdoption {
+        manifest,
+        model_lock,
+        verified,
+    })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn rename_no_replace_at(
+    source_directory: &File,
+    source_name: &std::ffi::OsStr,
+    destination_directory: &File,
+    destination_name: &std::ffi::OsStr,
+    source: &Path,
+    destination: &Path,
+) -> Result<super::NoReplaceRename, String> {
+    use rustix::fs::{renameat_with, RenameFlags};
+    use rustix::io::Errno;
+
+    match renameat_with(
+        source_directory,
+        source_name,
+        destination_directory,
+        destination_name,
+        RenameFlags::NOREPLACE,
+    ) {
+        Ok(()) => Ok(super::NoReplaceRename::Renamed),
+        Err(Errno::EXIST) => Ok(super::NoReplaceRename::Exists),
+        Err(error) => Err(format!(
             "failed to adopt {} into {}: {error}",
-            candidate.path.display(),
+            source.display(),
             destination.display()
-        )
-    })?;
-    super::publish_manifest(models_root, &manifest)?;
-    Ok(manifest)
+        )),
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn rename_no_replace_at(
+    _source_directory: &File,
+    _source_name: &std::ffi::OsStr,
+    _destination_directory: &File,
+    _destination_name: &std::ffi::OsStr,
+    source: &Path,
+    destination: &Path,
+) -> Result<super::NoReplaceRename, String> {
+    Err(format!(
+        "cannot safely adopt {} into {} on this platform",
+        source.display(),
+        destination.display()
+    ))
 }
 
 pub fn recover_pending(models_root: &Path) -> Result<(), String> {
@@ -392,6 +480,7 @@ impl FileIdentity {
     }
 }
 
+#[cfg(test)]
 fn sha256(path: &Path) -> Result<String, String> {
     let mut file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
     let mut hash = Sha256::new();
@@ -1125,6 +1214,71 @@ mod tests {
         assert!(!json.contains("\"repo\""), "{json}");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn first_adoption_hashes_once_and_the_next_admission_reads_no_content() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("Gemma 4.gguf");
+        std::fs::write(&source, gguf(3)).unwrap();
+        let candidate = discover(root.path()).unwrap().pop().unwrap();
+        crate::download::reset_content_hash_count();
+
+        let adoption = adopt_captured(root.path(), &candidate).unwrap();
+        let artifact = adoption.manifest.artifact_path(root.path());
+        crate::verification::refresh_verified(
+            &adoption.model_lock,
+            &adoption.manifest,
+            &artifact,
+            &adoption.verified,
+            None,
+        )
+        .unwrap();
+        assert_eq!(crate::download::content_hash_count(), 1);
+
+        let admission = crate::verification::verify_or_refresh(
+            &adoption.model_lock,
+            &root.path().join(&adoption.manifest.id),
+            &adoption.manifest,
+            &artifact,
+            None,
+            || crate::verification::verify_artifacts(&adoption.manifest, &artifact, None),
+        )
+        .unwrap();
+
+        assert_eq!(admission, crate::verification::Admission::ReceiptHit);
+        assert_eq!(crate::download::content_hash_count(), 1);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn adoption_rename_never_replaces_an_existing_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let source_dir = root.path().join("source");
+        let destination_dir = root.path().join("destination");
+        std::fs::create_dir(&source_dir).unwrap();
+        std::fs::create_dir(&destination_dir).unwrap();
+        let source = source_dir.join("model.gguf");
+        let destination = destination_dir.join("model.gguf");
+        std::fs::write(&source, b"trusted").unwrap();
+        std::fs::write(&destination, b"sentinel").unwrap();
+        let source_directory = File::open(&source_dir).unwrap();
+        let destination_directory = File::open(&destination_dir).unwrap();
+
+        let result = rename_no_replace_at(
+            &source_directory,
+            source.file_name().unwrap(),
+            &destination_directory,
+            destination.file_name().unwrap(),
+            &source,
+            &destination,
+        )
+        .unwrap();
+
+        assert_eq!(result, super::super::NoReplaceRename::Exists);
+        assert_eq!(std::fs::read(&source).unwrap(), b"trusted");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"sentinel");
+    }
+
     #[test]
     fn colliding_friendly_filenames_receive_distinct_candidate_ids() {
         let root = tempfile::tempdir().unwrap();
@@ -1242,6 +1396,7 @@ mod tests {
         let model_dir = root.path().join(&candidate.id);
         super::super::prepare_pull(&model_dir, &manifest).unwrap();
         std::fs::rename(&source, model_dir.join("model.gguf")).unwrap();
+        crate::download::reset_content_hash_count();
 
         recover_pending(root.path()).unwrap();
 
@@ -1250,6 +1405,11 @@ mod tests {
         assert_eq!(
             super::super::load_catalog(root.path()).unwrap(),
             vec![manifest]
+        );
+        assert_eq!(
+            crate::download::content_hash_count(),
+            1,
+            "crash recovery must fall back to a full verification"
         );
     }
 

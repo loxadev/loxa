@@ -147,6 +147,7 @@ mod runtime;
 mod safe_file;
 mod session;
 mod ui;
+mod verification;
 
 use catalog::Manifest;
 use cli::{Cli, Command};

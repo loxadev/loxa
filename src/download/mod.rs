@@ -14,7 +14,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub(crate) use artifact::{verify_regular, verify_regular_captured, VerifiedRegularFile};
+#[cfg(test)]
+pub(crate) use artifact::{content_hash_count, reset_content_hash_count};
+pub(crate) use artifact::{
+    hash_local_gguf_captured, verify_regular, verify_regular_captured, VerifiedRegularFile,
+};
 #[cfg(test)]
 pub(crate) use http::artifact_url;
 #[cfg(test)]

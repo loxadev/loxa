@@ -1,18 +1,17 @@
-mod receipt;
-
 use crate::catalog::Manifest;
 use crate::paths::AppPaths;
-use crate::{catalog, cli, config, download, load_installed_models, runner};
+use crate::{catalog, cli, config, load_installed_models, runner, verification};
 use std::path::Path;
+use std::time::Instant;
 
 pub(crate) struct Runnable {
     _model_lock: catalog::ModelLock,
     pub(crate) launch: runner::Launch,
 }
 
-struct VerifiedArtifacts {
-    primary: download::VerifiedRegularFile,
-    draft: Option<download::VerifiedRegularFile>,
+enum AdmissionSource {
+    Installed(Manifest),
+    Local(catalog::local::Candidate),
 }
 
 pub(crate) fn resolve_runnable(
@@ -25,7 +24,7 @@ pub(crate) fn resolve_runnable(
     let port = config::resolve_value(runtime.port, config.port, 0);
     let installed = load_installed_models(paths)?;
     let installed = installed.into_iter().find(|entry| entry.id == id);
-    let (manifest, profile, server) = match installed {
+    let (source, profile, server) = match installed {
         Some(manifest) => {
             let profile = launch_profile(&manifest, &paths.models)?;
             let server = runner::discover_from_process(
@@ -33,7 +32,7 @@ pub(crate) fn resolve_runnable(
                 &paths.managed_server,
                 &profile,
             )?;
-            (manifest, profile, server)
+            (AdmissionSource::Installed(manifest), profile, server)
         }
         None => {
             let candidate = catalog::local::discover(&paths.models)?
@@ -46,25 +45,49 @@ pub(crate) fn resolve_runnable(
                 &paths.managed_server,
                 &profile,
             )?;
-            let manifest = catalog::local::adopt(&paths.models, &candidate)?;
-            tracing::info!(event = "local_model_adopted", model_id = %manifest.id);
-            (manifest, profile, server)
+            (AdmissionSource::Local(candidate), profile, server)
         }
     };
-    let model_dir = paths.model_dir(&manifest.id)?;
-    let model_lock = catalog::ModelLock::acquire(&model_dir)?;
+    let admission_started = Instant::now();
+    let (manifest, model_lock, admission) = match source {
+        AdmissionSource::Local(candidate) => {
+            let catalog::local::CapturedAdoption {
+                manifest,
+                model_lock,
+                verified,
+            } = catalog::local::adopt_captured(&paths.models, &candidate)?;
+            let artifact = manifest.artifact_path(&paths.models);
+            verification::refresh_verified(&model_lock, &manifest, &artifact, &verified, None)?;
+            (manifest, model_lock, verification::Admission::Verified)
+        }
+        AdmissionSource::Installed(manifest) => {
+            let model_dir = paths.model_dir(&manifest.id)?;
+            let artifact = manifest.artifact_path(&paths.models);
+            let draft = manifest
+                .draft_artifact()
+                .map(|draft| paths.models.join(&manifest.id).join(draft.local_filename));
+            let model_lock = catalog::ModelLock::acquire(&model_dir)?;
+            let admission = verification::verify_or_refresh(
+                &model_lock,
+                &model_dir,
+                &manifest,
+                &artifact,
+                draft.as_deref(),
+                || verification::verify_artifacts(&manifest, &artifact, draft.as_deref()),
+            )?;
+            (manifest, model_lock, admission)
+        }
+    };
+    tracing::info!(
+        event = "model_admission_complete",
+        model_id = %manifest.id,
+        result = match admission {
+            verification::Admission::ReceiptHit => "receipt_hit",
+            verification::Admission::Verified => "verified",
+        },
+        elapsed_ms = admission_started.elapsed().as_millis() as u64,
+    );
     let artifact = manifest.artifact_path(&paths.models);
-    let draft = manifest
-        .draft_artifact()
-        .map(|draft| paths.models.join(&manifest.id).join(draft.local_filename));
-    verify_or_refresh(
-        &model_lock,
-        &model_dir,
-        &manifest,
-        &artifact,
-        draft.as_deref(),
-        || verify_artifacts(&manifest, &artifact, draft.as_deref()),
-    )?;
     Ok(Runnable {
         _model_lock: model_lock,
         launch: runner::Launch {
@@ -76,57 +99,6 @@ pub(crate) fn resolve_runnable(
             profile,
         },
     })
-}
-
-fn verify_or_refresh<F>(
-    model_lock: &catalog::ModelLock,
-    model_dir: &Path,
-    manifest: &Manifest,
-    primary: &Path,
-    draft: Option<&Path>,
-    verify: F,
-) -> Result<(), String>
-where
-    F: FnOnce() -> Result<VerifiedArtifacts, String>,
-{
-    if receipt::matches(model_lock, model_dir, manifest, primary, draft)? {
-        tracing::info!(event = "model_verification_receipt_hit", model_id = %manifest.id);
-        return Ok(());
-    }
-    tracing::debug!(event = "model_verification_receipt_miss", model_id = %manifest.id);
-    receipt::discard(model_lock, model_dir)?;
-    let verified = verify()?;
-    let verified_draft = match (draft, verified.draft.as_ref()) {
-        (Some(path), Some(file)) => Some((path, file)),
-        (None, None) => None,
-        _ => return Err("verified draft artifact mismatch".into()),
-    };
-    receipt::refresh(
-        model_lock,
-        manifest,
-        primary,
-        &verified.primary,
-        verified_draft,
-    )
-}
-
-fn verify_artifacts(
-    manifest: &Manifest,
-    primary_path: &Path,
-    draft_path: Option<&Path>,
-) -> Result<VerifiedArtifacts, String> {
-    let primary = manifest.primary_artifact();
-    let primary = download::verify_regular_captured(primary_path, primary.size, primary.sha256)?;
-    let draft = match (manifest.draft_artifact(), draft_path) {
-        (Some(artifact), Some(path)) => Some(download::verify_regular_captured(
-            path,
-            artifact.size,
-            artifact.sha256,
-        )?),
-        (None, None) => None,
-        _ => return Err("verified draft artifact mismatch".into()),
-    };
-    Ok(VerifiedArtifacts { primary, draft })
 }
 
 fn launch_profile(
@@ -161,9 +133,9 @@ fn launch_profile(
 
 #[cfg(test)]
 mod tests {
-    use super::{receipt, verify_or_refresh, VerifiedArtifacts};
     use crate::catalog::{Artifact, ArtifactProvenance, ArtifactRole, Manifest, ModelLock};
     use crate::download;
+    use crate::verification::{refresh_verified, verify_or_refresh, VerifiedArtifacts};
     use sha2::{Digest, Sha256};
     use std::cell::Cell;
     use std::fmt::Write as _;
@@ -291,34 +263,35 @@ mod tests {
             .unwrap();
 
             let mut candidate = manifest.clone();
-            let label = match change {
+            let (label, valid) = match change {
                 Change::Missing => {
                     std::fs::remove_file(model_dir.join("verification-receipt.json")).unwrap();
-                    "missing receipt"
+                    ("missing receipt", true)
                 }
                 Change::Corrupt => {
                     std::fs::write(model_dir.join("verification-receipt.json"), b"{not-json")
                         .unwrap();
-                    "corrupt receipt"
+                    ("corrupt receipt", true)
                 }
                 Change::Manifest => {
                     candidate.sha256 = "f".repeat(64);
-                    "manifest mismatch"
+                    ("manifest mismatch", false)
                 }
                 Change::SameSizeReplacement => {
                     let replacement = model_dir.join("replacement.gguf");
                     std::fs::write(&replacement, b"xyz").unwrap();
                     std::fs::rename(replacement, &primary).unwrap();
-                    "same-size replacement"
+                    ("same-size replacement", false)
                 }
             };
 
-            verify_or_refresh(&model_lock, &model_dir, &candidate, &primary, None, || {
-                calls.set(calls.get() + 1);
-                Ok(verified_artifacts(&primary, None))
-            })
-            .unwrap();
+            let result =
+                verify_or_refresh(&model_lock, &model_dir, &candidate, &primary, None, || {
+                    calls.set(calls.get() + 1);
+                    Ok(verified_artifacts(&primary, None))
+                });
 
+            assert_eq!(result.is_ok(), valid, "{label}");
             assert_eq!(calls.get(), 2, "{label} must invoke the full verifier");
         }
     }
@@ -364,7 +337,7 @@ mod tests {
         let replacement = model_dir.join("replacement-draft.gguf");
         std::fs::write(&replacement, b"other").unwrap();
         std::fs::rename(replacement, &draft).unwrap();
-        verify_or_refresh(
+        let result = verify_or_refresh(
             &model_lock,
             &model_dir,
             &manifest,
@@ -374,9 +347,9 @@ mod tests {
                 calls.set(calls.get() + 1);
                 Ok(verified_artifacts(&primary, Some(&draft)))
             },
-        )
-        .unwrap();
+        );
 
+        assert!(result.is_err());
         assert_eq!(calls.get(), 2);
     }
 
@@ -488,12 +461,29 @@ mod tests {
         symlink(&outside, &receipt_path).unwrap();
         let verified = verified_file(&primary);
 
-        receipt::refresh(&model_lock, &manifest, &primary, &verified, None).unwrap();
+        refresh_verified(&model_lock, &manifest, &primary, &verified, None).unwrap();
 
         assert_eq!(std::fs::read(&outside).unwrap(), b"outside witness");
         assert!(std::fs::symlink_metadata(receipt_path)
             .unwrap()
             .file_type()
             .is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn receipt_refresh_rejects_a_proof_for_a_different_digest() {
+        let root = tempdir().unwrap();
+        let model_dir = root.path().join("demo");
+        std::fs::create_dir(&model_dir).unwrap();
+        let primary = model_dir.join("model.gguf");
+        std::fs::write(&primary, b"abc").unwrap();
+        let mut candidate = manifest();
+        candidate.sha256 = "f".repeat(64);
+        let model_lock = ModelLock::acquire(&model_dir).unwrap();
+        let verified = verified_file(&primary);
+
+        assert!(refresh_verified(&model_lock, &candidate, &primary, &verified, None).is_err());
+        assert!(!model_dir.join("verification-receipt.json").exists());
     }
 }
