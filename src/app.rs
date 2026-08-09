@@ -11,8 +11,10 @@ use std::path::PathBuf;
 #[cfg(unix)]
 use sysinfo::{Disks, System};
 
+mod installed;
 pub(crate) mod transfer;
 
+pub use installed::InstalledModelSummary;
 pub use transfer::{
     ResolveArtifactError, ResolveArtifactRequest, TransferControl, TransferDisposition,
     TransferError, TransferPhase, TransferProgress, TransferResult, TransferSelected,
@@ -272,6 +274,10 @@ impl AppService {
     ) -> Result<RepositoryPlan, DiscoveryError> {
         crate::huggingface::inspect_repository(request)
     }
+
+    pub fn installed_models(&self) -> Result<Vec<InstalledModelSummary>, String> {
+        installed::load(&self.reader.paths.models)
+    }
 }
 
 #[cfg(unix)]
@@ -519,12 +525,12 @@ mod tests {
     use super::{destination_free_bytes_for_mounts, existing_destination_ancestor};
     use super::{
         AppService, AppSnapshot, BundleSnapshot, BundleUnavailableReason, DownloadSnapshot,
-        PartialBundle, PausedDownload, RecommendationAvailability, RecommendationSnapshot,
-        RecommendationUnavailableReason, RecommendedBundle, ResourceBudget,
+        InstalledModelSummary, PartialBundle, PausedDownload, RecommendationAvailability,
+        RecommendationSnapshot, RecommendationUnavailableReason, RecommendedBundle, ResourceBudget,
         RuntimeInventorySnapshot, RuntimeSnapshot, SnapshotReader, VerifiedBundle,
     };
     use crate::catalog::{
-        Artifact, ArtifactProvenance, ArtifactRole, Manifest, RuntimeQualification,
+        Artifact, ArtifactProvenance, ArtifactRole, Manifest, Origin, RuntimeQualification,
         TEST_LLAMA_BUILD, TEST_MTP_PROFILE,
     };
     use crate::discovery::{DiscoveryErrorKind, GatedStatus, InspectRepository, SearchModels};
@@ -859,6 +865,125 @@ mod tests {
         assert_eq!(service.snapshot(), reader.observe());
 
         let _: fn() -> Result<AppService, String> = AppService::from_env;
+    }
+
+    #[test]
+    fn installed_inventory_projects_sorted_published_metadata_without_artifact_hashing() {
+        fn assert_owned_contract<T: Clone + std::fmt::Debug + Eq + PartialEq + Send + 'static>() {}
+
+        let root = tempdir().unwrap();
+        let paths = test_paths(root.path());
+        let remote = Manifest {
+            version: 1,
+            id: "alpha".into(),
+            repo: Some("owner/repo".into()),
+            revision: Some("0123456789abcdef0123456789abcdef01234567".into()),
+            remote_filename: Some("alpha-q4.gguf".into()),
+            origin: None,
+            source_filename: None,
+            local_filename: "model.gguf".into(),
+            sha256: "a".repeat(64),
+            size: 42,
+            artifacts: None,
+            profile: None,
+            runtime: None,
+        };
+        let local = Manifest {
+            version: 2,
+            id: "local".into(),
+            repo: None,
+            revision: None,
+            remote_filename: None,
+            origin: Some(Origin::Local),
+            source_filename: Some("local-source.gguf".into()),
+            local_filename: "model.gguf".into(),
+            sha256: "b".repeat(64),
+            size: 7,
+            artifacts: None,
+            profile: None,
+            runtime: None,
+        };
+        let bundle = Manifest {
+            version: 3,
+            id: "bundle".into(),
+            repo: None,
+            revision: None,
+            remote_filename: None,
+            origin: None,
+            source_filename: None,
+            local_filename: "model.gguf".into(),
+            sha256: "c".repeat(64),
+            size: 11,
+            artifacts: Some(vec![Artifact {
+                role: ArtifactRole::Model,
+                local_filename: "model.gguf".into(),
+                sha256: "c".repeat(64),
+                size: 11,
+                provenance: ArtifactProvenance::Local {
+                    source_filename: "bundle-source.gguf".into(),
+                },
+            }]),
+            profile: Some(TEST_MTP_PROFILE.into()),
+            runtime: Some(RuntimeQualification {
+                engine: "llama.cpp".into(),
+                build: TEST_LLAMA_BUILD.into(),
+            }),
+        };
+        for manifest in [&local, &bundle, &remote] {
+            manifest.validate().unwrap();
+            let model_dir = paths.models.join(&manifest.id);
+            fs::create_dir_all(&model_dir).unwrap();
+            fs::write(
+                model_dir.join("manifest.json"),
+                serde_json::to_vec_pretty(manifest).unwrap(),
+            )
+            .unwrap();
+        }
+        let pending_dir = paths.models.join("pending-only");
+        fs::create_dir_all(&pending_dir).unwrap();
+        fs::write(
+            pending_dir.join("pending.json"),
+            serde_json::to_vec_pretty(&Manifest {
+                id: "pending-only".into(),
+                ..remote.clone()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let exact_alpha = crate::huggingface::test_resolved_file_for(
+            "owner/repo",
+            "alpha-q4.gguf",
+            "a".repeat(64),
+            42,
+        );
+        let different_sha = crate::huggingface::test_resolved_file_for(
+            "owner/repo",
+            "alpha-q4.gguf",
+            "d".repeat(64),
+            42,
+        );
+        let installed = AppService::from_paths(paths.clone())
+            .installed_models()
+            .unwrap();
+
+        assert_owned_contract::<InstalledModelSummary>();
+        assert_eq!(
+            installed
+                .iter()
+                .map(InstalledModelSummary::id)
+                .collect::<Vec<_>>(),
+            ["alpha", "bundle", "local"]
+        );
+        assert_eq!(installed[0].display_name(), "alpha-q4.gguf");
+        assert_eq!(installed[0].total_bytes(), 42);
+        assert!(installed[0].matches_remote(&exact_alpha));
+        assert!(!installed[0].matches_remote(&different_sha));
+        assert!(!installed[1].matches_remote(&exact_alpha));
+        assert!(!installed[2].matches_remote(&exact_alpha));
+        assert!(!paths.models.join("alpha/model.gguf").exists());
+        assert!(!paths.models.join("bundle/model.gguf").exists());
+        assert!(!paths.models.join("local/model.gguf").exists());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use super::AppService;
+use super::{installed, AppService};
 use crate::catalog::{self, Manifest, ModelLockError};
 use crate::download::{self, DownloadFailure, DownloadTerminalOutcome, ProgressUpdate};
 use crate::huggingface::ResolvedFile;
@@ -843,7 +843,7 @@ fn transfer_selected_with<F, C, T, D>(
     service: &AppService,
     request: TransferSelected,
     control: TransferControl,
-    mut progress: F,
+    progress: F,
     capacity: C,
     token: T,
     download: D,
@@ -860,11 +860,56 @@ where
         &mut F,
     ) -> Result<DownloadTerminalOutcome, DownloadFailure>,
 {
+    transfer_selected_with_lookup_observer(
+        service,
+        (request, |_| {}),
+        control,
+        progress,
+        capacity,
+        token,
+        download,
+    )
+}
+
+fn transfer_selected_with_lookup_observer<F, C, T, D, L>(
+    service: &AppService,
+    request_and_observer: (TransferSelected, L),
+    control: TransferControl,
+    mut progress: F,
+    capacity: C,
+    token: T,
+    download: D,
+) -> Result<TransferResult, TransferError>
+where
+    F: FnMut(TransferProgress),
+    C: FnOnce(&std::fs::File) -> Result<(u64, u64), TransferErrorKind>,
+    T: FnOnce() -> Option<String>,
+    D: FnOnce(
+        &ResolvedFile,
+        &Path,
+        Option<String>,
+        &TransferControl,
+        &mut F,
+    ) -> Result<DownloadTerminalOutcome, DownloadFailure>,
+    L: FnOnce(&str),
+{
+    let (request, after_alternate_lookup) = request_and_observer;
     let TransferSelected {
         artifact,
         requested_model_id,
     } = request;
-    let model_id = requested_model_id.unwrap_or_else(|| deterministic_model_id(&artifact));
+    let (model_id, chosen_by_alternate_reuse) = match requested_model_id {
+        Some(model_id) => (model_id, false),
+        None => match installed::exact_remote_model_id(&service.reader.paths.models, &artifact)
+            .map_err(|_| TransferError::terminal(TransferErrorKind::UnsafeLocalState))?
+        {
+            Some(model_id) => (model_id, true),
+            None => (deterministic_model_id(&artifact), false),
+        },
+    };
+    if chosen_by_alternate_reuse {
+        after_alternate_lookup(&model_id);
+    }
     crate::paths::validate_id(&model_id)
         .map_err(|_| TransferError::terminal(TransferErrorKind::InvalidModelId))?;
     let manifest = exact_manifest(model_id.clone(), &artifact);
@@ -885,7 +930,12 @@ where
         .paths
         .model_dir(&model_id)
         .map_err(|_| TransferError::terminal(TransferErrorKind::InvalidModelId))?;
-    let lock = catalog::ModelLock::acquire_for_transfer(&model_dir).map_err(|error| {
+    let lock_result = if chosen_by_alternate_reuse {
+        catalog::ModelLock::acquire_existing(&model_dir)
+    } else {
+        catalog::ModelLock::acquire_for_transfer(&model_dir)
+    };
+    let lock = lock_result.map_err(|error| {
         TransferError::terminal(match error {
             ModelLockError::Busy => TransferErrorKind::Busy,
             ModelLockError::Missing | ModelLockError::UnsafeLocalState => {
@@ -894,6 +944,16 @@ where
         })
     })?;
     let catalog_plan = catalog::transfer::plan_transfer(&lock, &manifest);
+    let catalog_state = catalog_plan.state();
+    if chosen_by_alternate_reuse
+        && !matches!(
+            catalog_state,
+            crate::catalog::transfer::CatalogTransferState::Installed
+                | crate::catalog::transfer::CatalogTransferState::InstalledCompletionDebris
+        )
+    {
+        return Err(TransferError::terminal(TransferErrorKind::UnsafeLocalState));
+    }
     let artifact_plan = match crate::download::plan::plan_artifact_transfer(
         lock.model_directory(),
         &model_dir,
@@ -906,9 +966,16 @@ where
         }
         crate::download::plan::ArtifactPlanOutcome::Ready(plan) => plan,
     };
-    let catalog_state = catalog_plan.state();
     let artifact_state = artifact_plan.state();
     let plan = combine_plans(catalog_state, artifact_state).map_err(TransferError::terminal)?;
+    if chosen_by_alternate_reuse
+        && !matches!(
+            plan,
+            CapacityPlan::CleanInstalled | CapacityPlan::InstalledCleanup
+        )
+    {
+        return Err(TransferError::terminal(TransferErrorKind::UnsafeLocalState));
+    }
     if let Err(error) = admit_capacity_with(&lock, plan, artifact.size(), manifest_len, capacity) {
         return Err(admission_error_with_audited_recovery(
             error,

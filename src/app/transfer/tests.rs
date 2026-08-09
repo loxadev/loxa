@@ -454,6 +454,307 @@ fn test_artifact(bytes: &[u8]) -> ResolvedFile {
     crate::huggingface::test_resolved_file(sha256, bytes.len() as u64)
 }
 
+fn seed_published_remote(root: &std::path::Path, manifest: &Manifest, bytes: &[u8]) {
+    manifest.validate().unwrap();
+    let model_dir = root.join("models").join(&manifest.id);
+    let lock = crate::catalog::ModelLock::acquire_for_transfer(&model_dir).unwrap();
+    drop(lock);
+    std::fs::write(
+        model_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(manifest).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(model_dir.join("model.gguf"), bytes).unwrap();
+}
+
+fn exercise_selected_without_requested_id(
+    service: &AppService,
+    artifact: ResolvedFile,
+) -> (
+    String,
+    TransferDisposition,
+    Vec<TransferPhase>,
+    usize,
+    usize,
+    usize,
+) {
+    use std::cell::{Cell, RefCell};
+
+    let progress = RefCell::new(Vec::new());
+    let capacity_calls = Cell::new(0);
+    let token_calls = Cell::new(0);
+    let download_calls = Cell::new(0);
+    let result = transfer_selected_with(
+        service,
+        TransferSelected::new(artifact, None),
+        TransferControl::new(),
+        |update| progress.borrow_mut().push(update.phase()),
+        |_| {
+            capacity_calls.set(capacity_calls.get() + 1);
+            Ok((u64::MAX, 1))
+        },
+        || {
+            token_calls.set(token_calls.get() + 1);
+            None
+        },
+        |_, model_dir, _, _, _| {
+            download_calls.set(download_calls.get() + 1);
+            let final_path = model_dir.join("model.gguf");
+            std::fs::write(&final_path, b"abcdef").unwrap();
+            Ok(DownloadTerminalOutcome::Complete(
+                crate::download::DownloadOutcome::Pulled(final_path),
+            ))
+        },
+    )
+    .unwrap();
+    (
+        result.model_id().to_owned(),
+        result.disposition(),
+        progress.into_inner(),
+        capacity_calls.get(),
+        token_calls.get(),
+        download_calls.get(),
+    )
+}
+
+#[test]
+fn alternate_id_reuse_requires_exact_v1_identity_and_chooses_sorted_match() {
+    let artifact = test_artifact(b"abcdef");
+
+    let exact_root = tempfile::tempdir().unwrap();
+    let exact_installed = exact_manifest("custom-model".into(), &artifact);
+    seed_published_remote(exact_root.path(), &exact_installed, b"abcdef");
+    let exact =
+        exercise_selected_without_requested_id(&test_service(exact_root.path()), artifact.clone());
+
+    let mut mismatch_results = Vec::new();
+    for (label, mutate) in [
+        (
+            "repository",
+            (|manifest: &mut Manifest| manifest.repo = Some("other/repo".into()))
+                as fn(&mut Manifest),
+        ),
+        ("commit", |manifest: &mut Manifest| {
+            manifest.revision = Some("fedcba9876543210fedcba9876543210fedcba98".into())
+        }),
+        ("path", |manifest: &mut Manifest| {
+            manifest.remote_filename = Some("different.gguf".into())
+        }),
+        ("sha256", |manifest: &mut Manifest| {
+            manifest.sha256 = "e".repeat(64)
+        }),
+        ("size", |manifest: &mut Manifest| manifest.size = 7),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let mut installed = exact_manifest("custom-model".into(), &artifact);
+        mutate(&mut installed);
+        seed_published_remote(root.path(), &installed, b"abcdef");
+        mismatch_results.push((
+            label,
+            exercise_selected_without_requested_id(&test_service(root.path()), artifact.clone()),
+        ));
+    }
+
+    let duplicate_root = tempfile::tempdir().unwrap();
+    for id in ["z-custom", "a-custom"] {
+        seed_published_remote(
+            duplicate_root.path(),
+            &exact_manifest(id.into(), &artifact),
+            b"abcdef",
+        );
+    }
+    let duplicate = exercise_selected_without_requested_id(
+        &test_service(duplicate_root.path()),
+        artifact.clone(),
+    );
+
+    assert_eq!(exact.0, "custom-model");
+    assert_eq!(exact.1, TransferDisposition::AlreadyInstalled);
+    assert!(exact.2.is_empty());
+    assert_eq!((exact.3, exact.4, exact.5), (0, 0, 0));
+
+    let deterministic = deterministic_model_id(&artifact);
+    for (label, result) in mismatch_results {
+        assert_eq!(result.0, deterministic, "{label}");
+        assert_eq!(result.1, TransferDisposition::Installed, "{label}");
+        assert_eq!(result.2, [TransferPhase::Publishing], "{label}");
+        assert_eq!((result.3, result.4, result.5), (1, 1, 1), "{label}");
+    }
+
+    assert_eq!(duplicate.0, "a-custom");
+    assert_eq!(duplicate.1, TransferDisposition::AlreadyInstalled);
+    assert!(duplicate.2.is_empty());
+    assert_eq!((duplicate.3, duplicate.4, duplicate.5), (0, 0, 0));
+}
+
+#[test]
+fn alternate_lookup_catalog_ambiguity_fails_before_transfer_work() {
+    use std::cell::Cell;
+
+    let root = tempfile::tempdir().unwrap();
+    let service = test_service(root.path());
+    let artifact = test_artifact(b"abcdef");
+    let malformed_dir = root.path().join("models/malformed");
+    std::fs::create_dir_all(&malformed_dir).unwrap();
+    std::fs::write(malformed_dir.join("manifest.json"), b"not json").unwrap();
+    let progress_calls = Cell::new(0);
+    let capacity_calls = Cell::new(0);
+    let token_calls = Cell::new(0);
+    let download_calls = Cell::new(0);
+
+    let result = transfer_selected_with(
+        &service,
+        TransferSelected::new(artifact.clone(), None),
+        TransferControl::new(),
+        |_| progress_calls.set(progress_calls.get() + 1),
+        |_| {
+            capacity_calls.set(capacity_calls.get() + 1);
+            Ok((u64::MAX, 1))
+        },
+        || {
+            token_calls.set(token_calls.get() + 1);
+            None
+        },
+        |_, _, _, _, _| {
+            download_calls.set(download_calls.get() + 1);
+            Err(DownloadFailure::Durability)
+        },
+    );
+    let error = match result {
+        Ok(_) => panic!("ambiguous catalog must refuse"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.kind(), TransferErrorKind::UnsafeLocalState);
+    assert_eq!(progress_calls.get(), 0);
+    assert_eq!(capacity_calls.get(), 0);
+    assert_eq!(token_calls.get(), 0);
+    assert_eq!(download_calls.get(), 0);
+    assert!(!root
+        .path()
+        .join("models")
+        .join(deterministic_model_id(&artifact))
+        .exists());
+}
+
+#[test]
+fn alternate_reuse_scan_to_lock_change_fails_before_artifact_hash_or_transfer_work() {
+    use std::cell::Cell;
+
+    for replacement in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let service = test_service(root.path());
+        let artifact = test_artifact(b"abcdef");
+        let installed = exact_manifest("custom-model".into(), &artifact);
+        seed_published_remote(root.path(), &installed, b"abcdef");
+        let model_dir = root.path().join("models/custom-model");
+        let control = TransferControl::new();
+        control.request_pause();
+        let progress_calls = Cell::new(0);
+        let capacity_calls = Cell::new(0);
+        let token_calls = Cell::new(0);
+        let download_calls = Cell::new(0);
+
+        let result = transfer_selected_with_lookup_observer(
+            &service,
+            (
+                TransferSelected::new(artifact.clone(), None),
+                |model_id: &str| {
+                    assert_eq!(model_id, "custom-model");
+                    if replacement {
+                        let mut changed = installed.clone();
+                        changed.sha256 = "f".repeat(64);
+                        std::fs::write(
+                            model_dir.join("manifest.json"),
+                            serde_json::to_vec_pretty(&changed).unwrap(),
+                        )
+                        .unwrap();
+                    } else {
+                        std::fs::remove_file(model_dir.join("manifest.json")).unwrap();
+                    }
+                },
+            ),
+            control,
+            |_| progress_calls.set(progress_calls.get() + 1),
+            |_| {
+                capacity_calls.set(capacity_calls.get() + 1);
+                Ok((u64::MAX, 1))
+            },
+            || {
+                token_calls.set(token_calls.get() + 1);
+                None
+            },
+            |_, _, _, _, _| {
+                download_calls.set(download_calls.get() + 1);
+                Err(DownloadFailure::Durability)
+            },
+        );
+        let error = match result {
+            Ok(_) => panic!("scan-to-lock manifest change must refuse"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), TransferErrorKind::UnsafeLocalState);
+        assert_eq!(progress_calls.get(), 0);
+        assert_eq!(capacity_calls.get(), 0);
+        assert_eq!(token_calls.get(), 0);
+        assert_eq!(download_calls.get(), 0);
+        assert!(!model_dir.join("pending.json").exists());
+        assert!(!root
+            .path()
+            .join("models")
+            .join(deterministic_model_id(&artifact))
+            .exists());
+    }
+}
+
+#[test]
+fn alternate_reuse_refuses_installed_artifact_repair_before_transfer_work() {
+    use std::cell::Cell;
+
+    let root = tempfile::tempdir().unwrap();
+    let service = test_service(root.path());
+    let artifact = test_artifact(b"abcdef");
+    let installed = exact_manifest("custom-model".into(), &artifact);
+    seed_published_remote(root.path(), &installed, b"ghijkl");
+    let model_dir = root.path().join("models/custom-model");
+    let progress_calls = Cell::new(0);
+    let capacity_calls = Cell::new(0);
+    let token_calls = Cell::new(0);
+    let download_calls = Cell::new(0);
+
+    let result = transfer_selected_with(
+        &service,
+        TransferSelected::new(artifact, None),
+        TransferControl::new(),
+        |_| progress_calls.set(progress_calls.get() + 1),
+        |_| {
+            capacity_calls.set(capacity_calls.get() + 1);
+            Ok((u64::MAX, 1))
+        },
+        || {
+            token_calls.set(token_calls.get() + 1);
+            None
+        },
+        |_, _, _, _, _| {
+            download_calls.set(download_calls.get() + 1);
+            Err(DownloadFailure::Durability)
+        },
+    );
+    let error = match result {
+        Ok(_) => panic!("alternate installed repair must refuse"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.kind(), TransferErrorKind::UnsafeLocalState);
+    assert_eq!(progress_calls.get(), 0);
+    assert_eq!(capacity_calls.get(), 0);
+    assert_eq!(token_calls.get(), 0);
+    assert_eq!(download_calls.get(), 0);
+    assert!(model_dir.join("manifest.json").exists());
+    assert!(!model_dir.join("pending.json").exists());
+}
+
 #[test]
 fn fresh_insufficient_disk_creates_only_stable_directory_and_lock() {
     let root = tempfile::tempdir().unwrap();
