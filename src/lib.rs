@@ -1016,6 +1016,7 @@ where
             let candidates = local_candidates(&paths, &installed)?;
             let runnable = runnable_candidates(&candidates);
             let auxiliaries = auxiliary_candidates(&candidates);
+            let incomplete = app::AppService::from_paths(paths.clone()).incomplete_transfers()?;
             if installed.is_empty() && runnable.is_empty() {
                 let muted = ui::muted();
                 anstream::println!("No runnable models installed.");
@@ -1083,6 +1084,14 @@ where
                         candidate.filename
                     );
                 }
+            }
+            let incomplete_output = format_incomplete_transfers(
+                incomplete.entries(),
+                incomplete.unrecognized_root_partials(),
+            );
+            if !incomplete_output.is_empty() {
+                anstream::println!();
+                anstream::print!("{incomplete_output}");
             }
             Ok(0)
         }
@@ -1264,6 +1273,63 @@ fn installed_model_size(manifest: &Manifest) -> BinaryBytes {
     BinaryBytes(manifest.total_size())
 }
 
+fn format_incomplete_transfers(
+    entries: &[app::IncompleteTransferSummary],
+    unrecognized_root_partials: usize,
+) -> String {
+    let mut output = String::new();
+    if !entries.is_empty() {
+        output.push_str(&format!("Incomplete downloads ({})\n", entries.len()));
+        for entry in entries {
+            let completed = entry.completed_bytes();
+            let total = entry.total_bytes();
+            let percent = if total == 0 {
+                0
+            } else {
+                ((u128::from(completed.min(total)) * 100 + u128::from(total) / 2)
+                    / u128::from(total)) as u64
+            };
+            output.push_str(&format!(
+                "\n  {}  {percent}% · {} of {}\n    Discard: loxa discard {}\n",
+                entry.model_id(),
+                format_decimal_bytes(completed),
+                format_decimal_bytes(total),
+                cli::shell_quote(entry.model_id()),
+            ));
+        }
+    }
+    if unrecognized_root_partials > 0 {
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        let noun = if unrecognized_root_partials == 1 {
+            "file was"
+        } else {
+            "files were"
+        };
+        output.push_str(&format!(
+            "{unrecognized_root_partials} unrecognized partial {noun} left untouched.\n"
+        ));
+    }
+    output
+}
+
+fn format_decimal_bytes(bytes: u64) -> String {
+    const KB: f64 = 1_000.0;
+    const MB: f64 = 1_000_000.0;
+    const GB: f64 = 1_000_000_000.0;
+
+    if bytes >= 1_000_000_000 {
+        format!("{:.1} GB", bytes as f64 / GB)
+    } else if bytes >= 1_000_000 {
+        format!("{:.1} MB", bytes as f64 / MB)
+    } else if bytes >= 1_000 {
+        format!("{:.1} KB", bytes as f64 / KB)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
 fn load_installed_models(paths: &AppPaths) -> Result<Vec<Manifest>, String> {
     load_installed_models_with_reconciler(paths, catalog::local::reconcile_qualified_bundle)
 }
@@ -1441,8 +1507,8 @@ fn default_id(repo: &str, filename: &str, sha256: &str) -> String {
 mod tests {
     use super::{
         completion_output, default_id, discovery_error_message, ensure_interactive_chat,
-        execute_inspect, execute_pull_resolution, execute_search, format_insufficient_disk,
-        format_paused, format_resumable_failure, installed_model_size,
+        execute_inspect, execute_pull_resolution, execute_search, format_incomplete_transfers,
+        format_insufficient_disk, format_paused, format_resumable_failure, installed_model_size,
         load_installed_models_with_reconciler, local_candidates, model_options,
         model_options_with_candidates, ordinary_pull_command, print_pull_completion,
         pull_adapter_with, recovery_command, removal_prompt, resolve_runnable, run,
@@ -1460,6 +1526,33 @@ mod tests {
     };
     use crate::paths::AppPaths;
     use clap::Parser;
+
+    #[test]
+    fn incomplete_list_copy_is_human_readable_shell_safe_and_leaves_foreign_parts_untouched() {
+        let entries = vec![
+            crate::app::IncompleteTransferSummary::new("alpha".into(), 15_900_000, 88_200_000),
+            crate::app::IncompleteTransferSummary::new(
+                "owner-s-model".into(),
+                57_000_000,
+                270_900_000,
+            ),
+        ];
+
+        assert_eq!(
+            format_incomplete_transfers(&entries, 2),
+            concat!(
+                "Incomplete downloads (2)\n",
+                "\n",
+                "  alpha  18% · 15.9 MB of 88.2 MB\n",
+                "    Discard: loxa discard 'alpha'\n",
+                "\n",
+                "  owner-s-model  21% · 57.0 MB of 270.9 MB\n",
+                "    Discard: loxa discard 'owner-s-model'\n",
+                "\n",
+                "2 unrecognized partial files were left untouched.\n",
+            )
+        );
+    }
 
     fn manifest(id: &str) -> Manifest {
         Manifest {

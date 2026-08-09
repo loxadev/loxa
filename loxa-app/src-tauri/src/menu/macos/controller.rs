@@ -17,6 +17,7 @@ use super::rows::{Actions, MenuRows, PopoverContent};
 #[cfg(not(test))]
 use super::timer::{weak_callback, ObservationTimer};
 use crate::menu::catalog::{CatalogEvent, CatalogState};
+use crate::menu::incomplete::{DiscardFailure, IncompleteState};
 use crate::menu::installed::InstalledState;
 use crate::menu::observation::BackendClient;
 #[cfg(not(test))]
@@ -35,6 +36,8 @@ struct NativePopoverState {
     rendered_catalog: Option<CatalogState>,
     installed: Rc<RefCell<InstalledState>>,
     rendered_installed: Option<InstalledState>,
+    incomplete: Rc<RefCell<IncompleteState>>,
+    rendered_incomplete: Option<IncompleteState>,
     #[cfg(test)]
     cancel: InlineCancelState,
     backend: Option<BackendClient>,
@@ -62,6 +65,8 @@ impl NativePopoverState {
             rendered_catalog: None,
             installed: Rc::new(RefCell::new(InstalledState::default())),
             rendered_installed: None,
+            incomplete: Rc::new(RefCell::new(IncompleteState::default())),
+            rendered_incomplete: None,
             #[cfg(test)]
             cancel: InlineCancelState::default(),
             backend: {
@@ -81,9 +86,12 @@ impl NativePopoverState {
     fn render(&mut self, target: &AnyObject, actions: Actions, mtm: MainThreadMarker) {
         let catalog_changed = self.rendered_catalog.as_ref() != Some(&self.catalog);
         let installed_changed = self.rendered_installed.as_ref() != Some(&*self.installed.borrow());
+        let incomplete_changed =
+            self.rendered_incomplete.as_ref() != Some(&*self.incomplete.borrow());
         let snapshot_update = self.snapshot.update_from(self.rendered.as_ref());
         let catalog_updated_in_place = catalog_changed
             && !installed_changed
+            && !incomplete_changed
             && snapshot_update == MenuUpdate::UpdateRetainedRows
             && self.rows.as_ref().is_some_and(|rows| {
                 self.rendered_catalog
@@ -91,6 +99,7 @@ impl NativePopoverState {
                     .is_some_and(|previous| rows.update_catalog_transfer(previous, &self.catalog))
             });
         let requires_rebuild = installed_changed
+            || incomplete_changed
             || snapshot_update == MenuUpdate::Rebuild
             || (catalog_changed && !catalog_updated_in_place)
             || self.rows.is_none();
@@ -105,15 +114,18 @@ impl NativePopoverState {
         self.rendered = Some(self.snapshot.clone());
         self.rendered_catalog = Some(self.catalog.clone());
         self.rendered_installed = Some(self.installed.borrow().clone());
+        self.rendered_incomplete = Some(self.incomplete.borrow().clone());
     }
 
     fn rebuild(&mut self, target: &AnyObject, actions: Actions, mtm: MainThreadMarker) {
         let search_focus = self.rows.as_ref().and_then(MenuRows::capture_search_focus);
         let PopoverContent { view, rows, .. } = {
+            let incomplete = self.incomplete.borrow();
             let installed = self.installed.borrow();
             MenuRows::build(
                 &self.snapshot,
                 &self.catalog,
+                &incomplete,
                 &installed,
                 Some(target),
                 actions,
@@ -134,11 +146,20 @@ impl NativePopoverState {
     fn popover_closed(&mut self, target: &AnyObject, actions: Actions, mtm: MainThreadMarker) {
         self.installed.borrow_mut().reset_feedback();
         self.rendered_installed = None;
+        self.cancel_incomplete_discard();
+        self.rendered_incomplete = None;
         #[cfg(test)]
         {
             self.cancel.reset();
         }
         self.render(target, actions, mtm);
+    }
+
+    fn cancel_incomplete_discard(&mut self) {
+        let model_id = self.incomplete.borrow_mut().cancel_prepared();
+        if let (Some(model_id), Some(backend)) = (model_id, self.backend.as_mut()) {
+            let _ = backend.keep_discard(model_id);
+        }
     }
 
     #[cfg(test)]
@@ -219,6 +240,16 @@ impl NativePopoverState {
                     Ok(items) => self.installed.borrow_mut().replace(items, pinned_model_id),
                     Err(error) => self.installed.borrow_mut().fail(error),
                 },
+                BackendMessage::Incomplete(result) => match result {
+                    Ok(items) => self.incomplete.borrow_mut().replace(items),
+                    Err(error) => self.incomplete.borrow_mut().fail(error),
+                },
+                BackendMessage::DiscardPrepared { model_id, result } => {
+                    let _ = self.incomplete.borrow_mut().prepared(&model_id, result);
+                }
+                BackendMessage::DiscardCompleted { model_id, result } => {
+                    let _ = self.incomplete.borrow_mut().completed(&model_id, result);
+                }
                 BackendMessage::Catalog(event) => {
                     let _ = self.catalog.apply(event);
                 }
@@ -228,6 +259,7 @@ impl NativePopoverState {
     }
 
     fn shutdown(&mut self) {
+        self.cancel_incomplete_discard();
         if let Some(backend) = &mut self.backend {
             backend.shutdown();
         }
@@ -315,6 +347,7 @@ define_class!(
             let mtm = MainThreadMarker::new()
                 .expect("AppKit must submit menu searches on the main thread");
             let mut state = self.ivars().state.borrow_mut();
+            state.cancel_incomplete_discard();
             let command = state.catalog.submit_search(&query);
             state.dispatch_catalog(command);
             state.render(self, action_selectors(), mtm);
@@ -328,6 +361,7 @@ define_class!(
             let mtm = MainThreadMarker::new()
                 .expect("AppKit must select repositories on the main thread");
             let mut state = self.ivars().state.borrow_mut();
+            state.cancel_incomplete_discard();
             let command = state.catalog.inspect_repository(index);
             state.dispatch_catalog(command);
             state.render(self, action_selectors(), mtm);
@@ -341,6 +375,7 @@ define_class!(
             let mtm = MainThreadMarker::new()
                 .expect("AppKit must select GGUF candidates on the main thread");
             let mut state = self.ivars().state.borrow_mut();
+            state.cancel_incomplete_discard();
             if state.catalog.select_candidate(index) {
                 state.render(self, action_selectors(), mtm);
             }
@@ -351,6 +386,7 @@ define_class!(
             let mtm = MainThreadMarker::new()
                 .expect("AppKit must start transfers on the main thread");
             let mut state = self.ivars().state.borrow_mut();
+            state.cancel_incomplete_discard();
             let command = state.catalog.start_transfer();
             state.dispatch_catalog(command);
             state.render(self, action_selectors(), mtm);
@@ -390,10 +426,68 @@ define_class!(
             }
             let mtm = MainThreadMarker::new()
                 .expect("AppKit must select installed models on the main thread");
-            self.ivars()
-                .state
-                .borrow_mut()
-                .render(self, action_selectors(), mtm);
+            let mut state = self.ivars().state.borrow_mut();
+            state.cancel_incomplete_discard();
+            state.render(self, action_selectors(), mtm);
+        }
+
+        #[unsafe(method(prepareIncompleteDiscard:))]
+        fn prepare_incomplete_discard(&self, sender: Option<&NSButton>) {
+            let Some(index) = sender.and_then(|button| usize::try_from(button.tag()).ok()) else {
+                return;
+            };
+            let mtm = MainThreadMarker::new()
+                .expect("AppKit must prepare incomplete discard on the main thread");
+            let mut state = self.ivars().state.borrow_mut();
+            let Some(model_id) = state.incomplete.borrow_mut().prepare_discard(index) else {
+                return;
+            };
+            if !state
+                .backend
+                .as_mut()
+                .is_some_and(|backend| backend.prepare_discard(model_id.clone()))
+            {
+                let _ = state
+                    .incomplete
+                    .borrow_mut()
+                    .prepared(&model_id, Err(DiscardFailure::Unavailable));
+            }
+            state.render(self, action_selectors(), mtm);
+        }
+
+        #[unsafe(method(keepIncompletePartial:))]
+        fn keep_incomplete_partial(&self, _sender: Option<&NSButton>) {
+            let mtm = MainThreadMarker::new()
+                .expect("AppKit must keep incomplete downloads on the main thread");
+            let mut state = self.ivars().state.borrow_mut();
+            let model_id = { state.incomplete.borrow_mut().keep_partial() };
+            if let Some(model_id) = model_id {
+                if let Some(backend) = state.backend.as_mut() {
+                    let _ = backend.keep_discard(model_id);
+                }
+            }
+            state.render(self, action_selectors(), mtm);
+        }
+
+        #[unsafe(method(confirmIncompleteDiscard:))]
+        fn confirm_incomplete_discard(&self, _sender: Option<&NSButton>) {
+            let mtm = MainThreadMarker::new()
+                .expect("AppKit must confirm incomplete discard on the main thread");
+            let mut state = self.ivars().state.borrow_mut();
+            let Some(model_id) = state.incomplete.borrow_mut().confirm_discard() else {
+                return;
+            };
+            if !state
+                .backend
+                .as_mut()
+                .is_some_and(|backend| backend.confirm_discard(model_id.clone()))
+            {
+                let _ = state
+                    .incomplete
+                    .borrow_mut()
+                    .completed(&model_id, Err(DiscardFailure::Unavailable));
+            }
+            state.render(self, action_selectors(), mtm);
         }
 
         #[unsafe(method(copyInstalledCommand:))]
@@ -623,6 +717,9 @@ struct ProductionActionSelectors {
     installed_select: Sel,
     installed_copy: Sel,
     installed_reveal: Sel,
+    incomplete_prepare: Sel,
+    incomplete_keep: Sel,
+    incomplete_confirm: Sel,
     quit: Sel,
 }
 
@@ -636,6 +733,9 @@ fn production_action_selectors() -> ProductionActionSelectors {
         installed_select: sel!(selectInstalled:),
         installed_copy: sel!(copyInstalledCommand:),
         installed_reveal: sel!(revealInstalled:),
+        incomplete_prepare: sel!(prepareIncompleteDiscard:),
+        incomplete_keep: sel!(keepIncompletePartial:),
+        incomplete_confirm: sel!(confirmIncompleteDiscard:),
         quit: sel!(quit:),
     }
 }
@@ -650,6 +750,9 @@ fn action_selectors() -> Actions {
         installed_select,
         installed_copy,
         installed_reveal,
+        incomplete_prepare,
+        incomplete_keep,
+        incomplete_confirm,
         quit,
     } = production_action_selectors();
     Actions {
@@ -661,6 +764,9 @@ fn action_selectors() -> Actions {
         installed_select,
         installed_copy,
         installed_reveal,
+        incomplete_prepare,
+        incomplete_keep,
+        incomplete_confirm,
         #[cfg(test)]
         start: sel!(startFixture:),
         #[cfg(test)]
@@ -707,6 +813,9 @@ mod tests {
             sel!(selectInstalled:),
             sel!(copyInstalledCommand:),
             sel!(revealInstalled:),
+            sel!(prepareIncompleteDiscard:),
+            sel!(keepIncompletePartial:),
+            sel!(confirmIncompleteDiscard:),
         ] {
             assert!(
                 class.instance_method(action).is_some(),
@@ -726,6 +835,9 @@ mod tests {
             installed_select,
             installed_copy,
             installed_reveal,
+            incomplete_prepare,
+            incomplete_keep,
+            incomplete_confirm,
             quit,
         } = production_action_selectors();
 
@@ -737,6 +849,9 @@ mod tests {
         assert_eq!(installed_select, sel!(selectInstalled:));
         assert_eq!(installed_copy, sel!(copyInstalledCommand:));
         assert_eq!(installed_reveal, sel!(revealInstalled:));
+        assert_eq!(incomplete_prepare, sel!(prepareIncompleteDiscard:));
+        assert_eq!(incomplete_keep, sel!(keepIncompletePartial:));
+        assert_eq!(incomplete_confirm, sel!(confirmIncompleteDiscard:));
         assert_eq!(quit, sel!(quit:));
     }
 }

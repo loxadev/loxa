@@ -1115,15 +1115,23 @@ where
     ))
 }
 
-pub(crate) struct DiscardCandidate {
+pub struct DiscardCandidate {
     model_id: String,
     catalog: catalog::transfer::CatalogDiscardFacts,
     artifact: download::ArtifactDiscardFacts,
 }
 
 impl DiscardCandidate {
-    pub(crate) fn model_id(&self) -> &str {
+    pub fn model_id(&self) -> &str {
         &self.model_id
+    }
+
+    pub(super) fn retained_bytes(&self) -> u64 {
+        self.artifact.retained_bytes()
+    }
+
+    pub(super) fn total_bytes(&self) -> u64 {
+        self.catalog.total_bytes()
     }
 }
 
@@ -1163,10 +1171,7 @@ impl AppService {
         )
     }
 
-    pub(crate) fn prepare_discard(
-        &self,
-        model_id: String,
-    ) -> Result<DiscardCandidate, TransferError> {
+    pub fn prepare_discard(&self, model_id: String) -> Result<DiscardCandidate, TransferError> {
         crate::paths::validate_id(&model_id)
             .map_err(|_| TransferError::terminal(TransferErrorKind::InvalidModelId))?;
         let model_dir = self
@@ -1213,10 +1218,7 @@ impl AppService {
         })
     }
 
-    pub(crate) fn discard_transfer(
-        &self,
-        candidate: DiscardCandidate,
-    ) -> Result<(), TransferError> {
+    pub fn discard_transfer(&self, candidate: DiscardCandidate) -> Result<(), TransferError> {
         let DiscardCandidate {
             model_id,
             catalog: captured_catalog,

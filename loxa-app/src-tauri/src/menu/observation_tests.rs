@@ -1,22 +1,23 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use loxa::app::{AppSnapshot, TransferControl};
 use loxa::huggingface::ResolvedFile;
 
 use super::{
-    map_app_snapshot, map_core_snapshot, run_backend_worker, BackendClient, BackendMessage,
-    BackendRequest, BackendSource, BackendTransfer, CoreBundle, CoreDownload, CoreObservation,
-    CoreRecommendation, CoreRecommendationUnavailableReason, InspectedRepository,
-    ObservationMessage, RefreshAdmission, TransferCompletion,
+    discard_service_failure, map_app_snapshot, map_core_snapshot, run_backend_worker,
+    BackendClient, BackendMessage, BackendRequest, BackendSource, BackendTransfer, CoreBundle,
+    CoreDownload, CoreObservation, CoreRecommendation, CoreRecommendationUnavailableReason,
+    InspectedRepository, ObservationMessage, RefreshAdmission, TransferCompletion,
 };
 use crate::menu::catalog::{
     CandidateItem, CandidateTransferIntent, CatalogCommand, CatalogEvent,
     CatalogTransferDisposition, RepositoryItem, TransferStage,
 };
+use crate::menu::incomplete::{DiscardFailure, IncompleteInventoryError, IncompleteItem};
 use crate::menu::installed::{InstalledInventoryError, InstalledItem};
 use crate::menu::presentation::{Fixture, MenuSnapshot};
 
@@ -133,6 +134,7 @@ fn worker_routes_search_inspection_and_exact_transfer_as_owned_events() {
                 result: Ok(vec![installed_item("new-model", 42)]),
                 pinned_model_id: Some("new-model".into()),
             },
+            BackendMessage::Incomplete(Ok(Vec::new())),
         ]
     );
 }
@@ -241,6 +243,7 @@ fn worker_refreshes_inventory_immediately_after_installed_and_already_installed(
                     result: Ok(initial_inventory),
                     pinned_model_id: None,
                 },
+                BackendMessage::Incomplete(Ok(Vec::new())),
                 BackendMessage::Catalog(CatalogEvent::Progress {
                     generation: 11,
                     stage: TransferStage::Transferring,
@@ -258,6 +261,7 @@ fn worker_refreshes_inventory_immediately_after_installed_and_already_installed(
                     ]),
                     pinned_model_id: Some("new-model".into()),
                 },
+                BackendMessage::Incomplete(Ok(Vec::new())),
             ],
             "terminal disposition {disposition:?} must refresh without admission delay"
         );
@@ -301,6 +305,7 @@ fn worker_drops_the_completion_pin_when_terminal_inventory_refresh_fails() {
                 result: Ok(vec![installed_item("old-model", 41)]),
                 pinned_model_id: None,
             },
+            BackendMessage::Incomplete(Ok(Vec::new())),
             BackendMessage::Catalog(CatalogEvent::Progress {
                 generation: 12,
                 stage: TransferStage::Transferring,
@@ -315,6 +320,7 @@ fn worker_drops_the_completion_pin_when_terminal_inventory_refresh_fails() {
                 result: Err(InstalledInventoryError::RefreshFailed),
                 pinned_model_id: None,
             },
+            BackendMessage::Incomplete(Ok(Vec::new())),
         ]
     );
 }
@@ -341,6 +347,7 @@ fn worker_maps_inventory_failures_to_the_closed_sanitized_error() {
                 result: Err(InstalledInventoryError::RefreshFailed),
                 pinned_model_id: None,
             },
+            BackendMessage::Incomplete(Ok(Vec::new())),
         ]
     );
 }
@@ -432,6 +439,284 @@ fn candidate() -> CandidateItem {
 
 fn installed_item(id: &str, total_bytes: u64) -> InstalledItem {
     InstalledItem::new(id.into(), format!("{id}.gguf"), total_bytes)
+}
+
+#[test]
+fn worker_prepares_before_confirmation_keeps_without_consuming_and_discards_the_exact_candidate() {
+    let (request_sender, request_receiver) = mpsc::channel();
+    let (message_sender, message_receiver) = mpsc::channel();
+    let operations = Arc::new(Mutex::new(Vec::new()));
+    request_sender
+        .send(BackendRequest::PrepareDiscard {
+            model_id: "alpha".into(),
+        })
+        .unwrap();
+    request_sender
+        .send(BackendRequest::KeepDiscard {
+            model_id: "alpha".into(),
+        })
+        .unwrap();
+    request_sender
+        .send(BackendRequest::PrepareDiscard {
+            model_id: "beta".into(),
+        })
+        .unwrap();
+    request_sender
+        .send(BackendRequest::ConfirmDiscard {
+            model_id: "beta".into(),
+        })
+        .unwrap();
+    request_sender.send(BackendRequest::Stop).unwrap();
+
+    run_backend_worker(
+        Ok(DiscardBackend {
+            prepared: None,
+            operations: operations.clone(),
+            fail_inventory: false,
+            refresh_barrier: None,
+        }),
+        request_receiver,
+        message_sender,
+        &AtomicBool::new(false),
+    );
+
+    assert_eq!(
+        *operations.lock().unwrap(),
+        [
+            "prepare alpha",
+            "keep alpha",
+            "prepare beta",
+            "discard beta"
+        ]
+    );
+    assert_eq!(
+        message_receiver.into_iter().collect::<Vec<_>>(),
+        [
+            BackendMessage::DiscardPrepared {
+                model_id: "alpha".into(),
+                result: Ok(()),
+            },
+            BackendMessage::DiscardPrepared {
+                model_id: "beta".into(),
+                result: Ok(()),
+            },
+            BackendMessage::DiscardCompleted {
+                model_id: "beta".into(),
+                result: Ok(()),
+            },
+            BackendMessage::Observation(ObservationMessage::Snapshot(Fixture::Empty.snapshot())),
+            BackendMessage::Installed {
+                result: Ok(Vec::new()),
+                pinned_model_id: None,
+            },
+            BackendMessage::Incomplete(Ok(Vec::new())),
+        ]
+    );
+}
+
+#[test]
+fn service_discard_failure_uses_neutral_retry_copy_instead_of_claiming_a_change() {
+    let failure = discard_service_failure();
+
+    assert_eq!(failure, DiscardFailure::Unavailable);
+    let mut state = crate::menu::incomplete::IncompleteState::default();
+    state.replace(vec![IncompleteItem::new("alpha".into(), 2, 10)]);
+    assert_eq!(state.prepare_discard(0).as_deref(), Some("alpha"));
+    assert!(state.prepared("alpha", Ok(())));
+    assert_eq!(state.confirm_discard().as_deref(), Some("alpha"));
+    assert!(state.completed("alpha", Err(failure)));
+    assert_eq!(
+        state.feedback_message(),
+        Some("Could not finish discarding. Refresh and try again.")
+    );
+}
+
+struct DiscardBackend {
+    prepared: Option<String>,
+    operations: Arc<Mutex<Vec<String>>>,
+    fail_inventory: bool,
+    refresh_barrier: Option<RefreshBarrier>,
+}
+
+struct RefreshBarrier {
+    started: mpsc::Sender<()>,
+    release: mpsc::Receiver<()>,
+}
+
+impl BackendSource for DiscardBackend {
+    fn snapshot(&mut self) -> MenuSnapshot {
+        if let Some(barrier) = self.refresh_barrier.take() {
+            let _ = barrier.started.send(());
+            let _ = barrier.release.recv_timeout(Duration::from_secs(2));
+        }
+        Fixture::Empty.snapshot()
+    }
+
+    fn installed_models(&mut self) -> Result<Vec<InstalledItem>, InstalledInventoryError> {
+        Ok(Vec::new())
+    }
+
+    fn incomplete_transfers(&mut self) -> Result<Vec<IncompleteItem>, IncompleteInventoryError> {
+        if self.fail_inventory {
+            Err(IncompleteInventoryError::RefreshFailed)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    fn search(&mut self, _query: String) -> Result<Vec<RepositoryItem>, String> {
+        Err("search is outside this test".into())
+    }
+
+    fn inspect(&mut self, _repo: String) -> Result<InspectedRepository, String> {
+        Err("inspection is outside this test".into())
+    }
+
+    fn transfer(
+        &mut self,
+        _transfer: BackendTransfer,
+        _progress: &mut dyn FnMut(TransferStage, u64, u64),
+    ) -> Result<TransferCompletion, String> {
+        Err("transfer is outside this test".into())
+    }
+
+    fn prepare_discard(&mut self, model_id: String) -> Result<(), DiscardFailure> {
+        self.operations
+            .lock()
+            .unwrap()
+            .push(format!("prepare {model_id}"));
+        self.prepared = Some(model_id);
+        Ok(())
+    }
+
+    fn keep_discard(&mut self, model_id: &str) {
+        self.operations
+            .lock()
+            .unwrap()
+            .push(format!("keep {model_id}"));
+        if self.prepared.as_deref() == Some(model_id) {
+            self.prepared = None;
+        }
+    }
+
+    fn confirm_discard(&mut self, model_id: &str) -> Result<(), DiscardFailure> {
+        if self.prepared.as_deref() != Some(model_id) {
+            return Err(DiscardFailure::Unavailable);
+        }
+        self.operations
+            .lock()
+            .unwrap()
+            .push(format!("discard {model_id}"));
+        self.prepared = None;
+        Ok(())
+    }
+}
+
+#[test]
+fn successful_discard_is_delivered_before_a_failed_inventory_refresh() {
+    let (request_sender, request_receiver) = mpsc::channel();
+    let (message_sender, message_receiver) = mpsc::channel();
+    request_sender
+        .send(BackendRequest::PrepareDiscard {
+            model_id: "alpha".into(),
+        })
+        .unwrap();
+    request_sender
+        .send(BackendRequest::ConfirmDiscard {
+            model_id: "alpha".into(),
+        })
+        .unwrap();
+    request_sender.send(BackendRequest::Stop).unwrap();
+
+    run_backend_worker(
+        Ok(DiscardBackend {
+            prepared: None,
+            operations: Arc::new(Mutex::new(Vec::new())),
+            fail_inventory: true,
+            refresh_barrier: None,
+        }),
+        request_receiver,
+        message_sender,
+        &AtomicBool::new(false),
+    );
+
+    let messages = message_receiver.into_iter().collect::<Vec<_>>();
+    assert_eq!(
+        messages,
+        [
+            BackendMessage::DiscardPrepared {
+                model_id: "alpha".into(),
+                result: Ok(()),
+            },
+            BackendMessage::DiscardCompleted {
+                model_id: "alpha".into(),
+                result: Ok(()),
+            },
+            BackendMessage::Observation(ObservationMessage::Snapshot(Fixture::Empty.snapshot())),
+            BackendMessage::Installed {
+                result: Ok(Vec::new()),
+                pinned_model_id: None,
+            },
+            BackendMessage::Incomplete(Err(IncompleteInventoryError::RefreshFailed)),
+        ]
+    );
+}
+
+#[test]
+fn discard_completion_crosses_the_channel_before_refresh_starts() {
+    let (request_sender, request_receiver) = mpsc::channel();
+    let (message_sender, message_receiver) = mpsc::channel();
+    let (refresh_started_sender, refresh_started_receiver) = mpsc::channel();
+    let (release_refresh_sender, release_refresh_receiver) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        run_backend_worker(
+            Ok(DiscardBackend {
+                prepared: None,
+                operations: Arc::new(Mutex::new(Vec::new())),
+                fail_inventory: false,
+                refresh_barrier: Some(RefreshBarrier {
+                    started: refresh_started_sender,
+                    release: release_refresh_receiver,
+                }),
+            }),
+            request_receiver,
+            message_sender,
+            &AtomicBool::new(false),
+        );
+    });
+
+    request_sender
+        .send(BackendRequest::PrepareDiscard {
+            model_id: "alpha".into(),
+        })
+        .unwrap();
+    assert_eq!(
+        message_receiver.recv_timeout(Duration::from_secs(2)),
+        Ok(BackendMessage::DiscardPrepared {
+            model_id: "alpha".into(),
+            result: Ok(()),
+        })
+    );
+    request_sender
+        .send(BackendRequest::ConfirmDiscard {
+            model_id: "alpha".into(),
+        })
+        .unwrap();
+
+    let refresh_started = refresh_started_receiver.recv_timeout(Duration::from_secs(2));
+    let completion = message_receiver.recv_timeout(Duration::from_millis(250));
+    let _ = release_refresh_sender.send(());
+    request_sender.send(BackendRequest::Stop).unwrap();
+    worker.join().unwrap();
+
+    assert_eq!(refresh_started, Ok(()));
+    assert_eq!(
+        completion,
+        Ok(BackendMessage::DiscardCompleted {
+            model_id: "alpha".into(),
+            result: Ok(()),
+        })
+    );
 }
 
 struct FakeBackend;

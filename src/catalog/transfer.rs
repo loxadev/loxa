@@ -39,6 +39,12 @@ pub(crate) struct CatalogDiscardFacts {
     manifest_temp: Option<RegularFileIdentity>,
 }
 
+impl CatalogDiscardFacts {
+    pub(crate) fn total_bytes(&self) -> u64 {
+        self.pending.size
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CatalogDiscardError {
     NoIncompleteTransfer,

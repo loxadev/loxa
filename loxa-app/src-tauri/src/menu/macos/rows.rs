@@ -12,8 +12,10 @@ use objc2_app_kit::{
 use objc2_foundation::{NSInteger, NSPoint, NSRect, NSSize, NSString};
 
 use super::catalog_rows::{self, CatalogActions};
+use super::incomplete_rows::{self, IncompleteActions};
 use super::installed_rows::{self, InstalledActions};
 use crate::menu::catalog::CatalogState;
+use crate::menu::incomplete::IncompleteState;
 #[cfg(test)]
 use crate::menu::presentation::{InlineCancelState, MenuAction};
 use crate::menu::presentation::{MenuLayout, MenuSnapshot, RecommendationRow, TransferRow};
@@ -37,6 +39,9 @@ pub(super) struct Actions {
     pub(super) installed_select: Sel,
     pub(super) installed_copy: Sel,
     pub(super) installed_reveal: Sel,
+    pub(super) incomplete_prepare: Sel,
+    pub(super) incomplete_keep: Sel,
+    pub(super) incomplete_confirm: Sel,
     #[cfg(test)]
     pub(super) start: Sel,
     #[cfg(test)]
@@ -57,6 +62,7 @@ pub(super) struct Actions {
 pub(super) struct MenuRows {
     header: HeaderRow,
     catalog: catalog_rows::CatalogContent,
+    _incomplete: Option<incomplete_rows::IncompleteContent>,
     body: BodyRows,
     footer: FooterRow,
 }
@@ -76,12 +82,16 @@ impl MenuRows {
     pub(super) fn build(
         snapshot: &MenuSnapshot,
         catalog: &CatalogState,
+        incomplete: &IncompleteState,
         installed: &crate::menu::installed::InstalledState,
         target: Option<&AnyObject>,
         actions: Actions,
         mtm: MainThreadMarker,
     ) -> PopoverContent {
-        let mut layout = ContentLayout::new(content_height(snapshot, catalog, installed), mtm);
+        let mut layout = ContentLayout::new(
+            content_height(snapshot, catalog, incomplete, installed),
+            mtm,
+        );
         let header = HeaderRow::build(snapshot, mtm);
         layout.add(&header.root, HEADER_HEIGHT);
         layout.add_separator(mtm);
@@ -100,6 +110,25 @@ impl MenuRows {
         );
         layout.add(&catalog_content.view, catalog_content.height);
         layout.add_separator(mtm);
+
+        let incomplete_content = if show_incomplete(snapshot, catalog, incomplete) {
+            layout.add(&section_header("Incomplete downloads", mtm), SECTION_HEIGHT);
+            let content = incomplete_rows::build(
+                incomplete,
+                target,
+                IncompleteActions {
+                    prepare: actions.incomplete_prepare,
+                    keep: actions.incomplete_keep,
+                    confirm: actions.incomplete_confirm,
+                },
+                mtm,
+            );
+            layout.add(&content.view, content.height);
+            layout.add_separator(mtm);
+            Some(content)
+        } else {
+            None
+        };
 
         let body = if catalog.owns_main_region() {
             BodyRows::Catalog
@@ -193,6 +222,10 @@ impl MenuRows {
         let mut action_buttons = body.action_buttons();
         #[cfg(test)]
         action_buttons.extend(catalog_content.action_buttons.iter().cloned());
+        #[cfg(test)]
+        if let Some(incomplete) = &incomplete_content {
+            action_buttons.extend(incomplete.action_buttons.iter().cloned());
+        }
 
         layout.add_separator(mtm);
         let footer = FooterRow::build(snapshot, mtm);
@@ -209,6 +242,7 @@ impl MenuRows {
             rows: Self {
                 header,
                 catalog: catalog_content,
+                _incomplete: incomplete_content,
                 body,
                 footer,
             },
@@ -349,6 +383,7 @@ impl ContentLayout {
 fn content_height(
     snapshot: &MenuSnapshot,
     catalog: &CatalogState,
+    incomplete: &IncompleteState,
     installed: &crate::menu::installed::InstalledState,
 ) -> f64 {
     let common = HEADER_HEIGHT
@@ -356,24 +391,30 @@ fn content_height(
         + 4.0 * SEPARATOR_HEIGHT
         + FINAL_CONTENT_SPACER_HEIGHT
         + catalog_rows::content_height(catalog);
+    let incomplete_height = if show_incomplete(snapshot, catalog, incomplete) {
+        SECTION_HEIGHT + incomplete_rows::content_height(incomplete) + SEPARATOR_HEIGHT
+    } else {
+        0.0
+    };
     if catalog.owns_main_region() {
         common
     } else if snapshot.is_loading()
         || snapshot.error_message().is_some()
         || snapshot.recovery_row().is_some()
     {
-        common + SECTION_HEIGHT + 56.0
+        common + incomplete_height + SECTION_HEIGHT + 56.0
     } else if snapshot.transfer_row().is_some() {
         common + SECTION_HEIGHT + MenuLayout::transfer_row_height()
     } else if inventory_is_primary(snapshot, installed) {
         let inventory = SECTION_HEIGHT + installed_rows::content_height(installed);
         if snapshot.recommendation_row().is_some() {
-            common + inventory + SEPARATOR_HEIGHT + SECTION_HEIGHT + 56.0
+            common + incomplete_height + inventory + SEPARATOR_HEIGHT + SECTION_HEIGHT + 56.0
         } else {
-            common + inventory
+            common + incomplete_height + inventory
         }
     } else if snapshot.recommendation_row().is_some() {
         common
+            + incomplete_height
             + SECTION_HEIGHT
             + MenuLayout::model_row_height()
             + SEPARATOR_HEIGHT
@@ -381,6 +422,7 @@ fn content_height(
             + 56.0
     } else {
         common
+            + incomplete_height
             + SECTION_HEIGHT
             + 56.0
             + if installed.error_message().is_some() {
@@ -389,6 +431,19 @@ fn content_height(
                 0.0
             }
     }
+}
+
+fn show_incomplete(
+    snapshot: &MenuSnapshot,
+    catalog: &CatalogState,
+    incomplete: &IncompleteState,
+) -> bool {
+    incomplete.has_content()
+        && !catalog.owns_main_region()
+        && !snapshot.is_loading()
+        && snapshot.error_message().is_none()
+        && snapshot.recovery_row().is_none()
+        && snapshot.transfer_row().is_none()
 }
 
 fn inventory_is_primary(

@@ -13,6 +13,13 @@ mod menu {
         ));
     }
 
+    pub(crate) mod incomplete {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/menu/incomplete.rs"
+        ));
+    }
+
     pub(crate) mod presentation {
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -36,6 +43,13 @@ mod menu {
             include!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/src/menu/macos/installed_rows.rs"
+            ));
+        }
+
+        pub(crate) mod incomplete_rows {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/menu/macos/incomplete_rows.rs"
             ));
         }
 

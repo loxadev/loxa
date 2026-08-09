@@ -113,6 +113,16 @@ impl ArtifactDiscardFacts {
     ) {
         (self.directory_identity, self.part, self.restart)
     }
+
+    pub(crate) fn retained_bytes(&self) -> u64 {
+        self.part
+            .as_ref()
+            .into_iter()
+            .chain(self.restart.as_ref())
+            .map(RegularFileIdentity::size)
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 pub(crate) fn plan_artifact_discard(

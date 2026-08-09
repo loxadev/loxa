@@ -11,13 +11,16 @@ use std::path::PathBuf;
 #[cfg(unix)]
 use sysinfo::{Disks, System};
 
+mod incomplete;
 mod installed;
 pub(crate) mod transfer;
 
+pub use incomplete::{IncompleteTransferInventory, IncompleteTransferSummary};
 pub use installed::InstalledModelSummary;
 pub use transfer::{
-    ResolveArtifactError, ResolveArtifactRequest, TransferControl, TransferDisposition,
-    TransferError, TransferPhase, TransferProgress, TransferResult, TransferSelected,
+    DiscardCandidate, ResolveArtifactError, ResolveArtifactRequest, TransferControl,
+    TransferDisposition, TransferError, TransferPhase, TransferProgress, TransferResult,
+    TransferSelected,
 };
 
 const GIB: u64 = 1024 * 1024 * 1024;

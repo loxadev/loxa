@@ -98,6 +98,10 @@ impl RegularFileIdentity {
             self == current
         }
     }
+
+    pub(crate) fn size(&self) -> u64 {
+        self.size
+    }
 }
 
 pub(crate) fn read_regular_file(path: &Path) -> io::Result<Vec<u8>> {

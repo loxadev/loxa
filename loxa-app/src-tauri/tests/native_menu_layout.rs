@@ -18,6 +18,13 @@ mod menu {
         ));
     }
 
+    pub(crate) mod incomplete {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/menu/incomplete.rs"
+        ));
+    }
+
     pub(crate) mod presentation {
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -50,6 +57,18 @@ mod menu {
             pub(crate) fn request_pause(&self, _generation: u64) -> bool {
                 false
             }
+
+            pub(crate) fn prepare_discard(&mut self, _model_id: String) -> bool {
+                false
+            }
+
+            pub(crate) fn keep_discard(&mut self, _model_id: String) -> bool {
+                false
+            }
+
+            pub(crate) fn confirm_discard(&mut self, _model_id: String) -> bool {
+                false
+            }
         }
     }
 
@@ -68,6 +87,13 @@ mod menu {
             ));
         }
 
+        pub(crate) mod incomplete_rows {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/menu/macos/incomplete_rows.rs"
+            ));
+        }
+
         pub(crate) mod timer {
             include!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -81,6 +107,7 @@ mod menu {
                 "/src/menu/macos/rows.rs"
             ));
             use crate::menu::catalog::{CandidateItem, CatalogEvent, RepositoryItem};
+            use crate::menu::incomplete::IncompleteItem;
             use crate::menu::installed::{
                 InstalledFeedback, InstalledInventoryError, InstalledItem, InstalledState,
             };
@@ -106,6 +133,7 @@ mod menu {
                     } = MenuRows::build(
                         &fixture.snapshot(),
                         &crate::menu::catalog::CatalogState::default(),
+                        &crate::menu::incomplete::IncompleteState::default(),
                         &InstalledState::default(),
                         None,
                         layout_fixture_actions(),
@@ -159,6 +187,7 @@ mod menu {
                 let search = MenuRows::build(
                     &Fixture::Empty.snapshot(),
                     &crate::menu::catalog::CatalogState::default(),
+                    &crate::menu::incomplete::IncompleteState::default(),
                     &InstalledState::default(),
                     None,
                     layout_fixture_actions(),
@@ -182,6 +211,7 @@ mod menu {
 
                 assert_catalog_browsing_contract(mtm);
                 assert_installed_rows_and_priority(mtm);
+                assert_incomplete_rows_are_bounded_accessible_and_hidden_while_browsing(mtm);
                 assert_empty_inventory_error_is_rendered(mtm);
                 assert_known_installed_row_outlives_cold_inventory_error(mtm);
                 super::controller::assert_feedback_close_rebuild_contract(mtm);
@@ -456,6 +486,7 @@ mod menu {
                 let installed_menu = MenuRows::build(
                     &Fixture::Installed.snapshot(),
                     &idle,
+                    &crate::menu::incomplete::IncompleteState::default(),
                     &one,
                     None,
                     layout_fixture_actions(),
@@ -475,6 +506,7 @@ mod menu {
                     let content = MenuRows::build(
                         &snapshot,
                         &idle,
+                        &crate::menu::incomplete::IncompleteState::default(),
                         &one,
                         None,
                         layout_fixture_actions(),
@@ -491,6 +523,7 @@ mod menu {
                 let recommended = MenuRows::build(
                     &Fixture::Empty.snapshot(),
                     &idle,
+                    &crate::menu::incomplete::IncompleteState::default(),
                     &one,
                     None,
                     layout_fixture_actions(),
@@ -521,6 +554,7 @@ mod menu {
                     let content = MenuRows::build(
                         &snapshot,
                         &failed_catalog,
+                        &crate::menu::incomplete::IncompleteState::default(),
                         &one,
                         None,
                         layout_fixture_actions(),
@@ -540,6 +574,7 @@ mod menu {
                 let browsing = MenuRows::build(
                     &MenuSnapshot::loading(),
                     &active,
+                    &crate::menu::incomplete::IncompleteState::default(),
                     &one,
                     None,
                     layout_fixture_actions(),
@@ -551,12 +586,134 @@ mod menu {
                 assert!(!browsing_text.contains(&"alpha-q4".into()));
             }
 
+            fn assert_incomplete_rows_are_bounded_accessible_and_hidden_while_browsing(
+                mtm: MainThreadMarker,
+            ) {
+                let mut incomplete = IncompleteState::default();
+                incomplete.replace(vec![
+                    IncompleteItem::new("delta".into(), 4_000_000, 10_000_000),
+                    IncompleteItem::new("alpha".into(), 15_900_000, 88_200_000),
+                    IncompleteItem::new("charlie".into(), 3_000_000, 10_000_000),
+                    IncompleteItem::new("bravo".into(), 2_000_000, 10_000_000),
+                ]);
+                assert_eq!(incomplete.prepare_discard(0).as_deref(), Some("alpha"));
+                let preparing = super::incomplete_rows::build(
+                    &incomplete,
+                    None,
+                    super::incomplete_rows::IncompleteActions {
+                        prepare: sel!(fixtureNoop:),
+                        keep: sel!(fixtureNoop:),
+                        confirm: sel!(fixtureNoop:),
+                    },
+                    mtm,
+                );
+                assert_eq!(preparing.action_buttons.len(), 3);
+                assert!(preparing
+                    .action_buttons
+                    .iter()
+                    .all(|button| !button.isEnabled()));
+                assert_eq!(preparing.action_buttons[0].title().to_string(), "Checking…");
+                assert_eq!(
+                    preparing.action_buttons[0]
+                        .accessibilityLabel()
+                        .map(|label| label.to_string())
+                        .as_deref(),
+                    Some("Checking incomplete download alpha")
+                );
+                assert_eq!(
+                    preparing.action_buttons[1]
+                        .accessibilityLabel()
+                        .map(|label| label.to_string())
+                        .as_deref(),
+                    Some("Prepare to discard the partial download for bravo")
+                );
+                assert!(incomplete.prepared("alpha", Ok(())));
+
+                let rows = super::incomplete_rows::build(
+                    &incomplete,
+                    None,
+                    super::incomplete_rows::IncompleteActions {
+                        prepare: sel!(fixtureNoop:),
+                        keep: sel!(fixtureNoop:),
+                        confirm: sel!(fixtureNoop:),
+                    },
+                    mtm,
+                );
+                assert_eq!(rows.view.frame().size, NSSize::new(360.0, 234.0));
+                assert_eq!(rows.action_buttons.len(), 5);
+                assert!(rows.action_buttons.iter().all(|button| {
+                    button
+                        .accessibilityLabel()
+                        .is_some_and(|label| !label.to_string().is_empty())
+                }));
+                let text = text_values(&rows.view);
+                assert!(text.contains(&"alpha".into()));
+                assert!(text.contains(&"18% · 15.9 MB of 88.2 MB".into()));
+                assert!(text.contains(&"1 more — use loxa list".into()));
+                assert!(!text.contains(&"delta".into()));
+
+                assert_eq!(incomplete.confirm_discard().as_deref(), Some("alpha"));
+                let discarding = super::incomplete_rows::build(
+                    &incomplete,
+                    None,
+                    super::incomplete_rows::IncompleteActions {
+                        prepare: sel!(fixtureNoop:),
+                        keep: sel!(fixtureNoop:),
+                        confirm: sel!(fixtureNoop:),
+                    },
+                    mtm,
+                );
+                assert_eq!(discarding.action_buttons.len(), 3);
+                assert!(discarding
+                    .action_buttons
+                    .iter()
+                    .all(|button| !button.isEnabled()));
+                assert_eq!(
+                    discarding.action_buttons[0].title().to_string(),
+                    "Discarding…"
+                );
+                assert_eq!(
+                    discarding.action_buttons[0]
+                        .accessibilityLabel()
+                        .map(|label| label.to_string())
+                        .as_deref(),
+                    Some("Discarding incomplete download alpha")
+                );
+
+                let menu = MenuRows::build(
+                    &Fixture::Installed.snapshot(),
+                    &CatalogState::default(),
+                    &incomplete,
+                    &InstalledState::default(),
+                    None,
+                    layout_fixture_actions(),
+                    mtm,
+                );
+                assert!(visible_text_values(&menu.view).contains(&"Incomplete downloads".into()));
+
+                let mut browsing = CatalogState::default();
+                assert!(browsing.submit_search("models").is_some());
+                let menu = MenuRows::build(
+                    &Fixture::Installed.snapshot(),
+                    &browsing,
+                    &incomplete,
+                    &InstalledState::default(),
+                    None,
+                    layout_fixture_actions(),
+                    mtm,
+                );
+                let text = visible_text_values(&menu.view);
+                assert!(!text.contains(&"Incomplete downloads".into()));
+                assert!(!text.contains(&"alpha".into()));
+            }
+
             fn assert_empty_inventory_error_is_rendered(mtm: MainThreadMarker) {
                 let mut installed = InstalledState::default();
                 installed.fail(InstalledInventoryError::RefreshFailed);
                 let content = MenuRows::build(
                     &Fixture::Empty.snapshot(),
                     &CatalogState::default(),
+                    &crate::menu::incomplete::IncompleteState::default(),
                     &installed,
                     None,
                     layout_fixture_actions(),
@@ -574,6 +731,7 @@ mod menu {
                 let content = MenuRows::build(
                     &Fixture::Installed.snapshot(),
                     &CatalogState::default(),
+                    &crate::menu::incomplete::IncompleteState::default(),
                     &installed,
                     None,
                     layout_fixture_actions(),
@@ -598,6 +756,9 @@ mod menu {
                     installed_select: sel!(fixtureNoop:),
                     installed_copy: sel!(fixtureNoop:),
                     installed_reveal: sel!(fixtureNoop:),
+                    incomplete_prepare: sel!(fixtureNoop:),
+                    incomplete_keep: sel!(fixtureNoop:),
+                    incomplete_confirm: sel!(fixtureNoop:),
                     start: sel!(fixtureNoop:),
                     pause: sel!(fixtureNoop:),
                     resume: sel!(fixtureNoop:),

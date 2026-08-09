@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 use loxa::app::TransferControl;
 #[cfg(not(test))]
 use loxa::app::{
-    AppService, TransferDisposition, TransferPhase, TransferProgress, TransferSelected,
+    AppService, DiscardCandidate, TransferDisposition, TransferPhase, TransferProgress,
+    TransferSelected,
 };
 use loxa::app::{
     AppSnapshot, BundleSnapshot, BundleUnavailableReason, DownloadSnapshot, RecommendationSnapshot,
@@ -20,6 +21,7 @@ use crate::menu::catalog::{
     CandidateItem, CandidateTransferIntent, CatalogEvent, CatalogTransferDisposition,
     RepositoryItem, TransferStage,
 };
+use crate::menu::incomplete::{DiscardFailure, IncompleteInventoryError, IncompleteItem};
 use crate::menu::installed::{InstalledInventoryError, InstalledItem};
 use crate::menu::presentation::{
     Bundle, Download, MenuSnapshot, Recommendation, RecommendationUnavailableReason as MenuReason,
@@ -286,6 +288,15 @@ enum BackendRequest {
         intent: CandidateTransferIntent,
         control: TransferControl,
     },
+    PrepareDiscard {
+        model_id: String,
+    },
+    KeepDiscard {
+        model_id: String,
+    },
+    ConfirmDiscard {
+        model_id: String,
+    },
     Stop,
 }
 
@@ -295,6 +306,15 @@ pub(crate) enum BackendMessage {
     Installed {
         result: Result<Vec<InstalledItem>, InstalledInventoryError>,
         pinned_model_id: Option<String>,
+    },
+    Incomplete(Result<Vec<IncompleteItem>, IncompleteInventoryError>),
+    DiscardPrepared {
+        model_id: String,
+        result: Result<(), DiscardFailure>,
+    },
+    DiscardCompleted {
+        model_id: String,
+        result: Result<(), DiscardFailure>,
     },
     Catalog(CatalogEvent),
 }
@@ -329,6 +349,10 @@ struct BackendTransfer {
     control: TransferControl,
 }
 
+fn discard_service_failure() -> DiscardFailure {
+    DiscardFailure::Unavailable
+}
+
 impl TransferCompletion {
     fn new(disposition: CatalogTransferDisposition, model_id: String) -> Self {
         Self {
@@ -341,6 +365,9 @@ impl TransferCompletion {
 trait BackendSource {
     fn snapshot(&mut self) -> MenuSnapshot;
     fn installed_models(&mut self) -> Result<Vec<InstalledItem>, InstalledInventoryError>;
+    fn incomplete_transfers(&mut self) -> Result<Vec<IncompleteItem>, IncompleteInventoryError> {
+        Ok(Vec::new())
+    }
     fn search(&mut self, query: String) -> Result<Vec<RepositoryItem>, String>;
     fn inspect(&mut self, repo: String) -> Result<InspectedRepository, String>;
     fn transfer(
@@ -348,19 +375,39 @@ trait BackendSource {
         transfer: BackendTransfer,
         progress: &mut dyn FnMut(TransferStage, u64, u64),
     ) -> Result<TransferCompletion, String>;
+    fn prepare_discard(&mut self, _model_id: String) -> Result<(), DiscardFailure> {
+        Err(DiscardFailure::Unavailable)
+    }
+    fn keep_discard(&mut self, _model_id: &str) {}
+    fn confirm_discard(&mut self, _model_id: &str) -> Result<(), DiscardFailure> {
+        Err(DiscardFailure::Unavailable)
+    }
 }
 
 #[cfg(not(test))]
-struct AppBackend(AppService);
+struct AppBackend {
+    service: AppService,
+    prepared_discard: Option<DiscardCandidate>,
+}
+
+#[cfg(not(test))]
+impl AppBackend {
+    fn new(service: AppService) -> Self {
+        Self {
+            service,
+            prepared_discard: None,
+        }
+    }
+}
 
 #[cfg(not(test))]
 impl BackendSource for AppBackend {
     fn snapshot(&mut self) -> MenuSnapshot {
-        map_app_snapshot(self.0.snapshot())
+        map_app_snapshot(self.service.snapshot())
     }
 
     fn installed_models(&mut self) -> Result<Vec<InstalledItem>, InstalledInventoryError> {
-        self.0
+        self.service
             .installed_models()
             .map(|models| {
                 models
@@ -377,9 +424,28 @@ impl BackendSource for AppBackend {
             .map_err(|_| InstalledInventoryError::RefreshFailed)
     }
 
+    fn incomplete_transfers(&mut self) -> Result<Vec<IncompleteItem>, IncompleteInventoryError> {
+        self.service
+            .incomplete_transfers()
+            .map(|inventory| {
+                inventory
+                    .entries()
+                    .iter()
+                    .map(|entry| {
+                        IncompleteItem::new(
+                            entry.model_id().into(),
+                            entry.completed_bytes(),
+                            entry.total_bytes(),
+                        )
+                    })
+                    .collect()
+            })
+            .map_err(|_| IncompleteInventoryError::RefreshFailed)
+    }
+
     fn search(&mut self, query: String) -> Result<Vec<RepositoryItem>, String> {
         let page = self
-            .0
+            .service
             .search_models(SearchModels::new(query))
             .map_err(|error| error.to_string())?;
         Ok(page
@@ -410,11 +476,11 @@ impl BackendSource for AppBackend {
 
     fn inspect(&mut self, repo: String) -> Result<InspectedRepository, String> {
         let plan = self
-            .0
+            .service
             .inspect_repository(InspectRepository::new(repo, None))
             .map_err(|error| error.to_string())?;
         let installed = self
-            .0
+            .service
             .installed_models()
             .map_err(|_| InstalledInventoryError::RefreshFailed.message().to_owned())?;
         let candidates = plan
@@ -472,7 +538,7 @@ impl BackendSource for AppBackend {
             }
         };
         let result = self
-            .0
+            .service
             .transfer_selected(request, control, |update: TransferProgress| {
                 let stage = match update.phase() {
                     TransferPhase::Transferring => TransferStage::Transferring,
@@ -492,6 +558,39 @@ impl BackendSource for AppBackend {
             disposition,
             result.model_id().into(),
         ))
+    }
+
+    fn prepare_discard(&mut self, model_id: String) -> Result<(), DiscardFailure> {
+        self.prepared_discard = None;
+        self.prepared_discard = Some(
+            self.service
+                .prepare_discard(model_id)
+                .map_err(|_| DiscardFailure::Unavailable)?,
+        );
+        Ok(())
+    }
+
+    fn keep_discard(&mut self, model_id: &str) {
+        if self
+            .prepared_discard
+            .as_ref()
+            .is_some_and(|candidate| candidate.model_id() == model_id)
+        {
+            self.prepared_discard = None;
+        }
+    }
+
+    fn confirm_discard(&mut self, model_id: &str) -> Result<(), DiscardFailure> {
+        let Some(candidate) = self.prepared_discard.take() else {
+            return Err(DiscardFailure::Unavailable);
+        };
+        if candidate.model_id() != model_id {
+            self.prepared_discard = Some(candidate);
+            return Err(DiscardFailure::Unavailable);
+        }
+        self.service
+            .discard_transfer(candidate)
+            .map_err(|_| discard_service_failure())
     }
 }
 
@@ -514,6 +613,20 @@ fn installed_message<B: BackendSource>(
     }
 }
 
+fn incomplete_message<B: BackendSource>(source: &mut Result<B, String>) -> BackendMessage {
+    BackendMessage::Incomplete(match source {
+        Ok(source) => source.incomplete_transfers(),
+        Err(_) => Err(IncompleteInventoryError::RefreshFailed),
+    })
+}
+
+fn observation_message<B: BackendSource>(source: &mut Result<B, String>) -> BackendMessage {
+    BackendMessage::Observation(match source {
+        Ok(source) => ObservationMessage::Snapshot(source.snapshot()),
+        Err(error) => ObservationMessage::Error(error.clone()),
+    })
+}
+
 fn run_backend_worker<B: BackendSource>(
     mut source: Result<B, String>,
     request_receiver: Receiver<BackendRequest>,
@@ -524,19 +637,14 @@ fn run_backend_worker<B: BackendSource>(
         if matches!(request, BackendRequest::Stop) || stopping.load(Ordering::Acquire) {
             break;
         }
-        let message = match request {
-            BackendRequest::Observe => {
-                let observation = BackendMessage::Observation(match &mut source {
-                    Ok(source) => ObservationMessage::Snapshot(source.snapshot()),
-                    Err(error) => ObservationMessage::Error(error.clone()),
-                });
-                if message_sender.send(observation).is_err() {
-                    break;
-                }
-                Some(installed_message(&mut source, None))
-            }
+        let messages = match request {
+            BackendRequest::Observe => vec![
+                observation_message(&mut source),
+                installed_message(&mut source, None),
+                incomplete_message(&mut source),
+            ],
             BackendRequest::Search { generation, query } => {
-                Some(BackendMessage::Catalog(match &mut source {
+                vec![BackendMessage::Catalog(match &mut source {
                     Ok(source) => match source.search(query) {
                         Ok(repositories) => CatalogEvent::Repositories {
                             generation,
@@ -551,10 +659,10 @@ fn run_backend_worker<B: BackendSource>(
                         generation,
                         message: message.clone(),
                     },
-                }))
+                })]
             }
             BackendRequest::Inspect { generation, repo } => {
-                Some(BackendMessage::Catalog(match &mut source {
+                vec![BackendMessage::Catalog(match &mut source {
                     Ok(source) => match source.inspect(repo) {
                         Ok(inspection) => CatalogEvent::Candidates {
                             generation,
@@ -571,7 +679,7 @@ fn run_backend_worker<B: BackendSource>(
                         generation,
                         message: message.clone(),
                     },
-                }))
+                })]
             }
             BackendRequest::Transfer {
                 generation,
@@ -637,18 +745,49 @@ fn run_backend_worker<B: BackendSource>(
                         None,
                     ),
                 };
+                let mut messages = vec![BackendMessage::Catalog(terminal)];
+                if let Some(model_id) = pinned_model_id {
+                    messages.push(installed_message(&mut source, Some(model_id)));
+                }
+                messages.push(incomplete_message(&mut source));
+                messages
+            }
+            BackendRequest::PrepareDiscard { model_id } => {
+                let result = match &mut source {
+                    Ok(source) => source.prepare_discard(model_id.clone()),
+                    Err(_) => Err(DiscardFailure::Unavailable),
+                };
+                vec![BackendMessage::DiscardPrepared { model_id, result }]
+            }
+            BackendRequest::KeepDiscard { model_id } => {
+                if let Ok(source) = &mut source {
+                    source.keep_discard(&model_id);
+                }
+                Vec::new()
+            }
+            BackendRequest::ConfirmDiscard { model_id } => {
+                let result = match &mut source {
+                    Ok(source) => source.confirm_discard(&model_id),
+                    Err(_) => Err(DiscardFailure::Unavailable),
+                };
                 if message_sender
-                    .send(BackendMessage::Catalog(terminal))
+                    .send(BackendMessage::DiscardCompleted { model_id, result })
                     .is_err()
                 {
-                    break;
+                    return;
                 }
-                pinned_model_id.map(|model_id| installed_message(&mut source, Some(model_id)))
+                vec![
+                    observation_message(&mut source),
+                    installed_message(&mut source, None),
+                    incomplete_message(&mut source),
+                ]
             }
-            BackendRequest::Stop => None,
+            BackendRequest::Stop => Vec::new(),
         };
-        if message.is_some_and(|message| message_sender.send(message).is_err()) {
-            break;
+        for message in messages {
+            if message_sender.send(message).is_err() {
+                return;
+            }
         }
     }
 }
@@ -669,7 +808,7 @@ impl BackendClient {
                 .name("loxa-menu-backend".to_owned())
                 .spawn(move || {
                     run_backend_worker(
-                        AppService::from_env().map(AppBackend),
+                        AppService::from_env().map(AppBackend::new),
                         request_receiver,
                         message_sender,
                         &stopping,
@@ -770,6 +909,18 @@ impl BackendClient {
         }
         control.request_pause();
         true
+    }
+
+    pub(crate) fn prepare_discard(&mut self, model_id: String) -> bool {
+        self.send(BackendRequest::PrepareDiscard { model_id })
+    }
+
+    pub(crate) fn keep_discard(&mut self, model_id: String) -> bool {
+        self.send(BackendRequest::KeepDiscard { model_id })
+    }
+
+    pub(crate) fn confirm_discard(&mut self, model_id: String) -> bool {
+        self.send(BackendRequest::ConfirmDiscard { model_id })
     }
 
     pub(crate) fn drain(&mut self, now: Instant) -> Vec<BackendMessage> {
