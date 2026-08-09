@@ -614,9 +614,27 @@ pub(crate) struct RuntimeOwnership {
     lease: Option<RuntimeLease>,
 }
 
+pub(crate) enum RuntimeOwnershipAcquireError {
+    Conflict,
+    Failed(String),
+}
+
+impl RuntimeOwnershipAcquireError {
+    fn into_message(self) -> String {
+        match self {
+            Self::Conflict => "another Loxa runtime is active".into(),
+            Self::Failed(message) => message,
+        }
+    }
+}
+
 impl RuntimeOwnership {
     pub(crate) fn acquire(run_dir: &Path) -> Result<Self, String> {
         Self::acquire_with_lock(run_dir, ForegroundLock::acquire)
+    }
+
+    pub(crate) fn acquire_persistent(run_dir: &Path) -> Result<Self, RuntimeOwnershipAcquireError> {
+        Self::acquire_with_lock_classified(run_dir, ForegroundLock::acquire)
     }
 
     #[cfg(all(test, unix))]
@@ -641,20 +659,29 @@ impl RuntimeOwnership {
         run_dir: &Path,
         acquire_lock: impl FnOnce(&Path) -> Result<ForegroundLock, ForegroundLockAcquireError>,
     ) -> Result<Self, String> {
-        ensure_directory(run_dir)?;
+        Self::acquire_with_lock_classified(run_dir, acquire_lock)
+            .map_err(RuntimeOwnershipAcquireError::into_message)
+    }
+
+    fn acquire_with_lock_classified(
+        run_dir: &Path,
+        acquire_lock: impl FnOnce(&Path) -> Result<ForegroundLock, ForegroundLockAcquireError>,
+    ) -> Result<Self, RuntimeOwnershipAcquireError> {
+        ensure_directory(run_dir).map_err(RuntimeOwnershipAcquireError::Failed)?;
         let lock_path = run_dir.join("foreground.lock");
         #[cfg(unix)]
-        let operation = lock_local_foreground_operation()?;
+        let operation =
+            lock_local_foreground_operation().map_err(RuntimeOwnershipAcquireError::Failed)?;
         let foreground_lock = acquire_lock(&lock_path).map_err(|error| match error {
-            ForegroundLockAcquireError::WouldBlock => "another Loxa runtime is active".into(),
-            ForegroundLockAcquireError::Error(error) => error,
+            ForegroundLockAcquireError::WouldBlock => RuntimeOwnershipAcquireError::Conflict,
+            ForegroundLockAcquireError::Error(error) => RuntimeOwnershipAcquireError::Failed(error),
         })?;
 
         let state_path = run_dir.join("foreground.json");
         // Keep `operation` until the fallible reconciliation has completed.
         // On an error or panic, `foreground_lock` drops first, which closes the
         // traditional descriptor before releasing its local reservation.
-        reconcile_state(&state_path)?;
+        reconcile_state(&state_path).map_err(RuntimeOwnershipAcquireError::Failed)?;
         #[cfg(unix)]
         drop(operation);
 
@@ -708,18 +735,25 @@ impl RuntimeOwnership {
     }
 
     pub(crate) fn clear(&mut self) -> Result<(), String> {
-        let Some(expected) = self.lease.take() else {
+        let Some(expected) = self.lease.as_ref() else {
             return Ok(());
         };
         let _state_guard = lock_lease_state()?;
         match read_lease(&self.state_path) {
-            Ok(current) if current == expected => fs::remove_file(&self.state_path)
-                .map_err(|error| format!("{}: {error}", self.state_path.display())),
+            Ok(current) if current == *expected => {
+                fs::remove_file(&self.state_path)
+                    .map_err(|error| format!("{}: {error}", self.state_path.display()))?;
+                self.lease = None;
+                Ok(())
+            }
             Ok(_) => Err(format!(
                 "runtime lease changed unexpectedly: {}",
                 self.state_path.display()
             )),
-            Err(_error) if !self.state_path.exists() => Ok(()),
+            Err(_error) if lease_is_absent(&self.state_path) => {
+                self.lease = None;
+                Ok(())
+            }
             Err(error) => Err(error),
         }
     }

@@ -185,10 +185,6 @@ pub(crate) fn discover_from_process(
     )
 }
 
-#[allow(
-    dead_code,
-    reason = "managed admission is wired by the follow-on host task"
-)]
 pub(crate) fn validate_managed_server(path: &Path) -> Result<PathBuf, String> {
     validate_managed_candidate(path)?;
     Ok(path.to_path_buf())
@@ -599,33 +595,43 @@ pub(crate) enum ForegroundStart {
     Stopped(ServerExit),
 }
 
-#[allow(
-    dead_code,
-    reason = "persistent startup is wired by the follow-on host task"
-)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StartupInterruption {
     Cancelled,
 }
 
-#[allow(
-    dead_code,
-    reason = "persistent startup is wired by the follow-on host task"
-)]
+#[derive(Debug)]
+pub(crate) enum PersistentStartError {
+    Conflict,
+    Failed(String),
+}
+
+impl From<String> for PersistentStartError {
+    fn from(error: String) -> Self {
+        Self::Failed(error)
+    }
+}
+
+impl From<crate::runtime::RuntimeOwnershipAcquireError> for PersistentStartError {
+    fn from(error: crate::runtime::RuntimeOwnershipAcquireError) -> Self {
+        match error {
+            crate::runtime::RuntimeOwnershipAcquireError::Conflict => Self::Conflict,
+            crate::runtime::RuntimeOwnershipAcquireError::Failed(message) => Self::Failed(message),
+        }
+    }
+}
+
 pub(crate) enum PersistentStart {
     Ready(Box<PersistentServer>),
     Stopped(ServerExit),
     Interrupted(StartupInterruption),
+    CleanupFailed(Box<PersistentServer>),
 }
 
 pub(crate) struct ForegroundServer {
     server: Box<OwnedServer>,
 }
 
-#[allow(
-    dead_code,
-    reason = "persistent startup is wired by the follow-on host task"
-)]
 pub(crate) struct PersistentServer {
     server: Box<OwnedServer>,
     runnable: crate::runnable::Runnable,
@@ -636,15 +642,11 @@ pub(crate) fn start_foreground(launch: &Launch, run_dir: &Path) -> Result<Foregr
     start_foreground_with(launch, run_dir, process_termination_signal)
 }
 
-#[allow(
-    dead_code,
-    reason = "persistent startup is wired by the follow-on host task"
-)]
 pub(crate) fn start_persistent<F>(
     mut runnable: crate::runnable::Runnable,
     run_dir: &Path,
     cancelled: F,
-) -> Result<PersistentStart, String>
+) -> Result<PersistentStart, PersistentStartError>
 where
     F: Fn() -> bool,
 {
@@ -658,13 +660,14 @@ where
         requested_port = runnable.launch().requested_port,
         context_size = runnable.launch().ctx
     );
-    let ownership = crate::runtime::RuntimeOwnership::acquire(run_dir)?;
+    let ownership = crate::runtime::RuntimeOwnership::acquire_persistent(run_dir)?;
     if cancelled() {
         return Ok(persistent_interrupted());
     }
     match start_persistent_attempt(&runnable, ownership, &cancelled)? {
         StartOutcome::Ready(server) => {
             finish_persistent_ready(server, runnable, launch_started, false, &cancelled)
+                .map_err(PersistentStartError::from)
         }
         StartOutcome::Exited(exit) => {
             if cancelled() {
@@ -687,42 +690,46 @@ where
                 model_id = %runnable.launch().id,
                 attempt = 2_u8
             );
-            let ownership = crate::runtime::RuntimeOwnership::acquire(run_dir)?;
+            let ownership = crate::runtime::RuntimeOwnership::acquire_persistent(run_dir)?;
             if cancelled() {
                 return Ok(persistent_interrupted());
             }
             match start_persistent_attempt(&runnable, ownership, &cancelled)? {
                 StartOutcome::Ready(server) => {
                     finish_persistent_ready(server, runnable, launch_started, true, &cancelled)
+                        .map_err(PersistentStartError::from)
                 }
                 StartOutcome::Exited(exit) => Ok(PersistentStart::Stopped(exit)),
                 StartOutcome::Interrupted(interruption) => {
                     Ok(PersistentStart::Interrupted(interruption))
                 }
-                StartOutcome::Signaled(_) => {
-                    Err("persistent startup returned an invalid signal interruption".into())
+                StartOutcome::CleanupFailed(server) => {
+                    Ok(persistent_cleanup_failed(server, runnable))
                 }
+                StartOutcome::Signaled(_) => Err(PersistentStartError::Failed(
+                    "persistent startup returned an invalid signal interruption".into(),
+                )),
             }
         }
         StartOutcome::Interrupted(interruption) => Ok(PersistentStart::Interrupted(interruption)),
-        StartOutcome::Signaled(_) => {
-            Err("persistent startup returned an invalid signal interruption".into())
-        }
+        StartOutcome::CleanupFailed(server) => Ok(persistent_cleanup_failed(server, runnable)),
+        StartOutcome::Signaled(_) => Err(PersistentStartError::Failed(
+            "persistent startup returned an invalid signal interruption".into(),
+        )),
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "persistent startup is wired by the follow-on host task"
-)]
 fn persistent_interrupted() -> PersistentStart {
     PersistentStart::Interrupted(StartupInterruption::Cancelled)
 }
 
-#[allow(
-    dead_code,
-    reason = "persistent startup is wired by the follow-on host task"
-)]
+fn persistent_cleanup_failed(
+    server: Box<OwnedServer>,
+    runnable: crate::runnable::Runnable,
+) -> PersistentStart {
+    PersistentStart::CleanupFailed(Box::new(PersistentServer { server, runnable }))
+}
+
 fn finish_persistent_ready<F>(
     mut server: Box<OwnedServer>,
     runnable: crate::runnable::Runnable,
@@ -734,7 +741,12 @@ where
     F: Fn() -> bool,
 {
     if cancelled() {
-        server.terminate()?;
+        if server.terminate().is_err() {
+            return Ok(PersistentStart::CleanupFailed(Box::new(PersistentServer {
+                server,
+                runnable,
+            })));
+        }
         return Ok(persistent_interrupted());
     }
     if fallback {
@@ -810,6 +822,9 @@ where
         Ok(StartOutcome::Interrupted(_)) => {
             Err("foreground startup returned an invalid cancellation interruption".into())
         }
+        Ok(StartOutcome::CleanupFailed(_)) => {
+            Err("foreground startup returned an invalid cleanup failure".into())
+        }
         Err(error) => Err(error),
     }
 }
@@ -837,10 +852,6 @@ where
     OwnedServer::start_with_ownership(launch, STARTUP_TIMEOUT, ownership, signal)
 }
 
-#[allow(
-    dead_code,
-    reason = "persistent startup is wired by the follow-on host task"
-)]
 fn start_persistent_attempt<F>(
     runnable: &crate::runnable::Runnable,
     ownership: crate::runtime::RuntimeOwnership,
@@ -921,6 +932,9 @@ where
         StartOutcome::Interrupted(_) => {
             Err("foreground startup returned an invalid cancellation interruption".into())
         }
+        StartOutcome::CleanupFailed(_) => {
+            Err("foreground startup returned an invalid cleanup failure".into())
+        }
     }
 }
 
@@ -955,10 +969,6 @@ impl ForegroundServer {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "persistent startup is wired by the follow-on host task"
-)]
 impl PersistentServer {
     pub(crate) fn port(&self) -> u16 {
         self.server.port()
@@ -1292,12 +1302,9 @@ enum StartOutcome {
     Exited(ServerExit),
     Signaled(i32),
     Interrupted(StartupInterruption),
+    CleanupFailed(Box<OwnedServer>),
 }
 
-#[allow(
-    dead_code,
-    reason = "persistent startup is wired by the follow-on host task"
-)]
 #[derive(Clone, Copy)]
 enum StartupStop {
     Signal(i32),
@@ -1313,18 +1320,29 @@ impl From<StartupStop> for StartOutcome {
     }
 }
 
+enum RequestedStartOutcome {
+    Continue,
+    Completed(StartOutcome),
+    CleanupFailed,
+}
+
 fn requested_start_outcome<F>(
     server: &mut OwnedServer,
     stop: &F,
-) -> Result<Option<StartOutcome>, String>
+) -> Result<RequestedStartOutcome, String>
 where
     F: Fn() -> Option<StartupStop>,
 {
     let Some(stop) = stop() else {
-        return Ok(None);
+        return Ok(RequestedStartOutcome::Continue);
     };
-    server.terminate()?;
-    Ok(Some(stop.into()))
+    match server.terminate() {
+        Ok(()) => Ok(RequestedStartOutcome::Completed(stop.into())),
+        Err(_cleanup) if matches!(stop, StartupStop::Interrupted(_)) => {
+            Ok(RequestedStartOutcome::CleanupFailed)
+        }
+        Err(cleanup) => Err(cleanup),
+    }
 }
 
 #[derive(Debug)]
@@ -1392,10 +1410,6 @@ impl OwnedServer {
         )
     }
 
-    #[allow(
-        dead_code,
-        reason = "persistent startup is wired by the follow-on host task"
-    )]
     fn start_with_persistent_ownership<F>(
         launch: &Launch,
         fingerprint: &crate::runtime_fingerprint::RuntimeFingerprint,
@@ -1506,8 +1520,12 @@ impl OwnedServer {
             }
         }
         if launch.policy == LaunchPolicy::PersistentApp {
-            if let Some(outcome) = requested_start_outcome(&mut owned, &stop)? {
-                return Ok(outcome);
+            match requested_start_outcome(&mut owned, &stop)? {
+                RequestedStartOutcome::Continue => {}
+                RequestedStartOutcome::Completed(outcome) => return Ok(outcome),
+                RequestedStartOutcome::CleanupFailed => {
+                    return Ok(StartOutcome::CleanupFailed(Box::new(owned)))
+                }
             }
         }
         let deadline = Instant::now() + timeout;
@@ -1515,8 +1533,12 @@ impl OwnedServer {
             if let Err(error) = owned.collect_announcements() {
                 return owned.fail_start(error);
             }
-            if let Some(outcome) = requested_start_outcome(&mut owned, &stop)? {
-                return Ok(outcome);
+            match requested_start_outcome(&mut owned, &stop)? {
+                RequestedStartOutcome::Continue => {}
+                RequestedStartOutcome::Completed(outcome) => return Ok(outcome),
+                RequestedStartOutcome::CleanupFailed => {
+                    return Ok(StartOutcome::CleanupFailed(Box::new(owned)))
+                }
             }
             if let Some(status) = owned
                 .child_mut()
@@ -1540,8 +1562,12 @@ impl OwnedServer {
                         }
                         owned.port = port;
                         if launch.policy == LaunchPolicy::PersistentApp {
-                            if let Some(outcome) = requested_start_outcome(&mut owned, &stop)? {
-                                return Ok(outcome);
+                            match requested_start_outcome(&mut owned, &stop)? {
+                                RequestedStartOutcome::Continue => {}
+                                RequestedStartOutcome::Completed(outcome) => return Ok(outcome),
+                                RequestedStartOutcome::CleanupFailed => {
+                                    return Ok(StartOutcome::CleanupFailed(Box::new(owned)))
+                                }
                             }
                         }
                         return Ok(StartOutcome::Ready(Box::new(owned)));
@@ -1607,11 +1633,10 @@ impl OwnedServer {
                 .map_err(|cleanup| format!("{error}; cleanup failed: {cleanup}"))?;
             return Err(self.with_diagnostic(error));
         }
-        let Some(status) = self
-            .child_mut()
-            .try_wait()
-            .map_err(|error| error.to_string())?
-        else {
+        let Some(child) = self.child.as_mut() else {
+            return Err("owned server child is no longer present".into());
+        };
+        let Some(status) = child.try_wait().map_err(|error| error.to_string())? else {
             return Ok(None);
         };
         let code = exit_code(status);
@@ -2402,6 +2427,71 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn persistent_cancellation_cleanup_failure_before_ready_returns_retryable_owned_server() {
+        let _lock = process_test_lock();
+        let dir = tempdir().unwrap();
+        let server = dir.path().join("server");
+        let run_dir = dir.path().join("run");
+        let lease_path = run_dir.join("foreground.json");
+        let port = resolve_requested_port(0).unwrap();
+        write_executable_script(&server, b"#!/bin/sh\nwhile :; do sleep 1; done\n");
+        let runnable = persistent_runnable(dir.path(), &server, port);
+        let group = Mutex::new(None);
+        let original_lease = Mutex::new(None);
+
+        let started = start_persistent(runnable, &run_dir, || {
+            if !lease_path.is_file() {
+                return false;
+            }
+            if let Some((_, active_group)) =
+                unpack_server_identity(ACTIVE_SERVER.load(Ordering::SeqCst))
+            {
+                *group.lock().unwrap() = Some(active_group);
+            }
+            let mut original = original_lease.lock().unwrap();
+            if original.is_none() {
+                let bytes = std::fs::read(&lease_path).unwrap();
+                let mut changed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                changed["port"] =
+                    serde_json::json!(changed["port"].as_u64().unwrap().checked_add(1).unwrap());
+                std::fs::write(&lease_path, serde_json::to_vec(&changed).unwrap()).unwrap();
+                *original = Some(bytes);
+            }
+            true
+        });
+
+        let mut owned = match started {
+            Ok(PersistentStart::CleanupFailed(owned)) => owned,
+            Ok(PersistentStart::Ready(_)) => panic!("cancelled startup returned ready"),
+            Ok(PersistentStart::Stopped(exit)) => panic!("cancelled startup stopped: {exit:?}"),
+            Ok(PersistentStart::Interrupted(interruption)) => {
+                panic!("cleanup failure was reported as interrupted: {interruption:?}")
+            }
+            Err(error) => panic!("pre-ready cleanup failure dropped ownership: {error:?}"),
+        };
+
+        let group = group.into_inner().unwrap().expect("owned process group");
+        assert!(!process_group_exists(group).unwrap());
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
+        assert!(lease_path.exists());
+        assert!(crate::runtime::RuntimeOwnership::acquire(&run_dir).is_err());
+        assert!(crate::catalog::ModelLock::acquire(&dir.path().join("models/demo")).is_err());
+        let original = original_lease
+            .into_inner()
+            .unwrap()
+            .expect("captured exact lease");
+        std::fs::write(&lease_path, original).unwrap();
+
+        owned.terminate().unwrap();
+
+        assert!(!lease_path.exists());
+        drop(owned);
+        drop(crate::runtime::RuntimeOwnership::acquire(&run_dir).unwrap());
+        drop(crate::catalog::ModelLock::acquire(&dir.path().join("models/demo")).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn persistent_cancellation_after_announcement_closes_the_child_listener() {
         let _lock = process_test_lock();
         let dir = tempdir().unwrap();
@@ -2480,6 +2570,68 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn cancellation_cleanup_failure_after_ready_returns_retryable_owned_server() {
+        let _lock = process_test_lock();
+        let dir = tempdir().unwrap();
+        let server = dir.path().join("server");
+        let announced = dir.path().join("announced");
+        let ready = dir.path().join("ready");
+        let run_dir = dir.path().join("run");
+        let lease_path = run_dir.join("foreground.json");
+        write_persistent_test_server(&server, &announced, &ready);
+        let runnable = persistent_runnable(dir.path(), &server, 0);
+        let ready_polls = AtomicUsize::new(0);
+        let original_lease = Mutex::new(None);
+
+        let started = start_persistent(runnable, &run_dir, || {
+            if !ready.is_file() {
+                return false;
+            }
+            let poll = ready_polls.fetch_add(1, Ordering::SeqCst) + 1;
+            if poll != 2 {
+                return false;
+            }
+            let original = std::fs::read(&lease_path).unwrap();
+            let mut changed: serde_json::Value = serde_json::from_slice(&original).unwrap();
+            changed["port"] =
+                serde_json::json!(changed["port"].as_u64().unwrap().checked_add(1).unwrap());
+            std::fs::write(&lease_path, serde_json::to_vec(&changed).unwrap()).unwrap();
+            *original_lease.lock().unwrap() = Some(original);
+            true
+        });
+
+        let mut owned = match started {
+            Ok(PersistentStart::CleanupFailed(owned)) => owned,
+            Ok(PersistentStart::Ready(_)) => panic!("cancelled startup returned ready"),
+            Ok(PersistentStart::Stopped(exit)) => panic!("cancelled startup stopped: {exit:?}"),
+            Ok(PersistentStart::Interrupted(interruption)) => {
+                panic!("cleanup failure was reported as interrupted: {interruption:?}")
+            }
+            Err(error) => panic!("cleanup failure dropped ownership: {error:?}"),
+        };
+
+        assert_eq!(ready_polls.load(Ordering::SeqCst), 2);
+        assert!(announced.is_file());
+        assert!(ready.is_file());
+        assert!(lease_path.exists());
+        assert!(crate::runtime::RuntimeOwnership::acquire(&run_dir).is_err());
+        assert!(crate::catalog::ModelLock::acquire(&dir.path().join("models/demo")).is_err());
+        let original = original_lease
+            .into_inner()
+            .unwrap()
+            .expect("captured exact lease");
+        std::fs::write(&lease_path, original).unwrap();
+
+        owned.terminate().unwrap();
+
+        assert!(!lease_path.exists());
+        drop(owned);
+        drop(crate::runtime::RuntimeOwnership::acquire(&run_dir).unwrap());
+        drop(crate::catalog::ModelLock::acquire(&dir.path().join("models/demo")).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn persistent_publication_carries_the_exact_whole_fingerprint() {
         let _lock = process_test_lock();
         let dir = tempdir().unwrap();
@@ -2497,6 +2649,9 @@ mod tests {
             PersistentStart::Stopped(exit) => panic!("persistent server stopped: {exit:?}"),
             PersistentStart::Interrupted(interruption) => {
                 panic!("persistent server was interrupted: {interruption:?}")
+            }
+            PersistentStart::CleanupFailed(_) => {
+                panic!("persistent server cleanup failed unexpectedly")
             }
         };
         let lease: serde_json::Value =
@@ -2587,6 +2742,9 @@ mod tests {
             PersistentStart::Stopped(exit) => panic!("persistent MTP fallback stopped: {exit:?}"),
             PersistentStart::Interrupted(interruption) => {
                 panic!("persistent MTP fallback was interrupted: {interruption:?}")
+            }
+            PersistentStart::CleanupFailed(_) => {
+                panic!("persistent MTP fallback cleanup failed unexpectedly")
             }
         };
         let port = server.port();

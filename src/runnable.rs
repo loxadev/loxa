@@ -5,20 +5,12 @@ use crate::{catalog, cli, config, load_installed_models, runner, verification};
 use std::path::Path;
 use std::time::Instant;
 
-#[allow(
-    dead_code,
-    reason = "persistent host ownership is added by the follow-on task"
-)]
 pub(crate) struct Runnable {
     _model_lock: catalog::ModelLock,
     launch: runner::Launch,
     fingerprint: RuntimeFingerprint,
 }
 
-#[allow(
-    dead_code,
-    reason = "persistent host ownership is added by the follow-on task"
-)]
 impl Runnable {
     fn new(
         model_lock: catalog::ModelLock,
@@ -61,6 +53,22 @@ impl Runnable {
 enum AdmissionSource {
     Installed(Manifest),
     Local(catalog::local::Candidate),
+}
+
+pub(crate) enum ManagedRunnableError {
+    Conflict,
+    ModelUnavailable(String),
+    StartupFailed(String),
+}
+
+impl ManagedRunnableError {
+    #[cfg(test)]
+    fn into_message(self) -> String {
+        match self {
+            Self::Conflict => "model is busy in another Loxa command".into(),
+            Self::ModelUnavailable(message) | Self::StartupFailed(message) => message,
+        }
+    }
 }
 
 pub(crate) fn resolve_runnable(
@@ -138,25 +146,35 @@ pub(crate) fn resolve_runnable(
     ))
 }
 
-#[allow(
-    dead_code,
-    reason = "persistent host ownership is added by the follow-on task"
-)]
+#[cfg(test)]
 pub(crate) fn resolve_managed_runnable(
     manifest: Manifest,
     paths: &AppPaths,
 ) -> Result<Runnable, String> {
-    let installed = catalog::load_catalog(&paths.models)?;
+    resolve_managed_runnable_for_host(manifest, paths).map_err(ManagedRunnableError::into_message)
+}
+
+pub(crate) fn resolve_managed_runnable_for_host(
+    manifest: Manifest,
+    paths: &AppPaths,
+) -> Result<Runnable, ManagedRunnableError> {
+    let installed =
+        catalog::load_catalog(&paths.models).map_err(ManagedRunnableError::ModelUnavailable)?;
     if !installed.iter().any(|candidate| candidate == &manifest) {
-        return Err(format!("model {} is not installed", manifest.id));
+        return Err(ManagedRunnableError::ModelUnavailable(format!(
+            "model {} is not installed",
+            manifest.id
+        )));
     }
 
-    let config = config::load(&paths.config)?;
+    let config = config::load(&paths.config).map_err(ManagedRunnableError::StartupFailed)?;
     let ctx = config::resolve_value(None, config.ctx, 4096);
-    let profile = launch_profile(&manifest, &paths.models)?;
-    let server = runner::validate_managed_server(&paths.managed_server)?;
+    let profile =
+        launch_profile(&manifest, &paths.models).map_err(ManagedRunnableError::ModelUnavailable)?;
+    let server = runner::validate_managed_server(&paths.managed_server)
+        .map_err(ManagedRunnableError::StartupFailed)?;
     let admission_started = Instant::now();
-    let (model_lock, admission) = admit_installed(&manifest, paths)?;
+    let (model_lock, admission) = admit_installed_for_host(&manifest, paths)?;
     report_admission(&manifest.id, admission, admission_started);
     let artifact = manifest.artifact_path(&paths.models);
     let policy = runner::LaunchPolicy::PersistentApp;
@@ -165,7 +183,8 @@ pub(crate) fn resolve_managed_runnable(
         ctx,
         profile.effective_profile(),
         policy.sleep_idle_seconds(),
-    )?;
+    )
+    .map_err(ManagedRunnableError::ModelUnavailable)?;
     Ok(Runnable::new(
         model_lock,
         runner::Launch {
@@ -199,6 +218,38 @@ fn admit_installed(
         draft.as_deref(),
         || verification::verify_artifacts(manifest, &artifact, draft.as_deref()),
     )?;
+    Ok((model_lock, admission))
+}
+
+fn admit_installed_for_host(
+    manifest: &Manifest,
+    paths: &AppPaths,
+) -> Result<(catalog::ModelLock, verification::Admission), ManagedRunnableError> {
+    let model_dir = paths
+        .model_dir(&manifest.id)
+        .map_err(ManagedRunnableError::ModelUnavailable)?;
+    let artifact = manifest.artifact_path(&paths.models);
+    let draft = manifest
+        .draft_artifact()
+        .map(|draft| paths.models.join(&manifest.id).join(draft.local_filename));
+    let model_lock =
+        catalog::ModelLock::acquire_existing(&model_dir).map_err(|error| match error {
+            catalog::ModelLockError::Busy => ManagedRunnableError::Conflict,
+            catalog::ModelLockError::Missing | catalog::ModelLockError::UnsafeLocalState => {
+                ManagedRunnableError::ModelUnavailable(
+                    "installed model state is unavailable".into(),
+                )
+            }
+        })?;
+    let admission = verification::verify_or_refresh(
+        &model_lock,
+        &model_dir,
+        manifest,
+        &artifact,
+        draft.as_deref(),
+        || verification::verify_artifacts(manifest, &artifact, draft.as_deref()),
+    )
+    .map_err(ManagedRunnableError::ModelUnavailable)?;
     Ok((model_lock, admission))
 }
 
@@ -332,6 +383,7 @@ mod tests {
         std::fs::create_dir_all(&model_dir).unwrap();
         std::fs::write(model_dir.join("model.gguf"), b"abc").unwrap();
         catalog::publish_manifest(&paths.models, &manifest).unwrap();
+        drop(ModelLock::acquire(&model_dir).unwrap());
         manifest
     }
 
@@ -350,6 +402,28 @@ mod tests {
             std::fs::Permissions::from_mode(0o700),
         )
         .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_host_admission_does_not_recreate_a_removed_installed_model() {
+        let root = tempdir().unwrap();
+        let paths = AppPaths::from_values(Some(root.path()), None).unwrap();
+        let manifest = install_manifest(&paths);
+        let model_dir = paths.model_dir(&manifest.id).unwrap();
+
+        // This is the removal race after the host's final catalog snapshot.
+        std::fs::remove_dir_all(&model_dir).unwrap();
+
+        let result = admit_installed_for_host(&manifest, &paths);
+
+        assert!(matches!(
+            result,
+            Err(ManagedRunnableError::ModelUnavailable(_))
+        ));
+        let error = std::fs::symlink_metadata(&model_dir)
+            .expect_err("host admission recreated the removed model directory");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[cfg(unix)]
