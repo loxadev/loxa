@@ -113,7 +113,7 @@ impl NativePopoverState {
         #[cfg(not(test))]
         let (api_runtime, api) = {
             let controller = ApiRuntimeController::start();
-            let presentation = ApiPresentation::from_controller(&controller);
+            let presentation = project_api_presentation(&controller, &snapshot);
             (controller, presentation)
         };
         Self {
@@ -329,7 +329,7 @@ impl NativePopoverState {
         self.cancel_incomplete_discard();
         let runtime = self.api_runtime.as_mut().expect("checked above");
         let _ = runtime.prepare_shutdown();
-        self.api = ApiPresentation::from_controller(runtime);
+        self.api = project_api_presentation(runtime, &self.snapshot);
         let backend = self.backend.as_ref().expect("checked above");
         let _ = backend.pause_active_transfer();
         Some(NativeExitResources {
@@ -339,7 +339,7 @@ impl NativePopoverState {
     }
 
     fn restore_exit_resources(&mut self, resources: NativeExitResources) {
-        self.api = ApiPresentation::from_controller(&resources.runtime);
+        self.api = project_api_presentation(&resources.runtime, &self.snapshot);
         self.api_runtime = Some(resources.runtime);
         self.backend = Some(resources.backend);
     }
@@ -348,7 +348,8 @@ impl NativePopoverState {
     fn drain_backend(&mut self, target: &AnyObject, actions: Actions, mtm: MainThreadMarker) {
         let now = Instant::now();
         let feedback_changed = self.reconcile_runtime_curl_copy_feedback(now);
-        let api_changed = drain_runtime_controller(self.api_runtime.as_mut(), &mut self.api);
+        let api_controller_changed =
+            drain_runtime_controller(self.api_runtime.as_mut(), &mut self.api);
         let messages = self
             .backend
             .as_mut()
@@ -388,7 +389,15 @@ impl NativePopoverState {
                 }
             }
         }
-        if feedback_changed || api_changed || backend_changed {
+        let api_projection_changed = self.api_runtime.as_ref().is_some_and(|controller| {
+            let projected = project_api_presentation(controller, &self.snapshot);
+            if projected == self.api {
+                return false;
+            }
+            self.api = projected;
+            true
+        });
+        if feedback_changed || api_controller_changed || api_projection_changed || backend_changed {
             self.render(target, actions, mtm);
         }
     }
@@ -419,6 +428,13 @@ impl NativePopoverState {
 
 pub(super) fn request_runtime_probe(controller: Option<&mut ApiRuntimeController>) -> bool {
     controller.is_some_and(ApiRuntimeController::request_probe)
+}
+
+pub(super) fn project_api_presentation(
+    controller: &ApiRuntimeController,
+    snapshot: &MenuSnapshot,
+) -> ApiPresentation {
+    ApiPresentation::from_controller_with_observed_runtime(controller, snapshot.observed_runtime())
 }
 
 pub(super) fn drain_runtime_controller(
@@ -838,6 +854,7 @@ impl NativePopoverTarget {
         if !action.is_enabled() || action.kind() != requested {
             return;
         }
+        let observed_runtime = state.snapshot.observed_runtime().cloned();
         let Some(controller) = state.api_runtime.as_mut() else {
             return;
         };
@@ -846,7 +863,10 @@ impl NativePopoverTarget {
             ApiPrimaryActionKind::Stop => controller.request_stop(),
         };
         if accepted {
-            state.api = ApiPresentation::from_controller(controller);
+            state.api = ApiPresentation::from_controller_with_observed_runtime(
+                controller,
+                observed_runtime.as_ref(),
+            );
             state.render(self, action_selectors(), mtm);
         }
     }

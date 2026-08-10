@@ -2,6 +2,7 @@ use loxa::api_runtime::ApiRuntimeActivity;
 
 use super::ApiPresentation;
 use crate::menu::api_runtime::{ApiEndpoint, ApiRuntimeNotice, ApiRuntimePhase};
+use crate::menu::presentation::{ObservedRuntime, ObservedRuntimeOwner};
 
 #[test]
 fn every_api_phase_has_exact_header_copy_and_ready_only_endpoint() {
@@ -216,4 +217,73 @@ fn only_ready_activity_changes_are_retained_in_place() {
 
     assert!(loaded.can_update_retained_from(&sleeping));
     assert!(!stopping.can_update_retained_from(&loaded));
+}
+
+#[test]
+fn observed_cli_runtime_is_read_only_and_never_overwrites_menu_owned_phases() {
+    let foreground =
+        ObservedRuntime::new(ObservedRuntimeOwner::Foreground, "alpha".into(), 43123).unwrap();
+    let cli = ApiPresentation::from_state_with_observed_runtime(
+        &ApiRuntimePhase::Idle,
+        None,
+        None,
+        Some(&foreground),
+    );
+    assert_eq!(cli.phase_label(), "API: Running · CLI");
+    assert_eq!(cli.detail_label(), Some("API · 127.0.0.1:43123"));
+    assert_eq!(
+        cli.curl_command(),
+        Some("curl http://127.0.0.1:43123/v1/models")
+    );
+    assert_eq!(cli.active_model_id(), Some("alpha"));
+    let action = cli.primary_action("alpha");
+    assert_eq!(action.title(), "Start API");
+    assert!(!action.is_enabled());
+    assert_eq!(action.disabled_reason(), Some("Stop the CLI runtime first"));
+
+    let starting = ApiPresentation::from_state_with_observed_runtime(
+        &ApiRuntimePhase::Starting {
+            generation: 7,
+            model_id: "alpha".into(),
+        },
+        None,
+        Some("alpha"),
+        Some(&foreground),
+    );
+    assert_eq!(starting.phase_label(), "API: Starting");
+    assert_eq!(starting.detail_label(), None);
+    assert_eq!(starting.curl_command(), None);
+
+    let ready = ApiPresentation::from_state_with_observed_runtime(
+        &ApiRuntimePhase::Ready {
+            generation: 7,
+            endpoint: ApiEndpoint::new("alpha".into(), 43124),
+            activity: ApiRuntimeActivity::Loaded,
+        },
+        None,
+        Some("alpha"),
+        Some(&foreground),
+    );
+    assert_eq!(ready.phase_label(), "API: Ready · Model loaded");
+    assert_eq!(ready.detail_label(), Some("API · 127.0.0.1:43124"));
+    assert_eq!(
+        ready.curl_command(),
+        Some("curl http://127.0.0.1:43124/v1/models")
+    );
+
+    for owner in [
+        ObservedRuntimeOwner::PersistentApp,
+        ObservedRuntimeOwner::Legacy,
+    ] {
+        let other = ObservedRuntime::new(owner, "alpha".into(), 43123).unwrap();
+        let idle = ApiPresentation::from_state_with_observed_runtime(
+            &ApiRuntimePhase::Idle,
+            None,
+            None,
+            Some(&other),
+        );
+        assert_eq!(idle.phase_label(), "API: Idle");
+        assert_eq!(idle.detail_label(), None);
+        assert_eq!(idle.curl_command(), None);
+    }
 }

@@ -130,10 +130,22 @@ pub(crate) enum RuntimeProvenance {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeOwner {
+    Legacy,
+    Foreground,
+    PersistentApp,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ForegroundObservation {
     Idle,
     Starting,
-    Running(RuntimeProvenance, u16),
+    Running {
+        provenance: RuntimeProvenance,
+        owner: RuntimeOwner,
+        model_id: String,
+        port: u16,
+    },
     Stopping,
     Error,
 }
@@ -191,7 +203,17 @@ impl ForegroundObserver {
                         Ok(Some(provenance)) => {
                             self.previously_running = true;
                             self.mismatch_started = None;
-                            ForegroundObservation::Running(provenance, lease.port)
+                            let owner = match lease.owner_mode {
+                                None => RuntimeOwner::Legacy,
+                                Some(LeaseOwnerMode::Foreground) => RuntimeOwner::Foreground,
+                                Some(LeaseOwnerMode::PersistentApp) => RuntimeOwner::PersistentApp,
+                            };
+                            ForegroundObservation::Running {
+                                provenance,
+                                owner,
+                                model_id: lease.model_id.clone(),
+                                port: lease.port,
+                            }
                         }
                         Ok(None) | Err(_) if self.previously_running => {
                             let started = self.mismatch_started.get_or_insert_with(Instant::now);
@@ -1451,7 +1473,9 @@ fn process_group_has_live_members(group: i32) -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{RuntimeInventorySnapshot, RuntimeSnapshot, SnapshotReader};
+    use crate::app::{
+        RuntimeInventorySnapshot, RuntimeOwnerSnapshot, RuntimeSnapshot, SnapshotReader,
+    };
     use crate::paths::AppPaths;
     use std::os::unix::process::CommandExt;
     use std::process::{Child, Command, Stdio};
@@ -2069,7 +2093,12 @@ mod tests {
         ));
         assert_eq!(
             observer.observe(managed),
-            ForegroundObservation::Running(RuntimeProvenance::External, 43123)
+            ForegroundObservation::Running {
+                provenance: RuntimeProvenance::External,
+                owner: RuntimeOwner::Foreground,
+                model_id: "demo".into(),
+                port: 43123,
+            }
         );
         assert_eq!(fs::read(&state_path).unwrap(), before);
         assert!(dir.path().join("foreground.lock").is_file());
@@ -2102,7 +2131,12 @@ mod tests {
         let mut observer = ForegroundObserver::new(dir.path().to_path_buf());
         assert_eq!(
             observer.observe(Path::new("/managed/llama-server")),
-            ForegroundObservation::Running(RuntimeProvenance::External, 43123)
+            ForegroundObservation::Running {
+                provenance: RuntimeProvenance::External,
+                owner: RuntimeOwner::Legacy,
+                model_id: "demo".into(),
+                port: 43123,
+            }
         );
         assert_eq!(fs::read(&state_path).unwrap(), before);
 
@@ -2284,7 +2318,12 @@ mod tests {
             let mut observer = ForegroundObserver::new(dir.path().to_path_buf());
             assert_ne!(
                 observer.observe(managed),
-                ForegroundObservation::Running(RuntimeProvenance::External, 43123),
+                ForegroundObservation::Running {
+                    provenance: RuntimeProvenance::External,
+                    owner: RuntimeOwner::Foreground,
+                    model_id: "demo".into(),
+                    port: 43123,
+                },
                 "mismatch unexpectedly became Running: {mismatch:?}"
             );
         }
@@ -2296,7 +2335,12 @@ mod tests {
         let mut observer = ForegroundObserver::new(grace.path().to_path_buf());
         assert_eq!(
             observer.observe(managed),
-            ForegroundObservation::Running(RuntimeProvenance::External, 43123)
+            ForegroundObservation::Running {
+                provenance: RuntimeProvenance::External,
+                owner: RuntimeOwner::Foreground,
+                model_id: "demo".into(),
+                port: 43123,
+            }
         );
         let mut wrong_port = lease;
         wrong_port.port = 43124;
@@ -2323,6 +2367,11 @@ mod tests {
         let snapshot = reader.observe();
 
         assert_eq!(snapshot.runtime(), RuntimeSnapshot::Running);
+        assert_eq!(
+            snapshot.runtime_owner(),
+            Some(RuntimeOwnerSnapshot::Foreground)
+        );
+        assert_eq!(snapshot.runtime_model_id(), Some("demo"));
         assert_eq!(
             snapshot.runtime_inventory(),
             RuntimeInventorySnapshot::External

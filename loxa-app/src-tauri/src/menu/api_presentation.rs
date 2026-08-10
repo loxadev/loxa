@@ -1,6 +1,7 @@
 use loxa::api_runtime::ApiRuntimeActivity;
 
 use super::api_runtime::{ApiRuntimeController, ApiRuntimeNotice, ApiRuntimePhase};
+use super::presentation::{ObservedRuntime, ObservedRuntimeOwner};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ApiPresentation {
@@ -14,6 +15,7 @@ pub(crate) struct ApiPresentation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ApiPresentationPhase {
     Idle,
+    CliRuntime,
     Starting,
     Ready,
     Stopping,
@@ -61,6 +63,18 @@ impl ApiPresentation {
             controller.phase(),
             controller.notice(),
             controller.active_model_id(),
+        )
+    }
+
+    pub(crate) fn from_controller_with_observed_runtime(
+        controller: &ApiRuntimeController,
+        observed_runtime: Option<&ObservedRuntime>,
+    ) -> Self {
+        Self::from_state_with_observed_runtime(
+            controller.phase(),
+            controller.notice(),
+            controller.active_model_id(),
+            observed_runtime,
         )
     }
 
@@ -118,6 +132,30 @@ impl ApiPresentation {
         }
     }
 
+    pub(super) fn from_state_with_observed_runtime(
+        phase: &ApiRuntimePhase,
+        notice: Option<ApiRuntimeNotice>,
+        active_model_id: Option<&str>,
+        observed_runtime: Option<&ObservedRuntime>,
+    ) -> Self {
+        let presentation = Self::from_state(phase, notice, active_model_id);
+        let Some(runtime) = observed_runtime.filter(|runtime| {
+            presentation.phase == ApiPresentationPhase::Idle
+                && runtime.owner() == ObservedRuntimeOwner::Foreground
+        }) else {
+            return presentation;
+        };
+        let port = runtime.port();
+
+        Self {
+            phase: ApiPresentationPhase::CliRuntime,
+            phase_label: "API: Running · CLI",
+            detail_label: Some(format!("API · 127.0.0.1:{port}")),
+            curl_command: Some(format!("curl http://127.0.0.1:{port}/v1/models")),
+            active_model_id: Some(runtime.model_id().into()),
+        }
+    }
+
     pub(crate) fn phase_label(&self) -> &'static str {
         self.phase_label
     }
@@ -140,6 +178,13 @@ impl ApiPresentation {
                 kind: ApiPrimaryActionKind::Start,
                 enabled: false,
                 disabled_reason: Some("Quit and reopen Loxa."),
+            };
+        }
+        if self.phase == ApiPresentationPhase::CliRuntime {
+            return ApiPrimaryAction {
+                kind: ApiPrimaryActionKind::Start,
+                enabled: false,
+                disabled_reason: Some("Stop the CLI runtime first"),
             };
         }
         if self

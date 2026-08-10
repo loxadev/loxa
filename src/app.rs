@@ -3,7 +3,7 @@ use crate::discovery::{
     DiscoveryError, InspectRepository, ModelSearchPage, RepositoryPlan, SearchModels,
 };
 use crate::paths::AppPaths;
-use crate::runtime::{ForegroundObservation, ForegroundObserver, RuntimeProvenance};
+use crate::runtime::{ForegroundObservation, ForegroundObserver, RuntimeOwner, RuntimeProvenance};
 use std::fs;
 use std::path::Path;
 #[cfg(unix)]
@@ -129,6 +129,13 @@ pub enum RuntimeSnapshot {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeOwnerSnapshot {
+    Legacy,
+    Foreground,
+    PersistentApp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeInventorySnapshot {
     External,
     Missing,
@@ -141,6 +148,8 @@ pub struct AppSnapshot {
     download: DownloadSnapshot,
     runtime: RuntimeSnapshot,
     runtime_port: Option<u16>,
+    runtime_owner: Option<RuntimeOwnerSnapshot>,
+    runtime_model_id: Option<String>,
     runtime_inventory: RuntimeInventorySnapshot,
 }
 
@@ -163,6 +172,18 @@ impl AppSnapshot {
 
     pub fn runtime_port(&self) -> Option<u16> {
         self.runtime_port
+    }
+
+    pub fn runtime_owner(&self) -> Option<RuntimeOwnerSnapshot> {
+        self.runtime_owner
+    }
+
+    pub fn runtime_model_id(&self) -> Option<&str> {
+        self.runtime_model_id.as_deref()
+    }
+
+    pub fn bundle_model_id(&self) -> &'static str {
+        TARGET_MODEL_ID
     }
 
     pub fn runtime_inventory(&self) -> RuntimeInventorySnapshot {
@@ -207,29 +228,65 @@ impl AppSnapshot {
                 ),
             },
         };
-        let runtime = match foreground {
-            ForegroundObservation::Idle => RuntimeSnapshot::Idle,
-            ForegroundObservation::Starting => RuntimeSnapshot::Starting,
-            ForegroundObservation::Running(_, _) => RuntimeSnapshot::Running,
-            ForegroundObservation::Stopping => RuntimeSnapshot::Stopping,
-            ForegroundObservation::Error => RuntimeSnapshot::Error,
-        };
-        let runtime_inventory = match foreground {
-            ForegroundObservation::Running(RuntimeProvenance::External, _) => {
-                RuntimeInventorySnapshot::External
-            }
-            _ => RuntimeInventorySnapshot::Missing,
-        };
-        let runtime_port = match foreground {
-            ForegroundObservation::Running(_, port) => Some(port),
-            _ => None,
-        };
+        let (runtime, runtime_port, runtime_owner, runtime_model_id, runtime_inventory) =
+            match foreground {
+                ForegroundObservation::Idle => (
+                    RuntimeSnapshot::Idle,
+                    None,
+                    None,
+                    None,
+                    RuntimeInventorySnapshot::Missing,
+                ),
+                ForegroundObservation::Starting => (
+                    RuntimeSnapshot::Starting,
+                    None,
+                    None,
+                    None,
+                    RuntimeInventorySnapshot::Missing,
+                ),
+                ForegroundObservation::Running {
+                    provenance,
+                    owner,
+                    model_id,
+                    port,
+                } => (
+                    RuntimeSnapshot::Running,
+                    Some(port),
+                    Some(match owner {
+                        RuntimeOwner::Legacy => RuntimeOwnerSnapshot::Legacy,
+                        RuntimeOwner::Foreground => RuntimeOwnerSnapshot::Foreground,
+                        RuntimeOwner::PersistentApp => RuntimeOwnerSnapshot::PersistentApp,
+                    }),
+                    Some(model_id),
+                    if provenance == RuntimeProvenance::External {
+                        RuntimeInventorySnapshot::External
+                    } else {
+                        RuntimeInventorySnapshot::Missing
+                    },
+                ),
+                ForegroundObservation::Stopping => (
+                    RuntimeSnapshot::Stopping,
+                    None,
+                    None,
+                    None,
+                    RuntimeInventorySnapshot::Missing,
+                ),
+                ForegroundObservation::Error => (
+                    RuntimeSnapshot::Error,
+                    None,
+                    None,
+                    None,
+                    RuntimeInventorySnapshot::Missing,
+                ),
+            };
         Self {
             bundle,
             recommendation,
             download,
             runtime,
             runtime_port,
+            runtime_owner,
+            runtime_model_id,
             runtime_inventory,
         }
     }
@@ -548,8 +605,8 @@ mod tests {
         observe_bundle, AppService, AppSnapshot, BundleSnapshot, BundleUnavailableReason,
         DownloadSnapshot, InstalledModelSummary, PartialBundle, PausedDownload,
         RecommendationAvailability, RecommendationSnapshot, RecommendationUnavailableReason,
-        RecommendedBundle, ResourceBudget, RuntimeInventorySnapshot, RuntimeSnapshot,
-        SnapshotReader, VerifiedBundle,
+        RecommendedBundle, ResourceBudget, RuntimeInventorySnapshot, RuntimeOwnerSnapshot,
+        RuntimeSnapshot, SnapshotReader, VerifiedBundle, TARGET_MODEL_ID,
     };
     use crate::catalog::{
         Artifact, ArtifactProvenance, ArtifactRole, Manifest, Origin, RuntimeQualification,
@@ -557,7 +614,7 @@ mod tests {
     };
     use crate::discovery::{DiscoveryErrorKind, GatedStatus, InspectRepository, SearchModels};
     use crate::paths::AppPaths;
-    use crate::runtime::{ForegroundObservation, RuntimeProvenance};
+    use crate::runtime::{ForegroundObservation, RuntimeOwner, RuntimeProvenance};
     use sha2::{Digest, Sha256};
     use std::fs::{self, OpenOptions};
     #[cfg(unix)]
@@ -1290,10 +1347,21 @@ mod tests {
         let external = AppSnapshot::from_observation(
             BundleSnapshot::Absent,
             Some(enough_budget()),
-            ForegroundObservation::Running(RuntimeProvenance::External, 43123),
+            ForegroundObservation::Running {
+                provenance: RuntimeProvenance::External,
+                owner: RuntimeOwner::Foreground,
+                model_id: "external-model".into(),
+                port: 43123,
+            },
         );
         assert_eq!(external.runtime(), RuntimeSnapshot::Running);
         assert_eq!(external.runtime_port(), Some(43123));
+        assert_eq!(
+            external.runtime_owner(),
+            Some(RuntimeOwnerSnapshot::Foreground)
+        );
+        assert_eq!(external.runtime_model_id(), Some("external-model"));
+        assert_eq!(external.bundle_model_id(), TARGET_MODEL_ID);
         assert_eq!(
             external.runtime_inventory(),
             RuntimeInventorySnapshot::External
@@ -1303,10 +1371,20 @@ mod tests {
         let managed = AppSnapshot::from_observation(
             BundleSnapshot::Absent,
             Some(enough_budget()),
-            ForegroundObservation::Running(RuntimeProvenance::Managed, 43124),
+            ForegroundObservation::Running {
+                provenance: RuntimeProvenance::Managed,
+                owner: RuntimeOwner::PersistentApp,
+                model_id: TARGET_MODEL_ID.into(),
+                port: 43124,
+            },
         );
         assert_eq!(managed.runtime(), RuntimeSnapshot::Running);
         assert_eq!(managed.runtime_port(), Some(43124));
+        assert_eq!(
+            managed.runtime_owner(),
+            Some(RuntimeOwnerSnapshot::PersistentApp)
+        );
+        assert_eq!(managed.runtime_model_id(), Some(TARGET_MODEL_ID));
         assert_eq!(
             managed.runtime_inventory(),
             RuntimeInventorySnapshot::Missing
@@ -1319,6 +1397,8 @@ mod tests {
         );
         assert_eq!(idle.runtime(), RuntimeSnapshot::Idle);
         assert_eq!(idle.runtime_port(), None);
+        assert_eq!(idle.runtime_owner(), None);
+        assert_eq!(idle.runtime_model_id(), None);
         assert_eq!(idle.runtime_inventory(), RuntimeInventorySnapshot::Missing);
     }
 

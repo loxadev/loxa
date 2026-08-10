@@ -9,7 +9,8 @@ use super::{
     discard_service_failure, map_app_snapshot, map_core_snapshot, run_backend_worker,
     BackendClient, BackendMessage, BackendRequest, BackendSource, BackendTransfer, CoreBundle,
     CoreDownload, CoreObservation, CoreRecommendation, CoreRecommendationUnavailableReason,
-    InspectedRepository, ObservationMessage, RefreshAdmission, TransferCompletion,
+    CoreRuntimeOwner, InspectedRepository, ObservationMessage, RefreshAdmission,
+    TransferCompletion,
 };
 use crate::menu::api_runtime::{
     run_runtime_worker, ApiEndpoint, ApiRuntimeController, ApiRuntimePhase, RuntimeHost,
@@ -34,6 +35,9 @@ fn mapper_keeps_live_absent_and_paused_states_truthful() {
         download: CoreDownload::Idle,
         runtime: super::CoreRuntime::Idle,
         runtime_port: None,
+        runtime_owner: None,
+        runtime_model_id: None,
+        bundle_model_id: "bundle".into(),
         runtime_inventory: super::CoreRuntimeInventory::Missing,
     });
     assert_eq!(
@@ -50,6 +54,9 @@ fn mapper_keeps_live_absent_and_paused_states_truthful() {
         },
         runtime: super::CoreRuntime::Running,
         runtime_port: Some(43123),
+        runtime_owner: Some(CoreRuntimeOwner::Foreground),
+        runtime_model_id: Some("demo".into()),
+        bundle_model_id: "bundle".into(),
         runtime_inventory: super::CoreRuntimeInventory::External,
     });
     assert_eq!(

@@ -1,7 +1,7 @@
 use crate::menu::presentation::{
     Bundle, Download, DownloadPhase, Fixture, InlineCancelState, MenuAction, MenuLayout,
-    MenuSection, MenuSnapshot, MenuUpdate, Recommendation, RecommendationUnavailableReason,
-    RecoveryReason, Runtime, RuntimeInventory,
+    MenuSection, MenuSnapshot, MenuUpdate, ObservedRuntimeOwner, Recommendation,
+    RecommendationUnavailableReason, RecoveryReason, Runtime, RuntimeInventory,
 };
 
 const TARGET_BYTES: u64 = 6_716_356_800;
@@ -173,14 +173,16 @@ fn installed_bundle_always_exposes_its_verified_status() {
 
 #[test]
 fn recovery_bundle_composes_one_recovery_row_without_a_recommendation() {
-    for (reason, expected_detail) in [
+    for (reason, expected_title, expected_detail) in [
         (
             RecoveryReason::Invalid,
+            "Managed bundle needs recovery",
             "Verify the managed bundle before trying again.",
         ),
         (
             RecoveryReason::Busy,
-            "Another Loxa process is updating this bundle.",
+            "Managed bundle is in use",
+            "A Loxa runtime or model operation is using this bundle.",
         ),
     ] {
         let snapshot = MenuSnapshot::new(
@@ -200,7 +202,9 @@ fn recovery_bundle_composes_one_recovery_row_without_a_recommendation() {
                 MenuSection::Footer,
             ]
         );
-        assert_eq!(snapshot.recovery_row().unwrap().detail(), expected_detail);
+        let recovery = snapshot.recovery_row().unwrap();
+        assert_eq!(recovery.title(), expected_title);
+        assert_eq!(recovery.detail(), expected_detail);
         assert!(snapshot.recommendation_row().is_none());
     }
 }
@@ -517,6 +521,38 @@ fn progress_updates_retained_rows_while_action_or_section_changes_rebuild() {
 }
 
 #[test]
+fn exact_busy_runtime_inventory_transition_rebuilds_the_body() {
+    let busy = MenuSnapshot::new(
+        Bundle::recovery(RecoveryReason::Busy),
+        Recommendation::Hidden,
+        Download::Idle,
+        Runtime::Running,
+        RuntimeInventory::External,
+    )
+    .unwrap()
+    .with_bundle_model_id("alpha".into())
+    .unwrap();
+    let unrelated = busy
+        .clone()
+        .with_observed_runtime(ObservedRuntimeOwner::Foreground, "beta".into(), 43123)
+        .unwrap();
+    let exact = busy
+        .clone()
+        .with_observed_runtime(ObservedRuntimeOwner::PersistentApp, "alpha".into(), 43123)
+        .unwrap();
+    let exact_new_port = busy
+        .with_observed_runtime(ObservedRuntimeOwner::PersistentApp, "alpha".into(), 43124)
+        .unwrap();
+
+    assert_eq!(exact.update_from(Some(&unrelated)), MenuUpdate::Rebuild);
+    assert_eq!(unrelated.update_from(Some(&exact)), MenuUpdate::Rebuild);
+    assert_eq!(
+        exact_new_port.update_from(Some(&exact)),
+        MenuUpdate::UpdateRetainedRows
+    );
+}
+
+#[test]
 fn named_fixtures_cover_each_static_menu_composition_without_live_observation() {
     for (name, expected_sections) in [
         (
@@ -708,7 +744,7 @@ fn every_named_fixture_maps_to_its_exact_static_presentation() {
         Expectation {
             name: "busy",
             runtime: "Inference: Idle",
-            body: ExpectedBody::Recovery("Another Loxa process is updating this bundle."),
+            body: ExpectedBody::Recovery("A Loxa runtime or model operation is using this bundle."),
             phase: None,
             action: None,
             progress: None,

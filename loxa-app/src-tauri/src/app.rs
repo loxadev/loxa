@@ -72,8 +72,7 @@ pub(crate) fn request_native_shell_exit(app_handle: &AppHandle) {
 }
 
 pub(crate) fn run() {
-    let app = tauri::Builder::default()
-        .enable_macos_default_menu(false)
+    let app = crate::native_menu::with_native_edit_menu(tauri::Builder::default())
         .setup(|app| {
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 

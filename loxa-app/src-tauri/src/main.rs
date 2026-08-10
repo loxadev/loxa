@@ -2,6 +2,7 @@
 
 mod app;
 mod menu;
+mod native_menu;
 
 fn main() {
     app::run();

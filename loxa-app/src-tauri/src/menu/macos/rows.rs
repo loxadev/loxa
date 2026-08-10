@@ -158,9 +158,12 @@ impl MenuRows {
             let row = StatusNativeRow::build(error, mtm);
             layout.add(&row.root, 56.0);
             BodyRows::Status(row)
-        } else if let Some(recovery) = snapshot.recovery_row() {
+        } else if let Some(recovery) = snapshot
+            .recovery_row()
+            .filter(|_| !inventory_overrides_busy_recovery(snapshot, installed))
+        {
             layout.add(&section_header("Installed", mtm), SECTION_HEIGHT);
-            let row = RecoveryNativeRow::build(recovery.detail(), mtm);
+            let row = RecoveryNativeRow::build(recovery, mtm);
             layout.add(&row.root, 56.0);
             BodyRows::Recovery(row)
         } else if let Some(transfer) = snapshot.transfer_row() {
@@ -337,7 +340,7 @@ impl MenuRows {
             }
             BodyRows::Recovery(row) => {
                 if let Some(recovery) = snapshot.recovery_row() {
-                    row.update(recovery.detail());
+                    row.update(recovery);
                 }
             }
             BodyRows::Transfer(row) => {
@@ -432,7 +435,8 @@ fn content_height(
         common
     } else if snapshot.is_loading()
         || snapshot.error_message().is_some()
-        || snapshot.recovery_row().is_some()
+        || (snapshot.recovery_row().is_some()
+            && !inventory_overrides_busy_recovery(snapshot, installed))
     {
         common + incomplete_height + SECTION_HEIGHT + 56.0
     } else if snapshot.transfer_row().is_some() {
@@ -484,6 +488,19 @@ fn inventory_is_primary(
 ) -> bool {
     !installed.visible_items().is_empty()
         || (installed.error_message().is_some() && snapshot.installed_row().is_none())
+}
+
+fn inventory_overrides_busy_recovery(
+    snapshot: &MenuSnapshot,
+    installed: &crate::menu::installed::InstalledState,
+) -> bool {
+    let Some(model_id) = snapshot.busy_runtime_model_matching_bundle() else {
+        return false;
+    };
+    installed
+        .visible_items_for(Some(model_id))
+        .into_iter()
+        .any(|item| item.id() == model_id)
 }
 
 enum BodyRows {
@@ -608,7 +625,7 @@ impl InstalledNativeRow {
     fn build(installed: &crate::menu::presentation::InstalledRow, mtm: MainThreadMarker) -> Self {
         let root = row_shell(56.0, mtm);
         let stack = horizontal_stack(mtm);
-        let icon = icon_container("sparkles", None, mtm);
+        let icon = icon_container("sparkles", mtm);
         let labels = vertical_stack(mtm);
         let title_text = format!("Gemma 4 12B · {}", installed.verification_label());
         let title = primary_label(&title_text, mtm);
@@ -649,33 +666,33 @@ impl InstalledNativeRow {
 
 struct RecoveryNativeRow {
     root: Retained<NSView>,
+    title: Retained<NSTextField>,
     detail: Retained<NSTextField>,
 }
 
 impl RecoveryNativeRow {
-    fn build(detail: &str, mtm: MainThreadMarker) -> Self {
+    fn build(recovery: &crate::menu::presentation::RecoveryRow, mtm: MainThreadMarker) -> Self {
         let root = row_shell(56.0, mtm);
         let stack = horizontal_stack(mtm);
-        let icon = icon_container(
-            "exclamationmark.triangle",
-            Some("Bundle recovery required"),
-            mtm,
-        );
+        let icon = icon_container("exclamationmark.triangle", mtm);
         let labels = vertical_stack(mtm);
-        labels.addArrangedSubview(&primary_label("Managed bundle needs recovery", mtm));
-        let detail_label = secondary_label(detail, mtm);
+        let title = primary_label(recovery.title(), mtm);
+        labels.addArrangedSubview(&title);
+        let detail_label = secondary_label(recovery.detail(), mtm);
         labels.addArrangedSubview(&detail_label);
         stack.addArrangedSubview(&icon);
         stack.addArrangedSubview(&labels);
         pin_to_content(&root, &stack);
         Self {
             root,
+            title,
             detail: detail_label,
         }
     }
 
-    fn update(&mut self, detail: &str) {
-        set_label(&self.detail, detail);
+    fn update(&mut self, recovery: &crate::menu::presentation::RecoveryRow) {
+        set_label(&self.title, recovery.title());
+        set_label(&self.detail, recovery.detail());
     }
 }
 
@@ -728,7 +745,7 @@ impl RecommendationNativeRow {
             row_shell(56.0, mtm)
         };
         let stack = horizontal_stack(mtm);
-        let icon = icon_container("sparkles", None, mtm);
+        let icon = icon_container("sparkles", mtm);
         let labels = vertical_stack(mtm);
         labels.addArrangedSubview(&primary_label("Gemma 4", mtm));
         let subtitle_text = recommendation.subtitle();
@@ -1225,24 +1242,17 @@ fn label(text: &str, size: f64, primary: bool, mtm: MainThreadMarker) -> Retaine
     label
 }
 
-fn icon_container(
-    symbol: &str,
-    description: Option<&str>,
-    mtm: MainThreadMarker,
-) -> Retained<NSBox> {
+fn icon_container(symbol: &str, mtm: MainThreadMarker) -> Retained<NSBox> {
     let container = icon_container_shell(mtm);
     let image = NSImageView::new(mtm);
-    let description = description.map(NSString::from_str);
     if let Some(symbol) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
         &NSString::from_str(symbol),
-        description.as_deref(),
+        None,
     ) {
         image.setImage(Some(&symbol));
     }
     image.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
-    if description.is_none() {
-        image.setAccessibilityElement(false);
-    }
+    image.setAccessibilityElement(false);
     add_centered_icon_image(&container, &image);
     container
 }

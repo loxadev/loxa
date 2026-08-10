@@ -1,6 +1,11 @@
 #![allow(dead_code, unused_imports)]
 
 #[cfg(target_os = "macos")]
+mod native_menu {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/native_menu.rs"));
+}
+
+#[cfg(target_os = "macos")]
 mod app {
     pub(crate) fn request_native_shell_exit(_app_handle: &tauri::AppHandle) {}
 }
@@ -150,7 +155,10 @@ mod menu {
             use crate::menu::installed::{
                 InstalledFeedback, InstalledInventoryError, InstalledItem, InstalledState,
             };
-            use crate::menu::presentation::Fixture;
+            use crate::menu::presentation::{
+                Bundle, Download, Fixture, ObservedRuntimeOwner, Recommendation, RecoveryReason,
+                Runtime, RuntimeInventory,
+            };
             use objc2::runtime::NSObjectProtocol;
             use objc2::sel;
             use objc2::ClassType;
@@ -738,6 +746,118 @@ mod menu {
                     .iter()
                     .any(|text| text.starts_with("Gemma 4 12B ·")));
 
+                let busy_running_same_model = MenuSnapshot::new(
+                    Bundle::recovery(RecoveryReason::Busy),
+                    Recommendation::Hidden,
+                    Download::Idle,
+                    Runtime::Running,
+                    RuntimeInventory::External,
+                )
+                .unwrap()
+                .with_bundle_model_id("alpha".into())
+                .unwrap()
+                .with_observed_runtime(ObservedRuntimeOwner::PersistentApp, "alpha".into(), 43123)
+                .unwrap();
+                let busy_with_inventory = MenuRows::build(
+                    &busy_running_same_model,
+                    &ApiPresentation::idle(),
+                    &idle,
+                    &crate::menu::incomplete::IncompleteState::default(),
+                    &one,
+                    ActionBindings::new(None, layout_fixture_actions()),
+                    mtm,
+                );
+                let busy_with_inventory_text = text_values(&busy_with_inventory.view);
+                assert!(busy_with_inventory_text.contains(&"alpha-q4".into()));
+                assert!(!busy_with_inventory_text.contains(&"Managed bundle needs recovery".into()));
+                assert!(!busy_with_inventory_text.contains(&"Managed bundle is in use".into()));
+
+                let busy_without_inventory = MenuRows::build(
+                    &busy_running_same_model,
+                    &ApiPresentation::idle(),
+                    &idle,
+                    &crate::menu::incomplete::IncompleteState::default(),
+                    &InstalledState::default(),
+                    ActionBindings::new(None, layout_fixture_actions()),
+                    mtm,
+                );
+                let busy_without_inventory_text = text_values(&busy_without_inventory.view);
+                assert!(busy_without_inventory_text.contains(&"Managed bundle is in use".into()));
+                assert!(busy_without_inventory_text
+                    .contains(&"A Loxa runtime or model operation is using this bundle.".into()));
+
+                let busy_running_other_model = MenuSnapshot::new(
+                    Bundle::recovery(RecoveryReason::Busy),
+                    Recommendation::Hidden,
+                    Download::Idle,
+                    Runtime::Running,
+                    RuntimeInventory::External,
+                )
+                .unwrap()
+                .with_bundle_model_id("alpha".into())
+                .unwrap()
+                .with_observed_runtime(ObservedRuntimeOwner::Foreground, "beta-q4".into(), 43123)
+                .unwrap();
+                let unrelated_runtime = MenuRows::build(
+                    &busy_running_other_model,
+                    &ApiPresentation::idle(),
+                    &idle,
+                    &crate::menu::incomplete::IncompleteState::default(),
+                    &one,
+                    ActionBindings::new(None, layout_fixture_actions()),
+                    mtm,
+                );
+                let unrelated_runtime_text = text_values(&unrelated_runtime.view);
+                assert!(unrelated_runtime_text.contains(&"Managed bundle is in use".into()));
+                assert!(!unrelated_runtime_text.contains(&"alpha-q4".into()));
+
+                let busy_model_operation = MenuRows::build(
+                    &Fixture::Busy.snapshot(),
+                    &ApiPresentation::idle(),
+                    &idle,
+                    &crate::menu::incomplete::IncompleteState::default(),
+                    &one,
+                    ActionBindings::new(None, layout_fixture_actions()),
+                    mtm,
+                );
+                let busy_model_operation_text = text_values(&busy_model_operation.view);
+                assert!(busy_model_operation_text.contains(&"Managed bundle is in use".into()));
+                assert!(!busy_model_operation_text.contains(&"alpha-q4".into()));
+
+                let invalid_with_runtime = MenuRows::build(
+                    &MenuSnapshot::new(
+                        Bundle::recovery(RecoveryReason::Invalid),
+                        Recommendation::Hidden,
+                        Download::Idle,
+                        Runtime::Running,
+                        RuntimeInventory::External,
+                    )
+                    .unwrap()
+                    .with_bundle_model_id("alpha".into())
+                    .unwrap()
+                    .with_observed_runtime(ObservedRuntimeOwner::Foreground, "alpha".into(), 43123)
+                    .unwrap(),
+                    &ApiPresentation::idle(),
+                    &idle,
+                    &crate::menu::incomplete::IncompleteState::default(),
+                    &one,
+                    ActionBindings::new(None, layout_fixture_actions()),
+                    mtm,
+                );
+                let invalid_with_runtime_text = text_values(&invalid_with_runtime.view);
+                assert!(invalid_with_runtime_text.contains(&"Managed bundle needs recovery".into()));
+                assert!(!invalid_with_runtime_text.contains(&"alpha-q4".into()));
+
+                for snapshot in [Fixture::Busy.snapshot(), Fixture::Invalid.snapshot()] {
+                    let recovery = snapshot
+                        .recovery_row()
+                        .expect("the recovery fixture must expose its warning row");
+                    let row = RecoveryNativeRow::build(recovery, mtm);
+                    assert!(all_image_views(&row.root)
+                        .iter()
+                        .all(|image| !image.isAccessibilityElement()));
+                }
+
                 for (snapshot, expected) in [
                     (MenuSnapshot::loading(), "Loading Loxa status…"),
                     (Fixture::Invalid.snapshot(), "Managed bundle needs recovery"),
@@ -1285,9 +1405,17 @@ mod menu {
                 assert!(state.arm_runtime_curl_copy_feedback(command.into(), started_at));
                 state.render(&target, action_selectors(), mtm);
                 assert!(state.runtime_curl_copy_feedback.is_some());
+                assert!(view_has_button_label(
+                    &state.content_view_controller.view(),
+                    "Curl copied"
+                ));
 
                 state.popover_closed(&target, action_selectors(), mtm);
                 assert!(state.runtime_curl_copy_feedback.is_none());
+                assert!(view_has_button_label(
+                    &state.content_view_controller.view(),
+                    "Copy API curl command"
+                ));
 
                 assert!(state.arm_runtime_curl_copy_feedback(command.into(), Instant::now()));
                 state.api = crate::menu::api_presentation::ApiPresentation::idle();
@@ -1296,6 +1424,17 @@ mod menu {
                     state.runtime_curl_copy_feedback.is_none(),
                     "an idle API must clear copied-runtime feedback immediately"
                 );
+            }
+
+            fn view_has_button_label(view: &NSView, expected: &str) -> bool {
+                view.subviews()
+                    .into_iter()
+                    .any(|child| match child.downcast::<NSButton>() {
+                        Ok(button) => button
+                            .accessibilityLabel()
+                            .is_some_and(|label| label.to_string() == expected),
+                        Err(child) => view_has_button_label(&child, expected),
+                    })
             }
 
             pub(crate) fn assert_rebuild_detaches_outgoing_search_action(mtm: MainThreadMarker) {
@@ -1563,8 +1702,35 @@ mod menu {
 
 #[cfg(target_os = "macos")]
 fn main() {
+    use tauri::menu::MenuItemKind;
+
     let mtm = objc2::MainThreadMarker::new()
         .expect("native popover layout coverage must run on the main thread");
+    let app = native_menu::with_native_edit_menu(tauri::test::mock_builder())
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("the configured native test app must build");
+    let menu = app.menu().expect("the native app must install its menu");
+    let edit = menu
+        .items()
+        .expect("the app menu must be readable")
+        .into_iter()
+        .find_map(|item| match item {
+            MenuItemKind::Submenu(submenu) if submenu.text().is_ok_and(|text| text == "Edit") => {
+                Some(submenu)
+            }
+            _ => None,
+        })
+        .expect("the native app menu must contain Edit");
+    assert!(edit
+        .items()
+        .expect("the Edit menu must be readable")
+        .into_iter()
+        .any(|item| match item {
+            MenuItemKind::Predefined(item) => {
+                item.text().is_ok_and(|text| text.starts_with("Paste"))
+            }
+            _ => false,
+        }));
     menu::macos::rows::assert_native_layout_contract(mtm);
     menu::macos::controller::assert_runtime_copy_feedback_lifecycle(mtm);
     menu::macos::controller::assert_progress_updates_retain_active_search(mtm);

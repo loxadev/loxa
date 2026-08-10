@@ -222,6 +222,49 @@ pub(crate) enum RuntimeInventory {
     External,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ObservedRuntimeOwner {
+    Legacy,
+    Foreground,
+    PersistentApp,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ObservedRuntime {
+    owner: ObservedRuntimeOwner,
+    model_id: String,
+    port: u16,
+}
+
+impl ObservedRuntime {
+    pub(crate) fn new(
+        owner: ObservedRuntimeOwner,
+        model_id: String,
+        port: u16,
+    ) -> Result<Self, &'static str> {
+        if model_id.is_empty() || port == 0 {
+            return Err("observed runtime requires a model and nonzero port");
+        }
+        Ok(Self {
+            owner,
+            model_id,
+            port,
+        })
+    }
+
+    pub(crate) fn owner(&self) -> ObservedRuntimeOwner {
+        self.owner
+    }
+
+    pub(crate) fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    pub(crate) fn port(&self) -> u16 {
+        self.port
+    }
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MenuAction {
@@ -484,11 +527,22 @@ impl TransferRow {
 }
 
 impl RecoveryRow {
+    pub(crate) fn title(&self) -> &'static str {
+        match self.reason {
+            RecoveryReason::Invalid => "Managed bundle needs recovery",
+            RecoveryReason::Busy => "Managed bundle is in use",
+        }
+    }
+
     pub(crate) fn detail(&self) -> &'static str {
         match self.reason {
             RecoveryReason::Invalid => "Verify the managed bundle before trying again.",
-            RecoveryReason::Busy => "Another Loxa process is updating this bundle.",
+            RecoveryReason::Busy => "A Loxa runtime or model operation is using this bundle.",
         }
+    }
+
+    pub(crate) fn is_busy(&self) -> bool {
+        self.reason == RecoveryReason::Busy
     }
 }
 
@@ -512,7 +566,8 @@ enum MenuBody {
 pub(crate) struct MenuSnapshot {
     body: MenuBody,
     runtime: Option<Runtime>,
-    runtime_port: Option<u16>,
+    observed_runtime: Option<ObservedRuntime>,
+    bundle_model_id: Option<String>,
     runtime_inventory: Option<RuntimeInventory>,
     footer: Footer,
 }
@@ -857,7 +912,8 @@ impl MenuSnapshot {
         Ok(Self {
             body,
             runtime: Some(runtime),
-            runtime_port: None,
+            observed_runtime: None,
+            bundle_model_id: None,
             runtime_inventory: Some(runtime_inventory),
             footer: Footer {
                 inventory: Some(runtime_inventory),
@@ -869,7 +925,8 @@ impl MenuSnapshot {
         Self {
             body: MenuBody::Loading,
             runtime: None,
-            runtime_port: None,
+            observed_runtime: None,
+            bundle_model_id: None,
             runtime_inventory: None,
             footer: Footer { inventory: None },
         }
@@ -879,7 +936,8 @@ impl MenuSnapshot {
         Self {
             body: MenuBody::Error(error),
             runtime: None,
-            runtime_port: None,
+            observed_runtime: None,
+            bundle_model_id: None,
             runtime_inventory: None,
             footer: Footer { inventory: None },
         }
@@ -995,28 +1053,65 @@ impl MenuSnapshot {
         }
     }
 
-    pub(crate) fn with_running_port(mut self, port: u16) -> Result<Self, &'static str> {
-        if self.runtime != Some(Runtime::Running) || port == 0 {
-            return Err("runtime port requires a running inference process");
+    #[cfg(test)]
+    pub(crate) fn with_running_port(self, port: u16) -> Result<Self, &'static str> {
+        self.with_observed_runtime(ObservedRuntimeOwner::Legacy, "fixture-model".into(), port)
+    }
+
+    pub(crate) fn with_observed_runtime(
+        mut self,
+        owner: ObservedRuntimeOwner,
+        model_id: String,
+        port: u16,
+    ) -> Result<Self, &'static str> {
+        if self.runtime != Some(Runtime::Running) {
+            return Err("runtime identity requires a running inference process");
         }
-        self.runtime_port = Some(port);
+        self.observed_runtime = Some(ObservedRuntime::new(owner, model_id, port)?);
         Ok(self)
+    }
+
+    pub(crate) fn with_bundle_model_id(mut self, model_id: String) -> Result<Self, &'static str> {
+        if model_id.is_empty() {
+            return Err("bundle identity must not be empty");
+        }
+        self.bundle_model_id = Some(model_id);
+        Ok(self)
+    }
+
+    pub(crate) fn observed_runtime(&self) -> Option<&ObservedRuntime> {
+        self.observed_runtime
+            .as_ref()
+            .filter(|_| matches!(self.runtime, Some(Runtime::Running)))
+    }
+
+    pub(crate) fn busy_runtime_model_matching_bundle(&self) -> Option<&str> {
+        if !self.recovery_row()?.is_busy() {
+            return None;
+        }
+        let runtime = self.observed_runtime()?;
+        let bundle_model_id = self.bundle_model_id.as_deref()?;
+        (runtime.model_id() == bundle_model_id).then_some(bundle_model_id)
     }
 
     #[cfg(test)]
     pub(crate) fn runtime_api_label(&self) -> Option<String> {
-        self.runtime_port
-            .map(|port| format!("API · 127.0.0.1:{port}"))
+        self.observed_runtime()
+            .map(|runtime| format!("API · 127.0.0.1:{}", runtime.port()))
     }
 
     #[cfg(test)]
     pub(crate) fn runtime_curl_command(&self) -> Option<String> {
-        self.runtime_port
-            .map(|port| format!("curl http://127.0.0.1:{port}/v1/models"))
+        self.observed_runtime()
+            .map(|runtime| format!("curl http://127.0.0.1:{}/v1/models", runtime.port()))
     }
 
     pub(crate) fn update_from(&self, previous: Option<&Self>) -> MenuUpdate {
-        if previous.is_some_and(|previous| previous.composition() == self.composition()) {
+        if previous.is_some_and(|previous| {
+            previous.composition() == self.composition()
+                && previous.busy_runtime_model_matching_bundle().is_some()
+                    == self.busy_runtime_model_matching_bundle().is_some()
+        }) {
             MenuUpdate::UpdateRetainedRows
         } else {
             MenuUpdate::Rebuild

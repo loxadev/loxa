@@ -4,12 +4,15 @@ use std::time::{Duration, Instant};
 
 use loxa::api_runtime::{ApiRuntimeActivity, ApiStartCancellation};
 
-use super::controller::{drain_runtime_controller, request_runtime_probe};
+use super::controller::{
+    drain_runtime_controller, project_api_presentation, request_runtime_probe,
+};
 use crate::menu::api_presentation::ApiPresentation;
 use crate::menu::api_runtime::{
-    run_runtime_worker, ApiEndpoint, ApiRuntimeController, ApiRuntimePhase, RuntimeHost,
-    RuntimeHostStart,
+    idle_controller_for_exit_test, run_runtime_worker, ApiEndpoint, ApiRuntimeController,
+    ApiRuntimePhase, RuntimeHost, RuntimeHostStart,
 };
+use crate::menu::presentation::{Fixture, ObservedRuntimeOwner};
 
 struct ProbeHost {
     endpoint: Option<ApiEndpoint>,
@@ -78,7 +81,41 @@ fn timer_drain_never_probes_and_popover_open_coalesces_one_probe() {
         assert!(Instant::now() < deadline);
         std::thread::yield_now();
     }
-    assert!(drain_runtime_controller(Some(&mut controller), &mut api));
+    while !drain_runtime_controller(Some(&mut controller), &mut api) {
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
     assert_eq!(activities.load(Ordering::Acquire), 2);
+    controller.shutdown_and_join().unwrap();
+}
+
+#[test]
+fn generic_cli_runtime_projects_as_read_only_when_the_menu_controller_is_idle() {
+    let mut controller = idle_controller_for_exit_test();
+    let snapshot = Fixture::Running
+        .snapshot()
+        .with_observed_runtime(ObservedRuntimeOwner::Foreground, "demo".into(), 43123)
+        .unwrap();
+
+    let api = project_api_presentation(&controller, &snapshot);
+    assert_eq!(api.phase_label(), "API: Running · CLI");
+    assert_eq!(api.detail_label(), Some("API · 127.0.0.1:43123"));
+    assert_eq!(
+        api.curl_command(),
+        Some("curl http://127.0.0.1:43123/v1/models")
+    );
+    let start = api.primary_action("demo");
+    assert!(!start.is_enabled());
+    assert_eq!(start.disabled_reason(), Some("Stop the CLI runtime first"));
+
+    let stale_persistent = Fixture::Running
+        .snapshot()
+        .with_observed_runtime(ObservedRuntimeOwner::PersistentApp, "demo".into(), 43123)
+        .unwrap();
+    let idle = project_api_presentation(&controller, &stale_persistent);
+    assert_eq!(idle.phase_label(), "API: Idle");
+    assert_eq!(idle.detail_label(), None);
+    assert_eq!(idle.curl_command(), None);
+
     controller.shutdown_and_join().unwrap();
 }

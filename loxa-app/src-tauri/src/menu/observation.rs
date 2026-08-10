@@ -12,7 +12,8 @@ use loxa::app::{
 };
 use loxa::app::{
     AppSnapshot, BundleSnapshot, BundleUnavailableReason, DownloadSnapshot, RecommendationSnapshot,
-    RecommendationUnavailableReason, RuntimeInventorySnapshot, RuntimeSnapshot,
+    RecommendationUnavailableReason, RuntimeInventorySnapshot, RuntimeOwnerSnapshot,
+    RuntimeSnapshot,
 };
 #[cfg(not(test))]
 use loxa::discovery::{CandidateDisposition, InspectRepository, SearchModels};
@@ -25,8 +26,8 @@ use crate::menu::catalog::{
 use crate::menu::incomplete::{DiscardFailure, IncompleteInventoryError, IncompleteItem};
 use crate::menu::installed::{InstalledInventoryError, InstalledItem};
 use crate::menu::presentation::{
-    Bundle, Download, MenuSnapshot, Recommendation, RecommendationUnavailableReason as MenuReason,
-    RecoveryReason, Runtime, RuntimeInventory,
+    Bundle, Download, MenuSnapshot, ObservedRuntimeOwner, Recommendation,
+    RecommendationUnavailableReason as MenuReason, RecoveryReason, Runtime, RuntimeInventory,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,12 +83,22 @@ enum CoreRuntimeInventory {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CoreRuntimeOwner {
+    Legacy,
+    Foreground,
+    PersistentApp,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct CoreObservation {
     bundle: CoreBundle,
     recommendation: CoreRecommendation,
     download: CoreDownload,
     runtime: CoreRuntime,
     runtime_port: Option<u16>,
+    runtime_owner: Option<CoreRuntimeOwner>,
+    runtime_model_id: Option<String>,
+    bundle_model_id: String,
     runtime_inventory: CoreRuntimeInventory,
 }
 
@@ -140,6 +151,13 @@ impl From<AppSnapshot> for CoreObservation {
             RuntimeSnapshot::Error => CoreRuntime::Error,
         };
         let runtime_port = snapshot.runtime_port();
+        let runtime_owner = snapshot.runtime_owner().map(|owner| match owner {
+            RuntimeOwnerSnapshot::Legacy => CoreRuntimeOwner::Legacy,
+            RuntimeOwnerSnapshot::Foreground => CoreRuntimeOwner::Foreground,
+            RuntimeOwnerSnapshot::PersistentApp => CoreRuntimeOwner::PersistentApp,
+        });
+        let runtime_model_id = snapshot.runtime_model_id().map(str::to_owned);
+        let bundle_model_id = snapshot.bundle_model_id().to_owned();
         let runtime_inventory = match snapshot.runtime_inventory() {
             RuntimeInventorySnapshot::External => CoreRuntimeInventory::External,
             RuntimeInventorySnapshot::Missing => CoreRuntimeInventory::Missing,
@@ -151,6 +169,9 @@ impl From<AppSnapshot> for CoreObservation {
             download,
             runtime,
             runtime_port,
+            runtime_owner,
+            runtime_model_id,
+            bundle_model_id,
             runtime_inventory,
         }
     }
@@ -211,12 +232,27 @@ fn map_core_snapshot(snapshot: CoreObservation) -> MenuSnapshot {
     };
 
     let menu = MenuSnapshot::new(bundle, recommendation, download, runtime, runtime_inventory)
-        .expect("core app snapshots always map to canonical menu snapshots");
-    match snapshot.runtime_port {
-        Some(port) => menu
-            .with_running_port(port)
-            .expect("core running snapshots carry a nonzero validated port"),
-        None => menu,
+        .expect("core app snapshots always map to canonical menu snapshots")
+        .with_bundle_model_id(snapshot.bundle_model_id)
+        .expect("core app snapshots carry the fixed bundle identity");
+    match (
+        snapshot.runtime_port,
+        snapshot.runtime_owner,
+        snapshot.runtime_model_id,
+    ) {
+        (Some(port), Some(owner), Some(model_id)) => menu
+            .with_observed_runtime(
+                match owner {
+                    CoreRuntimeOwner::Legacy => ObservedRuntimeOwner::Legacy,
+                    CoreRuntimeOwner::Foreground => ObservedRuntimeOwner::Foreground,
+                    CoreRuntimeOwner::PersistentApp => ObservedRuntimeOwner::PersistentApp,
+                },
+                model_id,
+                port,
+            )
+            .expect("core running snapshots carry validated runtime identity"),
+        (None, None, None) => menu,
+        _ => panic!("core runtime identity must be complete"),
     }
 }
 

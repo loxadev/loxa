@@ -49,6 +49,13 @@ impl ApiPresentation {
         Self::idle()
     }
 
+    pub(crate) fn from_controller_with_observed_runtime(
+        _controller: &crate::menu::api_runtime::ApiRuntimeController,
+        _observed_runtime: Option<&crate::menu::presentation::ObservedRuntime>,
+    ) -> Self {
+        Self::idle()
+    }
+
     pub(crate) fn idle() -> Self {
         Self {
             phase_label: "API: Idle",
