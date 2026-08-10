@@ -167,7 +167,7 @@ mod menu {
 
             pub(crate) fn assert_native_layout_contract(mtm: MainThreadMarker) {
                 for (name, fixture, expected_height, expected_action_button_count) in [
-                    ("recommendation", Fixture::Empty, 349.0, 1),
+                    ("recommendation", Fixture::Empty, 349.0, 0),
                     ("installed", Fixture::Installed, 272.0, 0),
                     ("recovery", Fixture::Invalid, 272.0, 0),
                     ("transfer", Fixture::Downloading, 332.0, 4),
@@ -232,6 +232,8 @@ mod menu {
                         "{name} Quit modifier"
                     );
                 }
+
+                assert_passive_recommendation_contract(mtm);
 
                 let running = Fixture::Running.snapshot();
                 let ready = ApiPresentation::ready(
@@ -433,6 +435,74 @@ mod menu {
                 assert_empty_inventory_error_is_rendered(mtm);
                 assert_known_installed_row_outlives_cold_inventory_error(mtm);
                 super::controller::assert_feedback_close_rebuild_contract(mtm);
+            }
+
+            fn assert_passive_recommendation_contract(mtm: MainThreadMarker) {
+                let idle = ApiPresentation::idle();
+                let mut content = MenuRows::build(
+                    &Fixture::Empty.snapshot(),
+                    &idle,
+                    &crate::menu::catalog::CatalogState::default(),
+                    &crate::menu::incomplete::IncompleteState::default(),
+                    &InstalledState::default(),
+                    ActionBindings::new(None, layout_fixture_actions()),
+                    mtm,
+                );
+                content.view.layoutSubtreeIfNeeded();
+
+                let text = visible_text_values(&content.view);
+                assert!(
+                    text.contains(&"Download not available in this version".into()),
+                    "the passive recommendation must describe the current product capability: {text:?}"
+                );
+                assert!(
+                    !text.contains(&"Ready to download".into()),
+                    "the passive recommendation must not promise an unavailable download: {text:?}"
+                );
+                assert!(
+                    content.action_buttons.is_empty(),
+                    "the passive recommendation must expose no action button"
+                );
+
+                let availability_ptr = match &content.rows.body {
+                    BodyRows::Recommendation(row) => {
+                        assert_eq!(
+                            row.root.class(),
+                            NSView::class(),
+                            "the passive recommendation must use a plain native view"
+                        );
+                        assert_eq!(
+                            row.root.trackingAreas().count(),
+                            0,
+                            "the passive recommendation must install no hover tracking area"
+                        );
+                        Retained::as_ptr(&row.availability)
+                    }
+                    _ => panic!("the empty fixture must retain its recommendation row"),
+                };
+                for (fixture, expected) in [
+                    (Fixture::LowMemory, "Insufficient memory"),
+                    (Fixture::LowDisk, "Insufficient disk space"),
+                    (Fixture::Unavailable, "Unavailable on this Mac"),
+                    (Fixture::Empty, "Download not available in this version"),
+                ] {
+                    content.rows.update(
+                        &fixture.snapshot(),
+                        &idle,
+                        &crate::menu::presentation::InlineCancelState::default(),
+                    );
+                    match &content.rows.body {
+                        BodyRows::Recommendation(row) => {
+                            assert_eq!(row.availability.stringValue().to_string(), expected);
+                            assert_eq!(
+                                Retained::as_ptr(&row.availability),
+                                availability_ptr,
+                                "recommendation updates must reuse the retained native label"
+                            );
+                        }
+                        _ => panic!("recommendation updates must retain the recommendation row"),
+                    }
+                }
             }
 
             fn assert_catalog_browsing_contract(mtm: MainThreadMarker) {
@@ -1138,7 +1208,6 @@ mod menu {
                     incomplete_prepare: sel!(fixtureNoop:),
                     incomplete_keep: sel!(fixtureNoop:),
                     incomplete_confirm: sel!(fixtureNoop:),
-                    start: sel!(fixtureNoop:),
                     pause: sel!(fixtureNoop:),
                     resume: sel!(fixtureNoop:),
                     retry: sel!(fixtureNoop:),

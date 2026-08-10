@@ -751,12 +751,6 @@ define_class!(
         }
 
         #[cfg(test)]
-        #[unsafe(method(startFixture:))]
-        fn start_fixture(&self, _sender: Option<&AnyObject>) {
-            self.apply_action(MenuAction::Start);
-        }
-
-        #[cfg(test)]
         #[unsafe(method(pauseFixture:))]
         fn pause_fixture(&self, _sender: Option<&AnyObject>) {
             self.apply_action(MenuAction::Pause);
@@ -1095,8 +1089,6 @@ fn action_selectors() -> Actions {
         incomplete_prepare,
         incomplete_keep,
         incomplete_confirm,
-        #[cfg(test)]
-        start: sel!(startFixture:),
         #[cfg(test)]
         pause: sel!(pauseFixture:),
         #[cfg(test)]

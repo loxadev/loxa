@@ -1,14 +1,19 @@
+#[cfg(test)]
 use std::cell::{Cell, RefCell};
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Sel};
-use objc2::{define_class, msg_send, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly};
+use objc2::{define_class, msg_send, MainThreadMarker, MainThreadOnly};
+#[cfg(test)]
+use objc2::{AnyThread, DefinedClass};
 use objc2_app_kit::{
-    NSAccessibility, NSBezierPath, NSBox, NSBoxType, NSButton, NSColor, NSControlSize, NSEvent,
-    NSFont, NSImage, NSImageView, NSLayoutAttribute, NSProgressIndicator, NSProgressIndicatorStyle,
-    NSStackView, NSStackViewDistribution, NSTextAlignment, NSTextField, NSTrackingArea,
-    NSTrackingAreaOptions, NSUserInterfaceLayoutOrientation, NSView,
+    NSAccessibility, NSBezierPath, NSBox, NSBoxType, NSButton, NSColor, NSControlSize, NSFont,
+    NSImage, NSImageView, NSLayoutAttribute, NSProgressIndicator, NSProgressIndicatorStyle,
+    NSStackView, NSStackViewDistribution, NSTextAlignment, NSTextField,
+    NSUserInterfaceLayoutOrientation, NSView,
 };
+#[cfg(test)]
+use objc2_app_kit::{NSEvent, NSTrackingArea, NSTrackingAreaOptions};
 use objc2_foundation::{NSEdgeInsets, NSInteger, NSPoint, NSRect, NSSize, NSString};
 
 use super::catalog_rows::{self, CatalogActions};
@@ -46,8 +51,6 @@ pub(super) struct Actions {
     pub(super) incomplete_prepare: Sel,
     pub(super) incomplete_keep: Sel,
     pub(super) incomplete_confirm: Sel,
-    #[cfg(test)]
-    pub(super) start: Sel,
     #[cfg(test)]
     pub(super) pause: Sel,
     #[cfg(test)]
@@ -716,8 +719,6 @@ struct RecommendationNativeRow {
     root: Retained<NSView>,
     subtitle: Retained<NSTextField>,
     availability: Retained<NSTextField>,
-    #[cfg(test)]
-    action_button: Option<Retained<NSButton>>,
 }
 
 impl RecommendationNativeRow {
@@ -727,15 +728,7 @@ impl RecommendationNativeRow {
         actions: Actions,
         mtm: MainThreadMarker,
     ) -> Self {
-        #[cfg(test)]
-        let actionable = recommendation.action().is_some();
-        #[cfg(not(test))]
-        let actionable = false;
-        let root = if actionable {
-            hover_row_shell(56.0, mtm).into_super()
-        } else {
-            row_shell(56.0, mtm)
-        };
+        let root = row_shell(56.0, mtm);
         let stack = horizontal_stack(mtm);
         let icon = icon_container("sparkles", mtm);
         let labels = vertical_stack(mtm);
@@ -744,34 +737,11 @@ impl RecommendationNativeRow {
         let subtitle = secondary_label(subtitle_text.as_deref().unwrap_or(""), mtm);
         apply_recommendation_size(&subtitle, recommendation);
         labels.addArrangedSubview(&subtitle);
-        let availability = secondary_label(
-            recommendation
-                .disabled_reason()
-                .unwrap_or("Ready to download"),
-            mtm,
-        );
+        let availability = secondary_label(recommendation_availability(recommendation), mtm);
         labels.addArrangedSubview(&availability);
         stack.addArrangedSubview(&icon);
         stack.addArrangedSubview(&labels);
 
-        #[cfg(test)]
-        let mut action_button = None;
-        #[cfg(test)]
-        if actionable {
-            let button = configure_icon_button(
-                NSButton::new(mtm),
-                "arrow.down.circle",
-                "Download Gemma 4 12B",
-                target,
-                actions.start,
-            );
-            #[cfg(test)]
-            {
-                action_button = Some(button.clone());
-            }
-            stack.addArrangedSubview(&button);
-        }
-        #[cfg(not(test))]
         let _ = (target, actions);
         pin_to_content(&root, &stack);
 
@@ -779,8 +749,6 @@ impl RecommendationNativeRow {
             root,
             subtitle,
             availability,
-            #[cfg(test)]
-            action_button,
         }
     }
 
@@ -788,16 +756,20 @@ impl RecommendationNativeRow {
         apply_recommendation_size(&self.subtitle, recommendation);
         set_label(
             &self.availability,
-            recommendation
-                .disabled_reason()
-                .unwrap_or("Ready to download"),
+            recommendation_availability(recommendation),
         );
     }
 
     #[cfg(test)]
     fn action_buttons(&self) -> Vec<Retained<NSButton>> {
-        self.action_button.iter().cloned().collect()
+        Vec::new()
     }
+}
+
+fn recommendation_availability(recommendation: &RecommendationRow) -> &'static str {
+    recommendation
+        .disabled_reason()
+        .unwrap_or("Download not available in this version")
 }
 
 struct TransferNativeRow {
@@ -1036,11 +1008,13 @@ fn empty_installed_row(mtm: MainThreadMarker) -> Retained<NSView> {
     root
 }
 
+#[cfg(test)]
 struct HoverRowIvars {
     hovered: Cell<bool>,
     tracking_area: RefCell<Option<Retained<NSTrackingArea>>>,
 }
 
+#[cfg(test)]
 define_class!(
     // SAFETY: NSView has no subclassing requirements, and this class has no Drop implementation.
     #[unsafe(super(NSView))]
@@ -1105,6 +1079,7 @@ define_class!(
     }
 );
 
+#[cfg(test)]
 impl HoverRowView {
     fn new(frame: NSRect, mtm: MainThreadMarker) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(HoverRowIvars {
@@ -1187,6 +1162,7 @@ fn row_shell(height: f64, mtm: MainThreadMarker) -> Retained<NSView> {
     NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, width, height))
 }
 
+#[cfg(test)]
 fn hover_row_shell(height: f64, mtm: MainThreadMarker) -> Retained<HoverRowView> {
     let width = MenuLayout::width_for(ROW_WIDTH);
     debug_assert_eq!(
