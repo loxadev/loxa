@@ -98,8 +98,7 @@ fn generic_cli_runtime_projects_as_read_only_when_the_menu_controller_is_idle() 
         .unwrap();
 
     let api = project_api_presentation(&controller, &snapshot);
-    assert_eq!(api.phase_label(), "API: Running · CLI");
-    assert_eq!(api.detail_label(), Some("API · 127.0.0.1:43123"));
+    assert_eq!(api.status_label(), "CLI runtime · 127.0.0.1:43123");
     assert_eq!(
         api.curl_command(),
         Some("curl http://127.0.0.1:43123/v1/models")
@@ -113,8 +112,7 @@ fn generic_cli_runtime_projects_as_read_only_when_the_menu_controller_is_idle() 
         .with_observed_runtime(ObservedRuntimeOwner::PersistentApp, "demo".into(), 43123)
         .unwrap();
     let idle = project_api_presentation(&controller, &stale_persistent);
-    assert_eq!(idle.phase_label(), "API: Idle");
-    assert_eq!(idle.detail_label(), None);
+    assert_eq!(idle.status_label(), "API idle");
     assert_eq!(idle.curl_command(), None);
 
     controller.shutdown_and_join().unwrap();

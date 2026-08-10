@@ -350,8 +350,7 @@ mod lifecycle_tests {
         prevented.set(prevented.get() + 1);
 
         let api = exit_resources_api(&failed);
-        assert_eq!(api.phase_label(), "API: Unavailable");
-        assert_eq!(api.detail_label(), Some("Quit and reopen Loxa."));
+        assert_eq!(api.status_label(), "API unavailable · Quit and reopen Loxa");
         let start = api.primary_action("demo");
         assert_eq!(start.title(), "Start API");
         assert!(!start.is_enabled());

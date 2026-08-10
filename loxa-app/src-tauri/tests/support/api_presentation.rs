@@ -34,8 +34,7 @@ impl ApiPrimaryAction {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ApiPresentation {
-    phase_label: &'static str,
-    detail_label: Option<String>,
+    status_label: String,
     curl_command: Option<String>,
     active_model_id: Option<String>,
     action_kind: ApiPrimaryActionKind,
@@ -58,8 +57,7 @@ impl ApiPresentation {
 
     pub(crate) fn idle() -> Self {
         Self {
-            phase_label: "API: Idle",
-            detail_label: None,
+            status_label: "API idle".into(),
             curl_command: None,
             active_model_id: None,
             action_kind: ApiPrimaryActionKind::Start,
@@ -72,14 +70,13 @@ impl ApiPresentation {
         port: u16,
         activity: loxa::api_runtime::ApiRuntimeActivity,
     ) -> Self {
-        let phase_label = match activity {
-            loxa::api_runtime::ApiRuntimeActivity::Loaded => "API: Ready · Model loaded",
-            loxa::api_runtime::ApiRuntimeActivity::Sleeping => "API: Ready · Model sleeping",
-            loxa::api_runtime::ApiRuntimeActivity::Unknown => "API: Ready",
+        let state = match activity {
+            loxa::api_runtime::ApiRuntimeActivity::Loaded => "Model loaded",
+            loxa::api_runtime::ApiRuntimeActivity::Sleeping => "Model sleeping",
+            loxa::api_runtime::ApiRuntimeActivity::Unknown => "API ready",
         };
         Self {
-            phase_label,
-            detail_label: Some(format!("API · 127.0.0.1:{port}")),
+            status_label: format!("{state} · 127.0.0.1:{port}"),
             curl_command: Some(format!("curl http://127.0.0.1:{port}/v1/models")),
             active_model_id: Some(model_id.into()),
             action_kind: ApiPrimaryActionKind::Stop,
@@ -89,8 +86,7 @@ impl ApiPresentation {
 
     pub(crate) fn stopping(model_id: &str) -> Self {
         Self {
-            phase_label: "API: Stopping",
-            detail_label: None,
+            status_label: "Stopping API…".into(),
             curl_command: None,
             active_model_id: Some(model_id.into()),
             action_kind: ApiPrimaryActionKind::Stop,
@@ -98,12 +94,8 @@ impl ApiPresentation {
         }
     }
 
-    pub(crate) fn phase_label(&self) -> &'static str {
-        self.phase_label
-    }
-
-    pub(crate) fn detail_label(&self) -> Option<&str> {
-        self.detail_label.as_deref()
+    pub(crate) fn status_label(&self) -> &str {
+        &self.status_label
     }
 
     pub(crate) fn curl_command(&self) -> Option<&str> {

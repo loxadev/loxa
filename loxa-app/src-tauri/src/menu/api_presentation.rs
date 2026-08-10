@@ -6,8 +6,7 @@ use super::presentation::{ObservedRuntime, ObservedRuntimeOwner};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ApiPresentation {
     phase: ApiPresentationPhase,
-    phase_label: &'static str,
-    detail_label: Option<String>,
+    status_label: String,
     curl_command: Option<String>,
     active_model_id: Option<String>,
 }
@@ -83,50 +82,51 @@ impl ApiPresentation {
         notice: Option<ApiRuntimeNotice>,
         active_model_id: Option<&str>,
     ) -> Self {
-        let (presentation_phase, phase_label) = match phase {
-            ApiRuntimePhase::Idle => (ApiPresentationPhase::Idle, "API: Idle"),
-            ApiRuntimePhase::Starting { .. } => (ApiPresentationPhase::Starting, "API: Starting"),
-            ApiRuntimePhase::Ready {
-                activity: ApiRuntimeActivity::Loaded,
-                ..
-            } => (ApiPresentationPhase::Ready, "API: Ready · Model loaded"),
-            ApiRuntimePhase::Ready {
-                activity: ApiRuntimeActivity::Sleeping,
-                ..
-            } => (ApiPresentationPhase::Ready, "API: Ready · Model sleeping"),
-            ApiRuntimePhase::Ready {
-                activity: ApiRuntimeActivity::Unknown,
-                ..
-            } => (ApiPresentationPhase::Ready, "API: Ready"),
-            ApiRuntimePhase::Stopping => (ApiPresentationPhase::Stopping, "API: Stopping"),
-            ApiRuntimePhase::CleanupFailed => {
-                (ApiPresentationPhase::CleanupFailed, "API: Stop failed")
-            }
-            ApiRuntimePhase::ControllerFailed => {
-                (ApiPresentationPhase::Unavailable, "API: Unavailable")
-            }
-        };
-        let (detail_label, curl_command) = match phase {
-            ApiRuntimePhase::Ready { endpoint, .. } => (
-                Some(format!("API · 127.0.0.1:{}", endpoint.port())),
-                Some(format!(
-                    "curl http://127.0.0.1:{}/v1/models",
-                    endpoint.port()
-                )),
-            ),
-            ApiRuntimePhase::CleanupFailed => (
-                Some("Could not stop the API. Try Stop API again.".into()),
+        let (presentation_phase, status_label, curl_command) = match phase {
+            ApiRuntimePhase::Idle => (
+                ApiPresentationPhase::Idle,
+                notice
+                    .map(|notice| notice.message().to_owned())
+                    .unwrap_or_else(|| "API idle".into()),
                 None,
             ),
-            ApiRuntimePhase::ControllerFailed => (Some("Quit and reopen Loxa.".into()), None),
-            ApiRuntimePhase::Idle
-            | ApiRuntimePhase::Starting { .. }
-            | ApiRuntimePhase::Stopping => (notice.map(|notice| notice.message().to_owned()), None),
+            ApiRuntimePhase::Starting { .. } => {
+                (ApiPresentationPhase::Starting, "Starting API…".into(), None)
+            }
+            ApiRuntimePhase::Ready {
+                endpoint, activity, ..
+            } => {
+                let state = match activity {
+                    ApiRuntimeActivity::Loaded => "Model loaded",
+                    ApiRuntimeActivity::Sleeping => "Model sleeping",
+                    ApiRuntimeActivity::Unknown => "API ready",
+                };
+                (
+                    ApiPresentationPhase::Ready,
+                    format!("{state} · 127.0.0.1:{}", endpoint.port()),
+                    Some(format!(
+                        "curl http://127.0.0.1:{}/v1/models",
+                        endpoint.port()
+                    )),
+                )
+            }
+            ApiRuntimePhase::Stopping => {
+                (ApiPresentationPhase::Stopping, "Stopping API…".into(), None)
+            }
+            ApiRuntimePhase::CleanupFailed => (
+                ApiPresentationPhase::CleanupFailed,
+                "Stop failed · Try Stop API again".into(),
+                None,
+            ),
+            ApiRuntimePhase::ControllerFailed => (
+                ApiPresentationPhase::Unavailable,
+                "API unavailable · Quit and reopen Loxa".into(),
+                None,
+            ),
         };
         Self {
             phase: presentation_phase,
-            phase_label,
-            detail_label,
+            status_label,
             curl_command,
             active_model_id: active_model_id.map(str::to_owned),
         }
@@ -149,19 +149,14 @@ impl ApiPresentation {
 
         Self {
             phase: ApiPresentationPhase::CliRuntime,
-            phase_label: "API: Running · CLI",
-            detail_label: Some(format!("API · 127.0.0.1:{port}")),
+            status_label: format!("CLI runtime · 127.0.0.1:{port}"),
             curl_command: Some(format!("curl http://127.0.0.1:{port}/v1/models")),
             active_model_id: Some(runtime.model_id().into()),
         }
     }
 
-    pub(crate) fn phase_label(&self) -> &'static str {
-        self.phase_label
-    }
-
-    pub(crate) fn detail_label(&self) -> Option<&str> {
-        self.detail_label.as_deref()
+    pub(crate) fn status_label(&self) -> &str {
+        &self.status_label
     }
 
     pub(crate) fn curl_command(&self) -> Option<&str> {

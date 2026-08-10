@@ -5,36 +5,32 @@ use crate::menu::api_runtime::{ApiEndpoint, ApiRuntimeNotice, ApiRuntimePhase};
 use crate::menu::presentation::{ObservedRuntime, ObservedRuntimeOwner};
 
 #[test]
-fn every_api_phase_has_exact_header_copy_and_ready_only_endpoint() {
+fn every_api_phase_has_one_compact_status_line_and_ready_only_curl() {
     let endpoint = ApiEndpoint::new("demo".into(), 43123);
     let cases = [
-        (ApiRuntimePhase::Idle, None, "API: Idle", None, None),
+        (ApiRuntimePhase::Idle, None, "API idle", None),
         (
             ApiRuntimePhase::Idle,
             Some(ApiRuntimeNotice::Conflict),
-            "API: Idle",
-            Some("Another Loxa model operation is active"),
+            "Another Loxa model operation is active",
             None,
         ),
         (
             ApiRuntimePhase::Idle,
             Some(ApiRuntimeNotice::ModelUnavailable),
-            "API: Idle",
-            Some("The selected installed model is unavailable"),
+            "The selected installed model is unavailable",
             None,
         ),
         (
             ApiRuntimePhase::Idle,
             Some(ApiRuntimeNotice::StartFailed),
-            "API: Idle",
-            Some("Could not start the API"),
+            "Could not start the API",
             None,
         ),
         (
             ApiRuntimePhase::Idle,
             Some(ApiRuntimeNotice::UnexpectedStop),
-            "API: Idle",
-            Some("The API stopped unexpectedly"),
+            "The API stopped unexpectedly",
             None,
         ),
         (
@@ -43,8 +39,7 @@ fn every_api_phase_has_exact_header_copy_and_ready_only_endpoint() {
                 model_id: "demo".into(),
             },
             None,
-            "API: Starting",
-            None,
+            "Starting API…",
             None,
         ),
         (
@@ -54,8 +49,7 @@ fn every_api_phase_has_exact_header_copy_and_ready_only_endpoint() {
                 activity: ApiRuntimeActivity::Loaded,
             },
             None,
-            "API: Ready · Model loaded",
-            Some("API · 127.0.0.1:43123"),
+            "Model loaded · 127.0.0.1:43123",
             Some("curl http://127.0.0.1:43123/v1/models"),
         ),
         (
@@ -65,8 +59,7 @@ fn every_api_phase_has_exact_header_copy_and_ready_only_endpoint() {
                 activity: ApiRuntimeActivity::Sleeping,
             },
             None,
-            "API: Ready · Model sleeping",
-            Some("API · 127.0.0.1:43123"),
+            "Model sleeping · 127.0.0.1:43123",
             Some("curl http://127.0.0.1:43123/v1/models"),
         ),
         (
@@ -76,31 +69,27 @@ fn every_api_phase_has_exact_header_copy_and_ready_only_endpoint() {
                 activity: ApiRuntimeActivity::Unknown,
             },
             None,
-            "API: Ready",
-            Some("API · 127.0.0.1:43123"),
+            "API ready · 127.0.0.1:43123",
             Some("curl http://127.0.0.1:43123/v1/models"),
         ),
-        (ApiRuntimePhase::Stopping, None, "API: Stopping", None, None),
+        (ApiRuntimePhase::Stopping, None, "Stopping API…", None),
         (
             ApiRuntimePhase::CleanupFailed,
             Some(ApiRuntimeNotice::CleanupFailed),
-            "API: Stop failed",
-            Some("Could not stop the API. Try Stop API again."),
+            "Stop failed · Try Stop API again",
             None,
         ),
         (
             ApiRuntimePhase::ControllerFailed,
             Some(ApiRuntimeNotice::ControllerFailed),
-            "API: Unavailable",
-            Some("Quit and reopen Loxa."),
+            "API unavailable · Quit and reopen Loxa",
             None,
         ),
     ];
 
-    for (phase, notice, phase_label, detail, curl) in cases {
+    for (phase, notice, status, curl) in cases {
         let presentation = ApiPresentation::from_state(&phase, notice, Some("demo"));
-        assert_eq!(presentation.phase_label(), phase_label);
-        assert_eq!(presentation.detail_label(), detail);
+        assert_eq!(presentation.status_label(), status);
         assert_eq!(presentation.curl_command(), curl);
         assert_eq!(presentation.active_model_id(), Some("demo"));
     }
@@ -229,8 +218,7 @@ fn observed_cli_runtime_is_read_only_and_never_overwrites_menu_owned_phases() {
         None,
         Some(&foreground),
     );
-    assert_eq!(cli.phase_label(), "API: Running · CLI");
-    assert_eq!(cli.detail_label(), Some("API · 127.0.0.1:43123"));
+    assert_eq!(cli.status_label(), "CLI runtime · 127.0.0.1:43123");
     assert_eq!(
         cli.curl_command(),
         Some("curl http://127.0.0.1:43123/v1/models")
@@ -250,8 +238,7 @@ fn observed_cli_runtime_is_read_only_and_never_overwrites_menu_owned_phases() {
         Some("alpha"),
         Some(&foreground),
     );
-    assert_eq!(starting.phase_label(), "API: Starting");
-    assert_eq!(starting.detail_label(), None);
+    assert_eq!(starting.status_label(), "Starting API…");
     assert_eq!(starting.curl_command(), None);
 
     let ready = ApiPresentation::from_state_with_observed_runtime(
@@ -264,8 +251,7 @@ fn observed_cli_runtime_is_read_only_and_never_overwrites_menu_owned_phases() {
         Some("alpha"),
         Some(&foreground),
     );
-    assert_eq!(ready.phase_label(), "API: Ready · Model loaded");
-    assert_eq!(ready.detail_label(), Some("API · 127.0.0.1:43124"));
+    assert_eq!(ready.status_label(), "Model loaded · 127.0.0.1:43124");
     assert_eq!(
         ready.curl_command(),
         Some("curl http://127.0.0.1:43124/v1/models")
@@ -282,8 +268,7 @@ fn observed_cli_runtime_is_read_only_and_never_overwrites_menu_owned_phases() {
             None,
             Some(&other),
         );
-        assert_eq!(idle.phase_label(), "API: Idle");
-        assert_eq!(idle.detail_label(), None);
+        assert_eq!(idle.status_label(), "API idle");
         assert_eq!(idle.curl_command(), None);
     }
 }

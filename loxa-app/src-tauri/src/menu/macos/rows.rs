@@ -6,8 +6,8 @@ use objc2::{define_class, msg_send, AnyThread, DefinedClass, MainThreadMarker, M
 use objc2_app_kit::{
     NSAccessibility, NSBezierPath, NSBox, NSBoxType, NSButton, NSColor, NSControlSize, NSEvent,
     NSFont, NSImage, NSImageView, NSLayoutAttribute, NSProgressIndicator, NSProgressIndicatorStyle,
-    NSStackView, NSTextAlignment, NSTextField, NSTrackingArea, NSTrackingAreaOptions,
-    NSUserInterfaceLayoutOrientation, NSView,
+    NSStackView, NSStackViewDistribution, NSTextAlignment, NSTextField, NSTrackingArea,
+    NSTrackingAreaOptions, NSUserInterfaceLayoutOrientation, NSView,
 };
 use objc2_foundation::{NSEdgeInsets, NSInteger, NSPoint, NSRect, NSSize, NSString};
 
@@ -24,7 +24,7 @@ use crate::menu::presentation::{MenuLayout, MenuSnapshot, RecommendationRow, Tra
 const ROW_WIDTH: f64 = MenuLayout::BASE_WIDTH;
 const CONTENT_INSET: f64 = MenuLayout::OUTER_PADDING + MenuLayout::INNER_PADDING;
 const SECTION_HEIGHT: f64 = 28.0;
-const HEADER_HEIGHT: f64 = 72.0;
+const HEADER_HEIGHT: f64 = 52.0;
 const FOOTER_HEIGHT: f64 = 28.0;
 const SEPARATOR_HEIGHT: f64 = 9.0;
 const ICON_IMAGE_SIZE: f64 = 16.0;
@@ -543,8 +543,7 @@ impl BodyRows {
 
 struct HeaderRow {
     root: Retained<NSView>,
-    phase_label: Retained<NSTextField>,
-    detail_label: Retained<NSTextField>,
+    status_label: Retained<NSTextField>,
     copy_button: Retained<NSButton>,
 }
 
@@ -558,41 +557,34 @@ impl HeaderRow {
         let root = row_shell(HEADER_HEIGHT, mtm);
         let stack = vertical_stack(mtm);
         let title = primary_label("Loxa", mtm);
-        let phase_label = secondary_label(api.phase_label(), mtm);
-        let detail = horizontal_stack(mtm);
-        let detail_label = secondary_label(api.detail_label().unwrap_or(""), mtm);
+        let status = horizontal_stack(mtm);
+        status.setDistribution(NSStackViewDistribution::Fill);
+        let status_label = secondary_label(api.status_label(), mtm);
         let (copy_symbol, copy_label) = runtime_curl_copy_button_content(false);
         let copy_button =
             runtime_curl_copy_button(copy_symbol, copy_label, target, actions.runtime_copy, mtm);
-        detail_label.setHidden(api.detail_label().is_none());
         copy_button.setHidden(api.curl_command().is_none());
 
         stack.addArrangedSubview(&title);
-        stack.addArrangedSubview(&phase_label);
-        detail.addArrangedSubview(&detail_label);
-        detail.addArrangedSubview(&copy_button);
-        stack.addArrangedSubview(&detail);
+        status.addArrangedSubview(&status_label);
+        status.addArrangedSubview(&copy_button);
+        stack.addArrangedSubview(&status);
+        activate(
+            status
+                .widthAnchor()
+                .constraintEqualToAnchor(&stack.widthAnchor()),
+        );
         pin_to_content(&root, &stack);
 
         Self {
             root,
-            phase_label,
-            detail_label,
+            status_label,
             copy_button,
         }
     }
 
     fn update(&mut self, api: &ApiPresentation) {
-        set_label(&self.phase_label, api.phase_label());
-        match api.detail_label() {
-            Some(label) => {
-                set_label(&self.detail_label, label);
-                self.detail_label.setHidden(false);
-            }
-            None => {
-                self.detail_label.setHidden(true);
-            }
-        }
+        set_label(&self.status_label, api.status_label());
         self.copy_button.setHidden(api.curl_command().is_none());
     }
 

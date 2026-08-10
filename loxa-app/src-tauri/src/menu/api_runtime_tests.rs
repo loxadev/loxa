@@ -495,11 +495,7 @@ fn unexpected_child_exit_clears_runtime_and_presents_one_static_idle_notice() {
     assert_eq!(controller.active_model_id(), None);
     assert_eq!(controller.owned_endpoint(), None);
     let presentation = ApiPresentation::from_controller(&controller);
-    assert_eq!(presentation.phase_label(), "API: Idle");
-    assert_eq!(
-        presentation.detail_label(),
-        Some("The API stopped unexpectedly")
-    );
+    assert_eq!(presentation.status_label(), "The API stopped unexpectedly");
     assert_eq!(presentation.curl_command(), None);
     assert!(presentation.primary_action("demo").is_enabled());
     controller.shutdown_and_join().unwrap();

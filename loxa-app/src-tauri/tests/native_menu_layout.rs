@@ -167,10 +167,10 @@ mod menu {
 
             pub(crate) fn assert_native_layout_contract(mtm: MainThreadMarker) {
                 for (name, fixture, expected_height, expected_action_button_count) in [
-                    ("recommendation", Fixture::Empty, 369.0, 1),
-                    ("installed", Fixture::Installed, 292.0, 0),
-                    ("recovery", Fixture::Invalid, 292.0, 0),
-                    ("transfer", Fixture::Downloading, 352.0, 4),
+                    ("recommendation", Fixture::Empty, 349.0, 1),
+                    ("installed", Fixture::Installed, 272.0, 0),
+                    ("recovery", Fixture::Invalid, 272.0, 0),
+                    ("transfer", Fixture::Downloading, 332.0, 4),
                 ] {
                     let PopoverContent {
                         view,
@@ -191,7 +191,7 @@ mod menu {
 
                     assert_eq!(view.frame().size.width, 360.0, "{name} width");
                     assert_eq!(view.frame().size.height, expected_height, "{name} height");
-                    assert_eq!(rows.header.root.frame().size.height, 72.0, "{name} header");
+                    assert_eq!(rows.header.root.frame().size.height, 52.0, "{name} header");
                     // SAFETY: MenuRows::build adds the retained Quit button to
                     // its retained row before returning this content view.
                     let quit_row = unsafe { quit_button.superview() }
@@ -236,7 +236,7 @@ mod menu {
                 let running = Fixture::Running.snapshot();
                 let ready = ApiPresentation::ready(
                     "demo",
-                    43123,
+                    65535,
                     loxa::api_runtime::ApiRuntimeActivity::Loaded,
                 );
                 let mut runtime = MenuRows::build(
@@ -251,8 +251,8 @@ mod menu {
                 runtime.view.layoutSubtreeIfNeeded();
                 let runtime_text = visible_text_values(&runtime.view);
                 assert!(
-                    runtime_text.contains(&"API · 127.0.0.1:43123".into()),
-                    "running header omitted its loopback endpoint: {runtime_text:?}"
+                    runtime_text.contains(&"Model loaded · 127.0.0.1:65535".into()),
+                    "running header did not keep model state and endpoint together: {runtime_text:?}"
                 );
                 assert_eq!(runtime.action_buttons.len(), 1);
                 assert_eq!(
@@ -284,12 +284,22 @@ mod menu {
                 let button_frame = copy_button.frame();
                 assert_eq!(button_frame.size, NSSize::new(28.0, 28.0));
                 let button_ptr = Retained::as_ptr(&runtime.rows.header.copy_button);
-                let phase_ptr = Retained::as_ptr(&runtime.rows.header.phase_label);
-                let detail_ptr = Retained::as_ptr(&runtime.rows.header.detail_label);
+                let status_ptr = Retained::as_ptr(&runtime.rows.header.status_label);
+                let status_frame = runtime.rows.header.status_label.frame();
+                assert!(
+                    status_frame.size.width
+                        >= runtime
+                            .rows
+                            .header
+                            .status_label
+                            .intrinsicContentSize()
+                            .width,
+                    "the full model state and endpoint must not be truncated"
+                );
 
                 let sleeping = ApiPresentation::ready(
                     "demo",
-                    43123,
+                    65535,
                     loxa::api_runtime::ApiRuntimeActivity::Sleeping,
                 );
                 runtime.rows.update(
@@ -297,17 +307,24 @@ mod menu {
                     &sleeping,
                     &crate::menu::presentation::InlineCancelState::default(),
                 );
+                runtime.view.layoutSubtreeIfNeeded();
                 assert_eq!(
-                    runtime.rows.header.phase_label.stringValue().to_string(),
-                    "API: Ready · Model sleeping"
+                    runtime.rows.header.status_label.stringValue().to_string(),
+                    "Model sleeping · 127.0.0.1:65535"
+                );
+                assert!(
+                    runtime.rows.header.status_label.frame().size.width
+                        >= runtime
+                            .rows
+                            .header
+                            .status_label
+                            .intrinsicContentSize()
+                            .width,
+                    "the longer sleeping state and endpoint must not be truncated"
                 );
                 assert_eq!(
-                    Retained::as_ptr(&runtime.rows.header.phase_label),
-                    phase_ptr
-                );
-                assert_eq!(
-                    Retained::as_ptr(&runtime.rows.header.detail_label),
-                    detail_ptr
+                    Retained::as_ptr(&runtime.rows.header.status_label),
+                    status_ptr
                 );
                 assert_eq!(
                     Retained::as_ptr(&runtime.rows.header.copy_button),
@@ -403,12 +420,11 @@ mod menu {
                     authoritative_idle
                         .rows
                         .header
-                        .phase_label
+                        .status_label
                         .stringValue()
                         .to_string(),
-                    "API: Idle"
+                    "API idle"
                 );
-                assert!(authoritative_idle.rows.header.detail_label.isHidden());
                 assert!(authoritative_idle.rows.header.copy_button.isHidden());
 
                 assert_catalog_browsing_contract(mtm);
