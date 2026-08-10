@@ -3263,6 +3263,7 @@ mod tests {
             {"type":"file","path":"mtp-model.gguf","size":4,"lfs":{"oid":oid,"size":4}},
             {"type":"file","path":"model-draft.gguf","size":4,"lfs":{"oid":"b".repeat(64),"size":4}},
             {"type":"file","path":"model-mmproj.gguf","size":4,"lfs":{"oid":"c".repeat(64),"size":4}},
+            {"type":"file","path":"dflash-kquant.gguf","size":4,"lfs":{"oid":"e".repeat(64),"size":4}},
             {"type":"file","path":"model-MtP-draft.mmproj.gguf","size":4,"lfs":{"oid":"d".repeat(64),"size":4}}
         ]);
         let mut transport = FakeDiscoveryTransport::queued(vec![
@@ -3294,6 +3295,9 @@ mod tests {
                 )),
                 CandidateDisposition::UnsupportedPackaging(UnsupportedPackagingReason::Auxiliary(
                     AuxiliaryRole::Mmproj,
+                )),
+                CandidateDisposition::UnsupportedPackaging(UnsupportedPackagingReason::Auxiliary(
+                    AuxiliaryRole::Draft,
                 )),
                 CandidateDisposition::UnsupportedPackaging(UnsupportedPackagingReason::Auxiliary(
                     AuxiliaryRole::Mtp,

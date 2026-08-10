@@ -414,7 +414,7 @@ pub(crate) fn auxiliary_role(filename: &str) -> Option<AuxiliaryRole> {
         .find_map(|token| {
             if token.eq_ignore_ascii_case("mtp") {
                 Some(AuxiliaryRole::Mtp)
-            } else if token.eq_ignore_ascii_case("draft") {
+            } else if token.eq_ignore_ascii_case("draft") || token.eq_ignore_ascii_case("dflash") {
                 Some(AuxiliaryRole::Draft)
             } else if token.eq_ignore_ascii_case("mmproj") {
                 Some(AuxiliaryRole::Mmproj)
@@ -1367,12 +1367,13 @@ mod tests {
     }
 
     #[test]
-    fn classifies_mtp_and_mmproj_files_as_auxiliaries() {
+    fn classifies_draft_mtp_mmproj_and_dflash_files_as_auxiliaries() {
         let root = tempfile::tempdir().unwrap();
         for name in [
             "mtp-gemma.gguf",
             "draft-gemma.gguf",
             "mmproj_gemma.gguf",
+            "dflash-kquant.gguf",
             "gemma-mtp.gguf",
             "gemma-draft.gguf",
             "gemma-mmproj.gguf",
@@ -1397,7 +1398,7 @@ mod tests {
                 .iter()
                 .filter(|candidate| candidate.kind == CandidateKind::Auxiliary)
                 .count(),
-            6
+            7
         );
     }
 
@@ -1415,9 +1416,15 @@ mod tests {
             auxiliary_role("model_mmproj.gguf"),
             Some(AuxiliaryRole::Mmproj)
         );
+        assert_eq!(
+            auxiliary_role("model-DfLaSh-kquant.gguf"),
+            Some(AuxiliaryRole::Draft)
+        );
         for filename in [
             "drafting-model.gguf",
             "redraft-model.gguf",
+            "redflash-kquant.gguf",
+            "dflashing-kquant.gguf",
             "ordinary-model.gguf",
         ] {
             assert_eq!(auxiliary_role(filename), None, "{filename}");
