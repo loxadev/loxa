@@ -2,6 +2,9 @@ use crate::catalog::{ArtifactRef, Manifest};
 use serde::{Deserialize, Serialize};
 
 const FINGERPRINT_SCHEMA_VERSION: u32 = 1;
+pub(crate) const PERSISTENT_SLEEP_IDLE_SECONDS: u64 = 60;
+// Prior schema-1 leases must remain decodable so recovery can terminate their exact child.
+const LEGACY_PERSISTENT_SLEEP_IDLE_SECONDS: u64 = 300;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -72,18 +75,32 @@ impl<'de> Deserialize<'de> for RuntimeFingerprint {
         if let Some(draft) = &mut fingerprint.draft {
             draft.sha256.make_ascii_lowercase();
         }
-        fingerprint.validate().map_err(serde::de::Error::custom)?;
+        fingerprint
+            .validate_recorded()
+            .map_err(serde::de::Error::custom)?;
         Ok(fingerprint)
     }
 }
 
 impl RuntimeFingerprint {
-    fn validate(&self) -> Result<(), String> {
+    fn validate_current(&self) -> Result<(), String> {
+        self.validate(false)
+    }
+
+    fn validate_recorded(&self) -> Result<(), String> {
+        self.validate(true)
+    }
+
+    fn validate(&self, allow_legacy_sleep_policy: bool) -> Result<(), String> {
         if self.schema_version != FINGERPRINT_SCHEMA_VERSION {
             return Err("unsupported runtime fingerprint schema".into());
         }
         crate::paths::validate_id(&self.model_id)?;
-        if !matches!(self.sleep_policy, None | Some(300)) {
+        if self.sleep_policy.is_some_and(|sleep_policy| {
+            sleep_policy != PERSISTENT_SLEEP_IDLE_SECONDS
+                && !(allow_legacy_sleep_policy
+                    && sleep_policy == LEGACY_PERSISTENT_SLEEP_IDLE_SECONDS)
+        }) {
             return Err("unsupported runtime fingerprint sleep policy".into());
         }
         validate_artifact(&self.primary)?;
@@ -95,9 +112,16 @@ impl RuntimeFingerprint {
             self.draft.is_some(),
             self.sleep_policy,
         ) {
-            (EffectiveProfile::Generic, false, _)
-            | (EffectiveProfile::Gemma4Mtp, true, _)
-            | (EffectiveProfile::PrimaryOnly, false, Some(300)) => Ok(()),
+            (EffectiveProfile::Generic, false, _) | (EffectiveProfile::Gemma4Mtp, true, _) => {
+                Ok(())
+            }
+            (EffectiveProfile::PrimaryOnly, false, Some(sleep_policy))
+                if sleep_policy == PERSISTENT_SLEEP_IDLE_SECONDS
+                    || (allow_legacy_sleep_policy
+                        && sleep_policy == LEGACY_PERSISTENT_SLEEP_IDLE_SECONDS) =>
+            {
+                Ok(())
+            }
             _ => Err("runtime fingerprint profile contradicts its draft artifact".into()),
         }
     }
@@ -120,14 +144,14 @@ impl RuntimeFingerprint {
             primary: manifest.primary_artifact().into(),
             draft: manifest.draft_artifact().map(Into::into),
         };
-        fingerprint.validate()?;
+        fingerprint.validate_current()?;
         Ok(fingerprint)
     }
 
     pub(crate) fn primary_only(&self) -> Option<Self> {
         if self.effective_profile != EffectiveProfile::Gemma4Mtp
             || self.draft.is_none()
-            || self.sleep_policy != Some(300)
+            || !self.sleep_policy.is_some_and(is_persistent_sleep_policy)
         {
             return None;
         }
@@ -138,12 +162,25 @@ impl RuntimeFingerprint {
     }
 
     pub(crate) fn validate_persistent_lease(&self, model_id: &str) -> Result<(), String> {
-        self.validate()?;
+        self.validate_current()?;
         if self.model_id != model_id {
             return Err("runtime lease model contradicts its fingerprint".into());
         }
-        if self.sleep_policy != Some(300) {
-            return Err("persistent runtime fingerprint requires sleep policy 300".into());
+        if self.sleep_policy != Some(PERSISTENT_SLEEP_IDLE_SECONDS) {
+            return Err(format!(
+                "persistent runtime fingerprint requires sleep policy {PERSISTENT_SLEEP_IDLE_SECONDS}"
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_recorded_persistent_lease(&self, model_id: &str) -> Result<(), String> {
+        self.validate_recorded()?;
+        if self.model_id != model_id {
+            return Err("runtime lease model contradicts its fingerprint".into());
+        }
+        if !self.sleep_policy.is_some_and(is_persistent_sleep_policy) {
+            return Err("persistent runtime fingerprint requires a supported sleep policy".into());
         }
         Ok(())
     }
@@ -179,6 +216,13 @@ impl RuntimeFingerprint {
     pub(crate) fn draft(&self) -> Option<&ArtifactFingerprint> {
         self.draft.as_ref()
     }
+}
+
+fn is_persistent_sleep_policy(seconds: u64) -> bool {
+    matches!(
+        seconds,
+        PERSISTENT_SLEEP_IDLE_SECONDS | LEGACY_PERSISTENT_SLEEP_IDLE_SECONDS
+    )
 }
 
 fn validate_artifact(artifact: &ArtifactFingerprint) -> Result<(), String> {
@@ -316,7 +360,7 @@ mod tests {
         generic_with_draft["draft"] = artifact("draft.gguf", &"b".repeat(64), 1);
         let mut primary_only_with_draft = generic_with_draft.clone();
         primary_only_with_draft["effective_profile"] = serde_json::json!("primary_only");
-        primary_only_with_draft["sleep_policy"] = serde_json::json!(300);
+        primary_only_with_draft["sleep_policy"] = serde_json::json!(60);
         let mut primary_only_without_sleep = generic_fingerprint();
         primary_only_without_sleep["effective_profile"] = serde_json::json!("primary_only");
         let mut mtp_without_draft = generic_fingerprint();
@@ -361,10 +405,10 @@ mod tests {
         let generic = generic_fingerprint();
         let mut primary_only = generic.clone();
         primary_only["effective_profile"] = serde_json::json!("primary_only");
-        primary_only["sleep_policy"] = serde_json::json!(300);
+        primary_only["sleep_policy"] = serde_json::json!(60);
         let mut mtp = generic;
         mtp["effective_profile"] = serde_json::json!("gemma4_mtp");
-        mtp["sleep_policy"] = serde_json::json!(300);
+        mtp["sleep_policy"] = serde_json::json!(60);
         mtp["draft"] = artifact("draft.gguf", &"b".repeat(64), 1);
 
         for (name, value) in [
@@ -384,7 +428,7 @@ mod tests {
         let mut wire = generic_fingerprint();
         wire["effective_context"] = serde_json::json!(0);
         wire["effective_profile"] = serde_json::json!("gemma4_mtp");
-        wire["sleep_policy"] = serde_json::json!(300);
+        wire["sleep_policy"] = serde_json::json!(60);
         wire["primary"]["sha256"] = serde_json::json!("A".repeat(64));
         wire["draft"] = artifact("draft.gguf", &"B".repeat(64), 1);
 
@@ -394,6 +438,42 @@ mod tests {
         assert_eq!(canonical["effective_context"], 0);
         assert_eq!(canonical["primary"]["sha256"], "a".repeat(64));
         assert_eq!(canonical["draft"]["sha256"], "b".repeat(64));
+    }
+
+    #[test]
+    fn legacy_sleep_policy_is_decode_and_recovery_only() {
+        let mut generic = generic_fingerprint();
+        generic["sleep_policy"] = serde_json::json!(300);
+        let mut mtp = generic.clone();
+        mtp["effective_profile"] = serde_json::json!("gemma4_mtp");
+        mtp["draft"] = artifact("draft.gguf", &"b".repeat(64), 1);
+        let mut primary_only = generic.clone();
+        primary_only["effective_profile"] = serde_json::json!("primary_only");
+
+        for (name, wire, expected_profile) in [
+            ("generic", generic, EffectiveProfile::Generic),
+            ("MTP", mtp, EffectiveProfile::Gemma4Mtp),
+            (
+                "primary-only fallback",
+                primary_only,
+                EffectiveProfile::PrimaryOnly,
+            ),
+        ] {
+            let fingerprint = serde_json::from_value::<RuntimeFingerprint>(wire)
+                .unwrap_or_else(|error| panic!("could not decode prior {name} lease: {error}"));
+
+            assert_eq!(fingerprint.effective_profile(), expected_profile);
+            assert!(
+                fingerprint
+                    .validate_recorded_persistent_lease("demo")
+                    .is_ok(),
+                "prior {name} lease was not valid for recovery"
+            );
+            assert!(
+                fingerprint.validate_persistent_lease("demo").is_err(),
+                "prior {name} lease was accepted for current publication or attachment"
+            );
+        }
     }
 
     #[test]
@@ -419,7 +499,7 @@ mod tests {
             &mtp,
             8192,
             EffectiveProfile::Gemma4Mtp,
-            Some(300),
+            Some(60),
         )
         .is_ok());
         let mut uppercase_sha = generic.clone();
@@ -454,25 +534,32 @@ mod tests {
                 Some(301),
             ),
             (
+                "legacy sleep policy outside wire recovery",
+                generic.clone(),
+                4096,
+                EffectiveProfile::Generic,
+                Some(300),
+            ),
+            (
                 "generic with draft",
                 mtp.clone(),
                 8192,
                 EffectiveProfile::Generic,
-                Some(300),
+                Some(60),
             ),
             (
                 "MTP without draft",
                 mtp_without_draft,
                 8192,
                 EffectiveProfile::Gemma4Mtp,
-                Some(300),
+                Some(60),
             ),
             (
                 "direct primary-only",
                 generic,
                 4096,
                 EffectiveProfile::PrimaryOnly,
-                Some(300),
+                Some(60),
             ),
         ] {
             assert!(

@@ -1,4 +1,6 @@
-use crate::runtime_fingerprint::{EffectiveProfile, RuntimeFingerprint};
+use crate::runtime_fingerprint::{
+    EffectiveProfile, RuntimeFingerprint, PERSISTENT_SLEEP_IDLE_SECONDS,
+};
 use crate::ui;
 use reqwest::blocking::Client;
 use serde::Deserialize;
@@ -23,8 +25,6 @@ const MAX_DIAGNOSTIC_TAIL: usize = 4096;
 const MAX_ANNOUNCEMENT_LINE: usize = 8192;
 const MAX_PENDING_ANNOUNCEMENTS: usize = 64;
 const MANAGED_VERSION: &str = "version: 10121 (555881ebc)";
-const PERSISTENT_SLEEP_IDLE_SECONDS: u64 = 300;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LaunchPolicy {
     Foreground,
@@ -2257,7 +2257,7 @@ mod tests {
                 "model_id": "demo",
                 "effective_context": 4096,
                 "effective_profile": "generic",
-                "sleep_policy": 300,
+                "sleep_policy": 60,
                 "primary": {
                     "local_filename": "model.gguf",
                     "sha256": "a".repeat(64),
@@ -2272,7 +2272,7 @@ mod tests {
                 "model_id": "demo",
                 "effective_context": 8192,
                 "effective_profile": "gemma4_mtp",
-                "sleep_policy": 300,
+                "sleep_policy": 60,
                 "primary": {
                     "local_filename": "model.gguf",
                     "sha256": "a".repeat(64),
@@ -2307,7 +2307,7 @@ mod tests {
             "--reasoning",
             "off",
             "--sleep-idle-seconds",
-            "300",
+            "60",
         ]
         .map(OsString::from)
         .to_vec();
@@ -2341,7 +2341,7 @@ mod tests {
             "--n-gpu-layers-draft",
             "all",
             "--sleep-idle-seconds",
-            "300",
+            "60",
         ]
         .map(OsString::from)
         .to_vec();
@@ -2367,7 +2367,7 @@ mod tests {
             "--reasoning",
             "off",
             "--sleep-idle-seconds",
-            "300",
+            "60",
         ]
         .map(OsString::from)
         .to_vec();
@@ -2412,7 +2412,7 @@ mod tests {
             .filter_map(|(index, argument)| (argument == "--sleep-idle-seconds").then_some(index))
             .collect::<Vec<_>>();
         assert_eq!(sleep_positions.len(), 1);
-        assert_eq!(persistent_args[sleep_positions[0] + 1], "300");
+        assert_eq!(persistent_args[sleep_positions[0] + 1], "60");
 
         for launch in [&foreground, &foreground_mtp, &foreground_fallback] {
             assert!(
@@ -2768,7 +2768,7 @@ mod tests {
         assert_eq!(lease["version"], 2);
         assert_eq!(lease["owner_mode"], "persistent_app");
         assert_eq!(lease["fingerprint"], expected_fingerprint);
-        assert_eq!(lease["fingerprint"]["sleep_policy"], 300);
+        assert_eq!(lease["fingerprint"]["sleep_policy"], 60);
         assert_eq!(lease["model_id"], lease["fingerprint"]["model_id"]);
 
         server.terminate().unwrap();
@@ -2861,7 +2861,7 @@ mod tests {
             EffectiveProfile::PrimaryOnly
         );
         assert!(server.fingerprint().draft().is_none());
-        assert_eq!(server.fingerprint().sleep_policy(), Some(300));
+        assert_eq!(server.fingerprint().sleep_policy(), Some(60));
         let lease: serde_json::Value =
             serde_json::from_slice(&std::fs::read(run_dir.join("foreground.json")).unwrap())
                 .unwrap();
@@ -2872,7 +2872,7 @@ mod tests {
         );
         assert_eq!(lease["fingerprint"]["effective_profile"], "primary_only");
         assert_eq!(lease["fingerprint"]["draft"], serde_json::Value::Null);
-        assert_eq!(lease["fingerprint"]["sleep_policy"], 300);
+        assert_eq!(lease["fingerprint"]["sleep_policy"], 60);
         assert!(server.poll().unwrap().is_none());
         let argv = std::fs::read_to_string(&argv).unwrap();
         let argv = argv.lines().collect::<Vec<_>>();
@@ -2888,7 +2888,7 @@ mod tests {
             .enumerate()
             .filter_map(|(index, argument)| (*argument == "--sleep-idle-seconds").then_some(index))
         {
-            assert_eq!(argv[index + 1], "300");
+            assert_eq!(argv[index + 1], "60");
         }
         assert_eq!(
             argv.iter()

@@ -1107,7 +1107,7 @@ fn validate_lease(lease: &RuntimeLease) -> Result<(), String> {
     {
         Err("invalid runtime lease".into())
     } else if let Some(fingerprint) = lease.persistent_fingerprint() {
-        fingerprint.validate_persistent_lease(&lease.model_id)
+        fingerprint.validate_recorded_persistent_lease(&lease.model_id)
     } else {
         Ok(())
     }
@@ -1489,7 +1489,7 @@ mod tests {
             "model_id": "demo",
             "effective_context": 4096,
             "effective_profile": "generic",
-            "sleep_policy": 300,
+            "sleep_policy": 60,
             "primary": {
                 "local_filename": "model.gguf",
                 "sha256": "a".repeat(64),
@@ -1720,6 +1720,24 @@ mod tests {
         let mut command = Command::new("/bin/sleep");
         command.arg("60");
         command.process_group(0);
+        command.spawn().unwrap()
+    }
+
+    fn spawn_lease_observing_sleep(lease: &Path, witness: &Path, ready: &Path) -> Child {
+        let mut command = Command::new("/bin/bash");
+        command
+            .arg("-c")
+            .arg(
+                r#"trap 'if [ -e "$LOXA_LEASE" ]; then printf present > "$LOXA_WITNESS"; else printf absent > "$LOXA_WITNESS"; fi; exit 0' TERM
+: > "$LOXA_READY"
+while :; do sleep 60; done"#,
+            )
+            .env("LOXA_LEASE", lease)
+            .env("LOXA_WITNESS", witness)
+            .env("LOXA_READY", ready)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
         command.spawn().unwrap()
     }
 
@@ -2391,6 +2409,49 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         false
+    }
+
+    #[test]
+    fn recovery_reconciles_a_prior_300_second_persistent_lease_before_removal() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("foreground.json");
+        let witness = dir.path().join("lease-at-termination");
+        let ready = dir.path().join("lease-observer.ready");
+        let mut child = spawn_lease_observing_sleep(&state_path, &witness, &ready);
+        wait_for_path(&ready, "lease-observing child");
+        let pid = child.id();
+        let group = i32::try_from(pid).unwrap();
+        let snapshot = process_snapshot(pid).unwrap().unwrap();
+        let mut fingerprint = fingerprint_value();
+        fingerprint["sleep_policy"] = serde_json::json!(300);
+        let mut lease = lease_value(LEASE_VERSION);
+        lease["owner_mode"] = serde_json::json!("persistent_app");
+        lease["fingerprint"] = fingerprint;
+        lease["owner_pid"] = serde_json::json!(u32::MAX);
+        lease["owner_start_time"] = serde_json::json!(1);
+        lease["child_pid"] = serde_json::json!(pid);
+        lease["child_start_time"] = serde_json::json!(snapshot.start_identity);
+        lease["child_pgid"] = serde_json::json!(group);
+        lease["server"] = serde_json::json!(snapshot.executable);
+        fs::write(&state_path, serde_json::to_vec(&lease).unwrap()).unwrap();
+
+        recover_stale(dir.path()).unwrap();
+
+        let child_was_reconciled = wait_until_gone(pid);
+        if !child_was_reconciled {
+            terminate_process_group(&mut child, group).unwrap();
+        }
+        assert!(
+            child_was_reconciled,
+            "prior-policy llama-server survived lease recovery"
+        );
+        assert_eq!(
+            fs::read(&witness).unwrap(),
+            b"present",
+            "runtime lease was removed before the exact old process was terminated"
+        );
+        assert!(!state_path.exists());
+        let _ = child.wait();
     }
 
     #[test]
