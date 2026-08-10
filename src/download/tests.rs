@@ -432,6 +432,55 @@ mod tests {
         test_resolved_file(hex(Sha256::digest(bytes).as_ref()), bytes.len() as u64)
     }
 
+    fn ready_artifact_plan(
+        directory: &std::fs::File,
+        model_dir: &std::path::Path,
+        resolved: &ResolvedFile,
+    ) -> Box<plan::ArtifactTransferPlan> {
+        match plan::plan_artifact_transfer(
+            directory,
+            model_dir,
+            resolved.size(),
+            resolved.sha256(),
+            &|| false,
+        ) {
+            plan::ArtifactPlanOutcome::Ready(plan) => plan,
+            plan::ArtifactPlanOutcome::Interrupted => panic!("inert artifact plan interrupted"),
+        }
+    }
+
+    fn download_with_proof_and_empty_transport(
+        resolved: &ResolvedFile,
+        model_dir: &std::path::Path,
+        directory: &std::fs::File,
+        verified_part: VerifiedRegularFile,
+        pause: bool,
+    ) -> (
+        Result<DownloadTerminalOutcome, DownloadFailure>,
+        Vec<Option<u64>>,
+    ) {
+        let transport = FakeTransport {
+            responses: RefCell::new(Vec::new()),
+            offsets: RefCell::new(Vec::new()),
+        };
+        let result = test_runtime().block_on(download_with_transport_controlled_async(
+            DownloadRequest {
+                spec: resolved,
+                directory: DownloadDirectoryAuthority::retained(model_dir, directory),
+                verified_part: Some(verified_part),
+            },
+            &transport,
+            &|| pause,
+            |_| {},
+            RetryWait {
+                observer: |_| panic!("verified local artifact must not retry"),
+                sleep: |_| std::future::ready(()),
+            },
+            perform_artifact_operation,
+        ));
+        (result, transport.offsets.into_inner())
+    }
+
     #[derive(Clone, Debug, Eq, PartialEq)]
     struct ArtifactSnapshotEntry {
         name: String,
@@ -466,6 +515,37 @@ mod tests {
             .collect::<Vec<_>>();
         entries.sort_by(|left, right| left.name.cmp(&right.name));
         entries
+    }
+
+    fn write_replacement_artifacts(path: &std::path::Path) {
+        std::fs::create_dir(path).unwrap();
+        std::fs::write(path.join("model.gguf"), b"replacement final").unwrap();
+        std::fs::write(path.join("model.gguf.part"), b"replacement part").unwrap();
+        std::fs::write(
+            path.join("model.gguf.part.restart"),
+            b"replacement restart",
+        )
+        .unwrap();
+        std::fs::write(path.join("replacement.witness"), b"replacement witness").unwrap();
+    }
+
+    fn assert_replacement_artifacts(path: &std::path::Path) {
+        assert_eq!(
+            std::fs::read(path.join("model.gguf")).unwrap(),
+            b"replacement final"
+        );
+        assert_eq!(
+            std::fs::read(path.join("model.gguf.part")).unwrap(),
+            b"replacement part"
+        );
+        assert_eq!(
+            std::fs::read(path.join("model.gguf.part.restart")).unwrap(),
+            b"replacement restart"
+        );
+        assert_eq!(
+            std::fs::read(path.join("replacement.witness")).unwrap(),
+            b"replacement witness"
+        );
     }
 
     #[test]
@@ -515,6 +595,1046 @@ mod tests {
             .unwrap_err()
             .contains("checksum"));
         assert!(!bad_dir.path().join("model.gguf").exists());
+    }
+
+    #[test]
+    fn ignored_range_completion_fence_does_not_mutate_a_replacement_directory() {
+        let bytes = b"abcdef";
+        let root = tempdir().unwrap();
+        let model_dir = root.path().join("model");
+        let moved_dir = root.path().join("captured-model");
+        std::fs::create_dir(&model_dir).unwrap();
+        std::fs::write(model_dir.join("model.gguf.part"), b"abc").unwrap();
+        let transport = FakeTransport {
+            responses: RefCell::new(vec![transfer(StatusCode::OK, None, bytes)]),
+            offsets: RefCell::new(Vec::new()),
+        };
+        let retries = Cell::new(0);
+        let swapped = Cell::new(false);
+
+        let failure = download_with_transport_controlled(
+            &spec(bytes),
+            &model_dir,
+            &transport,
+            || false,
+            |_| {},
+            RetryWait {
+                observer: |_| retries.set(retries.get() + 1),
+                sleep: tokio::time::sleep,
+            },
+            |operation| {
+                if matches!(
+                    &operation,
+                    ArtifactOperation::Observe(ArtifactCheckpoint::CompletionFencePassed)
+                ) {
+                    std::fs::rename(&model_dir, &moved_dir).unwrap();
+                    write_replacement_artifacts(&model_dir);
+                    swapped.set(true);
+                }
+                perform_artifact_operation(operation)
+            },
+        )
+        .unwrap_err();
+
+        assert!(swapped.get());
+        assert_eq!(failure, DownloadFailure::Durability);
+        assert_eq!(retries.get(), 0);
+        assert_eq!(&*transport.offsets.borrow(), &[Some(3)]);
+        assert_replacement_artifacts(&model_dir);
+        assert_eq!(
+            std::fs::read(moved_dir.join("model.gguf.part")).unwrap(),
+            b"abc"
+        );
+        assert_eq!(
+            std::fs::read(moved_dir.join("model.gguf.part.restart")).unwrap(),
+            bytes
+        );
+        assert!(!moved_dir.join("model.gguf").exists());
+    }
+
+    #[test]
+    fn ignored_range_part_removal_sync_failure_reenters_as_complete_restart() {
+        let bytes = b"abcdef";
+        let root = tempdir().unwrap();
+        let model_dir = root.path().join("model");
+        let moved_dir = root.path().join("captured-model");
+        std::fs::create_dir(&model_dir).unwrap();
+        std::fs::write(model_dir.join("model.gguf.part"), b"abc").unwrap();
+        std::fs::write(model_dir.join("model.gguf.invalid"), b"repair evidence").unwrap();
+        let transport = FakeTransport {
+            responses: RefCell::new(vec![transfer(StatusCode::OK, None, bytes)]),
+            offsets: RefCell::new(Vec::new()),
+        };
+        let promotion_syncs = Cell::new(0);
+
+        let failure = download_with_transport_controlled(
+            &spec(bytes),
+            &model_dir,
+            &transport,
+            || false,
+            |_| {},
+            RetryWait {
+                observer: |_| panic!("ignored-range durability failure must not retry"),
+                sleep: |_| std::future::ready(()),
+            },
+            |operation| {
+                let is_promotion_sync = matches!(
+                    &operation,
+                    ArtifactOperation::Sync {
+                        checkpoint: ArtifactCheckpoint::PromotionDirectorySynced,
+                        ..
+                    }
+                );
+                if is_promotion_sync {
+                    promotion_syncs.set(promotion_syncs.get() + 1);
+                }
+                if is_promotion_sync && promotion_syncs.get() == 1 {
+                    perform_artifact_operation(operation)?;
+                    std::fs::rename(&model_dir, &moved_dir).unwrap();
+                    write_replacement_artifacts(&model_dir);
+                    return Err(ArtifactOperationFailure::Other);
+                }
+                perform_artifact_operation(operation)
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(failure, DownloadFailure::Durability);
+        assert_eq!(promotion_syncs.get(), 1);
+        assert_eq!(&*transport.offsets.borrow(), &[Some(3)]);
+        assert!(!moved_dir.join("model.gguf").exists());
+        assert!(!moved_dir.join("model.gguf.part").exists());
+        assert_eq!(
+            std::fs::read(moved_dir.join("model.gguf.part.restart")).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            std::fs::read(moved_dir.join("model.gguf.invalid")).unwrap(),
+            b"repair evidence"
+        );
+        let directory = crate::safe_file::open_directory(&moved_dir).unwrap().0;
+        let plan = ready_artifact_plan(&directory, &moved_dir, &spec(bytes));
+        assert_eq!(plan.state(), plan::ArtifactTransferState::CompleteRestart);
+        assert_replacement_artifacts(&model_dir);
+    }
+
+    #[test]
+    fn ignored_range_repair_cleanup_sync_failure_reenters_as_clean_complete_restart() {
+        let bytes = b"abcdef";
+        let root = tempdir().unwrap();
+        let model_dir = root.path().join("model");
+        let moved_dir = root.path().join("captured-model");
+        std::fs::create_dir(&model_dir).unwrap();
+        std::fs::write(model_dir.join("model.gguf.part"), b"abc").unwrap();
+        std::fs::write(model_dir.join("model.gguf.invalid"), b"repair evidence").unwrap();
+        let transport = FakeTransport {
+            responses: RefCell::new(vec![transfer(StatusCode::OK, None, bytes)]),
+            offsets: RefCell::new(Vec::new()),
+        };
+        let cleanup_synced = Cell::new(false);
+
+        let failure = download_with_transport_controlled(
+            &spec(bytes),
+            &model_dir,
+            &transport,
+            || false,
+            |_| {},
+            RetryWait {
+                observer: |_| panic!("ignored-range durability failure must not retry"),
+                sleep: |_| std::future::ready(()),
+            },
+            |operation| {
+                if matches!(
+                    &operation,
+                    ArtifactOperation::Sync {
+                        checkpoint: ArtifactCheckpoint::ChecksumCleanupDirectorySynced,
+                        ..
+                    }
+                ) {
+                    perform_artifact_operation(operation)?;
+                    std::fs::rename(&model_dir, &moved_dir).unwrap();
+                    write_replacement_artifacts(&model_dir);
+                    cleanup_synced.set(true);
+                    return Err(ArtifactOperationFailure::Other);
+                }
+                perform_artifact_operation(operation)
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(failure, DownloadFailure::Durability);
+        assert!(cleanup_synced.get());
+        assert_eq!(&*transport.offsets.borrow(), &[Some(3)]);
+        assert!(!moved_dir.join("model.gguf").exists());
+        assert!(!moved_dir.join("model.gguf.part").exists());
+        assert_eq!(
+            std::fs::read(moved_dir.join("model.gguf.part.restart")).unwrap(),
+            bytes
+        );
+        assert!(!moved_dir.join("model.gguf.invalid").exists());
+        let directory = crate::safe_file::open_directory(&moved_dir).unwrap().0;
+        let plan = ready_artifact_plan(&directory, &moved_dir, &spec(bytes));
+        assert_eq!(plan.state(), plan::ArtifactTransferState::CompleteRestart);
+        assert_replacement_artifacts(&model_dir);
+    }
+
+    #[test]
+    fn ignored_range_repair_pre_sync_final_is_clean_and_retries_without_a_request() {
+        let bytes = b"abcdef";
+        let root = tempdir().unwrap();
+        let model_dir = root.path().join("model");
+        let moved_dir = root.path().join("captured-model");
+        let replacement_dir = root.path().join("replacement-model");
+        std::fs::create_dir(&model_dir).unwrap();
+        std::fs::write(model_dir.join("model.gguf.part"), b"abc").unwrap();
+        std::fs::write(model_dir.join("model.gguf.invalid"), b"repair evidence").unwrap();
+        let transport = FakeTransport {
+            responses: RefCell::new(vec![transfer(StatusCode::OK, None, bytes)]),
+            offsets: RefCell::new(Vec::new()),
+        };
+        let promotion_syncs = Cell::new(0);
+
+        let failure = download_with_transport_controlled(
+            &spec(bytes),
+            &model_dir,
+            &transport,
+            || false,
+            |_| {},
+            RetryWait {
+                observer: |_| panic!("ignored-range durability failure must not retry"),
+                sleep: |_| std::future::ready(()),
+            },
+            |operation| {
+                let is_promotion_sync = matches!(
+                    &operation,
+                    ArtifactOperation::Sync {
+                        checkpoint: ArtifactCheckpoint::PromotionDirectorySynced,
+                        ..
+                    }
+                );
+                if is_promotion_sync {
+                    promotion_syncs.set(promotion_syncs.get() + 1);
+                }
+                if is_promotion_sync && promotion_syncs.get() == 2 {
+                    std::fs::rename(&model_dir, &moved_dir).unwrap();
+                    write_replacement_artifacts(&model_dir);
+                    return Err(ArtifactOperationFailure::Other);
+                }
+                perform_artifact_operation(operation)
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(failure, DownloadFailure::Durability);
+        assert_eq!(promotion_syncs.get(), 2);
+        assert_eq!(&*transport.offsets.borrow(), &[Some(3)]);
+        assert_eq!(std::fs::read(moved_dir.join("model.gguf")).unwrap(), bytes);
+        assert!(!moved_dir.join("model.gguf.part").exists());
+        assert!(!moved_dir.join("model.gguf.part.restart").exists());
+        assert!(!moved_dir.join("model.gguf.invalid").exists());
+        let directory = crate::safe_file::open_directory(&moved_dir).unwrap().0;
+        let plan = ready_artifact_plan(&directory, &moved_dir, &spec(bytes));
+        assert_eq!(plan.state(), plan::ArtifactTransferState::ValidFinal);
+        assert_replacement_artifacts(&model_dir);
+
+        std::fs::rename(&model_dir, &replacement_dir).unwrap();
+        std::fs::rename(&moved_dir, &model_dir).unwrap();
+        let retry_transport = FakeTransport {
+            responses: RefCell::new(Vec::new()),
+            offsets: RefCell::new(Vec::new()),
+        };
+        let retry = download_with_transport_controlled(
+            &spec(bytes),
+            &model_dir,
+            &retry_transport,
+            || false,
+            |_| {},
+            RetryWait {
+                observer: |_| panic!("clean-final retry must not back off"),
+                sleep: |_| std::future::ready(()),
+            },
+            perform_artifact_operation,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            retry,
+            DownloadTerminalOutcome::Complete(ref completion)
+                if completion.outcome()
+                    == &DownloadOutcome::AlreadyInstalled(model_dir.join("model.gguf"))
+        ));
+        assert!(retry_transport.offsets.borrow().is_empty());
+        assert_replacement_artifacts(&replacement_dir);
+    }
+
+    #[test]
+    fn complete_restart_normalization_and_followup_promotion_failures_reenter_without_network() {
+        let bytes = b"abcdef";
+        let resolved = spec(bytes);
+        let root = tempdir().unwrap();
+        let model_dir = root.path().join("model");
+        let normalized_dir = root.path().join("normalized-model");
+        let first_replacement = root.path().join("first-replacement");
+        std::fs::create_dir(&model_dir).unwrap();
+        std::fs::write(model_dir.join("model.gguf.part.restart"), bytes).unwrap();
+        let directory = crate::safe_file::open_directory(&model_dir).unwrap().0;
+        let mut restart_plan = ready_artifact_plan(&directory, &model_dir, &resolved);
+        assert_eq!(
+            restart_plan.state(),
+            plan::ArtifactTransferState::CompleteRestart
+        );
+        let verified_restart = restart_plan.take_verified_restart().unwrap();
+        crate::download::reset_content_hash_count();
+
+        let normalization = normalize_complete_restart_controlled(
+            &directory,
+            &model_dir,
+            &resolved,
+            verified_restart,
+            |operation| {
+                if matches!(
+                    &operation,
+                    ArtifactOperation::Observe(ArtifactCheckpoint::BeforePromotion)
+                ) {
+                    std::fs::rename(&model_dir, &normalized_dir).unwrap();
+                    write_replacement_artifacts(&model_dir);
+                }
+                if matches!(
+                    &operation,
+                    ArtifactOperation::Sync {
+                        checkpoint: ArtifactCheckpoint::NormalizationDirectorySynced,
+                        ..
+                    }
+                ) {
+                    perform_artifact_operation(operation)?;
+                    return Err(ArtifactOperationFailure::Other);
+                }
+                perform_artifact_operation(operation)
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(normalization, DownloadFailure::Durability);
+        assert_eq!(
+            std::fs::read(normalized_dir.join("model.gguf.part")).unwrap(),
+            bytes
+        );
+        assert!(!normalized_dir.join("model.gguf.part.restart").exists());
+        assert!(!normalized_dir.join("model.gguf").exists());
+        let normalized_directory = crate::safe_file::open_directory(&normalized_dir).unwrap().0;
+        let normalized_plan =
+            ready_artifact_plan(&normalized_directory, &normalized_dir, &resolved);
+        assert_eq!(
+            normalized_plan.state(),
+            plan::ArtifactTransferState::CompletePart
+        );
+        assert_replacement_artifacts(&model_dir);
+
+        std::fs::rename(&model_dir, &first_replacement).unwrap();
+        std::fs::rename(&normalized_dir, &model_dir).unwrap();
+        let directory = crate::safe_file::open_directory(&model_dir).unwrap().0;
+        let mut complete_part = ready_artifact_plan(&directory, &model_dir, &resolved);
+        let verified_part = complete_part.take_verified_part().unwrap();
+        let promoted_dir = root.path().join("promoted-model");
+        let transport = FakeTransport {
+            responses: RefCell::new(Vec::new()),
+            offsets: RefCell::new(Vec::new()),
+        };
+        let promotion = test_runtime()
+            .block_on(download_with_transport_controlled_async(
+                DownloadRequest {
+                    spec: &resolved,
+                    directory: DownloadDirectoryAuthority::retained(&model_dir, &directory),
+                    verified_part: Some(verified_part),
+                },
+                &transport,
+                &|| false,
+                |_| {},
+                RetryWait {
+                    observer: |_| panic!("complete restart recovery must not retry"),
+                    sleep: |_| std::future::ready(()),
+                },
+                |operation| {
+                    if matches!(
+                        &operation,
+                        ArtifactOperation::Sync {
+                            checkpoint: ArtifactCheckpoint::PromotionDirectorySynced,
+                            ..
+                        }
+                    ) {
+                        perform_artifact_operation(operation)?;
+                        std::fs::rename(&model_dir, &promoted_dir).unwrap();
+                        write_replacement_artifacts(&model_dir);
+                        return Err(ArtifactOperationFailure::Other);
+                    }
+                    perform_artifact_operation(operation)
+                },
+            ))
+            .unwrap_err();
+
+        assert_eq!(promotion, DownloadFailure::Durability);
+        assert!(transport.offsets.borrow().is_empty());
+        assert_eq!(crate::download::content_hash_count(), 0);
+        assert_eq!(
+            std::fs::read(promoted_dir.join("model.gguf")).unwrap(),
+            bytes
+        );
+        assert!(!promoted_dir.join("model.gguf.part").exists());
+        assert!(!promoted_dir.join("model.gguf.part.restart").exists());
+        let promoted_directory = crate::safe_file::open_directory(&promoted_dir).unwrap().0;
+        let promoted_plan = ready_artifact_plan(&promoted_directory, &promoted_dir, &resolved);
+        assert_eq!(promoted_plan.state(), plan::ArtifactTransferState::ValidFinal);
+        assert_replacement_artifacts(&model_dir);
+        assert_replacement_artifacts(&first_replacement);
+    }
+
+    #[test]
+    fn complete_restart_normalization_refuses_byte_identical_inode_substitution() {
+        let bytes = b"abcdef";
+        let resolved = spec(bytes);
+        let root = tempdir().unwrap();
+        let model_dir = root.path().join("model");
+        let restart_path = model_dir.join("model.gguf.part.restart");
+        let captured_path = model_dir.join("captured-restart");
+        let replacement_path = model_dir.join("replacement-restart");
+        std::fs::create_dir(&model_dir).unwrap();
+        std::fs::write(&restart_path, bytes).unwrap();
+        std::fs::write(&replacement_path, bytes).unwrap();
+        let directory = crate::safe_file::open_directory(&model_dir).unwrap().0;
+        let mut plan = ready_artifact_plan(&directory, &model_dir, &resolved);
+        let verified_restart = plan.take_verified_restart().unwrap();
+
+        let result = normalize_complete_restart_controlled(
+            &directory,
+            &model_dir,
+            &resolved,
+            verified_restart,
+            |operation| {
+                if matches!(
+                    operation,
+                    ArtifactOperation::Observe(ArtifactCheckpoint::BeforePromotion)
+                ) {
+                    std::fs::rename(&restart_path, &captured_path).unwrap();
+                    std::fs::rename(&replacement_path, &restart_path).unwrap();
+                }
+                perform_artifact_operation(operation)
+            },
+        );
+
+        assert_eq!(result.unwrap_err(), DownloadFailure::Durability);
+        assert_eq!(std::fs::read(captured_path).unwrap(), bytes);
+        assert_eq!(std::fs::read(restart_path).unwrap(), bytes);
+        assert!(!model_dir.join("model.gguf.part").exists());
+        assert!(!model_dir.join("model.gguf").exists());
+    }
+
+    #[test]
+    fn complete_verified_part_repairs_invalid_without_request_or_rehash() {
+        let bytes = b"abcdef";
+        let resolved = spec(bytes);
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("model.gguf.part"), bytes).unwrap();
+        std::fs::write(dir.path().join("model.gguf.invalid"), b"repair evidence").unwrap();
+        let directory = crate::safe_file::open_directory(dir.path()).unwrap().0;
+        let mut plan = ready_artifact_plan(&directory, dir.path(), &resolved);
+        let verified_part = plan.take_verified_part().unwrap();
+        reset_content_hash_count();
+
+        let (outcome, offsets) = download_with_proof_and_empty_transport(
+            &resolved,
+            dir.path(),
+            &directory,
+            verified_part,
+            false,
+        );
+        let outcome = outcome.unwrap();
+
+        assert!(matches!(outcome, DownloadTerminalOutcome::Complete(_)));
+        assert!(offsets.is_empty());
+        assert_eq!(content_hash_count(), 0);
+        assert_eq!(std::fs::read(dir.path().join("model.gguf")).unwrap(), bytes);
+        assert!(!dir.path().join("model.gguf.part").exists());
+        assert!(!dir.path().join("model.gguf.invalid").exists());
+    }
+
+    #[test]
+    fn verified_repair_sync_failures_leave_only_clean_reenterable_states() {
+        let bytes = b"abcdef";
+        let resolved = spec(bytes);
+
+        for checkpoint in [
+            ArtifactCheckpoint::ChecksumCleanupDirectorySynced,
+            ArtifactCheckpoint::PromotionDirectorySynced,
+        ] {
+            let root = tempdir().unwrap();
+            let model_dir = root.path().join("model");
+            let moved_dir = root.path().join("moved-model");
+            std::fs::create_dir(&model_dir).unwrap();
+            std::fs::write(model_dir.join("model.gguf.part"), bytes).unwrap();
+            std::fs::write(model_dir.join("model.gguf.invalid"), b"repair evidence").unwrap();
+            let directory = crate::safe_file::open_directory(&model_dir).unwrap().0;
+            let mut plan = ready_artifact_plan(&directory, &model_dir, &resolved);
+            let verified_part = plan.take_verified_part().unwrap();
+            let transport = FakeTransport {
+                responses: RefCell::new(Vec::new()),
+                offsets: RefCell::new(Vec::new()),
+            };
+            let failed = Cell::new(false);
+
+            let result = test_runtime().block_on(download_with_transport_controlled_async(
+                DownloadRequest {
+                    spec: &resolved,
+                    directory: DownloadDirectoryAuthority::retained(&model_dir, &directory),
+                    verified_part: Some(verified_part),
+                },
+                &transport,
+                &|| false,
+                |_| {},
+                RetryWait {
+                    observer: |_| panic!("verified repair failure must not retry"),
+                    sleep: |_| std::future::ready(()),
+                },
+                |operation| {
+                    if matches!(
+                        &operation,
+                        ArtifactOperation::Sync {
+                            checkpoint: observed,
+                            ..
+                        } if *observed == checkpoint
+                    ) {
+                        perform_artifact_operation(operation)?;
+                        std::fs::rename(&model_dir, &moved_dir).unwrap();
+                        write_replacement_artifacts(&model_dir);
+                        failed.set(true);
+                        return Err(ArtifactOperationFailure::Other);
+                    }
+                    perform_artifact_operation(operation)
+                },
+            ));
+
+            assert_eq!(result.unwrap_err(), DownloadFailure::Durability);
+            assert!(failed.get(), "{checkpoint:?}");
+            assert!(transport.offsets.borrow().is_empty());
+            assert_replacement_artifacts(&model_dir);
+            if checkpoint == ArtifactCheckpoint::ChecksumCleanupDirectorySynced {
+                assert_eq!(
+                    std::fs::read(moved_dir.join("model.gguf.part")).unwrap(),
+                    bytes
+                );
+                assert!(!moved_dir.join("model.gguf").exists());
+            } else {
+                assert_eq!(
+                    std::fs::read(moved_dir.join("model.gguf")).unwrap(),
+                    bytes
+                );
+                assert!(!moved_dir.join("model.gguf.part").exists());
+            }
+            assert!(!moved_dir.join("model.gguf.invalid").exists());
+            assert!(!moved_dir.join("model.gguf.part.restart").exists());
+        }
+    }
+
+    #[test]
+    fn verified_complete_part_and_normalized_restart_pause_with_full_retained_bytes() {
+        let bytes = b"abcdef";
+        let resolved = spec(bytes);
+
+        for restart in [false, true] {
+            let dir = tempdir().unwrap();
+            let artifact_name = if restart {
+                "model.gguf.part.restart"
+            } else {
+                "model.gguf.part"
+            };
+            std::fs::write(dir.path().join(artifact_name), bytes).unwrap();
+            let directory = crate::safe_file::open_directory(dir.path()).unwrap().0;
+            let mut plan = ready_artifact_plan(&directory, dir.path(), &resolved);
+            let verified_part = if restart {
+                normalize_complete_restart_controlled(
+                    &directory,
+                    dir.path(),
+                    &resolved,
+                    plan.take_verified_restart().unwrap(),
+                    perform_artifact_operation,
+                )
+                .unwrap()
+            } else {
+                plan.take_verified_part().unwrap()
+            };
+            let (outcome, offsets) = download_with_proof_and_empty_transport(
+                &resolved,
+                dir.path(),
+                &directory,
+                verified_part,
+                true,
+            );
+            let outcome = outcome.unwrap();
+
+            assert_eq!(
+                outcome,
+                DownloadTerminalOutcome::Paused {
+                    retained_bytes: resolved.size(),
+                },
+                "restart={restart}"
+            );
+            assert!(offsets.is_empty(), "restart={restart}");
+        }
+
+        let dir = tempdir().unwrap();
+        let part_path = dir.path().join("model.gguf.part");
+        let captured_path = dir.path().join("captured-part");
+        let replacement_path = dir.path().join("replacement-part");
+        std::fs::write(&part_path, bytes).unwrap();
+        std::fs::write(&replacement_path, bytes).unwrap();
+        let directory = crate::safe_file::open_directory(dir.path()).unwrap().0;
+        let mut plan = ready_artifact_plan(&directory, dir.path(), &resolved);
+        let verified_part = plan.take_verified_part().unwrap();
+        std::fs::rename(&part_path, &captured_path).unwrap();
+        std::fs::rename(&replacement_path, &part_path).unwrap();
+
+        let (outcome, offsets) = download_with_proof_and_empty_transport(
+            &resolved,
+            dir.path(),
+            &directory,
+            verified_part,
+            true,
+        );
+
+        assert_eq!(outcome.unwrap_err(), DownloadFailure::Durability);
+        assert!(offsets.is_empty());
+        assert_eq!(std::fs::read(captured_path).unwrap(), bytes);
+        assert_eq!(std::fs::read(part_path).unwrap(), bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn immediate_pause_refuses_a_complete_part_reached_through_a_replaced_directory_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let bytes = b"abcdef";
+        let resolved = spec(bytes);
+        let root = tempdir().unwrap();
+        let model_dir = root.path().join("model");
+        let moved_dir = root.path().join("moved-model");
+        std::fs::create_dir(&model_dir).unwrap();
+        std::fs::write(model_dir.join("model.gguf.part"), bytes).unwrap();
+        let directory = crate::safe_file::open_directory(&model_dir).unwrap().0;
+        let mut plan = ready_artifact_plan(&directory, &model_dir, &resolved);
+        let verified_part = plan.take_verified_part().unwrap();
+        std::fs::rename(&model_dir, &moved_dir).unwrap();
+        symlink(&moved_dir, &model_dir).unwrap();
+        reset_content_hash_count();
+
+        let (outcome, offsets) = download_with_proof_and_empty_transport(
+            &resolved,
+            &model_dir,
+            &directory,
+            verified_part,
+            true,
+        );
+
+        assert_eq!(outcome.unwrap_err(), DownloadFailure::Durability);
+        assert!(offsets.is_empty());
+        assert_eq!(content_hash_count(), 0);
+        assert!(std::fs::symlink_metadata(&model_dir)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read(moved_dir.join("model.gguf.part")).unwrap(),
+            bytes
+        );
+        assert!(!moved_dir.join("model.gguf").exists());
+        assert!(!moved_dir.join("model.gguf.part.restart").exists());
+        assert!(!moved_dir.join("model.gguf.invalid").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_directory_authority_refuses_regular_replacements_and_missing_paths() {
+        #[derive(Clone, Copy, Debug)]
+        enum Replacement {
+            Missing,
+            Empty,
+            ExactCopy,
+            HardlinkedPart,
+        }
+
+        let bytes = b"abcdef";
+        for replacement in [
+            Replacement::Missing,
+            Replacement::Empty,
+            Replacement::ExactCopy,
+            Replacement::HardlinkedPart,
+        ] {
+            for pause in [true, false] {
+                let root = tempdir().unwrap();
+                let model_dir = root.path().join("model");
+                let moved_dir = root.path().join("moved-model");
+                std::fs::create_dir(&model_dir).unwrap();
+                std::fs::write(model_dir.join("model.gguf.part"), bytes).unwrap();
+                let resolved = spec(bytes);
+                let directory = crate::safe_file::open_directory(&model_dir).unwrap().0;
+                let mut plan = ready_artifact_plan(&directory, &model_dir, &resolved);
+                let verified_part = plan.take_verified_part().unwrap();
+                std::fs::rename(&model_dir, &moved_dir).unwrap();
+                if !matches!(replacement, Replacement::Missing) {
+                    std::fs::create_dir(&model_dir).unwrap();
+                }
+                match replacement {
+                    Replacement::Missing | Replacement::Empty => {}
+                    Replacement::ExactCopy => {
+                        std::fs::copy(
+                            moved_dir.join("model.gguf.part"),
+                            model_dir.join("model.gguf.part"),
+                        )
+                        .unwrap();
+                    }
+                    Replacement::HardlinkedPart => {
+                        std::fs::hard_link(
+                            moved_dir.join("model.gguf.part"),
+                            model_dir.join("model.gguf.part"),
+                        )
+                        .unwrap();
+                    }
+                }
+                let retained_before = artifact_snapshot(&moved_dir);
+                let replacement_before = (!matches!(replacement, Replacement::Missing))
+                    .then(|| artifact_snapshot(&model_dir));
+                let transport = FakeTransport {
+                    responses: RefCell::new(Vec::new()),
+                    offsets: RefCell::new(Vec::new()),
+                };
+                reset_content_hash_count();
+
+                let result = test_runtime().block_on(download_with_transport_controlled_async(
+                    DownloadRequest {
+                        spec: &resolved,
+                        directory: DownloadDirectoryAuthority::retained(&model_dir, &directory),
+                        verified_part: Some(verified_part),
+                    },
+                    &transport,
+                    &|| pause,
+                    |_| {},
+                    RetryWait {
+                        observer: |_| panic!("directory authority failure must not retry"),
+                        sleep: |_| std::future::ready(()),
+                    },
+                    perform_artifact_operation,
+                ));
+
+                assert_eq!(
+                    result.unwrap_err(),
+                    DownloadFailure::Durability,
+                    "{replacement:?}, pause={pause}"
+                );
+                assert!(
+                    transport.offsets.borrow().is_empty(),
+                    "{replacement:?}, pause={pause}"
+                );
+                assert_eq!(content_hash_count(), 0);
+                assert_eq!(artifact_snapshot(&moved_dir), retained_before);
+                match replacement_before {
+                    Some(before) => assert_eq!(artifact_snapshot(&model_dir), before),
+                    None => assert!(!model_dir.exists()),
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_directory_authority_survives_retry_and_pause_reproof() {
+        for pause_during_backoff in [false, true] {
+            let bytes = b"abcdef";
+            let root = tempdir().unwrap();
+            let model_dir = root.path().join("model");
+            let moved_dir = root.path().join("moved-model");
+            std::fs::create_dir(&model_dir).unwrap();
+            let retained_directory = crate::safe_file::open_directory(&model_dir).unwrap().0;
+            let transport = FakeTransport {
+                responses: RefCell::new(vec![
+                    failing_transfer(StatusCode::OK, None, b"abc"),
+                    transfer(StatusCode::PARTIAL_CONTENT, Some("bytes 3-5/6"), b"def"),
+                ]),
+                offsets: RefCell::new(Vec::new()),
+            };
+            let paused = Cell::new(false);
+            let retained_before = RefCell::new(None);
+            let replacement_before = RefCell::new(None);
+
+            let result = test_runtime().block_on(download_with_transport_controlled_async(
+                DownloadRequest {
+                    spec: &spec(bytes),
+                    directory: DownloadDirectoryAuthority::retained(
+                        &model_dir,
+                        &retained_directory,
+                    ),
+                    verified_part: None,
+                },
+                &transport,
+                &|| paused.get(),
+                |_| {},
+                RetryWait {
+                    observer: |_| {
+                        std::fs::rename(&model_dir, &moved_dir).unwrap();
+                        std::fs::create_dir(&model_dir).unwrap();
+                        std::fs::copy(
+                            moved_dir.join("model.gguf.part"),
+                            model_dir.join("model.gguf.part"),
+                        )
+                        .unwrap();
+                        retained_before.replace(Some(artifact_snapshot(&moved_dir)));
+                        replacement_before.replace(Some(artifact_snapshot(&model_dir)));
+                        paused.set(pause_during_backoff);
+                    },
+                    sleep: |_| std::future::ready(()),
+                },
+                perform_artifact_operation,
+            ));
+
+            assert_eq!(
+                result.unwrap_err(),
+                DownloadFailure::Durability,
+                "pause_during_backoff={pause_during_backoff}"
+            );
+            assert_eq!(&*transport.offsets.borrow(), &[None]);
+            assert_eq!(
+                artifact_snapshot(&moved_dir),
+                retained_before.borrow_mut().take().unwrap()
+            );
+            assert_eq!(
+                artifact_snapshot(&model_dir),
+                replacement_before.borrow_mut().take().unwrap()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zero_proof_immediate_pause_does_not_consult_or_mutate_directory_authority() {
+        let root = tempdir().unwrap();
+        let model_dir = root.path().join("model");
+        let moved_dir = root.path().join("moved-model");
+        std::fs::create_dir(&model_dir).unwrap();
+        std::fs::write(model_dir.join("retained.witness"), b"retained").unwrap();
+        let directory = crate::safe_file::open_directory(&model_dir).unwrap().0;
+        std::fs::rename(&model_dir, &moved_dir).unwrap();
+        std::fs::create_dir(&model_dir).unwrap();
+        std::fs::write(model_dir.join("replacement.witness"), b"replacement").unwrap();
+        let retained_before = artifact_snapshot(&moved_dir);
+        let replacement_before = artifact_snapshot(&model_dir);
+        let transport = FakeTransport {
+            responses: RefCell::new(Vec::new()),
+            offsets: RefCell::new(Vec::new()),
+        };
+
+        let outcome = test_runtime()
+            .block_on(download_with_transport_controlled_async(
+                DownloadRequest {
+                    spec: &spec(b"abcdef"),
+                    directory: DownloadDirectoryAuthority::retained(&model_dir, &directory),
+                    verified_part: None,
+                },
+                &transport,
+                &|| true,
+                |_| {},
+                RetryWait {
+                    observer: |_| panic!("zero-proof pause must not retry"),
+                    sleep: |_| std::future::ready(()),
+                },
+                perform_artifact_operation,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            DownloadTerminalOutcome::Paused { retained_bytes: 0 }
+        );
+        assert!(transport.offsets.borrow().is_empty());
+        assert_eq!(artifact_snapshot(&moved_dir), retained_before);
+        assert_eq!(artifact_snapshot(&model_dir), replacement_before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_open_after_parent_replacement_is_confined_to_the_retained_directory() {
+        #[derive(Clone, Copy, Debug)]
+        enum Case {
+            FreshPart,
+            IgnoredRangeRestart,
+            ExistingPartAppend,
+        }
+
+        let expected = b"abcdef";
+        for case in [
+            Case::FreshPart,
+            Case::IgnoredRangeRestart,
+            Case::ExistingPartAppend,
+        ] {
+            let root = tempdir().unwrap();
+            let model_dir = root.path().join("model");
+            let moved_dir = root.path().join("moved-model");
+            std::fs::create_dir(&model_dir).unwrap();
+            if !matches!(case, Case::FreshPart) {
+                std::fs::write(model_dir.join("model.gguf.part"), b"abc").unwrap();
+            }
+            let directory = crate::safe_file::open_directory(&model_dir).unwrap().0;
+            let response = match case {
+                Case::FreshPart | Case::IgnoredRangeRestart => {
+                    transfer(StatusCode::OK, None, expected)
+                }
+                Case::ExistingPartAppend => transfer(
+                    StatusCode::PARTIAL_CONTENT,
+                    Some("bytes 3-5/6"),
+                    b"def",
+                ),
+            };
+            let transport = FakeTransport {
+                responses: RefCell::new(vec![response]),
+                offsets: RefCell::new(Vec::new()),
+            };
+            let swapped = Cell::new(false);
+            let replacement_before = RefCell::new(None);
+            reset_content_hash_count();
+
+            let result = test_runtime().block_on(download_with_transport_controlled_async(
+                DownloadRequest {
+                    spec: &spec(expected),
+                    directory: DownloadDirectoryAuthority::retained(&model_dir, &directory),
+                    verified_part: None,
+                },
+                &transport,
+                &|| false,
+                |_| {},
+                RetryWait {
+                    observer: |_| panic!("retained namespace failure must not retry"),
+                    sleep: |_| std::future::ready(()),
+                },
+                |operation| {
+                    if matches!(
+                        &operation,
+                        ArtifactOperation::Observe(ArtifactCheckpoint::BeforeStagingOpen)
+                    ) {
+                        std::fs::rename(&model_dir, &moved_dir).unwrap();
+                        write_replacement_artifacts(&model_dir);
+                        replacement_before.replace(Some(artifact_snapshot(&model_dir)));
+                        swapped.set(true);
+                    }
+                    perform_artifact_operation(operation)
+                },
+            ));
+
+            assert!(swapped.get(), "{case:?}");
+            assert_eq!(
+                result.unwrap_err(),
+                DownloadFailure::Durability,
+                "{case:?}"
+            );
+            assert_eq!(
+                artifact_snapshot(&model_dir),
+                replacement_before.borrow_mut().take().unwrap(),
+                "{case:?}"
+            );
+            assert_eq!(
+                &*transport.offsets.borrow(),
+                &[if matches!(case, Case::FreshPart) {
+                    None
+                } else {
+                    Some(3)
+                }],
+                "{case:?}"
+            );
+            assert_eq!(content_hash_count(), 1, "{case:?}");
+            match case {
+                Case::FreshPart | Case::ExistingPartAppend => {
+                    assert_eq!(
+                        std::fs::read(moved_dir.join("model.gguf.part")).unwrap(),
+                        expected,
+                        "{case:?}"
+                    );
+                    assert!(!moved_dir.join("model.gguf.part.restart").exists());
+                }
+                Case::IgnoredRangeRestart => {
+                    assert_eq!(
+                        std::fs::read(moved_dir.join("model.gguf.part")).unwrap(),
+                        b"abc"
+                    );
+                    assert_eq!(
+                        std::fs::read(moved_dir.join("model.gguf.part.restart")).unwrap(),
+                        expected
+                    );
+                }
+            }
+            assert!(!moved_dir.join("model.gguf").exists());
+            assert!(!moved_dir.join("model.gguf.invalid").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn corrupt_final_quarantine_after_parent_replacement_is_descriptor_relative() {
+        let root = tempdir().unwrap();
+        let model_dir = root.path().join("model");
+        let moved_dir = root.path().join("moved-model");
+        std::fs::create_dir(&model_dir).unwrap();
+        std::fs::write(model_dir.join("model.gguf"), b"bad").unwrap();
+        std::fs::write(model_dir.join("retained.witness"), b"retained").unwrap();
+        let directory = crate::safe_file::open_directory(&model_dir).unwrap().0;
+        let transport = FakeTransport {
+            responses: RefCell::new(Vec::new()),
+            offsets: RefCell::new(Vec::new()),
+        };
+        let replacement_before = RefCell::new(None);
+        let swapped = Cell::new(false);
+        reset_content_hash_count();
+
+        let result = test_runtime().block_on(download_with_transport_controlled_async(
+            DownloadRequest {
+                spec: &spec(b"abcdef"),
+                directory: DownloadDirectoryAuthority::retained(&model_dir, &directory),
+                verified_part: None,
+            },
+            &transport,
+            &|| false,
+            |_| {},
+            RetryWait {
+                observer: |_| panic!("corrupt-final authority failure must not retry"),
+                sleep: |_| std::future::ready(()),
+            },
+            |operation| {
+                if matches!(
+                    &operation,
+                    ArtifactOperation::Observe(ArtifactCheckpoint::BeforeFinalInspection)
+                ) {
+                    std::fs::rename(&model_dir, &moved_dir).unwrap();
+                    std::fs::create_dir(&model_dir).unwrap();
+                    std::fs::write(model_dir.join("model.gguf"), b"xxxxxx").unwrap();
+                    std::fs::write(model_dir.join("replacement.witness"), b"replacement").unwrap();
+                    replacement_before.replace(Some(artifact_snapshot(&model_dir)));
+                    swapped.set(true);
+                }
+                perform_artifact_operation(operation)
+            },
+        ));
+
+        assert!(swapped.get());
+        assert_eq!(result.unwrap_err(), DownloadFailure::Durability);
+        assert!(transport.offsets.borrow().is_empty());
+        assert_eq!(content_hash_count(), 0);
+        assert_eq!(
+            artifact_snapshot(&model_dir),
+            replacement_before.borrow_mut().take().unwrap()
+        );
+        assert!(!moved_dir.join("model.gguf").exists());
+        assert_eq!(
+            std::fs::read(moved_dir.join("model.gguf.invalid")).unwrap(),
+            b"bad"
+        );
+        assert_eq!(
+            std::fs::read(moved_dir.join("retained.witness")).unwrap(),
+            b"retained"
+        );
     }
 
     #[test]
@@ -609,6 +1729,72 @@ mod tests {
         assert!(!dir.path().join("model.gguf.invalid").exists());
         assert!(!dir.path().join("model.gguf.part.restart").exists());
         assert!(transport.offsets.borrow().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn valid_final_repair_cleanup_never_mutates_a_swapped_replacement_directory() {
+        let root = tempdir().unwrap();
+        let model_dir = root.path().join("model");
+        let moved_dir = root.path().join("moved-model");
+        std::fs::create_dir(&model_dir).unwrap();
+        std::fs::write(model_dir.join("model.gguf"), b"abcdef").unwrap();
+        std::fs::write(model_dir.join("model.gguf.invalid"), b"old invalid").unwrap();
+        std::fs::write(
+            model_dir.join("model.gguf.part.restart"),
+            b"old restart",
+        )
+        .unwrap();
+        let transport = FakeTransport {
+            responses: RefCell::new(Vec::new()),
+            offsets: RefCell::new(Vec::new()),
+        };
+        let swapped = Cell::new(false);
+
+        let failure = download_with_transport_controlled(
+            &spec(b"abcdef"),
+            &model_dir,
+            &transport,
+            || false,
+            |update| {
+                if matches!(update, ProgressUpdate::Verifying { .. }) {
+                    std::fs::rename(&model_dir, &moved_dir).unwrap();
+                    std::fs::create_dir(&model_dir).unwrap();
+                    std::fs::write(model_dir.join("model.gguf.invalid"), b"replacement invalid")
+                        .unwrap();
+                    std::fs::write(
+                        model_dir.join("model.gguf.part.restart"),
+                        b"replacement restart",
+                    )
+                    .unwrap();
+                    swapped.set(true);
+                }
+            },
+            RetryWait {
+                observer: |_| panic!("valid final must not retry"),
+                sleep: |_| std::future::ready(()),
+            },
+            perform_artifact_operation,
+        )
+        .unwrap_err();
+
+        assert!(swapped.get());
+        assert_eq!(failure, DownloadFailure::Durability);
+        assert!(transport.offsets.borrow().is_empty());
+        assert_eq!(
+            std::fs::read(model_dir.join("model.gguf.invalid")).unwrap(),
+            b"replacement invalid"
+        );
+        assert_eq!(
+            std::fs::read(model_dir.join("model.gguf.part.restart")).unwrap(),
+            b"replacement restart"
+        );
+        assert_eq!(
+            std::fs::read(moved_dir.join("model.gguf")).unwrap(),
+            b"abcdef"
+        );
+        assert!(!moved_dir.join("model.gguf.invalid").exists());
+        assert!(!moved_dir.join("model.gguf.part.restart").exists());
     }
 
     #[test]
@@ -5317,8 +6503,9 @@ mod tests {
 
         assert!(matches!(
             outcome,
-            DownloadTerminalOutcome::Complete(DownloadOutcome::Pulled(ref path))
-                if path == &dir.path().join("model.gguf")
+            DownloadTerminalOutcome::Complete(ref completion)
+                if completion.outcome()
+                    == &DownloadOutcome::Pulled(dir.path().join("model.gguf"))
         ));
         assert!(completion_fence_passed.get());
         assert_eq!(verification_checks.get(), 3);
@@ -7127,10 +8314,12 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
+        assert!(matches!(
             installed,
-            DownloadTerminalOutcome::Complete(DownloadOutcome::AlreadyInstalled(installed_path))
-        );
+            DownloadTerminalOutcome::Complete(ref completion)
+                if completion.outcome()
+                    == &DownloadOutcome::AlreadyInstalled(installed_path)
+        ));
         assert!(installed_transport.offsets.borrow().is_empty());
 
         let pending_only_dir = tempdir().unwrap();
@@ -7936,6 +9125,50 @@ mod tests {
     }
 
     #[test]
+    fn complete_part_reuses_the_transfer_plan_proof_without_hashing_again() {
+        let bytes = b"complete part";
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("model.gguf.part"), bytes).unwrap();
+        let resolved = spec(bytes);
+        let directory = crate::safe_file::open_directory(dir.path()).unwrap().0;
+        let mut plan = ready_artifact_plan(&directory, dir.path(), &resolved);
+        assert_eq!(plan.state(), plan::ArtifactTransferState::CompletePart);
+        let verified = plan.take_verified_part().unwrap();
+        let transport = FakeTransport {
+            responses: RefCell::new(Vec::new()),
+            offsets: RefCell::new(Vec::new()),
+        };
+        reset_content_hash_count();
+
+        let outcome = test_runtime()
+            .block_on(download_with_transport_controlled_async(
+                DownloadRequest {
+                    spec: &resolved,
+                    directory: DownloadDirectoryAuthority::retained(dir.path(), &directory),
+                    verified_part: Some(verified),
+                },
+                &transport,
+                &|| false,
+                |_| {},
+                RetryWait {
+                    observer: |_| panic!("complete-part proof must not retry"),
+                    sleep: |_| std::future::ready(()),
+                },
+                perform_artifact_operation,
+            ))
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            DownloadTerminalOutcome::Complete(ref completion)
+                if completion.outcome()
+                    == &DownloadOutcome::Pulled(dir.path().join("model.gguf"))
+        ));
+        assert_eq!(content_hash_count(), 0);
+        assert!(transport.offsets.borrow().is_empty());
+    }
+
+    #[test]
     fn complete_part_hash_pause_and_completion_fence_are_controlled() {
         let bytes = vec![b'x'; 3 * 64 * 1024 + 17];
         let dir = tempdir().unwrap();
@@ -8179,12 +9412,12 @@ mod tests {
         .unwrap();
 
         assert!(late_pause.get());
-        assert_eq!(
+        assert!(matches!(
             late,
-            DownloadTerminalOutcome::Complete(DownloadOutcome::Pulled(
-                late_dir.path().join("model.gguf")
-            ))
-        );
+            DownloadTerminalOutcome::Complete(ref completion)
+                if completion.outcome()
+                    == &DownloadOutcome::Pulled(late_dir.path().join("model.gguf"))
+        ));
         assert!(late_transport.offsets.borrow().is_empty());
         assert_eq!(
             std::fs::read(late_dir.path().join("model.gguf")).unwrap(),
@@ -8731,12 +9964,12 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
+        assert!(matches!(
             outcome,
-            DownloadTerminalOutcome::Complete(DownloadOutcome::Pulled(
-                dir.path().join("model.gguf")
-            ))
-        );
+            DownloadTerminalOutcome::Complete(ref completion)
+                if completion.outcome()
+                    == &DownloadOutcome::Pulled(dir.path().join("model.gguf"))
+        ));
         assert!(cleanup_complete.get());
         assert!(transport.observed_cleanup.get());
         assert_eq!(&*transport.offsets.borrow(), &[None]);

@@ -1,4 +1,4 @@
-use super::{ArtifactDiscardError, ArtifactDiscardFacts};
+use super::{ArtifactDiscardError, ArtifactDiscardFacts, VerifiedRegularFile};
 use crate::safe_file::{
     directory_identity, ensure_directory_descriptor_matches_path, ensure_regular_descriptors_match,
     regular_file_identity, RegularFileIdentity,
@@ -14,25 +14,26 @@ pub(crate) enum ArtifactTransferState {
     ValidFinal,
     ValidFinalRepairDebris,
     CompletePart,
+    CompleteRestart,
     RequestCapable,
     InstalledRepair,
     Unsafe,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub(crate) enum ArtifactPlanOutcome {
     Ready(Box<ArtifactTransferPlan>),
     Interrupted,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 struct ArtifactEntry {
-    identity: RegularFileIdentity,
     length: u64,
     checksum_matches: bool,
+    verified: Option<VerifiedRegularFile>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub(crate) struct ArtifactTransferPlan {
     state: ArtifactTransferState,
     final_entry: Option<ArtifactEntry>,
@@ -60,6 +61,49 @@ impl ArtifactTransferPlan {
 
     pub(crate) fn invalid_length(&self) -> Option<u64> {
         self.invalid.as_ref().map(|entry| entry.length)
+    }
+
+    pub(crate) fn take_verified_final(&mut self) -> Option<VerifiedRegularFile> {
+        self.final_entry.as_mut()?.verified.take()
+    }
+
+    pub(crate) fn take_verified_part(&mut self) -> Option<VerifiedRegularFile> {
+        self.part.as_mut()?.verified.take()
+    }
+
+    pub(crate) fn take_verified_restart(&mut self) -> Option<VerifiedRegularFile> {
+        self.restart.as_mut()?.verified.take()
+    }
+
+    pub(crate) fn take_revalidated_clean_final(
+        &mut self,
+        directory: &File,
+        model_dir: &Path,
+        expected_size: u64,
+        expected_sha256: &str,
+    ) -> Result<VerifiedRegularFile, ()> {
+        if self.state != ArtifactTransferState::ValidFinal {
+            return Err(());
+        }
+        let verified = self.take_verified_final().ok_or(())?;
+        verified
+            .proves(
+                &ArtifactName::Final.path(model_dir),
+                expected_size,
+                expected_sha256,
+            )
+            .map_err(|_| ())?;
+        for name in [
+            ArtifactName::Part,
+            ArtifactName::Restart,
+            ArtifactName::Invalid,
+        ] {
+            match open_entry(directory, &name.path(model_dir), name) {
+                Ok(None) => {}
+                Ok(Some(_)) | Err(_) => return Err(()),
+            }
+        }
+        Ok(verified)
     }
 }
 
@@ -168,13 +212,24 @@ fn plan_artifact_transfer_inner(
         } else {
             ArtifactTransferState::ValidFinal
         }
-    } else if final_entry.is_some() || invalid.is_some() {
-        ArtifactTransferState::InstalledRepair
-    } else if part
-        .as_ref()
-        .is_some_and(|entry| entry.length == expected_size && entry.checksum_matches)
+    } else if final_entry.is_none()
+        && part.is_none()
+        && restart
+            .as_ref()
+            .is_some_and(|entry| entry.length == expected_size && entry.checksum_matches)
+    {
+        ArtifactTransferState::CompleteRestart
+    } else if final_entry.is_none() && part.is_none() && restart.is_some() {
+        ArtifactTransferState::Unsafe
+    } else if final_entry.is_none()
+        && restart.is_none()
+        && part
+            .as_ref()
+            .is_some_and(|entry| entry.length == expected_size && entry.checksum_matches)
     {
         ArtifactTransferState::CompletePart
+    } else if final_entry.is_some() || invalid.is_some() {
+        ArtifactTransferState::InstalledRepair
     } else if part.is_none() && restart.is_none() {
         ArtifactTransferState::Fresh
     } else {
@@ -208,7 +263,7 @@ impl ArtifactName {
     }
 
     fn needs_checksum(self) -> bool {
-        matches!(self, Self::Final | Self::Part)
+        matches!(self, Self::Final | Self::Part | Self::Restart)
     }
 
     #[cfg(unix)]
@@ -239,7 +294,7 @@ fn read_entry(
     let identity = regular_file_identity(&file, &path).map_err(|_| PlanReadError::Unsafe)?;
     after_open(name);
     let length = file.metadata().map_err(|_| PlanReadError::Unsafe)?.len();
-    let checksum_matches = if name.needs_checksum() && length == expected_size {
+    let actual = if name.needs_checksum() && length == expected_size {
         let mut hash = Sha256::new();
         let mut buffer = [0_u8; 64 * 1024];
         loop {
@@ -252,20 +307,25 @@ fn read_entry(
             }
             hash.update(&buffer[..read]);
         }
-        let actual = crate::download::artifact::hex(hash.finalize().as_ref());
-        actual == expected_sha256.to_ascii_lowercase()
+        Some(crate::download::artifact::hex(hash.finalize().as_ref()))
     } else {
-        false
+        None
     };
     let resolved = open_entry(directory, &path, name)
         .map_err(|_| PlanReadError::Unsafe)?
         .ok_or(PlanReadError::Unsafe)?;
     ensure_regular_descriptors_match(&file, &identity, &resolved, &path)
         .map_err(|_| PlanReadError::Unsafe)?;
+    let verified = actual
+        .filter(|actual| actual == &expected_sha256.to_ascii_lowercase())
+        .map(|actual| {
+            VerifiedRegularFile::from_captured_hash(file, identity.clone(), path.clone(), actual)
+        });
+    let checksum_matches = verified.is_some();
     Ok(Some(ArtifactEntry {
-        identity,
         length,
         checksum_matches,
+        verified,
     }))
 }
 
@@ -479,6 +539,19 @@ mod tests {
         assert_eq!(plan.state(), ArtifactTransferState::CompletePart);
         assert_eq!(snapshot(complete_part.path()), before);
 
+        let complete_restart = tempfile::tempdir().unwrap();
+        std::fs::write(
+            complete_restart.path().join("model.gguf.part.restart"),
+            bytes,
+        )
+        .unwrap();
+        let restart_directory = open_directory(complete_restart.path());
+        let before = snapshot(complete_restart.path());
+        let mut plan = ready_plan(&restart_directory, complete_restart.path(), 6, &sha256);
+        assert_eq!(plan.state(), ArtifactTransferState::CompleteRestart);
+        assert!(plan.take_verified_restart().is_some());
+        assert_eq!(snapshot(complete_restart.path()), before);
+
         for part in [b"".as_slice(), b"abc", b"abcdefg"] {
             let request = tempfile::tempdir().unwrap();
             std::fs::write(request.path().join("model.gguf.part"), part).unwrap();
@@ -538,7 +611,30 @@ mod tests {
             let before = snapshot(restart_root.path());
             let plan = ready_plan(&directory, restart_root.path(), 6, &sha256);
             assert_eq!(plan.restart_length(), Some(bytes.len() as u64));
+            assert_eq!(
+                plan.state(),
+                if bytes == expected {
+                    ArtifactTransferState::CompleteRestart
+                } else {
+                    ArtifactTransferState::Unsafe
+                }
+            );
             assert_eq!(snapshot(restart_root.path()), before);
+
+            std::fs::write(
+                restart_root.path().join("model.gguf.invalid"),
+                b"repair evidence",
+            )
+            .unwrap();
+            let plan = ready_plan(&directory, restart_root.path(), 6, &sha256);
+            assert_eq!(
+                plan.state(),
+                if bytes == expected {
+                    ArtifactTransferState::CompleteRestart
+                } else {
+                    ArtifactTransferState::Unsafe
+                }
+            );
 
             let invalid_root = tempfile::tempdir().unwrap();
             std::fs::write(invalid_root.path().join("model.gguf.invalid"), bytes).unwrap();

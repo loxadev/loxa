@@ -624,12 +624,20 @@ pub(crate) fn publish_manifest_verified(
     model_lock: &ModelLock,
     verified: &crate::download::VerifiedRegularFile,
 ) -> Result<PathBuf, String> {
-    publish_manifest_verified_inner(models_root, manifest, model_lock, verified, |_| Ok(()))
+    publish_manifest_verified_inner(
+        models_root,
+        manifest,
+        model_lock,
+        verified,
+        |_| Ok(()),
+        transfer::recover_installed_completion,
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum VerifiedPublicationPoint {
     AfterProof,
+    AfterManifestVisible,
 }
 
 #[cfg(test)]
@@ -643,25 +651,57 @@ fn publish_manifest_verified_with_hook<F>(
 where
     F: FnMut(VerifiedPublicationPoint) -> Result<(), String>,
 {
-    publish_manifest_verified_inner(models_root, manifest, model_lock, verified, hook)
+    publish_manifest_verified_inner(
+        models_root,
+        manifest,
+        model_lock,
+        verified,
+        hook,
+        transfer::recover_installed_completion,
+    )
 }
 
-fn publish_manifest_verified_inner<F>(
+#[cfg(test)]
+fn publish_manifest_verified_with_recovery<F, R>(
+    models_root: &Path,
+    manifest: &Manifest,
+    model_lock: &ModelLock,
+    verified: &crate::download::VerifiedRegularFile,
+    hook: F,
+    recover: R,
+) -> Result<PathBuf, String>
+where
+    F: FnMut(VerifiedPublicationPoint) -> Result<(), String>,
+    R: FnMut(
+        &ModelLock,
+        &Manifest,
+        &transfer::CatalogTransferPlan,
+    ) -> Result<(), transfer::CatalogMutationError>,
+{
+    publish_manifest_verified_inner(models_root, manifest, model_lock, verified, hook, recover)
+}
+
+fn publish_manifest_verified_inner<F, R>(
     models_root: &Path,
     manifest: &Manifest,
     model_lock: &ModelLock,
     verified: &crate::download::VerifiedRegularFile,
     mut hook: F,
+    mut recover: R,
 ) -> Result<PathBuf, String>
 where
     F: FnMut(VerifiedPublicationPoint) -> Result<(), String>,
+    R: FnMut(
+        &ModelLock,
+        &Manifest,
+        &transfer::CatalogTransferPlan,
+    ) -> Result<(), transfer::CatalogMutationError>,
 {
     manifest.validate()?;
-    if manifest.version != 2
-        || manifest.origin != Some(Origin::Local)
-        || manifest.artifacts.is_some()
-    {
-        return Err("captured publication requires a local single-file manifest".into());
+    if !matches!(manifest.version, 1 | 2) || manifest.artifacts.is_some() {
+        return Err(
+            "captured publication requires a validated single-file v1 or v2 manifest".into(),
+        );
     }
     let model_dir = models_root.join(&manifest.id);
     model_lock.revalidate_for(&model_dir)?;
@@ -670,9 +710,147 @@ where
     verified.proves(&primary_path, primary.size, primary.sha256)?;
     hook(VerifiedPublicationPoint::AfterProof)?;
     model_lock.revalidate_for(&model_dir)?;
-    publish_manifest_at(model_lock, &model_dir, manifest)?;
+    verified.proves(&primary_path, primary.size, primary.sha256)?;
+    if manifest.version == 1 {
+        publish_remote_manifest_at(
+            model_lock,
+            &model_dir,
+            manifest,
+            verified,
+            &primary_path,
+            &mut hook,
+            &mut recover,
+        )?;
+    } else {
+        let _published = publish_manifest_at(model_lock, &model_dir, manifest, true)?;
+    }
     model_lock.revalidate_for(&model_dir)?;
     Ok(model_dir.join("manifest.json"))
+}
+
+fn publish_remote_manifest_at<F, R>(
+    model_lock: &ModelLock,
+    model_dir: &Path,
+    manifest: &Manifest,
+    verified: &crate::download::VerifiedRegularFile,
+    primary_path: &Path,
+    hook: &mut F,
+    recover: &mut R,
+) -> Result<(), String>
+where
+    F: FnMut(VerifiedPublicationPoint) -> Result<(), String>,
+    R: FnMut(
+        &ModelLock,
+        &Manifest,
+        &transfer::CatalogTransferPlan,
+    ) -> Result<(), transfer::CatalogMutationError>,
+{
+    use transfer::CatalogTransferState;
+
+    let plan = transfer::plan_transfer(model_lock, manifest);
+    match plan.state() {
+        CatalogTransferState::Installed => Ok(()),
+        CatalogTransferState::InstalledCompletionDebris => {
+            match recover(model_lock, manifest, &plan) {
+                Ok(()) => Ok(()),
+                Err(transfer::CatalogMutationError::Changed)
+                    if transfer::plan_transfer(model_lock, manifest).state()
+                        == CatalogTransferState::Installed =>
+                {
+                    Ok(())
+                }
+                Err(_) => Err("remote manifest completion state changed".into()),
+            }
+        }
+        CatalogTransferState::MatchingPending => {
+            let published = publish_manifest_at(model_lock, model_dir, manifest, false)?;
+            let before_cleanup = (|| {
+                hook(VerifiedPublicationPoint::AfterManifestVisible)?;
+                model_lock.revalidate_for(model_dir)?;
+                let primary = manifest.primary_artifact();
+                verified.proves(primary_path, primary.size, primary.sha256)?;
+                Ok::<_, String>(transfer::plan_transfer(model_lock, manifest))
+            })();
+            let completion = match before_cleanup {
+                Ok(completion) => completion,
+                Err(error) => {
+                    published.rollback(model_lock.model_directory())?;
+                    return Err(error);
+                }
+            };
+            match completion.state() {
+                CatalogTransferState::Installed => Ok(()),
+                CatalogTransferState::InstalledCompletionDebris => {
+                    match recover(model_lock, manifest, &completion) {
+                        Ok(()) => Ok(()),
+                        Err(error) => {
+                            let current = transfer::plan_transfer(model_lock, manifest);
+                            if current.state() == CatalogTransferState::Installed {
+                                return match error {
+                                    transfer::CatalogMutationError::Changed => Ok(()),
+                                    transfer::CatalogMutationError::Durability => {
+                                        Err("remote manifest completion durability failed".into())
+                                    }
+                                };
+                            }
+                            published.rollback(model_lock.model_directory())?;
+                            Err("remote manifest completion state changed".into())
+                        }
+                    }
+                }
+                CatalogTransferState::Fresh
+                | CatalogTransferState::MatchingPending
+                | CatalogTransferState::ArtifactConflict
+                | CatalogTransferState::Unsafe => {
+                    published.rollback(model_lock.model_directory())?;
+                    Err("remote manifest completion state changed".into())
+                }
+            }
+        }
+        CatalogTransferState::Fresh
+        | CatalogTransferState::ArtifactConflict
+        | CatalogTransferState::Unsafe => Err("remote manifest publication state changed".into()),
+    }
+}
+
+struct PublishedManifest {
+    file: fs::File,
+    identity: crate::safe_file::RegularFileIdentity,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl PublishedManifest {
+    fn revalidate(&self, directory: &fs::File) -> Result<(), String> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        // SAFETY: `directory` is a retained live directory descriptor and the
+        // entry name is a fixed NUL-terminated catalog name.
+        let descriptor = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                c"manifest.json".as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            )
+        };
+        if descriptor == -1 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        // SAFETY: `openat` returned a new owned descriptor which has not been wrapped.
+        let resolved = unsafe { fs::File::from_raw_fd(descriptor) };
+        crate::safe_file::ensure_regular_descriptors_match(
+            &self.file,
+            &self.identity,
+            &resolved,
+            Path::new("manifest.json"),
+        )
+        .map_err(|_| "published manifest changed".to_string())
+    }
+
+    fn rollback(&self, directory: &fs::File) -> Result<(), String> {
+        self.revalidate(directory)?;
+        unlinkat_if_present(directory, b"manifest.json\0")?;
+        directory.sync_all().map_err(|error| error.to_string())
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -680,7 +858,8 @@ fn publish_manifest_at(
     model_lock: &ModelLock,
     model_dir: &Path,
     manifest: &Manifest,
-) -> Result<(), String> {
+    remove_pending: bool,
+) -> Result<PublishedManifest, String> {
     use rustix::fs::{renameat_with, RenameFlags};
     use rustix::io::Errno;
     use std::os::fd::{AsRawFd, FromRawFd};
@@ -710,7 +889,6 @@ fn publish_manifest_at(
         let _ = unlinkat_if_present(directory, TEMP);
         return Err(error.to_string());
     }
-    drop(temporary);
     model_lock.revalidate_for(model_dir)?;
     match renameat_with(
         directory,
@@ -730,10 +908,20 @@ fn publish_manifest_at(
         }
     }
     directory.sync_all().map_err(|error| error.to_string())?;
+    let identity = crate::safe_file::regular_file_identity(&temporary, Path::new("manifest.json"))
+        .map_err(|error| error.to_string())?;
+    let published = PublishedManifest {
+        file: temporary,
+        identity,
+    };
+    published.revalidate(directory)?;
     model_lock.revalidate_for(model_dir)?;
-    unlinkat_if_present(directory, PENDING)?;
-    directory.sync_all().map_err(|error| error.to_string())?;
-    model_lock.revalidate_for(model_dir)
+    if remove_pending {
+        unlinkat_if_present(directory, PENDING)?;
+        directory.sync_all().map_err(|error| error.to_string())?;
+    }
+    model_lock.revalidate_for(model_dir)?;
+    Ok(published)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -755,8 +943,9 @@ fn publish_manifest_at(
     _model_lock: &ModelLock,
     _model_dir: &Path,
     _manifest: &Manifest,
-) -> Result<(), String> {
-    Err("captured local publication requires macOS or Linux".into())
+    _remove_pending: bool,
+) -> Result<PublishedManifest, String> {
+    Err("captured publication requires macOS or Linux".into())
 }
 
 fn publish_manifest_with_verifier<F>(
@@ -1159,6 +1348,317 @@ mod tests {
         assert_eq!(successful_verifications, ["model.gguf", "draft.gguf"]);
         assert_eq!(published, manifest_path);
         assert!(manifest_path.exists());
+    }
+
+    #[test]
+    fn captured_publication_accepts_an_exact_remote_single_file_manifest() {
+        let root = tempdir().unwrap();
+        let expected = manifest("demo");
+        let model_dir = root.path().join("demo");
+        prepare_pull(&model_dir, &expected).unwrap();
+        std::fs::write(model_dir.join("model.gguf"), b"abc").unwrap();
+        let model_lock = ModelLock::acquire(&model_dir).unwrap();
+        let verified = crate::download::verify_regular_captured(
+            &model_dir.join("model.gguf"),
+            expected.size,
+            &expected.sha256,
+        )
+        .unwrap();
+
+        let published =
+            publish_manifest_verified(root.path(), &expected, &model_lock, &verified).unwrap();
+
+        assert_eq!(published, model_dir.join("manifest.json"));
+        assert_eq!(load_catalog(root.path()).unwrap(), vec![expected]);
+        assert!(!model_dir.join("pending.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_remote_publication_refuses_a_byte_identical_inode_substitution_after_proof() {
+        let root = tempdir().unwrap();
+        let expected = manifest("demo");
+        let model_dir = root.path().join("demo");
+        let model_path = model_dir.join("model.gguf");
+        let replacement_path = model_dir.join("replacement.gguf");
+        prepare_pull(&model_dir, &expected).unwrap();
+        std::fs::write(&model_path, b"abc").unwrap();
+        std::fs::write(&replacement_path, b"abc").unwrap();
+        let pending = std::fs::read(model_dir.join("pending.json")).unwrap();
+        let original_identity = crate::safe_file::regular_file_identity(
+            &std::fs::File::open(&model_path).unwrap(),
+            &model_path,
+        )
+        .unwrap();
+        let model_lock = ModelLock::acquire(&model_dir).unwrap();
+        let verified =
+            crate::download::verify_regular_captured(&model_path, expected.size, &expected.sha256)
+                .unwrap();
+
+        let result = publish_manifest_verified_with_hook(
+            root.path(),
+            &expected,
+            &model_lock,
+            &verified,
+            |point| {
+                assert_eq!(point, VerifiedPublicationPoint::AfterProof);
+                std::fs::rename(&replacement_path, &model_path).unwrap();
+                Ok(())
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&model_path).unwrap(), b"abc");
+        let replacement_identity = crate::safe_file::regular_file_identity(
+            &std::fs::File::open(&model_path).unwrap(),
+            &model_path,
+        )
+        .unwrap();
+        assert_ne!(replacement_identity, original_identity);
+        assert_eq!(
+            std::fs::read(model_dir.join("pending.json")).unwrap(),
+            pending
+        );
+        assert!(!model_dir.join("manifest.json").exists());
+        assert!(!model_dir.join("manifest.json.tmp").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_remote_publication_rolls_back_if_the_artifact_changes_after_manifest_visibility() {
+        let root = tempdir().unwrap();
+        let expected = manifest("demo");
+        let model_dir = root.path().join("demo");
+        let model_path = model_dir.join("model.gguf");
+        let replacement_path = model_dir.join("replacement.gguf");
+        prepare_pull(&model_dir, &expected).unwrap();
+        std::fs::write(&model_path, b"abc").unwrap();
+        std::fs::write(&replacement_path, b"abc").unwrap();
+        let pending = std::fs::read(model_dir.join("pending.json")).unwrap();
+        let original_identity = crate::safe_file::regular_file_identity(
+            &std::fs::File::open(&model_path).unwrap(),
+            &model_path,
+        )
+        .unwrap();
+        let model_lock = ModelLock::acquire(&model_dir).unwrap();
+        let verified =
+            crate::download::verify_regular_captured(&model_path, expected.size, &expected.sha256)
+                .unwrap();
+
+        let result = publish_manifest_verified_with_hook(
+            root.path(),
+            &expected,
+            &model_lock,
+            &verified,
+            |point| {
+                if point == VerifiedPublicationPoint::AfterManifestVisible {
+                    std::fs::rename(&replacement_path, &model_path).unwrap();
+                }
+                Ok(())
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&model_path).unwrap(), b"abc");
+        let replacement_identity = crate::safe_file::regular_file_identity(
+            &std::fs::File::open(&model_path).unwrap(),
+            &model_path,
+        )
+        .unwrap();
+        assert_ne!(replacement_identity, original_identity);
+        assert_eq!(
+            std::fs::read(model_dir.join("pending.json")).unwrap(),
+            pending
+        );
+        assert!(!model_dir.join("manifest.json").exists());
+        assert!(!model_dir.join("manifest.json.tmp").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_remote_publication_accepts_exact_installed_when_pending_disappears_after_visibility(
+    ) {
+        let root = tempdir().unwrap();
+        let expected = manifest("demo");
+        let model_dir = root.path().join("demo");
+        prepare_pull(&model_dir, &expected).unwrap();
+        std::fs::write(model_dir.join("model.gguf"), b"abc").unwrap();
+        let model_lock = ModelLock::acquire(&model_dir).unwrap();
+        let verified = crate::download::verify_regular_captured(
+            &model_dir.join("model.gguf"),
+            expected.size,
+            &expected.sha256,
+        )
+        .unwrap();
+
+        let published = publish_manifest_verified_with_hook(
+            root.path(),
+            &expected,
+            &model_lock,
+            &verified,
+            |point| {
+                if point == VerifiedPublicationPoint::AfterManifestVisible {
+                    std::fs::remove_file(model_dir.join("pending.json")).unwrap();
+                    std::fs::File::open(&model_dir).unwrap().sync_all().unwrap();
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(published, model_dir.join("manifest.json"));
+        assert_eq!(load_catalog(root.path()).unwrap(), vec![expected]);
+        assert!(!model_dir.join("pending.json").exists());
+        assert!(!model_dir.join("manifest.json.tmp").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_remote_publication_preserves_installed_manifest_after_pending_removal_sync_failure()
+    {
+        let root = tempdir().unwrap();
+        let expected = manifest("demo");
+        let model_dir = root.path().join("demo");
+        prepare_pull(&model_dir, &expected).unwrap();
+        std::fs::write(model_dir.join("model.gguf"), b"abc").unwrap();
+        let model_lock = ModelLock::acquire(&model_dir).unwrap();
+        let verified = crate::download::verify_regular_captured(
+            &model_dir.join("model.gguf"),
+            expected.size,
+            &expected.sha256,
+        )
+        .unwrap();
+        let sync_failed = std::cell::Cell::new(false);
+
+        let error = publish_manifest_verified_with_recovery(
+            root.path(),
+            &expected,
+            &model_lock,
+            &verified,
+            |_| Ok(()),
+            |lock, expected, plan| {
+                transfer::recover_installed_completion_with_sync(lock, expected, plan, |_| {
+                    assert!(!model_dir.join("pending.json").exists());
+                    assert!(model_dir.join("manifest.json").exists());
+                    sync_failed.set(true);
+                    Err(std::io::Error::other("injected directory sync failure"))
+                })
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("completion durability failed"), "{error}");
+        assert!(sync_failed.get());
+        assert_eq!(
+            std::fs::read(model_dir.join("manifest.json")).unwrap(),
+            serde_json::to_vec_pretty(&expected).unwrap()
+        );
+        assert!(!model_dir.join("pending.json").exists());
+        assert!(!model_dir.join("manifest.json.tmp").exists());
+        assert_eq!(
+            transfer::plan_transfer(&model_lock, &expected).state(),
+            transfer::CatalogTransferState::Installed
+        );
+    }
+
+    #[test]
+    fn captured_remote_publication_accepts_an_exact_existing_manifest_and_cleans_pending() {
+        let root = tempdir().unwrap();
+        let expected = manifest("demo");
+        let model_dir = root.path().join("demo");
+        std::fs::create_dir(&model_dir).unwrap();
+        std::fs::write(model_dir.join("model.gguf"), b"abc").unwrap();
+        publish_manifest(root.path(), &expected).unwrap();
+        let manifest_bytes = std::fs::read(model_dir.join("manifest.json")).unwrap();
+        std::fs::write(model_dir.join("pending.json"), &manifest_bytes).unwrap();
+        let model_lock = ModelLock::acquire(&model_dir).unwrap();
+        let verified = crate::download::verify_regular_captured(
+            &model_dir.join("model.gguf"),
+            expected.size,
+            &expected.sha256,
+        )
+        .unwrap();
+
+        let published =
+            publish_manifest_verified(root.path(), &expected, &model_lock, &verified).unwrap();
+
+        assert_eq!(published, model_dir.join("manifest.json"));
+        assert_eq!(std::fs::read(&published).unwrap(), manifest_bytes);
+        assert!(!model_dir.join("pending.json").exists());
+    }
+
+    #[test]
+    fn captured_single_file_publication_rejects_a_version_three_bundle() {
+        let root = tempdir().unwrap();
+        let expected = test_model_bundle("demo");
+        let model_dir = root.path().join("demo");
+        std::fs::create_dir(&model_dir).unwrap();
+        std::fs::write(model_dir.join("model.gguf"), b"abc").unwrap();
+        let model_lock = ModelLock::acquire(&model_dir).unwrap();
+        let verified = crate::download::verify_regular_captured(
+            &model_dir.join("model.gguf"),
+            expected.size,
+            &expected.sha256,
+        )
+        .unwrap();
+
+        let error =
+            publish_manifest_verified(root.path(), &expected, &model_lock, &verified).unwrap_err();
+
+        assert!(error.contains("single-file"), "{error}");
+        assert!(!model_dir.join("manifest.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_remote_publication_refuses_a_model_directory_swap_without_touching_either_directory(
+    ) {
+        let root = tempdir().unwrap();
+        let expected = manifest("demo");
+        let model_dir = root.path().join("demo");
+        let moved_dir = root.path().join("moved-demo");
+        prepare_pull(&model_dir, &expected).unwrap();
+        std::fs::write(model_dir.join("model.gguf"), b"abc").unwrap();
+        let pending = std::fs::read(model_dir.join("pending.json")).unwrap();
+        let model_lock = ModelLock::acquire(&model_dir).unwrap();
+        let verified = crate::download::verify_regular_captured(
+            &model_dir.join("model.gguf"),
+            expected.size,
+            &expected.sha256,
+        )
+        .unwrap();
+
+        let result = publish_manifest_verified_with_hook(
+            root.path(),
+            &expected,
+            &model_lock,
+            &verified,
+            |point| {
+                assert_eq!(point, VerifiedPublicationPoint::AfterProof);
+                std::fs::rename(&model_dir, &moved_dir).unwrap();
+                std::fs::create_dir(&model_dir).unwrap();
+                std::fs::write(model_dir.join("witness"), b"replacement witness").unwrap();
+                std::fs::write(model_dir.join("pending.json"), b"replacement pending").unwrap();
+                Ok(())
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read(model_dir.join("witness")).unwrap(),
+            b"replacement witness"
+        );
+        assert_eq!(
+            std::fs::read(model_dir.join("pending.json")).unwrap(),
+            b"replacement pending"
+        );
+        assert!(!model_dir.join("manifest.json").exists());
+        assert_eq!(
+            std::fs::read(moved_dir.join("pending.json")).unwrap(),
+            pending
+        );
+        assert!(!moved_dir.join("manifest.json").exists());
+        assert!(!moved_dir.join("manifest.json.tmp").exists());
     }
 
     #[cfg(unix)]

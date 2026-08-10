@@ -239,6 +239,23 @@ pub(crate) fn recover_installed_completion(
     )
 }
 
+#[cfg(test)]
+pub(super) fn recover_installed_completion_with_sync(
+    lock: &ModelLock,
+    expected: &Manifest,
+    plan: &CatalogTransferPlan,
+    mut sync_directory: impl FnMut(&File) -> io::Result<()>,
+) -> Result<(), CatalogMutationError> {
+    let mut after_checkpoint = |_: CatalogRecoveryPoint| Ok(());
+    recover_installed_completion_inner(
+        lock,
+        expected,
+        plan,
+        &mut sync_directory,
+        &mut after_checkpoint,
+    )
+}
+
 fn recover_installed_completion_inner(
     lock: &ModelLock,
     expected: &Manifest,

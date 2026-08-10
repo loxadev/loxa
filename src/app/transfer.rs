@@ -1,6 +1,8 @@
 use super::{installed, AppService};
 use crate::catalog::{self, Manifest, ModelLockError};
-use crate::download::{self, DownloadFailure, DownloadTerminalOutcome, ProgressUpdate};
+use crate::download::{
+    self, DownloadFailure, DownloadTerminalOutcome, ProgressUpdate, VerifiedRegularFile,
+};
 use crate::huggingface::ResolvedFile;
 use std::fmt;
 use std::path::Path;
@@ -281,9 +283,13 @@ fn combine_plans(
         (Catalog::Installed, Artifact::Fresh | Artifact::InstalledRepair) => {
             Ok(CapacityPlan::InstalledRepairRequest)
         }
-        (Catalog::MatchingPending, Artifact::ValidFinal | Artifact::CompletePart) => {
+        (Catalog::Installed, Artifact::CompletePart | Artifact::CompleteRestart) => {
             Ok(CapacityPlan::PendingPublish)
         }
+        (
+            Catalog::MatchingPending,
+            Artifact::ValidFinal | Artifact::CompletePart | Artifact::CompleteRestart,
+        ) => Ok(CapacityPlan::PendingPublish),
         (
             Catalog::MatchingPending,
             Artifact::Fresh | Artifact::RequestCapable | Artifact::InstalledRepair,
@@ -309,7 +315,10 @@ fn recovery_is_discardable(
         (Catalog::Fresh, Artifact::Fresh) => pending_created,
         (
             Catalog::MatchingPending,
-            Artifact::Fresh | Artifact::RequestCapable | Artifact::CompletePart,
+            Artifact::Fresh
+            | Artifact::RequestCapable
+            | Artifact::CompletePart
+            | Artifact::CompleteRestart,
         ) => true,
         _ => false,
     }
@@ -327,7 +336,10 @@ fn audited_retained_bytes(
     if plan.invalid_length().is_some()
         && !matches!(
             artifact,
-            Artifact::InstalledRepair | Artifact::ValidFinalRepairDebris
+            Artifact::CompletePart
+                | Artifact::CompleteRestart
+                | Artifact::InstalledRepair
+                | Artifact::ValidFinalRepairDebris
         )
     {
         return None;
@@ -340,7 +352,11 @@ fn audited_retained_bytes(
             .unwrap_or(0)
     };
     match (catalog, artifact) {
-        (Catalog::MatchingPending, Artifact::ValidFinal | Artifact::CompletePart) => {
+        (
+            Catalog::MatchingPending,
+            Artifact::ValidFinal | Artifact::CompletePart | Artifact::CompleteRestart,
+        )
+        | (Catalog::Installed, Artifact::CompletePart | Artifact::CompleteRestart) => {
             Some(artifact_size)
         }
         (Catalog::MatchingPending, Artifact::Fresh) => Some(0),
@@ -795,25 +811,17 @@ fn publication_error_after_final_audit(
     model_dir: &Path,
     model_id: &str,
     artifact: &ResolvedFile,
+    verified: &VerifiedRegularFile,
 ) -> TransferError {
-    if lock.revalidate().is_err() {
-        return TransferError::terminal(TransferErrorKind::Publication);
-    }
-    let exact_final = match crate::download::plan::plan_artifact_transfer(
-        lock.model_directory(),
-        model_dir,
-        artifact.size(),
-        artifact.sha256(),
-        &|| false,
-    ) {
-        crate::download::plan::ArtifactPlanOutcome::Ready(plan) => matches!(
-            plan.state(),
-            crate::download::plan::ArtifactTransferState::ValidFinal
-                | crate::download::plan::ArtifactTransferState::ValidFinalRepairDebris
-        ),
-        crate::download::plan::ArtifactPlanOutcome::Interrupted => false,
-    };
-    if !exact_final || lock.revalidate().is_err() {
+    if lock.revalidate().is_err()
+        || verified
+            .proves(
+                &model_dir.join("model.gguf"),
+                artifact.size(),
+                artifact.sha256(),
+            )
+            .is_err()
+    {
         return TransferError::terminal(TransferErrorKind::Publication);
     }
     TransferError::recovery(
@@ -830,29 +838,24 @@ fn recover_installed_completion_after_artifact_revalidation(
     model_dir: &Path,
     manifest: &Manifest,
     artifact: &ResolvedFile,
+    artifact_plan: &mut crate::download::plan::ArtifactTransferPlan,
     catalog_plan: &crate::catalog::transfer::CatalogTransferPlan,
 ) -> Result<(), TransferError> {
     lock.revalidate()
         .map_err(|_| TransferError::terminal(TransferErrorKind::UnsafeLocalState))?;
-    let exact_final = match crate::download::plan::plan_artifact_transfer(
-        lock.model_directory(),
-        model_dir,
-        artifact.size(),
-        artifact.sha256(),
-        &|| false,
-    ) {
-        crate::download::plan::ArtifactPlanOutcome::Ready(plan) => {
-            plan.state() == crate::download::plan::ArtifactTransferState::ValidFinal
-        }
-        crate::download::plan::ArtifactPlanOutcome::Interrupted => false,
-    };
-    if !exact_final {
-        return Err(TransferError::terminal(TransferErrorKind::UnsafeLocalState));
-    }
+    artifact_plan
+        .take_revalidated_clean_final(
+            lock.model_directory(),
+            model_dir,
+            artifact.size(),
+            artifact.sha256(),
+        )
+        .map_err(|_| TransferError::terminal(TransferErrorKind::UnsafeLocalState))?;
     catalog::transfer::recover_installed_completion(lock, manifest, catalog_plan)
         .map_err(catalog_mutation_error)
 }
 
+#[cfg(test)]
 fn transfer_selected_with<F, C, T, D>(
     service: &AppService,
     request: TransferSelected,
@@ -868,7 +871,7 @@ where
     T: FnOnce() -> Option<String>,
     D: FnOnce(
         &ResolvedFile,
-        &Path,
+        download::DownloadDirectoryAuthority<'_>,
         Option<String>,
         &TransferControl,
         &mut F,
@@ -885,9 +888,115 @@ where
     )
 }
 
+#[cfg(test)]
+fn transfer_selected_with_proof<F, C, T, D>(
+    service: &AppService,
+    request: TransferSelected,
+    control: TransferControl,
+    progress: F,
+    capacity: C,
+    token: T,
+    download: D,
+) -> Result<TransferResult, TransferError>
+where
+    F: FnMut(TransferProgress),
+    C: FnOnce(&std::fs::File) -> Result<(u64, u64), TransferErrorKind>,
+    T: FnOnce() -> Option<String>,
+    D: FnOnce(
+        &ResolvedFile,
+        download::DownloadDirectoryAuthority<'_>,
+        Option<String>,
+        Option<VerifiedRegularFile>,
+        &TransferControl,
+        &mut F,
+    ) -> Result<DownloadTerminalOutcome, DownloadFailure>,
+{
+    transfer_selected_with_observers(
+        service,
+        (request, |_| {}, || {}),
+        control,
+        progress,
+        capacity,
+        token,
+        download,
+    )
+}
+
+#[cfg(test)]
 fn transfer_selected_with_lookup_observer<F, C, T, D, L>(
     service: &AppService,
     request_and_observer: (TransferSelected, L),
+    control: TransferControl,
+    progress: F,
+    capacity: C,
+    token: T,
+    download: D,
+) -> Result<TransferResult, TransferError>
+where
+    F: FnMut(TransferProgress),
+    C: FnOnce(&std::fs::File) -> Result<(u64, u64), TransferErrorKind>,
+    T: FnOnce() -> Option<String>,
+    D: FnOnce(
+        &ResolvedFile,
+        download::DownloadDirectoryAuthority<'_>,
+        Option<String>,
+        &TransferControl,
+        &mut F,
+    ) -> Result<DownloadTerminalOutcome, DownloadFailure>,
+    L: FnOnce(&str),
+{
+    transfer_selected_with_observers(
+        service,
+        (request_and_observer.0, request_and_observer.1, || {}),
+        control,
+        progress,
+        capacity,
+        token,
+        |artifact, model_dir, token, _, control, progress| {
+            download(artifact, model_dir, token, control, progress)
+        },
+    )
+}
+
+#[cfg(test)]
+fn transfer_selected_with_publication_observer<F, C, T, D, P>(
+    service: &AppService,
+    request_and_observer: (TransferSelected, P),
+    control: TransferControl,
+    progress: F,
+    capacity: C,
+    token: T,
+    download: D,
+) -> Result<TransferResult, TransferError>
+where
+    F: FnMut(TransferProgress),
+    C: FnOnce(&std::fs::File) -> Result<(u64, u64), TransferErrorKind>,
+    T: FnOnce() -> Option<String>,
+    D: FnOnce(
+        &ResolvedFile,
+        download::DownloadDirectoryAuthority<'_>,
+        Option<String>,
+        &TransferControl,
+        &mut F,
+    ) -> Result<DownloadTerminalOutcome, DownloadFailure>,
+    P: FnOnce(),
+{
+    transfer_selected_with_observers(
+        service,
+        (request_and_observer.0, |_| {}, request_and_observer.1),
+        control,
+        progress,
+        capacity,
+        token,
+        |artifact, model_dir, token, _, control, progress| {
+            download(artifact, model_dir, token, control, progress)
+        },
+    )
+}
+
+fn transfer_selected_with_observers<F, C, T, D, L, P>(
+    service: &AppService,
+    request_and_observers: (TransferSelected, L, P),
     control: TransferControl,
     mut progress: F,
     capacity: C,
@@ -900,14 +1009,16 @@ where
     T: FnOnce() -> Option<String>,
     D: FnOnce(
         &ResolvedFile,
-        &Path,
+        download::DownloadDirectoryAuthority<'_>,
         Option<String>,
+        Option<VerifiedRegularFile>,
         &TransferControl,
         &mut F,
     ) -> Result<DownloadTerminalOutcome, DownloadFailure>,
     L: FnOnce(&str),
+    P: FnOnce(),
 {
-    let (request, after_alternate_lookup) = request_and_observer;
+    let (request, after_alternate_lookup, before_manifest_publication) = request_and_observers;
     let TransferSelected { artifact, intent } = request;
     let (requested_model_id, requires_existing_catalog) = match intent {
         TransferIntent::Requested(model_id) => (model_id, false),
@@ -969,7 +1080,7 @@ where
     {
         return Err(TransferError::terminal(TransferErrorKind::UnsafeLocalState));
     }
-    let artifact_plan = match crate::download::plan::plan_artifact_transfer(
+    let mut artifact_plan = match crate::download::plan::plan_artifact_transfer(
         lock.model_directory(),
         &model_dir,
         artifact.size(),
@@ -1011,6 +1122,7 @@ where
             &model_dir,
             &manifest,
             &artifact,
+            &mut artifact_plan,
             &catalog_plan,
         )?;
         return Ok(completed(
@@ -1039,7 +1151,7 @@ where
         false,
     );
 
-    let outcome = if plan == CapacityPlan::PendingPublish
+    let verified = if plan == CapacityPlan::PendingPublish
         && artifact_state == crate::download::plan::ArtifactTransferState::ValidFinal
     {
         lock.revalidate()
@@ -1047,7 +1159,9 @@ where
         if control.pause_requested() {
             return Ok(interrupted(model_id, artifact));
         }
-        None
+        artifact_plan
+            .take_verified_final()
+            .ok_or_else(|| TransferError::terminal(TransferErrorKind::UnsafeLocalState))?
     } else {
         let token = if matches!(
             plan,
@@ -1073,24 +1187,48 @@ where
         }
         lock.revalidate()
             .map_err(|_| TransferError::terminal(TransferErrorKind::UnsafeLocalState))?;
-        Some(download(
+        let verified_part = match artifact_state {
+            crate::download::plan::ArtifactTransferState::CompletePart => Some(
+                artifact_plan
+                    .take_verified_part()
+                    .ok_or_else(|| TransferError::terminal(TransferErrorKind::UnsafeLocalState))?,
+            ),
+            crate::download::plan::ArtifactTransferState::CompleteRestart => {
+                let verified_restart = artifact_plan
+                    .take_verified_restart()
+                    .ok_or_else(|| TransferError::terminal(TransferErrorKind::UnsafeLocalState))?;
+                match crate::download::normalize_complete_restart(
+                    lock.model_directory(),
+                    &model_dir,
+                    &artifact,
+                    verified_restart,
+                ) {
+                    Ok(verified) => Some(verified),
+                    Err(failure) => {
+                        return Err(download_failure(failure, model_id, artifact, discardable));
+                    }
+                }
+            }
+            _ => None,
+        };
+        let outcome = download(
             &artifact,
-            &model_dir,
+            download::DownloadDirectoryAuthority::retained(&model_dir, lock.model_directory()),
             token.flatten(),
+            verified_part,
             &control,
             &mut progress,
-        ))
+        );
+        match outcome {
+            Ok(DownloadTerminalOutcome::Paused { retained_bytes }) => {
+                return Ok(paused(model_id, artifact, retained_bytes, discardable));
+            }
+            Err(failure) => {
+                return Err(download_failure(failure, model_id, artifact, discardable));
+            }
+            Ok(DownloadTerminalOutcome::Complete(completion)) => completion.into_parts().1,
+        }
     };
-
-    match outcome {
-        Some(Ok(DownloadTerminalOutcome::Paused { retained_bytes })) => {
-            return Ok(paused(model_id, artifact, retained_bytes, discardable));
-        }
-        Some(Err(failure)) => {
-            return Err(download_failure(failure, model_id, artifact, discardable));
-        }
-        Some(Ok(DownloadTerminalOutcome::Complete(_))) | None => {}
-    }
 
     lock.revalidate()
         .map_err(|_| TransferError::terminal(TransferErrorKind::Publication))?;
@@ -1101,9 +1239,12 @@ where
     });
     lock.revalidate()
         .map_err(|_| TransferError::terminal(TransferErrorKind::Publication))?;
-    if catalog::publish_manifest(&service.reader.paths.models, &manifest).is_err() {
+    before_manifest_publication();
+    if catalog::publish_manifest_verified(&service.reader.paths.models, &manifest, &lock, &verified)
+        .is_err()
+    {
         return Err(publication_error_after_final_audit(
-            &lock, &model_dir, &model_id, &artifact,
+            &lock, &model_dir, &model_id, &artifact, &verified,
         ));
     }
     Ok(completed(
@@ -1154,18 +1295,19 @@ impl AppService {
     where
         F: FnMut(TransferProgress),
     {
-        transfer_selected_with(
+        transfer_selected_with_observers(
             self,
-            request,
+            (request, |_| {}, || {}),
             control,
             progress,
             available_capacity,
             crate::huggingface::discover_token,
-            |artifact, model_dir, token, control, progress| {
+            |artifact, model_dir, token, verified_part, control, progress| {
                 download::download_controlled(
                     artifact,
                     model_dir,
                     token,
+                    verified_part,
                     || control.pause_requested(),
                     |update| progress(TransferProgress::from_download(update)),
                 )

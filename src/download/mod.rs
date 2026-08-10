@@ -6,7 +6,9 @@ use crate::huggingface::ResolvedFile;
 use crate::safe_file::{DirectoryIdentity, RegularFileIdentity};
 #[cfg(test)]
 use artifact::hex;
-use artifact::{download_once, prove_existing_part_for_pause, ArtifactTransferError};
+use artifact::{
+    download_once, prove_existing_part_for_pause, ArtifactTransferError, DownloadRequest,
+};
 use backon::{BackoffBuilder, ExponentialBuilder};
 use std::fs::File;
 use std::future::Future;
@@ -30,6 +32,47 @@ use http::{wait_with_pause, ReqwestTransport, Transport, WaitOutcome};
 
 const MAX_RETRIES: usize = 3;
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DownloadDirectoryAuthority<'a> {
+    model_dir: &'a Path,
+    retained: Option<&'a File>,
+}
+
+impl<'a> DownloadDirectoryAuthority<'a> {
+    pub(crate) fn retained(model_dir: &'a Path, directory: &'a File) -> Self {
+        Self {
+            model_dir,
+            retained: Some(directory),
+        }
+    }
+
+    #[cfg(test)]
+    fn fresh(model_dir: &'a Path) -> Self {
+        Self {
+            model_dir,
+            retained: None,
+        }
+    }
+
+    fn retained_directory(self) -> Option<&'a File> {
+        self.retained
+    }
+}
+
+impl AsRef<Path> for DownloadDirectoryAuthority<'_> {
+    fn as_ref(&self) -> &Path {
+        self.model_dir
+    }
+}
+
+impl std::ops::Deref for DownloadDirectoryAuthority<'_> {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        self.model_dir
+    }
+}
+
 struct RetryWait<Observer, Sleeper> {
     observer: Observer,
     sleep: Sleeper,
@@ -43,6 +86,8 @@ pub(crate) enum ProgressUpdate {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ArtifactCheckpoint {
+    BeforeFinalInspection,
+    BeforeStagingOpen,
     StagingSynced,
     StagingIdentityMatched,
     DirectorySynced,
@@ -51,6 +96,9 @@ enum ArtifactCheckpoint {
     BeforeAuthoritativePartUnlink,
     AuthoritativePartIdentityMatched,
     AuthoritativePartUnlinked,
+    BeforeInvalidUnlink,
+    InvalidIdentityMatched,
+    InvalidUnlinked,
     ChecksumCleanupDirectorySynced,
     BeforeAuthoritativePartAbsenceProof,
     AuthoritativePartAbsent,
@@ -172,10 +220,15 @@ fn perform_artifact_operation(
             debug_assert!(matches!(
                 checkpoint,
                 ArtifactCheckpoint::StagingIdentityMatched
+                    | ArtifactCheckpoint::BeforeFinalInspection
+                    | ArtifactCheckpoint::BeforeStagingOpen
                     | ArtifactCheckpoint::AuthoritativeRestatted
                     | ArtifactCheckpoint::BeforeAuthoritativePartUnlink
                     | ArtifactCheckpoint::AuthoritativePartIdentityMatched
                     | ArtifactCheckpoint::AuthoritativePartUnlinked
+                    | ArtifactCheckpoint::BeforeInvalidUnlink
+                    | ArtifactCheckpoint::InvalidIdentityMatched
+                    | ArtifactCheckpoint::InvalidUnlinked
                     | ArtifactCheckpoint::BeforeAuthoritativePartAbsenceProof
                     | ArtifactCheckpoint::AuthoritativePartAbsent
                     | ArtifactCheckpoint::BeforeRestartUnlink
@@ -201,9 +254,41 @@ pub enum DownloadOutcome {
     AlreadyInstalled(PathBuf),
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
+pub(crate) struct DownloadCompletion {
+    outcome: DownloadOutcome,
+    verified: VerifiedRegularFile,
+}
+
+impl DownloadCompletion {
+    pub(crate) fn new(outcome: DownloadOutcome, verified: VerifiedRegularFile) -> Self {
+        Self { outcome, verified }
+    }
+
+    pub(crate) fn into_parts(self) -> (DownloadOutcome, VerifiedRegularFile) {
+        (self.outcome, self.verified)
+    }
+
+    #[cfg(test)]
+    fn outcome(&self) -> &DownloadOutcome {
+        &self.outcome
+    }
+}
+
+#[cfg(test)]
+impl PartialEq for DownloadCompletion {
+    fn eq(&self, other: &Self) -> bool {
+        self.outcome == other.outcome
+    }
+}
+
+#[cfg(test)]
+impl Eq for DownloadCompletion {}
+
+#[derive(Debug)]
+#[cfg_attr(test, derive(Eq, PartialEq))]
 pub(crate) enum DownloadTerminalOutcome {
-    Complete(DownloadOutcome),
+    Complete(DownloadCompletion),
     Paused { retained_bytes: u64 },
 }
 
@@ -252,8 +337,9 @@ impl AsRef<Path> for DownloadOutcome {
 
 pub(crate) fn download_controlled(
     file: &ResolvedFile,
-    model_dir: &Path,
+    directory: DownloadDirectoryAuthority<'_>,
     token: Option<String>,
+    verified_part: Option<VerifiedRegularFile>,
     should_pause: impl Fn() -> bool,
     progress: impl FnMut(ProgressUpdate),
 ) -> Result<DownloadTerminalOutcome, DownloadFailure> {
@@ -262,13 +348,16 @@ pub(crate) fn download_controlled(
         .build()
         .map_err(|error| DownloadFailure::Legacy(error.to_string()))?;
     runtime.block_on(async {
-        if should_pause() {
+        if should_pause() && verified_part.is_none() {
             return Ok(DownloadTerminalOutcome::Paused { retained_bytes: 0 });
         }
         let transport = ReqwestTransport::new(token).map_err(DownloadFailure::Legacy)?;
         download_with_transport_controlled_async(
-            file,
-            model_dir,
+            DownloadRequest {
+                spec: file,
+                directory,
+                verified_part,
+            },
             &transport,
             &should_pause,
             progress,
@@ -280,6 +369,42 @@ pub(crate) fn download_controlled(
         )
         .await
     })
+}
+
+pub(crate) fn normalize_complete_restart(
+    directory: &File,
+    model_dir: &Path,
+    file: &ResolvedFile,
+    verified: VerifiedRegularFile,
+) -> Result<VerifiedRegularFile, DownloadFailure> {
+    artifact::normalize_complete_restart(
+        directory,
+        model_dir,
+        file,
+        verified,
+        &mut perform_artifact_operation,
+    )
+    .map_err(|_| DownloadFailure::Durability)
+}
+
+#[cfg(test)]
+fn normalize_complete_restart_controlled(
+    directory: &File,
+    model_dir: &Path,
+    file: &ResolvedFile,
+    verified: VerifiedRegularFile,
+    mut artifact_operation: impl for<'a> FnMut(
+        ArtifactOperation<'a>,
+    ) -> Result<(), ArtifactOperationFailure>,
+) -> Result<VerifiedRegularFile, DownloadFailure> {
+    artifact::normalize_complete_restart(
+        directory,
+        model_dir,
+        file,
+        verified,
+        &mut artifact_operation,
+    )
+    .map_err(|_| DownloadFailure::Durability)
 }
 
 #[cfg(test)]
@@ -321,8 +446,11 @@ where
     Sleep: Future<Output = ()>,
 {
     test_runtime().block_on(download_with_transport_controlled_async(
-        spec,
-        model_dir,
+        DownloadRequest {
+            spec,
+            directory: DownloadDirectoryAuthority::fresh(model_dir),
+            verified_part: None,
+        },
         transport,
         &should_pause,
         progress,
@@ -332,8 +460,7 @@ where
 }
 
 async fn download_with_transport_controlled_async<Observer, S, Sleep>(
-    spec: &ResolvedFile,
-    model_dir: &Path,
+    request: DownloadRequest<'_>,
     transport: &impl Transport,
     should_pause: &impl Fn() -> bool,
     mut progress: impl FnMut(ProgressUpdate),
@@ -347,6 +474,11 @@ where
     S: FnMut(Duration) -> Sleep,
     Sleep: Future<Output = ()>,
 {
+    let DownloadRequest {
+        spec,
+        directory,
+        mut verified_part,
+    } = request;
     let RetryWait {
         observer: mut retry_observer,
         mut sleep,
@@ -360,7 +492,7 @@ where
     let total = spec.size();
     let mut last_transferred: Option<u64> = None;
     loop {
-        if should_pause() && !prefix_must_be_reproved {
+        if should_pause() && verified_part.is_none() && !prefix_must_be_reproved {
             return Ok(DownloadTerminalOutcome::Paused { retained_bytes: 0 });
         }
         let attempt = {
@@ -383,8 +515,11 @@ where
                 }
             };
             download_once(
-                spec,
-                model_dir,
+                DownloadRequest {
+                    spec,
+                    directory,
+                    verified_part: verified_part.take(),
+                },
                 transport,
                 &mut normalized_progress,
                 should_pause,
@@ -424,7 +559,7 @@ where
                     wait_with_pause(sleep(delay), should_pause).await,
                     WaitOutcome::Paused
                 ) {
-                    return prove_existing_part_for_pause(spec, model_dir, &mut artifact_operation)
+                    return prove_existing_part_for_pause(spec, directory, &mut artifact_operation)
                         .map(|retained_bytes| DownloadTerminalOutcome::Paused { retained_bytes })
                         .map_err(|_| DownloadFailure::Durability);
                 }
@@ -472,7 +607,7 @@ where
                     if prefix_must_be_reproved {
                         return prove_existing_part_for_pause(
                             spec,
-                            model_dir,
+                            directory,
                             &mut artifact_operation,
                         )
                         .map(|retained_bytes| DownloadTerminalOutcome::Paused { retained_bytes })
@@ -494,8 +629,11 @@ async fn download_with_transport_progress_async(
 ) -> Result<DownloadOutcome, String> {
     let should_pause = || false;
     match download_with_transport_controlled_async(
-        spec,
-        model_dir,
+        DownloadRequest {
+            spec,
+            directory: DownloadDirectoryAuthority::fresh(model_dir),
+            verified_part: None,
+        },
         transport,
         &should_pause,
         &mut progress,
@@ -508,7 +646,7 @@ async fn download_with_transport_progress_async(
     .await
     .map_err(DownloadFailure::into_message)?
     {
-        DownloadTerminalOutcome::Complete(outcome) => Ok(outcome),
+        DownloadTerminalOutcome::Complete(completion) => Ok(completion.into_parts().0),
         DownloadTerminalOutcome::Paused { .. } => Err("artifact transfer paused".into()),
     }
 }

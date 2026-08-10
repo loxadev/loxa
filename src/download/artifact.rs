@@ -2,12 +2,13 @@ use super::http::{artifact_url, wait_with_pause, Transfer, TransferError, Transp
 use super::plan::plan_artifact_discard_inner;
 use super::{
     ArtifactCheckpoint, ArtifactDiscardError, ArtifactDiscardFacts, ArtifactOperation,
-    ArtifactOperationFailure, DownloadOutcome, IntegrityAuthority, ProgressUpdate,
+    ArtifactOperationFailure, DownloadCompletion, DownloadOutcome, IntegrityAuthority,
+    ProgressUpdate,
 };
 use crate::huggingface::ResolvedFile;
 use crate::safe_file::{
-    ensure_directory_descriptor_matches_path, ensure_regular_descriptors_match, open_directory,
-    regular_file_identity, DirectoryIdentity, RegularFileIdentity,
+    directory_identity, ensure_directory_descriptor_matches_path, ensure_regular_descriptors_match,
+    open_directory, regular_file_identity, DirectoryIdentity, RegularFileIdentity,
 };
 use reqwest::StatusCode;
 use sha2::{Digest, Sha256};
@@ -43,6 +44,13 @@ enum CopyFailure {
     Durability,
 }
 
+struct CapturedInvalidAuthority {
+    file: File,
+    identity: RegularFileIdentity,
+}
+
+type OpenArtifactEntry = fn(&File, &Path) -> std::io::Result<File>;
+
 impl From<TransferError> for CopyFailure {
     fn from(error: TransferError) -> Self {
         Self::Transfer(error)
@@ -67,9 +75,129 @@ impl From<&str> for ArtifactTransferError {
     }
 }
 
-pub(super) async fn download_once(
+pub(super) struct DownloadRequest<'a> {
+    pub(super) spec: &'a ResolvedFile,
+    pub(super) directory: super::DownloadDirectoryAuthority<'a>,
+    pub(super) verified_part: Option<VerifiedRegularFile>,
+}
+
+fn prove_complete_restart(
+    directory: &File,
+    verified: &VerifiedRegularFile,
     spec: &ResolvedFile,
+    paths: (&Path, &Path, &Path, &Path),
+    invalid_authority: bool,
+) -> Result<(), ArtifactTransferError> {
+    let (restart_path, part_path, final_path, invalid_path) = paths;
+    if verified.path != restart_path || verified.sha256 != spec.sha256().to_ascii_lowercase() {
+        return Err(ArtifactTransferError::Durability);
+    }
+    let restart = open_restart_entry(directory, restart_path)
+        .map_err(|_| ArtifactTransferError::Durability)?;
+    ensure_regular_descriptors_match(&verified.file, &verified.identity, &restart, restart_path)
+        .map_err(|_| ArtifactTransferError::Durability)?;
+    if restart
+        .metadata()
+        .map_err(|_| ArtifactTransferError::Durability)?
+        .len()
+        != spec.size()
+    {
+        return Err(ArtifactTransferError::Durability);
+    }
+    for entry in [
+        open_part_entry(directory, part_path),
+        open_final_entry(directory, final_path),
+    ] {
+        match entry {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) | Err(_) => return Err(ArtifactTransferError::Durability),
+        }
+    }
+    if invalid_authority_is_present(directory, invalid_path)? != invalid_authority {
+        return Err(ArtifactTransferError::Durability);
+    }
+    Ok(())
+}
+
+pub(super) fn normalize_complete_restart(
+    directory: &File,
     model_dir: &Path,
+    spec: &ResolvedFile,
+    mut verified: VerifiedRegularFile,
+    artifact_operation: &mut impl for<'a> FnMut(
+        ArtifactOperation<'a>,
+    ) -> Result<(), ArtifactOperationFailure>,
+) -> Result<VerifiedRegularFile, ArtifactTransferError> {
+    let directory_identity =
+        directory_identity(directory, model_dir).map_err(|_| ArtifactTransferError::Durability)?;
+    let final_path = model_dir.join("model.gguf");
+    let part_path = model_dir.join("model.gguf.part");
+    let restart_path = model_dir.join("model.gguf.part.restart");
+    let invalid_path = model_dir.join("model.gguf.invalid");
+    ensure_directory_descriptor_matches_path(directory, &directory_identity, model_dir)
+        .map_err(|_| ArtifactTransferError::Durability)?;
+    let invalid_authority = invalid_authority_is_present(directory, &invalid_path)?;
+    prove_complete_restart(
+        directory,
+        &verified,
+        spec,
+        (&restart_path, &part_path, &final_path, &invalid_path),
+        invalid_authority,
+    )?;
+    ensure_directory_descriptor_matches_path(directory, &directory_identity, model_dir)
+        .map_err(|_| ArtifactTransferError::Durability)?;
+    artifact_operation(ArtifactOperation::Observe(
+        ArtifactCheckpoint::BeforePromotion,
+    ))
+    .map_err(|_| ArtifactTransferError::Durability)?;
+    prove_complete_restart(
+        directory,
+        &verified,
+        spec,
+        (&restart_path, &part_path, &final_path, &invalid_path),
+        invalid_authority,
+    )?;
+    rename_restart_to_part_no_replace(directory).map_err(|_| ArtifactTransferError::Durability)?;
+    let normalized_identity = regular_file_identity(&verified.file, &part_path)
+        .map_err(|_| ArtifactTransferError::Durability)?;
+    if !verified
+        .identity
+        .same_file_after_rename(&normalized_identity)
+    {
+        return Err(ArtifactTransferError::Durability);
+    }
+    artifact_operation(ArtifactOperation::Sync {
+        checkpoint: ArtifactCheckpoint::NormalizationDirectorySynced,
+        file: directory,
+    })
+    .map_err(|_| ArtifactTransferError::Durability)?;
+    ensure_directory_descriptor_matches_path(directory, &directory_identity, model_dir)
+        .map_err(|_| ArtifactTransferError::Durability)?;
+    let part =
+        open_part_entry(directory, &part_path).map_err(|_| ArtifactTransferError::Durability)?;
+    ensure_regular_descriptors_match(&verified.file, &normalized_identity, &part, &part_path)
+        .map_err(|_| ArtifactTransferError::Durability)?;
+    for entry in [
+        open_restart_entry(directory, &restart_path),
+        open_final_entry(directory, &final_path),
+    ] {
+        match entry {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) | Err(_) => return Err(ArtifactTransferError::Durability),
+        }
+    }
+    if invalid_authority_is_present(directory, &invalid_path)? != invalid_authority {
+        return Err(ArtifactTransferError::Durability);
+    }
+    ensure_directory_descriptor_matches_path(directory, &directory_identity, model_dir)
+        .map_err(|_| ArtifactTransferError::Durability)?;
+    verified.identity = normalized_identity;
+    verified.path = part_path;
+    Ok(verified)
+}
+
+pub(super) async fn download_once(
+    request: DownloadRequest<'_>,
     transport: &impl Transport,
     progress: &mut impl FnMut(ProgressUpdate),
     should_pause: &impl Fn() -> bool,
@@ -77,65 +205,116 @@ pub(super) async fn download_once(
     artifact_operation: &mut impl for<'a> FnMut(
         ArtifactOperation<'a>,
     ) -> Result<(), ArtifactOperationFailure>,
-) -> Result<DownloadOutcome, ArtifactTransferError> {
-    if !prefix_must_be_reproved {
-        fs::create_dir_all(model_dir).map_err(|error| error.to_string())?;
-    }
+) -> Result<DownloadCompletion, ArtifactTransferError> {
+    let DownloadRequest {
+        spec,
+        directory: directory_authority,
+        verified_part,
+    } = request;
+    let model_dir = directory_authority.as_ref();
+    let retained_directory_authority = directory_authority.retained_directory().is_some();
     let directory_failure = || {
-        if prefix_must_be_reproved {
+        if directory_authority.retained_directory().is_some()
+            || prefix_must_be_reproved
+            || verified_part.is_some()
+        {
             ArtifactTransferError::Durability
         } else {
             TransferError::fatal("unsafe model directory").into()
         }
     };
     let (directory, directory_identity) =
-        open_directory(model_dir).map_err(|_| directory_failure())?;
+        if let Some(retained) = directory_authority.retained_directory() {
+            let directory = retained.try_clone().map_err(|_| directory_failure())?;
+            let identity =
+                directory_identity(&directory, model_dir).map_err(|_| directory_failure())?;
+            (directory, identity)
+        } else {
+            if !prefix_must_be_reproved {
+                fs::create_dir_all(model_dir).map_err(|error| error.to_string())?;
+            }
+            open_directory(model_dir).map_err(|_| directory_failure())?
+        };
     ensure_directory_descriptor_matches_path(&directory, &directory_identity, model_dir)
         .map_err(|_| directory_failure())?;
     let final_path = model_dir.join("model.gguf");
     let part_path = model_dir.join("model.gguf.part");
     let restart_path = model_dir.join("model.gguf.part.restart");
     let invalid_path = model_dir.join("model.gguf.invalid");
-    let initial_invalid_authority = invalid_authority_is_present(&directory, &invalid_path)?;
+    let mut captured_invalid_authority = capture_invalid_authority(&directory, &invalid_path)?;
+    let initial_invalid_authority = captured_invalid_authority.is_some();
     ensure_directory_descriptor_matches_path(&directory, &directory_identity, model_dir)
         .map_err(|_| ArtifactTransferError::Durability)?;
+    if retained_directory_authority {
+        artifact_operation(ArtifactOperation::Observe(
+            ArtifactCheckpoint::BeforeFinalInspection,
+        ))
+        .map_err(|_| ArtifactTransferError::Durability)?;
+    }
     let mut integrity_authority = if initial_invalid_authority {
         IntegrityAuthority::Repair
     } else {
         IntegrityAuthority::PendingOnly
     };
-    if final_path.exists() {
-        reject_non_regular_if_present(&final_path)?;
-        if verify_regular(&final_path, spec.size(), spec.sha256()).is_ok() {
-            progress(ProgressUpdate::Verifying {
-                transferred: spec.size(),
-                total: spec.size(),
-            });
-            finish_repair(model_dir, &invalid_path, &restart_path)?;
-            return Ok(DownloadOutcome::AlreadyInstalled(final_path));
+    if let Some((final_file, final_identity)) =
+        capture_artifact_entry(&directory, &final_path, open_final_entry)?
+    {
+        if final_identity.size() == spec.size() {
+            match verify_regular_entry_controlled(
+                &directory,
+                &final_path,
+                open_final_entry,
+                spec.size(),
+                spec.sha256(),
+                Some((&final_file, &final_identity)),
+                &|| false,
+            ) {
+                Ok(VerificationOutcome::Verified(verified)) => {
+                    progress(ProgressUpdate::Verifying {
+                        transferred: spec.size(),
+                        total: spec.size(),
+                    });
+                    finish_repair(&directory, &directory_identity, model_dir)?;
+                    return Ok(DownloadCompletion::new(
+                        DownloadOutcome::AlreadyInstalled(final_path),
+                        verified,
+                    ));
+                }
+                Ok(VerificationOutcome::ChecksumMismatch) => {}
+                Ok(VerificationOutcome::Interrupted) | Err(_) => {
+                    return Err(ArtifactTransferError::Durability);
+                }
+            }
         }
         if integrity_authority == IntegrityAuthority::Repair
             || invalid_authority_is_present(&directory, &invalid_path)?
         {
             return Err("a prior corrupt artifact repair is still pending".into());
         }
-        fs::rename(&final_path, &invalid_path).map_err(|error| error.to_string())?;
+        captured_invalid_authority = Some(quarantine_captured_final(
+            &directory,
+            (&final_file, &final_identity, &final_path),
+            &invalid_path,
+        )?);
         integrity_authority = IntegrityAuthority::Repair;
     }
-    reject_unsafe_transfer_if_present(&part_path).map_err(|error| {
-        if prefix_must_be_reproved {
-            ArtifactTransferError::Durability
-        } else {
-            error.into()
-        }
-    })?;
-    reject_unsafe_transfer_if_present(&restart_path).map_err(|error| {
-        if prefix_must_be_reproved {
-            ArtifactTransferError::Durability
-        } else {
-            error.into()
-        }
-    })?;
+    reject_unsafe_artifact_entry_if_present(&directory, &part_path, open_part_entry).map_err(
+        |error| {
+            if prefix_must_be_reproved {
+                ArtifactTransferError::Durability
+            } else {
+                error.into()
+            }
+        },
+    )?;
+    reject_unsafe_artifact_entry_if_present(&directory, &restart_path, open_restart_entry)
+        .map_err(|error| {
+            if prefix_must_be_reproved {
+                ArtifactTransferError::Durability
+            } else {
+                error.into()
+            }
+        })?;
     ensure_directory_descriptor_matches_path(&directory, &directory_identity, model_dir)
         .map_err(|_| ArtifactTransferError::Durability)?;
     let mut recovered_part = match open_part_entry(&directory, &part_path) {
@@ -256,15 +435,20 @@ pub(super) async fn download_once(
         total: spec.size(),
     });
     if offset == spec.size() && offset > 0 {
-        if integrity_authority == IntegrityAuthority::Repair {
+        let repairing = integrity_authority == IntegrityAuthority::Repair;
+        if repairing && (verified_part.is_none() || captured_invalid_authority.is_none()) {
             return Err(ArtifactTransferError::Durability);
         }
-        ensure_repair_debris_absent(
+        let invalid_authority = repairing
+            .then_some(captured_invalid_authority.as_ref())
+            .flatten();
+        ensure_complete_part_authority(
             &directory,
             &directory_identity,
             model_dir,
             &invalid_path,
             &restart_path,
+            invalid_authority,
         )?;
         let (part, part_identity, _) = recovered_part
             .as_ref()
@@ -278,63 +462,77 @@ pub(super) async fn download_once(
             transferred: spec.size(),
             total: spec.size(),
         });
-        match verify_regular_controlled(
-            &part_path,
-            spec.size(),
-            spec.sha256(),
-            Some((part, part_identity)),
-            should_pause,
-        ) {
-            Ok(VerificationOutcome::Verified(_)) => {}
-            Ok(VerificationOutcome::Interrupted) => {
-                let retained_bytes = durable_part_barrier(
-                    &directory,
-                    &directory_identity,
-                    model_dir,
-                    part,
-                    &part_path,
-                    artifact_operation,
-                )?;
-                ensure_repair_debris_absent(
-                    &directory,
-                    &directory_identity,
-                    model_dir,
-                    &invalid_path,
-                    &restart_path,
-                )?;
-                return Err(TransferError::paused(retained_bytes).into());
+        let verified = match verified_part {
+            Some(verified) => {
+                let resolved = open_part_entry(&directory, &part_path)
+                    .map_err(|_| ArtifactTransferError::Durability)?;
+                verified
+                    .proves_resolved(&part_path, spec.size(), spec.sha256(), resolved)
+                    .map_err(|_| ArtifactTransferError::Durability)?;
+                verified
             }
-            Ok(VerificationOutcome::ChecksumMismatch) => {
-                remove_invalid_authoritative_part(
-                    &directory,
-                    &directory_identity,
-                    model_dir,
-                    part,
-                    part_identity,
-                    &part_path,
-                    artifact_operation,
-                )?;
-                integrity_authority = integrity_authority_at_fence(
-                    &directory,
-                    &directory_identity,
-                    model_dir,
-                    &invalid_path,
-                    integrity_authority,
-                    artifact_operation,
-                )?;
-                return Err(ArtifactTransferError::Integrity {
-                    retained_bytes: 0,
-                    authority: integrity_authority,
-                });
-            }
-            Err(_) => return Err(ArtifactTransferError::Durability),
-        }
-        ensure_repair_debris_absent(
+            None => match verify_regular_entry_controlled(
+                &directory,
+                &part_path,
+                open_part_entry,
+                spec.size(),
+                spec.sha256(),
+                Some((part, part_identity)),
+                should_pause,
+            ) {
+                Ok(VerificationOutcome::Verified(verified)) => verified,
+                Ok(VerificationOutcome::Interrupted) => {
+                    let retained_bytes = durable_part_barrier(
+                        &directory,
+                        &directory_identity,
+                        model_dir,
+                        part,
+                        &part_path,
+                        artifact_operation,
+                    )?;
+                    ensure_complete_part_authority(
+                        &directory,
+                        &directory_identity,
+                        model_dir,
+                        &invalid_path,
+                        &restart_path,
+                        invalid_authority,
+                    )?;
+                    return Err(TransferError::paused(retained_bytes).into());
+                }
+                Ok(VerificationOutcome::ChecksumMismatch) => {
+                    remove_invalid_authoritative_part(
+                        &directory,
+                        &directory_identity,
+                        model_dir,
+                        part,
+                        part_identity,
+                        &part_path,
+                        artifact_operation,
+                    )?;
+                    integrity_authority = integrity_authority_at_fence(
+                        &directory,
+                        &directory_identity,
+                        model_dir,
+                        &invalid_path,
+                        integrity_authority,
+                        artifact_operation,
+                    )?;
+                    return Err(ArtifactTransferError::Integrity {
+                        retained_bytes: 0,
+                        authority: integrity_authority,
+                    });
+                }
+                Err(_) => return Err(ArtifactTransferError::Durability),
+            },
+        };
+        ensure_complete_part_authority(
             &directory,
             &directory_identity,
             model_dir,
             &invalid_path,
             &restart_path,
+            invalid_authority,
         )?;
         artifact_operation(ArtifactOperation::Observe(
             ArtifactCheckpoint::BeforePromotion,
@@ -349,12 +547,13 @@ pub(super) async fn download_once(
                 &part_path,
                 artifact_operation,
             )?;
-            ensure_repair_debris_absent(
+            ensure_complete_part_authority(
                 &directory,
                 &directory_identity,
                 model_dir,
                 &invalid_path,
                 &restart_path,
+                invalid_authority,
             )?;
             return Err(TransferError::paused(retained_bytes).into());
         }
@@ -362,17 +561,36 @@ pub(super) async fn download_once(
             ArtifactCheckpoint::CompletionFencePassed,
         ))
         .map_err(|_| ArtifactTransferError::Durability)?;
-        ensure_repair_debris_absent(
+        ensure_complete_part_authority(
             &directory,
             &directory_identity,
             model_dir,
             &invalid_path,
             &restart_path,
+            invalid_authority,
         )?;
+        if let Some(invalid_authority) = invalid_authority {
+            remove_invalid_before_promotion(
+                (&directory, &directory_identity, model_dir),
+                (invalid_authority, &invalid_path),
+                (part, part_identity, &part_path, open_part_entry),
+                [
+                    (&restart_path, open_restart_entry),
+                    (&final_path, open_final_entry),
+                ],
+                artifact_operation,
+            )?;
+        }
         promote_authoritative_part(
             &directory,
             &directory_identity,
-            (model_dir, &part_path, &final_path),
+            (
+                model_dir,
+                &part_path,
+                &final_path,
+                &invalid_path,
+                &restart_path,
+            ),
             part,
             part_identity,
             spec.size(),
@@ -385,7 +603,15 @@ pub(super) async fn download_once(
             &invalid_path,
             &restart_path,
         )?;
-        return Ok(DownloadOutcome::Pulled(final_path));
+        let resolved = open_final_entry(&directory, &final_path)
+            .map_err(|_| ArtifactTransferError::Durability)?;
+        let verified = verified
+            .rebind_after_rename_resolved(&final_path, resolved)
+            .map_err(|_| ArtifactTransferError::Durability)?;
+        return Ok(DownloadCompletion::new(
+            DownloadOutcome::Pulled(final_path),
+            verified,
+        ));
     }
     let mut transfer = match wait_with_pause(
         transport.get(
@@ -454,6 +680,12 @@ pub(super) async fn download_once(
     };
     ensure_directory_descriptor_matches_path(&directory, &directory_identity, model_dir)
         .map_err(|_| ArtifactTransferError::Durability)?;
+    if retained_directory_authority {
+        artifact_operation(ArtifactOperation::Observe(
+            ArtifactCheckpoint::BeforeStagingOpen,
+        ))
+        .map_err(|_| ArtifactTransferError::Durability)?;
+    }
     let expected_written = if append {
         spec.size() - offset
     } else {
@@ -463,22 +695,20 @@ pub(super) async fn download_once(
         .checked_add(1)
         .ok_or_else(|| "artifact is too large".to_string())?;
     let captured_part_output = target == &part_path && recovered_part.is_some();
-    let mut options = OpenOptions::new();
-    options
-        .create(!captured_part_output)
-        .write(true)
-        .append(append)
-        .truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let mut output = if target == &restart_path {
+        create_restart_entry(&directory, target)
+    } else if captured_part_output {
+        open_part_entry_for_write(&directory, target, append)
+    } else {
+        create_part_entry(&directory, target)
     }
-    let mut output = match options.open(target) {
-        Ok(output) => output,
-        Err(_) if captured_part_output => return Err(ArtifactTransferError::Durability),
-        Err(error) => return Err(format!("{}: {error}", target.display()).into()),
-    };
+    .map_err(|_| {
+        if captured_part_output {
+            ArtifactTransferError::Durability
+        } else {
+            directory_failure()
+        }
+    })?;
     reject_unsafe_open_transfer(&output, target).map_err(|_| ArtifactTransferError::Durability)?;
     if target == &part_path {
         if let Some((part, identity, _)) = recovered_part.as_ref() {
@@ -598,14 +828,21 @@ pub(super) async fn download_once(
     });
     let staging_identity = regular_file_identity(&output, target)
         .map_err(|_| TransferError::fatal("unsafe staging artifact"))?;
-    match verify_regular_controlled(
+    let open_staging = if target == &restart_path {
+        open_restart_entry
+    } else {
+        open_part_entry
+    };
+    let verified = match verify_regular_entry_controlled(
+        &directory,
         target,
+        open_staging,
         spec.size(),
         spec.sha256(),
         Some((&output, &staging_identity)),
         should_pause,
     ) {
-        Ok(VerificationOutcome::Verified(_)) => {}
+        Ok(VerificationOutcome::Verified(verified)) => verified,
         Ok(VerificationOutcome::Interrupted) => {
             let retained_bytes = normalize_durable_prefix(
                 ignored_range,
@@ -667,7 +904,7 @@ pub(super) async fn download_once(
             });
         }
         Err(_) => return Err(ArtifactTransferError::Durability),
-    }
+    };
     artifact_operation(ArtifactOperation::Observe(
         ArtifactCheckpoint::BeforePromotion,
     ))
@@ -689,36 +926,96 @@ pub(super) async fn download_once(
     ))
     .map_err(|_| ArtifactTransferError::Durability)?;
     if !ignored_range {
+        if let Some(invalid_authority) = captured_invalid_authority.as_ref() {
+            remove_invalid_before_promotion(
+                (&directory, &directory_identity, model_dir),
+                (invalid_authority, &invalid_path),
+                (&output, &staging_identity, &part_path, open_part_entry),
+                [
+                    (&restart_path, open_restart_entry),
+                    (&final_path, open_final_entry),
+                ],
+                artifact_operation,
+            )?;
+        } else {
+            ensure_repair_debris_absent(
+                &directory,
+                &directory_identity,
+                model_dir,
+                &invalid_path,
+                &restart_path,
+            )?;
+        }
         promote_authoritative_part(
             &directory,
             &directory_identity,
-            (model_dir, &part_path, &final_path),
+            (
+                model_dir,
+                &part_path,
+                &final_path,
+                &invalid_path,
+                &restart_path,
+            ),
             &output,
             &staging_identity,
             spec.size(),
             artifact_operation,
         )?;
-        finish_repair(model_dir, &invalid_path, &restart_path)?;
-        return Ok(DownloadOutcome::Pulled(final_path));
+        let resolved = open_final_entry(&directory, &final_path)
+            .map_err(|_| ArtifactTransferError::Durability)?;
+        let verified = verified
+            .rebind_after_rename_resolved(&final_path, resolved)
+            .map_err(|_| ArtifactTransferError::Durability)?;
+        return Ok(DownloadCompletion::new(
+            DownloadOutcome::Pulled(final_path),
+            verified,
+        ));
     }
-    if ignored_range {
-        fs::remove_file(&part_path).map_err(|error| error.to_string())?;
-        fs::rename(&restart_path, &part_path).map_err(|error| error.to_string())?;
-    }
-    fs::rename(&part_path, &final_path).map_err(|error| error.to_string())?;
-    finish_repair(model_dir, &invalid_path, &restart_path)?;
-    Ok(DownloadOutcome::Pulled(final_path))
+    let (part, part_identity, _) = recovered_part
+        .as_ref()
+        .ok_or(ArtifactTransferError::Durability)?;
+    promote_authoritative_restart(
+        (&directory, &directory_identity, model_dir),
+        (&output, &staging_identity, &restart_path),
+        (part, part_identity, &part_path),
+        (
+            captured_invalid_authority.as_ref(),
+            &invalid_path,
+            &final_path,
+            spec.size(),
+        ),
+        artifact_operation,
+    )?;
+    let resolved =
+        open_final_entry(&directory, &final_path).map_err(|_| ArtifactTransferError::Durability)?;
+    let verified = verified
+        .rebind_after_rename_resolved(&final_path, resolved)
+        .map_err(|_| ArtifactTransferError::Durability)?;
+    Ok(DownloadCompletion::new(
+        DownloadOutcome::Pulled(final_path),
+        verified,
+    ))
 }
 
 pub(super) fn prove_existing_part_for_pause(
     spec: &ResolvedFile,
-    model_dir: &Path,
+    directory_authority: super::DownloadDirectoryAuthority<'_>,
     artifact_operation: &mut impl for<'a> FnMut(
         ArtifactOperation<'a>,
     ) -> Result<(), ArtifactOperationFailure>,
 ) -> Result<u64, ArtifactTransferError> {
-    let (directory, directory_identity) =
-        open_directory(model_dir).map_err(|_| ArtifactTransferError::Durability)?;
+    let model_dir = directory_authority.as_ref();
+    let directory = if let Some(retained) = directory_authority.retained_directory() {
+        retained
+            .try_clone()
+            .map_err(|_| ArtifactTransferError::Durability)?
+    } else {
+        open_directory(model_dir)
+            .map_err(|_| ArtifactTransferError::Durability)?
+            .0
+    };
+    let directory_identity =
+        directory_identity(&directory, model_dir).map_err(|_| ArtifactTransferError::Durability)?;
     ensure_directory_descriptor_matches_path(&directory, &directory_identity, model_dir)
         .map_err(|_| ArtifactTransferError::Durability)?;
     let part_path = model_dir.join("model.gguf.part");
@@ -820,10 +1117,122 @@ fn ensure_repair_debris_absent(
         .map_err(|_| ArtifactTransferError::Durability)
 }
 
+fn ensure_complete_part_authority(
+    directory: &File,
+    directory_identity: &DirectoryIdentity,
+    model_dir: &Path,
+    invalid_path: &Path,
+    restart_path: &Path,
+    invalid_authority: Option<&CapturedInvalidAuthority>,
+) -> Result<(), ArtifactTransferError> {
+    let Some(invalid_authority) = invalid_authority else {
+        return ensure_repair_debris_absent(
+            directory,
+            directory_identity,
+            model_dir,
+            invalid_path,
+            restart_path,
+        );
+    };
+    ensure_directory_descriptor_matches_path(directory, directory_identity, model_dir)
+        .map_err(|_| ArtifactTransferError::Durability)?;
+    let resolved = open_invalid_entry(directory, invalid_path)
+        .map_err(|_| ArtifactTransferError::Durability)?;
+    ensure_regular_descriptors_match(
+        &invalid_authority.file,
+        &invalid_authority.identity,
+        &resolved,
+        invalid_path,
+    )
+    .map_err(|_| ArtifactTransferError::Durability)?;
+    match open_restart_entry(directory, restart_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) | Err(_) => return Err(ArtifactTransferError::Durability),
+    }
+    ensure_directory_descriptor_matches_path(directory, directory_identity, model_dir)
+        .map_err(|_| ArtifactTransferError::Durability)
+}
+
+fn remove_invalid_before_promotion(
+    directory: (&File, &DirectoryIdentity, &Path),
+    invalid: (&CapturedInvalidAuthority, &Path),
+    source: (&File, &RegularFileIdentity, &Path, OpenArtifactEntry),
+    forbidden: [(&Path, OpenArtifactEntry); 2],
+    artifact_operation: &mut impl for<'a> FnMut(
+        ArtifactOperation<'a>,
+    ) -> Result<(), ArtifactOperationFailure>,
+) -> Result<(), ArtifactTransferError> {
+    let (directory, directory_identity, model_dir) = directory;
+    let (invalid, invalid_path) = invalid;
+    let (source, source_identity, source_path, open_source) = source;
+    let prove_current = || {
+        ensure_directory_descriptor_matches_path(directory, directory_identity, model_dir)
+            .map_err(|_| ArtifactTransferError::Durability)?;
+        let resolved = open_invalid_entry(directory, invalid_path)
+            .map_err(|_| ArtifactTransferError::Durability)?;
+        ensure_regular_descriptors_match(&invalid.file, &invalid.identity, &resolved, invalid_path)
+            .map_err(|_| ArtifactTransferError::Durability)?;
+        let resolved =
+            open_source(directory, source_path).map_err(|_| ArtifactTransferError::Durability)?;
+        ensure_regular_descriptors_match(source, source_identity, &resolved, source_path)
+            .map_err(|_| ArtifactTransferError::Durability)?;
+        for &(path, open) in &forbidden {
+            let entry = open(directory, path);
+            match entry {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) | Err(_) => return Err(ArtifactTransferError::Durability),
+            }
+        }
+        ensure_directory_descriptor_matches_path(directory, directory_identity, model_dir)
+            .map_err(|_| ArtifactTransferError::Durability)
+    };
+
+    prove_current()?;
+    artifact_operation(ArtifactOperation::Observe(
+        ArtifactCheckpoint::BeforeInvalidUnlink,
+    ))
+    .map_err(|_| ArtifactTransferError::Durability)?;
+    prove_current()?;
+    artifact_operation(ArtifactOperation::Observe(
+        ArtifactCheckpoint::InvalidIdentityMatched,
+    ))
+    .map_err(|_| ArtifactTransferError::Durability)?;
+    prove_current()?;
+    unlink_invalid_entry(directory).map_err(|_| ArtifactTransferError::Durability)?;
+    artifact_operation(ArtifactOperation::Observe(
+        ArtifactCheckpoint::InvalidUnlinked,
+    ))
+    .map_err(|_| ArtifactTransferError::Durability)?;
+    artifact_operation(ArtifactOperation::Sync {
+        checkpoint: ArtifactCheckpoint::ChecksumCleanupDirectorySynced,
+        file: directory,
+    })
+    .map_err(|_| ArtifactTransferError::Durability)?;
+    ensure_directory_descriptor_matches_path(directory, directory_identity, model_dir)
+        .map_err(|_| ArtifactTransferError::Durability)?;
+    let resolved =
+        open_source(directory, source_path).map_err(|_| ArtifactTransferError::Durability)?;
+    ensure_regular_descriptors_match(source, source_identity, &resolved, source_path)
+        .map_err(|_| ArtifactTransferError::Durability)?;
+    match open_invalid_entry(directory, invalid_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) | Err(_) => return Err(ArtifactTransferError::Durability),
+    }
+    for &(path, open) in &forbidden {
+        let entry = open(directory, path);
+        match entry {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) | Err(_) => return Err(ArtifactTransferError::Durability),
+        }
+    }
+    ensure_directory_descriptor_matches_path(directory, directory_identity, model_dir)
+        .map_err(|_| ArtifactTransferError::Durability)
+}
+
 fn promote_authoritative_part(
     directory: &File,
     directory_identity: &DirectoryIdentity,
-    paths: (&Path, &Path, &Path),
+    paths: (&Path, &Path, &Path, &Path, &Path),
     part: &File,
     verified_identity: &RegularFileIdentity,
     expected_size: u64,
@@ -831,13 +1240,23 @@ fn promote_authoritative_part(
         ArtifactOperation<'a>,
     ) -> Result<(), ArtifactOperationFailure>,
 ) -> Result<(), ArtifactTransferError> {
-    let (model_dir, part_path, final_path) = paths;
+    let (model_dir, part_path, final_path, invalid_path, restart_path) = paths;
     ensure_directory_descriptor_matches_path(directory, directory_identity, model_dir)
         .map_err(|_| ArtifactTransferError::Durability)?;
     let resolved =
         open_part_entry(directory, part_path).map_err(|_| ArtifactTransferError::Durability)?;
     ensure_regular_descriptors_match(part, verified_identity, &resolved, part_path)
         .map_err(|_| ArtifactTransferError::Durability)?;
+    for entry in [
+        open_invalid_entry(directory, invalid_path),
+        open_restart_entry(directory, restart_path),
+        open_final_entry(directory, final_path),
+    ] {
+        match entry {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) | Err(_) => return Err(ArtifactTransferError::Durability),
+        }
+    }
     rename_part_to_final_no_replace(directory).map_err(|_| ArtifactTransferError::Durability)?;
     let promoted_identity =
         regular_file_identity(part, final_path).map_err(|_| ArtifactTransferError::Durability)?;
@@ -860,6 +1279,136 @@ fn promote_authoritative_part(
     {
         return Err(ArtifactTransferError::Durability);
     }
+    for entry in [
+        open_part_entry(directory, part_path),
+        open_invalid_entry(directory, invalid_path),
+        open_restart_entry(directory, restart_path),
+    ] {
+        match entry {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) | Err(_) => return Err(ArtifactTransferError::Durability),
+        }
+    }
+    ensure_directory_descriptor_matches_path(directory, directory_identity, model_dir)
+        .map_err(|_| ArtifactTransferError::Durability)
+}
+
+fn promote_authoritative_restart(
+    directory: (&File, &DirectoryIdentity, &Path),
+    restart: (&File, &RegularFileIdentity, &Path),
+    part: (&File, &RegularFileIdentity, &Path),
+    final_artifact: (Option<&CapturedInvalidAuthority>, &Path, &Path, u64),
+    artifact_operation: &mut impl for<'a> FnMut(
+        ArtifactOperation<'a>,
+    ) -> Result<(), ArtifactOperationFailure>,
+) -> Result<(), ArtifactTransferError> {
+    let (directory, directory_identity, model_dir) = directory;
+    let (restart, restart_identity, restart_path) = restart;
+    let (part, part_identity, part_path) = part;
+    let (invalid_authority, invalid_path, final_path, expected_size) = final_artifact;
+    ensure_directory_descriptor_matches_path(directory, directory_identity, model_dir)
+        .map_err(|_| ArtifactTransferError::Durability)?;
+    let resolved = open_restart_entry(directory, restart_path)
+        .map_err(|_| ArtifactTransferError::Durability)?;
+    ensure_regular_descriptors_match(restart, restart_identity, &resolved, restart_path)
+        .map_err(|_| ArtifactTransferError::Durability)?;
+    let resolved =
+        open_part_entry(directory, part_path).map_err(|_| ArtifactTransferError::Durability)?;
+    ensure_regular_descriptors_match(part, part_identity, &resolved, part_path)
+        .map_err(|_| ArtifactTransferError::Durability)?;
+    unlink_part_entry(directory).map_err(|_| ArtifactTransferError::Durability)?;
+    artifact_operation(ArtifactOperation::Sync {
+        checkpoint: ArtifactCheckpoint::PromotionDirectorySynced,
+        file: directory,
+    })
+    .map_err(|_| ArtifactTransferError::Durability)?;
+    ensure_directory_descriptor_matches_path(directory, directory_identity, model_dir)
+        .map_err(|_| ArtifactTransferError::Durability)?;
+    let resolved = open_restart_entry(directory, restart_path)
+        .map_err(|_| ArtifactTransferError::Durability)?;
+    ensure_regular_descriptors_match(restart, restart_identity, &resolved, restart_path)
+        .map_err(|_| ArtifactTransferError::Durability)?;
+    if resolved
+        .metadata()
+        .map_err(|_| ArtifactTransferError::Durability)?
+        .len()
+        != expected_size
+    {
+        return Err(ArtifactTransferError::Durability);
+    }
+    for entry in [
+        open_part_entry(directory, part_path),
+        open_final_entry(directory, final_path),
+    ] {
+        match entry {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) | Err(_) => return Err(ArtifactTransferError::Durability),
+        }
+    }
+    if let Some(invalid_authority) = invalid_authority {
+        remove_invalid_before_promotion(
+            (directory, directory_identity, model_dir),
+            (invalid_authority, invalid_path),
+            (restart, restart_identity, restart_path, open_restart_entry),
+            [(part_path, open_part_entry), (final_path, open_final_entry)],
+            artifact_operation,
+        )?;
+    } else {
+        match open_invalid_entry(directory, invalid_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) | Err(_) => return Err(ArtifactTransferError::Durability),
+        }
+    }
+    ensure_directory_descriptor_matches_path(directory, directory_identity, model_dir)
+        .map_err(|_| ArtifactTransferError::Durability)?;
+    let resolved = open_restart_entry(directory, restart_path)
+        .map_err(|_| ArtifactTransferError::Durability)?;
+    ensure_regular_descriptors_match(restart, restart_identity, &resolved, restart_path)
+        .map_err(|_| ArtifactTransferError::Durability)?;
+    for entry in [
+        open_part_entry(directory, part_path),
+        open_invalid_entry(directory, invalid_path),
+        open_final_entry(directory, final_path),
+    ] {
+        match entry {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) | Err(_) => return Err(ArtifactTransferError::Durability),
+        }
+    }
+    ensure_directory_descriptor_matches_path(directory, directory_identity, model_dir)
+        .map_err(|_| ArtifactTransferError::Durability)?;
+    rename_restart_to_final_no_replace(directory).map_err(|_| ArtifactTransferError::Durability)?;
+    let promoted_identity = regular_file_identity(restart, final_path)
+        .map_err(|_| ArtifactTransferError::Durability)?;
+    artifact_operation(ArtifactOperation::Sync {
+        checkpoint: ArtifactCheckpoint::PromotionDirectorySynced,
+        file: directory,
+    })
+    .map_err(|_| ArtifactTransferError::Durability)?;
+    ensure_directory_descriptor_matches_path(directory, directory_identity, model_dir)
+        .map_err(|_| ArtifactTransferError::Durability)?;
+    let final_file =
+        open_final_entry(directory, final_path).map_err(|_| ArtifactTransferError::Durability)?;
+    ensure_regular_descriptors_match(restart, &promoted_identity, &final_file, final_path)
+        .map_err(|_| ArtifactTransferError::Durability)?;
+    if final_file
+        .metadata()
+        .map_err(|_| ArtifactTransferError::Durability)?
+        .len()
+        != expected_size
+    {
+        return Err(ArtifactTransferError::Durability);
+    }
+    for entry in [
+        open_part_entry(directory, part_path),
+        open_invalid_entry(directory, invalid_path),
+        open_restart_entry(directory, restart_path),
+    ] {
+        match entry {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) | Err(_) => return Err(ArtifactTransferError::Durability),
+        }
+    }
     ensure_directory_descriptor_matches_path(directory, directory_identity, model_dir)
         .map_err(|_| ArtifactTransferError::Durability)
 }
@@ -878,11 +1427,77 @@ fn rename_part_to_final_no_replace(directory: &File) -> std::io::Result<()> {
     .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn rename_final_to_invalid_no_replace(directory: &File) -> std::io::Result<()> {
+    use rustix::fs::{renameat_with, RenameFlags};
+
+    renameat_with(
+        directory,
+        "model.gguf",
+        directory,
+        "model.gguf.invalid",
+        RenameFlags::NOREPLACE,
+    )
+    .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn rename_restart_to_final_no_replace(directory: &File) -> std::io::Result<()> {
+    use rustix::fs::{renameat_with, RenameFlags};
+
+    renameat_with(
+        directory,
+        "model.gguf.part.restart",
+        directory,
+        "model.gguf",
+        RenameFlags::NOREPLACE,
+    )
+    .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn rename_restart_to_part_no_replace(directory: &File) -> std::io::Result<()> {
+    use rustix::fs::{renameat_with, RenameFlags};
+
+    renameat_with(
+        directory,
+        "model.gguf.part.restart",
+        directory,
+        "model.gguf.part",
+        RenameFlags::NOREPLACE,
+    )
+    .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn rename_restart_to_part_no_replace(_directory: &File) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "descriptor-relative no-replace restart normalization is unsupported",
+    ))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn rename_restart_to_final_no_replace(_directory: &File) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "descriptor-relative no-replace restart promotion is unsupported",
+    ))
+}
+
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn rename_part_to_final_no_replace(_directory: &File) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "descriptor-relative no-replace promotion is unsupported",
+    ))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn rename_final_to_invalid_no_replace(_directory: &File) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "descriptor-relative corrupt-artifact quarantine is unsupported",
     ))
 }
 
@@ -908,16 +1523,63 @@ fn exchange_part_and_restart(_directory: &File) -> std::io::Result<()> {
     ))
 }
 
-fn finish_repair(model_dir: &Path, invalid_path: &Path, restart_path: &Path) -> Result<(), String> {
-    for path in [invalid_path, restart_path] {
-        if path.exists() {
-            fs::remove_file(path).map_err(|error| error.to_string())?;
+fn finish_repair(
+    directory: &File,
+    directory_identity: &DirectoryIdentity,
+    model_dir: &Path,
+) -> Result<(), ArtifactTransferError> {
+    for name in [
+        b"model.gguf.invalid\0".as_slice(),
+        b"model.gguf.part.restart\0".as_slice(),
+    ] {
+        unlink_repair_entry_if_present(directory, name)
+            .map_err(|_| ArtifactTransferError::Durability)?;
+    }
+    directory
+        .sync_all()
+        .map_err(|_| ArtifactTransferError::Durability)?;
+    ensure_directory_descriptor_matches_path(directory, directory_identity, model_dir)
+        .map_err(|_| ArtifactTransferError::Durability)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn unlink_invalid_entry(directory: &File) -> std::io::Result<()> {
+    use rustix::fs::{unlinkat, AtFlags};
+
+    unlinkat(directory, "model.gguf.invalid", AtFlags::empty())
+        .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn unlink_invalid_entry(_directory: &File) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "descriptor-relative repair cleanup is unsupported",
+    ))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn unlink_repair_entry_if_present(directory: &File, name: &[u8]) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: `directory` is the retained live model-directory descriptor and
+    // callers provide only fixed NUL-terminated repair entry names.
+    let result = unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr().cast(), 0) };
+    if result == -1 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return Err(error);
         }
     }
-    File::open(model_dir)
-        .and_then(|dir| dir.sync_all())
-        .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn unlink_repair_entry_if_present(_directory: &File, _name: &[u8]) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "descriptor-relative repair cleanup is unsupported",
+    ))
 }
 
 fn remove_invalid_authoritative_part(
@@ -1747,9 +2409,16 @@ fn invalid_authority_is_present(
     directory: &File,
     invalid_path: &Path,
 ) -> Result<bool, ArtifactTransferError> {
+    capture_invalid_authority(directory, invalid_path).map(|authority| authority.is_some())
+}
+
+fn capture_invalid_authority(
+    directory: &File,
+    invalid_path: &Path,
+) -> Result<Option<CapturedInvalidAuthority>, ArtifactTransferError> {
     let invalid = match open_invalid_entry(directory, invalid_path) {
         Ok(invalid) => invalid,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(ArtifactTransferError::Durability),
     };
     let identity = regular_file_identity(&invalid, invalid_path)
@@ -1758,7 +2427,153 @@ fn invalid_authority_is_present(
         .map_err(|_| ArtifactTransferError::Durability)?;
     ensure_regular_descriptors_match(&invalid, &identity, &resolved, invalid_path)
         .map_err(|_| ArtifactTransferError::Durability)?;
-    Ok(true)
+    Ok(Some(CapturedInvalidAuthority {
+        file: invalid,
+        identity,
+    }))
+}
+
+fn capture_artifact_entry(
+    directory: &File,
+    path: &Path,
+    open_entry: OpenArtifactEntry,
+) -> Result<Option<(File, RegularFileIdentity)>, ArtifactTransferError> {
+    let file = match open_entry(directory, path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(ArtifactTransferError::Durability),
+    };
+    let identity =
+        regular_file_identity(&file, path).map_err(|_| ArtifactTransferError::Durability)?;
+    let resolved = open_entry(directory, path).map_err(|_| ArtifactTransferError::Durability)?;
+    ensure_regular_descriptors_match(&file, &identity, &resolved, path)
+        .map_err(|_| ArtifactTransferError::Durability)?;
+    Ok(Some((file, identity)))
+}
+
+fn quarantine_captured_final(
+    directory: &File,
+    final_artifact: (&File, &RegularFileIdentity, &Path),
+    invalid_path: &Path,
+) -> Result<CapturedInvalidAuthority, ArtifactTransferError> {
+    let (final_file, final_identity, final_path) = final_artifact;
+    let resolved =
+        open_final_entry(directory, final_path).map_err(|_| ArtifactTransferError::Durability)?;
+    ensure_regular_descriptors_match(final_file, final_identity, &resolved, final_path)
+        .map_err(|_| ArtifactTransferError::Durability)?;
+    match open_invalid_entry(directory, invalid_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) | Err(_) => return Err(ArtifactTransferError::Durability),
+    }
+    rename_final_to_invalid_no_replace(directory).map_err(|_| ArtifactTransferError::Durability)?;
+    let identity = regular_file_identity(final_file, invalid_path)
+        .map_err(|_| ArtifactTransferError::Durability)?;
+    if !final_identity.same_file_after_rename(&identity) {
+        return Err(ArtifactTransferError::Durability);
+    }
+    let invalid = open_invalid_entry(directory, invalid_path)
+        .map_err(|_| ArtifactTransferError::Durability)?;
+    ensure_regular_descriptors_match(final_file, &identity, &invalid, invalid_path)
+        .map_err(|_| ArtifactTransferError::Durability)?;
+    match open_final_entry(directory, final_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) | Err(_) => return Err(ArtifactTransferError::Durability),
+    }
+    Ok(CapturedInvalidAuthority {
+        file: final_file
+            .try_clone()
+            .map_err(|_| ArtifactTransferError::Durability)?,
+        identity,
+    })
+}
+
+fn reject_unsafe_artifact_entry_if_present(
+    directory: &File,
+    path: &Path,
+    open_entry: OpenArtifactEntry,
+) -> Result<(), String> {
+    let file = match open_entry(directory, path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    };
+    let identity = regular_file_identity(&file, path).map_err(|error| error.to_string())?;
+    let resolved =
+        open_entry(directory, path).map_err(|error| format!("{}: {error}", path.display()))?;
+    ensure_regular_descriptors_match(&file, &identity, &resolved, path)
+        .map_err(|_| format!("unsafe artifact path {}", path.display()))
+}
+
+#[cfg(unix)]
+fn create_part_entry(directory: &File, _path: &Path) -> std::io::Result<File> {
+    open_artifact_entry_for_write(directory, c"model.gguf.part", libc::O_CREAT | libc::O_EXCL)
+}
+
+#[cfg(not(unix))]
+fn create_part_entry(_directory: &File, path: &Path) -> std::io::Result<File> {
+    OpenOptions::new().create_new(true).write(true).open(path)
+}
+
+#[cfg(unix)]
+fn create_restart_entry(directory: &File, _path: &Path) -> std::io::Result<File> {
+    open_artifact_entry_for_write(
+        directory,
+        c"model.gguf.part.restart",
+        libc::O_CREAT | libc::O_EXCL,
+    )
+}
+
+#[cfg(not(unix))]
+fn create_restart_entry(_directory: &File, path: &Path) -> std::io::Result<File> {
+    OpenOptions::new().create_new(true).write(true).open(path)
+}
+
+#[cfg(unix)]
+fn open_part_entry_for_write(
+    directory: &File,
+    _path: &Path,
+    append: bool,
+) -> std::io::Result<File> {
+    open_artifact_entry_for_write(
+        directory,
+        c"model.gguf.part",
+        if append { libc::O_APPEND } else { 0 },
+    )
+}
+
+#[cfg(not(unix))]
+fn open_part_entry_for_write(
+    _directory: &File,
+    path: &Path,
+    append: bool,
+) -> std::io::Result<File> {
+    OpenOptions::new().write(true).append(append).open(path)
+}
+
+#[cfg(unix)]
+fn open_artifact_entry_for_write(
+    directory: &File,
+    name: &std::ffi::CStr,
+    extra_flags: libc::c_int,
+) -> std::io::Result<File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    // SAFETY: `directory` is the pinned model-directory descriptor, callers
+    // provide only closed artifact literals, and a successful descriptor is
+    // transferred to `File` exactly once.
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_WRONLY | extra_flags,
+            0o600,
+        )
+    };
+    if descriptor == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { File::from_raw_fd(descriptor) })
+    }
 }
 
 #[cfg(unix)]
@@ -2083,6 +2898,20 @@ pub(crate) struct VerifiedRegularFile {
 }
 
 impl VerifiedRegularFile {
+    pub(super) fn from_captured_hash(
+        file: File,
+        identity: RegularFileIdentity,
+        path: PathBuf,
+        sha256: String,
+    ) -> Self {
+        Self {
+            file,
+            identity,
+            path,
+            sha256,
+        }
+    }
+
     pub(crate) fn sha256(&self) -> &str {
         &self.sha256
     }
@@ -2132,7 +2961,29 @@ impl VerifiedRegularFile {
         Ok(())
     }
 
-    pub(crate) fn rebind_after_rename(mut self, destination: &Path) -> Result<Self, String> {
+    fn proves_resolved(
+        &self,
+        expected_path: &Path,
+        expected_size: u64,
+        expected_sha256: &str,
+        resolved: File,
+    ) -> Result<(), String> {
+        if self.path != expected_path
+            || self.sha256 != expected_sha256.to_ascii_lowercase()
+            || self.identity.size() != expected_size
+        {
+            return Err("verified model artifact proof mismatch".into());
+        }
+        ensure_regular_descriptors_match(&self.file, &self.identity, &resolved, expected_path)
+            .map_err(|_| {
+                format!(
+                    "model artifact changed after hashing {}",
+                    expected_path.display()
+                )
+            })
+    }
+
+    pub(crate) fn rebind_after_rename(self, destination: &Path) -> Result<Self, String> {
         let mut options = OpenOptions::new();
         options.read(true);
         #[cfg(unix)]
@@ -2143,6 +2994,14 @@ impl VerifiedRegularFile {
         let resolved = options
             .open(destination)
             .map_err(|error| format!("{}: {error}", destination.display()))?;
+        self.rebind_after_rename_resolved(destination, resolved)
+    }
+
+    fn rebind_after_rename_resolved(
+        mut self,
+        destination: &Path,
+        resolved: File,
+    ) -> Result<Self, String> {
         let current = regular_file_identity(&self.file, destination)
             .map_err(|error| format!("{}: {error}", destination.display()))?;
         if !self.identity.same_file_after_rename(&current) {
@@ -2244,16 +3103,44 @@ enum VerificationOutcome {
     ChecksumMismatch,
 }
 
-fn verify_regular_controlled(
+fn verify_regular_entry_controlled(
+    directory: &File,
     path: &Path,
+    open_entry: OpenArtifactEntry,
     size: u64,
     sha256: &str,
     expected_staging: Option<(&File, &RegularFileIdentity)>,
     should_pause: &impl Fn() -> bool,
 ) -> Result<VerificationOutcome, String> {
-    verify_regular_with_observer(path, size, sha256, expected_staging, should_pause, |_| {
-        Ok(())
-    })
+    let mut file =
+        open_entry(directory, path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    if metadata.len() != size {
+        return Err(format!("invalid model artifact {}", path.display()));
+    }
+    let opened = regular_file_identity(&file, path).map_err(|error| error.to_string())?;
+    if let Some((staging, expected)) = expected_staging {
+        ensure_regular_descriptors_match(staging, expected, &file, path)
+            .map_err(|_| format!("model artifact changed before hashing {}", path.display()))?;
+    }
+    let Some(actual) = hash_descriptor(&mut file, path, false, should_pause)? else {
+        return Ok(VerificationOutcome::Interrupted);
+    };
+    let resolved =
+        open_entry(directory, path).map_err(|error| format!("{}: {error}", path.display()))?;
+    ensure_regular_descriptors_match(&file, &opened, &resolved, path)
+        .map_err(|_| format!("model artifact changed while hashing {}", path.display()))?;
+    if actual != sha256.to_ascii_lowercase() {
+        return Ok(VerificationOutcome::ChecksumMismatch);
+    }
+    Ok(VerificationOutcome::Verified(VerifiedRegularFile {
+        file,
+        identity: opened,
+        path: path.to_owned(),
+        sha256: actual,
+    }))
 }
 
 fn verify_regular_with_observer<F>(
@@ -2404,33 +3291,6 @@ pub(super) fn hex(bytes: &[u8]) -> String {
         encoded.push(DIGITS[(byte & 0x0f) as usize] as char);
     }
     encoded
-}
-
-fn reject_non_regular_if_present(path: &Path) -> Result<(), String> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
-        Ok(_) => Err(format!("unsafe artifact path {}", path.display())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.to_string()),
-    }
-}
-
-fn reject_unsafe_transfer_if_present(path: &Path) -> Result<(), String> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_file() => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                if metadata.nlink() != 1 {
-                    return Err(format!("unsafe artifact path {}", path.display()));
-                }
-            }
-            Ok(())
-        }
-        Ok(_) => Err(format!("unsafe artifact path {}", path.display())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.to_string()),
-    }
 }
 
 fn reject_unsafe_open_transfer(file: &File, path: &Path) -> Result<(), String> {

@@ -392,6 +392,16 @@ fn combined_plan_covers_all_six_capacity_rows_and_exact_local_states() {
             CapacityPlan::InstalledRepairRequest,
         ),
         (
+            Catalog::Installed,
+            Artifact::CompletePart,
+            CapacityPlan::PendingPublish,
+        ),
+        (
+            Catalog::Installed,
+            Artifact::CompleteRestart,
+            CapacityPlan::PendingPublish,
+        ),
+        (
             Catalog::MatchingPending,
             Artifact::ValidFinal,
             CapacityPlan::PendingPublish,
@@ -399,6 +409,11 @@ fn combined_plan_covers_all_six_capacity_rows_and_exact_local_states() {
         (
             Catalog::MatchingPending,
             Artifact::CompletePart,
+            CapacityPlan::PendingPublish,
+        ),
+        (
+            Catalog::MatchingPending,
+            Artifact::CompleteRestart,
             CapacityPlan::PendingPublish,
         ),
         (
@@ -430,6 +445,7 @@ fn combined_plan_refuses_different_malformed_unsafe_local_bundle_and_unidentifie
         (Catalog::Unsafe, Artifact::Fresh),
         (Catalog::Fresh, Artifact::Unsafe),
         (Catalog::Fresh, Artifact::RequestCapable),
+        (Catalog::Fresh, Artifact::CompleteRestart),
         (Catalog::Installed, Artifact::ValidFinalRepairDebris),
         (
             Catalog::InstalledCompletionDebris,
@@ -456,6 +472,19 @@ fn test_artifact(bytes: &[u8]) -> ResolvedFile {
         .map(|byte| format!("{byte:02x}"))
         .collect();
     crate::huggingface::test_resolved_file(sha256, bytes.len() as u64)
+}
+
+fn completed_download(
+    artifact: &ResolvedFile,
+    outcome: crate::download::DownloadOutcome,
+) -> DownloadTerminalOutcome {
+    let verified = crate::download::verify_regular_captured(
+        outcome.as_ref(),
+        artifact.size(),
+        artifact.sha256(),
+    )
+    .unwrap();
+    DownloadTerminalOutcome::Complete(crate::download::DownloadCompletion::new(outcome, verified))
 }
 
 fn seed_published_remote(root: &std::path::Path, manifest: &Manifest, bytes: &[u8]) {
@@ -501,11 +530,12 @@ fn exercise_selected_without_requested_id(
             token_calls.set(token_calls.get() + 1);
             None
         },
-        |_, model_dir, _, _, _| {
+        |artifact, model_dir, _, _, _| {
             download_calls.set(download_calls.get() + 1);
             let final_path = model_dir.join("model.gguf");
             std::fs::write(&final_path, b"abcdef").unwrap();
-            Ok(DownloadTerminalOutcome::Complete(
+            Ok(completed_download(
+                artifact,
                 crate::download::DownloadOutcome::Pulled(final_path),
             ))
         },
@@ -829,6 +859,41 @@ fn exact_directory_snapshot(
 }
 
 #[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+enum PlannedDirectoryReplacement {
+    Empty,
+    ExactCopy,
+    HardlinkedPart,
+}
+
+#[cfg(unix)]
+fn replace_planned_model_directory(
+    model_dir: &std::path::Path,
+    moved_dir: &std::path::Path,
+    replacement: PlannedDirectoryReplacement,
+) {
+    std::fs::rename(model_dir, moved_dir).unwrap();
+    std::fs::create_dir(model_dir).unwrap();
+    match replacement {
+        PlannedDirectoryReplacement::Empty => {}
+        PlannedDirectoryReplacement::ExactCopy => {
+            for entry in std::fs::read_dir(moved_dir).unwrap() {
+                let entry = entry.unwrap();
+                std::fs::copy(entry.path(), model_dir.join(entry.file_name())).unwrap();
+            }
+        }
+        PlannedDirectoryReplacement::HardlinkedPart => {
+            std::fs::hard_link(
+                moved_dir.join("model.gguf.part"),
+                model_dir.join("model.gguf.part"),
+            )
+            .unwrap();
+            std::fs::write(model_dir.join("replacement.witness"), b"replacement").unwrap();
+        }
+    }
+}
+
+#[cfg(unix)]
 #[test]
 fn resume_insufficient_disk_preserves_pending_staging_temps_bytes_and_identities() {
     let root = tempfile::tempdir().unwrap();
@@ -878,6 +943,15 @@ fn matching_pending_insufficient_disk_attaches_only_audited_recovery_authority()
             "complete",
             Some(b"abcdef".as_slice()),
             None,
+            None,
+            false,
+            6,
+            true,
+        ),
+        (
+            "complete-restart",
+            None,
+            Some(b"abcdef".as_slice()),
             None,
             false,
             6,
@@ -1166,7 +1240,7 @@ fn exact_resolved_file_reaches_manifest_and_downloader_unchanged() {
         |received, model_dir, token, control, _| {
             download_calls.set(download_calls.get() + 1);
             assert_eq!(received, &expected);
-            assert_eq!(model_dir, root.path().join("models/demo"));
+            assert_eq!(model_dir.as_ref(), root.path().join("models/demo"));
             assert_eq!(token.as_deref(), Some("test-token"));
             assert!(!control.pause_requested());
             let pending: crate::catalog::Manifest =
@@ -1191,6 +1265,65 @@ fn seed_pending(
     drop(lock);
     crate::catalog::prepare_pull(&model_dir, &exact_manifest(model_id.into(), artifact)).unwrap();
     model_dir
+}
+
+fn seed_installed_repair(
+    root: &std::path::Path,
+    artifact: &ResolvedFile,
+    staging_name: &str,
+    bytes: &[u8],
+) -> (std::path::PathBuf, Vec<u8>) {
+    let model_dir = root.join("models/demo");
+    let lock = crate::catalog::ModelLock::acquire_for_transfer(&model_dir).unwrap();
+    drop(lock);
+    let manifest_bytes =
+        serde_json::to_vec_pretty(&exact_manifest("demo".into(), artifact)).unwrap();
+    std::fs::write(model_dir.join("manifest.json"), &manifest_bytes).unwrap();
+    std::fs::write(model_dir.join("model.gguf.invalid"), b"repair evidence").unwrap();
+    std::fs::write(model_dir.join(staging_name), bytes).unwrap();
+    (model_dir, manifest_bytes)
+}
+
+fn complete_installed_repair(
+    service: &AppService,
+    artifact: ResolvedFile,
+    available: u64,
+) -> TransferResult {
+    use std::cell::Cell;
+
+    let capacity_calls = Cell::new(0);
+    let downloader_calls = Cell::new(0);
+    let received_proof = Cell::new(false);
+    crate::download::reset_content_hash_count();
+    let result = transfer_selected_with_proof(
+        service,
+        TransferSelected::for_installed(artifact, "demo".into()),
+        TransferControl::new(),
+        |_| {},
+        |_| {
+            capacity_calls.set(capacity_calls.get() + 1);
+            Ok((available, 1))
+        },
+        || panic!("complete installed repair must not look up a token"),
+        |artifact, model_dir, token, verified_part, control, progress| {
+            downloader_calls.set(downloader_calls.get() + 1);
+            received_proof.set(verified_part.is_some());
+            crate::download::download_controlled(
+                artifact,
+                model_dir,
+                token,
+                verified_part,
+                || control.pause_requested(),
+                |update| progress(TransferProgress::from_download(update)),
+            )
+        },
+    )
+    .unwrap();
+    assert_eq!(capacity_calls.get(), 1);
+    assert_eq!(downloader_calls.get(), 1);
+    assert!(received_proof.get());
+    assert_eq!(crate::download::content_hash_count(), 0);
+    result
 }
 
 #[test]
@@ -1474,11 +1607,12 @@ fn control_immediately_before_fence_pauses_but_late_control_completion_wins() {
         |_| {},
         |_| Ok((u64::MAX, 1)),
         || None,
-        |_, model_dir, _, control, _| {
+        |artifact, model_dir, _, control, _| {
             let final_path = model_dir.join("model.gguf");
             std::fs::write(&final_path, b"abcdef").unwrap();
             control.request_pause();
-            Ok(DownloadTerminalOutcome::Complete(
+            Ok(completed_download(
+                artifact,
                 crate::download::DownloadOutcome::Pulled(final_path),
             ))
         },
@@ -1541,6 +1675,464 @@ fn valid_final_publish_only_checks_control_before_publication_fence() {
 }
 
 #[test]
+fn valid_final_publication_reuses_the_plan_proof_without_a_final_rehash() {
+    use std::cell::Cell;
+
+    let root = tempfile::tempdir().unwrap();
+    let service = test_service(root.path());
+    let artifact = test_artifact(b"abcdef");
+    let model_dir = seed_pending(root.path(), "demo", &artifact);
+    std::fs::write(model_dir.join("model.gguf"), b"abcdef").unwrap();
+    let reached_publication = Cell::new(false);
+
+    let result = transfer_selected_with(
+        &service,
+        TransferSelected::new(artifact, Some("demo".into())),
+        TransferControl::new(),
+        |progress| {
+            if progress.phase() == TransferPhase::Publishing {
+                crate::download::reset_content_hash_count();
+                reached_publication.set(true);
+            }
+        },
+        |_| Ok((u64::MAX, 1)),
+        || panic!("valid-final publication must not look up a token"),
+        |_, _, _, _, _| panic!("valid-final publication must not call downloader"),
+    )
+    .unwrap();
+
+    assert_eq!(result.disposition(), TransferDisposition::Installed);
+    assert!(reached_publication.get());
+    assert_eq!(crate::download::content_hash_count(), 0);
+    assert!(model_dir.join("manifest.json").exists());
+    assert!(!model_dir.join("pending.json").exists());
+}
+
+#[test]
+fn complete_part_transfer_forwards_the_plan_proof_without_rehashing() {
+    use std::cell::Cell;
+
+    let root = tempfile::tempdir().unwrap();
+    let service = test_service(root.path());
+    let artifact = test_artifact(b"abcdef");
+    let model_dir = seed_pending(root.path(), "demo", &artifact);
+    std::fs::write(model_dir.join("model.gguf.part"), b"abcdef").unwrap();
+    let received_proof = Cell::new(false);
+    crate::download::reset_content_hash_count();
+
+    let result = transfer_selected_with_proof(
+        &service,
+        TransferSelected::new(artifact, Some("demo".into())),
+        TransferControl::new(),
+        |_| {},
+        |_| Ok((u64::MAX, 1)),
+        || None,
+        |artifact, model_dir, token, verified_part, control, progress| {
+            received_proof.set(verified_part.is_some());
+            crate::download::download_controlled(
+                artifact,
+                model_dir,
+                token,
+                verified_part,
+                || control.pause_requested(),
+                |update| progress(TransferProgress::from_download(update)),
+            )
+        },
+    )
+    .unwrap();
+
+    assert_eq!(result.disposition(), TransferDisposition::Installed);
+    assert!(received_proof.get());
+    assert_eq!(crate::download::content_hash_count(), 0);
+    assert_eq!(
+        std::fs::read(model_dir.join("model.gguf")).unwrap(),
+        b"abcdef"
+    );
+    assert!(!model_dir.join("model.gguf.part").exists());
+    assert!(model_dir.join("manifest.json").exists());
+    assert!(!model_dir.join("pending.json").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn immediate_pause_after_planning_refuses_a_replaced_model_directory_symlink() {
+    use std::cell::Cell;
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let service = test_service(root.path());
+    let artifact = test_artifact(b"abcdef");
+    let model_dir = seed_pending(root.path(), "demo", &artifact);
+    let moved_dir = root.path().join("models/moved-demo");
+    std::fs::write(model_dir.join("model.gguf.part"), b"abcdef").unwrap();
+    let pending = std::fs::read(model_dir.join("pending.json")).unwrap();
+    let downloader_calls = Cell::new(0);
+
+    let result = transfer_selected_with_proof(
+        &service,
+        TransferSelected::new(artifact, Some("demo".into())),
+        TransferControl::new(),
+        |_| {},
+        |_| Ok((u64::MAX, 1)),
+        || panic!("verified immediate pause must not look up a token"),
+        |artifact, model_dir, token, verified_part, control, progress| {
+            downloader_calls.set(downloader_calls.get() + 1);
+            assert!(token.is_none());
+            assert!(verified_part.is_some());
+            crate::download::reset_content_hash_count();
+            std::fs::rename(model_dir, &moved_dir).unwrap();
+            symlink(&moved_dir, model_dir).unwrap();
+            control.request_pause();
+            crate::download::download_controlled(
+                artifact,
+                model_dir,
+                token,
+                verified_part,
+                || control.pause_requested(),
+                |update| progress(TransferProgress::from_download(update)),
+            )
+        },
+    );
+
+    let error = match result {
+        Ok(_) => panic!("replaced model-directory authority must not report paused recovery"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), TransferErrorKind::Durability);
+    assert_eq!(downloader_calls.get(), 1);
+    assert_eq!(crate::download::content_hash_count(), 0);
+    assert!(std::fs::symlink_metadata(&model_dir)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(
+        std::fs::read(moved_dir.join("model.gguf.part")).unwrap(),
+        b"abcdef"
+    );
+    assert_eq!(
+        std::fs::read(moved_dir.join("pending.json")).unwrap(),
+        pending
+    );
+    assert!(!moved_dir.join("model.gguf").exists());
+    assert!(!moved_dir.join("model.gguf.part.restart").exists());
+    assert!(!moved_dir.join("model.gguf.invalid").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn selected_transfer_refuses_regular_directory_replacements_before_download_side_effects() {
+    use std::cell::Cell;
+
+    for replacement in [
+        PlannedDirectoryReplacement::Empty,
+        PlannedDirectoryReplacement::ExactCopy,
+        PlannedDirectoryReplacement::HardlinkedPart,
+    ] {
+        for pause in [true, false] {
+            if matches!(replacement, PlannedDirectoryReplacement::Empty) && !pause {
+                continue;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let service = test_service(root.path());
+            let artifact = test_artifact(b"abcdef");
+            let model_dir = seed_pending(root.path(), "demo", &artifact);
+            let moved_dir = root.path().join("models/moved-demo");
+            std::fs::write(model_dir.join("model.gguf.part"), b"abcdef").unwrap();
+            let downloader_calls = Cell::new(0);
+            crate::download::reset_content_hash_count();
+
+            let result = transfer_selected_with_proof(
+                &service,
+                TransferSelected::new(artifact, Some("demo".into())),
+                TransferControl::new(),
+                |_| {},
+                |_| Ok((u64::MAX, 1)),
+                || panic!("verified replacement must not look up a token"),
+                |artifact, model_dir, token, verified_part, control, progress| {
+                    downloader_calls.set(downloader_calls.get() + 1);
+                    assert!(token.is_none());
+                    assert!(verified_part.is_some());
+                    let model_path: &std::path::Path = model_dir.as_ref();
+                    replace_planned_model_directory(model_path, &moved_dir, replacement);
+                    let retained_before = exact_directory_snapshot(&moved_dir);
+                    let replacement_before = exact_directory_snapshot(model_path);
+                    if pause {
+                        control.request_pause();
+                    }
+                    let outcome = crate::download::download_controlled(
+                        artifact,
+                        model_dir,
+                        token,
+                        verified_part,
+                        || control.pause_requested(),
+                        |update| progress(TransferProgress::from_download(update)),
+                    );
+                    assert_eq!(exact_directory_snapshot(&moved_dir), retained_before);
+                    assert_eq!(exact_directory_snapshot(model_path), replacement_before);
+                    outcome
+                },
+            );
+
+            let error = match result {
+                Ok(_) => panic!(
+                    "{replacement:?}, pause={pause}: replacement authority must not complete or pause"
+                ),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.kind(),
+                TransferErrorKind::Durability,
+                "{replacement:?}, pause={pause}"
+            );
+            assert_eq!(downloader_calls.get(), 1);
+            assert_eq!(crate::download::content_hash_count(), 0);
+        }
+    }
+}
+
+#[test]
+fn complete_restart_uses_manifest_capacity_and_completes_without_token_network_or_rehash() {
+    use std::cell::Cell;
+
+    let root = tempfile::tempdir().unwrap();
+    let service = test_service(root.path());
+    let artifact = test_artifact(b"abcdef");
+    let model_dir = seed_pending(root.path(), "demo", &artifact);
+    std::fs::write(model_dir.join("model.gguf.part.restart"), b"abcdef").unwrap();
+    let manifest_capacity = serde_json::to_vec_pretty(&exact_manifest("demo".into(), &artifact))
+        .unwrap()
+        .len() as u64;
+    let capacity_calls = Cell::new(0);
+    let downloader_calls = Cell::new(0);
+    crate::download::reset_content_hash_count();
+
+    let result = transfer_selected_with_proof(
+        &service,
+        TransferSelected::new(artifact, Some("demo".into())),
+        TransferControl::new(),
+        |_| {},
+        |_| {
+            capacity_calls.set(capacity_calls.get() + 1);
+            Ok((manifest_capacity, 1))
+        },
+        || panic!("complete restart must not look up a token"),
+        |artifact, model_dir, token, verified_part, control, progress| {
+            downloader_calls.set(downloader_calls.get() + 1);
+            assert!(verified_part.is_some());
+            crate::download::download_controlled(
+                artifact,
+                model_dir,
+                token,
+                verified_part,
+                || control.pause_requested(),
+                |update| progress(TransferProgress::from_download(update)),
+            )
+        },
+    )
+    .unwrap();
+
+    assert_eq!(result.disposition(), TransferDisposition::Installed);
+    assert_eq!(capacity_calls.get(), 1);
+    assert_eq!(downloader_calls.get(), 1);
+    assert_eq!(crate::download::content_hash_count(), 0);
+    assert_eq!(
+        std::fs::read(model_dir.join("model.gguf")).unwrap(),
+        b"abcdef"
+    );
+    assert!(!model_dir.join("model.gguf.part").exists());
+    assert!(!model_dir.join("model.gguf.part.restart").exists());
+    assert!(model_dir.join("manifest.json").exists());
+    assert!(!model_dir.join("pending.json").exists());
+}
+
+#[test]
+fn installed_repair_complete_staging_uses_manifest_capacity_without_token_network_or_rehash() {
+    let bytes = vec![b'x'; 4096];
+    for staging_name in ["model.gguf.part.restart", "model.gguf.part"] {
+        let root = tempfile::tempdir().unwrap();
+        let service = test_service(root.path());
+        let artifact = test_artifact(&bytes);
+        let (model_dir, manifest_bytes) =
+            seed_installed_repair(root.path(), &artifact, staging_name, &bytes);
+        assert!((manifest_bytes.len() as u64) < artifact.size());
+        let result = complete_installed_repair(&service, artifact, manifest_bytes.len() as u64);
+
+        assert_eq!(result.disposition(), TransferDisposition::AlreadyInstalled);
+        assert_eq!(std::fs::read(model_dir.join("model.gguf")).unwrap(), bytes);
+        assert_eq!(
+            std::fs::read(model_dir.join("manifest.json")).unwrap(),
+            manifest_bytes
+        );
+        for removed in [
+            "model.gguf.part",
+            "model.gguf.part.restart",
+            "model.gguf.invalid",
+        ] {
+            assert!(
+                !model_dir.join(removed).exists(),
+                "{staging_name}: {removed}"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn ignored_range_cleanup_crash_retries_through_app_service_without_token_network_or_rehash() {
+    let bytes = vec![b'x'; 4096];
+    let root = tempfile::tempdir().unwrap();
+    let service = test_service(root.path());
+    let artifact = test_artifact(&bytes);
+    let (model_dir, manifest_bytes) =
+        seed_installed_repair(root.path(), &artifact, "model.gguf.part.restart", &bytes);
+    assert!((manifest_bytes.len() as u64) < artifact.size());
+    std::fs::remove_file(model_dir.join("model.gguf.invalid")).unwrap();
+    std::fs::File::open(&model_dir).unwrap().sync_all().unwrap();
+    let replacement_dir = root.path().join("models/replacement-demo");
+    std::fs::create_dir(&replacement_dir).unwrap();
+    std::fs::write(replacement_dir.join("witness"), b"replacement").unwrap();
+    let replacement = exact_directory_snapshot(&replacement_dir);
+
+    let completed = complete_installed_repair(&service, artifact, manifest_bytes.len() as u64);
+
+    assert_eq!(
+        completed.disposition(),
+        TransferDisposition::AlreadyInstalled
+    );
+    assert_eq!(std::fs::read(model_dir.join("model.gguf")).unwrap(), bytes);
+    assert!(!model_dir.join("model.gguf.part.restart").exists());
+    assert!(!model_dir.join("model.gguf.invalid").exists());
+    assert_eq!(
+        std::fs::read(model_dir.join("manifest.json")).unwrap(),
+        manifest_bytes
+    );
+    assert_eq!(exact_directory_snapshot(&replacement_dir), replacement);
+}
+
+#[test]
+fn paused_installed_restart_resumes_from_complete_part_without_network_or_rehash() {
+    let bytes = vec![b'x'; 4096];
+    let root = tempfile::tempdir().unwrap();
+    let service = test_service(root.path());
+    let artifact = test_artifact(&bytes);
+    let (model_dir, manifest_bytes) =
+        seed_installed_repair(root.path(), &artifact, "model.gguf.part.restart", &bytes);
+
+    let paused = transfer_selected_with_proof(
+        &service,
+        TransferSelected::for_installed(artifact.clone(), "demo".into()),
+        TransferControl::new(),
+        |_| {},
+        |_| Ok((manifest_bytes.len() as u64, 1)),
+        || panic!("complete installed repair must not look up a token"),
+        |artifact, model_dir, _, verified_part, _, _| {
+            assert!(verified_part.is_some());
+            assert!(model_dir.join("model.gguf.part").exists());
+            assert!(model_dir.join("model.gguf.invalid").exists());
+            Ok(DownloadTerminalOutcome::Paused {
+                retained_bytes: artifact.size(),
+            })
+        },
+    )
+    .unwrap();
+
+    assert_eq!(paused.disposition(), TransferDisposition::Paused);
+    assert_eq!(paused.retained_bytes(), Some(artifact.size()));
+    assert!(!paused.discardable());
+    let completed = complete_installed_repair(&service, artifact, manifest_bytes.len() as u64);
+    assert_eq!(
+        completed.disposition(),
+        TransferDisposition::AlreadyInstalled
+    );
+    assert_eq!(std::fs::read(model_dir.join("model.gguf")).unwrap(), bytes);
+    assert!(!model_dir.join("model.gguf.invalid").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn installed_repair_crash_states_retry_without_network_or_rehash_and_preserve_replacement() {
+    let bytes = vec![b'x'; 4096];
+
+    for promoted in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let service = test_service(root.path());
+        let artifact = test_artifact(&bytes);
+        let (model_dir, manifest_bytes) =
+            seed_installed_repair(root.path(), &artifact, "model.gguf.part", &bytes);
+        let moved_dir = root.path().join("models/moved-demo");
+        let replacement_dir = root.path().join("models/replacement-demo");
+
+        let error = match transfer_selected_with_proof(
+            &service,
+            TransferSelected::for_installed(artifact.clone(), "demo".into()),
+            TransferControl::new(),
+            |_| {},
+            |_| Ok((manifest_bytes.len() as u64, 1)),
+            || panic!("verified installed repair must not look up a token"),
+            |_, model_dir, _, verified_part, _, _| {
+                assert!(verified_part.is_some());
+                std::fs::remove_file(model_dir.join("model.gguf.invalid")).unwrap();
+                if promoted {
+                    std::fs::rename(
+                        model_dir.join("model.gguf.part"),
+                        model_dir.join("model.gguf"),
+                    )
+                    .unwrap();
+                }
+                std::fs::File::open(model_dir).unwrap().sync_all().unwrap();
+                std::fs::rename(model_dir, &moved_dir).unwrap();
+                std::fs::create_dir(model_dir).unwrap();
+                std::fs::write(model_dir.join("replacement.witness"), b"replacement").unwrap();
+                std::fs::write(model_dir.join("model.gguf"), b"replacement final").unwrap();
+                Err(DownloadFailure::Durability)
+            },
+        ) {
+            Ok(_) => panic!("injected repair crash must not complete"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), TransferErrorKind::Durability);
+        assert!(!moved_dir.join("model.gguf.invalid").exists());
+        assert_eq!(
+            std::fs::read(moved_dir.join(if promoted {
+                "model.gguf"
+            } else {
+                "model.gguf.part"
+            }))
+            .unwrap(),
+            bytes
+        );
+        let replacement = exact_directory_snapshot(&model_dir);
+        std::fs::rename(&model_dir, &replacement_dir).unwrap();
+        std::fs::rename(&moved_dir, &model_dir).unwrap();
+
+        let completed = if promoted {
+            crate::download::reset_content_hash_count();
+            let completed = transfer_selected_with(
+                &service,
+                TransferSelected::for_installed(artifact, "demo".into()),
+                TransferControl::new(),
+                |_| {},
+                |_| panic!("clean final must not probe capacity"),
+                || panic!("clean final must not look up a token"),
+                |_, _, _, _, _| panic!("clean final must not call downloader"),
+            )
+            .unwrap();
+            assert_eq!(crate::download::content_hash_count(), 0);
+            completed
+        } else {
+            complete_installed_repair(&service, artifact, manifest_bytes.len() as u64)
+        };
+        assert_eq!(
+            completed.disposition(),
+            TransferDisposition::AlreadyInstalled
+        );
+        assert_eq!(std::fs::read(model_dir.join("model.gguf")).unwrap(), bytes);
+        assert_eq!(exact_directory_snapshot(&replacement_dir), replacement);
+    }
+}
+
+#[test]
 fn publishing_callback_directory_swap_is_refused_without_mutating_either_directory() {
     let root = tempfile::tempdir().unwrap();
     let service = test_service(root.path());
@@ -1596,6 +2188,174 @@ fn publishing_callback_directory_swap_is_refused_without_mutating_either_directo
     assert!(!moved_dir.join("manifest.json").exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn publishing_refuses_a_byte_identical_artifact_inode_substitution() {
+    let root = tempfile::tempdir().unwrap();
+    let service = test_service(root.path());
+    let artifact = test_artifact(b"abcdef");
+    let model_dir = seed_pending(root.path(), "demo", &artifact);
+    let final_path = model_dir.join("model.gguf");
+    let captured_path = model_dir.join("captured-model.gguf");
+    let replacement_path = model_dir.join("replacement-model.gguf");
+    std::fs::write(&final_path, b"abcdef").unwrap();
+    std::fs::write(&replacement_path, b"abcdef").unwrap();
+    let callback_final = final_path.clone();
+    let callback_captured = captured_path.clone();
+    let callback_replacement = replacement_path.clone();
+
+    let result = transfer_selected_with(
+        &service,
+        TransferSelected::new(artifact, Some("demo".into())),
+        TransferControl::new(),
+        move |progress| {
+            if progress.phase() == TransferPhase::Publishing {
+                std::fs::rename(&callback_final, &callback_captured).unwrap();
+                std::fs::rename(&callback_replacement, &callback_final).unwrap();
+            }
+        },
+        |_| Ok((u64::MAX, 1)),
+        || panic!("valid-final publication must not look up a token"),
+        |_, _, _, _, _| panic!("valid-final publication must not call downloader"),
+    );
+
+    let error = match result {
+        Ok(_) => panic!("artifact inode substitution must refuse publication"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), TransferErrorKind::Publication);
+    assert_eq!(std::fs::read(&final_path).unwrap(), b"abcdef");
+    assert_eq!(std::fs::read(&captured_path).unwrap(), b"abcdef");
+    assert!(model_dir.join("pending.json").exists());
+    assert!(!model_dir.join("manifest.json").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn final_publication_boundary_directory_swap_refuses_a_preexisting_verified_final() {
+    let root = tempfile::tempdir().unwrap();
+    let service = test_service(root.path());
+    let artifact = test_artifact(b"abcdef");
+    let model_dir = seed_pending(root.path(), "demo", &artifact);
+    let moved_dir = root.path().join("models/moved-demo");
+    std::fs::write(model_dir.join("model.gguf"), b"abcdef").unwrap();
+    let pending = std::fs::read(model_dir.join("pending.json")).unwrap();
+    let retained_before = exact_directory_snapshot(&model_dir);
+    let callback_model_dir = model_dir.clone();
+    let callback_moved_dir = moved_dir.clone();
+    let replacement_pending = pending.clone();
+
+    let result = transfer_selected_with_publication_observer(
+        &service,
+        (
+            TransferSelected::new(artifact, Some("demo".into())),
+            move || {
+                std::fs::rename(&callback_model_dir, &callback_moved_dir).unwrap();
+                std::fs::create_dir(&callback_model_dir).unwrap();
+                std::fs::write(callback_model_dir.join("witness"), b"replacement witness").unwrap();
+                std::fs::write(callback_model_dir.join("model.gguf"), b"abcdef").unwrap();
+                std::fs::write(
+                    callback_model_dir.join("pending.json"),
+                    &replacement_pending,
+                )
+                .unwrap();
+            },
+        ),
+        TransferControl::new(),
+        |_| {},
+        |_| Ok((u64::MAX, 1)),
+        || panic!("valid-final publication must not look up a token"),
+        |_, _, _, _, _| panic!("valid-final publication must not call downloader"),
+    );
+
+    let error = match result {
+        Ok(_) => panic!("final-boundary directory swap must refuse publication"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), TransferErrorKind::Publication);
+    assert_eq!(exact_directory_snapshot(&moved_dir), retained_before);
+    assert_eq!(
+        std::fs::read(model_dir.join("witness")).unwrap(),
+        b"replacement witness"
+    );
+    assert_eq!(
+        std::fs::read(model_dir.join("model.gguf")).unwrap(),
+        b"abcdef"
+    );
+    assert_eq!(
+        std::fs::read(model_dir.join("pending.json")).unwrap(),
+        pending
+    );
+    assert!(!model_dir.join("manifest.json").exists());
+    assert!(!model_dir.join("manifest.json.tmp").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn final_publication_boundary_directory_swap_refuses_a_downloader_completion_proof() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let root = tempfile::tempdir().unwrap();
+    let service = test_service(root.path());
+    let artifact = test_artifact(b"abcdef");
+    let model_dir = root.path().join("models/demo");
+    let moved_dir = root.path().join("models/moved-demo");
+    let retained_before = Rc::new(RefCell::new(None));
+    let callback_snapshot = Rc::clone(&retained_before);
+    let callback_model_dir = model_dir.clone();
+    let callback_moved_dir = moved_dir.clone();
+
+    let result = transfer_selected_with_publication_observer(
+        &service,
+        (
+            TransferSelected::new(artifact, Some("demo".into())),
+            move || {
+                callback_snapshot.replace(Some(exact_directory_snapshot(&callback_model_dir)));
+                let pending = std::fs::read(callback_model_dir.join("pending.json")).unwrap();
+                std::fs::rename(&callback_model_dir, &callback_moved_dir).unwrap();
+                std::fs::create_dir(&callback_model_dir).unwrap();
+                std::fs::write(callback_model_dir.join("witness"), b"replacement witness").unwrap();
+                std::fs::write(callback_model_dir.join("model.gguf"), b"abcdef").unwrap();
+                std::fs::write(callback_model_dir.join("pending.json"), pending).unwrap();
+            },
+        ),
+        TransferControl::new(),
+        |_| {},
+        |_| Ok((u64::MAX, 1)),
+        || None,
+        |artifact, model_dir, _, _, _| {
+            let final_path = model_dir.join("model.gguf");
+            std::fs::write(&final_path, b"abcdef").unwrap();
+            Ok(completed_download(
+                artifact,
+                crate::download::DownloadOutcome::Pulled(final_path),
+            ))
+        },
+    );
+
+    let error = match result {
+        Ok(_) => panic!("final-boundary directory swap must refuse publication"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), TransferErrorKind::Publication);
+    assert_eq!(
+        exact_directory_snapshot(&moved_dir),
+        retained_before.borrow_mut().take().unwrap()
+    );
+    assert_eq!(
+        std::fs::read(model_dir.join("witness")).unwrap(),
+        b"replacement witness"
+    );
+    assert_eq!(
+        std::fs::read(model_dir.join("model.gguf")).unwrap(),
+        b"abcdef"
+    );
+    assert!(model_dir.join("pending.json").exists());
+    assert!(!model_dir.join("manifest.json").exists());
+    assert!(!model_dir.join("manifest.json.tmp").exists());
+}
+
 #[test]
 fn publication_failure_is_typed_publication_not_paused() {
     let root = tempfile::tempdir().unwrap();
@@ -1614,12 +2374,13 @@ fn publication_failure_is_typed_publication_not_paused() {
         },
         |_| Ok((u64::MAX, 1)),
         || None,
-        |_, model_dir, _, _, _| {
+        |artifact, model_dir, _, _, _| {
             let final_path = model_dir.join("model.gguf");
             std::fs::write(&final_path, b"abcdef").unwrap();
             std::fs::write(model_dir.join("model.gguf.invalid"), b"repair evidence").unwrap();
             std::fs::write(model_dir.join("manifest.json"), b"not json").unwrap();
-            Ok(DownloadTerminalOutcome::Complete(
+            Ok(completed_download(
+                artifact,
                 crate::download::DownloadOutcome::Pulled(final_path),
             ))
         },
@@ -1641,17 +2402,24 @@ fn publication_failure_without_a_reproven_exact_final_omits_recovery_facts() {
     let root = tempfile::tempdir().unwrap();
     let service = test_service(root.path());
     let artifact = test_artifact(b"abcdef");
+    let final_path = root.path().join("models/demo/model.gguf");
+    let corrupt_final = final_path.clone();
     let result = match transfer_selected_with(
         &service,
         TransferSelected::new(artifact, Some("demo".into())),
         TransferControl::new(),
-        |_| {},
+        move |progress| {
+            if progress.phase() == TransferPhase::Publishing {
+                std::fs::write(&corrupt_final, b"broken").unwrap();
+            }
+        },
         |_| Ok((u64::MAX, 1)),
         || None,
-        |_, model_dir, _, _, _| {
+        |artifact, model_dir, _, _, _| {
             let final_path = model_dir.join("model.gguf");
-            std::fs::write(&final_path, b"broken").unwrap();
-            Ok(DownloadTerminalOutcome::Complete(
+            std::fs::write(&final_path, b"abcdef").unwrap();
+            Ok(completed_download(
+                artifact,
                 crate::download::DownloadOutcome::Pulled(final_path),
             ))
         },
@@ -1817,11 +2585,12 @@ fn inspected_installed_intent_retains_missing_and_corrupt_artifact_repair() {
             |_| {},
             |_| Ok((u64::MAX, 1)),
             || None,
-            |_, destination, _, _, _| {
+            |artifact, destination, _, _, _| {
                 download_calls.set(download_calls.get() + 1);
                 let final_path = destination.join("model.gguf");
                 std::fs::write(&final_path, b"abcdef").unwrap();
-                Ok(DownloadTerminalOutcome::Complete(
+                Ok(completed_download(
+                    artifact,
                     crate::download::DownloadOutcome::Pulled(final_path),
                 ))
             },
@@ -1910,7 +2679,7 @@ fn installed_completion_cleanup_reaudits_exact_final_before_catalog_mutation() {
             catalog_plan.state(),
             crate::catalog::transfer::CatalogTransferState::InstalledCompletionDebris
         );
-        let initial_artifact = match crate::download::plan::plan_artifact_transfer(
+        let mut initial_artifact = match crate::download::plan::plan_artifact_transfer(
             lock.model_directory(),
             &model_dir,
             artifact.size(),
@@ -1934,6 +2703,7 @@ fn installed_completion_cleanup_reaudits_exact_final_before_catalog_mutation() {
             &model_dir,
             &manifest,
             &artifact,
+            &mut initial_artifact,
             &catalog_plan,
         )
         .unwrap_err();
@@ -1972,7 +2742,7 @@ fn fresh_reentry_after_each_pending_staging_promotion_publication_and_temp_check
         |_| {},
         |_| Ok((u64::MAX, 1)),
         || None,
-        |_, model_dir, _, _, _| {
+        |artifact, model_dir, _, _, _| {
             assert_eq!(
                 std::fs::read(model_dir.join("model.gguf.part")).unwrap(),
                 b"abc"
@@ -1982,7 +2752,8 @@ fn fresh_reentry_after_each_pending_staging_promotion_publication_and_temp_check
             std::fs::remove_file(model_dir.join("model.gguf.part")).unwrap();
             let final_path = model_dir.join("model.gguf");
             std::fs::write(&final_path, b"abcdef").unwrap();
-            Ok(DownloadTerminalOutcome::Complete(
+            Ok(completed_download(
+                artifact,
                 crate::download::DownloadOutcome::Pulled(final_path),
             ))
         },
