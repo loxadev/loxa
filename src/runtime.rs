@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System, UpdateKind};
 
 const LEGACY_LEASE_VERSION: u32 = 1;
-const LEASE_VERSION: u32 = 2;
+const PERSISTENT_LEASE_VERSION: u32 = 2;
+const LEASE_VERSION: u32 = 3;
 const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const OBSERVER_TEARDOWN_GRACE: Duration = Duration::from_millis(500);
 static LEASE_STATE_IO: Mutex<()> = Mutex::new(());
@@ -21,6 +22,43 @@ static LEASE_STATE_IO: Mutex<()> = Mutex::new(());
 static LOCAL_FOREGROUND_LOCKS: Mutex<Vec<LocalForegroundLockKey>> = Mutex::new(Vec::new());
 #[cfg(unix)]
 static LOCAL_FOREGROUND_LOCK_OPERATIONS: Mutex<()> = Mutex::new(());
+#[cfg(all(test, unix))]
+static FAIL_NEXT_OWNED_GROUP_TERMINATIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(all(test, unix))]
+pub(crate) struct OwnedGroupTerminationFaultReset;
+
+#[cfg(all(test, unix))]
+impl Drop for OwnedGroupTerminationFaultReset {
+    fn drop(&mut self) {
+        FAIL_NEXT_OWNED_GROUP_TERMINATIONS.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn fail_next_owned_group_terminations_for_test(
+    count: usize,
+) -> OwnedGroupTerminationFaultReset {
+    FAIL_NEXT_OWNED_GROUP_TERMINATIONS.store(count, std::sync::atomic::Ordering::SeqCst);
+    OwnedGroupTerminationFaultReset
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn inject_owned_group_termination_failure_for_test() -> Result<(), String> {
+    let failed = FAIL_NEXT_OWNED_GROUP_TERMINATIONS
+        .fetch_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |remaining| remaining.checked_sub(1),
+        )
+        .is_ok();
+    if failed {
+        Err("injected owned process-group termination failure".into())
+    } else {
+        Ok(())
+    }
+}
 
 fn lock_lease_state() -> Result<MutexGuard<'static, ()>, String> {
     LEASE_STATE_IO
@@ -52,6 +90,7 @@ struct RuntimeLease {
     version: u32,
     owner_mode: Option<LeaseOwnerMode>,
     fingerprint: Option<RuntimeFingerprint>,
+    managed_source: Option<PathBuf>,
     owner_pid: u32,
     owner_start_time: u64,
     child_pid: u32,
@@ -98,9 +137,35 @@ struct RuntimeLeaseV2 {
     port: u16,
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeLeaseV3 {
+    version: u32,
+    owner_mode: LeaseOwnerMode,
+    #[serde(deserialize_with = "deserialize_explicit_fingerprint")]
+    fingerprint: Option<RuntimeFingerprint>,
+    #[serde(deserialize_with = "deserialize_explicit_managed_source")]
+    managed_source: Option<PathBuf>,
+    owner_pid: u32,
+    owner_start_time: u64,
+    child_pid: u32,
+    child_start_time: u64,
+    child_pgid: i32,
+    server: PathBuf,
+    model_id: String,
+    port: u16,
+}
+
 fn deserialize_explicit_fingerprint<'de, D>(
     deserializer: D,
 ) -> Result<Option<RuntimeFingerprint>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::deserialize(deserializer)
+}
+
+fn deserialize_explicit_managed_source<'de, D>(deserializer: D) -> Result<Option<PathBuf>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -115,11 +180,17 @@ impl RuntimeLease {
 
     fn persistent_fingerprint(&self) -> Option<&RuntimeFingerprint> {
         match (self.version, self.owner_mode, self.fingerprint.as_ref()) {
-            (LEASE_VERSION, Some(LeaseOwnerMode::PersistentApp), Some(fingerprint)) => {
-                Some(fingerprint)
-            }
+            (
+                PERSISTENT_LEASE_VERSION | LEASE_VERSION,
+                Some(LeaseOwnerMode::PersistentApp),
+                Some(fingerprint),
+            ) => Some(fingerprint),
             _ => None,
         }
+    }
+
+    fn attributed_managed_source(&self) -> &Path {
+        self.managed_source.as_deref().unwrap_or(&self.server)
     }
 }
 
@@ -446,11 +517,13 @@ fn exact_live_provenance(
     {
         return Ok(None);
     }
-    Ok(Some(if child.executable == managed_server {
-        RuntimeProvenance::Managed
-    } else {
-        RuntimeProvenance::External
-    }))
+    Ok(Some(
+        if lease.attributed_managed_source() == managed_server {
+            RuntimeProvenance::Managed
+        } else {
+            RuntimeProvenance::External
+        },
+    ))
 }
 
 #[derive(Deserialize)]
@@ -702,7 +775,11 @@ impl RuntimeOwnership {
         // Keep `operation` until the fallible reconciliation has completed.
         // On an error or panic, `foreground_lock` drops first, which closes the
         // traditional descriptor before releasing its local reservation.
+        #[cfg(unix)]
+        reconcile_interrupted_execution_builds(run_dir)?;
         reconcile_state(&state_path).map_err(RuntimeOwnershipAcquireError::Failed)?;
+        #[cfg(unix)]
+        reconcile_unleased_execution_stages(run_dir)?;
         #[cfg(unix)]
         drop(operation);
 
@@ -719,6 +796,7 @@ impl RuntimeOwnership {
         child_pgid: i32,
         model_id: &str,
         port: u16,
+        managed_source: Option<&Path>,
         publication: RuntimeLeasePublication<'_>,
     ) -> Result<(), String> {
         let owner_pid = std::process::id();
@@ -740,6 +818,7 @@ impl RuntimeOwnership {
             version: LEASE_VERSION,
             owner_mode: Some(owner_mode),
             fingerprint,
+            managed_source: managed_source.map(Path::to_path_buf),
             owner_pid,
             owner_start_time: owner.start_identity,
             child_pid,
@@ -762,6 +841,12 @@ impl RuntimeOwnership {
         let _state_guard = lock_lease_state()?;
         match read_lease(&self.state_path) {
             Ok(current) if current == *expected => {
+                cleanup_recorded_execution_stage(
+                    self.state_path
+                        .parent()
+                        .expect("runtime lease has a run-directory parent"),
+                    expected,
+                )?;
                 fs::remove_file(&self.state_path)
                     .map_err(|error| format!("{}: {error}", self.state_path.display()))?;
                 self.lease = None;
@@ -778,6 +863,36 @@ impl RuntimeOwnership {
             Err(error) => Err(error),
         }
     }
+}
+
+#[cfg(unix)]
+fn reconcile_interrupted_execution_builds(
+    run_dir: &Path,
+) -> Result<(), RuntimeOwnershipAcquireError> {
+    let builds = crate::runtime_bundle::recoverable_execution_builds(run_dir)
+        .map_err(RuntimeOwnershipAcquireError::Failed)?;
+    for build in builds {
+        let (owner_pid, owner_start) = build.owner();
+        if process_snapshot(owner_pid)
+            .map_err(RuntimeOwnershipAcquireError::Failed)?
+            .is_some_and(|owner| owner.start_identity == owner_start)
+        {
+            continue;
+        }
+        build
+            .ensure_current()
+            .map_err(RuntimeOwnershipAcquireError::Failed)?;
+        if process_snapshot(owner_pid)
+            .map_err(RuntimeOwnershipAcquireError::Failed)?
+            .is_some_and(|owner| owner.start_identity == owner_start)
+        {
+            continue;
+        }
+        build
+            .cleanup()
+            .map_err(RuntimeOwnershipAcquireError::Failed)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn clear_terminated_owned_lease(
@@ -807,6 +922,7 @@ pub(crate) fn clear_terminated_owned_lease(
             state_path.display()
         ));
     }
+    cleanup_recorded_execution_stage(run_dir, &lease)?;
     match fs::remove_file(&state_path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -1063,14 +1179,141 @@ fn reconcile_state(state_path: &Path) -> Result<(), String> {
                 .map_err(|error| format!("{}: {error}", state_path.display()))
         }
     };
-    reconcile(&stale)?;
+    if reconcile(
+        &stale,
+        state_path
+            .parent()
+            .expect("runtime lease has a run-directory parent"),
+    )? {
+        cleanup_recorded_execution_stage(
+            state_path
+                .parent()
+                .expect("runtime lease has a run-directory parent"),
+            &stale,
+        )?;
+    }
     fs::remove_file(state_path).map_err(|error| format!("{}: {error}", state_path.display()))
 }
 
-fn reconcile(lease: &RuntimeLease) -> Result<(), String> {
+#[cfg(unix)]
+fn reconcile_unleased_execution_stages(run_dir: &Path) -> Result<(), RuntimeOwnershipAcquireError> {
+    let stages = crate::runtime_bundle::recoverable_execution_stages(run_dir)
+        .map_err(RuntimeOwnershipAcquireError::Failed)?;
+    for mut stage in stages {
+        let (owner_pid, owner_start) = stage.owner();
+        if process_snapshot(owner_pid)
+            .map_err(RuntimeOwnershipAcquireError::Failed)?
+            .is_some_and(|owner| owner.start_identity == owner_start)
+            && !stage.is_abandoned()
+        {
+            continue;
+        }
+        if !stage
+            .lock_and_refresh()
+            .map_err(RuntimeOwnershipAcquireError::Failed)?
+        {
+            return Err(RuntimeOwnershipAcquireError::Conflict);
+        }
+        if process_snapshot(owner_pid)
+            .map_err(RuntimeOwnershipAcquireError::Failed)?
+            .is_some_and(|owner| owner.start_identity == owner_start)
+            && !stage.is_abandoned()
+        {
+            continue;
+        }
+        let Some((child_pid, child_group)) = stage.child() else {
+            stage
+                .cleanup()
+                .map_err(RuntimeOwnershipAcquireError::Failed)?;
+            continue;
+        };
+        stage
+            .ensure_current()
+            .map_err(RuntimeOwnershipAcquireError::Failed)?;
+        match process_snapshot(child_pid).map_err(RuntimeOwnershipAcquireError::Failed)? {
+            Some(child) => {
+                let observed_group =
+                    process_group(child_pid).map_err(RuntimeOwnershipAcquireError::Failed)?;
+                if child.executable == stage.server() && observed_group == child_group {
+                    #[cfg(all(test, target_os = "macos"))]
+                    if FAIL_NEXT_EXECUTION_STAGE_TERMINATION
+                        .swap(false, std::sync::atomic::Ordering::SeqCst)
+                    {
+                        return Err(RuntimeOwnershipAcquireError::Failed(
+                            "injected prepared runtime termination failure".into(),
+                        ));
+                    }
+                    terminate_stale_process_group(child_group)
+                        .map_err(RuntimeOwnershipAcquireError::Failed)?;
+                } else {
+                    #[cfg(test)]
+                    eprintln!(
+                        "prepared recovery identity: executable={:?}, expected={:?}, group={observed_group}, expected_group={child_group}",
+                        child.executable,
+                        stage.server()
+                    );
+                    return Err(RuntimeOwnershipAcquireError::Failed(
+                        "prepared runtime recovery child identity does not match".into(),
+                    ));
+                }
+            }
+            None if process_group_has_live_members(child_group)
+                .map_err(RuntimeOwnershipAcquireError::Failed)? =>
+            {
+                return Err(RuntimeOwnershipAcquireError::Failed(
+                    "prepared runtime recovery group has no matching leader".into(),
+                ));
+            }
+            None => {}
+        }
+        if process_group_has_live_members(child_group)
+            .map_err(RuntimeOwnershipAcquireError::Failed)?
+        {
+            return Err(RuntimeOwnershipAcquireError::Failed(
+                "prepared runtime recovery group is still active".into(),
+            ));
+        }
+        stage
+            .cleanup()
+            .map_err(RuntimeOwnershipAcquireError::Failed)?;
+    }
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+static FAIL_NEXT_EXECUTION_STAGE_TERMINATION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) struct ExecutionStageTerminationFaultReset;
+
+#[cfg(all(test, target_os = "macos"))]
+impl Drop for ExecutionStageTerminationFaultReset {
+    fn drop(&mut self) {
+        FAIL_NEXT_EXECUTION_STAGE_TERMINATION.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn fail_next_execution_stage_termination_for_test() -> ExecutionStageTerminationFaultReset
+{
+    FAIL_NEXT_EXECUTION_STAGE_TERMINATION.store(true, std::sync::atomic::Ordering::SeqCst);
+    ExecutionStageTerminationFaultReset
+}
+
+fn reconcile(lease: &RuntimeLease, run_dir: &Path) -> Result<bool, String> {
     validate_lease(lease)?;
+    #[cfg(unix)]
+    let abandoned_stage = lease.managed_source.is_some()
+        && crate::runtime_bundle::execution_stage_is_abandoned(run_dir, &lease.server)?;
+    #[cfg(not(unix))]
+    let abandoned_stage = {
+        let _ = run_dir;
+        false
+    };
     if process_snapshot(lease.owner_pid)?
         .is_some_and(|owner| owner.start_identity == lease.owner_start_time)
+        && !abandoned_stage
     {
         return Err("another Loxa runtime owns the recorded llama-server".into());
     }
@@ -1079,20 +1322,61 @@ fn reconcile(lease: &RuntimeLease) -> Result<(), String> {
             || child.executable != lease.server
             || process_group(lease.child_pid)? != lease.child_pgid
         {
-            return Ok(());
+            return Ok(false);
         }
     } else if !process_group_exists(lease.child_pgid)? {
+        return Ok(true);
+    }
+    terminate_stale_process_group(lease.child_pgid)?;
+    Ok(true)
+}
+
+fn cleanup_recorded_execution_stage(run_dir: &Path, lease: &RuntimeLease) -> Result<(), String> {
+    if lease.managed_source.is_none() {
         return Ok(());
     }
-    terminate_stale_process_group(lease.child_pgid)
+    if process_group_has_live_members(lease.child_pgid)? {
+        return Err("llama-server process group is still active during stage cleanup".into());
+    }
+    #[cfg(unix)]
+    {
+        crate::runtime_bundle::cleanup_execution_stage(run_dir, &lease.server)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (run_dir, lease);
+        Ok(())
+    }
 }
 
 fn validate_lease(lease: &RuntimeLease) -> Result<(), String> {
     let version_and_owner_are_valid = matches!(
-        (lease.version, lease.owner_mode, lease.fingerprint.as_ref()),
-        (LEGACY_LEASE_VERSION, None, None)
-            | (LEASE_VERSION, Some(LeaseOwnerMode::Foreground), None)
-            | (LEASE_VERSION, Some(LeaseOwnerMode::PersistentApp), Some(_))
+        (
+            lease.version,
+            lease.owner_mode,
+            lease.fingerprint.as_ref(),
+            lease.managed_source.as_ref(),
+        ),
+        (LEGACY_LEASE_VERSION, None, None, None)
+            | (
+                PERSISTENT_LEASE_VERSION,
+                Some(LeaseOwnerMode::Foreground),
+                None,
+                None
+            )
+            | (
+                PERSISTENT_LEASE_VERSION,
+                Some(LeaseOwnerMode::PersistentApp),
+                Some(_),
+                None,
+            )
+            | (LEASE_VERSION, Some(LeaseOwnerMode::Foreground), None, _)
+            | (
+                LEASE_VERSION,
+                Some(LeaseOwnerMode::PersistentApp),
+                Some(_),
+                _,
+            )
     );
     if !version_and_owner_are_valid
         || lease.owner_pid == 0
@@ -1102,6 +1386,10 @@ fn validate_lease(lease: &RuntimeLease) -> Result<(), String> {
         || lease.owner_start_time == 0
         || lease.child_start_time == 0
         || lease.server.as_os_str().is_empty()
+        || lease
+            .managed_source
+            .as_ref()
+            .is_some_and(|source| !source.is_absolute() || source.as_os_str().is_empty())
         || lease.model_id.is_empty()
         || lease.port == 0
     {
@@ -1168,6 +1456,25 @@ fn decode_lease(bytes: &[u8]) -> Result<RuntimeLease, String> {
                 version: lease.version,
                 owner_mode: None,
                 fingerprint: None,
+                managed_source: None,
+                owner_pid: lease.owner_pid,
+                owner_start_time: lease.owner_start_time,
+                child_pid: lease.child_pid,
+                child_start_time: lease.child_start_time,
+                child_pgid: lease.child_pgid,
+                server: lease.server,
+                model_id: lease.model_id,
+                port: lease.port,
+            }
+        }
+        PERSISTENT_LEASE_VERSION => {
+            let lease: RuntimeLeaseV2 =
+                serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+            RuntimeLease {
+                version: lease.version,
+                owner_mode: Some(lease.owner_mode),
+                fingerprint: lease.fingerprint,
+                managed_source: None,
                 owner_pid: lease.owner_pid,
                 owner_start_time: lease.owner_start_time,
                 child_pid: lease.child_pid,
@@ -1179,12 +1486,13 @@ fn decode_lease(bytes: &[u8]) -> Result<RuntimeLease, String> {
             }
         }
         LEASE_VERSION => {
-            let lease: RuntimeLeaseV2 =
+            let lease: RuntimeLeaseV3 =
                 serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
             RuntimeLease {
                 version: lease.version,
                 owner_mode: Some(lease.owner_mode),
                 fingerprint: lease.fingerprint,
+                managed_source: lease.managed_source,
                 owner_pid: lease.owner_pid,
                 owner_start_time: lease.owner_start_time,
                 child_pid: lease.child_pid,
@@ -1232,7 +1540,7 @@ fn map_runtime_lease_read_error(path: &Path, error: std::io::Error) -> String {
 
 fn write_lease(path: &Path, lease: &RuntimeLease) -> Result<(), String> {
     let temporary = path.with_extension("json.tmp");
-    let bytes = encode_v2_lease(lease)?;
+    let bytes = encode_v3_lease(lease)?;
     let mut options = OpenOptions::new();
     options.create(true).truncate(true).write(true);
     #[cfg(unix)]
@@ -1249,18 +1557,19 @@ fn write_lease(path: &Path, lease: &RuntimeLease) -> Result<(), String> {
     fs::rename(&temporary, path).map_err(|error| format!("{}: {error}", path.display()))
 }
 
-fn encode_v2_lease(lease: &RuntimeLease) -> Result<Vec<u8>, String> {
+fn encode_v3_lease(lease: &RuntimeLease) -> Result<Vec<u8>, String> {
     validate_lease(lease)?;
     if lease.version != LEASE_VERSION {
         return Err("legacy runtime leases cannot be published".into());
     }
     let owner_mode = lease
         .owner_mode
-        .ok_or_else(|| "v2 runtime lease owner mode is missing".to_string())?;
-    let wire = RuntimeLeaseV2 {
+        .ok_or_else(|| "v3 runtime lease owner mode is missing".to_string())?;
+    let wire = RuntimeLeaseV3 {
         version: lease.version,
         owner_mode,
         fingerprint: lease.fingerprint.clone(),
+        managed_source: lease.managed_source.clone(),
         owner_pid: lease.owner_pid,
         owner_start_time: lease.owner_start_time,
         child_pid: lease.child_pid,
@@ -1284,6 +1593,14 @@ fn process_snapshot(pid: u32) -> Result<Option<ProcessSnapshot>, String> {
             .with_exe(UpdateKind::OnlyIfNotSet),
     );
     process_snapshot_from_refreshed_system(&system, pid)
+}
+
+#[cfg(unix)]
+pub(crate) fn current_process_start_identity() -> Result<u64, String> {
+    let pid = std::process::id();
+    process_snapshot(pid)?
+        .map(|process| process.start_identity)
+        .ok_or_else(|| "failed to identify the Loxa process".to_string())
 }
 
 fn process_snapshot_from_refreshed_system(
@@ -1368,16 +1685,38 @@ fn process_group(pid: u32) -> Result<i32, String> {
 }
 
 pub(crate) fn terminate_process_group(child: &mut Child, group: i32) -> Result<(), String> {
+    #[cfg(test)]
+    inject_owned_group_termination_failure_for_test()?;
     signal_process_group(group, libc::SIGTERM)?;
     let deadline = Instant::now() + STOP_TIMEOUT;
     while Instant::now() < deadline {
         let _ = child.try_wait().map_err(|error| error.to_string())?;
-        if !process_group_exists(group)? {
+        if !process_group_has_live_members(group)? {
             let _ = child.wait().map_err(|error| error.to_string())?;
             return Ok(());
         }
         thread::sleep(Duration::from_millis(20));
     }
+    signal_process_group(group, libc::SIGKILL)?;
+    let deadline = Instant::now() + STOP_TIMEOUT;
+    while Instant::now() < deadline {
+        let _ = child.try_wait().map_err(|error| error.to_string())?;
+        if !process_group_has_live_members(group)? {
+            let _ = child.wait().map_err(|error| error.to_string())?;
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    Err("owned process group survived SIGKILL".into())
+}
+
+#[cfg(unix)]
+pub(crate) fn terminate_process_group_immediately(
+    child: &mut Child,
+    group: i32,
+) -> Result<(), String> {
+    #[cfg(test)]
+    inject_owned_group_termination_failure_for_test()?;
     signal_process_group(group, libc::SIGKILL)?;
     let deadline = Instant::now() + STOP_TIMEOUT;
     while Instant::now() < deadline {
@@ -1442,7 +1781,7 @@ fn process_group_exists(group: i32) -> Result<bool, String> {
     }
 }
 
-fn process_group_has_live_members(group: i32) -> Result<bool, String> {
+pub(crate) fn process_group_has_live_members(group: i32) -> Result<bool, String> {
     let mut system = System::new();
     system.refresh_processes(ProcessesToUpdate::All, true);
     for (pid, process) in system.processes() {
@@ -1526,7 +1865,7 @@ mod tests {
             expected["fingerprint"]
         );
         assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&encode_v2_lease(&lease).unwrap()).unwrap(),
+            serde_json::from_slice::<serde_json::Value>(&encode_v2_lease_fixture(&lease)).unwrap(),
             expected
         );
 
@@ -1545,7 +1884,7 @@ mod tests {
         let mut unknown_fingerprint_field = expected.clone();
         unknown_fingerprint_field["fingerprint"]["unexpected"] = serde_json::json!(true);
         let mut unsupported_version = expected.clone();
-        unsupported_version["version"] = serde_json::json!(3);
+        unsupported_version["version"] = serde_json::json!(99);
         let mut unknown_owner_mode = expected.clone();
         unknown_owner_mode["owner_mode"] = serde_json::json!("background");
         let mut persistent_without_fingerprint = expected.clone();
@@ -1590,6 +1929,101 @@ mod tests {
     }
 
     #[test]
+    fn v2_staged_process_remains_readable_but_does_not_invent_managed_provenance() {
+        let mut child = spawn_observable_server("demo", 43123);
+        let observed = observed_lease(&child, "demo", 43123);
+        let mut wire = lease_value(2);
+        wire["owner_mode"] = serde_json::json!("foreground");
+        wire["fingerprint"] = serde_json::Value::Null;
+        wire["owner_pid"] = serde_json::json!(observed.owner_pid);
+        wire["owner_start_time"] = serde_json::json!(observed.owner_start_time);
+        wire["child_pid"] = serde_json::json!(observed.child_pid);
+        wire["child_start_time"] = serde_json::json!(observed.child_start_time);
+        wire["child_pgid"] = serde_json::json!(observed.child_pgid);
+        wire["server"] = serde_json::json!(observed.server);
+
+        let decoded = decode_lease(&serde_json::to_vec(&wire).unwrap()).unwrap();
+        assert_eq!(decoded.managed_source.as_deref(), None);
+        assert_eq!(decoded.server, observed.server);
+        assert_eq!(
+            exact_live_provenance(&decoded, Path::new("/managed/llama-server")).unwrap(),
+            Some(RuntimeProvenance::External),
+            "a v2 lease cannot safely attribute a staged executable to a canonical source"
+        );
+
+        let group = i32::try_from(child.id()).unwrap();
+        terminate_process_group(&mut child, group).unwrap();
+    }
+
+    #[test]
+    fn v3_wire_separates_exact_process_identity_from_managed_source() {
+        let mut child = spawn_observable_server("demo", 43123);
+        let observed = observed_lease(&child, "demo", 43123);
+        let managed = PathBuf::from("/managed/llama-server");
+        let mut wire = lease_value(3);
+        wire["owner_mode"] = serde_json::json!("foreground");
+        wire["fingerprint"] = serde_json::Value::Null;
+        wire["managed_source"] = serde_json::json!(managed);
+        wire["owner_pid"] = serde_json::json!(observed.owner_pid);
+        wire["owner_start_time"] = serde_json::json!(observed.owner_start_time);
+        wire["child_pid"] = serde_json::json!(observed.child_pid);
+        wire["child_start_time"] = serde_json::json!(observed.child_start_time);
+        wire["child_pgid"] = serde_json::json!(observed.child_pgid);
+        wire["server"] = serde_json::json!(observed.server);
+
+        let decoded = decode_lease(&serde_json::to_vec(&wire).unwrap()).unwrap();
+        assert_eq!(decoded.server, observed.server);
+        assert_eq!(decoded.managed_source.as_deref(), Some(managed.as_path()));
+        assert_eq!(
+            exact_live_provenance(&decoded, &managed).unwrap(),
+            Some(RuntimeProvenance::Managed)
+        );
+        assert_eq!(
+            exact_live_provenance(&decoded, Path::new("/other/llama-server")).unwrap(),
+            Some(RuntimeProvenance::External),
+            "a mismatched canonical source must not be reported as managed"
+        );
+
+        let mut forged_process_identity = decoded.clone();
+        forged_process_identity.server = PathBuf::from("/managed/llama-server");
+        assert_eq!(
+            exact_live_provenance(&forged_process_identity, &managed).unwrap(),
+            None,
+            "canonical-source metadata must not replace exact child-process identity"
+        );
+
+        let group = i32::try_from(child.id()).unwrap();
+        terminate_process_group(&mut child, group).unwrap();
+    }
+
+    #[test]
+    fn v3_wire_requires_an_explicit_absolute_managed_source() {
+        let mut valid = lease_value(3);
+        valid["owner_mode"] = serde_json::json!("foreground");
+        valid["fingerprint"] = serde_json::Value::Null;
+        valid["managed_source"] = serde_json::Value::Null;
+        assert!(decode_lease(&serde_json::to_vec(&valid).unwrap()).is_ok());
+
+        let mut missing = valid.clone();
+        missing.as_object_mut().unwrap().remove("managed_source");
+        let mut relative = valid.clone();
+        relative["managed_source"] = serde_json::json!("relative/llama-server");
+        let mut empty = valid;
+        empty["managed_source"] = serde_json::json!("");
+
+        for (name, invalid) in [
+            ("missing managed source", missing),
+            ("relative managed source", relative),
+            ("empty managed source", empty),
+        ] {
+            assert!(
+                decode_lease(&serde_json::to_vec(&invalid).unwrap()).is_err(),
+                "accepted {name}"
+            );
+        }
+    }
+
+    #[test]
     fn exclusive_recovery_discards_untrusted_regular_state_without_using_embedded_identities() {
         let mut child = spawn_sleep();
         let pid = child.id();
@@ -1603,7 +2037,7 @@ mod tests {
         v1["child_pgid"] = serde_json::json!(group);
         v1["server"] = serde_json::json!(snapshot.executable);
         let mut v2 = v1.clone();
-        v2["version"] = serde_json::json!(LEASE_VERSION);
+        v2["version"] = serde_json::json!(PERSISTENT_LEASE_VERSION);
         v2["owner_mode"] = serde_json::json!("foreground");
         v2["fingerprint"] = serde_json::Value::Null;
 
@@ -1762,6 +2196,7 @@ while :; do sleep 60; done"#,
             version: LEASE_VERSION,
             owner_mode: Some(LeaseOwnerMode::Foreground),
             fingerprint: None,
+            managed_source: None,
             owner_pid: std::process::id(),
             owner_start_time: owner.start_identity,
             child_pid,
@@ -1774,8 +2209,8 @@ while :; do sleep 60; done"#,
     }
 
     fn write_lease_fixture(path: &Path, lease: &RuntimeLease) {
-        let bytes = if lease.version == LEGACY_LEASE_VERSION {
-            serde_json::to_vec_pretty(&RuntimeLeaseV1 {
+        let bytes = match lease.version {
+            LEGACY_LEASE_VERSION => serde_json::to_vec_pretty(&RuntimeLeaseV1 {
                 version: lease.version,
                 owner_pid: lease.owner_pid,
                 owner_start_time: lease.owner_start_time,
@@ -1786,9 +2221,10 @@ while :; do sleep 60; done"#,
                 model_id: lease.model_id.clone(),
                 port: lease.port,
             })
-            .unwrap()
-        } else {
-            encode_v2_lease_fixture(lease)
+            .unwrap(),
+            PERSISTENT_LEASE_VERSION => encode_v2_lease_fixture(lease),
+            LEASE_VERSION => encode_v3_lease(lease).unwrap(),
+            version => panic!("unsupported runtime lease fixture version {version}"),
         };
         fs::write(path, bytes).unwrap();
     }
@@ -2145,7 +2581,7 @@ while :; do sleep 60; done"#,
         let decoded = read_lease(&state_path).unwrap();
         assert_eq!(decoded.owner_mode(), None);
         assert!(decoded.persistent_fingerprint().is_none());
-        assert!(encode_v2_lease(&decoded).is_err());
+        assert!(encode_v3_lease(&decoded).is_err());
         let mut observer = ForegroundObserver::new(dir.path().to_path_buf());
         assert_eq!(
             observer.observe(Path::new("/managed/llama-server")),
@@ -2171,12 +2607,24 @@ while :; do sleep 60; done"#,
             ("v1", LEGACY_LEASE_VERSION, None, None),
             (
                 "v2 foreground",
-                LEASE_VERSION,
+                PERSISTENT_LEASE_VERSION,
                 Some(LeaseOwnerMode::Foreground),
                 None,
             ),
             (
                 "v2 persistent",
+                PERSISTENT_LEASE_VERSION,
+                Some(LeaseOwnerMode::PersistentApp),
+                Some(fingerprint.clone()),
+            ),
+            (
+                "v3 foreground",
+                LEASE_VERSION,
+                Some(LeaseOwnerMode::Foreground),
+                None,
+            ),
+            (
+                "v3 persistent",
                 LEASE_VERSION,
                 Some(LeaseOwnerMode::PersistentApp),
                 Some(fingerprint),
@@ -2190,6 +2638,7 @@ while :; do sleep 60; done"#,
                 version,
                 owner_mode,
                 fingerprint,
+                managed_source: None,
                 ..base.clone()
             };
             write_lease_fixture(&state_path, &lease);
@@ -2222,7 +2671,7 @@ while :; do sleep 60; done"#,
         unsupported["fingerprint"] = fingerprint_value();
         let mut malformed_v1 = lease_value(LEGACY_LEASE_VERSION);
         malformed_v1["unexpected"] = serde_json::json!(true);
-        let mut malformed_v2 = lease_value(LEASE_VERSION);
+        let mut malformed_v2 = lease_value(PERSISTENT_LEASE_VERSION);
         malformed_v2["owner_mode"] = serde_json::json!("foreground");
         let cases = [
             ("malformed JSON", b"not JSON".to_vec()),
@@ -2411,6 +2860,99 @@ while :; do sleep 60; done"#,
         false
     }
 
+    fn staged_sleep(run_dir: &Path, token: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let stage = run_dir.join(format!(".bundled-runtime-exec-{token}"));
+        let server = stage.join("Contents/MacOS/llama-server");
+        fs::create_dir_all(server.parent().unwrap()).unwrap();
+        fs::set_permissions(&stage, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::copy("/bin/sleep", &server).unwrap();
+        fs::set_permissions(&server, fs::Permissions::from_mode(0o555)).unwrap();
+        (stage, server)
+    }
+
+    #[test]
+    fn graceful_clear_removes_only_the_exact_recorded_execution_stage() {
+        let dir = tempdir().unwrap();
+        let run_dir = dir.path().join("run");
+        let (stage, server) = staged_sleep(&run_dir, "0123456789abcdef0123456789abcdef");
+        let neighbor = run_dir.join(".bundled-runtime-exec-0123456789abcdef0123456789abcdeg");
+        fs::create_dir_all(&neighbor).unwrap();
+        let mut child = Command::new(&server)
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let group = i32::try_from(child.id()).unwrap();
+        let mut ownership = RuntimeOwnership::acquire(&run_dir).unwrap();
+        ownership
+            .record(
+                child.id(),
+                group,
+                "demo",
+                43123,
+                Some(Path::new(
+                    "/Applications/Loxa.app/Contents/MacOS/llama-server",
+                )),
+                RuntimeLeasePublication::Foreground,
+            )
+            .unwrap();
+
+        terminate_process_group(&mut child, group).unwrap();
+        ownership.clear().unwrap();
+
+        assert!(!stage.exists(), "graceful clear leaked the execution stage");
+        assert!(neighbor.is_dir(), "cleanup removed an adjacent lookalike");
+        assert!(!run_dir.join("foreground.json").exists());
+    }
+
+    #[test]
+    fn stale_recovery_removes_only_the_exact_orphaned_execution_stage() {
+        let dir = tempdir().unwrap();
+        let run_dir = dir.path().join("run");
+        let (stage, server) = staged_sleep(&run_dir, "fedcba9876543210fedcba9876543210");
+        let neighbor = run_dir.join(".bundled-runtime-exec-fedcba9876543210fedcba987654321g");
+        fs::create_dir_all(&neighbor).unwrap();
+        let mut child = Command::new(&server)
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let snapshot = process_snapshot(pid).unwrap().unwrap();
+        let lease = RuntimeLease {
+            version: LEASE_VERSION,
+            owner_mode: Some(LeaseOwnerMode::Foreground),
+            fingerprint: None,
+            managed_source: Some(PathBuf::from(
+                "/Applications/Loxa.app/Contents/MacOS/llama-server",
+            )),
+            owner_pid: u32::MAX,
+            owner_start_time: 1,
+            child_pid: pid,
+            child_start_time: snapshot.start_identity,
+            child_pgid: i32::try_from(pid).unwrap(),
+            server: snapshot.executable,
+            model_id: "demo".into(),
+            port: 43123,
+        };
+        fs::create_dir_all(&run_dir).unwrap();
+        write_lease_fixture(&run_dir.join("foreground.json"), &lease);
+
+        recover_stale(&run_dir).unwrap();
+
+        let gone = wait_until_gone(pid);
+        if !gone {
+            terminate_process_group(&mut child, i32::try_from(pid).unwrap()).unwrap();
+        }
+        assert!(gone, "stale recovery left the exact staged child running");
+        assert!(!stage.exists(), "stale recovery leaked the execution stage");
+        assert!(neighbor.is_dir(), "cleanup removed an adjacent lookalike");
+        assert!(!run_dir.join("foreground.json").exists());
+        let _ = child.wait();
+    }
+
     #[test]
     fn recovery_reconciles_a_prior_300_second_persistent_lease_before_removal() {
         let dir = tempdir().unwrap();
@@ -2424,7 +2966,7 @@ while :; do sleep 60; done"#,
         let snapshot = process_snapshot(pid).unwrap().unwrap();
         let mut fingerprint = fingerprint_value();
         fingerprint["sleep_policy"] = serde_json::json!(300);
-        let mut lease = lease_value(LEASE_VERSION);
+        let mut lease = lease_value(PERSISTENT_LEASE_VERSION);
         lease["owner_mode"] = serde_json::json!("persistent_app");
         lease["fingerprint"] = fingerprint;
         lease["owner_pid"] = serde_json::json!(u32::MAX);
@@ -2461,12 +3003,24 @@ while :; do sleep 60; done"#,
             ("v1", LEGACY_LEASE_VERSION, None, None),
             (
                 "v2 foreground",
-                LEASE_VERSION,
+                PERSISTENT_LEASE_VERSION,
                 Some(LeaseOwnerMode::Foreground),
                 None,
             ),
             (
                 "v2 persistent",
+                PERSISTENT_LEASE_VERSION,
+                Some(LeaseOwnerMode::PersistentApp),
+                Some(persistent.clone()),
+            ),
+            (
+                "v3 foreground",
+                LEASE_VERSION,
+                Some(LeaseOwnerMode::Foreground),
+                None,
+            ),
+            (
+                "v3 persistent",
                 LEASE_VERSION,
                 Some(LeaseOwnerMode::PersistentApp),
                 Some(persistent),
@@ -2480,6 +3034,7 @@ while :; do sleep 60; done"#,
                 version,
                 owner_mode,
                 fingerprint,
+                managed_source: None,
                 owner_pid: u32::MAX,
                 owner_start_time: 1,
                 child_pid: pid,
@@ -2514,6 +3069,7 @@ while :; do sleep 60; done"#,
             version: LEASE_VERSION,
             owner_mode: Some(LeaseOwnerMode::Foreground),
             fingerprint: None,
+            managed_source: None,
             owner_pid: std::process::id(),
             owner_start_time: owner_snapshot.start_identity,
             child_pid: pid,
@@ -2544,6 +3100,7 @@ while :; do sleep 60; done"#,
             version: LEASE_VERSION,
             owner_mode: Some(LeaseOwnerMode::Foreground),
             fingerprint: None,
+            managed_source: None,
             owner_pid: u32::MAX,
             owner_start_time: 1,
             child_pid: pid,
@@ -2569,15 +3126,20 @@ while :; do sleep 60; done"#,
 
     #[test]
     fn acquiring_runtime_never_signals_a_reused_process_identity() {
-        for version in [LEGACY_LEASE_VERSION, LEASE_VERSION] {
+        for version in [
+            LEGACY_LEASE_VERSION,
+            PERSISTENT_LEASE_VERSION,
+            LEASE_VERSION,
+        ] {
             let dir = tempdir().unwrap();
             let mut child = spawn_sleep();
             let pid = child.id();
             let snapshot = process_snapshot(pid).unwrap().unwrap();
             let lease = RuntimeLease {
                 version,
-                owner_mode: (version == LEASE_VERSION).then_some(LeaseOwnerMode::Foreground),
+                owner_mode: (version != LEGACY_LEASE_VERSION).then_some(LeaseOwnerMode::Foreground),
                 fingerprint: None,
+                managed_source: None,
                 owner_pid: u32::MAX,
                 owner_start_time: 1,
                 child_pid: pid,

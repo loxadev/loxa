@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Instant;
 
+use loxa::paths::AppPaths;
 use objc2::rc::{Retained, Weak};
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
@@ -102,6 +103,8 @@ impl NativePopoverState {
         status_item: Retained<NSStatusItem>,
         popover: Retained<NSPopover>,
         content_view_controller: Retained<NSViewController>,
+        #[cfg(not(test))] backend_paths: AppPaths,
+        #[cfg(not(test))] runtime_paths: AppPaths,
         #[cfg(test)] fixture: Fixture,
     ) -> Self {
         #[cfg(test)]
@@ -112,7 +115,7 @@ impl NativePopoverState {
         let api = ApiPresentation::idle();
         #[cfg(not(test))]
         let (api_runtime, api) = {
-            let controller = ApiRuntimeController::start();
+            let controller = ApiRuntimeController::start(runtime_paths);
             let presentation = project_api_presentation(&controller, &snapshot);
             (controller, presentation)
         };
@@ -152,7 +155,7 @@ impl NativePopoverState {
                 }
                 #[cfg(not(test))]
                 {
-                    Some(BackendClient::start())
+                    Some(BackendClient::start(backend_paths))
                 }
             },
             rows: None,
@@ -940,6 +943,8 @@ impl NativePopoverController {
     pub(crate) fn attach(
         status_item: Retained<NSStatusItem>,
         app_handle: AppHandle,
+        _backend_paths: AppPaths,
+        _runtime_paths: AppPaths,
         mtm: MainThreadMarker,
     ) -> Self {
         status_item.setMenu(None);
@@ -962,6 +967,10 @@ impl NativePopoverController {
             status_item.clone(),
             popover.clone(),
             content_view_controller.clone(),
+            #[cfg(not(test))]
+            _backend_paths,
+            #[cfg(not(test))]
+            _runtime_paths,
             #[cfg(test)]
             fixture,
         )));

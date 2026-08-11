@@ -1,11 +1,41 @@
 use std::sync::Mutex;
 
 use dispatch2::MainThreadBound;
+use loxa::paths::AppPaths;
 use objc2::MainThreadMarker;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, ExitRequestApi, Manager, RunEvent, Wry};
 
 use crate::menu::macos::{NativeExitResources, NativePopoverController};
+
+#[derive(Clone)]
+struct ApplicationLaunch {
+    paths: AppPaths,
+}
+
+impl ApplicationLaunch {
+    fn from_process() -> Result<Self, String> {
+        let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+        Ok(Self {
+            paths: AppPaths::from_application_env(&executable)?,
+        })
+    }
+
+    #[cfg(test)]
+    fn from_values(
+        executable: &std::path::Path,
+        explicit: Option<&std::path::Path>,
+        home: Option<&std::path::Path>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            paths: AppPaths::from_application_values(executable, explicit, home)?,
+        })
+    }
+
+    fn worker_paths(&self) -> (AppPaths, AppPaths) {
+        (self.paths.clone(), self.paths.clone())
+    }
+}
 
 struct NativeShell {
     controller: MainThreadBound<NativePopoverController>,
@@ -72,8 +102,11 @@ pub(crate) fn request_native_shell_exit(app_handle: &AppHandle) {
 }
 
 pub(crate) fn run() {
+    let launch = ApplicationLaunch::from_process()
+        .expect("failed to resolve the Loxa application launch paths");
+    let (backend_paths, runtime_paths) = launch.worker_paths();
     let app = crate::native_menu::with_native_edit_menu(tauri::Builder::default())
-        .setup(|app| {
+        .setup(move |app| {
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
             let tray = TrayIconBuilder::with_id("loxa")
@@ -104,7 +137,13 @@ pub(crate) fn run() {
                     .expect("the macOS tray icon must expose an NSStatusItem");
 
                 MainThreadBound::new(
-                    NativePopoverController::attach(status_item, app_handle, mtm),
+                    NativePopoverController::attach(
+                        status_item,
+                        app_handle,
+                        backend_paths,
+                        runtime_paths,
+                        mtm,
+                    ),
                     mtm,
                 )
             })?;
@@ -205,6 +244,10 @@ fn toggle_native_popover_from_tray(app_handle: AppHandle) {
 mod presentation_tests;
 
 #[cfg(test)]
+#[path = "app_runtime_acceptance_tests.rs"]
+mod runtime_acceptance_tests;
+
+#[cfg(test)]
 mod lifecycle_tests {
     use std::cell::{Cell, RefCell};
     use std::sync::Mutex;
@@ -213,7 +256,6 @@ mod lifecycle_tests {
     use crate::menu::api_runtime::idle_controller_for_exit_test;
     use crate::menu::macos::{exit_resources_api, exit_resources_for_test};
     use crate::menu::observation::backend_client_panicking_on_shutdown;
-
     #[test]
     fn quit_requests_exit_without_synchronous_native_teardown() {
         let events = RefCell::new(Vec::new());

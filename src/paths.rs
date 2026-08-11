@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use crate::runtime_identity::RuntimeIdentity;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppPaths {
     pub root: PathBuf,
@@ -9,6 +11,8 @@ pub struct AppPaths {
     pub logs: PathBuf,
     pub runtimes: PathBuf,
     pub managed_server: PathBuf,
+    pub runtime_identity: RuntimeIdentity,
+    pub runtime_inventory: Option<PathBuf>,
 }
 
 impl AppPaths {
@@ -38,15 +42,54 @@ impl AppPaths {
             run: root.join("run"),
             logs: root.join("logs"),
             managed_server: runtimes.join("llama.cpp/b10121/llama-server"),
+            runtime_identity: RuntimeIdentity::LegacyCliB10121,
+            runtime_inventory: None,
             runtimes,
             root,
         })
+    }
+
+    pub fn from_application_values(
+        executable: &Path,
+        explicit: Option<&Path>,
+        home: Option<&Path>,
+    ) -> Result<Self, String> {
+        let mut paths = Self::from_values(explicit, home)?;
+        let Some(contents) = application_contents(executable) else {
+            return Ok(paths);
+        };
+        paths.managed_server = contents.join("MacOS/llama-server");
+        paths.runtime_identity = RuntimeIdentity::BundledB10344;
+        paths.runtime_inventory =
+            Some(contents.join("Resources/loxa-runtime/b10344/inventory.json"));
+        Ok(paths)
+    }
+
+    pub fn from_application_env(executable: &Path) -> Result<Self, String> {
+        let explicit = std::env::var_os("LOXA_HOME").map(PathBuf::from);
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from);
+        Self::from_application_values(executable, explicit.as_deref(), home.as_deref())
     }
 
     pub fn model_dir(&self, id: &str) -> Result<PathBuf, String> {
         validate_id(id)?;
         Ok(self.models.join(id))
     }
+}
+
+fn application_contents(executable: &Path) -> Option<&Path> {
+    let macos = executable.parent()?;
+    if macos.file_name()? != "MacOS" {
+        return None;
+    }
+    let contents = macos.parent()?;
+    if contents.file_name()? != "Contents" {
+        return None;
+    }
+    let app = contents.parent()?;
+    (app.extension()? == "app").then_some(contents)
 }
 
 pub(crate) fn validate_id(id: &str) -> Result<(), String> {

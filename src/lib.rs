@@ -6,6 +6,9 @@ pub mod cli;
 pub mod config;
 mod diagnostics;
 pub mod discovery;
+#[cfg(unix)]
+pub mod runtime_bundle;
+pub mod runtime_identity;
 #[cfg(test)]
 mod discovery_public_contract_tests {
     use crate::app::AppService;

@@ -353,7 +353,14 @@ fn qualified_target(manifest: &Manifest, qualification: &BundleQualification) ->
         3 => {
             manifest.profile.as_deref() == Some(qualification.profile.as_str())
                 && manifest.runtime.as_ref().is_some_and(|runtime| {
-                    runtime.engine == "llama.cpp" && runtime.build == qualification.build
+                    runtime.engine == "llama.cpp"
+                        && if qualification.profile == GEMMA4_MTP_PROFILE
+                            && qualification.build == GEMMA4_LLAMA_BUILD
+                        {
+                            catalog::is_qualified_gemma4_bundle(manifest)
+                        } else {
+                            runtime.build == qualification.build
+                        }
                 })
         }
         _ => false,

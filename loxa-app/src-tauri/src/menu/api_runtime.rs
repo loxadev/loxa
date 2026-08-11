@@ -93,15 +93,12 @@ pub(crate) struct ApiRuntimeController {
 }
 
 impl ApiRuntimeController {
-    pub(crate) fn start() -> Self {
+    pub(crate) fn start(paths: AppPaths) -> Self {
         Self::assemble(|requests, messages| {
             std::thread::Builder::new()
                 .name("loxa-menu-api-runtime".into())
-                .spawn(move || match AppPaths::from_env() {
-                    Ok(paths) => {
-                        run_runtime_worker(Ok(ApiRuntimeHost::new(paths)), requests, messages)
-                    }
-                    Err(_) => run_runtime_worker::<ApiRuntimeHost>(Err(()), requests, messages),
+                .spawn(move || {
+                    run_runtime_worker(Ok(ApiRuntimeHost::new(paths)), requests, messages)
                 })
                 .map_err(|_| ())
         })

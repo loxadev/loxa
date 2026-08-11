@@ -5,7 +5,6 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use loxa::app::TransferControl;
-#[cfg(not(test))]
 use loxa::app::{
     AppService, DiscardCandidate, TransferDisposition, TransferPhase, TransferProgress,
     TransferSelected,
@@ -15,7 +14,6 @@ use loxa::app::{
     RecommendationUnavailableReason, RuntimeInventorySnapshot, RuntimeOwnerSnapshot,
     RuntimeSnapshot,
 };
-#[cfg(not(test))]
 use loxa::discovery::{CandidateDisposition, InspectRepository, SearchModels};
 use loxa::huggingface::ResolvedFile;
 
@@ -433,13 +431,11 @@ trait BackendSource {
     }
 }
 
-#[cfg(not(test))]
 struct AppBackend {
     service: AppService,
     prepared_discard: Option<DiscardCandidate>,
 }
 
-#[cfg(not(test))]
 impl AppBackend {
     fn new(service: AppService) -> Self {
         Self {
@@ -449,7 +445,6 @@ impl AppBackend {
     }
 }
 
-#[cfg(not(test))]
 impl BackendSource for AppBackend {
     fn snapshot(&mut self) -> MenuSnapshot {
         map_app_snapshot(self.service.snapshot())
@@ -862,14 +857,13 @@ pub(crate) struct BackendClient {
 pub(crate) struct BackendShutdownError;
 
 impl BackendClient {
-    #[cfg(not(test))]
-    pub(crate) fn start() -> Self {
+    pub(crate) fn start(paths: loxa::paths::AppPaths) -> Self {
         Self::assemble(|request_receiver, message_sender, stopping| {
             std::thread::Builder::new()
                 .name("loxa-menu-backend".to_owned())
                 .spawn(move || {
                     run_backend_worker(
-                        AppService::from_env().map(AppBackend::new),
+                        Ok(AppBackend::new(AppService::from_paths(paths))),
                         request_receiver,
                         message_sender,
                         &stopping,

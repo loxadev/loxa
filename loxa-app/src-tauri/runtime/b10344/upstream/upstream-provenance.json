@@ -1,0 +1,131 @@
+{
+  "schema_version": 1,
+  "release": {
+    "repository": "ggml-org/llama.cpp",
+    "tag": "b10344",
+    "commit": "7a20b417f4526cae073bd997af5020cea3e7ccbe",
+    "release_id": 368054107,
+    "created_at": "2026-08-10T08:25:24Z",
+    "published_at": "2026-08-10T16:24:12Z",
+    "immutable": false
+  },
+  "asset": {
+    "name": "llama-b10344-bin-macos-arm64.tar.gz",
+    "asset_id": 508981785,
+    "created_at": "2026-08-10T16:24:48Z",
+    "updated_at": "2026-08-10T16:24:49Z",
+    "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10344/llama-b10344-bin-macos-arm64.tar.gz",
+    "size": 11024576,
+    "sha256": "24bf4348ddc6d1d9b465105ed8ae371e326c576623ac612fbff73532181c8f13"
+  },
+  "runtime": {
+    "version_line": "version: 10344 (7a20b417f)",
+    "architecture": "arm64",
+    "minimum_macos": "13.3"
+  },
+  "regular_files": [
+    {
+      "path": "LICENSE",
+      "size": 1078,
+      "sha256": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d"
+    },
+    {
+      "path": "llama-server",
+      "size": 33472,
+      "sha256": "d3bce60d45758268a90e0fca82ce5a22d5c35ecb92a06d1c544ed68ec2efa769"
+    },
+    {
+      "path": "libllama-server-impl.dylib",
+      "size": 9609768,
+      "sha256": "8fe5fbfb9cf291ece5091425a07429e164e860e875d9be19f0aded4b48612967"
+    },
+    {
+      "path": "libllama-common.0.0.10344.dylib",
+      "size": 7880808,
+      "sha256": "f372ff2e8379d981971e6559e76371c8d06500b37934fb5562d20059a41727b4"
+    },
+    {
+      "path": "libmtmd.0.0.10344.dylib",
+      "size": 1238112,
+      "sha256": "a3ca5155cddc7a7f1e82873a95aeb864c87f614a200589e25ef715474e707b97"
+    },
+    {
+      "path": "libllama.0.0.10344.dylib",
+      "size": 2830416,
+      "sha256": "79562cedcbf44083c2402e931ddeb25239de229dc6f26a86c63c71d20b62d825"
+    },
+    {
+      "path": "libggml.0.19.0.dylib",
+      "size": 59872,
+      "sha256": "d86c98babd7e63d9d0ead8cdd240bd2011a6d1a7996a52f87f21ae634853c20e"
+    },
+    {
+      "path": "libggml-cpu.0.19.0.dylib",
+      "size": 918064,
+      "sha256": "ba6d4d66eefae0da8d5927a9c4e379011c1472ad090939b356f9b4240f04c115"
+    },
+    {
+      "path": "libggml-blas.0.19.0.dylib",
+      "size": 58776,
+      "sha256": "b469f062cc2800e27b20e45e7653ab8af545838e16a03368f059d370dc3ab3a2"
+    },
+    {
+      "path": "libggml-metal.0.19.0.dylib",
+      "size": 884456,
+      "sha256": "5cac42dbd02198b55bd03365132b757f87553462bf07b2273116b2226b5e4670"
+    },
+    {
+      "path": "libggml-rpc.0.19.0.dylib",
+      "size": 133776,
+      "sha256": "494cc6414b6d5015d8fc67d641f04b2eff7b4aad8d6d99b028e74fa138098240"
+    },
+    {
+      "path": "libggml-base.0.19.0.dylib",
+      "size": 729960,
+      "sha256": "858b9b16c2bc4fe82eba70c4a2ee6159a2af2ab93ac0da7525eb3ee54d3c69ec"
+    }
+  ],
+  "symlinks": [
+    {
+      "path": "libllama-common.0.dylib",
+      "target": "libllama-common.0.0.10344.dylib"
+    },
+    {
+      "path": "libmtmd.0.dylib",
+      "target": "libmtmd.0.0.10344.dylib"
+    },
+    {
+      "path": "libllama.0.dylib",
+      "target": "libllama.0.0.10344.dylib"
+    },
+    {
+      "path": "libggml.0.dylib",
+      "target": "libggml.0.19.0.dylib"
+    },
+    {
+      "path": "libggml-cpu.0.dylib",
+      "target": "libggml-cpu.0.19.0.dylib"
+    },
+    {
+      "path": "libggml-blas.0.dylib",
+      "target": "libggml-blas.0.19.0.dylib"
+    },
+    {
+      "path": "libggml-metal.0.dylib",
+      "target": "libggml-metal.0.19.0.dylib"
+    },
+    {
+      "path": "libggml-rpc.0.dylib",
+      "target": "libggml-rpc.0.19.0.dylib"
+    },
+    {
+      "path": "libggml-base.0.dylib",
+      "target": "libggml-base.0.19.0.dylib"
+    }
+  ],
+  "license": {
+    "path": "LICENSE",
+    "source_url": "https://github.com/ggml-org/llama.cpp/blob/7a20b417f4526cae073bd997af5020cea3e7ccbe/LICENSE",
+    "sha256": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d"
+  }
+}

@@ -306,6 +306,7 @@ fn post_no_runtime_lock_race_fails_before_spawn_without_relookup() {
     std::fs::set_permissions(&server, permissions).unwrap();
     let launch = crate::runner::Launch {
         server,
+        managed_runtime: None,
         model: root.path().join("missing-model.gguf"),
         id: "demo".into(),
         requested_port: 0,

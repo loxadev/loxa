@@ -17,7 +17,9 @@ pub(crate) use transaction::{
 pub(crate) use transaction::{replace_manifest_atomic_with_hook, ManifestPublicationPoint};
 
 pub const GEMMA4_MTP_PROFILE: &str = "gemma4-mtp-v1";
-pub const GEMMA4_LLAMA_BUILD: &str = "b10121";
+pub const GEMMA4_LEGACY_LLAMA_BUILD: &str = "b10121";
+pub const GEMMA4_BUNDLED_LLAMA_BUILD: &str = "b10344";
+pub const GEMMA4_LLAMA_BUILD: &str = GEMMA4_BUNDLED_LLAMA_BUILD;
 pub const GEMMA4_MODEL_SHA256: &str =
     "90fd44e29e0d7cffeb0fd00dc73cfdab9ed0b0e95306ecf7821ea634c940c370";
 pub const GEMMA4_MODEL_SIZE: u64 = 6_716_356_800;
@@ -385,9 +387,7 @@ impl Manifest {
             .ok_or("missing bundle artifacts")?;
         let profile = self.profile.as_deref().ok_or("missing bundle profile")?;
         let runtime = self.runtime.as_ref().ok_or("missing qualified runtime")?;
-        let production_profile = profile == GEMMA4_MTP_PROFILE
-            && runtime.engine == "llama.cpp"
-            && runtime.build == GEMMA4_LLAMA_BUILD;
+        let production_profile = qualified_gemma4_runtime(profile, runtime);
         #[cfg(test)]
         let test_profile = profile == TEST_MTP_PROFILE
             && runtime.engine == "llama.cpp"
@@ -417,6 +417,9 @@ impl Manifest {
             || draft.is_some_and(|artifact| artifact.local_filename != "draft.gguf")
         {
             return Err("invalid managed bundle filenames".into());
+        }
+        if production_profile && draft.is_none() {
+            return Err("qualified production bundle is missing its draft artifact".into());
         }
         if production_profile
             && (model.sha256 != GEMMA4_MODEL_SHA256 || model.size != GEMMA4_MODEL_SIZE)
@@ -519,6 +522,25 @@ impl Manifest {
         self.draft_artifact()
             .map(|artifact| models_root.join(&self.id).join(artifact.local_filename))
     }
+}
+
+fn qualified_gemma4_runtime(profile: &str, runtime: &RuntimeQualification) -> bool {
+    profile == GEMMA4_MTP_PROFILE
+        && runtime.engine == "llama.cpp"
+        && matches!(
+            runtime.build.as_str(),
+            GEMMA4_LEGACY_LLAMA_BUILD | GEMMA4_BUNDLED_LLAMA_BUILD
+        )
+}
+
+pub fn is_qualified_gemma4_bundle(manifest: &Manifest) -> bool {
+    manifest.validate().is_ok()
+        && manifest.version == 3
+        && manifest
+            .profile
+            .as_deref()
+            .zip(manifest.runtime.as_ref())
+            .is_some_and(|(profile, runtime)| qualified_gemma4_runtime(profile, runtime))
 }
 
 fn artifact_ref(artifact: &Artifact) -> ArtifactRef<'_> {
@@ -1306,12 +1328,23 @@ mod tests {
     }
 
     #[test]
-    fn version_three_bundle_allows_a_qualified_model_without_a_draft() {
+    fn production_bundle_requires_the_exact_qualified_draft_artifact() {
         let mut model_only = bundle_manifest("gemma4");
         model_only.artifacts.as_mut().unwrap().pop();
+        assert_eq!(
+            model_only.validate().unwrap_err(),
+            "qualified production bundle is missing its draft artifact"
+        );
+        assert!(model_only.draft_artifact().is_none());
+        assert!(!is_qualified_gemma4_bundle(&model_only));
+    }
+
+    #[test]
+    fn intentionally_test_only_bundle_can_remain_primary_only() {
+        let model_only = test_model_bundle("test-only");
         model_only.validate().unwrap();
         assert!(model_only.draft_artifact().is_none());
-        assert_eq!(model_only.total_size(), GEMMA4_MODEL_SIZE);
+        assert_eq!(model_only.total_size(), model_only.size);
     }
 
     #[test]

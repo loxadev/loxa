@@ -171,6 +171,7 @@ impl RecordedPersistentRuntime {
             child_pgid,
             "demo",
             port,
+            None,
             RuntimeLeasePublication::PersistentApp(&fingerprint),
         ) {
             let _ = terminate_process_group(&mut child, child_pgid);
@@ -238,8 +239,7 @@ fn test_attachment_identity(
     let owner_pid = attached.expected_lease.owner_pid;
     let child_pid = attached.expected_lease.child_pid;
     let child_pgid = attached.expected_lease.child_pgid;
-    let managed_server = attached.expected_managed_server.clone();
-    let mut command = vec![managed_server.as_os_str().to_owned()];
+    let mut command = vec![attached.expected_lease.server.as_os_str().to_owned()];
     command.extend(attached.expected_argv.iter().cloned());
     validate_attachment_identity_with(
         attached,
@@ -343,6 +343,68 @@ fn exact_persistent_runtime_returns_an_opaque_revalidatable_attachment() {
     assert_eq!(attached.port(), fixture.port);
     assert_eq!(attached.model_id(), "demo");
     exact_test_attachment_identity(&attached).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn attachment_accepts_v2_direct_and_v3_staged_identity_without_conflating_them() {
+    let direct = RecordedPersistentRuntime::generic(43123);
+    let mut v2: serde_json::Value =
+        serde_json::from_slice(&fs::read(direct.lease_path()).unwrap()).unwrap();
+    v2["version"] = serde_json::json!(PERSISTENT_LEASE_VERSION);
+    v2.as_object_mut().unwrap().remove("managed_source");
+    fs::write(direct.lease_path(), serde_json::to_vec(&v2).unwrap()).unwrap();
+    assert!(matches!(
+        lookup_persistent_runtime_with_probe(
+            direct.run_dir(),
+            &direct.models_root,
+            &direct.managed_server,
+            std::slice::from_ref(&direct.fingerprint),
+            exact_test_attachment_identity,
+            |_, _| Ok(true),
+        ),
+        PersistentRuntimeLookup::Attached(_)
+    ));
+
+    let mut staged = RecordedPersistentRuntime::generic(43124);
+    let actual_server = staged.managed_server.clone();
+    let canonical_source = PathBuf::from("/Applications/Loxa.app/Contents/MacOS/llama-server");
+    let mut v3: serde_json::Value =
+        serde_json::from_slice(&fs::read(staged.lease_path()).unwrap()).unwrap();
+    v3["managed_source"] = serde_json::json!(canonical_source);
+    fs::write(staged.lease_path(), serde_json::to_vec(&v3).unwrap()).unwrap();
+    staged.managed_server = canonical_source.clone();
+
+    assert!(matches!(
+        lookup_persistent_runtime_with_probe(
+            staged.run_dir(),
+            &staged.models_root,
+            &staged.managed_server,
+            std::slice::from_ref(&staged.fingerprint),
+            exact_test_attachment_identity,
+            |_, _| Ok(true),
+        ),
+        PersistentRuntimeLookup::Attached(_)
+    ));
+
+    v3["server"] = serde_json::json!(canonical_source);
+    fs::write(staged.lease_path(), serde_json::to_vec(&v3).unwrap()).unwrap();
+    assert!(matches!(
+        lookup_persistent_runtime_with_probe(
+            staged.run_dir(),
+            &staged.models_root,
+            &staged.managed_server,
+            std::slice::from_ref(&staged.fingerprint),
+            |attached| {
+                let error = exact_test_attachment_identity(attached).unwrap_err();
+                assert!(error.contains("executable changed"), "{error}");
+                Err(error)
+            },
+            |_, _| panic!("mismatched process identity reached readiness"),
+        ),
+        PersistentRuntimeLookup::ActiveButNotAttachable
+    ));
+    assert_ne!(actual_server, canonical_source);
 }
 
 #[cfg(unix)]
@@ -689,6 +751,10 @@ fn nonpersistent_malformed_external_or_mismatched_state_is_active_without_probin
     legacy_lease["version"] = serde_json::json!(LEGACY_LEASE_VERSION);
     legacy_lease.as_object_mut().unwrap().remove("owner_mode");
     legacy_lease.as_object_mut().unwrap().remove("fingerprint");
+    legacy_lease
+        .as_object_mut()
+        .unwrap()
+        .remove("managed_source");
     fs::write(
         legacy.lease_path(),
         serde_json::to_vec(&legacy_lease).unwrap(),
@@ -1152,6 +1218,7 @@ fn attachment_lease_expectation_independently_requires_mode_and_whole_fingerprin
     let mut value = lease_value(LEASE_VERSION);
     value["owner_mode"] = serde_json::json!("persistent_app");
     value["fingerprint"] = fingerprint_value();
+    value["managed_source"] = serde_json::Value::Null;
     value["server"] = serde_json::json!("/usr/bin/llama-server");
     let exact = decode_lease(&serde_json::to_vec(&value).unwrap()).unwrap();
     assert!(lease_matches_attachment_expectation(

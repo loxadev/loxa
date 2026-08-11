@@ -1054,6 +1054,11 @@ impl MenuSnapshot {
     }
 
     #[cfg(test)]
+    pub(crate) fn runtime_inventory_for_test(&self) -> Option<RuntimeInventory> {
+        self.runtime_inventory
+    }
+
+    #[cfg(test)]
     pub(crate) fn with_running_port(self, port: u16) -> Result<Self, &'static str> {
         self.with_observed_runtime(ObservedRuntimeOwner::Legacy, "fixture-model".into(), port)
     }

@@ -3,6 +3,9 @@
   "private": true,
   "version": "0.1.0",
   "packageManager": "pnpm@11.7.0",
+  "scripts": {
+    "test:runtime-bundle": "node --test scripts/runtime-bundle.test.mjs scripts/runtime-qualification.test.mjs scripts/runtime-smoke.test.mjs"
+  },
   "devDependencies": {
     "@tauri-apps/cli": "2.11.4"
   }

@@ -822,7 +822,9 @@ fn channel_failure_after_start_admission_retains_unknown_worker_authority() {
 
 #[test]
 fn production_controller_owns_one_exactly_named_joinable_worker() {
-    let mut controller = ApiRuntimeController::start();
+    let paths =
+        AppPaths::from_values(Some(std::path::Path::new("/tmp/loxa-menu-worker")), None).unwrap();
+    let mut controller = ApiRuntimeController::start(paths);
     assert_eq!(
         controller
             .worker

@@ -9,6 +9,9 @@
   "bundle": {
     "active": true,
     "targets": ["app"],
+    "macOS": {
+      "minimumSystemVersion": "13.3"
+    },
     "icon": [
       "icons/AppIcon.appiconset/icon_16x16.png",
       "icons/AppIcon.appiconset/icon_16x16@2x.png",

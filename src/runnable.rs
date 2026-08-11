@@ -9,6 +9,7 @@ pub(crate) struct Runnable {
     _model_lock: catalog::ModelLock,
     launch: runner::Launch,
     fingerprint: RuntimeFingerprint,
+    allow_primary_fallback: bool,
 }
 
 pub(crate) struct PersistentFingerprintCandidates(Vec<RuntimeFingerprint>);
@@ -43,11 +44,13 @@ impl Runnable {
         model_lock: catalog::ModelLock,
         launch: runner::Launch,
         fingerprint: RuntimeFingerprint,
+        allow_primary_fallback: bool,
     ) -> Self {
         Self {
             _model_lock: model_lock,
             launch,
             fingerprint,
+            allow_primary_fallback,
         }
     }
 
@@ -65,10 +68,19 @@ impl Runnable {
         launch: runner::Launch,
         fingerprint: RuntimeFingerprint,
     ) -> Self {
-        Self::new(model_lock, launch, fingerprint)
+        Self::new(model_lock, launch, fingerprint, true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn without_primary_fallback_for_test(mut self) -> Self {
+        self.allow_primary_fallback = false;
+        self
     }
 
     pub(crate) fn primary_only(&mut self) -> Option<()> {
+        if !self.allow_primary_fallback {
+            return None;
+        }
         let launch = self.launch.primary_only()?;
         let fingerprint = self.fingerprint.primary_only()?;
         self.launch = launch;
@@ -112,11 +124,12 @@ pub(crate) fn resolve_runnable(
     let installed = installed.into_iter().find(|entry| entry.id == id);
     let (source, profile, server) = match installed {
         Some(manifest) => {
-            let profile = launch_profile(&manifest, &paths.models)?;
+            let profile = launch_profile(&manifest, &paths.models, paths.runtime_identity)?;
             let server = runner::discover_from_process(
                 runtime.server.as_deref(),
                 &paths.managed_server,
                 &profile,
+                paths.runtime_identity,
             )?;
             (AdmissionSource::Installed(manifest), profile, server)
         }
@@ -130,6 +143,7 @@ pub(crate) fn resolve_runnable(
                 runtime.server.as_deref(),
                 &paths.managed_server,
                 &profile,
+                paths.runtime_identity,
             )?;
             (AdmissionSource::Local(candidate), profile, server)
         }
@@ -164,6 +178,7 @@ pub(crate) fn resolve_runnable(
         model_lock,
         runner::Launch {
             server,
+            managed_runtime: None,
             model: artifact,
             id: manifest.id,
             requested_port: port,
@@ -172,6 +187,7 @@ pub(crate) fn resolve_runnable(
             policy,
         },
         fingerprint,
+        !paths.runtime_identity.is_bundled(),
     ))
 }
 
@@ -189,6 +205,20 @@ pub(crate) fn resolve_managed_runnable_for_host(
     paths: &AppPaths,
     cancelled: &impl Fn() -> bool,
 ) -> Result<Runnable, ManagedRunnableError> {
+    resolve_managed_runnable_with_admission(manifest, paths, |manifest, paths| {
+        admit_installed_for_host(manifest, paths, cancelled)
+    })
+}
+
+fn resolve_managed_runnable_with_admission(
+    manifest: Manifest,
+    paths: &AppPaths,
+    admit: impl FnOnce(
+        &Manifest,
+        &AppPaths,
+    )
+        -> Result<(catalog::ModelLock, verification::Admission), ManagedRunnableError>,
+) -> Result<Runnable, ManagedRunnableError> {
     let installed =
         catalog::load_catalog(&paths.models).map_err(ManagedRunnableError::ModelUnavailable)?;
     if !installed.iter().any(|candidate| candidate == &manifest) {
@@ -204,10 +234,10 @@ pub(crate) fn resolve_managed_runnable_for_host(
             ManagedRunnableError::ModelUnavailable(message)
         }
     })?;
-    let server = runner::validate_managed_server(&paths.managed_server)
-        .map_err(ManagedRunnableError::StartupFailed)?;
+    let server =
+        runner::validate_managed_runtime(paths).map_err(ManagedRunnableError::StartupFailed)?;
     let admission_started = Instant::now();
-    let (model_lock, admission) = admit_installed_for_host(&manifest, paths, cancelled)?;
+    let (model_lock, admission) = admit(&manifest, paths)?;
     report_admission(&manifest.id, admission, admission_started);
     let artifact = manifest.artifact_path(&paths.models);
     let policy = runner::LaunchPolicy::PersistentApp;
@@ -221,10 +251,12 @@ pub(crate) fn resolve_managed_runnable_for_host(
         .into_iter()
         .next()
         .expect("managed persistent plan always has an exact fingerprint");
+    let server_path = server.source_server().to_path_buf();
     Ok(Runnable::new(
         model_lock,
         runner::Launch {
-            server,
+            server: server_path,
+            managed_runtime: Some(server),
             model: artifact,
             id: manifest.id,
             requested_port: 0,
@@ -233,7 +265,30 @@ pub(crate) fn resolve_managed_runnable_for_host(
             policy,
         },
         fingerprint,
+        !paths.runtime_identity.is_bundled(),
     ))
+}
+
+#[cfg(test)]
+fn resolve_managed_runnable_with_test_admission(
+    manifest: Manifest,
+    paths: &AppPaths,
+) -> Result<Runnable, ManagedRunnableError> {
+    resolve_managed_runnable_with_admission(manifest, paths, |manifest, paths| {
+        let model_dir = paths
+            .model_dir(&manifest.id)
+            .map_err(ManagedRunnableError::ModelUnavailable)?;
+        let model_lock =
+            catalog::ModelLock::acquire_existing(&model_dir).map_err(|error| match error {
+                catalog::ModelLockError::Busy => ManagedRunnableError::Conflict,
+                catalog::ModelLockError::Missing | catalog::ModelLockError::UnsafeLocalState => {
+                    ManagedRunnableError::ModelUnavailable(
+                        "installed model state is unavailable".into(),
+                    )
+                }
+            })?;
+        Ok((model_lock, verification::Admission::ReceiptHit))
+    })
 }
 
 pub(crate) fn expected_persistent_fingerprints(
@@ -251,8 +306,8 @@ fn managed_persistent_plan(
 ) -> Result<ManagedPersistentPlan, ManagedPersistentPlanError> {
     let config = config::load(&paths.config).map_err(ManagedPersistentPlanError::Config)?;
     let ctx = config::resolve_value(None, config.ctx, 4096);
-    let profile =
-        launch_profile(manifest, &paths.models).map_err(ManagedPersistentPlanError::Model)?;
+    let profile = launch_profile(manifest, &paths.models, paths.runtime_identity)
+        .map_err(ManagedPersistentPlanError::Model)?;
     let fingerprint = RuntimeFingerprint::from_manifest(
         manifest,
         ctx,
@@ -260,7 +315,9 @@ fn managed_persistent_plan(
         runner::LaunchPolicy::PersistentApp.sleep_idle_seconds(),
     )
     .map_err(ManagedPersistentPlanError::Model)?;
-    let fallback = fingerprint.primary_only();
+    let fallback = (!paths.runtime_identity.is_bundled())
+        .then(|| fingerprint.primary_only())
+        .flatten();
     let mut candidates = vec![fingerprint];
     candidates.extend(fallback);
     Ok(ManagedPersistentPlan {
@@ -345,14 +402,15 @@ fn report_admission(id: &str, admission: verification::Admission, started: Insta
 fn launch_profile(
     manifest: &Manifest,
     models_root: &Path,
+    runtime_identity: crate::runtime_identity::RuntimeIdentity,
 ) -> Result<runner::LaunchProfile, String> {
     match (
         manifest.version,
         manifest.profile.as_deref(),
         manifest.runtime.as_ref(),
     ) {
-        (3, Some(catalog::GEMMA4_MTP_PROFILE), Some(runtime))
-            if runtime.engine == "llama.cpp" && runtime.build == catalog::GEMMA4_LLAMA_BUILD =>
+        (3, Some(catalog::GEMMA4_MTP_PROFILE), Some(_runtime))
+            if runtime_identity.supports_manifest(manifest) =>
         {
             Ok(runner::LaunchProfile::gemma4_mtp(
                 manifest.draft_path(models_root),
@@ -431,6 +489,189 @@ mod tests {
             },
         ]);
         manifest
+    }
+
+    fn production_bundle_manifest(build: &str) -> Manifest {
+        Manifest {
+            version: 3,
+            id: "gemma-4-12b-it-qat-ud-q4-k-xl".into(),
+            repo: None,
+            revision: None,
+            remote_filename: None,
+            origin: None,
+            source_filename: None,
+            local_filename: "model.gguf".into(),
+            sha256: catalog::GEMMA4_MODEL_SHA256.into(),
+            size: catalog::GEMMA4_MODEL_SIZE,
+            artifacts: Some(vec![
+                Artifact {
+                    role: ArtifactRole::Model,
+                    local_filename: "model.gguf".into(),
+                    sha256: catalog::GEMMA4_MODEL_SHA256.into(),
+                    size: catalog::GEMMA4_MODEL_SIZE,
+                    provenance: ArtifactProvenance::Local {
+                        source_filename: "target.gguf".into(),
+                    },
+                },
+                Artifact {
+                    role: ArtifactRole::Draft,
+                    local_filename: "draft.gguf".into(),
+                    sha256: catalog::GEMMA4_DRAFT_SHA256.into(),
+                    size: catalog::GEMMA4_DRAFT_SIZE,
+                    provenance: ArtifactProvenance::Local {
+                        source_filename: "draft-source.gguf".into(),
+                    },
+                },
+            ]),
+            profile: Some(catalog::GEMMA4_MTP_PROFILE.into()),
+            runtime: Some(catalog::RuntimeQualification {
+                engine: "llama.cpp".into(),
+                build: build.into(),
+            }),
+        }
+    }
+
+    fn install_manifest_metadata(paths: &AppPaths, manifest: &Manifest) {
+        let model_dir = paths.model_dir(&manifest.id).unwrap();
+        std::fs::create_dir_all(&model_dir).unwrap();
+        let mut bytes = serde_json::to_vec_pretty(manifest).unwrap();
+        bytes.push(b'\n');
+        std::fs::write(model_dir.join("manifest.json"), bytes).unwrap();
+        drop(ModelLock::acquire(&model_dir).unwrap());
+    }
+
+    fn assert_active_version(server: &Path, expected: &str) {
+        let output = std::process::Command::new(server)
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            combined.lines().filter(|line| *line == expected).count(),
+            1,
+            "{combined}"
+        );
+    }
+
+    fn assert_production_mutations_rejected(paths: &AppPaths, exact: &Manifest) {
+        let mut changed_build = exact.clone();
+        changed_build.runtime.as_mut().unwrap().build = "b10122".into();
+        let mut changed_profile = exact.clone();
+        changed_profile.profile = Some("gemma4-mtp-v2".into());
+        let mut changed_artifact = exact.clone();
+        changed_artifact.artifacts.as_mut().unwrap()[1].sha256 = "0".repeat(64);
+
+        for changed in [changed_build, changed_profile, changed_artifact] {
+            install_manifest_metadata(paths, &changed);
+            assert!(matches!(
+                resolve_managed_runnable_with_test_admission(changed, paths),
+                Err(ManagedRunnableError::ModelUnavailable(_))
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn b10344_provenance_under_legacy_cli_selects_and_reports_active_b10121_without_rewrite() {
+        let root = tempdir().unwrap();
+        let paths = AppPaths::from_values(Some(root.path()), None).unwrap();
+        let manifest = production_bundle_manifest(catalog::GEMMA4_BUNDLED_LLAMA_BUILD);
+        install_manifest_metadata(&paths, &manifest);
+        install_managed_server(&paths);
+
+        let mut runnable =
+            match resolve_managed_runnable_with_test_admission(manifest.clone(), &paths) {
+                Ok(runnable) => runnable,
+                Err(error) => panic!("{}", error.into_message()),
+            };
+
+        assert_eq!(
+            paths.runtime_identity,
+            crate::runtime_identity::RuntimeIdentity::LegacyCliB10121
+        );
+        assert_eq!(runnable.launch().server, paths.managed_server);
+        assert_eq!(
+            paths.runtime_identity.version_line(),
+            "version: 10121 (555881ebc)"
+        );
+        assert_active_version(
+            &runnable.launch().server,
+            paths.runtime_identity.version_line(),
+        );
+        assert_eq!(
+            runnable.fingerprint().effective_profile(),
+            EffectiveProfile::Gemma4Mtp
+        );
+        assert!(runnable.primary_only().is_some());
+        drop(runnable);
+        assert_eq!(
+            catalog::load_catalog(&paths.models).unwrap()[0]
+                .runtime
+                .as_ref()
+                .unwrap()
+                .build,
+            catalog::GEMMA4_BUNDLED_LLAMA_BUILD
+        );
+        assert_production_mutations_rejected(&paths, &manifest);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires the finalized built app"]
+    fn legacy_provenance_under_bundled_app_selects_and_reports_active_b10344_without_rewrite() {
+        let app = std::path::PathBuf::from(std::env::var_os("LOXA_BUILT_APP").unwrap());
+        let root = tempdir().unwrap();
+        let paths = AppPaths::from_application_values(
+            &app.join("Contents/MacOS/loxa-app"),
+            Some(root.path()),
+            None,
+        )
+        .unwrap();
+        let manifest = production_bundle_manifest(catalog::GEMMA4_LEGACY_LLAMA_BUILD);
+        install_manifest_metadata(&paths, &manifest);
+
+        let mut runnable =
+            match resolve_managed_runnable_with_test_admission(manifest.clone(), &paths) {
+                Ok(runnable) => runnable,
+                Err(error) => panic!("{}", error.into_message()),
+            };
+
+        assert_eq!(
+            paths.runtime_identity,
+            crate::runtime_identity::RuntimeIdentity::BundledB10344
+        );
+        assert_eq!(
+            runnable.launch().server,
+            app.join("Contents/MacOS/llama-server")
+        );
+        assert_eq!(
+            paths.runtime_identity.version_line(),
+            "version: 10344 (7a20b417f)"
+        );
+        assert_active_version(
+            &runnable.launch().server,
+            paths.runtime_identity.version_line(),
+        );
+        assert_eq!(
+            runnable.fingerprint().effective_profile(),
+            EffectiveProfile::Gemma4Mtp
+        );
+        assert!(runnable.primary_only().is_none());
+        drop(runnable);
+        assert_eq!(
+            catalog::load_catalog(&paths.models).unwrap()[0]
+                .runtime
+                .as_ref()
+                .unwrap()
+                .build,
+            catalog::GEMMA4_LEGACY_LLAMA_BUILD
+        );
+        assert_production_mutations_rejected(&paths, &manifest);
     }
 
     fn verified_file(path: &Path) -> download::VerifiedRegularFile {

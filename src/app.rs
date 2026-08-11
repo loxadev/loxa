@@ -497,15 +497,16 @@ fn qualified_bundle(manifest: &Manifest) -> Option<QualifiedBundle> {
         return None;
     }
     let runtime = manifest.runtime.as_ref()?;
-    let production_profile = manifest.profile.as_deref() == Some(catalog::GEMMA4_MTP_PROFILE)
-        && runtime.engine == "llama.cpp"
-        && runtime.build == catalog::GEMMA4_LLAMA_BUILD;
+    let production_profile = catalog::is_qualified_gemma4_bundle(manifest);
     #[cfg(test)]
     let test_profile = manifest.profile.as_deref() == Some(catalog::TEST_MTP_PROFILE)
         && runtime.engine == "llama.cpp"
         && runtime.build == catalog::TEST_LLAMA_BUILD;
     #[cfg(not(test))]
-    let test_profile = false;
+    let test_profile = {
+        let _ = runtime;
+        false
+    };
     if !production_profile && !test_profile {
         return None;
     }

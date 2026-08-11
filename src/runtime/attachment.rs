@@ -1,7 +1,7 @@
 use super::{
     foreground_lock_is_held, lease_is_absent, lock_lease_state, process_group,
     process_snapshot_from_refreshed_system, read_lease, LeaseOwnerMode, ProcessSnapshot,
-    RuntimeLease, LEASE_VERSION,
+    RuntimeLease, LEASE_VERSION, PERSISTENT_LEASE_VERSION,
 };
 use crate::runtime_fingerprint::{EffectiveProfile, RuntimeFingerprint};
 use std::cell::RefCell;
@@ -82,6 +82,7 @@ impl AttachedRuntime {
                 version: LEASE_VERSION,
                 owner_mode: Some(LeaseOwnerMode::PersistentApp),
                 fingerprint: None,
+                managed_source: None,
                 owner_pid: 1,
                 owner_start_time: 1,
                 child_pid: 2,
@@ -249,10 +250,10 @@ fn lease_matches_attachment_expectation(
     managed_server: &Path,
     expected_fingerprint: &RuntimeFingerprint,
 ) -> bool {
-    lease.version == LEASE_VERSION
+    matches!(lease.version, PERSISTENT_LEASE_VERSION | LEASE_VERSION)
         && lease.owner_mode == Some(LeaseOwnerMode::PersistentApp)
         && lease.fingerprint.as_ref() == Some(expected_fingerprint)
-        && lease.server == managed_server
+        && lease.attributed_managed_source() == managed_server
         && lease.model_id == expected_fingerprint.model_id()
 }
 
@@ -299,8 +300,8 @@ fn validate_attachment_identity_with(
     if child.start_identity != attached.expected_lease.child_start_time {
         return Err("persistent runtime child identity changed".into());
     }
-    if attached.expected_lease.server != attached.expected_managed_server
-        || child.executable != attached.expected_managed_server
+    if attached.expected_lease.attributed_managed_source() != attached.expected_managed_server
+        || child.executable != attached.expected_lease.server
     {
         return Err("persistent runtime executable changed".into());
     }
