@@ -52,9 +52,50 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
       - name: Run clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Run tests
         run: cargo test --workspace --all-targets --locked
+      - name: Test runtime bundle finalizer
+        working-directory: loxa-app
+        run: pnpm run test:runtime-bundle
       - name: Build unsigned macOS app
         working-directory: loxa-app
-        run: pnpm exec tauri build --ci --bundles app --no-sign
+        run: |
+          pnpm exec tauri build --ci --bundles app --no-sign
+          node scripts/runtime-bundle.mjs --app ../target/release/bundle/macos/Loxa.app
+      - name: Smoke test embedded runtime
+        shell: bash
+        working-directory: loxa-app
+        run: |
+          set -euo pipefail
+          small_model="${RUNNER_TEMP}/loxa-smollm2-135m-q2-k.gguf"
+          trap 'rm -f "${small_model}"' EXIT
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --connect-timeout 15 --max-time 600 \
+            --retry 3 --retry-delay 2 --retry-all-errors --retry-max-time 900 \
+            --output "${small_model}" \
+            'https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/09816acd5d99df7be770d85ea30822623dab342c/SmolLM2-135M-Instruct-Q2_K.gguf'
+          test "$(stat -f '%z' "${small_model}")" = '88202080'
+          test "$(shasum -a 256 "${small_model}" | awk '{print $1}')" = \
+            '741ad12b64088fedc17c33aacb22e48be1972ef36a39f03666dd68bd15614fb9'
+          node scripts/runtime-smoke.mjs \
+            --app ../target/release/bundle/macos/Loxa.app \
+            --model "${small_model}"
+          LOXA_BUILT_APP="$(pwd)/../target/release/bundle/macos/Loxa.app" \
+          LOXA_SMALL_MODEL="${small_model}" \
+            cargo test --locked -p loxa-app \
+              app::runtime_acceptance_tests::finalized_app_ \
+              -- --ignored --test-threads=1
+          LOXA_BUILT_APP="$(pwd)/../target/release/bundle/macos/Loxa.app" \
+          LOXA_SMALL_MODEL="${small_model}" \
+            cargo test --locked -p loxa \
+              runner::tests::bundled_ \
+              -- --ignored --test-threads=1
+          LOXA_BUILT_APP="$(pwd)/../target/release/bundle/macos/Loxa.app" \
+            cargo test --locked -p loxa \
+              runtime_bundle::tests::source_replacement_after_inventory_open_cannot_redefine_the_captured_closure \
+              -- --exact --ignored
+          LOXA_BUILT_APP="$(pwd)/../target/release/bundle/macos/Loxa.app" \
+            cargo test --locked -p loxa \
+              runnable::tests::legacy_provenance_under_bundled_app_selects_and_reports_active_b10344_without_rewrite \
+              -- --exact --ignored
