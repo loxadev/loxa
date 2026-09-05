@@ -29,3 +29,12 @@ unused-allowed-license = "allow"
 [[licenses.exceptions]]
 allow = ["CDLA-Permissive-2.0"]
 crate = "webpki-root-certs"
+
+# Required by rustyline's Windows clipboard support.
+[[licenses.exceptions]]
+allow = ["BSL-1.0"]
+crate = "clipboard-win"
+
+[[licenses.exceptions]]
+allow = ["BSL-1.0"]
+crate = "error-code"
