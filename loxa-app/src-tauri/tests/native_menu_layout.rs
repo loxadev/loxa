@@ -196,8 +196,11 @@ mod menu {
                     // its retained row before returning this content view.
                     let quit_row = unsafe { quit_button.superview() }
                         .expect("the Quit button must stay attached to its row");
+                    // Auto Layout constrains the alignment rectangle; native
+                    // button frame insets vary between macOS versions.
+                    let quit_alignment = quit_button.alignmentRectForFrame(quit_button.frame());
                     assert_eq!(
-                        quit_row.frame().origin.y + quit_button.frame().origin.y,
+                        quit_row.frame().origin.y + quit_alignment.origin.y,
                         8.0,
                         "{name} Quit gap"
                     );
