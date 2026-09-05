@@ -464,20 +464,31 @@ enum ChildTerminationMode {
     Immediate,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum PersistentSignalPolicy {
+    /// Register this child with the CLI process-exit watcher.
+    ForegroundExit,
+    /// Leave process-exit handling to the long-lived caller; this path never
+    /// installs the watcher or registers the child with it.
+    CallerManaged,
+}
+
 struct ChildProcessGuard {
     child: Option<Child>,
     group: i32,
     active_server: bool,
     termination: ChildTerminationMode,
     prepared: PreparedRuntimeGuard,
+    runtime: Option<crate::runtime::RuntimeChildOwnership>,
 }
 
 impl ChildProcessGuard {
     fn spawn(
         command: &mut Command,
-        active_server: bool,
+        signal_policy: PersistentSignalPolicy,
         termination: ChildTerminationMode,
         prepared: PreparedRuntimeGuard,
+        mut runtime: Option<crate::runtime::RuntimeChildOwnership>,
     ) -> Result<Self, String> {
         let mut child = command.spawn().map_err(|error| error.to_string())?;
         let group = match i32::try_from(child.id()) {
@@ -488,6 +499,10 @@ impl ChildProcessGuard {
                 return Err("invalid child process id".into());
             }
         };
+        if let Some(runtime) = runtime.as_mut() {
+            runtime.child_spawned();
+        }
+        let active_server = signal_policy == PersistentSignalPolicy::ForegroundExit;
         if active_server {
             activate_server(child.id(), group);
         }
@@ -499,11 +514,16 @@ impl ChildProcessGuard {
             active_server,
             termination,
             prepared,
+            runtime,
         })
     }
 
     fn id(&self) -> u32 {
         self.child.as_ref().expect("guarded child is present").id()
+    }
+
+    fn active_id(&self) -> Option<u32> {
+        self.child.as_ref().map(Child::id)
     }
 
     fn group(&self) -> i32 {
@@ -515,25 +535,31 @@ impl ChildProcessGuard {
     }
 
     fn terminate(&mut self) -> Result<(), String> {
-        let Some(child) = self.child.as_mut() else {
-            return Ok(());
-        };
-        let pid = child.id();
-        match self.termination {
-            ChildTerminationMode::Graceful => terminate_owned_group(child, self.group)?,
-            ChildTerminationMode::Immediate => terminate_probe(child, self.group)?,
+        if let Some(child) = self.child.as_mut() {
+            let pid = child.id();
+            match self.termination {
+                ChildTerminationMode::Graceful => terminate_owned_group(child, self.group)?,
+                ChildTerminationMode::Immediate => terminate_probe(child, self.group)?,
+            }
+            if self.active_server {
+                deactivate_server(pid, self.group);
+            }
+            self.child.take();
         }
-        if self.active_server {
-            deactivate_server(pid, self.group);
+        if let Some(runtime) = self.runtime.as_mut() {
+            runtime.clear()?;
         }
-        self.child.take();
         Ok(())
+    }
+
+    fn runtime_mut(&mut self) -> Option<&mut crate::runtime::RuntimeChildOwnership> {
+        self.runtime.as_mut()
     }
 }
 
 impl Drop for ChildProcessGuard {
     fn drop(&mut self) {
-        if self.terminate().is_err() {
+        if self.terminate().is_err() && self.child.is_some() {
             #[cfg(unix)]
             if let Some(prepared) = &self.prepared {
                 if prepared.abandon().is_ok() && self.active_server {
@@ -680,9 +706,10 @@ fn probe_version_command(
     }
     let mut child = ChildProcessGuard::spawn(
         &mut command,
-        false,
+        PersistentSignalPolicy::CallerManaged,
         ChildTerminationMode::Immediate,
         prepared,
+        None,
     )?;
     let stdout = child
         .child_mut()
@@ -992,7 +1019,7 @@ pub(crate) fn start_foreground(launch: &Launch, run_dir: &Path) -> Result<Foregr
 }
 
 pub(crate) fn start_persistent<F>(
-    mut runnable: crate::runnable::Runnable,
+    runnable: crate::runnable::Runnable,
     run_dir: &Path,
     cancelled: F,
 ) -> Result<PersistentStart, PersistentStartError>
@@ -1003,6 +1030,26 @@ where
         return Ok(persistent_interrupted());
     }
     install_termination_watcher(run_dir).map_err(PersistentStartError::Failed)?;
+    let ownership = crate::runtime::RuntimeOwnership::acquire_persistent(run_dir)?;
+    start_persistent_with_ownership(
+        runnable,
+        &ownership,
+        cancelled,
+        PersistentSignalPolicy::ForegroundExit,
+    )
+}
+
+pub(crate) fn start_persistent_with_ownership<F>(
+    mut runnable: crate::runnable::Runnable,
+    ownership: &crate::runtime::RuntimeOwnership,
+    cancelled: F,
+    signal_policy: PersistentSignalPolicy,
+) -> Result<PersistentStart, PersistentStartError>
+where
+    F: Fn() -> bool,
+{
+    // The caller keeps this common owner across attempts. Each attempt borrows
+    // its sole child slot and returns it only after verified child cleanup.
     let launch_started = Instant::now();
     tracing::info!(
         event = "server_starting",
@@ -1010,11 +1057,10 @@ where
         requested_port = runnable.launch().requested_port,
         context_size = runnable.launch().ctx
     );
-    let ownership = crate::runtime::RuntimeOwnership::acquire_persistent(run_dir)?;
     if cancelled() {
         return Ok(persistent_interrupted());
     }
-    match start_persistent_attempt(&runnable, ownership, &cancelled)? {
+    match start_persistent_attempt(&runnable, ownership, signal_policy, &cancelled)? {
         StartOutcome::Ready(server) => {
             finish_persistent_ready(server, runnable, launch_started, false, &cancelled)
                 .map_err(PersistentStartError::from)
@@ -1040,11 +1086,10 @@ where
                 model_id = %runnable.launch().id,
                 attempt = 2_u8
             );
-            let ownership = crate::runtime::RuntimeOwnership::acquire_persistent(run_dir)?;
             if cancelled() {
                 return Ok(persistent_interrupted());
             }
-            match start_persistent_attempt(&runnable, ownership, &cancelled)? {
+            match start_persistent_attempt(&runnable, ownership, signal_policy, &cancelled)? {
                 StartOutcome::Ready(server) => {
                     finish_persistent_ready(server, runnable, launch_started, true, &cancelled)
                         .map_err(PersistentStartError::from)
@@ -1204,17 +1249,20 @@ where
 
 fn start_persistent_attempt<F>(
     runnable: &crate::runnable::Runnable,
-    ownership: crate::runtime::RuntimeOwnership,
+    ownership: &crate::runtime::RuntimeOwnership,
+    signal_policy: PersistentSignalPolicy,
     cancelled: &F,
 ) -> Result<StartOutcome, String>
 where
     F: Fn() -> bool,
 {
+    let child_ownership = ownership.reserve_child()?;
     OwnedServer::start_with_persistent_ownership(
         runnable.launch(),
         runnable.fingerprint(),
         STARTUP_TIMEOUT,
-        ownership,
+        child_ownership,
+        signal_policy,
         cancelled,
     )
 }
@@ -1710,7 +1758,6 @@ pub struct OwnedServer {
     #[cfg(test)]
     group: i32,
     port: u16,
-    runtime: Option<crate::runtime::RuntimeOwnership>,
     announcements: mpsc::Receiver<Result<u16, String>>,
     announcement_overflow: Arc<AtomicBool>,
     announced_port: Option<u16>,
@@ -1718,6 +1765,7 @@ pub struct OwnedServer {
     stderr_reader: Option<std::thread::JoinHandle<Result<Vec<u8>, String>>>,
     stdout_tail: Vec<u8>,
     stderr_tail: Vec<u8>,
+    retain_cleanup_failure: bool,
 }
 
 impl OwnedServer {
@@ -1749,10 +1797,14 @@ impl OwnedServer {
     where
         F: Fn() -> Option<i32>,
     {
+        let child_ownership = runtime.reserve_child()?;
         Self::start_inner(
             launch,
             timeout,
-            Some((runtime, crate::runtime::RuntimeLeasePublication::Foreground)),
+            Some((
+                child_ownership,
+                crate::runtime::RuntimeLeasePublication::Foreground,
+            )),
             || signal().map(StartupStop::Signal),
         )
     }
@@ -1761,19 +1813,21 @@ impl OwnedServer {
         launch: &Launch,
         fingerprint: &crate::runtime_fingerprint::RuntimeFingerprint,
         timeout: Duration,
-        runtime: crate::runtime::RuntimeOwnership,
+        runtime: crate::runtime::RuntimeChildOwnership,
+        signal_policy: PersistentSignalPolicy,
         cancelled: &F,
     ) -> Result<StartOutcome, String>
     where
         F: Fn() -> bool,
     {
-        Self::start_inner(
+        Self::start_inner_with_policy(
             launch,
             timeout,
             Some((
                 runtime,
                 crate::runtime::RuntimeLeasePublication::PersistentApp(fingerprint),
             )),
+            signal_policy,
             || cancelled().then_some(StartupStop::Interrupted(StartupInterruption::Cancelled)),
         )
     }
@@ -1783,9 +1837,32 @@ impl OwnedServer {
         launch: &Launch,
         timeout: Duration,
         runtime: Option<(
-            crate::runtime::RuntimeOwnership,
+            crate::runtime::RuntimeChildOwnership,
             crate::runtime::RuntimeLeasePublication<'_>,
         )>,
+        stop: F,
+    ) -> Result<StartOutcome, String>
+    where
+        F: Fn() -> Option<StartupStop>,
+    {
+        Self::start_inner_with_policy(
+            launch,
+            timeout,
+            runtime,
+            PersistentSignalPolicy::ForegroundExit,
+            stop,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_inner_with_policy<F>(
+        launch: &Launch,
+        timeout: Duration,
+        runtime: Option<(
+            crate::runtime::RuntimeChildOwnership,
+            crate::runtime::RuntimeLeasePublication<'_>,
+        )>,
+        signal_policy: PersistentSignalPolicy,
         stop: F,
     ) -> Result<StartOutcome, String>
     where
@@ -1808,61 +1885,80 @@ impl OwnedServer {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
-        mark_server_starting();
-        let mut child = match ChildProcessGuard::spawn(
+        if signal_policy == PersistentSignalPolicy::ForegroundExit {
+            mark_server_starting();
+        }
+        let retain_cleanup_failure =
+            runtime.is_some() && launch.policy == LaunchPolicy::PersistentApp;
+        let (runtime, publication) = match runtime {
+            Some((runtime, publication)) => (Some(runtime), Some(publication)),
+            None => (None, None),
+        };
+        let child = match ChildProcessGuard::spawn(
             &mut command,
-            true,
+            signal_policy,
             ChildTerminationMode::Graceful,
             prepared,
+            runtime,
         ) {
             Ok(child) => child,
             Err(error) => {
-                clear_server_starting();
+                if signal_policy == PersistentSignalPolicy::ForegroundExit {
+                    clear_server_starting();
+                }
                 return Err(error);
             }
         };
         #[cfg(test)]
         kill_owner_after_spawn_before_lease_for_test();
         let group = child.group();
-        let stdout = child
-            .child_mut()
-            .stdout
-            .take()
-            .ok_or_else(|| "failed to capture llama-server stdout".to_string())?;
-        let stderr = child
-            .child_mut()
-            .stderr
-            .take()
-            .ok_or_else(|| "failed to capture llama-server stderr".to_string())?;
         let (announcement_sender, announcements) = mpsc::sync_channel(MAX_PENDING_ANNOUNCEMENTS);
         let announcement_overflow = Arc::new(AtomicBool::new(false));
-        let stdout_reader = spawn_output_reader(stdout, None)?;
-        let stderr_reader = spawn_output_reader(
-            stderr,
-            Some((announcement_sender, Arc::clone(&announcement_overflow))),
-        )?;
-        let (runtime, publication) = match runtime {
-            Some((runtime, publication)) => (Some(runtime), Some(publication)),
-            None => (None, None),
-        };
         let mut owned = Self {
             child: Some(child),
             #[cfg(test)]
             group,
             port: 0,
-            runtime,
             announcements,
             announcement_overflow,
             announced_port: None,
-            stdout_reader: Some(stdout_reader),
-            stderr_reader: Some(stderr_reader),
+            stdout_reader: None,
+            stderr_reader: None,
             stdout_tail: Vec::new(),
             stderr_tail: Vec::new(),
+            retain_cleanup_failure,
         };
-        if let Some(runtime) = owned.runtime.as_mut() {
+        let stdout = match owned.child_mut().stdout.take() {
+            Some(stdout) => stdout,
+            None => return owned.fail_start("failed to capture llama-server stdout".into()),
+        };
+        let stderr = match owned.child_mut().stderr.take() {
+            Some(stderr) => stderr,
+            None => return owned.fail_start("failed to capture llama-server stderr".into()),
+        };
+        owned.stdout_reader = match spawn_output_reader(stdout, None) {
+            Ok(reader) => Some(reader),
+            Err(error) => return owned.fail_start(error),
+        };
+        owned.stderr_reader = match spawn_output_reader(
+            stderr,
+            Some((
+                announcement_sender,
+                Arc::clone(&owned.announcement_overflow),
+            )),
+        ) {
+            Ok(reader) => Some(reader),
+            Err(error) => return owned.fail_start(error),
+        };
+        let child_pid = owned.child.as_ref().expect("owned child is present").id();
+        if let Some(runtime) = owned
+            .child
+            .as_mut()
+            .and_then(ChildProcessGuard::runtime_mut)
+        {
             let publication = publication.expect("owned runtime publication is present");
             if let Err(error) = runtime.record(
-                owned.child.as_ref().expect("owned child is present").id(),
+                child_pid,
                 group,
                 &launch.id,
                 requested_port,
@@ -1893,13 +1989,15 @@ impl OwnedServer {
                     return Ok(StartOutcome::CleanupFailed(Box::new(owned)))
                 }
             }
-            if let Some(status) = owned
-                .child_mut()
-                .try_wait()
-                .map_err(|error| error.to_string())?
-            {
+            let status = match owned.child_mut().try_wait() {
+                Ok(status) => status,
+                Err(error) => return owned.fail_start(error.to_string()),
+            };
+            if let Some(status) = status {
                 let code = exit_code(status);
-                owned.terminate()?;
+                if let Err(cleanup) = owned.terminate() {
+                    return owned.finish_cleanup_failure(cleanup);
+                }
                 return Ok(StartOutcome::Exited(owned.server_exit(code)));
             }
             if let Some(port) = owned.announced_port {
@@ -1948,9 +2046,21 @@ impl OwnedServer {
     }
 
     fn fail_start(mut self, error: String) -> Result<StartOutcome, String> {
-        self.terminate()
-            .map_err(|cleanup| format!("{error}; cleanup failed: {cleanup}"))?;
-        Err(self.with_diagnostic(error))
+        match self.terminate() {
+            Ok(()) => Err(self.with_diagnostic(error)),
+            Err(cleanup) => {
+                self.finish_cleanup_failure(format!("{error}; cleanup failed: {cleanup}"))
+            }
+        }
+    }
+
+    fn finish_cleanup_failure(self, error: String) -> Result<StartOutcome, String> {
+        if self.retain_cleanup_failure {
+            tracing::warn!(event = "server_start_cleanup_failed");
+            Ok(StartOutcome::CleanupFailed(Box::new(self)))
+        } else {
+            Err(error)
+        }
     }
 
     fn collect_announcements(&mut self) -> Result<(), String> {
@@ -1992,6 +2102,9 @@ impl OwnedServer {
         let Some(child) = self.child.as_mut() else {
             return Err("owned server child is no longer present".into());
         };
+        if child.active_id().is_none() {
+            return Err("owned server child cleanup is incomplete".into());
+        }
         let Some(status) = child
             .child_mut()
             .try_wait()
@@ -2006,16 +2119,18 @@ impl OwnedServer {
 
     pub fn terminate(&mut self) -> Result<(), String> {
         if let Some(child) = self.child.as_mut() {
-            let pid = child.id();
-            tracing::info!(event = "server_terminating", pid, port = self.port);
+            let pid = child.active_id();
+            if let Some(pid) = pid {
+                tracing::info!(event = "server_terminating", pid, port = self.port);
+            }
             child.terminate()?;
-            self.child.take();
-            tracing::info!(event = "server_terminated", pid, port = self.port);
+            if let Some(pid) = pid {
+                tracing::info!(event = "server_terminated", pid, port = self.port);
+            }
         }
-        if let Some(runtime) = self.runtime.as_mut() {
-            runtime.clear()?;
-        }
-        self.join_output_readers()
+        self.join_output_readers()?;
+        self.child.take();
+        Ok(())
     }
 
     fn join_output_readers(&mut self) -> Result<(), String> {
@@ -2390,6 +2505,61 @@ mod tests {
         assert_eq!(ACTIVE_SERVER.load(Ordering::SeqCst), 0);
         assert!(!run_dir.join("foreground.json").exists());
         drop(crate::runtime::RuntimeOwnership::acquire(&run_dir).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_reader_error_with_cleanup_failure_returns_retryable_server() {
+        if std::env::var_os("LOXA_PERSISTENT_READER_CLEANUP_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "runner::tests::persistent_reader_error_with_cleanup_failure_returns_retryable_server",
+                    "--nocapture",
+                ])
+                .env("LOXA_PERSISTENT_READER_CLEANUP_CHILD", "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+
+        let _process = process_test_lock();
+        let root = tempdir().unwrap();
+        let server = root.path().join("server");
+        let run_dir = root.path().join("run");
+        write_executable_script(&server, b"#!/bin/sh\nwhile :; do sleep 1; done\n");
+        let runnable = persistent_runnable(root.path(), &server, 0);
+        let ownership = crate::runtime::RuntimeOwnership::acquire(&run_dir).unwrap();
+        let _reader_fault = install_reader_spawn_fault_for_test(ReaderSpawnFault::Fail);
+        let _termination_fault = crate::runtime::fail_next_owned_group_terminations_for_test(1);
+
+        let started = start_persistent_with_ownership(
+            runnable,
+            &ownership,
+            || false,
+            PersistentSignalPolicy::CallerManaged,
+        );
+        let mut owned = match started {
+            Ok(PersistentStart::CleanupFailed(owned)) => owned,
+            Ok(_) => panic!("reader start failure did not retain cleanup ownership"),
+            Err(error) => panic!("reader start cleanup failure was flattened: {error:?}"),
+        };
+        let group = owned.server.group;
+        assert!(crate::runtime::process_group_has_live_members(group).unwrap());
+        assert!(ownership.reserve_child().is_err());
+        assert!(crate::runtime::RuntimeOwnership::acquire(&run_dir).is_err());
+        assert!(crate::catalog::ModelLock::acquire(&root.path().join("models/demo")).is_err());
+
+        owned.terminate().unwrap();
+
+        assert!(!crate::runtime::process_group_has_live_members(group).unwrap());
+        drop(owned);
+        let next_child = ownership.reserve_child().unwrap();
+        drop(next_child);
+        drop(ownership);
+        drop(crate::runtime::RuntimeOwnership::acquire(&run_dir).unwrap());
+        drop(crate::catalog::ModelLock::acquire(&root.path().join("models/demo")).unwrap());
     }
 
     #[cfg(target_os = "macos")]
@@ -3024,6 +3194,52 @@ int main(int argc, char **argv) {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn persistent_caller_managed_owner_child() {
+        let Some(root) = std::env::var_os("LOXA_PERSISTENT_CALLER_MANAGED_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let server = root.join("server");
+        let run_dir = root.join("run");
+        let owner_ready = root.join("owner-ready");
+        build_prelease_test_server(&root, &server);
+        let runnable = persistent_runnable(&root, &server, 0);
+        let ownership = crate::runtime::RuntimeOwnership::acquire(&run_dir).unwrap();
+        let marker = pack_server_identity(u32::MAX, i32::MAX);
+        ACTIVE_SERVER.store(marker, Ordering::SeqCst);
+
+        let runtime = match start_persistent_with_ownership(
+            runnable,
+            &ownership,
+            || {
+                assert_eq!(
+                    ACTIVE_SERVER.load(Ordering::SeqCst),
+                    marker,
+                    "caller-managed start changed the process-exit marker"
+                );
+                false
+            },
+            PersistentSignalPolicy::CallerManaged,
+        )
+        .unwrap()
+        {
+            PersistentStart::Ready(runtime) => runtime,
+            _ => panic!("caller-managed persistent owner did not become ready"),
+        };
+        assert_eq!(
+            ACTIVE_SERVER.load(Ordering::SeqCst),
+            marker,
+            "caller-managed readiness changed the process-exit marker"
+        );
+        std::fs::write(owner_ready, b"ready").unwrap();
+        std::hint::black_box((&ownership, &runtime));
+        loop {
+            std::thread::park();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn bundled_prelease_sigkill_owner_child() {
         let Some(root) = std::env::var_os("LOXA_BUNDLED_PRELEASE_OWNER_ROOT") else {
             return;
@@ -3303,6 +3519,94 @@ int main(int argc, char **argv) {
         drop(crate::catalog::ModelLock::acquire(&root.path().join("models/demo")).unwrap());
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn caller_managed_owner_does_not_install_process_exit_policy() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let _lock = process_test_lock();
+        let root = tempdir().unwrap();
+        let owner_ready = root.path().join("owner-ready");
+        let run_dir = root.path().join("run");
+        let lease_path = run_dir.join("foreground.json");
+        let mut owner = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runner::tests::persistent_caller_managed_owner_child",
+                "--nocapture",
+            ])
+            .env("LOXA_PERSISTENT_CALLER_MANAGED_ROOT", root.path())
+            .env("LOXA_PRELEASE_ANNOUNCED", root.path().join("announced"))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let handshake_deadline = Instant::now() + Duration::from_secs(5);
+        while !owner_ready.is_file() {
+            if let Some(status) = owner.try_wait().unwrap() {
+                let output = owner.wait_with_output().unwrap();
+                panic!("caller-managed owner exited before ready: {status}; {output:?}");
+            }
+            if Instant::now() >= handshake_deadline {
+                let _ = owner.kill();
+                let output = owner.wait_with_output().unwrap();
+                panic!("caller-managed owner readiness timed out: {output:?}");
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let lease: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&lease_path).unwrap()).unwrap();
+        let child_group = lease["child_pgid"].as_i64().unwrap() as i32;
+        assert_eq!(
+            unsafe { libc::kill(owner.id() as libc::pid_t, libc::SIGTERM) },
+            0
+        );
+
+        let exit_deadline = Instant::now() + Duration::from_secs(5);
+        let output = loop {
+            match owner.try_wait().unwrap() {
+                Some(_) => break owner.wait_with_output().unwrap(),
+                None if Instant::now() < exit_deadline => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                None => {
+                    let _ = owner.kill();
+                    let output = owner.wait_with_output().unwrap();
+                    let _ = crate::runtime::terminate_stale_process_group(child_group);
+                    let _ = crate::runtime::RuntimeOwnership::acquire(&run_dir);
+                    panic!("caller-managed owner SIGTERM timed out: {output:?}");
+                }
+            }
+        };
+
+        let recovered = crate::runtime::RuntimeOwnership::acquire(&run_dir);
+        let recovery_error = recovered.as_ref().err().cloned();
+        let recovery_deadline = Instant::now() + Duration::from_secs(1);
+        let group_survived = loop {
+            let group_is_live =
+                crate::runtime::process_group_has_live_members(child_group).unwrap();
+            if !group_is_live || Instant::now() >= recovery_deadline {
+                break group_is_live;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        if group_survived {
+            crate::runtime::terminate_stale_process_group(child_group).unwrap();
+        }
+
+        assert_eq!(output.status.signal(), Some(libc::SIGTERM), "{output:?}");
+        assert!(
+            recovery_error.is_none(),
+            "caller-managed runtime recovery failed: {recovery_error:?}"
+        );
+        assert!(!group_survived, "caller-managed child survived recovery");
+        assert!(!lease_path.exists());
+        drop(recovered.ok());
+        drop(crate::catalog::ModelLock::acquire(&root.path().join("models/demo")).unwrap());
+    }
+
     #[test]
     fn argv_and_readiness_are_exact_and_generic() {
         let launch = Launch::generic(
@@ -3523,6 +3827,66 @@ int main(int argc, char **argv) {
 
     #[cfg(unix)]
     #[test]
+    fn caller_managed_start_retains_idle_ownership() {
+        if std::env::var_os("LOXA_CALLER_MANAGED_IDLE_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "runner::tests::caller_managed_start_retains_idle_ownership",
+                    "--nocapture",
+                ])
+                .env("LOXA_CALLER_MANAGED_IDLE_CHILD", "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+
+        let _lock = process_test_lock();
+        let dir = tempdir().unwrap();
+        let server = dir.path().join("server");
+        let announced = dir.path().join("announced");
+        let ready = dir.path().join("ready");
+        let run_dir = dir.path().join("run");
+        let port = resolve_requested_port(0).unwrap();
+        write_persistent_test_server(&server, &announced, &ready);
+        let runnable = persistent_runnable(dir.path(), &server, port);
+        let ownership = crate::runtime::RuntimeOwnership::acquire(&run_dir).unwrap();
+
+        let started = start_persistent_with_ownership(
+            runnable,
+            &ownership,
+            || false,
+            PersistentSignalPolicy::CallerManaged,
+        )
+        .unwrap();
+        let mut runtime = match started {
+            PersistentStart::Ready(runtime) => runtime,
+            PersistentStart::Stopped(exit) => panic!("caller-managed runtime stopped: {exit:?}"),
+            PersistentStart::Interrupted(interruption) => {
+                panic!("caller-managed runtime was interrupted: {interruption:?}")
+            }
+            PersistentStart::CleanupFailed(_) => {
+                panic!("caller-managed runtime cleanup failed unexpectedly")
+            }
+        };
+
+        assert!(crate::runtime::RuntimeOwnership::acquire(&run_dir).is_err());
+        runtime.terminate().unwrap();
+        drop(runtime);
+        let next_child = ownership.reserve_child().unwrap();
+        drop(next_child);
+        assert!(
+            crate::runtime::RuntimeOwnership::acquire(&run_dir).is_err(),
+            "idle retained ownership released the common lock"
+        );
+        drop(ownership);
+        drop(crate::runtime::RuntimeOwnership::acquire(&run_dir).unwrap());
+        drop(crate::catalog::ModelLock::acquire(&dir.path().join("models/demo")).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn foreground_does_not_repoll_the_signal_callback_after_readiness() {
         let _lock = process_test_lock();
         let dir = tempdir().unwrap();
@@ -3640,29 +4004,35 @@ int main(int argc, char **argv) {
         let port = resolve_requested_port(0).unwrap();
         write_executable_script(&server, b"#!/bin/sh\nwhile :; do sleep 1; done\n");
         let runnable = persistent_runnable(dir.path(), &server, port);
+        let ownership = crate::runtime::RuntimeOwnership::acquire(&run_dir).unwrap();
         let group = Mutex::new(None);
         let original_lease = Mutex::new(None);
 
-        let started = start_persistent(runnable, &run_dir, || {
-            if !lease_path.is_file() {
-                return false;
-            }
-            if let Some((_, active_group)) =
-                unpack_server_identity(ACTIVE_SERVER.load(Ordering::SeqCst))
-            {
-                *group.lock().unwrap() = Some(active_group);
-            }
-            let mut original = original_lease.lock().unwrap();
-            if original.is_none() {
-                let bytes = std::fs::read(&lease_path).unwrap();
-                let mut changed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-                changed["port"] =
-                    serde_json::json!(changed["port"].as_u64().unwrap().checked_add(1).unwrap());
-                std::fs::write(&lease_path, serde_json::to_vec(&changed).unwrap()).unwrap();
-                *original = Some(bytes);
-            }
-            true
-        });
+        let started = start_persistent_with_ownership(
+            runnable,
+            &ownership,
+            || {
+                if !lease_path.is_file() {
+                    return false;
+                }
+                let mut original = original_lease.lock().unwrap();
+                if original.is_none() {
+                    let bytes = std::fs::read(&lease_path).unwrap();
+                    let lease: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    *group.lock().unwrap() = Some(lease["child_pgid"].as_i64().unwrap() as i32);
+                    let mut changed = lease;
+                    changed["port"] = serde_json::json!(changed["port"]
+                        .as_u64()
+                        .unwrap()
+                        .checked_add(1)
+                        .unwrap());
+                    std::fs::write(&lease_path, serde_json::to_vec(&changed).unwrap()).unwrap();
+                    *original = Some(bytes);
+                }
+                true
+            },
+            PersistentSignalPolicy::CallerManaged,
+        );
 
         let mut owned = match started {
             Ok(PersistentStart::CleanupFailed(owned)) => owned,
@@ -3679,7 +4049,12 @@ int main(int argc, char **argv) {
         assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
         assert!(lease_path.exists());
         assert!(crate::runtime::RuntimeOwnership::acquire(&run_dir).is_err());
+        assert!(ownership.reserve_child().is_err());
         assert!(crate::catalog::ModelLock::acquire(&dir.path().join("models/demo")).is_err());
+        assert!(
+            owned.poll().is_err(),
+            "poll accepted a server whose child cleanup is incomplete"
+        );
         let original = original_lease
             .into_inner()
             .unwrap()
@@ -3690,8 +4065,12 @@ int main(int argc, char **argv) {
 
         assert!(!lease_path.exists());
         drop(owned);
-        drop(crate::runtime::RuntimeOwnership::acquire(&run_dir).unwrap());
+        let next_child = ownership.reserve_child().unwrap();
+        drop(next_child);
+        assert!(crate::runtime::RuntimeOwnership::acquire(&run_dir).is_err());
         drop(crate::catalog::ModelLock::acquire(&dir.path().join("models/demo")).unwrap());
+        drop(ownership);
+        drop(crate::runtime::RuntimeOwnership::acquire(&run_dir).unwrap());
     }
 
     #[cfg(unix)]

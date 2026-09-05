@@ -1,7 +1,7 @@
 use super::*;
 use crate::runtime::{
-    decode_lease, terminate_process_group, RuntimeLeasePublication, RuntimeOwnership,
-    LEGACY_LEASE_VERSION,
+    decode_lease, terminate_process_group, RuntimeChildOwnership, RuntimeLeasePublication,
+    RuntimeOwnership, LEGACY_LEASE_VERSION,
 };
 use std::cell::Cell;
 use std::fs;
@@ -129,7 +129,7 @@ struct RecordedPersistentRuntime {
     managed_server: PathBuf,
     fingerprint: RuntimeFingerprint,
     port: u16,
-    ownership: Option<RuntimeOwnership>,
+    ownership: Option<RuntimeChildOwnership>,
     child: Child,
     child_pgid: i32,
 }
@@ -165,8 +165,10 @@ impl RecordedPersistentRuntime {
             .process_group(0);
         let mut child = command.spawn().unwrap();
         let child_pgid = i32::try_from(child.id()).unwrap();
-        let mut ownership = RuntimeOwnership::acquire(root.path()).unwrap();
-        if let Err(error) = ownership.record(
+        let ownership = RuntimeOwnership::acquire(root.path()).unwrap();
+        let mut child_ownership = ownership.reserve_child().unwrap();
+        child_ownership.child_spawned();
+        if let Err(error) = child_ownership.record(
             child.id(),
             child_pgid,
             "demo",
@@ -183,7 +185,7 @@ impl RecordedPersistentRuntime {
             managed_server,
             fingerprint,
             port,
-            ownership: Some(ownership),
+            ownership: Some(child_ownership),
             child,
             child_pgid,
         }

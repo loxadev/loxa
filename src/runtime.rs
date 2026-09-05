@@ -7,7 +7,7 @@ use std::io::{Read as _, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Child;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System, UpdateKind};
@@ -702,10 +702,27 @@ fn map_local_foreground_lock_error(error: String) -> ForegroundLockAcquireError 
     }
 }
 
+/// Common runtime ownership. The foreground lock remains held while either this
+/// handle or a reserved child token exists, and only one child may be reserved.
 pub(crate) struct RuntimeOwnership {
+    inner: Arc<Mutex<RuntimeOwnershipInner>>,
+}
+
+struct RuntimeOwnershipInner {
     _foreground_lock: ForegroundLock,
     state_path: PathBuf,
+    child_reserved: bool,
+}
+
+/// Exclusive child slot borrowed from [`RuntimeOwnership`]. After
+/// [`Self::child_spawned`], keep this token until the exact child is confirmed
+/// terminated and [`Self::clear`] has removed its recorded lease and stage.
+/// Dropping earlier leaves the child slot closed while the common owner is
+/// retained.
+pub(crate) struct RuntimeChildOwnership {
+    inner: Arc<Mutex<RuntimeOwnershipInner>>,
     lease: Option<RuntimeLease>,
+    release_on_drop: bool,
 }
 
 pub(crate) enum RuntimeOwnershipAcquireError {
@@ -784,10 +801,35 @@ impl RuntimeOwnership {
         drop(operation);
 
         Ok(Self {
-            _foreground_lock: foreground_lock,
-            state_path,
-            lease: None,
+            inner: Arc::new(Mutex::new(RuntimeOwnershipInner {
+                _foreground_lock: foreground_lock,
+                state_path,
+                child_reserved: false,
+            })),
         })
+    }
+
+    pub(crate) fn reserve_child(&self) -> Result<RuntimeChildOwnership, String> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| "runtime ownership state lock is poisoned".to_string())?;
+        if inner.child_reserved {
+            return Err("runtime ownership already has an active child".into());
+        }
+        inner.child_reserved = true;
+        drop(inner);
+        Ok(RuntimeChildOwnership {
+            inner: Arc::clone(&self.inner),
+            lease: None,
+            release_on_drop: true,
+        })
+    }
+}
+
+impl RuntimeChildOwnership {
+    pub(crate) fn child_spawned(&mut self) {
+        self.release_on_drop = false;
     }
 
     pub(crate) fn record(
@@ -828,39 +870,62 @@ impl RuntimeOwnership {
             model_id: model_id.to_owned(),
             port,
         };
+        let state_path = self.state_path()?;
         let _state_guard = lock_lease_state()?;
-        write_lease(&self.state_path, &lease)?;
+        write_lease(&state_path, &lease)?;
         self.lease = Some(lease);
         Ok(())
     }
 
     pub(crate) fn clear(&mut self) -> Result<(), String> {
         let Some(expected) = self.lease.as_ref() else {
+            self.release_on_drop = true;
             return Ok(());
         };
+        let state_path = self.state_path()?;
         let _state_guard = lock_lease_state()?;
-        match read_lease(&self.state_path) {
+        match read_lease(&state_path) {
             Ok(current) if current == *expected => {
                 cleanup_recorded_execution_stage(
-                    self.state_path
+                    state_path
                         .parent()
                         .expect("runtime lease has a run-directory parent"),
                     expected,
                 )?;
-                fs::remove_file(&self.state_path)
-                    .map_err(|error| format!("{}: {error}", self.state_path.display()))?;
+                fs::remove_file(&state_path)
+                    .map_err(|error| format!("{}: {error}", state_path.display()))?;
                 self.lease = None;
+                self.release_on_drop = true;
                 Ok(())
             }
             Ok(_) => Err(format!(
                 "runtime lease changed unexpectedly: {}",
-                self.state_path.display()
+                state_path.display()
             )),
-            Err(_error) if lease_is_absent(&self.state_path) => {
+            Err(_error) if lease_is_absent(&state_path) => {
                 self.lease = None;
+                self.release_on_drop = true;
                 Ok(())
             }
             Err(error) => Err(error),
+        }
+    }
+
+    fn state_path(&self) -> Result<PathBuf, String> {
+        self.inner
+            .lock()
+            .map(|inner| inner.state_path.clone())
+            .map_err(|_| "runtime ownership state lock is poisoned".to_string())
+    }
+}
+
+impl Drop for RuntimeChildOwnership {
+    fn drop(&mut self) {
+        if !self.release_on_drop {
+            return;
+        }
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.child_reserved = false;
         }
     }
 }
@@ -2406,6 +2471,73 @@ while :; do sleep 60; done"#,
 
     #[cfg(unix)]
     #[test]
+    fn child_token_keeps_common_ownership_after_parent_handle_drops() {
+        if std::env::var_os("LOXA_CHILD_TOKEN_LIFETIME_CHILD").is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "runtime::tests::child_token_keeps_common_ownership_after_parent_handle_drops",
+                    "--nocapture",
+                ])
+                .env("LOXA_CHILD_TOKEN_LIFETIME_CHILD", "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+
+        let dir = tempdir().unwrap();
+        let ownership = RuntimeOwnership::acquire(dir.path()).unwrap();
+        let child = ownership.reserve_child().unwrap();
+
+        drop(ownership);
+
+        assert!(
+            RuntimeOwnership::acquire(dir.path()).is_err(),
+            "the child token released common runtime ownership"
+        );
+        drop(child);
+        drop(RuntimeOwnership::acquire(dir.path()).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawned_child_without_verified_cleanup_keeps_retained_owner_closed() {
+        if std::env::var_os("LOXA_SPAWNED_CHILD_FAIL_CLOSED_CHILD").is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "runtime::tests::spawned_child_without_verified_cleanup_keeps_retained_owner_closed",
+                    "--nocapture",
+                ])
+                .env("LOXA_SPAWNED_CHILD_FAIL_CLOSED_CHILD", "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+
+        let dir = tempdir().unwrap();
+        let ownership = RuntimeOwnership::acquire(dir.path()).unwrap();
+        let mut child = ownership.reserve_child().unwrap();
+        child.child_spawned();
+
+        drop(child);
+
+        assert!(
+            ownership.reserve_child().is_err(),
+            "an unverified spawned child released its reservation"
+        );
+        assert!(
+            RuntimeOwnership::acquire(dir.path()).is_err(),
+            "an unverified spawned child released common ownership"
+        );
+        drop(ownership);
+        drop(RuntimeOwnership::acquire(dir.path()).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn traditional_lock_fallback_isolates_parent_symlink_aliases() {
         let dir = tempdir().unwrap();
         let alias = dir.path().join("alias");
@@ -2885,8 +3017,10 @@ while :; do sleep 60; done"#,
             .spawn()
             .unwrap();
         let group = i32::try_from(child.id()).unwrap();
-        let mut ownership = RuntimeOwnership::acquire(&run_dir).unwrap();
-        ownership
+        let ownership = RuntimeOwnership::acquire(&run_dir).unwrap();
+        let mut child_ownership = ownership.reserve_child().unwrap();
+        child_ownership.child_spawned();
+        child_ownership
             .record(
                 child.id(),
                 group,
@@ -2900,7 +3034,7 @@ while :; do sleep 60; done"#,
             .unwrap();
 
         terminate_process_group(&mut child, group).unwrap();
-        ownership.clear().unwrap();
+        child_ownership.clear().unwrap();
 
         assert!(!stage.exists(), "graceful clear leaked the execution stage");
         assert!(neighbor.is_dir(), "cleanup removed an adjacent lookalike");
