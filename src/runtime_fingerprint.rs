@@ -2,7 +2,10 @@ use crate::catalog::{ArtifactRef, Manifest};
 use serde::{Deserialize, Serialize};
 
 const FINGERPRINT_SCHEMA_VERSION: u32 = 1;
+const SERVICE_FINGERPRINT_SCHEMA_VERSION: u32 = 2;
 pub(crate) const PERSISTENT_SLEEP_IDLE_SECONDS: u64 = 60;
+pub(crate) const SERVICE_MIN_CONTEXT: u32 = 512;
+pub(crate) const SERVICE_MAX_CONTEXT: u32 = 32_768;
 // Prior schema-1 leases must remain decodable so recovery can terminate their exact child.
 const LEGACY_PERSISTENT_SLEEP_IDLE_SECONDS: u64 = 300;
 
@@ -12,6 +15,50 @@ pub(crate) enum EffectiveProfile {
     Generic,
     Gemma4Mtp,
     PrimaryOnly,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ServiceRuntimeProfile {
+    pub(crate) max_output_tokens: u32,
+    pub(crate) batch_size: u32,
+    pub(crate) micro_batch_size: u32,
+    pub(crate) threads: u16,
+    pub(crate) batch_threads: u16,
+    pub(crate) cache_type_k: String,
+    pub(crate) cache_type_v: String,
+    pub(crate) kv_offload: bool,
+    pub(crate) gpu_layers: String,
+    pub(crate) fit: bool,
+    pub(crate) parallel: u16,
+    pub(crate) http_threads: u16,
+    pub(crate) poll: u8,
+    pub(crate) batch_poll: u8,
+    pub(crate) extra_cache_mib: u32,
+    pub(crate) offline: bool,
+}
+
+impl ServiceRuntimeProfile {
+    pub(crate) fn qualified() -> Self {
+        Self {
+            max_output_tokens: 4096,
+            batch_size: 512,
+            micro_batch_size: 128,
+            threads: 4,
+            batch_threads: 4,
+            cache_type_k: "f16".into(),
+            cache_type_v: "f16".into(),
+            kv_offload: true,
+            gpu_layers: "all".into(),
+            fit: false,
+            parallel: 1,
+            http_threads: 1,
+            poll: 0,
+            batch_poll: 0,
+            extra_cache_mib: 0,
+            offline: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -42,6 +89,8 @@ pub(crate) struct RuntimeFingerprint {
     sleep_policy: Option<u64>,
     primary: ArtifactFingerprint,
     draft: Option<ArtifactFingerprint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_profile: Option<ServiceRuntimeProfile>,
 }
 
 impl<'de> Deserialize<'de> for RuntimeFingerprint {
@@ -59,6 +108,8 @@ impl<'de> Deserialize<'de> for RuntimeFingerprint {
             sleep_policy: Option<u64>,
             primary: ArtifactFingerprint,
             draft: Option<ArtifactFingerprint>,
+            #[serde(default)]
+            service_profile: Option<ServiceRuntimeProfile>,
         }
 
         let wire = WireFingerprint::deserialize(deserializer)?;
@@ -70,6 +121,7 @@ impl<'de> Deserialize<'de> for RuntimeFingerprint {
             sleep_policy: wire.sleep_policy,
             primary: wire.primary,
             draft: wire.draft,
+            service_profile: wire.service_profile,
         };
         fingerprint.primary.sha256.make_ascii_lowercase();
         if let Some(draft) = &mut fingerprint.draft {
@@ -92,7 +144,10 @@ impl RuntimeFingerprint {
     }
 
     fn validate(&self, allow_legacy_sleep_policy: bool) -> Result<(), String> {
-        if self.schema_version != FINGERPRINT_SCHEMA_VERSION {
+        if !matches!(
+            self.schema_version,
+            FINGERPRINT_SCHEMA_VERSION | SERVICE_FINGERPRINT_SCHEMA_VERSION
+        ) {
             return Err("unsupported runtime fingerprint schema".into());
         }
         crate::paths::validate_id(&self.model_id)?;
@@ -107,22 +162,43 @@ impl RuntimeFingerprint {
         if let Some(draft) = &self.draft {
             validate_artifact(draft)?;
         }
-        match (
+        let profile_is_valid = match (
             self.effective_profile,
             self.draft.is_some(),
             self.sleep_policy,
         ) {
-            (EffectiveProfile::Generic, false, _) | (EffectiveProfile::Gemma4Mtp, true, _) => {
-                Ok(())
-            }
+            (EffectiveProfile::Generic, false, _) | (EffectiveProfile::Gemma4Mtp, true, _) => true,
             (EffectiveProfile::PrimaryOnly, false, Some(sleep_policy))
                 if sleep_policy == PERSISTENT_SLEEP_IDLE_SECONDS
                     || (allow_legacy_sleep_policy
                         && sleep_policy == LEGACY_PERSISTENT_SLEEP_IDLE_SECONDS) =>
             {
+                true
+            }
+            (EffectiveProfile::PrimaryOnly, false, None)
+                if self.schema_version == SERVICE_FINGERPRINT_SCHEMA_VERSION =>
+            {
+                true
+            }
+            _ => false,
+        };
+        if !profile_is_valid {
+            return Err("runtime fingerprint profile contradicts its draft artifact".into());
+        }
+        match (self.schema_version, self.service_profile.as_ref()) {
+            (FINGERPRINT_SCHEMA_VERSION, None) => Ok(()),
+            (SERVICE_FINGERPRINT_SCHEMA_VERSION, Some(profile))
+                if self.sleep_policy.is_none()
+                    && *profile == ServiceRuntimeProfile::qualified()
+                    && (SERVICE_MIN_CONTEXT..=SERVICE_MAX_CONTEXT)
+                        .contains(&self.effective_context) =>
+            {
                 Ok(())
             }
-            _ => Err("runtime fingerprint profile contradicts its draft artifact".into()),
+            (SERVICE_FINGERPRINT_SCHEMA_VERSION, Some(_)) => {
+                Err("unsupported service runtime resource profile".into())
+            }
+            _ => Err("runtime fingerprint schema contradicts its service profile".into()),
         }
     }
 
@@ -143,6 +219,34 @@ impl RuntimeFingerprint {
             sleep_policy,
             primary: manifest.primary_artifact().into(),
             draft: manifest.draft_artifact().map(Into::into),
+            service_profile: None,
+        };
+        fingerprint.validate_current()?;
+        Ok(fingerprint)
+    }
+
+    pub(crate) fn from_manifest_for_service(
+        manifest: &Manifest,
+        effective_context: u32,
+        effective_profile: EffectiveProfile,
+    ) -> Result<Self, String> {
+        if effective_profile == EffectiveProfile::PrimaryOnly {
+            return Err("primary-only fingerprints must come from the paired fallback".into());
+        }
+        if !(SERVICE_MIN_CONTEXT..=SERVICE_MAX_CONTEXT).contains(&effective_context) {
+            return Err(format!(
+                "service context must be between {SERVICE_MIN_CONTEXT} and {SERVICE_MAX_CONTEXT} tokens"
+            ));
+        }
+        let fingerprint = Self {
+            schema_version: SERVICE_FINGERPRINT_SCHEMA_VERSION,
+            model_id: manifest.id.clone(),
+            effective_context,
+            effective_profile,
+            sleep_policy: None,
+            primary: manifest.primary_artifact().into(),
+            draft: manifest.draft_artifact().map(Into::into),
+            service_profile: Some(ServiceRuntimeProfile::qualified()),
         };
         fingerprint.validate_current()?;
         Ok(fingerprint)
@@ -158,6 +262,22 @@ impl RuntimeFingerprint {
         let mut primary_only = self.clone();
         primary_only.effective_profile = EffectiveProfile::PrimaryOnly;
         primary_only.draft = None;
+        Some(primary_only)
+    }
+
+    pub(crate) fn primary_only_for_service(&self) -> Option<Self> {
+        if self.schema_version != SERVICE_FINGERPRINT_SCHEMA_VERSION
+            || self.effective_profile != EffectiveProfile::Gemma4Mtp
+            || self.draft.is_none()
+            || self.sleep_policy.is_some()
+            || self.service_profile.as_ref() != Some(&ServiceRuntimeProfile::qualified())
+        {
+            return None;
+        }
+        let mut primary_only = self.clone();
+        primary_only.effective_profile = EffectiveProfile::PrimaryOnly;
+        primary_only.draft = None;
+        primary_only.validate_current().ok()?;
         Some(primary_only)
     }
 
@@ -181,6 +301,22 @@ impl RuntimeFingerprint {
         }
         if !self.sleep_policy.is_some_and(is_persistent_sleep_policy) {
             return Err("persistent runtime fingerprint requires a supported sleep policy".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_service_lease(&self, model_id: &str) -> Result<(), String> {
+        self.validate_current()?;
+        if self.model_id != model_id {
+            return Err("runtime lease model contradicts its fingerprint".into());
+        }
+        if self.sleep_policy.is_some() {
+            return Err("service runtime fingerprint must not use an engine sleep policy".into());
+        }
+        if self.schema_version != SERVICE_FINGERPRINT_SCHEMA_VERSION
+            || self.service_profile.as_ref() != Some(&ServiceRuntimeProfile::qualified())
+        {
+            return Err("service runtime fingerprint is not resource-qualified".into());
         }
         Ok(())
     }

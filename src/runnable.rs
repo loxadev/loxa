@@ -87,6 +87,17 @@ impl Runnable {
         self.fingerprint = fingerprint;
         Some(())
     }
+
+    pub(crate) fn primary_only_for_service(&mut self) -> Option<()> {
+        if !self.allow_primary_fallback {
+            return None;
+        }
+        let launch = self.launch.primary_only()?;
+        let fingerprint = self.fingerprint.primary_only_for_service()?;
+        self.launch = launch;
+        self.fingerprint = fingerprint;
+        Some(())
+    }
 }
 
 enum AdmissionSource {
@@ -208,6 +219,50 @@ pub(crate) fn resolve_managed_runnable_for_host(
     resolve_managed_runnable_with_admission(manifest, paths, |manifest, paths| {
         admit_installed_for_host(manifest, paths, cancelled)
     })
+}
+
+pub(crate) fn resolve_managed_runnable_for_service(
+    manifest: Manifest,
+    paths: &AppPaths,
+    cancelled: &impl Fn() -> bool,
+) -> Result<Runnable, ManagedRunnableError> {
+    let installed =
+        catalog::load_catalog(&paths.models).map_err(ManagedRunnableError::ModelUnavailable)?;
+    if !installed.iter().any(|candidate| candidate == &manifest) {
+        return Err(ManagedRunnableError::ModelUnavailable(format!(
+            "model {} is not installed",
+            manifest.id
+        )));
+    }
+    let config = config::load(&paths.config).map_err(ManagedRunnableError::StartupFailed)?;
+    let ctx = config::resolve_value(None, config.ctx, 4096);
+    let profile = launch_profile(&manifest, &paths.models, paths.runtime_identity)
+        .map_err(ManagedRunnableError::ModelUnavailable)?;
+    let server =
+        runner::validate_managed_runtime(paths).map_err(ManagedRunnableError::StartupFailed)?;
+    let admission_started = Instant::now();
+    let (model_lock, admission) = admit_installed_for_host(&manifest, paths, cancelled)?;
+    report_admission(&manifest.id, admission, admission_started);
+    let fingerprint =
+        RuntimeFingerprint::from_manifest_for_service(&manifest, ctx, profile.effective_profile())
+            .map_err(ManagedRunnableError::ModelUnavailable)?;
+    let artifact = manifest.artifact_path(&paths.models);
+    let server_path = server.source_server().to_path_buf();
+    Ok(Runnable::new(
+        model_lock,
+        runner::Launch {
+            server: server_path,
+            managed_runtime: Some(server),
+            model: artifact,
+            id: manifest.id,
+            requested_port: 0,
+            ctx,
+            profile,
+            policy: runner::LaunchPolicy::Service,
+        },
+        fingerprint,
+        !paths.runtime_identity.is_bundled(),
+    ))
 }
 
 fn resolve_managed_runnable_with_admission(

@@ -5,11 +5,20 @@ use std::path::{Path, PathBuf};
 pub(super) const LEGACY_LEASE_VERSION: u32 = 1;
 pub(super) const PERSISTENT_LEASE_VERSION: u32 = 2;
 pub(super) const LEASE_VERSION: u32 = 3;
+pub(super) const SERVICE_LEASE_VERSION: u32 = 4;
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum LeaseOwnerMode {
     Foreground,
     PersistentApp,
+    Service,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ServiceLeaseFields {
+    pub(super) endpoint: PathBuf,
+    pub(super) parallel: u16,
+    pub(super) offline: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -26,6 +35,7 @@ pub(super) struct RuntimeLease {
     pub(super) server: PathBuf,
     pub(super) model_id: String,
     pub(super) port: u16,
+    pub(super) service: Option<ServiceLeaseFields>,
 }
 
 #[derive(Deserialize)]
@@ -83,6 +93,28 @@ struct RuntimeLeaseV3 {
     port: u16,
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeLeaseV4 {
+    version: u32,
+    owner_mode: LeaseOwnerMode,
+    #[serde(deserialize_with = "deserialize_explicit_fingerprint")]
+    fingerprint: Option<RuntimeFingerprint>,
+    #[serde(deserialize_with = "deserialize_explicit_managed_source")]
+    managed_source: Option<PathBuf>,
+    owner_pid: u32,
+    owner_start_time: u64,
+    child_pid: u32,
+    child_start_time: u64,
+    child_pgid: i32,
+    server: PathBuf,
+    model_id: String,
+    port: u16,
+    endpoint: PathBuf,
+    parallel: u16,
+    offline: bool,
+}
+
 fn deserialize_explicit_fingerprint<'de, D>(
     deserializer: D,
 ) -> Result<Option<RuntimeFingerprint>, D::Error>
@@ -128,26 +160,47 @@ pub(super) fn validate_lease(lease: &RuntimeLease) -> Result<(), String> {
             lease.owner_mode,
             lease.fingerprint.as_ref(),
             lease.managed_source.as_ref(),
+            lease.service.as_ref(),
         ),
-        (LEGACY_LEASE_VERSION, None, None, None)
+        (LEGACY_LEASE_VERSION, None, None, None, None)
             | (
                 PERSISTENT_LEASE_VERSION,
                 Some(LeaseOwnerMode::Foreground),
                 None,
-                None
+                None,
+                None,
             )
             | (
                 PERSISTENT_LEASE_VERSION,
                 Some(LeaseOwnerMode::PersistentApp),
                 Some(_),
                 None,
+                None,
             )
-            | (LEASE_VERSION, Some(LeaseOwnerMode::Foreground), None, _)
+            | (
+                LEASE_VERSION,
+                Some(LeaseOwnerMode::Foreground),
+                None,
+                _,
+                None
+            )
             | (
                 LEASE_VERSION,
                 Some(LeaseOwnerMode::PersistentApp),
                 Some(_),
                 _,
+                None,
+            )
+            | (
+                SERVICE_LEASE_VERSION,
+                Some(LeaseOwnerMode::Service),
+                Some(_),
+                _,
+                Some(ServiceLeaseFields {
+                    parallel: 1,
+                    offline: true,
+                    ..
+                }),
             )
     );
     if !version_and_owner_are_valid
@@ -163,9 +216,18 @@ pub(super) fn validate_lease(lease: &RuntimeLease) -> Result<(), String> {
             .as_ref()
             .is_some_and(|source| !source.is_absolute() || source.as_os_str().is_empty())
         || lease.model_id.is_empty()
-        || lease.port == 0
+        || (lease.version == SERVICE_LEASE_VERSION) == (lease.port != 0)
+        || lease.service.as_ref().is_some_and(|service| {
+            !service.endpoint.is_absolute() || service.endpoint.as_os_str().is_empty()
+        })
     {
         Err("invalid runtime lease".into())
+    } else if lease.version == SERVICE_LEASE_VERSION {
+        lease
+            .fingerprint
+            .as_ref()
+            .expect("validated service lease has a fingerprint")
+            .validate_service_lease(&lease.model_id)
     } else if let Some(fingerprint) = lease.persistent_fingerprint() {
         fingerprint.validate_recorded_persistent_lease(&lease.model_id)
     } else {
@@ -192,6 +254,7 @@ pub(super) fn decode_lease(bytes: &[u8]) -> Result<RuntimeLease, String> {
                 server: lease.server,
                 model_id: lease.model_id,
                 port: lease.port,
+                service: None,
             }
         }
         PERSISTENT_LEASE_VERSION => {
@@ -210,6 +273,7 @@ pub(super) fn decode_lease(bytes: &[u8]) -> Result<RuntimeLease, String> {
                 server: lease.server,
                 model_id: lease.model_id,
                 port: lease.port,
+                service: None,
             }
         }
         LEASE_VERSION => {
@@ -228,6 +292,30 @@ pub(super) fn decode_lease(bytes: &[u8]) -> Result<RuntimeLease, String> {
                 server: lease.server,
                 model_id: lease.model_id,
                 port: lease.port,
+                service: None,
+            }
+        }
+        SERVICE_LEASE_VERSION => {
+            let lease: RuntimeLeaseV4 =
+                serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+            RuntimeLease {
+                version: lease.version,
+                owner_mode: Some(lease.owner_mode),
+                fingerprint: lease.fingerprint,
+                managed_source: lease.managed_source,
+                owner_pid: lease.owner_pid,
+                owner_start_time: lease.owner_start_time,
+                child_pid: lease.child_pid,
+                child_start_time: lease.child_start_time,
+                child_pgid: lease.child_pgid,
+                server: lease.server,
+                model_id: lease.model_id,
+                port: lease.port,
+                service: Some(ServiceLeaseFields {
+                    endpoint: lease.endpoint,
+                    parallel: lease.parallel,
+                    offline: lease.offline,
+                }),
             }
         }
         _ => return Err("unsupported runtime lease version".into()),
@@ -257,6 +345,40 @@ pub(super) fn encode_v3_lease(lease: &RuntimeLease) -> Result<Vec<u8>, String> {
         server: lease.server.clone(),
         model_id: lease.model_id.clone(),
         port: lease.port,
+    };
+    serde_json::to_vec_pretty(&wire).map_err(|error| error.to_string())
+}
+
+pub(super) fn encode_lease(lease: &RuntimeLease) -> Result<Vec<u8>, String> {
+    validate_lease(lease)?;
+    if lease.version == LEASE_VERSION {
+        return encode_v3_lease(lease);
+    }
+    if lease.version != SERVICE_LEASE_VERSION {
+        return Err("legacy runtime leases cannot be published".into());
+    }
+    let service = lease
+        .service
+        .as_ref()
+        .ok_or_else(|| "v4 service runtime lease fields are missing".to_string())?;
+    let wire = RuntimeLeaseV4 {
+        version: lease.version,
+        owner_mode: lease
+            .owner_mode
+            .ok_or_else(|| "v4 runtime lease owner mode is missing".to_string())?,
+        fingerprint: lease.fingerprint.clone(),
+        managed_source: lease.managed_source.clone(),
+        owner_pid: lease.owner_pid,
+        owner_start_time: lease.owner_start_time,
+        child_pid: lease.child_pid,
+        child_start_time: lease.child_start_time,
+        child_pgid: lease.child_pgid,
+        server: lease.server.clone(),
+        model_id: lease.model_id.clone(),
+        port: lease.port,
+        endpoint: service.endpoint.clone(),
+        parallel: service.parallel,
+        offline: service.offline,
     };
     serde_json::to_vec_pretty(&wire).map_err(|error| error.to_string())
 }
