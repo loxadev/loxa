@@ -1432,8 +1432,17 @@ fn random_stage_token() -> Result<String, String> {
 }
 
 fn publish_captured_regular(contents: &Path, regular: &CapturedRegular) -> Result<(), String> {
-    let destination = contents.join(&regular.relative);
-    let destination_mode = regular.mode & !0o222;
+    publish_regular_bytes(contents, &regular.relative, regular.mode, &regular.bytes)
+}
+
+fn publish_regular_bytes(
+    contents: &Path,
+    relative: &str,
+    source_mode: u32,
+    bytes: &[u8],
+) -> Result<(), String> {
+    let destination = contents.join(relative);
+    let destination_mode = source_mode & !0o222;
 
     let mut options = OpenOptions::new();
     options.create_new(true).write(true).mode(destination_mode);
@@ -1441,7 +1450,10 @@ fn publish_captured_regular(contents: &Path, regular: &CapturedRegular) -> Resul
         .open(&destination)
         .map_err(|_| "prepared runtime file could not be created".to_string())?;
     destination_file
-        .write_all(&regular.bytes)
+        .write_all(bytes)
+        .and_then(|()| {
+            destination_file.set_permissions(fs::Permissions::from_mode(destination_mode))
+        })
         .and_then(|()| destination_file.sync_all())
         .map_err(|_| "prepared runtime file could not be copied".to_string())
 }
@@ -1755,6 +1767,52 @@ fn read_u32(bytes: &[u8], offset: usize, relative: &str) -> Result<u32, String> 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restrictive_umask_publish_child() {
+        let Some(contents) = std::env::var_os("LOXA_TEST_RESTRICTIVE_UMASK_CONTENTS") else {
+            return;
+        };
+        // SAFETY: this exact-filter subprocess runs only this test, so changing
+        // its process umask cannot race another test or escape the child.
+        unsafe { libc::umask(0o077) };
+        let contents = PathBuf::from(contents);
+        fs::create_dir_all(&contents).unwrap();
+        publish_regular_bytes(&contents, "read-only", 0o444, b"captured").unwrap();
+        assert_eq!(
+            fs::metadata(contents.join("read-only"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o444
+        );
+    }
+
+    #[test]
+    fn captured_read_only_mode_survives_a_restrictive_service_umask() {
+        let root = tempfile::tempdir().unwrap();
+        let contents = root.path().join("Contents");
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runtime_bundle::tests::restrictive_umask_publish_child",
+                "--nocapture",
+            ])
+            .env("LOXA_TEST_RESTRICTIVE_UMASK_CONTENTS", &contents)
+            .output()
+            .unwrap();
+
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            fs::metadata(contents.join("read-only"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o444
+        );
+    }
 
     #[test]
     fn interrupted_stage_constructor_child() {

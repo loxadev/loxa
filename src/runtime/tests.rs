@@ -388,6 +388,7 @@ fn observed_lease(child: &Child, model_id: &str, port: u16) -> RuntimeLease {
         server: child.executable,
         model_id: model_id.into(),
         port,
+        service: None,
     }
 }
 
@@ -984,6 +985,24 @@ fn foreground_observer_treats_lease_lock_contradictions_and_malformed_leases_con
 }
 
 #[test]
+fn oversized_runtime_record_is_bounded_and_observed_conservatively() {
+    let root = tempdir().unwrap();
+    let _lock = hold_foreground_lock(root.path());
+    let lease_path = root.path().join("foreground.json");
+    let bytes = vec![b'x'; MAX_RUNTIME_RECORD_BYTES + 1];
+    fs::write(&lease_path, &bytes).unwrap();
+
+    let error = read_regular_file(&lease_path).unwrap_err();
+    assert!(error.contains("65536-byte limit"), "{error}");
+    let mut observer = ForegroundObserver::new(root.path().to_path_buf());
+    assert_eq!(
+        observer.observe(Path::new("/managed/llama-server")),
+        ForegroundObservation::Starting
+    );
+    assert_eq!(fs::metadata(&lease_path).unwrap().len(), bytes.len() as u64);
+}
+
+#[test]
 fn foreground_observer_requires_every_live_identity_and_allows_only_teardown_grace() {
     let managed = Path::new("/managed/llama-server");
     let mut child = spawn_observable_server("demo", 43123);
@@ -1184,6 +1203,7 @@ fn stale_recovery_removes_only_the_exact_orphaned_execution_stage() {
         server: snapshot.executable,
         model_id: "demo".into(),
         port: 43123,
+        service: None,
     };
     fs::create_dir_all(&run_dir).unwrap();
     write_lease_fixture(&run_dir.join("foreground.json"), &lease);
@@ -1291,6 +1311,7 @@ fn general_recovery_stops_an_exact_orphaned_child() {
             server: snapshot.executable,
             model_id: "demo".into(),
             port: 1234,
+            service: None,
         };
         write_lease_fixture(&dir.path().join("foreground.json"), &lease);
 
@@ -1326,6 +1347,7 @@ fn signal_cleanup_removes_the_exact_owned_lease_after_group_termination() {
         server: child_snapshot.executable,
         model_id: "demo".into(),
         port: 1234,
+        service: None,
     };
     let state_path = dir.path().join("foreground.json");
     write_lease(&state_path, &lease).unwrap();
@@ -1357,6 +1379,7 @@ fn signal_cleanup_preserves_a_foreign_lease() {
         server: child_snapshot.executable,
         model_id: "demo".into(),
         port: 1234,
+        service: None,
     };
     let state_path = dir.path().join("foreground.json");
     write_lease(&state_path, &lease).unwrap();
@@ -1396,6 +1419,7 @@ fn acquiring_runtime_never_signals_a_reused_process_identity() {
             server: snapshot.executable,
             model_id: "demo".into(),
             port: 1234,
+            service: None,
         };
         write_lease_fixture(&dir.path().join("foreground.json"), &lease);
 

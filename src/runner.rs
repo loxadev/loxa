@@ -1,5 +1,5 @@
 use crate::runtime_fingerprint::{
-    EffectiveProfile, RuntimeFingerprint, PERSISTENT_SLEEP_IDLE_SECONDS,
+    EffectiveProfile, RuntimeFingerprint, ServiceRuntimeProfile, PERSISTENT_SLEEP_IDLE_SECONDS,
 };
 use crate::runtime_identity::RuntimeIdentity;
 use crate::ui;
@@ -18,6 +18,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod discovery;
+#[cfg(unix)]
+mod service_transport;
 mod signal;
 pub(crate) use discovery::discover_from_process;
 #[cfg(all(test, target_os = "macos"))]
@@ -29,6 +31,11 @@ pub use discovery::{discover_server, validate_managed_runtime};
 use discovery::{
     managed_version_first_line, probe_validated_version, probe_version_with_timeout,
     VERSION_PROBE_TIMEOUT,
+};
+#[cfg(unix)]
+use service_transport::{
+    authenticate_unix_endpoint, readiness_unix, remove_owned_unix_endpoint,
+    require_absent_unix_endpoint, UnixEndpointIdentity, UnixReadiness,
 };
 use signal::{
     activate_server, clear_server_starting, deactivate_server, install_termination_watcher,
@@ -62,6 +69,7 @@ const MAX_PENDING_ANNOUNCEMENTS: usize = 64;
 pub(crate) enum LaunchPolicy {
     Foreground,
     PersistentApp,
+    Service,
 }
 
 impl LaunchPolicy {
@@ -69,6 +77,7 @@ impl LaunchPolicy {
         match self {
             Self::Foreground => None,
             Self::PersistentApp => Some(PERSISTENT_SLEEP_IDLE_SECONDS),
+            Self::Service => None,
         }
     }
 }
@@ -483,25 +492,80 @@ fn kill_owner_after_spawn_before_lease_for_test() {
 }
 
 pub(crate) fn build_args(launch: &Launch, port: u16) -> Vec<OsString> {
+    build_args_for_endpoint(launch, port, None)
+}
+
+fn build_args_for_endpoint(
+    launch: &Launch,
+    port: u16,
+    unix_socket: Option<&Path>,
+) -> Vec<OsString> {
     let mtp = matches!(&launch.profile, LaunchProfile::Gemma4Mtp { .. });
+    let service_profile =
+        (launch.policy == LaunchPolicy::Service).then(ServiceRuntimeProfile::qualified);
     let mut args = vec![
         "--model".into(),
         launch.model.as_os_str().to_owned(),
         "--alias".into(),
         launch.id.clone().into(),
         "--host".into(),
-        "127.0.0.1".into(),
-        "--cors-origins".into(),
-        "localhost".into(),
+        unix_socket
+            .map(|path| path.as_os_str().to_owned())
+            .unwrap_or_else(|| "127.0.0.1".into()),
+    ];
+    if unix_socket.is_none() {
+        args.extend(["--cors-origins".into(), "localhost".into()]);
+    }
+    args.extend([
         "--no-ui".into(),
         "--port".into(),
         port.to_string().into(),
         "--ctx-size".into(),
         launch.ctx.to_string().into(),
         "--n-gpu-layers".into(),
-        if mtp { "all" } else { "99" }.into(),
-    ];
-    if mtp {
+        service_profile
+            .as_ref()
+            .map(|profile| profile.gpu_layers.as_str())
+            .unwrap_or(if mtp { "all" } else { "99" })
+            .into(),
+    ]);
+    if let Some(profile) = &service_profile {
+        args.extend([
+            "--n-predict".into(),
+            profile.max_output_tokens.to_string().into(),
+            "--batch-size".into(),
+            profile.batch_size.to_string().into(),
+            "--ubatch-size".into(),
+            profile.micro_batch_size.to_string().into(),
+            "--threads".into(),
+            profile.threads.to_string().into(),
+            "--threads-batch".into(),
+            profile.batch_threads.to_string().into(),
+            "--cache-type-k".into(),
+            profile.cache_type_k.as_str().into(),
+            "--cache-type-v".into(),
+            profile.cache_type_v.as_str().into(),
+            "--parallel".into(),
+            profile.parallel.to_string().into(),
+            "--threads-http".into(),
+            profile.http_threads.to_string().into(),
+            "--poll".into(),
+            profile.poll.to_string().into(),
+            "--poll-batch".into(),
+            profile.batch_poll.to_string().into(),
+            "--cache-ram".into(),
+            profile.extra_cache_mib.to_string().into(),
+        ]);
+        if profile.kv_offload {
+            args.push("--kv-offload".into());
+        } else {
+            args.push("--no-kv-offload".into());
+        }
+        if profile.offline {
+            args.push("--offline".into());
+        }
+    }
+    if mtp || service_profile.as_ref().is_some_and(|profile| !profile.fit) {
         args.extend(["--fit".into(), "off".into()]);
     }
     args.extend(["--jinja".into(), "--reasoning".into(), "off".into()]);
@@ -755,6 +819,90 @@ where
         StartOutcome::CleanupFailed(server) => Ok(persistent_cleanup_failed(server, runnable)),
         StartOutcome::Signaled(_) => Err(PersistentStartError::Failed(
             "persistent startup returned an invalid signal interruption".into(),
+        )),
+    }
+}
+
+pub(crate) fn start_service_with_ownership<F>(
+    mut runnable: crate::runnable::Runnable,
+    ownership: &crate::runtime::RuntimeOwnership,
+    endpoint: &Path,
+    runtime_handle: &tokio::runtime::Handle,
+    cancelled: F,
+) -> Result<PersistentStart, PersistentStartError>
+where
+    F: Fn() -> bool,
+{
+    if runnable.launch().policy != LaunchPolicy::Service {
+        return Err(PersistentStartError::Failed(
+            "service start requires the service launch policy".into(),
+        ));
+    }
+    if cancelled() {
+        return Ok(persistent_interrupted());
+    }
+    let launch_started = Instant::now();
+    let child_ownership = ownership.reserve_child()?;
+    let started = OwnedServer::start_with_service_ownership(
+        runnable.launch(),
+        runnable.fingerprint(),
+        endpoint,
+        runtime_handle,
+        STARTUP_TIMEOUT,
+        child_ownership,
+        &cancelled,
+    )?;
+    match started {
+        StartOutcome::Ready(server) => {
+            finish_persistent_ready(server, runnable, launch_started, false, &cancelled)
+                .map_err(PersistentStartError::from)
+        }
+        StartOutcome::Exited(exit) => {
+            if cancelled() {
+                return Ok(persistent_interrupted());
+            }
+            if runnable.primary_only_for_service().is_none() {
+                return Ok(PersistentStart::Stopped(exit));
+            }
+            report_mtp_draft_start_failure(runnable.launch(), "exited", exit.diagnostic.as_deref());
+            if cancelled() {
+                return Ok(persistent_interrupted());
+            }
+            tracing::info!(
+                event = "gemma_mtp_primary_retry",
+                model_id = %runnable.launch().id,
+                attempt = 2_u8
+            );
+            let child_ownership = ownership.reserve_child()?;
+            match OwnedServer::start_with_service_ownership(
+                runnable.launch(),
+                runnable.fingerprint(),
+                endpoint,
+                runtime_handle,
+                STARTUP_TIMEOUT,
+                child_ownership,
+                &cancelled,
+            )? {
+                StartOutcome::Ready(server) => {
+                    finish_persistent_ready(server, runnable, launch_started, true, &cancelled)
+                        .map_err(PersistentStartError::from)
+                }
+                StartOutcome::Exited(exit) => Ok(PersistentStart::Stopped(exit)),
+                StartOutcome::Interrupted(interruption) => {
+                    Ok(PersistentStart::Interrupted(interruption))
+                }
+                StartOutcome::CleanupFailed(server) => {
+                    Ok(persistent_cleanup_failed(server, runnable))
+                }
+                StartOutcome::Signaled(_) => Err(PersistentStartError::Failed(
+                    "service startup returned an invalid signal interruption".into(),
+                )),
+            }
+        }
+        StartOutcome::Interrupted(interruption) => Ok(PersistentStart::Interrupted(interruption)),
+        StartOutcome::CleanupFailed(server) => Ok(persistent_cleanup_failed(server, runnable)),
+        StartOutcome::Signaled(_) => Err(PersistentStartError::Failed(
+            "service startup returned an invalid signal interruption".into(),
         )),
     }
 }
@@ -1021,6 +1169,13 @@ impl PersistentServer {
         self.runnable.fingerprint()
     }
 
+    pub(crate) fn pid(&self) -> Option<u32> {
+        self.server
+            .child
+            .as_ref()
+            .and_then(ChildProcessGuard::active_id)
+    }
+
     pub(crate) fn poll(&mut self) -> Result<Option<ServerExit>, String> {
         self.server.try_wait()
     }
@@ -1275,6 +1430,11 @@ pub struct OwnedServer {
     stdout_tail: Vec<u8>,
     stderr_tail: Vec<u8>,
     retain_cleanup_failure: bool,
+    unix_socket: Option<PathBuf>,
+    #[cfg(unix)]
+    unix_socket_identity: Option<UnixEndpointIdentity>,
+    #[cfg(unix)]
+    service_runtime: Option<tokio::runtime::Handle>,
 }
 
 impl OwnedServer {
@@ -1341,6 +1501,35 @@ impl OwnedServer {
         )
     }
 
+    fn start_with_service_ownership<F>(
+        launch: &Launch,
+        fingerprint: &crate::runtime_fingerprint::RuntimeFingerprint,
+        endpoint: &Path,
+        runtime_handle: &tokio::runtime::Handle,
+        timeout: Duration,
+        runtime: crate::runtime::RuntimeChildOwnership,
+        cancelled: &F,
+    ) -> Result<StartOutcome, String>
+    where
+        F: Fn() -> bool,
+    {
+        Self::start_inner_with_policy_and_endpoint(
+            launch,
+            timeout,
+            Some((
+                runtime,
+                crate::runtime::RuntimeLeasePublication::Service {
+                    fingerprint,
+                    endpoint,
+                },
+            )),
+            PersistentSignalPolicy::CallerManaged,
+            Some(endpoint),
+            Some(runtime_handle),
+            || cancelled().then_some(StartupStop::Interrupted(StartupInterruption::Cancelled)),
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn start_inner<F>(
         launch: &Launch,
@@ -1377,28 +1566,77 @@ impl OwnedServer {
     where
         F: Fn() -> Option<StartupStop>,
     {
-        let requested_port = resolve_requested_port(launch.requested_port)?;
-        let client = readiness_client()?;
+        Self::start_inner_with_policy_and_endpoint(
+            launch,
+            timeout,
+            runtime,
+            signal_policy,
+            None,
+            None,
+            stop,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_inner_with_policy_and_endpoint<F>(
+        launch: &Launch,
+        timeout: Duration,
+        runtime: Option<(
+            crate::runtime::RuntimeChildOwnership,
+            crate::runtime::RuntimeLeasePublication<'_>,
+        )>,
+        signal_policy: PersistentSignalPolicy,
+        unix_socket: Option<&Path>,
+        service_runtime: Option<&tokio::runtime::Handle>,
+        stop: F,
+    ) -> Result<StartOutcome, String>
+    where
+        F: Fn() -> Option<StartupStop>,
+    {
+        let requested_port = if unix_socket.is_some() {
+            0
+        } else {
+            resolve_requested_port(launch.requested_port)?
+        };
+        if let Some(endpoint) = unix_socket {
+            require_absent_unix_endpoint(endpoint)?;
+        }
+        if unix_socket.is_some() && service_runtime.is_none() {
+            return Err("Unix service launch requires its owning runtime handle".into());
+        }
+        let client = unix_socket.is_none().then(readiness_client).transpose()?;
         let mut command = launch.server_command();
         let prepared = launch.managed_runtime.as_ref().map_or_else(
             no_prepared_runtime_guard,
             ValidatedManagedRuntime::process_guard,
         );
         command
-            .args(build_args(launch, requested_port))
+            .args(build_args_for_endpoint(launch, requested_port, unix_socket))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if launch.policy == LaunchPolicy::Service {
+            command.env_clear();
+        }
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
+            if launch.policy == LaunchPolicy::Service {
+                // The socket and every incidental engine-created file must be
+                // private even when a launcher inherited a permissive umask.
+                unsafe {
+                    command.pre_exec(|| {
+                        libc::umask(0o077);
+                        Ok(())
+                    });
+                }
+            }
         }
         if signal_policy == PersistentSignalPolicy::ForegroundExit {
             mark_server_starting();
         }
-        let retain_cleanup_failure =
-            runtime.is_some() && launch.policy == LaunchPolicy::PersistentApp;
+        let retain_cleanup_failure = runtime.is_some() && launch.policy != LaunchPolicy::Foreground;
         let (runtime, publication) = match runtime {
             Some((runtime, publication)) => (Some(runtime), Some(publication)),
             None => (None, None),
@@ -1436,6 +1674,11 @@ impl OwnedServer {
             stdout_tail: Vec::new(),
             stderr_tail: Vec::new(),
             retain_cleanup_failure,
+            unix_socket: unix_socket.map(Path::to_path_buf),
+            #[cfg(unix)]
+            unix_socket_identity: None,
+            #[cfg(unix)]
+            service_runtime: service_runtime.cloned(),
         };
         let stdout = match owned.child_mut().stdout.take() {
             Some(stdout) => stdout,
@@ -1451,10 +1694,12 @@ impl OwnedServer {
         };
         owned.stderr_reader = match spawn_output_reader(
             stderr,
-            Some((
-                announcement_sender,
-                Arc::clone(&owned.announcement_overflow),
-            )),
+            unix_socket.is_none().then(|| {
+                (
+                    announcement_sender,
+                    Arc::clone(&owned.announcement_overflow),
+                )
+            }),
         ) {
             Ok(reader) => Some(reader),
             Err(error) => return owned.fail_start(error),
@@ -1477,7 +1722,7 @@ impl OwnedServer {
                 return owned.fail_start(error);
             }
         }
-        if launch.policy == LaunchPolicy::PersistentApp {
+        if launch.policy != LaunchPolicy::Foreground {
             match requested_start_outcome(&mut owned, &stop)? {
                 RequestedStartOutcome::Continue => {}
                 RequestedStartOutcome::Completed(outcome) => return Ok(outcome),
@@ -1509,19 +1754,73 @@ impl OwnedServer {
                 }
                 return Ok(StartOutcome::Exited(owned.server_exit(code)));
             }
+            if let Some(endpoint) = unix_socket {
+                #[cfg(unix)]
+                let readiness = readiness_unix(
+                    service_runtime.expect("Unix launch has its owning runtime handle"),
+                    endpoint,
+                    &launch.id,
+                    child_pid,
+                    &stop,
+                );
+                #[cfg(not(unix))]
+                let readiness = UnixReadinessPoll {
+                    endpoint_identity: None,
+                    outcome: Err("Unix engine endpoints are unsupported on this platform".into()),
+                };
+                #[cfg(unix)]
+                if let Some(identity) = readiness.endpoint_identity {
+                    if let Err(error) = owned.record_unix_endpoint_identity(identity) {
+                        return owned.fail_start(error);
+                    }
+                }
+                match readiness.outcome {
+                    Ok(UnixReadiness::Ready) => {
+                        if let Err(error) = owned.collect_announcements() {
+                            return owned.fail_start(error);
+                        }
+                        match requested_start_outcome(&mut owned, &stop)? {
+                            RequestedStartOutcome::Continue => {}
+                            RequestedStartOutcome::Completed(outcome) => return Ok(outcome),
+                            RequestedStartOutcome::CleanupFailed => {
+                                return Ok(StartOutcome::CleanupFailed(Box::new(owned)))
+                            }
+                        }
+                        return Ok(StartOutcome::Ready(Box::new(owned)));
+                    }
+                    Ok(UnixReadiness::Pending) => {}
+                    Ok(UnixReadiness::Stopped(stop)) => {
+                        let stopped = || Some(stop);
+                        match requested_start_outcome(&mut owned, &stopped)? {
+                            RequestedStartOutcome::Completed(outcome) => return Ok(outcome),
+                            RequestedStartOutcome::CleanupFailed => {
+                                return Ok(StartOutcome::CleanupFailed(Box::new(owned)))
+                            }
+                            RequestedStartOutcome::Continue => {
+                                unreachable!("readiness returned a concrete stop")
+                            }
+                        }
+                    }
+                    Err(error) => return owned.fail_start(error),
+                }
+            }
             if let Some(port) = owned.announced_port {
                 if requested_port != 0 && port != requested_port {
                     return owned.fail_start(format!(
                         "llama-server announced port {port}, expected {requested_port}"
                     ));
                 }
-                match readiness(&client, port, &launch.id) {
+                match readiness(
+                    client.as_ref().expect("TCP launch has a readiness client"),
+                    port,
+                    &launch.id,
+                ) {
                     Ok(true) => {
                         if let Err(error) = owned.collect_announcements() {
                             return owned.fail_start(error);
                         }
                         owned.port = port;
-                        if launch.policy == LaunchPolicy::PersistentApp {
+                        if launch.policy != LaunchPolicy::Foreground {
                             match requested_start_outcome(&mut owned, &stop)? {
                                 RequestedStartOutcome::Continue => {}
                                 RequestedStartOutcome::Completed(outcome) => return Ok(outcome),
@@ -1598,6 +1897,23 @@ impl OwnedServer {
             .child_mut()
     }
 
+    #[cfg(unix)]
+    fn record_unix_endpoint_identity(
+        &mut self,
+        identity: UnixEndpointIdentity,
+    ) -> Result<(), String> {
+        match self.unix_socket_identity {
+            Some(expected) if expected != identity => {
+                Err("service engine endpoint identity changed between requests".into())
+            }
+            Some(_) => Ok(()),
+            None => {
+                self.unix_socket_identity = Some(identity);
+                Ok(())
+            }
+        }
+    }
+
     pub fn port(&self) -> u16 {
         self.port
     }
@@ -1627,6 +1943,17 @@ impl OwnedServer {
     }
 
     pub fn terminate(&mut self) -> Result<(), String> {
+        #[cfg(unix)]
+        if self.unix_socket_identity.is_none() {
+            let endpoint = self.unix_socket.clone();
+            let runtime = self.service_runtime.clone();
+            let pid = self.child.as_ref().and_then(ChildProcessGuard::active_id);
+            if let (Some(endpoint), Some(runtime), Some(pid)) = (endpoint, runtime, pid) {
+                if let Ok(Some(identity)) = authenticate_unix_endpoint(&runtime, &endpoint, pid) {
+                    self.record_unix_endpoint_identity(identity)?;
+                }
+            }
+        }
         if let Some(child) = self.child.as_mut() {
             let pid = child.active_id();
             if let Some(pid) = pid {
@@ -1638,6 +1965,10 @@ impl OwnedServer {
             }
         }
         self.join_output_readers()?;
+        if let Some(endpoint) = &self.unix_socket {
+            #[cfg(unix)]
+            remove_owned_unix_endpoint(endpoint, self.unix_socket_identity)?;
+        }
         self.child.take();
         Ok(())
     }

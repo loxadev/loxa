@@ -91,6 +91,7 @@ impl AttachedRuntime {
                 server: PathBuf::new(),
                 model_id: model_id.to_owned(),
                 port,
+                service: None,
             }),
             expected_managed_server: PathBuf::new(),
             expected_argv: Vec::new(),

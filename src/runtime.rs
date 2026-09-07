@@ -1,70 +1,43 @@
 use crate::runtime_fingerprint::RuntimeFingerprint;
 use serde::Deserialize;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
+#[cfg(test)]
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{Read as _, Write};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::process::Child;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::thread;
 use std::time::{Duration, Instant};
-use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System, UpdateKind};
 
 mod lease;
 use lease::{
-    decode_lease, encode_v3_lease, validate_lease, LeaseOwnerMode, RuntimeLease, LEASE_VERSION,
-    PERSISTENT_LEASE_VERSION,
+    decode_lease, encode_lease, validate_lease, LeaseOwnerMode, RuntimeLease, ServiceLeaseFields,
+    LEASE_VERSION, PERSISTENT_LEASE_VERSION, SERVICE_LEASE_VERSION,
 };
 #[cfg(test)]
-use lease::{RuntimeLeaseV1, RuntimeLeaseV2, LEGACY_LEASE_VERSION};
+use lease::{encode_v3_lease, RuntimeLeaseV1, RuntimeLeaseV2, LEGACY_LEASE_VERSION};
 
-const STOP_TIMEOUT: Duration = Duration::from_secs(2);
+mod process;
+#[cfg(test)]
+pub(crate) use process::fail_next_owned_group_terminations_for_test;
+use process::{
+    command_has_unique_option, process_group, process_group_exists, process_snapshot,
+    process_snapshot_from_refreshed_system, ProcessSnapshot,
+};
+pub(crate) use process::{
+    current_process_start_identity, process_group_has_live_members, terminate_process_group,
+    terminate_process_group_immediately, terminate_stale_process_group,
+};
+
 const OBSERVER_TEARDOWN_GRACE: Duration = Duration::from_millis(500);
+const MAX_RUNTIME_RECORD_BYTES: usize = 64 * 1024;
 static LEASE_STATE_IO: Mutex<()> = Mutex::new(());
 #[cfg(unix)]
 static LOCAL_FOREGROUND_LOCKS: Mutex<Vec<LocalForegroundLockKey>> = Mutex::new(Vec::new());
 #[cfg(unix)]
 static LOCAL_FOREGROUND_LOCK_OPERATIONS: Mutex<()> = Mutex::new(());
-#[cfg(all(test, unix))]
-static FAIL_NEXT_OWNED_GROUP_TERMINATIONS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-#[cfg(all(test, unix))]
-pub(crate) struct OwnedGroupTerminationFaultReset;
-
-#[cfg(all(test, unix))]
-impl Drop for OwnedGroupTerminationFaultReset {
-    fn drop(&mut self) {
-        FAIL_NEXT_OWNED_GROUP_TERMINATIONS.store(0, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-#[cfg(all(test, unix))]
-pub(crate) fn fail_next_owned_group_terminations_for_test(
-    count: usize,
-) -> OwnedGroupTerminationFaultReset {
-    FAIL_NEXT_OWNED_GROUP_TERMINATIONS.store(count, std::sync::atomic::Ordering::SeqCst);
-    OwnedGroupTerminationFaultReset
-}
-
-#[cfg(all(test, unix))]
-pub(crate) fn inject_owned_group_termination_failure_for_test() -> Result<(), String> {
-    let failed = FAIL_NEXT_OWNED_GROUP_TERMINATIONS
-        .fetch_update(
-            std::sync::atomic::Ordering::SeqCst,
-            std::sync::atomic::Ordering::SeqCst,
-            |remaining| remaining.checked_sub(1),
-        )
-        .is_ok();
-    if failed {
-        Err("injected owned process-group termination failure".into())
-    } else {
-        Ok(())
-    }
-}
-
 fn lock_lease_state() -> Result<MutexGuard<'static, ()>, String> {
     LEASE_STATE_IO
         .lock()
@@ -81,6 +54,10 @@ fn lock_local_foreground_operation() -> Result<MutexGuard<'static, ()>, String> 
 pub(crate) enum RuntimeLeasePublication<'a> {
     Foreground,
     PersistentApp(&'a RuntimeFingerprint),
+    Service {
+        fingerprint: &'a RuntimeFingerprint,
+        endpoint: &'a Path,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -94,6 +71,7 @@ pub(crate) enum RuntimeOwner {
     Legacy,
     Foreground,
     PersistentApp,
+    Service,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -167,6 +145,7 @@ impl ForegroundObserver {
                                 None => RuntimeOwner::Legacy,
                                 Some(LeaseOwnerMode::Foreground) => RuntimeOwner::Foreground,
                                 Some(LeaseOwnerMode::PersistentApp) => RuntimeOwner::PersistentApp,
+                                Some(LeaseOwnerMode::Service) => RuntimeOwner::Service,
                             };
                             ForegroundObservation::Running {
                                 provenance,
@@ -432,14 +411,6 @@ struct LegacyRun {
     port: Option<u16>,
 }
 
-#[derive(Debug)]
-struct ProcessSnapshot {
-    start_identity: u64,
-    start_time_seconds: u64,
-    executable: PathBuf,
-    command: Vec<OsString>,
-}
-
 enum ForegroundLockAcquireError {
     WouldBlock,
     Error(String),
@@ -637,6 +608,15 @@ impl RuntimeOwnership {
         Self::acquire_with_lock_classified(run_dir, ForegroundLock::acquire)
     }
 
+    /// Acquires the common runtime lock without touching prior leases or
+    /// prepared stages. The service uses this seam so a recovery failure cannot
+    /// release the only cross-version ownership fence.
+    pub(crate) fn acquire_service_unreconciled(
+        run_dir: &Path,
+    ) -> Result<Self, RuntimeOwnershipAcquireError> {
+        Self::acquire_unreconciled_with_lock(run_dir, ForegroundLock::acquire)
+    }
+
     #[cfg(all(test, unix))]
     fn acquire_forced_traditional(run_dir: &Path) -> Result<Self, String> {
         Self::acquire_with_lock(run_dir, ForegroundLock::acquire_forced_traditional)
@@ -668,34 +648,123 @@ impl RuntimeOwnership {
         acquire_lock: impl FnOnce(&Path) -> Result<ForegroundLock, ForegroundLockAcquireError>,
     ) -> Result<Self, RuntimeOwnershipAcquireError> {
         ensure_directory(run_dir).map_err(RuntimeOwnershipAcquireError::Failed)?;
-        let lock_path = run_dir.join("foreground.lock");
         #[cfg(unix)]
         let operation =
             lock_local_foreground_operation().map_err(RuntimeOwnershipAcquireError::Failed)?;
+        let ownership = Self::acquire_lock_after_directory(run_dir, acquire_lock)?;
+        ownership.reconcile_existing_while_serialized()?;
+        #[cfg(unix)]
+        drop(operation);
+        Ok(ownership)
+    }
+
+    fn acquire_unreconciled_with_lock(
+        run_dir: &Path,
+        acquire_lock: impl FnOnce(&Path) -> Result<ForegroundLock, ForegroundLockAcquireError>,
+    ) -> Result<Self, RuntimeOwnershipAcquireError> {
+        ensure_directory(run_dir).map_err(RuntimeOwnershipAcquireError::Failed)?;
+        #[cfg(unix)]
+        let operation =
+            lock_local_foreground_operation().map_err(RuntimeOwnershipAcquireError::Failed)?;
+        let ownership = Self::acquire_lock_after_directory(run_dir, acquire_lock)?;
+        #[cfg(unix)]
+        drop(operation);
+        Ok(ownership)
+    }
+
+    fn acquire_lock_after_directory(
+        run_dir: &Path,
+        acquire_lock: impl FnOnce(&Path) -> Result<ForegroundLock, ForegroundLockAcquireError>,
+    ) -> Result<Self, RuntimeOwnershipAcquireError> {
+        let lock_path = run_dir.join("foreground.lock");
         let foreground_lock = acquire_lock(&lock_path).map_err(|error| match error {
             ForegroundLockAcquireError::WouldBlock => RuntimeOwnershipAcquireError::Conflict,
             ForegroundLockAcquireError::Error(error) => RuntimeOwnershipAcquireError::Failed(error),
         })?;
 
-        let state_path = run_dir.join("foreground.json");
-        // Keep `operation` until the fallible reconciliation has completed.
-        // On an error or panic, `foreground_lock` drops first, which closes the
-        // traditional descriptor before releasing its local reservation.
+        let ownership = Self {
+            inner: Arc::new(Mutex::new(RuntimeOwnershipInner {
+                _foreground_lock: foreground_lock,
+                state_path: run_dir.join("foreground.json"),
+                child_reserved: false,
+            })),
+        };
+        Ok(ownership)
+    }
+
+    fn reconcile_existing_while_serialized(&self) -> Result<(), RuntimeOwnershipAcquireError> {
+        let state_path = self
+            .inner
+            .lock()
+            .map_err(|_| {
+                RuntimeOwnershipAcquireError::Failed(
+                    "runtime ownership state lock is poisoned".into(),
+                )
+            })?
+            .state_path
+            .clone();
+        let run_dir = state_path.parent().ok_or_else(|| {
+            RuntimeOwnershipAcquireError::Failed("runtime lease has no run-directory parent".into())
+        })?;
         #[cfg(unix)]
         reconcile_interrupted_execution_builds(run_dir)?;
         reconcile_state(&state_path).map_err(RuntimeOwnershipAcquireError::Failed)?;
         #[cfg(unix)]
         reconcile_unleased_execution_stages(run_dir)?;
-        #[cfg(unix)]
-        drop(operation);
+        Ok(())
+    }
 
-        Ok(Self {
-            inner: Arc::new(Mutex::new(RuntimeOwnershipInner {
-                _foreground_lock: foreground_lock,
-                state_path,
-                child_reserved: false,
-            })),
-        })
+    /// Service startup uses a fail-closed recovery audit. Existing leases and
+    /// prepared runtime artifacts are retained for explicit diagnosis because
+    /// older Linux leases do not carry a sufficiently strong per-boot process
+    /// identity for safe survivor signaling.
+    pub(crate) fn audit_clean_for_service(&self) -> Result<(), RuntimeOwnershipAcquireError> {
+        let state_path = self
+            .inner
+            .lock()
+            .map_err(|_| {
+                RuntimeOwnershipAcquireError::Failed(
+                    "runtime ownership state lock is poisoned".into(),
+                )
+            })?
+            .state_path
+            .clone();
+        if !lease_is_absent(&state_path) {
+            read_lease(&state_path).map_err(|error| {
+                RuntimeOwnershipAcquireError::Failed(format!(
+                    "service recovery required; retained runtime lease: {error}"
+                ))
+            })?;
+            return Err(RuntimeOwnershipAcquireError::Failed(
+                "service recovery required; a prior runtime lease was retained".into(),
+            ));
+        }
+        let legacy_state_path = state_path.with_file_name("managed.json");
+        if !lease_is_absent(&legacy_state_path) {
+            return Err(RuntimeOwnershipAcquireError::Failed(
+                "service recovery required; legacy managed runtime state was retained".into(),
+            ));
+        }
+        #[cfg(unix)]
+        {
+            let run_dir = state_path.parent().ok_or_else(|| {
+                RuntimeOwnershipAcquireError::Failed(
+                    "runtime lease has no run-directory parent".into(),
+                )
+            })?;
+            if !crate::runtime_bundle::recoverable_execution_builds(run_dir)
+                .map_err(RuntimeOwnershipAcquireError::Failed)?
+                .is_empty()
+                || !crate::runtime_bundle::recoverable_execution_stages(run_dir)
+                    .map_err(RuntimeOwnershipAcquireError::Failed)?
+                    .is_empty()
+            {
+                return Err(RuntimeOwnershipAcquireError::Failed(
+                    "service recovery required; retained prepared runtime evidence".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn reserve_child(&self) -> Result<RuntimeChildOwnership, String> {
@@ -738,15 +807,38 @@ impl RuntimeChildOwnership {
         if process_group(child_pid)? != child_pgid {
             return Err("llama-server process group identity changed".into());
         }
-        let (owner_mode, fingerprint) = match publication {
-            RuntimeLeasePublication::Foreground => (LeaseOwnerMode::Foreground, None),
+        let (version, owner_mode, fingerprint, service) = match publication {
+            RuntimeLeasePublication::Foreground => {
+                (LEASE_VERSION, LeaseOwnerMode::Foreground, None, None)
+            }
             RuntimeLeasePublication::PersistentApp(fingerprint) => {
                 fingerprint.validate_persistent_lease(model_id)?;
-                (LeaseOwnerMode::PersistentApp, Some(fingerprint.clone()))
+                (
+                    LEASE_VERSION,
+                    LeaseOwnerMode::PersistentApp,
+                    Some(fingerprint.clone()),
+                    None,
+                )
+            }
+            RuntimeLeasePublication::Service {
+                fingerprint,
+                endpoint,
+            } => {
+                fingerprint.validate_service_lease(model_id)?;
+                (
+                    SERVICE_LEASE_VERSION,
+                    LeaseOwnerMode::Service,
+                    Some(fingerprint.clone()),
+                    Some(ServiceLeaseFields {
+                        endpoint: endpoint.to_path_buf(),
+                        parallel: 1,
+                        offline: true,
+                    }),
+                )
             }
         };
         let lease = RuntimeLease {
-            version: LEASE_VERSION,
+            version,
             owner_mode: Some(owner_mode),
             fingerprint,
             managed_source: managed_source.map(Path::to_path_buf),
@@ -757,7 +849,8 @@ impl RuntimeChildOwnership {
             child_pgid,
             server: child.executable,
             model_id: model_id.to_owned(),
-            port,
+            port: if service.is_some() { 0 } else { port },
+            service,
         };
         let state_path = self.state_path()?;
         let _state_guard = lock_lease_state()?;
@@ -1361,11 +1454,19 @@ fn read_regular_file(path: &Path) -> Result<Vec<u8>, String> {
         .map_err(|error| map_runtime_lease_read_error(path, error))?;
     let opened = crate::safe_file::regular_file_identity(&file, path)
         .map_err(|error| map_runtime_lease_read_error(path, error))?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
+    let mut bytes = Vec::with_capacity(4 * 1024);
+    (&mut file)
+        .take((MAX_RUNTIME_RECORD_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
         .map_err(|error| map_runtime_lease_read_error(path, error))?;
     crate::safe_file::ensure_descriptor_matches_path(&file, &opened, path)
         .map_err(|error| map_runtime_lease_read_error(path, error))?;
+    if bytes.len() > MAX_RUNTIME_RECORD_BYTES {
+        return Err(format!(
+            "runtime record exceeds the {MAX_RUNTIME_RECORD_BYTES}-byte limit: {}",
+            path.display()
+        ));
+    }
     Ok(bytes)
 }
 
@@ -1379,7 +1480,7 @@ fn map_runtime_lease_read_error(path: &Path, error: std::io::Error) -> String {
 
 fn write_lease(path: &Path, lease: &RuntimeLease) -> Result<(), String> {
     let temporary = path.with_extension("json.tmp");
-    let bytes = encode_v3_lease(lease)?;
+    let bytes = encode_lease(lease)?;
     let mut options = OpenOptions::new();
     options.create(true).truncate(true).write(true);
     #[cfg(unix)]
@@ -1394,233 +1495,6 @@ fn write_lease(path: &Path, lease: &RuntimeLease) -> Result<(), String> {
         .and_then(|_| file.sync_all())
         .map_err(|error| format!("{}: {error}", temporary.display()))?;
     fs::rename(&temporary, path).map_err(|error| format!("{}: {error}", path.display()))
-}
-
-fn process_snapshot(pid: u32) -> Result<Option<ProcessSnapshot>, String> {
-    let pid = Pid::from_u32(pid);
-    let mut system = System::new();
-    system.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[pid]),
-        true,
-        ProcessRefreshKind::nothing()
-            .with_cmd(UpdateKind::OnlyIfNotSet)
-            .with_exe(UpdateKind::OnlyIfNotSet),
-    );
-    process_snapshot_from_refreshed_system(&system, pid)
-}
-
-#[cfg(unix)]
-pub(crate) fn current_process_start_identity() -> Result<u64, String> {
-    let pid = std::process::id();
-    process_snapshot(pid)?
-        .map(|process| process.start_identity)
-        .ok_or_else(|| "failed to identify the Loxa process".to_string())
-}
-
-fn process_snapshot_from_refreshed_system(
-    system: &System,
-    pid: Pid,
-) -> Result<Option<ProcessSnapshot>, String> {
-    let Some(process) = system.process(pid) else {
-        return Ok(None);
-    };
-    let executable = process
-        .exe()
-        .ok_or_else(|| format!("failed to inspect executable for process {pid}"))?;
-    let start_time_seconds = process.start_time();
-    Ok(Some(ProcessSnapshot {
-        start_identity: process_start_identity(pid.as_u32(), start_time_seconds)?,
-        start_time_seconds,
-        executable: executable.to_path_buf(),
-        command: process.cmd().to_vec(),
-    }))
-}
-
-fn command_has_unique_option(command: &[OsString], option: &str, expected: &OsStr) -> bool {
-    let option = OsStr::new(option);
-    let mut matches = command
-        .iter()
-        .enumerate()
-        .filter_map(|(index, argument)| (argument == option).then_some(index));
-    let Some(index) = matches.next() else {
-        return false;
-    };
-    matches.next().is_none()
-        && command
-            .get(index + 1)
-            .is_some_and(|value| value.as_os_str() == expected)
-}
-
-#[cfg(target_os = "macos")]
-fn process_start_identity(pid: u32, expected_seconds: u64) -> Result<u64, String> {
-    let pid = i32::try_from(pid).map_err(|_| "process id is not representable".to_string())?;
-    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
-    let size = std::mem::size_of::<libc::proc_bsdinfo>();
-    let size =
-        i32::try_from(size).map_err(|_| "process identity buffer is too large".to_string())?;
-    // SAFETY: proc_pidinfo initializes exactly one proc_bsdinfo when it returns its full size.
-    let read = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            info.as_mut_ptr().cast(),
-            size,
-        )
-    };
-    if read != size {
-        return Err(format!("failed to inspect start time for process {pid}"));
-    }
-    // SAFETY: the full proc_bsdinfo was initialized above.
-    let info = unsafe { info.assume_init() };
-    if info.pbi_start_tvsec != expected_seconds {
-        return Err(format!("process {pid} changed while inspecting it"));
-    }
-    info.pbi_start_tvsec
-        .checked_mul(1_000_000)
-        .and_then(|seconds| seconds.checked_add(info.pbi_start_tvusec))
-        .ok_or_else(|| format!("invalid start time for process {pid}"))
-}
-
-#[cfg(not(target_os = "macos"))]
-fn process_start_identity(_pid: u32, expected_seconds: u64) -> Result<u64, String> {
-    Ok(expected_seconds)
-}
-
-fn process_group(pid: u32) -> Result<i32, String> {
-    let pid = i32::try_from(pid).map_err(|_| "process id is not representable".to_string())?;
-    // SAFETY: getpgid only observes the process-group identity for this validated PID.
-    let group = unsafe { libc::getpgid(pid) };
-    if group >= 0 {
-        Ok(group)
-    } else {
-        Err(std::io::Error::last_os_error().to_string())
-    }
-}
-
-pub(crate) fn terminate_process_group(child: &mut Child, group: i32) -> Result<(), String> {
-    #[cfg(test)]
-    inject_owned_group_termination_failure_for_test()?;
-    signal_process_group(group, libc::SIGTERM)?;
-    let deadline = Instant::now() + STOP_TIMEOUT;
-    while Instant::now() < deadline {
-        let _ = child.try_wait().map_err(|error| error.to_string())?;
-        if !process_group_has_live_members(group)? {
-            let _ = child.wait().map_err(|error| error.to_string())?;
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    signal_process_group(group, libc::SIGKILL)?;
-    let deadline = Instant::now() + STOP_TIMEOUT;
-    while Instant::now() < deadline {
-        let _ = child.try_wait().map_err(|error| error.to_string())?;
-        if !process_group_has_live_members(group)? {
-            let _ = child.wait().map_err(|error| error.to_string())?;
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    Err("owned process group survived SIGKILL".into())
-}
-
-#[cfg(unix)]
-pub(crate) fn terminate_process_group_immediately(
-    child: &mut Child,
-    group: i32,
-) -> Result<(), String> {
-    #[cfg(test)]
-    inject_owned_group_termination_failure_for_test()?;
-    signal_process_group(group, libc::SIGKILL)?;
-    let deadline = Instant::now() + STOP_TIMEOUT;
-    while Instant::now() < deadline {
-        let _ = child.try_wait().map_err(|error| error.to_string())?;
-        if !process_group_exists(group)? {
-            let _ = child.wait().map_err(|error| error.to_string())?;
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    Err("owned process group survived SIGKILL".into())
-}
-
-pub(crate) fn terminate_stale_process_group(group: i32) -> Result<(), String> {
-    signal_process_group(group, libc::SIGTERM)?;
-    let deadline = Instant::now() + STOP_TIMEOUT;
-    while Instant::now() < deadline {
-        if !process_group_has_live_members(group)? {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    signal_process_group(group, libc::SIGKILL)?;
-    let deadline = Instant::now() + STOP_TIMEOUT;
-    while Instant::now() < deadline {
-        if !process_group_has_live_members(group)? {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    Err("stale process group survived SIGKILL".into())
-}
-
-fn signal_process_group(group: i32, signal: i32) -> Result<(), String> {
-    if group <= 1 {
-        return Err("refusing to signal an unsafe process group".into());
-    }
-    // SAFETY: the negative PID targets only the validated process group.
-    let result = unsafe { libc::kill(-group, signal) };
-    if result == 0 {
-        return Ok(());
-    }
-    let error = std::io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ESRCH) {
-        Ok(())
-    } else {
-        Err(error.to_string())
-    }
-}
-
-fn process_group_exists(group: i32) -> Result<bool, String> {
-    // SAFETY: signal 0 probes existence without delivering a signal.
-    let result = unsafe { libc::kill(-group, 0) };
-    if result == 0 {
-        return Ok(true);
-    }
-    let error = std::io::Error::last_os_error();
-    match error.raw_os_error() {
-        Some(libc::ESRCH) => Ok(false),
-        Some(libc::EPERM) => Ok(true),
-        _ => Err(error.to_string()),
-    }
-}
-
-pub(crate) fn process_group_has_live_members(group: i32) -> Result<bool, String> {
-    let mut system = System::new();
-    system.refresh_processes(ProcessesToUpdate::All, true);
-    for (pid, process) in system.processes() {
-        if matches!(
-            process.status(),
-            ProcessStatus::Dead | ProcessStatus::Zombie
-        ) {
-            continue;
-        }
-        let Ok(pid) = i32::try_from(pid.as_u32()) else {
-            continue;
-        };
-        // SAFETY: getpgid only observes the process-group identity.
-        let observed = unsafe { libc::getpgid(pid) };
-        if observed == group {
-            return Ok(true);
-        }
-        if observed < 0 {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ESRCH) {
-                return Err(error.to_string());
-            }
-        }
-    }
-    Ok(false)
 }
 
 #[cfg(test)]
