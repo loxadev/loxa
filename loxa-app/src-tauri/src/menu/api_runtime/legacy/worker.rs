@@ -4,13 +4,12 @@ use loxa::api_runtime::{
     ApiRuntimeActivity, ApiRuntimeHost, ApiRuntimeProbe, ApiStartCancellation, ApiStartError,
     ApiStartOutcome,
 };
-use loxa_ipc::OperationTarget;
 
-use super::ApiEndpoint;
+use crate::menu::api_runtime::{ApiEndpoint, StartOutcome};
 
 pub(in crate::menu) trait RuntimeHost: Send + 'static {
     fn endpoint(&self) -> Option<ApiEndpoint>;
-    fn start(&mut self, model_id: &str, cancellation: &ApiStartCancellation) -> RuntimeHostStart;
+    fn start(&mut self, model_id: &str, cancellation: &ApiStartCancellation) -> StartOutcome;
     fn stop(&mut self) -> Result<(), ()>;
     fn activity(&mut self) -> ApiRuntimeActivity;
     fn probe(&mut self) -> ApiRuntimeProbe {
@@ -21,21 +20,21 @@ pub(in crate::menu) trait RuntimeHost: Send + 'static {
 impl RuntimeHost for ApiRuntimeHost {
     fn endpoint(&self) -> Option<ApiEndpoint> {
         ApiRuntimeHost::endpoint(self)
-            .map(|endpoint| ApiEndpoint::new(endpoint.model_id().to_owned(), endpoint.port()))
+            .map(|endpoint| ApiEndpoint::legacy(endpoint.model_id().to_owned(), endpoint.port()))
     }
 
-    fn start(&mut self, model_id: &str, cancellation: &ApiStartCancellation) -> RuntimeHostStart {
+    fn start(&mut self, model_id: &str, cancellation: &ApiStartCancellation) -> StartOutcome {
         match ApiRuntimeHost::start(self, model_id, cancellation) {
             Ok(ApiStartOutcome::Started(endpoint) | ApiStartOutcome::AlreadyRunning(endpoint)) => {
-                RuntimeHostStart::Ready(ApiEndpoint::new(
+                StartOutcome::Ready(ApiEndpoint::legacy(
                     endpoint.model_id().to_owned(),
                     endpoint.port(),
                 ))
             }
-            Err(ApiStartError::Conflict) => RuntimeHostStart::Conflict,
-            Err(ApiStartError::Cancelled) => RuntimeHostStart::Cancelled,
-            Err(ApiStartError::ModelUnavailable) => RuntimeHostStart::ModelUnavailable,
-            Err(ApiStartError::StartupFailed) => RuntimeHostStart::StartupFailed,
+            Err(ApiStartError::Conflict) => StartOutcome::Conflict,
+            Err(ApiStartError::Cancelled) => StartOutcome::Cancelled,
+            Err(ApiStartError::ModelUnavailable) => StartOutcome::ModelUnavailable,
+            Err(ApiStartError::StartupFailed) => StartOutcome::StartupFailed,
         }
     }
 
@@ -52,37 +51,24 @@ impl RuntimeHost for ApiRuntimeHost {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(in crate::menu) enum RuntimeHostStart {
-    Ready(ApiEndpoint),
-    Conflict,
-    Cancelled,
-    ModelUnavailable,
-    StartupFailed,
-    CleanupFailed(ApiEndpoint),
-}
-
-pub(in crate::menu) enum RuntimeRequest {
+pub(in crate::menu) enum LegacyRequest {
     Start {
         generation: u64,
         model_id: String,
         cancellation: ApiStartCancellation,
     },
-    Stop {
-        generation: Option<u64>,
-        target: Option<OperationTarget>,
-    },
+    Stop,
     Probe,
     Shutdown {
-        reply: Sender<RuntimeShutdownReply>,
+        reply: Sender<LegacyShutdownReply>,
     },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(in crate::menu) enum RuntimeMessage {
+pub(in crate::menu) enum LegacyEvent {
     Started {
         generation: u64,
-        outcome: RuntimeHostStart,
+        outcome: StartOutcome,
     },
     Activity {
         generation: u64,
@@ -103,24 +89,24 @@ pub(in crate::menu) enum RuntimeMessage {
     ControllerFailed,
 }
 
-pub(in crate::menu) struct RuntimeShutdownReply {
+pub(in crate::menu) struct LegacyShutdownReply {
     pub(in crate::menu) generation: Option<u64>,
     pub(in crate::menu) result: Result<(), ()>,
     pub(in crate::menu) endpoint: Option<ApiEndpoint>,
 }
 
-pub(in crate::menu) fn run_runtime_worker<H: RuntimeHost>(
+pub(in crate::menu) fn run_legacy_worker<H: RuntimeHost>(
     host: Result<H, ()>,
-    requests: Receiver<RuntimeRequest>,
-    messages: Sender<RuntimeMessage>,
+    requests: Receiver<LegacyRequest>,
+    messages: Sender<LegacyEvent>,
 ) {
     let Ok(mut host) = host else {
-        if messages.send(RuntimeMessage::ControllerFailed).is_err() {
+        if messages.send(LegacyEvent::ControllerFailed).is_err() {
             return;
         }
         while let Ok(request) = requests.recv() {
-            if let RuntimeRequest::Shutdown { reply } = request {
-                let _ = reply.send(RuntimeShutdownReply {
+            if let LegacyRequest::Shutdown { reply } = request {
+                let _ = reply.send(LegacyShutdownReply {
                     generation: None,
                     result: Ok(()),
                     endpoint: None,
@@ -134,21 +120,21 @@ pub(in crate::menu) fn run_runtime_worker<H: RuntimeHost>(
 
     while let Ok(request) = requests.recv() {
         match request {
-            RuntimeRequest::Start {
+            LegacyRequest::Start {
                 generation,
                 model_id,
                 cancellation,
             } => {
                 active_generation = Some(generation);
                 let mut outcome = host.start(&model_id, &cancellation);
-                if !matches!(outcome, RuntimeHostStart::Ready(_)) {
+                if !matches!(outcome, StartOutcome::Ready(_)) {
                     if let Some(endpoint) = host.endpoint() {
-                        outcome = RuntimeHostStart::CleanupFailed(endpoint);
+                        outcome = StartOutcome::CleanupFailed(endpoint);
                     }
                 }
-                let ready = matches!(&outcome, RuntimeHostStart::Ready(_));
+                let ready = matches!(&outcome, StartOutcome::Ready(_));
                 if messages
-                    .send(RuntimeMessage::Started {
+                    .send(LegacyEvent::Started {
                         generation,
                         outcome,
                     })
@@ -163,7 +149,7 @@ pub(in crate::menu) fn run_runtime_worker<H: RuntimeHost>(
                     }
                 }
             }
-            RuntimeRequest::Stop { .. } => {
+            LegacyRequest::Stop => {
                 let result = host.stop();
                 let endpoint = host.endpoint();
                 let generation = active_generation;
@@ -171,7 +157,7 @@ pub(in crate::menu) fn run_runtime_worker<H: RuntimeHost>(
                     active_generation = None;
                 }
                 if messages
-                    .send(RuntimeMessage::Stopped {
+                    .send(LegacyEvent::Stopped {
                         generation,
                         result,
                         endpoint,
@@ -181,7 +167,7 @@ pub(in crate::menu) fn run_runtime_worker<H: RuntimeHost>(
                     return;
                 }
             }
-            RuntimeRequest::Probe => {
+            LegacyRequest::Probe => {
                 let Some(generation) = active_generation else {
                     continue;
                 };
@@ -193,11 +179,11 @@ pub(in crate::menu) fn run_runtime_worker<H: RuntimeHost>(
                     return;
                 }
             }
-            RuntimeRequest::Shutdown { reply } => {
+            LegacyRequest::Shutdown { reply } => {
                 let result = host.stop();
                 let endpoint = host.endpoint();
                 let stopped = result.is_ok();
-                let _ = reply.send(RuntimeShutdownReply {
+                let _ = reply.send(LegacyShutdownReply {
                     generation: active_generation,
                     result,
                     endpoint,
@@ -210,19 +196,19 @@ pub(in crate::menu) fn run_runtime_worker<H: RuntimeHost>(
     }
 }
 
-fn probe_message(host: &mut impl RuntimeHost, generation: u64) -> RuntimeMessage {
+fn probe_message(host: &mut impl RuntimeHost, generation: u64) -> LegacyEvent {
     match host.probe() {
-        ApiRuntimeProbe::Activity(activity) => RuntimeMessage::Activity {
+        ApiRuntimeProbe::Activity(activity) => LegacyEvent::Activity {
             generation,
             activity,
         },
-        ApiRuntimeProbe::Stopped => RuntimeMessage::UnexpectedStop { generation },
+        ApiRuntimeProbe::Stopped => LegacyEvent::UnexpectedStop { generation },
         ApiRuntimeProbe::CleanupFailed => match host.endpoint() {
-            Some(endpoint) => RuntimeMessage::ProbeCleanupFailed {
+            Some(endpoint) => LegacyEvent::ProbeCleanupFailed {
                 generation,
                 endpoint,
             },
-            None => RuntimeMessage::ControllerFailed,
+            None => LegacyEvent::ControllerFailed,
         },
     }
 }

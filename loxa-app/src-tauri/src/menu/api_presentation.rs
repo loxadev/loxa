@@ -1,6 +1,8 @@
 use loxa::api_runtime::ApiRuntimeActivity;
 
-use super::api_runtime::{ApiRuntimeController, ApiRuntimeNotice, ApiRuntimePhase};
+use super::api_runtime::{
+    ApiRuntimeController, ApiRuntimeKind, ApiRuntimeNotice, ApiRuntimePhase, ApiRuntimeView,
+};
 use super::presentation::{ObservedRuntime, ObservedRuntimeOwner};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -62,32 +64,35 @@ impl ApiPrimaryAction {
 
 impl ApiPresentation {
     pub(crate) fn from_controller(controller: &ApiRuntimeController) -> Self {
-        if controller.is_shared_service() {
-            return Self::from_service_state(
-                controller.phase(),
-                controller.notice(),
-                controller.active_model_id(),
-                controller.service_initialized(),
-            );
+        Self::from_runtime_view(controller.view())
+    }
+
+    fn from_runtime_view(view: ApiRuntimeView<'_>) -> Self {
+        match view.kind() {
+            ApiRuntimeKind::Legacy => {
+                Self::from_state(view.phase(), view.notice(), view.active_model_id())
+            }
+            ApiRuntimeKind::Service => Self::from_service_state(
+                view.phase(),
+                view.notice(),
+                view.active_model_id(),
+                view.initialized(),
+            ),
         }
-        Self::from_state(
-            controller.phase(),
-            controller.notice(),
-            controller.active_model_id(),
-        )
     }
 
     pub(crate) fn from_controller_with_observed_runtime(
         controller: &ApiRuntimeController,
         observed_runtime: Option<&ObservedRuntime>,
     ) -> Self {
-        if controller.is_shared_service() {
-            return Self::from_controller(controller);
+        let view = controller.view();
+        if view.kind() == ApiRuntimeKind::Service {
+            return Self::from_runtime_view(view);
         }
         Self::from_state_with_observed_runtime(
-            controller.phase(),
-            controller.notice(),
-            controller.active_model_id(),
+            view.phase(),
+            view.notice(),
+            view.active_model_id(),
             observed_runtime,
         )
     }

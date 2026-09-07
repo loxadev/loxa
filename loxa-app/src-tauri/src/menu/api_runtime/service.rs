@@ -1,849 +1,581 @@
-use std::future::Future;
+mod worker;
+
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender, TryRecvError};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 use loxa::api_runtime::ApiStartCancellation;
-use loxa_ipc::{
-    Accepted, ClientError, ConnectMode, ErrorCategory, OperationTarget, ReplyOutcome, RuntimePhase,
-    ServiceClient, ServiceCommand, ServiceSubscription,
+use loxa_ipc::{OperationTarget, RuntimePhase, RuntimeStatus, ServiceClient};
+
+use super::{
+    ApiEndpoint, ApiRuntimeKind, ApiRuntimeNotice, ApiRuntimePhase, ApiRuntimeShutdownError,
+    ApiRuntimeView, RuntimeState, StartOutcome,
 };
+use worker::run_service_runtime_worker;
 
-use super::worker::{RuntimeHostStart, RuntimeMessage, RuntimeRequest, RuntimeShutdownReply};
-use super::{ApiEndpoint, ServiceObservation, ServiceObservationSlot};
-
-const SNAPSHOT_WAIT: Duration = Duration::from_millis(40);
-const ABSENT_RETRY: Duration = Duration::from_millis(250);
-
-pub(super) fn run_service_runtime_worker(
-    client: ServiceClient,
-    disconnect: Arc<AtomicBool>,
-    observation: Arc<ServiceObservationSlot>,
-    requests: Receiver<RuntimeRequest>,
-    messages: Sender<RuntimeMessage>,
-) {
-    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    else {
-        run_failed_worker(requests, messages);
-        return;
-    };
-
-    ServiceRuntimeWorker {
-        runtime,
-        client,
-        disconnect,
-        observation,
-        requests,
-        messages,
-        subscription: None,
-        next_subscribe: Instant::now(),
-        last_observed: None,
-        pending: None,
-        admitted_start: None,
-    }
-    .run();
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum ServiceObservation {
+    Absent,
+    Present(RuntimeStatus),
+    Unavailable,
 }
-
-fn run_failed_worker(requests: Receiver<RuntimeRequest>, messages: Sender<RuntimeMessage>) {
-    if messages.send(RuntimeMessage::ControllerFailed).is_err() {
-        return;
+impl ServiceObservation {
+    fn is_unavailable(&self) -> bool {
+        matches!(
+            self,
+            Self::Unavailable
+                | Self::Present(RuntimeStatus {
+                    phase: RuntimePhase::RecoveryRequired { .. } | RuntimePhase::Draining,
+                    ..
+                })
+        )
     }
-    while let Ok(request) = requests.recv() {
-        if let RuntimeRequest::Shutdown { reply } = request {
-            let _ = reply.send(RuntimeShutdownReply {
-                generation: None,
-                result: Ok(()),
-                endpoint: None,
-            });
-            return;
+    fn status(&self) -> Option<&RuntimeStatus> {
+        match self {
+            Self::Present(status) => Some(status),
+            _ => None,
         }
     }
-}
-
-struct ServiceRuntimeWorker {
-    runtime: tokio::runtime::Runtime,
-    client: ServiceClient,
-    disconnect: Arc<AtomicBool>,
-    observation: Arc<ServiceObservationSlot>,
-    requests: Receiver<RuntimeRequest>,
-    messages: Sender<RuntimeMessage>,
-    subscription: Option<ServiceSubscription>,
-    next_subscribe: Instant,
-    last_observed: Option<ServiceObservation>,
-    pending: Option<PendingCommand>,
-    admitted_start: Option<AdmittedStart>,
-}
-
-enum PendingCommand {
-    Start(PendingStart),
-    Stop(PendingStop),
-}
-
-struct PendingStart {
-    ui_generation: u64,
-    model_id: String,
-    cancellation: ApiStartCancellation,
-    target: OperationTarget,
-    unload_sent: bool,
-}
-
-struct PendingStop {
-    ui_generation: Option<u64>,
-    target: OperationTarget,
-}
-
-struct AdmittedStart {
-    ui_generation: u64,
-    model_id: String,
-    target: OperationTarget,
-}
-
-impl ServiceRuntimeWorker {
-    fn run(mut self) {
-        loop {
-            if self.disconnected() {
-                self.wait_for_shutdown();
-                return;
-            }
-
-            match self.requests.try_recv() {
-                Ok(RuntimeRequest::Shutdown { reply }) => {
-                    self.disconnect.store(true, Ordering::Release);
-                    let _ = reply.send(clean_shutdown_reply());
-                    return;
-                }
-                Ok(request) => {
-                    self.handle_request(request);
-                    continue;
-                }
-                Err(TryRecvError::Disconnected) => return,
-                Err(TryRecvError::Empty) => {}
-            }
-
-            self.advance_cancelled_start();
-            if self.disconnected() {
-                continue;
-            }
-            self.poll_subscription();
-        }
-    }
-
-    fn wait_for_shutdown(&self) {
-        while let Ok(request) = self.requests.recv() {
-            if let RuntimeRequest::Shutdown { reply } = request {
-                let _ = reply.send(clean_shutdown_reply());
-                return;
-            }
-        }
-    }
-
-    fn handle_request(&mut self, request: RuntimeRequest) {
-        match request {
-            RuntimeRequest::Start {
+    fn operation(&self) -> Option<(u64, OperationTarget, &str)> {
+        let status = self.status()?;
+        let (task_id, generation, model_id) = match &status.phase {
+            RuntimePhase::Starting {
+                task_id,
                 generation,
                 model_id,
-                cancellation,
-            } => self.start(generation, model_id, cancellation),
-            RuntimeRequest::Stop { generation, target } => self.stop(generation, target),
-            RuntimeRequest::Probe => self.probe(),
-            RuntimeRequest::Shutdown { reply } => {
-                let _ = reply.send(clean_shutdown_reply());
             }
-        }
-    }
-
-    fn start(&mut self, ui_generation: u64, model_id: String, cancellation: ApiStartCancellation) {
-        if self.pending.is_some() {
-            self.send_start_result(ui_generation, RuntimeHostStart::Conflict);
-            return;
-        }
-        let request = self.client.request(
-            ConnectMode::EnsureStarted,
-            ServiceCommand::Load {
-                model_id: model_id.clone(),
+            | RuntimePhase::Ready {
+                task_id,
+                generation,
+                model_id,
+                ..
+            }
+            | RuntimePhase::Stopping {
+                task_id,
+                generation,
+                model_id,
+            }
+            | RuntimePhase::CleanupFailed {
+                task_id,
+                generation,
+                model_id,
+            }
+            | RuntimePhase::LoadFailed {
+                task_id,
+                generation,
+                model_id,
+                ..
+            } => (task_id, generation, model_id.as_str()),
+            RuntimePhase::Unloaded
+            | RuntimePhase::RecoveryRequired { .. }
+            | RuntimePhase::Draining => return None,
+        };
+        Some((
+            generation
+                .parse()
+                .expect("validated service status has a numeric generation"),
+            OperationTarget {
+                boot_epoch: status.boot_epoch.clone(),
+                task_id: task_id.clone(),
+                generation: generation.clone(),
             },
-        );
-        let outcome = wait_interruptible(&self.runtime, &self.disconnect, request);
-        let accepted = match outcome {
-            Ok(Ok(ReplyOutcome::Accepted(accepted))) => accepted,
-            Ok(Ok(ReplyOutcome::Status(_) | ReplyOutcome::Rejected(_))) => {
-                let _ = self.messages.send(RuntimeMessage::ControllerFailed);
-                return;
-            }
-            Ok(Err(ClientError::Rejected(error))) => {
-                let failure = classify_start_rejection(error);
-                self.finish_rejected_start(ui_generation, &cancellation, failure);
-                return;
-            }
-            Ok(Err(ClientError::Absent | ClientError::Transport(_))) => {
-                let _ = self.messages.send(RuntimeMessage::ControllerFailed);
-                self.reconnect_now();
-                return;
-            }
-            Err(Interrupted) => return,
-        };
-
-        let target = accepted_target(accepted);
-        self.admitted_start = Some(AdmittedStart {
-            ui_generation,
-            model_id: model_id.clone(),
-            target: target.clone(),
-        });
-        self.pending = Some(PendingCommand::Start(PendingStart {
-            ui_generation,
             model_id,
-            cancellation,
-            target,
-            unload_sent: false,
-        }));
-        self.reconnect_now();
-        self.advance_cancelled_start();
+        ))
     }
-
-    fn finish_rejected_start(
-        &self,
-        ui_generation: u64,
-        cancellation: &ApiStartCancellation,
-        failure: RuntimeHostStart,
-    ) {
-        if cancellation.is_cancelled() {
-            self.send_stopped(Some(ui_generation), Ok(()), None);
-        } else {
-            self.send_start_result(ui_generation, failure);
-        }
+    fn target(&self) -> Option<OperationTarget> {
+        self.operation().map(|(_, target, _)| target)
     }
-
-    fn stop(&mut self, ui_generation: Option<u64>, target: Option<OperationTarget>) {
-        if let Some(PendingCommand::Start(start)) = self.pending.as_ref() {
-            if Some(start.ui_generation) == ui_generation {
-                start.cancellation.cancel();
-                self.advance_cancelled_start();
-                return;
-            }
-        }
-        if self.pending.is_some() {
-            self.send_stopped(
-                ui_generation,
-                Err(()),
-                target
-                    .as_ref()
-                    .and_then(|target| self.endpoint_for_target(target)),
-            );
-            return;
-        }
-        let target = effective_stop_target(target, ui_generation, self.admitted_start.as_ref());
-        let Some(target) = target else {
-            self.send_stopped(ui_generation, Err(()), None);
-            return;
-        };
-
-        if self.last_observed.as_ref().is_some_and(|observed| {
-            cleanup_observation(&target, observed) == CleanupObservation::Complete
-        }) {
-            self.clear_admitted_target(&target);
-            self.send_stopped(ui_generation, Ok(()), None);
-            return;
-        }
-
-        match self.request_unload(target.clone()) {
-            Ok(()) => {
-                self.pending = Some(PendingCommand::Stop(PendingStop {
-                    ui_generation,
-                    target,
-                }));
-                self.reconnect_now();
-            }
-            Err(()) => {
-                let endpoint = self
-                    .endpoint_for_target(&target)
-                    .or_else(|| self.admitted_endpoint(&target));
-                self.send_stopped(ui_generation, Err(()), endpoint);
-                self.reconnect_now();
-            }
-        }
+    fn endpoint(&self) -> Option<ApiEndpoint> {
+        let (_, target, model_id) = self.operation()?;
+        Some(ApiEndpoint::service(model_id.to_owned(), target))
     }
+}
 
-    fn probe(&mut self) {
-        if let Some(observed) = self.last_observed.clone() {
-            if self.observation.publish(observed).is_err() {
-                let _ = self.messages.send(RuntimeMessage::ControllerFailed);
-            }
-        } else {
-            self.reconnect_now();
-        }
+#[derive(Default)]
+pub(super) struct ServiceObservationSlot {
+    latest: Mutex<Option<ServiceObservation>>,
+}
+impl ServiceObservationSlot {
+    fn publish(&self, observed: ServiceObservation) -> Result<(), ()> {
+        *self.latest.lock().map_err(|_| ())? = Some(observed);
+        Ok(())
     }
-
-    fn advance_cancelled_start(&mut self) {
-        let Some(mut start) = take_pending_start(&mut self.pending) else {
-            return;
-        };
-        if !start.cancellation.is_cancelled() || start.unload_sent {
-            self.pending = Some(PendingCommand::Start(start));
-            return;
-        }
-
-        match self.request_unload(start.target.clone()) {
-            Ok(()) => {
-                start.unload_sent = true;
-                self.pending = Some(PendingCommand::Start(start));
-                self.reconnect_now();
-            }
-            Err(()) => {
-                let endpoint = self.endpoint_for_target(&start.target).or_else(|| {
-                    Some(ApiEndpoint::for_service(
-                        start.model_id.clone(),
-                        start.target.clone(),
-                    ))
-                });
-                self.send_stopped(Some(start.ui_generation), Err(()), endpoint);
-                self.reconnect_now();
-            }
-        }
+    fn take(&self) -> Result<Option<ServiceObservation>, ()> {
+        self.latest
+            .lock()
+            .map_err(|_| ())
+            .map(|mut latest| latest.take())
     }
+}
 
-    fn request_unload(&self, target: OperationTarget) -> Result<(), ()> {
-        let request = self.client.request(
-            ConnectMode::ObserveExisting,
-            ServiceCommand::Unload { target },
-        );
-        match wait_interruptible(&self.runtime, &self.disconnect, request) {
-            Ok(Ok(ReplyOutcome::Accepted(_))) => Ok(()),
-            _ => Err(()),
-        }
-    }
+pub(super) enum ServiceRequest {
+    Start {
+        generation: u64,
+        model_id: String,
+        cancellation: ApiStartCancellation,
+    },
+    Stop {
+        generation: Option<u64>,
+        target: Option<OperationTarget>,
+    },
+    Probe,
+    Shutdown {
+        reply: Sender<ServiceShutdownReply>,
+    },
+}
 
-    fn poll_subscription(&mut self) {
-        if self.subscription.is_none() {
-            if Instant::now() < self.next_subscribe {
-                std::thread::sleep(SNAPSHOT_WAIT);
-                return;
-            }
-            let subscribe = self.client.subscribe(ConnectMode::ObserveExisting);
-            match wait_interruptible(&self.runtime, &self.disconnect, subscribe) {
-                Ok(Ok(subscription)) => self.subscription = Some(subscription),
-                Ok(Err(ClientError::Absent)) => {
-                    self.resolve_and_emit(ServiceObservation::Absent);
-                    self.next_subscribe = Instant::now() + ABSENT_RETRY;
-                    return;
-                }
-                Ok(Err(_)) => {
-                    self.resolve_and_emit(ServiceObservation::Unavailable);
-                    self.next_subscribe = Instant::now() + ABSENT_RETRY;
-                    return;
-                }
-                Err(Interrupted) => return,
-            }
-        }
-
-        let result = {
-            let Some(subscription) = self.subscription.as_mut() else {
-                return;
-            };
-            self.runtime.block_on(async {
-                tokio::time::timeout(SNAPSHOT_WAIT, subscription.next_snapshot()).await
-            })
-        };
-        match result {
-            Err(_) => {}
-            Ok(Ok(status)) => self.resolve_and_emit(ServiceObservation::Present(status)),
-            Ok(Err(_)) => {
-                self.subscription = None;
-                self.next_subscribe = Instant::now();
-            }
-        }
-    }
-
-    fn resolve_and_emit(&mut self, observed: ServiceObservation) {
-        self.resolve_pending(&observed);
-        self.send_observed(observed);
-    }
-
-    fn resolve_pending(&mut self, observed: &ServiceObservation) {
-        let Some(pending) = self.pending.take() else {
-            return;
-        };
-        match pending {
-            PendingCommand::Start(start) => self.resolve_start(start, observed),
-            PendingCommand::Stop(stop) => self.resolve_stop(stop, observed),
-        }
-    }
-
-    fn resolve_start(&mut self, start: PendingStart, observed: &ServiceObservation) {
-        let expected = observed.target().as_ref() == Some(&start.target);
-        if start.cancellation.is_cancelled() {
-            match cleanup_observation(&start.target, observed) {
-                CleanupObservation::Pending => {
-                    self.pending = Some(PendingCommand::Start(start));
-                }
-                CleanupObservation::Complete => {
-                    self.clear_admitted_target(&start.target);
-                    self.send_stopped(Some(start.ui_generation), Ok(()), None);
-                }
-                CleanupObservation::Failed(endpoint) => {
-                    let endpoint = endpoint.or_else(|| {
-                        Some(ApiEndpoint::for_service(
-                            start.model_id,
-                            start.target.clone(),
-                        ))
-                    });
-                    self.send_stopped(Some(start.ui_generation), Err(()), endpoint);
-                }
-            }
-            return;
-        }
-
-        if let (true, Some(status)) = (expected, observed.status()) {
-            match &status.phase {
-                RuntimePhase::Starting { .. } | RuntimePhase::Stopping { .. } => {
-                    self.pending = Some(PendingCommand::Start(start));
-                    return;
-                }
-                RuntimePhase::Ready { .. } => {
-                    self.send_start_result(
-                        start.ui_generation,
-                        RuntimeHostStart::Ready(
-                            observed.endpoint().expect("ready status has an operation"),
-                        ),
-                    );
-                    return;
-                }
-                RuntimePhase::CleanupFailed { .. } => {
-                    self.send_start_result(
-                        start.ui_generation,
-                        RuntimeHostStart::CleanupFailed(
-                            observed
-                                .endpoint()
-                                .expect("cleanup-failed status has an operation"),
-                        ),
-                    );
-                    return;
-                }
-                RuntimePhase::LoadFailed { category, .. } => {
-                    self.clear_admitted_target(&start.target);
-                    self.send_start_result(start.ui_generation, start_failure(*category));
-                    return;
-                }
-                RuntimePhase::Unloaded
-                | RuntimePhase::RecoveryRequired { .. }
-                | RuntimePhase::Draining => {}
-            }
-        }
-
-        match cleanup_observation(&start.target, observed) {
-            CleanupObservation::Complete if observed.target().is_some() => {
-                self.clear_admitted_target(&start.target);
-                self.send_start_result(start.ui_generation, RuntimeHostStart::Conflict);
-            }
-            CleanupObservation::Complete => {
-                self.clear_admitted_target(&start.target);
-                self.send_start_result(start.ui_generation, RuntimeHostStart::StartupFailed);
-            }
-            CleanupObservation::Failed(endpoint) => {
-                let endpoint = endpoint
-                    .unwrap_or_else(|| ApiEndpoint::for_service(start.model_id, start.target));
-                self.send_start_result(
-                    start.ui_generation,
-                    RuntimeHostStart::CleanupFailed(endpoint),
-                );
-            }
-            CleanupObservation::Pending => {
-                unreachable!("matching nonterminal start states were handled above")
-            }
-        }
-    }
-
-    fn resolve_stop(&mut self, stop: PendingStop, observed: &ServiceObservation) {
-        match cleanup_observation(&stop.target, observed) {
-            CleanupObservation::Pending => {
-                self.pending = Some(PendingCommand::Stop(stop));
-            }
-            CleanupObservation::Complete => {
-                self.clear_admitted_target(&stop.target);
-                self.send_stopped(stop.ui_generation, Ok(()), None);
-            }
-            CleanupObservation::Failed(endpoint) => {
-                let endpoint = endpoint.or_else(|| self.admitted_endpoint(&stop.target));
-                self.send_stopped(stop.ui_generation, Err(()), endpoint);
-            }
-        }
-    }
-
-    fn reconnect_now(&mut self) {
-        self.subscription = None;
-        self.next_subscribe = Instant::now();
-    }
-
-    fn clear_admitted_target(&mut self, target: &OperationTarget) {
-        if self
-            .admitted_start
-            .as_ref()
-            .is_some_and(|accepted| &accepted.target == target)
-        {
-            self.admitted_start = None;
-        }
-    }
-
-    fn admitted_endpoint(&self, target: &OperationTarget) -> Option<ApiEndpoint> {
-        self.admitted_start.as_ref().and_then(|accepted| {
-            (&accepted.target == target).then(|| {
-                ApiEndpoint::for_service(accepted.model_id.clone(), accepted.target.clone())
-            })
-        })
-    }
-
-    fn endpoint_for_target(&self, expected: &OperationTarget) -> Option<ApiEndpoint> {
-        let observed = self.last_observed.as_ref()?;
-        if observed.target().as_ref() != Some(expected) {
-            return None;
-        }
-        observed.endpoint()
-    }
-
-    fn send_observed(&mut self, observed: ServiceObservation) {
-        if self.last_observed.as_ref() == Some(&observed) {
-            return;
-        }
-        self.last_observed = Some(observed.clone());
-        if self.observation.publish(observed).is_err() {
-            let _ = self.messages.send(RuntimeMessage::ControllerFailed);
-        }
-    }
-
-    fn send_start_result(&self, generation: u64, outcome: RuntimeHostStart) {
-        let _ = self.messages.send(RuntimeMessage::Started {
-            generation,
-            outcome,
-        });
-    }
-
-    fn send_stopped(
-        &self,
+pub(super) enum ServiceEvent {
+    Started {
+        generation: u64,
+        outcome: StartOutcome,
+    },
+    Stopped {
         generation: Option<u64>,
         result: Result<(), ()>,
         endpoint: Option<ApiEndpoint>,
-    ) {
-        let _ = self.messages.send(RuntimeMessage::Stopped {
-            generation,
-            result,
-            endpoint,
-        });
-    }
-
-    fn disconnected(&self) -> bool {
-        self.disconnect.load(Ordering::Acquire)
-    }
+    },
+    ControllerFailed,
 }
 
-fn take_pending_start(pending: &mut Option<PendingCommand>) -> Option<PendingStart> {
-    match pending.take() {
-        Some(PendingCommand::Start(start)) => Some(start),
-        retained => {
-            *pending = retained;
-            None
+pub(super) struct ServiceShutdownReply {
+    pub(super) generation: Option<u64>,
+    pub(super) result: Result<(), ()>,
+    pub(super) endpoint: Option<ApiEndpoint>,
+}
+
+pub(super) struct ServiceBackend {
+    pub(super) requests: Option<Sender<ServiceRequest>>,
+    pub(super) events: Option<Receiver<ServiceEvent>>,
+    pub(super) worker: Option<JoinHandle<()>>,
+    pub(super) state: RuntimeState,
+    pub(super) generation: Option<u64>,
+    pub(super) next_generation: u64,
+    pub(super) startup_cancellation: Option<ApiStartCancellation>,
+    pub(super) target: Option<OperationTarget>,
+    pub(super) command_in_flight: bool,
+    probe_in_flight: bool,
+    pub(super) initialized: bool,
+    pub(super) observation: Arc<ServiceObservationSlot>,
+    pub(super) disconnect: Arc<AtomicBool>,
+    pub(super) owned_endpoint: Option<ApiEndpoint>,
+}
+
+impl ServiceBackend {
+    pub(super) fn start(client: ServiceClient) -> Self {
+        let disconnect = Arc::new(AtomicBool::new(false));
+        let worker_disconnect = Arc::clone(&disconnect);
+        let observation = Arc::new(ServiceObservationSlot::default());
+        let worker_observation = Arc::clone(&observation);
+        Self::assemble(false, disconnect, observation, move |requests, events| {
+            std::thread::Builder::new()
+                .name("loxa-menu-service-runtime".into())
+                .spawn(move || {
+                    run_service_runtime_worker(
+                        client,
+                        worker_disconnect,
+                        worker_observation,
+                        requests,
+                        events,
+                    )
+                })
+                .map_err(|_| ())
+        })
+    }
+
+    pub(super) fn assemble(
+        initialized: bool,
+        disconnect: Arc<AtomicBool>,
+        observation: Arc<ServiceObservationSlot>,
+        spawn: impl FnOnce(Receiver<ServiceRequest>, Sender<ServiceEvent>) -> Result<JoinHandle<()>, ()>,
+    ) -> Self {
+        let (request_sender, requests) = mpsc::channel();
+        let (events_sender, events) = mpsc::channel();
+        let worker = spawn(requests, events_sender).ok();
+        let available = worker.is_some();
+        Self {
+            requests: available.then_some(request_sender),
+            events: available.then_some(events),
+            worker,
+            state: if available {
+                RuntimeState::available()
+            } else {
+                RuntimeState::failed()
+            },
+            generation: None,
+            next_generation: 1,
+            startup_cancellation: None,
+            target: None,
+            command_in_flight: false,
+            probe_in_flight: false,
+            initialized: initialized || !available,
+            observation,
+            disconnect,
+            owned_endpoint: None,
         }
     }
-}
 
-fn effective_stop_target(
-    requested: Option<OperationTarget>,
-    ui_generation: Option<u64>,
-    admitted: Option<&AdmittedStart>,
-) -> Option<OperationTarget> {
-    requested.or_else(|| {
-        admitted
-            .filter(|accepted| Some(accepted.ui_generation) == ui_generation)
-            .map(|accepted| accepted.target.clone())
-    })
-}
+    pub(super) fn view(&self) -> ApiRuntimeView<'_> {
+        self.state.view(ApiRuntimeKind::Service, self.initialized)
+    }
+    #[cfg(test)]
+    pub(super) fn owned_endpoint(&self) -> Option<&ApiEndpoint> {
+        self.owned_endpoint.as_ref()
+    }
 
-#[derive(Clone, Copy)]
-struct Interrupted;
-
-fn wait_interruptible<F>(
-    runtime: &tokio::runtime::Runtime,
-    disconnect: &AtomicBool,
-    future: F,
-) -> Result<F::Output, Interrupted>
-where
-    F: Future,
-{
-    let mut future = Box::pin(future);
-    loop {
-        if disconnect.load(Ordering::Acquire) {
-            return Err(Interrupted);
+    pub(super) fn request_start(&mut self, model_id: String) -> bool {
+        if !self.initialized || !matches!(self.state.phase, ApiRuntimePhase::Idle) {
+            return false;
         }
-        if let Ok(output) =
-            runtime.block_on(async { tokio::time::timeout(SNAPSHOT_WAIT, future.as_mut()).await })
-        {
-            return Ok(output);
-        }
-    }
-}
-
-fn clean_shutdown_reply() -> RuntimeShutdownReply {
-    RuntimeShutdownReply {
-        generation: None,
-        result: Ok(()),
-        endpoint: None,
-    }
-}
-
-fn accepted_target(accepted: Accepted) -> OperationTarget {
-    OperationTarget {
-        boot_epoch: accepted.boot_epoch,
-        task_id: accepted.task_id,
-        generation: accepted.generation,
-    }
-}
-
-#[derive(Debug, Eq, PartialEq)]
-enum CleanupObservation {
-    Pending,
-    Complete,
-    Failed(Option<ApiEndpoint>),
-}
-
-fn cleanup_observation(
-    expected: &OperationTarget,
-    observed: &ServiceObservation,
-) -> CleanupObservation {
-    let Some(status) = observed.status() else {
-        return CleanupObservation::Failed(None);
-    };
-    if status.boot_epoch != expected.boot_epoch {
-        return CleanupObservation::Failed(None);
-    }
-    let target = observed.target();
-    if target.as_ref() == Some(expected) {
-        return match status.phase {
-            RuntimePhase::Starting { .. }
-            | RuntimePhase::Ready { .. }
-            | RuntimePhase::Stopping { .. } => CleanupObservation::Pending,
-            RuntimePhase::CleanupFailed { .. } => CleanupObservation::Failed(observed.endpoint()),
-            RuntimePhase::LoadFailed { .. } => CleanupObservation::Complete,
-            RuntimePhase::Unloaded
-            | RuntimePhase::RecoveryRequired { .. }
-            | RuntimePhase::Draining => unreachable!("matching target requires an operation"),
+        let generation = self.next_generation;
+        let Some(next) = generation.checked_add(1) else {
+            self.fail();
+            return false;
         };
-    }
-    if matches!(status.phase, RuntimePhase::Unloaded) || target.is_some() {
-        // The coordinator admits one operation at a time. A different
-        // operation in the same boot epoch proves the accepted target ended.
-        CleanupObservation::Complete
-    } else {
-        CleanupObservation::Failed(None)
-    }
-}
-
-fn classify_start_rejection(error: loxa_ipc::ServiceError) -> RuntimeHostStart {
-    start_failure(error.category)
-}
-
-fn start_failure(category: ErrorCategory) -> RuntimeHostStart {
-    match category {
-        ErrorCategory::Busy | ErrorCategory::Conflict => RuntimeHostStart::Conflict,
-        ErrorCategory::NotFound | ErrorCategory::ModelUnavailable => {
-            RuntimeHostStart::ModelUnavailable
+        let cancellation = ApiStartCancellation::new();
+        if !self.send(ServiceRequest::Start {
+            generation,
+            model_id: model_id.clone(),
+            cancellation: cancellation.clone(),
+        }) {
+            return false;
         }
-        _ => RuntimeHostStart::StartupFailed,
+        self.next_generation = next;
+        self.generation = Some(generation);
+        self.startup_cancellation = Some(cancellation);
+        self.state.active_model_id = Some(model_id.clone());
+        self.owned_endpoint = None;
+        self.target = None;
+        self.command_in_flight = true;
+        self.probe_in_flight = false;
+        self.state.notice = None;
+        self.state.phase = ApiRuntimePhase::Starting {
+            generation,
+            model_id,
+        };
+        true
+    }
+
+    pub(super) fn request_stop(&mut self) -> bool {
+        if !matches!(
+            self.state.phase,
+            ApiRuntimePhase::Starting { .. }
+                | ApiRuntimePhase::Ready { .. }
+                | ApiRuntimePhase::CleanupFailed
+        ) {
+            return false;
+        }
+        if let Some(cancellation) = &self.startup_cancellation {
+            cancellation.cancel();
+        }
+        if !self.send(ServiceRequest::Stop {
+            generation: self.generation,
+            target: self.target.clone(),
+        }) {
+            return false;
+        }
+        self.command_in_flight = true;
+        self.probe_in_flight = false;
+        self.state.notice = None;
+        self.state.phase = ApiRuntimePhase::Stopping;
+        true
+    }
+
+    pub(super) fn request_probe(&mut self) -> bool {
+        if !self.initialized || self.command_in_flight || self.probe_in_flight {
+            return false;
+        }
+        if !self.send(ServiceRequest::Probe) {
+            return false;
+        }
+        self.probe_in_flight = true;
+        true
+    }
+
+    pub(super) fn prepare_shutdown(&mut self) -> bool {
+        self.disconnect.store(true, Ordering::Release);
+        false
+    }
+
+    pub(super) fn drain(&mut self) -> bool {
+        let mut changed = false;
+        let mut disconnected = false;
+        while let Some(events) = &self.events {
+            match events.try_recv() {
+                Ok(event) => changed |= self.apply_event(event),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+        if disconnected && self.worker.is_some() {
+            self.fail();
+            let _ = self.observation.take();
+            return true;
+        }
+        if !self.command_in_flight {
+            match self.observation.take() {
+                Ok(Some(observed)) => changed |= self.apply_observed(observed),
+                Ok(None) => {}
+                Err(()) => {
+                    self.fail();
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+    pub(super) fn shutdown_and_join(&mut self) -> Result<(), ApiRuntimeShutdownError> {
+        self.disconnect.store(true, Ordering::Release);
+        if self.worker.is_none() {
+            return Ok(());
+        }
+        let (reply, response) = mpsc::channel();
+        if !self
+            .requests
+            .as_ref()
+            .is_some_and(|sender| sender.send(ServiceRequest::Shutdown { reply }).is_ok())
+        {
+            self.fail();
+            return Err(ApiRuntimeShutdownError);
+        }
+        let Ok(reply) = response.recv() else {
+            self.fail();
+            return Err(ApiRuntimeShutdownError);
+        };
+        if reply.result.is_err() {
+            if let Some(endpoint) = reply.endpoint {
+                self.state.active_model_id = Some(endpoint.model_id.clone());
+                self.owned_endpoint = Some(endpoint);
+            }
+            self.generation = reply.generation.or(self.generation);
+            self.state.notice = Some(ApiRuntimeNotice::CleanupFailed);
+            self.state.phase = ApiRuntimePhase::CleanupFailed;
+            return Err(ApiRuntimeShutdownError);
+        }
+        let worker = self.worker.take().expect("the clean worker is retained");
+        if worker.join().is_err() {
+            self.fail();
+            return Err(ApiRuntimeShutdownError);
+        }
+        self.requests.take();
+        self.events.take();
+        self.clear(None);
+        Ok(())
+    }
+
+    pub(super) fn mark_unavailable(&mut self) {
+        debug_assert!(self.worker.is_none());
+        self.fail();
+    }
+
+    fn send(&mut self, request: ServiceRequest) -> bool {
+        if self
+            .requests
+            .as_ref()
+            .is_some_and(|sender| sender.send(request).is_ok())
+        {
+            true
+        } else {
+            self.fail();
+            false
+        }
+    }
+
+    pub(super) fn apply_event(&mut self, event: ServiceEvent) -> bool {
+        match event {
+            ServiceEvent::Started {
+                generation,
+                outcome,
+            } if matches!(&self.state.phase, ApiRuntimePhase::Starting { generation: current, .. } if *current == generation) =>
+            {
+                self.startup_cancellation = None;
+                self.command_in_flight = false;
+                match outcome {
+                    StartOutcome::Ready(endpoint) => {
+                        self.target = endpoint.service_target().cloned();
+                        self.state.active_model_id = Some(endpoint.model_id.clone());
+                        self.owned_endpoint = Some(endpoint.clone());
+                        self.state.notice = None;
+                        self.probe_in_flight = true;
+                        self.state.phase = ApiRuntimePhase::Ready {
+                            generation,
+                            endpoint,
+                            activity: loxa::api_runtime::ApiRuntimeActivity::Unknown,
+                        };
+                    }
+                    StartOutcome::CleanupFailed(endpoint) => {
+                        self.target = endpoint.service_target().cloned();
+                        self.state.active_model_id = Some(endpoint.model_id.clone());
+                        self.owned_endpoint = Some(endpoint);
+                        self.state.notice = Some(ApiRuntimeNotice::CleanupFailed);
+                        self.state.phase = ApiRuntimePhase::CleanupFailed;
+                    }
+                    StartOutcome::Conflict => self.clear(Some(ApiRuntimeNotice::Conflict)),
+                    StartOutcome::Cancelled => self.clear(None),
+                    StartOutcome::ModelUnavailable => {
+                        self.clear(Some(ApiRuntimeNotice::ModelUnavailable))
+                    }
+                    StartOutcome::StartupFailed => self.clear(Some(ApiRuntimeNotice::StartFailed)),
+                }
+                true
+            }
+            ServiceEvent::Stopped {
+                generation,
+                result,
+                endpoint,
+            } if matches!(self.state.phase, ApiRuntimePhase::Stopping)
+                && generation.is_some()
+                && generation == self.generation =>
+            {
+                self.startup_cancellation = None;
+                self.command_in_flight = false;
+                self.probe_in_flight = false;
+                if result.is_ok() {
+                    self.clear(None);
+                } else {
+                    if let Some(endpoint) = endpoint {
+                        self.target = endpoint.service_target().cloned();
+                        self.state.active_model_id = Some(endpoint.model_id.clone());
+                        self.owned_endpoint = Some(endpoint);
+                    }
+                    self.state.notice = Some(ApiRuntimeNotice::CleanupFailed);
+                    self.state.phase = ApiRuntimePhase::CleanupFailed;
+                }
+                true
+            }
+            ServiceEvent::ControllerFailed => {
+                self.fail();
+                true
+            }
+            ServiceEvent::Started { .. } | ServiceEvent::Stopped { .. } => false,
+        }
+    }
+
+    pub(super) fn apply_observed(&mut self, observed: ServiceObservation) -> bool {
+        let initialized_changed = !self.initialized;
+        self.initialized = true;
+        self.probe_in_flight = false;
+        if self.command_in_flight {
+            return initialized_changed;
+        }
+        if self.retained_authority_conflicts_with(&observed) {
+            if observed.is_unavailable() {
+                self.fail();
+            } else {
+                self.startup_cancellation = None;
+                self.state.notice = Some(ApiRuntimeNotice::CleanupFailed);
+                self.state.phase = ApiRuntimePhase::CleanupFailed;
+            }
+            return true;
+        }
+        let operation = observed
+            .operation()
+            .map(|(generation, target, model)| (generation, target, model.to_owned()));
+        match observed {
+            ServiceObservation::Absent => self.clear(Some(ApiRuntimeNotice::ServiceAbsent)),
+            ServiceObservation::Unavailable => self.fail(),
+            ServiceObservation::Present(status) => match status.phase {
+                RuntimePhase::Unloaded => self.clear(None),
+                phase @ (RuntimePhase::Starting { .. }
+                | RuntimePhase::Ready { .. }
+                | RuntimePhase::Stopping { .. }
+                | RuntimePhase::CleanupFailed { .. }) => {
+                    let Some((generation, target, model_id)) = operation else {
+                        self.fail();
+                        return true;
+                    };
+                    self.generation = Some(generation);
+                    self.startup_cancellation = None;
+                    self.target = Some(target.clone());
+                    self.state.active_model_id = Some(model_id.clone());
+                    self.state.notice = None;
+                    match phase {
+                        RuntimePhase::Starting { .. } => {
+                            self.owned_endpoint = None;
+                            self.state.phase = ApiRuntimePhase::Starting {
+                                generation,
+                                model_id,
+                            };
+                        }
+                        RuntimePhase::Ready { .. } => {
+                            let endpoint = ApiEndpoint::service(model_id, target);
+                            self.owned_endpoint = Some(endpoint.clone());
+                            self.state.phase = ApiRuntimePhase::Ready {
+                                generation,
+                                endpoint,
+                                activity: loxa::api_runtime::ApiRuntimeActivity::Unknown,
+                            };
+                        }
+                        RuntimePhase::Stopping { .. } => {
+                            self.owned_endpoint = None;
+                            self.state.phase = ApiRuntimePhase::Stopping;
+                        }
+                        RuntimePhase::CleanupFailed { .. } => {
+                            let endpoint = ApiEndpoint::service(model_id, target);
+                            self.owned_endpoint = Some(endpoint);
+                            self.state.notice = Some(ApiRuntimeNotice::CleanupFailed);
+                            self.state.phase = ApiRuntimePhase::CleanupFailed;
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                RuntimePhase::LoadFailed { category, .. } => {
+                    let notice = match category {
+                        loxa_ipc::ErrorCategory::Busy | loxa_ipc::ErrorCategory::Conflict => {
+                            ApiRuntimeNotice::Conflict
+                        }
+                        loxa_ipc::ErrorCategory::NotFound
+                        | loxa_ipc::ErrorCategory::ModelUnavailable => {
+                            ApiRuntimeNotice::ModelUnavailable
+                        }
+                        _ => ApiRuntimeNotice::StartFailed,
+                    };
+                    self.clear(Some(notice));
+                }
+                RuntimePhase::RecoveryRequired { .. } | RuntimePhase::Draining => self.fail(),
+            },
+        }
+        true
+    }
+
+    fn retained_authority_conflicts_with(&self, observed: &ServiceObservation) -> bool {
+        if matches!(self.state.phase, ApiRuntimePhase::CleanupFailed) && self.target.is_none() {
+            return true;
+        }
+        let Some(retained) = &self.target else {
+            return false;
+        };
+        match observed {
+            ServiceObservation::Absent | ServiceObservation::Unavailable => true,
+            ServiceObservation::Present(status) => {
+                matches!(
+                    status.phase,
+                    RuntimePhase::RecoveryRequired { .. } | RuntimePhase::Draining
+                ) || status.boot_epoch != retained.boot_epoch
+            }
+        }
+    }
+
+    fn clear(&mut self, notice: Option<ApiRuntimeNotice>) {
+        self.generation = None;
+        self.startup_cancellation = None;
+        self.owned_endpoint = None;
+        self.target = None;
+        self.command_in_flight = false;
+        self.probe_in_flight = false;
+        self.state.clear(notice);
+    }
+    fn fail(&mut self) {
+        self.startup_cancellation = None;
+        self.command_in_flight = false;
+        self.probe_in_flight = false;
+        self.state.fail();
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        cleanup_observation, effective_stop_target, take_pending_start, AdmittedStart,
-        CleanupObservation, PendingCommand, PendingStart, PendingStop, ServiceObservation,
-        ServiceRuntimeWorker,
-    };
-    use crate::menu::api_runtime::{RuntimeMessage, ServiceObservationSlot};
-    use loxa::api_runtime::ApiStartCancellation;
-    use loxa_ipc::{
-        initialize_development_root, OperationTarget, RuntimePhase, RuntimeStatus, ServiceClient,
-    };
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-    use std::sync::atomic::AtomicBool;
-    use std::sync::{mpsc, Arc};
-    use std::time::Instant;
-
-    fn target(epoch: &str) -> OperationTarget {
-        OperationTarget {
-            boot_epoch: epoch.into(),
-            task_id: "7".into(),
-            generation: "11".into(),
-        }
-    }
-
-    fn observed(epoch: &str, phase: RuntimePhase) -> ServiceObservation {
-        ServiceObservation::Present(RuntimeStatus {
-            boot_epoch: epoch.into(),
-            state_revision: "1".into(),
-            phase,
-        })
-    }
-
-    fn ready(target: &OperationTarget) -> ServiceObservation {
-        observed(
-            &target.boot_epoch,
-            RuntimePhase::Ready {
-                task_id: target.task_id.clone(),
-                generation: target.generation.clone(),
-                model_id: "demo".into(),
-                engine_pid: 42,
-            },
-        )
-    }
-
-    #[test]
-    fn restarted_service_with_reused_counters_never_matches_the_accepted_target() {
-        let accepted = target("epoch-a");
-        let restarted = target("epoch-b");
-        let observed = ready(&restarted);
-
-        assert_ne!(observed.target().as_ref(), Some(&accepted));
-    }
-
-    #[test]
-    fn cleanup_requires_same_epoch_authoritative_terminal_evidence() {
-        let accepted = target("epoch-a");
-
-        assert_eq!(
-            cleanup_observation(&accepted, &ServiceObservation::Absent),
-            CleanupObservation::Failed(None)
-        );
-        assert_eq!(
-            cleanup_observation(&accepted, &observed("epoch-b", RuntimePhase::Unloaded),),
-            CleanupObservation::Failed(None)
-        );
-        assert_eq!(
-            cleanup_observation(&accepted, &observed("epoch-a", RuntimePhase::Unloaded),),
-            CleanupObservation::Complete
-        );
-        for phase in [
-            RuntimePhase::Draining,
-            RuntimePhase::RecoveryRequired {
-                reason: "repair required".into(),
-            },
-        ] {
-            assert_eq!(
-                cleanup_observation(&accepted, &observed("epoch-a", phase)),
-                CleanupObservation::Failed(None)
-            );
-        }
-    }
-
-    #[test]
-    fn cancelled_start_scan_preserves_an_accepted_stop_pending_state() {
-        let stop_target = target("epoch-a");
-        let mut pending = Some(PendingCommand::Stop(PendingStop {
-            ui_generation: Some(4),
-            target: stop_target.clone(),
-        }));
-
-        let extracted = take_pending_start(&mut pending);
-
-        assert!(extracted.is_none());
-        assert!(matches!(
-            pending,
-            Some(PendingCommand::Stop(PendingStop {
-                ui_generation: Some(4),
-                target,
-            })) if target == stop_target
-        ));
-    }
-
-    #[test]
-    fn queued_stop_after_ready_uses_the_retained_accepted_target() {
-        let accepted_target = target("epoch-a");
-        let admitted = AdmittedStart {
-            ui_generation: 4,
-            model_id: "demo".into(),
-            target: accepted_target.clone(),
-        };
-
-        assert_eq!(
-            effective_stop_target(None, Some(4), Some(&admitted)),
-            Some(accepted_target)
-        );
-        assert_eq!(effective_stop_target(None, Some(5), Some(&admitted)), None);
-    }
-
-    #[test]
-    fn cancelled_start_subscription_loss_retains_the_accepted_target() {
-        let parent = std::path::Path::new("/tmp").join(format!(
-            "lms-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir(&parent).unwrap();
-        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
-        let parent = fs::canonicalize(parent).unwrap();
-        let forbidden = parent.join("normal");
-        let root = parent.join("development");
-        fs::create_dir(&forbidden).unwrap();
-        fs::set_permissions(&forbidden, fs::Permissions::from_mode(0o700)).unwrap();
-        initialize_development_root(
-            &root,
-            &forbidden,
-            &std::env::current_exe().unwrap(),
-            "test-build",
-        )
-        .unwrap();
-        let client = ServiceClient::load(&root, Some(&forbidden), "test-build").unwrap();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let (_request_sender, requests) = mpsc::channel();
-        let (messages, received) = mpsc::channel();
-        let target = target("epoch-a");
-        let mut worker = ServiceRuntimeWorker {
-            runtime,
-            client,
-            disconnect: Arc::new(AtomicBool::new(false)),
-            observation: Arc::new(ServiceObservationSlot::default()),
-            requests,
-            messages,
-            subscription: None,
-            next_subscribe: Instant::now(),
-            last_observed: None,
-            pending: None,
-            admitted_start: Some(AdmittedStart {
-                ui_generation: 4,
-                model_id: "demo".into(),
-                target: target.clone(),
-            }),
-        };
-        let cancellation = ApiStartCancellation::new();
-        cancellation.cancel();
-
-        worker.resolve_start(
-            PendingStart {
-                ui_generation: 4,
-                model_id: "demo".into(),
-                cancellation,
-                target: target.clone(),
-                unload_sent: true,
-            },
-            &ServiceObservation::Unavailable,
-        );
-
-        assert!(matches!(
-            received.recv().unwrap(),
-            RuntimeMessage::Stopped {
-                generation: Some(4),
-                result: Err(()),
-                endpoint: Some(endpoint),
-            } if endpoint.service_target() == Some(&target)
-        ));
-        drop(worker);
-        fs::remove_dir_all(parent).unwrap();
-    }
-}
+mod tests;
