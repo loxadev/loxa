@@ -148,6 +148,11 @@ impl TransferControl {
     fn pause_requested(&self) -> bool {
         self.pause.load(Ordering::SeqCst)
     }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn pause_requested_for_test(&self) -> bool {
+        self.pause_requested()
+    }
 }
 
 impl Default for TransferControl {

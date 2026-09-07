@@ -195,6 +195,19 @@ fn wait_for_sigint_child(child: std::process::Child) -> std::process::Output {
 }
 
 #[cfg(unix)]
+fn wait_for_sigint_pause(control: &crate::app::TransferControl) {
+    // Signal delivery and the listener's pause request are separate steps.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !control.pause_requested_for_test() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "SIGINT listener did not request pause"
+        );
+        std::thread::yield_now();
+    }
+}
+
+#[cfg(unix)]
 fn run_sigint_child(scenario: &str) -> (tempfile::TempDir, std::process::Output) {
     let root = tempfile::tempdir().unwrap();
     let scenario_path = root.path().join("scenario");
@@ -413,6 +426,7 @@ fn selected_transfer_sigint_child_helper() {
                 while !release.exists() {
                     std::thread::yield_now();
                 }
+                wait_for_sigint_pause(&control);
                 return service.transfer_selected(selected, control, progress);
             }
             let handshake_phase = if scenario == "late" {
@@ -420,12 +434,14 @@ fn selected_transfer_sigint_child_helper() {
             } else {
                 crate::app::TransferPhase::Verifying
             };
+            let observed_control = control.clone();
             service.transfer_selected(selected, control, |update| {
                 if update.phase() == handshake_phase && !handshake.exists() {
                     std::fs::write(&handshake, b"ready").unwrap();
                     while !release.exists() {
                         std::thread::yield_now();
                     }
+                    wait_for_sigint_pause(&observed_control);
                 }
                 progress(update);
             })
