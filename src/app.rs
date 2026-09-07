@@ -133,6 +133,7 @@ pub enum RuntimeOwnerSnapshot {
     Legacy,
     Foreground,
     PersistentApp,
+    Service,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -256,6 +257,7 @@ impl AppSnapshot {
                         RuntimeOwner::Legacy => RuntimeOwnerSnapshot::Legacy,
                         RuntimeOwner::Foreground => RuntimeOwnerSnapshot::Foreground,
                         RuntimeOwner::PersistentApp => RuntimeOwnerSnapshot::PersistentApp,
+                        RuntimeOwner::Service => RuntimeOwnerSnapshot::Service,
                     }),
                     Some(model_id),
                     if provenance == RuntimeProvenance::External {

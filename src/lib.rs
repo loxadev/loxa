@@ -4,7 +4,6 @@ pub mod catalog;
 pub mod chat;
 pub mod cli;
 pub mod config;
-mod diagnostics;
 pub mod discovery;
 #[cfg(unix)]
 pub mod runtime_bundle;
@@ -150,6 +149,7 @@ pub mod runner;
 mod runtime;
 mod runtime_fingerprint;
 mod safe_file;
+pub mod service;
 mod session;
 mod ui;
 mod verification;
@@ -349,20 +349,35 @@ impl ScopedTransferInterrupt {
 }
 
 pub fn run_from_env() -> Result<i32, String> {
+    match service::run_hidden_from_env() {
+        service::HiddenServiceResult::NotServiceCommand => {}
+        service::HiddenServiceResult::Exit(result) => return result,
+    }
     let cli = cli::parse_checked();
     let paths = AppPaths::from_env()?;
-    let _diagnostics = diagnostics::init(&paths.logs).map_err(|error| {
-        format!(
-            "failed to initialize diagnostics at {}: {error}",
-            paths.logs.display()
-        )
-    })?;
+    if matches!(&cli.command, Command::ServiceDev(_) | Command::List) {
+        return run(cli, paths);
+    }
+    let diagnostics = match loxa_diagnostics::init(&paths.logs, loxa_diagnostics::ProcessRole::Cli)
+    {
+        Ok(diagnostics) => Some(diagnostics),
+        Err(_) => {
+            anstream::eprintln!("Warning: local diagnostics are unavailable");
+            None
+        }
+    };
     let command = command_name(&cli.command);
     tracing::info!(event = "cli_startup", command);
     let result = run(cli, paths);
     match &result {
         Ok(code) => tracing::info!(event = "cli_finished", command, exit_code = *code),
         Err(_) => tracing::error!(event = "cli_failed", command),
+    }
+    if diagnostics
+        .map(loxa_diagnostics::Diagnostics::finish)
+        .is_some_and(|health| !health.is_healthy())
+    {
+        anstream::eprintln!("Warning: some local diagnostics could not be retained");
     }
     result
 }
@@ -371,7 +386,7 @@ pub fn report_error(error: &str) {
     let danger = ui::danger();
     let error = ui::sanitize_terminal(error);
     anstream::eprintln!("{danger}Error:{danger:#} {error}");
-    if let Some(path) = diagnostics::active_log_dir() {
+    if let Some(path) = loxa_diagnostics::active_log_dir() {
         let muted = ui::muted();
         let path = ui::sanitize_terminal(&path.display().to_string());
         anstream::eprintln!("{muted}Diagnostics: {path}{muted:#}");
@@ -388,6 +403,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Discard(_) => "discard",
         Command::Run(_) => "run",
         Command::Chat(_) => "chat",
+        Command::ServiceDev(_) => "service-dev",
     }
 }
 
@@ -930,11 +946,15 @@ where
     F: FnOnce(&AppPaths) -> Result<(), String>,
 {
     cli::preflight(&cli).map_err(|error| error.to_string())?;
-    if !matches!(
-        &cli.command,
-        Command::Search(_) | Command::Inspect(_) | Command::Discard(_)
-    ) {
-        recovery(&paths)?;
+    let service_development = matches!(&cli.command, Command::ServiceDev(_));
+    if !service_development {
+        reject_development_root_for_legacy_command(&paths)?;
+        if !matches!(
+            &cli.command,
+            Command::Search(_) | Command::Inspect(_) | Command::Discard(_)
+        ) {
+            recovery(&paths)?;
+        }
     }
     match cli.command {
         Command::Search(args) => {
@@ -1281,6 +1301,19 @@ where
                 runner::ForegroundStart::Stopped(exit) => Ok(runner::report_exit(exit)),
             }
         }
+        Command::ServiceDev(args) => service::run_development_cli(args),
+    }
+}
+
+fn reject_development_root_for_legacy_command(paths: &AppPaths) -> Result<(), String> {
+    let marker = paths.root.join(loxa_ipc::DEVELOPMENT_MARKER_FILENAME);
+    match std::fs::symlink_metadata(&marker) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(
+            "this data root is reserved for background-service development; use `loxa service-dev`"
+                .into(),
+        ),
+        Err(error) => Err(format!("could not inspect {}: {error}", marker.display())),
     }
 }
 

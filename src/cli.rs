@@ -31,6 +31,40 @@ pub enum Command {
     Run(RunArgs),
     /// Chat with a model in the terminal.
     Chat(ChatArgs),
+    /// Exercise the development-only background service in an isolated data root.
+    ServiceDev(ServiceDevArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ServiceDevArgs {
+    /// Absolute isolated data root marked for background-service development.
+    #[arg(long, value_name = "PATH")]
+    pub data_root: PathBuf,
+    #[command(subcommand)]
+    pub command: ServiceDevCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ServiceDevCommand {
+    /// Initialize an empty private development root and record its service executable.
+    Init {
+        /// Absolute service-capable executable; defaults to this CLI executable.
+        #[arg(long, value_name = "PATH")]
+        origin: Option<PathBuf>,
+    },
+    /// Start the recorded service origin and print its initial status.
+    Start,
+    /// Read status without starting an absent service.
+    Status,
+    /// Start the service if needed and load an installed model.
+    Load {
+        /// Installed model ID.
+        model_id: String,
+    },
+    /// Unload the exact active operation observed immediately before the request.
+    Unload,
+    /// Ask the existing service to drain and stop.
+    Stop,
 }
 
 #[derive(Debug, Args)]
@@ -126,6 +160,25 @@ pub(crate) fn preflight(cli: &Cli) -> Result<(), clap::Error> {
         Command::Pull(args) => parse_pull_input(args).map(|_| ()),
         Command::Discard(args) => crate::paths::validate_id(&args.id)
             .map_err(|_| clap::Error::raw(ErrorKind::ValueValidation, "invalid model ID")),
+        Command::ServiceDev(args) => {
+            if !args.data_root.is_absolute() {
+                return Err(clap::Error::raw(
+                    ErrorKind::ValueValidation,
+                    "service development data root must be absolute",
+                ));
+            }
+            match &args.command {
+                ServiceDevCommand::Init {
+                    origin: Some(origin),
+                } if !origin.is_absolute() => Err(clap::Error::raw(
+                    ErrorKind::ValueValidation,
+                    "service development origin must be absolute",
+                )),
+                ServiceDevCommand::Load { model_id } => crate::paths::validate_id(model_id)
+                    .map_err(|_| clap::Error::raw(ErrorKind::ValueValidation, "invalid model ID")),
+                _ => Ok(()),
+            }
+        }
         _ => Ok(()),
     }
 }
@@ -350,7 +403,17 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             names,
-            ["search", "inspect", "pull", "list", "rm", "discard", "run", "chat"]
+            [
+                "search",
+                "inspect",
+                "pull",
+                "list",
+                "rm",
+                "discard",
+                "run",
+                "chat",
+                "service-dev",
+            ]
         );
 
         let run = command
@@ -393,6 +456,27 @@ mod tests {
             }
             _ => panic!("expected chat"),
         }
+    }
+
+    #[test]
+    fn service_development_root_precedes_its_subcommand() {
+        Cli::command().debug_assert();
+        let cli = Cli::try_parse_from([
+            "loxa",
+            "service-dev",
+            "--data-root",
+            "/private/tmp/loxa-service-dev",
+            "status",
+        ])
+        .unwrap();
+        let Command::ServiceDev(args) = cli.command else {
+            panic!("expected service development command");
+        };
+        assert_eq!(
+            args.data_root,
+            PathBuf::from("/private/tmp/loxa-service-dev")
+        );
+        assert!(matches!(args.command, ServiceDevCommand::Status));
     }
 
     #[test]
