@@ -16,6 +16,26 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  linux-core:
+    name: Core and leaf checks (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        run: rustup toolchain install --profile minimal --no-self-update
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Check core and shared leaves
+        run: cargo check --locked -p loxa -p loxa-ipc -p loxa-diagnostics --all-targets
+      - name: Test Linux service behavior
+        run: 'cargo test --locked -p loxa --lib service::'
+      - name: Test all shared leaf targets
+        run: cargo test --locked -p loxa-ipc -p loxa-diagnostics --all-targets
+
   checks:
     name: Rust checks (macOS)
     runs-on: macos-15

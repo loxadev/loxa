@@ -4,6 +4,8 @@ on:
   pull_request:
     paths:
       - Cargo.toml
+      - crates/**/Cargo.toml
+      - loxa-app/src-tauri/Cargo.toml
       - Cargo.lock
       - deny.toml
       - rust-toolchain.toml
@@ -12,6 +14,8 @@ on:
     branches: [main]
     paths:
       - Cargo.toml
+      - crates/**/Cargo.toml
+      - loxa-app/src-tauri/Cargo.toml
       - Cargo.lock
       - deny.toml
       - rust-toolchain.toml
