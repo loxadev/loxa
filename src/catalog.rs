@@ -77,6 +77,7 @@ pub struct ModelLock {
     model_directory: fs::File,
     model_directory_identity: crate::safe_file::DirectoryIdentity,
     model_directory_path: PathBuf,
+    acquiring_process_id: u32,
 }
 
 impl ModelLock {
@@ -131,6 +132,7 @@ impl ModelLock {
             model_directory,
             model_directory_identity,
             model_directory_path: model_dir.to_owned(),
+            acquiring_process_id: std::process::id(),
         };
         lock.revalidate().map_err(ModelLockFailure::unsafe_legacy)?;
         Ok(lock)
@@ -167,6 +169,17 @@ impl ModelLock {
             &self.model_directory_path,
         )
         .map_err(|error| format!("{}: {error}", self.model_directory_path.display()))
+    }
+}
+
+impl Drop for ModelLock {
+    fn drop(&mut self) {
+        // A concurrent fork can retain the locked file description until exec.
+        // Only the acquiring process may unlock; an inherited guard must not
+        // release the parent's lock when dropped in a child.
+        if self.acquiring_process_id == std::process::id() {
+            let _ = self.lock_file.unlock();
+        }
     }
 }
 
@@ -1986,6 +1999,30 @@ mod tests {
         assert!(ModelLock::acquire(dir.path()).is_err());
         drop(first);
         ModelLock::acquire(dir.path()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_lock_release_does_not_wait_for_an_inherited_descriptor() {
+        let dir = tempdir().unwrap();
+        let first = ModelLock::acquire(dir.path()).unwrap();
+        // A forked child retains the same open file description until exec.
+        let inherited = first.lock_file.try_clone().unwrap();
+        assert_eq!(
+            ModelLock::acquire_existing(dir.path()).err(),
+            Some(ModelLockError::Busy)
+        );
+
+        drop(first);
+        let second = ModelLock::acquire_existing(dir.path()).unwrap();
+        drop(inherited);
+        assert_eq!(
+            ModelLock::acquire_existing(dir.path()).err(),
+            Some(ModelLockError::Busy)
+        );
+
+        drop(second);
+        ModelLock::acquire_existing(dir.path()).unwrap();
     }
 
     #[cfg(unix)]
