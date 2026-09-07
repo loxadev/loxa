@@ -1,3 +1,8 @@
+mod discovery;
+pub(crate) mod dispatch;
+mod models;
+mod transfer;
+
 use clap::{error::ErrorKind, ArgGroup, Args, Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -687,7 +692,7 @@ mod tests {
             );
 
             let calls = std::cell::Cell::new(0);
-            let run_error = crate::run_with_recovery(cli, paths.clone(), |_| {
+            let run_error = dispatch::run_with_recovery(cli, paths.clone(), |_| {
                 calls.set(calls.get() + 1);
                 Err("injected recovery must not run".into())
             })

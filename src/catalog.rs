@@ -606,6 +606,27 @@ pub fn load_catalog(models_root: &Path) -> Result<Vec<Manifest>, String> {
     Ok(manifests)
 }
 
+pub(crate) fn load_reconciled_catalog(models_root: &Path) -> Result<Vec<Manifest>, String> {
+    load_reconciled_catalog_with(models_root, local::reconcile_qualified_bundle)
+}
+
+fn load_reconciled_catalog_with<F>(
+    models_root: &Path,
+    reconcile: F,
+) -> Result<Vec<Manifest>, String>
+where
+    F: FnOnce(&Path) -> Result<Option<Manifest>, String>,
+{
+    match reconcile(models_root) {
+        Ok(Some(manifest)) => {
+            tracing::info!(event = "bundle_reconciled", model_id = %manifest.id)
+        }
+        Ok(None) => tracing::debug!(event = "bundle_reconciliation_not_needed"),
+        Err(_) => tracing::warn!(event = "bundle_reconciliation_failed"),
+    }
+    load_catalog(models_root)
+}
+
 pub fn prepare_pull(model_dir: &Path, manifest: &Manifest) -> Result<(), String> {
     manifest.validate()?;
     if model_dir.file_name().and_then(|name| name.to_str()) != Some(manifest.id.as_str()) {
@@ -2472,5 +2493,23 @@ mod tests {
         assert!(error.contains("busy"), "{error}");
         assert_eq!(load_catalog(root.path()).unwrap(), vec![expected]);
         drop(lock);
+    }
+    #[test]
+    fn reconciliation_failure_does_not_block_a_valid_catalog() {
+        let root = tempdir().unwrap();
+        let expected = manifest("demo");
+        write_artifact(root.path(), &expected.id);
+        publish_manifest(root.path(), &expected).unwrap();
+        let reconciled = std::cell::Cell::new(false);
+
+        let loaded = load_reconciled_catalog_with(root.path(), |models_root| {
+            assert_eq!(models_root, root.path());
+            reconciled.set(true);
+            Err("injected reconciliation failure".into())
+        })
+        .unwrap();
+
+        assert!(reconciled.get());
+        assert_eq!(loaded, vec![expected]);
     }
 }

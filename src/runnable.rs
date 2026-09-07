@@ -1,7 +1,7 @@
 use crate::catalog::Manifest;
 use crate::paths::AppPaths;
 use crate::runtime_fingerprint::RuntimeFingerprint;
-use crate::{catalog, cli, config, load_installed_models, runner, verification};
+use crate::{catalog, cli, config, runner, verification};
 use std::path::Path;
 use std::time::Instant;
 
@@ -131,7 +131,7 @@ pub(crate) fn resolve_runnable(
     let config = config::load(&paths.config)?;
     let ctx = config::resolve_value(runtime.ctx, config.ctx, 4096);
     let port = config::resolve_value(runtime.port, config.port, 0);
-    let installed = load_installed_models(paths)?;
+    let installed = catalog::load_reconciled_catalog(&paths.models)?;
     let installed = installed.into_iter().find(|entry| entry.id == id);
     let (source, profile, server) = match installed {
         Some(manifest) => {
