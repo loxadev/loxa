@@ -1,6 +1,7 @@
 use super::lease::{LeaseOwnerMode, RuntimeLease};
+use super::lock::foreground_lock_is_held;
 use super::process::{command_has_unique_option, process_group, process_snapshot};
-use super::{foreground_lock_is_held, lease_is_absent, read_lease};
+use super::record::{lease_is_absent, read_lease};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};

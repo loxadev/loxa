@@ -2,6 +2,7 @@ use super::observation::exact_live_provenance;
 use super::*;
 use crate::app::{RuntimeInventorySnapshot, RuntimeOwnerSnapshot, RuntimeSnapshot, SnapshotReader};
 use crate::paths::AppPaths;
+use std::fs::TryLockError;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::thread;
