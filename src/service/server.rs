@@ -356,7 +356,7 @@ async fn send_hello_ack(
             capabilities: CAPABILITIES.to_vec(),
             build: bootstrap.origin().build().to_owned(),
             storage_schema: STORAGE_SCHEMA,
-            boot_epoch: coordinator.status().boot_epoch,
+            boot_epoch: coordinator.boot_epoch().to_owned(),
             root_identity: bootstrap.root().root_identity().to_owned(),
             service_pid: std::process::id(),
             origin_sha256: bootstrap.origin().executable_sha256().to_owned(),
