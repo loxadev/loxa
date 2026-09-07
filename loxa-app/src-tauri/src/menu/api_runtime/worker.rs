@@ -4,6 +4,7 @@ use loxa::api_runtime::{
     ApiRuntimeActivity, ApiRuntimeHost, ApiRuntimeProbe, ApiStartCancellation, ApiStartError,
     ApiStartOutcome,
 };
+use loxa_ipc::OperationTarget;
 
 use super::ApiEndpoint;
 
@@ -67,7 +68,10 @@ pub(in crate::menu) enum RuntimeRequest {
         model_id: String,
         cancellation: ApiStartCancellation,
     },
-    Stop,
+    Stop {
+        generation: Option<u64>,
+        target: Option<OperationTarget>,
+    },
     Probe,
     Shutdown {
         reply: Sender<RuntimeShutdownReply>,
@@ -159,7 +163,7 @@ pub(in crate::menu) fn run_runtime_worker<H: RuntimeHost>(
                     }
                 }
             }
-            RuntimeRequest::Stop => {
+            RuntimeRequest::Stop { .. } => {
                 let result = host.stop();
                 let endpoint = host.endpoint();
                 let generation = active_generation;

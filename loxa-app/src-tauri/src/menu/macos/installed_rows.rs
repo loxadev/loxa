@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
+use loxa::paths::AppPaths;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Sel};
 use objc2::{MainThreadMarker, MainThreadOnly};
@@ -128,11 +129,16 @@ pub(super) fn build(
             let available_width = WIDTH - 2.0 * INSET;
             let copy = text_button(
                 "Copy chat command",
-                "Copy chat command for the selected installed model",
+                if api.can_copy_chat() {
+                    "Copy chat command for the selected installed model"
+                } else {
+                    "Chat commands are unavailable in background service mode"
+                },
                 target,
                 actions.copy,
                 mtm,
             );
+            copy.setEnabled(api.can_copy_chat());
             copy.setFrame(rect(INSET, 4.0, available_width / 2.0 - 3.0, 28.0));
             action_row.addSubview(&copy);
             let reveal = text_button(
@@ -394,15 +400,16 @@ pub(super) enum InstalledAction {
 pub(super) fn dispatch_native_selected_action(
     state: &RefCell<InstalledState>,
     action: InstalledAction,
+    paths: &AppPaths,
+    allow_copy_chat: bool,
 ) {
+    if action == InstalledAction::CopyChatCommand && !allow_copy_chat {
+        return;
+    }
     dispatch_selected_action(
         state,
         action,
-        |model_id| {
-            loxa::paths::AppPaths::from_env()
-                .and_then(|paths| paths.model_dir(model_id))
-                .map_err(|_| ())
-        },
+        |model_id| paths.model_dir(model_id).map_err(|_| ()),
         |path| std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir()),
         |command| {
             let pasteboard = NSPasteboard::generalPasteboard();

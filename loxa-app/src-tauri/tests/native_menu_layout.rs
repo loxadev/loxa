@@ -1438,6 +1438,14 @@ mod menu {
                     status_item,
                     popover.clone(),
                     content_view_controller.clone(),
+                    AppPaths::from_values(
+                        Some(std::path::Path::new(
+                            "/private/tmp/loxa-menu-fixture-models",
+                        )),
+                        None,
+                    )
+                    .expect("fixture paths must be valid"),
+                    None,
                     Fixture::Installed,
                 );
                 state.installed.borrow_mut().replace(
@@ -1678,7 +1686,20 @@ mod menu {
                     unsafe { msg_send![NSStatusItem::alloc(), init] };
                 let popover = NSPopover::new(mtm);
                 popover.setContentViewController(Some(&content_view_controller));
-                NativePopoverState::new(status_item, popover, content_view_controller, fixture)
+                NativePopoverState::new(
+                    status_item,
+                    popover,
+                    content_view_controller,
+                    AppPaths::from_values(
+                        Some(std::path::Path::new(
+                            "/private/tmp/loxa-menu-fixture-models",
+                        )),
+                        None,
+                    )
+                    .expect("fixture paths must be valid"),
+                    None,
+                    fixture,
+                )
             }
 
             fn transferring_catalog() -> (crate::menu::catalog::CatalogState, Instant) {

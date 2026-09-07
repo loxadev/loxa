@@ -28,7 +28,11 @@ tauri-build = { version = "=2.6.3", features = [] }
 
 [dependencies]
 loxa = { path = "../.." }
+loxa-diagnostics = { version = "0.1.0-dev", path = "../../crates/loxa-diagnostics" }
+loxa-ipc = { version = "0.1.0-dev", path = "../../crates/loxa-ipc" }
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tauri = { version = "=2.11.5", features = ["tray-icon"] }
+tokio = { version = "1.53.1", default-features = false, features = ["rt", "time"] }
 
 [dev-dependencies]
 loxa = { path = "../..", features = ["test-support"] }

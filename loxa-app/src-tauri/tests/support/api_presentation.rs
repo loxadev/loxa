@@ -106,6 +106,10 @@ impl ApiPresentation {
         self.active_model_id.as_deref()
     }
 
+    pub(crate) fn can_copy_chat(&self) -> bool {
+        true
+    }
+
     pub(crate) fn primary_action(&self, selected_model_id: &str) -> ApiPrimaryAction {
         if self
             .active_model_id()
