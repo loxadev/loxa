@@ -3,6 +3,7 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use loxa::paths::AppPaths;
+use loxa_ipc::ServiceClient;
 use objc2::rc::{Retained, Weak};
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
@@ -96,6 +97,8 @@ struct NativePopoverState {
     dispatched_catalog: Vec<crate::menu::catalog::CatalogCommand>,
     backend: Option<BackendClient>,
     rows: Option<MenuRows>,
+    model_paths: AppPaths,
+    shared_service: bool,
 }
 
 impl NativePopoverState {
@@ -103,8 +106,9 @@ impl NativePopoverState {
         status_item: Retained<NSStatusItem>,
         popover: Retained<NSPopover>,
         content_view_controller: Retained<NSViewController>,
-        #[cfg(not(test))] backend_paths: AppPaths,
+        backend_paths: AppPaths,
         #[cfg(not(test))] runtime_paths: AppPaths,
+        service_client: Option<ServiceClient>,
         #[cfg(test)] fixture: Fixture,
     ) -> Self {
         #[cfg(test)]
@@ -115,10 +119,20 @@ impl NativePopoverState {
         let api = ApiPresentation::idle();
         #[cfg(not(test))]
         let (api_runtime, api) = {
-            let controller = ApiRuntimeController::start(runtime_paths);
+            let controller = match service_client {
+                Some(client) => ApiRuntimeController::start_service(client),
+                None => ApiRuntimeController::start(runtime_paths),
+            };
             let presentation = project_api_presentation(&controller, &snapshot);
             (controller, presentation)
         };
+        let model_paths = backend_paths.clone();
+        #[cfg(not(test))]
+        let shared_service = api_runtime.is_shared_service();
+        #[cfg(test)]
+        let shared_service = false;
+        #[cfg(test)]
+        let _ = service_client;
         Self {
             status_item,
             popover,
@@ -159,6 +173,8 @@ impl NativePopoverState {
                 }
             },
             rows: None,
+            model_paths,
+            shared_service,
         }
     }
 
@@ -824,8 +840,20 @@ impl NativePopoverTarget {
     }
 
     fn perform_installed_action(&self, action: InstalledAction) {
-        let installed = self.ivars().state.borrow().installed.clone();
-        installed_rows::dispatch_native_selected_action(&installed, action);
+        let (installed, model_paths, allow_copy_chat) = {
+            let state = self.ivars().state.borrow();
+            (
+                state.installed.clone(),
+                state.model_paths.clone(),
+                !state.shared_service,
+            )
+        };
+        installed_rows::dispatch_native_selected_action(
+            &installed,
+            action,
+            &model_paths,
+            allow_copy_chat,
+        );
         let mtm = MainThreadMarker::new()
             .expect("AppKit must perform installed actions on the main thread");
         self.ivars()
@@ -943,8 +971,9 @@ impl NativePopoverController {
     pub(crate) fn attach(
         status_item: Retained<NSStatusItem>,
         app_handle: AppHandle,
-        _backend_paths: AppPaths,
+        backend_paths: AppPaths,
         _runtime_paths: AppPaths,
+        service_client: Option<ServiceClient>,
         mtm: MainThreadMarker,
     ) -> Self {
         status_item.setMenu(None);
@@ -967,10 +996,10 @@ impl NativePopoverController {
             status_item.clone(),
             popover.clone(),
             content_view_controller.clone(),
-            #[cfg(not(test))]
-            _backend_paths,
+            backend_paths,
             #[cfg(not(test))]
             _runtime_paths,
+            service_client,
             #[cfg(test)]
             fixture,
         )));

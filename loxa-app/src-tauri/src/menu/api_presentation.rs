@@ -9,6 +9,7 @@ pub(crate) struct ApiPresentation {
     status_label: String,
     curl_command: Option<String>,
     active_model_id: Option<String>,
+    shared_service: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,6 +34,7 @@ pub(crate) struct ApiPrimaryAction {
     kind: ApiPrimaryActionKind,
     enabled: bool,
     disabled_reason: Option<&'static str>,
+    shared_service: bool,
 }
 
 impl ApiPrimaryAction {
@@ -41,9 +43,11 @@ impl ApiPrimaryAction {
     }
 
     pub(crate) fn title(self) -> &'static str {
-        match self.kind {
-            ApiPrimaryActionKind::Start => "Start API",
-            ApiPrimaryActionKind::Stop => "Stop API",
+        match (self.kind, self.shared_service) {
+            (ApiPrimaryActionKind::Start, false) => "Start API",
+            (ApiPrimaryActionKind::Stop, false) => "Stop API",
+            (ApiPrimaryActionKind::Start, true) => "Load",
+            (ApiPrimaryActionKind::Stop, true) => "Unload",
         }
     }
 
@@ -58,6 +62,14 @@ impl ApiPrimaryAction {
 
 impl ApiPresentation {
     pub(crate) fn from_controller(controller: &ApiRuntimeController) -> Self {
+        if controller.is_shared_service() {
+            return Self::from_service_state(
+                controller.phase(),
+                controller.notice(),
+                controller.active_model_id(),
+                controller.service_initialized(),
+            );
+        }
         Self::from_state(
             controller.phase(),
             controller.notice(),
@@ -69,6 +81,9 @@ impl ApiPresentation {
         controller: &ApiRuntimeController,
         observed_runtime: Option<&ObservedRuntime>,
     ) -> Self {
+        if controller.is_shared_service() {
+            return Self::from_controller(controller);
+        }
         Self::from_state_with_observed_runtime(
             controller.phase(),
             controller.notice(),
@@ -129,6 +144,77 @@ impl ApiPresentation {
             status_label,
             curl_command,
             active_model_id: active_model_id.map(str::to_owned),
+            shared_service: false,
+        }
+    }
+
+    fn from_service_state(
+        phase: &ApiRuntimePhase,
+        notice: Option<ApiRuntimeNotice>,
+        active_model_id: Option<&str>,
+        initialized: bool,
+    ) -> Self {
+        let (presentation_phase, status_label) = if !initialized {
+            (
+                ApiPresentationPhase::Unavailable,
+                "Checking background service…".into(),
+            )
+        } else {
+            match phase {
+                ApiRuntimePhase::Idle => (
+                    ApiPresentationPhase::Idle,
+                    notice
+                        .map(|notice| match notice {
+                            ApiRuntimeNotice::ServiceAbsent => "Background service stopped",
+                            ApiRuntimeNotice::Conflict => {
+                                "Another background service model operation is active"
+                            }
+                            ApiRuntimeNotice::ModelUnavailable => {
+                                "The selected installed model is unavailable"
+                            }
+                            ApiRuntimeNotice::StartFailed => {
+                                "Could not load the model in the background service"
+                            }
+                            ApiRuntimeNotice::UnexpectedStop => {
+                                "The background service unloaded the model"
+                            }
+                            ApiRuntimeNotice::CleanupFailed => {
+                                "Could not unload the model. Try Unload again."
+                            }
+                            ApiRuntimeNotice::ControllerFailed => {
+                                "Background service unavailable · Quit and reopen Loxa"
+                            }
+                        })
+                        .unwrap_or("Background service idle")
+                        .into(),
+                ),
+                ApiRuntimePhase::Starting { .. } => (
+                    ApiPresentationPhase::Starting,
+                    "Loading model in background service…".into(),
+                ),
+                ApiRuntimePhase::Ready { .. } => (
+                    ApiPresentationPhase::Ready,
+                    "Model loaded in background service".into(),
+                ),
+                ApiRuntimePhase::Stopping => {
+                    (ApiPresentationPhase::Stopping, "Unloading model…".into())
+                }
+                ApiRuntimePhase::CleanupFailed => (
+                    ApiPresentationPhase::CleanupFailed,
+                    "Unload failed · Try Unload again".into(),
+                ),
+                ApiRuntimePhase::ControllerFailed => (
+                    ApiPresentationPhase::Unavailable,
+                    "Background service unavailable · Quit and reopen Loxa".into(),
+                ),
+            }
+        };
+        Self {
+            phase: presentation_phase,
+            status_label,
+            curl_command: None,
+            active_model_id: active_model_id.map(str::to_owned),
+            shared_service: true,
         }
     }
 
@@ -152,6 +238,7 @@ impl ApiPresentation {
             status_label: format!("CLI runtime · 127.0.0.1:{port}"),
             curl_command: Some(format!("curl http://127.0.0.1:{port}/v1/models")),
             active_model_id: Some(runtime.model_id().into()),
+            shared_service: false,
         }
     }
 
@@ -167,12 +254,17 @@ impl ApiPresentation {
         self.active_model_id.as_deref()
     }
 
+    pub(crate) fn can_copy_chat(&self) -> bool {
+        !self.shared_service
+    }
+
     pub(crate) fn primary_action(&self, selected_model_id: &str) -> ApiPrimaryAction {
         if self.phase == ApiPresentationPhase::Unavailable {
             return ApiPrimaryAction {
                 kind: ApiPrimaryActionKind::Start,
                 enabled: false,
                 disabled_reason: Some("Quit and reopen Loxa."),
+                shared_service: self.shared_service,
             };
         }
         if self.phase == ApiPresentationPhase::CliRuntime {
@@ -180,6 +272,7 @@ impl ApiPresentation {
                 kind: ApiPrimaryActionKind::Start,
                 enabled: false,
                 disabled_reason: Some("Stop the CLI runtime first"),
+                shared_service: self.shared_service,
             };
         }
         if self
@@ -189,7 +282,12 @@ impl ApiPresentation {
             return ApiPrimaryAction {
                 kind: ApiPrimaryActionKind::Start,
                 enabled: false,
-                disabled_reason: Some("Stop the current API first"),
+                disabled_reason: Some(if self.shared_service {
+                    "Unload the current model first"
+                } else {
+                    "Stop the current API first"
+                }),
+                shared_service: self.shared_service,
             };
         }
         match (self.phase, self.active_model_id()) {
@@ -202,21 +300,25 @@ impl ApiPresentation {
                 kind: ApiPrimaryActionKind::Stop,
                 enabled: true,
                 disabled_reason: None,
+                shared_service: self.shared_service,
             },
             (ApiPresentationPhase::Stopping, Some(_)) => ApiPrimaryAction {
                 kind: ApiPrimaryActionKind::Stop,
                 enabled: false,
                 disabled_reason: None,
+                shared_service: self.shared_service,
             },
             (ApiPresentationPhase::Idle, None) => ApiPrimaryAction {
                 kind: ApiPrimaryActionKind::Start,
                 enabled: true,
                 disabled_reason: None,
+                shared_service: self.shared_service,
             },
             _ => ApiPrimaryAction {
                 kind: ApiPrimaryActionKind::Start,
                 enabled: false,
                 disabled_reason: None,
+                shared_service: self.shared_service,
             },
         }
     }

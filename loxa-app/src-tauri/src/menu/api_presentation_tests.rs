@@ -209,6 +209,54 @@ fn only_ready_activity_changes_are_retained_in_place() {
 }
 
 #[test]
+fn shared_service_presentation_uses_load_unload_and_never_exposes_loopback() {
+    let checking = ApiPresentation::from_service_state(&ApiRuntimePhase::Idle, None, None, false);
+    assert_eq!(checking.status_label(), "Checking background service…");
+    assert_eq!(checking.curl_command(), None);
+    assert!(!checking.can_copy_chat());
+    let action = checking.primary_action("alpha");
+    assert_eq!(action.title(), "Load");
+    assert!(!action.is_enabled());
+
+    let idle = ApiPresentation::from_service_state(&ApiRuntimePhase::Idle, None, None, true);
+    assert_eq!(idle.status_label(), "Background service idle");
+    let action = idle.primary_action("alpha");
+    assert_eq!(action.title(), "Load");
+    assert!(action.is_enabled());
+
+    let absent = ApiPresentation::from_service_state(
+        &ApiRuntimePhase::Idle,
+        Some(ApiRuntimeNotice::ServiceAbsent),
+        None,
+        true,
+    );
+    assert_eq!(absent.status_label(), "Background service stopped");
+    assert!(absent.primary_action("alpha").is_enabled());
+
+    let ready = ApiPresentation::from_service_state(
+        &ApiRuntimePhase::Ready {
+            generation: 7,
+            endpoint: ApiEndpoint::new("alpha".into(), 0),
+            activity: ApiRuntimeActivity::Unknown,
+        },
+        None,
+        Some("alpha"),
+        true,
+    );
+    assert_eq!(ready.status_label(), "Model loaded in background service");
+    assert_eq!(ready.curl_command(), None);
+    assert!(!ready.status_label().contains("127.0.0.1"));
+    assert_eq!(ready.primary_action("alpha").title(), "Unload");
+    let other = ready.primary_action("beta");
+    assert_eq!(other.title(), "Load");
+    assert!(!other.is_enabled());
+    assert_eq!(
+        other.disabled_reason(),
+        Some("Unload the current model first")
+    );
+}
+
+#[test]
 fn observed_cli_runtime_is_read_only_and_never_overwrites_menu_owned_phases() {
     let foreground =
         ObservedRuntime::new(ObservedRuntimeOwner::Foreground, "alpha".into(), 43123).unwrap();

@@ -2,6 +2,7 @@ use std::sync::Mutex;
 
 use dispatch2::MainThreadBound;
 use loxa::paths::AppPaths;
+use loxa_ipc::ServiceClient;
 use objc2::MainThreadMarker;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, ExitRequestApi, Manager, RunEvent, Wry};
@@ -11,13 +12,32 @@ use crate::menu::macos::{NativeExitResources, NativePopoverController};
 #[derive(Clone)]
 struct ApplicationLaunch {
     paths: AppPaths,
+    service_client: Option<ServiceClient>,
 }
 
 impl ApplicationLaunch {
     fn from_process() -> Result<Self, String> {
         let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+        let normal_paths = AppPaths::from_application_env(&executable)?;
+        let Some(service_root) = std::env::var_os("LOXA_SERVICE_DEV_ROOT") else {
+            return Ok(Self {
+                paths: normal_paths,
+                service_client: None,
+            });
+        };
+        let service_client = ServiceClient::load(
+            std::path::Path::new(&service_root),
+            Some(&normal_paths.root),
+            loxa::service::BUILD_ID,
+        )?;
+        let service_paths = AppPaths::from_application_values(
+            service_client.bootstrap().origin().executable(),
+            Some(service_client.bootstrap().root().root()),
+            None,
+        )?;
         Ok(Self {
-            paths: AppPaths::from_application_env(&executable)?,
+            paths: service_paths,
+            service_client: Some(service_client),
         })
     }
 
@@ -29,11 +49,17 @@ impl ApplicationLaunch {
     ) -> Result<Self, String> {
         Ok(Self {
             paths: AppPaths::from_application_values(executable, explicit, home)?,
+            service_client: None,
         })
     }
 
+    #[cfg(test)]
     fn worker_paths(&self) -> (AppPaths, AppPaths) {
         (self.paths.clone(), self.paths.clone())
+    }
+
+    fn into_worker_parts(self) -> (AppPaths, AppPaths, Option<ServiceClient>) {
+        (self.paths.clone(), self.paths, self.service_client)
     }
 }
 
@@ -101,10 +127,19 @@ pub(crate) fn request_native_shell_exit(app_handle: &AppHandle) {
     );
 }
 
-pub(crate) fn run() {
+pub(crate) fn run() -> Result<(), String> {
     let launch = ApplicationLaunch::from_process()
-        .expect("failed to resolve the Loxa application launch paths");
-    let (backend_paths, runtime_paths) = launch.worker_paths();
+        .map_err(|error| format!("failed to resolve launch paths: {error}"))?;
+    let (backend_paths, runtime_paths, service_client) = launch.into_worker_parts();
+    let diagnostics =
+        match loxa_diagnostics::init(&backend_paths.logs, loxa_diagnostics::ProcessRole::Desktop) {
+            Ok(diagnostics) => Some(diagnostics),
+            Err(_) => {
+                eprintln!("Loxa desktop diagnostics are unavailable");
+                None
+            }
+        };
+    tracing::info!(target: "loxa_app", event = "desktop_startup");
     let app = crate::native_menu::with_native_edit_menu(tauri::Builder::default())
         .setup(move |app| {
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -142,6 +177,7 @@ pub(crate) fn run() {
                         app_handle,
                         backend_paths,
                         runtime_paths,
+                        service_client,
                         mtm,
                     ),
                     mtm,
@@ -155,7 +191,7 @@ pub(crate) fn run() {
             Ok(())
         })
         .build(tauri::generate_context!())
-        .expect("failed to build the Loxa native menu-bar application");
+        .map_err(|error| format!("failed to build the native menu-bar application: {error}"))?;
 
     app.run(|app_handle, event| {
         if let RunEvent::ExitRequested { api, .. } = event {
@@ -166,6 +202,14 @@ pub(crate) fn run() {
             );
         }
     });
+    tracing::info!(target: "loxa_app", event = "desktop_shutdown");
+    if diagnostics
+        .map(loxa_diagnostics::Diagnostics::finish)
+        .is_some_and(|health| !health.is_healthy())
+    {
+        eprintln!("Some Loxa desktop diagnostics could not be retained");
+    }
+    Ok(())
 }
 
 fn handle_exit_requested(app_handle: &AppHandle, api: &ExitRequestApi) {

@@ -85,6 +85,7 @@ enum CoreRuntimeOwner {
     Legacy,
     Foreground,
     PersistentApp,
+    Service,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -153,6 +154,7 @@ impl From<AppSnapshot> for CoreObservation {
             RuntimeOwnerSnapshot::Legacy => CoreRuntimeOwner::Legacy,
             RuntimeOwnerSnapshot::Foreground => CoreRuntimeOwner::Foreground,
             RuntimeOwnerSnapshot::PersistentApp => CoreRuntimeOwner::PersistentApp,
+            RuntimeOwnerSnapshot::Service => CoreRuntimeOwner::Service,
         });
         let runtime_model_id = snapshot.runtime_model_id().map(str::to_owned);
         let bundle_model_id = snapshot.bundle_model_id().to_owned();
@@ -238,12 +240,18 @@ fn map_core_snapshot(snapshot: CoreObservation) -> MenuSnapshot {
         snapshot.runtime_owner,
         snapshot.runtime_model_id,
     ) {
+        // Service runtimes are Unix-socket-only and are projected by the
+        // service client rather than the legacy loopback observation path.
+        (Some(0), Some(CoreRuntimeOwner::Service), Some(_)) => menu,
         (Some(port), Some(owner), Some(model_id)) => menu
             .with_observed_runtime(
                 match owner {
                     CoreRuntimeOwner::Legacy => ObservedRuntimeOwner::Legacy,
                     CoreRuntimeOwner::Foreground => ObservedRuntimeOwner::Foreground,
                     CoreRuntimeOwner::PersistentApp => ObservedRuntimeOwner::PersistentApp,
+                    CoreRuntimeOwner::Service => {
+                        unreachable!("service runtimes have no loopback port")
+                    }
                 },
                 model_id,
                 port,
