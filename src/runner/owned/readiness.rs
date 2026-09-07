@@ -1,3 +1,4 @@
+use super::startup::StartupEndpoint;
 use super::{exit_code, OwnedServer, StartOutcome, StartupStop};
 use crate::runner::launch::{Launch, LaunchPolicy};
 #[cfg(unix)]
@@ -5,7 +6,6 @@ use crate::runner::service_transport::{readiness_unix, UnixReadiness};
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::io::Read as _;
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 pub(in crate::runner) const MAX_MODELS_BODY: usize = 1024 * 1024;
@@ -104,8 +104,7 @@ impl OwnedServer {
         launch: &Launch,
         timeout: Duration,
         requested_port: u16,
-        unix_socket: Option<&Path>,
-        service_runtime: Option<&tokio::runtime::Handle>,
+        endpoint: StartupEndpoint<'_>,
         client: Option<&Client>,
         child_pid: u32,
         stop: &F,
@@ -118,7 +117,7 @@ impl OwnedServer {
             if let Err(error) = self.collect_announcements() {
                 return self.fail_start(error);
             }
-            match requested_start_outcome(&mut self, &stop)? {
+            match requested_start_outcome(&mut self, stop)? {
                 RequestedStartOutcome::Continue => {}
                 RequestedStartOutcome::Completed(outcome) => return Ok(outcome),
                 RequestedStartOutcome::CleanupFailed => {
@@ -136,15 +135,9 @@ impl OwnedServer {
                 }
                 return Ok(StartOutcome::Exited(self.server_exit(code)));
             }
-            if let Some(endpoint) = unix_socket {
+            if let StartupEndpoint::ServiceUnix { path, runtime } = endpoint {
                 #[cfg(unix)]
-                let readiness = readiness_unix(
-                    service_runtime.expect("Unix launch has its owning runtime handle"),
-                    endpoint,
-                    &launch.id,
-                    child_pid,
-                    &stop,
-                );
+                let readiness = readiness_unix(runtime, path, &launch.id, child_pid, stop);
                 #[cfg(not(unix))]
                 let readiness = UnixReadinessPoll {
                     endpoint_identity: None,
@@ -161,7 +154,7 @@ impl OwnedServer {
                         if let Err(error) = self.collect_announcements() {
                             return self.fail_start(error);
                         }
-                        match requested_start_outcome(&mut self, &stop)? {
+                        match requested_start_outcome(&mut self, stop)? {
                             RequestedStartOutcome::Continue => {}
                             RequestedStartOutcome::Completed(outcome) => return Ok(outcome),
                             RequestedStartOutcome::CleanupFailed => {
@@ -193,7 +186,7 @@ impl OwnedServer {
                     ));
                 }
                 match readiness(
-                    client.as_ref().expect("TCP launch has a readiness client"),
+                    client.expect("TCP launch has a readiness client"),
                     port,
                     &launch.id,
                 ) {
@@ -203,7 +196,7 @@ impl OwnedServer {
                         }
                         self.port = port;
                         if launch.policy != LaunchPolicy::Foreground {
-                            match requested_start_outcome(&mut self, &stop)? {
+                            match requested_start_outcome(&mut self, stop)? {
                                 RequestedStartOutcome::Continue => {}
                                 RequestedStartOutcome::Completed(outcome) => return Ok(outcome),
                                 RequestedStartOutcome::CleanupFailed => {

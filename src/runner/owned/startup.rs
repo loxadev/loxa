@@ -17,9 +17,17 @@ use std::time::Duration;
 #[cfg(test)]
 use std::time::Instant;
 
+#[derive(Clone, Copy)]
+pub(super) enum StartupEndpoint<'a> {
+    Tcp,
+    ServiceUnix {
+        path: &'a Path,
+        runtime: &'a tokio::runtime::Handle,
+    },
+}
+
 impl OwnedServer {
     #[cfg(test)]
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::runner) fn start<F>(
         server: &Path,
         model: &Path,
@@ -36,7 +44,6 @@ impl OwnedServer {
         Self::start_inner(&launch, timeout, None, || signal().map(StartupStop::Signal))
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::runner) fn start_with_ownership<F>(
         launch: &Launch,
         timeout: Duration,
@@ -47,13 +54,15 @@ impl OwnedServer {
         F: Fn() -> Option<i32>,
     {
         let child_ownership = runtime.reserve_child()?;
-        Self::start_inner(
+        Self::start_process(
             launch,
             timeout,
             Some((
                 child_ownership,
                 crate::runtime::RuntimeLeasePublication::Foreground,
             )),
+            PersistentSignalPolicy::ForegroundExit,
+            StartupEndpoint::Tcp,
             || signal().map(StartupStop::Signal),
         )
     }
@@ -69,7 +78,7 @@ impl OwnedServer {
     where
         F: Fn() -> bool,
     {
-        Self::start_inner_with_policy(
+        Self::start_process(
             launch,
             timeout,
             Some((
@@ -77,6 +86,7 @@ impl OwnedServer {
                 crate::runtime::RuntimeLeasePublication::PersistentApp(fingerprint),
             )),
             signal_policy,
+            StartupEndpoint::Tcp,
             || cancelled().then_some(StartupStop::Interrupted(StartupInterruption::Cancelled)),
         )
     }
@@ -93,7 +103,7 @@ impl OwnedServer {
     where
         F: Fn() -> bool,
     {
-        Self::start_inner_with_policy_and_endpoint(
+        Self::start_process(
             launch,
             timeout,
             Some((
@@ -104,13 +114,15 @@ impl OwnedServer {
                 },
             )),
             PersistentSignalPolicy::CallerManaged,
-            Some(endpoint),
-            Some(runtime_handle),
+            StartupEndpoint::ServiceUnix {
+                path: endpoint,
+                runtime: runtime_handle,
+            },
             || cancelled().then_some(StartupStop::Interrupted(StartupInterruption::Cancelled)),
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(in crate::runner) fn start_inner<F>(
         launch: &Launch,
         timeout: Duration,
@@ -123,17 +135,17 @@ impl OwnedServer {
     where
         F: Fn() -> Option<StartupStop>,
     {
-        Self::start_inner_with_policy(
+        Self::start_process(
             launch,
             timeout,
             runtime,
             PersistentSignalPolicy::ForegroundExit,
+            StartupEndpoint::Tcp,
             stop,
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn start_inner_with_policy<F>(
+    fn start_process<F>(
         launch: &Launch,
         timeout: Duration,
         runtime: Option<(
@@ -141,57 +153,36 @@ impl OwnedServer {
             crate::runtime::RuntimeLeasePublication<'_>,
         )>,
         signal_policy: PersistentSignalPolicy,
+        endpoint: StartupEndpoint<'_>,
         stop: F,
     ) -> Result<StartOutcome, String>
     where
         F: Fn() -> Option<StartupStop>,
     {
-        Self::start_inner_with_policy_and_endpoint(
-            launch,
-            timeout,
-            runtime,
-            signal_policy,
-            None,
-            None,
-            stop,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn start_inner_with_policy_and_endpoint<F>(
-        launch: &Launch,
-        timeout: Duration,
-        runtime: Option<(
-            crate::runtime::RuntimeChildOwnership,
-            crate::runtime::RuntimeLeasePublication<'_>,
-        )>,
-        signal_policy: PersistentSignalPolicy,
-        unix_socket: Option<&Path>,
-        service_runtime: Option<&tokio::runtime::Handle>,
-        stop: F,
-    ) -> Result<StartOutcome, String>
-    where
-        F: Fn() -> Option<StartupStop>,
-    {
-        let requested_port = if unix_socket.is_some() {
-            0
-        } else {
-            resolve_requested_port(launch.requested_port)?
+        let requested_port = match endpoint {
+            StartupEndpoint::Tcp => resolve_requested_port(launch.requested_port)?,
+            StartupEndpoint::ServiceUnix { .. } => 0,
         };
-        if let Some(endpoint) = unix_socket {
-            require_absent_unix_endpoint(endpoint)?;
+        if let StartupEndpoint::ServiceUnix { path, .. } = endpoint {
+            require_absent_unix_endpoint(path)?;
         }
-        if unix_socket.is_some() && service_runtime.is_none() {
-            return Err("Unix service launch requires its owning runtime handle".into());
-        }
-        let client = unix_socket.is_none().then(readiness_client).transpose()?;
+        let client = matches!(endpoint, StartupEndpoint::Tcp)
+            .then(readiness_client)
+            .transpose()?;
         let mut command = launch.server_command();
         let prepared = launch.managed_runtime.as_ref().map_or_else(
             no_prepared_runtime_guard,
             ValidatedManagedRuntime::process_guard,
         );
         command
-            .args(build_args_for_endpoint(launch, requested_port, unix_socket))
+            .args(build_args_for_endpoint(
+                launch,
+                requested_port,
+                match endpoint {
+                    StartupEndpoint::Tcp => None,
+                    StartupEndpoint::ServiceUnix { path, .. } => Some(path),
+                },
+            ))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -254,11 +245,17 @@ impl OwnedServer {
             stdout_tail: Vec::new(),
             stderr_tail: Vec::new(),
             retain_cleanup_failure,
-            unix_socket: unix_socket.map(Path::to_path_buf),
+            unix_socket: match endpoint {
+                StartupEndpoint::Tcp => None,
+                StartupEndpoint::ServiceUnix { path, .. } => Some(path.to_path_buf()),
+            },
             #[cfg(unix)]
             unix_socket_identity: None,
             #[cfg(unix)]
-            service_runtime: service_runtime.cloned(),
+            service_runtime: match endpoint {
+                StartupEndpoint::Tcp => None,
+                StartupEndpoint::ServiceUnix { runtime, .. } => Some(runtime.clone()),
+            },
         };
         let stdout = match owned.child_mut().stdout.take() {
             Some(stdout) => stdout,
@@ -274,7 +271,7 @@ impl OwnedServer {
         };
         owned.stderr_reader = match spawn_output_reader(
             stderr,
-            unix_socket.is_none().then(|| {
+            matches!(endpoint, StartupEndpoint::Tcp).then(|| {
                 (
                     announcement_sender,
                     Arc::clone(&owned.announcement_overflow),
@@ -315,8 +312,7 @@ impl OwnedServer {
             launch,
             timeout,
             requested_port,
-            unix_socket,
-            service_runtime,
+            endpoint,
             client.as_ref(),
             child_pid,
             &stop,

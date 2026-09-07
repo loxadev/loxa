@@ -76,7 +76,7 @@ where
         context_size = launch.ctx
     );
     let ownership = crate::runtime::RuntimeOwnership::acquire(run_dir)?;
-    match start_owned_attempt(launch, ownership, &signal) {
+    match OwnedServer::start_with_ownership(launch, STARTUP_TIMEOUT, ownership, &signal) {
         Ok(StartOutcome::Ready(server)) => {
             tracing::info!(target: "loxa::runner",
                 event = "server_ready",
@@ -128,17 +128,6 @@ where
     })
 }
 
-fn start_owned_attempt<F>(
-    launch: &Launch,
-    ownership: crate::runtime::RuntimeOwnership,
-    signal: &F,
-) -> Result<StartOutcome, String>
-where
-    F: Fn() -> Option<i32>,
-{
-    OwnedServer::start_with_ownership(launch, STARTUP_TIMEOUT, ownership, signal)
-}
-
 fn start_mtp_primary_retry<F>(
     launch: &Launch,
     run_dir: &Path,
@@ -154,7 +143,7 @@ where
         attempt = 2_u8
     );
     let ownership = crate::runtime::RuntimeOwnership::acquire(run_dir)?;
-    match start_owned_attempt(launch, ownership, signal)? {
+    match OwnedServer::start_with_ownership(launch, STARTUP_TIMEOUT, ownership, signal)? {
         StartOutcome::Ready(server) => {
             tracing::info!(target: "loxa::runner",
                 event = "server_ready",
