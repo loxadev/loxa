@@ -1,14 +1,44 @@
+use super::arguments::resolve_requested_port;
+#[cfg(unix)]
+use super::child::{process_group_exists, terminate_owned_group, LAST_GUARDED_GROUP};
+#[cfg(target_os = "macos")]
+use super::discovery::probe_validated_version_with_timeout_for_test;
+use super::discovery::{
+    managed_version_first_line, probe_validated_version, probe_version_with_timeout,
+    VERSION_PROBE_TIMEOUT,
+};
+use super::foreground::{
+    ready_line, start_foreground_with, start_foreground_with_signal, stopped_for_signal,
+};
+use super::launch::report_mtp_draft_start_failure;
+use super::output::{
+    install_reader_spawn_fault_for_test, validate_announcement_line, ReaderSpawnFault,
+    MAX_DIAGNOSTIC_TAIL,
+};
+use super::owned::readiness::{
+    models_reader_has_alias, readiness, readiness_client, MAX_MODELS_BODY,
+};
+use super::owned::StartOutcome;
+#[cfg(unix)]
+use super::signal::{
+    deactivate_server, pack_server_identity, process_termination_signal,
+    reset_process_termination_signal_for_test, unpack_server_identity, ACTIVE_SERVER,
+    PROCESS_TERMINATION_SIGNAL,
+};
 use super::*;
 use crate::catalog::{Artifact, ArtifactProvenance, ArtifactRole, Manifest};
 use crate::paths::AppPaths;
 use crate::runnable::Runnable;
-use crate::runtime_fingerprint::RuntimeFingerprint;
+use crate::runtime_fingerprint::{EffectiveProfile, RuntimeFingerprint};
 use crate::runtime_identity::RuntimeIdentity;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
-use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
 #[cfg(not(unix))]

@@ -1,4 +1,5 @@
-use super::{models_body_has_alias, StartupStop, MAX_MODELS_BODY};
+use super::owned::readiness::{models_body_has_alias, MAX_MODELS_BODY};
+use super::owned::StartupStop;
 use http_body_util::{BodyExt, Empty};
 use hyper::body::Bytes;
 use hyper::Request;

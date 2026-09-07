@@ -1,7 +1,8 @@
-use super::{
-    no_prepared_runtime_guard, spawn_reader_thread, ChildProcessGuard, ChildTerminationMode,
-    LaunchProfile, PersistentSignalPolicy, PreparedRuntimeGuard, ValidatedManagedRuntime,
+use super::child::{ChildProcessGuard, ChildTerminationMode, PersistentSignalPolicy};
+use super::launch::{
+    no_prepared_runtime_guard, LaunchProfile, PreparedRuntimeGuard, ValidatedManagedRuntime,
 };
+use super::output::spawn_reader_thread;
 use crate::paths::AppPaths;
 use crate::runtime_identity::RuntimeIdentity;
 use std::ffi::OsStr;
@@ -80,14 +81,14 @@ fn validate_prepared_managed_runtime(
         .map_err(|error| {
             format!(
                 "managed llama-server bundle is damaged at {}: {error}",
-                runtime.source_server.display()
+                runtime.source_server().display()
             )
         })?;
     let expected = runtime_identity.version_line();
     if first_line != expected {
         return Err(format!(
             "managed llama-server bundle is damaged at {}: expected --version first line {expected:?}, found {first_line:?}",
-            runtime.source_server.display()
+            runtime.source_server().display()
         ));
     }
     Ok(())
