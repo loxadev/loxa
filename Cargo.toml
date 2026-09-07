@@ -6,6 +6,7 @@ license = "Apache-2.0"
 authors = ["Muhammad Mahad"]
 repository = "https://github.com/loxadev/loxa"
 description = "Download and run verified Hugging Face GGUF models locally"
+exclude = [".pnpm-store/**"]
 
 [features]
 test-support = []
@@ -17,19 +18,25 @@ clap = { version = "4", features = ["derive"] }
 dialoguer = { version = "0.12.0", default-features = false, features = ["fuzzy-select"] }
 indicatif = "0.18.6"
 backon = { version = "1.6.0", default-features = false, features = ["std", "tokio-sleep"] }
+bytes = "1.12.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "json", "rustls"] }
 rustyline = { version = "18.0.1", default-features = false, features = ["signal-hook"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 sha2 = "0.11.0"
-tokio = { version = "1.52.0", default-features = false, features = ["rt", "time"] }
-time = { version = "0.3.53", default-features = false }
+loxa-ipc = { version = "0.1.0-dev", path = "crates/loxa-ipc" }
+loxa-diagnostics = { version = "0.1.0-dev", path = "crates/loxa-diagnostics" }
+http-body-util = "0.1.3"
+hyper = { version = "1.10.1", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "0.1.20", default-features = false, features = ["tokio"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+tokio = { version = "1.53.1", default-features = false, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "json", "std"] }
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2.186"
+libc = "0.2.189"
 rustix = { version = "1.1.4", default-features = false, features = ["fs", "std"] }
 signal-hook = { version = "0.4.4", default-features = false, features = ["iterator"] }
 sysinfo = { version = "0.39.5", default-features = false, features = ["disk", "system"] }
@@ -38,6 +45,6 @@ sysinfo = { version = "0.39.5", default-features = false, features = ["disk", "s
 tempfile = "3.27.0"
 
 [workspace]
-members = ["loxa-app/src-tauri"]
+members = ["crates/loxa-diagnostics", "crates/loxa-ipc", "loxa-app/src-tauri"]
 default-members = ["."]
 resolver = "2"
