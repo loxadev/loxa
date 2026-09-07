@@ -210,7 +210,7 @@ pub(super) fn create_execution_stage(
     fs::create_dir_all(run)
         .map_err(|_| "prepared runtime staging directory is unavailable".to_string())?;
     let owner_pid = std::process::id();
-    let owner_start = crate::runtime::current_process_start_identity()?;
+    let owner_start = crate::process_inspection::current_process_start_identity()?;
     let (build, stage, token) = (0..64)
         .find_map(|_| {
             let token = match random_stage_token() {

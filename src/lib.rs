@@ -8,6 +8,7 @@ pub mod discovery;
 mod download;
 pub mod huggingface;
 pub mod paths;
+mod process_inspection;
 mod runnable;
 pub mod runner;
 mod runtime;

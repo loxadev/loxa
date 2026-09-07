@@ -137,7 +137,7 @@ pub(super) fn parse_stage_record(
 #[cfg(all(test, target_os = "macos"))]
 pub(super) fn create_execution_stage_record(stage: &Path, token: &str) -> Result<File, String> {
     let owner_pid = std::process::id();
-    let owner_start = crate::runtime::current_process_start_identity()?;
+    let owner_start = crate::process_inspection::current_process_start_identity()?;
     create_execution_stage_record_for_owner(stage, token, owner_pid, owner_start)
 }
 
