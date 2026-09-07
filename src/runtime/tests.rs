@@ -114,6 +114,53 @@ fn v2_wire_roundtrip_is_strict_and_requires_explicit_attachment_state() {
 }
 
 #[test]
+fn v4_service_wire_preserves_the_qualified_private_endpoint_contract() {
+    let mut wire = lease_value(4);
+    wire["owner_mode"] = serde_json::json!("service");
+    wire["managed_source"] = serde_json::Value::Null;
+    wire["port"] = serde_json::json!(0);
+    wire["endpoint"] = serde_json::json!("/private/tmp/loxa/engine.sock");
+    wire["parallel"] = serde_json::json!(1);
+    wire["offline"] = serde_json::json!(true);
+    wire["fingerprint"] = fingerprint_value();
+    wire["fingerprint"]["schema_version"] = serde_json::json!(2);
+    wire["fingerprint"]["sleep_policy"] = serde_json::Value::Null;
+    wire["fingerprint"]["service_profile"] =
+        serde_json::to_value(crate::runtime_fingerprint::ServiceRuntimeProfile::qualified())
+            .unwrap();
+
+    let mut lease = decode_lease(&serde_json::to_vec(&wire).unwrap()).unwrap();
+    assert!(lease.persistent_fingerprint().is_none());
+    lease.service = Some(ServiceLeaseFields::qualified(Path::new(
+        "/private/tmp/loxa/engine.sock",
+    )));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&encode_lease(&lease).unwrap()).unwrap(),
+        wire
+    );
+
+    for (field, value) in [
+        ("parallel", serde_json::json!(2)),
+        ("offline", serde_json::json!(false)),
+        ("port", serde_json::json!(43123)),
+        ("endpoint", serde_json::json!("relative.sock")),
+        ("owner_mode", serde_json::json!("persistent_app")),
+        ("model_id", serde_json::json!("other")),
+    ] {
+        let mut invalid = wire.clone();
+        invalid[field] = value;
+        assert!(
+            decode_lease(&serde_json::to_vec(&invalid).unwrap()).is_err(),
+            "accepted incompatible service field {field}"
+        );
+    }
+
+    let mut missing_endpoint = wire;
+    missing_endpoint.as_object_mut().unwrap().remove("endpoint");
+    assert!(decode_lease(&serde_json::to_vec(&missing_endpoint).unwrap()).is_err());
+}
+
+#[test]
 fn v2_staged_process_remains_readable_but_does_not_invent_managed_provenance() {
     let mut child = spawn_observable_server("demo", 43123);
     let observed = observed_lease(&child, "demo", 43123);

@@ -1,4 +1,4 @@
-use crate::runtime_fingerprint::RuntimeFingerprint;
+use crate::runtime_fingerprint::{RuntimeFingerprint, ServiceRuntimeProfile};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -19,6 +19,22 @@ pub(super) struct ServiceLeaseFields {
     pub(super) endpoint: PathBuf,
     pub(super) parallel: u16,
     pub(super) offline: bool,
+}
+
+impl ServiceLeaseFields {
+    pub(super) fn qualified(endpoint: &Path) -> Self {
+        let profile = ServiceRuntimeProfile::qualified();
+        Self {
+            endpoint: endpoint.to_path_buf(),
+            parallel: profile.parallel,
+            offline: profile.offline,
+        }
+    }
+
+    fn has_qualified_profile(&self) -> bool {
+        let profile = ServiceRuntimeProfile::qualified();
+        self.parallel == profile.parallel && self.offline == profile.offline
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -196,11 +212,7 @@ pub(super) fn validate_lease(lease: &RuntimeLease) -> Result<(), String> {
                 Some(LeaseOwnerMode::Service),
                 Some(_),
                 _,
-                Some(ServiceLeaseFields {
-                    parallel: 1,
-                    offline: true,
-                    ..
-                }),
+                Some(_),
             )
     );
     if !version_and_owner_are_valid
@@ -218,7 +230,9 @@ pub(super) fn validate_lease(lease: &RuntimeLease) -> Result<(), String> {
         || lease.model_id.is_empty()
         || (lease.version == SERVICE_LEASE_VERSION) == (lease.port != 0)
         || lease.service.as_ref().is_some_and(|service| {
-            !service.endpoint.is_absolute() || service.endpoint.as_os_str().is_empty()
+            !service.has_qualified_profile()
+                || !service.endpoint.is_absolute()
+                || service.endpoint.as_os_str().is_empty()
         })
     {
         Err("invalid runtime lease".into())

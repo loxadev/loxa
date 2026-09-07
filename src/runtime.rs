@@ -829,11 +829,7 @@ impl RuntimeChildOwnership {
                     SERVICE_LEASE_VERSION,
                     LeaseOwnerMode::Service,
                     Some(fingerprint.clone()),
-                    Some(ServiceLeaseFields {
-                        endpoint: endpoint.to_path_buf(),
-                        parallel: 1,
-                        offline: true,
-                    }),
+                    Some(ServiceLeaseFields::qualified(endpoint)),
                 )
             }
         };
