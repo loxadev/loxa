@@ -1163,10 +1163,14 @@ fn snapshot_reader_surfaces_only_an_exact_external_foreground_runtime() {
     terminate_process_group(&mut child, group).unwrap();
 }
 
-fn wait_until_gone(pid: u32) -> bool {
+fn wait_for_child_exit(child: &mut Child) -> bool {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        if process_snapshot(pid).is_ok_and(|snapshot| snapshot.is_none()) {
+        if child
+            .try_wait()
+            .expect("failed to reap test child")
+            .is_some()
+        {
             return true;
         }
         thread::sleep(Duration::from_millis(20));
@@ -1259,7 +1263,7 @@ fn stale_recovery_removes_only_the_exact_orphaned_execution_stage() {
 
     recover_stale(&run_dir).unwrap();
 
-    let gone = wait_until_gone(pid);
+    let gone = wait_for_child_exit(&mut child);
     if !gone {
         terminate_process_group(&mut child, i32::try_from(pid).unwrap()).unwrap();
     }
@@ -1267,7 +1271,6 @@ fn stale_recovery_removes_only_the_exact_orphaned_execution_stage() {
     assert!(!stage.exists(), "stale recovery leaked the execution stage");
     assert!(neighbor.is_dir(), "cleanup removed an adjacent lookalike");
     assert!(!run_dir.join("foreground.json").exists());
-    let _ = child.wait();
 }
 
 #[test]
@@ -1296,7 +1299,7 @@ fn recovery_reconciles_a_prior_300_second_persistent_lease_before_removal() {
 
     recover_stale(dir.path()).unwrap();
 
-    let child_was_reconciled = wait_until_gone(pid);
+    let child_was_reconciled = wait_for_child_exit(&mut child);
     if !child_was_reconciled {
         terminate_process_group(&mut child, group).unwrap();
     }
@@ -1310,7 +1313,6 @@ fn recovery_reconciles_a_prior_300_second_persistent_lease_before_removal() {
         "runtime lease was removed before the exact old process was terminated"
     );
     assert!(!state_path.exists());
-    let _ = child.wait();
 }
 
 #[test]
@@ -1367,11 +1369,10 @@ fn general_recovery_stops_an_exact_orphaned_child() {
         recover_stale(dir.path()).unwrap();
 
         assert!(
-            wait_until_gone(pid),
+            wait_for_child_exit(&mut child),
             "exact {name} orphan survived recovery"
         );
         assert!(!dir.path().join("foreground.json").exists());
-        let _ = child.wait();
     }
 }
 

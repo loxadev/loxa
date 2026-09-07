@@ -9,7 +9,7 @@ use std::io::{Read as _, Write as _};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::{tempdir, TempDir};
 
 fn fingerprint_value() -> serde_json::Value {
@@ -158,6 +158,7 @@ impl RecordedPersistentRuntime {
         let managed_server = PathBuf::from("/usr/bin/yes");
         let mut command = Command::new(&managed_server);
         command
+            .arg("--")
             .args(build_args(&models_root, port))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -854,7 +855,30 @@ fn serve_attachment_http_once(
     reply: AttachmentHttpReply,
 ) -> std::thread::JoinHandle<()> {
     thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let timeout = Duration::from_secs(5);
+        let deadline = Instant::now() + timeout;
+        listener.set_nonblocking(true).unwrap();
+        let accepted = loop {
+            match listener.accept() {
+                Ok(connection) => break Ok(connection),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        break Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "attachment readiness probe did not connect",
+                        ));
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => break Err(error),
+            }
+        };
+        // A cloned listener shares its blocking mode with the owner's listener.
+        listener.set_nonblocking(false).unwrap();
+        let (mut stream, _) = accepted.unwrap();
+        stream.set_nonblocking(false).unwrap();
+        stream.set_read_timeout(Some(timeout)).unwrap();
+        stream.set_write_timeout(Some(timeout)).unwrap();
         let mut request = [0_u8; 4096];
         let read = stream.read(&mut request).unwrap();
         let request = std::str::from_utf8(&request[..read]).unwrap();
@@ -1052,6 +1076,7 @@ fn copied_alias_on_a_rebound_port_fails_identity_before_http() {
     terminate_process_group(&mut fixture.child, fixture.child_pgid).unwrap();
     let mut replacement = Command::new(&fixture.managed_server);
     replacement
+        .arg("--")
         .args(generic_attachment_args(&fixture.models_root, fixture.port))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
