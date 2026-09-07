@@ -38,7 +38,7 @@ impl ApiStartCancellation {
         self.0.store(true, Ordering::Release);
     }
 
-    fn is_cancelled(&self) -> bool {
+    pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Acquire)
     }
 }

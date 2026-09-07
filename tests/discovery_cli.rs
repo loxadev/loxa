@@ -29,7 +29,7 @@ fn inspect_help_explains_branch_tag_resolution_without_creating_state() {
 }
 
 fn owned_daily_log_events(home: &Path) -> Vec<Value> {
-    let log_dir = home.join("logs");
+    let log_dir = home.join("logs/cli");
     let mut entries = fs::read_dir(&log_dir)
         .expect("diagnostics log directory")
         .collect::<Result<Vec<_>, _>>()
@@ -186,7 +186,7 @@ fn invalid_inspect_prints_static_error_and_logs_only_command_name() {
         stderr,
         format!(
             "Error: invalid Hugging Face revision\nDiagnostics: {}\n",
-            home.path().join("logs").display()
+            home.path().join("logs/cli").display()
         )
     );
     for character in stderr.chars() {
