@@ -1,5 +1,3 @@
-const MAX_VISIBLE_ITEMS: usize = 5;
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct InstalledItem {
     id: String,
@@ -93,21 +91,25 @@ impl InstalledState {
         self.error = Some(error);
     }
 
-    #[cfg(test)]
     pub(crate) fn items(&self) -> &[InstalledItem] {
         &self.items
     }
 
-    pub(crate) fn visible_items(&self) -> Vec<&InstalledItem> {
-        self.visible_items_for(None)
+    pub(crate) fn item(&self, model_id: &str) -> Option<&InstalledItem> {
+        self.items.iter().find(|item| item.id() == model_id)
     }
 
-    pub(crate) fn visible_items_for(&self, active_model_id: Option<&str>) -> Vec<&InstalledItem> {
-        let active = active_model_id.and_then(|id| self.items.iter().find(|item| item.id() == id));
+    #[cfg(test)]
+    pub(crate) fn ordered_items(&self) -> Vec<&InstalledItem> {
+        self.ordered_items_for(None)
+    }
+
+    pub(crate) fn ordered_items_for(&self, active_model_id: Option<&str>) -> Vec<&InstalledItem> {
+        let active = active_model_id.and_then(|id| self.item(id));
         let pinned = self
             .pinned_model_id
             .as_deref()
-            .and_then(|id| self.items.iter().find(|item| item.id() == id))
+            .and_then(|id| self.item(id))
             .filter(|item| Some(item.id()) != active_model_id);
         active
             .into_iter()
@@ -118,16 +120,11 @@ impl InstalledState {
                     .filter(|item| Some(item.id()) != active_model_id)
                     .filter(|item| Some(item.id()) != self.pinned_model_id.as_deref()),
             )
-            .take(MAX_VISIBLE_ITEMS)
             .collect()
     }
 
-    pub(crate) fn remaining_count(&self) -> usize {
-        self.items.len().saturating_sub(MAX_VISIBLE_ITEMS)
-    }
-
     pub(crate) fn select(&mut self, model_id: &str) -> bool {
-        if !self.items.iter().any(|item| item.id() == model_id) {
+        if self.item(model_id).is_none() {
             return false;
         }
         if self.selected_model_id.as_deref() != Some(model_id) {
@@ -139,7 +136,7 @@ impl InstalledState {
 
     pub(crate) fn selected(&self) -> Option<&InstalledItem> {
         let selected = self.selected_model_id.as_deref()?;
-        self.items.iter().find(|item| item.id() == selected)
+        self.item(selected)
     }
 
     pub(crate) fn error_message(&self) -> Option<&'static str> {
@@ -219,7 +216,7 @@ mod tests {
     }
 
     #[test]
-    fn visible_inventory_is_bounded_and_pins_the_exact_completed_model_first() {
+    fn inventory_keeps_every_model_and_pins_the_exact_completed_model_first() {
         let mut state = InstalledState::default();
         state.replace(
             [
@@ -233,20 +230,19 @@ mod tests {
 
         assert_eq!(
             state
-                .visible_items()
+                .ordered_items()
                 .into_iter()
                 .map(InstalledItem::id)
                 .collect::<Vec<_>>(),
-            ["foxtrot", "alpha", "bravo", "charlie", "delta"]
+            ["foxtrot", "alpha", "bravo", "charlie", "delta", "echo", "golf"]
         );
-        assert_eq!(state.remaining_count(), 2);
         assert_eq!(state.selected(), None);
-        assert_eq!(state.visible_items()[0].display_name(), "foxtrot.gguf");
-        assert_eq!(state.visible_items()[0].total_bytes(), 42);
+        assert_eq!(state.ordered_items()[0].display_name(), "foxtrot.gguf");
+        assert_eq!(state.ordered_items()[0].total_bytes(), 42);
     }
 
     #[test]
-    fn active_model_beyond_the_default_cap_is_first_and_stays_addressable() {
+    fn active_model_is_first_without_hiding_other_models() {
         let mut state = InstalledState::default();
         state.replace(
             ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"]
@@ -256,11 +252,11 @@ mod tests {
             Some("bravo".into()),
         );
 
-        let visible = state.visible_items_for(Some("foxtrot"));
+        let visible = state.ordered_items_for(Some("foxtrot"));
         assert_eq!(
             visible.iter().map(|item| item.id()).collect::<Vec<_>>(),
-            ["foxtrot", "bravo", "alpha", "charlie", "delta"]
+            ["foxtrot", "bravo", "alpha", "charlie", "delta", "echo"]
         );
-        assert_eq!(visible.len(), 5);
+        assert_eq!(visible.len(), 6);
     }
 }

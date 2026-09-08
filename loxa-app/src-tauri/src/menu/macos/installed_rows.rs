@@ -7,8 +7,8 @@ use objc2::runtime::{AnyObject, Sel};
 use objc2::{MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSAccessibility, NSButton, NSColor, NSControlSize, NSFont, NSImage, NSImageView,
-    NSLineBreakMode, NSPasteboard, NSPasteboardTypeString, NSTextAlignment, NSTextField, NSView,
-    NSWorkspace,
+    NSLineBreakMode, NSPasteboard, NSPasteboardTypeString, NSScrollView, NSTextAlignment,
+    NSTextField, NSView, NSWorkspace,
 };
 use objc2_foundation::{NSArray, NSInteger, NSPoint, NSRect, NSSize, NSString, NSURL};
 
@@ -23,6 +23,8 @@ const ROW_HEIGHT: f64 = 52.0;
 const ACTION_HEIGHT: f64 = 36.0;
 const MESSAGE_HEIGHT: f64 = 24.0;
 const ICON_SIZE: f64 = 16.0;
+const VIEWPORT_ROWS: usize = 5;
+const SECTION_HEIGHT: f64 = 28.0;
 
 #[derive(Clone, Copy)]
 pub(super) struct InstalledActions {
@@ -36,6 +38,7 @@ pub(super) struct InstalledActions {
 pub(super) struct InstalledContent {
     pub(super) view: Retained<NSView>,
     pub(super) height: f64,
+    pub(super) scroll: Option<Retained<NSScrollView>>,
     #[cfg(test)]
     #[allow(dead_code)] // Read by the include-based native layout harness.
     pub(super) row_buttons: Vec<Retained<NSButton>>,
@@ -50,32 +53,89 @@ pub(super) struct InstalledContent {
 }
 
 pub(super) fn content_height(state: &InstalledState, api: &ApiPresentation) -> f64 {
-    let visible = state.visible_items_for(api.active_model_id());
-    let row_count = visible.len() as f64;
-    let selected_is_visible = state
-        .selected()
-        .is_some_and(|selected| visible.iter().any(|item| item.id() == selected.id()));
-    ROW_HEIGHT * row_count
-        + if selected_is_visible {
+    InstalledLayout::new(state, api).height()
+}
+
+pub(super) fn section_title(state: &InstalledState, api: &ApiPresentation) -> &'static str {
+    if api
+        .active_model_id()
+        .and_then(|id| state.item(id))
+        .is_some()
+    {
+        api.active_section_title().unwrap_or("Installed")
+    } else {
+        "Installed"
+    }
+}
+
+struct InstalledLayout<'a> {
+    active_id: Option<&'a str>,
+    active_height: f64,
+    list_header_height: f64,
+    document_height: f64,
+    viewport_height: f64,
+}
+
+impl<'a> InstalledLayout<'a> {
+    fn new(state: &'a InstalledState, api: &ApiPresentation) -> Self {
+        let active_id = api
+            .active_model_id()
+            .filter(|_| api.active_section_title().is_some())
+            .and_then(|id| state.item(id))
+            .map(|item| item.id());
+        let selected = state.selected();
+        let selected_height = selected.map_or(0.0, |item| {
             2.0 * ACTION_HEIGHT
+                + if state.feedback_message().is_some() {
+                    MESSAGE_HEIGHT
+                } else {
+                    0.0
+                }
+                + if api.primary_action(item.id()).disabled_reason().is_some() {
+                    MESSAGE_HEIGHT
+                } else {
+                    0.0
+                }
+        });
+        let active_height = active_id.map_or(0.0, |id| {
+            ROW_HEIGHT
+                + if selected.is_some_and(|item| item.id() == id) {
+                    selected_height
+                } else {
+                    0.0
+                }
+        });
+        let list_count = state.items().len() - usize::from(active_id.is_some());
+        let document_height = state.items().len() as f64 * ROW_HEIGHT
+            + selected_height
+            + if state.error_message().is_some() {
+                MESSAGE_HEIGHT
+            } else {
+                0.0
+            }
+            - active_height;
+        let visible_rows = if active_id.is_some() {
+            3
         } else {
-            0.0
+            VIEWPORT_ROWS
+        };
+        Self {
+            active_id,
+            active_height,
+            list_header_height: if active_id.is_some() && list_count > 0 {
+                SECTION_HEIGHT
+            } else {
+                0.0
+            },
+            document_height,
+            viewport_height: document_height
+                - list_count.saturating_sub(visible_rows) as f64 * ROW_HEIGHT,
         }
-        + if state.remaining_count() > 0 {
-            MESSAGE_HEIGHT
-        } else {
-            0.0
-        }
-        + if state.error_message().is_some() {
-            MESSAGE_HEIGHT
-        } else {
-            0.0
-        }
-        + if selected_is_visible && state.feedback_message().is_some() {
-            MESSAGE_HEIGHT
-        } else {
-            0.0
-        }
+    }
+
+    fn height(&self) -> f64 {
+        self.active_height + self.list_header_height + self.viewport_height
+    }
 }
 
 pub(super) fn build(
@@ -85,9 +145,17 @@ pub(super) fn build(
     actions: InstalledActions,
     mtm: MainThreadMarker,
 ) -> InstalledContent {
-    let height = content_height(state, api);
-    let root = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, WIDTH, height));
-    let mut next_y = height;
+    let layout = InstalledLayout::new(state, api);
+    let height = layout.height();
+    let document_height = layout.document_height;
+    let root = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, WIDTH, document_height));
+    let active = NSView::initWithFrame(
+        NSView::alloc(mtm),
+        rect(0.0, 0.0, WIDTH, layout.active_height),
+    );
+    let mut active_y = layout.active_height;
+    let mut next_y = document_height;
+    let mut selected_bounds = None;
     #[cfg(test)]
     let mut row_buttons = Vec::new();
     #[cfg(test)]
@@ -99,15 +167,22 @@ pub(super) fn build(
 
     let selected_id = state.selected().map(InstalledItem::id);
     for (index, item) in state
-        .visible_items_for(api.active_model_id())
+        .ordered_items_for(api.active_model_id())
         .into_iter()
         .enumerate()
     {
+        let is_active = layout.active_id == Some(item.id());
+        let (root, next_y) = if is_active {
+            (&active, &mut active_y)
+        } else {
+            (&root, &mut next_y)
+        };
+        let row_top = *next_y;
         let selected = selected_id == Some(item.id());
         let result = installed_row(item, selected, index, target, actions.select, mtm);
         result
             .view
-            .setFrame(rect(0.0, take(&mut next_y, ROW_HEIGHT), WIDTH, ROW_HEIGHT));
+            .setFrame(rect(0.0, take(next_y, ROW_HEIGHT), WIDTH, ROW_HEIGHT));
         root.addSubview(&result.view);
         #[cfg(test)]
         {
@@ -117,7 +192,7 @@ pub(super) fn build(
         }
         if selected {
             let primary_action = api.primary_action(item.id());
-            let primary_row = row(&mut next_y, ACTION_HEIGHT, mtm);
+            let primary_row = row(next_y, ACTION_HEIGHT, mtm);
             let primary = api_primary_button(primary_action, target, actions, mtm);
             primary.setFrame(rect(INSET, 4.0, WIDTH - 2.0 * INSET, 28.0));
             primary_row.addSubview(&primary);
@@ -125,7 +200,11 @@ pub(super) fn build(
             #[cfg(test)]
             action_buttons.push(primary);
 
-            let action_row = row(&mut next_y, ACTION_HEIGHT, mtm);
+            if let Some(reason) = primary_action.disabled_reason() {
+                root.addSubview(&message_row(next_y, reason, mtm));
+            }
+
+            let action_row = row(next_y, ACTION_HEIGHT, mtm);
             let available_width = WIDTH - 2.0 * INSET;
             let copy = text_button(
                 "Copy chat command",
@@ -159,25 +238,67 @@ pub(super) fn build(
             #[cfg(test)]
             action_buttons.extend([copy, reveal]);
             if let Some(feedback) = state.feedback_message() {
-                root.addSubview(&message_row(&mut next_y, feedback, mtm));
+                root.addSubview(&message_row(next_y, feedback, mtm));
+            }
+            if !is_active {
+                selected_bounds = Some(rect(0.0, *next_y, WIDTH, row_top - *next_y));
             }
         }
-    }
-
-    if state.remaining_count() > 0 {
-        root.addSubview(&message_row(
-            &mut next_y,
-            &format!("{} more installed", state.remaining_count()),
-            mtm,
-        ));
     }
     if let Some(error) = state.error_message() {
         root.addSubview(&message_row(&mut next_y, error, mtm));
     }
     debug_assert_eq!(next_y, 0.0);
+    debug_assert_eq!(active_y, 0.0);
+    let viewport_height = layout.viewport_height;
+    let scroll = (document_height > viewport_height).then(|| {
+        let scroll = NSScrollView::initWithFrame(
+            NSScrollView::alloc(mtm),
+            rect(0.0, 0.0, WIDTH, viewport_height),
+        );
+        scroll.setDrawsBackground(false);
+        scroll.setHasVerticalScroller(true);
+        scroll.setAutohidesScrollers(true);
+        scroll.setDocumentView(Some(&root));
+        let clip = scroll.contentView();
+        clip.scrollToPoint(NSPoint::new(0.0, document_height - viewport_height));
+        scroll.reflectScrolledClipView(&clip);
+        if let Some(bounds) = selected_bounds {
+            root.scrollRectToVisible(bounds);
+        }
+        scroll
+    });
+    let list_view = scroll
+        .as_ref()
+        .map_or(root, |scroll| scroll.clone().into_super());
+    let view = if layout.active_id.is_some() {
+        let container = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, WIDTH, height));
+        active.setFrame(rect(
+            0.0,
+            height - layout.active_height,
+            WIDTH,
+            layout.active_height,
+        ));
+        container.addSubview(&active);
+        if layout.list_header_height > 0.0 {
+            let label = primary_label("Installed", mtm);
+            label.setFrame(rect(
+                INSET,
+                viewport_height + 5.0,
+                WIDTH - 2.0 * INSET,
+                18.0,
+            ));
+            container.addSubview(&label);
+        }
+        container.addSubview(&list_view);
+        container
+    } else {
+        list_view
+    };
     InstalledContent {
-        view: root,
+        view,
         height,
+        scroll,
         #[cfg(test)]
         row_buttons,
         #[cfg(test)]
@@ -186,6 +307,26 @@ pub(super) fn build(
         primary_labels,
         #[cfg(test)]
         secondary_labels,
+    }
+}
+
+impl InstalledContent {
+    pub(super) fn scroll_offset(&self) -> Option<f64> {
+        let scroll = self.scroll.as_ref()?;
+        let document = scroll.documentView()?;
+        let clip = scroll.contentView().bounds();
+        Some((document.frame().size.height - clip.origin.y - clip.size.height).max(0.0))
+    }
+
+    pub(super) fn restore_scroll_offset(&self, offset: f64) {
+        let Some(scroll) = &self.scroll else { return };
+        let Some(document) = scroll.documentView() else {
+            return;
+        };
+        let clip = scroll.contentView();
+        let max_y = (document.frame().size.height - clip.bounds().size.height).max(0.0);
+        clip.scrollToPoint(NSPoint::new(0.0, (max_y - offset).clamp(0.0, max_y)));
+        scroll.reflectScrolledClipView(&clip);
     }
 }
 

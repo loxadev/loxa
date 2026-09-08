@@ -275,6 +275,17 @@ impl ApiPresentation {
         self.active_model_id.as_deref()
     }
 
+    pub(crate) fn active_section_title(&self) -> Option<&'static str> {
+        self.active_model_id()?;
+        match self.phase {
+            ApiPresentationPhase::Ready | ApiPresentationPhase::CliRuntime => Some("Running"),
+            ApiPresentationPhase::Starting => Some("Loading"),
+            ApiPresentationPhase::Stopping => Some("Stopping"),
+            ApiPresentationPhase::CleanupFailed => Some("Needs attention"),
+            ApiPresentationPhase::Idle | ApiPresentationPhase::Unavailable => None,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn can_copy_chat(&self) -> bool {
         self.chat_command.is_some() || !self.shared_service

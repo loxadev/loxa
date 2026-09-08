@@ -106,6 +106,11 @@ impl ApiPresentation {
         self.active_model_id.as_deref()
     }
 
+    pub(crate) fn active_section_title(&self) -> Option<&'static str> {
+        self.active_model_id()?;
+        Some(if self.action_enabled { "Running" } else { "Stopping" })
+    }
+
     pub(crate) fn can_copy_chat(&self) -> bool {
         true
     }

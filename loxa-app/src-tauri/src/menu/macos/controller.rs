@@ -224,6 +224,24 @@ impl NativePopoverState {
 
     fn rebuild(&mut self, target: &AnyObject, actions: Actions, mtm: MainThreadMarker) {
         let search_focus = self.rows.as_ref().and_then(MenuRows::capture_search_focus);
+        let installed_scroll = self
+            .rendered_installed
+            .as_ref()
+            .filter(|previous| {
+                previous.selected().map(|item| item.id())
+                    == self.installed.borrow().selected().map(|item| item.id())
+            })
+            .filter(|_| {
+                self.rendered_api
+                    .as_ref()
+                    .and_then(ApiPresentation::active_model_id)
+                    == self.api.active_model_id()
+            })
+            .and_then(|_| {
+                self.rows
+                    .as_ref()
+                    .and_then(MenuRows::installed_scroll_offset)
+            });
         if let Some(query) = search_focus
             .as_ref()
             .map(super::catalog_rows::SearchFocus::normalized_query)
@@ -251,6 +269,9 @@ impl NativePopoverState {
         }
         self.popover.setContentSize(view.frame().size);
         self.content_view_controller.setView(&view);
+        if let Some(offset) = installed_scroll {
+            rows.restore_installed_scroll_offset(offset);
+        }
         if let Some(search_focus) = search_focus {
             rows.restore_search_focus(search_focus);
         }
@@ -672,7 +693,7 @@ define_class!(
             };
             let model_id = installed
                 .borrow()
-                .visible_items_for(active_model_id.as_deref())
+                .ordered_items_for(active_model_id.as_deref())
                 .get(index)
                 .map(|item| item.id().to_owned());
             let Some(model_id) = model_id else {

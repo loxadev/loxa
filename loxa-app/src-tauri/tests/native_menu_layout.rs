@@ -761,7 +761,39 @@ mod menu {
                     mtm,
                 );
                 assert_eq!(rows.view.frame().size.width, 360.0);
-                assert_eq!(rows.row_buttons.len(), 5);
+                assert_eq!(rows.row_buttons.len(), 7);
+                assert_eq!(rows.height, 356.0);
+                let scroll = rows
+                    .scroll
+                    .as_ref()
+                    .expect("overflow inventory must scroll");
+                let document = scroll.documentView().unwrap();
+                assert_eq!(document.frame().size.height, 460.0);
+                assert_eq!(rows.scroll_offset(), Some(0.0));
+                rows.restore_scroll_offset(104.0);
+                assert_eq!(rows.scroll_offset(), Some(104.0));
+                let last_row = rows.row_buttons.last().unwrap();
+                let bounds = document.convertRect_fromView(last_row.bounds(), Some(last_row));
+                let visible = scroll.contentView().documentVisibleRect();
+                assert!(bounds.origin.y >= visible.origin.y);
+                assert!(
+                    bounds.origin.y + bounds.size.height <= visible.origin.y + visible.size.height
+                );
+                assert_eq!(last_row.tag(), 6);
+                assert!(last_row
+                    .accessibilityLabel()
+                    .unwrap()
+                    .to_string()
+                    .starts_with("golf;"));
+                let refreshed = super::installed_rows::build(
+                    &installed,
+                    &ApiPresentation::idle(),
+                    None,
+                    installed_fixture_actions(),
+                    mtm,
+                );
+                refreshed.restore_scroll_offset(rows.scroll_offset().unwrap());
+                assert_eq!(refreshed.scroll_offset(), rows.scroll_offset());
                 assert_eq!(
                     rows.primary_labels[0].stringValue().to_string(),
                     "foxtrot-q4"
@@ -789,7 +821,7 @@ mod menu {
                     .map(|label| label.to_string())
                     .is_some_and(|label| label.contains("selected; actions expanded")));
                 let text = text_values(&rows.view);
-                assert!(text.contains(&"2 more installed".into()));
+                assert!(!text.iter().any(|text| text.contains("more installed")));
                 assert!(text.contains(&"Could not refresh installed models".into()));
                 assert!(count_image_views(&rows.view) >= 6);
 
@@ -812,6 +844,17 @@ mod menu {
                 );
                 assert_eq!(active.action_buttons[0].title().to_string(), "Stop API");
                 assert!(active.action_buttons[0].isEnabled());
+                assert_eq!(
+                    super::installed_rows::section_title(&installed, &ready),
+                    "Running"
+                );
+                assert!(text_values(&active.view).contains(&"Installed".into()));
+                let list = active.scroll.as_ref().unwrap().documentView().unwrap();
+                assert!(
+                    !text_values(&list).contains(&"golf-q4".into()),
+                    "running model must not also appear in the scrollable installed list"
+                );
+                assert!(text_values(&list).contains(&"echo-q4".into()));
 
                 assert!(installed.select("alpha"));
                 let blocked = super::installed_rows::build(
@@ -821,6 +864,7 @@ mod menu {
                     installed_fixture_actions(),
                     mtm,
                 );
+                assert!(text_values(&blocked.view).contains(&"Stop the current API first".into()));
                 let start = &blocked.action_buttons[0];
                 assert_eq!(start.title().to_string(), "Start API");
                 assert!(!start.isEnabled());
@@ -1513,6 +1557,48 @@ mod menu {
                     !super::rows::visible_text_values(&content_view_controller.view())
                         .contains(&"Chat command copied".into())
                 );
+
+                state.installed.borrow_mut().replace(
+                    [
+                        "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf",
+                    ]
+                    .into_iter()
+                    .map(|id| {
+                        crate::menu::installed::InstalledItem::new(
+                            id.into(),
+                            format!("{id}.gguf"),
+                            42,
+                        )
+                    })
+                    .collect(),
+                    None,
+                );
+                state.render(&target, action_selectors(), mtm);
+                state
+                    .rows
+                    .as_ref()
+                    .unwrap()
+                    .restore_installed_scroll_offset(104.0);
+                state.installed.borrow_mut().apply_feedback(
+                    "alpha",
+                    Some(crate::menu::installed::InstalledFeedback::ChatCommandCopied),
+                );
+                state.render(&target, action_selectors(), mtm);
+                assert_eq!(
+                    state.rows.as_ref().unwrap().installed_scroll_offset(),
+                    Some(104.0)
+                );
+                state.installed.borrow_mut().select("golf");
+                state.render(&target, action_selectors(), mtm);
+                assert!(
+                    state
+                        .rows
+                        .as_ref()
+                        .unwrap()
+                        .installed_scroll_offset()
+                        .unwrap()
+                        > 0.0
+                );
             }
 
             pub(crate) fn assert_runtime_copy_feedback_lifecycle(mtm: MainThreadMarker) {
@@ -1731,6 +1817,58 @@ mod menu {
                 )
             }
 
+            pub(crate) fn assert_inventory_rebuilds_release_previous_views(mtm: MainThreadMarker) {
+                let mut state = native_state(NSViewController::new(mtm), Fixture::Installed, mtm);
+                state.installed.borrow_mut().replace(
+                    [
+                        "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf",
+                    ]
+                    .into_iter()
+                    .map(|id| {
+                        crate::menu::installed::InstalledItem::new(
+                            id.into(),
+                            format!("{id}.gguf"),
+                            42,
+                        )
+                    })
+                    .collect(),
+                    None,
+                );
+                state.api = ApiPresentation::ready(
+                    "golf",
+                    43123,
+                    loxa::api_runtime::ApiRuntimeActivity::Loaded,
+                );
+                let target = NSObject::new();
+                objc2::rc::autoreleasepool(|_| state.render(&target, action_selectors(), mtm));
+                let iterations = std::env::var("LOXA_PROFILE_MENU_REBUILDS")
+                    .ok()
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(32);
+                let start = Instant::now();
+                for index in 0..iterations {
+                    let previous = objc2::rc::autoreleasepool(|_| {
+                        Weak::from_retained(&state.content_view_controller.view())
+                    });
+                    objc2::rc::autoreleasepool(|_| {
+                        state.installed.borrow_mut().select(if index % 2 == 0 {
+                            "alpha"
+                        } else {
+                            "golf"
+                        });
+                        state.render(&target, action_selectors(), mtm);
+                    });
+                    assert!(
+                        previous.load().is_none(),
+                        "rebuild {index} retained the outgoing native view"
+                    );
+                }
+                eprintln!(
+                    "menu rebuilds: {iterations}, elapsed: {:?}",
+                    start.elapsed()
+                );
+            }
+
             fn transferring_catalog() -> (crate::menu::catalog::CatalogState, Instant) {
                 use crate::menu::catalog::{CandidateItem, CatalogEvent, RepositoryItem};
 
@@ -1871,6 +2009,7 @@ fn main() {
         }));
     menu::macos::rows::assert_native_layout_contract(mtm);
     menu::macos::controller::assert_runtime_copy_feedback_lifecycle(mtm);
+    menu::macos::controller::assert_inventory_rebuilds_release_previous_views(mtm);
     menu::macos::controller::assert_progress_updates_retain_active_search(mtm);
     menu::macos::controller::assert_rebuild_detaches_outgoing_search_action(mtm);
     menu::macos::assert_native_timer_contract(mtm);

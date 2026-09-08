@@ -13,6 +13,40 @@ use crate::menu::api_runtime::{ApiEndpoint, ApiRuntimeNotice, ApiRuntimePhase};
 use crate::menu::presentation::{ObservedRuntime, ObservedRuntimeOwner};
 
 #[test]
+fn active_section_tracks_lifecycle_without_calling_startup_running() {
+    for (phase, expected) in [
+        (ApiRuntimePhase::Idle, None),
+        (
+            ApiRuntimePhase::Starting {
+                generation: 1,
+                model_id: "demo".into(),
+            },
+            Some("Loading"),
+        ),
+        (
+            ApiRuntimePhase::Ready {
+                generation: 1,
+                endpoint: ApiEndpoint::new("demo".into(), 43123),
+                activity: ApiRuntimeActivity::Loaded,
+            },
+            Some("Running"),
+        ),
+        (ApiRuntimePhase::Stopping, Some("Stopping")),
+        (ApiRuntimePhase::CleanupFailed, Some("Needs attention")),
+        (ApiRuntimePhase::ControllerFailed, None),
+    ] {
+        assert_eq!(
+            ApiPresentation::from_state(&phase, None, Some("demo")).active_section_title(),
+            expected
+        );
+        assert_eq!(
+            ApiPresentation::from_state(&phase, None, None).active_section_title(),
+            None
+        );
+    }
+}
+
+#[test]
 fn every_api_phase_has_one_compact_status_line_and_ready_only_curl() {
     let endpoint = ApiEndpoint::new("demo".into(), 43123);
     let cases = [

@@ -97,6 +97,24 @@ pub(super) struct PopoverContent {
 }
 
 impl MenuRows {
+    pub(super) fn installed_scroll_offset(&self) -> Option<f64> {
+        match &self.body {
+            BodyRows::Inventory { inventory }
+            | BodyRows::InventoryRecommendation { inventory, .. } => inventory.scroll_offset(),
+            _ => None,
+        }
+    }
+
+    pub(super) fn restore_installed_scroll_offset(&self, offset: f64) {
+        match &self.body {
+            BodyRows::Inventory { inventory }
+            | BodyRows::InventoryRecommendation { inventory, .. } => {
+                inventory.restore_scroll_offset(offset)
+            }
+            _ => {}
+        }
+    }
+
     pub(super) fn build(
         snapshot: &MenuSnapshot,
         api: &ApiPresentation,
@@ -175,7 +193,10 @@ impl MenuRows {
             layout.add(&row.root, MenuLayout::transfer_row_height());
             BodyRows::Transfer(row)
         } else if inventory_is_primary(snapshot, installed) {
-            layout.add(&section_header("Installed", mtm), SECTION_HEIGHT);
+            layout.add(
+                &section_header(installed_rows::section_title(installed, api), mtm),
+                SECTION_HEIGHT,
+            );
             let inventory = installed_rows::build(
                 installed,
                 api,
@@ -200,15 +221,11 @@ impl MenuRows {
                     RecommendationNativeRow::build(recommendation, target, actions, mtm);
                 layout.add(&recommendation.root, 56.0);
                 BodyRows::InventoryRecommendation {
-                    #[cfg(test)]
                     inventory,
                     recommendation,
                 }
             } else {
-                BodyRows::Inventory {
-                    #[cfg(test)]
-                    inventory,
-                }
+                BodyRows::Inventory { inventory }
             }
         } else if let Some(recommendation) = snapshot.recommendation_row() {
             layout.add(&section_header("Installed", mtm), SECTION_HEIGHT);
@@ -495,7 +512,7 @@ fn inventory_is_primary(
     snapshot: &MenuSnapshot,
     installed: &crate::menu::installed::InstalledState,
 ) -> bool {
-    !installed.visible_items().is_empty()
+    !installed.items().is_empty()
         || (installed.error_message().is_some() && snapshot.installed_row().is_none())
 }
 
@@ -506,10 +523,7 @@ fn inventory_overrides_busy_recovery(
     let Some(model_id) = snapshot.busy_runtime_model_matching_bundle() else {
         return false;
     };
-    installed
-        .visible_items_for(Some(model_id))
-        .into_iter()
-        .any(|item| item.id() == model_id)
+    installed.item(model_id).is_some()
 }
 
 enum BodyRows {
@@ -518,11 +532,9 @@ enum BodyRows {
     EmptyInstalled,
     Recommendation(RecommendationNativeRow),
     Inventory {
-        #[cfg(test)]
         inventory: installed_rows::InstalledContent,
     },
     InventoryRecommendation {
-        #[cfg(test)]
         inventory: installed_rows::InstalledContent,
         recommendation: RecommendationNativeRow,
     },
