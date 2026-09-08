@@ -31,6 +31,7 @@ pub(crate) enum Recommendation {
         target_bytes: u64,
         draft_bytes: u64,
     },
+    #[cfg(test)]
     Unavailable {
         reason: RecommendationUnavailableReason,
         sizes: Option<(u64, u64)>,
@@ -57,15 +58,9 @@ impl Recommendation {
             sizes: Some((target_bytes, draft_bytes)),
         }
     }
-
-    pub(crate) fn unavailable_without_size(reason: RecommendationUnavailableReason) -> Self {
-        Self::Unavailable {
-            reason,
-            sizes: None,
-        }
-    }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RecommendationUnavailableReason {
     InsufficientMemory,
@@ -355,6 +350,7 @@ pub(crate) struct RecommendationRow {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RecommendationAvailability {
     Eligible,
+    #[cfg(test)]
     Unavailable(RecommendationUnavailableReason),
 }
 
@@ -385,12 +381,15 @@ impl RecommendationRow {
     pub(crate) fn disabled_reason(&self) -> Option<&'static str> {
         match self.availability {
             RecommendationAvailability::Eligible => None,
+            #[cfg(test)]
             RecommendationAvailability::Unavailable(
                 RecommendationUnavailableReason::InsufficientMemory,
             ) => Some("Insufficient memory"),
+            #[cfg(test)]
             RecommendationAvailability::Unavailable(
                 RecommendationUnavailableReason::InsufficientDisk,
             ) => Some("Insufficient disk space"),
+            #[cfg(test)]
             RecommendationAvailability::Unavailable(
                 RecommendationUnavailableReason::Unavailable,
             ) => Some("Unavailable on this Mac"),
@@ -556,7 +555,7 @@ impl Footer {
 enum MenuBody {
     Loading,
     Error(String),
-    CleanAbsence(RecommendationRow),
+    CleanAbsence(Option<RecommendationRow>),
     Verified(InstalledRow),
     Recovery(RecoveryRow),
     Partial(TransferRow),
@@ -796,6 +795,8 @@ enum MenuComposition {
     Loading,
     Error,
     CleanEligible,
+    CleanHidden,
+    #[cfg(test)]
     CleanUnavailable,
     Installed,
     Recovery,
@@ -860,17 +861,21 @@ impl MenuSnapshot {
                     draft_bytes,
                 },
                 Download::Idle,
-            ) => MenuBody::CleanAbsence(RecommendationRow {
+            ) => MenuBody::CleanAbsence(Some(RecommendationRow {
                 sizes: Some((target_bytes, draft_bytes)),
                 quantization,
                 availability: RecommendationAvailability::Eligible,
-            }),
+            })),
+            #[cfg(test)]
             (Bundle::Absent, Recommendation::Unavailable { reason, sizes }, Download::Idle) => {
-                MenuBody::CleanAbsence(RecommendationRow {
+                MenuBody::CleanAbsence(Some(RecommendationRow {
                     sizes,
                     quantization,
                     availability: RecommendationAvailability::Unavailable(reason),
-                })
+                }))
+            }
+            (Bundle::Absent, Recommendation::Hidden, Download::Idle) => {
+                MenuBody::CleanAbsence(None)
             }
             (
                 Bundle::Verified {
@@ -964,12 +969,19 @@ impl MenuSnapshot {
             MenuBody::Loading | MenuBody::Error(_) => {
                 vec![MenuSection::Header, MenuSection::Footer]
             }
-            MenuBody::CleanAbsence(_) => vec![
+            MenuBody::CleanAbsence(Some(_)) => vec![
                 MenuSection::Header,
                 MenuSection::InstalledEmpty,
                 MenuSection::Recommendation,
                 MenuSection::Footer,
             ],
+            MenuBody::CleanAbsence(None) => {
+                vec![
+                    MenuSection::Header,
+                    MenuSection::InstalledEmpty,
+                    MenuSection::Footer,
+                ]
+            }
             MenuBody::Verified(_) => vec![
                 MenuSection::Header,
                 MenuSection::InstalledModel,
@@ -990,13 +1002,18 @@ impl MenuSnapshot {
 
     pub(crate) fn recommendation_row(&self) -> Option<&RecommendationRow> {
         match &self.body {
-            MenuBody::CleanAbsence(row) => Some(row),
+            MenuBody::CleanAbsence(Some(row)) => Some(row),
+            MenuBody::CleanAbsence(None) => None,
             MenuBody::Loading
             | MenuBody::Error(_)
             | MenuBody::Verified(_)
             | MenuBody::Recovery(_)
             | MenuBody::Partial(_) => None,
         }
+    }
+
+    pub(crate) fn is_empty_library(&self) -> bool {
+        matches!(self.body, MenuBody::CleanAbsence(None))
     }
 
     pub(crate) fn installed_row(&self) -> Option<&InstalledRow> {
@@ -1126,7 +1143,7 @@ impl MenuSnapshot {
     #[cfg(test)]
     pub(crate) fn apply_fixture_action(&self, action: MenuAction) -> Option<Self> {
         let download = match (&self.body, action) {
-            (MenuBody::CleanAbsence(row), MenuAction::Start)
+            (MenuBody::CleanAbsence(Some(row)), MenuAction::Start)
                 if matches!(row.availability, RecommendationAvailability::Eligible) =>
             {
                 Download::active(
@@ -1183,10 +1200,12 @@ impl MenuSnapshot {
         match &self.body {
             MenuBody::Loading => MenuComposition::Loading,
             MenuBody::Error(_) => MenuComposition::Error,
-            MenuBody::CleanAbsence(row) => match row.availability {
+            MenuBody::CleanAbsence(Some(row)) => match row.availability {
                 RecommendationAvailability::Eligible => MenuComposition::CleanEligible,
+                #[cfg(test)]
                 RecommendationAvailability::Unavailable(_) => MenuComposition::CleanUnavailable,
             },
+            MenuBody::CleanAbsence(None) => MenuComposition::CleanHidden,
             MenuBody::Verified(_) => MenuComposition::Installed,
             MenuBody::Recovery(_) => MenuComposition::Recovery,
             MenuBody::Partial(row) => match row.state {

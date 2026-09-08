@@ -8,9 +8,8 @@ use loxa::huggingface::ResolvedFile;
 use super::{
     discard_service_failure, map_app_snapshot, map_core_snapshot, run_backend_worker,
     BackendClient, BackendMessage, BackendRequest, BackendSource, BackendTransfer, CoreBundle,
-    CoreDownload, CoreObservation, CoreRecommendation, CoreRecommendationUnavailableReason,
-    CoreRuntimeOwner, InspectedRepository, ObservationMessage, RefreshAdmission,
-    TransferCompletion,
+    CoreDownload, CoreObservation, CoreRecommendation, CoreRuntimeOwner, InspectedRepository,
+    ObservationMessage, RefreshAdmission, TransferCompletion,
 };
 use crate::menu::api_runtime::{
     run_runtime_worker, ApiEndpoint, ApiRuntimeController, ApiRuntimePhase, RuntimeHost,
@@ -25,13 +24,11 @@ use crate::menu::installed::{InstalledInventoryError, InstalledItem};
 use crate::menu::presentation::{Fixture, MenuSnapshot};
 
 #[test]
-fn mapper_keeps_live_absent_and_paused_states_truthful() {
+fn mapper_hides_an_unavailable_fixed_recommendation_and_keeps_paused_state_truthful() {
     let _mapper: fn(AppSnapshot) -> MenuSnapshot = map_app_snapshot;
     let idle = map_core_snapshot(CoreObservation {
         bundle: CoreBundle::Absent,
-        recommendation: CoreRecommendation::Unavailable(
-            CoreRecommendationUnavailableReason::Unavailable,
-        ),
+        recommendation: CoreRecommendation::Unavailable,
         download: CoreDownload::Idle,
         runtime: super::CoreRuntime::Idle,
         runtime_port: None,
@@ -40,9 +37,14 @@ fn mapper_keeps_live_absent_and_paused_states_truthful() {
         bundle_model_id: "bundle".into(),
         runtime_inventory: super::CoreRuntimeInventory::Missing,
     });
+    assert!(idle.recommendation_row().is_none());
     assert_eq!(
-        idle.recommendation_row().unwrap().disabled_reason(),
-        Some("Unavailable on this Mac")
+        idle.section_kinds(),
+        vec![
+            crate::menu::presentation::MenuSection::Header,
+            crate::menu::presentation::MenuSection::InstalledEmpty,
+            crate::menu::presentation::MenuSection::Footer,
+        ]
     );
 
     let paused = map_core_snapshot(CoreObservation {

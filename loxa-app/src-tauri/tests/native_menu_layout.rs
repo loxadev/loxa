@@ -238,6 +238,35 @@ mod menu {
 
                 assert_passive_recommendation_contract(mtm);
 
+                let hidden_recommendation = crate::menu::presentation::MenuSnapshot::new(
+                    Bundle::Absent,
+                    Recommendation::Hidden,
+                    Download::Idle,
+                    Runtime::Idle,
+                    RuntimeInventory::Missing,
+                )
+                .expect("an unavailable fixed recommendation has an empty library projection");
+                let mut empty_library = MenuRows::build(
+                    &hidden_recommendation,
+                    &ApiPresentation::idle(),
+                    &crate::menu::catalog::CatalogState::default(),
+                    &crate::menu::incomplete::IncompleteState::default(),
+                    &InstalledState::default(),
+                    ActionBindings::new(None, layout_fixture_actions()),
+                    mtm,
+                );
+                empty_library.view.layoutSubtreeIfNeeded();
+                assert_eq!(empty_library.view.frame().size.height, 256.0);
+                let empty_text = text_values(&empty_library.view);
+                assert!(empty_text.contains(&"Installed".into()));
+                assert!(empty_text.contains(&"No models yet".into()));
+                assert!(!empty_text.contains(&"Recommended for this Mac".into()));
+                empty_library.rows.update(
+                    &hidden_recommendation,
+                    &ApiPresentation::idle(),
+                    &crate::menu::presentation::InlineCancelState::default(),
+                );
+
                 let running = Fixture::Running.snapshot();
                 let ready = ApiPresentation::ready(
                     "demo",

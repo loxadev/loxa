@@ -11,8 +11,7 @@ use loxa::app::{
 };
 use loxa::app::{
     AppSnapshot, BundleSnapshot, BundleUnavailableReason, DownloadSnapshot, RecommendationSnapshot,
-    RecommendationUnavailableReason, RuntimeInventorySnapshot, RuntimeOwnerSnapshot,
-    RuntimeSnapshot,
+    RuntimeInventorySnapshot, RuntimeOwnerSnapshot, RuntimeSnapshot,
 };
 use loxa::discovery::{CandidateDisposition, InspectRepository, SearchModels};
 use loxa::huggingface::ResolvedFile;
@@ -24,8 +23,8 @@ use crate::menu::catalog::{
 use crate::menu::incomplete::{DiscardFailure, IncompleteInventoryError, IncompleteItem};
 use crate::menu::installed::{InstalledInventoryError, InstalledItem};
 use crate::menu::presentation::{
-    Bundle, Download, MenuSnapshot, ObservedRuntimeOwner, Recommendation,
-    RecommendationUnavailableReason as MenuReason, RecoveryReason, Runtime, RuntimeInventory,
+    Bundle, Download, MenuSnapshot, ObservedRuntimeOwner, Recommendation, RecoveryReason, Runtime,
+    RuntimeInventory,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,13 +45,6 @@ enum CoreBundleUnavailableReason {
 enum CoreRecommendation {
     Hidden,
     Available { target_bytes: u64, draft_bytes: u64 },
-    Unavailable(CoreRecommendationUnavailableReason),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CoreRecommendationUnavailableReason {
-    InsufficientMemory,
-    InsufficientDisk,
     Unavailable,
 }
 
@@ -121,19 +113,7 @@ impl From<AppSnapshot> for CoreObservation {
                 target_bytes: bundle.target_bytes(),
                 draft_bytes: bundle.draft_bytes(),
             },
-            RecommendationSnapshot::Unavailable(reason) => {
-                CoreRecommendation::Unavailable(match reason {
-                    RecommendationUnavailableReason::InsufficientMemory => {
-                        CoreRecommendationUnavailableReason::InsufficientMemory
-                    }
-                    RecommendationUnavailableReason::InsufficientDisk => {
-                        CoreRecommendationUnavailableReason::InsufficientDisk
-                    }
-                    RecommendationUnavailableReason::Unavailable => {
-                        CoreRecommendationUnavailableReason::Unavailable
-                    }
-                })
-            }
+            RecommendationSnapshot::Unavailable(_) => CoreRecommendation::Unavailable,
         };
         let download = match snapshot.download() {
             DownloadSnapshot::Idle => CoreDownload::Idle,
@@ -200,17 +180,9 @@ fn map_core_snapshot(snapshot: CoreObservation) -> MenuSnapshot {
             target_bytes,
             draft_bytes,
         } => Recommendation::available(target_bytes, draft_bytes),
-        CoreRecommendation::Unavailable(reason) => {
-            Recommendation::unavailable_without_size(match reason {
-                CoreRecommendationUnavailableReason::InsufficientMemory => {
-                    MenuReason::InsufficientMemory
-                }
-                CoreRecommendationUnavailableReason::InsufficientDisk => {
-                    MenuReason::InsufficientDisk
-                }
-                CoreRecommendationUnavailableReason::Unavailable => MenuReason::Unavailable,
-            })
-        }
+        // The only bundled recommendation is fixed. If it does not fit this Mac,
+        // there is no alternate recommendation to offer.
+        CoreRecommendation::Unavailable => Recommendation::Hidden,
     };
     let download = match snapshot.download {
         CoreDownload::Idle => Download::Idle,

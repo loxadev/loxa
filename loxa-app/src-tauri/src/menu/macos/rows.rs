@@ -242,6 +242,10 @@ impl MenuRows {
                 layout.add(&inventory_error.view, inventory_error.height);
             }
             BodyRows::Installed(row)
+        } else if snapshot.is_empty_library() {
+            layout.add(&section_header("Installed", mtm), SECTION_HEIGHT);
+            layout.add(&empty_installed_row(mtm), MenuLayout::model_row_height());
+            BodyRows::EmptyInstalled
         } else {
             unreachable!("every menu snapshot has exactly one body row")
         };
@@ -358,7 +362,7 @@ impl MenuRows {
                     recommendation.update(row);
                 }
             }
-            BodyRows::Catalog | BodyRows::Inventory { .. } => {}
+            BodyRows::Catalog | BodyRows::Inventory { .. } | BodyRows::EmptyInstalled => {}
         }
     }
 
@@ -459,6 +463,8 @@ fn content_height(
             + SEPARATOR_HEIGHT
             + SECTION_HEIGHT
             + 56.0
+    } else if snapshot.is_empty_library() {
+        common + incomplete_height + SECTION_HEIGHT + MenuLayout::model_row_height()
     } else {
         common
             + incomplete_height
@@ -509,6 +515,7 @@ fn inventory_overrides_busy_recovery(
 enum BodyRows {
     Catalog,
     Status(StatusNativeRow),
+    EmptyInstalled,
     Recommendation(RecommendationNativeRow),
     Inventory {
         #[cfg(test)]
@@ -528,7 +535,11 @@ enum BodyRows {
 impl BodyRows {
     fn action_buttons(&self) -> Vec<Retained<NSButton>> {
         match self {
-            Self::Catalog | Self::Status(_) | Self::Installed(_) | Self::Recovery(_) => Vec::new(),
+            Self::Catalog
+            | Self::Status(_)
+            | Self::EmptyInstalled
+            | Self::Installed(_)
+            | Self::Recovery(_) => Vec::new(),
             Self::Recommendation(row) => row.action_buttons(),
             Self::Transfer(row) => row.action_buttons(),
             Self::Inventory { inventory } => inventory.action_buttons.clone(),
