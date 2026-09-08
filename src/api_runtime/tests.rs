@@ -52,14 +52,24 @@ fn failed_preparation_requires_successful_recovery_before_another_load() {
 
 #[cfg(target_os = "macos")]
 #[test]
-#[ignore = "requires a finalized built app and the installed small-model fixture"]
+#[ignore = "requires a finalized built app and the exact small-model fixture"]
 fn bundled_host_prepares_without_ownership_and_reuses_across_model_loads() {
     use std::os::unix::fs::MetadataExt as _;
 
     let _process = process_test_lock();
     let app = PathBuf::from(std::env::var_os("LOXA_BUILT_APP").unwrap());
     let model = PathBuf::from(std::env::var_os("LOXA_SMALL_MODEL").unwrap());
-    let manifest_bytes = fs::read(model.with_file_name("manifest.json")).unwrap();
+    let manifest_bytes = serde_json::to_vec(&serde_json::json!({
+        "version": 1,
+        "id": "loxa-host-reuse",
+        "repo": "bartowski/SmolLM2-135M-Instruct-GGUF",
+        "revision": "09816acd5d99df7be770d85ea30822623dab342c",
+        "remote_filename": "SmolLM2-135M-Instruct-Q2_K.gguf",
+        "local_filename": "model.gguf",
+        "sha256": "741ad12b64088fedc17c33aacb22e48be1972ef36a39f03666dd68bd15614fb9",
+        "size": 88_202_080,
+    }))
+    .unwrap();
     let manifest: Manifest = serde_json::from_slice(&manifest_bytes).unwrap();
     let root = tempfile::Builder::new()
         .prefix("loxa-host-reuse-")
@@ -73,7 +83,10 @@ fn bundled_host_prepares_without_ownership_and_reuses_across_model_loads() {
     .unwrap();
     let model_dir = paths.model_dir(&manifest.id).unwrap();
     fs::create_dir_all(&model_dir).unwrap();
-    fs::copy(&model, model_dir.join(&manifest.local_filename)).unwrap();
+    assert_eq!(
+        fs::copy(&model, model_dir.join(&manifest.local_filename)).unwrap(),
+        manifest.size
+    );
     fs::write(model_dir.join("manifest.json"), manifest_bytes).unwrap();
     drop(ModelLock::acquire(&model_dir).unwrap());
     let mut host = ApiRuntimeHost::new(paths.clone());
@@ -96,6 +109,7 @@ fn bundled_host_prepares_without_ownership_and_reuses_across_model_loads() {
         let lease: serde_json::Value =
             serde_json::from_slice(&fs::read(paths.run.join("foreground.json")).unwrap()).unwrap();
         assert_eq!(lease["owner_mode"], "persistent_app");
+        assert_eq!(lease["fingerprint"]["sleep_policy"], 300);
         assert_eq!(lease["server"], executable.to_str().unwrap());
         host.stop().unwrap();
         assert!(!paths.run.join("foreground.json").exists());
