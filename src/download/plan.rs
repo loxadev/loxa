@@ -1,11 +1,11 @@
+use super::artifact::{inspect_regular_entry, RegularEntryError as PlanReadError};
 use super::{ArtifactDiscardError, ArtifactDiscardFacts, VerifiedRegularFile};
 use crate::safe_file::{
     directory_identity, ensure_directory_descriptor_matches_path, ensure_regular_descriptors_match,
     regular_file_identity, RegularFileIdentity,
 };
-use sha2::{Digest, Sha256};
 use std::fs::File;
-use std::io::{self, Read};
+use std::io;
 use std::path::Path;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -152,12 +152,6 @@ fn plan_artifact_transfer_with_after_open(
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PlanReadError {
-    Interrupted,
-    Unsafe,
-}
-
 fn plan_artifact_transfer_inner(
     directory: &File,
     model_dir: &Path,
@@ -287,43 +281,22 @@ fn read_entry(
     after_open: &mut impl FnMut(ArtifactName),
 ) -> Result<Option<ArtifactEntry>, PlanReadError> {
     let path = name.path(model_dir);
-    let Some(mut file) = open_entry(directory, &path, name).map_err(|_| PlanReadError::Unsafe)?
+    let Some(mut captured) = inspect_regular_entry(
+        directory,
+        &path,
+        name.needs_checksum()
+            .then_some((expected_size, expected_sha256)),
+        should_pause,
+        |directory, path| open_entry(directory, path, name),
+        || after_open(name),
+    )?
     else {
         return Ok(None);
     };
-    let identity = regular_file_identity(&file, &path).map_err(|_| PlanReadError::Unsafe)?;
-    after_open(name);
-    let length = file.metadata().map_err(|_| PlanReadError::Unsafe)?.len();
-    let actual = if name.needs_checksum() && length == expected_size {
-        let mut hash = Sha256::new();
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            if should_pause() {
-                return Err(PlanReadError::Interrupted);
-            }
-            let read = file.read(&mut buffer).map_err(|_| PlanReadError::Unsafe)?;
-            if read == 0 {
-                break;
-            }
-            hash.update(&buffer[..read]);
-        }
-        Some(crate::download::artifact::hex(hash.finalize().as_ref()))
-    } else {
-        None
-    };
-    let resolved = open_entry(directory, &path, name)
-        .map_err(|_| PlanReadError::Unsafe)?
-        .ok_or(PlanReadError::Unsafe)?;
-    ensure_regular_descriptors_match(&file, &identity, &resolved, &path)
-        .map_err(|_| PlanReadError::Unsafe)?;
-    let verified = actual
-        .filter(|actual| actual == &expected_sha256.to_ascii_lowercase())
-        .map(|actual| {
-            VerifiedRegularFile::from_captured_hash(file, identity.clone(), path.clone(), actual)
-        });
+    let verified = captured.verified.take();
     let checksum_matches = verified.is_some();
     Ok(Some(ArtifactEntry {
-        length,
+        length: captured.length,
         checksum_matches,
         verified,
     }))

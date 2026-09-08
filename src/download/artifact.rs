@@ -89,21 +89,11 @@ fn prove_complete_restart(
     invalid_authority: bool,
 ) -> Result<(), ArtifactTransferError> {
     let (restart_path, part_path, final_path, invalid_path) = paths;
-    if verified.path != restart_path || verified.sha256 != spec.sha256().to_ascii_lowercase() {
-        return Err(ArtifactTransferError::Durability);
-    }
-    let restart = open_restart_entry(directory, restart_path)
+    let _restart = verified
+        .resolve_proven_entry(restart_path, spec.size(), spec.sha256(), || {
+            open_restart_entry(directory, restart_path)
+        })
         .map_err(|_| ArtifactTransferError::Durability)?;
-    ensure_regular_descriptors_match(&verified.file, &verified.identity, &restart, restart_path)
-        .map_err(|_| ArtifactTransferError::Durability)?;
-    if restart
-        .metadata()
-        .map_err(|_| ArtifactTransferError::Durability)?
-        .len()
-        != spec.size()
-    {
-        return Err(ArtifactTransferError::Durability);
-    }
     for entry in [
         open_part_entry(directory, part_path),
         open_final_entry(directory, final_path),
@@ -123,7 +113,7 @@ pub(super) fn normalize_complete_restart(
     directory: &File,
     model_dir: &Path,
     spec: &ResolvedFile,
-    mut verified: VerifiedRegularFile,
+    verified: VerifiedRegularFile,
     artifact_operation: &mut impl for<'a> FnMut(
         ArtifactOperation<'a>,
     ) -> Result<(), ArtifactOperationFailure>,
@@ -158,42 +148,39 @@ pub(super) fn normalize_complete_restart(
         invalid_authority,
     )?;
     rename_restart_to_part_no_replace(directory).map_err(|_| ArtifactTransferError::Durability)?;
-    let normalized_identity = regular_file_identity(&verified.file, &part_path)
-        .map_err(|_| ArtifactTransferError::Durability)?;
-    if !verified
-        .identity
-        .same_file_after_rename(&normalized_identity)
-    {
-        return Err(ArtifactTransferError::Durability);
-    }
-    artifact_operation(ArtifactOperation::Sync {
-        checkpoint: ArtifactCheckpoint::NormalizationDirectorySynced,
-        file: directory,
-    })
-    .map_err(|_| ArtifactTransferError::Durability)?;
-    ensure_directory_descriptor_matches_path(directory, &directory_identity, model_dir)
-        .map_err(|_| ArtifactTransferError::Durability)?;
-    let part =
-        open_part_entry(directory, &part_path).map_err(|_| ArtifactTransferError::Durability)?;
-    ensure_regular_descriptors_match(&verified.file, &normalized_identity, &part, &part_path)
-        .map_err(|_| ArtifactTransferError::Durability)?;
-    for entry in [
-        open_restart_entry(directory, &restart_path),
-        open_final_entry(directory, &final_path),
-    ] {
-        match entry {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Ok(_) | Err(_) => return Err(ArtifactTransferError::Durability),
-        }
-    }
-    if invalid_authority_is_present(directory, &invalid_path)? != invalid_authority {
-        return Err(ArtifactTransferError::Durability);
-    }
-    ensure_directory_descriptor_matches_path(directory, &directory_identity, model_dir)
-        .map_err(|_| ArtifactTransferError::Durability)?;
-    verified.identity = normalized_identity;
-    verified.path = part_path;
-    Ok(verified)
+    verified
+        .rebind_after_rename_with_fences(
+            part_path,
+            |part_path| {
+                artifact_operation(ArtifactOperation::Sync {
+                    checkpoint: ArtifactCheckpoint::NormalizationDirectorySynced,
+                    file: directory,
+                })
+                .map_err(|_| ())?;
+                ensure_directory_descriptor_matches_path(directory, &directory_identity, model_dir)
+                    .map_err(|_| ())?;
+                open_part_entry(directory, part_path).map_err(|_| ())
+            },
+            || {
+                for entry in [
+                    open_restart_entry(directory, &restart_path),
+                    open_final_entry(directory, &final_path),
+                ] {
+                    match entry {
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Ok(_) | Err(_) => return Err(()),
+                    }
+                }
+                if invalid_authority_is_present(directory, &invalid_path).map_err(|_| ())?
+                    != invalid_authority
+                {
+                    return Err(());
+                }
+                ensure_directory_descriptor_matches_path(directory, &directory_identity, model_dir)
+                    .map_err(|_| ())
+            },
+        )
+        .map_err(|_| ArtifactTransferError::Durability)
 }
 
 pub(super) async fn download_once(
@@ -2889,6 +2876,72 @@ fn ensure_discard_entry(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RegularEntryError {
+    Interrupted,
+    Unsafe,
+}
+
+pub(super) struct CapturedRegularEntry {
+    pub(super) length: u64,
+    pub(super) verified: Option<VerifiedRegularFile>,
+    // Keep the re-opened descriptor alive until the caller finishes its entry.
+    _resolved: File,
+}
+
+pub(super) fn inspect_regular_entry(
+    directory: &File,
+    path: &Path,
+    expected: Option<(u64, &str)>,
+    should_pause: &impl Fn() -> bool,
+    open_entry: impl Fn(&File, &Path) -> std::io::Result<Option<File>>,
+    mut after_open: impl FnMut(),
+) -> Result<Option<CapturedRegularEntry>, RegularEntryError> {
+    let Some(mut file) = open_entry(directory, path).map_err(|_| RegularEntryError::Unsafe)? else {
+        return Ok(None);
+    };
+    let identity = regular_file_identity(&file, path).map_err(|_| RegularEntryError::Unsafe)?;
+    after_open();
+    let length = file
+        .metadata()
+        .map_err(|_| RegularEntryError::Unsafe)?
+        .len();
+    let actual = if expected.is_some_and(|(size, _)| length == size) {
+        let mut hash = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            if should_pause() {
+                return Err(RegularEntryError::Interrupted);
+            }
+            let read = file
+                .read(&mut buffer)
+                .map_err(|_| RegularEntryError::Unsafe)?;
+            if read == 0 {
+                break;
+            }
+            hash.update(&buffer[..read]);
+        }
+        Some(hex(hash.finalize().as_ref()))
+    } else {
+        None
+    };
+    let resolved = open_entry(directory, path)
+        .map_err(|_| RegularEntryError::Unsafe)?
+        .ok_or(RegularEntryError::Unsafe)?;
+    ensure_regular_descriptors_match(&file, &identity, &resolved, path)
+        .map_err(|_| RegularEntryError::Unsafe)?;
+    let verified = actual
+        .filter(|actual| expected.is_some_and(|(_, sha256)| actual == &sha256.to_ascii_lowercase()))
+        .map(|actual| {
+            VerifiedRegularFile::from_captured_hash(file, identity.clone(), path.to_owned(), actual)
+        });
+    Ok(Some(CapturedRegularEntry {
+        length,
+        verified,
+        _resolved: resolved,
+    }))
+}
+
 #[derive(Debug)]
 pub(crate) struct VerifiedRegularFile {
     file: File,
@@ -2898,7 +2951,7 @@ pub(crate) struct VerifiedRegularFile {
 }
 
 impl VerifiedRegularFile {
-    pub(super) fn from_captured_hash(
+    fn from_captured_hash(
         file: File,
         identity: RegularFileIdentity,
         path: PathBuf,
@@ -2914,6 +2967,46 @@ impl VerifiedRegularFile {
 
     pub(crate) fn sha256(&self) -> &str {
         &self.sha256
+    }
+
+    fn resolve_proven_entry(
+        &self,
+        expected_path: &Path,
+        expected_size: u64,
+        expected_sha256: &str,
+        resolve: impl FnOnce() -> std::io::Result<File>,
+    ) -> Result<File, ()> {
+        if self.path != expected_path || self.sha256 != expected_sha256.to_ascii_lowercase() {
+            return Err(());
+        }
+        let resolved = resolve().map_err(|_| ())?;
+        ensure_regular_descriptors_match(&self.file, &self.identity, &resolved, expected_path)
+            .map_err(|_| ())?;
+        if resolved.metadata().map_err(|_| ())?.len() != expected_size {
+            return Err(());
+        }
+        Ok(resolved)
+    }
+
+    fn rebind_after_rename_with_fences(
+        mut self,
+        destination: PathBuf,
+        resolve: impl FnOnce(&Path) -> Result<File, ()>,
+        finish: impl FnOnce() -> Result<(), ()>,
+    ) -> Result<Self, ()> {
+        // This identity must precede the caller's sync/open and remain the
+        // comparison authority through all of its remaining transaction fences.
+        let current = regular_file_identity(&self.file, &destination).map_err(|_| ())?;
+        if !self.identity.same_file_after_rename(&current) {
+            return Err(());
+        }
+        let resolved = resolve(&destination)?;
+        ensure_regular_descriptors_match(&self.file, &current, &resolved, &destination)
+            .map_err(|_| ())?;
+        finish()?;
+        self.identity = current;
+        self.path = destination;
+        Ok(self)
     }
 
     pub(crate) fn revalidate_for(&self, expected_path: &Path) -> Result<fs::Metadata, String> {
