@@ -18,6 +18,9 @@ pub(crate) use discovery::discover_from_process;
 #[allow(unused_imports)]
 pub(crate) use discovery::validate_managed_server;
 pub use discovery::{discover_server, validate_managed_runtime};
+pub(crate) use discovery::{
+    revalidate_managed_runtime_for_service, validate_managed_runtime_for_service, VersionProbeError,
+};
 pub use foreground::run;
 pub(crate) use foreground::{run_launch, start_foreground, ForegroundServer, ForegroundStart};
 pub use launch::ValidatedManagedRuntime;

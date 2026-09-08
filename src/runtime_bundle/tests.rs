@@ -1,5 +1,7 @@
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::io::Write as _;
+use std::os::unix::fs::{FileExt as _, PermissionsExt};
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -7,13 +9,96 @@ use crate::paths::AppPaths;
 
 use super::inventory::digest;
 use super::record::{
-    read_stage_record, BUILD_STAGING_PREFIX, STAGE_CHILD_PID_OFFSET, STAGE_TOKEN_OFFSET,
+    read_stage_record, BUILD_STAGING_PREFIX, STAGE_CHILD_PID_OFFSET, STAGE_OWNER_PID_OFFSET,
+    STAGE_TOKEN_OFFSET,
 };
 use super::stage::{
     create_execution_stage, prepare_embedded_runtime_with_after_capture_fence,
     prepare_embedded_runtime_with_after_inventory_open, publish_regular_bytes,
 };
 use super::PreparedRuntime;
+
+#[cfg(target_os = "macos")]
+fn copied_finalized_app_paths() -> Option<(tempfile::TempDir, AppPaths)> {
+    let built_app = PathBuf::from(std::env::var_os("LOXA_BUILT_APP")?);
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("Loxa.app");
+    let copied = Command::new("/usr/bin/ditto")
+        .args([built_app.as_os_str(), source.as_os_str()])
+        .status()
+        .unwrap();
+    assert!(copied.success(), "{copied:?}");
+    let paths = AppPaths::from_application_values(
+        &source.join("Contents/MacOS/loxa-app"),
+        Some(&root.path().join("loxa-home")),
+        None,
+    )
+    .unwrap();
+    Some((root, paths))
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn retained_runtime_reuse_revalidates_child_claim_and_rejects_tampering() {
+    let Some((_root, paths)) = copied_finalized_app_paths() else {
+        return;
+    };
+
+    let prepared = super::prepare_embedded_runtime(&paths).unwrap();
+    let mut command = prepared.command();
+    command.arg("--version").process_group(0);
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    prepared.revalidate_for_service_reuse(&paths).unwrap();
+    drop(prepared);
+
+    let prepared = super::prepare_embedded_runtime(&paths).unwrap();
+    let staged_server = prepared.execution_server();
+    fs::set_permissions(&staged_server, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&staged_server)
+        .unwrap()
+        .write_all(b"stage tamper")
+        .unwrap();
+    assert!(prepared.revalidate_for_service_reuse(&paths).is_err());
+    drop(prepared);
+
+    let prepared = super::prepare_embedded_runtime(&paths).unwrap();
+    let original_record = read_stage_record(&prepared.0.owner).unwrap();
+    prepared
+        .0
+        .owner
+        .write_all_at(
+            &[original_record[STAGE_OWNER_PID_OFFSET] ^ 1],
+            STAGE_OWNER_PID_OFFSET as u64,
+        )
+        .unwrap();
+    prepared.0.owner.sync_all().unwrap();
+    assert!(prepared.revalidate_for_service_reuse(&paths).is_err());
+    drop(prepared);
+
+    let prepared = super::prepare_embedded_runtime(&paths).unwrap();
+    prepared.abandon().unwrap();
+    assert!(prepared.revalidate_for_service_reuse(&paths).is_err());
+    drop(prepared);
+
+    let prepared = super::prepare_embedded_runtime(&paths).unwrap();
+    let source_license = paths
+        .managed_server
+        .parent()
+        .and_then(Path::parent)
+        .unwrap()
+        .join("Resources/loxa-runtime/b10344/LICENSE");
+    fs::set_permissions(&source_license, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&source_license)
+        .unwrap()
+        .write_all(b"source tamper")
+        .unwrap();
+    assert!(prepared.revalidate_for_service_reuse(&paths).is_err());
+}
 
 #[test]
 fn restrictive_umask_publish_child() {

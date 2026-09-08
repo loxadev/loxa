@@ -15,18 +15,23 @@ use crate::runtime_identity::RuntimeIdentity;
 use super::capture::{capture_source_closure, CapturedRegular};
 use super::inventory::{embedded_contents, read_regular, validate_embedded_runtime, SYMLINKS};
 #[cfg(all(test, target_os = "macos"))]
+use super::record::{create_execution_stage_record, stage_construction_checkpoint_for_test};
 use super::record::{
-    create_execution_stage_record, execution_stage_token, stage_construction_checkpoint_for_test,
-};
-use super::record::{
-    create_execution_stage_record_for_owner, errno_only_error, random_stage_token,
-    write_stage_child_claim, BUILD_STAGING_PREFIX, STAGE_STATE_OFFSET, STAGING_PREFIX,
+    create_execution_stage_record_for_owner, errno_only_error, execution_stage_token,
+    parse_stage_record, random_stage_token, read_stage_record, write_stage_child_claim,
+    BUILD_STAGING_PREFIX, STAGE_RECORD_NAME, STAGE_STATE_OFFSET, STAGING_PREFIX,
 };
 
 pub(super) struct ExecutionStage {
     root: PathBuf,
+    root_identity: crate::safe_file::DirectoryIdentity,
     contents: File,
+    contents_identity: crate::safe_file::DirectoryIdentity,
     pub(super) owner: File,
+    owner_identity: crate::safe_file::RegularFileIdentity,
+    owner_pid: u32,
+    owner_start: u64,
+    regular_identities: Vec<(String, crate::safe_file::RegularFileIdentity)>,
     cleanup_on_drop: AtomicBool,
 }
 
@@ -67,12 +72,25 @@ impl PreparedRuntime {
             .ok_or_else(|| "test execution stage name is invalid".to_string())?;
         let owner = create_execution_stage_record(&root, token)?;
         let contents_path = root.join("Contents");
-        let (contents, _) =
+        let (contents, contents_identity) =
             crate::safe_file::open_directory(&contents_path).map_err(|error| error.to_string())?;
+        let (_, root_identity) =
+            crate::safe_file::open_directory(&root).map_err(|error| error.to_string())?;
+        let owner_identity =
+            crate::safe_file::regular_file_identity(&owner, &root.join(STAGE_RECORD_NAME))
+                .map_err(|error| error.to_string())?;
+        let (owner_pid, owner_start, _, _) =
+            parse_stage_record(&read_stage_record(&owner)?, token)?;
         Ok(Self(Arc::new(ExecutionStage {
             root,
+            root_identity,
             contents,
+            contents_identity,
             owner,
+            owner_identity,
+            owner_pid,
+            owner_start,
+            regular_identities: Vec::new(),
             cleanup_on_drop: AtomicBool::new(true),
         })))
     }
@@ -98,6 +116,102 @@ impl PreparedRuntime {
 
     pub(crate) fn execution_server(&self) -> PathBuf {
         self.0.root.join("Contents/MacOS/llama-server")
+    }
+
+    pub(crate) fn revalidate_for_service_reuse(&self, paths: &AppPaths) -> Result<(), String> {
+        if !self.0.cleanup_on_drop.load(Ordering::Acquire) {
+            return Err("prepared runtime stage is abandoned".into());
+        }
+        let captured = capture_source_closure(paths, || {}, || {})?;
+        let (root, root_identity) = crate::safe_file::open_directory(&self.0.root)
+            .map_err(|_| "prepared runtime stage is unavailable".to_string())?;
+        if root_identity != self.0.root_identity
+            || crate::safe_file::ensure_directory_descriptor_matches_path(
+                &root,
+                &self.0.root_identity,
+                &self.0.root,
+            )
+            .is_err()
+        {
+            return Err("prepared runtime stage changed while retained".into());
+        }
+        let contents_path = self.0.root.join("Contents");
+        if crate::safe_file::ensure_directory_descriptor_matches_path(
+            &self.0.contents,
+            &self.0.contents_identity,
+            &contents_path,
+        )
+        .is_err()
+        {
+            return Err("prepared runtime Contents directory changed while retained".into());
+        }
+        for (relative, expected) in &self.0.regular_identities {
+            let path = self.0.root.join("Contents").join(relative);
+            let (_, current) = crate::safe_file::open_regular_file(&path)
+                .map_err(|_| format!("prepared runtime file is unavailable: {relative}"))?;
+            if &current != expected {
+                return Err(format!(
+                    "prepared runtime file changed while retained: {relative}"
+                ));
+            }
+        }
+        let record_path = self.0.root.join(STAGE_RECORD_NAME);
+        let (_, current_owner) = crate::safe_file::open_regular_file(&record_path)
+            .map_err(|_| "prepared runtime owner record changed while retained".to_string())?;
+        if !self.0.owner_identity.same_stable_file(&current_owner) {
+            return Err("prepared runtime owner record changed while retained".into());
+        }
+        let token = execution_stage_token(&self.0.root)
+            .ok_or_else(|| "prepared runtime stage token is invalid".to_string())?;
+        let (owner_pid, owner_start, _, abandoned) =
+            parse_stage_record(&read_stage_record(&self.0.owner)?, token)?;
+        if owner_pid != self.0.owner_pid || owner_start != self.0.owner_start {
+            return Err("prepared runtime owner record changed while retained".into());
+        }
+        if abandoned {
+            return Err("prepared runtime stage is abandoned".into());
+        }
+        let staged_paths = staged_paths(paths, &self.0.root);
+        validate_execution_stage_against_capture(&staged_paths, &captured)?;
+        // A byte comparison is only an observation. Re-check the retained
+        // identities afterwards so a replacement during validation cannot be
+        // the authority used by the next spawn.
+        for (relative, expected) in &self.0.regular_identities {
+            let path = self.0.root.join("Contents").join(relative);
+            let (_, current) = crate::safe_file::open_regular_file(&path)
+                .map_err(|_| format!("prepared runtime file is unavailable: {relative}"))?;
+            if &current != expected {
+                return Err(format!(
+                    "prepared runtime file changed while retained: {relative}"
+                ));
+            }
+        }
+        let (_, final_owner) = crate::safe_file::open_regular_file(&record_path)
+            .map_err(|_| "prepared runtime owner record changed while retained".to_string())?;
+        if !self.0.owner_identity.same_stable_file(&final_owner) {
+            return Err("prepared runtime owner record changed while retained".into());
+        }
+        let (owner_pid, owner_start, _, abandoned) =
+            parse_stage_record(&read_stage_record(&self.0.owner)?, token)?;
+        if owner_pid != self.0.owner_pid || owner_start != self.0.owner_start || abandoned {
+            return Err("prepared runtime owner record changed while retained".into());
+        }
+        crate::safe_file::ensure_directory_descriptor_matches_path(
+            &self.0.contents,
+            &self.0.contents_identity,
+            &contents_path,
+        )
+        .map_err(|_| "prepared runtime Contents directory changed while retained".to_string())?;
+        crate::safe_file::ensure_directory_descriptor_matches_path(
+            &root,
+            &self.0.root_identity,
+            &self.0.root,
+        )
+        .map_err(|_| "prepared runtime stage changed while retained".to_string())?;
+        if !self.0.cleanup_on_drop.load(Ordering::Acquire) {
+            return Err("prepared runtime stage is abandoned".into());
+        }
+        Ok(())
     }
 
     pub(crate) fn abandon(&self) -> Result<(), String> {
@@ -144,7 +258,56 @@ fn prepare_embedded_runtime_with_hooks(
     let captured = capture_source_closure(paths, after_inventory_open, after_capture_fence)?;
 
     let (stage, owner) = create_execution_stage(&paths.run, &captured)?;
-    let staged_paths = AppPaths {
+    let staged_paths = staged_paths(paths, &stage);
+    if let Err(error) = validate_execution_stage_against_capture(&staged_paths, &captured) {
+        let _ = fs::remove_dir_all(&stage);
+        return Err(error);
+    }
+    let prepared = (|| {
+        let contents_path = stage.join("Contents");
+        let (contents, contents_identity) = crate::safe_file::open_directory(&contents_path)
+            .map_err(|_| "prepared runtime Contents directory is unavailable".to_string())?;
+        let (_, root_identity) = crate::safe_file::open_directory(&stage)
+            .map_err(|_| "prepared runtime stage is unavailable".to_string())?;
+        let owner_identity =
+            crate::safe_file::regular_file_identity(&owner, &stage.join(STAGE_RECORD_NAME))
+                .map_err(|_| "prepared runtime owner record is unavailable".to_string())?;
+        let token = execution_stage_token(&stage)
+            .ok_or_else(|| "prepared runtime stage token is invalid".to_string())?;
+        let (owner_pid, owner_start, _, _) =
+            parse_stage_record(&read_stage_record(&owner)?, token)?;
+        let regular_identities = captured
+            .iter()
+            .map(|regular| {
+                let path = contents_path.join(&regular.relative);
+                crate::safe_file::open_regular_file(&path)
+                    .map(|(_, identity)| (regular.relative.clone(), identity))
+                    .map_err(|_| {
+                        format!("prepared runtime file is unavailable: {}", regular.relative)
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(PreparedRuntime(Arc::new(ExecutionStage {
+            root: stage.clone(),
+            root_identity,
+            contents,
+            contents_identity,
+            owner,
+            owner_identity,
+            owner_pid,
+            owner_start,
+            regular_identities,
+            cleanup_on_drop: AtomicBool::new(true),
+        })))
+    })();
+    if prepared.is_err() {
+        let _ = fs::remove_dir_all(&stage);
+    }
+    prepared
+}
+
+fn staged_paths(paths: &AppPaths, stage: &Path) -> AppPaths {
+    AppPaths {
         root: paths.root.clone(),
         models: paths.models.clone(),
         config: paths.config.clone(),
@@ -156,20 +319,7 @@ fn prepare_embedded_runtime_with_hooks(
         runtime_inventory: Some(
             stage.join("Contents/Resources/loxa-runtime/b10344/inventory.json"),
         ),
-    };
-    if let Err(error) = validate_execution_stage_against_capture(&staged_paths, &captured) {
-        let _ = fs::remove_dir_all(&stage);
-        return Err(error);
     }
-    let contents_path = stage.join("Contents");
-    let (contents, _) = crate::safe_file::open_directory(&contents_path)
-        .map_err(|_| "prepared runtime Contents directory is unavailable".to_string())?;
-    Ok(PreparedRuntime(Arc::new(ExecutionStage {
-        root: stage,
-        contents,
-        owner,
-        cleanup_on_drop: AtomicBool::new(true),
-    })))
 }
 
 fn validate_execution_stage_against_capture(

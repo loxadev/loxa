@@ -2,7 +2,9 @@ use super::state::OperationPhase;
 use super::{OperationControl, OwnerCommand, OwnerExit, Shared};
 use crate::catalog::Manifest;
 use crate::paths::AppPaths;
-use crate::runner::{PersistentServer, PersistentStart, PersistentStartError};
+use crate::runner::{
+    PersistentServer, PersistentStart, PersistentStartError, ValidatedManagedRuntime,
+};
 use crate::runtime::RuntimeOwnership;
 use crate::service::intent::{self, LaunchIntent};
 use loxa_ipc::{Accepted, ErrorCategory, ServiceError};
@@ -34,6 +36,7 @@ pub(super) fn run(
         control_dir,
         ownership,
         runtime_handle,
+        retained_runtime: None,
     }
     .run(owner_rx);
     completion.drained();
@@ -46,10 +49,11 @@ struct RuntimeWorker {
     // This same owner excludes other runtimes while idle and across all loads.
     ownership: RuntimeOwnership,
     runtime_handle: tokio::runtime::Handle,
+    retained_runtime: Option<ValidatedManagedRuntime>,
 }
 
 impl RuntimeWorker {
-    fn run(self, owner_rx: Receiver<OwnerCommand>) {
+    fn run(mut self, owner_rx: Receiver<OwnerCommand>) {
         loop {
             if self.shared.draining.load(Ordering::Acquire) {
                 return;
@@ -73,7 +77,7 @@ impl RuntimeWorker {
     }
 
     fn load(
-        &self,
+        &mut self,
         operation: Arc<OperationControl>,
         accepted: oneshot::Sender<Result<Accepted, ServiceError>>,
     ) {
@@ -120,27 +124,44 @@ impl RuntimeWorker {
         let _ = accepted.send(Ok(starting));
 
         let result = resolve_manifest(&self.paths, &operation.model_id)
-            .map_err(|_| Some(ErrorCategory::ModelUnavailable))
+            .map_err(crate::runnable::ManagedRunnableError::ModelUnavailable)
             .and_then(|manifest| {
                 crate::runnable::resolve_managed_runnable_for_service(
                     manifest,
                     &self.paths,
+                    self.retained_runtime.clone(),
                     &|| self.cancellation_requested(&operation),
                 )
-                .map_err(managed_error)
             });
         let runnable = match result {
             Ok(runnable) => runnable,
+            Err(crate::runnable::ManagedRunnableError::CleanupFailed(error)) => {
+                self.retained_runtime = None;
+                tracing::error!(
+                    event = "service_runtime_probe_cleanup_failed",
+                    model_id = %operation.model_id,
+                    failure = "cleanup_failed"
+                );
+                // The intent still describes a process group whose cleanup did
+                // not complete. Keep it durable and block later loads until
+                // service recovery has reconciled that authority.
+                self.shared.state().require_recovery(&operation, &error);
+                return;
+            }
             Err(error) => {
+                self.retained_runtime = None;
                 tracing::warn!(
                     event = "service_model_admission_failed",
                     model_id = %operation.model_id,
                     failure = "model_admission"
                 );
-                self.finish_without_server(operation, launch_intent, error);
+                self.finish_without_server(operation, launch_intent, managed_error(error));
                 return;
             }
         };
+        if self.retained_runtime.is_none() && self.paths.runtime_identity.is_bundled() {
+            self.retained_runtime = runnable.managed_runtime().cloned();
+        }
         let endpoint = self
             .control_dir
             .join(format!("engine-{:016x}.sock", operation.generation));
@@ -291,6 +312,9 @@ fn managed_error(error: crate::runnable::ManagedRunnableError) -> Option<ErrorCa
     match error {
         crate::runnable::ManagedRunnableError::Conflict => Some(ErrorCategory::Conflict),
         crate::runnable::ManagedRunnableError::Cancelled => None,
+        crate::runnable::ManagedRunnableError::CleanupFailed(_) => {
+            Some(ErrorCategory::RecoveryRequired)
+        }
         crate::runnable::ManagedRunnableError::ModelUnavailable(_) => {
             Some(ErrorCategory::ModelUnavailable)
         }

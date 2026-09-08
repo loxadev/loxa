@@ -182,7 +182,8 @@ impl ApiRuntimeHost {
                 crate::runnable::ManagedRunnableError::ModelUnavailable(_diagnostic) => {
                     ApiStartError::ModelUnavailable
                 }
-                crate::runnable::ManagedRunnableError::StartupFailed(_diagnostic) => {
+                crate::runnable::ManagedRunnableError::CleanupFailed(_diagnostic)
+                | crate::runnable::ManagedRunnableError::StartupFailed(_diagnostic) => {
                     ApiStartError::StartupFailed
                 }
             })?;

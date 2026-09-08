@@ -72,6 +72,61 @@ pub fn validate_managed_runtime(paths: &AppPaths) -> Result<ValidatedManagedRunt
         .map(ValidatedManagedRuntime::path)
 }
 
+pub(crate) fn revalidate_managed_runtime_for_service(
+    paths: &AppPaths,
+    runtime: &ValidatedManagedRuntime,
+    cancelled: &impl Fn() -> bool,
+) -> Result<(), VersionProbeError> {
+    if cancelled() {
+        return Err(VersionProbeError::Cancelled);
+    }
+    runtime
+        .revalidate_for_service_reuse(paths)
+        .map_err(VersionProbeError::Failed)?;
+    if cancelled() {
+        return Err(VersionProbeError::Cancelled);
+    }
+    validate_runtime_version_for_service(paths, runtime, cancelled)
+}
+
+fn validate_runtime_version_for_service(
+    paths: &AppPaths,
+    runtime: &ValidatedManagedRuntime,
+    cancelled: &impl Fn() -> bool,
+) -> Result<(), VersionProbeError> {
+    let first_line = probe_validated_version_cancellable(runtime, cancelled)
+        .and_then(|output| managed_version_first_line(output).map_err(VersionProbeError::Failed))?;
+    if first_line == paths.runtime_identity.version_line() {
+        Ok(())
+    } else {
+        Err(VersionProbeError::Failed(format!(
+            "managed llama-server bundle is damaged at {}: expected --version first line {:?}, found {first_line:?}",
+            runtime.source_server().display(),
+            paths.runtime_identity.version_line(),
+        )))
+    }
+}
+
+pub(crate) fn validate_managed_runtime_for_service(
+    paths: &AppPaths,
+    cancelled: &impl Fn() -> bool,
+) -> Result<ValidatedManagedRuntime, VersionProbeError> {
+    if cancelled() {
+        return Err(VersionProbeError::Cancelled);
+    }
+    if paths.runtime_identity.is_bundled() {
+        let prepared = crate::runtime_bundle::prepare_embedded_runtime(paths)
+            .map_err(VersionProbeError::Failed)?;
+        if cancelled() {
+            return Err(VersionProbeError::Cancelled);
+        }
+        let runtime = ValidatedManagedRuntime::bundled(paths.managed_server.clone(), prepared);
+        revalidate_managed_runtime_for_service(paths, &runtime, cancelled)?;
+        return Ok(runtime);
+    }
+    validate_managed_runtime(paths).map_err(VersionProbeError::Failed)
+}
+
 fn validate_prepared_managed_runtime(
     runtime: &ValidatedManagedRuntime,
     runtime_identity: RuntimeIdentity,
@@ -224,6 +279,21 @@ pub(super) struct VersionProbeOutput {
     stderr: Vec<u8>,
 }
 
+pub(crate) enum VersionProbeError {
+    Cancelled,
+    CleanupFailed(String),
+    Failed(String),
+}
+
+impl VersionProbeError {
+    fn into_string(self) -> String {
+        match self {
+            Self::Cancelled => "--version probe was cancelled".into(),
+            Self::CleanupFailed(error) | Self::Failed(error) => error,
+        }
+    }
+}
+
 fn probe_version(path: &Path) -> Result<VersionProbeOutput, String> {
     probe_version_with_timeout(path, VERSION_PROBE_TIMEOUT)
 }
@@ -231,10 +301,18 @@ fn probe_version(path: &Path) -> Result<VersionProbeOutput, String> {
 pub(super) fn probe_validated_version(
     runtime: &ValidatedManagedRuntime,
 ) -> Result<VersionProbeOutput, String> {
-    probe_version_command(
+    probe_validated_version_cancellable(runtime, &|| false).map_err(VersionProbeError::into_string)
+}
+
+pub(crate) fn probe_validated_version_cancellable(
+    runtime: &ValidatedManagedRuntime,
+    cancelled: &impl Fn() -> bool,
+) -> Result<VersionProbeOutput, VersionProbeError> {
+    probe_version_command_cancellable(
         runtime.command(),
         PREPARED_VERSION_PROBE_TIMEOUT,
         runtime.process_guard(),
+        cancelled,
     )
 }
 
@@ -254,10 +332,23 @@ pub(super) fn probe_version_with_timeout(
 }
 
 fn probe_version_command(
-    mut command: Command,
+    command: Command,
     timeout: Duration,
     prepared: PreparedRuntimeGuard,
 ) -> Result<VersionProbeOutput, String> {
+    probe_version_command_cancellable(command, timeout, prepared, &|| false)
+        .map_err(VersionProbeError::into_string)
+}
+
+fn probe_version_command_cancellable(
+    mut command: Command,
+    timeout: Duration,
+    prepared: PreparedRuntimeGuard,
+    cancelled: &impl Fn() -> bool,
+) -> Result<VersionProbeOutput, VersionProbeError> {
+    if cancelled() {
+        return Err(VersionProbeError::Cancelled);
+    }
     command
         .arg("--version")
         .stdin(Stdio::null())
@@ -274,100 +365,126 @@ fn probe_version_command(
         ChildTerminationMode::Immediate,
         prepared,
         None,
-    )?;
-    let stdout = child
-        .child_mut()
-        .stdout
-        .take()
-        .ok_or_else(|| "failed to capture --version output".to_string())?;
-    let stderr = child
-        .child_mut()
-        .stderr
-        .take()
-        .ok_or_else(|| "failed to capture --version output".to_string())?;
-    let (output_sender, output_receiver) = mpsc::sync_channel(2);
-    let stdout_sender = output_sender.clone();
-    let stdout_reader = spawn_reader_thread("loxa-version-stdout", move || {
-        let mut output = Vec::new();
-        let result = stdout
-            .take(MAX_VERSION_OUTPUT)
-            .read_to_end(&mut output)
-            .map(|_| output)
-            .map_err(|error| error.to_string());
-        let _ = stdout_sender.send((false, result));
-    })?;
-    let stderr_reader = spawn_reader_thread("loxa-version-stderr", move || {
-        let mut output = Vec::new();
-        let result = stderr
-            .take(MAX_VERSION_OUTPUT)
-            .read_to_end(&mut output)
-            .map(|_| output)
-            .map_err(|error| error.to_string());
-        let _ = output_sender.send((true, result));
-    })?;
-
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        if let Some(status) = child
-            .child_mut()
-            .try_wait()
-            .map_err(|error| error.to_string())?
-        {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            if let Err(cleanup) = child.terminate() {
-                return Err(format!(
-                    "timed out after {} ms; cleanup failed: {cleanup}",
+    )
+    .map_err(VersionProbeError::Failed)?;
+    let mut stdout_reader = None;
+    let mut stderr_reader = None;
+    let result = (|| {
+        let stdout = child.child_mut().stdout.take().ok_or_else(|| {
+            VersionProbeError::Failed("failed to capture --version output".into())
+        })?;
+        let stderr = child.child_mut().stderr.take().ok_or_else(|| {
+            VersionProbeError::Failed("failed to capture --version output".into())
+        })?;
+        let (output_sender, output_receiver) = mpsc::sync_channel(2);
+        let stdout_sender = output_sender.clone();
+        stdout_reader = Some(
+            spawn_reader_thread("loxa-version-stdout", move || {
+                let mut output = Vec::new();
+                let result = stdout
+                    .take(MAX_VERSION_OUTPUT)
+                    .read_to_end(&mut output)
+                    .map(|_| output)
+                    .map_err(|error| error.to_string());
+                let _ = stdout_sender.send((false, result));
+            })
+            .map_err(VersionProbeError::Failed)?,
+        );
+        stderr_reader = Some(
+            spawn_reader_thread("loxa-version-stderr", move || {
+                let mut output = Vec::new();
+                let result = stderr
+                    .take(MAX_VERSION_OUTPUT)
+                    .read_to_end(&mut output)
+                    .map(|_| output)
+                    .map_err(|error| error.to_string());
+                let _ = output_sender.send((true, result));
+            })
+            .map_err(VersionProbeError::Failed)?,
+        );
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            if cancelled() {
+                return Err(VersionProbeError::Cancelled);
+            }
+            if let Some(status) = child
+                .child_mut()
+                .try_wait()
+                .map_err(|error| VersionProbeError::Failed(error.to_string()))?
+            {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                return Err(VersionProbeError::Failed(format!(
+                    "timed out after {} ms",
                     timeout.as_millis()
-                ));
+                )));
             }
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
-            return Err(format!("timed out after {} ms", timeout.as_millis()));
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    let output_deadline = Instant::now() + VERSION_OUTPUT_TIMEOUT;
-    let mut stdout = None;
-    let mut stderr = None;
-    for _ in 0..2 {
-        let remaining = output_deadline.saturating_duration_since(Instant::now());
-        let (is_stderr, output) = match output_receiver.recv_timeout(remaining) {
-            Ok(output) => output,
-            Err(_) => {
-                if let Err(cleanup) = child.terminate() {
-                    return Err(format!(
-                        "timed out reading --version output; cleanup failed: {cleanup}"
-                    ));
-                }
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                return Err(format!(
-                    "timed out reading --version output after {} ms",
-                    VERSION_OUTPUT_TIMEOUT.as_millis()
-                ));
-            }
+            std::thread::sleep(Duration::from_millis(10));
         };
-        if is_stderr {
-            stderr = Some(output);
-        } else {
-            stdout = Some(output);
+        let output_deadline = Instant::now() + VERSION_OUTPUT_TIMEOUT;
+        let mut stdout = None;
+        let mut stderr = None;
+        while stdout.is_none() || stderr.is_none() {
+            if cancelled() {
+                return Err(VersionProbeError::Cancelled);
+            }
+            let remaining = output_deadline.saturating_duration_since(Instant::now());
+            let (is_stderr, output) =
+                match output_receiver.recv_timeout(remaining.min(Duration::from_millis(10))) {
+                    Ok(output) => output,
+                    Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() < output_deadline => {
+                        continue
+                    }
+                    Err(_) => {
+                        return Err(VersionProbeError::Failed(format!(
+                            "timed out reading --version output after {} ms",
+                            VERSION_OUTPUT_TIMEOUT.as_millis()
+                        )))
+                    }
+                };
+            if is_stderr {
+                stderr = Some(output);
+            } else {
+                stdout = Some(output);
+            }
         }
+        if !status.success() {
+            return Err(VersionProbeError::Failed(format!("{status}")));
+        }
+        Ok(VersionProbeOutput {
+            stdout: stdout
+                .transpose()
+                .map_err(VersionProbeError::Failed)?
+                .unwrap_or_default(),
+            stderr: stderr
+                .transpose()
+                .map_err(VersionProbeError::Failed)?
+                .unwrap_or_default(),
+        })
+    })();
+    if let Err(cleanup) = child.terminate() {
+        return Err(VersionProbeError::CleanupFailed(format!(
+            "--version cleanup failed: {cleanup}"
+        )));
     }
-    stdout_reader
-        .join()
-        .map_err(|_| "--version stdout reader panicked".to_string())?;
-    stderr_reader
-        .join()
-        .map_err(|_| "--version stderr reader panicked".to_string())?;
-    if !status.success() {
-        return Err(format!("{status}"));
+    if stdout_reader
+        .take()
+        .is_some_and(|reader| reader.join().is_err())
+    {
+        return Err(VersionProbeError::Failed(
+            "--version stdout reader panicked".into(),
+        ));
     }
-    Ok(VersionProbeOutput {
-        stdout: stdout.transpose()?.unwrap_or_default(),
-        stderr: stderr.transpose()?.unwrap_or_default(),
-    })
+    if stderr_reader
+        .take()
+        .is_some_and(|reader| reader.join().is_err())
+    {
+        return Err(VersionProbeError::Failed(
+            "--version stderr reader panicked".into(),
+        ));
+    }
+    result
 }
 
 pub(super) fn managed_version_first_line(output: VersionProbeOutput) -> Result<String, String> {

@@ -218,6 +218,17 @@ impl ValidatedManagedRuntime {
         self.prepared.clone()
     }
 
+    pub(crate) fn revalidate_for_service_reuse(
+        &self,
+        paths: &crate::paths::AppPaths,
+    ) -> Result<(), String> {
+        #[cfg(unix)]
+        if let Some(prepared) = &self.prepared {
+            return prepared.revalidate_for_service_reuse(paths);
+        }
+        Err("managed runtime is not a bundled prepared runtime".into())
+    }
+
     #[cfg(not(unix))]
     pub(super) fn process_guard(&self) -> PreparedRuntimeGuard {}
 }
@@ -234,6 +245,10 @@ impl Launch {
         self.managed_runtime
             .as_ref()
             .map(ValidatedManagedRuntime::source_server)
+    }
+
+    pub(crate) fn managed_runtime(&self) -> Option<&ValidatedManagedRuntime> {
+        self.managed_runtime.as_ref()
     }
 }
 

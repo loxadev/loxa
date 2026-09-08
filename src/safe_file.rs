@@ -99,6 +99,20 @@ impl RegularFileIdentity {
         }
     }
 
+    pub(crate) fn same_stable_file(&self, current: &Self) -> bool {
+        #[cfg(unix)]
+        {
+            self.size == current.size
+                && self.device == current.device
+                && self.inode == current.inode
+                && self.links == current.links
+        }
+        #[cfg(not(unix))]
+        {
+            self == current
+        }
+    }
+
     pub(crate) fn size(&self) -> u64 {
         self.size
     }

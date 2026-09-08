@@ -1,11 +1,14 @@
 use super::arguments::resolve_requested_port;
 #[cfg(unix)]
 use super::child::{process_group_exists, terminate_owned_group, LAST_GUARDED_GROUP};
-#[cfg(target_os = "macos")]
-use super::discovery::probe_validated_version_with_timeout_for_test;
 use super::discovery::{
     managed_version_first_line, probe_validated_version, probe_version_with_timeout,
     VERSION_PROBE_TIMEOUT,
+};
+#[cfg(target_os = "macos")]
+use super::discovery::{
+    probe_validated_version_cancellable, probe_validated_version_with_timeout_for_test,
+    VersionProbeError,
 };
 use super::foreground::{
     ready_line, start_foreground_with, start_foreground_with_signal, stopped_for_signal,
@@ -317,6 +320,37 @@ fn persistent_reader_error_with_cleanup_failure_returns_retryable_server() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn version_probe_reader_failure_with_termination_fault_is_typed_cleanup_failure() {
+    let _process = process_test_lock();
+    let root = tempdir().unwrap();
+    let run_dir = root.path().join("run");
+    let stage = run_dir.join(".bundled-runtime-exec-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let server = stage.join("Contents/MacOS/llama-server");
+    std::fs::create_dir_all(server.parent().unwrap()).unwrap();
+    build_prelease_test_server(root.path(), &server);
+    let prepared = crate::runtime_bundle::PreparedRuntime::for_test(stage.clone()).unwrap();
+    let runtime = ValidatedManagedRuntime::bundled(
+        PathBuf::from("/Applications/Loxa.app/Contents/MacOS/llama-server"),
+        prepared,
+    );
+    let _reader_fault = install_reader_spawn_fault_for_test(ReaderSpawnFault::Fail);
+    let _termination_fault = crate::runtime::fail_next_owned_group_terminations_for_test(1);
+
+    let error = probe_validated_version_cancellable(&runtime, &|| false).unwrap_err();
+    assert!(
+        matches!(error, VersionProbeError::CleanupFailed(message) if message.contains("injected owned process-group termination failure"))
+    );
+    let group = LAST_GUARDED_GROUP.load(Ordering::SeqCst);
+    drop(runtime);
+    assert!(!process_group_exists(group).unwrap());
+    assert!(
+        !stage.exists(),
+        "cleanup failure abandoned a reusable stage"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn version_probe_one_shot_termination_failure_retries_before_releasing_stage() {
     let _process = process_test_lock();
     let root = tempdir().unwrap();
@@ -359,6 +393,37 @@ fn version_probe_one_shot_termination_failure_retries_before_releasing_stage() {
         !stage_survived,
         "stage survived after the exact group was gone"
     );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn cancellable_version_probe_terminates_its_exact_group() {
+    let _process = process_test_lock();
+    let root = tempdir().unwrap();
+    let run_dir = root.path().join("run");
+    let stage = run_dir.join(".bundled-runtime-exec-33333333333333333333333333333333");
+    let server = stage.join("Contents/MacOS/llama-server");
+    std::fs::create_dir_all(server.parent().unwrap()).unwrap();
+    build_prelease_test_server(root.path(), &server);
+    let prepared = crate::runtime_bundle::PreparedRuntime::for_test(stage.clone()).unwrap();
+    let runtime = ValidatedManagedRuntime::bundled(
+        PathBuf::from("/Applications/Loxa.app/Contents/MacOS/llama-server"),
+        prepared,
+    );
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let trigger = Arc::clone(&cancelled);
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(30));
+        trigger.store(true, Ordering::Release);
+    });
+    assert!(matches!(
+        probe_validated_version_cancellable(&runtime, &|| cancelled.load(Ordering::Acquire)),
+        Err(VersionProbeError::Cancelled)
+    ));
+    let group = LAST_GUARDED_GROUP.load(Ordering::SeqCst);
+    assert!(!process_group_exists(group).unwrap());
+    drop(runtime);
+    assert!(!stage.exists());
 }
 
 #[cfg(target_os = "macos")]

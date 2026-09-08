@@ -58,6 +58,10 @@ impl Runnable {
         &self.launch
     }
 
+    pub(crate) fn managed_runtime(&self) -> Option<&runner::ValidatedManagedRuntime> {
+        self.launch.managed_runtime()
+    }
+
     pub(crate) fn fingerprint(&self) -> &RuntimeFingerprint {
         &self.fingerprint
     }
@@ -108,6 +112,7 @@ enum AdmissionSource {
 pub(crate) enum ManagedRunnableError {
     Conflict,
     Cancelled,
+    CleanupFailed(String),
     ModelUnavailable(String),
     StartupFailed(String),
 }
@@ -118,7 +123,9 @@ impl ManagedRunnableError {
         match self {
             Self::Conflict => "model is busy in another Loxa command".into(),
             Self::Cancelled => "model admission was cancelled".into(),
-            Self::ModelUnavailable(message) | Self::StartupFailed(message) => message,
+            Self::CleanupFailed(message)
+            | Self::ModelUnavailable(message)
+            | Self::StartupFailed(message) => message,
         }
     }
 }
@@ -224,6 +231,7 @@ pub(crate) fn resolve_managed_runnable_for_host(
 pub(crate) fn resolve_managed_runnable_for_service(
     manifest: Manifest,
     paths: &AppPaths,
+    retained_runtime: Option<runner::ValidatedManagedRuntime>,
     cancelled: &impl Fn() -> bool,
 ) -> Result<Runnable, ManagedRunnableError> {
     let installed =
@@ -238,8 +246,35 @@ pub(crate) fn resolve_managed_runnable_for_service(
     let ctx = config::resolve_value(None, config.ctx, 4096);
     let profile = launch_profile(&manifest, &paths.models, paths.runtime_identity)
         .map_err(ManagedRunnableError::ModelUnavailable)?;
-    let server =
-        runner::validate_managed_runtime(paths).map_err(ManagedRunnableError::StartupFailed)?;
+    let server = match retained_runtime {
+        Some(runtime) => {
+            runner::revalidate_managed_runtime_for_service(paths, &runtime, cancelled).map_err(
+                |error| match error {
+                    runner::VersionProbeError::Cancelled => ManagedRunnableError::Cancelled,
+                    runner::VersionProbeError::CleanupFailed(error) => {
+                        ManagedRunnableError::CleanupFailed(error)
+                    }
+                    runner::VersionProbeError::Failed(error) => {
+                        ManagedRunnableError::StartupFailed(error)
+                    }
+                },
+            )?;
+            runtime
+        }
+        None => {
+            runner::validate_managed_runtime_for_service(paths, cancelled).map_err(|error| {
+                match error {
+                    runner::VersionProbeError::Cancelled => ManagedRunnableError::Cancelled,
+                    runner::VersionProbeError::CleanupFailed(error) => {
+                        ManagedRunnableError::CleanupFailed(error)
+                    }
+                    runner::VersionProbeError::Failed(error) => {
+                        ManagedRunnableError::StartupFailed(error)
+                    }
+                }
+            })?
+        }
+    };
     let admission_started = Instant::now();
     let (model_lock, admission) = admit_installed_for_host(&manifest, paths, cancelled)?;
     report_admission(&manifest.id, admission, admission_started);
