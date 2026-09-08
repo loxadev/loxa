@@ -108,6 +108,22 @@ fn selected_model_primary_action_is_phase_and_identity_aware() {
     let endpoint = ApiEndpoint::new("alpha".into(), 43123);
     let rows = [
         (
+            ApiRuntimePhase::CleanupFailed,
+            None,
+            "alpha",
+            "Stop API",
+            true,
+            None,
+        ),
+        (
+            ApiRuntimePhase::Stopping,
+            None,
+            "alpha",
+            "Stop API",
+            false,
+            None,
+        ),
+        (
             ApiRuntimePhase::Idle,
             None,
             "alpha",

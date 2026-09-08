@@ -6,10 +6,7 @@ use super::discovery::{
     VERSION_PROBE_TIMEOUT,
 };
 #[cfg(target_os = "macos")]
-use super::discovery::{
-    probe_validated_version_cancellable, probe_validated_version_with_timeout_for_test,
-    VersionProbeError,
-};
+use super::discovery::{probe_validated_version_cancellable, VersionProbeError};
 use super::foreground::{
     ready_line, start_foreground_with, start_foreground_with_signal, stopped_for_signal,
 };
@@ -192,7 +189,7 @@ fn bundled_prepared_closure_starts_the_exact_small_model() {
         }
         StartOutcome::CleanupFailed(_) => panic!("prepared runtime cleanup failed"),
     }
-    revalidate_managed_runtime_for_service(&paths, &retained, &|| false).unwrap_or_else(|error| {
+    revalidate_managed_runtime(&paths, &retained, &|| false).unwrap_or_else(|error| {
         panic!("retained runtime failed after real engine cleanup: {error:?}")
     });
 }
@@ -240,7 +237,7 @@ fn bundled_service_unload_preserves_stage_for_reload() {
         RuntimeFingerprint::from_manifest_for_service(&manifest, 4096, EffectiveProfile::Generic)
             .unwrap();
     for generation in 1..=2 {
-        revalidate_managed_runtime_for_service(&paths, &runtime, &|| false).unwrap();
+        revalidate_managed_runtime(&paths, &runtime, &|| false).unwrap();
         let launch = Launch {
             server: runtime.source_server().to_path_buf(),
             managed_runtime: Some(runtime.clone()),
@@ -455,8 +452,10 @@ fn version_probe_one_shot_termination_failure_retries_before_releasing_stage() {
     );
     let _fault = crate::runtime::fail_next_owned_group_terminations_for_test(1);
 
-    let error = probe_validated_version_with_timeout_for_test(&validated, Duration::from_secs(1))
-        .unwrap_err();
+    let error = probe_validated_version_cancellable(&validated, &|| {
+        root.path().join("descendant-pid").is_file()
+    })
+    .unwrap_err();
     let group = LAST_GUARDED_GROUP.load(Ordering::SeqCst);
     let descendant_was_started = root.path().join("descendant-pid").is_file();
     let group_survived = process_group_exists(group).unwrap();
@@ -469,7 +468,8 @@ fn version_probe_one_shot_termination_failure_retries_before_releasing_stage() {
         std::fs::remove_dir_all(&stage).unwrap();
     }
 
-    assert!(error.contains("injected owned process-group termination failure"));
+    assert!(matches!(error, VersionProbeError::CleanupFailed(message)
+        if message.contains("injected owned process-group termination failure")));
     assert!(
         descendant_was_started,
         "version probe did not start its descendant"
@@ -532,8 +532,10 @@ fn version_probe_persistent_termination_failure_is_reaped_on_next_acquire() {
     );
     let _fault = crate::runtime::fail_next_owned_group_terminations_for_test(2);
 
-    let error = probe_validated_version_with_timeout_for_test(&validated, Duration::from_secs(1))
-        .unwrap_err();
+    let error = probe_validated_version_cancellable(&validated, &|| {
+        root.path().join("descendant-pid").is_file()
+    })
+    .unwrap_err();
     let group = LAST_GUARDED_GROUP.load(Ordering::SeqCst);
     let descendant_was_started = root.path().join("descendant-pid").is_file();
     let group_was_retained = crate::runtime::process_group_has_live_members(group).unwrap();
@@ -554,7 +556,8 @@ fn version_probe_persistent_termination_failure_is_reaped_on_next_acquire() {
         std::fs::remove_dir_all(&stage).unwrap();
     }
 
-    assert!(error.contains("injected owned process-group termination failure"));
+    assert!(matches!(error, VersionProbeError::CleanupFailed(message)
+        if message.contains("injected owned process-group termination failure")));
     assert!(
         descendant_was_started,
         "version probe did not start its descendant"

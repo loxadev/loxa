@@ -49,7 +49,7 @@ fn retained_runtime_reuse_revalidates_child_claim_and_rejects_tampering() {
     command.arg("--version").process_group(0);
     let output = command.output().unwrap();
     assert!(output.status.success(), "{output:?}");
-    prepared.revalidate_for_service_reuse(&paths).unwrap();
+    prepared.revalidate_for_reuse(&paths).unwrap();
     drop(prepared);
 
     let prepared = super::prepare_embedded_runtime(&paths).unwrap();
@@ -61,7 +61,7 @@ fn retained_runtime_reuse_revalidates_child_claim_and_rejects_tampering() {
         .unwrap()
         .write_all(b"stage tamper")
         .unwrap();
-    assert!(prepared.revalidate_for_service_reuse(&paths).is_err());
+    assert!(prepared.revalidate_for_reuse(&paths).is_err());
     drop(prepared);
 
     let prepared = super::prepare_embedded_runtime(&paths).unwrap();
@@ -75,12 +75,12 @@ fn retained_runtime_reuse_revalidates_child_claim_and_rejects_tampering() {
         )
         .unwrap();
     prepared.0.owner.sync_all().unwrap();
-    assert!(prepared.revalidate_for_service_reuse(&paths).is_err());
+    assert!(prepared.revalidate_for_reuse(&paths).is_err());
     drop(prepared);
 
     let prepared = super::prepare_embedded_runtime(&paths).unwrap();
     prepared.abandon().unwrap();
-    assert!(prepared.revalidate_for_service_reuse(&paths).is_err());
+    assert!(prepared.revalidate_for_reuse(&paths).is_err());
     drop(prepared);
 
     let prepared = super::prepare_embedded_runtime(&paths).unwrap();
@@ -97,7 +97,7 @@ fn retained_runtime_reuse_revalidates_child_claim_and_rejects_tampering() {
         .unwrap()
         .write_all(b"source tamper")
         .unwrap();
-    assert!(prepared.revalidate_for_service_reuse(&paths).is_err());
+    assert!(prepared.revalidate_for_reuse(&paths).is_err());
 }
 
 #[test]

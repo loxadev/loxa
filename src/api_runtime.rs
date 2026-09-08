@@ -110,6 +110,8 @@ enum OwnedRuntimePoll {
 pub struct ApiRuntimeHost {
     paths: AppPaths,
     runtime: Option<Box<PersistentServer>>,
+    prepared_runtime: Option<crate::runner::ValidatedManagedRuntime>,
+    preparation_cleanup_failed: bool,
     #[cfg(test)]
     fail_next_stop: bool,
 }
@@ -119,6 +121,8 @@ impl ApiRuntimeHost {
         Self {
             paths,
             runtime: None,
+            prepared_runtime: None,
+            preparation_cleanup_failed: false,
             #[cfg(test)]
             fail_next_stop: false,
         }
@@ -131,7 +135,19 @@ impl ApiRuntimeHost {
         })
     }
 
+    pub fn preparation_requires_recovery(&self) -> bool {
+        self.preparation_cleanup_failed
+    }
+
     pub fn stop(&mut self) -> Result<ApiStopOutcome, ApiStopError> {
+        if self.preparation_cleanup_failed {
+            // Only the existing identity-checked recovery may release a failed
+            // preparation barrier. It leaves evidence intact on any uncertainty.
+            let ownership = crate::runtime::RuntimeOwnership::acquire_persistent(&self.paths.run)
+                .map_err(|_| ApiStopError)?;
+            drop(ownership);
+            self.preparation_cleanup_failed = false;
+        }
         let Some(mut runtime) = self.runtime.take() else {
             return Ok(ApiStopOutcome::AlreadyStopped);
         };
@@ -140,6 +156,47 @@ impl ApiRuntimeHost {
             return Err(ApiStopError);
         }
         Ok(ApiStopOutcome::Stopped)
+    }
+
+    /// Qualify the bundled engine before the first model load, without acquiring
+    /// a model or the common runtime lock. The caller runs this off the UI thread.
+    pub fn prepare_runtime(
+        &mut self,
+        cancellation: &ApiStartCancellation,
+    ) -> Result<(), ApiStartError> {
+        if self.preparation_cleanup_failed {
+            return Err(ApiStartError::StartupFailed);
+        }
+        if !self.paths.runtime_identity.is_bundled() || self.prepared_runtime.is_some() {
+            return Ok(());
+        }
+        let runtime = crate::runner::prepare_managed_runtime(&self.paths, None, &|| {
+            cancellation.is_cancelled()
+        })
+        .map_err(|error| self.map_preparation_error(error.into()))?;
+        self.prepared_runtime = Some(runtime);
+        Ok(())
+    }
+
+    fn map_preparation_error(
+        &mut self,
+        error: crate::runnable::ManagedRunnableError,
+    ) -> ApiStartError {
+        use crate::runnable::ManagedRunnableError;
+        match error {
+            ManagedRunnableError::Conflict => ApiStartError::Conflict,
+            ManagedRunnableError::Cancelled => ApiStartError::Cancelled,
+            ManagedRunnableError::ModelUnavailable(_diagnostic) => ApiStartError::ModelUnavailable,
+            ManagedRunnableError::CleanupFailed(_diagnostic) => {
+                self.preparation_cleanup_failed = true;
+                self.prepared_runtime = None;
+                ApiStartError::StartupFailed
+            }
+            ManagedRunnableError::StartupFailed(_diagnostic) => {
+                self.prepared_runtime = None;
+                ApiStartError::StartupFailed
+            }
+        }
     }
 
     pub fn start(
@@ -157,6 +214,9 @@ impl ApiRuntimeHost {
         after_admission: impl FnOnce(),
         after_ready: impl FnOnce(),
     ) -> Result<ApiStartOutcome, ApiStartError> {
+        if self.preparation_cleanup_failed {
+            return Err(ApiStartError::StartupFailed);
+        }
         if let Some(endpoint) = self.endpoint() {
             return if endpoint.model_id() == model_id {
                 Ok(ApiStartOutcome::AlreadyRunning(endpoint))
@@ -172,21 +232,16 @@ impl ApiRuntimeHost {
             .into_iter()
             .find(|manifest| manifest.id == model_id)
             .ok_or(ApiStartError::ModelUnavailable)?;
-        let runnable =
-            crate::runnable::resolve_managed_runnable_for_host(manifest, &self.paths, &|| {
-                cancellation.is_cancelled()
-            })
-            .map_err(|error| match error {
-                crate::runnable::ManagedRunnableError::Conflict => ApiStartError::Conflict,
-                crate::runnable::ManagedRunnableError::Cancelled => ApiStartError::Cancelled,
-                crate::runnable::ManagedRunnableError::ModelUnavailable(_diagnostic) => {
-                    ApiStartError::ModelUnavailable
-                }
-                crate::runnable::ManagedRunnableError::CleanupFailed(_diagnostic)
-                | crate::runnable::ManagedRunnableError::StartupFailed(_diagnostic) => {
-                    ApiStartError::StartupFailed
-                }
-            })?;
+        let runnable = crate::runnable::resolve_managed_runnable_for_host_reusing(
+            manifest,
+            &self.paths,
+            self.prepared_runtime.clone(),
+            &|| cancellation.is_cancelled(),
+        )
+        .map_err(|error| self.map_preparation_error(error))?;
+        if self.paths.runtime_identity.is_bundled() {
+            self.prepared_runtime = runnable.managed_runtime().cloned();
+        }
         after_admission();
         if cancellation.is_cancelled() {
             return Err(ApiStartError::Cancelled);
@@ -257,6 +312,9 @@ impl ApiRuntimeHost {
     }
 
     fn poll_owned_runtime(&mut self) -> OwnedRuntimePoll {
+        if self.preparation_cleanup_failed {
+            return OwnedRuntimePoll::CleanupFailed;
+        }
         let (port, result) = match self.runtime.as_mut() {
             Some(runtime) => (runtime.port(), runtime.poll()),
             None => return OwnedRuntimePoll::Stopped,

@@ -162,7 +162,7 @@ impl PreparedRuntime {
         Ok(())
     }
 
-    pub(crate) fn revalidate_for_service_reuse(&self, paths: &AppPaths) -> Result<(), String> {
+    pub(crate) fn revalidate_for_reuse(&self, paths: &AppPaths) -> Result<(), String> {
         if !self.0.cleanup_on_drop.load(Ordering::Acquire) {
             return Err("prepared runtime stage is abandoned".into());
         }

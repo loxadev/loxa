@@ -20,18 +20,29 @@ pub(super) struct LegacyBackend {
     pub(super) generation: Option<u64>,
     pub(super) next_generation: u64,
     pub(super) startup_cancellation: Option<ApiStartCancellation>,
+    preparation_cancellation: Option<ApiStartCancellation>,
     pub(super) probe_in_flight: bool,
     pub(super) owned_endpoint: Option<ApiEndpoint>,
 }
 
 impl LegacyBackend {
     pub(super) fn start(paths: AppPaths) -> Self {
-        Self::assemble(|requests, events| {
+        let preparation = ApiStartCancellation::new();
+        let worker_preparation = preparation.clone();
+        let mut backend = Self::assemble(|requests, events| {
             std::thread::Builder::new()
                 .name("loxa-menu-api-runtime".into())
-                .spawn(move || run_legacy_worker(Ok(ApiRuntimeHost::new(paths)), requests, events))
+                .spawn(move || {
+                    let mut host = ApiRuntimeHost::new(paths);
+                    // Ordinary preparation failures can be retried by Load.
+                    // The host retains cleanup failures as a recovery barrier.
+                    let _ = host.prepare_runtime(&worker_preparation);
+                    run_legacy_worker(Ok(host), requests, events);
+                })
                 .map_err(|_| ())
-        })
+        });
+        backend.preparation_cancellation = Some(preparation);
+        backend
     }
 
     pub(super) fn assemble(
@@ -53,6 +64,7 @@ impl LegacyBackend {
             generation: None,
             next_generation: 1,
             startup_cancellation: None,
+            preparation_cancellation: None,
             probe_in_flight: false,
             owned_endpoint: None,
         }
@@ -106,6 +118,9 @@ impl LegacyBackend {
         ) {
             return false;
         }
+        if let Some(cancellation) = &self.preparation_cancellation {
+            cancellation.cancel();
+        }
         if let Some(cancellation) = &self.startup_cancellation {
             cancellation.cancel();
         }
@@ -130,6 +145,9 @@ impl LegacyBackend {
     }
 
     pub(super) fn prepare_shutdown(&mut self) -> bool {
+        if let Some(cancellation) = &self.preparation_cancellation {
+            cancellation.cancel();
+        }
         if let Some(cancellation) = &self.startup_cancellation {
             cancellation.cancel();
         }
@@ -168,6 +186,9 @@ impl LegacyBackend {
     }
 
     pub(super) fn shutdown_and_join(&mut self) -> Result<(), ApiRuntimeShutdownError> {
+        if let Some(cancellation) = &self.preparation_cancellation {
+            cancellation.cancel();
+        }
         if let Some(cancellation) = &self.startup_cancellation {
             cancellation.cancel();
         }
@@ -233,6 +254,20 @@ impl LegacyBackend {
 
     pub(super) fn apply(&mut self, event: LegacyEvent) -> bool {
         match event {
+            LegacyEvent::PreparationCleanupFailed { generation } => {
+                if generation != self.generation
+                    || !matches!(
+                        self.state.phase,
+                        ApiRuntimePhase::Idle | ApiRuntimePhase::Starting { .. }
+                    )
+                {
+                    return false;
+                }
+                self.startup_cancellation = None;
+                self.state.notice = Some(ApiRuntimeNotice::CleanupFailed);
+                self.state.phase = ApiRuntimePhase::CleanupFailed;
+                true
+            }
             LegacyEvent::Started {
                 generation,
                 outcome,
@@ -331,7 +366,6 @@ impl LegacyBackend {
                 result,
                 endpoint,
             } if matches!(self.state.phase, ApiRuntimePhase::Stopping)
-                && generation.is_some()
                 && generation == self.generation =>
             {
                 self.startup_cancellation = None;
@@ -367,5 +401,96 @@ impl LegacyBackend {
         self.startup_cancellation = None;
         self.probe_in_flight = false;
         self.state.fail();
+    }
+}
+
+#[cfg(test)]
+mod preparation_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    struct FailedPreparation(bool);
+
+    impl worker::RuntimeHost for FailedPreparation {
+        fn preparation_requires_recovery(&self) -> bool {
+            self.0
+        }
+        fn endpoint(&self) -> Option<ApiEndpoint> {
+            None
+        }
+        fn start(&mut self, _: &str, _: &ApiStartCancellation) -> StartOutcome {
+            StartOutcome::StartupFailed
+        }
+        fn stop(&mut self) -> Result<(), ()> {
+            self.0 = false;
+            Ok(())
+        }
+        fn activity(&mut self) -> ApiRuntimeActivity {
+            ApiRuntimeActivity::Unknown
+        }
+    }
+
+    fn drain_until(backend: &mut LegacyBackend, expected: ApiRuntimePhase) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while backend.state.phase != expected {
+            assert!(
+                Instant::now() < deadline,
+                "worker did not reach {expected:?}"
+            );
+            backend.drain();
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn preparation_cleanup_failure_can_be_retried_without_a_model_endpoint() {
+        for load_queued in [false, true] {
+            let mut backend = LegacyBackend::assemble(|requests, events| {
+                std::thread::Builder::new()
+                    .spawn(move || {
+                        run_legacy_worker(Ok(FailedPreparation(true)), requests, events);
+                    })
+                    .map_err(|_| ())
+            });
+            if load_queued {
+                assert!(backend.request_start("demo".into()));
+            }
+            drain_until(&mut backend, ApiRuntimePhase::CleanupFailed);
+            assert!(backend.owned_endpoint.is_none());
+            assert!(backend.request_stop());
+            drain_until(&mut backend, ApiRuntimePhase::Idle);
+            backend.shutdown_and_join().unwrap();
+        }
+    }
+
+    #[test]
+    fn idle_shutdown_cancels_preparation_before_waiting_for_the_worker() {
+        let preparation = ApiStartCancellation::new();
+        let observed = preparation.clone();
+        let mut backend = LegacyBackend::assemble(|requests, _events| {
+            std::thread::Builder::new()
+                .spawn(move || {
+                    let LegacyRequest::Shutdown { reply } = requests.recv().unwrap() else {
+                        panic!("expected shutdown");
+                    };
+                    assert!(observed.is_cancelled());
+                    reply
+                        .send(LegacyShutdownReply {
+                            generation: None,
+                            result: Ok(()),
+                            endpoint: None,
+                        })
+                        .unwrap();
+                })
+                .map_err(|_| ())
+        });
+        backend.preparation_cancellation = Some(preparation);
+        assert!(!backend.prepare_shutdown());
+        assert!(backend
+            .preparation_cancellation
+            .as_ref()
+            .unwrap()
+            .is_cancelled());
+        backend.shutdown_and_join().unwrap();
     }
 }

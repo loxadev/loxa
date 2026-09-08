@@ -23,6 +23,93 @@ fn process_test_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 #[cfg(unix)]
+#[test]
+fn failed_preparation_requires_successful_recovery_before_another_load() {
+    let _process = process_test_lock();
+    let fixture = InstalledFixture::new();
+    let mut host = ApiRuntimeHost::new(fixture.paths.clone());
+    host.map_preparation_error(crate::runnable::ManagedRunnableError::CleanupFailed(
+        "injected probe cleanup failure".into(),
+    ));
+    assert_eq!(host.probe(), ApiRuntimeProbe::CleanupFailed);
+    assert_eq!(
+        host.start("demo", &ApiStartCancellation::new()),
+        Err(ApiStartError::StartupFailed)
+    );
+    let owner = RuntimeOwnership::acquire(&fixture.paths.run).unwrap();
+    assert_eq!(host.stop(), Err(ApiStopError));
+    assert!(host.preparation_cleanup_failed);
+    assert_eq!(fixture.launch_count(), 0);
+    drop(owner);
+    assert_eq!(host.stop(), Ok(ApiStopOutcome::AlreadyStopped));
+    assert!(!host.preparation_cleanup_failed);
+    assert!(matches!(
+        host.start("demo", &ApiStartCancellation::new()),
+        Ok(ApiStartOutcome::Started(_))
+    ));
+    host.stop().unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires a finalized built app and the installed small-model fixture"]
+fn bundled_host_prepares_without_ownership_and_reuses_across_model_loads() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let _process = process_test_lock();
+    let app = PathBuf::from(std::env::var_os("LOXA_BUILT_APP").unwrap());
+    let model = PathBuf::from(std::env::var_os("LOXA_SMALL_MODEL").unwrap());
+    let manifest_bytes = fs::read(model.with_file_name("manifest.json")).unwrap();
+    let manifest: Manifest = serde_json::from_slice(&manifest_bytes).unwrap();
+    let root = tempfile::Builder::new()
+        .prefix("loxa-host-reuse-")
+        .tempdir_in("/private/tmp")
+        .unwrap();
+    let paths = AppPaths::from_application_values(
+        &app.join("Contents/MacOS/loxa-app"),
+        Some(root.path()),
+        None,
+    )
+    .unwrap();
+    let model_dir = paths.model_dir(&manifest.id).unwrap();
+    fs::create_dir_all(&model_dir).unwrap();
+    fs::copy(&model, model_dir.join(&manifest.local_filename)).unwrap();
+    fs::write(model_dir.join("manifest.json"), manifest_bytes).unwrap();
+    drop(ModelLock::acquire(&model_dir).unwrap());
+    let mut host = ApiRuntimeHost::new(paths.clone());
+    let started = Instant::now();
+    host.prepare_runtime(&ApiStartCancellation::new()).unwrap();
+    eprintln!("background preparation: {:?}", started.elapsed());
+    assert!(host.endpoint().is_none());
+    assert!(!paths.run.join("foreground.json").exists());
+    drop(RuntimeOwnership::acquire(&paths.run).unwrap());
+    let executable = host.prepared_runtime.as_ref().unwrap().execution_server();
+    let inode = fs::metadata(&executable).unwrap().ino();
+    for _ in 0..2 {
+        let started = Instant::now();
+        let result = host.start(&manifest.id, &ApiStartCancellation::new());
+        assert!(
+            matches!(result, Ok(ApiStartOutcome::Started(_))),
+            "model load: {result:?}"
+        );
+        eprintln!("prepared model load: {:?}", started.elapsed());
+        let lease: serde_json::Value =
+            serde_json::from_slice(&fs::read(paths.run.join("foreground.json")).unwrap()).unwrap();
+        assert_eq!(lease["owner_mode"], "persistent_app");
+        assert_eq!(lease["server"], executable.to_str().unwrap());
+        host.stop().unwrap();
+        assert!(!paths.run.join("foreground.json").exists());
+        assert_eq!(fs::metadata(&executable).unwrap().ino(), inode);
+        drop(RuntimeOwnership::acquire(&paths.run).unwrap());
+    }
+    drop(host);
+    assert!(
+        !executable.exists(),
+        "host drop must release its retained stage"
+    );
+}
+
+#[cfg(unix)]
 fn write_executable(path: &Path, bytes: &[u8]) {
     use std::os::unix::fs::PermissionsExt;
 

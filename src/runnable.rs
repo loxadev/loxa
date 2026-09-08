@@ -109,12 +109,23 @@ enum AdmissionSource {
     Local(catalog::local::Candidate),
 }
 
+#[derive(Debug)]
 pub(crate) enum ManagedRunnableError {
     Conflict,
     Cancelled,
     CleanupFailed(String),
     ModelUnavailable(String),
     StartupFailed(String),
+}
+
+impl From<runner::VersionProbeError> for ManagedRunnableError {
+    fn from(error: runner::VersionProbeError) -> Self {
+        match error {
+            runner::VersionProbeError::Cancelled => Self::Cancelled,
+            runner::VersionProbeError::CleanupFailed(error) => Self::CleanupFailed(error),
+            runner::VersionProbeError::Failed(error) => Self::StartupFailed(error),
+        }
+    }
 }
 
 impl ManagedRunnableError {
@@ -218,14 +229,27 @@ pub(crate) fn resolve_managed_runnable(
         .map_err(ManagedRunnableError::into_message)
 }
 
+#[cfg(test)]
 pub(crate) fn resolve_managed_runnable_for_host(
     manifest: Manifest,
     paths: &AppPaths,
     cancelled: &impl Fn() -> bool,
 ) -> Result<Runnable, ManagedRunnableError> {
-    resolve_managed_runnable_with_admission(manifest, paths, |manifest, paths| {
-        admit_installed_for_host(manifest, paths, cancelled)
-    })
+    resolve_managed_runnable_for_host_reusing(manifest, paths, None, cancelled)
+}
+
+pub(crate) fn resolve_managed_runnable_for_host_reusing(
+    manifest: Manifest,
+    paths: &AppPaths,
+    retained: Option<runner::ValidatedManagedRuntime>,
+    cancelled: &impl Fn() -> bool,
+) -> Result<Runnable, ManagedRunnableError> {
+    resolve_managed_runnable_with_admission(
+        manifest,
+        paths,
+        || runner::prepare_managed_runtime(paths, retained, cancelled).map_err(Into::into),
+        |manifest, paths| admit_installed_for_host(manifest, paths, cancelled),
+    )
 }
 
 pub(crate) fn resolve_managed_runnable_for_service(
@@ -246,35 +270,7 @@ pub(crate) fn resolve_managed_runnable_for_service(
     let ctx = config::resolve_value(None, config.ctx, 4096);
     let profile = launch_profile(&manifest, &paths.models, paths.runtime_identity)
         .map_err(ManagedRunnableError::ModelUnavailable)?;
-    let server = match retained_runtime {
-        Some(runtime) => {
-            runner::revalidate_managed_runtime_for_service(paths, &runtime, cancelled).map_err(
-                |error| match error {
-                    runner::VersionProbeError::Cancelled => ManagedRunnableError::Cancelled,
-                    runner::VersionProbeError::CleanupFailed(error) => {
-                        ManagedRunnableError::CleanupFailed(error)
-                    }
-                    runner::VersionProbeError::Failed(error) => {
-                        ManagedRunnableError::StartupFailed(error)
-                    }
-                },
-            )?;
-            runtime
-        }
-        None => {
-            runner::validate_managed_runtime_for_service(paths, cancelled).map_err(|error| {
-                match error {
-                    runner::VersionProbeError::Cancelled => ManagedRunnableError::Cancelled,
-                    runner::VersionProbeError::CleanupFailed(error) => {
-                        ManagedRunnableError::CleanupFailed(error)
-                    }
-                    runner::VersionProbeError::Failed(error) => {
-                        ManagedRunnableError::StartupFailed(error)
-                    }
-                }
-            })?
-        }
-    };
+    let server = runner::prepare_managed_runtime(paths, retained_runtime, cancelled)?;
     let admission_started = Instant::now();
     let (model_lock, admission) = admit_installed_for_host(&manifest, paths, cancelled)?;
     report_admission(&manifest.id, admission, admission_started);
@@ -303,6 +299,7 @@ pub(crate) fn resolve_managed_runnable_for_service(
 fn resolve_managed_runnable_with_admission(
     manifest: Manifest,
     paths: &AppPaths,
+    prepare: impl FnOnce() -> Result<runner::ValidatedManagedRuntime, ManagedRunnableError>,
     admit: impl FnOnce(
         &Manifest,
         &AppPaths,
@@ -324,8 +321,7 @@ fn resolve_managed_runnable_with_admission(
             ManagedRunnableError::ModelUnavailable(message)
         }
     })?;
-    let server =
-        runner::validate_managed_runtime(paths).map_err(ManagedRunnableError::StartupFailed)?;
+    let server = prepare()?;
     let admission_started = Instant::now();
     let (model_lock, admission) = admit(&manifest, paths)?;
     report_admission(&manifest.id, admission, admission_started);
@@ -364,21 +360,27 @@ fn resolve_managed_runnable_with_test_admission(
     manifest: Manifest,
     paths: &AppPaths,
 ) -> Result<Runnable, ManagedRunnableError> {
-    resolve_managed_runnable_with_admission(manifest, paths, |manifest, paths| {
-        let model_dir = paths
-            .model_dir(&manifest.id)
-            .map_err(ManagedRunnableError::ModelUnavailable)?;
-        let model_lock =
-            catalog::ModelLock::acquire_existing(&model_dir).map_err(|error| match error {
-                catalog::ModelLockError::Busy => ManagedRunnableError::Conflict,
-                catalog::ModelLockError::Missing | catalog::ModelLockError::UnsafeLocalState => {
-                    ManagedRunnableError::ModelUnavailable(
-                        "installed model state is unavailable".into(),
-                    )
-                }
-            })?;
-        Ok((model_lock, verification::Admission::ReceiptHit))
-    })
+    resolve_managed_runnable_with_admission(
+        manifest,
+        paths,
+        || runner::validate_managed_runtime(paths).map_err(ManagedRunnableError::StartupFailed),
+        |manifest, paths| {
+            let model_dir = paths
+                .model_dir(&manifest.id)
+                .map_err(ManagedRunnableError::ModelUnavailable)?;
+            let model_lock =
+                catalog::ModelLock::acquire_existing(&model_dir).map_err(|error| match error {
+                    catalog::ModelLockError::Busy => ManagedRunnableError::Conflict,
+                    catalog::ModelLockError::Missing
+                    | catalog::ModelLockError::UnsafeLocalState => {
+                        ManagedRunnableError::ModelUnavailable(
+                            "installed model state is unavailable".into(),
+                        )
+                    }
+                })?;
+            Ok((model_lock, verification::Admission::ReceiptHit))
+        },
+    )
 }
 
 pub(crate) fn expected_persistent_fingerprints(
@@ -1011,7 +1013,13 @@ mod tests {
         drop(first);
         drop(ModelLock::acquire(&model_dir).unwrap());
 
-        let second = match resolve_managed_runnable_for_host(manifest, &paths, &|| true) {
+        let (receipt_lock, admission) = admit_installed_for_host(&manifest, &paths, &|| {
+            panic!("an unchanged receipt must not hash the model")
+        })
+        .unwrap();
+        assert_eq!(admission, verification::Admission::ReceiptHit);
+        drop(receipt_lock);
+        let second = match resolve_managed_runnable_for_host(manifest, &paths, &|| false) {
             Ok(runnable) => runnable,
             Err(_) => panic!("an unchanged receipt hit consulted cancellation during hashing"),
         };
@@ -1053,7 +1061,7 @@ mod tests {
             let polls = Cell::new(0_usize);
             let receipt_was_published = Cell::new(false);
 
-            let result = resolve_managed_runnable_for_host(manifest, &paths, &|| {
+            let result = admit_installed_for_host(&manifest, &paths, &|| {
                 receipt_was_published.set(receipt_was_published.get() || receipt.exists());
                 let next = polls.get() + 1;
                 polls.set(next);

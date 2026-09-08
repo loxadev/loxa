@@ -356,6 +356,12 @@ impl ApiPresentation {
             };
         }
         match (self.phase, self.active_model_id()) {
+            (ApiPresentationPhase::CleanupFailed, None) => ApiPrimaryAction {
+                kind: ApiPrimaryActionKind::Stop,
+                enabled: true,
+                disabled_reason: None,
+                shared_service: self.shared_service,
+            },
             (
                 ApiPresentationPhase::Starting
                 | ApiPresentationPhase::Ready
@@ -367,7 +373,7 @@ impl ApiPresentation {
                 disabled_reason: None,
                 shared_service: self.shared_service,
             },
-            (ApiPresentationPhase::Stopping, Some(_)) => ApiPrimaryAction {
+            (ApiPresentationPhase::Stopping, _) => ApiPrimaryAction {
                 kind: ApiPrimaryActionKind::Stop,
                 enabled: false,
                 disabled_reason: None,

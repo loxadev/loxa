@@ -261,7 +261,10 @@ impl RuntimeChildOwnership {
         let Some(expected) = self.lease.as_ref() else {
             return self.clear();
         };
-        if expected.owner_mode != Some(LeaseOwnerMode::Service) {
+        if !matches!(
+            expected.owner_mode,
+            Some(LeaseOwnerMode::Service | LeaseOwnerMode::PersistentApp)
+        ) {
             return self.clear();
         }
         let state_path = self.state_path()?;

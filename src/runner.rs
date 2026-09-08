@@ -15,12 +15,12 @@ mod signal;
 
 pub(crate) use arguments::build_persistent_args_for_fingerprint;
 pub(crate) use discovery::discover_from_process;
+#[cfg(test)]
+pub(crate) use discovery::revalidate_managed_runtime;
 #[allow(unused_imports)]
 pub(crate) use discovery::validate_managed_server;
 pub use discovery::{discover_server, validate_managed_runtime};
-pub(crate) use discovery::{
-    revalidate_managed_runtime_for_service, validate_managed_runtime_for_service, VersionProbeError,
-};
+pub(crate) use discovery::{prepare_managed_runtime, VersionProbeError};
 pub use foreground::run;
 pub(crate) use foreground::{run_launch, start_foreground, ForegroundServer, ForegroundStart};
 pub use launch::ValidatedManagedRuntime;

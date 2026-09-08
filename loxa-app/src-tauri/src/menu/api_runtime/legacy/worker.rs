@@ -8,6 +8,9 @@ use loxa::api_runtime::{
 use crate::menu::api_runtime::{ApiEndpoint, StartOutcome};
 
 pub(in crate::menu) trait RuntimeHost: Send + 'static {
+    fn preparation_requires_recovery(&self) -> bool {
+        false
+    }
     fn endpoint(&self) -> Option<ApiEndpoint>;
     fn start(&mut self, model_id: &str, cancellation: &ApiStartCancellation) -> StartOutcome;
     fn stop(&mut self) -> Result<(), ()>;
@@ -18,6 +21,9 @@ pub(in crate::menu) trait RuntimeHost: Send + 'static {
 }
 
 impl RuntimeHost for ApiRuntimeHost {
+    fn preparation_requires_recovery(&self) -> bool {
+        ApiRuntimeHost::preparation_requires_recovery(self)
+    }
     fn endpoint(&self) -> Option<ApiEndpoint> {
         ApiRuntimeHost::endpoint(self)
             .map(|endpoint| ApiEndpoint::legacy(endpoint.model_id().to_owned(), endpoint.port()))
@@ -66,6 +72,9 @@ pub(in crate::menu) enum LegacyRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::menu) enum LegacyEvent {
+    PreparationCleanupFailed {
+        generation: Option<u64>,
+    },
     Started {
         generation: u64,
         outcome: StartOutcome,
@@ -117,6 +126,13 @@ pub(in crate::menu) fn run_legacy_worker<H: RuntimeHost>(
         return;
     };
     let mut active_generation = None;
+    if host.preparation_requires_recovery()
+        && messages
+            .send(LegacyEvent::PreparationCleanupFailed { generation: None })
+            .is_err()
+    {
+        return;
+    }
 
     while let Ok(request) = requests.recv() {
         match request {
@@ -127,6 +143,17 @@ pub(in crate::menu) fn run_legacy_worker<H: RuntimeHost>(
             } => {
                 active_generation = Some(generation);
                 let mut outcome = host.start(&model_id, &cancellation);
+                if host.preparation_requires_recovery() {
+                    if messages
+                        .send(LegacyEvent::PreparationCleanupFailed {
+                            generation: Some(generation),
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                }
                 if !matches!(outcome, StartOutcome::Ready(_)) {
                     if let Some(endpoint) = host.endpoint() {
                         outcome = StartOutcome::CleanupFailed(endpoint);

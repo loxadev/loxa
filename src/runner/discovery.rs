@@ -72,7 +72,7 @@ pub fn validate_managed_runtime(paths: &AppPaths) -> Result<ValidatedManagedRunt
         .map(ValidatedManagedRuntime::path)
 }
 
-pub(crate) fn revalidate_managed_runtime_for_service(
+pub(crate) fn revalidate_managed_runtime(
     paths: &AppPaths,
     runtime: &ValidatedManagedRuntime,
     cancelled: &impl Fn() -> bool,
@@ -81,15 +81,29 @@ pub(crate) fn revalidate_managed_runtime_for_service(
         return Err(VersionProbeError::Cancelled);
     }
     runtime
-        .revalidate_for_service_reuse(paths)
+        .revalidate_for_reuse(paths)
         .map_err(VersionProbeError::Failed)?;
     if cancelled() {
         return Err(VersionProbeError::Cancelled);
     }
-    validate_runtime_version_for_service(paths, runtime, cancelled)
+    validate_runtime_version_cancellable(paths, runtime, cancelled)
 }
 
-fn validate_runtime_version_for_service(
+pub(crate) fn prepare_managed_runtime(
+    paths: &AppPaths,
+    retained: Option<ValidatedManagedRuntime>,
+    cancelled: &impl Fn() -> bool,
+) -> Result<ValidatedManagedRuntime, VersionProbeError> {
+    match retained {
+        Some(runtime) => {
+            revalidate_managed_runtime(paths, &runtime, cancelled)?;
+            Ok(runtime)
+        }
+        None => validate_managed_runtime_cancellable(paths, cancelled),
+    }
+}
+
+fn validate_runtime_version_cancellable(
     paths: &AppPaths,
     runtime: &ValidatedManagedRuntime,
     cancelled: &impl Fn() -> bool,
@@ -107,7 +121,7 @@ fn validate_runtime_version_for_service(
     }
 }
 
-pub(crate) fn validate_managed_runtime_for_service(
+pub(crate) fn validate_managed_runtime_cancellable(
     paths: &AppPaths,
     cancelled: &impl Fn() -> bool,
 ) -> Result<ValidatedManagedRuntime, VersionProbeError> {
@@ -121,7 +135,7 @@ pub(crate) fn validate_managed_runtime_for_service(
             return Err(VersionProbeError::Cancelled);
         }
         let runtime = ValidatedManagedRuntime::bundled(paths.managed_server.clone(), prepared);
-        revalidate_managed_runtime_for_service(paths, &runtime, cancelled)?;
+        revalidate_managed_runtime(paths, &runtime, cancelled)?;
         return Ok(runtime);
     }
     validate_managed_runtime(paths).map_err(VersionProbeError::Failed)
@@ -315,14 +329,6 @@ pub(crate) fn probe_validated_version_cancellable(
         runtime.process_guard(),
         cancelled,
     )
-}
-
-#[cfg(all(test, target_os = "macos"))]
-pub(super) fn probe_validated_version_with_timeout_for_test(
-    runtime: &ValidatedManagedRuntime,
-    timeout: Duration,
-) -> Result<VersionProbeOutput, String> {
-    probe_version_command(runtime.command(), timeout, runtime.process_guard())
 }
 
 pub(super) fn probe_version_with_timeout(
