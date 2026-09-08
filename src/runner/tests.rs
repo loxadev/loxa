@@ -196,16 +196,25 @@ fn bundled_prepared_closure_starts_the_exact_small_model() {
 
 #[cfg(target_os = "macos")]
 #[test]
-#[ignore = "requires a finalized built app and the installed small-model fixture"]
+#[ignore = "requires a finalized built app and the exact small-model fixture"]
 fn bundled_service_unload_preserves_stage_for_reload() {
     use std::os::unix::fs::MetadataExt as _;
 
     let _process = process_test_lock();
     let app = PathBuf::from(std::env::var_os("LOXA_BUILT_APP").unwrap());
     let model = PathBuf::from(std::env::var_os("LOXA_SMALL_MODEL").unwrap());
-    let manifest: Manifest =
-        serde_json::from_slice(&std::fs::read(model.with_file_name("manifest.json")).unwrap())
-            .unwrap();
+    let manifest: Manifest = serde_json::from_value(serde_json::json!({
+        "version": 1,
+        "id": "loxa-service-reuse",
+        "repo": "bartowski/SmolLM2-135M-Instruct-GGUF",
+        "revision": "09816acd5d99df7be770d85ea30822623dab342c",
+        "remote_filename": "SmolLM2-135M-Instruct-Q2_K.gguf",
+        "local_filename": "model.gguf",
+        "sha256": "741ad12b64088fedc17c33aacb22e48be1972ef36a39f03666dd68bd15614fb9",
+        "size": 88_202_080,
+    }))
+    .unwrap();
+    assert_eq!(std::fs::metadata(&model).unwrap().len(), manifest.size);
     let root = tempfile::Builder::new()
         .prefix("loxa-reload-")
         .tempdir_in("/private/tmp")
