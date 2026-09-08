@@ -42,7 +42,7 @@ struct CommandHint;
 
 impl Hint for CommandHint {
     fn display(&self) -> &str {
-        "  /clear  /help  /exit"
+        "  (Tab for commands)"
     }
 
     fn completion(&self) -> Option<&str> {
@@ -78,7 +78,11 @@ impl Hinter for ChatHelper {
     }
 }
 
-impl Highlighter for ChatHelper {}
+impl Highlighter for ChatHelper {
+    fn highlight_hint<'h>(&self, hint: &'h str) -> std::borrow::Cow<'h, str> {
+        std::borrow::Cow::Owned(format!("\x1b[2m{hint}\x1b[0m"))
+    }
+}
 impl Validator for ChatHelper {
     fn validate(&self, context: &mut ValidationContext<'_>) -> rustyline::Result<ValidationResult> {
         if continues_on_next_line(context.input()) {
@@ -621,7 +625,7 @@ mod tests {
 
         let hint = ChatHelper.hint("/", 1, &context).unwrap();
 
-        assert_eq!(hint.display(), "  /clear  /help  /exit");
+        assert_eq!(hint.display(), "  (Tab for commands)");
         assert_eq!(hint.completion(), None);
     }
 
