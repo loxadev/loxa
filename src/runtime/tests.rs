@@ -15,7 +15,7 @@ fn fingerprint_value() -> serde_json::Value {
         "model_id": "demo",
         "effective_context": 4096,
         "effective_profile": "generic",
-        "sleep_policy": 60,
+        "sleep_policy": 300,
         "primary": {
             "local_filename": "model.gguf",
             "sha256": "a".repeat(64),
@@ -1274,7 +1274,7 @@ fn stale_recovery_removes_only_the_exact_orphaned_execution_stage() {
 }
 
 #[test]
-fn recovery_reconciles_a_prior_300_second_persistent_lease_before_removal() {
+fn recovery_reconciles_a_prior_60_second_persistent_lease_before_removal() {
     let dir = tempdir().unwrap();
     let state_path = dir.path().join("foreground.json");
     let witness = dir.path().join("lease-at-termination");
@@ -1285,7 +1285,7 @@ fn recovery_reconciles_a_prior_300_second_persistent_lease_before_removal() {
     let group = i32::try_from(pid).unwrap();
     let snapshot = process_snapshot(pid).unwrap().unwrap();
     let mut fingerprint = fingerprint_value();
-    fingerprint["sleep_policy"] = serde_json::json!(300);
+    fingerprint["sleep_policy"] = serde_json::json!(60);
     let mut lease = lease_value(PERSISTENT_LEASE_VERSION);
     lease["owner_mode"] = serde_json::json!("persistent_app");
     lease["fingerprint"] = fingerprint;

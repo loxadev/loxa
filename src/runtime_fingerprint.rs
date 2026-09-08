@@ -3,11 +3,11 @@ use serde::{Deserialize, Serialize};
 
 const FINGERPRINT_SCHEMA_VERSION: u32 = 1;
 const SERVICE_FINGERPRINT_SCHEMA_VERSION: u32 = 2;
-pub(crate) const PERSISTENT_SLEEP_IDLE_SECONDS: u64 = 60;
+pub(crate) const PERSISTENT_SLEEP_IDLE_SECONDS: u64 = 300;
 pub(crate) const SERVICE_MIN_CONTEXT: u32 = 512;
 pub(crate) const SERVICE_MAX_CONTEXT: u32 = 32_768;
 // Prior schema-1 leases must remain decodable so recovery can terminate their exact child.
-const LEGACY_PERSISTENT_SLEEP_IDLE_SECONDS: u64 = 300;
+const LEGACY_PERSISTENT_SLEEP_IDLE_SECONDS: u64 = 60;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -579,7 +579,7 @@ mod tests {
     #[test]
     fn legacy_sleep_policy_is_decode_and_recovery_only() {
         let mut generic = generic_fingerprint();
-        generic["sleep_policy"] = serde_json::json!(300);
+        generic["sleep_policy"] = serde_json::json!(60);
         let mut mtp = generic.clone();
         mtp["effective_profile"] = serde_json::json!("gemma4_mtp");
         mtp["draft"] = artifact("draft.gguf", &"b".repeat(64), 1);
@@ -635,7 +635,7 @@ mod tests {
             &mtp,
             8192,
             EffectiveProfile::Gemma4Mtp,
-            Some(60),
+            Some(300),
         )
         .is_ok());
         let mut uppercase_sha = generic.clone();
@@ -674,28 +674,28 @@ mod tests {
                 generic.clone(),
                 4096,
                 EffectiveProfile::Generic,
-                Some(300),
+                Some(60),
             ),
             (
                 "generic with draft",
                 mtp.clone(),
                 8192,
                 EffectiveProfile::Generic,
-                Some(60),
+                Some(300),
             ),
             (
                 "MTP without draft",
                 mtp_without_draft,
                 8192,
                 EffectiveProfile::Gemma4Mtp,
-                Some(60),
+                Some(300),
             ),
             (
                 "direct primary-only",
                 generic,
                 4096,
                 EffectiveProfile::PrimaryOnly,
-                Some(60),
+                Some(300),
             ),
         ] {
             assert!(

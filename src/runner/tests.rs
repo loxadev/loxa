@@ -1565,7 +1565,7 @@ fn attachment_argv_rebuilds_each_persistent_profile_from_the_exact_fingerprint()
             "model_id": "demo",
             "effective_context": 4096,
             "effective_profile": "generic",
-            "sleep_policy": 60,
+            "sleep_policy": 300,
             "primary": {
                 "local_filename": "model.gguf",
                 "sha256": "a".repeat(64),
@@ -1580,7 +1580,7 @@ fn attachment_argv_rebuilds_each_persistent_profile_from_the_exact_fingerprint()
             "model_id": "demo",
             "effective_context": 8192,
             "effective_profile": "gemma4_mtp",
-            "sleep_policy": 60,
+            "sleep_policy": 300,
             "primary": {
                 "local_filename": "model.gguf",
                 "sha256": "a".repeat(64),
@@ -1615,7 +1615,7 @@ fn attachment_argv_rebuilds_each_persistent_profile_from_the_exact_fingerprint()
         "--reasoning",
         "off",
         "--sleep-idle-seconds",
-        "60",
+        "300",
     ]
     .map(OsString::from)
     .to_vec();
@@ -1649,7 +1649,7 @@ fn attachment_argv_rebuilds_each_persistent_profile_from_the_exact_fingerprint()
         "--n-gpu-layers-draft",
         "all",
         "--sleep-idle-seconds",
-        "60",
+        "300",
     ]
     .map(OsString::from)
     .to_vec();
@@ -1675,7 +1675,7 @@ fn attachment_argv_rebuilds_each_persistent_profile_from_the_exact_fingerprint()
         "--reasoning",
         "off",
         "--sleep-idle-seconds",
-        "60",
+        "300",
     ]
     .map(OsString::from)
     .to_vec();
@@ -1720,7 +1720,7 @@ fn persistent_argv_adds_one_sleep_policy_without_changing_foreground_or_fallback
         .filter_map(|(index, argument)| (argument == "--sleep-idle-seconds").then_some(index))
         .collect::<Vec<_>>();
     assert_eq!(sleep_positions.len(), 1);
-    assert_eq!(persistent_args[sleep_positions[0] + 1], "60");
+    assert_eq!(persistent_args[sleep_positions[0] + 1], "300");
 
     for launch in [&foreground, &foreground_mtp, &foreground_fallback] {
         assert!(
@@ -2148,7 +2148,7 @@ fn persistent_publication_carries_the_exact_whole_fingerprint() {
     assert_eq!(lease["owner_mode"], "persistent_app");
     assert_eq!(lease["fingerprint"], expected_fingerprint);
     assert_eq!(lease["managed_source"], serde_json::Value::Null);
-    assert_eq!(lease["fingerprint"]["sleep_policy"], 60);
+    assert_eq!(lease["fingerprint"]["sleep_policy"], 300);
     assert_eq!(lease["model_id"], lease["fingerprint"]["model_id"]);
 
     server.terminate().unwrap();
@@ -2241,7 +2241,7 @@ fn persistent_mtp_fallback_transforms_fingerprint_and_keeps_sleep_policy() {
         EffectiveProfile::PrimaryOnly
     );
     assert!(server.fingerprint().draft().is_none());
-    assert_eq!(server.fingerprint().sleep_policy(), Some(60));
+    assert_eq!(server.fingerprint().sleep_policy(), Some(300));
     let lease: serde_json::Value =
         serde_json::from_slice(&std::fs::read(run_dir.join("foreground.json")).unwrap()).unwrap();
     assert_eq!(lease["owner_mode"], "persistent_app");
@@ -2251,7 +2251,7 @@ fn persistent_mtp_fallback_transforms_fingerprint_and_keeps_sleep_policy() {
     );
     assert_eq!(lease["fingerprint"]["effective_profile"], "primary_only");
     assert_eq!(lease["fingerprint"]["draft"], serde_json::Value::Null);
-    assert_eq!(lease["fingerprint"]["sleep_policy"], 60);
+    assert_eq!(lease["fingerprint"]["sleep_policy"], 300);
     assert!(server.poll().unwrap().is_none());
     let argv = std::fs::read_to_string(&argv).unwrap();
     let argv = argv.lines().collect::<Vec<_>>();
@@ -2267,7 +2267,7 @@ fn persistent_mtp_fallback_transforms_fingerprint_and_keeps_sleep_policy() {
         .enumerate()
         .filter_map(|(index, argument)| (*argument == "--sleep-idle-seconds").then_some(index))
     {
-        assert_eq!(argv[index + 1], "60");
+        assert_eq!(argv[index + 1], "300");
     }
     assert_eq!(
         argv.iter()

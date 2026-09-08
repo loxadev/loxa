@@ -855,7 +855,7 @@ mod tests {
             runnable.launch().policy,
             runner::LaunchPolicy::PersistentApp
         );
-        assert_eq!(runnable.fingerprint().sleep_policy(), Some(60));
+        assert_eq!(runnable.fingerprint().sleep_policy(), Some(300));
         drop(runnable);
 
         std::fs::remove_file(&paths.config).unwrap();
@@ -1103,9 +1103,13 @@ mod tests {
     #[test]
     fn fingerprint_is_exact_and_changes_with_artifact_profile_or_context() {
         let manifest = manifest();
-        let fingerprint =
-            RuntimeFingerprint::from_manifest(&manifest, 4096, EffectiveProfile::Generic, Some(60))
-                .unwrap();
+        let fingerprint = RuntimeFingerprint::from_manifest(
+            &manifest,
+            4096,
+            EffectiveProfile::Generic,
+            Some(300),
+        )
+        .unwrap();
         assert_eq!(
             serde_json::to_value(&fingerprint).unwrap(),
             serde_json::json!({
@@ -1113,7 +1117,7 @@ mod tests {
                 "model_id": "demo",
                 "effective_context": 4096,
                 "effective_profile": "generic",
-                "sleep_policy": 60,
+                "sleep_policy": 300,
                 "primary": {
                     "local_filename": "model.gguf",
                     "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
@@ -1131,7 +1135,7 @@ mod tests {
                 &changed_artifact,
                 4096,
                 EffectiveProfile::Generic,
-                Some(60),
+                Some(300),
             )
             .unwrap()
         );
@@ -1141,7 +1145,7 @@ mod tests {
                 &manifest,
                 8192,
                 EffectiveProfile::Generic,
-                Some(60),
+                Some(300),
             )
             .unwrap()
         );
@@ -1159,7 +1163,7 @@ mod tests {
             &bundle_manifest(),
             8192,
             EffectiveProfile::Gemma4Mtp,
-            Some(60),
+            Some(300),
         )
         .unwrap();
 
@@ -1170,7 +1174,7 @@ mod tests {
             EffectiveProfile::PrimaryOnly
         );
         assert!(primary_only.draft().is_none());
-        assert_eq!(primary_only.sleep_policy(), Some(60));
+        assert_eq!(primary_only.sleep_policy(), Some(300));
     }
 
     #[test]
@@ -1202,8 +1206,8 @@ mod tests {
         );
         assert_eq!(candidates[0].effective_context(), 8192);
         assert_eq!(candidates[1].effective_context(), 8192);
-        assert_eq!(candidates[0].sleep_policy(), Some(60));
-        assert_eq!(candidates[1].sleep_policy(), Some(60));
+        assert_eq!(candidates[0].sleep_policy(), Some(300));
+        assert_eq!(candidates[1].sleep_policy(), Some(300));
         assert!(candidates[0].draft().is_some());
         assert!(candidates[1].draft().is_none());
         assert!(!model_dir.join("verification-receipt.json").exists());

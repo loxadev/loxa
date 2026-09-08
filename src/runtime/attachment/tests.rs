@@ -18,7 +18,7 @@ fn fingerprint_value() -> serde_json::Value {
         "model_id": "demo",
         "effective_context": 4096,
         "effective_profile": "generic",
-        "sleep_policy": 60,
+        "sleep_policy": 300,
         "primary": {
             "local_filename": "model.gguf",
             "sha256": "a".repeat(64),
@@ -34,7 +34,7 @@ fn mtp_fingerprint_value() -> serde_json::Value {
         "model_id": "demo",
         "effective_context": 8192,
         "effective_profile": "gemma4_mtp",
-        "sleep_policy": 60,
+        "sleep_policy": 300,
         "primary": {
             "local_filename": "model.gguf",
             "sha256": "a".repeat(64),
@@ -148,7 +148,7 @@ fn generic_attachment_args(models_root: &Path, port: u16) -> Vec<OsString> {
         OsString::from("--reasoning"),
         OsString::from("off"),
         OsString::from("--sleep-idle-seconds"),
-        OsString::from("60"),
+        OsString::from("300"),
     ]
 }
 
@@ -176,7 +176,7 @@ fn primary_only_attachment_args(models_root: &Path, port: u16) -> Vec<OsString> 
         OsString::from("--reasoning"),
         OsString::from("off"),
         OsString::from("--sleep-idle-seconds"),
-        OsString::from("60"),
+        OsString::from("300"),
     ]
 }
 
@@ -351,9 +351,10 @@ fn test_attachment_identity(
                         child.command.truncate(child.command.len() - 2);
                     }
                     AttachmentIdentityMutation::DuplicateSleepPair => {
-                        child
-                            .command
-                            .extend([OsString::from("--sleep-idle-seconds"), OsString::from("60")]);
+                        child.command.extend([
+                            OsString::from("--sleep-idle-seconds"),
+                            OsString::from("300"),
+                        ]);
                     }
                     AttachmentIdentityMutation::None
                     | AttachmentIdentityMutation::OwnerStart
