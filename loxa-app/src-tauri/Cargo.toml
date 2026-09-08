@@ -23,6 +23,11 @@ name = "native_menu_search_focus"
 path = "tests/native_menu_search_focus.rs"
 harness = false
 
+[[test]]
+name = "native_observation_timer"
+path = "tests/native_observation_timer.rs"
+harness = false
+
 [build-dependencies]
 tauri-build = { version = "=2.6.3", features = [] }
 
@@ -42,6 +47,7 @@ tauri = { version = "=2.11.5", features = ["test"] }
 dispatch2 = { version = "=0.3.1", default-features = false, features = ["objc2", "std"] }
 objc2 = "=0.6.4"
 objc2-app-kit = { version = "=0.3.2", default-features = false, features = [
+  "NSApplication",
   "NSAccessibilityProtocols",
   "NSButton",
   "NSBezierPath",
@@ -76,8 +82,10 @@ objc2-app-kit = { version = "=0.3.2", default-features = false, features = [
 ] }
 objc2-foundation = { version = "=0.3.2", default-features = false, features = [
   "NSArray",
+  "NSDate",
   "NSGeometry",
   "NSObject",
+  "NSRunLoop",
   "NSString",
   "NSTimer",
   "NSURL",

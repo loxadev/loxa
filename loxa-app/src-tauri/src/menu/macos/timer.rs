@@ -1,6 +1,6 @@
 use objc2::rc::{Retained, Weak};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
-use objc2_foundation::{NSObject, NSObjectProtocol, NSTimer};
+use objc2_foundation::{NSObject, NSObjectProtocol, NSRunLoop, NSRunLoopCommonModes, NSTimer};
 
 pub(super) fn weak_callback<T: Message + 'static>(
     target: &Retained<T>,
@@ -60,9 +60,9 @@ impl ObservationTimer {
     ) -> Self {
         let callback_target = NativeTimerTarget::new(callback, mtm);
         // SAFETY: the retained target implements drainObservation:, and shutdown
-        // invalidates the scheduled timer before releasing that target.
+        // invalidates the timer before releasing that target.
         let timer = unsafe {
-            NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+            NSTimer::timerWithTimeInterval_target_selector_userInfo_repeats(
                 interval,
                 &callback_target,
                 sel!(drainObservation:),
@@ -70,6 +70,11 @@ impl ObservationTimer {
                 true,
             )
         };
+        // SAFETY: this main-thread timer remains retained until shutdown, and common
+        // modes include AppKit event tracking as well as the default run-loop mode.
+        unsafe {
+            NSRunLoop::currentRunLoop().addTimer_forMode(&timer, NSRunLoopCommonModes);
+        }
         Self {
             timer: Some(timer),
             callback_target: Some(callback_target),
