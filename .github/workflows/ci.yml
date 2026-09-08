@@ -103,18 +103,20 @@ jobs:
             --model "${small_model}"
           export LOXA_BUILT_APP="$(pwd)/../target/release/bundle/macos/Loxa.app"
           export LOXA_SMALL_MODEL="${small_model}"
-          cargo test --locked -p loxa-app \
+          # Keep workspace feature unification to reuse the unit-test binaries.
+          # Exclude integration harnesses, which already ran in the test step.
+          cargo test --locked --workspace --lib --bins \
             app::runtime_acceptance_tests::finalized_app_ \
             -- --ignored --test-threads=1
-          cargo test --locked -p loxa \
+          cargo test --locked --workspace --lib --bins \
             runner::tests::bundled_ \
             -- --ignored --test-threads=1
-          cargo test --locked -p loxa \
+          cargo test --locked --workspace --lib --bins \
             api_runtime::tests::bundled_host_prepares_without_ownership_and_reuses_across_model_loads \
             -- --exact --ignored
-          cargo test --locked -p loxa \
+          cargo test --locked --workspace --lib --bins \
             runtime_bundle::tests::source_replacement_after_inventory_open_cannot_redefine_the_captured_closure \
             -- --exact --ignored
-          cargo test --locked -p loxa \
+          cargo test --locked --workspace --lib --bins \
             runnable::tests::legacy_provenance_under_bundled_app_selects_and_reports_active_b10344_without_rewrite \
             -- --exact --ignored
