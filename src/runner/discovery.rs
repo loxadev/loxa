@@ -94,13 +94,26 @@ pub(crate) fn prepare_managed_runtime(
     retained: Option<ValidatedManagedRuntime>,
     cancelled: &impl Fn() -> bool,
 ) -> Result<ValidatedManagedRuntime, VersionProbeError> {
-    match retained {
-        Some(runtime) => {
-            revalidate_managed_runtime(paths, &runtime, cancelled)?;
-            Ok(runtime)
-        }
+    let started = Instant::now();
+    let reused = retained.is_some();
+    tracing::info!(event = "runtime_preparation_started", reused);
+    let result = match retained {
+        Some(runtime) => revalidate_managed_runtime(paths, &runtime, cancelled).map(|()| runtime),
         None => validate_managed_runtime_cancellable(paths, cancelled),
-    }
+    };
+    let outcome = match &result {
+        Ok(_) => "ready",
+        Err(VersionProbeError::Cancelled) => "cancelled",
+        Err(VersionProbeError::CleanupFailed(_)) => "cleanup_failed",
+        Err(VersionProbeError::Failed(_)) => "failed",
+    };
+    tracing::info!(
+        event = "runtime_preparation_finished",
+        reused,
+        outcome,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+    );
+    result
 }
 
 fn validate_runtime_version_cancellable(
