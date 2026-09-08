@@ -118,6 +118,50 @@ impl PreparedRuntime {
         self.0.root.join("Contents/MacOS/llama-server")
     }
 
+    pub(crate) fn can_preserve_after_child_cleanup(
+        &self,
+        run: &Path,
+        server: &Path,
+    ) -> Result<(), String> {
+        if !self.0.cleanup_on_drop.load(Ordering::Acquire)
+            || self.execution_server() != server
+            || self.0.root.parent() != Some(run)
+        {
+            return Err("prepared runtime stage cannot be retained".into());
+        }
+        crate::safe_file::ensure_directory_descriptor_matches_path(
+            &self.0.contents,
+            &self.0.contents_identity,
+            &self.0.root.join("Contents"),
+        )
+        .map_err(|_| "prepared runtime stage cannot be retained".to_string())?;
+        let (root, identity) = crate::safe_file::open_directory(&self.0.root)
+            .map_err(|_| "prepared runtime stage cannot be retained".to_string())?;
+        if identity != self.0.root_identity
+            || crate::safe_file::ensure_directory_descriptor_matches_path(
+                &root,
+                &self.0.root_identity,
+                &self.0.root,
+            )
+            .is_err()
+        {
+            return Err("prepared runtime stage cannot be retained".into());
+        }
+        let (_, owner) = crate::safe_file::open_regular_file(&self.0.root.join(STAGE_RECORD_NAME))
+            .map_err(|_| "prepared runtime stage cannot be retained".to_string())?;
+        if !self.0.owner_identity.same_stable_file(&owner) {
+            return Err("prepared runtime stage cannot be retained".into());
+        }
+        let token = execution_stage_token(&self.0.root)
+            .ok_or_else(|| "prepared runtime stage token is invalid".to_string())?;
+        let (owner_pid, owner_start, _, abandoned) =
+            parse_stage_record(&read_stage_record(&self.0.owner)?, token)?;
+        if abandoned || owner_pid != self.0.owner_pid || owner_start != self.0.owner_start {
+            return Err("prepared runtime stage is abandoned".into());
+        }
+        Ok(())
+    }
+
     pub(crate) fn revalidate_for_service_reuse(&self, paths: &AppPaths) -> Result<(), String> {
         if !self.0.cleanup_on_drop.load(Ordering::Acquire) {
             return Err("prepared runtime stage is abandoned".into());

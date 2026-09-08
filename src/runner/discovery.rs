@@ -279,6 +279,7 @@ pub(super) struct VersionProbeOutput {
     stderr: Vec<u8>,
 }
 
+#[derive(Debug)]
 pub(crate) enum VersionProbeError {
     Cancelled,
     CleanupFailed(String),

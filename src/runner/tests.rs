@@ -171,6 +171,7 @@ fn bundled_prepared_closure_starts_the_exact_small_model() {
     )
     .unwrap();
     let runtime = validate_managed_runtime(&paths).unwrap();
+    let retained = runtime.clone();
     let launch = Launch {
         server: runtime.source_server().to_path_buf(),
         managed_runtime: Some(runtime),
@@ -191,6 +192,94 @@ fn bundled_prepared_closure_starts_the_exact_small_model() {
         }
         StartOutcome::CleanupFailed(_) => panic!("prepared runtime cleanup failed"),
     }
+    revalidate_managed_runtime_for_service(&paths, &retained, &|| false).unwrap_or_else(|error| {
+        panic!("retained runtime failed after real engine cleanup: {error:?}")
+    });
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires a finalized built app and the installed small-model fixture"]
+fn bundled_service_unload_preserves_stage_for_reload() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let _process = process_test_lock();
+    let app = PathBuf::from(std::env::var_os("LOXA_BUILT_APP").unwrap());
+    let model = PathBuf::from(std::env::var_os("LOXA_SMALL_MODEL").unwrap());
+    let manifest: Manifest =
+        serde_json::from_slice(&std::fs::read(model.with_file_name("manifest.json")).unwrap())
+            .unwrap();
+    let root = tempfile::Builder::new()
+        .prefix("loxa-reload-")
+        .tempdir_in("/private/tmp")
+        .unwrap();
+    let paths = AppPaths::from_application_values(
+        &app.join("Contents/MacOS/loxa-app"),
+        Some(root.path()),
+        None,
+    )
+    .unwrap();
+    let ownership = crate::runtime::RuntimeOwnership::acquire(&paths.run).unwrap();
+    let runtime = validate_managed_runtime(&paths).unwrap();
+    let stage = runtime
+        .execution_server()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let inode = std::fs::metadata(&stage).unwrap().ino();
+    let reactor = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let fingerprint =
+        RuntimeFingerprint::from_manifest_for_service(&manifest, 4096, EffectiveProfile::Generic)
+            .unwrap();
+    for generation in 1..=2 {
+        revalidate_managed_runtime_for_service(&paths, &runtime, &|| false).unwrap();
+        let launch = Launch {
+            server: runtime.source_server().to_path_buf(),
+            managed_runtime: Some(runtime.clone()),
+            model: model.clone(),
+            id: manifest.id.clone(),
+            requested_port: 0,
+            ctx: 4096,
+            profile: LaunchProfile::generic(),
+            policy: LaunchPolicy::Service,
+        };
+        let endpoint = paths.run.join(format!("engine-{generation}.sock"));
+        let mut server = match OwnedServer::start_with_service_ownership(
+            &launch,
+            &fingerprint,
+            &endpoint,
+            reactor.handle(),
+            Duration::from_secs(30),
+            ownership.reserve_child().unwrap(),
+            &|| false,
+        )
+        .unwrap()
+        {
+            StartOutcome::Ready(server) => server,
+            _ => panic!("service engine did not become ready"),
+        };
+        let lease_path = paths.run.join("foreground.json");
+        let lease: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&lease_path).unwrap()).unwrap();
+        assert_eq!(lease["owner_mode"], "service");
+        server.terminate().unwrap();
+        assert!(!lease_path.exists());
+        assert!(!endpoint.exists());
+        assert_eq!(std::fs::metadata(&stage).unwrap().ino(), inode);
+    }
+    drop(runtime);
+    assert!(
+        !stage.exists(),
+        "the last retained capability must clean its stage"
+    );
 }
 
 #[cfg(unix)]

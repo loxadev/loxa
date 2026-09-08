@@ -4,6 +4,7 @@ use super::lease::{
 #[cfg(unix)]
 use super::lock::lock_local_foreground_operation;
 use super::lock::{ForegroundLock, ForegroundLockAcquireError};
+use super::process::process_group_has_live_members;
 use super::process::{process_group, process_snapshot};
 use super::record::{
     cleanup_recorded_execution_stage, ensure_directory, lease_is_absent, lock_lease_state,
@@ -42,7 +43,8 @@ struct RuntimeOwnershipInner {
 
 /// Exclusive child slot borrowed from [`RuntimeOwnership`]. After
 /// [`Self::child_spawned`], keep this token until the exact child is confirmed
-/// terminated and [`Self::clear`] has removed its recorded lease and stage.
+/// terminated and its recorded lease is cleared. A service may separately retain
+/// the prepared stage; ordinary [`Self::clear`] also removes that stage.
 /// Dropping earlier leaves the child slot closed while the common owner is
 /// retained.
 pub(crate) struct RuntimeChildOwnership {
@@ -252,6 +254,45 @@ impl RuntimeOwnership {
 }
 
 impl RuntimeChildOwnership {
+    pub(crate) fn clear_preserving_prepared_stage(
+        &mut self,
+        prepared: &crate::runtime_bundle::PreparedRuntime,
+    ) -> Result<(), String> {
+        let Some(expected) = self.lease.as_ref() else {
+            return self.clear();
+        };
+        if expected.owner_mode != Some(LeaseOwnerMode::Service) {
+            return self.clear();
+        }
+        let state_path = self.state_path()?;
+        let run = state_path
+            .parent()
+            .expect("runtime lease has a run-directory parent");
+        prepared.can_preserve_after_child_cleanup(run, &expected.server)?;
+        if process_group_has_live_members(expected.child_pgid)? {
+            return Err("llama-server process group is still active during stage cleanup".into());
+        }
+        let _state_guard = lock_lease_state()?;
+        match read_lease(&state_path) {
+            Ok(current) if current == *expected => {
+                fs::remove_file(&state_path)
+                    .map_err(|error| format!("{}: {error}", state_path.display()))?;
+                self.lease = None;
+                self.release_on_drop = true;
+                Ok(())
+            }
+            Ok(_) => Err(format!(
+                "runtime lease changed unexpectedly: {}",
+                state_path.display()
+            )),
+            Err(_error) if lease_is_absent(&state_path) => {
+                self.lease = None;
+                self.release_on_drop = true;
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
     pub(crate) fn child_spawned(&mut self) {
         self.release_on_drop = false;
     }

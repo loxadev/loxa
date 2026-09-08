@@ -94,7 +94,11 @@ impl ChildProcessGuard {
             self.child.take();
         }
         if let Some(runtime) = self.runtime.as_mut() {
-            runtime.clear()?;
+            if let Some(prepared) = &self.prepared {
+                runtime.clear_preserving_prepared_stage(prepared)?;
+            } else {
+                runtime.clear()?;
+            }
         }
         Ok(())
     }
