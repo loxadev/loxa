@@ -1,6 +1,8 @@
 use super::lease::{LeaseOwnerMode, RuntimeLease, LEASE_VERSION, PERSISTENT_LEASE_VERSION};
 use super::lock::foreground_lock_is_held;
-use super::process::{process_group, process_snapshot_from_refreshed_system, ProcessSnapshot};
+use super::process::{
+    process_group, process_snapshot, process_snapshot_from_refreshed_system, ProcessSnapshot,
+};
 use super::record::{lease_is_absent, lock_lease_state, read_lease};
 use crate::runtime_fingerprint::{EffectiveProfile, RuntimeFingerprint};
 use std::cell::RefCell;
@@ -31,6 +33,7 @@ pub(crate) struct AttachedRuntime {
     lease_path: PathBuf,
     expected_lease: Box<RuntimeLease>,
     expected_managed_server: PathBuf,
+    expected_owner_executable: Option<PathBuf>,
     expected_argv: Vec<OsString>,
     processes: RefCell<Box<System>>,
     #[cfg(test)]
@@ -93,6 +96,7 @@ impl AttachedRuntime {
                 service: None,
             }),
             expected_managed_server: PathBuf::new(),
+            expected_owner_executable: None,
             expected_argv: Vec::new(),
             processes: RefCell::new(Box::new(System::new())),
             test_revalidate: Some(Box::new(revalidate)),
@@ -179,10 +183,14 @@ fn lookup_persistent_runtime_with(
         Ok(lease) => lease,
         Err(_) => return PersistentRuntimeLookup::ActiveButNotAttachable,
     };
-    let Some(expected_fingerprint) = expected_fingerprints
-        .iter()
-        .find(|candidate| lease_matches_attachment_expectation(&lease, managed_server, candidate))
-    else {
+    let (expected_managed_server, expected_owner_executable) =
+        match attachment_origin(&lease, managed_server, process_snapshot) {
+            Ok(path) => path,
+            Err(_) => return PersistentRuntimeLookup::ActiveButNotAttachable,
+        };
+    let Some(expected_fingerprint) = expected_fingerprints.iter().find(|candidate| {
+        lease_matches_attachment_expectation(&lease, &expected_managed_server, candidate)
+    }) else {
         return PersistentRuntimeLookup::ActiveButNotAttachable;
     };
     let expected_argv = match crate::runner::build_persistent_args_for_fingerprint(
@@ -197,7 +205,8 @@ fn lookup_persistent_runtime_with(
         lock_path,
         lease_path,
         expected_lease: Box::new(lease),
-        expected_managed_server: managed_server.to_path_buf(),
+        expected_managed_server,
+        expected_owner_executable,
         expected_argv,
         processes: RefCell::new(Box::new(System::new())),
         #[cfg(test)]
@@ -217,6 +226,40 @@ fn lookup_persistent_runtime_with(
         return PersistentRuntimeLookup::ActiveButNotAttachable;
     }
     PersistentRuntimeLookup::Attached(attached)
+}
+
+fn attachment_origin(
+    lease: &RuntimeLease,
+    fallback: &Path,
+    lookup: impl FnOnce(u32) -> Result<Option<ProcessSnapshot>, String>,
+) -> Result<(PathBuf, Option<PathBuf>), String> {
+    let Some(source) = lease.managed_source.as_deref() else {
+        return Ok((fallback.to_path_buf(), None));
+    };
+    if source == fallback {
+        return Ok((fallback.to_path_buf(), None));
+    }
+    let owner = lookup(lease.owner_pid)?
+        .ok_or_else(|| "persistent runtime owner is no longer running".to_string())?;
+    if owner.start_identity != lease.owner_start_time {
+        return Err("persistent runtime owner identity changed".into());
+    }
+    if owner
+        .executable
+        .file_name()
+        .is_none_or(|name| name != "loxa-app")
+    {
+        return Err("persistent runtime owner is not the packaged Loxa application".into());
+    }
+    let contents = crate::paths::application_contents(&owner.executable)
+        .ok_or_else(|| "persistent runtime owner is not in an application bundle".to_string())?;
+    let derived = contents.join("MacOS/llama-server");
+    if source != derived {
+        return Err(
+            "persistent runtime managed source does not match its owner application".into(),
+        );
+    }
+    Ok((derived, Some(owner.executable)))
 }
 
 fn runtime_state(run_dir: &Path) -> RuntimeState {
@@ -285,6 +328,13 @@ fn validate_attachment_identity_with(
     let owner = owner.ok_or_else(|| "persistent runtime owner is no longer running".to_string())?;
     if owner.start_identity != attached.expected_lease.owner_start_time {
         return Err("persistent runtime owner identity changed".into());
+    }
+    if attached
+        .expected_owner_executable
+        .as_ref()
+        .is_some_and(|expected| expected != &owner.executable)
+    {
+        return Err("persistent runtime owner executable changed".into());
     }
     let child = child.ok_or_else(|| "persistent runtime child is no longer running".to_string())?;
     #[cfg(test)]

@@ -62,6 +62,70 @@ fn lease_value(version: u32) -> serde_json::Value {
     })
 }
 
+#[test]
+fn packaged_attachment_origin_requires_the_exact_live_owner_and_bundle_source() {
+    let mut value = lease_value(LEASE_VERSION);
+    value["owner_mode"] = "persistent_app".into();
+    value["fingerprint"] = fingerprint_value();
+    value["managed_source"] = "/Applications/Loxa.app/Contents/MacOS/llama-server".into();
+    let lease = decode_lease(&serde_json::to_vec(&value).unwrap()).unwrap();
+    let legacy = Path::new("/home/loxa/runtimes/llama-server");
+    let origin = |executable: &str, start_identity| {
+        attachment_origin(&lease, legacy, |pid| {
+            assert_eq!(pid, lease.owner_pid);
+            Ok(Some(ProcessSnapshot {
+                start_identity,
+                start_time_seconds: 0,
+                executable: executable.into(),
+                command: Vec::new(),
+            }))
+        })
+    };
+    let executable = "/Applications/Loxa.app/Contents/MacOS/loxa-app";
+    assert_eq!(
+        origin(executable, lease.owner_start_time).unwrap(),
+        (
+            lease.managed_source.clone().unwrap(),
+            Some(executable.into())
+        )
+    );
+    for invalid in [
+        "/Applications/Loxa.app/Contents/MacOS/other",
+        "/Applications/Other.app/Contents/MacOS/loxa-app",
+        "/Applications/Loxa/Contents/MacOS/loxa-app",
+        "/Applications/Loxa.app/MacOS/loxa-app",
+    ] {
+        assert!(
+            origin(invalid, lease.owner_start_time).is_err(),
+            "accepted {invalid}"
+        );
+    }
+    assert!(origin(executable, lease.owner_start_time + 1).is_err());
+    assert!(attachment_origin(&lease, legacy, |_| Ok(None)).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn bundled_attachment_rejects_owner_exec_without_pid_or_start_change() {
+    let fixture = RecordedPersistentRuntime::generic(43123);
+    let mut attached = attached_from_fixture(&fixture);
+    attached.expected_owner_executable =
+        Some("/Applications/Loxa.app/Contents/MacOS/loxa-app".into());
+    let result = validate_attachment_identity_with(
+        &attached,
+        |system, owner_pid, child_pid| {
+            let (mut owner, child) = refresh_attachment_processes(system, owner_pid, child_pid)?;
+            owner.as_mut().unwrap().executable = "/usr/bin/other".into();
+            Ok((owner, child))
+        },
+        process_group,
+    );
+    assert_eq!(
+        result.unwrap_err(),
+        "persistent runtime owner executable changed"
+    );
+}
+
 #[cfg(unix)]
 fn generic_attachment_args(models_root: &Path, port: u16) -> Vec<OsString> {
     vec![

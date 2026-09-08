@@ -79,7 +79,7 @@ impl AppPaths {
     }
 }
 
-fn application_contents(executable: &Path) -> Option<&Path> {
+pub(crate) fn application_contents(executable: &Path) -> Option<&Path> {
     let macos = executable.parent()?;
     if macos.file_name()? != "MacOS" {
         return None;

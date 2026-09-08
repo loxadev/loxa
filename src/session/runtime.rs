@@ -16,7 +16,7 @@ const ATTACHED_RUNTIME_UNAVAILABLE: &str =
 const CHAT_OVERRIDE_CONFLICT: &str =
     "runtime overrides cannot be used while chat is attached to the running model";
 const CHAT_ACTIVE_RUNTIME_CONFLICT: &str =
-    "another Loxa runtime is active; stop it before starting chat";
+    "another Loxa runtime is active; unload it from the Loxa menu or stop its owning command, then retry chat";
 const CHAT_CONFIGURATION_INVALID: &str = "chat runtime configuration is invalid";
 
 pub(super) enum ChatRuntime {
