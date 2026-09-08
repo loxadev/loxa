@@ -1,7 +1,8 @@
+pub(crate) mod file;
 mod receipt;
 
 use crate::catalog::{Manifest, ModelLock};
-use crate::download::{self, VerifiedRegularFile};
+use file::VerifiedRegularFile;
 use std::path::Path;
 
 pub(crate) struct VerifiedArtifacts {
@@ -57,9 +58,9 @@ pub(crate) fn verify_artifacts(
     draft_path: Option<&Path>,
 ) -> Result<VerifiedArtifacts, String> {
     let primary = manifest.primary_artifact();
-    let primary = download::verify_regular_captured(primary_path, primary.size, primary.sha256)?;
+    let primary = file::verify_regular_captured(primary_path, primary.size, primary.sha256)?;
     let draft = match (manifest.draft_artifact(), draft_path) {
-        (Some(artifact), Some(path)) => Some(download::verify_regular_captured(
+        (Some(artifact), Some(path)) => Some(file::verify_regular_captured(
             path,
             artifact.size,
             artifact.sha256,
@@ -83,25 +84,25 @@ pub(crate) fn verify_or_refresh_cancellable(
     }
     receipt::discard(model_lock, model_dir)?;
     let primary_artifact = manifest.primary_artifact();
-    let primary = match download::verify_regular_captured_cancellable(
+    let primary = match file::verify_regular_captured_cancellable(
         primary_path,
         primary_artifact.size,
         primary_artifact.sha256,
         cancelled,
     )? {
-        download::CapturedVerification::Verified(primary) => primary,
-        download::CapturedVerification::Cancelled => return Ok(CancellableAdmission::Cancelled),
+        file::CapturedVerification::Verified(primary) => primary,
+        file::CapturedVerification::Cancelled => return Ok(CancellableAdmission::Cancelled),
     };
     let draft = match (manifest.draft_artifact(), draft_path) {
         (Some(artifact), Some(path)) => {
-            match download::verify_regular_captured_cancellable(
+            match file::verify_regular_captured_cancellable(
                 path,
                 artifact.size,
                 artifact.sha256,
                 cancelled,
             )? {
-                download::CapturedVerification::Verified(draft) => Some(draft),
-                download::CapturedVerification::Cancelled => {
+                file::CapturedVerification::Verified(draft) => Some(draft),
+                file::CapturedVerification::Cancelled => {
                     return Ok(CancellableAdmission::Cancelled)
                 }
             }

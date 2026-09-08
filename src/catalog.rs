@@ -670,7 +670,7 @@ pub fn prepare_pull(model_dir: &Path, manifest: &Manifest) -> Result<(), String>
 
 pub fn publish_manifest(models_root: &Path, manifest: &Manifest) -> Result<PathBuf, String> {
     publish_manifest_with_verifier(models_root, manifest, |path, size, sha256| {
-        crate::download::verify_regular(path, size, sha256)
+        crate::verification::file::verify_regular(path, size, sha256)
     })
 }
 
@@ -678,7 +678,7 @@ pub(crate) fn publish_manifest_verified(
     models_root: &Path,
     manifest: &Manifest,
     model_lock: &ModelLock,
-    verified: &crate::download::VerifiedRegularFile,
+    verified: &crate::verification::file::VerifiedRegularFile,
 ) -> Result<PathBuf, String> {
     publish_manifest_verified_inner(
         models_root,
@@ -701,7 +701,7 @@ fn publish_manifest_verified_with_hook<F>(
     models_root: &Path,
     manifest: &Manifest,
     model_lock: &ModelLock,
-    verified: &crate::download::VerifiedRegularFile,
+    verified: &crate::verification::file::VerifiedRegularFile,
     hook: F,
 ) -> Result<PathBuf, String>
 where
@@ -722,7 +722,7 @@ fn publish_manifest_verified_with_recovery<F, R>(
     models_root: &Path,
     manifest: &Manifest,
     model_lock: &ModelLock,
-    verified: &crate::download::VerifiedRegularFile,
+    verified: &crate::verification::file::VerifiedRegularFile,
     hook: F,
     recover: R,
 ) -> Result<PathBuf, String>
@@ -741,7 +741,7 @@ fn publish_manifest_verified_inner<F, R>(
     models_root: &Path,
     manifest: &Manifest,
     model_lock: &ModelLock,
-    verified: &crate::download::VerifiedRegularFile,
+    verified: &crate::verification::file::VerifiedRegularFile,
     mut hook: F,
     mut recover: R,
 ) -> Result<PathBuf, String>
@@ -788,7 +788,7 @@ fn publish_remote_manifest_at<F, R>(
     model_lock: &ModelLock,
     model_dir: &Path,
     manifest: &Manifest,
-    verified: &crate::download::VerifiedRegularFile,
+    verified: &crate::verification::file::VerifiedRegularFile,
     primary_path: &Path,
     hook: &mut F,
     recover: &mut R,

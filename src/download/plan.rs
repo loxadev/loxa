@@ -1,9 +1,9 @@
-use super::artifact::{inspect_regular_entry, RegularEntryError as PlanReadError};
 use super::{ArtifactDiscardError, ArtifactDiscardFacts, VerifiedRegularFile};
 use crate::safe_file::{
     directory_identity, ensure_directory_descriptor_matches_path, ensure_regular_descriptors_match,
     regular_file_identity, RegularFileIdentity,
 };
+use crate::verification::file::{inspect_regular_entry, RegularEntryError as PlanReadError};
 use std::fs::File;
 use std::io;
 use std::path::Path;

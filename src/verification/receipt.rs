@@ -1,5 +1,5 @@
+use super::file::VerifiedRegularFile;
 use crate::catalog::{Manifest, ModelLock};
-use crate::download::VerifiedRegularFile;
 use std::path::Path;
 
 const RECEIPT_NAME: &str = "verification-receipt.json";

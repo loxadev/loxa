@@ -12,7 +12,7 @@ use super::{Manifest, Origin};
 pub(crate) struct CapturedAdoption {
     pub(crate) manifest: Manifest,
     pub(crate) model_lock: super::ModelLock,
-    pub(crate) verified: crate::download::VerifiedRegularFile,
+    pub(crate) verified: crate::verification::file::VerifiedRegularFile,
 }
 
 mod bundle;
@@ -157,7 +157,7 @@ where
     }
     let (source_directory, source_directory_identity) =
         crate::safe_file::open_directory(models_root).map_err(|error| error.to_string())?;
-    let verified = crate::download::hash_local_gguf_captured(
+    let verified = crate::verification::file::hash_local_gguf_captured(
         &source_directory,
         &source_directory_identity,
         models_root,

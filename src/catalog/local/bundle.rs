@@ -129,7 +129,7 @@ where
         return Ok(None);
     }
     observer(UpgradePoint::BeforePrimaryVerification)?;
-    if crate::download::verify_regular(
+    if crate::verification::file::verify_regular(
         &current.artifact_path(models_root),
         qualification.target_size,
         &qualification.target_sha256,
@@ -172,7 +172,7 @@ where
         return Ok(None);
     };
     if before.size != qualification.draft_size
-        || crate::download::verify_regular(
+        || crate::verification::file::verify_regular(
             &candidate.path,
             qualification.draft_size,
             &qualification.draft_sha256,
@@ -200,7 +200,7 @@ where
     ) {
         return Ok(None);
     }
-    if crate::download::verify_regular(
+    if crate::verification::file::verify_regular(
         &destination,
         qualification.draft_size,
         &qualification.draft_sha256,
@@ -240,7 +240,7 @@ fn complete_bundle_is_verified(
     manifest: &Manifest,
     qualification: &BundleQualification,
 ) -> bool {
-    crate::download::verify_regular(
+    crate::verification::file::verify_regular(
         &manifest.artifact_path(models_root),
         qualification.target_size,
         &qualification.target_sha256,
@@ -250,7 +250,7 @@ fn complete_bundle_is_verified(
             draft.local_filename == "draft.gguf"
                 && draft.size == qualification.draft_size
                 && draft.sha256 == qualification.draft_sha256
-                && crate::download::verify_regular(
+                && crate::verification::file::verify_regular(
                     &models_root.join(&manifest.id).join(draft.local_filename),
                     draft.size,
                     draft.sha256,
@@ -326,7 +326,7 @@ fn managed_draft_state(model_dir: &Path, qualification: &BundleQualification) ->
                 return ManagedDraft::UnsafeOrInvalid;
             };
             if before.size == qualification.draft_size
-                && crate::download::verify_regular(
+                && crate::verification::file::verify_regular(
                     &path,
                     qualification.draft_size,
                     &qualification.draft_sha256,
@@ -377,7 +377,7 @@ fn qualified_draft(manifest: &Manifest, qualification: &BundleQualification) -> 
 
 fn verified_candidate(candidate: &Candidate, qualification: &BundleQualification) -> bool {
     candidate.size == qualification.draft_size
-        && crate::download::verify_regular(
+        && crate::verification::file::verify_regular(
             &candidate.path,
             qualification.draft_size,
             &qualification.draft_sha256,

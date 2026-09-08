@@ -265,7 +265,7 @@ fn replacement_artifacts_are_verified(
         .as_deref()
         .ok_or("replacement is not a bundle")?
     {
-        if crate::download::verify_regular(
+        if crate::verification::file::verify_regular(
             &models_root
                 .join(&replacement.id)
                 .join(&artifact.local_filename),
