@@ -617,7 +617,7 @@ fn runtime_curl_copy_button_content(copied: bool) -> (&'static str, &'static str
     if copied {
         ("checkmark", "Curl copied")
     } else {
-        ("doc.on.doc", "Copy API curl command")
+        ("doc.on.doc", "Copy API command")
     }
 }
 

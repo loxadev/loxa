@@ -70,6 +70,37 @@ pub enum ServiceDevCommand {
     Unload,
     /// Ask the existing service to drain and stop.
     Stop,
+    /// Open an interactive terminal chat against one already-loaded service model.
+    Chat {
+        /// Exact installed model ID currently loaded by the service.
+        model_id: String,
+        #[arg(long, default_value_t = 512, value_parser = clap::value_parser!(u32).range(1..=i64::from(i32::MAX)))]
+        max_tokens: u32,
+        #[command(flatten)]
+        target: ServiceTargetArgs,
+    },
+    /// Send one narrow OpenAI-compatible request to the already-loaded engine.
+    Api {
+        /// Exact installed model ID currently loaded by the service.
+        model_id: String,
+        /// Either `models` or `chat-completions`.
+        endpoint: String,
+        /// JSON request object for chat-completions.
+        #[arg(long)]
+        data: Option<String>,
+        #[command(flatten)]
+        target: ServiceTargetArgs,
+    },
+}
+
+#[derive(Debug, Args, Default)]
+pub struct ServiceTargetArgs {
+    #[arg(long)]
+    pub boot_epoch: Option<String>,
+    #[arg(long)]
+    pub task_id: Option<String>,
+    #[arg(long)]
+    pub generation: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -181,11 +212,74 @@ pub(crate) fn preflight(cli: &Cli) -> Result<(), clap::Error> {
                 )),
                 ServiceDevCommand::Load { model_id } => crate::paths::validate_id(model_id)
                     .map_err(|_| clap::Error::raw(ErrorKind::ValueValidation, "invalid model ID")),
+                ServiceDevCommand::Chat {
+                    model_id, target, ..
+                } => {
+                    crate::paths::validate_id(model_id).map_err(|_| {
+                        clap::Error::raw(ErrorKind::ValueValidation, "invalid model ID")
+                    })?;
+                    validate_service_target(target)
+                }
+                ServiceDevCommand::Api {
+                    model_id,
+                    endpoint,
+                    data,
+                    target,
+                } => {
+                    crate::paths::validate_id(model_id).map_err(|_| {
+                        clap::Error::raw(ErrorKind::ValueValidation, "invalid model ID")
+                    })?;
+                    if !matches!(endpoint.as_str(), "models" | "chat-completions") {
+                        return Err(clap::Error::raw(
+                            ErrorKind::ValueValidation,
+                            "endpoint must be models or chat-completions",
+                        ));
+                    }
+                    if endpoint == "models" && data.is_some() {
+                        return Err(clap::Error::raw(
+                            ErrorKind::ArgumentConflict,
+                            "--data is only valid for chat-completions",
+                        ));
+                    }
+                    if endpoint == "chat-completions" && data.is_none() {
+                        return Err(clap::Error::raw(
+                            ErrorKind::MissingRequiredArgument,
+                            "chat-completions requires --data JSON",
+                        ));
+                    }
+                    validate_service_target(target)
+                }
                 _ => Ok(()),
             }
         }
         _ => Ok(()),
     }
+}
+
+fn validate_service_target(target: &ServiceTargetArgs) -> Result<(), clap::Error> {
+    let supplied = [
+        target.boot_epoch.is_some(),
+        target.task_id.is_some(),
+        target.generation.is_some(),
+    ];
+    if supplied.iter().any(|value| *value) && !supplied.iter().all(|value| *value) {
+        return Err(clap::Error::raw(
+            ErrorKind::MissingRequiredArgument,
+            "--boot-epoch, --task-id, and --generation must be supplied together",
+        ));
+    }
+    if let (Some(boot_epoch), Some(task_id), Some(generation)) =
+        (&target.boot_epoch, &target.task_id, &target.generation)
+    {
+        loxa_ipc::OperationTarget {
+            boot_epoch: boot_epoch.clone(),
+            task_id: task_id.clone(),
+            generation: generation.clone(),
+        }
+        .validate_shape()
+        .map_err(|message| clap::Error::raw(ErrorKind::ValueValidation, message))?;
+    }
+    Ok(())
 }
 
 pub(crate) fn parse_pull_input(args: &PullArgs) -> Result<PullInput, clap::Error> {
@@ -482,6 +576,37 @@ mod tests {
             PathBuf::from("/private/tmp/loxa-service-dev")
         );
         assert!(matches!(args.command, ServiceDevCommand::Status));
+    }
+
+    #[test]
+    fn service_api_and_chat_require_an_all_or_none_target() {
+        let partial = Cli::parse_from([
+            "loxa",
+            "service-dev",
+            "--data-root",
+            "/private/tmp/loxa-test",
+            "chat",
+            "demo",
+            "--boot-epoch",
+            "boot",
+        ]);
+        assert!(preflight(&partial).is_err());
+        let complete = Cli::parse_from([
+            "loxa",
+            "service-dev",
+            "--data-root",
+            "/private/tmp/loxa-test",
+            "api",
+            "demo",
+            "models",
+            "--boot-epoch",
+            "boot",
+            "--task-id",
+            "1",
+            "--generation",
+            "2",
+        ]);
+        assert!(preflight(&complete).is_ok());
     }
 
     #[test]

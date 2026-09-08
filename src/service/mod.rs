@@ -1,3 +1,4 @@
+pub(crate) mod attachment;
 mod coordinator;
 mod dev_cli;
 mod intent;

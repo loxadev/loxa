@@ -1,6 +1,14 @@
 use loxa::api_runtime::ApiRuntimeActivity;
 
 use super::ApiPresentation;
+
+#[test]
+fn service_command_shell_quotes_apostrophes() {
+    assert_eq!(
+        super::shell_quote("/tmp/Mahad's Loxa"),
+        "'/tmp/Mahad'\"'\"'s Loxa'"
+    );
+}
 use crate::menu::api_runtime::{ApiEndpoint, ApiRuntimeNotice, ApiRuntimePhase};
 use crate::menu::presentation::{ObservedRuntime, ObservedRuntimeOwner};
 
@@ -245,6 +253,7 @@ fn shared_service_presentation_uses_load_unload_and_never_exposes_loopback() {
     );
     assert_eq!(ready.status_label(), "Model loaded in background service");
     assert_eq!(ready.curl_command(), None);
+    assert!(!ready.can_copy_chat_for("alpha"));
     assert!(!ready.status_label().contains("127.0.0.1"));
     assert_eq!(ready.primary_action("alpha").title(), "Unload");
     let other = ready.primary_action("beta");

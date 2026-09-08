@@ -41,7 +41,7 @@ fn history_snapshot_precedes_the_literal_pre_worker_revalidation() {
         "        if let Some(code) = runtime.poll()? {\n",
         "            return Ok(code);\n",
         "        }\n\n",
-        "        let worker = start_worker(runtime.port(), model.to_owned(), messages, max_tokens)?;"
+        "        let worker = start_worker(model.to_owned(), messages, max_tokens)?;"
     )));
 }
 
@@ -64,7 +64,7 @@ fn attached_poll_revalidates_and_terminate_owned_is_a_strict_noop() {
     let mut runtime = ChatRuntime::attached(attached);
 
     assert_eq!(runtime.model_id(), "demo");
-    assert_eq!(runtime.port(), 43123);
+    assert_eq!(runtime.port().unwrap(), 43123);
     assert_eq!(runtime.poll().unwrap(), None);
     assert_eq!(runtime.poll().unwrap(), None);
     assert_eq!(revalidations.load(Ordering::SeqCst), 2);
@@ -348,7 +348,7 @@ fn owned_runtime_delegates_poll_and_teardown_to_the_incumbent_server_boundary() 
     );
 
     assert_eq!(runtime.model_id(), "demo");
-    assert_eq!(runtime.port(), 43123);
+    assert_eq!(runtime.port().unwrap(), 43123);
     assert_eq!(runtime.poll().unwrap(), Some(37));
     runtime.terminate_owned().unwrap();
     assert_eq!(polls.load(Ordering::SeqCst), 1);
@@ -625,7 +625,7 @@ fn attached_terminal_worker_channel_join_and_output_failures_never_control_the_o
                 1,
                 || input.take().expect("one terminal event"),
                 &mut output,
-                |_, _, _, _| panic!("terminal exit must not start a Worker"),
+                |_, _, _| panic!("terminal exit must not start a Worker"),
             )
         });
         assert_eq!(outcome, expected);
@@ -641,7 +641,7 @@ fn attached_terminal_worker_channel_join_and_output_failures_never_control_the_o
             1,
             || input.take().expect("one prompt"),
             &mut output,
-            |_, _, _, _| Err("Worker start failed".into()),
+            |_, _, _| Err("Worker start failed".into()),
         )
     })
     .unwrap_err();
@@ -662,7 +662,7 @@ fn attached_terminal_worker_channel_join_and_output_failures_never_control_the_o
                 1,
                 || inputs.pop().expect("bounded terminal input"),
                 &mut output,
-                |_, _, _, _| {
+                |_, _, _| {
                     Ok(crate::chat::Worker::for_session_test(
                         events.take().expect("one Worker"),
                         false,
@@ -683,7 +683,7 @@ fn attached_terminal_worker_channel_join_and_output_failures_never_control_the_o
             1,
             || input.take().expect("one prompt"),
             &mut output,
-            |_, _, _, _| {
+            |_, _, _| {
                 Ok(crate::chat::Worker::for_session_test(
                     vec![Event::Complete("done".into())],
                     true,
@@ -704,7 +704,7 @@ fn attached_terminal_worker_channel_join_and_output_failures_never_control_the_o
             1,
             || input.take().expect("one prompt"),
             &mut output,
-            |_, _, _, _| {
+            |_, _, _| {
                 Ok(crate::chat::Worker::for_session_test(
                     vec![
                         Event::Delta("token".into()),
@@ -755,7 +755,7 @@ fn owned_endpoint_error_terminates_once_before_joining_the_worker() {
             1,
             || input.take().expect("one prompt"),
             &mut output,
-            move |_, _, _, _| {
+            move |_, _, _| {
                 let worker_order = Arc::clone(&worker_order);
                 Ok(crate::chat::Worker::for_session_test_thread(move || {
                     std::thread::sleep(Duration::from_millis(30));

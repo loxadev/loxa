@@ -159,28 +159,37 @@ pub(super) struct ServiceBackend {
     pub(super) observation: Arc<ServiceObservationSlot>,
     pub(super) disconnect: Arc<AtomicBool>,
     pub(super) owned_endpoint: Option<ApiEndpoint>,
+    command_executable: Option<std::path::PathBuf>,
+    command_root: Option<std::path::PathBuf>,
 }
 
 impl ServiceBackend {
     pub(super) fn start(client: ServiceClient) -> Self {
+        let command_executable = std::env::current_exe().ok();
+        let command_root = client.bootstrap().root().root().to_owned();
+        let worker_client = client.clone();
         let disconnect = Arc::new(AtomicBool::new(false));
         let worker_disconnect = Arc::clone(&disconnect);
         let observation = Arc::new(ServiceObservationSlot::default());
         let worker_observation = Arc::clone(&observation);
-        Self::assemble(false, disconnect, observation, move |requests, events| {
-            std::thread::Builder::new()
-                .name("loxa-menu-service-runtime".into())
-                .spawn(move || {
-                    run_service_runtime_worker(
-                        client,
-                        worker_disconnect,
-                        worker_observation,
-                        requests,
-                        events,
-                    )
-                })
-                .map_err(|_| ())
-        })
+        let mut backend =
+            Self::assemble(false, disconnect, observation, move |requests, events| {
+                std::thread::Builder::new()
+                    .name("loxa-menu-service-runtime".into())
+                    .spawn(move || {
+                        run_service_runtime_worker(
+                            worker_client,
+                            worker_disconnect,
+                            worker_observation,
+                            requests,
+                            events,
+                        )
+                    })
+                    .map_err(|_| ())
+            });
+        backend.command_executable = command_executable;
+        backend.command_root = Some(command_root);
+        backend
     }
 
     pub(super) fn assemble(
@@ -212,11 +221,19 @@ impl ServiceBackend {
             observation,
             disconnect,
             owned_endpoint: None,
+            command_executable: None,
+            command_root: None,
         }
     }
 
     pub(super) fn view(&self) -> ApiRuntimeView<'_> {
         self.state.view(ApiRuntimeKind::Service, self.initialized)
+    }
+    pub(super) fn command_context(&self) -> Option<(&std::path::Path, &std::path::Path)> {
+        Some((
+            self.command_executable.as_deref()?,
+            self.command_root.as_deref()?,
+        ))
     }
     #[cfg(test)]
     pub(super) fn owned_endpoint(&self) -> Option<&ApiEndpoint> {

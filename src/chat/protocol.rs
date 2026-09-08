@@ -131,52 +131,112 @@ where
     F: FnMut(Event) -> Result<(), String>,
 {
     let mut buffer = [0_u8; 4096];
-    let mut line = Vec::new();
-    let mut data = Vec::new();
-    let mut data_seen = false;
-    let mut event_bytes = 0_usize;
-    let mut assistant = String::new();
+    let mut decoder = SseDecoder::with_limits(event_limit, assistant_limit);
 
     loop {
         let count = reader
             .read(&mut buffer)
             .map_err(|error| error.to_string())?;
         if count == 0 {
-            if !line.is_empty() {
-                process_line(&line, &mut data, &mut data_seen, event_limit)?;
-            }
-            if dispatch(&data, &mut assistant, assistant_limit, &mut emit)? {
-                return Ok(assistant);
-            }
-            return Err("chat stream ended before [DONE]".into());
+            return decoder.finish(&mut emit);
         }
-        for &byte in &buffer[..count] {
-            event_bytes = event_bytes
+        if decoder.push(&buffer[..count], &mut emit)? {
+            return decoder.finish(&mut emit);
+        }
+    }
+}
+
+pub(super) struct SseDecoder {
+    line: Vec<u8>,
+    data: Vec<u8>,
+    data_seen: bool,
+    event_bytes: usize,
+    assistant: String,
+    event_limit: usize,
+    assistant_limit: usize,
+    done: bool,
+}
+
+impl SseDecoder {
+    pub(super) fn new() -> Self {
+        Self::with_limits(MAX_EVENT_BYTES, MAX_ASSISTANT_BYTES)
+    }
+    fn with_limits(event_limit: usize, assistant_limit: usize) -> Self {
+        Self {
+            line: Vec::new(),
+            data: Vec::new(),
+            data_seen: false,
+            event_bytes: 0,
+            assistant: String::new(),
+            event_limit,
+            assistant_limit,
+            done: false,
+        }
+    }
+    pub(super) fn push<F>(&mut self, bytes: &[u8], emit: &mut F) -> Result<bool, String>
+    where
+        F: FnMut(Event) -> Result<(), String>,
+    {
+        if self.done {
+            return Ok(true);
+        }
+        for &byte in bytes {
+            self.event_bytes = self
+                .event_bytes
                 .checked_add(1)
                 .ok_or_else(|| "chat SSE event is too large".to_string())?;
-            if event_bytes > event_limit {
+            if self.event_bytes > self.event_limit {
                 return Err(format!(
-                    "chat SSE event is too large (limit {event_limit} bytes)"
+                    "chat SSE event is too large (limit {} bytes)",
+                    self.event_limit
                 ));
             }
             if byte != b'\n' {
-                line.push(byte);
+                self.line.push(byte);
                 continue;
             }
-            if line.last() == Some(&b'\r') {
-                line.pop();
+            if self.line.last() == Some(&b'\r') {
+                self.line.pop();
             }
-            if line.is_empty() {
-                if dispatch(&data, &mut assistant, assistant_limit, &mut emit)? {
-                    return Ok(assistant);
+            if self.line.is_empty() {
+                self.done = dispatch(&self.data, &mut self.assistant, self.assistant_limit, emit)?;
+                self.data.clear();
+                self.data_seen = false;
+                self.event_bytes = 0;
+                if self.done {
+                    return Ok(true);
                 }
-                data.clear();
-                data_seen = false;
-                event_bytes = 0;
             } else {
-                process_line(&line, &mut data, &mut data_seen, event_limit)?;
+                process_line(
+                    &self.line,
+                    &mut self.data,
+                    &mut self.data_seen,
+                    self.event_limit,
+                )?;
             }
-            line.clear();
+            self.line.clear();
+        }
+        Ok(self.done)
+    }
+    pub(super) fn finish<F>(mut self, emit: &mut F) -> Result<String, String>
+    where
+        F: FnMut(Event) -> Result<(), String>,
+    {
+        if !self.done {
+            if !self.line.is_empty() {
+                process_line(
+                    &self.line,
+                    &mut self.data,
+                    &mut self.data_seen,
+                    self.event_limit,
+                )?;
+            }
+            self.done = dispatch(&self.data, &mut self.assistant, self.assistant_limit, emit)?;
+        }
+        if self.done {
+            Ok(self.assistant)
+        } else {
+            Err("chat stream ended before [DONE]".into())
         }
     }
 }
@@ -512,5 +572,31 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("invalid chat SSE JSON"));
+    }
+
+    #[test]
+    fn incremental_decoder_emits_delta_before_eof() {
+        let mut decoder = super::SseDecoder::new();
+        let mut events = Vec::new();
+        assert!(!decoder
+            .push(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+                &mut |event| {
+                    events.push(event);
+                    Ok(())
+                }
+            )
+            .unwrap());
+        assert!(matches!(events.as_slice(), [super::Event::Delta(value)] if value == "Hi"));
+        assert!(decoder.push(b"data: [DONE]\n\n", &mut |_| Ok(())).unwrap());
+        assert_eq!(decoder.finish(&mut |_| Ok(())).unwrap(), "Hi");
+    }
+
+    #[test]
+    fn accepts_done_at_eof_after_a_trailing_newline() {
+        assert_eq!(
+            decode_sse(b"data: [DONE]\n".as_slice(), |_| Ok(())).unwrap(),
+            ""
+        );
     }
 }

@@ -268,6 +268,12 @@ impl ApiRuntimeController {
             RuntimeBackend::Service(b) => b.view(),
         }
     }
+    pub(crate) fn service_command_context(&self) -> Option<(&std::path::Path, &std::path::Path)> {
+        match &self.backend {
+            RuntimeBackend::Service(backend) => backend.command_context(),
+            RuntimeBackend::Legacy(_) => None,
+        }
+    }
     #[cfg(test)]
     pub(crate) fn phase(&self) -> &ApiRuntimePhase {
         self.view().phase()

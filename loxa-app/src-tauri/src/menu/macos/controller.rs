@@ -26,7 +26,7 @@ use crate::menu::api_runtime::ApiRuntimeController;
 use crate::menu::catalog::CatalogEvent;
 use crate::menu::catalog::CatalogState;
 use crate::menu::incomplete::{DiscardFailure, IncompleteState};
-use crate::menu::installed::InstalledState;
+use crate::menu::installed::{InstalledFeedback, InstalledState};
 use crate::menu::observation::BackendClient;
 #[cfg(not(test))]
 use crate::menu::observation::{BackendMessage, ObservationMessage};
@@ -840,20 +840,54 @@ impl NativePopoverTarget {
     }
 
     fn perform_installed_action(&self, action: InstalledAction) {
-        let (installed, model_paths, allow_copy_chat) = {
+        let (installed, model_paths, allow_copy_chat, service_chat_command) = {
             let state = self.ivars().state.borrow();
+            let selected_can_copy = state
+                .installed
+                .borrow()
+                .selected()
+                .is_some_and(|item| state.api.can_copy_chat_for(item.id()));
             (
                 state.installed.clone(),
                 state.model_paths.clone(),
                 !state.shared_service,
+                selected_can_copy
+                    .then(|| state.api.chat_command())
+                    .flatten()
+                    .map(str::to_owned),
             )
         };
-        installed_rows::dispatch_native_selected_action(
-            &installed,
-            action,
-            &model_paths,
-            allow_copy_chat,
-        );
+        if action == InstalledAction::CopyChatCommand && !allow_copy_chat {
+            let Some(command) = service_chat_command else {
+                return;
+            };
+            let pasteboard = NSPasteboard::generalPasteboard();
+            pasteboard.clearContents();
+            // SAFETY: AppKit initializes this immutable standard pasteboard type.
+            let string_type = unsafe { NSPasteboardTypeString };
+            let feedback =
+                if pasteboard.setString_forType(&NSString::from_str(&command), string_type) {
+                    InstalledFeedback::ChatCommandCopied
+                } else {
+                    InstalledFeedback::CopyFailed
+                };
+            let model_id = installed
+                .borrow()
+                .selected()
+                .map(|item| item.id().to_owned());
+            if let Some(model_id) = model_id {
+                installed
+                    .borrow_mut()
+                    .apply_feedback(&model_id, Some(feedback));
+            }
+        } else {
+            installed_rows::dispatch_native_selected_action(
+                &installed,
+                action,
+                &model_paths,
+                allow_copy_chat,
+            );
+        }
         let mtm = MainThreadMarker::new()
             .expect("AppKit must perform installed actions on the main thread");
         self.ivars()

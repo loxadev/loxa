@@ -2,6 +2,7 @@ use crate::chat::{Event, Message, PromptProgress, Role, Timing, Worker};
 use crate::runner::ForegroundServer;
 use crate::runtime::AttachedRuntime;
 use crate::ui;
+use loxa_ipc::{OperationTarget, ServiceClient};
 use rustyline::completion::Completer;
 use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
@@ -283,6 +284,28 @@ pub(crate) fn run_attached(attached: AttachedRuntime, max_tokens: u32) -> Result
     run_runtime(runtime::ChatRuntime::attached(attached), max_tokens)
 }
 
+pub(crate) fn run_service(
+    client: ServiceClient,
+    model_id: String,
+    target: OperationTarget,
+    max_tokens: u32,
+) -> Result<i32, String> {
+    let runtime = runtime::ChatRuntime::service(model_id, client.clone(), target.clone())?;
+    runtime::with_runtime_teardown(runtime, |runtime| {
+        let mut editor = new_editor()?;
+        let mut output = std::io::stdout();
+        run_session_loop(
+            runtime,
+            max_tokens,
+            || prompt_input(&mut editor),
+            &mut output,
+            move |model, messages, max_tokens| {
+                Worker::start_service(client.clone(), target.clone(), model, messages, max_tokens)
+            },
+        )
+    })
+}
+
 fn run_runtime(runtime: runtime::ChatRuntime, max_tokens: u32) -> Result<i32, String> {
     runtime::with_runtime_teardown(runtime, |runtime| run_session(runtime, max_tokens))
 }
@@ -290,12 +313,13 @@ fn run_runtime(runtime: runtime::ChatRuntime, max_tokens: u32) -> Result<i32, St
 fn run_session(runtime: &mut runtime::ChatRuntime, max_tokens: u32) -> Result<i32, String> {
     let mut editor = new_editor()?;
     let mut output = std::io::stdout();
+    let port = runtime.port()?;
     run_session_loop(
         runtime,
         max_tokens,
         || prompt_input(&mut editor),
         &mut output,
-        Worker::start,
+        move |model, messages, max_tokens| Worker::start(port, model, messages, max_tokens),
     )
 }
 
@@ -306,7 +330,14 @@ fn run_session_with_input(
     input: impl FnMut() -> InputEvent,
 ) -> Result<i32, String> {
     let mut output = std::io::sink();
-    run_session_loop(runtime, max_tokens, input, &mut output, Worker::start)
+    let port = runtime.port()?;
+    run_session_loop(
+        runtime,
+        max_tokens,
+        input,
+        &mut output,
+        move |model, messages, max_tokens| Worker::start(port, model, messages, max_tokens),
+    )
 }
 
 #[cfg(test)]
@@ -315,7 +346,7 @@ fn run_session_with_seams(
     max_tokens: u32,
     input: impl FnMut() -> InputEvent,
     output: &mut dyn Write,
-    start_worker: impl FnMut(u16, String, Vec<Message>, u32) -> Result<Worker, String>,
+    start_worker: impl FnMut(String, Vec<Message>, u32) -> Result<Worker, String>,
 ) -> Result<i32, String> {
     run_session_loop(runtime, max_tokens, input, output, start_worker)
 }
@@ -331,7 +362,7 @@ pub(crate) fn run_attached_exit_for_test(attached: AttachedRuntime) -> Result<i3
             1,
             || input.take().expect("one injected /exit"),
             &mut output,
-            |_, _, _, _| -> Result<Worker, String> { panic!("/exit must not start a chat Worker") },
+            |_, _, _| -> Result<Worker, String> { panic!("/exit must not start a chat Worker") },
         )
     })
 }
@@ -341,7 +372,7 @@ fn run_session_loop(
     max_tokens: u32,
     mut input: impl FnMut() -> InputEvent,
     output: &mut dyn Write,
-    mut start_worker: impl FnMut(u16, String, Vec<Message>, u32) -> Result<Worker, String>,
+    mut start_worker: impl FnMut(String, Vec<Message>, u32) -> Result<Worker, String>,
 ) -> Result<i32, String> {
     let mut session = Session::default();
     let model = runtime.model_id().to_owned();
@@ -403,7 +434,7 @@ fn run_session_loop(
             return Ok(code);
         }
 
-        let worker = start_worker(runtime.port(), model.to_owned(), messages, max_tokens)?;
+        let worker = start_worker(model.to_owned(), messages, max_tokens)?;
         let thinking = ui::spinner("Processing prompt…".into());
         let mut waiting = true;
         let mut timing = None;

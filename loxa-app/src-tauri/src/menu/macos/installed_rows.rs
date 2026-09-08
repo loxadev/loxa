@@ -129,7 +129,7 @@ pub(super) fn build(
             let available_width = WIDTH - 2.0 * INSET;
             let copy = text_button(
                 "Copy chat command",
-                if api.can_copy_chat() {
+                if api.can_copy_chat_for(item.id()) {
                     "Copy chat command for the selected installed model"
                 } else {
                     "Chat commands are unavailable in background service mode"
@@ -138,7 +138,7 @@ pub(super) fn build(
                 actions.copy,
                 mtm,
             );
-            copy.setEnabled(api.can_copy_chat());
+            copy.setEnabled(api.can_copy_chat_for(item.id()));
             copy.setFrame(rect(INSET, 4.0, available_width / 2.0 - 3.0, 28.0));
             action_row.addSubview(&copy);
             let reveal = text_button(

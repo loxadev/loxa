@@ -26,6 +26,13 @@ pub(super) enum ChatRuntime {
         terminated: bool,
     },
     Attached(AttachedRuntime),
+    Service {
+        model_id: String,
+        client: Box<loxa_ipc::ServiceClient>,
+        target: loxa_ipc::OperationTarget,
+        observer: tokio::runtime::Runtime,
+        last_validated: std::time::Instant,
+    },
     #[cfg(test)]
     OwnedTest {
         model_id: String,
@@ -118,6 +125,26 @@ impl ChatRuntime {
     pub(super) fn attached(runtime: AttachedRuntime) -> Self {
         Self::Attached(runtime)
     }
+    pub(super) fn service(
+        model_id: String,
+        client: loxa_ipc::ServiceClient,
+        target: loxa_ipc::OperationTarget,
+    ) -> Result<Self, String> {
+        let observer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())?;
+        observer.block_on(crate::service::attachment::validate_target(
+            &client, &model_id, &target,
+        ))?;
+        Ok(Self::Service {
+            model_id,
+            client: Box::new(client),
+            target,
+            observer,
+            last_validated: std::time::Instant::now(),
+        })
+    }
 
     #[cfg(test)]
     pub(super) fn owned_for_test(
@@ -139,22 +166,24 @@ impl ChatRuntime {
         match self {
             Self::Owned { model_id, .. } => model_id,
             Self::Attached(runtime) => runtime.model_id(),
+            Self::Service { model_id, .. } => model_id,
             #[cfg(test)]
             Self::OwnedTest { model_id, .. } => model_id,
         }
     }
 
-    pub(super) fn port(&self) -> u16 {
+    pub(super) fn port(&self) -> Result<u16, String> {
         match self {
-            Self::Owned { server, .. } => server.port(),
-            Self::Attached(runtime) => runtime.port(),
+            Self::Owned { server, .. } => Ok(server.port()),
+            Self::Attached(runtime) => Ok(runtime.port()),
+            Self::Service { .. } => Err("service chat has no TCP endpoint".into()),
             #[cfg(test)]
-            Self::OwnedTest { port, .. } => *port,
+            Self::OwnedTest { port, .. } => Ok(*port),
         }
     }
 
     pub(super) fn is_attached(&self) -> bool {
-        matches!(self, Self::Attached(_))
+        matches!(self, Self::Attached(_) | Self::Service { .. })
     }
 
     pub(super) fn poll(&mut self) -> Result<Option<i32>, String> {
@@ -164,6 +193,21 @@ impl ChatRuntime {
                 .revalidate()
                 .map(|()| None)
                 .map_err(|_| ATTACHED_RUNTIME_UNAVAILABLE.to_string()),
+            Self::Service {
+                model_id,
+                client,
+                target,
+                observer,
+                last_validated,
+            } => {
+                if last_validated.elapsed() >= crate::service::attachment::TARGET_POLL_INTERVAL {
+                    observer.block_on(crate::service::attachment::validate_target(
+                        client, model_id, target,
+                    ))?;
+                    *last_validated = std::time::Instant::now();
+                }
+                Ok(None)
+            }
             #[cfg(test)]
             Self::OwnedTest { poll, .. } => poll(),
         }
@@ -181,6 +225,7 @@ impl ChatRuntime {
                 server.terminate()
             }
             Self::Attached(_) => Ok(()),
+            Self::Service { .. } => Ok(()),
             #[cfg(test)]
             Self::OwnedTest {
                 terminate,

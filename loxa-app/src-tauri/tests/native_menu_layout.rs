@@ -293,18 +293,18 @@ mod menu {
                     runtime.action_buttons[0]
                         .accessibilityLabel()
                         .map(|label| label.to_string()),
-                    Some("Copy API curl command".into())
+                    Some("Copy API command".into())
                 );
                 let copy_button = &runtime.action_buttons[0];
                 assert_eq!(
                     copy_button.toolTip().map(|label| label.to_string()),
-                    Some("Copy API curl command".into())
+                    Some("Copy API command".into())
                 );
                 assert!(copy_button.image().is_some());
                 assert!(!copy_button.refusesFirstResponder());
                 assert_eq!(
                     runtime_curl_copy_button_content(false),
-                    ("doc.on.doc", "Copy API curl command")
+                    ("doc.on.doc", "Copy API command")
                 );
 
                 let content_frame = runtime.view.frame();
@@ -398,11 +398,11 @@ mod menu {
                     copy_button
                         .accessibilityLabel()
                         .map(|label| label.to_string()),
-                    Some("Copy API curl command".into())
+                    Some("Copy API command".into())
                 );
                 assert_eq!(
                     copy_button.toolTip().map(|label| label.to_string()),
-                    Some("Copy API curl command".into())
+                    Some("Copy API command".into())
                 );
                 assert!(copy_button.image().is_some());
                 assert_eq!(
@@ -1539,7 +1539,7 @@ mod menu {
                 assert!(state.runtime_curl_copy_feedback.is_none());
                 assert!(view_has_button_label(
                     &state.content_view_controller.view(),
-                    "Copy API curl command"
+                    "Copy API command"
                 ));
 
                 assert!(state.arm_runtime_curl_copy_feedback(command.into(), Instant::now()));

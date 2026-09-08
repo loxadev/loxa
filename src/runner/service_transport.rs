@@ -24,7 +24,7 @@ pub(super) fn require_absent_unix_endpoint(path: &Path) -> Result<(), String> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct UnixEndpointIdentity {
+pub(crate) struct UnixEndpointIdentity {
     device: u64,
     inode: u64,
 }
@@ -144,7 +144,10 @@ async fn readiness_unix_attempt(
     response
 }
 
-async fn connect_authenticated(
+/// Connect only after proving the pathname and kernel peer are the exact
+/// private engine selected by the service status projection.  Callers must
+/// still re-read that projection after this returns, before writing HTTP.
+pub(crate) async fn connect_authenticated(
     path: &Path,
     expected_pid: u32,
     authenticated: &Cell<Option<UnixEndpointIdentity>>,

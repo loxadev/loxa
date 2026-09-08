@@ -110,6 +110,10 @@ impl ApiPresentation {
         true
     }
 
+    pub(crate) fn can_copy_chat_for(&self, _model_id: &str) -> bool { true }
+
+    pub(crate) fn chat_command(&self) -> Option<&str> { None }
+
     pub(crate) fn primary_action(&self, selected_model_id: &str) -> ApiPrimaryAction {
         if self
             .active_model_id()

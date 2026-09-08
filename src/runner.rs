@@ -10,7 +10,7 @@ mod output;
 mod owned;
 mod persistent;
 #[cfg(unix)]
-mod service_transport;
+pub(crate) mod service_transport;
 mod signal;
 
 pub(crate) use arguments::build_persistent_args_for_fingerprint;

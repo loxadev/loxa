@@ -2,12 +2,22 @@ mod protocol;
 
 pub use protocol::{Event, Message, PromptProgress, Role, Timing};
 
+use loxa_ipc::{OperationTarget, ServiceClient};
 use protocol::{decode_sse, http_error, Request};
 use std::sync::mpsc;
 use std::time::Duration;
 
 const EVENT_QUEUE_CAPACITY: usize = 64;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+pub(crate) fn service_request_json(
+    model: &str,
+    messages: &[Message],
+    max_tokens: u32,
+) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(&Request::new(model, messages, max_tokens))
+        .map_err(|error| error.to_string())
+}
 
 pub struct Worker {
     events: mpsc::Receiver<Event>,
@@ -22,6 +32,54 @@ impl Worker {
         max_tokens: u32,
     ) -> Result<Self, String> {
         Self::start_with_request_timeout(port, model, messages, max_tokens, REQUEST_TIMEOUT)
+    }
+
+    pub(crate) fn start_service(
+        client: ServiceClient,
+        target: OperationTarget,
+        model: String,
+        messages: Vec<Message>,
+        max_tokens: u32,
+    ) -> Result<Self, String> {
+        let (sender, events) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
+        let thread = std::thread::Builder::new()
+            .name("loxa-service-chat-request".into())
+            .spawn(move || {
+                let result = (|| {
+                    let body = service_request_json(&model, &messages, max_tokens)?;
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|error| error.to_string())?;
+                    let mut decoder = protocol::SseDecoder::new();
+                    let mut emit = |event| {
+                        sender
+                            .send(event)
+                            .map_err(|_| "chat event receiver closed".to_string())
+                    };
+                    runtime.block_on(crate::service::attachment::chat(
+                        &client,
+                        &target,
+                        &model,
+                        body,
+                        |data| decoder.push(data, &mut emit),
+                    ))?;
+                    decoder.finish(&mut emit)
+                })();
+                match result {
+                    Ok(assistant) => {
+                        let _ = sender.send(Event::Complete(assistant));
+                    }
+                    Err(error) => {
+                        let _ = sender.send(Event::Error(error));
+                    }
+                }
+            })
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            events,
+            thread: Some(thread),
+        })
     }
 
     fn start_with_request_timeout(

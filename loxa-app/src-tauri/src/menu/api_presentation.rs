@@ -5,11 +5,20 @@ use super::api_runtime::{
 };
 use super::presentation::{ObservedRuntime, ObservedRuntimeOwner};
 
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn shell_quote_path(value: &std::path::Path) -> String {
+    shell_quote(&value.to_string_lossy())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ApiPresentation {
     phase: ApiPresentationPhase,
     status_label: String,
     curl_command: Option<String>,
+    chat_command: Option<String>,
     active_model_id: Option<String>,
     shared_service: bool,
 }
@@ -64,7 +73,9 @@ impl ApiPrimaryAction {
 
 impl ApiPresentation {
     pub(crate) fn from_controller(controller: &ApiRuntimeController) -> Self {
-        Self::from_runtime_view(controller.view())
+        let mut presentation = Self::from_runtime_view(controller.view());
+        presentation.attach_service_commands(controller);
+        presentation
     }
 
     fn from_runtime_view(view: ApiRuntimeView<'_>) -> Self {
@@ -87,7 +98,9 @@ impl ApiPresentation {
     ) -> Self {
         let view = controller.view();
         if view.kind() == ApiRuntimeKind::Service {
-            return Self::from_runtime_view(view);
+            let mut presentation = Self::from_runtime_view(view);
+            presentation.attach_service_commands(controller);
+            return presentation;
         }
         Self::from_state_with_observed_runtime(
             view.phase(),
@@ -148,6 +161,7 @@ impl ApiPresentation {
             phase: presentation_phase,
             status_label,
             curl_command,
+            chat_command: None,
             active_model_id: active_model_id.map(str::to_owned),
             shared_service: false,
         }
@@ -218,6 +232,7 @@ impl ApiPresentation {
             phase: presentation_phase,
             status_label,
             curl_command: None,
+            chat_command: None,
             active_model_id: active_model_id.map(str::to_owned),
             shared_service: true,
         }
@@ -242,6 +257,7 @@ impl ApiPresentation {
             phase: ApiPresentationPhase::CliRuntime,
             status_label: format!("CLI runtime · 127.0.0.1:{port}"),
             curl_command: Some(format!("curl http://127.0.0.1:{port}/v1/models")),
+            chat_command: None,
             active_model_id: Some(runtime.model_id().into()),
             shared_service: false,
         }
@@ -259,8 +275,52 @@ impl ApiPresentation {
         self.active_model_id.as_deref()
     }
 
+    #[cfg(test)]
     pub(crate) fn can_copy_chat(&self) -> bool {
+        self.chat_command.is_some() || !self.shared_service
+    }
+
+    pub(crate) fn can_copy_chat_for(&self, model_id: &str) -> bool {
         !self.shared_service
+            || (self.chat_command.is_some() && self.active_model_id() == Some(model_id))
+    }
+
+    pub(crate) fn chat_command(&self) -> Option<&str> {
+        self.chat_command.as_deref()
+    }
+
+    fn attach_service_commands(&mut self, controller: &ApiRuntimeController) {
+        if !self.shared_service || self.phase != ApiPresentationPhase::Ready {
+            return;
+        }
+        let Some((executable, root)) = controller.service_command_context() else {
+            return;
+        };
+        let ApiRuntimePhase::Ready { endpoint, .. } = controller.view().phase() else {
+            return;
+        };
+        let Some(target) = endpoint.service_target() else {
+            return;
+        };
+        let prefix = format!(
+            "{} service-dev --data-root {}",
+            shell_quote_path(executable),
+            shell_quote_path(root)
+        );
+        let target = format!(
+            "--boot-epoch {} --task-id {} --generation {}",
+            shell_quote(&target.boot_epoch),
+            shell_quote(&target.task_id),
+            shell_quote(&target.generation)
+        );
+        self.curl_command = Some(format!(
+            "{prefix} api {} models {target}",
+            shell_quote(&endpoint.model_id)
+        ));
+        self.chat_command = Some(format!(
+            "{prefix} chat {} {target}",
+            shell_quote(&endpoint.model_id)
+        ));
     }
 
     pub(crate) fn primary_action(&self, selected_model_id: &str) -> ApiPrimaryAction {
