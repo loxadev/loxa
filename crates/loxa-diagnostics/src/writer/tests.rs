@@ -228,7 +228,7 @@ fn daily_writer_drops_a_record_that_would_cross_the_file_cap() {
 
 #[cfg(unix)]
 #[test]
-fn contended_log_lock_disables_the_sink_without_blocking() {
+fn contended_log_lock_drops_one_record_and_later_writes_resume() {
     let root = tempfile::tempdir().unwrap();
     let date = time::Date::from_calendar_date(2026, time::Month::August, 5).unwrap();
     let health = Arc::new(SinkHealth::default());
@@ -238,7 +238,7 @@ fn contended_log_lock_disables_the_sink_without_blocking() {
     let holder = fs::OpenOptions::new()
         .read(true)
         .append(true)
-        .open(path)
+        .open(&path)
         .unwrap();
     lock_log_file(&holder).unwrap();
 
@@ -246,11 +246,18 @@ fn contended_log_lock_disables_the_sink_without_blocking() {
     assert_eq!(writer.write_at(date, b"contended\n").unwrap(), 10);
     assert!(started.elapsed() < Duration::from_millis(100));
     let snapshot = health.snapshot(0);
-    assert!(snapshot.sink_failed);
-    assert_eq!(snapshot.sink_failures, 1);
+    assert!(!snapshot.sink_failed);
+    assert_eq!(snapshot.sink_failures, 0);
     assert_eq!(snapshot.sink_discards, 1);
+    assert!(snapshot.is_available());
+    assert!(!snapshot.is_healthy());
 
     unlock_log_file(&holder).unwrap();
+    assert_eq!(writer.write_at(date, b"resumed\n").unwrap(), 8);
+    let contents = fs::read_to_string(path).unwrap();
+    assert!(contents.ends_with("resumed\n"));
+    assert!(!contents.contains("contended"));
+    assert_eq!(health.snapshot(0).sink_discards, 1);
 }
 
 #[test]

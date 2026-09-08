@@ -86,6 +86,10 @@ impl RetainedDailyWriter {
         }
         match append_bounded_record(&mut self.file, bytes) {
             Ok(AppendOutcome::Written) => Ok(bytes.len()),
+            Ok(AppendOutcome::Contended) => {
+                self.health.record_discard();
+                Ok(bytes.len())
+            }
             Ok(AppendOutcome::AtCapacity) => {
                 self.at_capacity = true;
                 self.health.record_capacity_discard();
@@ -136,11 +140,18 @@ impl IoWrite for RetainedDailyWriter {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AppendOutcome {
     Written,
+    Contended,
     AtCapacity,
 }
 
 fn append_bounded_record(file: &mut File, bytes: &[u8]) -> std::io::Result<AppendOutcome> {
-    lock_log_file(file)?;
+    match lock_log_file(file) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            return Ok(AppendOutcome::Contended);
+        }
+        Err(error) => return Err(error),
+    }
     let result: std::io::Result<AppendOutcome> = (|| {
         let length = file.metadata()?.len();
         let bytes_u64 = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
