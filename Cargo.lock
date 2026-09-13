@@ -2100,14 +2100,18 @@ name = "loxa-app"
 version = "0.1.0"
 dependencies = [
  "dispatch2",
+ "libc",
  "loxa",
  "loxa-diagnostics",
  "loxa-ipc",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
+ "serde",
+ "serde_json",
  "tauri",
  "tauri-build",
+ "tempfile",
  "tokio",
  "tracing",
 ]

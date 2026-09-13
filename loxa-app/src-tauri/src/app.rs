@@ -1,6 +1,6 @@
 use std::sync::Mutex;
 
-use dispatch2::MainThreadBound;
+use dispatch2::{DispatchQueue, DispatchTime, MainThreadBound};
 use loxa::paths::AppPaths;
 use loxa_ipc::ServiceClient;
 use objc2::MainThreadMarker;
@@ -8,6 +8,7 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, Tray
 use tauri::{AppHandle, ExitRequestApi, Manager, RunEvent, Wry};
 
 use crate::menu::macos::{NativeExitResources, NativePopoverController};
+use crate::preferences::{PreferencesExit, PreferencesOwner, WeakPreferencesOwner};
 
 #[derive(Clone)]
 struct ApplicationLaunch {
@@ -84,6 +85,96 @@ struct NativeShellState(Mutex<Option<NativeShell>>);
 struct NativeExitAttempt {
     shell: NativeShell,
     resources: NativeExitResources,
+    preferences: PreferencesOwner,
+}
+
+struct NativePreferencesState(PreferencesOwner);
+
+struct NativeExitState(Mutex<NativeExitStateInner>);
+
+struct NativeExitStateInner {
+    phase: NativeExitPhase,
+    attempt: Option<NativeExitAttempt>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeExitPhase {
+    Idle,
+    Preparing,
+    Waiting,
+    Completed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeExitAdmission {
+    Proceed,
+    Prevent,
+    Allow,
+}
+
+impl NativeExitState {
+    fn new() -> Self {
+        Self(Mutex::new(NativeExitStateInner {
+            phase: NativeExitPhase::Idle,
+            attempt: None,
+        }))
+    }
+
+    fn claim(&self) -> NativeExitAdmission {
+        let mut state = self
+            .0
+            .lock()
+            .expect("native exit state mutex must not be poisoned");
+        match state.phase {
+            NativeExitPhase::Idle => {
+                state.phase = NativeExitPhase::Preparing;
+                NativeExitAdmission::Proceed
+            }
+            NativeExitPhase::Preparing | NativeExitPhase::Waiting => NativeExitAdmission::Prevent,
+            NativeExitPhase::Completed => NativeExitAdmission::Allow,
+        }
+    }
+
+    fn wait_with(&self, attempt: NativeExitAttempt) {
+        let mut state = self
+            .0
+            .lock()
+            .expect("native exit state mutex must not be poisoned");
+        debug_assert_eq!(state.phase, NativeExitPhase::Preparing);
+        debug_assert!(state.attempt.is_none());
+        state.attempt = Some(attempt);
+        state.phase = NativeExitPhase::Waiting;
+    }
+
+    fn take_waiting(&self) -> Option<NativeExitAttempt> {
+        let mut state = self
+            .0
+            .lock()
+            .expect("native exit state mutex must not be poisoned");
+        if state.phase != NativeExitPhase::Waiting {
+            return None;
+        }
+        state.phase = NativeExitPhase::Preparing;
+        state.attempt.take()
+    }
+
+    fn reset(&self) {
+        let mut state = self
+            .0
+            .lock()
+            .expect("native exit state mutex must not be poisoned");
+        debug_assert!(state.attempt.is_none());
+        state.phase = NativeExitPhase::Idle;
+    }
+
+    fn complete(&self) {
+        let mut state = self
+            .0
+            .lock()
+            .expect("native exit state mutex must not be poisoned");
+        debug_assert!(state.attempt.is_none());
+        state.phase = NativeExitPhase::Completed;
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -105,10 +196,14 @@ fn dispatch_native_shell_lifecycle(
 
 fn run_exit_transaction<Resource>(
     mut resource: Resource,
+    flush_preferences: impl FnOnce(&mut Resource) -> Result<(), ()>,
     shutdown_runtime: impl FnOnce(&mut Resource) -> Result<(), ()>,
     shutdown_backend: impl FnOnce(&mut Resource) -> Result<(), ()>,
     finish: impl FnOnce(Resource),
 ) -> Result<(), Resource> {
+    if flush_preferences(&mut resource).is_err() {
+        return Err(resource);
+    }
     if shutdown_runtime(&mut resource).is_err() {
         return Err(resource);
     }
@@ -143,6 +238,18 @@ pub(crate) fn run() -> Result<(), String> {
     let app = crate::native_menu::with_native_edit_menu(tauri::Builder::default())
         .setup(move |app| {
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
+            let preferences_directory = app.path().app_config_dir()?;
+            std::fs::create_dir_all(&preferences_directory)?;
+            let preferences =
+                PreferencesOwner::open(&preferences_directory.join("desktop-preferences.json"))
+                    .map_err(|error| std::io::Error::other(error.context))?;
+            let notification_owner = preferences.downgrade();
+            preferences.set_completion_notifier(std::sync::Arc::new(move || {
+                schedule_preference_completion(notification_owner.clone());
+            }));
+            assert!(app.manage(NativePreferencesState(preferences)));
+            assert!(app.manage(NativeExitState::new()));
 
             let tray = TrayIconBuilder::with_id("loxa")
                 .icon(tauri::include_image!("./icons/loxa-template.png"))
@@ -213,6 +320,15 @@ pub(crate) fn run() -> Result<(), String> {
 }
 
 fn handle_exit_requested(app_handle: &AppHandle, api: &ExitRequestApi) {
+    let exit_state = app_handle.state::<NativeExitState>();
+    match exit_state.claim() {
+        NativeExitAdmission::Allow => return,
+        NativeExitAdmission::Prevent => {
+            api.prevent_exit();
+            return;
+        }
+        NativeExitAdmission::Proceed => {}
+    }
     let shell = {
         let state = app_handle.state::<NativeShellState>();
         let mut state = state
@@ -223,6 +339,7 @@ fn handle_exit_requested(app_handle: &AppHandle, api: &ExitRequestApi) {
     };
 
     let Some(mut shell) = shell else {
+        exit_state.reset();
         api.prevent_exit();
         return;
     };
@@ -230,29 +347,145 @@ fn handle_exit_requested(app_handle: &AppHandle, api: &ExitRequestApi) {
         MainThreadMarker::new().expect("Tauri must deliver native shell exit on the main thread");
     let Some(resources) = shell.controller.get_mut(mtm).prepare_exit(mtm) else {
         restore_native_shell(app_handle, shell);
+        exit_state.reset();
         api.prevent_exit();
         return;
     };
-    let attempt = NativeExitAttempt { shell, resources };
-    let result = run_exit_transaction(
+    let preferences = app_handle.state::<NativePreferencesState>().0.clone();
+    let attempt = NativeExitAttempt {
+        shell,
+        resources,
+        preferences: preferences.clone(),
+    };
+    let preferences_exit = match preferences.begin_drain() {
+        PreferencesExit::Failed => preferences.retry_for_exit(),
+        state => Ok(state),
+    };
+    match preferences_exit {
+        Ok(PreferencesExit::Drained) => complete_native_exit_request(app_handle, attempt, api),
+        Ok(PreferencesExit::Pending) => {
+            api.prevent_exit();
+            defer_native_exit(app_handle, attempt);
+        }
+        Ok(PreferencesExit::Failed) | Err(_) => {
+            restore_native_exit_attempt(app_handle, attempt);
+            api.prevent_exit();
+        }
+    }
+}
+
+fn complete_native_exit_request(
+    app_handle: &AppHandle,
+    attempt: NativeExitAttempt,
+    api: &ExitRequestApi,
+) {
+    match finish_native_exit(app_handle, attempt) {
+        Ok(()) => app_handle.state::<NativeExitState>().complete(),
+        Err(attempt) => {
+            restore_native_exit_attempt(app_handle, attempt);
+            api.prevent_exit();
+        }
+    }
+}
+
+fn finish_native_exit(
+    app_handle: &AppHandle,
+    attempt: NativeExitAttempt,
+) -> Result<(), NativeExitAttempt> {
+    run_exit_transaction(
         attempt,
+        |attempt| attempt.preferences.finish_ready_drain().map_err(|_| ()),
         |attempt| attempt.resources.shutdown_runtime(),
         |attempt| attempt.resources.shutdown_backend(),
         |attempt| {
+            attempt.preferences.clear_completion_notifier();
             let removed = app_handle.remove_tray_by_id("loxa");
             drop(removed);
             attempt.shell.teardown();
         },
-    );
-    if let Err(mut attempt) = result {
-        attempt
-            .shell
-            .controller
-            .get_mut(mtm)
-            .restore_exit(attempt.resources, mtm);
-        restore_native_shell(app_handle, attempt.shell);
-        api.prevent_exit();
+    )
+}
+
+fn schedule_preference_completion(owner: WeakPreferencesOwner) {
+    DispatchQueue::main().exec_async(move || finish_preference_completion(owner));
+}
+
+fn finish_preference_completion(owner: WeakPreferencesOwner) {
+    let Some(owner) = owner.upgrade() else {
+        return;
+    };
+    if owner.finish_notified_write() {
+        return;
     }
+    let owner = owner.downgrade();
+    let retry_at = DispatchTime::try_from(std::time::Duration::from_millis(1))
+        .expect("one millisecond must fit in dispatch time");
+    let _ = DispatchQueue::main().after(retry_at, move || {
+        finish_preference_completion(owner);
+    });
+}
+
+fn defer_native_exit(app_handle: &AppHandle, attempt: NativeExitAttempt) {
+    let preferences = attempt.preferences.clone();
+    let exit_state = app_handle.state::<NativeExitState>();
+    exit_state.wait_with(attempt);
+    let callback_app = app_handle.clone();
+    let spawned = std::thread::Builder::new()
+        .name("loxa-desktop-exit-preferences".into())
+        .spawn(move || {
+            let result = preferences.resolve_exit_blocking();
+            let scheduler = callback_app.clone();
+            let _ = scheduler.run_on_main_thread(move || {
+                finish_deferred_native_exit(&callback_app, result);
+            });
+        });
+    if spawned.is_err() {
+        tracing::warn!(
+            target: "loxa_app",
+            event = "desktop_preference_exit_observer_failed"
+        );
+        if let Some(attempt) = exit_state.take_waiting() {
+            restore_native_exit_attempt(app_handle, attempt);
+        }
+    }
+}
+
+fn finish_deferred_native_exit(
+    app_handle: &AppHandle,
+    preferences_result: Result<(), crate::preferences::PreferenceError>,
+) {
+    let exit_state = app_handle.state::<NativeExitState>();
+    let Some(attempt) = exit_state.take_waiting() else {
+        return;
+    };
+    if preferences_result.is_err() {
+        tracing::warn!(
+            target: "loxa_app",
+            event = "desktop_preference_flush_failed"
+        );
+        restore_native_exit_attempt(app_handle, attempt);
+        return;
+    }
+    match finish_native_exit(app_handle, attempt) {
+        Ok(()) => {
+            exit_state.complete();
+            app_handle.exit(0);
+        }
+        Err(attempt) => restore_native_exit_attempt(app_handle, attempt),
+    }
+}
+
+fn restore_native_exit_attempt(app_handle: &AppHandle, attempt: NativeExitAttempt) {
+    let mtm =
+        MainThreadMarker::new().expect("Tauri must restore native exit state on the main thread");
+    let NativeExitAttempt {
+        mut shell,
+        resources,
+        preferences: _,
+    } = attempt;
+    shell.controller.get_mut(mtm).restore_exit(resources, mtm);
+    restore_native_shell(app_handle, shell);
+    app_handle.state::<NativeExitState>().reset();
 }
 
 fn restore_native_shell(app_handle: &AppHandle, shell: NativeShell) {
@@ -296,7 +529,10 @@ mod lifecycle_tests {
     use std::cell::{Cell, RefCell};
     use std::sync::Mutex;
 
-    use super::{dispatch_native_shell_lifecycle, run_exit_transaction, NativeShellLifecycleEvent};
+    use super::{
+        dispatch_native_shell_lifecycle, run_exit_transaction, NativeExitAdmission,
+        NativeExitPhase, NativeExitState, NativeShellLifecycleEvent,
+    };
     use crate::menu::api_runtime::idle_controller_for_exit_test;
     use crate::menu::macos::{exit_resources_api, exit_resources_for_test};
     use crate::menu::observation::backend_client_panicking_on_shutdown;
@@ -321,9 +557,33 @@ mod lifecycle_tests {
         assert_eq!(events.into_inner(), ["teardown"]);
     }
 
+    #[test]
+    fn exit_admission_serializes_requests_and_allows_completed_reentry() {
+        let state = NativeExitState::new();
+        assert_eq!(state.claim(), NativeExitAdmission::Proceed);
+        assert_eq!(state.claim(), NativeExitAdmission::Prevent);
+
+        state.reset();
+        assert_eq!(state.claim(), NativeExitAdmission::Proceed);
+        {
+            let mut inner = state.0.lock().unwrap();
+            inner.phase = NativeExitPhase::Waiting;
+        }
+        assert_eq!(state.claim(), NativeExitAdmission::Prevent);
+
+        {
+            let mut inner = state.0.lock().unwrap();
+            inner.phase = NativeExitPhase::Preparing;
+        }
+        state.complete();
+        assert_eq!(state.claim(), NativeExitAdmission::Allow);
+        assert_eq!(state.claim(), NativeExitAdmission::Allow);
+    }
+
     #[derive(Debug, Eq, PartialEq)]
     struct ExitFixture {
         shell_id: u8,
+        preference_id: u8,
         runtime_id: u8,
         backend_id: u8,
     }
@@ -337,8 +597,16 @@ mod lifecycle_tests {
         let result = run_exit_transaction(
             ExitFixture {
                 shell_id: 1,
+                preference_id: 4,
                 runtime_id: 2,
                 backend_id: 3,
+            },
+            |fixture| {
+                assert_eq!(fixture.preference_id, 4);
+                assert!(shell_mutex.try_lock().is_ok());
+                assert!(native_state.try_borrow_mut().is_ok());
+                events.borrow_mut().push("preferences flush");
+                Ok(())
             },
             |fixture| {
                 assert_eq!(fixture.runtime_id, 2);
@@ -363,7 +631,12 @@ mod lifecycle_tests {
         assert_eq!(result, Ok(()));
         assert_eq!(
             events.into_inner(),
-            ["runtime join", "backend join", "remove tray"]
+            [
+                "preferences flush",
+                "runtime join",
+                "backend join",
+                "remove tray"
+            ]
         );
     }
 
@@ -372,11 +645,16 @@ mod lifecycle_tests {
         let events = RefCell::new(Vec::new());
         let fixture = ExitFixture {
             shell_id: 7,
+            preference_id: 6,
             runtime_id: 8,
             backend_id: 9,
         };
         let failed = run_exit_transaction(
             fixture,
+            |_| {
+                events.borrow_mut().push("preferences flush");
+                Ok(())
+            },
             |_| {
                 events.borrow_mut().push("runtime failed");
                 Err(())
@@ -389,6 +667,7 @@ mod lifecycle_tests {
             failed,
             ExitFixture {
                 shell_id: 7,
+                preference_id: 6,
                 runtime_id: 8,
                 backend_id: 9,
             }
@@ -396,6 +675,10 @@ mod lifecycle_tests {
 
         let retry = run_exit_transaction(
             failed,
+            |_| {
+                events.borrow_mut().push("preferences retry");
+                Ok(())
+            },
             |_| {
                 events.borrow_mut().push("runtime retry");
                 Ok(())
@@ -410,10 +693,72 @@ mod lifecycle_tests {
         assert_eq!(
             events.into_inner(),
             [
+                "preferences flush",
                 "runtime failed",
+                "preferences retry",
                 "runtime retry",
                 "backend retry",
                 "remove tray"
+            ]
+        );
+    }
+
+    #[test]
+    fn preference_failure_retains_every_exit_resource_and_stops_cleanup() {
+        let events = RefCell::new(Vec::new());
+        let fixture = ExitFixture {
+            shell_id: 11,
+            preference_id: 12,
+            runtime_id: 13,
+            backend_id: 14,
+        };
+        let failed = run_exit_transaction(
+            fixture,
+            |_| {
+                events.borrow_mut().push("preferences failed");
+                Err(())
+            },
+            |_| panic!("runtime must stay retained after preference failure"),
+            |_| panic!("backend must stay retained after preference failure"),
+            |_| panic!("shell must stay retained after preference failure"),
+        )
+        .expect_err("preference failure must block exit");
+        assert_eq!(
+            failed,
+            ExitFixture {
+                shell_id: 11,
+                preference_id: 12,
+                runtime_id: 13,
+                backend_id: 14,
+            }
+        );
+        assert_eq!(events.borrow().as_slice(), ["preferences failed"]);
+
+        let retried = run_exit_transaction(
+            failed,
+            |_| {
+                events.borrow_mut().push("preferences retry");
+                Ok(())
+            },
+            |_| {
+                events.borrow_mut().push("runtime shutdown");
+                Ok(())
+            },
+            |_| {
+                events.borrow_mut().push("backend shutdown");
+                Ok(())
+            },
+            |_| events.borrow_mut().push("shell teardown"),
+        );
+        assert_eq!(retried, Ok(()));
+        assert_eq!(
+            events.into_inner(),
+            [
+                "preferences failed",
+                "preferences retry",
+                "runtime shutdown",
+                "backend shutdown",
+                "shell teardown"
             ]
         );
     }
@@ -428,6 +773,7 @@ mod lifecycle_tests {
         );
         let failed = run_exit_transaction(
             resources,
+            |_| Ok(()),
             |resources| resources.shutdown_runtime(),
             |resources| resources.shutdown_backend(),
             |_| tray_removals.set(tray_removals.get() + 1),
@@ -444,6 +790,7 @@ mod lifecycle_tests {
 
         assert!(run_exit_transaction(
             failed,
+            |_| Ok(()),
             |resources| resources.shutdown_runtime(),
             |resources| resources.shutdown_backend(),
             |_| tray_removals.set(tray_removals.get() + 1),

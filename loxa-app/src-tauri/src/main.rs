@@ -3,6 +3,7 @@
 mod app;
 mod menu;
 mod native_menu;
+mod preferences;
 
 fn main() {
     // Menu-copied service commands invoke the packaged desktop executable.

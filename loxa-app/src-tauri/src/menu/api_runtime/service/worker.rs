@@ -171,7 +171,13 @@ impl ServiceRuntimeWorker {
         let outcome = wait_interruptible(&self.runtime, &self.disconnect, request);
         let accepted = match outcome {
             Ok(Ok(ReplyOutcome::Accepted(accepted))) => accepted,
-            Ok(Ok(ReplyOutcome::Status(_) | ReplyOutcome::Rejected(_))) => {
+            Ok(Ok(
+                ReplyOutcome::Status(_)
+                | ReplyOutcome::History { .. }
+                | ReplyOutcome::Draft { .. }
+                | ReplyOutcome::Settings { .. }
+                | ReplyOutcome::Rejected(_),
+            )) => {
                 let _ = self.messages.send(ServiceEvent::ControllerFailed);
                 return;
             }
