@@ -18,23 +18,12 @@ pub struct Config {
     pub port: Option<u16>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct LoadedSettings {
     pub(crate) config: Config,
     pub(crate) revision: u64,
     pub(crate) generation: GenerationSettings,
     pub(crate) v2: bool,
-}
-
-impl Default for LoadedSettings {
-    fn default() -> Self {
-        Self {
-            config: Config::default(),
-            revision: 0,
-            generation: GenerationSettings::default(),
-            v2: false,
-        }
-    }
 }
 
 enum Field {

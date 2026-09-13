@@ -153,7 +153,7 @@ fn admit(
     }
     let conversation = read_conversation(&transaction, prepared.conversation_id)?
         .ok_or_else(|| not_found("conversation was not found"))?;
-    validate_conversation(&prepared, &conversation)?;
+    validate_conversation(prepared, &conversation)?;
     let excluded_attempt = match &prepared.kind {
         AdmissionKind::Retry { prior_attempt_id } => Some(*prior_attempt_id),
         AdmissionKind::Send { .. } => None,
