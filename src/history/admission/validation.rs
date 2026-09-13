@@ -4,7 +4,7 @@ use super::types::{
 use super::{conflict, invalid};
 use crate::history::{schema, HistoryError, HistoryErrorKind};
 use crate::runtime_fingerprint::EffectiveProfile;
-use rusqlite::{params, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 pub(super) fn validate_prepared(prepared: &PreparedAdmission) -> Result<(), HistoryError> {
     if prepared.expected_conversation_revision <= 0
@@ -20,6 +20,10 @@ pub(super) fn validate_prepared(prepared: &PreparedAdmission) -> Result<(), Hist
     }
     if prepared.system_instruction.len() > MAX_SYSTEM_TEXT_BYTES
         || !(1..=i64::from(i32::MAX)).contains(&prepared.max_output_tokens)
+        || !(crate::runtime_fingerprint::SERVICE_MIN_CONTEXT
+            ..=crate::runtime_fingerprint::SERVICE_MAX_CONTEXT)
+            .contains(&prepared.effective_context)
+        || prepared.effective_context > prepared.runtime_fingerprint.effective_context()
     {
         return Err(invalid("invalid generation profile"));
     }
@@ -236,10 +240,10 @@ pub(super) fn validate_conversation(
 }
 
 pub(super) fn require_previous_turn_resolved(
-    transaction: &Transaction<'_>,
+    connection: &Connection,
     conversation_id: [u8; 16],
 ) -> Result<(), HistoryError> {
-    let blocked: bool = transaction
+    let blocked: bool = connection
         .query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM attempts a

@@ -18,6 +18,12 @@ const MARKER_SCHEMA: u32 = 1;
 const ORIGIN_SCHEMA: u32 = 1;
 const MAX_RECORD_BYTES: usize = 16 * 1024;
 const MAX_UNIX_SOCKET_PATH_BYTES: usize = 103;
+pub const ENGINE_SOCKET_NONCE_BYTES: usize = 16;
+pub const ENGINE_SOCKET_FILENAME_BYTES: usize = "engine-".len()
+    + u64::BITS as usize / 4
+    + "-".len()
+    + ENGINE_SOCKET_NONCE_BYTES * 2
+    + ".sock".len();
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -428,7 +434,10 @@ fn require_initializer_only_tree(root: &Path, control_dir: &Path) -> Result<(), 
 }
 
 fn validate_socket_path_length(path: &Path) -> Result<(), String> {
-    let length = path.as_os_str().as_bytes().len();
+    validate_socket_path_byte_length(path.as_os_str().as_bytes().len())
+}
+
+fn validate_socket_path_byte_length(length: usize) -> Result<(), String> {
     if length > MAX_UNIX_SOCKET_PATH_BYTES {
         Err(format!(
             "service socket path is too long; choose a shorter development root ({length} bytes, maximum {MAX_UNIX_SOCKET_PATH_BYTES})"
@@ -441,7 +450,14 @@ fn validate_socket_path_length(path: &Path) -> Result<(), String> {
 fn validate_service_socket_paths(root: &Path) -> Result<(), String> {
     let control = root.join("run/service");
     validate_socket_path_length(&control.join("control.sock"))?;
-    validate_socket_path_length(&control.join("engine-ffffffffffffffff.sock"))
+    let engine_path_bytes = control
+        .as_os_str()
+        .as_bytes()
+        .len()
+        .checked_add(1)
+        .and_then(|length| length.checked_add(ENGINE_SOCKET_FILENAME_BYTES))
+        .ok_or_else(|| "service socket path length overflow".to_string())?;
+    validate_socket_path_byte_length(engine_path_bytes)
 }
 
 fn root_identity(path: &Path, uid: u32, device: u64, inode: u64) -> String {

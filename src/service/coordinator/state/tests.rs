@@ -36,6 +36,208 @@ fn target(accepted: &Accepted) -> OperationTarget {
     }
 }
 
+fn ready_state() -> (CoordinatorState, Arc<OperationControl>) {
+    let mut state = CoordinatorState::new("boot".into(), None, Arc::new(AtomicBool::new(false)));
+    let operation = state.reserve_load("demo".into()).unwrap();
+    state.accept_start(&operation).unwrap();
+    assert!(state.advance(
+        &operation,
+        OperationPhase::Ready {
+            engine: EngineDescriptor {
+                pid: 42,
+                endpoint: Arc::new("/tmp/engine.sock".into()),
+            },
+            fingerprint: fingerprint("demo"),
+        }
+    ));
+    (state, operation)
+}
+
+#[test]
+fn pending_stop_prevents_fresh_admission_without_tombstoning_a_retry() {
+    let (mut state, _) = ready_state();
+    let pending = state.register_pending_generation().unwrap();
+    let target = loxa_ipc::GenerationTarget::Pending {
+        boot_epoch: "boot".into(),
+        pending_nonce: pending.nonce().into(),
+    };
+    state.cancel_generation(&target).unwrap();
+    state
+        .bind_pending_generation(&pending, [2; 16], [3; 32])
+        .unwrap();
+    assert_eq!(
+        state
+            .reserve_pending_admission(&pending, [1; 16], [2; 16], [3; 32], 1, 1)
+            .err()
+            .unwrap()
+            .category,
+        ErrorCategory::ServiceUnavailable
+    );
+    assert_eq!(
+        state.cancel_generation(&target).unwrap_err().category,
+        ErrorCategory::NotFound
+    );
+
+    let retry = state.register_pending_generation().unwrap();
+    state
+        .bind_pending_generation(&retry, [2; 16], [3; 32])
+        .unwrap();
+    assert!(matches!(
+        state
+            .reserve_pending_admission(&retry, [1; 16], [2; 16], [3; 32], 1, 1)
+            .unwrap(),
+        AdmissionClaim::Fresh(_)
+    ));
+}
+
+#[test]
+fn cancelled_duplicate_attaches_without_cancelling_the_canonical_admission() {
+    let (mut state, _) = ready_state();
+    let canonical = state.register_pending_generation().unwrap();
+    state
+        .bind_pending_generation(&canonical, [2; 16], [3; 32])
+        .unwrap();
+    let admission = match state
+        .reserve_pending_admission(&canonical, [1; 16], [2; 16], [3; 32], 1, 1)
+        .unwrap()
+    {
+        AdmissionClaim::Fresh(admission) => admission,
+        AdmissionClaim::Existing(_) => panic!("canonical reservation was not fresh"),
+    };
+
+    let duplicate = state.register_pending_generation().unwrap();
+    let duplicate_target = loxa_ipc::GenerationTarget::Pending {
+        boot_epoch: "boot".into(),
+        pending_nonce: duplicate.nonce().into(),
+    };
+    state
+        .bind_pending_generation(&duplicate, [2; 16], [3; 32])
+        .unwrap();
+    state.cancel_generation(&duplicate_target).unwrap();
+    let attached = match state
+        .reserve_pending_admission(&duplicate, [1; 16], [2; 16], [3; 32], 1, 1)
+        .unwrap()
+    {
+        AdmissionClaim::Existing(admission) => admission,
+        AdmissionClaim::Fresh(_) => panic!("duplicate received a fresh reservation"),
+    };
+    assert!(Arc::ptr_eq(&admission, &attached));
+    assert!(!admission.is_cancelled());
+    assert_eq!(
+        state
+            .cancel_generation(&duplicate_target)
+            .unwrap_err()
+            .category,
+        ErrorCategory::NotFound
+    );
+}
+
+#[test]
+fn pending_target_follows_its_reservation_and_capacity_waits_for_both_terminals() {
+    let (mut state, _) = ready_state();
+    let pending = state.register_pending_generation().unwrap();
+    let pending_target = loxa_ipc::GenerationTarget::Pending {
+        boot_epoch: "boot".into(),
+        pending_nonce: pending.nonce().into(),
+    };
+    state
+        .bind_pending_generation(&pending, [2; 16], [3; 32])
+        .unwrap();
+    let admission = match state
+        .reserve_pending_admission(&pending, [1; 16], [2; 16], [3; 32], 1, 1)
+        .unwrap()
+    {
+        AdmissionClaim::Fresh(admission) => admission,
+        AdmissionClaim::Existing(_) => panic!("fresh send attached unexpectedly"),
+    };
+    state.cancel_generation(&pending_target).unwrap();
+    assert!(admission.is_cancelled());
+    state.finish_admission(&admission);
+
+    let admission = match state
+        .reserve_admission([4; 16], [5; 16], [6; 32], 1, 1)
+        .unwrap()
+    {
+        AdmissionClaim::Fresh(admission) => admission,
+        AdmissionClaim::Existing(_) => panic!("fresh reservation attached unexpectedly"),
+    };
+    state.begin_generation_execution(&admission).unwrap();
+    admission.mark_durable_terminal();
+    assert!(!state.finish_admission_if_resolved(&admission));
+    assert_eq!(
+        state
+            .reserve_admission([7; 16], [8; 16], [9; 32], 1, 1)
+            .err()
+            .unwrap()
+            .category,
+        ErrorCategory::Busy
+    );
+    admission.mark_engine_quiescent();
+    assert!(state.finish_admission_if_resolved(&admission));
+    assert!(matches!(
+        state
+            .reserve_admission([7; 16], [8; 16], [9; 32], 1, 1)
+            .unwrap(),
+        AdmissionClaim::Fresh(_)
+    ));
+}
+
+#[test]
+fn runtime_cleanup_releases_a_terminalized_admission_in_either_order() {
+    for terminal_first in [false, true] {
+        let (mut state, operation) = ready_state();
+        let admission = match state
+            .reserve_admission([1; 16], [2; 16], [3; 32], 1, 1)
+            .unwrap()
+        {
+            AdmissionClaim::Fresh(admission) => admission,
+            AdmissionClaim::Existing(_) => panic!("fresh admission attached unexpectedly"),
+        };
+        state.begin_generation_execution(&admission).unwrap();
+        if terminal_first {
+            admission.mark_durable_terminal();
+            assert!(state.complete(&operation, None));
+        } else {
+            assert!(!state.complete(&operation, None));
+            admission.mark_durable_terminal();
+            assert!(state.finish_admission_if_resolved(&admission));
+        }
+        assert!(!state.admission_is_current(&admission));
+        assert!(state.reserve_load("next".into()).is_ok());
+    }
+}
+
+#[test]
+fn idle_proof_loses_to_stop_and_a_cancelling_runtime_rejects_admission() {
+    let (mut state, operation) = ready_state();
+    let admission = match state
+        .reserve_admission([1; 16], [2; 16], [3; 32], 1, 1)
+        .unwrap()
+    {
+        AdmissionClaim::Fresh(admission) => admission,
+        AdmissionClaim::Existing(_) => panic!("fresh admission attached unexpectedly"),
+    };
+    state.begin_generation_execution(&admission).unwrap();
+    admission.request_cancel();
+    operation.request_cleanup();
+    assert_eq!(
+        state
+            .begin_generation_execution(&admission)
+            .unwrap_err()
+            .category,
+        ErrorCategory::ServiceUnavailable
+    );
+    assert!(!state.confirm_generation_quiescence(&admission));
+    state.finish_admission(&admission);
+    assert_eq!(
+        state
+            .reserve_admission([4; 16], [5; 16], [6; 32], 1, 1)
+            .unwrap_err()
+            .category,
+        ErrorCategory::ServiceUnavailable
+    );
+}
+
 #[test]
 fn stop_during_blocked_start_cancels_without_waiting_and_prevents_late_ready() {
     for stop_service in [false, true] {
@@ -55,7 +257,10 @@ fn stop_during_blocked_start_cancels_without_waiting_and_prevents_late_ready() {
             let ready = worker_state.lock().unwrap().advance(
                 &operation,
                 OperationPhase::Ready {
-                    engine_pid: 42,
+                    engine: EngineDescriptor {
+                        pid: 42,
+                        endpoint: Arc::new("/tmp/engine.sock".into()),
+                    },
                     fingerprint: fingerprint("demo"),
                 },
             );
@@ -98,7 +303,10 @@ fn cleanup_failure_keeps_admission_and_exact_identity_until_explicit_retry_compl
     assert!(state.advance(
         &operation,
         OperationPhase::Ready {
-            engine_pid: 42,
+            engine: EngineDescriptor {
+                pid: 42,
+                endpoint: Arc::new("/tmp/engine.sock".into()),
+            },
             fingerprint: fingerprint("demo"),
         }
     ));
@@ -145,7 +353,10 @@ fn cleanup_failure_keeps_admission_and_exact_identity_until_explicit_retry_compl
     assert!(!state.advance(
         &operation,
         OperationPhase::Ready {
-            engine_pid: 42,
+            engine: EngineDescriptor {
+                pid: 42,
+                endpoint: Arc::new("/tmp/engine.sock".into()),
+            },
             fingerprint: fingerprint("demo"),
         }
     ));
@@ -176,7 +387,10 @@ fn unresolved_output_fences_a_new_load_after_runtime_completion() {
     assert!(state.advance(
         &operation,
         OperationPhase::Ready {
-            engine_pid: 42,
+            engine: EngineDescriptor {
+                pid: 42,
+                endpoint: Arc::new("/tmp/engine.sock".into()),
+            },
             fingerprint: fingerprint("demo"),
         }
     ));
@@ -197,4 +411,34 @@ fn unresolved_output_fences_a_new_load_after_runtime_completion() {
 
     state.finish_admission(&reservation);
     assert!(state.reserve_load("other".into()).is_ok());
+}
+
+#[test]
+fn stale_runtime_completion_cannot_cancel_a_replacement_admission() {
+    let (mut state, old_operation) = ready_state();
+    state.complete(&old_operation, None);
+
+    let replacement = state.reserve_load("replacement".into()).unwrap();
+    state.accept_start(&replacement).unwrap();
+    assert!(state.advance(
+        &replacement,
+        OperationPhase::Ready {
+            engine: EngineDescriptor {
+                pid: 84,
+                endpoint: Arc::new("/tmp/replacement.sock".into()),
+            },
+            fingerprint: fingerprint("replacement"),
+        }
+    ));
+    let admission = match state
+        .reserve_admission([4; 16], [5; 16], [6; 32], 1, 1)
+        .unwrap()
+    {
+        AdmissionClaim::Fresh(admission) => admission,
+        AdmissionClaim::Existing(_) => panic!("replacement admission was not fresh"),
+    };
+
+    state.complete(&old_operation, None);
+    assert!(!admission.is_cancelled());
+    assert!(state.admission_is_current(&admission));
 }

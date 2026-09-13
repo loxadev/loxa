@@ -4,7 +4,6 @@ use http_body_util::{BodyExt, Empty};
 use hyper::body::Bytes;
 use hyper::Request;
 use hyper_util::rt::TokioIo;
-use std::cell::Cell;
 use std::path::Path;
 use std::time::Duration;
 
@@ -76,7 +75,7 @@ async fn readiness_unix_attempt(
     path: &Path,
     id: &str,
     expected_pid: u32,
-    authenticated: &Cell<Option<UnixEndpointIdentity>>,
+    authenticated: &mut Option<UnixEndpointIdentity>,
 ) -> Result<bool, String> {
     let Some(stream) = connect_authenticated(path, expected_pid, authenticated).await? else {
         return Ok(false);
@@ -150,7 +149,7 @@ async fn readiness_unix_attempt(
 pub(crate) async fn connect_authenticated(
     path: &Path,
     expected_pid: u32,
-    authenticated: &Cell<Option<UnixEndpointIdentity>>,
+    authenticated: &mut Option<UnixEndpointIdentity>,
 ) -> Result<Option<tokio::net::UnixStream>, String> {
     let Some(before) = private_unix_endpoint(path)? else {
         return Ok(None);
@@ -179,7 +178,7 @@ pub(crate) async fn connect_authenticated(
     if after != before {
         return Err("service engine endpoint changed during authentication".into());
     }
-    authenticated.set(Some(after));
+    *authenticated = Some(after);
     Ok(Some(stream))
 }
 
@@ -193,14 +192,14 @@ pub(super) fn readiness_unix<F>(
 where
     F: Fn() -> Option<StartupStop>,
 {
-    let authenticated = Cell::new(None);
+    let mut authenticated = None;
     let outcome = runtime.block_on(async {
         tokio::select! {
             biased;
             stop = wait_for_startup_stop(stop) => Ok(UnixReadiness::Stopped(stop)),
             result = tokio::time::timeout(
                 UNIX_READINESS_ATTEMPT_TIMEOUT,
-                readiness_unix_attempt(path, id, expected_pid, &authenticated),
+                readiness_unix_attempt(path, id, expected_pid, &mut authenticated),
             ) => match result {
                 Ok(Ok(true)) => Ok(UnixReadiness::Ready),
                 Ok(Ok(false)) | Err(_) => Ok(UnixReadiness::Pending),
@@ -209,7 +208,7 @@ where
         }
     });
     UnixReadinessPoll {
-        endpoint_identity: authenticated.get(),
+        endpoint_identity: authenticated,
         outcome,
     }
 }
@@ -219,16 +218,16 @@ pub(super) fn authenticate_unix_endpoint(
     path: &Path,
     expected_pid: u32,
 ) -> Result<Option<UnixEndpointIdentity>, String> {
-    let authenticated = Cell::new(None);
+    let mut authenticated = None;
     let result = runtime.block_on(async {
         tokio::time::timeout(
             UNIX_READINESS_ATTEMPT_TIMEOUT,
-            connect_authenticated(path, expected_pid, &authenticated),
+            connect_authenticated(path, expected_pid, &mut authenticated),
         )
         .await
     });
     match result {
-        Ok(Ok(_)) | Err(_) => Ok(authenticated.get()),
+        Ok(Ok(_)) | Err(_) => Ok(authenticated),
         Ok(Err(error)) => Err(error),
     }
 }

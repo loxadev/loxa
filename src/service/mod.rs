@@ -14,6 +14,14 @@ pub const BUILD_ID: &str = env!("CARGO_PKG_VERSION");
 
 pub(crate) use dev_cli::run as run_development_cli;
 
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) async fn run_bundled_generation_acceptance(
+    app: &Path,
+    model: &Path,
+) -> Result<String, String> {
+    coordinator::run_bundled_generation_acceptance(app, model).await
+}
+
 pub enum HiddenServiceResult {
     NotServiceCommand,
     Exit(Result<i32, String>),

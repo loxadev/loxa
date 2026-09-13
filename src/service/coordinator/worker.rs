@@ -8,6 +8,7 @@ use crate::runner::{
 use crate::runtime::RuntimeOwnership;
 use crate::service::intent::{self, LaunchIntent};
 use loxa_ipc::{Accepted, ErrorCategory, ServiceError};
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver};
@@ -101,7 +102,7 @@ impl RuntimeWorker<'_> {
         accepted: oneshot::Sender<Result<Accepted, ServiceError>>,
     ) {
         if self.cancellation_requested(&operation) {
-            self.shared.state().complete(&operation, None);
+            self.complete(&operation, None);
             let _ = accepted.send(Err(ServiceError::new(
                 ErrorCategory::ServiceUnavailable,
                 "service began draining before the load was admitted",
@@ -118,7 +119,7 @@ impl RuntimeWorker<'_> {
         ) {
             Ok(intent) => intent,
             Err(error) => {
-                self.shared.state().complete(&operation, None);
+                self.complete(&operation, None);
                 let _ = accepted.send(Err(ServiceError::new(ErrorCategory::Internal, error)));
                 return;
             }
@@ -182,9 +183,18 @@ impl RuntimeWorker<'_> {
         if self.retained_runtime.is_none() && self.paths.runtime_identity.is_bundled() {
             self.retained_runtime = runnable.managed_runtime().cloned();
         }
-        let endpoint = self
-            .control_dir
-            .join(format!("engine-{:016x}.sock", operation.generation));
+        let endpoint = match private_engine_endpoint(&self.control_dir, operation.generation) {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                self.finish_without_server(
+                    operation,
+                    launch_intent,
+                    Some(ErrorCategory::StartupFailed),
+                );
+                tracing::warn!(event = "service_engine_endpoint_failed", failure = %error);
+                return;
+            }
+        };
         let started = crate::runner::start_service_with_ownership(
             runnable,
             self.ownership,
@@ -202,7 +212,10 @@ impl RuntimeWorker<'_> {
                 let ready = self.shared.state().advance(
                     &operation,
                     OperationPhase::Ready {
-                        engine_pid: pid,
+                        engine: super::state::EngineDescriptor {
+                            pid,
+                            endpoint: Arc::new(endpoint),
+                        },
                         fingerprint,
                     },
                 );
@@ -307,7 +320,7 @@ impl RuntimeWorker<'_> {
         let mut clear_progress = intent::ClearProgress::default();
         loop {
             if intent::clear(&self.control_dir, &launch_intent, &mut clear_progress).is_ok() {
-                self.shared.state().complete(&operation, failure);
+                self.complete(&operation, failure);
                 return;
             }
             self.shared
@@ -323,6 +336,30 @@ impl RuntimeWorker<'_> {
             }
         }
     }
+
+    fn complete(&self, operation: &Arc<OperationControl>, failure: Option<ErrorCategory>) {
+        if self.shared.state().complete(operation, failure) {
+            super::history::maybe_begin_history_drain(&self.shared);
+        }
+    }
+}
+
+fn private_engine_endpoint(
+    control_dir: &std::path::Path,
+    generation: u64,
+) -> Result<PathBuf, String> {
+    let mut nonce = [0_u8; loxa_ipc::ENGINE_SOCKET_NONCE_BYTES];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut source| source.read_exact(&mut nonce))
+        .map_err(|error| format!("could not create private engine endpoint identity: {error}"))?;
+    let mut suffix = String::with_capacity(loxa_ipc::ENGINE_SOCKET_NONCE_BYTES * 2);
+    for byte in nonce {
+        use std::fmt::Write as _;
+        write!(&mut suffix, "{byte:02x}").expect("writing to a String is infallible");
+    }
+    let filename = format!("engine-{generation:016x}-{suffix}.sock");
+    debug_assert_eq!(filename.len(), loxa_ipc::ENGINE_SOCKET_FILENAME_BYTES);
+    Ok(control_dir.join(filename))
 }
 
 fn resolve_manifest(paths: &AppPaths, model_id: &str) -> Result<Manifest, String> {

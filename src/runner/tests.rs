@@ -290,6 +290,41 @@ fn bundled_service_unload_preserves_stage_for_reload() {
     );
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires a finalized built app and the exact small-model fixture"]
+fn bundled_generation_preflight_usage_quiescence_and_stop() {
+    use std::io::Write as _;
+
+    let _process = process_test_lock();
+    let app = PathBuf::from(std::env::var_os("LOXA_BUILT_APP").unwrap());
+    let model = PathBuf::from(std::env::var_os("LOXA_SMALL_MODEL").unwrap());
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    let report = runtime
+        .block_on(crate::service::run_bundled_generation_acceptance(
+            &app, &model,
+        ))
+        .unwrap();
+    println!("LOXA_GENERATION_QUALIFICATION={report}");
+
+    if let Some(summary) = std::env::var_os("GITHUB_STEP_SUMMARY") {
+        let mut summary = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(summary)
+            .unwrap();
+        writeln!(
+            summary,
+            "## Loxa generation qualification\n\n```json\n{report}\n```"
+        )
+        .unwrap();
+    }
+}
+
 #[cfg(unix)]
 static RUN_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

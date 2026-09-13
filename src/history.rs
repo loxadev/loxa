@@ -13,6 +13,7 @@ mod content;
 mod conversations;
 mod drafts;
 mod identity;
+mod prompt;
 mod purge;
 mod reads;
 mod recovery;
@@ -25,6 +26,10 @@ pub(crate) use admission::{
 #[cfg(test)]
 pub(crate) use content::ContentRange;
 pub(crate) use content::{ExecutionOutcome, FinalizationInput, SuffixCommit, SuffixInput};
+pub(crate) use identity::{decode_id, encode_id, parse_revision};
+#[cfg(test)]
+pub(crate) use prompt::PromptMessage;
+pub(crate) use prompt::{PromptPreparation, PromptRole};
 
 const COMMAND_CAPACITY: usize = 12;
 const ORDINARY_CAPACITY: usize = 8;
@@ -96,6 +101,12 @@ pub(crate) struct ProfileCompletion {
 }
 
 #[derive(Debug)]
+pub(crate) struct PromptCompletion {
+    pub(crate) result: Result<PromptPreparation, HistoryError>,
+    pub(crate) permit: OwnedSemaphorePermit,
+}
+
+#[derive(Debug)]
 pub(crate) struct AdmissionCompletion {
     pub(crate) result: Result<CommittedAdmission, HistoryError>,
     pub(crate) permit: OwnedSemaphorePermit,
@@ -129,6 +140,14 @@ enum HistoryCommand {
     ExecuteDraft {
         operation: loxa_ipc::DraftCommand,
         reply: oneshot::Sender<DraftCompletion>,
+        permit: OwnedSemaphorePermit,
+    },
+    PreparePrompt {
+        conversation_id: [u8; 16],
+        expected_conversation_revision: i64,
+        expected_profile_revision: i64,
+        current_user_text: String,
+        reply: oneshot::Sender<PromptCompletion>,
         permit: OwnedSemaphorePermit,
     },
     LookupSubmission {
@@ -452,6 +471,49 @@ impl HistoryHandle {
             )
         })?;
         result
+    }
+
+    pub(crate) async fn prepare_prompt(
+        &self,
+        conversation_id: [u8; 16],
+        expected_conversation_revision: i64,
+        expected_profile_revision: i64,
+        current_user_text: String,
+    ) -> Result<PromptCompletion, HistoryError> {
+        if self.draining.load(Ordering::Acquire) {
+            return Err(HistoryError::new(
+                HistoryErrorKind::WorkerUnavailable,
+                "history is draining",
+            ));
+        }
+        let permit = Arc::clone(&self.ordinary)
+            .try_acquire_owned()
+            .map_err(|_| HistoryError::new(HistoryErrorKind::Busy, "history capacity is full"))?;
+        let (reply, completion) = oneshot::channel();
+        self.commands
+            .try_send(HistoryCommand::PreparePrompt {
+                conversation_id,
+                expected_conversation_revision,
+                expected_profile_revision,
+                current_user_text,
+                reply,
+                permit,
+            })
+            .map_err(|error| match error {
+                TrySendError::Full(_) => {
+                    HistoryError::new(HistoryErrorKind::Busy, "history capacity is full")
+                }
+                TrySendError::Disconnected(_) => HistoryError::new(
+                    HistoryErrorKind::WorkerUnavailable,
+                    "history owner is unavailable",
+                ),
+            })?;
+        completion.await.map_err(|_| {
+            HistoryError::new(
+                HistoryErrorKind::WorkerUnavailable,
+                "history owner stopped before prompt preparation completed",
+            )
+        })
     }
 
     pub(crate) fn try_admit(

@@ -23,6 +23,8 @@ pub(super) struct AdmissionInput {
     pub(super) submission_id: [u8; 16],
     pub(super) expected_conversation_revision: i64,
     pub(super) expected_profile_revision: i64,
+    pub(super) submission_hash: Option<[u8; 32]>,
+    pub(super) effective_context: Option<u32>,
     pub(super) system_instruction: String,
     pub(super) max_output_tokens: i64,
     pub(super) prompt_basis: PromptBasis,
@@ -104,14 +106,15 @@ fn update_bytes(hash: &mut Sha256, value: &[u8]) {
 pub(super) type AdmissionResult = Result<CommittedAdmission, loxa_ipc::ServiceError>;
 pub(super) type AdmissionObserver = watch::Receiver<Option<AdmissionResult>>;
 
-#[cfg_attr(not(test), allow(dead_code))] // M4 binds these entry points to generation dispatch.
 impl Coordinator {
     pub(super) async fn admit_history_generation(
         &self,
         input: AdmissionInput,
     ) -> Result<AdmissionObserver, loxa_ipc::ServiceError> {
         input.validate_backing()?;
-        let submission_hash = input.semantic_hash();
+        let submission_hash = input
+            .submission_hash
+            .unwrap_or_else(|| input.semantic_hash());
         if let Some(reservation) = self
             .shared
             .state()
@@ -158,6 +161,21 @@ impl Coordinator {
             }
             AdmissionClaim::Fresh(reservation) => reservation,
         };
+        self.dispatch_reserved_admission(input, submission_hash, reservation)
+    }
+
+    pub(super) fn dispatch_reserved_admission(
+        &self,
+        input: AdmissionInput,
+        submission_hash: [u8; 32],
+        reservation: Arc<AdmissionReservation>,
+    ) -> Result<AdmissionObserver, loxa_ipc::ServiceError> {
+        if let Err(error) = input.validate_backing() {
+            reservation.publish(Err(error.clone()));
+            self.shared.state().finish_admission(&reservation);
+            maybe_begin_history_drain(&self.shared);
+            return Err(error);
+        }
         let observer = reservation.subscribe();
         let prepared = match PreparedAdmission::new(
             input.conversation_id,
@@ -169,6 +187,9 @@ impl Coordinator {
             reservation.operation_generation,
             Arc::clone(&reservation.fingerprint),
             self.shared.runtime_identity,
+            input
+                .effective_context
+                .unwrap_or_else(|| reservation.fingerprint.effective_context()),
             input.system_instruction,
             input.max_output_tokens,
             input.prompt_basis,
@@ -206,6 +227,9 @@ impl Coordinator {
                     drop(completion.permit);
                     #[cfg(test)]
                     wait_at_barrier(&shared.admission_completion_barrier);
+                    #[cfg(all(test, target_os = "macos"))]
+                    super::native_test_gate::pause_once(&shared.native_admission_completion_gate)
+                        .await;
                     resolve_completion(&shared, &reservation, result).await;
                 }
                 Err(_) => reservation.admission_unknown(),
@@ -315,6 +339,7 @@ async fn resolve_committed(
         && committed.submission_id == reservation.submission_id
         && committed.pre_conversation_revision == reservation.expected_conversation_revision
         && committed.profile_revision == reservation.expected_profile_revision
+        && committed.owner_epoch == shared.boot_epoch
         && committed.operation_generation == reservation.operation_generation;
     let cancelled = {
         let state = shared.state();
@@ -322,8 +347,7 @@ async fn resolve_committed(
             reservation.admission_unknown();
             return;
         }
-        let cancelled = reservation.cancelled.load(Ordering::Acquire)
-            || shared.draining.load(Ordering::Acquire);
+        let cancelled = reservation.is_cancelled() || shared.draining.load(Ordering::Acquire);
         if !cancelled && !reservation.install_output(committed.clone()) {
             reservation.admission_unknown();
             return;
@@ -362,7 +386,8 @@ async fn resolve_stop(
         reservation.stop_unknown();
         return;
     }
-    shared.state().finish_admission(reservation);
+    reservation.mark_durable_terminal();
+    shared.state().finish_admission_if_resolved(reservation);
     reservation.publish(Ok(committed));
 }
 

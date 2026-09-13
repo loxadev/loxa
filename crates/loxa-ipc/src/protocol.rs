@@ -1,10 +1,15 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 mod drafts;
+mod generation;
 mod history;
 mod settings;
 
 pub use drafts::{DraftCommand, DraftReply, DraftSnapshot, MAX_DRAFT_TEXT_BYTES};
+pub use generation::{
+    GenerationAccepted, GenerationCommand, GenerationConnection, GenerationDraft, GenerationHello,
+    GenerationHelloAck, GenerationReply, GenerationTarget, MAX_GENERATION_USER_TEXT_BYTES,
+};
 pub use history::{
     AttemptExecution, AttemptSave, AttemptSummary, ContentRange, ContentSource, ConversationCursor,
     ConversationPage, ConversationSummary, HistoryCommand, HistoryPhase, HistoryReply,
@@ -19,7 +24,7 @@ pub use settings::{
 };
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 1;
+pub const PROTOCOL_MINOR: u16 = 2;
 
 pub const MAX_BUILD_BYTES: usize = 96;
 pub const MAX_ID_BYTES: usize = 160;
@@ -36,6 +41,7 @@ pub struct ProtocolVersion {
 
 impl ProtocolVersion {
     pub const V1_0: Self = Self { major: 1, minor: 0 };
+    pub const V1_1: Self = Self { major: 1, minor: 1 };
 
     pub const CURRENT: Self = Self {
         major: PROTOCOL_MAJOR,
@@ -71,6 +77,12 @@ pub struct Hello {
     pub required_capabilities: Vec<Capability>,
     pub build: String,
     pub root_identity: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub generation: Option<GenerationHello>,
 }
 
 impl Hello {
@@ -80,6 +92,7 @@ impl Hello {
             required_capabilities: REQUIRED_CAPABILITIES.to_vec(),
             build: build.into(),
             root_identity: root_identity.into(),
+            generation: None,
         }
     }
 
@@ -89,13 +102,30 @@ impl Hello {
 
     pub fn history(build: impl Into<String>, root_identity: impl Into<String>) -> Self {
         Self {
-            protocol: ProtocolVersion::CURRENT,
+            protocol: ProtocolVersion::V1_1,
             // Protocol 1.0 peers have a closed capability enum. Keep this
             // initial vocabulary decodable so they can return the typed
             // protocol mismatch before a 1.1 client asks for history.
             required_capabilities: REQUIRED_CAPABILITIES.to_vec(),
             build: build.into(),
             root_identity: root_identity.into(),
+            generation: None,
+        }
+    }
+
+    pub fn generation(
+        build: impl Into<String>,
+        root_identity: impl Into<String>,
+        connection: GenerationConnection,
+    ) -> Self {
+        Self {
+            protocol: ProtocolVersion::CURRENT,
+            // Generation is minor-version gated so the closed 1.0 capability
+            // vocabulary stays decodable and remains at eight entries.
+            required_capabilities: REQUIRED_CAPABILITIES.to_vec(),
+            build: build.into(),
+            root_identity: root_identity.into(),
+            generation: Some(GenerationHello { connection }),
         }
     }
 
@@ -108,6 +138,9 @@ impl Hello {
         }
         if self.required_capabilities.len() > MAX_CAPABILITIES {
             return Err("too many required capabilities");
+        }
+        if self.generation.is_some() && self.protocol != ProtocolVersion::CURRENT {
+            return Err("generation handshake requires service protocol 1.2");
         }
         Ok(())
     }
@@ -124,6 +157,12 @@ pub struct HelloAck {
     pub root_identity: String,
     pub service_pid: u32,
     pub origin_sha256: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub generation: Option<GenerationHelloAck>,
 }
 
 impl HelloAck {
@@ -142,6 +181,12 @@ impl HelloAck {
         }
         if self.service_pid == 0 || !is_lower_hex_64(&self.origin_sha256) {
             return Err("invalid service process identity");
+        }
+        match (&self.generation, self.protocol) {
+            (Some(generation), ProtocolVersion::CURRENT) => generation.validate_shape()?,
+            (Some(_), _) => return Err("generation acknowledgement requires protocol 1.2"),
+            (None, ProtocolVersion::CURRENT) => {}
+            (None, _) => {}
         }
         Ok(())
     }
@@ -220,6 +265,7 @@ pub enum ServiceCommand {
     History { command: HistoryCommand },
     Draft { command: DraftCommand },
     Settings { command: ServiceSettingsCommand },
+    Generation { command: GenerationCommand },
 }
 
 impl ServiceCommand {
@@ -230,6 +276,7 @@ impl ServiceCommand {
             Self::History { command } => command.validate_shape(),
             Self::Draft { command } => command.validate_shape(),
             Self::Settings { command } => command.validate_shape(),
+            Self::Generation { command } => command.validate_shape(),
             _ => Ok(()),
         }
     }
@@ -270,6 +317,7 @@ impl Reply {
             ReplyOutcome::History { reply } => reply.validate_shape(),
             ReplyOutcome::Draft { reply } => reply.validate_shape(),
             ReplyOutcome::Settings { reply } => reply.validate_shape(),
+            ReplyOutcome::Generation { reply } => reply.validate_shape(),
         }
     }
 }
@@ -283,6 +331,7 @@ pub enum ReplyOutcome {
     History { reply: HistoryReply },
     Draft { reply: DraftReply },
     Settings { reply: ServiceSettingsReply },
+    Generation { reply: GenerationReply },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -541,6 +590,14 @@ fn is_lower_hex_64(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
+fn deserialize_present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -605,6 +662,33 @@ mod tests {
     }
 
     #[test]
+    fn legacy_hello_and_ack_reject_an_explicit_generation_null() {
+        let hello = br#"{
+            "type":"hello",
+            "protocol":{"major":1,"minor":0},
+            "required_capabilities":["status","load","unload","stop_service","engine_unix_socket"],
+            "build":"0.1.0-dev",
+            "root_identity":"root",
+            "generation":null
+        }"#;
+        assert!(serde_json::from_slice::<ClientEnvelope>(hello).is_err());
+
+        let ack = br#"{
+            "type":"hello_ack",
+            "protocol":{"major":1,"minor":1},
+            "capabilities":["status","load","unload","stop_service","engine_unix_socket"],
+            "build":"0.1.0-dev",
+            "storage_schema":1,
+            "boot_epoch":"boot",
+            "root_identity":"root",
+            "service_pid":1,
+            "origin_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "generation":null
+        }"#;
+        assert!(serde_json::from_slice::<ServerEnvelope>(ack).is_err());
+    }
+
+    #[test]
     fn legacy_hello_and_ack_projection_remain_decodable_by_closed_old_shapes() {
         let encoded =
             serde_json::to_vec(&ClientEnvelope::Hello(Hello::current("0.1.0-dev", "root")))
@@ -629,6 +713,7 @@ mod tests {
             root_identity: "root".into(),
             service_pid: 1,
             origin_sha256: "a".repeat(64),
+            generation: None,
         });
         let encoded = serde_json::to_vec(&ack).unwrap();
         let OldServerEnvelope::HelloAck {
