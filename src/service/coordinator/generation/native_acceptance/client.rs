@@ -180,28 +180,32 @@ pub(super) async fn wait_for_saved(
     client: &ServiceClient,
     conversation: &Conversation,
     accepted: &GenerationAccepted,
+    label: &str,
 ) -> Result<String, String> {
-    let attempt = wait_for_attempt(client, conversation, accepted).await?;
+    let attempt = wait_for_attempt(client, conversation, accepted, label).await?;
     if attempt.execution != AttemptExecution::Completed || attempt.save != AttemptSave::Saved {
         return Err(format!(
-            "native generation did not complete durably: {:?}/{:?}/{:?}",
+            "{label} native generation did not complete durably: {:?}/{:?}/{:?}",
             attempt.execution, attempt.save, attempt.failure_code
         ));
     }
-    read_assistant(client, &attempt.id, &attempt.saved_end).await
+    read_assistant(client, &attempt.id, &attempt.saved_end)
+        .await
+        .map_err(|error| format!("{label}: {error}"))
 }
 
 pub(super) async fn wait_for_stopped(
     client: &ServiceClient,
     conversation: &Conversation,
     accepted: &GenerationAccepted,
+    label: &str,
 ) -> Result<(), String> {
-    let attempt = wait_for_attempt(client, conversation, accepted).await?;
+    let attempt = wait_for_attempt(client, conversation, accepted, label).await?;
     if attempt.execution == AttemptExecution::Stopped && attempt.save == AttemptSave::Saved {
         Ok(())
     } else {
         Err(format!(
-            "stopped native generation has the wrong terminal state: {:?}/{:?}/{:?}",
+            "{label} native generation has the wrong terminal state: {:?}/{:?}/{:?}",
             attempt.execution, attempt.save, attempt.failure_code
         ))
     }
@@ -211,21 +215,45 @@ async fn wait_for_attempt(
     client: &ServiceClient,
     conversation: &Conversation,
     accepted: &GenerationAccepted,
+    label: &str,
 ) -> Result<loxa_ipc::AttemptSummary, String> {
     let deadline = tokio::time::Instant::now() + WAIT_TIMEOUT;
     loop {
-        let turns = list_turns(client, &conversation.id).await?;
-        if let Some(attempt) = turns
-            .into_iter()
-            .filter_map(|turn| turn.selected_attempt)
-            .find(|attempt| attempt.id == accepted.attempt_id)
-        {
+        let turns = list_turns(client, &conversation.id)
+            .await
+            .map_err(|error| format!("{label}: {error}"))?;
+        let mut selected_attempts = 0usize;
+        let mut matching = None;
+        for attempt in turns.into_iter().filter_map(|turn| turn.selected_attempt) {
+            selected_attempts += 1;
+            if matching.is_none() && attempt.id == accepted.attempt_id {
+                matching = Some(attempt);
+            }
+        }
+        if let Some(attempt) = matching.as_ref() {
             if attempt.execution != AttemptExecution::Pending && attempt.save != AttemptSave::Open {
-                return Ok(attempt);
+                return Ok(matching.expect("the terminal attempt is present"));
             }
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err("native generation attempt did not become terminal".into());
+            return Err(match matching.as_ref() {
+                Some(attempt) => format!(
+                    "{label} native generation attempt did not become terminal: \
+                     attempt_present=true execution={:?} save={:?} failure_code={:?} \
+                     saved_end={} generated_end={:?} terminal_saved_end={:?} \
+                     selected_attempts={selected_attempts}",
+                    attempt.execution,
+                    attempt.save,
+                    attempt.failure_code,
+                    attempt.saved_end,
+                    attempt.generated_end,
+                    attempt.terminal_saved_end,
+                ),
+                None => format!(
+                    "{label} native generation attempt did not become terminal: \
+                     attempt_present=false selected_attempts={selected_attempts}"
+                ),
+            });
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }

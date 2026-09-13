@@ -20,7 +20,9 @@ pub(in crate::service) async fn run_bundled_generation_acceptance(
 ) -> Result<String, String> {
     qualification_fixture::clear_observations();
     let mut fixture = NativeService::start(app, source_model).await?;
-    let result = exercise(&mut fixture).await;
+    let result = exercise(&mut fixture)
+        .await
+        .map_err(|error| format!("{error}; {}", observation_diagnostics()));
     let cleanup = fixture.shutdown(true).await;
     match (result, cleanup) {
         (Ok(report), Ok(())) => Ok(report),
@@ -63,7 +65,7 @@ async fn exercise(fixture: &mut NativeService) -> Result<String, String> {
         .map_err(client::client_error)?;
     require_rejected(busy_result, ErrorCategory::Busy, "concurrent generation")?;
     require_same_draft(&busy_draft, &busy_after?)?;
-    let first_output = wait_for_saved(&fixture.client, &first, &first_accepted).await?;
+    let first_output = wait_for_saved(&fixture.client, &first, &first_accepted, "first").await?;
     if first_output.is_empty() {
         return Err("first native generation saved no assistant bytes".into());
     }
@@ -78,7 +80,8 @@ async fn exercise(fixture: &mut NativeService) -> Result<String, String> {
     )
     .await
     .map_err(client::client_error)?;
-    let second_output = wait_for_saved(&fixture.client, &second, &second_accepted).await?;
+    let second_output =
+        wait_for_saved(&fixture.client, &second, &second_accepted, "cached").await?;
     if second_output.is_empty() {
         return Err("cached native generation saved no assistant bytes".into());
     }
@@ -139,7 +142,7 @@ async fn exercise(fixture: &mut NativeService) -> Result<String, String> {
         GenerationReply::Stopping { target: returned } if returned == target => {}
         _ => return Err("generation Stop returned the wrong target".into()),
     }
-    wait_for_stopped(&fixture.client, &stopped, &stopped_accepted).await?;
+    wait_for_stopped(&fixture.client, &stopped, &stopped_accepted, "stopped").await?;
     wait_for_unloaded(&fixture.client).await?;
     if endpoint.exists() {
         return Err("stopped exact engine endpoint survived verified cleanup".into());
@@ -153,4 +156,37 @@ async fn exercise(fixture: &mut NativeService) -> Result<String, String> {
         &fixture.runtime_evidence,
         true,
     ))
+}
+
+fn observation_diagnostics() -> String {
+    let observations = qualification_fixture::observations();
+    let postcommit = observations
+        .iter()
+        .filter(|observation| observation.postcommit_gate_entered)
+        .count();
+    let dispatched = observations
+        .iter()
+        .filter(|observation| observation.generation_dispatched)
+        .count();
+    let basis = observations
+        .iter()
+        .filter(|observation| observation.basis_carried_to_execution)
+        .count();
+    let usage = observations
+        .iter()
+        .filter(|observation| observation.completion_prompt_tokens.is_some())
+        .count();
+    let cached_usage = observations
+        .iter()
+        .filter(|observation| observation.completion_cached_tokens.is_some())
+        .count();
+    let quiescent = observations
+        .iter()
+        .filter(|observation| observation.quiescent_after_terminal)
+        .count();
+    format!(
+        "qualification observations: total={} postcommit={postcommit} dispatched={dispatched} \
+         basis={basis} usage={usage} cached_usage={cached_usage} quiescent={quiescent}",
+        observations.len(),
+    )
 }
