@@ -181,13 +181,12 @@ pub(super) fn replace(path: &Path, bytes: &[u8], fault: WriteFault) -> Result<()
         ensure_file_matches_path(&temporary, &installed, path)
             .map_err(|error| io_failure(true, "revalidate replaced preferences", error))
     })();
-    if written.as_ref().is_err_and(|error| !error.outcome_unknown) {
-        if file_identity(&temporary, &temporary_path)
+    if written.as_ref().is_err_and(|error| !error.outcome_unknown)
+        && file_identity(&temporary, &temporary_path)
             .and_then(|identity| ensure_file_matches_path(&temporary, &identity, &temporary_path))
             .is_ok()
-        {
-            let _ = fs::remove_file(&temporary_path);
-        }
+    {
+        let _ = fs::remove_file(&temporary_path);
     }
     written
 }

@@ -3,9 +3,7 @@ mod schema;
 
 use file::{WriteFailure, WriteFault};
 use schema::{encode, load, validate};
-pub(crate) use schema::{
-    Appearance, MotionPreference, Preferences, PreferencesPatch, ReadingWidth, SendKey,
-};
+pub(crate) use schema::{Preferences, PreferencesPatch};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
@@ -49,6 +47,7 @@ impl PreferenceAcknowledgement {
         }
     }
 
+    #[allow(dead_code, reason = "reserved for the M4 preferences UI")]
     pub(crate) fn result(&self) -> Option<Result<Preferences, PreferenceError>> {
         self.result
             .lock()
@@ -158,6 +157,7 @@ impl PreferencesOwner {
         })
     }
 
+    #[allow(dead_code, reason = "reserved for the M4 preferences UI")]
     pub(crate) fn snapshot(&self) -> Preferences {
         self.lock_state().committed.clone()
     }
@@ -207,6 +207,7 @@ impl PreferencesOwner {
         true
     }
 
+    #[allow(dead_code, reason = "reserved for the M4 preferences UI")]
     pub(crate) fn patch(
         &self,
         expected_revision: u64,
@@ -655,6 +656,7 @@ fn error(kind: PreferenceErrorKind, context: impl Into<String>) -> PreferenceErr
 
 #[cfg(test)]
 mod tests {
+    use super::schema::{Appearance, MotionPreference, ReadingWidth, SendKey};
     use super::*;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;

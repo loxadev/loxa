@@ -382,7 +382,7 @@ fn complete_native_exit_request(
     match finish_native_exit(app_handle, attempt) {
         Ok(()) => app_handle.state::<NativeExitState>().complete(),
         Err(attempt) => {
-            restore_native_exit_attempt(app_handle, attempt);
+            restore_native_exit_attempt(app_handle, *attempt);
             api.prevent_exit();
         }
     }
@@ -391,7 +391,7 @@ fn complete_native_exit_request(
 fn finish_native_exit(
     app_handle: &AppHandle,
     attempt: NativeExitAttempt,
-) -> Result<(), NativeExitAttempt> {
+) -> Result<(), Box<NativeExitAttempt>> {
     run_exit_transaction(
         attempt,
         |attempt| attempt.preferences.finish_ready_drain().map_err(|_| ()),
@@ -404,6 +404,7 @@ fn finish_native_exit(
             attempt.shell.teardown();
         },
     )
+    .map_err(Box::new)
 }
 
 fn schedule_preference_completion(owner: WeakPreferencesOwner) {
@@ -471,7 +472,7 @@ fn finish_deferred_native_exit(
             exit_state.complete();
             app_handle.exit(0);
         }
-        Err(attempt) => restore_native_exit_attempt(app_handle, attempt),
+        Err(attempt) => restore_native_exit_attempt(app_handle, *attempt),
     }
 }
 
