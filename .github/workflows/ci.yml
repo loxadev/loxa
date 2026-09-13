@@ -30,7 +30,7 @@ jobs:
       - name: Cache Rust
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Check core and shared leaves
-        run: cargo clippy --locked -p loxa -p loxa-ipc -p loxa-diagnostics --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --exclude loxa-app --all-targets -- -D warnings
       - name: Test core and shared leaves
         run: cargo test --locked --workspace --exclude loxa-app --all-targets
       - name: Verify publishable packages
