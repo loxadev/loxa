@@ -114,6 +114,7 @@ pub(super) fn render(
             .iter()
             .map(|observation| json!({
                 "input_tokens": observation.input_tokens,
+                "max_output_tokens": observation.max_output_tokens,
                 "completion_prompt_tokens": observation.completion_prompt_tokens,
                 "completion_cached_tokens": observation.completion_cached_tokens,
                 "quiescent_after_terminal": observation.quiescent_after_terminal,

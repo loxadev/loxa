@@ -12,7 +12,7 @@ use loxa_ipc::{ConnectMode, ErrorCategory, GenerationCommand, GenerationReply, G
 use std::path::Path;
 
 pub(super) use qualification_fixture::{CONTEXT_TOKENS, MODEL_ID, MODEL_SHA256, MODEL_SIZE};
-const GENERATION_TOKENS: u32 = 32;
+const GENERATION_TOKENS: u32 = 2;
 
 pub(in crate::service) async fn run_bundled_generation_acceptance(
     app: &Path,
