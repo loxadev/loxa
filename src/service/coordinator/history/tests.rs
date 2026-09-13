@@ -22,7 +22,7 @@ struct Fixture {
 impl Fixture {
     async fn start() -> Self {
         let directory = tempfile::Builder::new()
-            .prefix("loxa-coordinator-history-")
+            .prefix("lc-")
             .tempdir_in("/tmp")
             .unwrap();
         let directory_path = fs::canonicalize(directory.path()).unwrap();

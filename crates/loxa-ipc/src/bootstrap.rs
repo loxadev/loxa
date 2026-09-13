@@ -675,12 +675,12 @@ mod tests {
     #[test]
     fn marked_root_is_private_canonical_and_cannot_alias_forbidden_root() {
         let root = tempfile::Builder::new()
-            .prefix("loxa-ipc-")
+            .prefix("li-")
             .tempdir_in("/tmp")
             .unwrap();
         let canonical_root = fs::canonicalize(root.path()).unwrap();
         let forbidden = canonical_root.join("normal");
-        let development = canonical_root.join("development");
+        let development = canonical_root.join("dev");
         fs::create_dir(&forbidden).unwrap();
         fs::set_permissions(&forbidden, fs::Permissions::from_mode(0o700)).unwrap();
         initialize_development_root(

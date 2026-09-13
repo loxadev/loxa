@@ -4,7 +4,7 @@ use crate::service::coordinator::Coordinator;
 use loxa_ipc::{ConnectMode, ReplyOutcome, RuntimePhase, ServiceClient, ServiceCommand};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::os::unix::fs::{DirBuilderExt as _, FileTypeExt as _, PermissionsExt as _};
+use std::os::unix::fs::{DirBuilderExt as _, FileTypeExt as _};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 

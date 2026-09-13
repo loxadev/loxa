@@ -24,7 +24,7 @@ impl ServerFixture {
 
     async fn start_with_diagnostics(with_diagnostics: bool) -> Self {
         let directory = tempfile::Builder::new()
-            .prefix("loxa-service-pressure-")
+            .prefix("ls-")
             .tempdir_in("/tmp")
             .unwrap();
         let directory_path = fs::canonicalize(directory.path()).unwrap();

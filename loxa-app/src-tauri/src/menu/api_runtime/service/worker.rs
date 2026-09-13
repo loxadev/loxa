@@ -774,19 +774,13 @@ mod tests {
 
     #[test]
     fn cancelled_start_subscription_loss_retains_the_accepted_target() {
-        let parent = std::path::Path::new("/tmp").join(format!(
-            "lms-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir(&parent).unwrap();
-        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
-        let parent = fs::canonicalize(parent).unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("lm-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let parent = fs::canonicalize(directory.path()).unwrap();
         let forbidden = parent.join("normal");
-        let root = parent.join("development");
+        let root = parent.join("dev");
         fs::create_dir(&forbidden).unwrap();
         fs::set_permissions(&forbidden, fs::Permissions::from_mode(0o700)).unwrap();
         initialize_development_root(
@@ -844,6 +838,5 @@ mod tests {
             } if endpoint.service_target() == Some(&target)
         ));
         drop(worker);
-        fs::remove_dir_all(parent).unwrap();
     }
 }

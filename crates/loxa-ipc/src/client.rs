@@ -943,13 +943,13 @@ mod tests {
     #[test]
     fn stale_client_refuses_a_replaced_root_before_spawning_the_recorded_origin() {
         let parent = tempfile::Builder::new()
-            .prefix("loxa-ipc-client-")
+            .prefix("li-")
             .tempdir_in("/tmp")
             .unwrap();
         let parent = fs::canonicalize(parent.path()).unwrap();
         let forbidden = parent.join("normal");
-        let root = parent.join("development");
-        let moved = parent.join("development-moved");
+        let root = parent.join("dev");
+        let moved = parent.join("dev-moved");
         let origin = parent.join("origin.sh");
         let witness = parent.join("origin-spawned");
         fs::create_dir(&forbidden).unwrap();
