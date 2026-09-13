@@ -117,6 +117,7 @@ impl OwnedServer {
         F: Fn() -> Option<StartupStop>,
     {
         let deadline = Instant::now() + timeout;
+        let mut publication_error = None;
         loop {
             if let Err(error) = self.collect_announcements() {
                 return self.fail_start(error);
@@ -171,21 +172,17 @@ impl OwnedServer {
                         next_publication,
                     );
                 if let Err(error) = record_result {
-                    let status = match self.child_mut().try_wait() {
-                        Ok(status) => status,
-                        Err(wait_error) => {
-                            return self.fail_start(format!("{error}; {wait_error}"));
-                        }
-                    };
-                    if let Some(status) = status {
-                        let code = exit_code(status);
-                        if let Err(cleanup) = self.terminate() {
-                            return self.finish_cleanup_failure(cleanup);
-                        }
-                        return Ok(StartOutcome::Exited(self.server_exit(code)));
-                    }
-                    return self.fail_start(error);
+                    publication_error = Some(error);
                 }
+            }
+            // A fast child can lose /proc/exe before its exit becomes waitable;
+            // retain this error without retrying lease publication.
+            if let Some(error) = publication_error.as_ref() {
+                if Instant::now() >= deadline {
+                    return self.fail_start(error.clone());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
             }
             if let StartupEndpoint::ServiceUnix { path, runtime } = endpoint {
                 #[cfg(unix)]
