@@ -1119,7 +1119,6 @@ fn persistent_caller_managed_owner_child() {
     let server = root.join("server");
     let run_dir = root.join("run");
     let owner_ready = root.join("owner-ready");
-    build_prelease_test_server(&root, &server);
     let runnable = persistent_runnable(&root, &server, 0);
     let ownership = crate::runtime::RuntimeOwnership::acquire(&run_dir).unwrap();
     let marker = pack_server_identity(u32::MAX, i32::MAX);
@@ -1446,6 +1445,7 @@ fn caller_managed_owner_does_not_install_process_exit_policy() {
     let owner_ready = root.path().join("owner-ready");
     let run_dir = root.path().join("run");
     let lease_path = run_dir.join("foreground.json");
+    build_prelease_test_server(root.path(), &root.path().join("server"));
     let mut owner = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
