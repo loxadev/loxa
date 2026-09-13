@@ -229,6 +229,7 @@ impl OwnedServer {
         };
         #[cfg(test)]
         kill_owner_after_spawn_before_lease_for_test();
+        #[cfg(test)]
         let group = child.group();
         let (announcement_sender, announcements) = mpsc::sync_channel(MAX_PENDING_ANNOUNCEMENTS);
         let announcement_overflow = Arc::new(AtomicBool::new(false));
@@ -282,23 +283,6 @@ impl OwnedServer {
             Err(error) => return owned.fail_start(error),
         };
         let child_pid = owned.child.as_ref().expect("owned child is present").id();
-        if let Some(runtime) = owned
-            .child
-            .as_mut()
-            .and_then(ChildProcessGuard::runtime_mut)
-        {
-            let publication = publication.expect("owned runtime publication is present");
-            if let Err(error) = runtime.record(
-                child_pid,
-                group,
-                &launch.id,
-                requested_port,
-                launch.managed_source_server(),
-                publication,
-            ) {
-                return owned.fail_start(error);
-            }
-        }
         if launch.policy != LaunchPolicy::Foreground {
             match requested_start_outcome(&mut owned, &stop)? {
                 RequestedStartOutcome::Continue => {}
@@ -315,6 +299,7 @@ impl OwnedServer {
             endpoint,
             client.as_ref(),
             child_pid,
+            publication,
             &stop,
         )
     }

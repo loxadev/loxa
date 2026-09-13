@@ -12,7 +12,7 @@ mod transaction;
 pub(crate) mod transfer;
 
 pub use inventory::load_catalog;
-pub(crate) use inventory::load_reconciled_catalog;
+pub(crate) use inventory::{load_model_manifest, load_reconciled_catalog};
 pub use lock::ModelLock;
 pub(crate) use lock::{model_is_busy, ModelLockError};
 pub use manifest::{

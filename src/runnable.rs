@@ -255,6 +255,7 @@ pub(crate) fn resolve_managed_runnable_for_host_reusing(
 pub(crate) fn resolve_managed_runnable_for_service(
     manifest: Manifest,
     paths: &AppPaths,
+    config: config::Config,
     retained_runtime: Option<runner::ValidatedManagedRuntime>,
     cancelled: &impl Fn() -> bool,
 ) -> Result<Runnable, ManagedRunnableError> {
@@ -266,7 +267,6 @@ pub(crate) fn resolve_managed_runnable_for_service(
             manifest.id
         )));
     }
-    let config = config::load(&paths.config).map_err(ManagedRunnableError::StartupFailed)?;
     let ctx = config::resolve_value(None, config.ctx, 4096);
     let profile = launch_profile(&manifest, &paths.models, paths.runtime_identity)
         .map_err(ManagedRunnableError::ModelUnavailable)?;

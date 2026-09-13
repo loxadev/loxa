@@ -43,6 +43,10 @@ pub(crate) struct RegularFileIdentity {
     #[cfg(unix)]
     links: u64,
     #[cfg(unix)]
+    owner: u32,
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(unix)]
     modified_seconds: i64,
     #[cfg(unix)]
     modified_nanoseconds: i64,
@@ -69,6 +73,8 @@ impl RegularFileIdentity {
                 device: metadata.dev(),
                 inode: metadata.ino(),
                 links: metadata.nlink(),
+                owner: metadata.uid(),
+                mode: metadata.mode() & 0o777,
                 modified_seconds: metadata.mtime(),
                 modified_nanoseconds: metadata.mtime_nsec(),
                 changed_seconds: metadata.ctime(),
@@ -90,6 +96,8 @@ impl RegularFileIdentity {
                 && self.device == current.device
                 && self.inode == current.inode
                 && self.links == current.links
+                && self.owner == current.owner
+                && self.mode == current.mode
                 && self.modified_seconds == current.modified_seconds
                 && self.modified_nanoseconds == current.modified_nanoseconds
         }
@@ -106,6 +114,8 @@ impl RegularFileIdentity {
                 && self.device == current.device
                 && self.inode == current.inode
                 && self.links == current.links
+                && self.owner == current.owner
+                && self.mode == current.mode
         }
         #[cfg(not(unix))]
         {
@@ -116,10 +126,71 @@ impl RegularFileIdentity {
     pub(crate) fn size(&self) -> u64 {
         self.size
     }
+
+    pub(crate) fn require_private_user_file(&self, path: &Path) -> io::Result<()> {
+        #[cfg(unix)]
+        if self.owner != unsafe { libc::geteuid() } || self.mode != 0o600 || self.links != 1 {
+            return Err(unsafe_file_error(
+                path,
+                "expected a private user-owned 0600 single-link file",
+            ));
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn read_regular_file(path: &Path) -> io::Result<Vec<u8>> {
     read_regular_file_with_after_open(path, || {})
+}
+
+pub(crate) fn read_regular_file_bounded(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
+    read_regular_file_bounded_with_policy(path, limit, false)
+}
+
+pub(crate) fn read_private_regular_file_bounded(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
+    read_regular_file_bounded_with_policy(path, limit, true)
+}
+
+fn read_regular_file_bounded_with_policy(
+    path: &Path,
+    limit: usize,
+    require_private: bool,
+) -> io::Result<Vec<u8>> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options.open(path)?;
+    let opened = regular_file_identity(&file, path)?;
+    if require_private {
+        opened.require_private_user_file(path)?;
+    }
+    let mut bytes = Vec::with_capacity(limit.min(8_192));
+    let mut buffer = [0_u8; 8_192];
+    while bytes.len() <= limit {
+        let remaining = limit.saturating_add(1).saturating_sub(bytes.len());
+        if remaining == 0 {
+            break;
+        }
+        let requested = remaining.min(buffer.len());
+        let read = file.read(&mut buffer[..requested])?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+    ensure_descriptor_matches_path(&file, &opened, path)?;
+    if bytes.len() > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} exceeds its byte limit", path.display()),
+        ));
+    }
+    Ok(bytes)
 }
 
 pub(crate) fn open_directory(path: &Path) -> io::Result<(File, DirectoryIdentity)> {
@@ -172,6 +243,10 @@ pub(crate) fn open_regular_file(path: &Path) -> io::Result<(File, RegularFileIde
 
 pub(crate) fn regular_file_identity(file: &File, path: &Path) -> io::Result<RegularFileIdentity> {
     RegularFileIdentity::from_metadata(&file.metadata()?, path)
+}
+
+pub(crate) fn regular_path_identity(path: &Path) -> io::Result<RegularFileIdentity> {
+    RegularFileIdentity::from_metadata(&fs::symlink_metadata(path)?, path)
 }
 
 pub(crate) fn ensure_regular_descriptors_match(
@@ -242,7 +317,7 @@ fn changed_while_open(path: &Path, kind: &str) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::read_regular_file_with_after_open;
+    use super::{read_regular_file_bounded, read_regular_file_with_after_open};
     use std::fs;
     use tempfile::tempdir;
 
@@ -304,5 +379,23 @@ mod tests {
         let error = read_regular_file_with_after_open(&path, || {}).unwrap_err();
 
         assert!(error.to_string().contains("single-link"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_reader_rejects_a_fifo_without_waiting_for_a_writer() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = tempdir().unwrap();
+        let path = root.path().join("manifest.json");
+        let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+        let started = std::time::Instant::now();
+        let error = read_regular_file_bounded(&path, 1024).unwrap_err();
+
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 }

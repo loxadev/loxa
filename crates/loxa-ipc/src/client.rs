@@ -1,8 +1,12 @@
 use crate::bootstrap::ClientBootstrap;
-use crate::codec::{decode, encode, framed};
+use crate::codec::{
+    decode_with_limit, encode_with_limit, framed, set_frame_limit, MAX_FRAME_BYTES,
+    MAX_HISTORY_FRAME_BYTES,
+};
 use crate::protocol::{
-    ClientEnvelope, ErrorCategory, Hello, Reply, Request, ServerEnvelope, ServiceCommand,
-    ServiceError,
+    Capability, ClientEnvelope, DraftCommand, DraftReply, ErrorCategory, Hello, HistoryCommand,
+    HistoryReply, HistoryStatus, Reply, Request, ServerEnvelope, ServiceCommand, ServiceError,
+    ServiceSettingsCommand, ServiceSettingsReply, HISTORY_SCHEMA_VERSION,
 };
 use crate::{peer_credentials, ReplyOutcome};
 use futures_util::{SinkExt, StreamExt};
@@ -95,39 +99,23 @@ impl ServiceClient {
         mode: ConnectMode,
         command: ServiceCommand,
     ) -> Result<ReplyOutcome, ClientError> {
+        if matches!(
+            &command,
+            ServiceCommand::History { .. }
+                | ServiceCommand::Draft { .. }
+                | ServiceCommand::Settings { .. }
+        ) {
+            return Err(ClientError::Transport(
+                "this command requires an explicit protocol 1.1 client entry point".into(),
+            ));
+        }
         command
             .validate_shape()
             .map_err(|error| ClientError::Transport(error.into()))?;
         let expects_status = matches!(command, ServiceCommand::Status);
         let mut connection = self.connect(mode).await?;
         let expected_boot_epoch = connection.hello.boot_epoch.clone();
-        let request_id = format!(
-            "{}-{}",
-            std::process::id(),
-            NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
-        );
-        let request = Request::new(request_id.clone(), command);
-        send_frame(
-            &mut connection.framed,
-            &ClientEnvelope::Request(request),
-            REQUEST_TIMEOUT,
-        )
-        .await?;
-        let envelope = receive_envelope(&mut connection.framed, REQUEST_TIMEOUT).await?;
-        let ServerEnvelope::Reply(Reply {
-            request_id: response_id,
-            outcome,
-        }) = envelope
-        else {
-            return Err(ClientError::Transport(
-                "service returned an unexpected envelope".into(),
-            ));
-        };
-        if response_id != request_id {
-            return Err(ClientError::Transport(
-                "service reply request identity changed".into(),
-            ));
-        }
+        let outcome = connection.request(command).await?;
         match outcome {
             ReplyOutcome::Rejected(error) => Err(ClientError::Rejected(error)),
             ReplyOutcome::Status(status) if expects_status => {
@@ -142,8 +130,122 @@ impl ServiceClient {
                 }
                 Ok(ReplyOutcome::Accepted(accepted))
             }
-            ReplyOutcome::Status(_) | ReplyOutcome::Accepted(_) => Err(ClientError::Transport(
+            ReplyOutcome::Status(_)
+            | ReplyOutcome::Accepted(_)
+            | ReplyOutcome::History { .. }
+            | ReplyOutcome::Draft { .. }
+            | ReplyOutcome::Settings { .. } => Err(ClientError::Transport(
                 "service returned an outcome for a different command".into(),
+            )),
+        }
+    }
+
+    pub async fn draft_request(
+        &self,
+        mode: ConnectMode,
+        command: DraftCommand,
+    ) -> Result<DraftReply, ClientError> {
+        command
+            .validate_shape()
+            .map_err(|error| ClientError::Transport(error.into()))?;
+        let mut connection = self.connect_for(mode, ClientContract::History).await?;
+        if !connection.hello.capabilities.contains(&Capability::Drafts)
+            || connection.hello.storage_schema != HISTORY_SCHEMA_VERSION
+        {
+            return Err(ClientError::Transport(
+                "service drafts are not ready with a supported schema".into(),
+            ));
+        }
+        let outcome = connection
+            .request(ServiceCommand::Draft { command })
+            .await?;
+        match outcome {
+            ReplyOutcome::Draft { reply } => Ok(reply),
+            ReplyOutcome::Rejected(error) => Err(ClientError::Rejected(error)),
+            _ => Err(ClientError::Transport(
+                "service returned an outcome for a different draft command".into(),
+            )),
+        }
+    }
+
+    pub async fn settings_request(
+        &self,
+        mode: ConnectMode,
+        command: ServiceSettingsCommand,
+    ) -> Result<ServiceSettingsReply, ClientError> {
+        command
+            .validate_shape()
+            .map_err(|error| ClientError::Transport(error.into()))?;
+        let mut connection = self.connect_for(mode, ClientContract::History).await?;
+        validate_settings_contract(&command, &connection.hello)?;
+        let outcome = connection
+            .request(ServiceCommand::Settings { command })
+            .await?;
+        match outcome {
+            ReplyOutcome::Settings { reply } => Ok(reply),
+            ReplyOutcome::Rejected(error) => Err(ClientError::Rejected(error)),
+            _ => Err(ClientError::Transport(
+                "service returned an outcome for a different settings command".into(),
+            )),
+        }
+    }
+
+    pub async fn history_status(&self, mode: ConnectMode) -> Result<HistoryStatus, ClientError> {
+        match self
+            .history_request_with_contract(
+                mode,
+                HistoryCommand::GetHistoryStatus,
+                ClientContract::HistoryStatus,
+            )
+            .await?
+        {
+            HistoryReply::Status(status) => Ok(status),
+            _ => Err(ClientError::Transport(
+                "service returned an outcome for a different history command".into(),
+            )),
+        }
+    }
+
+    pub async fn history_request(
+        &self,
+        mode: ConnectMode,
+        command: HistoryCommand,
+    ) -> Result<HistoryReply, ClientError> {
+        if matches!(command, HistoryCommand::GetHistoryStatus) {
+            return self
+                .history_request_with_contract(mode, command, ClientContract::HistoryStatus)
+                .await;
+        }
+        self.history_request_with_contract(mode, command, ClientContract::History)
+            .await
+    }
+
+    async fn history_request_with_contract(
+        &self,
+        mode: ConnectMode,
+        command: HistoryCommand,
+        contract: ClientContract,
+    ) -> Result<HistoryReply, ClientError> {
+        command
+            .validate_shape()
+            .map_err(|error| ClientError::Transport(error.into()))?;
+        let mut connection = self.connect_for(mode, contract).await?;
+        if contract == ClientContract::History
+            && (!connection.hello.capabilities.contains(&Capability::History)
+                || connection.hello.storage_schema != HISTORY_SCHEMA_VERSION)
+        {
+            return Err(ClientError::Transport(
+                "service history is not ready with a supported schema".into(),
+            ));
+        }
+        let outcome = connection
+            .request(ServiceCommand::History { command })
+            .await?;
+        match outcome {
+            ReplyOutcome::History { reply } => Ok(reply),
+            ReplyOutcome::Rejected(error) => Err(ClientError::Rejected(error)),
+            _ => Err(ClientError::Transport(
+                "service returned an outcome for a different history command".into(),
             )),
         }
     }
@@ -153,31 +255,43 @@ impl ServiceClient {
     /// published, so callers do not have to close a status/subscription gap.
     pub async fn subscribe(&self, mode: ConnectMode) -> Result<ServiceSubscription, ClientError> {
         let mut connection = self.connect(mode).await?;
-        let request_id = format!(
-            "{}-{}",
-            std::process::id(),
-            NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
-        );
+        let request_id = next_request_id();
         send_frame(
             &mut connection.framed,
             &ClientEnvelope::Subscribe { request_id },
             REQUEST_TIMEOUT,
+            connection.frame_limit,
         )
         .await?;
         let expected_boot_epoch = connection.hello.boot_epoch;
-        let initial =
-            snapshot_from(receive_envelope(&mut connection.framed, REQUEST_TIMEOUT).await?)?;
+        let initial = snapshot_from(
+            receive_envelope(
+                &mut connection.framed,
+                REQUEST_TIMEOUT,
+                connection.frame_limit,
+            )
+            .await?,
+        )?;
         let initial_revision = validate_projection(&initial, &expected_boot_epoch)?;
         Ok(ServiceSubscription {
             framed: connection.framed,
             initial: Some(initial),
             expected_boot_epoch,
             last_revision: initial_revision,
+            frame_limit: connection.frame_limit,
         })
     }
 
     async fn connect(&self, mode: ConnectMode) -> Result<Connection, ClientError> {
-        match self.connect_once().await {
+        self.connect_for(mode, ClientContract::Legacy).await
+    }
+
+    async fn connect_for(
+        &self,
+        mode: ConnectMode,
+        contract: ClientContract,
+    ) -> Result<Connection, ClientError> {
+        match self.connect_once(contract).await {
             Ok(connection) => return Ok(connection),
             Err(ClientError::Absent) if mode == ConnectMode::ObserveExisting => {
                 return Err(ClientError::Absent)
@@ -198,7 +312,7 @@ impl ServiceClient {
         .await?;
         let deadline = Instant::now() + STARTUP_TIMEOUT;
         loop {
-            match self.connect_once().await {
+            match self.connect_once(contract).await {
                 Ok(connection) => return Ok(connection),
                 Err(ClientError::Absent) if Instant::now() < deadline => {
                     sleep(Duration::from_millis(25)).await;
@@ -213,7 +327,7 @@ impl ServiceClient {
         }
     }
 
-    async fn connect_once(&self) -> Result<Connection, ClientError> {
+    async fn connect_once(&self, contract: ClientContract) -> Result<Connection, ClientError> {
         validate_socket_path(self.bootstrap.root().socket_path())?;
         let stream = match timeout(
             CONNECT_TIMEOUT,
@@ -238,16 +352,28 @@ impl ServiceClient {
             .validate_peer(peer)
             .map_err(ClientError::Transport)?;
         let mut framed = framed(stream);
-        send_frame(
-            &mut framed,
-            &ClientEnvelope::Hello(Hello::current(
+        let requested_hello = match contract {
+            ClientContract::Legacy => Hello::current(
                 self.client_build.clone(),
                 self.bootstrap.root().root_identity(),
-            )),
+            ),
+            ClientContract::HistoryStatus => Hello::history_status(
+                self.client_build.clone(),
+                self.bootstrap.root().root_identity(),
+            ),
+            ClientContract::History => Hello::history(
+                self.client_build.clone(),
+                self.bootstrap.root().root_identity(),
+            ),
+        };
+        send_frame(
+            &mut framed,
+            &ClientEnvelope::Hello(requested_hello.clone()),
             HANDSHAKE_TIMEOUT,
+            MAX_FRAME_BYTES,
         )
         .await?;
-        let envelope = receive_envelope(&mut framed, HANDSHAKE_TIMEOUT).await?;
+        let envelope = receive_envelope(&mut framed, HANDSHAKE_TIMEOUT, MAX_FRAME_BYTES).await?;
         let hello = match envelope {
             ServerEnvelope::HelloAck(hello) => hello,
             ServerEnvelope::HelloRejected(error) => return Err(ClientError::Rejected(error)),
@@ -257,11 +383,12 @@ impl ServiceClient {
                 ))
             }
         };
-        if !protocol_is_compatible(hello.protocol, crate::ProtocolVersion::CURRENT)
+        if !protocol_is_compatible(hello.protocol, requested_hello.protocol)
             || hello.root_identity != self.bootstrap.root().root_identity()
             || hello.service_pid != peer.pid
             || hello.origin_sha256 != self.bootstrap.origin().executable_sha256()
-            || !crate::protocol::REQUIRED_CAPABILITIES
+            || !requested_hello
+                .required_capabilities
                 .iter()
                 .all(|required| hello.capabilities.contains(required))
         {
@@ -269,7 +396,17 @@ impl ServiceClient {
                 "service handshake identity or compatibility check failed".into(),
             ));
         }
-        Ok(Connection { framed, hello })
+        let frame_limit = if hello.protocol.minor == 0 {
+            MAX_FRAME_BYTES
+        } else {
+            MAX_HISTORY_FRAME_BYTES
+        };
+        set_frame_limit(&mut framed, frame_limit).map_err(ClientError::Transport)?;
+        Ok(Connection {
+            framed,
+            hello,
+            frame_limit,
+        })
     }
 }
 
@@ -280,11 +417,33 @@ fn protocol_is_compatible(
     actual.major == required.major && actual.minor >= required.minor
 }
 
+fn validate_settings_contract(
+    command: &ServiceSettingsCommand,
+    hello: &crate::HelloAck,
+) -> Result<(), ClientError> {
+    if !hello.capabilities.contains(&Capability::Settings) {
+        return Err(ClientError::Transport(
+            "service settings are not ready".into(),
+        ));
+    }
+    if command.requires_ready_history()
+        && (!hello.capabilities.contains(&Capability::History)
+            || hello.storage_schema != HISTORY_SCHEMA_VERSION)
+    {
+        return Err(ClientError::Transport(
+            "conversation profiles are not ready with a supported schema; reconnect after history opens"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 pub struct ServiceSubscription {
     framed: crate::codec::IpcFramed,
     initial: Option<crate::RuntimeStatus>,
     expected_boot_epoch: String,
     last_revision: u64,
+    frame_limit: usize,
 }
 
 impl ServiceSubscription {
@@ -299,7 +458,7 @@ impl ServiceSubscription {
                 .await
                 .ok_or_else(|| ClientError::Transport("service closed the subscription".into()))?
                 .map_err(|error| ClientError::Transport(error.to_string()))?;
-            let status = snapshot_from(decode_envelope(&frame)?)?;
+            let status = snapshot_from(decode_envelope(&frame, self.frame_limit)?)?;
             let revision = validate_projection(&status, &self.expected_boot_epoch)?;
             if revision < self.last_revision {
                 return Err(ClientError::Transport(
@@ -318,14 +477,53 @@ impl ServiceSubscription {
 struct Connection {
     framed: crate::codec::IpcFramed,
     hello: crate::HelloAck,
+    frame_limit: usize,
+}
+
+impl Connection {
+    async fn request(&mut self, command: ServiceCommand) -> Result<ReplyOutcome, ClientError> {
+        let request_id = next_request_id();
+        send_frame(
+            &mut self.framed,
+            &ClientEnvelope::Request(Request::new(request_id.clone(), command)),
+            REQUEST_TIMEOUT,
+            self.frame_limit,
+        )
+        .await?;
+        let envelope =
+            receive_envelope(&mut self.framed, REQUEST_TIMEOUT, self.frame_limit).await?;
+        let ServerEnvelope::Reply(Reply {
+            request_id: response_id,
+            outcome,
+        }) = envelope
+        else {
+            return Err(ClientError::Transport(
+                "service returned an unexpected envelope".into(),
+            ));
+        };
+        if response_id != request_id {
+            return Err(ClientError::Transport(
+                "service reply request identity changed".into(),
+            ));
+        }
+        Ok(outcome)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClientContract {
+    Legacy,
+    HistoryStatus,
+    History,
 }
 
 async fn send_frame<T: serde::Serialize>(
     framed: &mut crate::codec::IpcFramed,
     value: &T,
     deadline: Duration,
+    frame_limit: usize,
 ) -> Result<(), ClientError> {
-    let bytes = encode(value).map_err(ClientError::Transport)?;
+    let bytes = encode_with_limit(value, frame_limit).map_err(ClientError::Transport)?;
     timeout(deadline, framed.send(bytes.freeze()))
         .await
         .map_err(|_| ClientError::Transport("service write timed out".into()))?
@@ -335,21 +533,31 @@ async fn send_frame<T: serde::Serialize>(
 async fn receive_envelope(
     framed: &mut crate::codec::IpcFramed,
     deadline: Duration,
+    frame_limit: usize,
 ) -> Result<ServerEnvelope, ClientError> {
     let frame = timeout(deadline, framed.next())
         .await
         .map_err(|_| ClientError::Transport("service response timed out".into()))?
         .ok_or_else(|| ClientError::Transport("service closed the connection".into()))?
         .map_err(|error| ClientError::Transport(error.to_string()))?;
-    decode_envelope(&frame)
+    decode_envelope(&frame, frame_limit)
 }
 
-fn decode_envelope(frame: &[u8]) -> Result<ServerEnvelope, ClientError> {
-    let envelope: ServerEnvelope = decode(frame).map_err(ClientError::Transport)?;
+fn decode_envelope(frame: &[u8], frame_limit: usize) -> Result<ServerEnvelope, ClientError> {
+    let envelope: ServerEnvelope =
+        decode_with_limit(frame, frame_limit).map_err(ClientError::Transport)?;
     envelope
         .validate_shape()
         .map_err(|error| ClientError::Transport(error.into()))?;
     Ok(envelope)
+}
+
+fn next_request_id() -> String {
+    format!(
+        "{}-{}",
+        std::process::id(),
+        NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 fn snapshot_from(envelope: ServerEnvelope) -> Result<crate::RuntimeStatus, ClientError> {
@@ -423,8 +631,196 @@ impl From<String> for ClientError {
 mod tests {
     use super::*;
     use crate::initialize_development_root;
+    use bytes::Bytes;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+
+    enum TestResponse {
+        Matching(ReplyOutcome),
+        MismatchedId,
+        UnexpectedEnvelope,
+        MalformedJson,
+        InvalidShape,
+        PeerEof,
+    }
+
+    fn settings_hello(capabilities: Vec<Capability>, storage_schema: u32) -> crate::HelloAck {
+        crate::HelloAck {
+            protocol: crate::ProtocolVersion::CURRENT,
+            capabilities,
+            build: "test-build".into(),
+            storage_schema,
+            boot_epoch: "test-boot".into(),
+            root_identity: "test-root".into(),
+            service_pid: 1,
+            origin_sha256: "00".repeat(32),
+        }
+    }
+
+    fn request_with_response(response: TestResponse) -> Result<ReplyOutcome, ClientError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let (client, server) = UnixStream::pair().unwrap();
+            let mut connection = Connection {
+                framed: framed(client),
+                hello: settings_hello(Vec::new(), 0),
+                frame_limit: MAX_FRAME_BYTES,
+            };
+            let peer = tokio::spawn(async move {
+                let mut server = framed(server);
+                let frame = server.next().await.unwrap().unwrap();
+                let request: ClientEnvelope = decode_with_limit(&frame, MAX_FRAME_BYTES).unwrap();
+                let ClientEnvelope::Request(request) = request else {
+                    panic!("connection helper sent a non-request envelope");
+                };
+                match response {
+                    TestResponse::Matching(outcome) => {
+                        send_frame(
+                            &mut server,
+                            &ServerEnvelope::Reply(Reply {
+                                request_id: request.request_id,
+                                outcome,
+                            }),
+                            REQUEST_TIMEOUT,
+                            MAX_FRAME_BYTES,
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    TestResponse::MismatchedId => {
+                        send_frame(
+                            &mut server,
+                            &ServerEnvelope::Reply(Reply {
+                                request_id: "different-request".into(),
+                                outcome: ReplyOutcome::Rejected(ServiceError::new(
+                                    ErrorCategory::Busy,
+                                    "busy",
+                                )),
+                            }),
+                            REQUEST_TIMEOUT,
+                            MAX_FRAME_BYTES,
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    TestResponse::UnexpectedEnvelope => {
+                        send_frame(
+                            &mut server,
+                            &ServerEnvelope::HelloRejected(ServiceError::new(
+                                ErrorCategory::Busy,
+                                "busy",
+                            )),
+                            REQUEST_TIMEOUT,
+                            MAX_FRAME_BYTES,
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    TestResponse::MalformedJson => {
+                        server.send(Bytes::from_static(b"{")).await.unwrap();
+                    }
+                    TestResponse::InvalidShape => {
+                        let bytes = encode_with_limit(
+                            &ServerEnvelope::Reply(Reply {
+                                request_id: String::new(),
+                                outcome: ReplyOutcome::Rejected(ServiceError::new(
+                                    ErrorCategory::Busy,
+                                    "busy",
+                                )),
+                            }),
+                            MAX_FRAME_BYTES,
+                        )
+                        .unwrap();
+                        server.send(bytes.freeze()).await.unwrap();
+                    }
+                    TestResponse::PeerEof => {}
+                }
+            });
+            let result = connection.request(ServiceCommand::Status).await;
+            peer.await.unwrap();
+            result
+        })
+    }
+
+    #[test]
+    fn connection_request_returns_a_matching_valid_reply() {
+        let expected = ReplyOutcome::Rejected(ServiceError::new(ErrorCategory::Busy, "busy"));
+        assert_eq!(
+            request_with_response(TestResponse::Matching(expected.clone())).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn connection_request_rejects_wrong_envelopes_and_request_identities() {
+        assert!(matches!(
+            request_with_response(TestResponse::MismatchedId),
+            Err(ClientError::Transport(message)) if message.contains("request identity changed")
+        ));
+        assert!(matches!(
+            request_with_response(TestResponse::UnexpectedEnvelope),
+            Err(ClientError::Transport(message)) if message.contains("unexpected envelope")
+        ));
+    }
+
+    #[test]
+    fn connection_request_rejects_malformed_invalid_and_closed_peer_replies() {
+        assert!(matches!(
+            request_with_response(TestResponse::MalformedJson),
+            Err(ClientError::Transport(_))
+        ));
+        assert!(matches!(
+            request_with_response(TestResponse::InvalidShape),
+            Err(ClientError::Transport(message)) if message.contains("invalid reply request identity")
+        ));
+        assert!(matches!(
+            request_with_response(TestResponse::PeerEof),
+            Err(ClientError::Transport(message)) if message.contains("closed the connection")
+        ));
+    }
+
+    #[test]
+    fn profile_settings_require_a_ready_history_handshake() {
+        let global = ServiceSettingsCommand::GetServiceSettings;
+        let profile = ServiceSettingsCommand::GetConversationProfile {
+            conversation_id: "00".repeat(16),
+        };
+        let opening = settings_hello(vec![Capability::Settings], 0);
+        assert!(validate_settings_contract(&global, &opening).is_ok());
+        assert!(matches!(
+            validate_settings_contract(&profile, &opening),
+            Err(ClientError::Transport(message))
+                if message.contains("reconnect after history opens")
+        ));
+
+        let missing_settings = settings_hello(vec![Capability::History], HISTORY_SCHEMA_VERSION);
+        for command in [&global, &profile] {
+            assert!(matches!(
+                validate_settings_contract(command, &missing_settings),
+                Err(ClientError::Transport(message)) if message.contains("settings are not ready")
+            ));
+        }
+
+        let wrong_schema = settings_hello(
+            vec![Capability::Settings, Capability::History],
+            HISTORY_SCHEMA_VERSION + 1,
+        );
+        assert!(validate_settings_contract(&global, &wrong_schema).is_ok());
+        assert!(matches!(
+            validate_settings_contract(&profile, &wrong_schema),
+            Err(ClientError::Transport(message))
+                if message.contains("reconnect after history opens")
+        ));
+
+        let ready = settings_hello(
+            vec![Capability::Settings, Capability::History],
+            HISTORY_SCHEMA_VERSION,
+        );
+        assert!(validate_settings_contract(&profile, &ready).is_ok());
+    }
 
     #[test]
     fn stale_client_refuses_a_replaced_root_before_spawning_the_recorded_origin() {

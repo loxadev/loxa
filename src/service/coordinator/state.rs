@@ -3,13 +3,17 @@ use loxa_ipc::{
     Accepted, ErrorCategory, OperationTarget, RuntimePhase, RuntimeStatus, ServiceError,
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
+
+use super::history::OutputState;
 
 // All admission and publication decisions run under Shared::state. The watch
 // value is an observer copy: never read it back to decide a transition.
 pub(super) struct CoordinatorState {
     current: Option<Arc<OperationControl>>,
+    admission: Option<Arc<AdmissionReservation>>,
+    conversation_mutations: Vec<Arc<ConversationMutationReservation>>,
     next_task_id: u64,
     next_generation: u64,
     revision: u64,
@@ -34,13 +38,173 @@ enum Phase {
     Draining,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) enum OperationPhase {
     Starting,
-    Ready { engine_pid: u32 },
+    Ready {
+        engine_pid: u32,
+        fingerprint: Arc<crate::runtime_fingerprint::RuntimeFingerprint>,
+    },
     Stopping,
     CleanupFailed,
     LoadFailed(ErrorCategory),
+}
+
+pub(super) struct AdmissionReservation {
+    pub(super) conversation_id: [u8; 16],
+    pub(super) submission_id: [u8; 16],
+    pub(super) submission_hash: [u8; 32],
+    pub(super) expected_conversation_revision: i64,
+    pub(super) expected_profile_revision: i64,
+    pub(super) operation_generation: i64,
+    pub(super) fingerprint: Arc<crate::runtime_fingerprint::RuntimeFingerprint>,
+    pub(super) cancelled: AtomicBool,
+    outcome: watch::Sender<Option<Result<crate::history::CommittedAdmission, ServiceError>>>,
+    recovery: Mutex<AdmissionRecovery>,
+    pub(super) output: Mutex<Option<OutputState>>,
+}
+
+pub(super) struct ConversationMutationReservation {
+    conversation_id: [u8; 16],
+}
+
+pub(super) enum AdmissionClaim {
+    Existing(Arc<AdmissionReservation>),
+    Fresh(Arc<AdmissionReservation>),
+}
+
+pub(super) enum AdmissionRecoveryAction {
+    Lookup(Arc<crate::history::PreparedAdmission>),
+    Stop(
+        Arc<crate::history::PreparedAdmission>,
+        crate::history::CommittedAdmission,
+    ),
+}
+
+enum AdmissionRecovery {
+    Preparing,
+    AdmissionInFlight(Arc<crate::history::PreparedAdmission>),
+    AdmissionUnknown(Arc<crate::history::PreparedAdmission>),
+    StopInFlight(
+        Arc<crate::history::PreparedAdmission>,
+        crate::history::CommittedAdmission,
+    ),
+    StopUnknown(
+        Arc<crate::history::PreparedAdmission>,
+        crate::history::CommittedAdmission,
+    ),
+    OutputOwned,
+}
+
+impl AdmissionReservation {
+    pub(super) fn subscribe(
+        &self,
+    ) -> watch::Receiver<Option<Result<crate::history::CommittedAdmission, ServiceError>>> {
+        self.outcome.subscribe()
+    }
+
+    pub(super) fn publish(
+        &self,
+        outcome: Result<crate::history::CommittedAdmission, ServiceError>,
+    ) {
+        self.outcome.send_replace(Some(outcome));
+    }
+
+    pub(super) fn retain_prepared(&self, prepared: Arc<crate::history::PreparedAdmission>) {
+        *self
+            .recovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            AdmissionRecovery::AdmissionInFlight(prepared);
+    }
+
+    pub(super) fn admission_unknown(&self) {
+        let mut recovery = self
+            .recovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let AdmissionRecovery::AdmissionInFlight(prepared) = &*recovery {
+            *recovery = AdmissionRecovery::AdmissionUnknown(Arc::clone(prepared));
+        }
+    }
+
+    pub(super) fn retain_stop(&self, committed: crate::history::CommittedAdmission) {
+        let mut recovery = self
+            .recovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prepared = match &*recovery {
+            AdmissionRecovery::AdmissionInFlight(prepared)
+            | AdmissionRecovery::AdmissionUnknown(prepared) => Arc::clone(prepared),
+            AdmissionRecovery::StopInFlight(prepared, _)
+            | AdmissionRecovery::StopUnknown(prepared, _) => Arc::clone(prepared),
+            AdmissionRecovery::Preparing | AdmissionRecovery::OutputOwned => return,
+        };
+        *recovery = AdmissionRecovery::StopInFlight(prepared, committed);
+    }
+
+    pub(super) fn stop_unknown(&self) {
+        let mut recovery = self
+            .recovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let AdmissionRecovery::StopInFlight(prepared, committed) = &*recovery {
+            *recovery = AdmissionRecovery::StopUnknown(Arc::clone(prepared), committed.clone());
+        }
+    }
+
+    pub(super) fn take_recovery_action(&self) -> Option<AdmissionRecoveryAction> {
+        let mut recovery = self
+            .recovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &*recovery {
+            AdmissionRecovery::AdmissionUnknown(prepared) => {
+                let prepared = Arc::clone(prepared);
+                *recovery = AdmissionRecovery::AdmissionInFlight(Arc::clone(&prepared));
+                Some(AdmissionRecoveryAction::Lookup(prepared))
+            }
+            AdmissionRecovery::StopUnknown(prepared, committed) => {
+                let prepared = Arc::clone(prepared);
+                let committed = committed.clone();
+                *recovery =
+                    AdmissionRecovery::StopInFlight(Arc::clone(&prepared), committed.clone());
+                Some(AdmissionRecoveryAction::Stop(prepared, committed))
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) fn install_output(&self, committed: crate::history::CommittedAdmission) -> bool {
+        let mut recovery = self
+            .recovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut output = self
+            .output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if output.is_some()
+            || !matches!(
+                &*recovery,
+                AdmissionRecovery::AdmissionInFlight(_) | AdmissionRecovery::AdmissionUnknown(_)
+            )
+        {
+            return false;
+        }
+        *output = Some(OutputState::new(committed));
+        *recovery = AdmissionRecovery::OutputOwned;
+        true
+    }
+
+    #[cfg(test)]
+    pub(super) fn stop_retry_ready(&self) -> bool {
+        let recovery = self
+            .recovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        matches!(&*recovery, AdmissionRecovery::StopUnknown(_, _))
+    }
 }
 
 impl CoordinatorState {
@@ -62,6 +226,8 @@ impl CoordinatorState {
         let (snapshots, _) = watch::channel(initial);
         Self {
             current: None,
+            admission: None,
+            conversation_mutations: Vec::with_capacity(8),
             next_task_id: 1,
             next_generation: 1,
             revision: 0,
@@ -78,6 +244,26 @@ impl CoordinatorState {
             state_revision: self.revision.to_string(),
             phase: self.phase.to_wire(),
         }
+    }
+
+    pub(super) fn matching_admission(
+        &self,
+        submission_id: [u8; 16],
+        submission_hash: [u8; 32],
+    ) -> Result<Option<Arc<AdmissionReservation>>, ServiceError> {
+        let Some(admission) = &self.admission else {
+            return Ok(None);
+        };
+        if admission.submission_id != submission_id {
+            return Ok(None);
+        }
+        if admission.submission_hash != submission_hash {
+            return Err(ServiceError::new(
+                ErrorCategory::Conflict,
+                "submission identity was reused with a different payload",
+            ));
+        }
+        Ok(Some(Arc::clone(admission)))
     }
 
     pub(super) fn subscribe(&self) -> watch::Receiver<RuntimeStatus> {
@@ -98,6 +284,12 @@ impl CoordinatorState {
             return Err(ServiceError::new(
                 ErrorCategory::RecoveryRequired,
                 reason.clone(),
+            ));
+        }
+        if self.admission.is_some() {
+            return Err(ServiceError::new(
+                ErrorCategory::Busy,
+                "conversation output is still active or unresolved",
             ));
         }
         if self.current.is_some()
@@ -134,6 +326,12 @@ impl CoordinatorState {
     }
 
     pub(super) fn unload(&mut self, target: &OperationTarget) -> Result<Accepted, ServiceError> {
+        if self.admission.is_some() {
+            return Err(ServiceError::new(
+                ErrorCategory::Busy,
+                "a conversation admission is active",
+            ));
+        }
         let operation = self.current.as_ref().ok_or_else(|| {
             ServiceError::new(ErrorCategory::NotFound, "no model operation is active")
         })?;
@@ -167,6 +365,9 @@ impl CoordinatorState {
         self.draining.store(true, Ordering::Release);
         if let Some(operation) = &self.current {
             operation.request_cleanup();
+        }
+        if let Some(admission) = &self.admission {
+            admission.cancelled.store(true, Ordering::Release);
         }
         self.publish(Phase::Draining);
     }
@@ -202,6 +403,9 @@ impl CoordinatorState {
         expected: &Arc<OperationControl>,
         failure: Option<ErrorCategory>,
     ) {
+        if let Some(admission) = &self.admission {
+            admission.cancelled.store(true, Ordering::Release);
+        }
         let phase = failure.map_or(Phase::Unloaded, |category| Phase::Operation {
             control: Arc::clone(expected),
             phase: OperationPhase::LoadFailed(category),
@@ -210,6 +414,9 @@ impl CoordinatorState {
     }
 
     pub(super) fn require_recovery(&mut self, expected: &Arc<OperationControl>, reason: &str) {
+        if let Some(admission) = &self.admission {
+            admission.cancelled.store(true, Ordering::Release);
+        }
         self.release_and_publish(
             expected,
             Phase::RecoveryRequired(
@@ -222,6 +429,145 @@ impl CoordinatorState {
         if self.is_current(expected) {
             self.current = None;
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn reserve_admission(
+        &mut self,
+        conversation_id: [u8; 16],
+        submission_id: [u8; 16],
+        submission_hash: [u8; 32],
+        expected_conversation_revision: i64,
+        expected_profile_revision: i64,
+    ) -> Result<AdmissionClaim, ServiceError> {
+        if self.draining.load(Ordering::Acquire) {
+            return Err(ServiceError::new(
+                ErrorCategory::ServiceUnavailable,
+                "service is draining",
+            ));
+        }
+        if let Some(admission) = &self.admission {
+            if admission.submission_id == submission_id {
+                if admission.submission_hash != submission_hash {
+                    return Err(ServiceError::new(
+                        ErrorCategory::Conflict,
+                        "submission identity was reused with a different payload",
+                    ));
+                }
+                return Ok(AdmissionClaim::Existing(Arc::clone(admission)));
+            }
+            return Err(ServiceError::new(
+                ErrorCategory::Busy,
+                "another conversation admission is active",
+            ));
+        }
+        if self
+            .conversation_mutations
+            .iter()
+            .any(|mutation| mutation.conversation_id == conversation_id)
+        {
+            return Err(ServiceError::new(
+                ErrorCategory::Busy,
+                "a conversation mutation is active",
+            ));
+        }
+        let (operation, fingerprint) = match &self.phase {
+            Phase::Operation {
+                control,
+                phase: OperationPhase::Ready { fingerprint, .. },
+            } if self.is_current(control) => (control, fingerprint),
+            _ => {
+                return Err(ServiceError::new(
+                    ErrorCategory::ServiceUnavailable,
+                    "no verified runtime is ready",
+                ));
+            }
+        };
+        let operation_generation = i64::try_from(operation.generation).map_err(|_| {
+            ServiceError::new(
+                ErrorCategory::Internal,
+                "runtime generation exceeds the history range",
+            )
+        })?;
+        let (outcome, _) = watch::channel(None);
+        let reservation = Arc::new(AdmissionReservation {
+            conversation_id,
+            submission_id,
+            submission_hash,
+            expected_conversation_revision,
+            expected_profile_revision,
+            operation_generation,
+            fingerprint: Arc::clone(fingerprint),
+            cancelled: AtomicBool::new(false),
+            outcome,
+            recovery: Mutex::new(AdmissionRecovery::Preparing),
+            output: Mutex::new(None),
+        });
+        self.admission = Some(Arc::clone(&reservation));
+        Ok(AdmissionClaim::Fresh(reservation))
+    }
+
+    pub(super) fn admission_is_current(&self, expected: &Arc<AdmissionReservation>) -> bool {
+        self.admission
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, expected))
+    }
+
+    pub(super) fn current_admission(&self) -> Option<Arc<AdmissionReservation>> {
+        self.admission.as_ref().map(Arc::clone)
+    }
+
+    pub(super) fn reserve_conversation_mutation(
+        &mut self,
+        conversation_id: [u8; 16],
+    ) -> Result<Arc<ConversationMutationReservation>, ServiceError> {
+        if self.draining.load(Ordering::Acquire) {
+            return Err(ServiceError::new(
+                ErrorCategory::ServiceUnavailable,
+                "service is draining",
+            ));
+        }
+        if self
+            .admission
+            .as_ref()
+            .is_some_and(|admission| admission.conversation_id == conversation_id)
+            || self
+                .conversation_mutations
+                .iter()
+                .any(|mutation| mutation.conversation_id == conversation_id)
+        {
+            return Err(ServiceError::new(
+                ErrorCategory::Busy,
+                "the conversation has an active mutation",
+            ));
+        }
+        if self.conversation_mutations.len() == 8 {
+            return Err(ServiceError::new(
+                ErrorCategory::Busy,
+                "conversation mutation capacity is full",
+            ));
+        }
+        let reservation = Arc::new(ConversationMutationReservation { conversation_id });
+        self.conversation_mutations.push(Arc::clone(&reservation));
+        Ok(reservation)
+    }
+
+    pub(super) fn finish_conversation_mutation(
+        &mut self,
+        reservation: &Arc<ConversationMutationReservation>,
+    ) {
+        self.conversation_mutations
+            .retain(|current| !Arc::ptr_eq(current, reservation));
+    }
+
+    pub(super) fn finish_admission(&mut self, expected: &Arc<AdmissionReservation>) {
+        if self.admission_is_current(expected) {
+            self.admission = None;
+        }
+    }
+
+    pub(super) fn history_close_is_safe(&self) -> bool {
+        self.admission.is_none()
     }
 
     fn release_and_publish(&mut self, expected: &Arc<OperationControl>, phase: Phase) {
@@ -278,7 +624,7 @@ impl Phase {
                         generation,
                         model_id,
                     },
-                    OperationPhase::Ready { engine_pid } => RuntimePhase::Ready {
+                    OperationPhase::Ready { engine_pid, .. } => RuntimePhase::Ready {
                         task_id,
                         generation,
                         model_id,

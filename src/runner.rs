@@ -15,7 +15,7 @@ mod signal;
 
 pub(crate) use arguments::build_persistent_args_for_fingerprint;
 pub(crate) use discovery::discover_from_process;
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub(crate) use discovery::revalidate_managed_runtime;
 #[allow(unused_imports)]
 pub(crate) use discovery::validate_managed_server;

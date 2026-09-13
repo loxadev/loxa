@@ -229,6 +229,7 @@ impl RecordedPersistentRuntime {
             .stderr(Stdio::null())
             .process_group(0);
         let mut child = command.spawn().unwrap();
+        crate::process_inspection::wait_for_test_process_executable(&mut child, &managed_server);
         let child_pgid = i32::try_from(child.id()).unwrap();
         let ownership = RuntimeOwnership::acquire(root.path()).unwrap();
         let mut child_ownership = ownership.reserve_child().unwrap();

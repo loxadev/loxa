@@ -1,7 +1,25 @@
 use serde::{Deserialize, Serialize};
 
+mod drafts;
+mod history;
+mod settings;
+
+pub use drafts::{DraftCommand, DraftReply, DraftSnapshot, MAX_DRAFT_TEXT_BYTES};
+pub use history::{
+    AttemptExecution, AttemptSave, AttemptSummary, ContentRange, ContentSource, ConversationCursor,
+    ConversationPage, ConversationSummary, HistoryCommand, HistoryPhase, HistoryReply,
+    HistoryStatus, TurnCursor, TurnPage, TurnSummary, HISTORY_SCHEMA_VERSION,
+    MAX_CONTENT_RANGE_BYTES, MAX_CONVERSATION_PAGE_BYTES, MAX_CONVERSATION_PAGE_ITEMS,
+    MAX_CONVERSATION_TITLE_BYTES, MAX_TURN_PAGE_BYTES, MAX_TURN_PAGE_ITEMS,
+};
+pub use settings::{
+    ConversationProfile, GenerationSettings, GenerationSettingsPatch, OptionalU16Patch,
+    OptionalU32Patch, ServiceSettings, ServiceSettingsApplication, ServiceSettingsCommand,
+    ServiceSettingsDurability, ServiceSettingsPatch, ServiceSettingsReply,
+};
+
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 0;
+pub const PROTOCOL_MINOR: u16 = 1;
 
 pub const MAX_BUILD_BYTES: usize = 96;
 pub const MAX_ID_BYTES: usize = 160;
@@ -17,6 +35,8 @@ pub struct ProtocolVersion {
 }
 
 impl ProtocolVersion {
+    pub const V1_0: Self = Self { major: 1, minor: 0 };
+
     pub const CURRENT: Self = Self {
         major: PROTOCOL_MAJOR,
         minor: PROTOCOL_MINOR,
@@ -31,6 +51,9 @@ pub enum Capability {
     Unload,
     StopService,
     EngineUnixSocket,
+    History,
+    Drafts,
+    Settings,
 }
 
 pub const REQUIRED_CAPABILITIES: [Capability; 5] = [
@@ -53,7 +76,23 @@ pub struct Hello {
 impl Hello {
     pub fn current(build: impl Into<String>, root_identity: impl Into<String>) -> Self {
         Self {
+            protocol: ProtocolVersion::V1_0,
+            required_capabilities: REQUIRED_CAPABILITIES.to_vec(),
+            build: build.into(),
+            root_identity: root_identity.into(),
+        }
+    }
+
+    pub fn history_status(build: impl Into<String>, root_identity: impl Into<String>) -> Self {
+        Self::history(build, root_identity)
+    }
+
+    pub fn history(build: impl Into<String>, root_identity: impl Into<String>) -> Self {
+        Self {
             protocol: ProtocolVersion::CURRENT,
+            // Protocol 1.0 peers have a closed capability enum. Keep this
+            // initial vocabulary decodable so they can return the typed
+            // protocol mismatch before a 1.1 client asks for history.
             required_capabilities: REQUIRED_CAPABILITIES.to_vec(),
             build: build.into(),
             root_identity: root_identity.into(),
@@ -178,6 +217,9 @@ pub enum ServiceCommand {
     Load { model_id: String },
     Unload { target: OperationTarget },
     StopService,
+    History { command: HistoryCommand },
+    Draft { command: DraftCommand },
+    Settings { command: ServiceSettingsCommand },
 }
 
 impl ServiceCommand {
@@ -185,6 +227,9 @@ impl ServiceCommand {
         match self {
             Self::Load { model_id } => validate_model_id(model_id),
             Self::Unload { target } => target.validate_shape(),
+            Self::History { command } => command.validate_shape(),
+            Self::Draft { command } => command.validate_shape(),
+            Self::Settings { command } => command.validate_shape(),
             _ => Ok(()),
         }
     }
@@ -222,6 +267,9 @@ impl Reply {
             ReplyOutcome::Status(status) => status.validate_shape(),
             ReplyOutcome::Accepted(accepted) => accepted.validate_shape(),
             ReplyOutcome::Rejected(error) => error.validate_shape(),
+            ReplyOutcome::History { reply } => reply.validate_shape(),
+            ReplyOutcome::Draft { reply } => reply.validate_shape(),
+            ReplyOutcome::Settings { reply } => reply.validate_shape(),
         }
     }
 }
@@ -232,6 +280,9 @@ pub enum ReplyOutcome {
     Status(ServiceStatus),
     Accepted(Accepted),
     Rejected(ServiceError),
+    History { reply: HistoryReply },
+    Draft { reply: DraftReply },
+    Settings { reply: ServiceSettingsReply },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -415,6 +466,7 @@ pub enum ErrorCategory {
     ModelUnavailable,
     StartupFailed,
     Internal,
+    OutcomeUnknown,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -487,4 +539,240 @@ fn is_lower_hex_64(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, Deserialize, Eq, PartialEq)]
+    #[serde(deny_unknown_fields)]
+    struct OldProtocolVersion {
+        major: u16,
+        minor: u16,
+    }
+
+    #[derive(Debug, Deserialize, Eq, PartialEq)]
+    #[serde(rename_all = "snake_case")]
+    enum OldCapability {
+        Status,
+        Load,
+        Unload,
+        StopService,
+        EngineUnixSocket,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum OldClientEnvelope {
+        Hello {
+            protocol: OldProtocolVersion,
+            required_capabilities: Vec<OldCapability>,
+            build: String,
+            root_identity: String,
+        },
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum OldServerEnvelope {
+        HelloAck {
+            protocol: OldProtocolVersion,
+            capabilities: Vec<OldCapability>,
+            build: String,
+            storage_schema: u32,
+            boot_epoch: String,
+            root_identity: String,
+            service_pid: u32,
+            origin_sha256: String,
+        },
+    }
+
+    #[test]
+    fn genuine_protocol_1_0_hello_fixture_still_decodes() {
+        let fixture = br#"{
+            "type":"hello",
+            "protocol":{"major":1,"minor":0},
+            "required_capabilities":["status","load","unload","stop_service","engine_unix_socket"],
+            "build":"0.1.0-dev",
+            "root_identity":"root"
+        }"#;
+        let envelope: ClientEnvelope = serde_json::from_slice(fixture).unwrap();
+        assert_eq!(
+            envelope,
+            ClientEnvelope::Hello(Hello::current("0.1.0-dev", "root"))
+        );
+    }
+
+    #[test]
+    fn legacy_hello_and_ack_projection_remain_decodable_by_closed_old_shapes() {
+        let encoded =
+            serde_json::to_vec(&ClientEnvelope::Hello(Hello::current("0.1.0-dev", "root")))
+                .unwrap();
+        let OldClientEnvelope::Hello {
+            protocol,
+            required_capabilities,
+            build,
+            root_identity,
+        } = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(protocol, OldProtocolVersion { major: 1, minor: 0 });
+        assert_eq!(required_capabilities.len(), 5);
+        assert_eq!(build, "0.1.0-dev");
+        assert_eq!(root_identity, "root");
+
+        let ack = ServerEnvelope::HelloAck(HelloAck {
+            protocol: ProtocolVersion::V1_0,
+            capabilities: REQUIRED_CAPABILITIES.to_vec(),
+            build: "0.1.0-dev".into(),
+            storage_schema: 1,
+            boot_epoch: "boot".into(),
+            root_identity: "root".into(),
+            service_pid: 1,
+            origin_sha256: "a".repeat(64),
+        });
+        let encoded = serde_json::to_vec(&ack).unwrap();
+        let OldServerEnvelope::HelloAck {
+            protocol,
+            capabilities,
+            build,
+            storage_schema,
+            boot_epoch,
+            root_identity,
+            service_pid,
+            origin_sha256,
+        } = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(protocol, OldProtocolVersion { major: 1, minor: 0 });
+        assert_eq!(capabilities.len(), 5);
+        assert_eq!(build, "0.1.0-dev");
+        assert_eq!(storage_schema, 1);
+        assert_eq!(boot_epoch, "boot");
+        assert_eq!(root_identity, "root");
+        assert_eq!(service_pid, 1);
+        assert_eq!(origin_sha256, "a".repeat(64));
+    }
+
+    #[test]
+    fn history_hello_is_decodable_by_a_closed_protocol_1_0_peer() {
+        let encoded =
+            serde_json::to_vec(&ClientEnvelope::Hello(Hello::history("0.1.0-dev", "root")))
+                .unwrap();
+        let OldClientEnvelope::Hello {
+            protocol,
+            required_capabilities,
+            ..
+        } = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(protocol, OldProtocolVersion { major: 1, minor: 1 });
+        assert_eq!(required_capabilities.len(), REQUIRED_CAPABILITIES.len());
+    }
+
+    #[test]
+    fn conversation_pages_reject_a_fifty_first_item_during_decode() {
+        let item = ConversationSummary {
+            id: "a".repeat(32),
+            model_id: "demo".into(),
+            title: "chat".into(),
+            created_ms: "1".into(),
+            updated_ms: "1".into(),
+            revision: "1".into(),
+            profile_revision: "1".into(),
+        };
+        let encoded = serde_json::json!({
+            "conversations": vec![item; MAX_CONVERSATION_PAGE_ITEMS + 1],
+            "next": null
+        });
+        assert!(serde_json::from_value::<ConversationPage>(encoded).is_err());
+    }
+
+    #[test]
+    fn history_commands_and_replies_have_one_tag_at_each_wire_level() {
+        let request = ClientEnvelope::Request(Request::new(
+            "history-1",
+            ServiceCommand::History {
+                command: HistoryCommand::ListConversations {
+                    cursor: None,
+                    limit: 1,
+                },
+            },
+        ));
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(encoded["type"], "request");
+        assert_eq!(encoded["command"]["type"], "history");
+        assert_eq!(encoded["command"]["command"]["type"], "list_conversations");
+        assert_eq!(
+            serde_json::from_value::<ClientEnvelope>(encoded).unwrap(),
+            request
+        );
+
+        let response = ServerEnvelope::Reply(Reply {
+            request_id: "history-1".into(),
+            outcome: ReplyOutcome::History {
+                reply: HistoryReply::ConversationPage(ConversationPage {
+                    conversations: Vec::new(),
+                    next: None,
+                }),
+            },
+        });
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(encoded["type"], "reply");
+        assert_eq!(encoded["outcome"]["type"], "history");
+        assert_eq!(encoded["outcome"]["reply"]["type"], "conversation_page");
+        assert_eq!(
+            serde_json::from_value::<ServerEnvelope>(encoded).unwrap(),
+            response
+        );
+    }
+
+    #[test]
+    fn turn_and_content_dtos_reject_impossible_public_shapes() {
+        let valid_attempt = AttemptSummary {
+            id: "b".repeat(32),
+            attempt_number: "1".into(),
+            execution: AttemptExecution::Completed,
+            save: AttemptSave::Saved,
+            saved_end: "2".into(),
+            generated_end: Some("2".into()),
+            terminal_saved_end: Some("2".into()),
+            failure_code: None,
+            created_ms: "1".into(),
+            updated_ms: "2".into(),
+        };
+        let page = |attempt: AttemptSummary, user_text_end: &str| {
+            HistoryReply::TurnPage(TurnPage {
+                turns: vec![TurnSummary {
+                    id: "a".repeat(32),
+                    ordinal: "1".into(),
+                    user_text_end: user_text_end.into(),
+                    selected_attempt: Some(attempt),
+                }],
+                next: None,
+            })
+        };
+
+        let mut invalid = valid_attempt.clone();
+        invalid.terminal_saved_end = None;
+        assert!(page(invalid, "1").validate_shape().is_err());
+
+        let mut invalid = valid_attempt.clone();
+        invalid.updated_ms = "0".into();
+        assert!(page(invalid, "1").validate_shape().is_err());
+        assert!(page(valid_attempt, "32769").validate_shape().is_err());
+
+        assert!(HistoryReply::ContentRange(ContentRange {
+            start: "0".into(),
+            end: "2".into(),
+            prefix_end: "2".into(),
+            content: "x".into(),
+        })
+        .validate_shape()
+        .is_err());
+        assert!(HistoryCommand::ReadContentRange {
+            source: ContentSource::Assistant {
+                attempt_id: "c".repeat(32),
+            },
+            start: "0".into(),
+            prefix_end: "16777217".into(),
+        }
+        .validate_shape()
+        .is_err());
+    }
 }

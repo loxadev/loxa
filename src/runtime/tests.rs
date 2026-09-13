@@ -386,7 +386,12 @@ fn spawn_sleep() -> Child {
     let mut command = Command::new("/bin/sleep");
     command.arg("60");
     command.process_group(0);
-    command.spawn().unwrap()
+    let mut child = command.spawn().unwrap();
+    crate::process_inspection::wait_for_test_process_executable(
+        &mut child,
+        Path::new("/bin/sleep"),
+    );
+    child
 }
 
 fn spawn_lease_observing_sleep(lease: &Path, witness: &Path, ready: &Path) -> Child {
@@ -417,7 +422,9 @@ fn spawn_observable_server(model_id: &str, port: u16) -> Child {
         .arg("--port")
         .arg(port.to_string())
         .process_group(0);
-    command.spawn().unwrap()
+    let mut child = command.spawn().unwrap();
+    crate::process_inspection::wait_for_test_process_executable(&mut child, Path::new("/bin/bash"));
+    child
 }
 
 fn observed_lease(child: &Child, model_id: &str, port: u16) -> RuntimeLease {
@@ -1202,6 +1209,7 @@ fn graceful_clear_removes_only_the_exact_recorded_execution_stage() {
         .process_group(0)
         .spawn()
         .unwrap();
+    crate::process_inspection::wait_for_test_process_executable(&mut child, &server);
     let group = i32::try_from(child.id()).unwrap();
     let ownership = RuntimeOwnership::acquire(&run_dir).unwrap();
     let mut child_ownership = ownership.reserve_child().unwrap();
@@ -1239,6 +1247,7 @@ fn stale_recovery_removes_only_the_exact_orphaned_execution_stage() {
         .process_group(0)
         .spawn()
         .unwrap();
+    crate::process_inspection::wait_for_test_process_executable(&mut child, &server);
     let pid = child.id();
     let snapshot = process_snapshot(pid).unwrap().unwrap();
     let lease = RuntimeLease {
@@ -1496,6 +1505,7 @@ fn legacy_recovery_never_signals_without_unique_command_identity() {
     let mut command = Command::new(&server);
     command.arg("60").process_group(0);
     let mut child = command.spawn().unwrap();
+    crate::process_inspection::wait_for_test_process_executable(&mut child, &server);
     let pid = child.id();
     let snapshot = process_snapshot(pid).unwrap().unwrap();
     let legacy = serde_json::json!({

@@ -26,43 +26,61 @@ pub(super) fn run(
     control_dir: PathBuf,
     ownership: RuntimeOwnership,
     runtime_handle: tokio::runtime::Handle,
+    runtime_release_rx: Receiver<()>,
 ) {
     let completion = OwnerCompletion::new(shared.owner_exit_tx.clone());
-    // The worker drops common runtime ownership before announcing its exit,
-    // including when an engine operation unwinds through a panic.
-    RuntimeWorker {
-        shared,
-        paths,
-        control_dir,
-        ownership,
-        runtime_handle,
-        retained_runtime: None,
+    // Keep common ownership in this outer thread frame so unwinding the
+    // operation loop cannot release the cross-process runtime exclusion before
+    // the SQL/config durability barrier resolves.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        RuntimeWorker {
+            shared,
+            paths,
+            control_dir,
+            ownership: &ownership,
+            runtime_handle,
+            retained_runtime: None,
+        }
+        .run(owner_rx);
+    }));
+    match outcome {
+        Ok(()) => {
+            let _ = runtime_release_rx.recv();
+            drop(ownership);
+            completion.drained();
+        }
+        Err(payload) => {
+            completion.failed();
+            let _ = runtime_release_rx.recv();
+            drop(ownership);
+            std::panic::resume_unwind(payload);
+        }
     }
-    .run(owner_rx);
-    completion.drained();
 }
 
-struct RuntimeWorker {
+struct RuntimeWorker<'a> {
     shared: Arc<Shared>,
     paths: AppPaths,
     control_dir: PathBuf,
     // This same owner excludes other runtimes while idle and across all loads.
-    ownership: RuntimeOwnership,
+    ownership: &'a RuntimeOwnership,
     runtime_handle: tokio::runtime::Handle,
     retained_runtime: Option<ValidatedManagedRuntime>,
 }
 
-impl RuntimeWorker {
+impl RuntimeWorker<'_> {
     fn run(mut self, owner_rx: Receiver<OwnerCommand>) {
         loop {
             if self.shared.draining.load(Ordering::Acquire) {
+                self.shared.owner_exit_tx.send_replace(OwnerExit::Quiesced);
                 return;
             }
             match owner_rx.recv() {
                 Ok(OwnerCommand::Load {
                     operation,
+                    config,
                     accepted,
-                }) => self.load(operation, accepted),
+                }) => self.load(operation, config, accepted),
                 Ok(OwnerCommand::Wake) => {}
                 #[cfg(test)]
                 Ok(OwnerCommand::PanicForTest) => panic!("injected runtime owner failure"),
@@ -79,6 +97,7 @@ impl RuntimeWorker {
     fn load(
         &mut self,
         operation: Arc<OperationControl>,
+        config: crate::config::Config,
         accepted: oneshot::Sender<Result<Accepted, ServiceError>>,
     ) {
         if self.cancellation_requested(&operation) {
@@ -129,6 +148,7 @@ impl RuntimeWorker {
                 crate::runnable::resolve_managed_runnable_for_service(
                     manifest,
                     &self.paths,
+                    config,
                     self.retained_runtime.clone(),
                     &|| self.cancellation_requested(&operation),
                 )
@@ -167,7 +187,7 @@ impl RuntimeWorker {
             .join(format!("engine-{:016x}.sock", operation.generation));
         let started = crate::runner::start_service_with_ownership(
             runnable,
-            &self.ownership,
+            self.ownership,
             &endpoint,
             &self.runtime_handle,
             || self.cancellation_requested(&operation),
@@ -178,10 +198,14 @@ impl RuntimeWorker {
                     self.manage_cleanup_failed(operation, launch_intent, *server, 0);
                     return;
                 };
-                let ready = self
-                    .shared
-                    .state()
-                    .advance(&operation, OperationPhase::Ready { engine_pid: pid });
+                let fingerprint = Arc::new(server.fingerprint().clone());
+                let ready = self.shared.state().advance(
+                    &operation,
+                    OperationPhase::Ready {
+                        engine_pid: pid,
+                        fingerprint,
+                    },
+                );
                 if ready {
                     self.manage_ready(operation, launch_intent, *server);
                 } else {
@@ -346,6 +370,11 @@ impl OwnerCompletion {
 
     fn drained(mut self) {
         self.tx.send_replace(OwnerExit::Drained);
+        self.completed = true;
+    }
+
+    fn failed(mut self) {
+        self.tx.send_replace(OwnerExit::Failed);
         self.completed = true;
     }
 }

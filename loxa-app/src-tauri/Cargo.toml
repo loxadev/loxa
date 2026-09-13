@@ -35,6 +35,9 @@ tauri-build = { version = "=2.6.3", features = [] }
 loxa = { path = "../.." }
 loxa-diagnostics = { version = "0.1.0-dev", path = "../../crates/loxa-diagnostics" }
 loxa-ipc = { version = "0.1.0-dev", path = "../../crates/loxa-ipc" }
+libc = "0.2.189"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tauri = { version = "=2.11.5", features = ["tray-icon"] }
 tokio = { version = "1.53.1", default-features = false, features = ["rt", "time"] }
@@ -42,6 +45,7 @@ tokio = { version = "1.53.1", default-features = false, features = ["rt", "time"
 [dev-dependencies]
 loxa = { path = "../..", features = ["test-support"] }
 tauri = { version = "=2.11.5", features = ["test"] }
+tempfile = "3.27.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 dispatch2 = { version = "=0.3.1", default-features = false, features = ["objc2", "std"] }

@@ -30,11 +30,11 @@ jobs:
       - name: Cache Rust
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Check core and shared leaves
-        run: cargo check --locked -p loxa -p loxa-ipc -p loxa-diagnostics --all-targets
-      - name: Test Linux service behavior
-        run: 'cargo test --locked -p loxa --lib service::'
-      - name: Test all shared leaf targets
-        run: cargo test --locked -p loxa-ipc -p loxa-diagnostics --all-targets
+        run: cargo clippy --locked --workspace --exclude loxa-app --all-targets -- -D warnings
+      - name: Test core and shared leaves
+        run: cargo test --locked --workspace --exclude loxa-app --all-targets
+      - name: Verify publishable packages
+        run: cargo package --locked --workspace --exclude loxa-app
 
   checks:
     name: Rust checks (macOS)
@@ -47,6 +47,13 @@ jobs:
           persist-credentials: false
       - name: Install Rust toolchain
         run: rustup toolchain install --profile minimal --no-self-update
+      - name: Install coverage tools
+        run: rustup component add llvm-tools-preview
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
+        with:
+          tool: cargo-llvm-cov@0.9.1
+          fallback: none
       - name: Cache Rust
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install pnpm
@@ -73,8 +80,13 @@ jobs:
         run: cargo fmt --all --check
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      - name: Run tests
-        run: cargo test --workspace --all-targets --locked
+      - name: Run tests with coverage
+        run: cargo llvm-cov --workspace --all-targets --locked --no-cfg-coverage --json --output-path target/coverage.json
+      - name: Upload coverage
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: macos-coverage
+          path: target/coverage.json
       - name: Test runtime bundle finalizer
         working-directory: loxa-app
         run: pnpm run test:runtime-bundle
@@ -103,7 +115,7 @@ jobs:
             --model "${small_model}"
           export LOXA_BUILT_APP="$(pwd)/../target/release/bundle/macos/Loxa.app"
           export LOXA_SMALL_MODEL="${small_model}"
-          # Keep workspace feature unification to reuse the unit-test binaries.
+          # Keep workspace feature unification for the runtime acceptance tests.
           # Exclude integration harnesses, which already ran in the test step.
           cargo test --locked --workspace --lib --bins \
             app::runtime_acceptance_tests::finalized_app_ \

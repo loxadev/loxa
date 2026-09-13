@@ -1,12 +1,12 @@
 use super::arguments::resolve_requested_port;
 #[cfg(unix)]
 use super::child::{process_group_exists, terminate_owned_group, LAST_GUARDED_GROUP};
-use super::discovery::{
-    managed_version_first_line, probe_validated_version, probe_version_with_timeout,
-    VERSION_PROBE_TIMEOUT,
-};
 #[cfg(target_os = "macos")]
-use super::discovery::{probe_validated_version_cancellable, VersionProbeError};
+use super::discovery::{
+    managed_version_first_line, probe_validated_version, probe_validated_version_cancellable,
+    VersionProbeError,
+};
+use super::discovery::{probe_version_with_timeout, VERSION_PROBE_TIMEOUT};
 use super::foreground::{
     ready_line, start_foreground_with, start_foreground_with_signal, stopped_for_signal,
 };
@@ -19,14 +19,16 @@ use super::owned::readiness::{
     models_reader_has_alias, readiness, readiness_client, MAX_MODELS_BODY,
 };
 use super::owned::StartOutcome;
+#[cfg(target_os = "macos")]
+use super::signal::{deactivate_server, pack_server_identity};
 #[cfg(unix)]
 use super::signal::{
-    deactivate_server, pack_server_identity, process_termination_signal,
-    reset_process_termination_signal_for_test, unpack_server_identity, ACTIVE_SERVER,
-    PROCESS_TERMINATION_SIGNAL,
+    process_termination_signal, reset_process_termination_signal_for_test, unpack_server_identity,
+    ACTIVE_SERVER, PROCESS_TERMINATION_SIGNAL,
 };
 use super::*;
 use crate::catalog::{Artifact, ArtifactProvenance, ArtifactRole, Manifest};
+#[cfg(any(not(unix), target_os = "macos"))]
 use crate::paths::AppPaths;
 use crate::runnable::Runnable;
 use crate::runtime_fingerprint::{EffectiveProfile, RuntimeFingerprint};
@@ -1119,7 +1121,6 @@ fn persistent_caller_managed_owner_child() {
     let server = root.join("server");
     let run_dir = root.join("run");
     let owner_ready = root.join("owner-ready");
-    build_prelease_test_server(&root, &server);
     let runnable = persistent_runnable(&root, &server, 0);
     let ownership = crate::runtime::RuntimeOwnership::acquire(&run_dir).unwrap();
     let marker = pack_server_identity(u32::MAX, i32::MAX);
@@ -1446,6 +1447,7 @@ fn caller_managed_owner_does_not_install_process_exit_policy() {
     let owner_ready = root.path().join("owner-ready");
     let run_dir = root.path().join("run");
     let lease_path = run_dir.join("foreground.json");
+    build_prelease_test_server(root.path(), &root.path().join("server"));
     let mut owner = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
