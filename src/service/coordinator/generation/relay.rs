@@ -36,11 +36,11 @@ pub(super) async fn run(
     };
     let mut pipeline = OutputPipeline::new(output, committed);
     let mut decoder = SseDecoder::new();
-    let engine = match coordinator
-        .shared
-        .state()
-        .begin_generation_execution(&reservation)
-    {
+    let execution = {
+        let state = coordinator.shared.state();
+        state.begin_generation_execution(&reservation)
+    };
+    let engine = match execution {
         Ok(engine) => engine,
         Err(_) if reservation.is_cancelled() => {
             drop(qualified);

@@ -65,6 +65,7 @@ impl SseDecoder {
         self.cached_prompt_tokens
     }
 
+    #[cfg(test)]
     pub(super) fn retained_backing_bytes(&self) -> usize {
         self.line
             .capacity()
@@ -498,8 +499,7 @@ mod tests {
             .push(
                 b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"}}],\"usage\":{\"prompt_tokens\":1}}\n\n"
             )
-            .unwrap_err()
-            .contains("usage with a streaming choice"));
+            .is_err_and(|error| error.contains("usage with a streaming choice")));
     }
 
     #[test]
@@ -562,8 +562,7 @@ mod tests {
         let mut decoder = SseDecoder::new();
         assert!(decoder
             .push(b"data: {\"choices\":[{\"index\":1,\"delta\":{\"content\":\"x\"}}]}\n\n")
-            .unwrap_err()
-            .contains("unexpected streaming choice"));
+            .is_err_and(|error| error.contains("unexpected streaming choice")));
         assert!(decoder.push(b"data: [DONE]\n\n").is_err());
     }
 
@@ -606,15 +605,14 @@ mod tests {
             .push(
                 b"data: {\"choices\":[{\"index\":0,\"delta\":{}},{\"index\":1,\"delta\":{}}]}\n\n"
             )
-            .unwrap_err()
-            .contains("malformed streaming JSON"));
+            .is_err_and(|error| error.contains("malformed streaming JSON")));
 
         let message = "x".repeat(MAX_EVENT_BYTES / 2);
         let event = format!("data: {{\"choices\":[],\"error\":{{\"message\":\"{message}\"}}}}\n\n");
         let mut decoder = SseDecoder::new();
         assert_eq!(
-            decoder.push(event.as_bytes()).unwrap_err(),
-            "engine reported a generation failure"
+            decoder.push(event.as_bytes()).err().as_deref(),
+            Some("engine reported a generation failure")
         );
         assert!(decoder.retained_backing_bytes() <= 3 * MAX_EVENT_BYTES);
     }
@@ -636,7 +634,6 @@ mod tests {
         decoder.generated_end = MAX_OUTPUT_BYTES;
         assert!(decoder
             .push(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"}}]}\n\n")
-            .unwrap_err()
-            .contains("assistant output"));
+            .is_err_and(|error| error.contains("assistant output")));
     }
 }

@@ -26,7 +26,7 @@ mod transport;
 pub(in crate::service) use native_acceptance::run_bundled_generation_acceptance;
 
 impl Coordinator {
-    pub(super) async fn generation_send(
+    pub(in crate::service) async fn generation_send(
         &self,
         command: GenerationCommand,
         pending: PendingGenerationConnection,
@@ -38,11 +38,15 @@ impl Coordinator {
                 return Err(error);
             }
         };
-        if let Err(error) = self.shared.state().bind_pending_generation(
-            &pending.pending,
-            submitted.submission_id,
-            submitted.submission_hash,
-        ) {
+        let binding = {
+            let state = self.shared.state();
+            state.bind_pending_generation(
+                &pending.pending,
+                submitted.submission_id,
+                submitted.submission_hash,
+            )
+        };
+        if let Err(error) = binding {
             self.finish_generation_connection(&pending);
             return Err(error);
         }
@@ -146,14 +150,18 @@ async fn drive_send(
         Ok(None) => {}
     }
 
-    let reservation = match coordinator.shared.state().reserve_pending_admission(
-        &pending.pending,
-        submitted.conversation_id,
-        submitted.submission_id,
-        submitted.submission_hash,
-        submitted.expected_conversation_revision,
-        submitted.expected_profile_revision,
-    )? {
+    let claim = {
+        let mut state = coordinator.shared.state();
+        state.reserve_pending_admission(
+            &pending.pending,
+            submitted.conversation_id,
+            submitted.submission_id,
+            submitted.submission_hash,
+            submitted.expected_conversation_revision,
+            submitted.expected_profile_revision,
+        )
+    }?;
+    let reservation = match claim {
         AdmissionClaim::Existing(reservation) => {
             super::history::maybe_resume_admission(
                 Arc::clone(&coordinator.shared),
@@ -243,6 +251,7 @@ async fn drive_send(
         submission_id: submitted.submission_id,
         expected_conversation_revision: submitted.expected_conversation_revision,
         expected_profile_revision: submitted.expected_profile_revision,
+        #[cfg(test)]
         submission_hash: Some(submitted.submission_hash),
         effective_context: Some(qualified.actual_context()),
         system_instruction,

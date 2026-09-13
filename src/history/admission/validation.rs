@@ -239,7 +239,7 @@ pub(super) fn validate_conversation(
     Ok(())
 }
 
-pub(super) fn require_previous_turn_resolved(
+pub(in crate::history) fn require_previous_turn_resolved(
     connection: &Connection,
     conversation_id: [u8; 16],
 ) -> Result<(), HistoryError> {

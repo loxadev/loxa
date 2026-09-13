@@ -1,28 +1,31 @@
-use super::state::{AdmissionClaim, AdmissionRecoveryAction, AdmissionReservation};
+#[cfg(test)]
+use super::state::AdmissionClaim;
+use super::state::{AdmissionRecoveryAction, AdmissionReservation};
 use super::{history_error, Coordinator};
 use crate::history::{
     AdmissionKind, CommittedAdmission, HistoryError, HistoryErrorKind, PreparedAdmission,
     PromptBasis,
 };
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::sync::watch;
 
 mod output;
-pub(in crate::service::coordinator) use output::{GenerationOutput, OutputState};
 #[cfg(test)]
-pub(in crate::service::coordinator) use output::{OutputObserver, OutputSavePhase};
+pub(in crate::service::coordinator) use output::OutputSavePhase;
+pub(in crate::service::coordinator) use output::{GenerationOutput, OutputObserver, OutputState};
 
 const MAX_ADMISSION_BACKING_BYTES: usize = 256 * 1024;
 
 #[derive(Clone)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct AdmissionInput {
     pub(super) conversation_id: [u8; 16],
     pub(super) submission_id: [u8; 16],
     pub(super) expected_conversation_revision: i64,
     pub(super) expected_profile_revision: i64,
+    #[cfg(test)]
     pub(super) submission_hash: Option<[u8; 32]>,
     pub(super) effective_context: Option<u32>,
     pub(super) system_instruction: String,
@@ -55,6 +58,7 @@ impl AdmissionInput {
         Ok(())
     }
 
+    #[cfg(test)]
     fn semantic_hash(&self) -> [u8; 32] {
         let mut hash = Sha256::new();
         hash.update(b"loxa-history-admission-v1\0");
@@ -98,6 +102,7 @@ impl AdmissionInput {
     }
 }
 
+#[cfg(test)]
 fn update_bytes(hash: &mut Sha256, value: &[u8]) {
     hash.update((value.len() as u64).to_le_bytes());
     hash.update(value);
@@ -107,6 +112,7 @@ pub(super) type AdmissionResult = Result<CommittedAdmission, loxa_ipc::ServiceEr
 pub(super) type AdmissionObserver = watch::Receiver<Option<AdmissionResult>>;
 
 impl Coordinator {
+    #[cfg(test)]
     pub(super) async fn admit_history_generation(
         &self,
         input: AdmissionInput,
@@ -429,7 +435,7 @@ pub(super) fn maybe_resume_admission(
     });
 }
 
-fn maybe_begin_history_drain(shared: &Arc<super::Shared>) {
+pub(super) fn maybe_begin_history_drain(shared: &Arc<super::Shared>) {
     if shared.draining.load(Ordering::Acquire) && shared.state().history_close_is_safe() {
         shared.history.begin_drain();
     }

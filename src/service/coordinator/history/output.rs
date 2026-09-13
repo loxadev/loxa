@@ -69,14 +69,18 @@ impl OutputState {
 }
 
 impl GenerationOutput {
-    pub(super) fn new(shared: Arc<Shared>, reservation: Arc<AdmissionReservation>) -> Self {
+    pub(in crate::service::coordinator) fn new(
+        shared: Arc<Shared>,
+        reservation: Arc<AdmissionReservation>,
+    ) -> Self {
         Self {
             shared,
             reservation,
         }
     }
 
-    pub(super) fn status(&self) -> Result<OutputSavePhase, ServiceError> {
+    #[cfg(test)]
+    pub(in crate::service::coordinator) fn status(&self) -> Result<OutputSavePhase, ServiceError> {
         let output = self
             .reservation
             .output
@@ -88,19 +92,16 @@ impl GenerationOutput {
             .ok_or_else(|| conflict("output persistence is no longer active"))
     }
 
-    pub(super) fn is_cancelled(&self) -> bool {
+    #[cfg(test)]
+    pub(in crate::service::coordinator) fn is_cancelled(&self) -> bool {
         self.reservation.is_cancelled()
     }
 
-    pub(super) async fn wait_cancelled(&self) {
-        self.reservation.wait_cancelled().await;
-    }
-
-    pub(super) fn request_cancel(&self) {
+    pub(in crate::service::coordinator) fn request_cancel(&self) {
         self.reservation.request_cancel();
     }
 
-    pub(super) fn report_capacity_saturation(&self) {
+    pub(in crate::service::coordinator) fn report_capacity_saturation(&self) {
         self.reservation.request_cancel();
         let mut output = self
             .reservation
@@ -114,21 +115,24 @@ impl GenerationOutput {
         }
     }
 
-    pub(super) fn checkpoint(
+    #[cfg(test)]
+    pub(in crate::service::coordinator) fn checkpoint(
         &self,
         input: Arc<SuffixInput>,
     ) -> Result<OutputObserver, ServiceError> {
         self.checkpoint_owned(input).map_err(|(error, _)| error)
     }
 
-    pub(super) fn finalize(
+    #[cfg(test)]
+    pub(in crate::service::coordinator) fn finalize(
         &self,
         input: Arc<FinalizationInput>,
     ) -> Result<OutputObserver, ServiceError> {
         self.finalize_owned(input).map_err(|(error, _)| error)
     }
 
-    pub(super) fn checkpoint_owned(
+    #[cfg(test)]
+    pub(in crate::service::coordinator) fn checkpoint_owned(
         &self,
         input: Arc<SuffixInput>,
     ) -> Result<OutputObserver, (ServiceError, Arc<SuffixInput>)> {
@@ -144,7 +148,7 @@ impl GenerationOutput {
         .map_err(|(error, _)| (error, input))
     }
 
-    pub(super) fn checkpoint_generation_owned(
+    pub(in crate::service::coordinator) fn checkpoint_generation_owned(
         &self,
         input: Arc<SuffixInput>,
     ) -> Result<OutputObserver, (ServiceError, Arc<SuffixInput>, bool)> {
@@ -160,7 +164,7 @@ impl GenerationOutput {
         .map_err(|(error, cancelled)| (error, input, cancelled))
     }
 
-    pub(super) fn checkpoint_terminal_owned(
+    pub(in crate::service::coordinator) fn checkpoint_terminal_owned(
         &self,
         input: Arc<SuffixInput>,
     ) -> Result<OutputObserver, (ServiceError, Arc<SuffixInput>)> {
@@ -176,7 +180,8 @@ impl GenerationOutput {
         .map_err(|(error, _)| (error, input))
     }
 
-    pub(super) fn finalize_owned(
+    #[cfg(test)]
+    pub(in crate::service::coordinator) fn finalize_owned(
         &self,
         input: Arc<FinalizationInput>,
     ) -> Result<OutputObserver, (ServiceError, Arc<FinalizationInput>)> {
@@ -188,7 +193,7 @@ impl GenerationOutput {
             .map_err(|(error, _)| (error, input))
     }
 
-    pub(super) fn finalize_generation_owned(
+    pub(in crate::service::coordinator) fn finalize_generation_owned(
         &self,
         input: Arc<FinalizationInput>,
     ) -> Result<(OutputObserver, ExecutionOutcome), (ServiceError, Arc<FinalizationInput>)> {
@@ -205,7 +210,9 @@ impl GenerationOutput {
             .map_err(|(error, _)| (error, input))
     }
 
-    pub(super) fn retry_save(&self) -> Result<OutputObserver, ServiceError> {
+    pub(in crate::service::coordinator) fn retry_save(
+        &self,
+    ) -> Result<OutputObserver, ServiceError> {
         let intent = {
             let state = self.shared.state();
             if !state.admission_is_current(&self.reservation) {

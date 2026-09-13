@@ -220,22 +220,16 @@ fn idle_proof_loses_to_stop_and_a_cancelling_runtime_rejects_admission() {
     state.begin_generation_execution(&admission).unwrap();
     admission.request_cancel();
     operation.request_cleanup();
-    assert_eq!(
-        state
-            .begin_generation_execution(&admission)
-            .unwrap_err()
-            .category,
-        ErrorCategory::ServiceUnavailable
-    );
+    assert!(matches!(
+        state.begin_generation_execution(&admission),
+        Err(error) if error.category == ErrorCategory::ServiceUnavailable
+    ));
     assert!(!state.confirm_generation_quiescence(&admission));
     state.finish_admission(&admission);
-    assert_eq!(
-        state
-            .reserve_admission([4; 16], [5; 16], [6; 32], 1, 1)
-            .unwrap_err()
-            .category,
-        ErrorCategory::ServiceUnavailable
-    );
+    assert!(matches!(
+        state.reserve_admission([4; 16], [5; 16], [6; 32], 1, 1),
+        Err(error) if error.category == ErrorCategory::ServiceUnavailable
+    ));
 }
 
 #[test]

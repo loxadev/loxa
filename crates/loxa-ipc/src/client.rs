@@ -753,7 +753,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     enum TestResponse {
-        Matching(ReplyOutcome),
+        Matching(Box<ReplyOutcome>),
         MismatchedId,
         UnexpectedEnvelope,
         MalformedJson,
@@ -800,7 +800,7 @@ mod tests {
                             &mut server,
                             &ServerEnvelope::Reply(Reply {
                                 request_id: request.request_id,
-                                outcome,
+                                outcome: *outcome,
                             }),
                             REQUEST_TIMEOUT,
                             MAX_FRAME_BYTES,
@@ -867,7 +867,7 @@ mod tests {
     fn connection_request_returns_a_matching_valid_reply() {
         let expected = ReplyOutcome::Rejected(ServiceError::new(ErrorCategory::Busy, "busy"));
         assert_eq!(
-            request_with_response(TestResponse::Matching(expected.clone())).unwrap(),
+            request_with_response(TestResponse::Matching(Box::new(expected.clone()))).unwrap(),
             expected
         );
     }

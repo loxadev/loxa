@@ -21,11 +21,14 @@ mod schema;
 mod worker;
 
 pub(crate) use admission::{
-    AdmissionKind, CommittedAdmission, PreparedAdmission, PromptBasis, PromptReference,
+    AdmissionKind, CommittedAdmission, DraftSubmission, PreparedAdmission, PromptBasis,
+    PromptReference,
 };
 #[cfg(test)]
 pub(crate) use content::ContentRange;
-pub(crate) use content::{ExecutionOutcome, FinalizationInput, SuffixCommit, SuffixInput};
+pub(crate) use content::{
+    ExecutionOutcome, FinalizationInput, SuffixCommit, SuffixInput, MAX_SUFFIX_BYTES,
+};
 pub(crate) use identity::{decode_id, encode_id, parse_revision};
 #[cfg(test)]
 pub(crate) use prompt::PromptMessage;

@@ -11,12 +11,12 @@ use tokio::sync::{watch, Notify};
 const MAX_PENDING_GENERATIONS: usize = 16;
 
 #[derive(Clone)]
-pub(super) struct EngineDescriptor {
-    pub(super) pid: u32,
-    pub(super) endpoint: Arc<PathBuf>,
+pub(in crate::service::coordinator) struct EngineDescriptor {
+    pub(in crate::service::coordinator) pid: u32,
+    pub(in crate::service::coordinator) endpoint: Arc<PathBuf>,
 }
 
-pub(super) struct PendingGeneration {
+pub(in crate::service::coordinator) struct PendingGeneration {
     nonce: String,
     identity: Mutex<Option<PendingIdentity>>,
     cancellation: Arc<Cancellation>,
@@ -62,7 +62,7 @@ impl Cancellation {
 }
 
 impl PendingGeneration {
-    pub(super) fn nonce(&self) -> &str {
+    pub(in crate::service::coordinator) fn nonce(&self) -> &str {
         &self.nonce
     }
 
@@ -76,15 +76,15 @@ impl PendingGeneration {
 }
 
 impl AdmissionReservation {
-    pub(super) fn request_cancel(&self) {
+    pub(in crate::service::coordinator) fn request_cancel(&self) {
         self.cancellation.request();
     }
 
-    pub(super) async fn wait_cancelled(&self) {
+    pub(in crate::service::coordinator) async fn wait_cancelled(&self) {
         self.cancellation.wait().await;
     }
 
-    pub(super) fn is_cancelled(&self) -> bool {
+    pub(in crate::service::coordinator) fn is_cancelled(&self) -> bool {
         self.cancellation.is_cancelled()
     }
 
@@ -100,7 +100,7 @@ impl AdmissionReservation {
         self.engine_quiescent.load(Ordering::Acquire)
     }
 
-    pub(super) fn mark_durable_terminal(&self) {
+    pub(in crate::service::coordinator) fn mark_durable_terminal(&self) {
         self.durable_terminal.store(true, Ordering::Release);
     }
 
@@ -111,7 +111,7 @@ impl AdmissionReservation {
 }
 
 impl CoordinatorState {
-    pub(super) fn register_pending_generation(
+    pub(in crate::service::coordinator) fn register_pending_generation(
         &mut self,
     ) -> Result<Arc<PendingGeneration>, ServiceError> {
         if self.draining.load(Ordering::Acquire) {
@@ -142,7 +142,7 @@ impl CoordinatorState {
         Ok(pending)
     }
 
-    pub(super) fn bind_pending_generation(
+    pub(in crate::service::coordinator) fn bind_pending_generation(
         &self,
         pending: &Arc<PendingGeneration>,
         submission_id: [u8; 16],
@@ -178,13 +178,17 @@ impl CoordinatorState {
         }
     }
 
-    pub(super) fn finish_pending_generation(&mut self, pending: &Arc<PendingGeneration>) {
+    pub(in crate::service::coordinator) fn finish_pending_generation(
+        &mut self,
+        pending: &Arc<PendingGeneration>,
+    ) {
         self.pending_generations
             .retain(|current| !Arc::ptr_eq(current, pending));
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn reserve_admission(
+    #[cfg(test)]
+    pub(in crate::service::coordinator) fn reserve_admission(
         &mut self,
         conversation_id: [u8; 16],
         submission_id: [u8; 16],
@@ -204,7 +208,7 @@ impl CoordinatorState {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn reserve_pending_admission(
+    pub(in crate::service::coordinator) fn reserve_pending_admission(
         &mut self,
         pending: &Arc<PendingGeneration>,
         conversation_id: [u8; 16],
@@ -358,17 +362,22 @@ impl CoordinatorState {
         Ok(AdmissionClaim::Fresh(reservation))
     }
 
-    pub(super) fn admission_is_current(&self, expected: &Arc<AdmissionReservation>) -> bool {
+    pub(in crate::service::coordinator) fn admission_is_current(
+        &self,
+        expected: &Arc<AdmissionReservation>,
+    ) -> bool {
         self.admission
             .as_ref()
             .is_some_and(|current| Arc::ptr_eq(current, expected))
     }
 
-    pub(super) fn current_admission(&self) -> Option<Arc<AdmissionReservation>> {
+    pub(in crate::service::coordinator) fn current_admission(
+        &self,
+    ) -> Option<Arc<AdmissionReservation>> {
         self.admission.as_ref().map(Arc::clone)
     }
 
-    pub(super) fn cancel_generation(
+    pub(in crate::service::coordinator) fn cancel_generation(
         &mut self,
         target: &GenerationTarget,
     ) -> Result<(), ServiceError> {
@@ -427,14 +436,17 @@ impl CoordinatorState {
         }
     }
 
-    pub(super) fn require_generation_cleanup(&self, expected: &Arc<AdmissionReservation>) {
+    pub(in crate::service::coordinator) fn require_generation_cleanup(
+        &self,
+        expected: &Arc<AdmissionReservation>,
+    ) {
         if self.admission_is_current(expected) {
             expected.request_cancel();
             self.request_engine_cleanup_if_needed(expected);
         }
     }
 
-    pub(super) fn begin_generation_execution(
+    pub(in crate::service::coordinator) fn begin_generation_execution(
         &self,
         expected: &Arc<AdmissionReservation>,
     ) -> Result<EngineDescriptor, ServiceError> {
@@ -469,7 +481,7 @@ impl CoordinatorState {
         Ok(expected.engine.clone())
     }
 
-    pub(super) fn confirm_generation_quiescence(
+    pub(in crate::service::coordinator) fn confirm_generation_quiescence(
         &mut self,
         expected: &Arc<AdmissionReservation>,
     ) -> bool {
@@ -485,13 +497,16 @@ impl CoordinatorState {
         true
     }
 
-    pub(super) fn finish_admission(&mut self, expected: &Arc<AdmissionReservation>) {
+    pub(in crate::service::coordinator) fn finish_admission(
+        &mut self,
+        expected: &Arc<AdmissionReservation>,
+    ) {
         if self.admission_is_current(expected) {
             self.admission = None;
         }
     }
 
-    pub(super) fn finish_admission_if_resolved(
+    pub(in crate::service::coordinator) fn finish_admission_if_resolved(
         &mut self,
         expected: &Arc<AdmissionReservation>,
     ) -> bool {
