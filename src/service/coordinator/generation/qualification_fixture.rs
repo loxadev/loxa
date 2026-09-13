@@ -64,6 +64,12 @@ pub(super) struct PreflightObservation {
     pub(super) postcommit_gate_entered: bool,
     pub(super) generation_dispatched: bool,
     pub(super) basis_carried_to_execution: bool,
+    pub(super) response_status: Option<u16>,
+    pub(super) data_frames: usize,
+    pub(super) data_bytes: usize,
+    pub(super) generated_end: usize,
+    pub(super) http_driver_completed: bool,
+    pub(super) http_driver_error: bool,
     pub(super) completion_prompt_tokens: Option<u32>,
     pub(super) completion_cached_tokens: Option<u32>,
     pub(super) quiescent_after_terminal: bool,
@@ -109,6 +115,12 @@ pub(super) fn record_preflight(
         postcommit_gate_entered: false,
         generation_dispatched: false,
         basis_carried_to_execution: false,
+        response_status: None,
+        data_frames: 0,
+        data_bytes: 0,
+        generated_end: 0,
+        http_driver_completed: false,
+        http_driver_error: false,
         completion_prompt_tokens: None,
         completion_cached_tokens: None,
         quiescent_after_terminal: false,
@@ -145,6 +157,43 @@ pub(super) fn record_postcommit(id: Option<u64>, template_sha256: [u8; 32]) {
 pub(super) fn record_dispatch(id: Option<u64>) {
     with_observation(id, |observation| {
         observation.generation_dispatched = true;
+    });
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn record_response(id: Option<u64>, status: u16) {
+    with_observation(id, |observation| {
+        observation.response_status = Some(status);
+    });
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn record_data_frame(id: Option<u64>, bytes: usize) {
+    with_observation(id, |observation| {
+        observation.data_frames = observation.data_frames.saturating_add(1);
+        observation.data_bytes = observation.data_bytes.saturating_add(bytes);
+    });
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn record_parse_progress(
+    id: Option<u64>,
+    generated_end: usize,
+    prompt_tokens: Option<u32>,
+) {
+    with_observation(id, |observation| {
+        observation.generated_end = generated_end;
+        if prompt_tokens.is_some() {
+            observation.completion_prompt_tokens = prompt_tokens;
+        }
+    });
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn record_http_driver(id: Option<u64>, failed: bool) {
+    with_observation(id, |observation| {
+        observation.http_driver_completed = true;
+        observation.http_driver_error = failed;
     });
 }
 

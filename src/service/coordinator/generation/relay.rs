@@ -188,6 +188,15 @@ async fn stream(
         .header(hyper::header::CONNECTION, "close")
         .body(Full::new(body))
         .map_err(|_| failure("engine_request"))?;
+    #[cfg(all(test, target_os = "macos"))]
+    let driver_observation_id = observation_id;
+    #[cfg(all(test, target_os = "macos"))]
+    let mut driver = tokio::spawn(async move {
+        let result = connection.await;
+        super::qualification_fixture::record_http_driver(driver_observation_id, result.is_err());
+        result
+    });
+    #[cfg(not(all(test, target_os = "macos")))]
     let mut driver = tokio::spawn(connection);
     let exchange = async {
         let mut response = tokio::select! {
@@ -201,6 +210,8 @@ async fn stream(
                 result.map_err(|_| failure("engine_transport"))?
             }
         };
+        #[cfg(all(test, target_os = "macos"))]
+        super::qualification_fixture::record_response(observation_id, response.status().as_u16());
         if response.status() != StatusCode::OK {
             return Err(failure("engine_rejected"));
         }
@@ -213,6 +224,8 @@ async fn stream(
             let Ok(data) = frame.into_data() else {
                 continue;
             };
+            #[cfg(all(test, target_os = "macos"))]
+            super::qualification_fixture::record_data_frame(observation_id, data.len());
             let mut offset = 0;
             loop {
                 let step = decoder.push(&data[offset..]).map_err(|error| {
@@ -223,6 +236,12 @@ async fn stream(
                     }
                 })?;
                 offset += step.consumed;
+                #[cfg(all(test, target_os = "macos"))]
+                super::qualification_fixture::record_parse_progress(
+                    observation_id,
+                    decoder.generated_end(),
+                    decoder.prompt_tokens(),
+                );
                 let emitted = step.chunk.is_some();
                 if let Some(chunk) = step.chunk {
                     match pipeline.save_chunk(chunk) {

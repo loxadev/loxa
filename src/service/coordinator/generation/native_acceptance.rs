@@ -184,9 +184,33 @@ fn observation_diagnostics() -> String {
         .iter()
         .filter(|observation| observation.quiescent_after_terminal)
         .count();
+    let statuses = observations
+        .iter()
+        .filter_map(|observation| observation.response_status)
+        .collect::<Vec<_>>();
+    let data_frames = observations.iter().fold(0usize, |total, observation| {
+        total.saturating_add(observation.data_frames)
+    });
+    let data_bytes = observations.iter().fold(0usize, |total, observation| {
+        total.saturating_add(observation.data_bytes)
+    });
+    let generated_end = observations.iter().fold(0usize, |total, observation| {
+        total.saturating_add(observation.generated_end)
+    });
+    let drivers_completed = observations
+        .iter()
+        .filter(|observation| observation.http_driver_completed)
+        .count();
+    let driver_errors = observations
+        .iter()
+        .filter(|observation| observation.http_driver_error)
+        .count();
     format!(
         "qualification observations: total={} postcommit={postcommit} dispatched={dispatched} \
-         basis={basis} usage={usage} cached_usage={cached_usage} quiescent={quiescent}",
+         basis={basis} statuses={statuses:?} data_frames={data_frames} data_bytes={data_bytes} \
+         generated_end={generated_end} usage={usage} cached_usage={cached_usage} \
+         drivers_completed={drivers_completed} driver_errors={driver_errors} \
+         quiescent={quiescent}",
         observations.len(),
     )
 }
