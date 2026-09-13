@@ -286,8 +286,10 @@ fn install_model(models: &Path, source_model: &Path) -> Result<(), String> {
     directory
         .create(&model_dir)
         .map_err(|error| error.to_string())?;
+    let model_lock = crate::catalog::ModelLock::acquire(&model_dir)?;
     fs::copy(source_model, model_dir.join("model.gguf")).map_err(|error| error.to_string())?;
     crate::catalog::publish_manifest(models, &manifest)?;
+    drop(model_lock);
     Ok(())
 }
 
