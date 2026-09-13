@@ -1,8 +1,11 @@
 use super::startup::StartupEndpoint;
 use super::{exit_code, OwnedServer, StartOutcome, StartupStop};
+#[cfg(target_os = "linux")]
+use crate::process_inspection::process_has_execed;
 use crate::runner::launch::{Launch, LaunchPolicy};
 #[cfg(unix)]
 use crate::runner::service_transport::{readiness_unix, UnixReadiness};
+use crate::runtime::RuntimeLeasePublication;
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::io::Read as _;
@@ -107,6 +110,7 @@ impl OwnedServer {
         endpoint: StartupEndpoint<'_>,
         client: Option<&Client>,
         child_pid: u32,
+        mut publication: Option<RuntimeLeasePublication<'_>>,
         stop: &F,
     ) -> Result<StartOutcome, String>
     where
@@ -134,6 +138,54 @@ impl OwnedServer {
                     return self.finish_cleanup_failure(cleanup);
                 }
                 return Ok(StartOutcome::Exited(self.server_exit(code)));
+            }
+            #[cfg(target_os = "linux")]
+            if publication.is_some() {
+                let child_has_execed = match process_has_execed(child_pid) {
+                    Ok(child_has_execed) => child_has_execed,
+                    Err(error) => return self.fail_start(error),
+                };
+                if !child_has_execed {
+                    if Instant::now() >= deadline {
+                        return self.fail_start(format!(
+                            "llama-server did not exec within {} ms",
+                            timeout.as_millis()
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+            }
+            if let Some(next_publication) = publication.take() {
+                let child = self.child.as_mut().expect("owned child is present");
+                let child_pgid = child.group();
+                let record_result = child
+                    .runtime_mut()
+                    .expect("owned runtime publication has child ownership")
+                    .record(
+                        child_pid,
+                        child_pgid,
+                        &launch.id,
+                        requested_port,
+                        launch.managed_source_server(),
+                        next_publication,
+                    );
+                if let Err(error) = record_result {
+                    let status = match self.child_mut().try_wait() {
+                        Ok(status) => status,
+                        Err(wait_error) => {
+                            return self.fail_start(format!("{error}; {wait_error}"));
+                        }
+                    };
+                    if let Some(status) = status {
+                        let code = exit_code(status);
+                        if let Err(cleanup) = self.terminate() {
+                            return self.finish_cleanup_failure(cleanup);
+                        }
+                        return Ok(StartOutcome::Exited(self.server_exit(code)));
+                    }
+                    return self.fail_start(error);
+                }
             }
             if let StartupEndpoint::ServiceUnix { path, runtime } = endpoint {
                 #[cfg(unix)]

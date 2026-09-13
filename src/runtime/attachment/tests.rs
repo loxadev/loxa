@@ -229,6 +229,7 @@ impl RecordedPersistentRuntime {
             .stderr(Stdio::null())
             .process_group(0);
         let mut child = command.spawn().unwrap();
+        crate::process_inspection::wait_for_test_process_executable(&mut child, &managed_server);
         let child_pgid = i32::try_from(child.id()).unwrap();
         let ownership = RuntimeOwnership::acquire(root.path()).unwrap();
         let mut child_ownership = ownership.reserve_child().unwrap();
@@ -397,11 +398,7 @@ fn exact_persistent_runtime_returns_an_opaque_revalidatable_attachment() {
         &fixture.models_root,
         &fixture.managed_server,
         std::slice::from_ref(&fixture.fingerprint),
-        |attached| {
-            exact_test_attachment_identity(attached).inspect_err(|error| {
-                eprintln!("attachment identity validation failed: {error}");
-            })
-        },
+        exact_test_attachment_identity,
         |port, model_id| {
             assert_eq!(port, 43123);
             assert_eq!(model_id, "demo");

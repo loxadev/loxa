@@ -209,12 +209,8 @@ fn v3_wire_separates_exact_process_identity_from_managed_source() {
     assert_eq!(decoded.server, observed.server);
     assert_eq!(decoded.managed_source.as_deref(), Some(managed.as_path()));
     assert_eq!(
-        exact_live_provenance(&decoded, &managed),
-        Ok(Some(RuntimeProvenance::Managed)),
-        "lease={decoded:?}; owner={:?}; child={:?}; child_group={:?}",
-        process_snapshot(decoded.owner_pid),
-        process_snapshot(decoded.child_pid),
-        process_group(decoded.child_pid),
+        exact_live_provenance(&decoded, &managed).unwrap(),
+        Some(RuntimeProvenance::Managed)
     );
     assert_eq!(
         exact_live_provenance(&decoded, Path::new("/other/llama-server")).unwrap(),
@@ -390,7 +386,12 @@ fn spawn_sleep() -> Child {
     let mut command = Command::new("/bin/sleep");
     command.arg("60");
     command.process_group(0);
-    command.spawn().unwrap()
+    let mut child = command.spawn().unwrap();
+    crate::process_inspection::wait_for_test_process_executable(
+        &mut child,
+        Path::new("/bin/sleep"),
+    );
+    child
 }
 
 fn spawn_lease_observing_sleep(lease: &Path, witness: &Path, ready: &Path) -> Child {
@@ -421,7 +422,9 @@ fn spawn_observable_server(model_id: &str, port: u16) -> Child {
         .arg("--port")
         .arg(port.to_string())
         .process_group(0);
-    command.spawn().unwrap()
+    let mut child = command.spawn().unwrap();
+    crate::process_inspection::wait_for_test_process_executable(&mut child, Path::new("/bin/bash"));
+    child
 }
 
 fn observed_lease(child: &Child, model_id: &str, port: u16) -> RuntimeLease {
@@ -1206,6 +1209,7 @@ fn graceful_clear_removes_only_the_exact_recorded_execution_stage() {
         .process_group(0)
         .spawn()
         .unwrap();
+    crate::process_inspection::wait_for_test_process_executable(&mut child, &server);
     let group = i32::try_from(child.id()).unwrap();
     let ownership = RuntimeOwnership::acquire(&run_dir).unwrap();
     let mut child_ownership = ownership.reserve_child().unwrap();
@@ -1243,6 +1247,7 @@ fn stale_recovery_removes_only_the_exact_orphaned_execution_stage() {
         .process_group(0)
         .spawn()
         .unwrap();
+    crate::process_inspection::wait_for_test_process_executable(&mut child, &server);
     let pid = child.id();
     let snapshot = process_snapshot(pid).unwrap().unwrap();
     let lease = RuntimeLease {
@@ -1257,33 +1262,21 @@ fn stale_recovery_removes_only_the_exact_orphaned_execution_stage() {
         child_pid: pid,
         child_start_time: snapshot.start_identity,
         child_pgid: i32::try_from(pid).unwrap(),
-        server: snapshot.executable.clone(),
+        server: snapshot.executable,
         model_id: "demo".into(),
         port: 43123,
         service: None,
     };
     fs::create_dir_all(&run_dir).unwrap();
-    let lease_path = run_dir.join("foreground.json");
-    write_lease_fixture(&lease_path, &lease);
+    write_lease_fixture(&run_dir.join("foreground.json"), &lease);
 
     recover_stale(&run_dir).unwrap();
 
     let gone = wait_for_child_exit(&mut child);
-    let failure_state = (!gone).then(|| {
-        (
-            process_snapshot(pid),
-            process_group(pid),
-            stage.exists(),
-            lease_path.exists(),
-        )
-    });
     if !gone {
         terminate_process_group(&mut child, i32::try_from(pid).unwrap()).unwrap();
     }
-    assert!(
-        gone,
-        "stale recovery left the exact staged child running: expected={snapshot:?}; current={failure_state:?}"
-    );
+    assert!(gone, "stale recovery left the exact staged child running");
     assert!(!stage.exists(), "stale recovery leaked the execution stage");
     assert!(neighbor.is_dir(), "cleanup removed an adjacent lookalike");
     assert!(!run_dir.join("foreground.json").exists());
@@ -1512,6 +1505,7 @@ fn legacy_recovery_never_signals_without_unique_command_identity() {
     let mut command = Command::new(&server);
     command.arg("60").process_group(0);
     let mut child = command.spawn().unwrap();
+    crate::process_inspection::wait_for_test_process_executable(&mut child, &server);
     let pid = child.id();
     let snapshot = process_snapshot(pid).unwrap().unwrap();
     let legacy = serde_json::json!({
