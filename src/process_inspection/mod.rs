@@ -39,18 +39,23 @@ pub(crate) fn process_snapshot_from_refreshed_system(
     pid: Pid,
 ) -> Result<Option<ProcessSnapshot>, String> {
     let Some(process) = system.process(pid) else {
+        #[cfg(all(test, target_os = "linux"))]
+        eprintln!("process snapshot: pid={pid}, snapshot=None");
         return Ok(None);
     };
     let executable = process
         .exe()
         .ok_or_else(|| format!("failed to inspect executable for process {pid}"))?;
     let start_time_seconds = process.start_time();
-    Ok(Some(ProcessSnapshot {
+    let snapshot = ProcessSnapshot {
         start_identity: process_start_identity(pid.as_u32(), start_time_seconds)?,
         start_time_seconds,
         executable: executable.to_path_buf(),
         command: process.cmd().to_vec(),
-    }))
+    };
+    #[cfg(all(test, target_os = "linux"))]
+    eprintln!("process snapshot: pid={pid}, snapshot={snapshot:?}");
+    Ok(Some(snapshot))
 }
 
 #[cfg(target_os = "macos")]
