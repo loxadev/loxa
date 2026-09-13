@@ -1,7 +1,6 @@
 mod client;
 mod evidence;
 mod harness;
-mod sample;
 
 use super::qualification_fixture;
 use client::{
@@ -21,14 +20,9 @@ pub(in crate::service) async fn run_bundled_generation_acceptance(
 ) -> Result<String, String> {
     qualification_fixture::clear_observations();
     let mut fixture = NativeService::start(app, source_model).await?;
-    let result = match exercise(&mut fixture).await {
-        Ok(report) => Ok(report),
-        Err(error) => {
-            let observations = observation_diagnostics();
-            let sample = sample::capture(&fixture.coordinator).await;
-            Err(format!("{error}; {observations}; {sample}"))
-        }
-    };
+    let result = exercise(&mut fixture)
+        .await
+        .map_err(|error| format!("{error}; {}", observation_diagnostics()));
     let cleanup = fixture.shutdown(true).await;
     match (result, cleanup) {
         (Ok(report), Ok(())) => Ok(report),
