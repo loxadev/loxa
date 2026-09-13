@@ -6,6 +6,7 @@ pub mod cli;
 pub mod config;
 pub mod discovery;
 mod download;
+mod history;
 pub mod huggingface;
 pub mod paths;
 mod process_inspection;

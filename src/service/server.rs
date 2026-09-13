@@ -1,16 +1,18 @@
 use super::coordinator::{Coordinator, OwnerExit};
-use futures_util::{SinkExt, StreamExt};
-use loxa_ipc::{
-    decode, encode, framed, peer_credentials, Capability, ClientBootstrap, ClientEnvelope,
-    ErrorCategory, Hello, HelloAck, Reply, ReplyOutcome, Request, RuntimeStatus, ServerEnvelope,
-    ServiceCommand, ServiceError, PROTOCOL_MAJOR, PROTOCOL_MINOR,
-};
+mod connection;
+
+use crate::config::SettingsExit;
+use crate::history::HistoryExit;
+use connection::{classify_overload_connection, handle_connection, send_frame};
+#[cfg(test)]
+use connection::{receive_frame, receive_frame_with_limit, send_frame_with_limit};
+use loxa_ipc::{Capability, ClientBootstrap, Reply, ReplyOutcome, ServerEnvelope};
 use std::fs;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::UnixListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 
@@ -23,14 +25,20 @@ const OVERLOAD_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(500);
 const OVERLOAD_REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
 const OVERLOAD_REPLY_TIMEOUT: Duration = Duration::from_millis(500);
 const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
-const STORAGE_SCHEMA: u32 = 1;
-const CAPABILITIES: [Capability; 5] = [
+const LEGACY_CAPABILITIES: [Capability; 5] = [
     Capability::Status,
     Capability::Load,
     Capability::Unload,
     Capability::StopService,
     Capability::EngineUnixSocket,
 ];
+
+struct NegotiatedHello {
+    protocol: loxa_ipc::ProtocolVersion,
+    capabilities: Vec<Capability>,
+    storage_schema: u32,
+    frame_limit: usize,
+}
 
 pub(super) async fn run(
     bootstrap: ClientBootstrap,
@@ -41,11 +49,15 @@ pub(super) async fn run(
         Err(error) => {
             coordinator.drain_after_server_failure();
             let mut owner_exit = coordinator.owner_exit_receiver();
-            while *owner_exit.borrow() == OwnerExit::Running {
-                if owner_exit.changed().await.is_err() {
-                    break;
-                }
-            }
+            let mut history_exit = coordinator.history_exit_receiver();
+            let mut settings_exit = coordinator.settings_exit_receiver();
+            wait_for_owner_resolution(
+                &coordinator,
+                &mut owner_exit,
+                &mut history_exit,
+                &mut settings_exit,
+            )
+            .await;
             coordinator.join_owner()?;
             return Err(error);
         }
@@ -60,6 +72,8 @@ pub(super) async fn run(
     // a separate permit into the non-preemptible reply task below.
     let mut overload_classifier = JoinSet::new();
     let mut owner_exit = coordinator.owner_exit_receiver();
+    let mut history_exit = coordinator.history_exit_receiver();
+    let mut settings_exit = coordinator.settings_exit_receiver();
     let mut owner_failed = false;
     loop {
         while let Some(completed) = connections.try_join_next() {
@@ -76,10 +90,40 @@ pub(super) async fn run(
                 match (changed, *owner_exit.borrow()) {
                     (_, OwnerExit::Failed) | (Err(_), _) => {
                         owner_failed = true;
-                        break;
+                        coordinator.drain_after_server_failure();
+                        coordinator.release_runtime_if_durable();
+                        if durability_is_drained(&history_exit, &settings_exit) {
+                            break;
+                        }
                     }
                     (_, OwnerExit::Drained) => break,
-                    (Ok(()), OwnerExit::Running) => {}
+                    (Ok(()), OwnerExit::Running | OwnerExit::Quiesced) => {
+                        coordinator.release_runtime_if_durable();
+                    }
+                }
+            }
+            changed = history_exit.changed() => {
+                if changed.is_err() || *history_exit.borrow() == HistoryExit::Failed {
+                    tracing::warn!(event = "service_history_owner_failed");
+                }
+                coordinator.release_runtime_if_durable();
+                if owner_failed && durability_is_drained(&history_exit, &settings_exit) {
+                    break;
+                }
+            }
+            changed = settings_exit.changed() => {
+                if changed.is_err() {
+                    tracing::warn!(event = "service_settings_owner_failed");
+                } else if *settings_exit.borrow() == SettingsExit::WriteCompleted {
+                    if coordinator.finish_settings_write().is_err() {
+                        tracing::warn!(event = "service_settings_join_failed");
+                    }
+                } else if *settings_exit.borrow() == SettingsExit::FlushFailed {
+                    tracing::warn!(event = "service_settings_flush_failed");
+                }
+                coordinator.release_runtime_if_durable();
+                if owner_failed && durability_is_drained(&history_exit, &settings_exit) {
+                    break;
                 }
             }
             completed = connections.join_next(), if !connections.is_empty() => {
@@ -217,278 +261,50 @@ fn dispatch_overload_result(
     });
 }
 
-async fn classify_overload_connection(
-    stream: UnixStream,
-    bootstrap: ClientBootstrap,
-    coordinator: Coordinator,
-    protected_stops: Arc<Semaphore>,
-) -> Result<Option<ClassifiedStop>, String> {
-    let peer = peer_credentials(&stream)?;
-    if peer.uid != unsafe { libc::geteuid() } || peer.pid == 0 {
-        return Err("service client is not an authenticated local user process".into());
-    }
-    let mut transport = framed(stream);
-    let first: ClientEnvelope = receive_frame(&mut transport, OVERLOAD_HANDSHAKE_TIMEOUT).await?;
-    first.validate_shape().map_err(str::to_owned)?;
-    let ClientEnvelope::Hello(hello) = first else {
-        return Err("the first overload service envelope must be a hello".into());
-    };
-    validate_hello(&hello, &bootstrap).map_err(|error| error.context)?;
-    send_hello_ack(
-        &mut transport,
-        &bootstrap,
-        &coordinator,
-        OVERLOAD_HANDSHAKE_TIMEOUT,
-    )
-    .await?;
-
-    let envelope: ClientEnvelope = receive_frame(&mut transport, OVERLOAD_REQUEST_TIMEOUT).await?;
-    envelope.validate_shape().map_err(str::to_owned)?;
-    let ClientEnvelope::Request(request) = envelope else {
-        return Err("overload service lane accepts only requests".into());
-    };
-    if !matches!(request.command, ServiceCommand::StopService) {
-        let reply = Reply {
-            request_id: request.request_id,
-            outcome: ReplyOutcome::Rejected(ServiceError::new(
-                ErrorCategory::Busy,
-                "service control capacity is full",
-            )),
-        };
-        send_frame(
-            &mut transport,
-            &ServerEnvelope::Reply(reply),
-            OVERLOAD_REPLY_TIMEOUT,
-        )
-        .await?;
-        return Ok(None);
-    }
-    let permit = protected_stops
-        .try_acquire_owned()
-        .map_err(|_| "protected service stop capacity is full".to_string())?;
-    Ok(Some(ClassifiedStop {
-        transport,
-        request_id: request.request_id,
-        _permit: permit,
-    }))
-}
-
-async fn handle_connection(
-    stream: UnixStream,
-    bootstrap: ClientBootstrap,
-    coordinator: Coordinator,
-    subscriptions: Arc<Semaphore>,
-) -> Result<(), String> {
-    // Kernel credentials are checked before constructing the framed transport,
-    // so unauthenticated peers cannot make us read even a length prefix. The
-    // private 0700 root admits compatible desktop and CLI executables for this
-    // user; clients separately prove that this server is the recorded origin.
-    let peer = peer_credentials(&stream)?;
-    if peer.uid != unsafe { libc::geteuid() } || peer.pid == 0 {
-        return Err("service client is not an authenticated local user process".into());
-    }
-    let mut transport = framed(stream);
-    let first: ClientEnvelope = receive_frame(&mut transport, HANDSHAKE_TIMEOUT).await?;
-    first.validate_shape().map_err(str::to_owned)?;
-    let ClientEnvelope::Hello(hello) = first else {
-        send_frame(
-            &mut transport,
-            &ServerEnvelope::HelloRejected(ServiceError::new(
-                ErrorCategory::InvalidRequest,
-                "the first service envelope must be a hello",
-            )),
-            HANDSHAKE_TIMEOUT,
-        )
-        .await?;
-        return Ok(());
-    };
-    match validate_hello(&hello, &bootstrap) {
-        Ok(()) => {
-            send_hello_ack(&mut transport, &bootstrap, &coordinator, HANDSHAKE_TIMEOUT).await?;
-        }
-        Err(error) => {
-            send_frame(
-                &mut transport,
-                &ServerEnvelope::HelloRejected(error),
-                HANDSHAKE_TIMEOUT,
-            )
-            .await?;
-            return Ok(());
-        }
-    }
-
-    let envelope: ClientEnvelope = receive_frame(&mut transport, REQUEST_TIMEOUT).await?;
-    envelope.validate_shape().map_err(str::to_owned)?;
-    match envelope {
-        ClientEnvelope::Request(request) => {
-            let reply = execute_request(&coordinator, request).await;
-            let send_result = send_frame(
-                &mut transport,
-                &ServerEnvelope::Reply(reply),
-                REQUEST_TIMEOUT,
-            )
-            .await;
-            send_result?;
-        }
-        ClientEnvelope::Subscribe { .. } => {
-            let _subscription = subscriptions
-                .try_acquire_owned()
-                .map_err(|_| "service subscription capacity is full".to_string())?;
-            stream_snapshots(transport, &coordinator).await?;
-        }
-        ClientEnvelope::Hello(_) => {
-            return Err("service received a second hello envelope".into());
-        }
-    }
-    Ok(())
-}
-
-async fn send_hello_ack(
-    transport: &mut loxa_ipc::IpcFramed,
-    bootstrap: &ClientBootstrap,
+async fn wait_for_owner_resolution(
     coordinator: &Coordinator,
-    deadline: Duration,
-) -> Result<(), String> {
-    send_frame(
-        transport,
-        &ServerEnvelope::HelloAck(HelloAck {
-            protocol: loxa_ipc::ProtocolVersion::CURRENT,
-            capabilities: CAPABILITIES.to_vec(),
-            build: bootstrap.origin().build().to_owned(),
-            storage_schema: STORAGE_SCHEMA,
-            boot_epoch: coordinator.boot_epoch().to_owned(),
-            root_identity: bootstrap.root().root_identity().to_owned(),
-            service_pid: std::process::id(),
-            origin_sha256: bootstrap.origin().executable_sha256().to_owned(),
-        }),
-        deadline,
-    )
-    .await
-}
-
-fn validate_hello(hello: &Hello, bootstrap: &ClientBootstrap) -> Result<(), ServiceError> {
-    if hello.protocol.major != PROTOCOL_MAJOR || hello.protocol.minor > PROTOCOL_MINOR {
-        return Err(ServiceError::new(
-            ErrorCategory::IncompatibleProtocol,
-            "client protocol is incompatible with this service",
-        ));
-    }
-    if hello.root_identity != bootstrap.root().root_identity() {
-        return Err(ServiceError::new(
-            ErrorCategory::HomeMismatch,
-            "client and service development roots differ",
-        ));
-    }
-    if hello
-        .required_capabilities
-        .iter()
-        .find(|capability| !CAPABILITIES.contains(capability))
-        .is_some()
-    {
-        return Err(ServiceError::new(
-            ErrorCategory::UnsupportedCapability,
-            "service does not support a required client capability",
-        ));
-    }
-    Ok(())
-}
-
-async fn execute_request(coordinator: &Coordinator, request: Request) -> Reply {
-    let outcome = match request.command {
-        ServiceCommand::Status => ReplyOutcome::Status(coordinator.status_report()),
-        ServiceCommand::Load { model_id } => match coordinator.load(model_id).await {
-            Ok(accepted) => ReplyOutcome::Accepted(accepted),
-            Err(error) => ReplyOutcome::Rejected(error),
-        },
-        ServiceCommand::Unload { target } => match coordinator.unload(&target) {
-            Ok(accepted) => ReplyOutcome::Accepted(accepted),
-            Err(error) => ReplyOutcome::Rejected(error),
-        },
-        ServiceCommand::StopService => match coordinator.stop_service() {
-            Ok(accepted) => ReplyOutcome::Accepted(accepted),
-            Err(error) => ReplyOutcome::Rejected(error),
-        },
-    };
-    Reply {
-        request_id: request.request_id,
-        outcome,
-    }
-}
-
-async fn stream_snapshots(
-    transport: loxa_ipc::IpcFramed,
-    coordinator: &Coordinator,
-) -> Result<(), String> {
-    // Registration happens before the initial borrow, closing the Status ->
-    // Subscribe race without requiring an unbounded replay log.
-    let mut snapshots = coordinator.subscribe();
-    let initial = snapshots.borrow_and_update().clone();
-    let (mut writer, mut reader) = transport.split();
-    send_snapshot(&mut writer, initial).await?;
-    let mut stop = coordinator.server_stop_receiver();
+    owner_exit: &mut tokio::sync::watch::Receiver<OwnerExit>,
+    history_exit: &mut tokio::sync::watch::Receiver<HistoryExit>,
+    settings_exit: &mut tokio::sync::watch::Receiver<SettingsExit>,
+) {
     loop {
+        coordinator.release_runtime_if_durable();
+        let owner_resolved = matches!(*owner_exit.borrow(), OwnerExit::Drained | OwnerExit::Failed);
+        if owner_resolved && durability_is_drained(history_exit, settings_exit) {
+            return;
+        }
         tokio::select! {
-            biased;
-            changed = stop.changed() => {
-                if changed.is_err() || *stop.borrow() {
-                    return Ok(());
+            changed = owner_exit.changed() => {
+                if changed.is_err() {
+                    return;
                 }
             }
-            changed = snapshots.changed() => {
-                changed.map_err(|_| "service snapshot publisher closed".to_string())?;
-                let snapshot = snapshots.borrow_and_update().clone();
-                send_snapshot(&mut writer, snapshot).await?;
+            changed = history_exit.changed() => {
+                if changed.is_err() {
+                    return;
+                }
             }
-            incoming = reader.next() => {
-                return match incoming {
-                    None => Ok(()),
-                    Some(Ok(_)) => Err("service subscription received an unexpected client frame".into()),
-                    Some(Err(_)) => Err("service subscription transport failed".into()),
-                };
+            changed = settings_exit.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                let settings_state = *settings_exit.borrow();
+                if settings_state == SettingsExit::WriteCompleted
+                    && coordinator.finish_settings_write().is_err() {
+                    return;
+                }
             }
         }
     }
 }
 
-async fn send_snapshot<S>(transport: &mut S, status: RuntimeStatus) -> Result<(), String>
-where
-    S: futures_util::Sink<bytes::Bytes> + Unpin,
-    S::Error: std::fmt::Display,
-{
-    send_frame(
-        transport,
-        &ServerEnvelope::Snapshot(status),
-        REQUEST_TIMEOUT,
-    )
-    .await
-}
-
-async fn send_frame<S, T: serde::Serialize>(
-    transport: &mut S,
-    value: &T,
-    deadline: Duration,
-) -> Result<(), String>
-where
-    S: futures_util::Sink<bytes::Bytes> + Unpin,
-    S::Error: std::fmt::Display,
-{
-    let bytes = encode(value)?;
-    tokio::time::timeout(deadline, transport.send(bytes.freeze()))
-        .await
-        .map_err(|_| "service write timed out".to_string())?
-        .map_err(|error| error.to_string())
-}
-
-async fn receive_frame<T: serde::de::DeserializeOwned>(
-    transport: &mut loxa_ipc::IpcFramed,
-    deadline: Duration,
-) -> Result<T, String> {
-    let bytes = tokio::time::timeout(deadline, transport.next())
-        .await
-        .map_err(|_| "service read timed out".to_string())?
-        .ok_or_else(|| "client closed the service connection".to_string())?
-        .map_err(|error| error.to_string())?;
-    decode(&bytes)
+fn durability_is_drained(
+    history_exit: &tokio::sync::watch::Receiver<HistoryExit>,
+    settings_exit: &tokio::sync::watch::Receiver<SettingsExit>,
+) -> bool {
+    let history = *history_exit.borrow();
+    let settings = *settings_exit.borrow();
+    history == HistoryExit::Drained && settings == SettingsExit::Drained
 }
 
 struct ControlSocket {
@@ -548,14 +364,22 @@ fn bind_control_socket(path: &Path) -> Result<(UnixListener, ControlSocket), Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use loxa_ipc::initialize_development_root;
+    use futures_util::StreamExt;
+    use loxa_ipc::{
+        framed, initialize_development_root, set_frame_limit, ClientEnvelope, ConnectMode,
+        ErrorCategory, Hello, Request, ServiceClient, ServiceCommand, HISTORY_SCHEMA_VERSION,
+        MAX_FRAME_BYTES, MAX_HISTORY_FRAME_BYTES,
+    };
+    use std::sync::Barrier;
     use tempfile::TempDir;
+    use tokio::net::UnixStream;
 
     struct ServerFixture {
         _directory: TempDir,
         _diagnostics: Option<loxa_diagnostics::Diagnostics>,
         bootstrap: ClientBootstrap,
         coordinator: Coordinator,
+        run_dir: PathBuf,
     }
 
     impl ServerFixture {
@@ -581,6 +405,7 @@ mod tests {
             )
             .unwrap();
             let paths = crate::paths::AppPaths::from_values(Some(&root), None).unwrap();
+            let run_dir = paths.run.clone();
             let diagnostics = with_diagnostics
                 .then(|| {
                     loxa_diagnostics::init(&paths.logs, loxa_diagnostics::ProcessRole::Service)
@@ -610,6 +435,7 @@ mod tests {
                 _diagnostics: diagnostics,
                 bootstrap,
                 coordinator,
+                run_dir,
             }
         }
 
@@ -720,9 +546,15 @@ mod tests {
             connections.abort_all();
             while connections.join_next().await.is_some() {}
             let mut owner_exit = self.coordinator.owner_exit_receiver();
-            while *owner_exit.borrow() == OwnerExit::Running {
-                owner_exit.changed().await.unwrap();
-            }
+            let mut history_exit = self.coordinator.history_exit_receiver();
+            let mut settings_exit = self.coordinator.settings_exit_receiver();
+            wait_for_owner_resolution(
+                &self.coordinator,
+                &mut owner_exit,
+                &mut history_exit,
+                &mut settings_exit,
+            )
+            .await;
             assert_eq!(*owner_exit.borrow(), OwnerExit::Drained);
             self.coordinator.join_owner().unwrap();
         }
@@ -762,6 +594,94 @@ mod tests {
             .unwrap();
         assert!(matches!(snapshot, ServerEnvelope::Snapshot(_)));
         transport
+    }
+
+    async fn history_client(
+        bootstrap: &ClientBootstrap,
+        client: UnixStream,
+    ) -> loxa_ipc::IpcFramed {
+        let mut transport = framed(client);
+        send_frame(
+            &mut transport,
+            &ClientEnvelope::Hello(Hello::history(
+                super::super::BUILD_ID,
+                bootstrap.root().root_identity(),
+            )),
+            HANDSHAKE_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        let hello: ServerEnvelope = receive_frame(&mut transport, HANDSHAKE_TIMEOUT)
+            .await
+            .unwrap();
+        let ServerEnvelope::HelloAck(hello) = hello else {
+            panic!("expected history hello acknowledgement");
+        };
+        assert_eq!(hello.protocol, loxa_ipc::ProtocolVersion::CURRENT);
+        assert_eq!(hello.storage_schema, HISTORY_SCHEMA_VERSION);
+        assert!(hello.capabilities.contains(&Capability::History));
+        set_frame_limit(&mut transport, MAX_HISTORY_FRAME_BYTES).unwrap();
+        transport
+    }
+
+    async fn wait_for_history_ready(coordinator: &Coordinator) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !coordinator.history_is_ready() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(coordinator.history_is_ready());
+    }
+
+    async fn persist_settings(
+        coordinator: &Coordinator,
+        command: loxa_ipc::ServiceSettingsCommand,
+    ) -> loxa_ipc::ServiceSettings {
+        let mut exit = coordinator.settings_exit_receiver();
+        let task = {
+            let coordinator = coordinator.clone();
+            tokio::spawn(async move { coordinator.settings(command).await })
+        };
+        loop {
+            if *exit.borrow() == SettingsExit::WriteCompleted {
+                coordinator.finish_settings_write().unwrap();
+                break;
+            }
+            exit.changed().await.unwrap();
+        }
+        let (reply, permit) = task.await.unwrap();
+        assert!(permit.is_none());
+        match reply.unwrap() {
+            loxa_ipc::ServiceSettingsReply::Service(settings) => settings,
+            _ => panic!("settings save returned a conversation profile"),
+        }
+    }
+
+    fn install_history_model(root: &Path) {
+        use crate::catalog::{Manifest, Origin};
+
+        let models = root.join("models");
+        let model = models.join("demo");
+        fs::create_dir_all(&model).unwrap();
+        fs::write(model.join("model.gguf"), b"GGUF").unwrap();
+        crate::catalog::publish_manifest(
+            &models,
+            &Manifest {
+                version: 2,
+                id: "demo".into(),
+                repo: None,
+                revision: None,
+                remote_filename: None,
+                origin: Some(Origin::Local),
+                source_filename: Some("source.gguf".into()),
+                local_filename: "model.gguf".into(),
+                sha256: "b83633aa785344791618f2fddf131b010ea04912a60430760b070bad293f65bd".into(),
+                size: 4,
+                artifacts: None,
+                profile: None,
+                runtime: None,
+            },
+        )
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -820,11 +740,372 @@ mod tests {
 
         fixture.coordinator.stop_service().unwrap();
         let mut owner_exit = fixture.coordinator.owner_exit_receiver();
-        while *owner_exit.borrow() == OwnerExit::Running {
-            owner_exit.changed().await.unwrap();
-        }
+        let mut history_exit = fixture.coordinator.history_exit_receiver();
+        let mut settings_exit = fixture.coordinator.settings_exit_receiver();
+        wait_for_owner_resolution(
+            &fixture.coordinator,
+            &mut owner_exit,
+            &mut history_exit,
+            &mut settings_exit,
+        )
+        .await;
         assert_eq!(*owner_exit.borrow(), OwnerExit::Drained);
         fixture.coordinator.join_owner().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn coordinator_settings_capture_globals_for_new_conversations_and_profile_reset() {
+        let fixture = ServerFixture::start().await;
+        wait_for_history_ready(&fixture.coordinator).await;
+        install_history_model(fixture.bootstrap.root().root());
+
+        let initial = persist_settings(
+            &fixture.coordinator,
+            loxa_ipc::ServiceSettingsCommand::PatchServiceSettings {
+                expected_revision: "0".into(),
+                patch: loxa_ipc::ServiceSettingsPatch {
+                    ctx: None,
+                    port: None,
+                    generation: Some(loxa_ipc::GenerationSettingsPatch::Fields {
+                        system_instruction: Some("initial global".into()),
+                        max_output_tokens: Some(700),
+                    }),
+                },
+            },
+        )
+        .await;
+        assert_eq!(initial.revision, "1");
+        assert_eq!(
+            initial.durability,
+            loxa_ipc::ServiceSettingsDurability::Saved
+        );
+        assert_eq!(
+            initial.application,
+            loxa_ipc::ServiceSettingsApplication::NotApplied
+        );
+
+        let (created, permit) = fixture
+            .coordinator
+            .history(loxa_ipc::HistoryCommand::CreateConversation {
+                model_id: "demo".into(),
+            })
+            .await;
+        drop(permit);
+        let created = match created.unwrap() {
+            loxa_ipc::HistoryReply::Conversation(conversation) => conversation,
+            _ => panic!("create returned the wrong history reply"),
+        };
+        let (profile, permit) = fixture
+            .coordinator
+            .settings(loxa_ipc::ServiceSettingsCommand::GetConversationProfile {
+                conversation_id: created.id.clone(),
+            })
+            .await;
+        drop(permit);
+        let profile = match profile.unwrap() {
+            loxa_ipc::ServiceSettingsReply::Conversation(profile) => profile,
+            _ => panic!("profile read returned service settings"),
+        };
+        assert_eq!(profile.generation.system_instruction, "initial global");
+        assert_eq!(profile.generation.max_output_tokens, 700);
+
+        persist_settings(
+            &fixture.coordinator,
+            loxa_ipc::ServiceSettingsCommand::PatchServiceSettings {
+                expected_revision: "1".into(),
+                patch: loxa_ipc::ServiceSettingsPatch {
+                    ctx: None,
+                    port: None,
+                    generation: Some(loxa_ipc::GenerationSettingsPatch::Fields {
+                        system_instruction: Some("current global".into()),
+                        max_output_tokens: Some(900),
+                    }),
+                },
+            },
+        )
+        .await;
+        let (unchanged, permit) = fixture
+            .coordinator
+            .settings(loxa_ipc::ServiceSettingsCommand::GetConversationProfile {
+                conversation_id: created.id.clone(),
+            })
+            .await;
+        drop(permit);
+        assert!(matches!(
+            unchanged.unwrap(),
+            loxa_ipc::ServiceSettingsReply::Conversation(ref profile)
+                if profile.generation.system_instruction == "initial global"
+                    && profile.generation.max_output_tokens == 700
+        ));
+
+        let (reset, permit) = fixture
+            .coordinator
+            .settings(loxa_ipc::ServiceSettingsCommand::PatchConversationProfile {
+                conversation_id: created.id,
+                expected_conversation_revision: "1".into(),
+                expected_profile_revision: "1".into(),
+                patch: loxa_ipc::GenerationSettingsPatch::Reset,
+            })
+            .await;
+        drop(permit);
+        assert!(matches!(
+            reset.unwrap(),
+            loxa_ipc::ServiceSettingsReply::Conversation(ref profile)
+                if profile.conversation_revision == "2"
+                    && profile.profile_revision == "2"
+                    && profile.generation.system_instruction == "current global"
+                    && profile.generation.max_output_tokens == 900
+        ));
+
+        fixture.coordinator.stop_service().unwrap();
+        let mut owner_exit = fixture.coordinator.owner_exit_receiver();
+        let mut history_exit = fixture.coordinator.history_exit_receiver();
+        let mut settings_exit = fixture.coordinator.settings_exit_receiver();
+        wait_for_owner_resolution(
+            &fixture.coordinator,
+            &mut owner_exit,
+            &mut history_exit,
+            &mut settings_exit,
+        )
+        .await;
+        assert_eq!(*owner_exit.borrow(), OwnerExit::Drained);
+        fixture.coordinator.join_owner().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn history_protocol_freezes_a_conversation_and_stop_bypasses_stalled_sql() {
+        let fixture = ServerFixture::start().await;
+        wait_for_history_ready(&fixture.coordinator).await;
+        install_history_model(fixture.bootstrap.root().root());
+
+        let (client, server) = UnixStream::pair().unwrap();
+        let handler = tokio::spawn(handle_connection(
+            server,
+            fixture.bootstrap.clone(),
+            fixture.coordinator.clone(),
+            Arc::new(Semaphore::new(MAX_SUBSCRIPTIONS)),
+        ));
+        let mut client = history_client(&fixture.bootstrap, client).await;
+        send_frame_with_limit(
+            &mut client,
+            &ClientEnvelope::Request(Request::new(
+                "create-history",
+                ServiceCommand::History {
+                    command: loxa_ipc::HistoryCommand::CreateConversation {
+                        model_id: "demo".into(),
+                    },
+                },
+            )),
+            REQUEST_TIMEOUT,
+            MAX_HISTORY_FRAME_BYTES,
+        )
+        .await
+        .unwrap();
+        let reply: ServerEnvelope =
+            match receive_frame_with_limit(&mut client, REQUEST_TIMEOUT, MAX_HISTORY_FRAME_BYTES)
+                .await
+            {
+                Ok(reply) => reply,
+                Err(error) => panic!(
+                    "history create transport failed: {error}; server: {:?}",
+                    handler.await
+                ),
+            };
+        assert!(matches!(
+            reply,
+            ServerEnvelope::Reply(Reply {
+                outcome: ReplyOutcome::History {
+                    reply: loxa_ipc::HistoryReply::Conversation(_)
+                },
+                ..
+            })
+        ));
+        handler.await.unwrap().unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        fixture
+            .coordinator
+            .stall_history_for_test(Arc::clone(&barrier));
+        barrier.wait();
+        let (client, server) = UnixStream::pair().unwrap();
+        let handler = tokio::spawn(handle_connection(
+            server,
+            fixture.bootstrap.clone(),
+            fixture.coordinator.clone(),
+            Arc::new(Semaphore::new(MAX_SUBSCRIPTIONS)),
+        ));
+        let mut client = history_client(&fixture.bootstrap, client).await;
+        send_frame_with_limit(
+            &mut client,
+            &ClientEnvelope::Request(Request::new(
+                "list-history",
+                ServiceCommand::History {
+                    command: loxa_ipc::HistoryCommand::ListConversations {
+                        cursor: None,
+                        limit: 1,
+                    },
+                },
+            )),
+            REQUEST_TIMEOUT,
+            MAX_HISTORY_FRAME_BYTES,
+        )
+        .await
+        .unwrap();
+        let admission_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while fixture.coordinator.history_ordinary_available_for_test() == 8
+            && tokio::time::Instant::now() < admission_deadline
+        {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(fixture.coordinator.history_ordinary_available_for_test(), 7);
+
+        let started = std::time::Instant::now();
+        fixture.coordinator.stop_service().unwrap();
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(
+            fixture.coordinator.history_status().phase,
+            loxa_ipc::HistoryPhase::FlushPending
+        );
+        barrier.wait();
+        let reply: ServerEnvelope =
+            receive_frame_with_limit(&mut client, REQUEST_TIMEOUT, MAX_HISTORY_FRAME_BYTES)
+                .await
+                .unwrap();
+        assert!(matches!(
+            reply,
+            ServerEnvelope::Reply(Reply {
+                outcome: ReplyOutcome::History {
+                    reply: loxa_ipc::HistoryReply::ConversationPage(_)
+                },
+                ..
+            })
+        ));
+        handler.await.unwrap().unwrap();
+
+        let mut owner_exit = fixture.coordinator.owner_exit_receiver();
+        let mut history_exit = fixture.coordinator.history_exit_receiver();
+        let mut settings_exit = fixture.coordinator.settings_exit_receiver();
+        wait_for_owner_resolution(
+            &fixture.coordinator,
+            &mut owner_exit,
+            &mut history_exit,
+            &mut settings_exit,
+        )
+        .await;
+        assert_eq!(*owner_exit.borrow(), OwnerExit::Drained);
+        fixture.coordinator.join_owner().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn public_typed_client_round_trips_legacy_history_drafts_and_settings() {
+        let fixture = ServerFixture::start().await;
+        wait_for_history_ready(&fixture.coordinator).await;
+        install_history_model(fixture.bootstrap.root().root());
+        let mut server = tokio::spawn(run(fixture.bootstrap.clone(), fixture.coordinator.clone()));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !fixture.bootstrap.root().socket_path().exists()
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        if !fixture.bootstrap.root().socket_path().exists() {
+            let outcome = tokio::time::timeout(Duration::from_secs(1), &mut server)
+                .await
+                .expect("server did not report its bind failure");
+            panic!("server did not bind its control socket: {outcome:?}");
+        }
+
+        let client = ServiceClient::load(
+            fixture.bootstrap.root().root(),
+            None,
+            super::super::BUILD_ID,
+        )
+        .unwrap();
+        assert!(matches!(
+            client
+                .request(ConnectMode::ObserveExisting, ServiceCommand::Status)
+                .await
+                .unwrap(),
+            ReplyOutcome::Status(_)
+        ));
+        assert_eq!(
+            client
+                .history_status(ConnectMode::ObserveExisting)
+                .await
+                .unwrap()
+                .phase,
+            loxa_ipc::HistoryPhase::Ready
+        );
+        let conversation = match client
+            .history_request(
+                ConnectMode::ObserveExisting,
+                loxa_ipc::HistoryCommand::CreateConversation {
+                    model_id: "demo".into(),
+                },
+            )
+            .await
+            .unwrap()
+        {
+            loxa_ipc::HistoryReply::Conversation(conversation) => conversation,
+            _ => panic!("typed history client returned the wrong reply"),
+        };
+
+        let desktop_client_id = "11".repeat(16);
+        let draft = match client
+            .draft_request(
+                ConnectMode::ObserveExisting,
+                loxa_ipc::DraftCommand::CreateScope {
+                    desktop_client_id: desktop_client_id.clone(),
+                    conversation_id: Some(conversation.id),
+                },
+            )
+            .await
+            .unwrap()
+        {
+            loxa_ipc::DraftReply::Snapshot(snapshot) => snapshot,
+            _ => panic!("typed draft client returned the wrong reply"),
+        };
+        let text = "x".repeat(loxa_ipc::MAX_DRAFT_TEXT_BYTES);
+        let save = loxa_ipc::DraftCommand::SaveSnapshot {
+            draft_id: draft.id,
+            desktop_client_id,
+            revision: "1".into(),
+            text: text.clone(),
+        };
+        assert!(serde_json::to_vec(&save).unwrap().len() > MAX_FRAME_BYTES);
+        let saved = match client
+            .draft_request(ConnectMode::ObserveExisting, save)
+            .await
+            .unwrap()
+        {
+            loxa_ipc::DraftReply::Snapshot(snapshot) => snapshot,
+            _ => panic!("typed draft save returned the wrong reply"),
+        };
+        assert_eq!(saved.revision, "1");
+        assert_eq!(saved.text, text);
+
+        assert!(matches!(
+            client
+                .settings_request(
+                    ConnectMode::ObserveExisting,
+                    loxa_ipc::ServiceSettingsCommand::GetServiceSettings,
+                )
+                .await
+                .unwrap(),
+            loxa_ipc::ServiceSettingsReply::Service(_)
+        ));
+        assert!(matches!(
+            client
+                .request(ConnectMode::ObserveExisting, ServiceCommand::StopService,)
+                .await
+                .unwrap(),
+            ReplyOutcome::Accepted(_)
+        ));
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("server did not stop after the typed Stop request")
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -846,6 +1127,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn owner_panic_is_signaled_without_claiming_a_completed_drain() {
         let fixture = ServerFixture::start().await;
+        let barrier = Arc::new(Barrier::new(2));
+        fixture
+            .coordinator
+            .stall_history_for_test(Arc::clone(&barrier));
+        barrier.wait();
         let mut owner_exit = fixture.coordinator.owner_exit_receiver();
         fixture.coordinator.panic_owner_for_test();
         tokio::time::timeout(Duration::from_secs(1), owner_exit.changed())
@@ -857,7 +1143,323 @@ mod tests {
             fixture.coordinator.status().phase,
             loxa_ipc::RuntimePhase::Unloaded
         ));
+        assert!(
+            crate::runtime::RuntimeOwnership::acquire_service_unreconciled(&fixture.run_dir)
+                .is_err()
+        );
+        fixture.coordinator.drain_after_server_failure();
+        barrier.wait();
         assert!(fixture.coordinator.join_owner().is_err());
+        match crate::runtime::RuntimeOwnership::acquire_service_unreconciled(&fixture.run_dir) {
+            Ok(ownership) => drop(ownership),
+            Err(_) => panic!("durability resolution must release runtime ownership"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn settings_completion_is_joined_before_owner_resolution_returns() {
+        let fixture = ServerFixture::start().await;
+        let barrier = Arc::new(Barrier::new(2));
+        fixture
+            .coordinator
+            .stall_next_settings_write_for_test(Arc::clone(&barrier));
+        let settings_task = {
+            let coordinator = fixture.coordinator.clone();
+            tokio::spawn(async move {
+                coordinator
+                    .settings(loxa_ipc::ServiceSettingsCommand::PatchServiceSettings {
+                        expected_revision: "0".into(),
+                        patch: loxa_ipc::ServiceSettingsPatch {
+                            ctx: Some(loxa_ipc::OptionalU32Patch::Set { value: 8192 }),
+                            port: None,
+                            generation: None,
+                        },
+                    })
+                    .await
+                    .0
+            })
+        };
+        barrier.wait();
+        fixture.coordinator.stop_service().unwrap();
+        barrier.wait();
+
+        let mut owner_exit = fixture.coordinator.owner_exit_receiver();
+        let mut history_exit = fixture.coordinator.history_exit_receiver();
+        let mut settings_exit = fixture.coordinator.settings_exit_receiver();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            wait_for_owner_resolution(
+                &fixture.coordinator,
+                &mut owner_exit,
+                &mut history_exit,
+                &mut settings_exit,
+            ),
+        )
+        .await
+        .expect("settings completion deadlocked its own watch publication");
+        assert_eq!(*owner_exit.borrow(), OwnerExit::Drained);
+        assert!(matches!(
+            settings_task.await.unwrap().unwrap(),
+            loxa_ipc::ServiceSettingsReply::Service(ref settings)
+                if settings.revision == "1"
+                    && settings.durability == loxa_ipc::ServiceSettingsDurability::Saved
+        ));
+        fixture.coordinator.join_owner().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_gate_rejects_a_settings_patch_before_private_drain_begins() {
+        let fixture = ServerFixture::start().await;
+        let barrier = Arc::new(Barrier::new(2));
+        fixture
+            .coordinator
+            .stall_settings_drain_for_test(Arc::clone(&barrier));
+        let stop = {
+            let coordinator = fixture.coordinator.clone();
+            std::thread::spawn(move || coordinator.stop_service())
+        };
+        barrier.wait();
+        let (result, permit) = fixture
+            .coordinator
+            .settings(loxa_ipc::ServiceSettingsCommand::PatchServiceSettings {
+                expected_revision: "0".into(),
+                patch: loxa_ipc::ServiceSettingsPatch {
+                    ctx: Some(loxa_ipc::OptionalU32Patch::Set { value: 8192 }),
+                    port: None,
+                    generation: None,
+                },
+            })
+            .await;
+        assert!(permit.is_none());
+        assert!(matches!(
+            result,
+            Err(loxa_ipc::ServiceError {
+                category: ErrorCategory::ServiceUnavailable,
+                ..
+            })
+        ));
+        barrier.wait();
+        stop.join().unwrap().unwrap();
+
+        let mut owner_exit = fixture.coordinator.owner_exit_receiver();
+        let mut history_exit = fixture.coordinator.history_exit_receiver();
+        let mut settings_exit = fixture.coordinator.settings_exit_receiver();
+        wait_for_owner_resolution(
+            &fixture.coordinator,
+            &mut owner_exit,
+            &mut history_exit,
+            &mut settings_exit,
+        )
+        .await;
+        fixture.coordinator.join_owner().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn opening_handshake_cannot_use_sql_backed_profile_settings() {
+        let fixture = ServerFixture::start().await;
+        let mut capabilities = LEGACY_CAPABILITIES.to_vec();
+        capabilities.push(Capability::Settings);
+        let negotiated = NegotiatedHello {
+            protocol: loxa_ipc::ProtocolVersion::CURRENT,
+            capabilities,
+            storage_schema: 0,
+            frame_limit: MAX_HISTORY_FRAME_BYTES,
+        };
+        let (reply, permit) = connection::execute_request(
+            &fixture.coordinator,
+            Request::new(
+                "profile-before-ready",
+                ServiceCommand::Settings {
+                    command: loxa_ipc::ServiceSettingsCommand::GetConversationProfile {
+                        conversation_id: "00".repeat(16),
+                    },
+                },
+            ),
+            &negotiated,
+        )
+        .await;
+        assert!(permit.is_none());
+        assert!(matches!(
+            reply.outcome,
+            ReplyOutcome::Rejected(loxa_ipc::ServiceError {
+                category: ErrorCategory::ServiceUnavailable,
+                ..
+            })
+        ));
+
+        let (reply, permit) = connection::execute_request(
+            &fixture.coordinator,
+            Request::new(
+                "global-before-ready",
+                ServiceCommand::Settings {
+                    command: loxa_ipc::ServiceSettingsCommand::GetServiceSettings,
+                },
+            ),
+            &negotiated,
+        )
+        .await;
+        assert!(permit.is_none());
+        assert!(matches!(reply.outcome, ReplyOutcome::Settings { .. }));
+
+        fixture.coordinator.stop_service().unwrap();
+        let mut owner_exit = fixture.coordinator.owner_exit_receiver();
+        let mut history_exit = fixture.coordinator.history_exit_receiver();
+        let mut settings_exit = fixture.coordinator.settings_exit_receiver();
+        wait_for_owner_resolution(
+            &fixture.coordinator,
+            &mut owner_exit,
+            &mut history_exit,
+            &mut settings_exit,
+        )
+        .await;
+        fixture.coordinator.join_owner().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runtime_panic_waits_for_an_in_flight_settings_save_to_drain() {
+        let fixture = ServerFixture::start().await;
+        let (probe_listener, probe_socket) =
+            bind_control_socket(fixture.bootstrap.root().socket_path()).unwrap();
+        drop(probe_listener);
+        drop(probe_socket);
+        let mut server = tokio::spawn(run(fixture.bootstrap.clone(), fixture.coordinator.clone()));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !fixture.bootstrap.root().socket_path().exists()
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(fixture.bootstrap.root().socket_path().exists());
+
+        let barrier = Arc::new(Barrier::new(2));
+        fixture
+            .coordinator
+            .stall_next_settings_write_for_test(Arc::clone(&barrier));
+        let settings_task = {
+            let coordinator = fixture.coordinator.clone();
+            tokio::spawn(async move {
+                coordinator
+                    .settings(loxa_ipc::ServiceSettingsCommand::PatchServiceSettings {
+                        expected_revision: "0".into(),
+                        patch: loxa_ipc::ServiceSettingsPatch {
+                            ctx: Some(loxa_ipc::OptionalU32Patch::Set { value: 4096 }),
+                            port: None,
+                            generation: None,
+                        },
+                    })
+                    .await
+                    .0
+            })
+        };
+        barrier.wait();
+        fixture.coordinator.panic_owner_for_test();
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut server)
+            .await
+            .is_err());
+        assert!(
+            crate::runtime::RuntimeOwnership::acquire_service_unreconciled(&fixture.run_dir)
+                .is_err()
+        );
+
+        barrier.wait();
+        assert!(matches!(
+            settings_task.await.unwrap().unwrap(),
+            loxa_ipc::ServiceSettingsReply::Service(ref settings)
+                if settings.revision == "1"
+                    && settings.durability == loxa_ipc::ServiceSettingsDurability::Saved
+        ));
+        assert!(tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server did not finish after durable owners drained")
+            .unwrap()
+            .is_err());
+        match crate::runtime::RuntimeOwnership::acquire_service_unreconciled(&fixture.run_dir) {
+            Ok(ownership) => drop(ownership),
+            Err(_) => panic!("settings drain must release runtime ownership after owner failure"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runtime_panic_keeps_control_open_for_a_failed_history_close_retry() {
+        let fixture = ServerFixture::start().await;
+        wait_for_history_ready(&fixture.coordinator).await;
+        let (probe_listener, probe_socket) =
+            bind_control_socket(fixture.bootstrap.root().socket_path()).unwrap();
+        drop(probe_listener);
+        drop(probe_socket);
+        fixture.coordinator.fail_next_history_close_for_test();
+        let mut server = tokio::spawn(run(fixture.bootstrap.clone(), fixture.coordinator.clone()));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !fixture.bootstrap.root().socket_path().exists()
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        if !fixture.bootstrap.root().socket_path().exists() {
+            let outcome = tokio::time::timeout(Duration::from_secs(1), &mut server)
+                .await
+                .expect("server did not report its bind failure");
+            panic!("server did not bind its control socket: {outcome:?}");
+        }
+
+        fixture.coordinator.panic_owner_for_test();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while fixture.coordinator.history_status().phase != loxa_ipc::HistoryPhase::FlushFailed
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            fixture.coordinator.history_status().phase,
+            loxa_ipc::HistoryPhase::FlushFailed
+        );
+        assert!(
+            crate::runtime::RuntimeOwnership::acquire_service_unreconciled(&fixture.run_dir)
+                .is_err()
+        );
+
+        let stream = UnixStream::connect(fixture.bootstrap.root().socket_path())
+            .await
+            .unwrap();
+        let mut client = framed(stream);
+        send_frame(
+            &mut client,
+            &ClientEnvelope::Hello(Hello::current(
+                super::super::BUILD_ID,
+                fixture.bootstrap.root().root_identity(),
+            )),
+            HANDSHAKE_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            receive_frame::<ServerEnvelope>(&mut client, HANDSHAKE_TIMEOUT)
+                .await
+                .unwrap(),
+            ServerEnvelope::HelloAck(_)
+        ));
+        send_frame(
+            &mut client,
+            &ClientEnvelope::Request(Request::new("retry-stop", ServiceCommand::StopService)),
+            REQUEST_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            receive_frame::<ServerEnvelope>(&mut client, REQUEST_TIMEOUT)
+                .await
+                .unwrap(),
+            ServerEnvelope::Reply(Reply {
+                outcome: ReplyOutcome::Accepted(_),
+                ..
+            })
+        ));
+
+        assert!(server.await.unwrap().is_err());
+        match crate::runtime::RuntimeOwnership::acquire_service_unreconciled(&fixture.run_dir) {
+            Ok(ownership) => drop(ownership),
+            Err(_) => panic!("resolved failed drain must release runtime ownership"),
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -911,9 +1513,15 @@ mod tests {
 
         fixture.coordinator.stop_service().unwrap();
         let mut owner_exit = fixture.coordinator.owner_exit_receiver();
-        while *owner_exit.borrow() == OwnerExit::Running {
-            owner_exit.changed().await.unwrap();
-        }
+        let mut history_exit = fixture.coordinator.history_exit_receiver();
+        let mut settings_exit = fixture.coordinator.settings_exit_receiver();
+        wait_for_owner_resolution(
+            &fixture.coordinator,
+            &mut owner_exit,
+            &mut history_exit,
+            &mut settings_exit,
+        )
+        .await;
         assert_eq!(*owner_exit.borrow(), OwnerExit::Drained);
         fixture.coordinator.join_owner().unwrap();
     }
@@ -959,9 +1567,15 @@ mod tests {
 
         fixture.coordinator.stop_service().unwrap();
         let mut owner_exit = fixture.coordinator.owner_exit_receiver();
-        while *owner_exit.borrow() == OwnerExit::Running {
-            owner_exit.changed().await.unwrap();
-        }
+        let mut history_exit = fixture.coordinator.history_exit_receiver();
+        let mut settings_exit = fixture.coordinator.settings_exit_receiver();
+        wait_for_owner_resolution(
+            &fixture.coordinator,
+            &mut owner_exit,
+            &mut history_exit,
+            &mut settings_exit,
+        )
+        .await;
         assert_eq!(*owner_exit.borrow(), OwnerExit::Drained);
         fixture.coordinator.join_owner().unwrap();
     }

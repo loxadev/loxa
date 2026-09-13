@@ -2,6 +2,32 @@ use super::*;
 use std::sync::{mpsc, Mutex};
 use std::time::Duration;
 
+fn fingerprint(model_id: &str) -> Arc<crate::runtime_fingerprint::RuntimeFingerprint> {
+    let manifest = crate::catalog::Manifest {
+        version: 2,
+        id: model_id.into(),
+        repo: None,
+        revision: None,
+        remote_filename: None,
+        origin: Some(crate::catalog::Origin::Local),
+        source_filename: Some("source.gguf".into()),
+        local_filename: "model.gguf".into(),
+        sha256: "a".repeat(64),
+        size: 1,
+        artifacts: None,
+        profile: None,
+        runtime: None,
+    };
+    Arc::new(
+        crate::runtime_fingerprint::RuntimeFingerprint::from_manifest_for_service(
+            &manifest,
+            4096,
+            crate::runtime_fingerprint::EffectiveProfile::Generic,
+        )
+        .unwrap(),
+    )
+}
+
 fn target(accepted: &Accepted) -> OperationTarget {
     OperationTarget {
         boot_epoch: accepted.boot_epoch.clone(),
@@ -26,10 +52,13 @@ fn stop_during_blocked_start_cancels_without_waiting_and_prevents_late_ready() {
             // the transition lock. Cancellation must reach it independently.
             blocked.recv_timeout(Duration::from_secs(2)).unwrap();
             let cancelled = operation.cancel.load(Ordering::Acquire);
-            let ready = worker_state
-                .lock()
-                .unwrap()
-                .advance(&operation, OperationPhase::Ready { engine_pid: 42 });
+            let ready = worker_state.lock().unwrap().advance(
+                &operation,
+                OperationPhase::Ready {
+                    engine_pid: 42,
+                    fingerprint: fingerprint("demo"),
+                },
+            );
             finished.send((cancelled, ready)).unwrap();
         });
 
@@ -66,7 +95,13 @@ fn cleanup_failure_keeps_admission_and_exact_identity_until_explicit_retry_compl
     let mut state = CoordinatorState::new("boot".into(), None, Arc::new(AtomicBool::new(false)));
     let operation = state.reserve_load("demo".into()).unwrap();
     let accepted = state.accept_start(&operation).unwrap();
-    assert!(state.advance(&operation, OperationPhase::Ready { engine_pid: 42 }));
+    assert!(state.advance(
+        &operation,
+        OperationPhase::Ready {
+            engine_pid: 42,
+            fingerprint: fingerprint("demo"),
+        }
+    ));
     state.unload(&target(&accepted)).unwrap();
     let attempted = operation.retry_cleanup.load(Ordering::Acquire);
     assert!(state.advance(&operation, OperationPhase::CleanupFailed));
@@ -107,7 +142,13 @@ fn cleanup_failure_keeps_admission_and_exact_identity_until_explicit_retry_compl
     assert_ne!(accepted_next.generation, accepted.generation);
     let starting = state.snapshot();
     state.complete(&operation, None);
-    assert!(!state.advance(&operation, OperationPhase::Ready { engine_pid: 42 }));
+    assert!(!state.advance(
+        &operation,
+        OperationPhase::Ready {
+            engine_pid: 42,
+            fingerprint: fingerprint("demo"),
+        }
+    ));
     assert_eq!(
         state.snapshot(),
         starting,
@@ -125,4 +166,35 @@ fn cleanup_failure_keeps_admission_and_exact_identity_until_explicit_retry_compl
         state.reserve_load("later".into()).err().unwrap().category,
         ErrorCategory::ServiceUnavailable
     );
+}
+
+#[test]
+fn unresolved_output_fences_a_new_load_after_runtime_completion() {
+    let mut state = CoordinatorState::new("boot".into(), None, Arc::new(AtomicBool::new(false)));
+    let operation = state.reserve_load("demo".into()).unwrap();
+    state.accept_start(&operation).unwrap();
+    assert!(state.advance(
+        &operation,
+        OperationPhase::Ready {
+            engine_pid: 42,
+            fingerprint: fingerprint("demo"),
+        }
+    ));
+    let reservation = match state
+        .reserve_admission([1; 16], [2; 16], [3; 32], 1, 1)
+        .unwrap()
+    {
+        AdmissionClaim::Fresh(reservation) => reservation,
+        AdmissionClaim::Existing(_) => panic!("fresh admission returned an existing reservation"),
+    };
+
+    state.complete(&operation, None);
+    assert!(matches!(state.snapshot().phase, RuntimePhase::Unloaded));
+    assert_eq!(
+        state.reserve_load("other".into()).err().unwrap().category,
+        ErrorCategory::Busy
+    );
+
+    state.finish_admission(&reservation);
+    assert!(state.reserve_load("other".into()).is_ok());
 }

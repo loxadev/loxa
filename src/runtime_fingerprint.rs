@@ -135,6 +135,27 @@ impl<'de> Deserialize<'de> for RuntimeFingerprint {
 }
 
 impl RuntimeFingerprint {
+    pub(crate) fn retained_backing_bytes(&self) -> usize {
+        let artifact = |value: &ArtifactFingerprint| {
+            value
+                .local_filename
+                .capacity()
+                .saturating_add(value.sha256.capacity())
+        };
+        let profile = self.service_profile.as_ref().map_or(0, |value| {
+            value
+                .cache_type_k
+                .capacity()
+                .saturating_add(value.cache_type_v.capacity())
+                .saturating_add(value.gpu_layers.capacity())
+        });
+        self.model_id
+            .capacity()
+            .saturating_add(artifact(&self.primary))
+            .saturating_add(self.draft.as_ref().map_or(0, artifact))
+            .saturating_add(profile)
+    }
+
     fn validate_current(&self) -> Result<(), String> {
         self.validate(false)
     }
@@ -337,10 +358,26 @@ impl RuntimeFingerprint {
         &self.primary.local_filename
     }
 
+    pub(crate) fn primary_sha256(&self) -> &str {
+        &self.primary.sha256
+    }
+
+    pub(crate) fn primary_size(&self) -> u64 {
+        self.primary.size
+    }
+
     pub(crate) fn draft_local_filename(&self) -> Option<&str> {
         self.draft
             .as_ref()
             .map(|artifact| artifact.local_filename.as_str())
+    }
+
+    pub(crate) fn draft_sha256(&self) -> Option<&str> {
+        self.draft.as_ref().map(|artifact| artifact.sha256.as_str())
+    }
+
+    pub(crate) fn draft_size(&self) -> Option<u64> {
+        self.draft.as_ref().map(|artifact| artifact.size)
     }
 
     #[cfg(test)]

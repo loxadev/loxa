@@ -42,6 +42,38 @@ pub fn load_catalog(models_root: &Path) -> Result<Vec<Manifest>, String> {
     Ok(manifests)
 }
 
+pub(crate) fn load_model_manifest(
+    models_root: &Path,
+    model_id: &str,
+) -> Result<Option<Manifest>, String> {
+    const MAX_HISTORY_MANIFEST_BYTES: usize = 256 * 1024;
+
+    crate::paths::validate_id(model_id)?;
+    let model_dir = models_root.join(model_id);
+    let (directory, identity) = match crate::safe_file::open_directory(&model_dir) {
+        Ok(opened) => opened,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("model catalog contains unsafe local state".into()),
+    };
+    let manifest_path = model_dir.join("manifest.json");
+    let bytes =
+        crate::safe_file::read_regular_file_bounded(&manifest_path, MAX_HISTORY_MANIFEST_BYTES);
+    crate::safe_file::ensure_directory_descriptor_matches_path(&directory, &identity, &model_dir)
+        .map_err(|_| "model directory changed while its manifest was read".to_string())?;
+    let bytes = match bytes {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("model manifest is unavailable or exceeds its byte limit".into()),
+    };
+    let manifest: Manifest =
+        serde_json::from_slice(&bytes).map_err(|_| "model manifest is malformed".to_string())?;
+    manifest.validate()?;
+    if manifest.id != model_id {
+        return Err("model manifest identity does not match its directory".into());
+    }
+    Ok(Some(manifest))
+}
+
 pub(crate) fn load_reconciled_catalog(models_root: &Path) -> Result<Vec<Manifest>, String> {
     load_reconciled_catalog_with(models_root, local::reconcile_qualified_bundle)
 }
