@@ -82,7 +82,12 @@ pub(crate) fn wait_for_test_process_executable(child: &mut Child, expected: &std
         let child_has_execed = Ok::<_, String>(true);
         let observation = match child_has_execed {
             Ok(true) => match process_snapshot(child.id()) {
-                Ok(Some(snapshot)) if snapshot.executable == expected => return,
+                Ok(Some(snapshot))
+                    if std::fs::canonicalize(&snapshot.executable)
+                        .is_ok_and(|observed| observed == expected) =>
+                {
+                    return;
+                }
                 Ok(observed) => format!("{observed:?}"),
                 Err(error) => error,
             },
