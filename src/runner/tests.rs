@@ -1474,9 +1474,20 @@ fn sigterm_of_persistent_owner_cleans_the_exact_group_lease_and_locks() {
             }
         }
     };
-    let group_survived = process_group_exists(child_group).unwrap();
-    let child_survived = unsafe { libc::kill(child_pid as libc::pid_t, 0) } == 0;
+    let live_group_survived = crate::runtime::process_group_has_live_members(child_group).unwrap();
     let lease_survived = lease_path.exists();
+    let reap_deadline = Instant::now() + Duration::from_secs(5);
+    let (group_survived, child_survived) = loop {
+        let group_survived = process_group_exists(child_group).unwrap();
+        let child_survived = unsafe { libc::kill(child_pid as libc::pid_t, 0) } == 0;
+        if live_group_survived
+            || (!group_survived && !child_survived)
+            || Instant::now() >= reap_deadline
+        {
+            break (group_survived, child_survived);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
     if group_survived {
         crate::runtime::terminate_stale_process_group(child_group).unwrap();
     }
@@ -1488,6 +1499,10 @@ fn sigterm_of_persistent_owner_cleans_the_exact_group_lease_and_locks() {
         "{output:?}"
     );
     assert_eq!(output.status.signal(), None, "{output:?}");
+    assert!(
+        !live_group_survived,
+        "persistent server group retained live members after owner SIGTERM"
+    );
     assert!(
         !child_survived,
         "persistent server child survived owner SIGTERM"
