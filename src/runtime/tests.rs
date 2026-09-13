@@ -401,7 +401,7 @@ fn spawn_lease_observing_sleep(lease: &Path, witness: &Path, ready: &Path) -> Ch
             .arg(
                 r#"trap 'if [ -e "$LOXA_LEASE" ]; then printf present > "$LOXA_WITNESS"; else printf absent > "$LOXA_WITNESS"; fi; exit 0' TERM
 : > "$LOXA_READY"
-while :; do sleep 60; done"#,
+while :; do sleep 60 & wait "$!"; done"#,
             )
             .env("LOXA_LEASE", lease)
             .env("LOXA_WITNESS", witness)
