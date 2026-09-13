@@ -118,6 +118,14 @@ impl DraftSnapshot {
     }
 }
 
+fn validate_text(text: &str) -> Result<(), &'static str> {
+    if text.len() > MAX_DRAFT_TEXT_BYTES {
+        Err("draft text exceeds 32 KiB")
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,13 +146,5 @@ mod tests {
             snapshot.validate_shape(),
             Err("consumed draft revision exceeds current revision")
         );
-    }
-}
-
-fn validate_text(text: &str) -> Result<(), &'static str> {
-    if text.len() > MAX_DRAFT_TEXT_BYTES {
-        Err("draft text exceeds 32 KiB")
-    } else {
-        Ok(())
     }
 }

@@ -1462,7 +1462,6 @@ fn sqlite_full_and_late_update_failure_roll_back_suffix_transaction() {
     let (mut connection, _) = open_store(&root).unwrap();
     let (_, committed) = admitted_attempt(&mut connection, &models, 33, 33);
 
-    connection.execute_batch("VACUUM").unwrap();
     let previous_max_pages: i64 = connection
         .query_row("PRAGMA max_page_count", [], |row| row.get(0))
         .unwrap();
