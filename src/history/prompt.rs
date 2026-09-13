@@ -401,7 +401,10 @@ mod tests {
 
     #[test]
     fn attempt_prefix_reader_rejects_corrupt_ranges() {
-        let cases: &[(&[(i64, i64, &str)], usize)] = &[
+        type StoredChunk<'a> = (i64, i64, &'a str);
+        type CorruptionCase<'a> = (&'a [StoredChunk<'a>], usize);
+
+        let cases: &[CorruptionCase<'_>] = &[
             (&[(1, 2, "a")], 2),
             (&[(0, 1, "a"), (0, 1, "b")], 1),
             (&[(0, 2, "a")], 2),

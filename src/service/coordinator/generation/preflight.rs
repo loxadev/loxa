@@ -190,7 +190,7 @@ fn validate_context(
     })?;
     if input_tokens
         .checked_add(output)
-        .map_or(true, |required| required > actual_context)
+        .is_none_or(|required| required > actual_context)
     {
         return Err(ServiceError::new(
             ErrorCategory::InvalidRequest,
