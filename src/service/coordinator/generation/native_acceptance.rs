@@ -33,6 +33,7 @@ pub(in crate::service) async fn run_bundled_generation_acceptance(
 }
 
 async fn exercise(fixture: &mut NativeService) -> Result<String, String> {
+    let prompt: &'static str = "Reply with the English word hello. Input: café 你好 👋.";
     let first = create_conversation(&fixture.client, GENERATION_TOKENS).await?;
     let busy = create_conversation(&fixture.client, GENERATION_TOKENS).await?;
     let busy_draft = create_draft(&fixture.client, &busy, "busy draft remains exact").await?;
@@ -41,13 +42,7 @@ async fn exercise(fixture: &mut NativeService) -> Result<String, String> {
     // this pause. The second Send can complete its retained-submission lookup
     // before it observes the active admission and returns Busy.
     let mut completion = fixture.coordinator.pause_native_admission_completion();
-    let first_send = tokio::spawn(send(
-        fixture.client.clone(),
-        first.clone(),
-        "Reply briefly to café 你好 👋.",
-        None,
-        1,
-    ));
+    let first_send = tokio::spawn(send(fixture.client.clone(), first.clone(), prompt, None, 1));
     completion.wait_reached().await?;
     let busy_result = send(
         fixture.client.clone(),
@@ -71,15 +66,9 @@ async fn exercise(fixture: &mut NativeService) -> Result<String, String> {
     }
 
     let second = create_conversation(&fixture.client, GENERATION_TOKENS).await?;
-    let second_accepted = send(
-        fixture.client.clone(),
-        second.clone(),
-        "Reply briefly to café 你好 👋.",
-        None,
-        3,
-    )
-    .await
-    .map_err(client::client_error)?;
+    let second_accepted = send(fixture.client.clone(), second.clone(), prompt, None, 3)
+        .await
+        .map_err(client::client_error)?;
     let second_output =
         wait_for_saved(&fixture.client, &second, &second_accepted, "cached").await?;
     if second_output.is_empty() {
