@@ -397,7 +397,11 @@ fn exact_persistent_runtime_returns_an_opaque_revalidatable_attachment() {
         &fixture.models_root,
         &fixture.managed_server,
         std::slice::from_ref(&fixture.fingerprint),
-        exact_test_attachment_identity,
+        |attached| {
+            exact_test_attachment_identity(attached).inspect_err(|error| {
+                eprintln!("attachment identity validation failed: {error}");
+            })
+        },
         |port, model_id| {
             assert_eq!(port, 43123);
             assert_eq!(model_id, "demo");

@@ -209,8 +209,12 @@ fn v3_wire_separates_exact_process_identity_from_managed_source() {
     assert_eq!(decoded.server, observed.server);
     assert_eq!(decoded.managed_source.as_deref(), Some(managed.as_path()));
     assert_eq!(
-        exact_live_provenance(&decoded, &managed).unwrap(),
-        Some(RuntimeProvenance::Managed)
+        exact_live_provenance(&decoded, &managed),
+        Ok(Some(RuntimeProvenance::Managed)),
+        "lease={decoded:?}; owner={:?}; child={:?}; child_group={:?}",
+        process_snapshot(decoded.owner_pid),
+        process_snapshot(decoded.child_pid),
+        process_group(decoded.child_pid),
     );
     assert_eq!(
         exact_live_provenance(&decoded, Path::new("/other/llama-server")).unwrap(),
@@ -1253,21 +1257,33 @@ fn stale_recovery_removes_only_the_exact_orphaned_execution_stage() {
         child_pid: pid,
         child_start_time: snapshot.start_identity,
         child_pgid: i32::try_from(pid).unwrap(),
-        server: snapshot.executable,
+        server: snapshot.executable.clone(),
         model_id: "demo".into(),
         port: 43123,
         service: None,
     };
     fs::create_dir_all(&run_dir).unwrap();
-    write_lease_fixture(&run_dir.join("foreground.json"), &lease);
+    let lease_path = run_dir.join("foreground.json");
+    write_lease_fixture(&lease_path, &lease);
 
     recover_stale(&run_dir).unwrap();
 
     let gone = wait_for_child_exit(&mut child);
+    let failure_state = (!gone).then(|| {
+        (
+            process_snapshot(pid),
+            process_group(pid),
+            stage.exists(),
+            lease_path.exists(),
+        )
+    });
     if !gone {
         terminate_process_group(&mut child, i32::try_from(pid).unwrap()).unwrap();
     }
-    assert!(gone, "stale recovery left the exact staged child running");
+    assert!(
+        gone,
+        "stale recovery left the exact staged child running: expected={snapshot:?}; current={failure_state:?}"
+    );
     assert!(!stage.exists(), "stale recovery leaked the execution stage");
     assert!(neighbor.is_dir(), "cleanup removed an adjacent lookalike");
     assert!(!run_dir.join("foreground.json").exists());
