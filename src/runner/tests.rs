@@ -1039,11 +1039,40 @@ int main(int argc, char **argv) {
     int client = accept(listener, NULL, NULL);
     if (client < 0) return 94;
     char request[4096];
-    if (recv(client, request, sizeof(request), 0) <= 0) return 95;
+    size_t received = 0;
+    int header_complete = 0;
+    while (received < sizeof(request)) {
+        ssize_t count = recv(client, request + received, sizeof(request) - received, 0);
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            return 95;
+        }
+        if (count == 0) return 95;
+        received += (size_t)count;
+        for (size_t index = 3; index < received; ++index) {
+            if (request[index - 3] == '\r' && request[index - 2] == '\n' &&
+                request[index - 1] == '\r' && request[index] == '\n') {
+                header_complete = 1;
+                break;
+            }
+        }
+        if (header_complete) break;
+    }
+    if (!header_complete) return 95;
     const char *body = "{\"data\":[{\"id\":\"demo\"}]}";
     char response[512];
     int length = snprintf(response, sizeof(response), "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n%s", strlen(body), body);
-    if (length <= 0 || send(client, response, (size_t)length, 0) != length) return 96;
+    if (length <= 0 || (size_t)length >= sizeof(response)) return 96;
+    size_t written = 0;
+    while (written < (size_t)length) {
+        ssize_t count = send(client, response + written, (size_t)length - written, 0);
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            return 96;
+        }
+        if (count == 0) return 96;
+        written += (size_t)count;
+    }
     close(client);
     for (;;) pause();
 }
