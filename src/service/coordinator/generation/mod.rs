@@ -129,6 +129,21 @@ async fn drive_send(
     submitted: SubmittedSend,
     pending: PendingGenerationConnection,
 ) -> Result<GenerationReply, ServiceError> {
+    let matching = {
+        let state = coordinator.shared.state();
+        state.matching_admission(submitted.submission_id, submitted.submission_hash)
+    }?;
+    if let Some(reservation) = matching {
+        let observer = reservation.subscribe();
+        coordinator.finish_generation_connection(&pending);
+        super::history::maybe_resume_admission(
+            Arc::clone(&coordinator.shared),
+            Arc::clone(&reservation),
+        );
+        let committed = wait_for_admission(observer).await?;
+        return Ok(accepted(&committed));
+    }
+
     let lookup = coordinator
         .shared
         .history
