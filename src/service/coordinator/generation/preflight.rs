@@ -12,12 +12,9 @@ const MAX_TEMPLATE_BASIS_BYTES: usize = 64 * 1024;
 
 pub(super) struct QualifiedRequest {
     pub(super) request: PreparedEngineRequest,
-    provenance: PreflightProvenance,
-}
-
-struct PreflightProvenance {
     actual_context: u32,
     input_tokens: u32,
+    #[cfg(all(test, target_os = "macos"))]
     template_sha256: [u8; 32],
     #[cfg(all(test, target_os = "macos"))]
     observation_id: Option<u64>,
@@ -25,20 +22,21 @@ struct PreflightProvenance {
 
 impl QualifiedRequest {
     pub(super) fn actual_context(&self) -> u32 {
-        self.provenance.actual_context
+        self.actual_context
     }
 
     pub(super) fn input_tokens(&self) -> u32 {
-        self.provenance.input_tokens
+        self.input_tokens
     }
 
+    #[cfg(all(test, target_os = "macos"))]
     pub(super) fn template_sha256(&self) -> [u8; 32] {
-        self.provenance.template_sha256
+        self.template_sha256
     }
 
     #[cfg(all(test, target_os = "macos"))]
     pub(super) fn observation_id(&self) -> Option<u64> {
-        self.provenance.observation_id
+        self.observation_id
     }
 }
 
@@ -104,21 +102,20 @@ pub(super) async fn qualify(
         counted.input_tokens,
         prompt.max_output_tokens,
     )?;
-    let provenance = PreflightProvenance {
+    Ok(QualifiedRequest {
+        request,
         actual_context: qualification.actual_context,
         input_tokens: counted.input_tokens,
+        #[cfg(all(test, target_os = "macos"))]
         template_sha256: qualification.template_sha256,
         #[cfg(all(test, target_os = "macos"))]
         observation_id,
-    };
-    Ok(QualifiedRequest {
-        request,
-        provenance,
     })
 }
 
 struct PreflightQualification {
     actual_context: u32,
+    #[cfg(test)]
     template_sha256: [u8; 32],
 }
 

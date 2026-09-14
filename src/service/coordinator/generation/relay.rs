@@ -66,16 +66,16 @@ pub(super) async fn run(
         }
     };
     let expected_input_tokens = qualified.input_tokens();
-    let qualified_template_sha256 = qualified.template_sha256();
     #[cfg(all(test, target_os = "macos"))]
     let observation_id = qualified.observation_id();
     #[cfg(all(test, target_os = "macos"))]
     {
-        super::qualification_fixture::record_postcommit(observation_id, qualified_template_sha256);
+        super::qualification_fixture::record_postcommit(
+            observation_id,
+            qualified.template_sha256(),
+        );
         coordinator.wait_at_native_generation_execution_gate().await;
     }
-    #[cfg(not(all(test, target_os = "macos")))]
-    let _ = qualified_template_sha256;
     let stream = stream(
         &engine,
         &reservation,
