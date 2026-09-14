@@ -62,9 +62,6 @@ fn pending_stop_prevents_fresh_admission_without_tombstoning_a_retry() {
         pending_nonce: pending.nonce().into(),
     };
     state.cancel_generation(&target).unwrap();
-    state
-        .bind_pending_generation(&pending, [2; 16], [3; 32])
-        .unwrap();
     assert_eq!(
         state
             .reserve_pending_admission(&pending, [1; 16], [2; 16], [3; 32], 1, 1)
@@ -79,9 +76,6 @@ fn pending_stop_prevents_fresh_admission_without_tombstoning_a_retry() {
     );
 
     let retry = state.register_pending_generation().unwrap();
-    state
-        .bind_pending_generation(&retry, [2; 16], [3; 32])
-        .unwrap();
     assert!(matches!(
         state
             .reserve_pending_admission(&retry, [1; 16], [2; 16], [3; 32], 1, 1)
@@ -94,9 +88,6 @@ fn pending_stop_prevents_fresh_admission_without_tombstoning_a_retry() {
 fn cancelled_duplicate_attaches_without_cancelling_the_canonical_admission() {
     let (mut state, _) = ready_state();
     let canonical = state.register_pending_generation().unwrap();
-    state
-        .bind_pending_generation(&canonical, [2; 16], [3; 32])
-        .unwrap();
     let admission = match state
         .reserve_pending_admission(&canonical, [1; 16], [2; 16], [3; 32], 1, 1)
         .unwrap()
@@ -110,9 +101,6 @@ fn cancelled_duplicate_attaches_without_cancelling_the_canonical_admission() {
         boot_epoch: "boot".into(),
         pending_nonce: duplicate.nonce().into(),
     };
-    state
-        .bind_pending_generation(&duplicate, [2; 16], [3; 32])
-        .unwrap();
     state.cancel_generation(&duplicate_target).unwrap();
     let attached = match state
         .reserve_pending_admission(&duplicate, [1; 16], [2; 16], [3; 32], 1, 1)
@@ -130,6 +118,40 @@ fn cancelled_duplicate_attaches_without_cancelling_the_canonical_admission() {
             .category,
         ErrorCategory::NotFound
     );
+
+    let conflicting = state.register_pending_generation().unwrap();
+    assert_eq!(
+        state
+            .reserve_pending_admission(&conflicting, [1; 16], [2; 16], [4; 32], 1, 1)
+            .err()
+            .unwrap()
+            .category,
+        ErrorCategory::Conflict
+    );
+    assert!(!state.pending_is_current(&conflicting));
+    assert!(state.admission_is_current(&admission));
+    assert!(!admission.is_cancelled());
+}
+
+#[test]
+fn finished_pending_connection_cannot_reserve_again() {
+    let (mut state, _) = ready_state();
+    let stale = state.register_pending_generation().unwrap();
+    assert!(state.pending_is_current(&stale));
+    state.finish_pending_generation(&stale);
+    let current = state.register_pending_generation().unwrap();
+    assert_ne!(stale.nonce(), current.nonce());
+    assert!(!state.pending_is_current(&stale));
+    assert_eq!(
+        state
+            .reserve_pending_admission(&stale, [1; 16], [2; 16], [3; 32], 1, 1)
+            .err()
+            .unwrap()
+            .category,
+        ErrorCategory::Conflict
+    );
+    assert!(state.pending_is_current(&current));
+    assert!(state.current_admission().is_none());
 }
 
 #[test]
@@ -140,9 +162,6 @@ fn pending_target_follows_its_reservation_and_capacity_waits_for_both_terminals(
         boot_epoch: "boot".into(),
         pending_nonce: pending.nonce().into(),
     };
-    state
-        .bind_pending_generation(&pending, [2; 16], [3; 32])
-        .unwrap();
     let admission = match state
         .reserve_pending_admission(&pending, [1; 16], [2; 16], [3; 32], 1, 1)
         .unwrap()

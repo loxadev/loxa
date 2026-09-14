@@ -18,14 +18,7 @@ pub(in crate::service::coordinator) struct EngineDescriptor {
 
 pub(in crate::service::coordinator) struct PendingGeneration {
     nonce: String,
-    identity: Mutex<Option<PendingIdentity>>,
     cancellation: Arc<Cancellation>,
-}
-
-#[derive(Clone, Copy)]
-struct PendingIdentity {
-    submission_id: [u8; 16],
-    submission_hash: [u8; 32],
 }
 
 pub(super) struct Cancellation {
@@ -135,47 +128,10 @@ impl CoordinatorState {
         })?;
         let pending = Arc::new(PendingGeneration {
             nonce,
-            identity: Mutex::new(None),
             cancellation: Arc::new(Cancellation::new()),
         });
         self.pending_generations.push(Arc::clone(&pending));
         Ok(pending)
-    }
-
-    pub(in crate::service::coordinator) fn bind_pending_generation(
-        &self,
-        pending: &Arc<PendingGeneration>,
-        submission_id: [u8; 16],
-        submission_hash: [u8; 32],
-    ) -> Result<(), ServiceError> {
-        if !self.pending_is_current(pending) {
-            return Err(ServiceError::new(
-                ErrorCategory::Conflict,
-                "generation connection is no longer current",
-            ));
-        }
-        let mut identity = pending.identity.lock().map_err(|_| {
-            ServiceError::new(ErrorCategory::Internal, "pending identity lock is poisoned")
-        })?;
-        match *identity {
-            Some(current)
-                if current.submission_id != submission_id
-                    || current.submission_hash != submission_hash =>
-            {
-                Err(ServiceError::new(
-                    ErrorCategory::Conflict,
-                    "generation connection was rebound to another submission",
-                ))
-            }
-            Some(_) => Ok(()),
-            None => {
-                *identity = Some(PendingIdentity {
-                    submission_id,
-                    submission_hash,
-                });
-                Ok(())
-            }
-        }
     }
 
     pub(in crate::service::coordinator) fn finish_pending_generation(
@@ -223,18 +179,6 @@ impl CoordinatorState {
                 "generation connection is no longer current",
             ));
         }
-        let identity = *pending.identity.lock().map_err(|_| {
-            ServiceError::new(ErrorCategory::Internal, "pending identity lock is poisoned")
-        })?;
-        if !identity.is_some_and(|identity| {
-            identity.submission_id == submission_id && identity.submission_hash == submission_hash
-        }) {
-            return Err(ServiceError::new(
-                ErrorCategory::Conflict,
-                "generation connection identity changed",
-            ));
-        }
-
         if let Some(admission) = &self.admission {
             let result = if admission.submission_id == submission_id {
                 if admission.submission_hash != submission_hash {
@@ -518,7 +462,10 @@ impl CoordinatorState {
         }
     }
 
-    fn pending_is_current(&self, pending: &Arc<PendingGeneration>) -> bool {
+    pub(in crate::service::coordinator) fn pending_is_current(
+        &self,
+        pending: &Arc<PendingGeneration>,
+    ) -> bool {
         self.pending_generations
             .iter()
             .any(|current| Arc::ptr_eq(current, pending))

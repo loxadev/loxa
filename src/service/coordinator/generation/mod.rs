@@ -38,17 +38,16 @@ impl Coordinator {
                 return Err(error);
             }
         };
-        let binding = {
+        let pending_is_current = {
             let state = self.shared.state();
-            state.bind_pending_generation(
-                &pending.pending,
-                submitted.submission_id,
-                submitted.submission_hash,
-            )
+            state.pending_is_current(&pending.pending)
         };
-        if let Err(error) = binding {
+        if !pending_is_current {
             self.finish_generation_connection(&pending);
-            return Err(error);
+            return Err(ServiceError::new(
+                ErrorCategory::Conflict,
+                "generation connection is no longer current",
+            ));
         }
 
         let coordinator = self.clone();
