@@ -171,7 +171,7 @@ impl SseDecoder {
     fn end_line(&mut self) -> Result<(), String> {
         if self.line.is_empty() {
             self.dispatch()?;
-            self.data = Vec::new();
+            self.data.clear();
             self.has_data = false;
             self.event_bytes = 0;
             return Ok(());
@@ -193,19 +193,23 @@ impl SseDecoder {
         }
         let value_len = self.line.len().saturating_sub(start);
         let separator = usize::from(self.has_data);
-        if self
+        let data_len = self
             .data
             .len()
             .saturating_add(separator)
-            .saturating_add(value_len)
-            > MAX_EVENT_BYTES
-        {
+            .saturating_add(value_len);
+        if data_len > MAX_EVENT_BYTES {
             return Err(event_too_large());
         }
         if !self.has_data {
             self.line.drain(..start);
             std::mem::swap(&mut self.line, &mut self.data);
         } else {
+            if data_len > self.data.capacity() {
+                // Both swapped buffers retain power-of-two capacities at most MAX_EVENT_BYTES.
+                self.data
+                    .reserve_exact(data_len.next_power_of_two() - self.data.len());
+            }
             self.data.push(b'\n');
             self.data.extend_from_slice(&self.line[start..]);
         }
@@ -475,6 +479,78 @@ mod tests {
             decode(&[&body.as_bytes()[..split], &body.as_bytes()[split..]]).unwrap();
         assert_eq!(generated_end, 6);
         assert_eq!(output.concat(), "héllo");
+    }
+
+    #[test]
+    fn repeated_events_reuse_both_scratch_allocations() {
+        let mut decoder = SseDecoder::new();
+        let mut original = [decoder.line.as_ptr(), decoder.data.as_ptr()];
+        original.sort_unstable();
+        for _ in 0..8 {
+            let step = decoder.push(b"data: {\"choices\":[]}\n\n").unwrap();
+            assert!(step.chunk.is_none());
+            let mut current = [decoder.line.as_ptr(), decoder.data.as_ptr()];
+            current.sort_unstable();
+            assert_eq!(current, original);
+            assert!(decoder.line.is_empty());
+            assert!(decoder.data.is_empty());
+        }
+    }
+
+    #[test]
+    fn multiline_then_large_and_small_events_keep_retained_backing_bounded() {
+        let multiline = format!(
+            "data: {{\"padding\":\"{}\",\ndata: \"tail\":\"{}\"}}\n\n",
+            "x".repeat(310_000),
+            "y".repeat(400_000),
+        );
+        let content = "é".repeat(400_000);
+        let large = format!(
+            "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{content}\"}}}}]}}\n\n"
+        );
+        let mut decoder = SseDecoder::new();
+        let mut recovered = String::new();
+        for event in [&multiline, &large, &large] {
+            let mut offset = 0;
+            loop {
+                let step = decoder.push(&event.as_bytes()[offset..]).unwrap();
+                offset += step.consumed;
+                assert!(decoder.line.capacity() <= MAX_EVENT_BYTES);
+                assert!(decoder.data.capacity() <= MAX_EVENT_BYTES);
+                let emitted_capacity = step.chunk.as_ref().map_or(0, String::capacity);
+                assert!(
+                    decoder.retained_backing_bytes() + emitted_capacity
+                        <= 3 * MAX_EVENT_BYTES + MAX_SUFFIX_BYTES
+                );
+                let emitted = step.chunk.is_some();
+                if let Some(chunk) = step.chunk {
+                    assert_eq!(chunk.capacity(), MAX_SUFFIX_BYTES);
+                    recovered.push_str(&chunk);
+                }
+                if offset == event.len() && !emitted {
+                    break;
+                }
+                assert!(step.consumed > 0 || emitted);
+            }
+        }
+        assert_eq!(decoder.line.capacity(), MAX_EVENT_BYTES);
+        assert_eq!(decoder.data.capacity(), MAX_EVENT_BYTES);
+        for _ in 0..16 {
+            let step = decoder.push(b"data: {\"choices\":[]}\n\n").unwrap();
+            assert!(step.chunk.is_none());
+            assert_eq!(decoder.line.capacity(), MAX_EVENT_BYTES);
+            assert_eq!(decoder.data.capacity(), MAX_EVENT_BYTES);
+            assert!(decoder.retained_backing_bytes() <= 2 * MAX_EVENT_BYTES + MAX_SUFFIX_BYTES);
+        }
+        assert!(decoder.push(b"data: [DONE]\n\n").unwrap().done);
+        decoder.finish().unwrap();
+        while let Some(chunk) = decoder.take_remaining_chunk() {
+            assert!(chunk.capacity() <= MAX_SUFFIX_BYTES);
+            recovered.push_str(&chunk);
+        }
+        assert_eq!(recovered, content.repeat(2));
+        assert_eq!(decoder.generated_end(), 2 * content.len());
+        assert_eq!(decoder.retained_backing_bytes(), 2 * MAX_EVENT_BYTES);
     }
 
     #[test]
