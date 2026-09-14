@@ -24,7 +24,7 @@ impl ServerFixture {
 
     async fn start_with_diagnostics(with_diagnostics: bool) -> Self {
         let directory = tempfile::Builder::new()
-            .prefix("loxa-service-pressure-")
+            .prefix("ls-")
             .tempdir_in("/tmp")
             .unwrap();
         let directory_path = fs::canonicalize(directory.path()).unwrap();
@@ -246,7 +246,7 @@ async fn history_client(bootstrap: &ClientBootstrap, client: UnixStream) -> loxa
     let ServerEnvelope::HelloAck(hello) = hello else {
         panic!("expected history hello acknowledgement");
     };
-    assert_eq!(hello.protocol, loxa_ipc::ProtocolVersion::CURRENT);
+    assert_eq!(hello.protocol, loxa_ipc::ProtocolVersion::V1_1);
     assert_eq!(hello.storage_schema, HISTORY_SCHEMA_VERSION);
     assert!(hello.capabilities.contains(&Capability::History));
     set_frame_limit(&mut transport, MAX_HISTORY_FRAME_BYTES).unwrap();
@@ -890,7 +890,9 @@ async fn opening_handshake_cannot_use_sql_backed_profile_settings() {
         capabilities,
         storage_schema: 0,
         frame_limit: MAX_HISTORY_FRAME_BYTES,
+        generation: None,
     };
+    let mut pending = None;
     let (reply, permit) = connection::execute_request(
         &fixture.coordinator,
         Request::new(
@@ -902,6 +904,7 @@ async fn opening_handshake_cannot_use_sql_backed_profile_settings() {
             },
         ),
         &negotiated,
+        &mut pending,
     )
     .await;
     assert!(permit.is_none());
@@ -922,6 +925,7 @@ async fn opening_handshake_cannot_use_sql_backed_profile_settings() {
             },
         ),
         &negotiated,
+        &mut pending,
     )
     .await;
     assert!(permit.is_none());

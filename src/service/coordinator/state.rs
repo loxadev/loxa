@@ -8,14 +8,20 @@ use tokio::sync::watch;
 
 use super::history::OutputState;
 
+mod generation;
+use generation::Cancellation;
+pub(super) use generation::{EngineDescriptor, PendingGeneration};
+
 // All admission and publication decisions run under Shared::state. The watch
 // value is an observer copy: never read it back to decide a transition.
 pub(super) struct CoordinatorState {
     current: Option<Arc<OperationControl>>,
     admission: Option<Arc<AdmissionReservation>>,
+    pending_generations: Vec<Arc<PendingGeneration>>,
     conversation_mutations: Vec<Arc<ConversationMutationReservation>>,
     next_task_id: u64,
     next_generation: u64,
+    next_pending_nonce: u128,
     revision: u64,
     phase: Phase,
     boot_epoch: String,
@@ -42,7 +48,7 @@ enum Phase {
 pub(super) enum OperationPhase {
     Starting,
     Ready {
-        engine_pid: u32,
+        engine: EngineDescriptor,
         fingerprint: Arc<crate::runtime_fingerprint::RuntimeFingerprint>,
     },
     Stopping,
@@ -57,8 +63,13 @@ pub(super) struct AdmissionReservation {
     pub(super) expected_conversation_revision: i64,
     pub(super) expected_profile_revision: i64,
     pub(super) operation_generation: i64,
+    operation: Arc<OperationControl>,
     pub(super) fingerprint: Arc<crate::runtime_fingerprint::RuntimeFingerprint>,
-    pub(super) cancelled: AtomicBool,
+    pub(super) engine: EngineDescriptor,
+    pending_nonce: Option<String>,
+    cancellation: Arc<Cancellation>,
+    engine_quiescent: AtomicBool,
+    durable_terminal: AtomicBool,
     outcome: watch::Sender<Option<Result<crate::history::CommittedAdmission, ServiceError>>>,
     recovery: Mutex<AdmissionRecovery>,
     pub(super) output: Mutex<Option<OutputState>>,
@@ -227,9 +238,11 @@ impl CoordinatorState {
         Self {
             current: None,
             admission: None,
+            pending_generations: Vec::with_capacity(16),
             conversation_mutations: Vec::with_capacity(8),
             next_task_id: 1,
             next_generation: 1,
+            next_pending_nonce: 1,
             revision: 0,
             phase,
             boot_epoch,
@@ -367,7 +380,10 @@ impl CoordinatorState {
             operation.request_cleanup();
         }
         if let Some(admission) = &self.admission {
-            admission.cancelled.store(true, Ordering::Release);
+            admission.request_cancel();
+        }
+        for pending in &self.pending_generations {
+            pending.request_cancel();
         }
         self.publish(Phase::Draining);
     }
@@ -402,20 +418,39 @@ impl CoordinatorState {
         &mut self,
         expected: &Arc<OperationControl>,
         failure: Option<ErrorCategory>,
-    ) {
+    ) -> bool {
+        if !self.is_current(expected) {
+            return false;
+        }
+        let mut admission_released = false;
         if let Some(admission) = &self.admission {
-            admission.cancelled.store(true, Ordering::Release);
+            admission.request_cancel();
+            if Arc::ptr_eq(&admission.operation, expected) {
+                admission.mark_engine_quiescent();
+                let admission = Arc::clone(admission);
+                admission_released = self.finish_admission_if_resolved(&admission);
+            }
+        }
+        for pending in &self.pending_generations {
+            pending.request_cancel();
         }
         let phase = failure.map_or(Phase::Unloaded, |category| Phase::Operation {
             control: Arc::clone(expected),
             phase: OperationPhase::LoadFailed(category),
         });
         self.release_and_publish(expected, phase);
+        admission_released
     }
 
     pub(super) fn require_recovery(&mut self, expected: &Arc<OperationControl>, reason: &str) {
+        if !self.is_current(expected) {
+            return;
+        }
         if let Some(admission) = &self.admission {
-            admission.cancelled.store(true, Ordering::Release);
+            admission.request_cancel();
+        }
+        for pending in &self.pending_generations {
+            pending.request_cancel();
         }
         self.release_and_publish(
             expected,
@@ -429,92 +464,6 @@ impl CoordinatorState {
         if self.is_current(expected) {
             self.current = None;
         }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn reserve_admission(
-        &mut self,
-        conversation_id: [u8; 16],
-        submission_id: [u8; 16],
-        submission_hash: [u8; 32],
-        expected_conversation_revision: i64,
-        expected_profile_revision: i64,
-    ) -> Result<AdmissionClaim, ServiceError> {
-        if self.draining.load(Ordering::Acquire) {
-            return Err(ServiceError::new(
-                ErrorCategory::ServiceUnavailable,
-                "service is draining",
-            ));
-        }
-        if let Some(admission) = &self.admission {
-            if admission.submission_id == submission_id {
-                if admission.submission_hash != submission_hash {
-                    return Err(ServiceError::new(
-                        ErrorCategory::Conflict,
-                        "submission identity was reused with a different payload",
-                    ));
-                }
-                return Ok(AdmissionClaim::Existing(Arc::clone(admission)));
-            }
-            return Err(ServiceError::new(
-                ErrorCategory::Busy,
-                "another conversation admission is active",
-            ));
-        }
-        if self
-            .conversation_mutations
-            .iter()
-            .any(|mutation| mutation.conversation_id == conversation_id)
-        {
-            return Err(ServiceError::new(
-                ErrorCategory::Busy,
-                "a conversation mutation is active",
-            ));
-        }
-        let (operation, fingerprint) = match &self.phase {
-            Phase::Operation {
-                control,
-                phase: OperationPhase::Ready { fingerprint, .. },
-            } if self.is_current(control) => (control, fingerprint),
-            _ => {
-                return Err(ServiceError::new(
-                    ErrorCategory::ServiceUnavailable,
-                    "no verified runtime is ready",
-                ));
-            }
-        };
-        let operation_generation = i64::try_from(operation.generation).map_err(|_| {
-            ServiceError::new(
-                ErrorCategory::Internal,
-                "runtime generation exceeds the history range",
-            )
-        })?;
-        let (outcome, _) = watch::channel(None);
-        let reservation = Arc::new(AdmissionReservation {
-            conversation_id,
-            submission_id,
-            submission_hash,
-            expected_conversation_revision,
-            expected_profile_revision,
-            operation_generation,
-            fingerprint: Arc::clone(fingerprint),
-            cancelled: AtomicBool::new(false),
-            outcome,
-            recovery: Mutex::new(AdmissionRecovery::Preparing),
-            output: Mutex::new(None),
-        });
-        self.admission = Some(Arc::clone(&reservation));
-        Ok(AdmissionClaim::Fresh(reservation))
-    }
-
-    pub(super) fn admission_is_current(&self, expected: &Arc<AdmissionReservation>) -> bool {
-        self.admission
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, expected))
-    }
-
-    pub(super) fn current_admission(&self) -> Option<Arc<AdmissionReservation>> {
-        self.admission.as_ref().map(Arc::clone)
     }
 
     pub(super) fn reserve_conversation_mutation(
@@ -560,14 +509,8 @@ impl CoordinatorState {
             .retain(|current| !Arc::ptr_eq(current, reservation));
     }
 
-    pub(super) fn finish_admission(&mut self, expected: &Arc<AdmissionReservation>) {
-        if self.admission_is_current(expected) {
-            self.admission = None;
-        }
-    }
-
     pub(super) fn history_close_is_safe(&self) -> bool {
-        self.admission.is_none()
+        self.admission.is_none() && self.pending_generations.is_empty()
     }
 
     fn release_and_publish(&mut self, expected: &Arc<OperationControl>, phase: Phase) {
@@ -624,11 +567,11 @@ impl Phase {
                         generation,
                         model_id,
                     },
-                    OperationPhase::Ready { engine_pid, .. } => RuntimePhase::Ready {
+                    OperationPhase::Ready { engine, .. } => RuntimePhase::Ready {
                         task_id,
                         generation,
                         model_id,
-                        engine_pid: *engine_pid,
+                        engine_pid: engine.pid,
                     },
                     OperationPhase::Stopping => RuntimePhase::Stopping {
                         task_id,

@@ -6,14 +6,14 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 mod types;
 mod validation;
 
-#[cfg(test)]
 pub(crate) use types::DraftSubmission;
 pub(crate) use types::{
     AdmissionKind, CommittedAdmission, PreparedAdmission, PromptBasis, PromptReference,
 };
+pub(super) use validation::require_previous_turn_resolved;
 use validation::{
-    read_conversation, read_retry_target, require_previous_turn_resolved, validate_conversation,
-    validate_prepared, validate_prompt_basis,
+    read_conversation, read_retry_target, validate_conversation, validate_prepared,
+    validate_prompt_basis,
 };
 
 pub(super) fn lookup_submission(
@@ -92,11 +92,13 @@ pub(super) fn stop_before_execution(
              SET execution_outcome = 2, save_outcome = 1, generated_end = 0,
                  terminal_saved_end = 0, updated_ms = CASE
                      WHEN updated_ms < 9223372036854775807 THEN updated_ms + 1 ELSE updated_ms END
-             WHERE id = ?1 AND submission_id = ?2 AND operation_generation = ?3
+             WHERE id = ?1 AND submission_id = ?2 AND owner_epoch = ?3
+               AND operation_generation = ?4
                AND execution_outcome = 0 AND save_outcome = 0 AND saved_end = 0",
             params![
                 committed.attempt_id.as_slice(),
                 committed.submission_id.as_slice(),
+                committed.owner_epoch,
                 committed.operation_generation,
             ],
         )
@@ -107,12 +109,14 @@ pub(super) fn stop_before_execution(
     let already_stopped: bool = connection
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM attempts
-             WHERE id = ?1 AND submission_id = ?2 AND operation_generation = ?3
+             WHERE id = ?1 AND submission_id = ?2 AND owner_epoch = ?3
+               AND operation_generation = ?4
                AND execution_outcome = 2 AND save_outcome = 1 AND saved_end = 0
                AND generated_end = 0 AND terminal_saved_end = 0)",
             params![
                 committed.attempt_id.as_slice(),
                 committed.submission_id.as_slice(),
+                committed.owner_epoch,
                 committed.operation_generation,
             ],
             |row| row.get(0),
@@ -252,7 +256,7 @@ fn admit(
                 prepared.runtime_identity.build(),
                 prepared.runtime_identity.version_line(),
                 &prepared.runtime_fingerprint_json,
-                i64::from(prepared.runtime_fingerprint.effective_context()),
+                i64::from(prepared.effective_context),
                 prepared.system_instruction,
                 prepared.max_output_tokens,
                 &prepared.prompt_basis_json,
@@ -317,6 +321,7 @@ fn admit(
         pre_conversation_revision: prepared.expected_conversation_revision,
         post_conversation_revision: post_revision,
         profile_revision: prepared.expected_profile_revision,
+        owner_epoch: prepared.owner_epoch.clone(),
         operation_generation: prepared.operation_generation,
     })
 }
@@ -330,7 +335,7 @@ fn lookup_in(
         .query_row(
             "SELECT a.submission_hash, t.conversation_id, t.id, a.id,
                     a.admitted_conversation_revision, a.admitted_profile_revision,
-                    a.operation_generation
+                    a.operation_generation, a.owner_epoch
              FROM attempts a JOIN turns t ON t.id = a.turn_id
              JOIN conversations c ON c.id = t.conversation_id
              WHERE a.submission_id = ?1 AND c.deleted = 0",
@@ -344,12 +349,15 @@ fn lookup_in(
                     row.get::<_, i64>(4)?,
                     row.get::<_, i64>(5)?,
                     row.get::<_, i64>(6)?,
+                    decode_text_column(row, 7, 128, "invalid admission owner epoch")?,
                 ))
             },
         )
         .optional()
         .map_err(schema::classify_sql_error)?;
-    let Some((hash, conversation_id, turn_id, attempt_id, post, profile, generation)) = row else {
+    let Some((hash, conversation_id, turn_id, attempt_id, post, profile, generation, owner_epoch)) =
+        row
+    else {
         return Ok(None);
     };
     if hash != submission_hash {
@@ -371,8 +379,35 @@ fn lookup_in(
         pre_conversation_revision: pre,
         post_conversation_revision: post,
         profile_revision: profile,
+        owner_epoch,
         operation_generation: generation,
     }))
+}
+
+fn decode_text_column(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+    maximum: usize,
+    context: &'static str,
+) -> rusqlite::Result<String> {
+    match row.get_ref(index)? {
+        rusqlite::types::ValueRef::Text(bytes) if !bytes.is_empty() && bytes.len() <= maximum => {
+            std::str::from_utf8(bytes)
+                .map(str::to_owned)
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        index,
+                        rusqlite::types::Type::Text,
+                        error.into(),
+                    )
+                })
+        }
+        value => Err(rusqlite::Error::FromSqlConversionFailure(
+            index,
+            value.data_type(),
+            std::io::Error::new(std::io::ErrorKind::InvalidData, context).into(),
+        )),
+    }
 }
 
 fn decode_blob_column<const N: usize>(

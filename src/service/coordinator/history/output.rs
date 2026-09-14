@@ -5,7 +5,6 @@ use crate::history::{
 use crate::service::coordinator::state::AdmissionReservation;
 use crate::service::coordinator::Shared;
 use loxa_ipc::{ErrorCategory, ServiceError};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::sync::watch;
 
@@ -21,7 +20,6 @@ pub(in crate::service::coordinator) enum OutputSavePhase {
 }
 
 #[derive(Clone)]
-#[cfg_attr(not(test), allow(dead_code))] // M4 constructs this handle after generation admission.
 pub(in crate::service::coordinator) struct GenerationOutput {
     shared: Arc<Shared>,
     reservation: Arc<AdmissionReservation>,
@@ -70,16 +68,19 @@ impl OutputState {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // M4 drives persistence through this handle.
 impl GenerationOutput {
-    pub(super) fn new(shared: Arc<Shared>, reservation: Arc<AdmissionReservation>) -> Self {
+    pub(in crate::service::coordinator) fn new(
+        shared: Arc<Shared>,
+        reservation: Arc<AdmissionReservation>,
+    ) -> Self {
         Self {
             shared,
             reservation,
         }
     }
 
-    pub(super) fn status(&self) -> Result<OutputSavePhase, ServiceError> {
+    #[cfg(test)]
+    pub(in crate::service::coordinator) fn status(&self) -> Result<OutputSavePhase, ServiceError> {
         let output = self
             .reservation
             .output
@@ -91,27 +92,127 @@ impl GenerationOutput {
             .ok_or_else(|| conflict("output persistence is no longer active"))
     }
 
-    pub(super) fn is_cancelled(&self) -> bool {
-        self.reservation.cancelled.load(Ordering::Acquire)
+    #[cfg(test)]
+    pub(in crate::service::coordinator) fn is_cancelled(&self) -> bool {
+        self.reservation.is_cancelled()
     }
 
-    pub(super) fn checkpoint(
+    pub(in crate::service::coordinator) fn request_cancel(&self) {
+        self.reservation.request_cancel();
+    }
+
+    pub(in crate::service::coordinator) fn report_capacity_saturation(&self) {
+        self.reservation.request_cancel();
+        let mut output = self
+            .reservation
+            .output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(output) = output.as_mut().filter(|output| !output.closed) {
+            output.status = OutputSavePhase::SaveFailed {
+                saved_end: output.saved_end,
+            };
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::service::coordinator) fn checkpoint(
         &self,
         input: Arc<SuffixInput>,
     ) -> Result<OutputObserver, ServiceError> {
-        input.validate(false).map_err(history_error)?;
-        self.enqueue(OutputIntentKind::Checkpoint(input))
+        self.checkpoint_owned(input).map_err(|(error, _)| error)
     }
 
-    pub(super) fn finalize(
+    #[cfg(test)]
+    pub(in crate::service::coordinator) fn finalize(
         &self,
         input: Arc<FinalizationInput>,
     ) -> Result<OutputObserver, ServiceError> {
-        input.validate().map_err(history_error)?;
-        self.enqueue(OutputIntentKind::Final(input))
+        self.finalize_owned(input).map_err(|(error, _)| error)
     }
 
-    pub(super) fn retry_save(&self) -> Result<OutputObserver, ServiceError> {
+    #[cfg(test)]
+    pub(in crate::service::coordinator) fn checkpoint_owned(
+        &self,
+        input: Arc<SuffixInput>,
+    ) -> Result<OutputObserver, (ServiceError, Arc<SuffixInput>)> {
+        if let Err(error) = input.validate(false) {
+            return Err((history_error(error), input));
+        }
+        self.enqueue(
+            OutputIntentKind::Checkpoint(Arc::clone(&input)),
+            false,
+            false,
+        )
+        .map(|(observer, _)| observer)
+        .map_err(|(error, _)| (error, input))
+    }
+
+    pub(in crate::service::coordinator) fn checkpoint_generation_owned(
+        &self,
+        input: Arc<SuffixInput>,
+    ) -> Result<OutputObserver, (ServiceError, Arc<SuffixInput>, bool)> {
+        if let Err(error) = input.validate(false) {
+            return Err((history_error(error), input, false));
+        }
+        self.enqueue(
+            OutputIntentKind::Checkpoint(Arc::clone(&input)),
+            false,
+            false,
+        )
+        .map(|(observer, _)| observer)
+        .map_err(|(error, cancelled)| (error, input, cancelled))
+    }
+
+    pub(in crate::service::coordinator) fn checkpoint_terminal_owned(
+        &self,
+        input: Arc<SuffixInput>,
+    ) -> Result<OutputObserver, (ServiceError, Arc<SuffixInput>)> {
+        if let Err(error) = input.validate(false) {
+            return Err((history_error(error), input));
+        }
+        self.enqueue(
+            OutputIntentKind::Checkpoint(Arc::clone(&input)),
+            true,
+            false,
+        )
+        .map(|(observer, _)| observer)
+        .map_err(|(error, _)| (error, input))
+    }
+
+    #[cfg(test)]
+    pub(in crate::service::coordinator) fn finalize_owned(
+        &self,
+        input: Arc<FinalizationInput>,
+    ) -> Result<OutputObserver, (ServiceError, Arc<FinalizationInput>)> {
+        if let Err(error) = input.validate() {
+            return Err((history_error(error), input));
+        }
+        self.enqueue(OutputIntentKind::Final(Arc::clone(&input)), false, false)
+            .map(|(observer, _)| observer)
+            .map_err(|(error, _)| (error, input))
+    }
+
+    pub(in crate::service::coordinator) fn finalize_generation_owned(
+        &self,
+        input: Arc<FinalizationInput>,
+    ) -> Result<(OutputObserver, ExecutionOutcome), (ServiceError, Arc<FinalizationInput>)> {
+        if let Err(error) = input.validate() {
+            return Err((history_error(error), input));
+        }
+        self.enqueue(OutputIntentKind::Final(Arc::clone(&input)), true, true)
+            .map(|(observer, outcome)| {
+                (
+                    observer,
+                    outcome.expect("generation finalization has an execution outcome"),
+                )
+            })
+            .map_err(|(error, _)| (error, input))
+    }
+
+    pub(in crate::service::coordinator) fn retry_save(
+        &self,
+    ) -> Result<OutputObserver, ServiceError> {
         let intent = {
             let state = self.shared.state();
             if !state.admission_is_current(&self.reservation) {
@@ -153,83 +254,112 @@ impl GenerationOutput {
         Ok(observer)
     }
 
-    fn enqueue(&self, kind: OutputIntentKind) -> Result<OutputObserver, ServiceError> {
-        let mut dispatch_now = None;
-        let observer = {
-            let state = self.shared.state();
-            if !state.admission_is_current(&self.reservation) {
-                return Err(conflict("output persistence is no longer authoritative"));
-            }
-            let cancelled = self.reservation.cancelled.load(Ordering::Acquire);
-            if cancelled
-                && (matches!(&kind, OutputIntentKind::Checkpoint(_))
-                    || matches!(
-                        &kind,
+    fn enqueue(
+        &self,
+        mut kind: OutputIntentKind,
+        allow_cancelled_checkpoint: bool,
+        normalize_completed: bool,
+    ) -> Result<(OutputObserver, Option<ExecutionOutcome>), (ServiceError, bool)> {
+        let mut cancelled_rejection = false;
+        let result = (|| {
+            let mut dispatch_now = None;
+            let (observer, selected_outcome) = {
+                let state = self.shared.state();
+                if !state.admission_is_current(&self.reservation) {
+                    return Err(conflict("output persistence is no longer authoritative"));
+                }
+                let cancelled = self.reservation.is_cancelled();
+                if cancelled {
+                    match &mut kind {
+                        OutputIntentKind::Checkpoint(_) if !allow_cancelled_checkpoint => {
+                            cancelled_rejection = true;
+                            return Err(unavailable("generation output has been cancelled"));
+                        }
                         OutputIntentKind::Final(input)
                             if input.execution_outcome == ExecutionOutcome::Completed
-                    ))
-            {
-                return Err(unavailable("generation output has been cancelled"));
-            }
-            let mut output = self
-                .reservation
-                .output
-                .lock()
-                .map_err(|_| internal("output persistence lock is poisoned"))?;
-            let output = output
-                .as_mut()
-                .ok_or_else(|| conflict("output persistence is no longer active"))?;
-            if output.closed {
-                return Err(conflict("output persistence is already finalized"));
-            }
-            validate_identity(&self.shared, output, &kind)?;
-            if output.failed {
-                return Err(unavailable(
-                    "output save failed; retry the exact retained suffix",
-                ));
-            }
-            if output.pending.is_some() {
-                return Err(busy("output persistence already has a pending suffix"));
-            }
-            let expected_start = output
-                .current
-                .as_ref()
-                .map_or(output.saved_end, OutputIntent::end);
-            if kind.start() != expected_start {
-                return Err(conflict(
-                    "output suffix does not follow the retained prefix",
-                ));
-            }
-            if output.current.as_ref().is_some_and(OutputIntent::is_final) {
-                return Err(conflict("output finalization is already in flight"));
-            }
-            let (outcome, observer) = watch::channel(None);
-            let intent = OutputIntent {
-                sequence: output.next_sequence,
-                kind,
-                outcome,
-            };
-            output.next_sequence = output.next_sequence.saturating_add(1);
-            if output.current.is_none() {
-                output.current = Some(intent.clone());
-                output.status = OutputSavePhase::Saving {
-                    saved_end: output.saved_end,
+                                && normalize_completed =>
+                        {
+                            let input = Arc::make_mut(input);
+                            input.execution_outcome = ExecutionOutcome::Stopped;
+                            input.failure_code = Some("stopped".into());
+                        }
+                        OutputIntentKind::Final(input)
+                            if input.execution_outcome == ExecutionOutcome::Completed =>
+                        {
+                            cancelled_rejection = true;
+                            return Err(unavailable("generation output has been cancelled"));
+                        }
+                        OutputIntentKind::Checkpoint(_) | OutputIntentKind::Final(_) => {}
+                    }
+                }
+                let mut output = self
+                    .reservation
+                    .output
+                    .lock()
+                    .map_err(|_| internal("output persistence lock is poisoned"))?;
+                let output = output
+                    .as_mut()
+                    .ok_or_else(|| conflict("output persistence is no longer active"))?;
+                if output.closed {
+                    return Err(conflict("output persistence is already finalized"));
+                }
+                validate_identity(&self.shared, output, &kind)?;
+                if output.failed && !matches!(&kind, OutputIntentKind::Final(_)) {
+                    return Err(unavailable(
+                        "output save failed; retry the exact retained suffix",
+                    ));
+                }
+                if output.pending.is_some() {
+                    return Err(busy("output persistence already has a pending suffix"));
+                }
+                let expected_start = output
+                    .current
+                    .as_ref()
+                    .map_or(output.saved_end, OutputIntent::end);
+                if kind.start() != expected_start {
+                    return Err(conflict(
+                        "output suffix does not follow the retained prefix",
+                    ));
+                }
+                if output.current.as_ref().is_some_and(OutputIntent::is_final) {
+                    return Err(conflict("output finalization is already in flight"));
+                }
+                if let OutputIntentKind::Final(input) = &kind {
+                    input.validate().map_err(history_error)?;
+                }
+                let selected_outcome = match &kind {
+                    OutputIntentKind::Final(input) => Some(input.execution_outcome),
+                    OutputIntentKind::Checkpoint(_) => None,
                 };
-                dispatch_now = Some(intent);
-            } else {
-                output.pending = Some(intent);
+                let (outcome, observer) = watch::channel(None);
+                let intent = OutputIntent {
+                    sequence: output.next_sequence,
+                    kind,
+                    outcome,
+                };
+                output.next_sequence = output.next_sequence.saturating_add(1);
+                if output.current.is_none() {
+                    output.current = Some(intent.clone());
+                    output.status = OutputSavePhase::Saving {
+                        saved_end: output.saved_end,
+                    };
+                    dispatch_now = Some(intent);
+                } else {
+                    output.pending = Some(intent);
+                }
+                drop(state);
+                (observer, selected_outcome)
+            };
+            if let Some(intent) = dispatch_now {
+                dispatch(
+                    Arc::clone(&self.shared),
+                    Arc::clone(&self.reservation),
+                    intent,
+                );
             }
-            drop(state);
-            observer
-        };
-        if let Some(intent) = dispatch_now {
-            dispatch(
-                Arc::clone(&self.shared),
-                Arc::clone(&self.reservation),
-                intent,
-            );
-        }
-        Ok(observer)
+            Ok((observer, selected_outcome))
+        })();
+        result.map_err(|error| (error, cancelled_rejection))
     }
 }
 
@@ -320,14 +450,14 @@ fn resolve(
             Ok(_) => {
                 published = Err(internal("history owner returned a mismatched suffix range"));
                 output.failed = true;
-                reservation.cancelled.store(true, Ordering::Release);
+                reservation.request_cancel();
                 output.status = OutputSavePhase::SaveFailed {
                     saved_end: output.saved_end,
                 };
             }
             Err(_) => {
                 output.failed = true;
-                reservation.cancelled.store(true, Ordering::Release);
+                reservation.request_cancel();
                 output.status = OutputSavePhase::SaveFailed {
                     saved_end: output.saved_end,
                 };
@@ -336,9 +466,10 @@ fn resolve(
     }
     drop(intent);
     if terminal {
+        reservation.mark_durable_terminal();
         {
             let mut state = shared.state();
-            state.finish_admission(&reservation);
+            state.finish_admission_if_resolved(&reservation);
             outcome.send_replace(Some(published));
         }
         maybe_begin_history_drain(&shared);
@@ -358,6 +489,7 @@ fn validate_identity(
     let input = kind.suffix();
     if input.attempt_id != output.committed.attempt_id
         || input.operation_generation != output.committed.operation_generation
+        || input.owner_epoch != output.committed.owner_epoch
         || input.owner_epoch != shared.boot_epoch
     {
         return Err(conflict(

@@ -4,9 +4,10 @@ use crate::codec::{
     MAX_HISTORY_FRAME_BYTES,
 };
 use crate::protocol::{
-    Capability, ClientEnvelope, DraftCommand, DraftReply, ErrorCategory, Hello, HistoryCommand,
-    HistoryReply, HistoryStatus, Reply, Request, ServerEnvelope, ServiceCommand, ServiceError,
-    ServiceSettingsCommand, ServiceSettingsReply, HISTORY_SCHEMA_VERSION,
+    Capability, ClientEnvelope, DraftCommand, DraftReply, ErrorCategory, GenerationCommand,
+    GenerationReply, Hello, HistoryCommand, HistoryReply, HistoryStatus, Reply, Request,
+    ServerEnvelope, ServiceCommand, ServiceError, ServiceSettingsCommand, ServiceSettingsReply,
+    HISTORY_SCHEMA_VERSION,
 };
 use crate::{peer_credentials, ReplyOutcome};
 use futures_util::{SinkExt, StreamExt};
@@ -58,6 +59,11 @@ pub struct ServiceClient {
     client_build: String,
 }
 
+pub struct PendingGenerationRequest {
+    connection: Connection,
+    target: crate::GenerationTarget,
+}
+
 impl ServiceClient {
     pub fn load(
         data_root: &Path,
@@ -104,9 +110,10 @@ impl ServiceClient {
             ServiceCommand::History { .. }
                 | ServiceCommand::Draft { .. }
                 | ServiceCommand::Settings { .. }
+                | ServiceCommand::Generation { .. }
         ) {
             return Err(ClientError::Transport(
-                "this command requires an explicit protocol 1.1 client entry point".into(),
+                "this command requires an explicit versioned client entry point".into(),
             ));
         }
         command
@@ -134,10 +141,69 @@ impl ServiceClient {
             | ReplyOutcome::Accepted(_)
             | ReplyOutcome::History { .. }
             | ReplyOutcome::Draft { .. }
-            | ReplyOutcome::Settings { .. } => Err(ClientError::Transport(
+            | ReplyOutcome::Settings { .. }
+            | ReplyOutcome::Generation { .. } => Err(ClientError::Transport(
                 "service returned an outcome for a different command".into(),
             )),
         }
+    }
+
+    pub async fn generation_request(
+        &self,
+        mode: ConnectMode,
+        command: GenerationCommand,
+    ) -> Result<GenerationReply, ClientError> {
+        if !command.is_stop() {
+            return Err(ClientError::Transport(
+                "generation Send requires a prepared generation connection".into(),
+            ));
+        }
+        command
+            .validate_shape()
+            .map_err(|error| ClientError::Transport(error.into()))?;
+        let contract = ClientContract::GenerationControl;
+        let mut connection = self.connect_for(mode, contract).await?;
+        if connection.hello.storage_schema != HISTORY_SCHEMA_VERSION
+            || !connection.hello.capabilities.contains(&Capability::History)
+        {
+            return Err(ClientError::Transport(
+                "service generation history is not ready with a supported schema".into(),
+            ));
+        }
+        let outcome = connection
+            .request(ServiceCommand::Generation { command })
+            .await?;
+        match outcome {
+            ReplyOutcome::Generation { reply } => Ok(reply),
+            ReplyOutcome::Rejected(error) => Err(ClientError::Rejected(error)),
+            _ => Err(ClientError::Transport(
+                "service returned an outcome for a different generation command".into(),
+            )),
+        }
+    }
+
+    pub async fn prepare_generation(
+        &self,
+        mode: ConnectMode,
+    ) -> Result<PendingGenerationRequest, ClientError> {
+        let connection = self
+            .connect_for(mode, ClientContract::GenerationRequest)
+            .await?;
+        if connection.hello.storage_schema != HISTORY_SCHEMA_VERSION
+            || !connection.hello.capabilities.contains(&Capability::History)
+        {
+            return Err(ClientError::Transport(
+                "service generation history is not ready with a supported schema".into(),
+            ));
+        }
+        let generation = connection.hello.generation.as_ref().ok_or_else(|| {
+            ClientError::Transport("service did not issue a pending generation identity".into())
+        })?;
+        let target = crate::GenerationTarget::Pending {
+            boot_epoch: connection.hello.boot_epoch.clone(),
+            pending_nonce: generation.pending_nonce.clone(),
+        };
+        Ok(PendingGenerationRequest { connection, target })
     }
 
     pub async fn draft_request(
@@ -365,6 +431,16 @@ impl ServiceClient {
                 self.client_build.clone(),
                 self.bootstrap.root().root_identity(),
             ),
+            ClientContract::GenerationRequest => Hello::generation(
+                self.client_build.clone(),
+                self.bootstrap.root().root_identity(),
+                crate::GenerationConnection::Request,
+            ),
+            ClientContract::GenerationControl => Hello::generation(
+                self.client_build.clone(),
+                self.bootstrap.root().root_identity(),
+                crate::GenerationConnection::Control,
+            ),
         };
         send_frame(
             &mut framed,
@@ -383,7 +459,15 @@ impl ServiceClient {
                 ))
             }
         };
+        let generation_shape_matches = match contract {
+            ClientContract::GenerationRequest => hello.generation.is_some(),
+            ClientContract::GenerationControl
+            | ClientContract::Legacy
+            | ClientContract::HistoryStatus
+            | ClientContract::History => hello.generation.is_none(),
+        };
         if !protocol_is_compatible(hello.protocol, requested_hello.protocol)
+            || !generation_shape_matches
             || hello.root_identity != self.bootstrap.root().root_identity()
             || hello.service_pid != peer.pid
             || hello.origin_sha256 != self.bootstrap.origin().executable_sha256()
@@ -510,11 +594,44 @@ impl Connection {
     }
 }
 
+impl PendingGenerationRequest {
+    pub fn target(&self) -> &crate::GenerationTarget {
+        &self.target
+    }
+
+    pub async fn send(
+        mut self,
+        command: GenerationCommand,
+    ) -> Result<GenerationReply, ClientError> {
+        if command.is_stop() {
+            return Err(ClientError::Transport(
+                "prepared generation connection accepts only Send".into(),
+            ));
+        }
+        command
+            .validate_shape()
+            .map_err(|error| ClientError::Transport(error.into()))?;
+        let outcome = self
+            .connection
+            .request(ServiceCommand::Generation { command })
+            .await?;
+        match outcome {
+            ReplyOutcome::Generation { reply } => Ok(reply),
+            ReplyOutcome::Rejected(error) => Err(ClientError::Rejected(error)),
+            _ => Err(ClientError::Transport(
+                "service returned an outcome for a different generation command".into(),
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ClientContract {
     Legacy,
     HistoryStatus,
     History,
+    GenerationRequest,
+    GenerationControl,
 }
 
 async fn send_frame<T: serde::Serialize>(
@@ -636,7 +753,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     enum TestResponse {
-        Matching(ReplyOutcome),
+        Matching(Box<ReplyOutcome>),
         MismatchedId,
         UnexpectedEnvelope,
         MalformedJson,
@@ -654,6 +771,7 @@ mod tests {
             root_identity: "test-root".into(),
             service_pid: 1,
             origin_sha256: "00".repeat(32),
+            generation: None,
         }
     }
 
@@ -682,7 +800,7 @@ mod tests {
                             &mut server,
                             &ServerEnvelope::Reply(Reply {
                                 request_id: request.request_id,
-                                outcome,
+                                outcome: *outcome,
                             }),
                             REQUEST_TIMEOUT,
                             MAX_FRAME_BYTES,
@@ -749,7 +867,7 @@ mod tests {
     fn connection_request_returns_a_matching_valid_reply() {
         let expected = ReplyOutcome::Rejected(ServiceError::new(ErrorCategory::Busy, "busy"));
         assert_eq!(
-            request_with_response(TestResponse::Matching(expected.clone())).unwrap(),
+            request_with_response(TestResponse::Matching(Box::new(expected.clone()))).unwrap(),
             expected
         );
     }
@@ -825,13 +943,13 @@ mod tests {
     #[test]
     fn stale_client_refuses_a_replaced_root_before_spawning_the_recorded_origin() {
         let parent = tempfile::Builder::new()
-            .prefix("loxa-ipc-client-")
+            .prefix("li-")
             .tempdir_in("/tmp")
             .unwrap();
         let parent = fs::canonicalize(parent.path()).unwrap();
         let forbidden = parent.join("normal");
-        let root = parent.join("development");
-        let moved = parent.join("development-moved");
+        let root = parent.join("dev");
+        let moved = parent.join("dev-moved");
         let origin = parent.join("origin.sh");
         let witness = parent.join("origin-spawned");
         fs::create_dir(&forbidden).unwrap();
