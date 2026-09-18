@@ -61,7 +61,7 @@ fn pending_stop_prevents_fresh_admission_without_tombstoning_a_retry() {
         boot_epoch: "boot".into(),
         pending_nonce: pending.nonce().into(),
     };
-    state.cancel_generation(&target).unwrap();
+    assert!(state.cancel_generation(&target).unwrap().is_none());
     assert_eq!(
         state
             .reserve_pending_admission(&pending, [1; 16], [2; 16], [3; 32], 1, 1)
@@ -71,7 +71,7 @@ fn pending_stop_prevents_fresh_admission_without_tombstoning_a_retry() {
         ErrorCategory::ServiceUnavailable
     );
     assert_eq!(
-        state.cancel_generation(&target).unwrap_err().category,
+        state.cancel_generation(&target).err().unwrap().category,
         ErrorCategory::NotFound
     );
 
@@ -101,7 +101,10 @@ fn cancelled_duplicate_attaches_without_cancelling_the_canonical_admission() {
         boot_epoch: "boot".into(),
         pending_nonce: duplicate.nonce().into(),
     };
-    state.cancel_generation(&duplicate_target).unwrap();
+    assert!(state
+        .cancel_generation(&duplicate_target)
+        .unwrap()
+        .is_none());
     let attached = match state
         .reserve_pending_admission(&duplicate, [1; 16], [2; 16], [3; 32], 1, 1)
         .unwrap()
@@ -114,7 +117,8 @@ fn cancelled_duplicate_attaches_without_cancelling_the_canonical_admission() {
     assert_eq!(
         state
             .cancel_generation(&duplicate_target)
-            .unwrap_err()
+            .err()
+            .unwrap()
             .category,
         ErrorCategory::NotFound
     );
@@ -169,7 +173,42 @@ fn pending_target_follows_its_reservation_and_capacity_waits_for_both_terminals(
         AdmissionClaim::Fresh(admission) => admission,
         AdmissionClaim::Existing(_) => panic!("fresh send attached unexpectedly"),
     };
-    state.cancel_generation(&pending_target).unwrap();
+    let accepted_target = loxa_ipc::GenerationTarget::Accepted {
+        boot_epoch: "boot".into(),
+        submission_id: crate::history::encode_id(admission.submission_id),
+        operation_generation: admission.operation_generation.to_string(),
+    };
+    for target in [
+        loxa_ipc::GenerationTarget::Pending {
+            boot_epoch: "old-boot".into(),
+            pending_nonce: pending.nonce().into(),
+        },
+        loxa_ipc::GenerationTarget::Accepted {
+            boot_epoch: "old-boot".into(),
+            submission_id: crate::history::encode_id(admission.submission_id),
+            operation_generation: admission.operation_generation.to_string(),
+        },
+        loxa_ipc::GenerationTarget::Accepted {
+            boot_epoch: "boot".into(),
+            submission_id: crate::history::encode_id([9; 16]),
+            operation_generation: admission.operation_generation.to_string(),
+        },
+        loxa_ipc::GenerationTarget::Accepted {
+            boot_epoch: "boot".into(),
+            submission_id: crate::history::encode_id(admission.submission_id),
+            operation_generation: "999".into(),
+        },
+    ] {
+        assert_eq!(
+            state.cancel_generation(&target).err().unwrap().category,
+            ErrorCategory::Conflict
+        );
+        assert!(!admission.is_cancelled());
+    }
+    for target in [&pending_target, &accepted_target] {
+        let matched = state.cancel_generation(target).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&matched, &admission));
+    }
     assert!(admission.is_cancelled());
     state.finish_admission(&admission);
 
@@ -180,6 +219,23 @@ fn pending_target_follows_its_reservation_and_capacity_waits_for_both_terminals(
         AdmissionClaim::Fresh(admission) => admission,
         AdmissionClaim::Existing(_) => panic!("fresh reservation attached unexpectedly"),
     };
+    assert_eq!(
+        state
+            .cancel_generation(&pending_target)
+            .err()
+            .unwrap()
+            .category,
+        ErrorCategory::NotFound
+    );
+    assert_eq!(
+        state
+            .cancel_generation(&accepted_target)
+            .err()
+            .unwrap()
+            .category,
+        ErrorCategory::Conflict
+    );
+    assert!(!admission.is_cancelled());
     state.begin_generation_execution(&admission).unwrap();
     admission.mark_durable_terminal();
     assert!(!state.finish_admission_if_resolved(&admission));

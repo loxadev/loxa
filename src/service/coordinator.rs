@@ -282,7 +282,14 @@ impl Coordinator {
         &self,
         target: &loxa_ipc::GenerationTarget,
     ) -> Result<(), ServiceError> {
-        self.shared.state().cancel_generation(target)
+        let admission = {
+            let mut state = self.shared.state();
+            state.cancel_generation(target)?
+        };
+        if let Some(admission) = admission {
+            history::maybe_resume_admission(Arc::clone(&self.shared), admission);
+        }
+        Ok(())
     }
 
     pub(super) fn status(&self) -> RuntimeStatus {

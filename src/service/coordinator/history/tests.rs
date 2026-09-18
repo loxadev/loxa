@@ -5,7 +5,7 @@ use crate::runtime_fingerprint::{EffectiveProfile, RuntimeFingerprint};
 use crate::service::coordinator::generation::parser::SseDecoder;
 use crate::service::coordinator::generation::persistence::{OutputPipeline, SaveChunkFailure};
 use crate::service::coordinator::{Coordinator, HistoryExit, OwnerExit};
-use loxa_ipc::{ErrorCategory, HistoryCommand, HistoryPhase, HistoryReply};
+use loxa_ipc::{ErrorCategory, GenerationTarget, HistoryCommand, HistoryPhase, HistoryReply};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
@@ -100,6 +100,80 @@ impl Fixture {
                 draft: None,
             },
         }
+    }
+
+    fn reserve_pending(
+        &self,
+        input: &AdmissionInput,
+    ) -> (Arc<AdmissionReservation>, GenerationTarget) {
+        let pending = self.coordinator.register_generation_connection().unwrap();
+        let target = GenerationTarget::Pending {
+            boot_epoch: self.coordinator.boot_epoch().into(),
+            pending_nonce: pending.nonce().into(),
+        };
+        let claim = self.coordinator.shared.state().reserve_pending_admission(
+            &pending.pending,
+            input.conversation_id,
+            input.submission_id,
+            input.semantic_hash(),
+            input.expected_conversation_revision,
+            input.expected_profile_revision,
+        );
+        let AdmissionClaim::Fresh(reservation) = claim.unwrap() else {
+            panic!("pending admission was not fresh");
+        };
+        (reservation, target)
+    }
+
+    async fn assert_recovered_before_execution(
+        &self,
+        reservation: &Arc<AdmissionReservation>,
+        committed: &CommittedAdmission,
+    ) {
+        assert_eq!(committed.submission_id, reservation.submission_id);
+        assert_eq!(committed.conversation_id, reservation.conversation_id);
+        assert_eq!(
+            committed.operation_generation,
+            reservation.operation_generation
+        );
+        assert_eq!(committed.owner_epoch, self.coordinator.boot_epoch());
+        assert!(!self.coordinator.admission_active_for_test());
+        assert!(reservation.output.lock().unwrap().is_none());
+        assert!(matches!(
+            self.coordinator.status().phase,
+            loxa_ipc::RuntimePhase::Ready { .. }
+        ));
+        assert!(self.coordinator.history_is_ready());
+        assert_terminalized(&self.root);
+
+        let connection = rusqlite::Connection::open(self.root.join("app.sqlite")).unwrap();
+        let (attempts, matching): (i64, i64) = connection
+            .query_row(
+                "SELECT COUNT(*), COUNT(CASE WHEN id = ?1 AND submission_id = ?2
+                     AND owner_epoch = ?3 AND operation_generation = ?4 THEN 1 END)
+                 FROM attempts",
+                rusqlite::params![
+                    committed.attempt_id.as_slice(),
+                    reservation.submission_id.as_slice(),
+                    self.coordinator.boot_epoch(),
+                    reservation.operation_generation,
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((attempts, matching), (1, 1));
+        connection.close().unwrap();
+
+        let (renamed, permit) = self
+            .coordinator
+            .history(HistoryCommand::RenameConversation {
+                conversation_id: self.conversation_id.clone(),
+                expected_revision: committed.post_conversation_revision.to_string(),
+                title: "Recovered".into(),
+            })
+            .await;
+        drop(permit);
+        assert!(matches!(renamed.unwrap(), HistoryReply::Conversation(_)));
     }
 
     async fn finish_stopped(&self) {
@@ -375,6 +449,180 @@ async fn lost_admission_reply_and_terminal_failure_retry_under_drain() {
     );
     fixture.finish_stopped().await;
     assert_terminalized(&fixture.root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn targeted_stop_retries_failed_pre_execution_save_once() {
+    for accepted_target in [false, true] {
+        let fixture = Fixture::start().await;
+        fixture
+            .coordinator
+            .fail_next_stop_before_execution_for_test();
+        let commit = Arc::new(Barrier::new(2));
+        fixture
+            .coordinator
+            .set_admission_commit_barrier_for_test(Arc::clone(&commit));
+        let input = fixture.input(19, "recover targeted stop");
+        let (reservation, pending_target) = fixture.reserve_pending(&input);
+        let target = if accepted_target {
+            GenerationTarget::Accepted {
+                boot_epoch: fixture.coordinator.boot_epoch().into(),
+                submission_id: crate::history::encode_id(reservation.submission_id),
+                operation_generation: reservation.operation_generation.to_string(),
+            }
+        } else {
+            pending_target
+        };
+        // Drive the admission boundary directly; no generation relay is started.
+        let observer = fixture
+            .coordinator
+            .dispatch_reserved_admission(
+                input,
+                reservation.submission_hash,
+                Arc::clone(&reservation),
+            )
+            .unwrap();
+        commit.wait();
+        let stopped = fixture.coordinator.stop_generation(&target);
+        commit.wait();
+        stopped.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !reservation.stop_retry_ready() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first stop save did not reach its retry state");
+        assert!(observer.borrow().is_none());
+        assert!(reservation.is_cancelled());
+        assert!(fixture.coordinator.admission_active_for_test());
+        assert!(fixture
+            .coordinator
+            .shared
+            .state()
+            .begin_generation_execution(&reservation)
+            .is_err());
+        assert_eq!(reservation.recovery_claims.load(Ordering::Relaxed), 0);
+
+        let recovery = Arc::new(Barrier::new(2));
+        fixture
+            .coordinator
+            .stall_history_for_test(Arc::clone(&recovery));
+        recovery.wait();
+        let replies: Vec<_> = (0..8)
+            .map(|_| fixture.coordinator.stop_generation(&target))
+            .collect();
+        let claims = reservation.recovery_claims.load(Ordering::Relaxed);
+        let retry_ready = reservation.stop_retry_ready();
+        let unresolved = observer.borrow().is_none();
+        recovery.wait();
+        for reply in replies {
+            reply.unwrap();
+        }
+        assert_eq!(claims, 1);
+        assert!(!retry_ready);
+        assert!(unresolved);
+
+        let committed = tokio::time::timeout(Duration::from_secs(2), wait_for_admission(observer))
+            .await
+            .expect("targeted Stop did not resolve the original admission")
+            .unwrap();
+        assert_eq!(reservation.recovery_claims.load(Ordering::Relaxed), 1);
+        fixture
+            .assert_recovered_before_execution(&reservation, &committed)
+            .await;
+        fixture.coordinator.stop_service().unwrap();
+        fixture.finish_stopped().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn targeted_stop_reconciles_a_lost_admission_reply_without_replay() {
+    let fixture = Fixture::start().await;
+    fixture.coordinator.drop_next_admission_reply_for_test();
+    let input = fixture.input(20, "recover lost admission reply");
+    let (reservation, target) = fixture.reserve_pending(&input);
+    let observer = fixture
+        .coordinator
+        .dispatch_reserved_admission(input, reservation.submission_hash, Arc::clone(&reservation))
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !reservation.admission_retry_ready() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("lost admission reply did not reach its retry state");
+    let expected = fixture
+        .coordinator
+        .shared
+        .history
+        .lookup_submission(reservation.submission_id, reservation.submission_hash)
+        .await
+        .unwrap()
+        .expect("admission committed before its reply was lost");
+
+    let unrelated = fixture
+        .coordinator
+        .register_generation_connection()
+        .unwrap();
+    let unrelated_target = GenerationTarget::Pending {
+        boot_epoch: fixture.coordinator.boot_epoch().into(),
+        pending_nonce: unrelated.nonce().into(),
+    };
+    fixture
+        .coordinator
+        .stop_generation(&unrelated_target)
+        .unwrap();
+    for invalid in [
+        GenerationTarget::Pending {
+            boot_epoch: "old-boot".into(),
+            pending_nonce: match &target {
+                GenerationTarget::Pending { pending_nonce, .. } => pending_nonce.clone(),
+                GenerationTarget::Accepted { .. } => unreachable!(),
+            },
+        },
+        GenerationTarget::Accepted {
+            boot_epoch: fixture.coordinator.boot_epoch().into(),
+            submission_id: crate::history::encode_id([21; 16]),
+            operation_generation: reservation.operation_generation.to_string(),
+        },
+    ] {
+        assert_eq!(
+            fixture
+                .coordinator
+                .stop_generation(&invalid)
+                .unwrap_err()
+                .category,
+            ErrorCategory::Conflict
+        );
+    }
+    drop(unrelated);
+    assert_eq!(
+        fixture
+            .coordinator
+            .stop_generation(&unrelated_target)
+            .unwrap_err()
+            .category,
+        ErrorCategory::NotFound
+    );
+    assert!(!reservation.is_cancelled());
+    assert!(reservation.admission_retry_ready());
+    assert_eq!(reservation.recovery_claims.load(Ordering::Relaxed), 0);
+    assert!(observer.borrow().is_none());
+
+    fixture.coordinator.stop_generation(&target).unwrap();
+    let committed = tokio::time::timeout(Duration::from_secs(2), wait_for_admission(observer))
+        .await
+        .expect("targeted Stop did not reconcile the lost admission reply")
+        .unwrap();
+    assert_eq!(committed, expected);
+    assert_eq!(reservation.recovery_claims.load(Ordering::Relaxed), 1);
+    fixture
+        .assert_recovered_before_execution(&reservation, &committed)
+        .await;
+    fixture.coordinator.stop_service().unwrap();
+    fixture.finish_stopped().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -72,6 +72,8 @@ pub(super) struct AdmissionReservation {
     durable_terminal: AtomicBool,
     outcome: watch::Sender<Option<Result<crate::history::CommittedAdmission, ServiceError>>>,
     recovery: Mutex<AdmissionRecovery>,
+    #[cfg(test)]
+    pub(super) recovery_claims: AtomicU64,
     pub(super) output: Mutex<Option<OutputState>>,
 }
 
@@ -173,6 +175,8 @@ impl AdmissionReservation {
             AdmissionRecovery::AdmissionUnknown(prepared) => {
                 let prepared = Arc::clone(prepared);
                 *recovery = AdmissionRecovery::AdmissionInFlight(Arc::clone(&prepared));
+                #[cfg(test)]
+                self.recovery_claims.fetch_add(1, Ordering::Relaxed);
                 Some(AdmissionRecoveryAction::Lookup(prepared))
             }
             AdmissionRecovery::StopUnknown(prepared, committed) => {
@@ -180,6 +184,8 @@ impl AdmissionReservation {
                 let committed = committed.clone();
                 *recovery =
                     AdmissionRecovery::StopInFlight(Arc::clone(&prepared), committed.clone());
+                #[cfg(test)]
+                self.recovery_claims.fetch_add(1, Ordering::Relaxed);
                 Some(AdmissionRecoveryAction::Stop(prepared, committed))
             }
             _ => None,
@@ -206,6 +212,15 @@ impl AdmissionReservation {
         *output = Some(OutputState::new(committed));
         *recovery = AdmissionRecovery::OutputOwned;
         true
+    }
+
+    #[cfg(test)]
+    pub(super) fn admission_retry_ready(&self) -> bool {
+        let recovery = self
+            .recovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        matches!(&*recovery, AdmissionRecovery::AdmissionUnknown(_))
     }
 
     #[cfg(test)]

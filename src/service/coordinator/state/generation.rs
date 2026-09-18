@@ -300,6 +300,8 @@ impl CoordinatorState {
             durable_terminal: AtomicBool::new(false),
             outcome,
             recovery: Mutex::new(AdmissionRecovery::Preparing),
+            #[cfg(test)]
+            recovery_claims: std::sync::atomic::AtomicU64::new(0),
             output: Mutex::new(None),
         });
         self.admission = Some(Arc::clone(&reservation));
@@ -324,7 +326,7 @@ impl CoordinatorState {
     pub(in crate::service::coordinator) fn cancel_generation(
         &mut self,
         target: &GenerationTarget,
-    ) -> Result<(), ServiceError> {
+    ) -> Result<Option<Arc<AdmissionReservation>>, ServiceError> {
         match target {
             GenerationTarget::Pending {
                 boot_epoch,
@@ -342,14 +344,14 @@ impl CoordinatorState {
                     .find(|pending| pending.nonce == *pending_nonce)
                 {
                     pending.request_cancel();
-                    return Ok(());
+                    return Ok(None);
                 }
                 if let Some(admission) = self.admission.as_ref().filter(|admission| {
                     admission.pending_nonce.as_deref() == Some(pending_nonce.as_str())
                 }) {
                     admission.request_cancel();
                     self.request_engine_cleanup_if_needed(admission);
-                    return Ok(());
+                    return Ok(Some(Arc::clone(admission)));
                 }
                 Err(ServiceError::new(
                     ErrorCategory::NotFound,
@@ -375,7 +377,7 @@ impl CoordinatorState {
                 }
                 admission.request_cancel();
                 self.request_engine_cleanup_if_needed(admission);
-                Ok(())
+                Ok(Some(Arc::clone(admission)))
             }
         }
     }
