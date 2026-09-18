@@ -32,6 +32,7 @@ hyper = { version = "1.10.1", default-features = false, features = ["client", "h
 hyper-util = { version = "0.1.20", default-features = false, features = ["tokio"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 tokio = { version = "1.53.1", default-features = false, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7.19", default-features = false, features = ["rt"] }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 
 [target.'cfg(unix)'.dependencies]
@@ -42,6 +43,7 @@ sysinfo = { version = "0.39.5", default-features = false, features = ["disk", "s
 
 [dev-dependencies]
 tempfile = "3.27.0"
+tokio = { version = "1.53.1", default-features = false, features = ["test-util"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "json", "std"] }
 
 [workspace]

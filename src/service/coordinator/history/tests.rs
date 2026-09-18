@@ -11,6 +11,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
+mod preflight;
+
 struct Fixture {
     _directory: tempfile::TempDir,
     root: PathBuf,
@@ -21,6 +23,14 @@ struct Fixture {
 
 impl Fixture {
     async fn start() -> Self {
+        Self::start_with_engine(super::super::state::EngineDescriptor {
+            pid: 42,
+            endpoint: Arc::new("/tmp/loxa-history-test-engine.sock".into()),
+        })
+        .await
+    }
+
+    async fn start_with_engine(engine: super::super::state::EngineDescriptor) -> Self {
         let directory = tempfile::Builder::new()
             .prefix("lc-")
             .tempdir_in("/tmp")
@@ -72,7 +82,7 @@ impl Fixture {
             panic!("create conversation returned the wrong reply");
         };
         let conversation_bytes = decode_id(&conversation.id);
-        coordinator.force_ready_for_history_test(fingerprint);
+        coordinator.force_ready_for_history_test(fingerprint, engine);
         Self {
             _directory: directory,
             root,

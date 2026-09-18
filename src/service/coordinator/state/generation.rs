@@ -6,7 +6,8 @@ use loxa_ipc::{ErrorCategory, GenerationTarget, ServiceError};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{watch, Notify};
+use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 const MAX_PENDING_GENERATIONS: usize = 16;
 
@@ -18,40 +19,7 @@ pub(in crate::service::coordinator) struct EngineDescriptor {
 
 pub(in crate::service::coordinator) struct PendingGeneration {
     nonce: String,
-    cancellation: Arc<Cancellation>,
-}
-
-pub(super) struct Cancellation {
-    cancelled: AtomicBool,
-    wake: Notify,
-}
-
-impl Cancellation {
-    pub(super) fn new() -> Self {
-        Self {
-            cancelled: AtomicBool::new(false),
-            wake: Notify::new(),
-        }
-    }
-
-    pub(super) fn request(&self) {
-        self.cancelled.store(true, Ordering::Release);
-        self.wake.notify_waiters();
-    }
-
-    pub(super) fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
-    }
-
-    pub(super) async fn wait(&self) {
-        loop {
-            let notified = self.wake.notified();
-            if self.is_cancelled() {
-                return;
-            }
-            notified.await;
-        }
-    }
+    cancellation: CancellationToken,
 }
 
 impl PendingGeneration {
@@ -60,7 +28,7 @@ impl PendingGeneration {
     }
 
     pub(super) fn request_cancel(&self) {
-        self.cancellation.request();
+        self.cancellation.cancel();
     }
 
     pub(super) fn is_cancelled(&self) -> bool {
@@ -70,11 +38,11 @@ impl PendingGeneration {
 
 impl AdmissionReservation {
     pub(in crate::service::coordinator) fn request_cancel(&self) {
-        self.cancellation.request();
+        self.cancellation.cancel();
     }
 
     pub(in crate::service::coordinator) async fn wait_cancelled(&self) {
-        self.cancellation.wait().await;
+        self.cancellation.cancelled().await;
     }
 
     pub(in crate::service::coordinator) fn is_cancelled(&self) -> bool {
@@ -128,7 +96,7 @@ impl CoordinatorState {
         })?;
         let pending = Arc::new(PendingGeneration {
             nonce,
-            cancellation: Arc::new(Cancellation::new()),
+            cancellation: CancellationToken::new(),
         });
         self.pending_generations.push(Arc::clone(&pending));
         Ok(pending)
@@ -159,7 +127,7 @@ impl CoordinatorState {
             expected_conversation_revision,
             expected_profile_revision,
             None,
-            Arc::new(Cancellation::new()),
+            CancellationToken::new(),
         )
     }
 
@@ -213,7 +181,7 @@ impl CoordinatorState {
             expected_conversation_revision,
             expected_profile_revision,
             Some(pending.nonce.clone()),
-            Arc::clone(&pending.cancellation),
+            pending.cancellation.clone(),
         )
     }
 
@@ -226,7 +194,7 @@ impl CoordinatorState {
         expected_conversation_revision: i64,
         expected_profile_revision: i64,
         pending_nonce: Option<String>,
-        cancellation: Arc<Cancellation>,
+        cancellation: CancellationToken,
     ) -> Result<AdmissionClaim, ServiceError> {
         if self.draining.load(Ordering::Acquire) {
             return Err(ServiceError::new(

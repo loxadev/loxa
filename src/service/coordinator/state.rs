@@ -5,11 +5,11 @@ use loxa_ipc::{
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 use super::history::OutputState;
 
 mod generation;
-use generation::Cancellation;
 pub(super) use generation::{EngineDescriptor, PendingGeneration};
 
 // All admission and publication decisions run under Shared::state. The watch
@@ -67,7 +67,7 @@ pub(super) struct AdmissionReservation {
     pub(super) fingerprint: Arc<crate::runtime_fingerprint::RuntimeFingerprint>,
     pub(super) engine: EngineDescriptor,
     pending_nonce: Option<String>,
-    cancellation: Arc<Cancellation>,
+    cancellation: CancellationToken,
     engine_quiescent: AtomicBool,
     durable_terminal: AtomicBool,
     outcome: watch::Sender<Option<Result<crate::history::CommittedAdmission, ServiceError>>>,

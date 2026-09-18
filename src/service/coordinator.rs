@@ -718,6 +718,7 @@ impl Coordinator {
     pub(super) fn force_ready_for_history_test(
         &self,
         fingerprint: Arc<crate::runtime_fingerprint::RuntimeFingerprint>,
+        engine: state::EngineDescriptor,
     ) {
         let mut state = self.shared.state();
         let operation = state
@@ -729,10 +730,7 @@ impl Coordinator {
         assert!(state.advance(
             &operation,
             state::OperationPhase::Ready {
-                engine: state::EngineDescriptor {
-                    pid: 42,
-                    endpoint: Arc::new("/tmp/loxa-history-test-engine.sock".into()),
-                },
+                engine,
                 fingerprint,
             },
         ));

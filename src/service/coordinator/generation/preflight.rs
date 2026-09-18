@@ -7,8 +7,11 @@ use hyper::body::Bytes;
 use hyper::Method;
 use loxa_ipc::{ErrorCategory, ServiceError};
 use serde::Deserialize;
+use std::time::Duration;
 
 const MAX_TEMPLATE_BASIS_BYTES: usize = 64 * 1024;
+// One total control budget leaves headroom under the client's five-second reply wait.
+const PREFLIGHT_CONTROL_TIMEOUT: Duration = Duration::from_secs(4);
 
 pub(super) struct QualifiedRequest {
     pub(super) request: PreparedEngineRequest,
@@ -41,6 +44,24 @@ impl QualifiedRequest {
 }
 
 pub(super) async fn qualify(
+    runtime_identity: RuntimeIdentity,
+    reservation: &AdmissionReservation,
+    prompt: &PromptPreparation,
+) -> Result<QualifiedRequest, ServiceError> {
+    tokio::time::timeout(
+        PREFLIGHT_CONTROL_TIMEOUT,
+        qualify_engine(runtime_identity, reservation, prompt),
+    )
+    .await
+    .map_err(|_| {
+        ServiceError::new(
+            ErrorCategory::ServiceUnavailable,
+            "engine preflight timed out before generation admission",
+        )
+    })?
+}
+
+async fn qualify_engine(
     runtime_identity: RuntimeIdentity,
     reservation: &AdmissionReservation,
     prompt: &PromptPreparation,
