@@ -1,7 +1,7 @@
 use super::{
-    admission, conversations, drafts, schema, AdmissionCompletion, AdmissionKind, DraftCompletion,
-    HistoryCommand, HistoryCompletion, HistoryErrorKind, HistoryExit, HistoryHandle,
-    ProfileCompletion, RequiredCompletion, SuffixCompletion,
+    admission, conversations, drafts, prompt, schema, AdmissionCompletion, AdmissionKind,
+    DraftCompletion, HistoryCommand, HistoryCompletion, HistoryErrorKind, HistoryExit,
+    HistoryHandle, ProfileCompletion, PromptCompletion, RequiredCompletion, SuffixCompletion,
 };
 use loxa_ipc::HistoryStatus;
 use std::collections::VecDeque;
@@ -157,6 +157,30 @@ pub(super) fn run(
                     )),
                 };
                 let _ = reply.send(DraftCompletion { result, permit });
+            }
+            Ok(HistoryCommand::PreparePrompt {
+                conversation_id,
+                expected_conversation_revision,
+                expected_profile_revision,
+                current_user_text,
+                reply,
+                permit,
+            }) => {
+                interrupt_on_drain.store(true, Ordering::Release);
+                let result = match connection.as_ref() {
+                    Some(WorkerStore::Ready(store)) => prompt::prepare(
+                        store,
+                        conversation_id,
+                        expected_conversation_revision,
+                        expected_profile_revision,
+                        current_user_text,
+                    ),
+                    Some(WorkerStore::Unavailable(_)) | None => Err(super::HistoryError::new(
+                        HistoryErrorKind::WorkerUnavailable,
+                        "history store is unavailable",
+                    )),
+                };
+                let _ = reply.send(PromptCompletion { result, permit });
             }
             Ok(HistoryCommand::LookupSubmission {
                 submission_id,

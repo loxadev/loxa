@@ -5,7 +5,6 @@ use hyper::body::Bytes;
 use hyper::{Method, Request};
 use hyper_util::rt::TokioIo;
 use loxa_ipc::{ConnectMode, OperationTarget, ReplyOutcome, RuntimePhase, ServiceClient};
-use std::cell::Cell;
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -78,13 +77,13 @@ async fn transfer(
     consume: impl FnMut(hyper::StatusCode, &[u8]) -> Result<bool, String>,
 ) -> Result<(), String> {
     let attached = observe_ready(client, model_id, expected).await?;
-    let authenticated = Cell::new(None);
+    let mut authenticated = None;
     let stream = tokio::time::timeout(
         Duration::from_secs(2),
         crate::runner::service_transport::connect_authenticated(
             &attached.socket,
             attached.engine_pid,
-            &authenticated,
+            &mut authenticated,
         ),
     )
     .await

@@ -134,6 +134,7 @@ fn prepared_admission_with_basis(
         generation,
         Arc::new(generic_service_fingerprint()),
         RuntimeIdentity::BundledB10344,
+        4096,
         String::new(),
         512,
         prompt_basis,
@@ -611,6 +612,7 @@ fn conversation_profiles_freeze_creation_defaults_reset_to_captured_globals_and_
         91,
         Arc::new(generic_service_fingerprint()),
         RuntimeIdentity::BundledB10344,
+        4096,
         current_global.system_instruction.clone(),
         i64::from(current_global.max_output_tokens),
         PromptBasis {

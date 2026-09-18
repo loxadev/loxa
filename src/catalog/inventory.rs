@@ -1,5 +1,5 @@
 //! Catalog observation and the existing qualified-bundle reconciliation entry.
-use super::{local, Manifest};
+use super::{local, Manifest, MAX_CATALOG_MANIFEST_BYTES};
 use std::fs;
 use std::path::Path;
 
@@ -19,7 +19,10 @@ pub fn load_catalog(models_root: &Path) -> Result<Vec<Manifest>, String> {
             continue;
         }
         let manifest_path = path.join("manifest.json");
-        let bytes = match crate::safe_file::read_regular_file(&manifest_path) {
+        let bytes = match crate::safe_file::read_regular_file_bounded(
+            &manifest_path,
+            MAX_CATALOG_MANIFEST_BYTES,
+        ) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(format!("{}: {error}", manifest_path.display())),

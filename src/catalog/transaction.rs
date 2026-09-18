@@ -1,4 +1,4 @@
-use super::{ArtifactProvenance, ArtifactRole, Manifest};
+use super::{ArtifactProvenance, ArtifactRole, Manifest, MAX_CATALOG_MANIFEST_BYTES};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -340,7 +340,8 @@ fn write_bundle_manifest_temp(
 }
 
 fn read_regular_manifest(path: &Path) -> Result<Option<Manifest>, String> {
-    let bytes = match crate::safe_file::read_regular_file(path) {
+    let bytes = match crate::safe_file::read_regular_file_bounded(path, MAX_CATALOG_MANIFEST_BYTES)
+    {
         Ok(bytes) => bytes,
         Err(_) => return Ok(None),
     };

@@ -16,7 +16,33 @@ use tokio::sync::{oneshot, watch, OwnedSemaphorePermit};
 mod state;
 mod worker;
 use state::CoordinatorState;
+mod generation;
 mod history;
+#[cfg(all(test, target_os = "macos"))]
+mod native_test_gate;
+#[cfg(all(test, target_os = "macos"))]
+pub(in crate::service) use generation::run_bundled_generation_acceptance;
+
+pub(super) struct PendingGenerationConnection {
+    coordinator: Coordinator,
+    pending: Arc<state::PendingGeneration>,
+}
+
+impl PendingGenerationConnection {
+    pub(super) fn nonce(&self) -> &str {
+        self.pending.nonce()
+    }
+}
+
+impl Drop for PendingGenerationConnection {
+    fn drop(&mut self) {
+        self.coordinator
+            .shared
+            .state()
+            .finish_pending_generation(&self.pending);
+        history::maybe_begin_history_drain(&self.coordinator.shared);
+    }
+}
 
 #[derive(Clone)]
 pub(super) struct Coordinator {
@@ -50,6 +76,10 @@ struct Shared {
     admission_pre_lookup_barrier: Mutex<Option<Arc<std::sync::Barrier>>>,
     #[cfg(test)]
     output_handoff_barrier: Mutex<Option<Arc<std::sync::Barrier>>>,
+    #[cfg(all(test, target_os = "macos"))]
+    native_admission_completion_gate: Mutex<Option<Arc<native_test_gate::NativeTestGate>>>,
+    #[cfg(all(test, target_os = "macos"))]
+    native_generation_execution_gate: Mutex<Option<Arc<native_test_gate::NativeTestGate>>>,
     #[cfg(test)]
     settings_drain_barrier: Mutex<Option<Arc<std::sync::Barrier>>>,
 }
@@ -180,6 +210,10 @@ impl Coordinator {
             admission_pre_lookup_barrier: Mutex::new(None),
             #[cfg(test)]
             output_handoff_barrier: Mutex::new(None),
+            #[cfg(all(test, target_os = "macos"))]
+            native_admission_completion_gate: Mutex::new(None),
+            #[cfg(all(test, target_os = "macos"))]
+            native_generation_execution_gate: Mutex::new(None),
             #[cfg(test)]
             settings_drain_barrier: Mutex::new(None),
         });
@@ -225,6 +259,37 @@ impl Coordinator {
 
     pub(super) fn boot_epoch(&self) -> &str {
         &self.shared.boot_epoch
+    }
+
+    pub(super) fn register_generation_connection(
+        &self,
+    ) -> Result<PendingGenerationConnection, ServiceError> {
+        let pending = self.shared.state().register_pending_generation()?;
+        Ok(PendingGenerationConnection {
+            coordinator: self.clone(),
+            pending,
+        })
+    }
+
+    pub(super) fn finish_generation_connection(&self, pending: &PendingGenerationConnection) {
+        self.shared
+            .state()
+            .finish_pending_generation(&pending.pending);
+        history::maybe_begin_history_drain(&self.shared);
+    }
+
+    pub(super) fn stop_generation(
+        &self,
+        target: &loxa_ipc::GenerationTarget,
+    ) -> Result<(), ServiceError> {
+        let admission = {
+            let mut state = self.shared.state();
+            state.cancel_generation(target)?
+        };
+        if let Some(admission) = admission {
+            history::maybe_resume_admission(Arc::clone(&self.shared), admission);
+        }
+        Ok(())
     }
 
     pub(super) fn status(&self) -> RuntimeStatus {
@@ -650,9 +715,10 @@ impl Coordinator {
     }
 
     #[cfg(test)]
-    pub(super) fn force_ready_for_history_test(
+    fn force_ready_for_history_test(
         &self,
         fingerprint: Arc<crate::runtime_fingerprint::RuntimeFingerprint>,
+        engine: state::EngineDescriptor,
     ) {
         let mut state = self.shared.state();
         let operation = state
@@ -664,7 +730,7 @@ impl Coordinator {
         assert!(state.advance(
             &operation,
             state::OperationPhase::Ready {
-                engine_pid: 42,
+                engine,
                 fingerprint,
             },
         ));
