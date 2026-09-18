@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 
 #[cfg(test)]
 use super::{Artifact, ArtifactProvenance, ArtifactRole, RuntimeQualification};
-use super::{Manifest, Origin};
+use super::{Manifest, Origin, MAX_CATALOG_MANIFEST_BYTES};
 
 pub(crate) struct CapturedAdoption {
     pub(crate) manifest: Manifest,
@@ -363,9 +363,9 @@ fn read_local_pending(path: &Path) -> Result<Option<Manifest>, String> {
             return Ok(None);
         }
     }
-    let manifest: Manifest = match serde_json::from_slice(
-        &fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?,
-    ) {
+    let bytes = crate::safe_file::read_regular_file_bounded(path, MAX_CATALOG_MANIFEST_BYTES)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let manifest: Manifest = match serde_json::from_slice(&bytes) {
         Ok(manifest) => manifest,
         Err(_) => return Ok(None),
     };
@@ -1481,16 +1481,50 @@ mod tests {
         let candidate = discover(root.path()).unwrap().pop().unwrap();
         let manifest = adopt(root.path(), &candidate).unwrap();
         let model_dir = root.path().join(&manifest.id);
-        std::fs::write(
-            model_dir.join("pending.json"),
-            serde_json::to_vec(&manifest).unwrap(),
-        )
-        .unwrap();
+        let mut pending = serde_json::to_vec(&manifest).unwrap();
+        pending.resize(MAX_CATALOG_MANIFEST_BYTES, b' ');
+        std::fs::write(model_dir.join("pending.json"), pending).unwrap();
 
         recover_pending(root.path()).unwrap();
 
         assert!(model_dir.join("manifest.json").is_file());
         assert!(!model_dir.join("pending.json").exists());
+    }
+
+    #[test]
+    fn recovery_refuses_oversized_pending_metadata_without_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let artifact = gguf(3);
+        let manifest = install_local(root.path(), "demo", &artifact);
+        let model_dir = root.path().join(&manifest.id);
+        let manifest_path = model_dir.join("manifest.json");
+        let before = std::fs::read(&manifest_path).unwrap();
+        let pending_path = model_dir.join("pending.json");
+        let mut pending = serde_json::to_vec(&manifest).unwrap();
+        pending.resize(MAX_CATALOG_MANIFEST_BYTES + 1, b' ');
+        for sparse in [false, true] {
+            if sparse {
+                File::create(&pending_path)
+                    .unwrap()
+                    .set_len(pending.len() as u64)
+                    .unwrap();
+            } else {
+                std::fs::write(&pending_path, &pending).unwrap();
+            }
+
+            let error = recover_pending(root.path()).unwrap_err();
+
+            assert!(error.contains("exceeds its byte limit"), "{error}");
+            assert_eq!(
+                std::fs::metadata(&pending_path).unwrap().len(),
+                pending.len() as u64
+            );
+            assert_eq!(std::fs::read(&manifest_path).unwrap(), before);
+            assert_eq!(
+                std::fs::read(model_dir.join("model.gguf")).unwrap(),
+                artifact
+            );
+        }
     }
 
     #[test]

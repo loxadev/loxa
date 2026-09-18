@@ -1076,7 +1076,7 @@ fn generated_catalog_manifest_over_limit_fails_before_transfer_mutation() {
     let service = test_service(root.path());
     let remote_filename = format!(
         "{}.gguf",
-        "a".repeat(crate::catalog::transfer::MAX_CATALOG_MANIFEST_BYTES)
+        "a".repeat(crate::catalog::MAX_CATALOG_MANIFEST_BYTES)
     );
     let artifact = crate::huggingface::test_resolved_file_for(
         "owner/repo",
