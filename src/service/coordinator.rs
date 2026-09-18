@@ -715,7 +715,7 @@ impl Coordinator {
     }
 
     #[cfg(test)]
-    pub(super) fn force_ready_for_history_test(
+    fn force_ready_for_history_test(
         &self,
         fingerprint: Arc<crate::runtime_fingerprint::RuntimeFingerprint>,
         engine: state::EngineDescriptor,
