@@ -380,7 +380,7 @@ fn read_local_pending(path: &Path) -> Result<Option<Manifest>, String> {
 
 fn candidate_id(filename: &str) -> Option<String> {
     let extension = filename.len().checked_sub(5)?;
-    if !filename[extension..].eq_ignore_ascii_case(".gguf") {
+    if !filename.get(extension..)?.eq_ignore_ascii_case(".gguf") {
         return None;
     }
     let stem = &filename[..extension];
@@ -1195,10 +1195,12 @@ mod tests {
     }
 
     #[test]
-    fn discovers_an_immediate_regular_gguf_without_mutating_the_store() {
+    fn discovers_regular_gguf_beside_utf8_non_model_without_mutating_the_store() {
         let root = tempfile::tempdir().unwrap();
         let model = root.path().join("Gemma 4.Q4_K_M.gguf");
         std::fs::write(&model, gguf(3)).unwrap();
+        let unrelated = root.path().join("é.txt");
+        std::fs::write(&unrelated, b"notes").unwrap();
 
         let candidates = discover(root.path()).unwrap();
 
@@ -1213,7 +1215,8 @@ mod tests {
             }]
         );
         assert!(model.is_file());
-        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+        assert_eq!(std::fs::read(&unrelated).unwrap(), b"notes");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 2);
     }
 
     #[test]
