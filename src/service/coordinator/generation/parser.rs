@@ -6,6 +6,13 @@ use std::fmt;
 pub(super) const MAX_EVENT_BYTES: usize = 1024 * 1024;
 pub(super) const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::service::coordinator) enum DecodeError {
+    OutputLimit,
+    EventLimit,
+    InvalidStream(&'static str),
+}
+
 pub(in crate::service::coordinator) struct DecodeStep {
     pub(in crate::service::coordinator) consumed: usize,
     pub(in crate::service::coordinator) chunk: Option<String>,
@@ -81,9 +88,11 @@ impl SseDecoder {
     pub(in crate::service::coordinator) fn push(
         &mut self,
         bytes: &[u8],
-    ) -> Result<DecodeStep, String> {
+    ) -> Result<DecodeStep, DecodeError> {
         if self.poisoned {
-            return Err("engine stream parser is no longer usable".into());
+            return Err(DecodeError::InvalidStream(
+                "engine stream parser is no longer usable",
+            ));
         }
         self.fill_chunk();
         if let Some(chunk) = self.take_ready_chunk() {
@@ -106,9 +115,9 @@ impl SseDecoder {
             self.event_bytes = self
                 .event_bytes
                 .checked_add(1)
-                .ok_or_else(event_too_large)?;
+                .ok_or(DecodeError::EventLimit)?;
             if self.event_bytes > MAX_EVENT_BYTES {
-                return self.poison(event_too_large());
+                return self.poison(DecodeError::EventLimit);
             }
             consumed += 1;
             if self.skip_lf {
@@ -146,14 +155,18 @@ impl SseDecoder {
         })
     }
 
-    pub(super) fn finish(&self) -> Result<(), String> {
+    pub(super) fn finish(&self) -> Result<(), DecodeError> {
         if self.poisoned {
-            return Err("engine stream parser is no longer usable".into());
+            return Err(DecodeError::InvalidStream(
+                "engine stream parser is no longer usable",
+            ));
         }
         if self.done && self.decoded.is_none() {
             Ok(())
         } else {
-            Err("engine stream ended before its terminal event".into())
+            Err(DecodeError::InvalidStream(
+                "engine stream ended before its terminal event",
+            ))
         }
     }
 
@@ -168,7 +181,7 @@ impl SseDecoder {
         None
     }
 
-    fn end_line(&mut self) -> Result<(), String> {
+    fn end_line(&mut self) -> Result<(), DecodeError> {
         if self.line.is_empty() {
             self.dispatch()?;
             self.data.clear();
@@ -181,7 +194,7 @@ impl SseDecoder {
         Ok(())
     }
 
-    fn process_line(&mut self) -> Result<(), String> {
+    fn process_line(&mut self) -> Result<(), DecodeError> {
         if self.line.starts_with(b":") {
             return Ok(());
         }
@@ -199,7 +212,7 @@ impl SseDecoder {
             .saturating_add(separator)
             .saturating_add(value_len);
         if data_len > MAX_EVENT_BYTES {
-            return Err(event_too_large());
+            return Err(DecodeError::EventLimit);
         }
         if !self.has_data {
             self.line.drain(..start);
@@ -217,7 +230,7 @@ impl SseDecoder {
         Ok(())
     }
 
-    fn dispatch(&mut self) -> Result<(), String> {
+    fn dispatch(&mut self) -> Result<(), DecodeError> {
         if !self.has_data {
             return Ok(());
         }
@@ -226,20 +239,26 @@ impl SseDecoder {
             return Ok(());
         }
         let payload: StreamPayload = serde_json::from_slice(&self.data)
-            .map_err(|_| "engine returned malformed streaming JSON".to_string())?;
+            .map_err(|_| DecodeError::InvalidStream("engine returned malformed streaming JSON"))?;
         if payload.error.is_some() {
-            return Err("engine reported a generation failure".into());
+            return Err(DecodeError::InvalidStream(
+                "engine reported a generation failure",
+            ));
         }
         let choice = payload.choices.0;
         if let Some(usage) = payload.usage {
             if choice.is_some() {
-                return Err("engine returned usage with a streaming choice".into());
+                return Err(DecodeError::InvalidStream(
+                    "engine returned usage with a streaming choice",
+                ));
             }
             let cached = usage
                 .prompt_tokens_details
                 .map(|details| details.cached_tokens);
             if cached.is_some_and(|cached| cached > usage.prompt_tokens) {
-                return Err("engine returned an invalid cached-token count".into());
+                return Err(DecodeError::InvalidStream(
+                    "engine returned an invalid cached-token count",
+                ));
             }
             match (self.prompt_tokens, self.cached_prompt_tokens) {
                 (None, None) => {
@@ -248,8 +267,16 @@ impl SseDecoder {
                 }
                 (Some(existing), existing_cached)
                     if existing == usage.prompt_tokens && existing_cached == cached => {}
-                (Some(_), _) => return Err("engine changed its streaming input-token count".into()),
-                _ => return Err("engine changed its streaming usage details".into()),
+                (Some(_), _) => {
+                    return Err(DecodeError::InvalidStream(
+                        "engine changed its streaming input-token count",
+                    ));
+                }
+                _ => {
+                    return Err(DecodeError::InvalidStream(
+                        "engine changed its streaming usage details",
+                    ));
+                }
             }
             return Ok(());
         }
@@ -257,7 +284,9 @@ impl SseDecoder {
             return Ok(());
         };
         if choice.index != 0 {
-            return Err("engine returned an unexpected streaming choice".into());
+            return Err(DecodeError::InvalidStream(
+                "engine returned an unexpected streaming choice",
+            ));
         }
         let Some(content) = choice.delta.content.filter(|content| !content.is_empty()) else {
             return Ok(());
@@ -265,9 +294,9 @@ impl SseDecoder {
         let next = self
             .generated_end
             .checked_add(content.len())
-            .ok_or_else(output_too_large)?;
+            .ok_or(DecodeError::OutputLimit)?;
         if next > MAX_OUTPUT_BYTES {
-            return Err(output_too_large());
+            return Err(DecodeError::OutputLimit);
         }
         self.generated_end = next;
         self.decoded = Some(DecodedContent { content, offset: 0 });
@@ -316,7 +345,7 @@ impl SseDecoder {
         })
     }
 
-    fn poison<T>(&mut self, error: String) -> Result<T, String> {
+    fn poison<T>(&mut self, error: DecodeError) -> Result<T, DecodeError> {
         self.poisoned = true;
         self.line.clear();
         self.data.clear();
@@ -425,19 +454,11 @@ impl<'de> Deserialize<'de> for EngineError {
     }
 }
 
-fn event_too_large() -> String {
-    format!("engine streaming event exceeds {MAX_EVENT_BYTES} bytes")
-}
-
-fn output_too_large() -> String {
-    format!("assistant output exceeds {MAX_OUTPUT_BYTES} bytes")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn decode(chunks: &[&[u8]]) -> Result<(Vec<String>, usize, usize), String> {
+    fn decode(chunks: &[&[u8]]) -> Result<(Vec<String>, usize, usize), DecodeError> {
         let mut decoder = SseDecoder::new();
         let mut output = Vec::new();
         for bytes in chunks {
@@ -456,7 +477,7 @@ mod tests {
                     break;
                 }
                 if step.consumed == 0 && !emitted {
-                    return Err("decoder made no progress".into());
+                    return Err(DecodeError::InvalidStream("decoder made no progress"));
                 }
             }
         }
@@ -571,11 +592,12 @@ mod tests {
         assert_eq!(decoder.generated_end(), 0);
 
         let mut invalid = SseDecoder::new();
-        assert!(invalid
-            .push(
+        assert_eq!(
+            invalid.push(
                 b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"}}],\"usage\":{\"prompt_tokens\":1}}\n\n"
-            )
-            .is_err_and(|error| error.contains("usage with a streaming choice")));
+            ).err(),
+            Some(DecodeError::InvalidStream("engine returned usage with a streaming choice"))
+        );
     }
 
     #[test]
@@ -632,14 +654,24 @@ mod tests {
         decoder.push(b"data: [DONE]").unwrap();
         assert_eq!(
             decoder.finish().unwrap_err(),
-            "engine stream ended before its terminal event"
+            DecodeError::InvalidStream("engine stream ended before its terminal event")
         );
 
         let mut decoder = SseDecoder::new();
-        assert!(decoder
-            .push(b"data: {\"choices\":[{\"index\":1,\"delta\":{\"content\":\"x\"}}]}\n\n")
-            .is_err_and(|error| error.contains("unexpected streaming choice")));
-        assert!(decoder.push(b"data: [DONE]\n\n").is_err());
+        assert_eq!(
+            decoder
+                .push(b"data: {\"choices\":[{\"index\":1,\"delta\":{\"content\":\"x\"}}]}\n\n")
+                .err(),
+            Some(DecodeError::InvalidStream(
+                "engine returned an unexpected streaming choice"
+            ))
+        );
+        assert_eq!(
+            decoder.push(b"data: [DONE]\n\n").err(),
+            Some(DecodeError::InvalidStream(
+                "engine stream parser is no longer usable"
+            ))
+        );
     }
 
     #[test]
@@ -677,18 +709,21 @@ mod tests {
     #[test]
     fn multiple_choices_and_large_engine_errors_fail_without_retaining_messages() {
         let mut decoder = SseDecoder::new();
-        assert!(decoder
-            .push(
+        assert_eq!(
+            decoder.push(
                 b"data: {\"choices\":[{\"index\":0,\"delta\":{}},{\"index\":1,\"delta\":{}}]}\n\n"
-            )
-            .is_err_and(|error| error.contains("malformed streaming JSON")));
+            ).err(),
+            Some(DecodeError::InvalidStream("engine returned malformed streaming JSON"))
+        );
 
         let message = "x".repeat(MAX_EVENT_BYTES / 2);
         let event = format!("data: {{\"choices\":[],\"error\":{{\"message\":\"{message}\"}}}}\n\n");
         let mut decoder = SseDecoder::new();
         assert_eq!(
-            decoder.push(event.as_bytes()).err().as_deref(),
-            Some("engine reported a generation failure")
+            decoder.push(event.as_bytes()).err(),
+            Some(DecodeError::InvalidStream(
+                "engine reported a generation failure"
+            ))
         );
         assert!(decoder.retained_backing_bytes() <= 3 * MAX_EVENT_BYTES);
     }
@@ -697,19 +732,25 @@ mod tests {
     fn crlf_comments_count_toward_the_raw_event_limit() {
         let comments = ":\r\n".repeat(MAX_EVENT_BYTES / 3 + 1);
         let mut decoder = SseDecoder::new();
-        assert!(decoder.push(comments.as_bytes()).is_err());
+        assert_eq!(
+            decoder.push(comments.as_bytes()).err(),
+            Some(DecodeError::EventLimit)
+        );
     }
 
     #[test]
     fn event_and_total_output_limits_fail_at_the_boundary() {
         let mut decoder = SseDecoder::new();
         assert!(decoder.push(&vec![b'x'; MAX_EVENT_BYTES]).is_ok());
-        assert!(decoder.push(b"x").is_err());
+        assert_eq!(decoder.push(b"x").err(), Some(DecodeError::EventLimit));
 
         let mut decoder = SseDecoder::new();
         decoder.generated_end = MAX_OUTPUT_BYTES;
-        assert!(decoder
-            .push(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"}}]}\n\n")
-            .is_err_and(|error| error.contains("assistant output")));
+        assert_eq!(
+            decoder
+                .push(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"}}]}\n\n")
+                .err(),
+            Some(DecodeError::OutputLimit)
+        );
     }
 }

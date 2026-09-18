@@ -1,6 +1,6 @@
 use super::super::state::AdmissionReservation;
 use super::super::Coordinator;
-use super::parser::SseDecoder;
+use super::parser::{DecodeError, SseDecoder};
 use super::persistence::{OutputPipeline, SaveChunkFailure};
 use super::preflight::QualifiedRequest;
 use crate::history::{CommittedAdmission, ExecutionOutcome};
@@ -228,13 +228,7 @@ async fn stream(
             super::qualification_fixture::record_data_frame(observation_id, data.len());
             let mut offset = 0;
             loop {
-                let step = decoder.push(&data[offset..]).map_err(|error| {
-                    if error.contains("assistant output") {
-                        failure("output_limit")
-                    } else {
-                        failure("engine_stream")
-                    }
-                })?;
+                let step = decoder.push(&data[offset..]).map_err(decode_failure)?;
                 offset += step.consumed;
                 #[cfg(all(test, target_os = "macos"))]
                 super::qualification_fixture::record_parse_progress(
@@ -253,7 +247,7 @@ async fn stream(
                     }
                 }
                 if step.done {
-                    decoder.finish().map_err(|_| failure("engine_stream"))?;
+                    decoder.finish().map_err(decode_failure)?;
                     if decoder.prompt_tokens() != Some(expected_input_tokens) {
                         return Err(failure("engine_usage"));
                     }
@@ -267,7 +261,7 @@ async fn stream(
                 }
             }
         }
-        decoder.finish().map_err(|_| failure("engine_stream"))?;
+        decoder.finish().map_err(decode_failure)?;
         Ok(StreamEnd::Completed)
     };
     let result = exchange.await;
@@ -323,4 +317,11 @@ struct Slot {
 
 fn failure(code: &'static str) -> StreamFailure {
     StreamFailure { code }
+}
+
+fn decode_failure(error: DecodeError) -> StreamFailure {
+    match error {
+        DecodeError::OutputLimit => failure("output_limit"),
+        DecodeError::EventLimit | DecodeError::InvalidStream(_) => failure("engine_stream"),
+    }
 }
