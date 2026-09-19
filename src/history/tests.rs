@@ -19,6 +19,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
+mod reopen;
+
 fn private_root(label: &str) -> (tempfile::TempDir, PathBuf) {
     let directory = tempfile::Builder::new()
         .prefix(label)
