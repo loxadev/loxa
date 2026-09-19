@@ -15,14 +15,23 @@ use std::time::Duration;
 
 const MAX_HEADERS: usize = 64;
 const MAX_HTTP_BUFFER: usize = 64 * 1024;
+const MAX_CHECKPOINT_DELAY: Duration = Duration::from_millis(250);
 const DRIVER_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
 const QUIESCENCE_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[cfg(test)]
+#[derive(Clone, Copy, Default)]
+pub(in crate::service::coordinator) struct StreamProgress {
+    pub(in crate::service::coordinator) decoded_end: usize,
+    pub(in crate::service::coordinator) checkpoints: usize,
+}
 
 pub(super) async fn run(
     coordinator: Coordinator,
     reservation: Arc<AdmissionReservation>,
     committed: CommittedAdmission,
     qualified: QualifiedRequest,
+    #[cfg(test)] progress: Option<tokio::sync::watch::Sender<StreamProgress>>,
 ) {
     let output = match coordinator.generation_output(&committed) {
         Ok(output) => output,
@@ -44,9 +53,16 @@ pub(super) async fn run(
         Ok(engine) => engine,
         Err(_) if reservation.is_cancelled() => {
             drop(qualified);
-            pipeline
+            if pipeline
                 .finish(&mut decoder, ExecutionOutcome::Stopped, Some("stopped"))
-                .await;
+                .await
+                .is_err()
+            {
+                coordinator
+                    .shared
+                    .state()
+                    .require_generation_cleanup(&reservation);
+            }
             return;
         }
         Err(_) => {
@@ -55,7 +71,7 @@ pub(super) async fn run(
                 .shared
                 .state()
                 .require_generation_cleanup(&reservation);
-            pipeline
+            let _ = pipeline
                 .finish(
                     &mut decoder,
                     ExecutionOutcome::Failed,
@@ -83,6 +99,10 @@ pub(super) async fn run(
         expected_input_tokens,
         #[cfg(all(test, target_os = "macos"))]
         observation_id,
+        #[cfg(all(test, target_os = "macos"))]
+        coordinator.take_native_generation_output_gate(),
+        #[cfg(test)]
+        progress,
         &mut decoder,
         &mut pipeline,
     )
@@ -132,7 +152,7 @@ pub(super) async fn run(
             .require_generation_cleanup(&reservation);
     }
     let selected_outcome = pipeline.finish(&mut decoder, outcome, failure_code).await;
-    if selected_outcome != ExecutionOutcome::Completed {
+    if !matches!(selected_outcome, Ok(ExecutionOutcome::Completed)) {
         coordinator
             .shared
             .state()
@@ -149,12 +169,17 @@ struct StreamFailure {
     code: &'static str,
 }
 
+#[cfg_attr(all(test, target_os = "macos"), allow(clippy::too_many_arguments))]
 async fn stream(
     engine: &super::super::state::EngineDescriptor,
     reservation: &AdmissionReservation,
     body: Bytes,
     expected_input_tokens: u32,
     #[cfg(all(test, target_os = "macos"))] observation_id: Option<u64>,
+    #[cfg(all(test, target_os = "macos"))] mut output_gate: Option<
+        Arc<super::super::native_test_gate::NativeTestGate>,
+    >,
+    #[cfg(test)] progress: Option<tokio::sync::watch::Sender<StreamProgress>>,
     decoder: &mut SseDecoder,
     pipeline: &mut OutputPipeline,
 ) -> Result<StreamEnd, StreamFailure> {
@@ -215,11 +240,43 @@ async fn stream(
         if response.status() != StatusCode::OK {
             return Err(failure("engine_rejected"));
         }
-        while let Some(frame) = tokio::select! {
-            biased;
-            () = reservation.wait_cancelled() => return Ok(StreamEnd::Stopped),
-            frame = response.body_mut().frame() => frame,
-        } {
+        let mut checkpoint_deadline = None;
+        loop {
+            // Keep an overdue deadline while SQL owns the other suffix slot;
+            // its acknowledgement wakes us without polling an expired timer.
+            let checkpoint_pending = pipeline.checkpoint_pending();
+            let frame = tokio::select! {
+                biased;
+                () = reservation.wait_cancelled() => return Ok(StreamEnd::Stopped),
+                result = pipeline.wait_checkpoint() => {
+                    result.map_err(|_| failure("output_save"))?;
+                    continue;
+                }
+                () = async {
+                    match checkpoint_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                }, if !checkpoint_pending => {
+                    checkpoint_deadline = None;
+                    if let Some(chunk) = decoder.take_remaining_chunk() {
+                        match pipeline.save_chunk(chunk) {
+                            Ok(()) => {}
+                            Err(SaveChunkFailure::Cancelled) => return Ok(StreamEnd::Stopped),
+                            Err(SaveChunkFailure::Failed) => return Err(failure("output_save")),
+                        }
+                        #[cfg(test)]
+                        if let Some(progress) = &progress {
+                            progress.send_modify(|progress| progress.checkpoints += 1);
+                        }
+                    }
+                    continue;
+                }
+                frame = response.body_mut().frame() => frame,
+            };
+            let Some(frame) = frame else {
+                break;
+            };
             let frame = frame.map_err(|_| failure("engine_transport"))?;
             let Ok(data) = frame.into_data() else {
                 continue;
@@ -228,14 +285,44 @@ async fn stream(
             super::qualification_fixture::record_data_frame(observation_id, data.len());
             let mut offset = 0;
             loop {
-                let step = decoder.push(&data[offset..]).map_err(decode_failure)?;
+                let input = &data[offset..];
+                #[cfg(all(test, target_os = "macos"))]
+                let input = if output_gate.is_some() {
+                    // A Hyper frame may contain content and DONE. Only this
+                    // one-shot gate needs to observe the first event separately.
+                    &input[..input.len().min(1)]
+                } else {
+                    input
+                };
+                let step = decoder.push(input).map_err(decode_failure)?;
                 offset += step.consumed;
+                if decoder.has_pending_chunk() {
+                    checkpoint_deadline
+                        .get_or_insert_with(|| tokio::time::Instant::now() + MAX_CHECKPOINT_DELAY);
+                } else {
+                    checkpoint_deadline = None;
+                }
+                #[cfg(test)]
+                if let Some(progress) = &progress {
+                    progress.send_modify(|progress| progress.decoded_end = decoder.generated_end());
+                }
                 #[cfg(all(test, target_os = "macos"))]
                 super::qualification_fixture::record_parse_progress(
                     observation_id,
                     decoder.generated_end(),
                     decoder.prompt_tokens(),
                 );
+                #[cfg(all(test, target_os = "macos"))]
+                if decoder.generated_end() > 0 && !step.done {
+                    if let Some(gate) = output_gate.take() {
+                        let prefix = step
+                            .chunk
+                            .as_deref()
+                            .unwrap_or_else(|| decoder.pending_chunk());
+                        super::qualification_fixture::record_output_gate(observation_id, prefix);
+                        gate.pause().await;
+                    }
+                }
                 let emitted = step.chunk.is_some();
                 if let Some(chunk) = step.chunk {
                     match pipeline.save_chunk(chunk) {
@@ -244,6 +331,10 @@ async fn stream(
                         Err(SaveChunkFailure::Failed) => {
                             return Err(failure("output_save"));
                         }
+                    }
+                    #[cfg(test)]
+                    if let Some(progress) = &progress {
+                        progress.send_modify(|progress| progress.checkpoints += 1);
                     }
                 }
                 if step.done {
@@ -273,6 +364,52 @@ async fn stream(
         }
     }
     result
+}
+
+#[cfg(test)]
+pub(in crate::service::coordinator) async fn run_for_test(
+    coordinator: Coordinator,
+    reservation: Arc<AdmissionReservation>,
+    committed: CommittedAdmission,
+    progress: tokio::sync::watch::Sender<StreamProgress>,
+) {
+    run(
+        coordinator,
+        reservation,
+        committed,
+        QualifiedRequest::for_test(),
+        Some(progress),
+    )
+    .await;
+}
+
+#[cfg(test)]
+pub(in crate::service::coordinator) async fn stream_for_test(
+    engine: &super::super::state::EngineDescriptor,
+    reservation: &AdmissionReservation,
+    decoder: &mut SseDecoder,
+    pipeline: &mut OutputPipeline,
+    progress: tokio::sync::watch::Sender<StreamProgress>,
+) -> Result<ExecutionOutcome, &'static str> {
+    match stream(
+        engine,
+        reservation,
+        Bytes::from_static(b"{}"),
+        1,
+        #[cfg(target_os = "macos")]
+        None,
+        #[cfg(target_os = "macos")]
+        None,
+        Some(progress),
+        decoder,
+        pipeline,
+    )
+    .await
+    {
+        Ok(StreamEnd::Completed) => Ok(ExecutionOutcome::Completed),
+        Ok(StreamEnd::Stopped) => Ok(ExecutionOutcome::Stopped),
+        Err(error) => Err(error.code),
+    }
 }
 
 async fn wait_for_idle(

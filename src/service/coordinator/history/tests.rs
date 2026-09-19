@@ -7,16 +7,20 @@ use crate::service::coordinator::generation::persistence::{OutputPipeline, SaveC
 use crate::service::coordinator::{Coordinator, HistoryExit, OwnerExit};
 use loxa_ipc::{ErrorCategory, GenerationTarget, HistoryCommand, HistoryPhase, HistoryReply};
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
+mod checkpoint;
+mod engine_failure;
 mod preflight;
 
 struct Fixture {
     _directory: tempfile::TempDir,
     root: PathBuf,
     coordinator: Coordinator,
+    operation: Arc<crate::service::coordinator::OperationControl>,
     conversation_id: String,
     conversation_bytes: [u8; 16],
 }
@@ -39,7 +43,10 @@ impl Fixture {
         let root = directory_path.join("dev");
         let forbidden_root = directory_path.join("normal");
         fs::create_dir(&forbidden_root).unwrap();
-        let executable = fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+        // This owner runs in-process; bootstrap still validates the isolated origin.
+        let executable = directory_path.join("loxa-origin");
+        fs::write(&executable, b"#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         let bootstrap = loxa_ipc::initialize_development_root(
             &root,
             &forbidden_root,
@@ -82,11 +89,12 @@ impl Fixture {
             panic!("create conversation returned the wrong reply");
         };
         let conversation_bytes = decode_id(&conversation.id);
-        coordinator.force_ready_for_history_test(fingerprint, engine);
+        let operation = coordinator.force_ready_for_history_test(fingerprint, engine);
         Self {
             _directory: directory,
             root,
             coordinator,
+            operation,
             conversation_id: conversation.id,
             conversation_bytes,
         }
@@ -814,6 +822,22 @@ async fn failed_output_cancels_and_retry_reuses_the_exact_retained_suffix() {
         output.status().unwrap(),
         OutputSavePhase::SaveFailed { saved_end: 0 }
     );
+    let snapshot = fixture
+        .coordinator
+        .generation_status(&GenerationTarget::Accepted {
+            boot_epoch: committed.owner_epoch.clone(),
+            submission_id: crate::history::encode_id(committed.submission_id),
+            operation_generation: committed.operation_generation.to_string(),
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        snapshot.execution,
+        loxa_ipc::GenerationExecutionPhase::Cancelling
+    );
+    assert_eq!(snapshot.save, loxa_ipc::GenerationSavePhase::SaveFailed);
+    assert_eq!(snapshot.failure_code.as_deref(), Some("output_save"));
+    assert_eq!(snapshot.generated_end, None);
     assert_eq!(Arc::strong_count(&suffix), 2);
 
     assert_eq!(
@@ -842,7 +866,7 @@ async fn failed_output_cancels_and_retry_reuses_the_exact_retained_suffix() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn failed_checkpoint_retains_a_later_stopped_terminal_for_exact_retry() {
+async fn failed_checkpoint_retains_a_later_failed_terminal_for_exact_retry() {
     let fixture = Fixture::start().await;
     let committed = wait_for_admission(
         fixture
@@ -862,12 +886,10 @@ async fn failed_checkpoint_retains_a_later_stopped_terminal_for_exact_retry() {
             .is_err()
     );
 
-    let terminal = Arc::new(final_input(
-        &committed,
-        5,
-        "tail",
-        ExecutionOutcome::Stopped,
-    ));
+    let terminal = Arc::new(FinalizationInput {
+        failure_code: Some("output_save".into()),
+        ..final_input(&committed, 5, "tail", ExecutionOutcome::Failed)
+    });
     let final_observer = output.finalize(Arc::clone(&terminal)).unwrap();
     assert_eq!(Arc::strong_count(&checkpoint), 2);
     assert_eq!(Arc::strong_count(&terminal), 2);
@@ -925,12 +947,24 @@ async fn full_output_envelope_cancels_then_drains_one_large_event_exactly() {
         output.status().unwrap(),
         OutputSavePhase::SaveFailed { saved_end: 0 }
     );
+    let snapshot = fixture
+        .coordinator
+        .generation_status(&GenerationTarget::Accepted {
+            boot_epoch: committed.owner_epoch.clone(),
+            submission_id: crate::history::encode_id(committed.submission_id),
+            operation_generation: committed.operation_generation.to_string(),
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.save, loxa_ipc::GenerationSavePhase::SaveFailed);
+    assert_eq!(snapshot.generated_end, None);
     barrier.wait();
 
     assert_eq!(
         pipeline
             .finish(&mut decoder, ExecutionOutcome::Failed, Some("output_save"),)
-            .await,
+            .await
+            .unwrap(),
         ExecutionOutcome::Failed
     );
     assert!(!fixture.coordinator.admission_active_for_test());
@@ -1168,6 +1202,10 @@ async fn stop_winning_before_output_intent_rejects_more_completed_content() {
             .category,
         ErrorCategory::ServiceUnavailable
     );
+    let frozen = output
+        .publish_execution(ExecutionOutcome::Completed, None, 0)
+        .unwrap();
+    assert_eq!(frozen.outcome, ExecutionOutcome::Stopped);
     assert_eq!(
         output
             .finalize(Arc::new(final_input(
@@ -1178,7 +1216,7 @@ async fn stop_winning_before_output_intent_rejects_more_completed_content() {
             )))
             .unwrap_err()
             .category,
-        ErrorCategory::ServiceUnavailable
+        ErrorCategory::Conflict
     );
     assert_eq!(
         wait_for_output(
@@ -1198,6 +1236,62 @@ async fn stop_winning_before_output_intent_rejects_more_completed_content() {
     );
     fixture.finish_stopped().await;
     assert_terminalized(&fixture.root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejected_terminal_inputs_leave_execution_unpublished() {
+    let fixture = Fixture::start().await;
+    let committed = wait_for_admission(
+        fixture
+            .coordinator
+            .admit_history_generation(fixture.input(19, "validate terminal"))
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let output = fixture.coordinator.generation_output(&committed).unwrap();
+    let mut wrong_attempt = final_input(&committed, 0, "wrong", ExecutionOutcome::Completed);
+    wrong_attempt.suffix.attempt_id = [0xff; 16];
+    let wrong_start = final_input(&committed, 1, "wrong", ExecutionOutcome::Completed);
+    for input in [wrong_attempt, wrong_start] {
+        assert_eq!(
+            output.finalize(Arc::new(input)).unwrap_err().category,
+            ErrorCategory::Conflict
+        );
+    }
+
+    let mut pipeline = OutputPipeline::new(output.clone(), committed.clone());
+    let mut decoder = SseDecoder::new();
+    let error = tokio::time::timeout(
+        Duration::from_secs(2),
+        pipeline.finish(&mut decoder, ExecutionOutcome::Failed, Some("")),
+    )
+    .await
+    .expect("invalid publication entered the persistence retry loop")
+    .unwrap_err();
+    assert_eq!(error.category, ErrorCategory::Internal);
+    assert!(fixture.coordinator.admission_active_for_test());
+
+    let finalization = Arc::new(FinalizationInput {
+        failure_code: Some("engine_transport".into()),
+        ..final_input(&committed, 0, "", ExecutionOutcome::Failed)
+    });
+    let (observer, selected) = output.finalize_generation_owned(finalization).unwrap();
+    assert_eq!(selected, ExecutionOutcome::Failed);
+    assert_eq!(wait_for_output(observer).await.unwrap().end, 0);
+    fixture.coordinator.stop_service().unwrap();
+    fixture.finish_stopped().await;
+    let connection = rusqlite::Connection::open(fixture.root.join("app.sqlite")).unwrap();
+    let terminal: (i64, i64, String) = connection
+        .query_row(
+            "SELECT execution_outcome, generated_end, failure_code FROM attempts",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(terminal, (3, 0, "engine_transport".into()));
+    connection.close().unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1268,7 +1362,8 @@ async fn stop_before_checkpoint_handoff_stays_stopped_and_saves_the_observed_tai
     assert_eq!(
         pipeline
             .finish(&mut decoder, ExecutionOutcome::Stopped, Some("stopped"),)
-            .await,
+            .await
+            .unwrap(),
         ExecutionOutcome::Stopped
     );
     fixture.finish_stopped().await;

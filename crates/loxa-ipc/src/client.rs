@@ -111,6 +111,7 @@ impl ServiceClient {
                 | ServiceCommand::Draft { .. }
                 | ServiceCommand::Settings { .. }
                 | ServiceCommand::Generation { .. }
+                | ServiceCommand::GetGenerationStatus { .. }
         ) {
             return Err(ClientError::Transport(
                 "this command requires an explicit versioned client entry point".into(),
@@ -142,8 +143,52 @@ impl ServiceClient {
             | ReplyOutcome::History { .. }
             | ReplyOutcome::Draft { .. }
             | ReplyOutcome::Settings { .. }
-            | ReplyOutcome::Generation { .. } => Err(ClientError::Transport(
+            | ReplyOutcome::Generation { .. }
+            | ReplyOutcome::GenerationStatus { .. } => Err(ClientError::Transport(
                 "service returned an outcome for a different command".into(),
+            )),
+        }
+    }
+
+    /// Observe an accepted attempt without starting the service or waiting for history.
+    /// After admission is released, use its accepted IDs to read durable history.
+    pub async fn generation_status(
+        &self,
+        target: &crate::GenerationTarget,
+    ) -> Result<Option<crate::GenerationStatus>, ClientError> {
+        target
+            .validate_shape()
+            .map_err(|error| ClientError::Transport(error.into()))?;
+        let mut connection = self
+            .connect_for(
+                ConnectMode::ObserveExisting,
+                ClientContract::GenerationStatus,
+            )
+            .await?;
+        match connection
+            .request(ServiceCommand::GetGenerationStatus {
+                target: target.clone(),
+            })
+            .await?
+        {
+            ReplyOutcome::GenerationStatus { snapshot } => {
+                if let Some(snapshot) = &snapshot {
+                    let current_boot = matches!(
+                        &snapshot.target,
+                        crate::GenerationTarget::Accepted { boot_epoch, .. }
+                            if boot_epoch == &connection.hello.boot_epoch
+                    );
+                    if &snapshot.target != target || !current_boot {
+                        return Err(ClientError::Transport(
+                            "service returned a different generation snapshot".into(),
+                        ));
+                    }
+                }
+                Ok(snapshot)
+            }
+            ReplyOutcome::Rejected(error) => Err(ClientError::Rejected(error)),
+            _ => Err(ClientError::Transport(
+                "service returned an outcome for a different generation status request".into(),
             )),
         }
     }
@@ -431,6 +476,10 @@ impl ServiceClient {
                 self.client_build.clone(),
                 self.bootstrap.root().root_identity(),
             ),
+            ClientContract::GenerationStatus => Hello::generation_status(
+                self.client_build.clone(),
+                self.bootstrap.root().root_identity(),
+            ),
             ClientContract::GenerationRequest => Hello::generation(
                 self.client_build.clone(),
                 self.bootstrap.root().root_identity(),
@@ -460,8 +509,13 @@ impl ServiceClient {
             }
         };
         let generation_shape_matches = match contract {
-            ClientContract::GenerationRequest => hello.generation.is_some(),
-            ClientContract::GenerationControl
+            ClientContract::GenerationRequest => {
+                hello.generation.is_some() && hello.protocol == crate::ProtocolVersion::V1_2
+            }
+            ClientContract::GenerationControl => {
+                hello.generation.is_none() && hello.protocol == crate::ProtocolVersion::V1_2
+            }
+            ClientContract::GenerationStatus
             | ClientContract::Legacy
             | ClientContract::HistoryStatus
             | ClientContract::History => hello.generation.is_none(),
@@ -632,6 +686,7 @@ enum ClientContract {
     History,
     GenerationRequest,
     GenerationControl,
+    GenerationStatus,
 }
 
 async fn send_frame<T: serde::Serialize>(

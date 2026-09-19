@@ -80,6 +80,8 @@ struct Shared {
     native_admission_completion_gate: Mutex<Option<Arc<native_test_gate::NativeTestGate>>>,
     #[cfg(all(test, target_os = "macos"))]
     native_generation_execution_gate: Mutex<Option<Arc<native_test_gate::NativeTestGate>>>,
+    #[cfg(all(test, target_os = "macos"))]
+    native_generation_output_gate: Mutex<Option<Arc<native_test_gate::NativeTestGate>>>,
     #[cfg(test)]
     settings_drain_barrier: Mutex<Option<Arc<std::sync::Barrier>>>,
 }
@@ -214,6 +216,8 @@ impl Coordinator {
             native_admission_completion_gate: Mutex::new(None),
             #[cfg(all(test, target_os = "macos"))]
             native_generation_execution_gate: Mutex::new(None),
+            #[cfg(all(test, target_os = "macos"))]
+            native_generation_output_gate: Mutex::new(None),
             #[cfg(test)]
             settings_drain_barrier: Mutex::new(None),
         });
@@ -719,7 +723,7 @@ impl Coordinator {
         &self,
         fingerprint: Arc<crate::runtime_fingerprint::RuntimeFingerprint>,
         engine: state::EngineDescriptor,
-    ) {
+    ) -> Arc<OperationControl> {
         let mut state = self.shared.state();
         let operation = state
             .reserve_load(fingerprint.model_id().to_owned())
@@ -734,6 +738,7 @@ impl Coordinator {
                 fingerprint,
             },
         ));
+        operation
     }
 
     #[cfg(test)]

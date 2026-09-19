@@ -1,6 +1,6 @@
 use super::{
-    AdmissionClaim, AdmissionRecovery, AdmissionReservation, CoordinatorState, OperationPhase,
-    Phase,
+    AdmissionClaim, AdmissionRecovery, AdmissionReservation, CoordinatorState, OperationControl,
+    OperationPhase, Phase,
 };
 use loxa_ipc::{ErrorCategory, GenerationTarget, ServiceError};
 use std::path::PathBuf;
@@ -10,6 +10,13 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 const MAX_PENDING_GENERATIONS: usize = 16;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::service::coordinator) enum CancellationCause {
+    Requested,
+    OutputSave,
+    EngineFailure,
+}
 
 #[derive(Clone)]
 pub(in crate::service::coordinator) struct EngineDescriptor {
@@ -38,7 +45,27 @@ impl PendingGeneration {
 
 impl AdmissionReservation {
     pub(in crate::service::coordinator) fn request_cancel(&self) {
+        self.cancel_with(CancellationCause::Requested);
+    }
+
+    pub(in crate::service::coordinator) fn cancel_output_save(&self) {
+        self.cancel_with(CancellationCause::OutputSave);
+    }
+
+    fn cancel_with(&self, cause: CancellationCause) {
+        // This lock is never held while acquiring state/output or awaiting work.
+        self.cancellation_cause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert(cause);
         self.cancellation.cancel();
+    }
+
+    pub(in crate::service::coordinator) fn cancellation_cause(&self) -> Option<CancellationCause> {
+        *self
+            .cancellation_cause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub(in crate::service::coordinator) async fn wait_cancelled(&self) {
@@ -57,7 +84,7 @@ impl AdmissionReservation {
         self.engine_quiescent.store(true, Ordering::Release);
     }
 
-    fn engine_is_quiescent(&self) -> bool {
+    pub(in crate::service::coordinator) fn engine_is_quiescent(&self) -> bool {
         self.engine_quiescent.load(Ordering::Acquire)
     }
 
@@ -263,6 +290,11 @@ impl CoordinatorState {
             fingerprint: Arc::clone(fingerprint),
             engine: engine.clone(),
             pending_nonce,
+            cancellation_cause: Mutex::new(
+                cancellation
+                    .is_cancelled()
+                    .then_some(CancellationCause::Requested),
+            ),
             cancellation,
             engine_quiescent: AtomicBool::new(true),
             durable_terminal: AtomicBool::new(false),
@@ -358,6 +390,25 @@ impl CoordinatorState {
             expected.request_cancel();
             self.request_engine_cleanup_if_needed(expected);
         }
+    }
+
+    pub(in crate::service::coordinator) fn cancel_generation_for_engine_failure(
+        &self,
+        expected: &Arc<OperationControl>,
+    ) {
+        if !self.is_current(expected) {
+            return;
+        }
+        if let Some(admission) = self
+            .admission
+            .as_ref()
+            .filter(|admission| Arc::ptr_eq(&admission.operation, expected))
+        {
+            admission.cancel_with(CancellationCause::EngineFailure);
+        }
+        // Fence this operation even if pre-execution persistence releases its
+        // reservation before the runtime owner finishes cleanup.
+        expected.request_cleanup();
     }
 
     pub(in crate::service::coordinator) fn begin_generation_execution(

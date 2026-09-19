@@ -20,6 +20,8 @@ mod preflight;
 #[cfg(test)]
 mod qualification_fixture;
 mod relay;
+#[cfg(test)]
+pub(in crate::service::coordinator) use relay::{run_for_test, stream_for_test, StreamProgress};
 mod transport;
 
 #[cfg(all(test, target_os = "macos"))]
@@ -290,6 +292,8 @@ async fn drive_send(
         Arc::clone(&reservation),
         committed.clone(),
         qualified,
+        #[cfg(test)]
+        None,
     ));
     Ok(accepted(&committed))
 }

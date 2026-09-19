@@ -7,6 +7,7 @@ pub(super) const MODEL_SHA256: &str =
     "741ad12b64088fedc17c33aacb22e48be1972ef36a39f03666dd68bd15614fb9";
 pub(super) const MODEL_SIZE: u64 = 88_202_080;
 pub(super) const CONTEXT_TOKENS: u32 = 4096;
+pub(super) const TEMPERATURE: f32 = 0.0;
 
 #[cfg(target_os = "macos")]
 pub(super) fn manifest() -> Manifest {
@@ -62,17 +63,25 @@ pub(super) struct PreflightObservation {
     pub(super) input_tokens: u32,
     pub(super) max_output_tokens: u32,
     pub(super) postcommit_gate_entered: bool,
-    pub(super) generation_dispatched: bool,
+    pub(super) generation_dispatches: usize,
     pub(super) basis_carried_to_execution: bool,
     pub(super) response_status: Option<u16>,
     pub(super) data_frames: usize,
     pub(super) data_bytes: usize,
     pub(super) generated_end: usize,
+    pub(super) output_gate_prefix: Option<OutputPrefix>,
     pub(super) http_driver_completed: bool,
     pub(super) http_driver_error: bool,
     pub(super) completion_prompt_tokens: Option<u32>,
     pub(super) completion_cached_tokens: Option<u32>,
     pub(super) quiescent_after_terminal: bool,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug)]
+pub(super) struct OutputPrefix {
+    pub(super) bytes: usize,
+    pub(super) sha256: String,
 }
 
 #[cfg(target_os = "macos")]
@@ -113,12 +122,13 @@ pub(super) fn record_preflight(
         input_tokens,
         max_output_tokens,
         postcommit_gate_entered: false,
-        generation_dispatched: false,
+        generation_dispatches: 0,
         basis_carried_to_execution: false,
         response_status: None,
         data_frames: 0,
         data_bytes: 0,
         generated_end: 0,
+        output_gate_prefix: None,
         http_driver_completed: false,
         http_driver_error: false,
         completion_prompt_tokens: None,
@@ -156,7 +166,7 @@ pub(super) fn record_postcommit(id: Option<u64>, template_sha256: [u8; 32]) {
 #[cfg(target_os = "macos")]
 pub(super) fn record_dispatch(id: Option<u64>) {
     with_observation(id, |observation| {
-        observation.generation_dispatched = true;
+        observation.generation_dispatches = observation.generation_dispatches.saturating_add(1);
     });
 }
 
@@ -186,6 +196,16 @@ pub(super) fn record_parse_progress(
         if prompt_tokens.is_some() {
             observation.completion_prompt_tokens = prompt_tokens;
         }
+    });
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn record_output_gate(id: Option<u64>, prefix: &str) {
+    with_observation(id, |observation| {
+        observation.output_gate_prefix = Some(OutputPrefix {
+            bytes: prefix.len(),
+            sha256: encode_digest(Sha256::digest(prefix.as_bytes()).into()),
+        });
     });
 }
 

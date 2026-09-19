@@ -251,11 +251,17 @@ impl RuntimeWorker<'_> {
             }
             match server.poll() {
                 Ok(Some(_)) => {
+                    self.shared
+                        .state()
+                        .cancel_generation_for_engine_failure(&operation);
                     self.finish_without_server(operation, launch_intent, None);
                     return;
                 }
                 Ok(None) => std::thread::sleep(OWNER_POLL_INTERVAL),
                 Err(_) => {
+                    self.shared
+                        .state()
+                        .cancel_generation_for_engine_failure(&operation);
                     self.stop_and_finish(operation, launch_intent, server);
                     return;
                 }

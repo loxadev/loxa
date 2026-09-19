@@ -2,6 +2,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 mod drafts;
 mod generation;
+mod generation_status;
 mod history;
 mod settings;
 
@@ -10,6 +11,7 @@ pub use generation::{
     GenerationAccepted, GenerationCommand, GenerationConnection, GenerationDraft, GenerationHello,
     GenerationHelloAck, GenerationReply, GenerationTarget, MAX_GENERATION_USER_TEXT_BYTES,
 };
+pub use generation_status::{GenerationExecutionPhase, GenerationSavePhase, GenerationStatus};
 pub use history::{
     AttemptExecution, AttemptSave, AttemptSummary, ContentRange, ContentSource, ConversationCursor,
     ConversationPage, ConversationSummary, HistoryCommand, HistoryPhase, HistoryReply,
@@ -24,7 +26,7 @@ pub use settings::{
 };
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 2;
+pub const PROTOCOL_MINOR: u16 = 3;
 
 pub const MAX_BUILD_BYTES: usize = 96;
 pub const MAX_ID_BYTES: usize = 160;
@@ -42,6 +44,7 @@ pub struct ProtocolVersion {
 impl ProtocolVersion {
     pub const V1_0: Self = Self { major: 1, minor: 0 };
     pub const V1_1: Self = Self { major: 1, minor: 1 };
+    pub const V1_2: Self = Self { major: 1, minor: 2 };
 
     pub const CURRENT: Self = Self {
         major: PROTOCOL_MAJOR,
@@ -119,13 +122,20 @@ impl Hello {
         connection: GenerationConnection,
     ) -> Self {
         Self {
-            protocol: ProtocolVersion::CURRENT,
+            protocol: ProtocolVersion::V1_2,
             // Generation is minor-version gated so the closed 1.0 capability
             // vocabulary stays decodable and remains at eight entries.
             required_capabilities: REQUIRED_CAPABILITIES.to_vec(),
             build: build.into(),
             root_identity: root_identity.into(),
             generation: Some(GenerationHello { connection }),
+        }
+    }
+
+    pub fn generation_status(build: impl Into<String>, root_identity: impl Into<String>) -> Self {
+        Self {
+            protocol: ProtocolVersion::CURRENT,
+            ..Self::current(build, root_identity)
         }
     }
 
@@ -139,7 +149,7 @@ impl Hello {
         if self.required_capabilities.len() > MAX_CAPABILITIES {
             return Err("too many required capabilities");
         }
-        if self.generation.is_some() && self.protocol != ProtocolVersion::CURRENT {
+        if self.generation.is_some() && self.protocol != ProtocolVersion::V1_2 {
             return Err("generation handshake requires service protocol 1.2");
         }
         Ok(())
@@ -183,9 +193,8 @@ impl HelloAck {
             return Err("invalid service process identity");
         }
         match (&self.generation, self.protocol) {
-            (Some(generation), ProtocolVersion::CURRENT) => generation.validate_shape()?,
+            (Some(generation), ProtocolVersion::V1_2) => generation.validate_shape()?,
             (Some(_), _) => return Err("generation acknowledgement requires protocol 1.2"),
-            (None, ProtocolVersion::CURRENT) => {}
             (None, _) => {}
         }
         Ok(())
@@ -266,6 +275,7 @@ pub enum ServiceCommand {
     Draft { command: DraftCommand },
     Settings { command: ServiceSettingsCommand },
     Generation { command: GenerationCommand },
+    GetGenerationStatus { target: GenerationTarget },
 }
 
 impl ServiceCommand {
@@ -277,6 +287,7 @@ impl ServiceCommand {
             Self::Draft { command } => command.validate_shape(),
             Self::Settings { command } => command.validate_shape(),
             Self::Generation { command } => command.validate_shape(),
+            Self::GetGenerationStatus { target } => target.validate_shape(),
             _ => Ok(()),
         }
     }
@@ -318,6 +329,9 @@ impl Reply {
             ReplyOutcome::Draft { reply } => reply.validate_shape(),
             ReplyOutcome::Settings { reply } => reply.validate_shape(),
             ReplyOutcome::Generation { reply } => reply.validate_shape(),
+            ReplyOutcome::GenerationStatus { snapshot } => snapshot
+                .as_ref()
+                .map_or(Ok(()), GenerationStatus::validate_shape),
         }
     }
 }
@@ -332,6 +346,7 @@ pub enum ReplyOutcome {
     Draft { reply: DraftReply },
     Settings { reply: ServiceSettingsReply },
     Generation { reply: GenerationReply },
+    GenerationStatus { snapshot: Option<GenerationStatus> },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -643,6 +658,40 @@ mod tests {
             service_pid: u32,
             origin_sha256: String,
         },
+    }
+
+    #[test]
+    fn generation_control_stays_on_1_2_while_status_uses_an_ordinary_1_3_hello() {
+        for connection in [GenerationConnection::Request, GenerationConnection::Control] {
+            let mut hello = Hello::generation("build", "root", connection);
+            assert_eq!(hello.protocol, ProtocolVersion::V1_2);
+            hello.validate_shape().unwrap();
+            hello.protocol = ProtocolVersion::CURRENT;
+            assert!(hello.validate_shape().is_err());
+        }
+        let hello = Hello::generation_status("build", "root");
+        assert_eq!(hello.protocol, ProtocolVersion { major: 1, minor: 3 });
+        assert!(hello.generation.is_none());
+        assert_eq!(hello.required_capabilities, REQUIRED_CAPABILITIES);
+        hello.validate_shape().unwrap();
+        let mut ack = HelloAck {
+            protocol: ProtocolVersion::V1_2,
+            capabilities: REQUIRED_CAPABILITIES.to_vec(),
+            build: "build".into(),
+            storage_schema: 0,
+            boot_epoch: "boot".into(),
+            root_identity: "root".into(),
+            service_pid: 1,
+            origin_sha256: "aa".repeat(32),
+            generation: Some(GenerationHelloAck {
+                pending_nonce: "11".repeat(16),
+            }),
+        };
+        ack.validate_shape().unwrap();
+        ack.protocol = hello.protocol;
+        assert!(ack.validate_shape().is_err());
+        ack.generation = None;
+        ack.validate_shape().unwrap();
     }
 
     #[test]

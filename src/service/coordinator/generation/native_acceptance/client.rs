@@ -189,7 +189,7 @@ pub(super) async fn wait_for_saved(
             attempt.execution, attempt.save, attempt.failure_code
         ));
     }
-    read_assistant(client, &attempt.id, &attempt.saved_end)
+    read_assistant(client, &attempt)
         .await
         .map_err(|error| format!("{label}: {error}"))
 }
@@ -199,16 +199,20 @@ pub(super) async fn wait_for_stopped(
     conversation: &Conversation,
     accepted: &GenerationAccepted,
     label: &str,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let attempt = wait_for_attempt(client, conversation, accepted, label).await?;
-    if attempt.execution == AttemptExecution::Stopped && attempt.save == AttemptSave::Saved {
-        Ok(())
-    } else {
-        Err(format!(
+    if attempt.execution != AttemptExecution::Stopped
+        || attempt.save != AttemptSave::Saved
+        || attempt.failure_code.as_deref() != Some("stopped")
+    {
+        return Err(format!(
             "{label} native generation has the wrong terminal state: {:?}/{:?}/{:?}",
             attempt.execution, attempt.save, attempt.failure_code
-        ))
+        ));
     }
+    read_assistant(client, &attempt)
+        .await
+        .map_err(|error| format!("{label}: {error}"))
 }
 
 async fn wait_for_attempt(
@@ -282,10 +286,15 @@ pub(super) async fn list_turns(
 
 async fn read_assistant(
     client: &ServiceClient,
-    attempt_id: &str,
-    saved_end: &str,
+    attempt: &loxa_ipc::AttemptSummary,
 ) -> Result<String, String> {
-    let expected_end = saved_end
+    if attempt.generated_end.as_ref() != Some(&attempt.saved_end)
+        || attempt.terminal_saved_end.as_ref() != Some(&attempt.saved_end)
+    {
+        return Err("native generation terminal content ends disagree".into());
+    }
+    let expected_end = attempt
+        .saved_end
         .parse::<u64>()
         .map_err(|_| "native saved end is invalid".to_string())?;
     let mut start = 0u64;
@@ -296,7 +305,7 @@ async fn read_assistant(
                 ConnectMode::ObserveExisting,
                 HistoryCommand::ReadContentRange {
                     source: ContentSource::Assistant {
-                        attempt_id: attempt_id.into(),
+                        attempt_id: attempt.id.clone(),
                     },
                     start: start.to_string(),
                     prefix_end: expected_end.to_string(),
@@ -316,7 +325,11 @@ async fn read_assistant(
             .end
             .parse::<u64>()
             .map_err(|_| "native content range end is invalid".to_string())?;
-        if range_start != start || range_end <= start {
+        if range_start != start
+            || range_end <= start
+            || range_end > expected_end
+            || range.content.len() as u64 != range_end - range_start
+        {
             return Err("native saved output is not contiguous".into());
         }
         content.push_str(&range.content);

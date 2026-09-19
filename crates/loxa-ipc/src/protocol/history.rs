@@ -14,7 +14,7 @@ pub const HISTORY_SCHEMA_VERSION: u32 = 3;
 pub const MAX_CONVERSATION_TITLE_BYTES: usize = 256;
 pub const MAX_CONVERSATION_PAGE_ITEMS: usize = 50;
 pub const MAX_CONVERSATION_PAGE_BYTES: usize = 24 * 1024;
-const MAX_ATTEMPT_CONTENT_BYTES: u64 = 16 * 1024 * 1024;
+pub(super) const MAX_ATTEMPT_CONTENT_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

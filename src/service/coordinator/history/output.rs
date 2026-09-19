@@ -2,11 +2,20 @@ use super::{history_error, maybe_begin_history_drain};
 use crate::history::{
     CommittedAdmission, ExecutionOutcome, FinalizationInput, SuffixCommit, SuffixInput,
 };
-use crate::service::coordinator::state::AdmissionReservation;
+use crate::service::coordinator::state::{AdmissionReservation, CancellationCause};
 use crate::service::coordinator::Shared;
 use loxa_ipc::{ErrorCategory, ServiceError};
 use std::sync::Arc;
 use tokio::sync::watch;
+
+mod status;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::service::coordinator) struct ExecutionFact {
+    pub(in crate::service::coordinator) outcome: ExecutionOutcome,
+    pub(in crate::service::coordinator) failure_code: Option<String>,
+    pub(in crate::service::coordinator) generated_end: u64,
+}
 
 pub(in crate::service::coordinator) type OutputObserver =
     watch::Receiver<Option<Result<SuffixCommit, loxa_ipc::ServiceError>>>;
@@ -34,6 +43,7 @@ pub(in crate::service::coordinator) struct OutputState {
     closed: bool,
     next_sequence: u64,
     status: OutputSavePhase,
+    execution: Option<ExecutionFact>,
 }
 
 #[derive(Clone)]
@@ -60,7 +70,49 @@ impl OutputState {
             closed: false,
             next_sequence: 1,
             status: OutputSavePhase::Open { saved_end: 0 },
+            execution: None,
         }
+    }
+
+    fn publish_execution(
+        &mut self,
+        reservation: &AdmissionReservation,
+        proposed: ExecutionOutcome,
+        failure_code: Option<&str>,
+        generated_end: u64,
+    ) -> Result<ExecutionFact, ServiceError> {
+        if let Some(fact) = &self.execution {
+            return Ok(fact.clone());
+        }
+        if matches!(
+            (proposed, failure_code),
+            (ExecutionOutcome::Completed, Some(_)) | (ExecutionOutcome::Failed, None)
+        ) || failure_code
+            .is_some_and(|code| code.is_empty() || code.len() > 64 || !code.is_ascii())
+        {
+            return Err(internal("invalid generation failure code"));
+        }
+        let cancellation_can_select = proposed != ExecutionOutcome::Failed
+            || matches!(failure_code, Some("stopped" | "output_save"));
+        let (outcome, failure_code) = match reservation.cancellation_cause() {
+            Some(CancellationCause::Requested) if cancellation_can_select => {
+                (ExecutionOutcome::Stopped, Some("stopped"))
+            }
+            Some(CancellationCause::OutputSave) if cancellation_can_select => {
+                (ExecutionOutcome::Failed, Some("output_save"))
+            }
+            Some(CancellationCause::EngineFailure) if cancellation_can_select => {
+                (ExecutionOutcome::Failed, Some("engine_transport"))
+            }
+            _ => (proposed, failure_code),
+        };
+        let fact = ExecutionFact {
+            outcome,
+            failure_code: failure_code.map(str::to_owned),
+            generated_end,
+        };
+        self.execution = Some(fact.clone());
+        Ok(fact)
     }
 
     pub(in crate::service::coordinator) fn matches(&self, committed: &CommittedAdmission) -> bool {
@@ -97,12 +149,33 @@ impl GenerationOutput {
         self.reservation.is_cancelled()
     }
 
-    pub(in crate::service::coordinator) fn request_cancel(&self) {
-        self.reservation.request_cancel();
+    pub(in crate::service::coordinator) fn cancel_output_save(&self) {
+        self.reservation.cancel_output_save();
+    }
+
+    pub(in crate::service::coordinator) fn publish_execution(
+        &self,
+        proposed: ExecutionOutcome,
+        failure_code: Option<&str>,
+        generated_end: u64,
+    ) -> Result<ExecutionFact, ServiceError> {
+        let state = self.shared.state();
+        if !state.admission_is_current(&self.reservation) {
+            return Err(conflict("generation execution is no longer authoritative"));
+        }
+        let mut output = self
+            .reservation
+            .output
+            .lock()
+            .map_err(|_| internal("output persistence lock is poisoned"))?;
+        let output = output
+            .as_mut()
+            .filter(|output| !output.closed)
+            .ok_or_else(|| conflict("generation execution is no longer active"))?;
+        output.publish_execution(&self.reservation, proposed, failure_code, generated_end)
     }
 
     pub(in crate::service::coordinator) fn report_capacity_saturation(&self) {
-        self.reservation.request_cancel();
         let mut output = self
             .reservation
             .output
@@ -113,6 +186,7 @@ impl GenerationOutput {
                 saved_end: output.saved_end,
             };
         }
+        self.reservation.cancel_output_save();
     }
 
     #[cfg(test)]
@@ -139,13 +213,9 @@ impl GenerationOutput {
         if let Err(error) = input.validate(false) {
             return Err((history_error(error), input));
         }
-        self.enqueue(
-            OutputIntentKind::Checkpoint(Arc::clone(&input)),
-            false,
-            false,
-        )
-        .map(|(observer, _)| observer)
-        .map_err(|(error, _)| (error, input))
+        self.enqueue(OutputIntentKind::Checkpoint(Arc::clone(&input)), false)
+            .map(|(observer, _)| observer)
+            .map_err(|(error, _)| (error, input))
     }
 
     pub(in crate::service::coordinator) fn checkpoint_generation_owned(
@@ -155,13 +225,9 @@ impl GenerationOutput {
         if let Err(error) = input.validate(false) {
             return Err((history_error(error), input, false));
         }
-        self.enqueue(
-            OutputIntentKind::Checkpoint(Arc::clone(&input)),
-            false,
-            false,
-        )
-        .map(|(observer, _)| observer)
-        .map_err(|(error, cancelled)| (error, input, cancelled))
+        self.enqueue(OutputIntentKind::Checkpoint(Arc::clone(&input)), false)
+            .map(|(observer, _)| observer)
+            .map_err(|(error, cancelled)| (error, input, cancelled))
     }
 
     pub(in crate::service::coordinator) fn checkpoint_terminal_owned(
@@ -171,13 +237,9 @@ impl GenerationOutput {
         if let Err(error) = input.validate(false) {
             return Err((history_error(error), input));
         }
-        self.enqueue(
-            OutputIntentKind::Checkpoint(Arc::clone(&input)),
-            true,
-            false,
-        )
-        .map(|(observer, _)| observer)
-        .map_err(|(error, _)| (error, input))
+        self.enqueue(OutputIntentKind::Checkpoint(Arc::clone(&input)), true)
+            .map(|(observer, _)| observer)
+            .map_err(|(error, _)| (error, input))
     }
 
     #[cfg(test)]
@@ -185,12 +247,8 @@ impl GenerationOutput {
         &self,
         input: Arc<FinalizationInput>,
     ) -> Result<OutputObserver, (ServiceError, Arc<FinalizationInput>)> {
-        if let Err(error) = input.validate() {
-            return Err((history_error(error), input));
-        }
-        self.enqueue(OutputIntentKind::Final(Arc::clone(&input)), false, false)
+        self.finalize_generation_owned(input)
             .map(|(observer, _)| observer)
-            .map_err(|(error, _)| (error, input))
     }
 
     pub(in crate::service::coordinator) fn finalize_generation_owned(
@@ -200,7 +258,7 @@ impl GenerationOutput {
         if let Err(error) = input.validate() {
             return Err((history_error(error), input));
         }
-        self.enqueue(OutputIntentKind::Final(Arc::clone(&input)), true, true)
+        self.enqueue(OutputIntentKind::Final(Arc::clone(&input)), true)
             .map(|(observer, outcome)| {
                 (
                     observer,
@@ -258,7 +316,6 @@ impl GenerationOutput {
         &self,
         mut kind: OutputIntentKind,
         allow_cancelled_checkpoint: bool,
-        normalize_completed: bool,
     ) -> Result<(OutputObserver, Option<ExecutionOutcome>), (ServiceError, bool)> {
         let mut cancelled_rejection = false;
         let result = (|| {
@@ -269,28 +326,12 @@ impl GenerationOutput {
                     return Err(conflict("output persistence is no longer authoritative"));
                 }
                 let cancelled = self.reservation.is_cancelled();
-                if cancelled {
-                    match &mut kind {
-                        OutputIntentKind::Checkpoint(_) if !allow_cancelled_checkpoint => {
-                            cancelled_rejection = true;
-                            return Err(unavailable("generation output has been cancelled"));
-                        }
-                        OutputIntentKind::Final(input)
-                            if input.execution_outcome == ExecutionOutcome::Completed
-                                && normalize_completed =>
-                        {
-                            let input = Arc::make_mut(input);
-                            input.execution_outcome = ExecutionOutcome::Stopped;
-                            input.failure_code = Some("stopped".into());
-                        }
-                        OutputIntentKind::Final(input)
-                            if input.execution_outcome == ExecutionOutcome::Completed =>
-                        {
-                            cancelled_rejection = true;
-                            return Err(unavailable("generation output has been cancelled"));
-                        }
-                        OutputIntentKind::Checkpoint(_) | OutputIntentKind::Final(_) => {}
-                    }
+                if cancelled
+                    && !allow_cancelled_checkpoint
+                    && matches!(kind, OutputIntentKind::Checkpoint(_))
+                {
+                    cancelled_rejection = true;
+                    return Err(unavailable("generation output has been cancelled"));
                 }
                 let mut output = self
                     .reservation
@@ -303,7 +344,7 @@ impl GenerationOutput {
                 if output.closed {
                     return Err(conflict("output persistence is already finalized"));
                 }
-                validate_identity(&self.shared, output, &kind)?;
+                validate_identity(&self.shared, output, kind.suffix())?;
                 if output.failed && !matches!(&kind, OutputIntentKind::Final(_)) {
                     return Err(unavailable(
                         "output save failed; retry the exact retained suffix",
@@ -324,8 +365,26 @@ impl GenerationOutput {
                 if output.current.as_ref().is_some_and(OutputIntent::is_final) {
                     return Err(conflict("output finalization is already in flight"));
                 }
-                if let OutputIntentKind::Final(input) = &kind {
+                if let OutputIntentKind::Final(input) = &mut kind {
                     input.validate().map_err(history_error)?;
+                    // An unpublished low-level final intent must pass every
+                    // ownership/range check before it can freeze execution.
+                    let fact = output.publish_execution(
+                        &self.reservation,
+                        input.execution_outcome,
+                        input.failure_code.as_deref(),
+                        input.generated_end,
+                    )?;
+                    if input.generated_end != fact.generated_end {
+                        return Err(conflict("final output does not match frozen execution"));
+                    }
+                    if input.execution_outcome != fact.outcome
+                        || input.failure_code != fact.failure_code
+                    {
+                        let input = Arc::make_mut(input);
+                        input.execution_outcome = fact.outcome;
+                        input.failure_code = fact.failure_code;
+                    }
                 }
                 let selected_outcome = match &kind {
                     OutputIntentKind::Final(input) => Some(input.execution_outcome),
@@ -419,6 +478,7 @@ fn resolve(
                     && commit.end == intent.end()
                     && commit.current_saved_end >= commit.end =>
             {
+                let save_failed = matches!(output.status, OutputSavePhase::SaveFailed { .. });
                 output.saved_end = commit.current_saved_end;
                 terminal = intent.is_final();
                 output.current = output.pending.take();
@@ -441,6 +501,10 @@ fn resolve(
                         saved_end: output.saved_end,
                     };
                     next = Some(current.clone());
+                } else if save_failed {
+                    output.status = OutputSavePhase::SaveFailed {
+                        saved_end: output.saved_end,
+                    };
                 } else {
                     output.status = OutputSavePhase::Open {
                         saved_end: output.saved_end,
@@ -450,14 +514,14 @@ fn resolve(
             Ok(_) => {
                 published = Err(internal("history owner returned a mismatched suffix range"));
                 output.failed = true;
-                reservation.request_cancel();
+                reservation.cancel_output_save();
                 output.status = OutputSavePhase::SaveFailed {
                     saved_end: output.saved_end,
                 };
             }
             Err(_) => {
                 output.failed = true;
-                reservation.request_cancel();
+                reservation.cancel_output_save();
                 output.status = OutputSavePhase::SaveFailed {
                     saved_end: output.saved_end,
                 };
@@ -484,9 +548,8 @@ fn resolve(
 fn validate_identity(
     shared: &Shared,
     output: &OutputState,
-    kind: &OutputIntentKind,
+    input: &SuffixInput,
 ) -> Result<(), ServiceError> {
-    let input = kind.suffix();
     if input.attempt_id != output.committed.attempt_id
         || input.operation_generation != output.committed.operation_generation
         || input.owner_epoch != output.committed.owner_epoch

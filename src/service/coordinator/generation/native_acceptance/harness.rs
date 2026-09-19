@@ -29,6 +29,91 @@ pub(super) struct NativeRuntimeEvidence {
     pub(super) inventory_sha256: String,
 }
 
+pub(super) struct NativeEngine {
+    pid: u32,
+    start_identity: u64,
+    group: i32,
+    endpoint: PathBuf,
+    lease_path: PathBuf,
+}
+
+#[derive(serde::Deserialize)]
+struct NativeLeaseIdentity {
+    child_pid: u32,
+    child_start_time: u64,
+    child_pgid: i32,
+    endpoint: PathBuf,
+}
+
+impl NativeEngine {
+    pub(super) fn capture(fixture: &NativeService) -> Result<Self, String> {
+        let RuntimePhase::Ready { engine_pid, .. } = fixture.coordinator.status().phase else {
+            return Err("native engine is not ready for identity capture".into());
+        };
+        let process = crate::process_inspection::process_snapshot(engine_pid)?
+            .ok_or_else(|| "ready native engine process is absent".to_string())?;
+        let pid = i32::try_from(engine_pid).map_err(|error| error.to_string())?;
+        // SAFETY: getpgid only observes this Ready engine's process group.
+        let group = unsafe { libc::getpgid(pid) };
+        if group < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let endpoint = only_engine_endpoint(&fixture.root.join("run/service"))?;
+        let lease_path = fixture.root.join("run/foreground.json");
+        let lease: NativeLeaseIdentity = serde_json::from_slice(
+            &crate::safe_file::read_regular_file_bounded(&lease_path, 64 * 1024)
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        if group <= 1
+            || lease.child_pid != engine_pid
+            || lease.child_start_time != process.start_identity
+            || lease.child_pgid != group
+            || lease.endpoint != endpoint
+        {
+            return Err("native runtime lease does not identify the Ready engine".into());
+        }
+        Ok(Self {
+            pid: engine_pid,
+            start_identity: process.start_identity,
+            group,
+            endpoint,
+            lease_path,
+        })
+    }
+
+    pub(super) fn require_removed(&self) -> Result<(), String> {
+        if self
+            .endpoint
+            .try_exists()
+            .map_err(|error| error.to_string())?
+            || crate::process_inspection::process_snapshot(self.pid)?
+                .is_some_and(|process| process.start_identity == self.start_identity)
+            || crate::runtime::process_group_has_live_members(self.group)?
+        {
+            return Err("stopped exact native engine survived verified cleanup".into());
+        }
+        match fs::symlink_metadata(&self.lease_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+            Ok(_) => return Err("stopped native engine retained its runtime lease".into()),
+        }
+        Ok(())
+    }
+
+    pub(super) fn require_current(&self, fixture: &NativeService) -> Result<(), String> {
+        let phase = fixture.coordinator.status().phase;
+        if !matches!(phase, RuntimePhase::Ready { engine_pid, .. } if engine_pid == self.pid)
+            || only_engine_endpoint(&fixture.root.join("run/service"))? != self.endpoint
+            || !crate::process_inspection::process_snapshot(self.pid)?
+                .is_some_and(|process| process.start_identity == self.start_identity)
+        {
+            return Err("stale Stop disturbed the replacement native engine".into());
+        }
+        Ok(())
+    }
+}
+
 impl NativeService {
     pub(super) async fn start(app: &Path, source_model: &Path) -> Result<Self, String> {
         crate::verification::file::verify_regular(source_model, MODEL_SIZE, MODEL_SHA256)?;
@@ -134,6 +219,16 @@ impl NativeService {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+    }
+
+    pub(super) async fn wait_for_admission_release(&self) -> Result<(), String> {
+        tokio::time::timeout(WAIT_TIMEOUT, async {
+            while self.coordinator.admission_active_for_test() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| "native generation retained resolved admission".to_string())
     }
 
     pub(super) async fn shutdown(&mut self, require_wire_stop: bool) -> Result<(), String> {

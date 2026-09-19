@@ -177,6 +177,7 @@ impl ServiceRuntimeWorker {
                 | ReplyOutcome::Draft { .. }
                 | ReplyOutcome::Settings { .. }
                 | ReplyOutcome::Generation { .. }
+                | ReplyOutcome::GenerationStatus { .. }
                 | ReplyOutcome::Rejected(_),
             )) => {
                 let _ = self.messages.send(ServiceEvent::ControllerFailed);

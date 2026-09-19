@@ -24,6 +24,21 @@ pub(super) struct QualifiedRequest {
 }
 
 impl QualifiedRequest {
+    #[cfg(test)]
+    pub(super) fn for_test() -> Self {
+        Self {
+            request: PreparedEngineRequest {
+                body: Bytes::from_static(b"{}"),
+            },
+            actual_context: 4096,
+            input_tokens: 1,
+            #[cfg(target_os = "macos")]
+            template_sha256: [0; 32],
+            #[cfg(target_os = "macos")]
+            observation_id: None,
+        }
+    }
+
     pub(super) fn actual_context(&self) -> u32 {
         self.actual_context
     }

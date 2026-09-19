@@ -109,6 +109,61 @@ impl ServerFixture {
         }
         assert!(Arc::clone(&permits).try_acquire_owned().is_err());
 
+        let pending = self.coordinator.register_generation_connection().unwrap();
+        let target = loxa_ipc::GenerationTarget::Pending {
+            boot_epoch: self.coordinator.boot_epoch().into(),
+            pending_nonce: pending.nonce().into(),
+        };
+        let (client, server) = UnixStream::pair().unwrap();
+        let classification = tokio::spawn(classify_overload_connection(
+            server,
+            self.bootstrap.clone(),
+            self.coordinator.clone(),
+            Arc::clone(&protected_stops),
+        ));
+        let mut control = framed(client);
+        send_frame(
+            &mut control,
+            &ClientEnvelope::Hello(Hello::generation(
+                super::super::BUILD_ID,
+                self.bootstrap.root().root_identity(),
+                loxa_ipc::GenerationConnection::Control,
+            )),
+            OVERLOAD_HANDSHAKE_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        let ServerEnvelope::HelloAck(ack) = receive_frame(&mut control, OVERLOAD_HANDSHAKE_TIMEOUT)
+            .await
+            .unwrap()
+        else {
+            panic!("overloaded generation Stop lost its control handshake");
+        };
+        assert_eq!(ack.protocol, loxa_ipc::ProtocolVersion::V1_2);
+        assert!(ack.generation.is_none());
+        send_frame(
+            &mut control,
+            &ClientEnvelope::Request(Request::new(
+                "generation-stop",
+                ServiceCommand::Generation {
+                    command: loxa_ipc::GenerationCommand::Stop {
+                        target: target.clone(),
+                    },
+                },
+            )),
+            OVERLOAD_REQUEST_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        dispatch_overload_result(classification.await, &self.coordinator, &mut connections);
+        let reply: ServerEnvelope = receive_frame(&mut control, OVERLOAD_REPLY_TIMEOUT)
+            .await
+            .unwrap();
+        assert!(matches!(reply, ServerEnvelope::Reply(Reply {
+            outcome: ReplyOutcome::Generation { reply: loxa_ipc::GenerationReply::Stopping { target: stopped } }, ..
+        }) if stopped == target));
+        self.coordinator.finish_generation_connection(&pending);
+
         // This connection occupies the only overload classifier without
         // sending a hello. The next prompt connection must replace and
         // fully reap it before being classified.
@@ -648,6 +703,29 @@ async fn public_typed_client_round_trips_legacy_history_drafts_and_settings() {
         super::super::BUILD_ID,
     )
     .unwrap();
+    assert_eq!(
+        client
+            .generation_status(&loxa_ipc::GenerationTarget::Accepted {
+                boot_epoch: fixture.coordinator.boot_epoch().into(),
+                submission_id: "11".repeat(16),
+                operation_generation: "1".into(),
+            })
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(matches!(
+        client
+            .generation_status(&loxa_ipc::GenerationTarget::Pending {
+                boot_epoch: fixture.coordinator.boot_epoch().into(),
+                pending_nonce: "22".repeat(16),
+            })
+            .await,
+        Err(loxa_ipc::ClientError::Rejected(loxa_ipc::ServiceError {
+            category: ErrorCategory::InvalidRequest,
+            ..
+        }))
+    ));
     assert!(matches!(
         client
             .request(ConnectMode::ObserveExisting, ServiceCommand::Status)
@@ -893,6 +971,46 @@ async fn opening_handshake_cannot_use_sql_backed_profile_settings() {
         generation: None,
     };
     let mut pending = None;
+    for minor in 0..=3 {
+        let ordinary = NegotiatedHello {
+            protocol: loxa_ipc::ProtocolVersion { major: 1, minor },
+            capabilities: LEGACY_CAPABILITIES.to_vec(),
+            storage_schema: 0,
+            frame_limit: MAX_HISTORY_FRAME_BYTES,
+            generation: None,
+        };
+        let (reply, permit) = connection::execute_request(
+            &fixture.coordinator,
+            Request::new(
+                "generation-without-history",
+                ServiceCommand::GetGenerationStatus {
+                    target: loxa_ipc::GenerationTarget::Accepted {
+                        boot_epoch: fixture.coordinator.boot_epoch().into(),
+                        submission_id: "11".repeat(16),
+                        operation_generation: "1".into(),
+                    },
+                },
+            ),
+            &ordinary,
+            &mut pending,
+        )
+        .await;
+        assert!(permit.is_none());
+        if minor < 3 {
+            assert!(matches!(
+                reply.outcome,
+                ReplyOutcome::Rejected(loxa_ipc::ServiceError {
+                    category: ErrorCategory::IncompatibleProtocol,
+                    ..
+                })
+            ));
+        } else {
+            assert_eq!(
+                reply.outcome,
+                ReplyOutcome::GenerationStatus { snapshot: None }
+            );
+        }
+    }
     let (reply, permit) = connection::execute_request(
         &fixture.coordinator,
         Request::new(

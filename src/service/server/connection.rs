@@ -34,7 +34,7 @@ pub(super) async fn classify_overload_connection(
     };
     let legacy_control =
         hello.protocol == loxa_ipc::ProtocolVersion::V1_0 && hello.generation.is_none();
-    let generation_control = hello.protocol == loxa_ipc::ProtocolVersion::CURRENT
+    let generation_control = hello.protocol == loxa_ipc::ProtocolVersion::V1_2
         && hello.generation.as_ref().is_some_and(|generation| {
             generation.connection == loxa_ipc::GenerationConnection::Control
         });
@@ -313,6 +313,18 @@ pub(super) async fn execute_request(
             Ok(accepted) => ReplyOutcome::Accepted(accepted),
             Err(error) => ReplyOutcome::Rejected(error),
         },
+        ServiceCommand::GetGenerationStatus { .. } if negotiated.protocol.minor < 3 => {
+            ReplyOutcome::Rejected(ServiceError::new(
+                ErrorCategory::IncompatibleProtocol,
+                "generation status requires service protocol 1.3",
+            ))
+        }
+        ServiceCommand::GetGenerationStatus { target } => {
+            match coordinator.generation_status(&target) {
+                Ok(snapshot) => ReplyOutcome::GenerationStatus { snapshot },
+                Err(error) => ReplyOutcome::Rejected(error),
+            }
+        }
         ServiceCommand::History { command: _command } if negotiated.protocol.minor == 0 => {
             ReplyOutcome::Rejected(ServiceError::new(
                 ErrorCategory::IncompatibleProtocol,

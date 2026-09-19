@@ -43,9 +43,12 @@ impl OutputPipeline {
         &mut self,
         content: String,
     ) -> Result<(), SaveChunkFailure> {
-        self.validate_chunk(&content)
-            .map_err(|_| SaveChunkFailure::Failed)?;
+        self.validate_chunk(&content).map_err(|_| {
+            self.output.cancel_output_save();
+            SaveChunkFailure::Failed
+        })?;
         if self.retained_tail.is_some() {
+            self.output.cancel_output_save();
             return Err(SaveChunkFailure::Failed);
         }
         if let Some(checkpoint) = self.checkpoint.as_mut() {
@@ -54,7 +57,7 @@ impl OutputPipeline {
                 Some(Ok(_)) => self.checkpoint = None,
                 Some(Err(error)) => {
                     self.retained_tail = Some(content);
-                    self.output.request_cancel();
+                    self.output.cancel_output_save();
                     drop(error);
                     return Err(SaveChunkFailure::Failed);
                 }
@@ -70,9 +73,35 @@ impl OutputPipeline {
                 if cancelled {
                     SaveChunkFailure::Cancelled
                 } else {
+                    self.output.cancel_output_save();
                     SaveChunkFailure::Failed
                 }
             })
+    }
+
+    pub(super) fn checkpoint_pending(&self) -> bool {
+        self.checkpoint.is_some()
+    }
+
+    pub(super) async fn wait_checkpoint(&mut self) -> Result<(), SaveChunkFailure> {
+        // Keep the observer owned here when a body frame or Stop cancels this wait.
+        let Some(observer) = self.checkpoint.as_mut() else {
+            return std::future::pending().await;
+        };
+        loop {
+            let resolved = { observer.borrow().clone() };
+            match resolved {
+                Some(Ok(_)) => {
+                    self.checkpoint = None;
+                    return Ok(());
+                }
+                Some(Err(_)) => break,
+                None if observer.changed().await.is_err() => break,
+                None => {}
+            }
+        }
+        self.output.cancel_output_save();
+        Err(SaveChunkFailure::Failed)
     }
 
     pub(in crate::service::coordinator) async fn finish(
@@ -80,7 +109,12 @@ impl OutputPipeline {
         decoder: &mut super::parser::SseDecoder,
         proposed_outcome: ExecutionOutcome,
         failure_code: Option<&'static str>,
-    ) -> ExecutionOutcome {
+    ) -> Result<ExecutionOutcome, ServiceError> {
+        let generated_end = u64::try_from(decoder.generated_end()).unwrap_or(u64::MAX);
+        let fact = self
+            .output
+            .publish_execution(proposed_outcome, failure_code, generated_end)
+            .inspect_err(|_| self.output.cancel_output_save())?;
         self.settle_checkpoint().await;
         if let Some(content) = self.retained_tail.take() {
             self.persist_terminal_chunk(content).await;
@@ -89,7 +123,6 @@ impl OutputPipeline {
             self.persist_terminal_chunk(content).await;
         }
 
-        let generated_end = u64::try_from(decoder.generated_end()).unwrap_or(u64::MAX);
         debug_assert_eq!(generated_end, self.enqueued_end);
         let input = Arc::new(FinalizationInput {
             suffix: SuffixInput {
@@ -99,23 +132,23 @@ impl OutputPipeline {
                 expected_saved_end: self.enqueued_end,
                 content: String::new(),
             },
-            execution_outcome: proposed_outcome,
-            generated_end,
-            failure_code: failure_code.map(str::to_owned),
+            execution_outcome: fact.outcome,
+            generated_end: fact.generated_end,
+            failure_code: fact.failure_code,
         });
         let mut delay = MIN_RETRY_DELAY;
         let (mut observer, selected_outcome) = loop {
             match self.output.finalize_generation_owned(Arc::clone(&input)) {
                 Ok(accepted) => break accepted,
                 Err((_error, _returned)) => {
-                    self.output.request_cancel();
+                    self.output.cancel_output_save();
                     tokio::time::sleep(delay).await;
                     delay = next_delay(delay);
                 }
             }
         };
         self.settle_observer(&mut observer).await;
-        selected_outcome
+        Ok(selected_outcome)
     }
 
     fn enqueue_chunk(
@@ -175,7 +208,7 @@ impl OutputPipeline {
                     return;
                 }
                 Err((_error, _cancelled)) => {
-                    self.output.request_cancel();
+                    self.output.cancel_output_save();
                     content = self.retained_tail.take();
                     tokio::time::sleep(delay).await;
                     delay = next_delay(delay);
@@ -208,7 +241,7 @@ impl OutputPipeline {
             if result.is_ok() {
                 return;
             }
-            self.output.request_cancel();
+            self.output.cancel_output_save();
             tokio::time::sleep(delay).await;
             delay = next_delay(delay);
             if let Ok(retry) = self.output.retry_save() {

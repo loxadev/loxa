@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use super::history::OutputState;
 
 mod generation;
-pub(super) use generation::{EngineDescriptor, PendingGeneration};
+pub(super) use generation::{CancellationCause, EngineDescriptor, PendingGeneration};
 
 // All admission and publication decisions run under Shared::state. The watch
 // value is an observer copy: never read it back to decide a transition.
@@ -68,6 +68,7 @@ pub(super) struct AdmissionReservation {
     pub(super) engine: EngineDescriptor,
     pending_nonce: Option<String>,
     cancellation: CancellationToken,
+    cancellation_cause: Mutex<Option<CancellationCause>>,
     engine_quiescent: AtomicBool,
     durable_terminal: AtomicBool,
     outcome: watch::Sender<Option<Result<crate::history::CommittedAdmission, ServiceError>>>,

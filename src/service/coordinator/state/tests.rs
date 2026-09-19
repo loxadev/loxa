@@ -483,7 +483,7 @@ fn unresolved_output_fences_a_new_load_after_runtime_completion() {
 }
 
 #[test]
-fn stale_runtime_completion_cannot_cancel_a_replacement_admission() {
+fn stale_runtime_completion_and_failure_cannot_cancel_a_replacement_admission() {
     let (mut state, old_operation) = ready_state();
     state.complete(&old_operation, None);
 
@@ -507,7 +507,45 @@ fn stale_runtime_completion_cannot_cancel_a_replacement_admission() {
         AdmissionClaim::Existing(_) => panic!("replacement admission was not fresh"),
     };
 
+    state.cancel_generation_for_engine_failure(&old_operation);
     state.complete(&old_operation, None);
     assert!(!admission.is_cancelled());
+    assert_eq!(admission.cancellation_cause(), None);
+    assert!(!replacement.cancel.load(Ordering::Acquire));
     assert!(state.admission_is_current(&admission));
+    admission.request_cancel();
+    state.cancel_generation_for_engine_failure(&replacement);
+    assert_eq!(
+        admission.cancellation_cause(),
+        Some(CancellationCause::Requested)
+    );
+    assert!(replacement.cancel.load(Ordering::Acquire));
+}
+
+#[test]
+fn engine_failure_fences_the_operation_even_without_an_admission() {
+    let (mut state, operation) = ready_state();
+    state.cancel_generation_for_engine_failure(&operation);
+    assert!(state.current_admission().is_none());
+    assert!(operation.cancel.load(Ordering::Acquire));
+    assert!(operation.retry_cleanup.load(Ordering::Acquire) > 0);
+    assert!(matches!(state.snapshot().phase, RuntimePhase::Ready { .. }));
+    assert_eq!(
+        state
+            .reserve_admission([1; 16], [2; 16], [3; 32], 1, 1)
+            .err()
+            .unwrap()
+            .category,
+        ErrorCategory::ServiceUnavailable
+    );
+    assert_eq!(
+        state
+            .reserve_load("replacement".into())
+            .err()
+            .unwrap()
+            .category,
+        ErrorCategory::Busy
+    );
+    state.complete(&operation, None);
+    assert!(state.reserve_load("replacement".into()).is_ok());
 }

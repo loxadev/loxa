@@ -63,6 +63,15 @@ impl SseDecoder {
         self.generated_end
     }
 
+    pub(super) fn has_pending_chunk(&self) -> bool {
+        !self.chunk.is_empty()
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(super) fn pending_chunk(&self) -> &str {
+        &self.chunk
+    }
+
     pub(super) fn prompt_tokens(&self) -> Option<u32> {
         self.prompt_tokens
     }

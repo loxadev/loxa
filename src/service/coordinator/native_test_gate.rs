@@ -31,7 +31,7 @@ impl NativeTestGate {
         (gate, control)
     }
 
-    async fn pause(&self) {
+    pub(super) async fn pause(&self) {
         self.reached.add_permits(1);
         if let Ok(permit) = self.release.acquire().await {
             permit.forget();
@@ -96,6 +96,24 @@ impl Coordinator {
 
     pub(super) async fn wait_at_native_generation_execution_gate(&self) {
         pause_once(&self.shared.native_generation_execution_gate).await;
+    }
+
+    pub(super) fn pause_native_generation_output(&self) -> NativeTestGateControl {
+        let (gate, control) = NativeTestGate::pair();
+        *self
+            .shared
+            .native_generation_output_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(gate);
+        control
+    }
+
+    pub(super) fn take_native_generation_output_gate(&self) -> Option<Arc<NativeTestGate>> {
+        self.shared
+            .native_generation_output_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 
     pub(super) async fn wait_for_native_shutdown_resolution(&self) -> Result<(), String> {

@@ -53,6 +53,9 @@ impl PreparedEngineRequest {
             stream_options: StreamOptions {
                 include_usage: true,
             },
+            #[cfg(test)]
+            temperature: (prompt.model_id == super::qualification_fixture::MODEL_ID)
+                .then_some(super::qualification_fixture::TEMPERATURE),
         };
         let raw_capacity = prompt
             .messages
@@ -79,6 +82,10 @@ struct WireRequest<'a> {
     max_completion_tokens: u32,
     stream: bool,
     stream_options: StreamOptions,
+    // The pinned native fixture needs deterministic content to reach its Stop gate.
+    #[cfg(test)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
 }
 
 #[derive(Serialize)]
@@ -161,7 +168,9 @@ pub(super) async fn bounded_json_request(
     tokio::select! {
         biased;
         () = reservation.wait_cancelled() => Err(stopped()),
-        joined = async { tokio::join!(connection, exchange) } => {
+        // Drop this one-request socket after HTTP completion. On macOS a peer
+        // that has already closed can make a redundant write shutdown fail.
+        joined = async { tokio::join!(connection.without_shutdown(), exchange) } => {
             let (driver, response) = joined;
             if driver.is_err() && response.is_ok() {
                 return Err(unavailable("engine HTTP driver failed"));

@@ -1,10 +1,10 @@
 #[cfg(test)]
 use super::state::AdmissionClaim;
-use super::state::{AdmissionRecoveryAction, AdmissionReservation};
+use super::state::{AdmissionRecoveryAction, AdmissionReservation, CancellationCause};
 use super::{history_error, Coordinator};
 use crate::history::{
-    AdmissionKind, CommittedAdmission, HistoryError, HistoryErrorKind, PreparedAdmission,
-    PromptBasis,
+    AdmissionKind, CommittedAdmission, ExecutionOutcome, FinalizationInput, HistoryError,
+    HistoryErrorKind, PreparedAdmission, PromptBasis, SuffixInput,
 };
 #[cfg(test)]
 use sha2::{Digest, Sha256};
@@ -375,26 +375,55 @@ async fn resolve_stop(
     reservation: &Arc<AdmissionReservation>,
     committed: CommittedAdmission,
 ) {
-    let terminal = match shared.history.try_stop_before_execution(committed.clone()) {
-        Ok(terminal) => terminal,
-        Err(_) => {
-            reservation.stop_unknown();
-            return;
-        }
-    };
-    let Ok(terminal) = terminal.await else {
-        reservation.stop_unknown();
-        return;
-    };
-    let result = terminal.result;
-    drop(terminal.permit);
-    if result.is_err() {
+    if persist_cancelled_admission(shared, reservation, &committed)
+        .await
+        .is_none()
+    {
         reservation.stop_unknown();
         return;
     }
     reservation.mark_durable_terminal();
     shared.state().finish_admission_if_resolved(reservation);
     reservation.publish(Ok(committed));
+}
+
+async fn persist_cancelled_admission(
+    shared: &super::Shared,
+    reservation: &AdmissionReservation,
+    committed: &CommittedAdmission,
+) -> Option<()> {
+    if reservation.cancellation_cause() == Some(CancellationCause::EngineFailure) {
+        let terminal = shared
+            .history
+            .try_finalize(Arc::new(FinalizationInput {
+                suffix: SuffixInput {
+                    attempt_id: committed.attempt_id,
+                    owner_epoch: committed.owner_epoch.clone(),
+                    operation_generation: committed.operation_generation,
+                    expected_saved_end: 0,
+                    content: String::new(),
+                },
+                execution_outcome: ExecutionOutcome::Failed,
+                generated_end: 0,
+                failure_code: Some("engine_transport".into()),
+            }))
+            .ok()?
+            .await
+            .ok()?;
+        let result = terminal.result;
+        drop(terminal.permit);
+        result.ok().map(|_| ())
+    } else {
+        let terminal = shared
+            .history
+            .try_stop_before_execution(committed.clone())
+            .ok()?
+            .await
+            .ok()?;
+        let result = terminal.result;
+        drop(terminal.permit);
+        result.ok()
+    }
 }
 
 pub(super) fn maybe_resume_admission(
