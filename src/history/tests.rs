@@ -349,8 +349,11 @@ fn foreign_newer_malformed_and_unsafe_stores_fail_closed() {
     );
 
     let (_newer_directory, newer_root) = private_root("loxa-history-newer-");
-    let (newer, _) = open_store(&newer_root).unwrap();
-    newer.pragma_update(None, "user_version", 5).unwrap();
+    let (newer, info) = open_store(&newer_root).unwrap();
+    let unsupported = info.schema_version.checked_add(1).unwrap();
+    newer
+        .pragma_update(None, "user_version", unsupported)
+        .unwrap();
     newer.close().unwrap();
     assert_eq!(
         open_store(&newer_root).unwrap_err().kind(),
