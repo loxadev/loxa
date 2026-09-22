@@ -145,6 +145,7 @@ impl Fixture {
             input.semantic_hash(),
             input.expected_conversation_revision,
             input.expected_profile_revision,
+            None,
         );
         let AdmissionClaim::Fresh(reservation) = claim.unwrap() else {
             panic!("pending admission was not fresh");
@@ -478,6 +479,106 @@ async fn lost_admission_reply_and_terminal_failure_retry_under_drain() {
     );
     fixture.finish_stopped().await;
     assert_terminalized(&fixture.root, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bound_submission_reconciles_durably_before_the_fresh_runtime_fence() {
+    let fixture = Fixture::start().await;
+    let target = loxa_ipc::OperationTarget {
+        boot_epoch: fixture.coordinator.boot_epoch().into(),
+        task_id: fixture.operation.task_id.to_string(),
+        generation: fixture.operation.generation.to_string(),
+    };
+    let user_text = "bound replay";
+    let submission_id = [28; 16];
+    let base_hash = super::super::generation::stable_submission_hash(
+        fixture.conversation_bytes,
+        1,
+        1,
+        user_text,
+        None,
+    );
+    let mut input = fixture.input(28, user_text);
+    input.submission_hash = Some(super::super::generation::runtime_bound_hash(
+        base_hash, &target,
+    ));
+    let observer = fixture
+        .coordinator
+        .admit_history_generation(input)
+        .await
+        .unwrap();
+    let committed = wait_for_admission(observer).await.unwrap();
+    let output = fixture.coordinator.generation_output(&committed).unwrap();
+    wait_for_output(
+        output
+            .finalize(Arc::new(final_input(
+                &committed,
+                0,
+                "",
+                ExecutionOutcome::Stopped,
+            )))
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(!fixture.coordinator.admission_active_for_test());
+    fixture.coordinator.stop_service().unwrap();
+    fixture.finish_stopped().await;
+
+    let bootstrap = loxa_ipc::ClientBootstrap::load(&fixture.root, None).unwrap();
+    let paths = crate::paths::AppPaths::from_values(Some(&fixture.root), None).unwrap();
+    let ownership = crate::runtime::RuntimeOwnership::acquire_service_unreconciled(&paths.run)
+        .unwrap_or_else(|_| panic!("reacquire runtime ownership for bound replay"));
+    let reopened = Coordinator::start(
+        paths,
+        bootstrap.root().control_dir().to_owned(),
+        bootstrap.root().root_identity().to_owned(),
+        "test-machine-boot".into(),
+        "replacement-service-boot".into(),
+        ownership,
+        tokio::runtime::Handle::current(),
+        None,
+        None,
+    )
+    .unwrap();
+    wait_for_history_ready(&reopened).await;
+    assert!(!reopened.admission_active_for_test());
+    let command = loxa_ipc::GenerationCommand::Send {
+        conversation_id: fixture.conversation_id.clone(),
+        submission_id: crate::history::encode_id(submission_id),
+        expected_conversation_revision: "1".into(),
+        expected_profile_revision: "1".into(),
+        user_text: user_text.into(),
+        draft: None,
+    };
+    let changed = loxa_ipc::OperationTarget {
+        generation: "999".into(),
+        ..target.clone()
+    };
+    let conflicting_pending = reopened.register_generation_connection().unwrap();
+    let error = reopened
+        .generation_request_at(command.clone(), conflicting_pending, changed)
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.category, ErrorCategory::Conflict);
+    let pending = reopened.register_generation_connection().unwrap();
+    let reply = reopened
+        .generation_request_at(command.clone(), pending, target.clone())
+        .await
+        .unwrap();
+    let loxa_ipc::GenerationReply::Accepted(accepted) = reply else {
+        panic!("bound replay did not return Accepted")
+    };
+    assert_eq!(
+        accepted.attempt_id,
+        crate::history::encode_id(committed.attempt_id)
+    );
+    assert_eq!(accepted.boot_epoch, target.boot_epoch);
+    assert_eq!(accepted.operation_generation, target.generation);
+    assert!(!reopened.admission_active_for_test());
+    reopened.stop_service().unwrap();
+    finish_stopped_coordinator(&reopened).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

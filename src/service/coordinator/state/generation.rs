@@ -172,6 +172,7 @@ impl CoordinatorState {
             expected_conversation_revision,
             expected_profile_revision,
             None,
+            None,
             CancellationToken::new(),
         )
     }
@@ -185,6 +186,7 @@ impl CoordinatorState {
         submission_hash: [u8; 32],
         expected_conversation_revision: i64,
         expected_profile_revision: i64,
+        target: Option<&loxa_ipc::OperationTarget>,
     ) -> Result<AdmissionClaim, ServiceError> {
         if !self.pending_is_current(pending) {
             return Err(ServiceError::new(
@@ -225,6 +227,7 @@ impl CoordinatorState {
             submission_hash,
             expected_conversation_revision,
             expected_profile_revision,
+            target,
             Some(pending.nonce.clone()),
             pending.cancellation.clone(),
         )
@@ -238,6 +241,7 @@ impl CoordinatorState {
         submission_hash: [u8; 32],
         expected_conversation_revision: i64,
         expected_profile_revision: i64,
+        target: Option<&loxa_ipc::OperationTarget>,
         pending_nonce: Option<String>,
         cancellation: CancellationToken,
     ) -> Result<AdmissionClaim, ServiceError> {
@@ -291,6 +295,12 @@ impl CoordinatorState {
                 ));
             }
         };
+        if target.is_some_and(|target| !self.matches_target(operation, target)) {
+            return Err(ServiceError::new(
+                ErrorCategory::Conflict,
+                "selected runtime changed before generation admission",
+            ));
+        }
         let operation_generation = i64::try_from(operation.generation).map_err(|_| {
             ServiceError::new(
                 ErrorCategory::Internal,

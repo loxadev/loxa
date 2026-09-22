@@ -568,6 +568,37 @@ pub(super) async fn execute_request(
                 Err(error) => ReplyOutcome::Rejected(error),
             }
         }
+        ServiceCommand::GenerationAt { .. } if negotiated.protocol.minor < 6 => {
+            ReplyOutcome::Rejected(ServiceError::new(
+                ErrorCategory::IncompatibleProtocol,
+                "runtime-bound generation requires service protocol 1.6",
+            ))
+        }
+        ServiceCommand::GenerationAt { .. }
+            if negotiated.generation != Some(loxa_ipc::GenerationConnection::Request) =>
+        {
+            ReplyOutcome::Rejected(ServiceError::new(
+                ErrorCategory::InvalidRequest,
+                "runtime-bound generation requires a prepared request connection",
+            ))
+        }
+        ServiceCommand::GenerationAt { target, command } => {
+            let result = match pending_generation.take() {
+                Some(pending) => {
+                    coordinator
+                        .generation_request_at(command, pending, target)
+                        .await
+                }
+                None => Err(ServiceError::new(
+                    ErrorCategory::Conflict,
+                    "pending generation connection is no longer current",
+                )),
+            };
+            match result {
+                Ok(reply) => ReplyOutcome::Generation { reply },
+                Err(error) => ReplyOutcome::Rejected(error),
+            }
+        }
     };
     (
         Reply {

@@ -55,6 +55,60 @@ fn ready_state() -> (CoordinatorState, Arc<OperationControl>) {
 }
 
 #[test]
+fn same_model_replacement_cannot_reserve_against_the_old_runtime() {
+    let (mut state, old) = ready_state();
+    let old_target = OperationTarget {
+        boot_epoch: "boot".into(),
+        task_id: old.task_id.to_string(),
+        generation: old.generation.to_string(),
+    };
+    assert!(state.complete(&old, None));
+    let replacement = state.reserve_load("demo".into()).unwrap();
+    state.accept_start(&replacement).unwrap();
+    assert!(state.advance(
+        &replacement,
+        OperationPhase::Ready {
+            engine: EngineDescriptor {
+                pid: 43,
+                endpoint: Arc::new("/tmp/replacement.sock".into())
+            },
+            fingerprint: fingerprint("demo"),
+            observed_context: Some(4096),
+        }
+    ));
+    let pending = state.register_pending_generation().unwrap();
+    assert_eq!(
+        state
+            .reserve_pending_admission(&pending, [1; 16], [2; 16], [3; 32], 1, 1, Some(&old_target))
+            .err()
+            .unwrap()
+            .category,
+        ErrorCategory::Conflict
+    );
+    assert!(state.current_admission().is_none());
+    let current_target = OperationTarget {
+        task_id: replacement.task_id.to_string(),
+        generation: replacement.generation.to_string(),
+        ..old_target
+    };
+    let current = state.register_pending_generation().unwrap();
+    assert!(matches!(
+        state
+            .reserve_pending_admission(
+                &current,
+                [1; 16],
+                [2; 16],
+                [3; 32],
+                1,
+                1,
+                Some(&current_target)
+            )
+            .unwrap(),
+        AdmissionClaim::Fresh(_)
+    ));
+}
+
+#[test]
 fn pending_stop_prevents_fresh_admission_without_tombstoning_a_retry() {
     let (mut state, _) = ready_state();
     let pending = state.register_pending_generation().unwrap();
@@ -65,7 +119,7 @@ fn pending_stop_prevents_fresh_admission_without_tombstoning_a_retry() {
     assert!(state.cancel_generation(&target).unwrap().is_none());
     assert_eq!(
         state
-            .reserve_pending_admission(&pending, [1; 16], [2; 16], [3; 32], 1, 1)
+            .reserve_pending_admission(&pending, [1; 16], [2; 16], [3; 32], 1, 1, None)
             .err()
             .unwrap()
             .category,
@@ -79,7 +133,7 @@ fn pending_stop_prevents_fresh_admission_without_tombstoning_a_retry() {
     let retry = state.register_pending_generation().unwrap();
     assert!(matches!(
         state
-            .reserve_pending_admission(&retry, [1; 16], [2; 16], [3; 32], 1, 1)
+            .reserve_pending_admission(&retry, [1; 16], [2; 16], [3; 32], 1, 1, None)
             .unwrap(),
         AdmissionClaim::Fresh(_)
     ));
@@ -90,7 +144,7 @@ fn cancelled_duplicate_attaches_without_cancelling_the_canonical_admission() {
     let (mut state, _) = ready_state();
     let canonical = state.register_pending_generation().unwrap();
     let admission = match state
-        .reserve_pending_admission(&canonical, [1; 16], [2; 16], [3; 32], 1, 1)
+        .reserve_pending_admission(&canonical, [1; 16], [2; 16], [3; 32], 1, 1, None)
         .unwrap()
     {
         AdmissionClaim::Fresh(admission) => admission,
@@ -107,7 +161,7 @@ fn cancelled_duplicate_attaches_without_cancelling_the_canonical_admission() {
         .unwrap()
         .is_none());
     let attached = match state
-        .reserve_pending_admission(&duplicate, [1; 16], [2; 16], [3; 32], 1, 1)
+        .reserve_pending_admission(&duplicate, [1; 16], [2; 16], [3; 32], 1, 1, None)
         .unwrap()
     {
         AdmissionClaim::Existing(admission) => admission,
@@ -127,7 +181,7 @@ fn cancelled_duplicate_attaches_without_cancelling_the_canonical_admission() {
     let conflicting = state.register_pending_generation().unwrap();
     assert_eq!(
         state
-            .reserve_pending_admission(&conflicting, [1; 16], [2; 16], [4; 32], 1, 1)
+            .reserve_pending_admission(&conflicting, [1; 16], [2; 16], [4; 32], 1, 1, None)
             .err()
             .unwrap()
             .category,
@@ -149,7 +203,7 @@ fn finished_pending_connection_cannot_reserve_again() {
     assert!(!state.pending_is_current(&stale));
     assert_eq!(
         state
-            .reserve_pending_admission(&stale, [1; 16], [2; 16], [3; 32], 1, 1)
+            .reserve_pending_admission(&stale, [1; 16], [2; 16], [3; 32], 1, 1, None)
             .err()
             .unwrap()
             .category,
@@ -168,7 +222,7 @@ fn pending_target_follows_its_reservation_and_capacity_waits_for_both_terminals(
         pending_nonce: pending.nonce().into(),
     };
     let admission = match state
-        .reserve_pending_admission(&pending, [1; 16], [2; 16], [3; 32], 1, 1)
+        .reserve_pending_admission(&pending, [1; 16], [2; 16], [3; 32], 1, 1, None)
         .unwrap()
     {
         AdmissionClaim::Fresh(admission) => admission,

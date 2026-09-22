@@ -62,6 +62,7 @@ pub struct ServiceClient {
 pub struct PendingGenerationRequest {
     connection: Connection,
     target: crate::GenerationTarget,
+    expected_runtime: Option<crate::OperationTarget>,
 }
 
 impl ServiceClient {
@@ -113,6 +114,7 @@ impl ServiceClient {
                 | ServiceCommand::Generation { .. }
                 | ServiceCommand::GetGenerationStatus { .. }
                 | ServiceCommand::Reload { .. }
+                | ServiceCommand::GenerationAt { .. }
         ) {
             return Err(ClientError::Transport(
                 "this command requires an explicit versioned client entry point".into(),
@@ -260,7 +262,7 @@ impl ServiceClient {
         &self,
         mode: ConnectMode,
     ) -> Result<PendingGenerationRequest, ClientError> {
-        self.prepare_generation_with_contract(mode, ClientContract::GenerationRequest)
+        self.prepare_generation_with_contract(mode, ClientContract::GenerationRequest, None)
             .await
     }
 
@@ -268,7 +270,19 @@ impl ServiceClient {
         &self,
         mode: ConnectMode,
     ) -> Result<PendingGenerationRequest, ClientError> {
-        self.prepare_generation_with_contract(mode, ClientContract::GenerationRetry)
+        self.prepare_generation_with_contract(mode, ClientContract::GenerationRetry, None)
+            .await
+    }
+
+    pub async fn prepare_generation_at(
+        &self,
+        mode: ConnectMode,
+        target: crate::OperationTarget,
+    ) -> Result<PendingGenerationRequest, ClientError> {
+        target
+            .validate_shape()
+            .map_err(|error| ClientError::Transport(error.into()))?;
+        self.prepare_generation_with_contract(mode, ClientContract::GenerationAt, Some(target))
             .await
     }
 
@@ -276,6 +290,7 @@ impl ServiceClient {
         &self,
         mode: ConnectMode,
         contract: ClientContract,
+        expected_runtime: Option<crate::OperationTarget>,
     ) -> Result<PendingGenerationRequest, ClientError> {
         let connection = self.connect_for(mode, contract).await?;
         if connection.hello.storage_schema != HISTORY_SCHEMA_VERSION
@@ -292,7 +307,11 @@ impl ServiceClient {
             boot_epoch: connection.hello.boot_epoch.clone(),
             pending_nonce: generation.pending_nonce.clone(),
         };
-        Ok(PendingGenerationRequest { connection, target })
+        Ok(PendingGenerationRequest {
+            connection,
+            target,
+            expected_runtime,
+        })
     }
 
     pub async fn draft_request(
@@ -594,6 +613,10 @@ impl ServiceClient {
                 self.client_build.clone(),
                 self.bootstrap.root().root_identity(),
             ),
+            ClientContract::GenerationAt => Hello::generation_at(
+                self.client_build.clone(),
+                self.bootstrap.root().root_identity(),
+            ),
             ClientContract::GenerationControl => Hello::generation(
                 self.client_build.clone(),
                 self.bootstrap.root().root_identity(),
@@ -625,6 +648,9 @@ impl ServiceClient {
             }
             ClientContract::GenerationRetry => {
                 hello.generation.is_some() && hello.protocol == crate::ProtocolVersion::V1_5
+            }
+            ClientContract::GenerationAt => {
+                hello.generation.is_some() && hello.protocol == crate::ProtocolVersion::V1_6
             }
             ClientContract::GenerationControl => {
                 hello.generation.is_none() && hello.protocol == crate::ProtocolVersion::V1_2
@@ -815,7 +841,7 @@ impl PendingGenerationRequest {
                 "prepared generation connection accepts only Send or Retry".into(),
             ));
         }
-        if command.is_retry() && self.connection.hello.protocol != crate::ProtocolVersion::V1_5 {
+        if command.is_retry() && self.connection.hello.protocol.minor < 5 {
             return Err(ClientError::Transport(
                 "generation Retry requires service protocol 1.5".into(),
             ));
@@ -823,10 +849,11 @@ impl PendingGenerationRequest {
         command
             .validate_shape()
             .map_err(|error| ClientError::Transport(error.into()))?;
-        let outcome = self
-            .connection
-            .request(ServiceCommand::Generation { command })
-            .await?;
+        let command = match self.expected_runtime {
+            Some(target) => ServiceCommand::GenerationAt { target, command },
+            None => ServiceCommand::Generation { command },
+        };
+        let outcome = self.connection.request(command).await?;
         match outcome {
             ReplyOutcome::Generation { reply } => Ok(reply),
             ReplyOutcome::Rejected(error) => Err(ClientError::Rejected(error)),
@@ -845,6 +872,7 @@ enum ClientContract {
     Reload,
     GenerationRequest,
     GenerationRetry,
+    GenerationAt,
     GenerationControl,
     GenerationStatus,
     GenerationObservation,

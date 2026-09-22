@@ -32,7 +32,7 @@ pub use settings::{
 };
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 5;
+pub const PROTOCOL_MINOR: u16 = 6;
 
 pub const MAX_BUILD_BYTES: usize = 96;
 pub const MAX_ID_BYTES: usize = 160;
@@ -54,6 +54,7 @@ impl ProtocolVersion {
     pub const V1_3: Self = Self { major: 1, minor: 3 };
     pub const V1_4: Self = Self { major: 1, minor: 4 };
     pub const V1_5: Self = Self { major: 1, minor: 5 };
+    pub const V1_6: Self = Self { major: 1, minor: 6 };
 
     pub const CURRENT: Self = Self {
         major: PROTOCOL_MAJOR,
@@ -114,7 +115,7 @@ impl Hello {
 
     pub fn history(build: impl Into<String>, root_identity: impl Into<String>) -> Self {
         Self {
-            protocol: ProtocolVersion::CURRENT,
+            protocol: ProtocolVersion::V1_5,
             // Protocol 1.0 peers have a closed capability enum. Keep this
             // initial vocabulary decodable so they can return the typed
             // protocol mismatch before a 1.1 client asks for history.
@@ -147,7 +148,19 @@ impl Hello {
 
     pub fn generation_retry(build: impl Into<String>, root_identity: impl Into<String>) -> Self {
         Self {
-            protocol: ProtocolVersion::CURRENT,
+            protocol: ProtocolVersion::V1_5,
+            required_capabilities: REQUIRED_CAPABILITIES.to_vec(),
+            build: build.into(),
+            root_identity: root_identity.into(),
+            generation: Some(GenerationHello {
+                connection: GenerationConnection::Request,
+            }),
+        }
+    }
+
+    pub fn generation_at(build: impl Into<String>, root_identity: impl Into<String>) -> Self {
+        Self {
+            protocol: ProtocolVersion::V1_6,
             required_capabilities: REQUIRED_CAPABILITIES.to_vec(),
             build: build.into(),
             root_identity: root_identity.into(),
@@ -184,7 +197,7 @@ impl Hello {
         if let Some(generation) = &self.generation {
             let supported = self.protocol == ProtocolVersion::V1_2
                 || (generation.connection == GenerationConnection::Request
-                    && self.protocol == ProtocolVersion::V1_5);
+                    && matches!(self.protocol, ProtocolVersion::V1_5 | ProtocolVersion::V1_6));
             if !supported {
                 return Err("generation handshake uses an unsupported protocol");
             }
@@ -230,9 +243,10 @@ impl HelloAck {
             return Err("invalid service process identity");
         }
         match (&self.generation, self.protocol) {
-            (Some(generation), ProtocolVersion::V1_2 | ProtocolVersion::V1_5) => {
-                generation.validate_shape()?
-            }
+            (
+                Some(generation),
+                ProtocolVersion::V1_2 | ProtocolVersion::V1_5 | ProtocolVersion::V1_6,
+            ) => generation.validate_shape()?,
             (Some(_), _) => return Err("generation acknowledgement uses an unsupported protocol"),
             (None, _) => {}
         }
@@ -351,6 +365,10 @@ pub enum ServiceCommand {
     Generation {
         command: GenerationCommand,
     },
+    GenerationAt {
+        target: OperationTarget,
+        command: GenerationCommand,
+    },
     GetGenerationStatus {
         target: GenerationTarget,
     },
@@ -375,6 +393,14 @@ impl ServiceCommand {
             Self::Draft { command } => command.validate_shape(),
             Self::Settings { command } => command.validate_shape(),
             Self::Generation { command } => command.validate_shape(),
+            Self::GenerationAt { target, command } => {
+                target.validate_shape()?;
+                command.validate_shape()?;
+                if command.is_stop() {
+                    return Err("GenerationAt cannot Stop");
+                }
+                Ok(())
+            }
             Self::GetGenerationStatus { target } => target.validate_shape(),
             _ => Ok(()),
         }
@@ -756,6 +782,9 @@ mod tests {
         let retry = Hello::generation_retry("build", "root");
         assert_eq!(retry.protocol, ProtocolVersion::V1_5);
         retry.validate_shape().unwrap();
+        let bound = Hello::generation_at("build", "root");
+        assert_eq!(bound.protocol, ProtocolVersion::V1_6);
+        bound.validate_shape().unwrap();
         let mut control = Hello::generation("build", "root", GenerationConnection::Control);
         assert_eq!(control.protocol, ProtocolVersion::V1_2);
         control.validate_shape().unwrap();
@@ -783,10 +812,47 @@ mod tests {
         ack.validate_shape().unwrap();
         ack.protocol = ProtocolVersion::V1_5;
         ack.validate_shape().unwrap();
+        ack.protocol = ProtocolVersion::V1_6;
+        ack.validate_shape().unwrap();
         ack.protocol = hello.protocol;
         assert!(ack.validate_shape().is_err());
         ack.generation = None;
         ack.validate_shape().unwrap();
+    }
+
+    #[test]
+    fn generation_at_accepts_only_a_bound_send_or_retry() {
+        let target = OperationTarget {
+            boot_epoch: "boot".into(),
+            task_id: "1".into(),
+            generation: "2".into(),
+        };
+        let send = GenerationCommand::Send {
+            conversation_id: "11".repeat(16),
+            submission_id: "22".repeat(16),
+            expected_conversation_revision: "1".into(),
+            expected_profile_revision: "1".into(),
+            user_text: "hello".into(),
+            draft: None,
+        };
+        ServiceCommand::GenerationAt {
+            target: target.clone(),
+            command: send,
+        }
+        .validate_shape()
+        .unwrap();
+        let stop = GenerationCommand::Stop {
+            target: GenerationTarget::Pending {
+                boot_epoch: "boot".into(),
+                pending_nonce: "33".repeat(16),
+            },
+        };
+        assert!(ServiceCommand::GenerationAt {
+            target,
+            command: stop
+        }
+        .validate_shape()
+        .is_err());
     }
 
     #[test]

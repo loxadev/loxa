@@ -6,7 +6,8 @@ use crate::history::{
     PromptPreparation, PromptRequest,
 };
 use loxa_ipc::{
-    ErrorCategory, GenerationAccepted, GenerationCommand, GenerationReply, ServiceError,
+    ErrorCategory, GenerationAccepted, GenerationCommand, GenerationReply, OperationTarget,
+    ServiceError,
 };
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -33,7 +34,26 @@ impl Coordinator {
         command: GenerationCommand,
         pending: PendingGenerationConnection,
     ) -> Result<GenerationReply, ServiceError> {
-        let submitted = match SubmittedGeneration::parse(command) {
+        self.generation_request_for(command, pending, None).await
+    }
+
+    pub(in crate::service) async fn generation_request_at(
+        &self,
+        command: GenerationCommand,
+        pending: PendingGenerationConnection,
+        target: OperationTarget,
+    ) -> Result<GenerationReply, ServiceError> {
+        self.generation_request_for(command, pending, Some(target))
+            .await
+    }
+
+    async fn generation_request_for(
+        &self,
+        command: GenerationCommand,
+        pending: PendingGenerationConnection,
+        target: Option<OperationTarget>,
+    ) -> Result<GenerationReply, ServiceError> {
+        let submitted = match SubmittedGeneration::parse(command, target) {
             Ok(submitted) => submitted,
             Err(error) => {
                 self.finish_generation_connection(&pending);
@@ -74,6 +94,7 @@ struct SubmittedGeneration {
     expected_profile_revision: i64,
     kind: SubmittedKind,
     submission_hash: [u8; 32],
+    target: Option<OperationTarget>,
 }
 
 enum SubmittedKind {
@@ -87,7 +108,10 @@ enum SubmittedKind {
 }
 
 impl SubmittedGeneration {
-    fn parse(command: GenerationCommand) -> Result<Self, ServiceError> {
+    fn parse(
+        command: GenerationCommand,
+        target: Option<OperationTarget>,
+    ) -> Result<Self, ServiceError> {
         let (
             conversation_id,
             submission_id,
@@ -161,6 +185,10 @@ impl SubmittedGeneration {
                 *prior_attempt_id,
             ),
         };
+        let submission_hash = match &target {
+            Some(target) => runtime_bound_hash(submission_hash, target),
+            None => submission_hash,
+        };
         Ok(Self {
             conversation_id,
             submission_id,
@@ -168,6 +196,7 @@ impl SubmittedGeneration {
             expected_profile_revision,
             kind,
             submission_hash,
+            target,
         })
     }
 
@@ -240,6 +269,7 @@ async fn drive_generation(
             submitted.submission_hash,
             submitted.expected_conversation_revision,
             submitted.expected_profile_revision,
+            submitted.target.as_ref(),
         )
     }?;
     let reservation = match claim {
@@ -465,6 +495,19 @@ fn stable_retry_submission_hash(
     hash.finalize().into()
 }
 
+pub(in crate::service::coordinator) fn runtime_bound_hash(
+    submission_hash: [u8; 32],
+    target: &OperationTarget,
+) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"loxa-generation-at-v1\0");
+    update_bytes(&mut hash, target.boot_epoch.as_bytes());
+    update_bytes(&mut hash, target.task_id.as_bytes());
+    update_bytes(&mut hash, target.generation.as_bytes());
+    hash.update(submission_hash);
+    hash.finalize().into()
+}
+
 fn update_bytes(hash: &mut Sha256, value: &[u8]) {
     hash.update((value.len() as u64).to_le_bytes());
     hash.update(value);
@@ -512,6 +555,19 @@ mod tests {
         let retry = stable_retry_submission_hash([1; 16], 2, 3, [4; 16]);
         assert_ne!(original, retry);
         assert_ne!(retry, stable_retry_submission_hash([1; 16], 2, 3, [5; 16]));
+        let target = OperationTarget {
+            boot_epoch: "boot".into(),
+            task_id: "1".into(),
+            generation: "2".into(),
+        };
+        let bound = runtime_bound_hash(original, &target);
+        assert_ne!(bound, original);
+        assert_eq!(bound, runtime_bound_hash(original, &target));
+        let replacement = OperationTarget {
+            generation: "3".into(),
+            ..target
+        };
+        assert_ne!(bound, runtime_bound_hash(original, &replacement));
     }
 
     #[test]
