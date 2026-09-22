@@ -146,10 +146,11 @@ pub(crate) fn run_service(
             Ok(tag) => tag,
             Err(_) => signals.exit_now(None),
         };
-        let output = match {
+        let output_result = {
             let _entered = runtime.enter();
             TerminalOutput::stdout()
-        } {
+        };
+        let output = match output_result {
             Ok(output) => output,
             Err(_) => signals.exit_with_code(1, None),
         };
