@@ -104,9 +104,9 @@ async fn socket_observation_binds_durable_attempt_to_its_exact_generation_owner(
     );
     assert!(matches!(
         receive_observation(&mut live).await,
-        loxa_ipc::ServerEnvelope::GenerationSnapshot(
-            loxa_ipc::GenerationObservation::Live { status }
-        ) if status.execution == Execution::Working && status.save == Save::Open
+        loxa_ipc::ServerEnvelope::GenerationSnapshot {
+            observation: loxa_ipc::GenerationObservation::Live { status }
+        } if status.execution == Execution::Working && status.save == Save::Open
     ));
 
     let terminal = first_output
@@ -121,9 +121,9 @@ async fn socket_observation_binds_durable_attempt_to_its_exact_generation_owner(
     receive_terminal_live(&mut live, &first_target, &first_attempt).await;
     assert!(matches!(
         receive_observation(&mut live).await,
-        loxa_ipc::ServerEnvelope::GenerationSnapshot(
-            loxa_ipc::GenerationObservation::Durable { attempt }
-        ) if attempt.id == first_attempt
+        loxa_ipc::ServerEnvelope::GenerationSnapshot {
+            observation: loxa_ipc::GenerationObservation::Durable { attempt }
+        } if attempt.id == first_attempt
     ));
     live_task.await.unwrap().unwrap();
     assert!(tokio::time::timeout(Duration::from_secs(1), live.next())
@@ -197,9 +197,9 @@ async fn socket_observation_binds_durable_attempt_to_its_exact_generation_owner(
         observation_socket(reopened.clone(), second_target, second_attempt.clone());
     assert!(matches!(
         receive_observation(&mut old_boot).await,
-        loxa_ipc::ServerEnvelope::GenerationSnapshot(
-            loxa_ipc::GenerationObservation::Durable { attempt }
-        ) if attempt.id == second_attempt
+        loxa_ipc::ServerEnvelope::GenerationSnapshot {
+            observation: loxa_ipc::GenerationObservation::Durable { attempt }
+        } if attempt.id == second_attempt
     ));
     old_boot_task.await.unwrap().unwrap();
     assert!(
@@ -267,9 +267,9 @@ async fn receive_terminal_live(
             let envelope: loxa_ipc::ServerEnvelope =
                 loxa_ipc::decode_with_limit(&frame, loxa_ipc::MAX_HISTORY_FRAME_BYTES)
                     .expect("terminal observation response was invalid");
-            let loxa_ipc::ServerEnvelope::GenerationSnapshot(
-                loxa_ipc::GenerationObservation::Live { status },
-            ) = envelope
+            let loxa_ipc::ServerEnvelope::GenerationSnapshot {
+                observation: loxa_ipc::GenerationObservation::Live { status },
+            } = envelope
             else {
                 panic!("expected a live terminal observation")
             };

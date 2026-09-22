@@ -613,7 +613,7 @@ impl ServiceClient {
             ServerEnvelope::HelloRejected(error) => return Err(ClientError::Rejected(error)),
             ServerEnvelope::Reply(_)
             | ServerEnvelope::Snapshot(_)
-            | ServerEnvelope::GenerationSnapshot(_) => {
+            | ServerEnvelope::GenerationSnapshot { .. } => {
                 return Err(ClientError::Transport(
                     "service replied before the handshake completed".into(),
                 ))
@@ -909,7 +909,7 @@ fn observation_from(
     attempt_id: &str,
 ) -> Result<GenerationObservation, ClientError> {
     let observation = match envelope {
-        ServerEnvelope::GenerationSnapshot(observation) => observation,
+        ServerEnvelope::GenerationSnapshot { observation } => observation,
         ServerEnvelope::Reply(Reply {
             request_id: response_id,
             outcome: ReplyOutcome::Rejected(error),
@@ -1242,20 +1242,21 @@ mod tests {
             operation_generation: "2".into(),
         };
         let attempt_id = "22".repeat(16);
-        let live = |target: GenerationTarget, attempt_id: String| {
-            ServerEnvelope::GenerationSnapshot(GenerationObservation::Live {
-                status: crate::GenerationStatus {
-                    target,
-                    attempt_id,
-                    execution: crate::GenerationExecutionPhase::Working,
-                    save: crate::GenerationSavePhase::Open,
-                    saved_end: "0".into(),
-                    generated_end: None,
-                    terminal_saved_end: None,
-                    failure_code: None,
+        let live =
+            |target: GenerationTarget, attempt_id: String| ServerEnvelope::GenerationSnapshot {
+                observation: GenerationObservation::Live {
+                    status: crate::GenerationStatus {
+                        target,
+                        attempt_id,
+                        execution: crate::GenerationExecutionPhase::Working,
+                        save: crate::GenerationSavePhase::Open,
+                        saved_end: "0".into(),
+                        generated_end: None,
+                        terminal_saved_end: None,
+                        failure_code: None,
+                    },
                 },
-            })
-        };
+            };
 
         assert!(observation_from(
             live(target.clone(), attempt_id.clone()),

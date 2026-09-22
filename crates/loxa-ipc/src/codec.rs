@@ -5,11 +5,10 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 pub const MAX_FRAME_BYTES: usize = 32 * 1024;
 pub const MAX_HISTORY_FRAME_BYTES: usize = 256 * 1024;
-// The largest current wire collections contain 50 metadata records. Keeping
-// this comfortably above that encoded shape prevents serde's internally
-// tagged buffering from multiplying a compact adversarial object array past
-// the per-connection allocation budget.
-const MAX_JSON_STRUCTURAL_TOKENS: usize = 2 * 1024;
+// Fifty TurnPage metadata records are the largest legal current collection.
+// Their most structurally dense mixed optional shape uses about 2,673 tokens;
+// keep a small source-derived ceiling independent of allocator string capacity.
+const MAX_JSON_STRUCTURAL_TOKENS: usize = 3 * 1024;
 
 pub type IpcFramed = Framed<UnixStream, LengthDelimitedCodec>;
 
@@ -174,5 +173,96 @@ mod tests {
         let decoded =
             decode_with_limit::<ServerEnvelope>(&encoded, MAX_HISTORY_FRAME_BYTES).unwrap();
         decoded.validate_shape().unwrap();
+    }
+
+    #[test]
+    fn decoder_accepts_the_dense_turn_page_limit_and_counts_statistics_backing() {
+        use crate::{
+            AttemptExecution, AttemptSave, AttemptStatistics, AttemptStopReason, AttemptSummary,
+            EffectiveSamplingSettings, EngineDecodeRate, HistoryReply, Reply, ReplyOutcome,
+            SamplingValue, ServerEnvelope, TurnPage, TurnSummary, MAX_TURN_PAGE_BYTES,
+            MAX_TURN_PAGE_ITEMS,
+        };
+
+        let attempt = AttemptSummary {
+            id: "b".repeat(32),
+            attempt_number: "1".into(),
+            execution: AttemptExecution::Completed,
+            save: AttemptSave::Saved,
+            saved_end: "1".into(),
+            generated_end: Some("1".into()),
+            terminal_saved_end: Some("1".into()),
+            failure_code: None,
+            statistics: Some(AttemptStatistics {
+                qualified_input_tokens: Some(1),
+                qualified_output_tokens: Some(1),
+                service_first_output_latency_ms: Some("1".into()),
+                qualified_engine_decode_tokens_per_second: EngineDecodeRate::new(1.0),
+                service_total_duration_ms: "2".into(),
+                stop_reason: AttemptStopReason::Completed,
+            }),
+            effective_sampling: Some(EffectiveSamplingSettings {
+                temperature: SamplingValue::new(0.8).unwrap(),
+                top_p: SamplingValue::new(0.95).unwrap(),
+            }),
+            created_ms: "1".into(),
+            updated_ms: "2".into(),
+        };
+        let turn = |ordinal: usize, mut attempt: AttemptSummary| {
+            if ordinal % 2 == 0 {
+                attempt.statistics = None;
+            }
+            TurnSummary {
+                id: "a".repeat(32),
+                ordinal: ordinal.to_string(),
+                user_text_end: "1".into(),
+                selected_attempt: Some(attempt),
+            }
+        };
+        let page = TurnPage {
+            turns: (1..=MAX_TURN_PAGE_ITEMS)
+                .map(|ordinal| turn(ordinal, attempt.clone()))
+                .collect(),
+            next: None,
+        };
+        let page_bytes = serde_json::to_vec(&page).unwrap();
+        assert!(page_bytes.len() <= MAX_TURN_PAGE_BYTES);
+
+        let envelope = ServerEnvelope::Reply(Reply {
+            request_id: "r".into(),
+            outcome: ReplyOutcome::History {
+                reply: HistoryReply::TurnPage(page),
+            },
+        });
+        let encoded = encode_with_limit(&envelope, MAX_HISTORY_FRAME_BYTES).unwrap();
+        let decoded =
+            decode_with_limit::<ServerEnvelope>(&encoded, MAX_HISTORY_FRAME_BYTES).unwrap();
+        decoded.validate_shape().unwrap();
+
+        let mut retained = attempt;
+        let statistics = retained.statistics.as_mut().unwrap();
+        statistics.service_first_output_latency_ms =
+            Some(String::with_capacity(MAX_TURN_PAGE_BYTES));
+        statistics
+            .service_first_output_latency_ms
+            .as_mut()
+            .unwrap()
+            .push('1');
+        let mut total = String::with_capacity(MAX_TURN_PAGE_BYTES);
+        total.push('2');
+        statistics.service_total_duration_ms = total;
+        let bloated = ServerEnvelope::Reply(Reply {
+            request_id: "r".into(),
+            outcome: ReplyOutcome::History {
+                reply: HistoryReply::TurnPage(TurnPage {
+                    turns: vec![turn(1, retained)],
+                    next: None,
+                }),
+            },
+        });
+        assert_eq!(
+            bloated.validate_shape(),
+            Err("turn page exceeds the decoded backing limit")
+        );
     }
 }

@@ -429,6 +429,13 @@ fn turn_backing_bytes(items: &[TurnSummary], capacity: usize, next: Option<&Turn
                         .map_or(0, String::capacity),
                 )
                 .saturating_add(attempt.failure_code.as_ref().map_or(0, String::capacity))
+                .saturating_add(attempt.statistics.as_ref().map_or(0, |statistics| {
+                    statistics
+                        .service_first_output_latency_ms
+                        .as_ref()
+                        .map_or(0, String::capacity)
+                        .saturating_add(statistics.service_total_duration_ms.capacity())
+                }))
                 .saturating_add(attempt.created_ms.capacity())
                 .saturating_add(attempt.updated_ms.capacity())
         })

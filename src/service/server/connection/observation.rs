@@ -83,7 +83,7 @@ where
 {
     send_frame(
         transport,
-        &ServerEnvelope::GenerationSnapshot(observation),
+        &ServerEnvelope::GenerationSnapshot { observation },
         REQUEST_TIMEOUT,
     )
     .await

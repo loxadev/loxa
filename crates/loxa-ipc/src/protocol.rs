@@ -286,7 +286,7 @@ pub enum ServerEnvelope {
     HelloRejected(ServiceError),
     Reply(Reply),
     Snapshot(RuntimeStatus),
-    GenerationSnapshot(GenerationObservation),
+    GenerationSnapshot { observation: GenerationObservation },
 }
 
 impl ServerEnvelope {
@@ -296,7 +296,7 @@ impl ServerEnvelope {
             Self::HelloRejected(error) => error.validate_shape(),
             Self::Reply(reply) => reply.validate_shape(),
             Self::Snapshot(status) => status.validate_shape(),
-            Self::GenerationSnapshot(observation) => observation.validate_shape(),
+            Self::GenerationSnapshot { observation } => observation.validate_shape(),
         }
     }
 }
@@ -1022,6 +1022,64 @@ mod tests {
             serde_json::from_value::<ServerEnvelope>(encoded).unwrap(),
             response
         );
+    }
+
+    #[test]
+    fn generation_observation_envelopes_round_trip_with_nested_wire_tags() {
+        let target = GenerationTarget::Accepted {
+            boot_epoch: "boot".into(),
+            submission_id: "a".repeat(32),
+            operation_generation: "1".into(),
+        };
+        let observations = [
+            GenerationObservation::Live {
+                status: GenerationStatus {
+                    target,
+                    attempt_id: "b".repeat(32),
+                    execution: GenerationExecutionPhase::Working,
+                    save: GenerationSavePhase::Open,
+                    saved_end: "0".into(),
+                    generated_end: None,
+                    terminal_saved_end: None,
+                    failure_code: None,
+                },
+            },
+            GenerationObservation::Durable {
+                attempt: AttemptSummary {
+                    id: "b".repeat(32),
+                    attempt_number: "1".into(),
+                    execution: AttemptExecution::Completed,
+                    save: AttemptSave::Saved,
+                    saved_end: "2".into(),
+                    generated_end: Some("2".into()),
+                    terminal_saved_end: Some("2".into()),
+                    failure_code: None,
+                    statistics: None,
+                    effective_sampling: None,
+                    created_ms: "1".into(),
+                    updated_ms: "2".into(),
+                },
+            },
+        ];
+
+        for observation in observations {
+            let envelope = ServerEnvelope::GenerationSnapshot { observation };
+            let encoded = crate::encode_with_limit(&envelope, crate::MAX_HISTORY_FRAME_BYTES)
+                .expect("generation observation encodes");
+            let json: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(json["type"], "generation_snapshot");
+            assert!(matches!(
+                json["observation"]["type"].as_str(),
+                Some("live" | "durable")
+            ));
+            let decoded = crate::decode_with_limit::<ServerEnvelope>(
+                &encoded,
+                crate::MAX_HISTORY_FRAME_BYTES,
+            )
+            .expect("generation observation decodes");
+            assert_eq!(decoded, envelope);
+            decoded.validate_shape().unwrap();
+        }
     }
 
     #[test]
