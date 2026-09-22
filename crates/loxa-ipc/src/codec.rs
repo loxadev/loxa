@@ -209,7 +209,7 @@ mod tests {
             updated_ms: "2".into(),
         };
         let turn = |ordinal: usize, mut attempt: AttemptSummary| {
-            if ordinal % 2 == 0 {
+            if ordinal.is_multiple_of(2) {
                 attempt.statistics = None;
             }
             TurnSummary {
