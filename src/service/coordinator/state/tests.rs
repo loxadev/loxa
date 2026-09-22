@@ -62,7 +62,7 @@ fn same_model_replacement_cannot_reserve_against_the_old_runtime() {
         task_id: old.task_id.to_string(),
         generation: old.generation.to_string(),
     };
-    assert!(state.complete(&old, None));
+    assert!(!state.complete(&old, None)); // No generation admission was held.
     let replacement = state.reserve_load("demo".into()).unwrap();
     state.accept_start(&replacement).unwrap();
     assert!(state.advance(
