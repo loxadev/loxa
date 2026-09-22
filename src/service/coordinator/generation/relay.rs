@@ -105,10 +105,7 @@ pub(super) async fn run(
     let stream = stream(
         &engine,
         &reservation,
-        qualified.request.body,
-        expected_input_tokens,
-        #[cfg(all(test, target_os = "macos"))]
-        observation_id,
+        qualified,
         #[cfg(all(test, target_os = "macos"))]
         coordinator.take_native_generation_output_gate(),
         #[cfg(test)]
@@ -194,9 +191,7 @@ struct StreamFailure {
 async fn stream(
     engine: &super::super::state::EngineDescriptor,
     reservation: &AdmissionReservation,
-    body: Bytes,
-    expected_input_tokens: u32,
-    #[cfg(all(test, target_os = "macos"))] observation_id: Option<u64>,
+    qualified: QualifiedRequest,
     #[cfg(all(test, target_os = "macos"))] mut output_gate: Option<
         Arc<super::super::native_test_gate::NativeTestGate>,
     >,
@@ -205,6 +200,9 @@ async fn stream(
     pipeline: &mut OutputPipeline,
     measurements: &mut AttemptMeasurements,
 ) -> Result<StreamEnd, StreamFailure> {
+    let expected_input_tokens = qualified.input_tokens();
+    #[cfg(all(test, target_os = "macos"))]
+    let observation_id = qualified.observation_id();
     let mut authenticated = None;
     let stream = tokio::select! {
         biased;
@@ -233,7 +231,7 @@ async fn stream(
         .header(hyper::header::CONTENT_TYPE, "application/json")
         .header(hyper::header::ACCEPT, "text/event-stream")
         .header(hyper::header::CONNECTION, "close")
-        .body(Full::new(body))
+        .body(Full::new(qualified.request.body))
         .map_err(|_| failure("engine_request"))?;
     #[cfg(all(test, target_os = "macos"))]
     let driver_observation_id = observation_id;
@@ -422,14 +420,12 @@ pub(in crate::service::coordinator) async fn stream_for_test(
     pipeline: &mut OutputPipeline,
     progress: tokio::sync::watch::Sender<StreamProgress>,
 ) -> Result<ExecutionOutcome, &'static str> {
-    let mut measurements = AttemptMeasurements::new(1);
+    let qualified = QualifiedRequest::for_test();
+    let mut measurements = AttemptMeasurements::new(qualified.input_tokens());
     match stream(
         engine,
         reservation,
-        Bytes::from_static(b"{}"),
-        1,
-        #[cfg(target_os = "macos")]
-        None,
+        qualified,
         #[cfg(target_os = "macos")]
         None,
         Some(progress),
