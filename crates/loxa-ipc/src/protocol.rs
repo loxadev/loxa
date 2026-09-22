@@ -1,25 +1,38 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 mod drafts;
+mod generation;
+mod generation_status;
 mod history;
 mod settings;
 
+use history::validate_hex_id;
+
 pub use drafts::{DraftCommand, DraftReply, DraftSnapshot, MAX_DRAFT_TEXT_BYTES};
+pub use generation::{
+    GenerationAccepted, GenerationCommand, GenerationConnection, GenerationDraft, GenerationHello,
+    GenerationHelloAck, GenerationReply, GenerationTarget, MAX_GENERATION_USER_TEXT_BYTES,
+};
+pub use generation_status::{
+    GenerationExecutionPhase, GenerationObservation, GenerationSavePhase, GenerationStatus,
+};
 pub use history::{
-    AttemptExecution, AttemptSave, AttemptSummary, ContentRange, ContentSource, ConversationCursor,
-    ConversationPage, ConversationSummary, HistoryCommand, HistoryPhase, HistoryReply,
-    HistoryStatus, TurnCursor, TurnPage, TurnSummary, HISTORY_SCHEMA_VERSION,
-    MAX_CONTENT_RANGE_BYTES, MAX_CONVERSATION_PAGE_BYTES, MAX_CONVERSATION_PAGE_ITEMS,
-    MAX_CONVERSATION_TITLE_BYTES, MAX_TURN_PAGE_BYTES, MAX_TURN_PAGE_ITEMS,
+    AttemptExecution, AttemptSave, AttemptStatistics, AttemptStopReason, AttemptSummary,
+    ContentRange, ContentSource, ConversationCursor, ConversationPage, ConversationSummary,
+    EngineDecodeRate, HistoryCommand, HistoryPhase, HistoryReply, HistoryStatus, TurnCursor,
+    TurnPage, TurnSummary, HISTORY_SCHEMA_VERSION, MAX_CONTENT_RANGE_BYTES,
+    MAX_CONVERSATION_PAGE_BYTES, MAX_CONVERSATION_PAGE_ITEMS, MAX_CONVERSATION_TITLE_BYTES,
+    MAX_TURN_PAGE_BYTES, MAX_TURN_PAGE_ITEMS,
 };
 pub use settings::{
-    ConversationProfile, GenerationSettings, GenerationSettingsPatch, OptionalU16Patch,
-    OptionalU32Patch, ServiceSettings, ServiceSettingsApplication, ServiceSettingsCommand,
-    ServiceSettingsDurability, ServiceSettingsPatch, ServiceSettingsReply,
+    ConversationProfile, EffectiveSamplingSettings, GenerationSettings, GenerationSettingsPatch,
+    OptionalSamplingValuePatch, OptionalU16Patch, OptionalU32Patch, SamplingValue, ServiceSettings,
+    ServiceSettingsApplication, ServiceSettingsCommand, ServiceSettingsDurability,
+    ServiceSettingsPatch, ServiceSettingsReply,
 };
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 1;
+pub const PROTOCOL_MINOR: u16 = 6;
 
 pub const MAX_BUILD_BYTES: usize = 96;
 pub const MAX_ID_BYTES: usize = 160;
@@ -36,6 +49,12 @@ pub struct ProtocolVersion {
 
 impl ProtocolVersion {
     pub const V1_0: Self = Self { major: 1, minor: 0 };
+    pub const V1_1: Self = Self { major: 1, minor: 1 };
+    pub const V1_2: Self = Self { major: 1, minor: 2 };
+    pub const V1_3: Self = Self { major: 1, minor: 3 };
+    pub const V1_4: Self = Self { major: 1, minor: 4 };
+    pub const V1_5: Self = Self { major: 1, minor: 5 };
+    pub const V1_6: Self = Self { major: 1, minor: 6 };
 
     pub const CURRENT: Self = Self {
         major: PROTOCOL_MAJOR,
@@ -71,6 +90,12 @@ pub struct Hello {
     pub required_capabilities: Vec<Capability>,
     pub build: String,
     pub root_identity: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub generation: Option<GenerationHello>,
 }
 
 impl Hello {
@@ -80,6 +105,7 @@ impl Hello {
             required_capabilities: REQUIRED_CAPABILITIES.to_vec(),
             build: build.into(),
             root_identity: root_identity.into(),
+            generation: None,
         }
     }
 
@@ -89,14 +115,73 @@ impl Hello {
 
     pub fn history(build: impl Into<String>, root_identity: impl Into<String>) -> Self {
         Self {
-            protocol: ProtocolVersion::CURRENT,
+            protocol: ProtocolVersion::V1_5,
             // Protocol 1.0 peers have a closed capability enum. Keep this
             // initial vocabulary decodable so they can return the typed
             // protocol mismatch before a 1.1 client asks for history.
             required_capabilities: REQUIRED_CAPABILITIES.to_vec(),
             build: build.into(),
             root_identity: root_identity.into(),
+            generation: None,
         }
+    }
+
+    pub fn reload(build: impl Into<String>, root_identity: impl Into<String>) -> Self {
+        Self::history(build, root_identity)
+    }
+
+    pub fn generation(
+        build: impl Into<String>,
+        root_identity: impl Into<String>,
+        connection: GenerationConnection,
+    ) -> Self {
+        Self {
+            protocol: ProtocolVersion::V1_2,
+            // Generation is minor-version gated so the closed 1.0 capability
+            // vocabulary stays decodable and remains at eight entries.
+            required_capabilities: REQUIRED_CAPABILITIES.to_vec(),
+            build: build.into(),
+            root_identity: root_identity.into(),
+            generation: Some(GenerationHello { connection }),
+        }
+    }
+
+    pub fn generation_retry(build: impl Into<String>, root_identity: impl Into<String>) -> Self {
+        Self {
+            protocol: ProtocolVersion::V1_5,
+            required_capabilities: REQUIRED_CAPABILITIES.to_vec(),
+            build: build.into(),
+            root_identity: root_identity.into(),
+            generation: Some(GenerationHello {
+                connection: GenerationConnection::Request,
+            }),
+        }
+    }
+
+    pub fn generation_at(build: impl Into<String>, root_identity: impl Into<String>) -> Self {
+        Self {
+            protocol: ProtocolVersion::V1_6,
+            required_capabilities: REQUIRED_CAPABILITIES.to_vec(),
+            build: build.into(),
+            root_identity: root_identity.into(),
+            generation: Some(GenerationHello {
+                connection: GenerationConnection::Request,
+            }),
+        }
+    }
+
+    pub fn generation_status(build: impl Into<String>, root_identity: impl Into<String>) -> Self {
+        Self {
+            protocol: ProtocolVersion::V1_3,
+            ..Self::current(build, root_identity)
+        }
+    }
+
+    pub fn generation_observation(
+        build: impl Into<String>,
+        root_identity: impl Into<String>,
+    ) -> Self {
+        Self::history(build, root_identity)
     }
 
     pub fn validate_shape(&self) -> Result<(), &'static str> {
@@ -108,6 +193,14 @@ impl Hello {
         }
         if self.required_capabilities.len() > MAX_CAPABILITIES {
             return Err("too many required capabilities");
+        }
+        if let Some(generation) = &self.generation {
+            let supported = self.protocol == ProtocolVersion::V1_2
+                || (generation.connection == GenerationConnection::Request
+                    && matches!(self.protocol, ProtocolVersion::V1_5 | ProtocolVersion::V1_6));
+            if !supported {
+                return Err("generation handshake uses an unsupported protocol");
+            }
         }
         Ok(())
     }
@@ -124,6 +217,12 @@ pub struct HelloAck {
     pub root_identity: String,
     pub service_pid: u32,
     pub origin_sha256: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub generation: Option<GenerationHelloAck>,
 }
 
 impl HelloAck {
@@ -143,6 +242,14 @@ impl HelloAck {
         if self.service_pid == 0 || !is_lower_hex_64(&self.origin_sha256) {
             return Err("invalid service process identity");
         }
+        match (&self.generation, self.protocol) {
+            (
+                Some(generation),
+                ProtocolVersion::V1_2 | ProtocolVersion::V1_5 | ProtocolVersion::V1_6,
+            ) => generation.validate_shape()?,
+            (Some(_), _) => return Err("generation acknowledgement uses an unsupported protocol"),
+            (None, _) => {}
+        }
         Ok(())
     }
 }
@@ -152,7 +259,14 @@ impl HelloAck {
 pub enum ClientEnvelope {
     Hello(Hello),
     Request(Request),
-    Subscribe { request_id: String },
+    Subscribe {
+        request_id: String,
+    },
+    SubscribeGeneration {
+        request_id: String,
+        target: GenerationTarget,
+        attempt_id: String,
+    },
 }
 
 impl ClientEnvelope {
@@ -162,6 +276,18 @@ impl ClientEnvelope {
             Self::Request(request) => request.validate_shape(),
             Self::Subscribe { request_id } => {
                 validate_identifier(request_id, "invalid subscription request identity")
+            }
+            Self::SubscribeGeneration {
+                request_id,
+                target,
+                attempt_id,
+            } => {
+                validate_identifier(request_id, "invalid subscription request identity")?;
+                target.validate_shape()?;
+                if !matches!(target, GenerationTarget::Accepted { .. }) {
+                    return Err("generation observation requires an accepted target");
+                }
+                validate_hex_id(attempt_id)
             }
         }
     }
@@ -174,6 +300,7 @@ pub enum ServerEnvelope {
     HelloRejected(ServiceError),
     Reply(Reply),
     Snapshot(RuntimeStatus),
+    GenerationSnapshot { observation: GenerationObservation },
 }
 
 impl ServerEnvelope {
@@ -183,6 +310,7 @@ impl ServerEnvelope {
             Self::HelloRejected(error) => error.validate_shape(),
             Self::Reply(reply) => reply.validate_shape(),
             Self::Snapshot(status) => status.validate_shape(),
+            Self::GenerationSnapshot { observation } => observation.validate_shape(),
         }
     }
 }
@@ -214,22 +342,66 @@ impl Request {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServiceCommand {
     Status,
-    Load { model_id: String },
-    Unload { target: OperationTarget },
+    Load {
+        model_id: String,
+    },
+    Reload {
+        target: OperationTarget,
+        expected_settings_revision: String,
+    },
+    Unload {
+        target: OperationTarget,
+    },
     StopService,
-    History { command: HistoryCommand },
-    Draft { command: DraftCommand },
-    Settings { command: ServiceSettingsCommand },
+    History {
+        command: HistoryCommand,
+    },
+    Draft {
+        command: DraftCommand,
+    },
+    Settings {
+        command: ServiceSettingsCommand,
+    },
+    Generation {
+        command: GenerationCommand,
+    },
+    GenerationAt {
+        target: OperationTarget,
+        command: GenerationCommand,
+    },
+    GetGenerationStatus {
+        target: GenerationTarget,
+    },
 }
 
 impl ServiceCommand {
     pub fn validate_shape(&self) -> Result<(), &'static str> {
         match self {
             Self::Load { model_id } => validate_model_id(model_id),
+            Self::Reload {
+                target,
+                expected_settings_revision,
+            } => {
+                target.validate_shape()?;
+                validate_decimal(
+                    expected_settings_revision,
+                    "invalid service settings revision",
+                )
+            }
             Self::Unload { target } => target.validate_shape(),
             Self::History { command } => command.validate_shape(),
             Self::Draft { command } => command.validate_shape(),
             Self::Settings { command } => command.validate_shape(),
+            Self::Generation { command } => command.validate_shape(),
+            Self::GenerationAt { target, command } => {
+                target.validate_shape()?;
+                command.validate_shape()?;
+                if command.is_stop() {
+                    return Err("GenerationAt cannot Stop");
+                }
+                Ok(())
+            }
+            Self::GetGenerationStatus { target } => target.validate_shape(),
             _ => Ok(()),
         }
     }
@@ -270,6 +442,10 @@ impl Reply {
             ReplyOutcome::History { reply } => reply.validate_shape(),
             ReplyOutcome::Draft { reply } => reply.validate_shape(),
             ReplyOutcome::Settings { reply } => reply.validate_shape(),
+            ReplyOutcome::Generation { reply } => reply.validate_shape(),
+            ReplyOutcome::GenerationStatus { snapshot } => snapshot
+                .as_ref()
+                .map_or(Ok(()), GenerationStatus::validate_shape),
         }
     }
 }
@@ -283,6 +459,8 @@ pub enum ReplyOutcome {
     History { reply: HistoryReply },
     Draft { reply: DraftReply },
     Settings { reply: ServiceSettingsReply },
+    Generation { reply: GenerationReply },
+    GenerationStatus { snapshot: Option<GenerationStatus> },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -541,6 +719,14 @@ fn is_lower_hex_64(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
+fn deserialize_present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -589,6 +775,87 @@ mod tests {
     }
 
     #[test]
+    fn generation_request_versions_are_explicit_while_control_stays_on_1_2() {
+        let send = Hello::generation("build", "root", GenerationConnection::Request);
+        assert_eq!(send.protocol, ProtocolVersion::V1_2);
+        send.validate_shape().unwrap();
+        let retry = Hello::generation_retry("build", "root");
+        assert_eq!(retry.protocol, ProtocolVersion::V1_5);
+        retry.validate_shape().unwrap();
+        let bound = Hello::generation_at("build", "root");
+        assert_eq!(bound.protocol, ProtocolVersion::V1_6);
+        bound.validate_shape().unwrap();
+        let mut control = Hello::generation("build", "root", GenerationConnection::Control);
+        assert_eq!(control.protocol, ProtocolVersion::V1_2);
+        control.validate_shape().unwrap();
+        control.protocol = ProtocolVersion::CURRENT;
+        assert!(control.validate_shape().is_err());
+
+        let hello = Hello::generation_status("build", "root");
+        assert_eq!(hello.protocol, ProtocolVersion { major: 1, minor: 3 });
+        assert!(hello.generation.is_none());
+        assert_eq!(hello.required_capabilities, REQUIRED_CAPABILITIES);
+        hello.validate_shape().unwrap();
+        let mut ack = HelloAck {
+            protocol: ProtocolVersion::V1_2,
+            capabilities: REQUIRED_CAPABILITIES.to_vec(),
+            build: "build".into(),
+            storage_schema: 0,
+            boot_epoch: "boot".into(),
+            root_identity: "root".into(),
+            service_pid: 1,
+            origin_sha256: "aa".repeat(32),
+            generation: Some(GenerationHelloAck {
+                pending_nonce: "11".repeat(16),
+            }),
+        };
+        ack.validate_shape().unwrap();
+        ack.protocol = ProtocolVersion::V1_5;
+        ack.validate_shape().unwrap();
+        ack.protocol = ProtocolVersion::V1_6;
+        ack.validate_shape().unwrap();
+        ack.protocol = hello.protocol;
+        assert!(ack.validate_shape().is_err());
+        ack.generation = None;
+        ack.validate_shape().unwrap();
+    }
+
+    #[test]
+    fn generation_at_accepts_only_a_bound_send_or_retry() {
+        let target = OperationTarget {
+            boot_epoch: "boot".into(),
+            task_id: "1".into(),
+            generation: "2".into(),
+        };
+        let send = GenerationCommand::Send {
+            conversation_id: "11".repeat(16),
+            submission_id: "22".repeat(16),
+            expected_conversation_revision: "1".into(),
+            expected_profile_revision: "1".into(),
+            user_text: "hello".into(),
+            draft: None,
+        };
+        ServiceCommand::GenerationAt {
+            target: target.clone(),
+            command: send,
+        }
+        .validate_shape()
+        .unwrap();
+        let stop = GenerationCommand::Stop {
+            target: GenerationTarget::Pending {
+                boot_epoch: "boot".into(),
+                pending_nonce: "33".repeat(16),
+            },
+        };
+        assert!(ServiceCommand::GenerationAt {
+            target,
+            command: stop
+        }
+        .validate_shape()
+        .is_err());
+    }
+
+    #[test]
     fn genuine_protocol_1_0_hello_fixture_still_decodes() {
         let fixture = br#"{
             "type":"hello",
@@ -602,6 +869,33 @@ mod tests {
             envelope,
             ClientEnvelope::Hello(Hello::current("0.1.0-dev", "root"))
         );
+    }
+
+    #[test]
+    fn legacy_hello_and_ack_reject_an_explicit_generation_null() {
+        let hello = br#"{
+            "type":"hello",
+            "protocol":{"major":1,"minor":0},
+            "required_capabilities":["status","load","unload","stop_service","engine_unix_socket"],
+            "build":"0.1.0-dev",
+            "root_identity":"root",
+            "generation":null
+        }"#;
+        assert!(serde_json::from_slice::<ClientEnvelope>(hello).is_err());
+
+        let ack = br#"{
+            "type":"hello_ack",
+            "protocol":{"major":1,"minor":1},
+            "capabilities":["status","load","unload","stop_service","engine_unix_socket"],
+            "build":"0.1.0-dev",
+            "storage_schema":1,
+            "boot_epoch":"boot",
+            "root_identity":"root",
+            "service_pid":1,
+            "origin_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "generation":null
+        }"#;
+        assert!(serde_json::from_slice::<ServerEnvelope>(ack).is_err());
     }
 
     #[test]
@@ -629,6 +923,7 @@ mod tests {
             root_identity: "root".into(),
             service_pid: 1,
             origin_sha256: "a".repeat(64),
+            generation: None,
         });
         let encoded = serde_json::to_vec(&ack).unwrap();
         let OldServerEnvelope::HelloAck {
@@ -652,17 +947,90 @@ mod tests {
     }
 
     #[test]
-    fn history_hello_is_decodable_by_a_closed_protocol_1_0_peer() {
-        let encoded =
-            serde_json::to_vec(&ClientEnvelope::Hello(Hello::history("0.1.0-dev", "root")))
-                .unwrap();
-        let OldClientEnvelope::Hello {
-            protocol,
-            required_capabilities,
-            ..
-        } = serde_json::from_slice(&encoded).unwrap();
-        assert_eq!(protocol, OldProtocolVersion { major: 1, minor: 1 });
-        assert_eq!(required_capabilities.len(), REQUIRED_CAPABILITIES.len());
+    fn history_hellos_request_the_current_protocol_through_the_closed_old_shape() {
+        for hello in [
+            Hello::history_status("0.1.0-dev", "root"),
+            Hello::history("0.1.0-dev", "root"),
+            Hello::reload("0.1.0-dev", "root"),
+        ] {
+            let encoded = serde_json::to_vec(&ClientEnvelope::Hello(hello)).unwrap();
+            let OldClientEnvelope::Hello {
+                protocol,
+                required_capabilities,
+                ..
+            } = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(protocol, OldProtocolVersion { major: 1, minor: 5 });
+            assert_eq!(required_capabilities.len(), REQUIRED_CAPABILITIES.len());
+        }
+    }
+
+    #[test]
+    fn reload_and_applied_settings_have_closed_validated_shapes() {
+        let target = OperationTarget {
+            boot_epoch: "boot".into(),
+            task_id: "2".into(),
+            generation: "3".into(),
+        };
+        let command = ServiceCommand::Reload {
+            target: target.clone(),
+            expected_settings_revision: "7".into(),
+        };
+        command.validate_shape().unwrap();
+        let encoded = serde_json::to_value(&command).unwrap();
+        assert_eq!(encoded["type"], "reload");
+        assert_eq!(encoded["expected_settings_revision"], "7");
+        assert_eq!(
+            serde_json::from_value::<ServiceCommand>(encoded).unwrap(),
+            command
+        );
+
+        let settings = ServiceSettings {
+            revision: "8".into(),
+            ctx: None,
+            port: None,
+            generation: GenerationSettings {
+                system_instruction: String::new(),
+                max_output_tokens: 512,
+                temperature: None,
+                top_p: None,
+            },
+            durability: ServiceSettingsDurability::Saved,
+            application: ServiceSettingsApplication::Applied {
+                target,
+                settings_revision: "7".into(),
+                context_preference: None,
+                requested_context: 4096,
+                observed_context: None,
+                runtime_build: "b10344".into(),
+                runtime_version: "version: 10344 (7a20b417f)".into(),
+                reload_required: false,
+            },
+        };
+        let mut application = serde_json::to_value(&settings.application).unwrap();
+        application["applied"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<ServiceSettingsApplication>(application).is_err());
+        let reply = ServerEnvelope::Reply(Reply {
+            request_id: "settings".into(),
+            outcome: ReplyOutcome::Settings {
+                reply: ServiceSettingsReply::Service(settings.clone()),
+            },
+        });
+        reply.validate_shape().unwrap();
+        let mut invalid = settings;
+        if let ServiceSettingsApplication::Applied {
+            requested_context, ..
+        } = &mut invalid.application
+        {
+            *requested_context = 0;
+        }
+        assert!(ServerEnvelope::Reply(Reply {
+            request_id: "settings".into(),
+            outcome: ReplyOutcome::Settings {
+                reply: ServiceSettingsReply::Service(invalid),
+            },
+        })
+        .validate_shape()
+        .is_err());
     }
 
     #[test]
@@ -723,8 +1091,66 @@ mod tests {
     }
 
     #[test]
+    fn generation_observation_envelopes_round_trip_with_nested_wire_tags() {
+        let target = GenerationTarget::Accepted {
+            boot_epoch: "boot".into(),
+            submission_id: "a".repeat(32),
+            operation_generation: "1".into(),
+        };
+        let observations = [
+            GenerationObservation::Live {
+                status: GenerationStatus {
+                    target,
+                    attempt_id: "b".repeat(32),
+                    execution: GenerationExecutionPhase::Working,
+                    save: GenerationSavePhase::Open,
+                    saved_end: "0".into(),
+                    generated_end: None,
+                    terminal_saved_end: None,
+                    failure_code: None,
+                },
+            },
+            GenerationObservation::Durable {
+                attempt: AttemptSummary {
+                    id: "b".repeat(32),
+                    attempt_number: "1".into(),
+                    execution: AttemptExecution::Completed,
+                    save: AttemptSave::Saved,
+                    saved_end: "2".into(),
+                    generated_end: Some("2".into()),
+                    terminal_saved_end: Some("2".into()),
+                    failure_code: None,
+                    statistics: None,
+                    effective_sampling: None,
+                    created_ms: "1".into(),
+                    updated_ms: "2".into(),
+                },
+            },
+        ];
+
+        for observation in observations {
+            let envelope = ServerEnvelope::GenerationSnapshot { observation };
+            let encoded = crate::encode_with_limit(&envelope, crate::MAX_HISTORY_FRAME_BYTES)
+                .expect("generation observation encodes");
+            let json: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(json["type"], "generation_snapshot");
+            assert!(matches!(
+                json["observation"]["type"].as_str(),
+                Some("live" | "durable")
+            ));
+            let decoded = crate::decode_with_limit::<ServerEnvelope>(
+                &encoded,
+                crate::MAX_HISTORY_FRAME_BYTES,
+            )
+            .expect("generation observation decodes");
+            assert_eq!(decoded, envelope);
+            decoded.validate_shape().unwrap();
+        }
+    }
+
+    #[test]
     fn turn_and_content_dtos_reject_impossible_public_shapes() {
-        let valid_attempt = AttemptSummary {
+        let mut valid_attempt = AttemptSummary {
             id: "b".repeat(32),
             attempt_number: "1".into(),
             execution: AttemptExecution::Completed,
@@ -733,6 +1159,11 @@ mod tests {
             generated_end: Some("2".into()),
             terminal_saved_end: Some("2".into()),
             failure_code: None,
+            statistics: None,
+            effective_sampling: Some(EffectiveSamplingSettings {
+                temperature: SamplingValue::new(0.0).unwrap(),
+                top_p: SamplingValue::new(0.95).unwrap(),
+            }),
             created_ms: "1".into(),
             updated_ms: "2".into(),
         };
@@ -748,12 +1179,42 @@ mod tests {
             })
         };
 
+        valid_attempt.statistics = Some(AttemptStatistics {
+            qualified_input_tokens: Some(7),
+            qualified_output_tokens: Some(2),
+            service_first_output_latency_ms: Some("3".into()),
+            qualified_engine_decode_tokens_per_second: EngineDecodeRate::new(25.0),
+            service_total_duration_ms: "9".into(),
+            stop_reason: AttemptStopReason::Completed,
+        });
+        let encoded = serde_json::to_value(&valid_attempt).unwrap();
+        assert_eq!(encoded["statistics"]["qualified_input_tokens"], 7);
+        assert_eq!(
+            encoded["statistics"]["qualified_engine_decode_tokens_per_second"],
+            25.0
+        );
+        assert_eq!(encoded["statistics"]["service_total_duration_ms"], "9");
+        assert_eq!(encoded["effective_sampling"]["temperature"], 0.0);
+
         let mut invalid = valid_attempt.clone();
         invalid.terminal_saved_end = None;
         assert!(page(invalid, "1").validate_shape().is_err());
 
         let mut invalid = valid_attempt.clone();
         invalid.updated_ms = "0".into();
+        assert!(page(invalid, "1").validate_shape().is_err());
+        let mut invalid = valid_attempt.clone();
+        invalid
+            .statistics
+            .as_mut()
+            .unwrap()
+            .service_first_output_latency_ms = Some("10".into());
+        assert!(page(invalid, "1").validate_shape().is_err());
+        let mut invalid = valid_attempt.clone();
+        invalid.statistics.as_mut().unwrap().qualified_output_tokens = None;
+        assert!(page(invalid, "1").validate_shape().is_err());
+        let mut invalid = valid_attempt.clone();
+        invalid.effective_sampling.as_mut().unwrap().top_p = SamplingValue::new(1.1).unwrap();
         assert!(page(invalid, "1").validate_shape().is_err());
         assert!(page(valid_attempt, "32769").validate_shape().is_err());
 

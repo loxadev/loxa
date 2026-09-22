@@ -732,6 +732,73 @@ fn foreign_store_entries_do_not_hide_managed_models() {
     assert_eq!(load_catalog(root.path()).unwrap(), vec![expected]);
 }
 
+#[test]
+fn catalog_and_bundle_pending_reads_share_the_four_mib_limit() {
+    let root = tempdir().unwrap();
+    let expected = bundle_manifest("gemma4");
+    let model_dir = root.path().join(&expected.id);
+    std::fs::create_dir(&model_dir).unwrap();
+    let manifest_path = model_dir.join("manifest.json");
+    let pending_path = model_dir.join("bundle.pending.json");
+    let mut bytes = serde_json::to_vec(&expected).unwrap();
+    bytes.resize(MAX_CATALOG_MANIFEST_BYTES, b' ');
+    for path in [&manifest_path, &pending_path] {
+        std::fs::write(path, &bytes).unwrap();
+    }
+
+    assert_eq!(load_catalog(root.path()).unwrap(), vec![expected.clone()]);
+    assert!(
+        matches!(bundle_pending(&model_dir), BundlePending::Valid(found) if *found == expected)
+    );
+
+    bytes.push(b' ');
+    for path in [&manifest_path, &pending_path] {
+        std::fs::write(path, &bytes).unwrap();
+    }
+    assert!(load_catalog(root.path())
+        .unwrap_err()
+        .contains("exceeds its byte limit"));
+    assert!(matches!(
+        bundle_pending(&model_dir),
+        BundlePending::UnsafeOrInvalid
+    ));
+
+    std::fs::File::create(&manifest_path)
+        .unwrap()
+        .set_len((MAX_CATALOG_MANIFEST_BYTES + 1) as u64)
+        .unwrap();
+    assert!(load_catalog(root.path())
+        .unwrap_err()
+        .contains("exceeds its byte limit"));
+    assert_eq!(
+        std::fs::metadata(&manifest_path).unwrap().len(),
+        (MAX_CATALOG_MANIFEST_BYTES + 1) as u64,
+    );
+}
+
+#[test]
+fn history_manifest_reads_keep_the_smaller_admission_limit() {
+    let root = tempdir().unwrap();
+    let expected = manifest("demo");
+    let model_dir = root.path().join(&expected.id);
+    std::fs::create_dir(&model_dir).unwrap();
+    let path = model_dir.join("manifest.json");
+    let mut bytes = serde_json::to_vec(&expected).unwrap();
+    bytes.resize(256 * 1024, b' ');
+    std::fs::write(&path, &bytes).unwrap();
+    assert_eq!(
+        load_model_manifest(root.path(), "demo").unwrap(),
+        Some(expected.clone())
+    );
+
+    bytes.push(b' ');
+    std::fs::write(&path, &bytes).unwrap();
+    assert!(load_model_manifest(root.path(), "demo")
+        .unwrap_err()
+        .contains("exceeds its byte limit"));
+    assert_eq!(load_catalog(root.path()).unwrap(), vec![expected]);
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn symlinked_model_directory_is_rejected_before_catalog_mutation() {

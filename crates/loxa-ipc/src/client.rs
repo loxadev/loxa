@@ -4,8 +4,9 @@ use crate::codec::{
     MAX_HISTORY_FRAME_BYTES,
 };
 use crate::protocol::{
-    Capability, ClientEnvelope, DraftCommand, DraftReply, ErrorCategory, Hello, HistoryCommand,
-    HistoryReply, HistoryStatus, Reply, Request, ServerEnvelope, ServiceCommand, ServiceError,
+    Capability, ClientEnvelope, DraftCommand, DraftReply, ErrorCategory, GenerationCommand,
+    GenerationObservation, GenerationReply, GenerationTarget, Hello, HistoryCommand, HistoryReply,
+    HistoryStatus, Reply, Request, ServerEnvelope, ServiceCommand, ServiceError,
     ServiceSettingsCommand, ServiceSettingsReply, HISTORY_SCHEMA_VERSION,
 };
 use crate::{peer_credentials, ReplyOutcome};
@@ -58,6 +59,12 @@ pub struct ServiceClient {
     client_build: String,
 }
 
+pub struct PendingGenerationRequest {
+    connection: Connection,
+    target: crate::GenerationTarget,
+    expected_runtime: Option<crate::OperationTarget>,
+}
+
 impl ServiceClient {
     pub fn load(
         data_root: &Path,
@@ -104,9 +111,13 @@ impl ServiceClient {
             ServiceCommand::History { .. }
                 | ServiceCommand::Draft { .. }
                 | ServiceCommand::Settings { .. }
+                | ServiceCommand::Generation { .. }
+                | ServiceCommand::GetGenerationStatus { .. }
+                | ServiceCommand::Reload { .. }
+                | ServiceCommand::GenerationAt { .. }
         ) {
             return Err(ClientError::Transport(
-                "this command requires an explicit protocol 1.1 client entry point".into(),
+                "this command requires an explicit versioned client entry point".into(),
             ));
         }
         command
@@ -134,10 +145,173 @@ impl ServiceClient {
             | ReplyOutcome::Accepted(_)
             | ReplyOutcome::History { .. }
             | ReplyOutcome::Draft { .. }
-            | ReplyOutcome::Settings { .. } => Err(ClientError::Transport(
+            | ReplyOutcome::Settings { .. }
+            | ReplyOutcome::Generation { .. }
+            | ReplyOutcome::GenerationStatus { .. } => Err(ClientError::Transport(
                 "service returned an outcome for a different command".into(),
             )),
         }
+    }
+
+    pub async fn reload(
+        &self,
+        mode: ConnectMode,
+        target: crate::OperationTarget,
+        expected_settings_revision: String,
+    ) -> Result<crate::Accepted, ClientError> {
+        let retiring = target.clone();
+        let command = ServiceCommand::Reload {
+            target,
+            expected_settings_revision,
+        };
+        command
+            .validate_shape()
+            .map_err(|error| ClientError::Transport(error.into()))?;
+        let mut connection = self.connect_for(mode, ClientContract::Reload).await?;
+        let expected_boot_epoch = connection.hello.boot_epoch.clone();
+        let retiring_ids = validate_reload_target(&retiring, &expected_boot_epoch)?;
+        match connection.request(command).await? {
+            ReplyOutcome::Accepted(accepted) => {
+                validate_reload_successor(retiring_ids, &expected_boot_epoch, accepted)
+            }
+            ReplyOutcome::Rejected(error) => Err(ClientError::Rejected(error)),
+            _ => Err(ClientError::Transport(
+                "service returned an outcome for a different Reload command".into(),
+            )),
+        }
+    }
+
+    /// Observe an accepted attempt without starting the service or waiting for history.
+    /// After admission is released, use its accepted IDs to read durable history.
+    pub async fn generation_status(
+        &self,
+        target: &crate::GenerationTarget,
+    ) -> Result<Option<crate::GenerationStatus>, ClientError> {
+        target
+            .validate_shape()
+            .map_err(|error| ClientError::Transport(error.into()))?;
+        let mut connection = self
+            .connect_for(
+                ConnectMode::ObserveExisting,
+                ClientContract::GenerationStatus,
+            )
+            .await?;
+        match connection
+            .request(ServiceCommand::GetGenerationStatus {
+                target: target.clone(),
+            })
+            .await?
+        {
+            ReplyOutcome::GenerationStatus { snapshot } => {
+                if let Some(snapshot) = &snapshot {
+                    let current_boot = matches!(
+                        &snapshot.target,
+                        crate::GenerationTarget::Accepted { boot_epoch, .. }
+                            if boot_epoch == &connection.hello.boot_epoch
+                    );
+                    if &snapshot.target != target || !current_boot {
+                        return Err(ClientError::Transport(
+                            "service returned a different generation snapshot".into(),
+                        ));
+                    }
+                }
+                Ok(snapshot)
+            }
+            ReplyOutcome::Rejected(error) => Err(ClientError::Rejected(error)),
+            _ => Err(ClientError::Transport(
+                "service returned an outcome for a different generation status request".into(),
+            )),
+        }
+    }
+
+    pub async fn generation_request(
+        &self,
+        mode: ConnectMode,
+        command: GenerationCommand,
+    ) -> Result<GenerationReply, ClientError> {
+        if !command.is_stop() {
+            return Err(ClientError::Transport(
+                "generation Send requires a prepared generation connection".into(),
+            ));
+        }
+        command
+            .validate_shape()
+            .map_err(|error| ClientError::Transport(error.into()))?;
+        let contract = ClientContract::GenerationControl;
+        let mut connection = self.connect_for(mode, contract).await?;
+        if connection.hello.storage_schema != HISTORY_SCHEMA_VERSION
+            || !connection.hello.capabilities.contains(&Capability::History)
+        {
+            return Err(ClientError::Transport(
+                "service generation history is not ready with a supported schema".into(),
+            ));
+        }
+        let outcome = connection
+            .request(ServiceCommand::Generation { command })
+            .await?;
+        match outcome {
+            ReplyOutcome::Generation { reply } => Ok(reply),
+            ReplyOutcome::Rejected(error) => Err(ClientError::Rejected(error)),
+            _ => Err(ClientError::Transport(
+                "service returned an outcome for a different generation command".into(),
+            )),
+        }
+    }
+
+    pub async fn prepare_generation(
+        &self,
+        mode: ConnectMode,
+    ) -> Result<PendingGenerationRequest, ClientError> {
+        self.prepare_generation_with_contract(mode, ClientContract::GenerationRequest, None)
+            .await
+    }
+
+    pub async fn prepare_generation_retry(
+        &self,
+        mode: ConnectMode,
+    ) -> Result<PendingGenerationRequest, ClientError> {
+        self.prepare_generation_with_contract(mode, ClientContract::GenerationRetry, None)
+            .await
+    }
+
+    pub async fn prepare_generation_at(
+        &self,
+        mode: ConnectMode,
+        target: crate::OperationTarget,
+    ) -> Result<PendingGenerationRequest, ClientError> {
+        target
+            .validate_shape()
+            .map_err(|error| ClientError::Transport(error.into()))?;
+        self.prepare_generation_with_contract(mode, ClientContract::GenerationAt, Some(target))
+            .await
+    }
+
+    async fn prepare_generation_with_contract(
+        &self,
+        mode: ConnectMode,
+        contract: ClientContract,
+        expected_runtime: Option<crate::OperationTarget>,
+    ) -> Result<PendingGenerationRequest, ClientError> {
+        let connection = self.connect_for(mode, contract).await?;
+        if connection.hello.storage_schema != HISTORY_SCHEMA_VERSION
+            || !connection.hello.capabilities.contains(&Capability::History)
+        {
+            return Err(ClientError::Transport(
+                "service generation history is not ready with a supported schema".into(),
+            ));
+        }
+        let generation = connection.hello.generation.as_ref().ok_or_else(|| {
+            ClientError::Transport("service did not issue a pending generation identity".into())
+        })?;
+        let target = crate::GenerationTarget::Pending {
+            boot_epoch: connection.hello.boot_epoch.clone(),
+            pending_nonce: generation.pending_nonce.clone(),
+        };
+        Ok(PendingGenerationRequest {
+            connection,
+            target,
+            expected_runtime,
+        })
     }
 
     pub async fn draft_request(
@@ -282,6 +456,59 @@ impl ServiceClient {
         })
     }
 
+    pub async fn subscribe_generation(
+        &self,
+        mode: ConnectMode,
+        target: GenerationTarget,
+        attempt_id: String,
+    ) -> Result<GenerationSubscription, ClientError> {
+        let mut connection = self
+            .connect_for(mode, ClientContract::GenerationObservation)
+            .await?;
+        if connection.hello.storage_schema != HISTORY_SCHEMA_VERSION
+            || !connection.hello.capabilities.contains(&Capability::History)
+        {
+            return Err(ClientError::Transport(
+                "service generation history is not ready with a supported schema".into(),
+            ));
+        }
+        let request_id = next_request_id();
+        let request = ClientEnvelope::SubscribeGeneration {
+            request_id: request_id.clone(),
+            target: target.clone(),
+            attempt_id: attempt_id.clone(),
+        };
+        request
+            .validate_shape()
+            .map_err(|error| ClientError::Transport(error.into()))?;
+        send_frame(
+            &mut connection.framed,
+            &request,
+            REQUEST_TIMEOUT,
+            connection.frame_limit,
+        )
+        .await?;
+        let initial = observation_from(
+            receive_envelope(
+                &mut connection.framed,
+                REQUEST_TIMEOUT,
+                connection.frame_limit,
+            )
+            .await?,
+            &request_id,
+            &target,
+            &attempt_id,
+        )?;
+        Ok(GenerationSubscription {
+            framed: connection.framed,
+            initial: Some(initial),
+            request_id,
+            target,
+            attempt_id,
+            frame_limit: connection.frame_limit,
+        })
+    }
+
     async fn connect(&self, mode: ConnectMode) -> Result<Connection, ClientError> {
         self.connect_for(mode, ClientContract::Legacy).await
     }
@@ -365,6 +592,36 @@ impl ServiceClient {
                 self.client_build.clone(),
                 self.bootstrap.root().root_identity(),
             ),
+            ClientContract::Reload => Hello::reload(
+                self.client_build.clone(),
+                self.bootstrap.root().root_identity(),
+            ),
+            ClientContract::GenerationStatus => Hello::generation_status(
+                self.client_build.clone(),
+                self.bootstrap.root().root_identity(),
+            ),
+            ClientContract::GenerationObservation => Hello::generation_observation(
+                self.client_build.clone(),
+                self.bootstrap.root().root_identity(),
+            ),
+            ClientContract::GenerationRequest => Hello::generation(
+                self.client_build.clone(),
+                self.bootstrap.root().root_identity(),
+                crate::GenerationConnection::Request,
+            ),
+            ClientContract::GenerationRetry => Hello::generation_retry(
+                self.client_build.clone(),
+                self.bootstrap.root().root_identity(),
+            ),
+            ClientContract::GenerationAt => Hello::generation_at(
+                self.client_build.clone(),
+                self.bootstrap.root().root_identity(),
+            ),
+            ClientContract::GenerationControl => Hello::generation(
+                self.client_build.clone(),
+                self.bootstrap.root().root_identity(),
+                crate::GenerationConnection::Control,
+            ),
         };
         send_frame(
             &mut framed,
@@ -377,13 +634,44 @@ impl ServiceClient {
         let hello = match envelope {
             ServerEnvelope::HelloAck(hello) => hello,
             ServerEnvelope::HelloRejected(error) => return Err(ClientError::Rejected(error)),
-            ServerEnvelope::Reply(_) | ServerEnvelope::Snapshot(_) => {
+            ServerEnvelope::Reply(_)
+            | ServerEnvelope::Snapshot(_)
+            | ServerEnvelope::GenerationSnapshot { .. } => {
                 return Err(ClientError::Transport(
                     "service replied before the handshake completed".into(),
                 ))
             }
         };
+        let generation_shape_matches = match contract {
+            ClientContract::GenerationRequest => {
+                hello.generation.is_some() && hello.protocol == crate::ProtocolVersion::V1_2
+            }
+            ClientContract::GenerationRetry => {
+                hello.generation.is_some() && hello.protocol == crate::ProtocolVersion::V1_5
+            }
+            ClientContract::GenerationAt => {
+                hello.generation.is_some() && hello.protocol == crate::ProtocolVersion::V1_6
+            }
+            ClientContract::GenerationControl => {
+                hello.generation.is_none() && hello.protocol == crate::ProtocolVersion::V1_2
+            }
+            ClientContract::Reload => {
+                hello.generation.is_none()
+                    && hello.protocol == crate::ProtocolVersion::V1_5
+                    && hello.capabilities.contains(&Capability::Settings)
+            }
+            ClientContract::GenerationObservation => {
+                hello.generation.is_none()
+                    && hello.protocol == crate::ProtocolVersion::V1_5
+                    && hello.capabilities.contains(&Capability::History)
+            }
+            ClientContract::GenerationStatus
+            | ClientContract::Legacy
+            | ClientContract::HistoryStatus
+            | ClientContract::History => hello.generation.is_none(),
+        };
         if !protocol_is_compatible(hello.protocol, requested_hello.protocol)
+            || !generation_shape_matches
             || hello.root_identity != self.bootstrap.root().root_identity()
             || hello.service_pid != peer.pid
             || hello.origin_sha256 != self.bootstrap.origin().executable_sha256()
@@ -444,6 +732,35 @@ pub struct ServiceSubscription {
     expected_boot_epoch: String,
     last_revision: u64,
     frame_limit: usize,
+}
+
+pub struct GenerationSubscription {
+    framed: crate::codec::IpcFramed,
+    initial: Option<GenerationObservation>,
+    request_id: String,
+    target: GenerationTarget,
+    attempt_id: String,
+    frame_limit: usize,
+}
+
+impl GenerationSubscription {
+    pub async fn next_observation(&mut self) -> Result<GenerationObservation, ClientError> {
+        if let Some(initial) = self.initial.take() {
+            return Ok(initial);
+        }
+        let frame = self
+            .framed
+            .next()
+            .await
+            .ok_or_else(|| ClientError::Transport("service closed the generation stream".into()))?
+            .map_err(|error| ClientError::Transport(error.to_string()))?;
+        observation_from(
+            decode_envelope(&frame, self.frame_limit)?,
+            &self.request_id,
+            &self.target,
+            &self.attempt_id,
+        )
+    }
 }
 
 impl ServiceSubscription {
@@ -510,11 +827,55 @@ impl Connection {
     }
 }
 
+impl PendingGenerationRequest {
+    pub fn target(&self) -> &crate::GenerationTarget {
+        &self.target
+    }
+
+    pub async fn send(
+        mut self,
+        command: GenerationCommand,
+    ) -> Result<GenerationReply, ClientError> {
+        if command.is_stop() {
+            return Err(ClientError::Transport(
+                "prepared generation connection accepts only Send or Retry".into(),
+            ));
+        }
+        if command.is_retry() && self.connection.hello.protocol.minor < 5 {
+            return Err(ClientError::Transport(
+                "generation Retry requires service protocol 1.5".into(),
+            ));
+        }
+        command
+            .validate_shape()
+            .map_err(|error| ClientError::Transport(error.into()))?;
+        let command = match self.expected_runtime {
+            Some(target) => ServiceCommand::GenerationAt { target, command },
+            None => ServiceCommand::Generation { command },
+        };
+        let outcome = self.connection.request(command).await?;
+        match outcome {
+            ReplyOutcome::Generation { reply } => Ok(reply),
+            ReplyOutcome::Rejected(error) => Err(ClientError::Rejected(error)),
+            _ => Err(ClientError::Transport(
+                "service returned an outcome for a different generation command".into(),
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ClientContract {
     Legacy,
     HistoryStatus,
     History,
+    Reload,
+    GenerationRequest,
+    GenerationRetry,
+    GenerationAt,
+    GenerationControl,
+    GenerationStatus,
+    GenerationObservation,
 }
 
 async fn send_frame<T: serde::Serialize>(
@@ -569,6 +930,38 @@ fn snapshot_from(envelope: ServerEnvelope) -> Result<crate::RuntimeStatus, Clien
     Ok(status)
 }
 
+fn observation_from(
+    envelope: ServerEnvelope,
+    request_id: &str,
+    target: &GenerationTarget,
+    attempt_id: &str,
+) -> Result<GenerationObservation, ClientError> {
+    let observation = match envelope {
+        ServerEnvelope::GenerationSnapshot { observation } => observation,
+        ServerEnvelope::Reply(Reply {
+            request_id: response_id,
+            outcome: ReplyOutcome::Rejected(error),
+        }) if response_id == request_id => return Err(ClientError::Rejected(error)),
+        _ => {
+            return Err(ClientError::Transport(
+                "service returned an unexpected generation observation envelope".into(),
+            ))
+        }
+    };
+    let matches = match &observation {
+        GenerationObservation::Live { status } => {
+            &status.target == target && status.attempt_id == attempt_id
+        }
+        GenerationObservation::Durable { attempt } => attempt.id == attempt_id,
+    };
+    if !matches {
+        return Err(ClientError::Transport(
+            "service returned a different generation observation".into(),
+        ));
+    }
+    Ok(observation)
+}
+
 fn validate_socket_path(path: &Path) -> Result<(), ClientError> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
     let metadata = match std::fs::symlink_metadata(path) {
@@ -604,6 +997,50 @@ fn validate_projection(
         .map_err(|_| ClientError::Transport("invalid service state revision".into()))
 }
 
+fn validate_reload_target(
+    target: &crate::OperationTarget,
+    acknowledged_boot_epoch: &str,
+) -> Result<(u64, u64), ClientError> {
+    if target.boot_epoch != acknowledged_boot_epoch {
+        return Err(ClientError::Transport(
+            "Reload target boot epoch changed".into(),
+        ));
+    }
+    let task_id = target
+        .task_id
+        .parse::<u64>()
+        .map_err(|_| ClientError::Transport("invalid Reload target identity".into()))?;
+    let generation = target
+        .generation
+        .parse::<u64>()
+        .map_err(|_| ClientError::Transport("invalid Reload target identity".into()))?;
+    Ok((task_id, generation))
+}
+
+fn validate_reload_successor(
+    retiring: (u64, u64),
+    acknowledged_boot_epoch: &str,
+    accepted: crate::Accepted,
+) -> Result<crate::Accepted, ClientError> {
+    let task_id = accepted
+        .task_id
+        .parse::<u64>()
+        .map_err(|_| ClientError::Transport("invalid Reload successor identity".into()))?;
+    let generation = accepted
+        .generation
+        .parse::<u64>()
+        .map_err(|_| ClientError::Transport("invalid Reload successor identity".into()))?;
+    if accepted.boot_epoch != acknowledged_boot_epoch
+        || task_id <= retiring.0
+        || generation <= retiring.1
+    {
+        return Err(ClientError::Transport(
+            "service returned an invalid Reload successor identity".into(),
+        ));
+    }
+    Ok(accepted)
+}
+
 async fn run_bootstrap<T, E, F>(work: F) -> Result<T, E>
 where
     T: Send + 'static,
@@ -636,7 +1073,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     enum TestResponse {
-        Matching(ReplyOutcome),
+        Matching(Box<ReplyOutcome>),
         MismatchedId,
         UnexpectedEnvelope,
         MalformedJson,
@@ -654,6 +1091,7 @@ mod tests {
             root_identity: "test-root".into(),
             service_pid: 1,
             origin_sha256: "00".repeat(32),
+            generation: None,
         }
     }
 
@@ -682,7 +1120,7 @@ mod tests {
                             &mut server,
                             &ServerEnvelope::Reply(Reply {
                                 request_id: request.request_id,
-                                outcome,
+                                outcome: *outcome,
                             }),
                             REQUEST_TIMEOUT,
                             MAX_FRAME_BYTES,
@@ -749,7 +1187,7 @@ mod tests {
     fn connection_request_returns_a_matching_valid_reply() {
         let expected = ReplyOutcome::Rejected(ServiceError::new(ErrorCategory::Busy, "busy"));
         assert_eq!(
-            request_with_response(TestResponse::Matching(expected.clone())).unwrap(),
+            request_with_response(TestResponse::Matching(Box::new(expected.clone()))).unwrap(),
             expected
         );
     }
@@ -779,6 +1217,121 @@ mod tests {
         assert!(matches!(
             request_with_response(TestResponse::PeerEof),
             Err(ClientError::Transport(message)) if message.contains("closed the connection")
+        ));
+    }
+
+    #[test]
+    fn reload_accepts_only_a_monotonic_successor_from_the_acknowledged_boot() {
+        let retiring = crate::OperationTarget {
+            boot_epoch: "boot".into(),
+            task_id: "7".into(),
+            generation: "9".into(),
+        };
+        let retiring_ids = validate_reload_target(&retiring, "boot").unwrap();
+        let accepted = |boot_epoch: &str, task_id: u64, generation: u64| crate::Accepted {
+            boot_epoch: boot_epoch.into(),
+            task_id: task_id.to_string(),
+            generation: generation.to_string(),
+            state_revision: "1".into(),
+        };
+
+        for invalid in [
+            accepted("boot", 0, 10),
+            accepted("boot", 8, 0),
+            accepted("boot", 6, 10),
+            accepted("boot", 8, 8),
+            accepted("boot", 7, 10),
+            accepted("boot", 8, 9),
+            accepted("other", 8, 10),
+        ] {
+            assert!(matches!(
+                validate_reload_successor(retiring_ids, "boot", invalid),
+                Err(ClientError::Transport(message))
+                    if message.contains("invalid Reload successor identity")
+            ));
+        }
+
+        let valid = accepted("boot", 8, 10);
+        assert_eq!(
+            validate_reload_successor(retiring_ids, "boot", valid.clone()).unwrap(),
+            valid
+        );
+        assert!(matches!(
+            validate_reload_target(&retiring, "replacement"),
+            Err(ClientError::Transport(message)) if message.contains("boot epoch changed")
+        ));
+    }
+
+    #[test]
+    fn generation_observation_accepts_only_the_requested_attempt_and_target() {
+        let target = GenerationTarget::Accepted {
+            boot_epoch: "boot".into(),
+            submission_id: "11".repeat(16),
+            operation_generation: "2".into(),
+        };
+        let attempt_id = "22".repeat(16);
+        let live =
+            |target: GenerationTarget, attempt_id: String| ServerEnvelope::GenerationSnapshot {
+                observation: GenerationObservation::Live {
+                    status: crate::GenerationStatus {
+                        target,
+                        attempt_id,
+                        execution: crate::GenerationExecutionPhase::Working,
+                        save: crate::GenerationSavePhase::Open,
+                        saved_end: "0".into(),
+                        generated_end: None,
+                        terminal_saved_end: None,
+                        failure_code: None,
+                    },
+                },
+            };
+
+        assert!(observation_from(
+            live(target.clone(), attempt_id.clone()),
+            "observe",
+            &target,
+            &attempt_id,
+        )
+        .is_ok());
+        assert!(matches!(
+            observation_from(
+                live(target.clone(), "33".repeat(16)),
+                "observe",
+                &target,
+                &attempt_id,
+            ),
+            Err(ClientError::Transport(message))
+                if message.contains("different generation observation")
+        ));
+        let mut different_target = target.clone();
+        let GenerationTarget::Accepted { submission_id, .. } = &mut different_target else {
+            unreachable!()
+        };
+        *submission_id = "44".repeat(16);
+        assert!(observation_from(
+            live(different_target, attempt_id.clone()),
+            "observe",
+            &target,
+            &attempt_id,
+        )
+        .is_err());
+        assert!(matches!(
+            observation_from(
+                ServerEnvelope::Reply(Reply {
+                    request_id: "observe".into(),
+                    outcome: ReplyOutcome::Rejected(ServiceError::new(
+                        ErrorCategory::NotFound,
+                        "attempt was not found",
+                    )),
+                }),
+                "observe",
+                &target,
+                &attempt_id,
+            ),
+            Err(ClientError::Rejected(ServiceError {
+                category: ErrorCategory::NotFound,
+                ..
+            }))
         ));
     }
 
@@ -825,13 +1378,13 @@ mod tests {
     #[test]
     fn stale_client_refuses_a_replaced_root_before_spawning_the_recorded_origin() {
         let parent = tempfile::Builder::new()
-            .prefix("loxa-ipc-client-")
+            .prefix("li-")
             .tempdir_in("/tmp")
             .unwrap();
         let parent = fs::canonicalize(parent.path()).unwrap();
         let forbidden = parent.join("normal");
-        let root = parent.join("development");
-        let moved = parent.join("development-moved");
+        let root = parent.join("dev");
+        let moved = parent.join("dev-moved");
         let origin = parent.join("origin.sh");
         let witness = parent.join("origin-spawned");
         fs::create_dir(&forbidden).unwrap();

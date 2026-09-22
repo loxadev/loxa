@@ -3,6 +3,7 @@ use super::{invalid, limit};
 use crate::history::HistoryError;
 use crate::runtime_fingerprint::RuntimeFingerprint;
 use crate::runtime_identity::RuntimeIdentity;
+use loxa_ipc::EffectiveSamplingSettings;
 use serde::Serialize;
 use std::sync::Arc;
 
@@ -67,8 +68,10 @@ pub(crate) struct PreparedAdmission {
     pub(super) operation_generation: i64,
     pub(super) runtime_fingerprint: Arc<RuntimeFingerprint>,
     pub(super) runtime_identity: RuntimeIdentity,
+    pub(super) effective_context: u32,
     pub(super) system_instruction: String,
     pub(super) max_output_tokens: i64,
+    pub(super) effective_sampling: EffectiveSamplingSettings,
     pub(super) prompt_basis: PromptBasis,
     pub(super) kind: AdmissionKind,
     pub(super) runtime_fingerprint_json: Vec<u8>,
@@ -87,8 +90,10 @@ impl PreparedAdmission {
         operation_generation: i64,
         runtime_fingerprint: Arc<RuntimeFingerprint>,
         runtime_identity: RuntimeIdentity,
+        effective_context: u32,
         system_instruction: String,
         max_output_tokens: i64,
+        effective_sampling: EffectiveSamplingSettings,
         prompt_basis: PromptBasis,
         kind: AdmissionKind,
     ) -> Result<Self, HistoryError> {
@@ -102,8 +107,10 @@ impl PreparedAdmission {
             operation_generation,
             runtime_fingerprint,
             runtime_identity,
+            effective_context,
             system_instruction,
             max_output_tokens,
+            effective_sampling,
             prompt_basis,
             kind,
             runtime_fingerprint_json: Vec::new(),
@@ -170,5 +177,6 @@ pub(crate) struct CommittedAdmission {
     pub(crate) pre_conversation_revision: i64,
     pub(crate) post_conversation_revision: i64,
     pub(crate) profile_revision: i64,
+    pub(crate) owner_epoch: String,
     pub(crate) operation_generation: i64,
 }

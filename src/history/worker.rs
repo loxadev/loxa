@@ -1,7 +1,7 @@
 use super::{
-    admission, conversations, drafts, schema, AdmissionCompletion, AdmissionKind, DraftCompletion,
-    HistoryCommand, HistoryCompletion, HistoryErrorKind, HistoryExit, HistoryHandle,
-    ProfileCompletion, RequiredCompletion, SuffixCompletion,
+    admission, conversations, drafts, prompt, reads, schema, AdmissionCompletion, AdmissionKind,
+    AttemptCompletion, DraftCompletion, HistoryCommand, HistoryCompletion, HistoryErrorKind,
+    HistoryExit, HistoryHandle, ProfileCompletion, PromptCompletion, SuffixCompletion,
 };
 use loxa_ipc::HistoryStatus;
 use std::collections::VecDeque;
@@ -70,8 +70,6 @@ pub(super) fn run(
     let mut drop_next_admission_reply = false;
     #[cfg(test)]
     let mut drop_next_persistence_reply = false;
-    #[cfg(test)]
-    let mut fail_next_stop_before_execution = false;
     let mut pending = VecDeque::with_capacity(super::COMMAND_CAPACITY);
     loop {
         match next_command(&receiver, &mut pending) {
@@ -115,6 +113,23 @@ pub(super) fn run(
                 };
                 let _ = reply.send(ProfileCompletion { result, permit });
             }
+            Ok(HistoryCommand::ReadObservedAttempt {
+                observation,
+                reply,
+                permit,
+            }) => {
+                interrupt_on_drain.store(true, Ordering::Release);
+                let result = match connection.as_ref() {
+                    Some(WorkerStore::Ready(store)) => {
+                        reads::get_observed_attempt(store, &observation)
+                    }
+                    Some(WorkerStore::Unavailable(_)) | None => Err(super::HistoryError::new(
+                        HistoryErrorKind::WorkerUnavailable,
+                        "history store is unavailable",
+                    )),
+                };
+                let _ = reply.send(AttemptCompletion { result, permit });
+            }
             Ok(HistoryCommand::Drain) => match connection.take() {
                 #[cfg(test)]
                 Some(store) if fail_next_close => {
@@ -157,6 +172,30 @@ pub(super) fn run(
                     )),
                 };
                 let _ = reply.send(DraftCompletion { result, permit });
+            }
+            Ok(HistoryCommand::PreparePrompt {
+                conversation_id,
+                expected_conversation_revision,
+                expected_profile_revision,
+                request,
+                reply,
+                permit,
+            }) => {
+                interrupt_on_drain.store(true, Ordering::Release);
+                let result = match connection.as_ref() {
+                    Some(WorkerStore::Ready(store)) => prompt::prepare(
+                        store,
+                        conversation_id,
+                        expected_conversation_revision,
+                        expected_profile_revision,
+                        request,
+                    ),
+                    Some(WorkerStore::Unavailable(_)) | None => Err(super::HistoryError::new(
+                        HistoryErrorKind::WorkerUnavailable,
+                        "history store is unavailable",
+                    )),
+                };
+                let _ = reply.send(PromptCompletion { result, permit });
             }
             Ok(HistoryCommand::LookupSubmission {
                 submission_id,
@@ -241,42 +280,6 @@ pub(super) fn run(
                 #[cfg(not(test))]
                 let _ = reply.send(AdmissionCompletion { result, permit });
             }
-            Ok(HistoryCommand::StopBeforeExecution {
-                committed,
-                reply,
-                permit,
-            }) => {
-                interrupt_on_drain.store(false, Ordering::Release);
-                #[cfg(test)]
-                let result = if fail_next_stop_before_execution {
-                    fail_next_stop_before_execution = false;
-                    Err(super::HistoryError::new(
-                        HistoryErrorKind::Io,
-                        "injected cancelled-admission save failure",
-                    ))
-                } else {
-                    match connection.as_ref() {
-                        Some(WorkerStore::Ready(store)) => {
-                            admission::stop_before_execution(store, &committed)
-                        }
-                        Some(WorkerStore::Unavailable(_)) | None => Err(super::HistoryError::new(
-                            HistoryErrorKind::OutcomeUnknown,
-                            "history owner cannot save cancelled admission",
-                        )),
-                    }
-                };
-                #[cfg(not(test))]
-                let result = match connection.as_ref() {
-                    Some(WorkerStore::Ready(store)) => {
-                        admission::stop_before_execution(store, &committed)
-                    }
-                    Some(WorkerStore::Unavailable(_)) | None => Err(super::HistoryError::new(
-                        HistoryErrorKind::OutcomeUnknown,
-                        "history owner cannot save cancelled admission",
-                    )),
-                };
-                let _ = reply.send(RequiredCompletion { result, permit });
-            }
             Ok(HistoryCommand::AppendSuffix {
                 input,
                 reply,
@@ -350,11 +353,6 @@ pub(super) fn run(
                 let _ = ready.send(());
             }
             #[cfg(test)]
-            Ok(HistoryCommand::FailNextStopBeforeExecution(ready)) => {
-                fail_next_stop_before_execution = true;
-                let _ = ready.send(());
-            }
-            #[cfg(test)]
             Ok(HistoryCommand::SetProgressInterval {
                 instructions,
                 ready,
@@ -406,7 +404,6 @@ fn is_required(command: &HistoryCommand) -> bool {
         command,
         HistoryCommand::Admit { .. }
             | HistoryCommand::ReconcileSubmission { .. }
-            | HistoryCommand::StopBeforeExecution { .. }
             | HistoryCommand::AppendSuffix { .. }
             | HistoryCommand::Finalize { .. }
     )

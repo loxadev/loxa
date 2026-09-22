@@ -1,8 +1,9 @@
 use super::{
     bounded_decimal, positive_bounded_decimal, validate_hex_id, MAX_ATTEMPT_CONTENT_BYTES,
 };
+use crate::EffectiveSamplingSettings;
 use serde::de::{SeqAccess, Visitor};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
 pub const MAX_TURN_PAGE_ITEMS: usize = 50;
@@ -43,6 +44,100 @@ pub enum AttemptSave {
     Interrupted,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptStopReason {
+    Completed,
+    OutputLimit,
+    UserStop,
+    Failure,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttemptStatistics {
+    pub qualified_input_tokens: Option<u32>,
+    pub qualified_output_tokens: Option<u32>,
+    pub service_first_output_latency_ms: Option<String>,
+    pub qualified_engine_decode_tokens_per_second: Option<EngineDecodeRate>,
+    pub service_total_duration_ms: String,
+    pub stop_reason: AttemptStopReason,
+}
+
+impl AttemptStatistics {
+    fn validate_shape(&self) -> Result<(), &'static str> {
+        if self
+            .qualified_engine_decode_tokens_per_second
+            .is_some_and(|_| {
+                self.qualified_output_tokens
+                    .is_none_or(|tokens| tokens == 0)
+            })
+        {
+            return Err("invalid attempt statistics");
+        }
+        let total = bounded_decimal(
+            &self.service_total_duration_ms,
+            MAX_STORED_INTEGER,
+            "invalid service total duration",
+        )?;
+        let first_output = self
+            .service_first_output_latency_ms
+            .as_ref()
+            .map(|value| {
+                bounded_decimal(
+                    value,
+                    MAX_STORED_INTEGER,
+                    "invalid service first output latency",
+                )
+            })
+            .transpose()?;
+        if first_output.is_some_and(|value| value > total) {
+            return Err("invalid attempt statistics");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct EngineDecodeRate(f64);
+
+impl EngineDecodeRate {
+    pub fn new(value: f64) -> Option<Self> {
+        (value.is_finite() && value > 0.0 && value < 1.0e308).then_some(Self(value))
+    }
+
+    pub fn get(self) -> f64 {
+        self.0
+    }
+}
+
+impl PartialEq for EngineDecodeRate {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_bits() == other.0.to_bits()
+    }
+}
+
+impl Eq for EngineDecodeRate {}
+
+impl Serialize for EngineDecodeRate {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_f64(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for EngineDecodeRate {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = f64::deserialize(deserializer)?;
+        Self::new(value).ok_or_else(|| serde::de::Error::custom("invalid engine decode rate"))
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AttemptSummary {
@@ -54,12 +149,14 @@ pub struct AttemptSummary {
     pub generated_end: Option<String>,
     pub terminal_saved_end: Option<String>,
     pub failure_code: Option<String>,
+    pub statistics: Option<AttemptStatistics>,
+    pub effective_sampling: Option<EffectiveSamplingSettings>,
     pub created_ms: String,
     pub updated_ms: String,
 }
 
 impl AttemptSummary {
-    pub(super) fn validate_shape(&self) -> Result<(), &'static str> {
+    pub(crate) fn validate_shape(&self) -> Result<(), &'static str> {
         validate_hex_id(&self.id)?;
         positive_bounded_decimal(
             &self.attempt_number,
@@ -116,6 +213,26 @@ impl AttemptSummary {
             value.is_empty() || value.len() > 64 || value.capacity() > 64 || !value.is_ascii()
         }) {
             return Err("invalid attempt failure code");
+        }
+        if let Some(statistics) = &self.statistics {
+            if self.save != AttemptSave::Saved {
+                return Err("attempt statistics require a saved terminal outcome");
+            }
+            let matching_outcome = matches!(
+                (self.execution, statistics.stop_reason),
+                (
+                    AttemptExecution::Completed,
+                    AttemptStopReason::Completed | AttemptStopReason::OutputLimit
+                ) | (AttemptExecution::Stopped, AttemptStopReason::UserStop)
+                    | (AttemptExecution::Failed, AttemptStopReason::Failure)
+            );
+            if !matching_outcome {
+                return Err("attempt statistics do not match the execution outcome");
+            }
+            statistics.validate_shape()?;
+        }
+        if let Some(sampling) = &self.effective_sampling {
+            sampling.validate_shape()?;
         }
         let created = bounded_decimal(
             &self.created_ms,
@@ -312,6 +429,13 @@ fn turn_backing_bytes(items: &[TurnSummary], capacity: usize, next: Option<&Turn
                         .map_or(0, String::capacity),
                 )
                 .saturating_add(attempt.failure_code.as_ref().map_or(0, String::capacity))
+                .saturating_add(attempt.statistics.as_ref().map_or(0, |statistics| {
+                    statistics
+                        .service_first_output_latency_ms
+                        .as_ref()
+                        .map_or(0, String::capacity)
+                        .saturating_add(statistics.service_total_duration_ms.capacity())
+                }))
                 .saturating_add(attempt.created_ms.capacity())
                 .saturating_add(attempt.updated_ms.capacity())
         })

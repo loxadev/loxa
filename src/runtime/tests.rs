@@ -401,7 +401,7 @@ fn spawn_lease_observing_sleep(lease: &Path, witness: &Path, ready: &Path) -> Ch
             .arg(
                 r#"trap 'if [ -e "$LOXA_LEASE" ]; then printf present > "$LOXA_WITNESS"; else printf absent > "$LOXA_WITNESS"; fi; exit 0' TERM
 : > "$LOXA_READY"
-while :; do sleep 60; done"#,
+while :; do sleep 60 & wait "$!"; done"#,
             )
             .env("LOXA_LEASE", lease)
             .env("LOXA_WITNESS", witness)
@@ -1500,7 +1500,14 @@ fn legacy_recovery_never_signals_without_unique_command_identity() {
 
     let dir = tempdir().unwrap();
     let server = dir.path().join("llama-server");
-    fs::copy("/bin/sleep", &server).unwrap();
+    // Keep the writer out of this process so parallel forks cannot inherit it
+    // and cause ETXTBSY when the copied fixture is executed on Linux.
+    assert!(Command::new("/bin/cp")
+        .arg("/bin/sleep")
+        .arg(&server)
+        .status()
+        .unwrap()
+        .success());
     fs::set_permissions(&server, fs::Permissions::from_mode(0o755)).unwrap();
     let mut command = Command::new(&server);
     command.arg("60").process_group(0);

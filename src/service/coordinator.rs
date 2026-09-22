@@ -16,7 +16,33 @@ use tokio::sync::{oneshot, watch, OwnedSemaphorePermit};
 mod state;
 mod worker;
 use state::CoordinatorState;
+mod generation;
 mod history;
+#[cfg(all(test, target_os = "macos"))]
+mod native_test_gate;
+#[cfg(all(test, target_os = "macos"))]
+pub(in crate::service) use generation::run_bundled_generation_acceptance;
+
+pub(super) struct PendingGenerationConnection {
+    coordinator: Coordinator,
+    pending: Arc<state::PendingGeneration>,
+}
+
+impl PendingGenerationConnection {
+    pub(super) fn nonce(&self) -> &str {
+        self.pending.nonce()
+    }
+}
+
+impl Drop for PendingGenerationConnection {
+    fn drop(&mut self) {
+        self.coordinator
+            .shared
+            .state()
+            .finish_pending_generation(&self.pending);
+        history::maybe_begin_history_drain(&self.coordinator.shared);
+    }
+}
 
 #[derive(Clone)]
 pub(super) struct Coordinator {
@@ -50,6 +76,18 @@ struct Shared {
     admission_pre_lookup_barrier: Mutex<Option<Arc<std::sync::Barrier>>>,
     #[cfg(test)]
     output_handoff_barrier: Mutex<Option<Arc<std::sync::Barrier>>>,
+    #[cfg(all(test, target_os = "macos"))]
+    native_admission_completion_gate: Mutex<Option<Arc<native_test_gate::NativeTestGate>>>,
+    #[cfg(all(test, target_os = "macos"))]
+    native_generation_execution_gate: Mutex<Option<Arc<native_test_gate::NativeTestGate>>>,
+    #[cfg(all(test, target_os = "macos"))]
+    native_generation_output_gate: Mutex<Option<Arc<native_test_gate::NativeTestGate>>>,
+    #[cfg(all(test, target_os = "macos"))]
+    native_reload_launch_gate: Mutex<Option<Arc<native_test_gate::NativeTestGate>>>,
+    #[cfg(all(test, target_os = "macos"))]
+    fail_next_runtime_termination: AtomicBool,
+    #[cfg(all(test, target_os = "macos"))]
+    fail_next_intent_clear: AtomicBool,
     #[cfg(test)]
     settings_drain_barrier: Mutex<Option<Arc<std::sync::Barrier>>>,
 }
@@ -66,8 +104,17 @@ struct OperationControl {
     task_id: u64,
     generation: u64,
     model_id: String,
+    launch_settings: LaunchSettings,
     cancel: AtomicBool,
     retry_cleanup: AtomicU64,
+}
+
+#[derive(Clone, Copy)]
+struct LaunchSettings {
+    settings_revision: u64,
+    context_preference: Option<u32>,
+    requested_context: u32,
+    runtime_identity: crate::runtime_identity::RuntimeIdentity,
 }
 
 impl OperationControl {
@@ -76,6 +123,14 @@ impl OperationControl {
     fn request_cleanup(&self) {
         self.cancel.store(true, Ordering::Release);
         self.retry_cleanup.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn target(&self, boot_epoch: &str) -> OperationTarget {
+        OperationTarget {
+            boot_epoch: boot_epoch.to_owned(),
+            task_id: self.task_id.to_string(),
+            generation: self.generation.to_string(),
+        }
     }
 }
 
@@ -114,11 +169,13 @@ enum OwnerCommand {
     Load {
         operation: Arc<OperationControl>,
         config: crate::config::Config,
-        accepted: oneshot::Sender<Result<Accepted, ServiceError>>,
+        accepted: Option<oneshot::Sender<Result<Accepted, ServiceError>>>,
     },
     Wake,
     #[cfg(test)]
     PanicForTest,
+    #[cfg(all(test, target_os = "macos"))]
+    QueueProbeForTest(std::sync::mpsc::SyncSender<()>),
 }
 
 impl Coordinator {
@@ -180,6 +237,18 @@ impl Coordinator {
             admission_pre_lookup_barrier: Mutex::new(None),
             #[cfg(test)]
             output_handoff_barrier: Mutex::new(None),
+            #[cfg(all(test, target_os = "macos"))]
+            native_admission_completion_gate: Mutex::new(None),
+            #[cfg(all(test, target_os = "macos"))]
+            native_generation_execution_gate: Mutex::new(None),
+            #[cfg(all(test, target_os = "macos"))]
+            native_generation_output_gate: Mutex::new(None),
+            #[cfg(all(test, target_os = "macos"))]
+            native_reload_launch_gate: Mutex::new(None),
+            #[cfg(all(test, target_os = "macos"))]
+            fail_next_runtime_termination: AtomicBool::new(false),
+            #[cfg(all(test, target_os = "macos"))]
+            fail_next_intent_clear: AtomicBool::new(false),
             #[cfg(test)]
             settings_drain_barrier: Mutex::new(None),
         });
@@ -227,6 +296,37 @@ impl Coordinator {
         &self.shared.boot_epoch
     }
 
+    pub(super) fn register_generation_connection(
+        &self,
+    ) -> Result<PendingGenerationConnection, ServiceError> {
+        let pending = self.shared.state().register_pending_generation()?;
+        Ok(PendingGenerationConnection {
+            coordinator: self.clone(),
+            pending,
+        })
+    }
+
+    pub(super) fn finish_generation_connection(&self, pending: &PendingGenerationConnection) {
+        self.shared
+            .state()
+            .finish_pending_generation(&pending.pending);
+        history::maybe_begin_history_drain(&self.shared);
+    }
+
+    pub(super) fn stop_generation(
+        &self,
+        target: &loxa_ipc::GenerationTarget,
+    ) -> Result<(), ServiceError> {
+        let admission = {
+            let mut state = self.shared.state();
+            state.cancel_generation(target)?
+        };
+        if let Some(admission) = admission {
+            history::maybe_resume_admission(Arc::clone(&self.shared), admission);
+        }
+        Ok(())
+    }
+
     pub(super) fn status(&self) -> RuntimeStatus {
         self.shared.state().snapshot()
     }
@@ -262,6 +362,40 @@ impl Coordinator {
         self.shared.settings.finish_write()
     }
 
+    fn settings_snapshot(&self) -> loxa_ipc::ServiceSettings {
+        let state = self.shared.state();
+        let mut settings = self.shared.settings.snapshot();
+        settings.application = state.settings_application(settings.ctx);
+        settings
+    }
+
+    fn apply_settings_facts(
+        &self,
+        mut settings: loxa_ipc::ServiceSettings,
+    ) -> loxa_ipc::ServiceSettings {
+        settings.application = self.shared.state().settings_application(settings.ctx);
+        settings
+    }
+
+    fn launch_settings(
+        &self,
+        captured: crate::config::CapturedConfig,
+    ) -> Result<LaunchSettings, ServiceError> {
+        let requested_context = crate::runnable::resolve_service_context(captured.config.ctx);
+        if !crate::runnable::service_context_is_supported(requested_context) {
+            return Err(ServiceError::new(
+                ErrorCategory::InvalidRequest,
+                "service context is outside the supported range",
+            ));
+        }
+        Ok(LaunchSettings {
+            settings_revision: captured.revision,
+            context_preference: captured.config.ctx,
+            requested_context,
+            runtime_identity: self.shared.runtime_identity,
+        })
+    }
+
     pub(super) async fn settings(
         &self,
         command: ServiceSettingsCommand,
@@ -271,9 +405,7 @@ impl Coordinator {
     ) {
         match command {
             ServiceSettingsCommand::GetServiceSettings => (
-                Ok(ServiceSettingsReply::Service(
-                    self.shared.settings.snapshot(),
-                )),
+                Ok(ServiceSettingsReply::Service(self.settings_snapshot())),
                 None,
             ),
             ServiceSettingsCommand::PatchServiceSettings {
@@ -302,6 +434,7 @@ impl Coordinator {
                 (
                     await_settings(observer)
                         .await
+                        .map(|settings| self.apply_settings_facts(settings))
                         .map(ServiceSettingsReply::Service),
                     None,
                 )
@@ -314,6 +447,7 @@ impl Coordinator {
                 (
                     await_settings(observer)
                         .await
+                        .map(|settings| self.apply_settings_facts(settings))
                         .map(ServiceSettingsReply::Service),
                     None,
                 )
@@ -492,11 +626,6 @@ impl Coordinator {
     }
 
     #[cfg(test)]
-    pub(super) fn fail_next_stop_before_execution_for_test(&self) {
-        self.shared.history.fail_next_stop_before_execution();
-    }
-
-    #[cfg(test)]
     pub(super) fn drop_next_persistence_reply_for_test(&self) {
         self.shared.history.drop_next_persistence_reply();
     }
@@ -507,35 +636,71 @@ impl Coordinator {
     }
 
     pub(super) async fn load(&self, model_id: String) -> Result<Accepted, ServiceError> {
-        let config = self.shared.settings.capture_config()?;
-        let operation = self
-            .shared
-            .state
-            .lock()
-            .map_err(|_| internal_error())?
-            .reserve_load(model_id)?;
         let (accepted_tx, accepted_rx) = oneshot::channel();
-        if self
-            .owner_tx
-            .try_send(OwnerCommand::Load {
-                operation: Arc::clone(&operation),
-                config,
-                accepted: accepted_tx,
-            })
-            .is_err()
-        {
-            self.shared.state().release_reservation(&operation);
-            return Err(ServiceError::new(
-                ErrorCategory::ServiceUnavailable,
-                "runtime owner queue is unavailable",
-            ));
-        }
+        let operation = {
+            let mut state = self.shared.state.lock().map_err(|_| internal_error())?;
+            let captured = self.shared.settings.capture_config()?;
+            let launch_settings = self.launch_settings(captured)?;
+            let operation = state.reserve_load_with_settings(model_id, launch_settings)?;
+            if self
+                .owner_tx
+                .try_send(OwnerCommand::Load {
+                    operation: Arc::clone(&operation),
+                    config: captured.config,
+                    accepted: Some(accepted_tx),
+                })
+                .is_err()
+            {
+                state.release_reservation(&operation);
+                return Err(ServiceError::new(
+                    ErrorCategory::ServiceUnavailable,
+                    "runtime owner queue is unavailable",
+                ));
+            }
+            operation
+        };
         accepted_rx.await.unwrap_or_else(|_| {
             self.shared.state().release_reservation(&operation);
             Err(ServiceError::new(
                 ErrorCategory::Internal,
                 "runtime owner stopped before acknowledging the load",
             ))
+        })
+    }
+
+    pub(super) fn reload(
+        &self,
+        target: &OperationTarget,
+        expected_settings_revision: &str,
+    ) -> Result<Accepted, ServiceError> {
+        let mut state = self.shared.state.lock().map_err(|_| internal_error())?;
+        let captured = self
+            .shared
+            .settings
+            .capture_config_at(expected_settings_revision)?;
+        let launch_settings = self.launch_settings(captured)?;
+        let (retiring, successor) = state.reserve_reload(target, launch_settings)?;
+        if self
+            .owner_tx
+            .try_send(OwnerCommand::Load {
+                operation: Arc::clone(&successor),
+                config: captured.config,
+                accepted: None,
+            })
+            .is_err()
+        {
+            state.release_reload_reservation(&successor);
+            return Err(ServiceError::new(
+                ErrorCategory::ServiceUnavailable,
+                "runtime owner queue is unavailable",
+            ));
+        }
+        state.activate_reload(&retiring, &successor).ok_or_else(|| {
+            successor.request_cleanup();
+            ServiceError::new(
+                ErrorCategory::ServiceUnavailable,
+                "runtime Reload reservation changed before activation",
+            )
         })
     }
 
@@ -650,10 +815,11 @@ impl Coordinator {
     }
 
     #[cfg(test)]
-    pub(super) fn force_ready_for_history_test(
+    fn force_ready_for_history_test(
         &self,
         fingerprint: Arc<crate::runtime_fingerprint::RuntimeFingerprint>,
-    ) {
+        engine: state::EngineDescriptor,
+    ) -> Arc<OperationControl> {
         let mut state = self.shared.state();
         let operation = state
             .reserve_load(fingerprint.model_id().to_owned())
@@ -664,10 +830,12 @@ impl Coordinator {
         assert!(state.advance(
             &operation,
             state::OperationPhase::Ready {
-                engine_pid: 42,
+                engine,
                 fingerprint,
+                observed_context: None,
             },
         ));
+        operation
     }
 
     #[cfg(test)]

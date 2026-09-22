@@ -261,6 +261,16 @@ mod platform {
         Some(captured)
     }
 
+    #[cfg(test)]
+    #[test]
+    fn fifo_receipt_is_a_cache_miss_without_waiting_for_a_writer() {
+        let root = tempfile::tempdir().unwrap();
+        crate::safe_file::tests::assert_fifo_rejected_without_writer(
+            &root.path().join(RECEIPT_NAME),
+            |path| read(path.parent().unwrap()).is_none(),
+        );
+    }
+
     fn write_atomically(
         model_lock: &ModelLock,
         bytes: &[u8],

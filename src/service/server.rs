@@ -3,6 +3,8 @@ mod connection;
 
 use crate::config::SettingsExit;
 use crate::history::HistoryExit;
+#[cfg(test)]
+pub(in crate::service) use connection::stream_generation_observation_for_test;
 use connection::{classify_overload_connection, handle_connection, send_frame};
 #[cfg(test)]
 use connection::{receive_frame, receive_frame_with_limit, send_frame_with_limit};
@@ -38,6 +40,7 @@ struct NegotiatedHello {
     capabilities: Vec<Capability>,
     storage_schema: u32,
     frame_limit: usize,
+    generation: Option<loxa_ipc::GenerationConnection>,
 }
 
 pub(super) async fn run(
@@ -209,7 +212,13 @@ pub(super) async fn run(
 struct ClassifiedStop {
     transport: loxa_ipc::IpcFramed,
     request_id: String,
+    action: ClassifiedStopAction,
     _permit: OwnedSemaphorePermit,
+}
+
+enum ClassifiedStopAction {
+    Service,
+    Generation(loxa_ipc::GenerationTarget),
 }
 
 fn dispatch_overload_result(
@@ -236,11 +245,20 @@ fn dispatch_overload_result(
     let ClassifiedStop {
         transport,
         request_id,
+        action,
         _permit,
     } = classified;
-    let outcome = match coordinator.stop_service() {
-        Ok(accepted) => ReplyOutcome::Accepted(accepted),
-        Err(error) => ReplyOutcome::Rejected(error),
+    let outcome = match action {
+        ClassifiedStopAction::Service => match coordinator.stop_service() {
+            Ok(accepted) => ReplyOutcome::Accepted(accepted),
+            Err(error) => ReplyOutcome::Rejected(error),
+        },
+        ClassifiedStopAction::Generation(target) => match coordinator.stop_generation(&target) {
+            Ok(()) => ReplyOutcome::Generation {
+                reply: loxa_ipc::GenerationReply::Stopping { target },
+            },
+            Err(error) => ReplyOutcome::Rejected(error),
+        },
     };
     let reply = Reply {
         request_id,

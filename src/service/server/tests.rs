@@ -24,7 +24,7 @@ impl ServerFixture {
 
     async fn start_with_diagnostics(with_diagnostics: bool) -> Self {
         let directory = tempfile::Builder::new()
-            .prefix("loxa-service-pressure-")
+            .prefix("ls-")
             .tempdir_in("/tmp")
             .unwrap();
         let directory_path = fs::canonicalize(directory.path()).unwrap();
@@ -108,6 +108,61 @@ impl ServerFixture {
             pressure.push(transport);
         }
         assert!(Arc::clone(&permits).try_acquire_owned().is_err());
+
+        let pending = self.coordinator.register_generation_connection().unwrap();
+        let target = loxa_ipc::GenerationTarget::Pending {
+            boot_epoch: self.coordinator.boot_epoch().into(),
+            pending_nonce: pending.nonce().into(),
+        };
+        let (client, server) = UnixStream::pair().unwrap();
+        let classification = tokio::spawn(classify_overload_connection(
+            server,
+            self.bootstrap.clone(),
+            self.coordinator.clone(),
+            Arc::clone(&protected_stops),
+        ));
+        let mut control = framed(client);
+        send_frame(
+            &mut control,
+            &ClientEnvelope::Hello(Hello::generation(
+                super::super::BUILD_ID,
+                self.bootstrap.root().root_identity(),
+                loxa_ipc::GenerationConnection::Control,
+            )),
+            OVERLOAD_HANDSHAKE_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        let ServerEnvelope::HelloAck(ack) = receive_frame(&mut control, OVERLOAD_HANDSHAKE_TIMEOUT)
+            .await
+            .unwrap()
+        else {
+            panic!("overloaded generation Stop lost its control handshake");
+        };
+        assert_eq!(ack.protocol, loxa_ipc::ProtocolVersion::V1_2);
+        assert!(ack.generation.is_none());
+        send_frame(
+            &mut control,
+            &ClientEnvelope::Request(Request::new(
+                "generation-stop",
+                ServiceCommand::Generation {
+                    command: loxa_ipc::GenerationCommand::Stop {
+                        target: target.clone(),
+                    },
+                },
+            )),
+            OVERLOAD_REQUEST_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        dispatch_overload_result(classification.await, &self.coordinator, &mut connections);
+        let reply: ServerEnvelope = receive_frame(&mut control, OVERLOAD_REPLY_TIMEOUT)
+            .await
+            .unwrap();
+        assert!(matches!(reply, ServerEnvelope::Reply(Reply {
+            outcome: ReplyOutcome::Generation { reply: loxa_ipc::GenerationReply::Stopping { target: stopped } }, ..
+        }) if stopped == target));
+        self.coordinator.finish_generation_connection(&pending);
 
         // This connection occupies the only overload classifier without
         // sending a hello. The next prompt connection must replace and
@@ -246,7 +301,7 @@ async fn history_client(bootstrap: &ClientBootstrap, client: UnixStream) -> loxa
     let ServerEnvelope::HelloAck(hello) = hello else {
         panic!("expected history hello acknowledgement");
     };
-    assert_eq!(hello.protocol, loxa_ipc::ProtocolVersion::CURRENT);
+    assert_eq!(hello.protocol, loxa_ipc::ProtocolVersion::V1_5);
     assert_eq!(hello.storage_schema, HISTORY_SCHEMA_VERSION);
     assert!(hello.capabilities.contains(&Capability::History));
     set_frame_limit(&mut transport, MAX_HISTORY_FRAME_BYTES).unwrap();
@@ -398,6 +453,8 @@ async fn coordinator_settings_capture_globals_for_new_conversations_and_profile_
                 generation: Some(loxa_ipc::GenerationSettingsPatch::Fields {
                     system_instruction: Some("initial global".into()),
                     max_output_tokens: Some(700),
+                    temperature: None,
+                    top_p: None,
                 }),
             },
         },
@@ -448,6 +505,8 @@ async fn coordinator_settings_capture_globals_for_new_conversations_and_profile_
                 generation: Some(loxa_ipc::GenerationSettingsPatch::Fields {
                     system_instruction: Some("current global".into()),
                     max_output_tokens: Some(900),
+                    temperature: None,
+                    top_p: None,
                 }),
             },
         },
@@ -648,6 +707,29 @@ async fn public_typed_client_round_trips_legacy_history_drafts_and_settings() {
         super::super::BUILD_ID,
     )
     .unwrap();
+    assert_eq!(
+        client
+            .generation_status(&loxa_ipc::GenerationTarget::Accepted {
+                boot_epoch: fixture.coordinator.boot_epoch().into(),
+                submission_id: "11".repeat(16),
+                operation_generation: "1".into(),
+            })
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(matches!(
+        client
+            .generation_status(&loxa_ipc::GenerationTarget::Pending {
+                boot_epoch: fixture.coordinator.boot_epoch().into(),
+                pending_nonce: "22".repeat(16),
+            })
+            .await,
+        Err(loxa_ipc::ClientError::Rejected(loxa_ipc::ServiceError {
+            category: ErrorCategory::InvalidRequest,
+            ..
+        }))
+    ));
     assert!(matches!(
         client
             .request(ConnectMode::ObserveExisting, ServiceCommand::Status)
@@ -890,7 +972,69 @@ async fn opening_handshake_cannot_use_sql_backed_profile_settings() {
         capabilities,
         storage_schema: 0,
         frame_limit: MAX_HISTORY_FRAME_BYTES,
+        generation: None,
     };
+    let mut pending = None;
+    let (reply, permit) = connection::execute_request(
+        &fixture.coordinator,
+        Request::new(
+            "history-status-before-ready",
+            ServiceCommand::History {
+                command: loxa_ipc::HistoryCommand::GetHistoryStatus,
+            },
+        ),
+        &negotiated,
+        &mut pending,
+    )
+    .await;
+    assert!(permit.is_none());
+    assert!(matches!(
+        reply.outcome,
+        ReplyOutcome::History {
+            reply: loxa_ipc::HistoryReply::Status(_)
+        }
+    ));
+
+    for minor in 0..=3 {
+        let ordinary = NegotiatedHello {
+            protocol: loxa_ipc::ProtocolVersion { major: 1, minor },
+            capabilities: LEGACY_CAPABILITIES.to_vec(),
+            storage_schema: 0,
+            frame_limit: MAX_HISTORY_FRAME_BYTES,
+            generation: None,
+        };
+        let (reply, permit) = connection::execute_request(
+            &fixture.coordinator,
+            Request::new(
+                "generation-without-history",
+                ServiceCommand::GetGenerationStatus {
+                    target: loxa_ipc::GenerationTarget::Accepted {
+                        boot_epoch: fixture.coordinator.boot_epoch().into(),
+                        submission_id: "11".repeat(16),
+                        operation_generation: "1".into(),
+                    },
+                },
+            ),
+            &ordinary,
+            &mut pending,
+        )
+        .await;
+        assert!(permit.is_none());
+        if minor < 3 {
+            assert!(matches!(
+                reply.outcome,
+                ReplyOutcome::Rejected(loxa_ipc::ServiceError {
+                    category: ErrorCategory::IncompatibleProtocol,
+                    ..
+                })
+            ));
+        } else {
+            assert_eq!(
+                reply.outcome,
+                ReplyOutcome::GenerationStatus { snapshot: None }
+            );
+        }
+    }
     let (reply, permit) = connection::execute_request(
         &fixture.coordinator,
         Request::new(
@@ -902,6 +1046,7 @@ async fn opening_handshake_cannot_use_sql_backed_profile_settings() {
             },
         ),
         &negotiated,
+        &mut pending,
     )
     .await;
     assert!(permit.is_none());
@@ -922,10 +1067,266 @@ async fn opening_handshake_cannot_use_sql_backed_profile_settings() {
             },
         ),
         &negotiated,
+        &mut pending,
     )
     .await;
     assert!(permit.is_none());
     assert!(matches!(reply.outcome, ReplyOutcome::Settings { .. }));
+
+    fixture.coordinator.stop_service().unwrap();
+    let mut owner_exit = fixture.coordinator.owner_exit_receiver();
+    let mut history_exit = fixture.coordinator.history_exit_receiver();
+    let mut settings_exit = fixture.coordinator.settings_exit_receiver();
+    wait_for_owner_resolution(
+        &fixture.coordinator,
+        &mut owner_exit,
+        &mut history_exit,
+        &mut settings_exit,
+    )
+    .await;
+    fixture.coordinator.join_owner().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn protocol_one_four_rejects_schema_five_replies() {
+    let fixture = ServerFixture::start().await;
+    for protocol in [
+        loxa_ipc::ProtocolVersion::V1_4,
+        loxa_ipc::ProtocolVersion::V1_5,
+    ] {
+        let (client, server) = UnixStream::pair().unwrap();
+        let handler = tokio::spawn(handle_connection(
+            server,
+            fixture.bootstrap.clone(),
+            fixture.coordinator.clone(),
+            Arc::new(Semaphore::new(MAX_SUBSCRIPTIONS)),
+        ));
+        let mut transport = framed(client);
+        let mut hello = Hello::history(
+            super::super::BUILD_ID,
+            fixture.bootstrap.root().root_identity(),
+        );
+        hello.protocol = protocol;
+        hello.required_capabilities.push(Capability::Settings);
+        send_frame(
+            &mut transport,
+            &ClientEnvelope::Hello(hello),
+            HANDSHAKE_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        let response: ServerEnvelope = receive_frame(&mut transport, HANDSHAKE_TIMEOUT)
+            .await
+            .unwrap();
+        if protocol == loxa_ipc::ProtocolVersion::V1_4 {
+            assert!(matches!(
+                response,
+                ServerEnvelope::HelloRejected(loxa_ipc::ServiceError {
+                    category: ErrorCategory::UnsupportedCapability,
+                    ..
+                })
+            ));
+        } else {
+            let ServerEnvelope::HelloAck(ack) = response else {
+                panic!("current settings hello was rejected");
+            };
+            assert!(ack.capabilities.contains(&Capability::Settings));
+            set_frame_limit(&mut transport, MAX_HISTORY_FRAME_BYTES).unwrap();
+            send_frame(
+                &mut transport,
+                &ClientEnvelope::Request(Request::new("current-status", ServiceCommand::Status)),
+                REQUEST_TIMEOUT,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                receive_frame::<ServerEnvelope>(&mut transport, REQUEST_TIMEOUT)
+                    .await
+                    .unwrap(),
+                ServerEnvelope::Reply(Reply {
+                    outcome: ReplyOutcome::Status(_),
+                    ..
+                })
+            ));
+        }
+        handler.await.unwrap().unwrap();
+    }
+
+    let negotiated = NegotiatedHello {
+        protocol: loxa_ipc::ProtocolVersion::V1_4,
+        capabilities: LEGACY_CAPABILITIES.to_vec(),
+        storage_schema: 4,
+        frame_limit: MAX_HISTORY_FRAME_BYTES,
+        generation: None,
+    };
+    let mut pending = None;
+    for (request_id, command) in [
+        (
+            "old-history-status",
+            loxa_ipc::HistoryCommand::GetHistoryStatus,
+        ),
+        (
+            "old-list-turns",
+            loxa_ipc::HistoryCommand::ListTurns {
+                conversation_id: "00".repeat(16),
+                cursor: None,
+                limit: 1,
+            },
+        ),
+        (
+            "old-get-attempt",
+            loxa_ipc::HistoryCommand::GetAttempt {
+                attempt_id: "00".repeat(16),
+            },
+        ),
+    ] {
+        let (reply, permit) = connection::execute_request(
+            &fixture.coordinator,
+            Request::new(request_id, ServiceCommand::History { command }),
+            &negotiated,
+            &mut pending,
+        )
+        .await;
+        assert!(permit.is_none());
+        assert!(matches!(
+            reply.outcome,
+            ReplyOutcome::Rejected(loxa_ipc::ServiceError {
+                category: ErrorCategory::IncompatibleProtocol,
+                ..
+            })
+        ));
+    }
+
+    wait_for_history_ready(&fixture.coordinator).await;
+    let (client, server) = UnixStream::pair().unwrap();
+    let handler = tokio::spawn(handle_connection(
+        server,
+        fixture.bootstrap.clone(),
+        fixture.coordinator.clone(),
+        Arc::new(Semaphore::new(MAX_SUBSCRIPTIONS)),
+    ));
+    let mut transport = framed(client);
+    let mut hello = Hello::history(
+        super::super::BUILD_ID,
+        fixture.bootstrap.root().root_identity(),
+    );
+    hello.protocol = loxa_ipc::ProtocolVersion::V1_4;
+    send_frame(
+        &mut transport,
+        &ClientEnvelope::Hello(hello),
+        HANDSHAKE_TIMEOUT,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        receive_frame::<ServerEnvelope>(&mut transport, HANDSHAKE_TIMEOUT)
+            .await
+            .unwrap(),
+        ServerEnvelope::HelloAck(_)
+    ));
+    set_frame_limit(&mut transport, MAX_HISTORY_FRAME_BYTES).unwrap();
+    send_frame(
+        &mut transport,
+        &ClientEnvelope::SubscribeGeneration {
+            request_id: "old-observation".into(),
+            target: loxa_ipc::GenerationTarget::Accepted {
+                boot_epoch: fixture.coordinator.boot_epoch().into(),
+                submission_id: "11".repeat(16),
+                operation_generation: "1".into(),
+            },
+            attempt_id: "22".repeat(16),
+        },
+        REQUEST_TIMEOUT,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        receive_frame::<ServerEnvelope>(&mut transport, REQUEST_TIMEOUT)
+            .await
+            .unwrap(),
+        ServerEnvelope::Reply(Reply {
+            outcome: ReplyOutcome::Rejected(loxa_ipc::ServiceError {
+                category: ErrorCategory::IncompatibleProtocol,
+                ..
+            }),
+            ..
+        })
+    ));
+    handler.await.unwrap().unwrap();
+
+    let (reply, permit) = connection::execute_request(
+        &fixture.coordinator,
+        Request::new(
+            "old-settings",
+            ServiceCommand::Settings {
+                command: loxa_ipc::ServiceSettingsCommand::GetServiceSettings,
+            },
+        ),
+        &negotiated,
+        &mut pending,
+    )
+    .await;
+    assert!(permit.is_none());
+    assert!(matches!(
+        reply.outcome,
+        ReplyOutcome::Rejected(loxa_ipc::ServiceError {
+            category: ErrorCategory::IncompatibleProtocol,
+            ..
+        })
+    ));
+
+    let (reply, permit) = connection::execute_request(
+        &fixture.coordinator,
+        Request::new(
+            "old-reload",
+            ServiceCommand::Reload {
+                target: loxa_ipc::OperationTarget {
+                    boot_epoch: fixture.coordinator.boot_epoch().into(),
+                    task_id: "1".into(),
+                    generation: "1".into(),
+                },
+                expected_settings_revision: "0".into(),
+            },
+        ),
+        &negotiated,
+        &mut pending,
+    )
+    .await;
+    assert!(permit.is_none());
+    assert!(matches!(
+        reply.outcome,
+        ReplyOutcome::Rejected(loxa_ipc::ServiceError {
+            category: ErrorCategory::IncompatibleProtocol,
+            ..
+        })
+    ));
+
+    let (reply, permit) = connection::execute_request(
+        &fixture.coordinator,
+        Request::new(
+            "old-retry",
+            ServiceCommand::Generation {
+                command: loxa_ipc::GenerationCommand::Retry {
+                    conversation_id: "00".repeat(16),
+                    submission_id: "11".repeat(16),
+                    expected_conversation_revision: "1".into(),
+                    expected_profile_revision: "1".into(),
+                    prior_attempt_id: "22".repeat(16),
+                },
+            },
+        ),
+        &negotiated,
+        &mut pending,
+    )
+    .await;
+    assert!(permit.is_none());
+    assert!(matches!(
+        reply.outcome,
+        ReplyOutcome::Rejected(loxa_ipc::ServiceError {
+            category: ErrorCategory::IncompatibleProtocol,
+            ..
+        })
+    ));
 
     fixture.coordinator.stop_service().unwrap();
     let mut owner_exit = fixture.coordinator.owner_exit_receiver();

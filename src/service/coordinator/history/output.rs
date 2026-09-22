@@ -1,13 +1,121 @@
 use super::{history_error, maybe_begin_history_drain};
 use crate::history::{
-    CommittedAdmission, ExecutionOutcome, FinalizationInput, SuffixCommit, SuffixInput,
+    AttemptStatistics, CommittedAdmission, ExecutionOutcome, FinalizationInput, SuffixCommit,
+    SuffixInput,
 };
-use crate::service::coordinator::state::AdmissionReservation;
+use crate::service::coordinator::state::{AdmissionReservation, CancellationCause};
 use crate::service::coordinator::Shared;
-use loxa_ipc::{ErrorCategory, ServiceError};
-use std::sync::atomic::Ordering;
+use loxa_ipc::{AttemptStopReason, ErrorCategory, ServiceError};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::watch;
+
+mod status;
+
+#[derive(Clone, Debug, PartialEq)]
+pub(in crate::service::coordinator) struct ExecutionFact {
+    pub(in crate::service::coordinator) outcome: ExecutionOutcome,
+    pub(in crate::service::coordinator) failure_code: Option<String>,
+    pub(in crate::service::coordinator) generated_end: u64,
+    pub(in crate::service::coordinator) statistics: AttemptStatistics,
+}
+
+#[derive(Clone, Copy)]
+pub(in crate::service::coordinator) struct AttemptMeasurements {
+    qualified_input_tokens: Option<u32>,
+    qualified_output_tokens: Option<u32>,
+    service_first_output_latency_ms: Option<u64>,
+    qualified_engine_decode_tokens_per_second: Option<f64>,
+    service_total_duration_ms: Option<u64>,
+    engine_output_limit: bool,
+}
+
+impl AttemptMeasurements {
+    pub(in crate::service::coordinator) fn new(qualified_input_tokens: u32) -> Self {
+        Self {
+            qualified_input_tokens: Some(qualified_input_tokens),
+            qualified_output_tokens: None,
+            service_first_output_latency_ms: None,
+            qualified_engine_decode_tokens_per_second: None,
+            service_total_duration_ms: None,
+            engine_output_limit: false,
+        }
+    }
+
+    pub(in crate::service::coordinator) fn observe_first_output(&mut self, elapsed: Duration) {
+        self.service_first_output_latency_ms
+            .get_or_insert_with(|| super::duration_ms(elapsed));
+    }
+
+    pub(in crate::service::coordinator) fn freeze_duration(&mut self, elapsed: Duration) {
+        self.service_total_duration_ms
+            .get_or_insert_with(|| super::duration_ms(elapsed));
+    }
+
+    pub(in crate::service::coordinator) fn record_terminal_usage(
+        &mut self,
+        output_tokens: Option<u32>,
+        decode_rate: Option<f64>,
+        output_limit: bool,
+    ) {
+        self.qualified_output_tokens = output_tokens;
+        self.qualified_engine_decode_tokens_per_second = decode_rate.filter(|rate| {
+            rate.is_finite()
+                && *rate > 0.0
+                && *rate < 1.0e308
+                && self
+                    .qualified_output_tokens
+                    .is_some_and(|tokens| tokens > 0)
+        });
+        self.engine_output_limit = output_limit;
+    }
+
+    fn finish(self, outcome: ExecutionOutcome) -> Result<AttemptStatistics, ServiceError> {
+        let total = self
+            .service_total_duration_ms
+            .ok_or_else(|| internal("generation duration was not frozen"))?;
+        let statistics = AttemptStatistics {
+            qualified_input_tokens: self.qualified_input_tokens,
+            qualified_output_tokens: self.qualified_output_tokens,
+            service_first_output_latency_ms: self.service_first_output_latency_ms,
+            qualified_engine_decode_tokens_per_second: self
+                .qualified_engine_decode_tokens_per_second,
+            service_total_duration_ms: total,
+            stop_reason: match outcome {
+                ExecutionOutcome::Completed if self.engine_output_limit => {
+                    AttemptStopReason::OutputLimit
+                }
+                ExecutionOutcome::Completed => AttemptStopReason::Completed,
+                ExecutionOutcome::Stopped => AttemptStopReason::UserStop,
+                ExecutionOutcome::Failed => AttemptStopReason::Failure,
+            },
+        };
+        statistics.validate_for(outcome).map_err(history_error)?;
+        Ok(statistics)
+    }
+}
+
+enum ExecutionStatistics {
+    Measurements(AttemptMeasurements),
+    Frozen(AttemptStatistics),
+}
+
+impl ExecutionStatistics {
+    fn finish(self, outcome: ExecutionOutcome) -> Result<AttemptStatistics, ServiceError> {
+        match self {
+            Self::Measurements(measurements) => measurements.finish(outcome),
+            Self::Frozen(mut statistics) => {
+                statistics.stop_reason = match outcome {
+                    ExecutionOutcome::Completed => statistics.stop_reason,
+                    ExecutionOutcome::Stopped => AttemptStopReason::UserStop,
+                    ExecutionOutcome::Failed => AttemptStopReason::Failure,
+                };
+                statistics.validate_for(outcome).map_err(history_error)?;
+                Ok(statistics)
+            }
+        }
+    }
+}
 
 pub(in crate::service::coordinator) type OutputObserver =
     watch::Receiver<Option<Result<SuffixCommit, loxa_ipc::ServiceError>>>;
@@ -21,7 +129,6 @@ pub(in crate::service::coordinator) enum OutputSavePhase {
 }
 
 #[derive(Clone)]
-#[cfg_attr(not(test), allow(dead_code))] // M4 constructs this handle after generation admission.
 pub(in crate::service::coordinator) struct GenerationOutput {
     shared: Arc<Shared>,
     reservation: Arc<AdmissionReservation>,
@@ -31,11 +138,11 @@ pub(in crate::service::coordinator) struct OutputState {
     committed: CommittedAdmission,
     saved_end: u64,
     current: Option<OutputIntent>,
-    pending: Option<OutputIntent>,
     failed: bool,
     closed: bool,
     next_sequence: u64,
     status: OutputSavePhase,
+    execution: Option<ExecutionFact>,
 }
 
 #[derive(Clone)]
@@ -57,12 +164,55 @@ impl OutputState {
             committed,
             saved_end: 0,
             current: None,
-            pending: None,
             failed: false,
             closed: false,
             next_sequence: 1,
             status: OutputSavePhase::Open { saved_end: 0 },
+            execution: None,
         }
+    }
+
+    fn publish_execution(
+        &mut self,
+        reservation: &AdmissionReservation,
+        proposed: ExecutionOutcome,
+        failure_code: Option<&str>,
+        generated_end: u64,
+        statistics: ExecutionStatistics,
+    ) -> Result<ExecutionFact, ServiceError> {
+        if let Some(fact) = &self.execution {
+            return Ok(fact.clone());
+        }
+        if matches!(
+            (proposed, failure_code),
+            (ExecutionOutcome::Completed, Some(_)) | (ExecutionOutcome::Failed, None)
+        ) || failure_code
+            .is_some_and(|code| code.is_empty() || code.len() > 64 || !code.is_ascii())
+        {
+            return Err(internal("invalid generation failure code"));
+        }
+        let cancellation_can_select = proposed != ExecutionOutcome::Failed
+            || matches!(failure_code, Some("stopped" | "output_save"));
+        let (outcome, failure_code) = match reservation.cancellation_cause() {
+            Some(CancellationCause::Requested) if cancellation_can_select => {
+                (ExecutionOutcome::Stopped, Some("stopped"))
+            }
+            Some(CancellationCause::OutputSave) if cancellation_can_select => {
+                (ExecutionOutcome::Failed, Some("output_save"))
+            }
+            Some(CancellationCause::EngineFailure) if cancellation_can_select => {
+                (ExecutionOutcome::Failed, Some("engine_transport"))
+            }
+            _ => (proposed, failure_code),
+        };
+        let fact = ExecutionFact {
+            outcome,
+            failure_code: failure_code.map(str::to_owned),
+            generated_end,
+            statistics: statistics.finish(outcome)?,
+        };
+        self.execution = Some(fact.clone());
+        Ok(fact)
     }
 
     pub(in crate::service::coordinator) fn matches(&self, committed: &CommittedAdmission) -> bool {
@@ -70,16 +220,19 @@ impl OutputState {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // M4 drives persistence through this handle.
 impl GenerationOutput {
-    pub(super) fn new(shared: Arc<Shared>, reservation: Arc<AdmissionReservation>) -> Self {
+    pub(in crate::service::coordinator) fn new(
+        shared: Arc<Shared>,
+        reservation: Arc<AdmissionReservation>,
+    ) -> Self {
         Self {
             shared,
             reservation,
         }
     }
 
-    pub(super) fn status(&self) -> Result<OutputSavePhase, ServiceError> {
+    #[cfg(test)]
+    pub(in crate::service::coordinator) fn status(&self) -> Result<OutputSavePhase, ServiceError> {
         let output = self
             .reservation
             .output
@@ -91,27 +244,151 @@ impl GenerationOutput {
             .ok_or_else(|| conflict("output persistence is no longer active"))
     }
 
-    pub(super) fn is_cancelled(&self) -> bool {
-        self.reservation.cancelled.load(Ordering::Acquire)
+    #[cfg(test)]
+    pub(in crate::service::coordinator) fn is_cancelled(&self) -> bool {
+        self.reservation.is_cancelled()
     }
 
-    pub(super) fn checkpoint(
+    pub(in crate::service::coordinator) fn cancel_output_save(&self) {
+        self.reservation.cancel_output_save();
+        let state = self.shared.state();
+        if state.admission_is_current(&self.reservation) {
+            self.reservation.publish_current_generation_status();
+        }
+    }
+
+    pub(in crate::service::coordinator) fn publish_execution(
+        &self,
+        proposed: ExecutionOutcome,
+        failure_code: Option<&str>,
+        generated_end: u64,
+        measurements: AttemptMeasurements,
+    ) -> Result<ExecutionFact, ServiceError> {
+        let state = self.shared.state();
+        if !state.admission_is_current(&self.reservation) {
+            return Err(conflict("generation execution is no longer authoritative"));
+        }
+        let mut output = self
+            .reservation
+            .output
+            .lock()
+            .map_err(|_| internal("output persistence lock is poisoned"))?;
+        let output = output
+            .as_mut()
+            .filter(|output| !output.closed)
+            .ok_or_else(|| conflict("generation execution is no longer active"))?;
+        let fact = output.publish_execution(
+            &self.reservation,
+            proposed,
+            failure_code,
+            generated_end,
+            ExecutionStatistics::Measurements(measurements),
+        )?;
+        self.reservation.publish_generation_status(output);
+        Ok(fact)
+    }
+
+    pub(in crate::service::coordinator) fn report_capacity_saturation(&self) {
+        self.reservation.cancel_output_save();
+        let state = self.shared.state();
+        if !state.admission_is_current(&self.reservation) {
+            return;
+        }
+        let mut output = self
+            .reservation
+            .output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(output) = output.as_mut().filter(|output| !output.closed) {
+            output.status = OutputSavePhase::SaveFailed {
+                saved_end: output.saved_end,
+            };
+            self.reservation.publish_generation_status(output);
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::service::coordinator) fn checkpoint(
         &self,
         input: Arc<SuffixInput>,
     ) -> Result<OutputObserver, ServiceError> {
-        input.validate(false).map_err(history_error)?;
-        self.enqueue(OutputIntentKind::Checkpoint(input))
+        self.checkpoint_owned(input).map_err(|(error, _)| error)
     }
 
-    pub(super) fn finalize(
+    #[cfg(test)]
+    pub(in crate::service::coordinator) fn finalize(
         &self,
         input: Arc<FinalizationInput>,
     ) -> Result<OutputObserver, ServiceError> {
-        input.validate().map_err(history_error)?;
-        self.enqueue(OutputIntentKind::Final(input))
+        self.finalize_owned(input).map_err(|(error, _)| error)
     }
 
-    pub(super) fn retry_save(&self) -> Result<OutputObserver, ServiceError> {
+    #[cfg(test)]
+    pub(in crate::service::coordinator) fn checkpoint_owned(
+        &self,
+        input: Arc<SuffixInput>,
+    ) -> Result<OutputObserver, (ServiceError, Arc<SuffixInput>)> {
+        if let Err(error) = input.validate(false) {
+            return Err((history_error(error), input));
+        }
+        self.enqueue(OutputIntentKind::Checkpoint(Arc::clone(&input)), false)
+            .map(|(observer, _)| observer)
+            .map_err(|(error, _)| (error, input))
+    }
+
+    pub(in crate::service::coordinator) fn checkpoint_generation_owned(
+        &self,
+        input: Arc<SuffixInput>,
+    ) -> Result<OutputObserver, (ServiceError, Arc<SuffixInput>, bool)> {
+        if let Err(error) = input.validate(false) {
+            return Err((history_error(error), input, false));
+        }
+        self.enqueue(OutputIntentKind::Checkpoint(Arc::clone(&input)), false)
+            .map(|(observer, _)| observer)
+            .map_err(|(error, cancelled)| (error, input, cancelled))
+    }
+
+    pub(in crate::service::coordinator) fn checkpoint_terminal_owned(
+        &self,
+        input: Arc<SuffixInput>,
+    ) -> Result<OutputObserver, (ServiceError, Arc<SuffixInput>)> {
+        if let Err(error) = input.validate(false) {
+            return Err((history_error(error), input));
+        }
+        self.enqueue(OutputIntentKind::Checkpoint(Arc::clone(&input)), true)
+            .map(|(observer, _)| observer)
+            .map_err(|(error, _)| (error, input))
+    }
+
+    #[cfg(test)]
+    pub(in crate::service::coordinator) fn finalize_owned(
+        &self,
+        input: Arc<FinalizationInput>,
+    ) -> Result<OutputObserver, (ServiceError, Arc<FinalizationInput>)> {
+        self.finalize_generation_owned(input)
+            .map(|(observer, _)| observer)
+    }
+
+    pub(in crate::service::coordinator) fn finalize_generation_owned(
+        &self,
+        input: Arc<FinalizationInput>,
+    ) -> Result<(OutputObserver, ExecutionOutcome), (ServiceError, Arc<FinalizationInput>)> {
+        if let Err(error) = input.validate() {
+            return Err((history_error(error), input));
+        }
+        self.enqueue(OutputIntentKind::Final(Arc::clone(&input)), true)
+            .map(|(observer, outcome)| {
+                (
+                    observer,
+                    outcome.expect("generation finalization has an execution outcome"),
+                )
+            })
+            .map_err(|(error, _)| (error, input))
+    }
+
+    pub(in crate::service::coordinator) fn retry_save(
+        &self,
+    ) -> Result<OutputObserver, ServiceError> {
         let intent = {
             let state = self.shared.state();
             if !state.admission_is_current(&self.reservation) {
@@ -141,6 +418,7 @@ impl GenerationOutput {
             output.status = OutputSavePhase::Saving {
                 saved_end: output.saved_end,
             };
+            self.reservation.publish_generation_status(output);
             drop(state);
             intent
         };
@@ -153,83 +431,104 @@ impl GenerationOutput {
         Ok(observer)
     }
 
-    fn enqueue(&self, kind: OutputIntentKind) -> Result<OutputObserver, ServiceError> {
-        let mut dispatch_now = None;
-        let observer = {
-            let state = self.shared.state();
-            if !state.admission_is_current(&self.reservation) {
-                return Err(conflict("output persistence is no longer authoritative"));
-            }
-            let cancelled = self.reservation.cancelled.load(Ordering::Acquire);
-            if cancelled
-                && (matches!(&kind, OutputIntentKind::Checkpoint(_))
-                    || matches!(
-                        &kind,
-                        OutputIntentKind::Final(input)
-                            if input.execution_outcome == ExecutionOutcome::Completed
-                    ))
-            {
-                return Err(unavailable("generation output has been cancelled"));
-            }
-            let mut output = self
-                .reservation
-                .output
-                .lock()
-                .map_err(|_| internal("output persistence lock is poisoned"))?;
-            let output = output
-                .as_mut()
-                .ok_or_else(|| conflict("output persistence is no longer active"))?;
-            if output.closed {
-                return Err(conflict("output persistence is already finalized"));
-            }
-            validate_identity(&self.shared, output, &kind)?;
-            if output.failed {
-                return Err(unavailable(
-                    "output save failed; retry the exact retained suffix",
-                ));
-            }
-            if output.pending.is_some() {
-                return Err(busy("output persistence already has a pending suffix"));
-            }
-            let expected_start = output
-                .current
-                .as_ref()
-                .map_or(output.saved_end, OutputIntent::end);
-            if kind.start() != expected_start {
-                return Err(conflict(
-                    "output suffix does not follow the retained prefix",
-                ));
-            }
-            if output.current.as_ref().is_some_and(OutputIntent::is_final) {
-                return Err(conflict("output finalization is already in flight"));
-            }
-            let (outcome, observer) = watch::channel(None);
-            let intent = OutputIntent {
-                sequence: output.next_sequence,
-                kind,
-                outcome,
-            };
-            output.next_sequence = output.next_sequence.saturating_add(1);
-            if output.current.is_none() {
+    fn enqueue(
+        &self,
+        mut kind: OutputIntentKind,
+        allow_cancelled_checkpoint: bool,
+    ) -> Result<(OutputObserver, Option<ExecutionOutcome>), (ServiceError, bool)> {
+        let mut cancelled_rejection = false;
+        let result = (|| {
+            let (observer, selected_outcome, intent) = {
+                let state = self.shared.state();
+                if !state.admission_is_current(&self.reservation) {
+                    return Err(conflict("output persistence is no longer authoritative"));
+                }
+                let cancelled = self.reservation.is_cancelled();
+                if cancelled
+                    && !allow_cancelled_checkpoint
+                    && matches!(kind, OutputIntentKind::Checkpoint(_))
+                {
+                    cancelled_rejection = true;
+                    return Err(unavailable("generation output has been cancelled"));
+                }
+                let mut output = self
+                    .reservation
+                    .output
+                    .lock()
+                    .map_err(|_| internal("output persistence lock is poisoned"))?;
+                let output = output
+                    .as_mut()
+                    .ok_or_else(|| conflict("output persistence is no longer active"))?;
+                if output.closed {
+                    return Err(conflict("output persistence is already finalized"));
+                }
+                validate_identity(&self.shared, output, kind.suffix())?;
+                if output.failed {
+                    return Err(unavailable(
+                        "output save failed; retry the exact retained suffix",
+                    ));
+                }
+                if output.current.is_some() {
+                    return Err(busy("output persistence already has a suffix in flight"));
+                }
+                if kind.start() != output.saved_end {
+                    return Err(conflict(
+                        "output suffix does not follow the retained prefix",
+                    ));
+                }
+                if let OutputIntentKind::Final(input) = &mut kind {
+                    input.validate().map_err(history_error)?;
+                    let statistics = input.statistics.clone().ok_or_else(|| {
+                        internal("final generation is missing frozen attempt statistics")
+                    })?;
+                    let fact = output.publish_execution(
+                        &self.reservation,
+                        input.execution_outcome,
+                        input.failure_code.as_deref(),
+                        input.generated_end,
+                        ExecutionStatistics::Frozen(statistics),
+                    )?;
+                    self.reservation.publish_generation_status(output);
+                    if input.generated_end != fact.generated_end {
+                        return Err(conflict("final output does not match frozen execution"));
+                    }
+                    if input.execution_outcome != fact.outcome
+                        || input.failure_code != fact.failure_code
+                        || input.statistics.as_ref() != Some(&fact.statistics)
+                    {
+                        let input = Arc::make_mut(input);
+                        input.execution_outcome = fact.outcome;
+                        input.failure_code = fact.failure_code;
+                        input.statistics = Some(fact.statistics);
+                    }
+                }
+                let selected_outcome = match &kind {
+                    OutputIntentKind::Final(input) => Some(input.execution_outcome),
+                    OutputIntentKind::Checkpoint(_) => None,
+                };
+                let (outcome, observer) = watch::channel(None);
+                let intent = OutputIntent {
+                    sequence: output.next_sequence,
+                    kind,
+                    outcome,
+                };
+                output.next_sequence = output.next_sequence.saturating_add(1);
                 output.current = Some(intent.clone());
                 output.status = OutputSavePhase::Saving {
                     saved_end: output.saved_end,
                 };
-                dispatch_now = Some(intent);
-            } else {
-                output.pending = Some(intent);
-            }
-            drop(state);
-            observer
-        };
-        if let Some(intent) = dispatch_now {
+                self.reservation.publish_generation_status(output);
+                drop(state);
+                (observer, selected_outcome, intent)
+            };
             dispatch(
                 Arc::clone(&self.shared),
                 Arc::clone(&self.reservation),
                 intent,
             );
-        }
-        Ok(observer)
+            Ok((observer, selected_outcome))
+        })();
+        result.map_err(|error| (error, cancelled_rejection))
     }
 }
 
@@ -265,9 +564,12 @@ fn resolve(
     result: Result<SuffixCommit, ServiceError>,
 ) {
     let outcome = intent.outcome.clone();
-    let mut next = None;
     let mut terminal = false;
     let mut published = result.clone();
+    let mut state = shared.state();
+    if !state.admission_is_current(&reservation) {
+        return;
+    }
     {
         let mut output = reservation
             .output
@@ -289,28 +591,20 @@ fn resolve(
                     && commit.end == intent.end()
                     && commit.current_saved_end >= commit.end =>
             {
+                let save_failed = matches!(output.status, OutputSavePhase::SaveFailed { .. });
                 output.saved_end = commit.current_saved_end;
                 terminal = intent.is_final();
-                output.current = output.pending.take();
+                output.current = None;
                 output.failed = false;
                 if terminal {
-                    if output.current.is_some() {
-                        published = Err(internal(
-                            "output persisted a finalization before a pending suffix",
-                        ));
-                        output.failed = true;
-                        terminal = false;
-                    } else {
-                        output.closed = true;
-                        output.status = OutputSavePhase::Saved {
-                            saved_end: output.saved_end,
-                        };
-                    }
-                } else if let Some(current) = &output.current {
-                    output.status = OutputSavePhase::Saving {
+                    output.closed = true;
+                    output.status = OutputSavePhase::Saved {
                         saved_end: output.saved_end,
                     };
-                    next = Some(current.clone());
+                } else if save_failed {
+                    output.status = OutputSavePhase::SaveFailed {
+                        saved_end: output.saved_end,
+                    };
                 } else {
                     output.status = OutputSavePhase::Open {
                         saved_end: output.saved_end,
@@ -320,44 +614,42 @@ fn resolve(
             Ok(_) => {
                 published = Err(internal("history owner returned a mismatched suffix range"));
                 output.failed = true;
-                reservation.cancelled.store(true, Ordering::Release);
+                reservation.cancel_output_save();
                 output.status = OutputSavePhase::SaveFailed {
                     saved_end: output.saved_end,
                 };
             }
             Err(_) => {
                 output.failed = true;
-                reservation.cancelled.store(true, Ordering::Release);
+                reservation.cancel_output_save();
                 output.status = OutputSavePhase::SaveFailed {
                     saved_end: output.saved_end,
                 };
             }
         }
+        reservation.publish_generation_status(output);
     }
     drop(intent);
     if terminal {
-        {
-            let mut state = shared.state();
-            state.finish_admission(&reservation);
-            outcome.send_replace(Some(published));
-        }
+        reservation.mark_durable_terminal();
+        state.finish_admission_if_resolved(&reservation);
+        outcome.send_replace(Some(published));
+        drop(state);
         maybe_begin_history_drain(&shared);
     } else {
+        drop(state);
         outcome.send_replace(Some(published));
-        if let Some(next) = next {
-            dispatch(shared, reservation, next);
-        }
     }
 }
 
 fn validate_identity(
     shared: &Shared,
     output: &OutputState,
-    kind: &OutputIntentKind,
+    input: &SuffixInput,
 ) -> Result<(), ServiceError> {
-    let input = kind.suffix();
     if input.attempt_id != output.committed.attempt_id
         || input.operation_generation != output.committed.operation_generation
+        || input.owner_epoch != output.committed.owner_epoch
         || input.owner_epoch != shared.boot_epoch
     {
         return Err(conflict(
@@ -412,4 +704,29 @@ fn unavailable(context: impl Into<String>) -> ServiceError {
 
 fn internal(context: impl Into<String>) -> ServiceError {
     ServiceError::new(ErrorCategory::Internal, context)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_measurements_stay_frozen_across_later_cleanup_delays() {
+        let mut measurements = AttemptMeasurements::new(7);
+        measurements.observe_first_output(Duration::from_millis(4));
+        measurements.record_terminal_usage(Some(3), Some(50.0), true);
+        measurements.freeze_duration(Duration::from_millis(9));
+        measurements.freeze_duration(Duration::from_secs(3));
+
+        let statistics = measurements.finish(ExecutionOutcome::Completed).unwrap();
+        assert_eq!(statistics.qualified_input_tokens, Some(7));
+        assert_eq!(statistics.qualified_output_tokens, Some(3));
+        assert_eq!(statistics.service_first_output_latency_ms, Some(4));
+        assert_eq!(
+            statistics.qualified_engine_decode_tokens_per_second,
+            Some(50.0)
+        );
+        assert_eq!(statistics.service_total_duration_ms, 9);
+        assert_eq!(statistics.stop_reason, AttemptStopReason::OutputLimit);
+    }
 }

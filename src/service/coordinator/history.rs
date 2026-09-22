@@ -1,30 +1,38 @@
-use super::state::{AdmissionClaim, AdmissionRecoveryAction, AdmissionReservation};
+#[cfg(test)]
+use super::state::AdmissionClaim;
+use super::state::{AdmissionRecoveryAction, AdmissionReservation, CancellationCause};
 use super::{history_error, Coordinator};
 use crate::history::{
-    AdmissionKind, CommittedAdmission, HistoryError, HistoryErrorKind, PreparedAdmission,
-    PromptBasis,
+    AdmissionKind, CommittedAdmission, ExecutionOutcome, FinalizationInput, HistoryError,
+    HistoryErrorKind, PreparedAdmission, PromptBasis, SuffixInput,
 };
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::sync::watch;
 
 mod output;
-pub(in crate::service::coordinator) use output::{GenerationOutput, OutputState};
 #[cfg(test)]
-pub(in crate::service::coordinator) use output::{OutputObserver, OutputSavePhase};
+pub(in crate::service::coordinator) use output::OutputSavePhase;
+pub(in crate::service::coordinator) use output::{
+    AttemptMeasurements, GenerationOutput, OutputObserver, OutputState,
+};
 
 const MAX_ADMISSION_BACKING_BYTES: usize = 256 * 1024;
 
 #[derive(Clone)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct AdmissionInput {
     pub(super) conversation_id: [u8; 16],
     pub(super) submission_id: [u8; 16],
     pub(super) expected_conversation_revision: i64,
     pub(super) expected_profile_revision: i64,
+    #[cfg(test)]
+    pub(super) submission_hash: Option<[u8; 32]>,
+    pub(super) effective_context: Option<u32>,
     pub(super) system_instruction: String,
     pub(super) max_output_tokens: i64,
+    pub(super) effective_sampling: loxa_ipc::EffectiveSamplingSettings,
     pub(super) prompt_basis: PromptBasis,
     pub(super) kind: AdmissionKind,
 }
@@ -53,6 +61,7 @@ impl AdmissionInput {
         Ok(())
     }
 
+    #[cfg(test)]
     fn semantic_hash(&self) -> [u8; 32] {
         let mut hash = Sha256::new();
         hash.update(b"loxa-history-admission-v1\0");
@@ -96,6 +105,7 @@ impl AdmissionInput {
     }
 }
 
+#[cfg(test)]
 fn update_bytes(hash: &mut Sha256, value: &[u8]) {
     hash.update((value.len() as u64).to_le_bytes());
     hash.update(value);
@@ -104,14 +114,16 @@ fn update_bytes(hash: &mut Sha256, value: &[u8]) {
 pub(super) type AdmissionResult = Result<CommittedAdmission, loxa_ipc::ServiceError>;
 pub(super) type AdmissionObserver = watch::Receiver<Option<AdmissionResult>>;
 
-#[cfg_attr(not(test), allow(dead_code))] // M4 binds these entry points to generation dispatch.
 impl Coordinator {
+    #[cfg(test)]
     pub(super) async fn admit_history_generation(
         &self,
         input: AdmissionInput,
     ) -> Result<AdmissionObserver, loxa_ipc::ServiceError> {
         input.validate_backing()?;
-        let submission_hash = input.semantic_hash();
+        let submission_hash = input
+            .submission_hash
+            .unwrap_or_else(|| input.semantic_hash());
         if let Some(reservation) = self
             .shared
             .state()
@@ -158,6 +170,21 @@ impl Coordinator {
             }
             AdmissionClaim::Fresh(reservation) => reservation,
         };
+        self.dispatch_reserved_admission(input, submission_hash, reservation)
+    }
+
+    pub(super) fn dispatch_reserved_admission(
+        &self,
+        input: AdmissionInput,
+        submission_hash: [u8; 32],
+        reservation: Arc<AdmissionReservation>,
+    ) -> Result<AdmissionObserver, loxa_ipc::ServiceError> {
+        if let Err(error) = input.validate_backing() {
+            reservation.publish(Err(error.clone()));
+            self.shared.state().finish_admission(&reservation);
+            maybe_begin_history_drain(&self.shared);
+            return Err(error);
+        }
         let observer = reservation.subscribe();
         let prepared = match PreparedAdmission::new(
             input.conversation_id,
@@ -169,8 +196,12 @@ impl Coordinator {
             reservation.operation_generation,
             Arc::clone(&reservation.fingerprint),
             self.shared.runtime_identity,
+            input
+                .effective_context
+                .unwrap_or_else(|| reservation.fingerprint.effective_context()),
             input.system_instruction,
             input.max_output_tokens,
+            input.effective_sampling,
             input.prompt_basis,
             input.kind,
         ) {
@@ -206,6 +237,9 @@ impl Coordinator {
                     drop(completion.permit);
                     #[cfg(test)]
                     wait_at_barrier(&shared.admission_completion_barrier);
+                    #[cfg(all(test, target_os = "macos"))]
+                    super::native_test_gate::pause_once(&shared.native_admission_completion_gate)
+                        .await;
                     resolve_completion(&shared, &reservation, result).await;
                 }
                 Err(_) => reservation.admission_unknown(),
@@ -315,24 +349,25 @@ async fn resolve_committed(
         && committed.submission_id == reservation.submission_id
         && committed.pre_conversation_revision == reservation.expected_conversation_revision
         && committed.profile_revision == reservation.expected_profile_revision
+        && committed.owner_epoch == shared.boot_epoch
         && committed.operation_generation == reservation.operation_generation;
-    let cancelled = {
+    let terminal = {
         let state = shared.state();
         if !exact || !state.admission_is_current(reservation) {
             reservation.admission_unknown();
             return;
         }
-        let cancelled = reservation.cancelled.load(Ordering::Acquire)
-            || shared.draining.load(Ordering::Acquire);
+        reservation.mark_admission_accepted();
+        let cancelled = reservation.is_cancelled() || shared.draining.load(Ordering::Acquire);
         if !cancelled && !reservation.install_output(committed.clone()) {
             reservation.admission_unknown();
             return;
         }
-        cancelled
+        cancelled.then(|| cancelled_terminal(reservation, &committed))
     };
-    if cancelled {
-        reservation.retain_stop(committed.clone());
-        resolve_stop(shared, reservation, committed).await;
+    if let Some(terminal) = terminal {
+        reservation.retain_stop(committed.clone(), Arc::clone(&terminal));
+        resolve_stop(shared, reservation, committed, terminal).await;
     } else {
         #[cfg(test)]
         wait_at_barrier(&shared.output_handoff_barrier);
@@ -344,26 +379,74 @@ async fn resolve_stop(
     shared: &Arc<super::Shared>,
     reservation: &Arc<AdmissionReservation>,
     committed: CommittedAdmission,
+    terminal: Arc<FinalizationInput>,
 ) {
-    let terminal = match shared.history.try_stop_before_execution(committed.clone()) {
-        Ok(terminal) => terminal,
-        Err(_) => {
-            reservation.stop_unknown();
-            return;
-        }
-    };
-    let Ok(terminal) = terminal.await else {
-        reservation.stop_unknown();
-        return;
-    };
-    let result = terminal.result;
-    drop(terminal.permit);
-    if result.is_err() {
+    if persist_cancelled_admission(shared, Arc::clone(&terminal))
+        .await
+        .is_none()
+    {
         reservation.stop_unknown();
         return;
     }
-    shared.state().finish_admission(reservation);
+    reservation.mark_durable_terminal();
+    shared.state().finish_admission_if_resolved(reservation);
     reservation.publish(Ok(committed));
+}
+
+async fn persist_cancelled_admission(
+    shared: &super::Shared,
+    terminal: Arc<FinalizationInput>,
+) -> Option<()> {
+    let completion = shared.history.try_finalize(terminal).ok()?.await.ok()?;
+    let result = completion.result;
+    drop(completion.permit);
+    result.ok().map(|_| ())
+}
+
+fn cancelled_terminal(
+    reservation: &AdmissionReservation,
+    committed: &CommittedAdmission,
+) -> Arc<FinalizationInput> {
+    let failed = reservation.cancellation_cause() == Some(CancellationCause::EngineFailure);
+    Arc::new(FinalizationInput {
+        suffix: SuffixInput {
+            attempt_id: committed.attempt_id,
+            owner_epoch: committed.owner_epoch.clone(),
+            operation_generation: committed.operation_generation,
+            expected_saved_end: 0,
+            content: String::new(),
+        },
+        execution_outcome: if failed {
+            ExecutionOutcome::Failed
+        } else {
+            ExecutionOutcome::Stopped
+        },
+        generated_end: 0,
+        failure_code: Some(
+            if failed {
+                "engine_transport"
+            } else {
+                "stopped"
+            }
+            .into(),
+        ),
+        statistics: Some(crate::history::AttemptStatistics {
+            qualified_input_tokens: None,
+            qualified_output_tokens: None,
+            service_first_output_latency_ms: None,
+            qualified_engine_decode_tokens_per_second: None,
+            service_total_duration_ms: duration_ms(reservation.accepted_elapsed()),
+            stop_reason: if failed {
+                loxa_ipc::AttemptStopReason::Failure
+            } else {
+                loxa_ipc::AttemptStopReason::UserStop
+            },
+        }),
+    })
+}
+
+fn duration_ms(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 pub(super) fn maybe_resume_admission(
@@ -396,15 +479,15 @@ pub(super) fn maybe_resume_admission(
                     Err(_) => reservation.admission_unknown(),
                 }
             }
-            AdmissionRecoveryAction::Stop(_prepared, committed) => {
-                resolve_stop(&shared, &reservation, committed).await;
+            AdmissionRecoveryAction::Stop(_prepared, committed, terminal) => {
+                resolve_stop(&shared, &reservation, committed, terminal).await;
             }
         }
         maybe_begin_history_drain(&shared);
     });
 }
 
-fn maybe_begin_history_drain(shared: &Arc<super::Shared>) {
+pub(super) fn maybe_begin_history_drain(shared: &Arc<super::Shared>) {
     if shared.draining.load(Ordering::Acquire) && shared.state().history_close_is_safe() {
         shared.history.begin_drain();
     }

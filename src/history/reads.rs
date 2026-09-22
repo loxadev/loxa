@@ -1,5 +1,5 @@
 use super::identity::{decode_id, encode_id, parse_nonnegative};
-use super::{content, schema, HistoryError, HistoryErrorKind};
+use super::{content, schema, statistics, HistoryError, HistoryErrorKind, ObservedAttempt};
 use loxa_ipc::{
     AttemptExecution, AttemptSave, AttemptSummary, ContentRange, ContentSource, TurnCursor,
     TurnPage, TurnSummary,
@@ -16,18 +16,91 @@ pub(super) const LIST_TURNS_AFTER_SQL: &str =
     "SELECT t.id, t.ordinal, length(CAST(t.user_text AS BLOB)),
             t.selected_attempt_id, a.id, a.turn_id, a.attempt_number,
             a.execution_outcome, a.save_outcome, a.saved_end, a.generated_end,
-            a.terminal_saved_end, a.failure_code, a.created_ms, a.updated_ms
+            a.terminal_saved_end, a.failure_code, a.created_ms, a.updated_ms,
+            s.attempt_id, s.qualified_input_tokens, s.qualified_output_tokens,
+            s.service_first_output_latency_ms,
+            s.qualified_engine_decode_tokens_per_second, s.service_total_duration_ms,
+            s.stop_reason, p.attempt_id, p.temperature, p.top_p
      FROM turns t LEFT JOIN attempts a ON a.id = t.selected_attempt_id
+     LEFT JOIN attempt_statistics s ON s.attempt_id = a.id
+     LEFT JOIN attempt_sampling p ON p.attempt_id = a.id
      WHERE t.conversation_id = ?1 AND t.ordinal < ?2
      ORDER BY t.ordinal DESC LIMIT ?3";
 
 const LIST_TURNS_FIRST_SQL: &str = "SELECT t.id, t.ordinal, length(CAST(t.user_text AS BLOB)),
             t.selected_attempt_id, a.id, a.turn_id, a.attempt_number,
             a.execution_outcome, a.save_outcome, a.saved_end, a.generated_end,
-            a.terminal_saved_end, a.failure_code, a.created_ms, a.updated_ms
+            a.terminal_saved_end, a.failure_code, a.created_ms, a.updated_ms,
+            s.attempt_id, s.qualified_input_tokens, s.qualified_output_tokens,
+            s.service_first_output_latency_ms,
+            s.qualified_engine_decode_tokens_per_second, s.service_total_duration_ms,
+            s.stop_reason, p.attempt_id, p.temperature, p.top_p
      FROM turns t LEFT JOIN attempts a ON a.id = t.selected_attempt_id
+     LEFT JOIN attempt_statistics s ON s.attempt_id = a.id
+     LEFT JOIN attempt_sampling p ON p.attempt_id = a.id
      WHERE t.conversation_id = ?1
      ORDER BY t.ordinal DESC LIMIT ?2";
+
+const GET_ATTEMPT_SQL: &str =
+    "SELECT a.id, a.turn_id, a.attempt_number, a.execution_outcome, a.save_outcome,
+            a.saved_end, a.generated_end, a.terminal_saved_end, a.failure_code,
+            a.created_ms, a.updated_ms, s.attempt_id, s.qualified_input_tokens,
+            s.qualified_output_tokens, s.service_first_output_latency_ms,
+            s.qualified_engine_decode_tokens_per_second, s.service_total_duration_ms,
+            s.stop_reason, p.attempt_id, p.temperature, p.top_p
+     FROM attempts a JOIN turns t ON t.id = a.turn_id
+     JOIN conversations c ON c.id = t.conversation_id
+     LEFT JOIN attempt_statistics s ON s.attempt_id = a.id
+     LEFT JOIN attempt_sampling p ON p.attempt_id = a.id
+     WHERE a.id = ?1 AND c.deleted = 0";
+
+const GET_OBSERVED_ATTEMPT_SQL: &str =
+    "SELECT a.id, a.turn_id, a.attempt_number, a.execution_outcome, a.save_outcome,
+            a.saved_end, a.generated_end, a.terminal_saved_end, a.failure_code,
+            a.created_ms, a.updated_ms, s.attempt_id, s.qualified_input_tokens,
+            s.qualified_output_tokens, s.service_first_output_latency_ms,
+            s.qualified_engine_decode_tokens_per_second, s.service_total_duration_ms,
+            s.stop_reason, p.attempt_id, p.temperature, p.top_p
+     FROM attempts a JOIN turns t ON t.id = a.turn_id
+     JOIN conversations c ON c.id = t.conversation_id
+     LEFT JOIN attempt_statistics s ON s.attempt_id = a.id
+     LEFT JOIN attempt_sampling p ON p.attempt_id = a.id
+     WHERE a.id = ?1 AND a.owner_epoch = ?2 AND a.submission_id = ?3
+       AND a.operation_generation = ?4 AND c.deleted = 0";
+
+pub(super) fn get_attempt(
+    connection: &Connection,
+    attempt_id: &str,
+) -> Result<AttemptSummary, HistoryError> {
+    let attempt_id = decode_id(attempt_id)?;
+    let result = connection
+        .query_row(GET_ATTEMPT_SQL, [attempt_id.as_slice()], |row| {
+            attempt_row(row, 0, None)
+        })
+        .optional()
+        .map_err(schema::classify_sql_error)?;
+    result.ok_or_else(|| not_found("attempt was not found"))
+}
+
+pub(super) fn get_observed_attempt(
+    connection: &Connection,
+    observation: &ObservedAttempt,
+) -> Result<AttemptSummary, HistoryError> {
+    let result = connection
+        .query_row(
+            GET_OBSERVED_ATTEMPT_SQL,
+            params![
+                observation.attempt_id.as_slice(),
+                observation.owner_epoch,
+                observation.submission_id.as_slice(),
+                observation.operation_generation,
+            ],
+            |row| attempt_row(row, 0, None),
+        )
+        .optional()
+        .map_err(schema::classify_sql_error)?;
+    result.ok_or_else(|| not_found("generation observation was not found"))
+}
 
 pub(super) fn list_turns(
     connection: &Connection,
@@ -226,52 +299,7 @@ fn turn_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnSummary> {
             if selected != attempt_id || attempt_turn_id != id {
                 return Err(invalid_row(4));
             }
-            let execution = match row.get::<_, i64>(7)? {
-                0 => AttemptExecution::Pending,
-                1 => AttemptExecution::Completed,
-                2 => AttemptExecution::Stopped,
-                3 => AttemptExecution::Failed,
-                4 => AttemptExecution::Interrupted,
-                _ => return Err(invalid_row(7)),
-            };
-            let save = match row.get::<_, i64>(8)? {
-                0 => AttemptSave::Open,
-                1 => AttemptSave::Saved,
-                2 => AttemptSave::Failed,
-                3 => AttemptSave::Interrupted,
-                _ => return Err(invalid_row(8)),
-            };
-            let saved_end_value = row.get(9)?;
-            let generated_end_value = optional_offset_value(row, 10)?;
-            let terminal_saved_end_value = optional_offset_value(row, 11)?;
-            if generated_end_value.is_some_and(|end| saved_end_value > end)
-                || (save == AttemptSave::Saved
-                    && (generated_end_value != Some(saved_end_value)
-                        || terminal_saved_end_value != Some(saved_end_value)))
-                || (save != AttemptSave::Saved && terminal_saved_end_value.is_some())
-                || (save == AttemptSave::Saved && execution == AttemptExecution::Pending)
-            {
-                return Err(invalid_row(9));
-            }
-            let created_value: i64 = row.get(13)?;
-            let updated_value: i64 = row.get(14)?;
-            let created_ms = nonnegative(created_value, 13)?;
-            let updated_ms = nonnegative(updated_value, 14)?;
-            if updated_value < created_value {
-                return Err(invalid_row(14));
-            }
-            Some(AttemptSummary {
-                id: encode_id(attempt_id),
-                attempt_number: positive(row.get(6)?, 6)?,
-                execution,
-                save,
-                saved_end: offset(saved_end_value, 9)?,
-                generated_end: generated_end_value.map(|value| value.to_string()),
-                terminal_saved_end: terminal_saved_end_value.map(|value| value.to_string()),
-                failure_code: optional_ascii(row, 12, 64)?,
-                created_ms,
-                updated_ms,
-            })
+            Some(attempt_row(row, 4, Some(id))?)
         }
         _ => return Err(invalid_row(3)),
     };
@@ -280,6 +308,70 @@ fn turn_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnSummary> {
         ordinal,
         user_text_end,
         selected_attempt,
+    })
+}
+
+fn attempt_row(
+    row: &rusqlite::Row<'_>,
+    base: usize,
+    expected_turn_id: Option<[u8; 16]>,
+) -> rusqlite::Result<AttemptSummary> {
+    let attempt_id = fixed_id(row, base)?;
+    let turn_id = fixed_id(row, base + 1)?;
+    if expected_turn_id.is_some_and(|expected| turn_id != expected) {
+        return Err(invalid_row(base + 1));
+    }
+    let execution = match row.get::<_, i64>(base + 3)? {
+        0 => AttemptExecution::Pending,
+        1 => AttemptExecution::Completed,
+        2 => AttemptExecution::Stopped,
+        3 => AttemptExecution::Failed,
+        4 => AttemptExecution::Interrupted,
+        _ => return Err(invalid_row(base + 3)),
+    };
+    let save = match row.get::<_, i64>(base + 4)? {
+        0 => AttemptSave::Open,
+        1 => AttemptSave::Saved,
+        2 => AttemptSave::Failed,
+        3 => AttemptSave::Interrupted,
+        _ => return Err(invalid_row(base + 4)),
+    };
+    let saved_end_value = row.get(base + 5)?;
+    let generated_end_value = optional_offset_value(row, base + 6)?;
+    let terminal_saved_end_value = optional_offset_value(row, base + 7)?;
+    if generated_end_value.is_some_and(|end| saved_end_value > end)
+        || (save == AttemptSave::Saved
+            && (generated_end_value != Some(saved_end_value)
+                || terminal_saved_end_value != Some(saved_end_value)))
+        || (save != AttemptSave::Saved && terminal_saved_end_value.is_some())
+        || (save == AttemptSave::Saved && execution == AttemptExecution::Pending)
+    {
+        return Err(invalid_row(base + 5));
+    }
+    let created_value: i64 = row.get(base + 9)?;
+    let updated_value: i64 = row.get(base + 10)?;
+    let created_ms = nonnegative(created_value, base + 9)?;
+    let updated_ms = nonnegative(updated_value, base + 10)?;
+    if updated_value < created_value {
+        return Err(invalid_row(base + 10));
+    }
+    let statistics = statistics::read(row, base + 11, attempt_id)?
+        .map(|statistics| statistics.to_wire(execution, save, base + 11))
+        .transpose()?;
+    let effective_sampling = super::sampling::read_attempt(row, base + 18, attempt_id)?;
+    Ok(AttemptSummary {
+        id: encode_id(attempt_id),
+        attempt_number: positive(row.get(base + 2)?, base + 2)?,
+        execution,
+        save,
+        saved_end: offset(saved_end_value, base + 5)?,
+        generated_end: generated_end_value.map(|value| value.to_string()),
+        terminal_saved_end: terminal_saved_end_value.map(|value| value.to_string()),
+        failure_code: optional_ascii(row, base + 8, 64)?,
+        statistics,
+        effective_sampling,
+        created_ms,
+        updated_ms,
     })
 }
 
@@ -381,6 +473,13 @@ fn turn_backing(turn: &TurnSummary) -> usize {
                     .map_or(0, String::capacity),
             )
             .saturating_add(attempt.failure_code.as_ref().map_or(0, String::capacity))
+            .saturating_add(attempt.statistics.as_ref().map_or(0, |statistics| {
+                statistics
+                    .service_first_output_latency_ms
+                    .as_ref()
+                    .map_or(0, String::capacity)
+                    .saturating_add(statistics.service_total_duration_ms.capacity())
+            }))
             .saturating_add(attempt.created_ms.capacity())
             .saturating_add(attempt.updated_ms.capacity())
     })

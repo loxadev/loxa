@@ -7,8 +7,9 @@ use crate::catalog::{
 };
 use crate::runtime_identity::RuntimeIdentity;
 use loxa_ipc::{
-    DraftCommand, DraftReply, GenerationSettings, GenerationSettingsPatch,
-    HistoryCommand as WireCommand, HistoryPhase, HistoryReply, ServiceSettingsCommand,
+    DraftCommand, DraftReply, EffectiveSamplingSettings, GenerationSettings,
+    GenerationSettingsPatch, HistoryCommand as WireCommand, HistoryPhase, HistoryReply,
+    OptionalSamplingValuePatch, SamplingValue, ServiceSettingsCommand,
 };
 use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
@@ -18,6 +19,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
+
+mod reopen;
 
 fn private_root(label: &str) -> (tempfile::TempDir, PathBuf) {
     let directory = tempfile::Builder::new()
@@ -94,6 +97,13 @@ fn generic_service_fingerprint() -> crate::runtime_fingerprint::RuntimeFingerpri
     .unwrap()
 }
 
+fn effective_sampling() -> EffectiveSamplingSettings {
+    EffectiveSamplingSettings {
+        temperature: SamplingValue::new(0.8).unwrap(),
+        top_p: SamplingValue::new(0.95).unwrap(),
+    }
+}
+
 fn prepared_admission(
     conversation_id: [u8; 16],
     revision: i64,
@@ -134,8 +144,10 @@ fn prepared_admission_with_basis(
         generation,
         Arc::new(generic_service_fingerprint()),
         RuntimeIdentity::BundledB10344,
+        4096,
         String::new(),
         512,
+        effective_sampling(),
         prompt_basis,
         kind,
     )
@@ -256,7 +268,7 @@ fn install_bundle_manifest(models: &Path) {
 fn store_initialization_is_private_verified_and_reopenable() {
     let (_directory, root) = private_root("loxa-history-schema-");
     let (connection, info) = open_store(&root).unwrap();
-    assert_eq!(info.schema_version, 3);
+    assert_eq!(info.schema_version, 5);
     assert!(!info.sqlite_version.is_empty());
     assert!(!info.sqlite_source_id.is_empty());
     assert_eq!(
@@ -337,8 +349,11 @@ fn foreign_newer_malformed_and_unsafe_stores_fail_closed() {
     );
 
     let (_newer_directory, newer_root) = private_root("loxa-history-newer-");
-    let (newer, _) = open_store(&newer_root).unwrap();
-    newer.pragma_update(None, "user_version", 4).unwrap();
+    let (newer, info) = open_store(&newer_root).unwrap();
+    let unsupported = info.schema_version.checked_add(1).unwrap();
+    newer
+        .pragma_update(None, "user_version", unsupported)
+        .unwrap();
     newer.close().unwrap();
     assert_eq!(
         open_store(&newer_root).unwrap_err().kind(),
@@ -509,6 +524,8 @@ fn conversation_profiles_freeze_creation_defaults_reset_to_captured_globals_and_
     let initial_default = GenerationSettings {
         system_instruction: "initial global".into(),
         max_output_tokens: 700,
+        temperature: Some(SamplingValue::new(0.0).unwrap()),
+        top_p: None,
     };
     let created = match conversations::execute_with_generation(
         &mut connection,
@@ -545,6 +562,10 @@ fn conversation_profiles_freeze_creation_defaults_reset_to_captured_globals_and_
             patch: GenerationSettingsPatch::Fields {
                 system_instruction: Some("conversation override".into()),
                 max_output_tokens: None,
+                temperature: Some(OptionalSamplingValuePatch::Clear),
+                top_p: Some(OptionalSamplingValuePatch::Set {
+                    value: SamplingValue::new(0.7).unwrap(),
+                }),
             },
         },
         None,
@@ -557,6 +578,8 @@ fn conversation_profiles_freeze_creation_defaults_reset_to_captured_globals_and_
         "conversation override"
     );
     assert_eq!(patched.generation.max_output_tokens, 700);
+    assert_eq!(patched.generation.temperature, None);
+    assert_eq!(patched.generation.top_p.unwrap().get(), 0.7);
     let stale = conversations::execute_profile(
         &mut connection,
         ServiceSettingsCommand::PatchConversationProfile {
@@ -566,6 +589,8 @@ fn conversation_profiles_freeze_creation_defaults_reset_to_captured_globals_and_
             patch: GenerationSettingsPatch::Fields {
                 system_instruction: None,
                 max_output_tokens: Some(701),
+                temperature: None,
+                top_p: None,
             },
         },
         None,
@@ -576,6 +601,8 @@ fn conversation_profiles_freeze_creation_defaults_reset_to_captured_globals_and_
     let current_global = GenerationSettings {
         system_instruction: "new global".into(),
         max_output_tokens: 900,
+        temperature: Some(SamplingValue::new(0.2).unwrap()),
+        top_p: Some(SamplingValue::new(0.9).unwrap()),
     };
     let unchanged = conversations::execute_profile(
         &mut connection,
@@ -600,6 +627,17 @@ fn conversation_profiles_freeze_creation_defaults_reset_to_captured_globals_and_
     assert_eq!(reset.generation, current_global);
     assert_eq!(reset.conversation_revision, "3");
     assert_eq!(reset.profile_revision, "3");
+    connection.close().unwrap();
+    let (mut connection, _) = open_store(&root).unwrap();
+    let reopened = conversations::execute_profile(
+        &mut connection,
+        ServiceSettingsCommand::GetConversationProfile {
+            conversation_id: created.id.clone(),
+        },
+        None,
+    )
+    .unwrap();
+    assert_eq!(reopened.generation, current_global);
 
     let prepared = PreparedAdmission::new(
         identity::decode_id(&created.id).unwrap(),
@@ -611,8 +649,10 @@ fn conversation_profiles_freeze_creation_defaults_reset_to_captured_globals_and_
         91,
         Arc::new(generic_service_fingerprint()),
         RuntimeIdentity::BundledB10344,
+        4096,
         current_global.system_instruction.clone(),
         i64::from(current_global.max_output_tokens),
+        effective_sampling(),
         PromptBasis {
             references: Vec::new(),
         },
@@ -632,6 +672,8 @@ fn conversation_profiles_freeze_creation_defaults_reset_to_captured_globals_and_
             patch: GenerationSettingsPatch::Fields {
                 system_instruction: Some("later profile".into()),
                 max_output_tokens: Some(1000),
+                temperature: None,
+                top_p: None,
             },
         },
         None,
@@ -646,6 +688,22 @@ fn conversation_profiles_freeze_creation_defaults_reset_to_captured_globals_and_
         )
         .unwrap();
     assert_eq!(frozen_attempt, ("new global".into(), 900, 3));
+    let frozen_sampling: (f64, f64) = connection
+        .query_row(
+            "SELECT temperature, top_p FROM attempt_sampling",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(frozen_sampling, (0.8, 0.95));
+    let desired_sampling: (f64, f64) = connection
+        .query_row(
+            "SELECT temperature, top_p FROM conversation_sampling",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(desired_sampling, (0.2, 0.9));
 }
 
 #[test]
@@ -981,14 +1039,15 @@ fn late_admission_sql_failure_rolls_back_send_and_retry_atomically() {
     assert_eq!(current_draft, saved);
     let unchanged_conversation = conversation_state(&connection);
     assert_eq!(unchanged_conversation, original_conversation);
-    let counts: (i64, i64) = connection
+    let counts: (i64, i64, i64) = connection
         .query_row(
-            "SELECT (SELECT COUNT(*) FROM turns), (SELECT COUNT(*) FROM attempts)",
+            "SELECT (SELECT COUNT(*) FROM turns), (SELECT COUNT(*) FROM attempts),
+                    (SELECT COUNT(*) FROM attempt_sampling)",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(counts, (0, 0));
+    assert_eq!(counts, (0, 0, 0));
 
     connection
         .execute_batch("DROP TRIGGER fail_late_admission")
@@ -1033,10 +1092,15 @@ fn late_admission_sql_failure_rolls_back_send_and_retry_atomically() {
         })
         .unwrap();
     assert_eq!(selected_after, selected_before);
-    let attempts: i64 = connection
-        .query_row("SELECT COUNT(*) FROM attempts", [], |row| row.get(0))
+    let attempts: (i64, i64) = connection
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM attempts),
+                    (SELECT COUNT(*) FROM attempt_sampling)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
         .unwrap();
-    assert_eq!(attempts, 1);
+    assert_eq!(attempts, (1, 1));
 
     connection
         .execute_batch("DROP TRIGGER fail_late_admission")
@@ -1233,6 +1297,236 @@ fn retry_targets_only_the_latest_selected_terminal_attempt() {
 }
 
 #[test]
+fn exact_attempt_reads_survive_retry_and_follow_conversation_deletion() {
+    let (_directory, root) = private_root("loxa-history-exact-attempt-");
+    let models = root.join("models");
+    fs::create_dir(&models).unwrap();
+    install_local_manifest(&models, "demo");
+    let (mut connection, _) = open_store(&root).unwrap();
+    let conversation = create_local_conversation(&mut connection, &models);
+    let conversation_id = identity::decode_id(&conversation.id).unwrap();
+    let first = admission::admit_send(
+        &mut connection,
+        &prepared_admission(
+            conversation_id,
+            1,
+            31,
+            31,
+            61,
+            AdmissionKind::Send {
+                user_text: "question".into(),
+                draft: None,
+            },
+        ),
+    )
+    .unwrap();
+    admission::stop_before_execution(&connection, &first).unwrap();
+    let second = admission::admit_retry(
+        &mut connection,
+        &prepared_admission(
+            conversation_id,
+            first.post_conversation_revision,
+            32,
+            32,
+            62,
+            AdmissionKind::Retry {
+                prior_attempt_id: first.attempt_id,
+            },
+        ),
+    )
+    .unwrap();
+    admission::stop_before_execution(&connection, &second).unwrap();
+
+    let first_id = identity::encode_id(first.attempt_id);
+    let first_summary = conversations::execute(
+        &mut connection,
+        &models,
+        RuntimeIdentity::BundledB10344,
+        WireCommand::GetAttempt {
+            attempt_id: first_id.clone(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        first_summary,
+        HistoryReply::Attempt(ref attempt)
+            if attempt.id == first_id && attempt.attempt_number == "1"
+    ));
+
+    conversations::execute(
+        &mut connection,
+        &models,
+        RuntimeIdentity::BundledB10344,
+        WireCommand::DeleteConversation {
+            conversation_id: conversation.id,
+            expected_revision: second.post_conversation_revision.to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        conversations::execute(
+            &mut connection,
+            &models,
+            RuntimeIdentity::BundledB10344,
+            WireCommand::GetAttempt {
+                attempt_id: first_id,
+            },
+        )
+        .unwrap_err()
+        .kind(),
+        HistoryErrorKind::NotFound
+    );
+    connection.close().unwrap();
+}
+
+#[test]
+fn retry_prompt_keeps_the_stored_user_and_excludes_only_the_replaced_assistant() {
+    let (_directory, root) = private_root("loxa-history-retry-prompt-");
+    let models = root.join("models");
+    fs::create_dir(&models).unwrap();
+    install_local_manifest(&models, "demo");
+    let (mut connection, _) = open_store(&root).unwrap();
+    let conversation = create_local_conversation(&mut connection, &models);
+    let conversation_id = identity::decode_id(&conversation.id).unwrap();
+
+    let first = admission::admit_send(
+        &mut connection,
+        &prepared_admission(
+            conversation_id,
+            1,
+            61,
+            61,
+            61,
+            AdmissionKind::Send {
+                user_text: "first user".into(),
+                draft: None,
+            },
+        ),
+    )
+    .unwrap();
+    content::finalize(
+        &mut connection,
+        &FinalizationInput {
+            suffix: suffix_input(&first, 61, 0, "first assistant"),
+            execution_outcome: ExecutionOutcome::Completed,
+            generated_end: 15,
+            failure_code: None,
+            statistics: None,
+        },
+    )
+    .unwrap();
+    let second = admission::admit_send(
+        &mut connection,
+        &prepared_admission(
+            conversation_id,
+            2,
+            62,
+            62,
+            62,
+            AdmissionKind::Send {
+                user_text: "retry this user".into(),
+                draft: None,
+            },
+        ),
+    )
+    .unwrap();
+    content::finalize(
+        &mut connection,
+        &FinalizationInput {
+            suffix: suffix_input(&second, 62, 0, "replace this assistant"),
+            execution_outcome: ExecutionOutcome::Completed,
+            generated_end: 22,
+            failure_code: None,
+            statistics: None,
+        },
+    )
+    .unwrap();
+
+    let prepared = prompt::prepare(
+        &connection,
+        conversation_id,
+        3,
+        1,
+        PromptRequest::Retry {
+            prior_attempt_id: second.attempt_id,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        prepared.messages,
+        [
+            PromptMessage {
+                role: PromptRole::User,
+                content: "first user".into(),
+            },
+            PromptMessage {
+                role: PromptRole::Assistant,
+                content: "first assistant".into(),
+            },
+            PromptMessage {
+                role: PromptRole::User,
+                content: "retry this user".into(),
+            },
+        ]
+    );
+    assert_eq!(
+        prepared.basis.references,
+        [
+            PromptReference {
+                turn_id: first.turn_id,
+                attempt_id: None,
+                prefix_end: 10,
+            },
+            PromptReference {
+                turn_id: first.turn_id,
+                attempt_id: Some(first.attempt_id),
+                prefix_end: 15,
+            },
+            PromptReference {
+                turn_id: second.turn_id,
+                attempt_id: None,
+                prefix_end: 15,
+            },
+        ]
+    );
+    assert_eq!(
+        prompt::prepare(
+            &connection,
+            conversation_id,
+            3,
+            2,
+            PromptRequest::Retry {
+                prior_attempt_id: second.attempt_id,
+            },
+        )
+        .unwrap_err()
+        .kind(),
+        HistoryErrorKind::Conflict
+    );
+    connection
+        .execute(
+            "UPDATE conversations SET deleted = 1 WHERE id = ?1",
+            [conversation_id.as_slice()],
+        )
+        .unwrap();
+    assert_eq!(
+        prompt::prepare(
+            &connection,
+            conversation_id,
+            3,
+            1,
+            PromptRequest::Retry {
+                prior_attempt_id: second.attempt_id,
+            },
+        )
+        .unwrap_err()
+        .kind(),
+        HistoryErrorKind::NotFound
+    );
+    connection.close().unwrap();
+}
+
+#[test]
 fn suffixes_finalize_exactly_and_ranges_keep_a_captured_prefix() {
     let (_directory, root) = private_root("loxa-history-content-");
     let models = root.join("models");
@@ -1293,12 +1587,32 @@ fn suffixes_finalize_exactly_and_ranges_keep_a_captured_prefix() {
         execution_outcome: ExecutionOutcome::Completed,
         generated_end: 11,
         failure_code: None,
+        statistics: Some(AttemptStatistics {
+            qualified_input_tokens: Some(7),
+            qualified_output_tokens: Some(3),
+            service_first_output_latency_ms: Some(4),
+            qualified_engine_decode_tokens_per_second: Some(50.0),
+            service_total_duration_ms: 10,
+            stop_reason: loxa_ipc::AttemptStopReason::Completed,
+        }),
     };
     assert_eq!(
         content::finalize(&mut connection, &finalization)
             .unwrap()
             .end,
         11
+    );
+    let mut changed_statistics = finalization.clone();
+    changed_statistics
+        .statistics
+        .as_mut()
+        .unwrap()
+        .qualified_output_tokens = Some(4);
+    assert_eq!(
+        content::finalize(&mut connection, &changed_statistics)
+            .unwrap_err()
+            .kind(),
+        HistoryErrorKind::Conflict
     );
     assert_eq!(
         content::finalize(&mut connection, &finalization)
@@ -1311,6 +1625,7 @@ fn suffixes_finalize_exactly_and_ranges_keep_a_captured_prefix() {
         execution_outcome: ExecutionOutcome::Completed,
         generated_end: 11,
         failure_code: None,
+        statistics: None,
     };
     assert_eq!(
         content::finalize(&mut connection, &empty_replay)
@@ -1323,12 +1638,74 @@ fn suffixes_finalize_exactly_and_ranges_keep_a_captured_prefix() {
         execution_outcome: ExecutionOutcome::Failed,
         generated_end: 11,
         failure_code: Some("stopped".into()),
+        statistics: None,
     };
     assert_eq!(
         content::finalize(&mut connection, &changed_outcome)
             .unwrap_err()
             .kind(),
         HistoryErrorKind::Conflict
+    );
+    connection.close().unwrap();
+}
+
+#[test]
+fn terminal_statistics_and_outcome_roll_back_together() {
+    let (_directory, root) = private_root("loxa-history-statistics-atomic-");
+    let models = root.join("models");
+    fs::create_dir(&models).unwrap();
+    install_local_manifest(&models, "demo");
+    let (mut connection, _) = open_store(&root).unwrap();
+    let (_, committed) = admitted_attempt(&mut connection, &models, 22, 22);
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_terminal_update BEFORE UPDATE OF execution_outcome ON attempts
+             WHEN NEW.execution_outcome != 0 BEGIN SELECT RAISE(ABORT, 'injected'); END",
+        )
+        .unwrap();
+    let finalization = FinalizationInput {
+        suffix: suffix_input(&committed, 22, 0, "answer"),
+        execution_outcome: ExecutionOutcome::Completed,
+        generated_end: 6,
+        failure_code: None,
+        statistics: Some(AttemptStatistics {
+            qualified_input_tokens: Some(5),
+            qualified_output_tokens: None,
+            service_first_output_latency_ms: Some(1),
+            qualified_engine_decode_tokens_per_second: None,
+            service_total_duration_ms: 2,
+            stop_reason: loxa_ipc::AttemptStopReason::Completed,
+        }),
+    };
+    assert!(content::finalize(&mut connection, &finalization).is_err());
+    let rolled_back: (i64, i64, i64, i64, i64) = connection
+        .query_row(
+            "SELECT execution_outcome, save_outcome,
+                    (SELECT COUNT(*) FROM attempt_chunks),
+                    (SELECT COUNT(*) FROM attempt_finalizations),
+                    (SELECT COUNT(*) FROM attempt_statistics)
+             FROM attempts WHERE id = ?1",
+            [committed.attempt_id.as_slice()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(rolled_back, (0, 0, 0, 0, 0));
+    connection
+        .execute_batch("DROP TRIGGER fail_terminal_update")
+        .unwrap();
+    assert_eq!(
+        content::finalize(&mut connection, &finalization)
+            .unwrap()
+            .end,
+        6
     );
     connection.close().unwrap();
 }
@@ -1354,6 +1731,19 @@ fn turn_metadata_and_content_reads_are_bounded_to_a_captured_prefix() {
     assert_eq!(attempt.saved_end, "3");
     assert_eq!(attempt.execution, loxa_ipc::AttemptExecution::Pending);
     assert_eq!(attempt.save, loxa_ipc::AttemptSave::Open);
+    assert_eq!(attempt.effective_sampling, Some(effective_sampling()));
+    assert!(connection
+        .execute(
+            "UPDATE attempt_sampling SET temperature = -1.0 WHERE attempt_id = ?1",
+            [committed.attempt_id.as_slice()],
+        )
+        .is_err());
+    assert!(connection
+        .execute(
+            "UPDATE attempt_sampling SET top_p = NULL WHERE attempt_id = ?1",
+            [committed.attempt_id.as_slice()],
+        )
+        .is_err());
 
     content::append_suffix(&mut connection, &suffix_input(&committed, 34, 3, "later")).unwrap();
     let assistant = reads::read_content_range(
@@ -1378,6 +1768,28 @@ fn turn_metadata_and_content_reads_are_bounded_to_a_captured_prefix() {
     .unwrap();
     assert_eq!(user.content, "question");
     assert_eq!(user.end, "8");
+
+    connection
+        .execute_batch("PRAGMA ignore_check_constraints = ON")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE attempt_sampling SET top_p = 2.0 WHERE attempt_id = ?1",
+            [committed.attempt_id.as_slice()],
+        )
+        .unwrap();
+    assert_eq!(
+        reads::list_turns(&connection, &conversation.id, None, 50)
+            .unwrap_err()
+            .kind(),
+        HistoryErrorKind::Corrupt
+    );
+    connection
+        .execute(
+            "UPDATE attempt_sampling SET top_p = 0.95 WHERE attempt_id = ?1",
+            [committed.attempt_id.as_slice()],
+        )
+        .unwrap();
 
     connection
         .execute(
@@ -1409,6 +1821,7 @@ fn turn_reads_reject_saved_nulls_and_cross_turn_selected_attempts() {
             execution_outcome: ExecutionOutcome::Completed,
             generated_end: 0,
             failure_code: None,
+            statistics: None,
         },
     )
     .unwrap();
@@ -1694,6 +2107,7 @@ fn tombstone_hides_immediately_and_purge_removes_bounded_content_batches() {
             execution_outcome: ExecutionOutcome::Completed,
             generated_end: 20,
             failure_code: None,
+            statistics: None,
         },
     )
     .unwrap();
@@ -1707,6 +2121,7 @@ fn tombstone_hides_immediately_and_purge_removes_bounded_content_batches() {
                 execution_outcome: ExecutionOutcome::Completed,
                 generated_end: 0,
                 failure_code: None,
+                statistics: None,
             },
         )
         .unwrap();
@@ -1849,6 +2264,7 @@ fn deep_turn_seek_and_late_purge_keep_bounded_progress_with_128_terminal_turns()
                 execution_outcome: ExecutionOutcome::Completed,
                 generated_end: 0,
                 failure_code: None,
+                statistics: None,
             },
         )
         .unwrap();
@@ -1984,17 +2400,17 @@ fn deep_turn_seek_and_late_purge_keep_bounded_progress_with_128_terminal_turns()
 }
 
 #[test]
-fn schema_one_fixture_migrates_atomically_to_schema_three() {
+fn schema_one_fixture_migrates_atomically_to_schema_five() {
     let (_directory, root) = private_root("loxa-history-v1-migration-");
     let path = root.join("app.sqlite");
     schema::create_v1_fixture(&path);
 
     let (connection, info) = open_store(&root).unwrap();
-    assert_eq!(info.schema_version, 3);
+    assert_eq!(info.schema_version, 5);
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 5);
     let objects: Vec<String> = connection
         .prepare(
             "SELECT name FROM sqlite_schema
@@ -2011,11 +2427,14 @@ fn schema_one_fixture_migrates_atomically_to_schema_three() {
         [
             "attempt_chunks",
             "attempt_finalizations",
+            "attempt_sampling",
+            "attempt_statistics",
             "attempts",
             "attempts_latest",
             "attempts_prior",
             "attempts_recovery",
             "attempts_unresolved",
+            "conversation_sampling",
             "conversations",
             "conversations_recency",
             "drafts",
@@ -2031,26 +2450,147 @@ fn schema_one_fixture_migrates_atomically_to_schema_three() {
 }
 
 #[test]
-fn schema_two_fixture_migrates_atomically_to_schema_three() {
+fn schema_two_fixture_migrates_atomically_to_schema_five() {
     let (_directory, root) = private_root("loxa-history-v2-migration-");
     let path = root.join("app.sqlite");
     schema::create_v2_fixture(&path);
 
     let (connection, info) = open_store(&root).unwrap();
-    assert_eq!(info.schema_version, 3);
+    assert_eq!(info.schema_version, 5);
     assert_eq!(
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        3
+        5
     );
     assert!(connection
         .prepare("SELECT attempt_id, start_offset, end_offset, content FROM attempt_chunks")
         .is_ok());
     assert!(connection
+        .prepare("SELECT conversation_id, temperature, top_p FROM conversation_sampling")
+        .is_ok());
+    assert!(connection
+        .prepare("SELECT attempt_id, temperature, top_p FROM attempt_sampling")
+        .is_ok());
+    assert!(connection
         .prepare("SELECT attempt_id, start_offset, end_offset FROM attempt_finalizations")
         .is_ok());
+    assert!(connection
+        .prepare(
+            "SELECT attempt_id, qualified_input_tokens, qualified_output_tokens,
+                    service_first_output_latency_ms,
+                    qualified_engine_decode_tokens_per_second, service_total_duration_ms,
+                    stop_reason FROM attempt_statistics",
+        )
+        .is_ok());
     connection.close().unwrap();
+}
+
+#[test]
+fn populated_schema_fixtures_migrate_without_inventing_attempt_sampling() {
+    for (schema_version, create_fixture) in [
+        (3, schema::create_v3_fixture as fn(&Path)),
+        (4, schema::create_v4_fixture as fn(&Path)),
+    ] {
+        let label = format!("loxa-history-v{schema_version}-to-v5-migration-");
+        let (_directory, root) = private_root(&label);
+        let path = root.join("app.sqlite");
+        create_fixture(&path);
+
+        let conversation_id = [1_u8; 16];
+        let turn_id = [2_u8; 16];
+        let attempt_id = [3_u8; 16];
+        let mut fixture = Connection::open(&path).unwrap();
+        fixture.pragma_update(None, "foreign_keys", true).unwrap();
+        let transaction = fixture.transaction().unwrap();
+        transaction
+            .execute(
+                "INSERT INTO conversations (
+                 id, model_id, manifest_version, binding_profile,
+                 primary_filename, primary_sha256, primary_size,
+                 primary_source_kind, primary_source_filename,
+                 title, system_instruction, max_output_tokens,
+                 created_ms, updated_ms, revision, profile_revision, deleted
+             ) VALUES (?1, 'demo', 2, 0, 'model.gguf', ?2, 4, 0,
+                       'source.gguf', 'Migration', '', 512, 1, 2, 2, 1, 0)",
+                params![conversation_id.as_slice(), [4_u8; 32].as_slice()],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO turns (id, conversation_id, ordinal, user_text, selected_attempt_id)
+             VALUES (?1, ?2, 1, 'hello', NULL)",
+                params![turn_id.as_slice(), conversation_id.as_slice()],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO attempts (
+                 id, turn_id, attempt_number, submission_id, submission_hash,
+                 admitted_conversation_revision, admitted_profile_revision,
+                 prior_attempt_id, owner_epoch, operation_generation, model_id,
+                 applied_engine_build, applied_engine_version, runtime_fingerprint,
+                 effective_context, system_instruction, max_output_tokens, prompt_basis,
+                 execution_outcome, save_outcome, saved_end, generated_end,
+                 terminal_saved_end, failure_code, created_ms, updated_ms
+             ) VALUES (
+                 ?1, ?2, 1, ?3, ?4, 2, 1, NULL, 'owner', 1, 'demo',
+                 'build', 'version', ?5, 4096, '', 512, ?6,
+                 2, 1, 0, 0, 0, 'stopped', 1, 2
+             )",
+                params![
+                    attempt_id.as_slice(),
+                    turn_id.as_slice(),
+                    [5_u8; 16].as_slice(),
+                    [6_u8; 32].as_slice(),
+                    b"fingerprint".as_slice(),
+                    b"[]".as_slice(),
+                ],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO attempt_finalizations (attempt_id, start_offset, end_offset)
+             VALUES (?1, 0, 0)",
+                params![attempt_id.as_slice()],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "UPDATE turns SET selected_attempt_id = ?1 WHERE id = ?2",
+                params![attempt_id.as_slice(), turn_id.as_slice()],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+        fixture.close().unwrap();
+
+        let (connection, info) = open_store(&root).unwrap();
+        assert_eq!(info.schema_version, 5);
+        assert_eq!(
+            connection
+                .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap(),
+            5
+        );
+        assert!(connection
+            .prepare(
+                "SELECT attempt_id, qualified_input_tokens, qualified_output_tokens,
+                    service_first_output_latency_ms,
+                    qualified_engine_decode_tokens_per_second, service_total_duration_ms,
+                    stop_reason FROM attempt_statistics",
+            )
+            .is_ok());
+        let page = reads::list_turns(&connection, &identity::encode_id(conversation_id), None, 50)
+            .unwrap();
+        let attempt = page.turns[0].selected_attempt.as_ref().unwrap();
+        assert_eq!(attempt.id, identity::encode_id(attempt_id));
+        assert_eq!(attempt.execution, loxa_ipc::AttemptExecution::Stopped);
+        assert_eq!(attempt.save, loxa_ipc::AttemptSave::Saved);
+        assert_eq!(attempt.failure_code.as_deref(), Some("stopped"));
+        assert_eq!(attempt.statistics, None);
+        assert_eq!(attempt.effective_sampling, None);
+        connection.close().unwrap();
+    }
 }
 
 #[test]
@@ -2095,12 +2635,12 @@ fn failed_schema_three_migration_rolls_back_and_clean_retry_upgrades() {
     connection.close().unwrap();
 
     let (connection, info) = open_store(&root).unwrap();
-    assert_eq!(info.schema_version, 3);
+    assert_eq!(info.schema_version, 5);
     assert_eq!(
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        3
+        5
     );
     assert!(connection
         .prepare("SELECT attempt_id, start_offset, end_offset, content FROM attempt_chunks")
@@ -2366,6 +2906,7 @@ async fn persistence_owner_bounds_pending_bytes_and_orders_final_after_checkpoin
                 execution_outcome: ExecutionOutcome::Failed,
                 generated_end: 0,
                 failure_code: Some(oversized_code),
+                statistics: None,
             }))
             .unwrap_err()
             .kind(),
@@ -2378,6 +2919,7 @@ async fn persistence_owner_bounds_pending_bytes_and_orders_final_after_checkpoin
         execution_outcome: ExecutionOutcome::Completed,
         generated_end: 2,
         failure_code: None,
+        statistics: None,
     });
     let checkpoint_result = handle.try_append_suffix(Arc::clone(&checkpoint)).unwrap();
     let terminal_result = handle.try_finalize(Arc::clone(&terminal)).unwrap();
@@ -2464,6 +3006,7 @@ async fn lost_suffix_result_reconciles_from_retained_shared_input() {
         execution_outcome: ExecutionOutcome::Completed,
         generated_end: 7,
         failure_code: None,
+        statistics: None,
     });
     handle.drop_next_persistence_reply();
     assert!(handle

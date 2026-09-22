@@ -66,6 +66,9 @@ pub(super) fn execute_with_generation(
             limit,
         } => super::reads::list_turns(connection, &conversation_id, cursor, limit)
             .map(HistoryReply::TurnPage),
+        HistoryCommand::GetAttempt { attempt_id } => {
+            super::reads::get_attempt(connection, &attempt_id).map(HistoryReply::Attempt)
+        }
         HistoryCommand::ReadContentRange {
             source,
             start,
@@ -138,7 +141,8 @@ fn create(
         }
         None => (None, None, None, None, None, None, None),
     };
-    connection
+    let transaction = connection.transaction().map_err(sql_error)?;
+    transaction
         .execute(
             "INSERT INTO conversations (
                 id, model_id, manifest_version, binding_profile,
@@ -184,6 +188,8 @@ fn create(
             ],
         )
         .map_err(sql_error)?;
+    super::sampling::write_conversation(&transaction, id, &generation).map_err(sql_error)?;
+    transaction.commit().map_err(sql_error)?;
     Ok(summary(
         id,
         binding.model_id,

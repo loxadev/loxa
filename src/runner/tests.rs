@@ -290,6 +290,41 @@ fn bundled_service_unload_preserves_stage_for_reload() {
     );
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires a finalized built app and the exact small-model fixture"]
+fn bundled_generation_preflight_usage_quiescence_and_stop() {
+    use std::io::Write as _;
+
+    let _process = process_test_lock();
+    let app = PathBuf::from(std::env::var_os("LOXA_BUILT_APP").unwrap());
+    let model = PathBuf::from(std::env::var_os("LOXA_SMALL_MODEL").unwrap());
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    let report = runtime
+        .block_on(crate::service::run_bundled_generation_acceptance(
+            &app, &model,
+        ))
+        .unwrap();
+    println!("LOXA_GENERATION_QUALIFICATION={report}");
+
+    if let Some(summary) = std::env::var_os("GITHUB_STEP_SUMMARY") {
+        let mut summary = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(summary)
+            .unwrap();
+        writeln!(
+            summary,
+            "## Loxa generation qualification\n\n```json\n{report}\n```"
+        )
+        .unwrap();
+    }
+}
+
 #[cfg(unix)]
 static RUN_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -1004,11 +1039,40 @@ int main(int argc, char **argv) {
     int client = accept(listener, NULL, NULL);
     if (client < 0) return 94;
     char request[4096];
-    if (recv(client, request, sizeof(request), 0) <= 0) return 95;
+    size_t received = 0;
+    int header_complete = 0;
+    while (received < sizeof(request)) {
+        ssize_t count = recv(client, request + received, sizeof(request) - received, 0);
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            return 95;
+        }
+        if (count == 0) return 95;
+        received += (size_t)count;
+        for (size_t index = 3; index < received; ++index) {
+            if (request[index - 3] == '\r' && request[index - 2] == '\n' &&
+                request[index - 1] == '\r' && request[index] == '\n') {
+                header_complete = 1;
+                break;
+            }
+        }
+        if (header_complete) break;
+    }
+    if (!header_complete) return 95;
     const char *body = "{\"data\":[{\"id\":\"demo\"}]}";
     char response[512];
     int length = snprintf(response, sizeof(response), "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n%s", strlen(body), body);
-    if (length <= 0 || send(client, response, (size_t)length, 0) != length) return 96;
+    if (length <= 0 || (size_t)length >= sizeof(response)) return 96;
+    size_t written = 0;
+    while (written < (size_t)length) {
+        ssize_t count = send(client, response + written, (size_t)length - written, 0);
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            return 96;
+        }
+        if (count == 0) return 96;
+        written += (size_t)count;
+    }
     close(client);
     for (;;) pause();
 }
@@ -1410,9 +1474,20 @@ fn sigterm_of_persistent_owner_cleans_the_exact_group_lease_and_locks() {
             }
         }
     };
-    let group_survived = process_group_exists(child_group).unwrap();
-    let child_survived = unsafe { libc::kill(child_pid as libc::pid_t, 0) } == 0;
+    let live_group_survived = crate::runtime::process_group_has_live_members(child_group).unwrap();
     let lease_survived = lease_path.exists();
+    let reap_deadline = Instant::now() + Duration::from_secs(5);
+    let (group_survived, child_survived) = loop {
+        let group_survived = process_group_exists(child_group).unwrap();
+        let child_survived = unsafe { libc::kill(child_pid as libc::pid_t, 0) } == 0;
+        if live_group_survived
+            || (!group_survived && !child_survived)
+            || Instant::now() >= reap_deadline
+        {
+            break (group_survived, child_survived);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
     if group_survived {
         crate::runtime::terminate_stale_process_group(child_group).unwrap();
     }
@@ -1424,6 +1499,10 @@ fn sigterm_of_persistent_owner_cleans_the_exact_group_lease_and_locks() {
         "{output:?}"
     );
     assert_eq!(output.status.signal(), None, "{output:?}");
+    assert!(
+        !live_group_survived,
+        "persistent server group retained live members after owner SIGTERM"
+    );
     assert!(
         !child_survived,
         "persistent server child survived owner SIGTERM"

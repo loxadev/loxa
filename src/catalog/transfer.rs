@@ -1,12 +1,10 @@
-use super::{Manifest, ModelLock};
+use super::{Manifest, ModelLock, MAX_CATALOG_MANIFEST_BYTES};
 use crate::safe_file::{
     ensure_regular_descriptors_match, regular_file_identity, RegularFileIdentity,
 };
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::Path;
-
-pub(crate) const MAX_CATALOG_MANIFEST_BYTES: usize = 4_194_304;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CatalogTransferState {
