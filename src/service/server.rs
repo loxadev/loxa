@@ -3,6 +3,8 @@ mod connection;
 
 use crate::config::SettingsExit;
 use crate::history::HistoryExit;
+#[cfg(test)]
+pub(in crate::service) use connection::stream_generation_observation_for_test;
 use connection::{classify_overload_connection, handle_connection, send_frame};
 #[cfg(test)]
 use connection::{receive_frame, receive_frame_with_limit, send_frame_with_limit};

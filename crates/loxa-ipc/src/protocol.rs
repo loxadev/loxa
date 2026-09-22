@@ -6,12 +6,16 @@ mod generation_status;
 mod history;
 mod settings;
 
+use history::validate_hex_id;
+
 pub use drafts::{DraftCommand, DraftReply, DraftSnapshot, MAX_DRAFT_TEXT_BYTES};
 pub use generation::{
     GenerationAccepted, GenerationCommand, GenerationConnection, GenerationDraft, GenerationHello,
     GenerationHelloAck, GenerationReply, GenerationTarget, MAX_GENERATION_USER_TEXT_BYTES,
 };
-pub use generation_status::{GenerationExecutionPhase, GenerationSavePhase, GenerationStatus};
+pub use generation_status::{
+    GenerationExecutionPhase, GenerationObservation, GenerationSavePhase, GenerationStatus,
+};
 pub use history::{
     AttemptExecution, AttemptSave, AttemptStatistics, AttemptStopReason, AttemptSummary,
     ContentRange, ContentSource, ConversationCursor, ConversationPage, ConversationSummary,
@@ -160,6 +164,13 @@ impl Hello {
         }
     }
 
+    pub fn generation_observation(
+        build: impl Into<String>,
+        root_identity: impl Into<String>,
+    ) -> Self {
+        Self::history(build, root_identity)
+    }
+
     pub fn validate_shape(&self) -> Result<(), &'static str> {
         if self.build.is_empty() || self.build.len() > MAX_BUILD_BYTES {
             return Err("invalid client build identity");
@@ -234,7 +245,14 @@ impl HelloAck {
 pub enum ClientEnvelope {
     Hello(Hello),
     Request(Request),
-    Subscribe { request_id: String },
+    Subscribe {
+        request_id: String,
+    },
+    SubscribeGeneration {
+        request_id: String,
+        target: GenerationTarget,
+        attempt_id: String,
+    },
 }
 
 impl ClientEnvelope {
@@ -244,6 +262,18 @@ impl ClientEnvelope {
             Self::Request(request) => request.validate_shape(),
             Self::Subscribe { request_id } => {
                 validate_identifier(request_id, "invalid subscription request identity")
+            }
+            Self::SubscribeGeneration {
+                request_id,
+                target,
+                attempt_id,
+            } => {
+                validate_identifier(request_id, "invalid subscription request identity")?;
+                target.validate_shape()?;
+                if !matches!(target, GenerationTarget::Accepted { .. }) {
+                    return Err("generation observation requires an accepted target");
+                }
+                validate_hex_id(attempt_id)
             }
         }
     }
@@ -256,6 +286,7 @@ pub enum ServerEnvelope {
     HelloRejected(ServiceError),
     Reply(Reply),
     Snapshot(RuntimeStatus),
+    GenerationSnapshot(GenerationObservation),
 }
 
 impl ServerEnvelope {
@@ -265,6 +296,7 @@ impl ServerEnvelope {
             Self::HelloRejected(error) => error.validate_shape(),
             Self::Reply(reply) => reply.validate_shape(),
             Self::Snapshot(status) => status.validate_shape(),
+            Self::GenerationSnapshot(observation) => observation.validate_shape(),
         }
     }
 }

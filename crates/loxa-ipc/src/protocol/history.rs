@@ -38,6 +38,9 @@ pub enum HistoryCommand {
         cursor: Option<TurnCursor>,
         limit: u16,
     },
+    GetAttempt {
+        attempt_id: String,
+    },
     ReadContentRange {
         source: ContentSource,
         start: String,
@@ -86,6 +89,7 @@ impl HistoryCommand {
                 }
                 Ok(())
             }
+            Self::GetAttempt { attempt_id } => validate_hex_id(attempt_id),
             Self::ReadContentRange {
                 source,
                 start,
@@ -129,6 +133,7 @@ pub enum HistoryReply {
     Conversation(ConversationSummary),
     ConversationPage(ConversationPage),
     TurnPage(TurnPage),
+    Attempt(AttemptSummary),
     ContentRange(ContentRange),
     ConversationDeleted {
         conversation_id: String,
@@ -144,6 +149,7 @@ impl HistoryReply {
             Self::Conversation(conversation) => conversation.validate_shape(),
             Self::ConversationPage(page) => page.validate_shape(),
             Self::TurnPage(page) => page.validate_shape(),
+            Self::Attempt(attempt) => attempt.validate_shape(),
             Self::ContentRange(range) => range.validate_shape(),
             Self::ConversationDeleted {
                 conversation_id,

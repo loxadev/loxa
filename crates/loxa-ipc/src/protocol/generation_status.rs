@@ -1,4 +1,4 @@
-use super::{validate_decimal, GenerationTarget};
+use super::{validate_decimal, AttemptSummary, GenerationTarget};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -34,6 +34,22 @@ pub struct GenerationStatus {
     pub generated_end: Option<String>,
     pub terminal_saved_end: Option<String>,
     pub failure_code: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GenerationObservation {
+    Live { status: GenerationStatus },
+    Durable { attempt: AttemptSummary },
+}
+
+impl GenerationObservation {
+    pub(super) fn validate_shape(&self) -> Result<(), &'static str> {
+        match self {
+            Self::Live { status } => status.validate_shape(),
+            Self::Durable { attempt } => attempt.validate_shape(),
+        }
+    }
 }
 
 impl GenerationStatus {
@@ -123,5 +139,33 @@ mod tests {
         status.validate_shape().unwrap();
         status.saved_end = (super::super::history::MAX_ATTEMPT_CONTENT_BYTES + 1).to_string();
         assert!(status.validate_shape().is_err());
+    }
+
+    #[test]
+    fn durable_observation_requires_a_valid_attempt() {
+        let attempt = AttemptSummary {
+            id: "22".repeat(16),
+            attempt_number: "1".into(),
+            execution: super::super::AttemptExecution::Stopped,
+            save: super::super::AttemptSave::Saved,
+            saved_end: "0".into(),
+            generated_end: Some("0".into()),
+            terminal_saved_end: Some("0".into()),
+            failure_code: Some("stopped".into()),
+            statistics: None,
+            effective_sampling: None,
+            created_ms: "1".into(),
+            updated_ms: "2".into(),
+        };
+        GenerationObservation::Durable {
+            attempt: attempt.clone(),
+        }
+        .validate_shape()
+        .unwrap();
+        let mut invalid = attempt;
+        invalid.terminal_saved_end = None;
+        assert!(GenerationObservation::Durable { attempt: invalid }
+            .validate_shape()
+            .is_err());
     }
 }

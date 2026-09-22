@@ -1,4 +1,7 @@
-use loxa_ipc::{ConversationProfile, DraftReply, GenerationSettings, HistoryReply, HistoryStatus};
+use loxa_ipc::{
+    AttemptSummary, ConversationProfile, DraftReply, GenerationSettings, HistoryReply,
+    HistoryStatus,
+};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
@@ -95,6 +98,19 @@ pub(crate) struct HistoryCompletion {
 }
 
 #[derive(Debug)]
+pub(crate) struct AttemptCompletion {
+    pub(crate) result: Result<AttemptSummary, HistoryError>,
+    pub(crate) permit: OwnedSemaphorePermit,
+}
+
+pub(crate) struct ObservedAttempt {
+    pub(crate) attempt_id: [u8; 16],
+    pub(crate) owner_epoch: String,
+    pub(crate) submission_id: [u8; 16],
+    pub(crate) operation_generation: i64,
+}
+
+#[derive(Debug)]
 pub(crate) struct DraftCompletion {
     pub(crate) result: Result<DraftReply, HistoryError>,
     pub(crate) permit: OwnedSemaphorePermit,
@@ -135,6 +151,11 @@ enum HistoryCommand {
         operation: loxa_ipc::ServiceSettingsCommand,
         reset_default: Option<GenerationSettings>,
         reply: oneshot::Sender<ProfileCompletion>,
+        permit: OwnedSemaphorePermit,
+    },
+    ReadObservedAttempt {
+        observation: ObservedAttempt,
+        reply: oneshot::Sender<AttemptCompletion>,
         permit: OwnedSemaphorePermit,
     },
     ExecuteDraft {
@@ -385,6 +406,43 @@ impl HistoryHandle {
             HistoryError::new(
                 HistoryErrorKind::WorkerUnavailable,
                 "history owner stopped before completing the profile request",
+            )
+        })
+    }
+
+    pub(crate) async fn read_observed_attempt(
+        &self,
+        observation: ObservedAttempt,
+    ) -> Result<AttemptCompletion, HistoryError> {
+        if self.draining.load(Ordering::Acquire) {
+            return Err(HistoryError::new(
+                HistoryErrorKind::WorkerUnavailable,
+                "history is draining",
+            ));
+        }
+        let permit = Arc::clone(&self.ordinary)
+            .try_acquire_owned()
+            .map_err(|_| HistoryError::new(HistoryErrorKind::Busy, "history capacity is full"))?;
+        let (reply, completion) = oneshot::channel();
+        self.commands
+            .try_send(HistoryCommand::ReadObservedAttempt {
+                observation,
+                reply,
+                permit,
+            })
+            .map_err(|error| match error {
+                TrySendError::Full(_) => {
+                    HistoryError::new(HistoryErrorKind::Busy, "history capacity is full")
+                }
+                TrySendError::Disconnected(_) => HistoryError::new(
+                    HistoryErrorKind::WorkerUnavailable,
+                    "history owner is unavailable",
+                ),
+            })?;
+        completion.await.map_err(|_| {
+            HistoryError::new(
+                HistoryErrorKind::WorkerUnavailable,
+                "history owner stopped before completing the attempt observation",
             )
         })
     }

@@ -387,6 +387,7 @@ impl CoordinatorState {
         }
         if let Some(admission) = &self.admission {
             admission.request_cancel();
+            admission.publish_current_generation_status();
         }
         for pending in &self.pending_generations {
             pending.request_cancel();
@@ -456,8 +457,10 @@ impl CoordinatorState {
         let mut admission_released = false;
         if let Some(admission) = &self.admission {
             admission.request_cancel();
+            admission.publish_current_generation_status();
             if Arc::ptr_eq(&admission.operation, expected) {
                 admission.mark_engine_quiescent();
+                admission.publish_current_generation_status();
                 let admission = Arc::clone(admission);
                 admission_released = self.finish_admission_if_resolved(&admission);
             }
@@ -502,6 +505,7 @@ impl CoordinatorState {
         }
         if let Some(admission) = &self.admission {
             admission.request_cancel();
+            admission.publish_current_generation_status();
         }
         for pending in &self.pending_generations {
             pending.request_cancel();

@@ -1173,6 +1173,12 @@ async fn protocol_one_four_rejects_schema_five_replies() {
                 limit: 1,
             },
         ),
+        (
+            "old-get-attempt",
+            loxa_ipc::HistoryCommand::GetAttempt {
+                attempt_id: "00".repeat(16),
+            },
+        ),
     ] {
         let (reply, permit) = connection::execute_request(
             &fixture.coordinator,
@@ -1190,6 +1196,63 @@ async fn protocol_one_four_rejects_schema_five_replies() {
             })
         ));
     }
+
+    wait_for_history_ready(&fixture.coordinator).await;
+    let (client, server) = UnixStream::pair().unwrap();
+    let handler = tokio::spawn(handle_connection(
+        server,
+        fixture.bootstrap.clone(),
+        fixture.coordinator.clone(),
+        Arc::new(Semaphore::new(MAX_SUBSCRIPTIONS)),
+    ));
+    let mut transport = framed(client);
+    let mut hello = Hello::history(
+        super::super::BUILD_ID,
+        fixture.bootstrap.root().root_identity(),
+    );
+    hello.protocol = loxa_ipc::ProtocolVersion::V1_4;
+    send_frame(
+        &mut transport,
+        &ClientEnvelope::Hello(hello),
+        HANDSHAKE_TIMEOUT,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        receive_frame::<ServerEnvelope>(&mut transport, HANDSHAKE_TIMEOUT)
+            .await
+            .unwrap(),
+        ServerEnvelope::HelloAck(_)
+    ));
+    set_frame_limit(&mut transport, MAX_HISTORY_FRAME_BYTES).unwrap();
+    send_frame(
+        &mut transport,
+        &ClientEnvelope::SubscribeGeneration {
+            request_id: "old-observation".into(),
+            target: loxa_ipc::GenerationTarget::Accepted {
+                boot_epoch: fixture.coordinator.boot_epoch().into(),
+                submission_id: "11".repeat(16),
+                operation_generation: "1".into(),
+            },
+            attempt_id: "22".repeat(16),
+        },
+        REQUEST_TIMEOUT,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        receive_frame::<ServerEnvelope>(&mut transport, REQUEST_TIMEOUT)
+            .await
+            .unwrap(),
+        ServerEnvelope::Reply(Reply {
+            outcome: ReplyOutcome::Rejected(loxa_ipc::ServiceError {
+                category: ErrorCategory::IncompatibleProtocol,
+                ..
+            }),
+            ..
+        })
+    ));
+    handler.await.unwrap().unwrap();
 
     let (reply, permit) = connection::execute_request(
         &fixture.coordinator,

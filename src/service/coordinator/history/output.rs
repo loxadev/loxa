@@ -251,6 +251,10 @@ impl GenerationOutput {
 
     pub(in crate::service::coordinator) fn cancel_output_save(&self) {
         self.reservation.cancel_output_save();
+        let state = self.shared.state();
+        if state.admission_is_current(&self.reservation) {
+            self.reservation.publish_current_generation_status();
+        }
     }
 
     pub(in crate::service::coordinator) fn publish_execution(
@@ -273,16 +277,23 @@ impl GenerationOutput {
             .as_mut()
             .filter(|output| !output.closed)
             .ok_or_else(|| conflict("generation execution is no longer active"))?;
-        output.publish_execution(
+        let fact = output.publish_execution(
             &self.reservation,
             proposed,
             failure_code,
             generated_end,
             ExecutionStatistics::Measurements(measurements),
-        )
+        )?;
+        self.reservation.publish_generation_status(output);
+        Ok(fact)
     }
 
     pub(in crate::service::coordinator) fn report_capacity_saturation(&self) {
+        self.reservation.cancel_output_save();
+        let state = self.shared.state();
+        if !state.admission_is_current(&self.reservation) {
+            return;
+        }
         let mut output = self
             .reservation
             .output
@@ -292,8 +303,8 @@ impl GenerationOutput {
             output.status = OutputSavePhase::SaveFailed {
                 saved_end: output.saved_end,
             };
+            self.reservation.publish_generation_status(output);
         }
-        self.reservation.cancel_output_save();
     }
 
     #[cfg(test)]
@@ -407,6 +418,7 @@ impl GenerationOutput {
             output.status = OutputSavePhase::Saving {
                 saved_end: output.saved_end,
             };
+            self.reservation.publish_generation_status(output);
             drop(state);
             intent
         };
@@ -476,6 +488,7 @@ impl GenerationOutput {
                         input.generated_end,
                         ExecutionStatistics::Frozen(statistics),
                     )?;
+                    self.reservation.publish_generation_status(output);
                     if input.generated_end != fact.generated_end {
                         return Err(conflict("final output does not match frozen execution"));
                     }
@@ -504,6 +517,7 @@ impl GenerationOutput {
                 output.status = OutputSavePhase::Saving {
                     saved_end: output.saved_end,
                 };
+                self.reservation.publish_generation_status(output);
                 drop(state);
                 (observer, selected_outcome, intent)
             };
@@ -552,6 +566,10 @@ fn resolve(
     let outcome = intent.outcome.clone();
     let mut terminal = false;
     let mut published = result.clone();
+    let mut state = shared.state();
+    if !state.admission_is_current(&reservation) {
+        return;
+    }
     {
         let mut output = reservation
             .output
@@ -609,17 +627,17 @@ fn resolve(
                 };
             }
         }
+        reservation.publish_generation_status(output);
     }
     drop(intent);
     if terminal {
         reservation.mark_durable_terminal();
-        {
-            let mut state = shared.state();
-            state.finish_admission_if_resolved(&reservation);
-            outcome.send_replace(Some(published));
-        }
+        state.finish_admission_if_resolved(&reservation);
+        outcome.send_replace(Some(published));
+        drop(state);
         maybe_begin_history_drain(&shared);
     } else {
+        drop(state);
         outcome.send_replace(Some(published));
     }
 }

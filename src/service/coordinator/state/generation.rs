@@ -298,6 +298,7 @@ impl CoordinatorState {
             )
         })?;
         let (outcome, _) = watch::channel(None);
+        let (generation_status, _) = watch::channel(None);
         let reservation = Arc::new(AdmissionReservation {
             conversation_id,
             submission_id,
@@ -319,6 +320,7 @@ impl CoordinatorState {
             durable_terminal: AtomicBool::new(false),
             accepted_at: std::sync::OnceLock::new(),
             outcome,
+            generation_status,
             recovery: Mutex::new(AdmissionRecovery::Preparing),
             #[cfg(test)]
             recovery_claims: std::sync::atomic::AtomicU64::new(0),
@@ -370,6 +372,7 @@ impl CoordinatorState {
                     admission.pending_nonce.as_deref() == Some(pending_nonce.as_str())
                 }) {
                     admission.request_cancel();
+                    admission.publish_current_generation_status();
                     self.request_engine_cleanup_if_needed(admission);
                     return Ok(Some(Arc::clone(admission)));
                 }
@@ -396,6 +399,7 @@ impl CoordinatorState {
                     ));
                 }
                 admission.request_cancel();
+                admission.publish_current_generation_status();
                 self.request_engine_cleanup_if_needed(admission);
                 Ok(Some(Arc::clone(admission)))
             }
@@ -408,6 +412,7 @@ impl CoordinatorState {
     ) {
         if self.admission_is_current(expected) {
             expected.request_cancel();
+            expected.publish_current_generation_status();
             self.request_engine_cleanup_if_needed(expected);
         }
     }
@@ -425,6 +430,7 @@ impl CoordinatorState {
             .filter(|admission| Arc::ptr_eq(&admission.operation, expected))
         {
             admission.cancel_with(CancellationCause::EngineFailure);
+            admission.publish_current_generation_status();
         }
         // Fence this operation even if pre-execution persistence releases its
         // reservation before the runtime owner finishes cleanup.
@@ -463,6 +469,7 @@ impl CoordinatorState {
             ));
         }
         expected.begin_execution();
+        expected.publish_current_generation_status();
         Ok(expected.engine.clone())
     }
 
@@ -478,6 +485,7 @@ impl CoordinatorState {
             return false;
         }
         expected.mark_engine_quiescent();
+        expected.publish_current_generation_status();
         self.finish_admission_if_resolved(expected);
         true
     }

@@ -204,24 +204,28 @@ impl Fixture {
     }
 
     async fn finish_stopped(&self) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let owner = *self.coordinator.owner_exit_receiver().borrow();
-            let history = *self.coordinator.history_exit_receiver().borrow();
-            if matches!(owner, OwnerExit::Quiesced | OwnerExit::Failed)
-                && history == HistoryExit::Drained
-            {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "owners did not drain"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        self.coordinator.release_runtime_if_durable();
-        self.coordinator.join_owner().unwrap();
+        finish_stopped_coordinator(&self.coordinator).await;
     }
+}
+
+async fn finish_stopped_coordinator(coordinator: &Coordinator) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let owner = *coordinator.owner_exit_receiver().borrow();
+        let history = *coordinator.history_exit_receiver().borrow();
+        if matches!(owner, OwnerExit::Quiesced | OwnerExit::Failed)
+            && history == HistoryExit::Drained
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "owners did not drain"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    coordinator.release_runtime_if_durable();
+    coordinator.join_owner().unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

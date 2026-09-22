@@ -1294,6 +1294,89 @@ fn retry_targets_only_the_latest_selected_terminal_attempt() {
 }
 
 #[test]
+fn exact_attempt_reads_survive_retry_and_follow_conversation_deletion() {
+    let (_directory, root) = private_root("loxa-history-exact-attempt-");
+    let models = root.join("models");
+    fs::create_dir(&models).unwrap();
+    install_local_manifest(&models, "demo");
+    let (mut connection, _) = open_store(&root).unwrap();
+    let conversation = create_local_conversation(&mut connection, &models);
+    let conversation_id = identity::decode_id(&conversation.id).unwrap();
+    let first = admission::admit_send(
+        &mut connection,
+        &prepared_admission(
+            conversation_id,
+            1,
+            31,
+            31,
+            61,
+            AdmissionKind::Send {
+                user_text: "question".into(),
+                draft: None,
+            },
+        ),
+    )
+    .unwrap();
+    admission::stop_before_execution(&connection, &first).unwrap();
+    let second = admission::admit_retry(
+        &mut connection,
+        &prepared_admission(
+            conversation_id,
+            first.post_conversation_revision,
+            32,
+            32,
+            62,
+            AdmissionKind::Retry {
+                prior_attempt_id: first.attempt_id,
+            },
+        ),
+    )
+    .unwrap();
+    admission::stop_before_execution(&connection, &second).unwrap();
+
+    let first_id = identity::encode_id(first.attempt_id);
+    let first_summary = conversations::execute(
+        &mut connection,
+        &models,
+        RuntimeIdentity::BundledB10344,
+        WireCommand::GetAttempt {
+            attempt_id: first_id.clone(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        first_summary,
+        HistoryReply::Attempt(ref attempt)
+            if attempt.id == first_id && attempt.attempt_number == "1"
+    ));
+
+    conversations::execute(
+        &mut connection,
+        &models,
+        RuntimeIdentity::BundledB10344,
+        WireCommand::DeleteConversation {
+            conversation_id: conversation.id,
+            expected_revision: second.post_conversation_revision.to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        conversations::execute(
+            &mut connection,
+            &models,
+            RuntimeIdentity::BundledB10344,
+            WireCommand::GetAttempt {
+                attempt_id: first_id,
+            },
+        )
+        .unwrap_err()
+        .kind(),
+        HistoryErrorKind::NotFound
+    );
+    connection.close().unwrap();
+}
+
+#[test]
 fn retry_prompt_keeps_the_stored_user_and_excludes_only_the_replaced_assistant() {
     let (_directory, root) = private_root("loxa-history-retry-prompt-");
     let models = root.join("models");

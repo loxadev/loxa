@@ -156,7 +156,7 @@ pub struct AttemptSummary {
 }
 
 impl AttemptSummary {
-    pub(super) fn validate_shape(&self) -> Result<(), &'static str> {
+    pub(crate) fn validate_shape(&self) -> Result<(), &'static str> {
         validate_hex_id(&self.id)?;
         positive_bounded_decimal(
             &self.attempt_number,

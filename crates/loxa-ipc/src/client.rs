@@ -5,9 +5,9 @@ use crate::codec::{
 };
 use crate::protocol::{
     Capability, ClientEnvelope, DraftCommand, DraftReply, ErrorCategory, GenerationCommand,
-    GenerationReply, Hello, HistoryCommand, HistoryReply, HistoryStatus, Reply, Request,
-    ServerEnvelope, ServiceCommand, ServiceError, ServiceSettingsCommand, ServiceSettingsReply,
-    HISTORY_SCHEMA_VERSION,
+    GenerationObservation, GenerationReply, GenerationTarget, Hello, HistoryCommand, HistoryReply,
+    HistoryStatus, Reply, Request, ServerEnvelope, ServiceCommand, ServiceError,
+    ServiceSettingsCommand, ServiceSettingsReply, HISTORY_SCHEMA_VERSION,
 };
 use crate::{peer_credentials, ReplyOutcome};
 use futures_util::{SinkExt, StreamExt};
@@ -437,6 +437,59 @@ impl ServiceClient {
         })
     }
 
+    pub async fn subscribe_generation(
+        &self,
+        mode: ConnectMode,
+        target: GenerationTarget,
+        attempt_id: String,
+    ) -> Result<GenerationSubscription, ClientError> {
+        let mut connection = self
+            .connect_for(mode, ClientContract::GenerationObservation)
+            .await?;
+        if connection.hello.storage_schema != HISTORY_SCHEMA_VERSION
+            || !connection.hello.capabilities.contains(&Capability::History)
+        {
+            return Err(ClientError::Transport(
+                "service generation history is not ready with a supported schema".into(),
+            ));
+        }
+        let request_id = next_request_id();
+        let request = ClientEnvelope::SubscribeGeneration {
+            request_id: request_id.clone(),
+            target: target.clone(),
+            attempt_id: attempt_id.clone(),
+        };
+        request
+            .validate_shape()
+            .map_err(|error| ClientError::Transport(error.into()))?;
+        send_frame(
+            &mut connection.framed,
+            &request,
+            REQUEST_TIMEOUT,
+            connection.frame_limit,
+        )
+        .await?;
+        let initial = observation_from(
+            receive_envelope(
+                &mut connection.framed,
+                REQUEST_TIMEOUT,
+                connection.frame_limit,
+            )
+            .await?,
+            &request_id,
+            &target,
+            &attempt_id,
+        )?;
+        Ok(GenerationSubscription {
+            framed: connection.framed,
+            initial: Some(initial),
+            request_id,
+            target,
+            attempt_id,
+            frame_limit: connection.frame_limit,
+        })
+    }
+
     async fn connect(&self, mode: ConnectMode) -> Result<Connection, ClientError> {
         self.connect_for(mode, ClientContract::Legacy).await
     }
@@ -528,6 +581,10 @@ impl ServiceClient {
                 self.client_build.clone(),
                 self.bootstrap.root().root_identity(),
             ),
+            ClientContract::GenerationObservation => Hello::generation_observation(
+                self.client_build.clone(),
+                self.bootstrap.root().root_identity(),
+            ),
             ClientContract::GenerationRequest => Hello::generation(
                 self.client_build.clone(),
                 self.bootstrap.root().root_identity(),
@@ -554,7 +611,9 @@ impl ServiceClient {
         let hello = match envelope {
             ServerEnvelope::HelloAck(hello) => hello,
             ServerEnvelope::HelloRejected(error) => return Err(ClientError::Rejected(error)),
-            ServerEnvelope::Reply(_) | ServerEnvelope::Snapshot(_) => {
+            ServerEnvelope::Reply(_)
+            | ServerEnvelope::Snapshot(_)
+            | ServerEnvelope::GenerationSnapshot(_) => {
                 return Err(ClientError::Transport(
                     "service replied before the handshake completed".into(),
                 ))
@@ -574,6 +633,11 @@ impl ServiceClient {
                 hello.generation.is_none()
                     && hello.protocol == crate::ProtocolVersion::V1_5
                     && hello.capabilities.contains(&Capability::Settings)
+            }
+            ClientContract::GenerationObservation => {
+                hello.generation.is_none()
+                    && hello.protocol == crate::ProtocolVersion::V1_5
+                    && hello.capabilities.contains(&Capability::History)
             }
             ClientContract::GenerationStatus
             | ClientContract::Legacy
@@ -642,6 +706,35 @@ pub struct ServiceSubscription {
     expected_boot_epoch: String,
     last_revision: u64,
     frame_limit: usize,
+}
+
+pub struct GenerationSubscription {
+    framed: crate::codec::IpcFramed,
+    initial: Option<GenerationObservation>,
+    request_id: String,
+    target: GenerationTarget,
+    attempt_id: String,
+    frame_limit: usize,
+}
+
+impl GenerationSubscription {
+    pub async fn next_observation(&mut self) -> Result<GenerationObservation, ClientError> {
+        if let Some(initial) = self.initial.take() {
+            return Ok(initial);
+        }
+        let frame = self
+            .framed
+            .next()
+            .await
+            .ok_or_else(|| ClientError::Transport("service closed the generation stream".into()))?
+            .map_err(|error| ClientError::Transport(error.to_string()))?;
+        observation_from(
+            decode_envelope(&frame, self.frame_limit)?,
+            &self.request_id,
+            &self.target,
+            &self.attempt_id,
+        )
+    }
 }
 
 impl ServiceSubscription {
@@ -754,6 +847,7 @@ enum ClientContract {
     GenerationRetry,
     GenerationControl,
     GenerationStatus,
+    GenerationObservation,
 }
 
 async fn send_frame<T: serde::Serialize>(
@@ -806,6 +900,38 @@ fn snapshot_from(envelope: ServerEnvelope) -> Result<crate::RuntimeStatus, Clien
         ));
     };
     Ok(status)
+}
+
+fn observation_from(
+    envelope: ServerEnvelope,
+    request_id: &str,
+    target: &GenerationTarget,
+    attempt_id: &str,
+) -> Result<GenerationObservation, ClientError> {
+    let observation = match envelope {
+        ServerEnvelope::GenerationSnapshot(observation) => observation,
+        ServerEnvelope::Reply(Reply {
+            request_id: response_id,
+            outcome: ReplyOutcome::Rejected(error),
+        }) if response_id == request_id => return Err(ClientError::Rejected(error)),
+        _ => {
+            return Err(ClientError::Transport(
+                "service returned an unexpected generation observation envelope".into(),
+            ))
+        }
+    };
+    let matches = match &observation {
+        GenerationObservation::Live { status } => {
+            &status.target == target && status.attempt_id == attempt_id
+        }
+        GenerationObservation::Durable { attempt } => attempt.id == attempt_id,
+    };
+    if !matches {
+        return Err(ClientError::Transport(
+            "service returned a different generation observation".into(),
+        ));
+    }
+    Ok(observation)
 }
 
 fn validate_socket_path(path: &Path) -> Result<(), ClientError> {
@@ -1105,6 +1231,78 @@ mod tests {
         assert!(matches!(
             validate_reload_target(&retiring, "replacement"),
             Err(ClientError::Transport(message)) if message.contains("boot epoch changed")
+        ));
+    }
+
+    #[test]
+    fn generation_observation_accepts_only_the_requested_attempt_and_target() {
+        let target = GenerationTarget::Accepted {
+            boot_epoch: "boot".into(),
+            submission_id: "11".repeat(16),
+            operation_generation: "2".into(),
+        };
+        let attempt_id = "22".repeat(16);
+        let live = |target: GenerationTarget, attempt_id: String| {
+            ServerEnvelope::GenerationSnapshot(GenerationObservation::Live {
+                status: crate::GenerationStatus {
+                    target,
+                    attempt_id,
+                    execution: crate::GenerationExecutionPhase::Working,
+                    save: crate::GenerationSavePhase::Open,
+                    saved_end: "0".into(),
+                    generated_end: None,
+                    terminal_saved_end: None,
+                    failure_code: None,
+                },
+            })
+        };
+
+        assert!(observation_from(
+            live(target.clone(), attempt_id.clone()),
+            "observe",
+            &target,
+            &attempt_id,
+        )
+        .is_ok());
+        assert!(matches!(
+            observation_from(
+                live(target.clone(), "33".repeat(16)),
+                "observe",
+                &target,
+                &attempt_id,
+            ),
+            Err(ClientError::Transport(message))
+                if message.contains("different generation observation")
+        ));
+        let mut different_target = target.clone();
+        let GenerationTarget::Accepted { submission_id, .. } = &mut different_target else {
+            unreachable!()
+        };
+        *submission_id = "44".repeat(16);
+        assert!(observation_from(
+            live(different_target, attempt_id.clone()),
+            "observe",
+            &target,
+            &attempt_id,
+        )
+        .is_err());
+        assert!(matches!(
+            observation_from(
+                ServerEnvelope::Reply(Reply {
+                    request_id: "observe".into(),
+                    outcome: ReplyOutcome::Rejected(ServiceError::new(
+                        ErrorCategory::NotFound,
+                        "attempt was not found",
+                    )),
+                }),
+                "observe",
+                &target,
+                &attempt_id,
+            ),
+            Err(ClientError::Rejected(ServiceError {
+                category: ErrorCategory::NotFound,
+                ..
+            }))
         ));
     }
 

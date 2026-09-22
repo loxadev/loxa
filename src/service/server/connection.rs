@@ -16,6 +16,25 @@ use super::{
     OVERLOAD_HANDSHAKE_TIMEOUT, OVERLOAD_REPLY_TIMEOUT, OVERLOAD_REQUEST_TIMEOUT, REQUEST_TIMEOUT,
 };
 
+mod observation;
+
+#[cfg(test)]
+pub(in crate::service) async fn stream_generation_observation_for_test(
+    transport: loxa_ipc::IpcFramed,
+    coordinator: &Coordinator,
+    target: loxa_ipc::GenerationTarget,
+    attempt_id: String,
+) -> Result<(), String> {
+    observation::stream(
+        transport,
+        coordinator,
+        "observation-test".into(),
+        target,
+        attempt_id,
+    )
+    .await
+}
+
 pub(super) async fn classify_overload_connection(
     stream: UnixStream,
     bootstrap: ClientBootstrap,
@@ -194,6 +213,63 @@ pub(super) async fn handle_connection(
                 .map_err(|_| "service subscription capacity is full".to_string())?;
             stream_snapshots(transport, &coordinator).await?;
         }
+        ClientEnvelope::SubscribeGeneration {
+            request_id,
+            target,
+            attempt_id,
+        } => {
+            let _subscription = subscriptions
+                .try_acquire_owned()
+                .map_err(|_| "service subscription capacity is full".to_string())?;
+            if negotiated.protocol.minor < 5 {
+                send_frame_with_limit(
+                    &mut transport,
+                    &ServerEnvelope::Reply(Reply {
+                        request_id,
+                        outcome: ReplyOutcome::Rejected(ServiceError::new(
+                            ErrorCategory::IncompatibleProtocol,
+                            "generation observation requires service protocol 1.5",
+                        )),
+                    }),
+                    REQUEST_TIMEOUT,
+                    frame_limit,
+                )
+                .await?;
+            } else if negotiated.generation.is_some() {
+                send_frame_with_limit(
+                    &mut transport,
+                    &ServerEnvelope::Reply(Reply {
+                        request_id,
+                        outcome: ReplyOutcome::Rejected(ServiceError::new(
+                            ErrorCategory::InvalidRequest,
+                            "generation observation requires an ordinary history connection",
+                        )),
+                    }),
+                    REQUEST_TIMEOUT,
+                    frame_limit,
+                )
+                .await?;
+            } else if !negotiated.capabilities.contains(&Capability::History)
+                || negotiated.storage_schema != HISTORY_SCHEMA_VERSION
+            {
+                send_frame_with_limit(
+                    &mut transport,
+                    &ServerEnvelope::Reply(Reply {
+                        request_id,
+                        outcome: ReplyOutcome::Rejected(ServiceError::new(
+                            ErrorCategory::ServiceUnavailable,
+                            "service generation history is not ready",
+                        )),
+                    }),
+                    REQUEST_TIMEOUT,
+                    frame_limit,
+                )
+                .await?;
+            } else {
+                observation::stream(transport, &coordinator, request_id, target, attempt_id)
+                    .await?;
+            }
+        }
         ClientEnvelope::Hello(_) => {
             return Err("service received a second hello envelope".into());
         }
@@ -359,10 +435,11 @@ pub(super) async fn execute_request(
             "history status requires service protocol 1.5",
         )),
         ServiceCommand::History {
-            command: loxa_ipc::HistoryCommand::ListTurns { .. },
+            command:
+                loxa_ipc::HistoryCommand::ListTurns { .. } | loxa_ipc::HistoryCommand::GetAttempt { .. },
         } if negotiated.protocol.minor < 5 => ReplyOutcome::Rejected(ServiceError::new(
             ErrorCategory::IncompatibleProtocol,
-            "attempt settings require service protocol 1.5",
+            "attempt metadata requires service protocol 1.5",
         )),
         ServiceCommand::History { command }
             if command.requires_ready_history()

@@ -15,7 +15,8 @@ pub use bootstrap::{
     ENGINE_SOCKET_NONCE_BYTES,
 };
 pub use client::{
-    ClientError, ConnectMode, PendingGenerationRequest, ServiceClient, ServiceSubscription,
+    ClientError, ConnectMode, GenerationSubscription, PendingGenerationRequest, ServiceClient,
+    ServiceSubscription,
 };
 pub use codec::{
     decode, decode_with_limit, encode, encode_with_limit, framed, set_frame_limit, IpcFramed,
@@ -28,15 +29,15 @@ pub use protocol::{
     ConversationProfile, ConversationSummary, DiagnosticsStatus, DraftCommand, DraftReply,
     DraftSnapshot, EffectiveSamplingSettings, EngineDecodeRate, ErrorCategory, GenerationAccepted,
     GenerationCommand, GenerationConnection, GenerationDraft, GenerationExecutionPhase,
-    GenerationHello, GenerationHelloAck, GenerationReply, GenerationSavePhase, GenerationSettings,
-    GenerationSettingsPatch, GenerationStatus, GenerationTarget, Hello, HelloAck, HistoryCommand,
-    HistoryPhase, HistoryReply, HistoryStatus, OperationTarget, OptionalSamplingValuePatch,
-    OptionalU16Patch, OptionalU32Patch, ProtocolVersion, Reply, ReplyOutcome, Request,
-    RuntimePhase, RuntimeStatus, SamplingValue, ServerEnvelope, ServiceCommand, ServiceError,
-    ServiceSettings, ServiceSettingsApplication, ServiceSettingsCommand, ServiceSettingsDurability,
-    ServiceSettingsPatch, ServiceSettingsReply, ServiceStatus, TurnCursor, TurnPage, TurnSummary,
-    HISTORY_SCHEMA_VERSION, MAX_CONTENT_RANGE_BYTES, MAX_CONVERSATION_PAGE_BYTES,
-    MAX_CONVERSATION_PAGE_ITEMS, MAX_CONVERSATION_TITLE_BYTES, MAX_DRAFT_TEXT_BYTES,
-    MAX_GENERATION_USER_TEXT_BYTES, MAX_TURN_PAGE_BYTES, MAX_TURN_PAGE_ITEMS, PROTOCOL_MAJOR,
-    PROTOCOL_MINOR,
+    GenerationHello, GenerationHelloAck, GenerationObservation, GenerationReply,
+    GenerationSavePhase, GenerationSettings, GenerationSettingsPatch, GenerationStatus,
+    GenerationTarget, Hello, HelloAck, HistoryCommand, HistoryPhase, HistoryReply, HistoryStatus,
+    OperationTarget, OptionalSamplingValuePatch, OptionalU16Patch, OptionalU32Patch,
+    ProtocolVersion, Reply, ReplyOutcome, Request, RuntimePhase, RuntimeStatus, SamplingValue,
+    ServerEnvelope, ServiceCommand, ServiceError, ServiceSettings, ServiceSettingsApplication,
+    ServiceSettingsCommand, ServiceSettingsDurability, ServiceSettingsPatch, ServiceSettingsReply,
+    ServiceStatus, TurnCursor, TurnPage, TurnSummary, HISTORY_SCHEMA_VERSION,
+    MAX_CONTENT_RANGE_BYTES, MAX_CONVERSATION_PAGE_BYTES, MAX_CONVERSATION_PAGE_ITEMS,
+    MAX_CONVERSATION_TITLE_BYTES, MAX_DRAFT_TEXT_BYTES, MAX_GENERATION_USER_TEXT_BYTES,
+    MAX_TURN_PAGE_BYTES, MAX_TURN_PAGE_ITEMS, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };

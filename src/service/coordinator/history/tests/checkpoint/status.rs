@@ -1,5 +1,306 @@
 use super::*;
+use futures_util::StreamExt;
 use loxa_ipc::{GenerationExecutionPhase as Execution, GenerationSavePhase as Save};
+use tokio::net::UnixStream;
+
+#[tokio::test(flavor = "current_thread")]
+async fn metadata_watch_coalesces_terminal_release_without_retaining_output() {
+    let fixture = Fixture::start().await;
+    let committed = wait_for_admission(
+        fixture
+            .coordinator
+            .admit_history_generation(fixture.input(40, "observe exact attempt"))
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let output = fixture.coordinator.generation_output(&committed).unwrap();
+    let reservation = fixture
+        .coordinator
+        .shared
+        .state()
+        .current_admission()
+        .unwrap();
+    let weak = Arc::downgrade(&reservation);
+    let target = GenerationTarget::Accepted {
+        boot_epoch: committed.owner_epoch.clone(),
+        submission_id: crate::history::encode_id(committed.submission_id),
+        operation_generation: committed.operation_generation.to_string(),
+    };
+    let attempt_id = crate::history::encode_id(committed.attempt_id);
+    let mut statuses = fixture
+        .coordinator
+        .subscribe_generation_status(&target, &attempt_id)
+        .unwrap()
+        .unwrap();
+    let initial = statuses.borrow_and_update().clone().unwrap();
+    assert_eq!(initial.execution, Execution::Working);
+    assert_eq!(initial.save, Save::Open);
+
+    let terminal = output
+        .finalize(Arc::new(final_input(
+            &committed,
+            0,
+            "",
+            ExecutionOutcome::Stopped,
+        )))
+        .unwrap();
+    wait_for_output(terminal).await.unwrap();
+    assert!(!fixture.coordinator.admission_active_for_test());
+    let final_status = statuses.borrow_and_update().clone().unwrap();
+    assert_eq!(final_status.execution, Execution::Stopped);
+    assert_eq!(final_status.save, Save::Saved);
+    assert_eq!(final_status.terminal_saved_end.as_deref(), Some("0"));
+
+    drop(output);
+    drop(reservation);
+    assert!(weak.upgrade().is_none());
+    assert_eq!(statuses.borrow().as_ref(), Some(&final_status));
+    let mut old_boot = target.clone();
+    let GenerationTarget::Accepted { boot_epoch, .. } = &mut old_boot else {
+        unreachable!()
+    };
+    *boot_epoch = "old-service-boot".into();
+    assert!(fixture
+        .coordinator
+        .subscribe_generation_status(&old_boot, &attempt_id)
+        .unwrap()
+        .is_none());
+    let (durable, permit) = fixture
+        .coordinator
+        .history(HistoryCommand::GetAttempt {
+            attempt_id: attempt_id.clone(),
+        })
+        .await;
+    drop(permit);
+    assert!(matches!(
+        durable.unwrap(),
+        HistoryReply::Attempt(attempt) if attempt.id == attempt_id
+    ));
+    fixture.coordinator.stop_service().unwrap();
+    fixture.finish_stopped().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn socket_observation_binds_durable_attempt_to_its_exact_generation_owner() {
+    let fixture = Fixture::start().await;
+    let first = wait_for_admission(
+        fixture
+            .coordinator
+            .admit_history_generation(fixture.input(43, "first observed attempt"))
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let first_output = fixture.coordinator.generation_output(&first).unwrap();
+    let first_target = accepted_target(&first);
+    let first_attempt = crate::history::encode_id(first.attempt_id);
+    let (mut live, live_task) = observation_socket(
+        fixture.coordinator.clone(),
+        first_target.clone(),
+        first_attempt.clone(),
+    );
+    assert!(matches!(
+        receive_observation(&mut live).await,
+        loxa_ipc::ServerEnvelope::GenerationSnapshot(
+            loxa_ipc::GenerationObservation::Live { status }
+        ) if status.execution == Execution::Working && status.save == Save::Open
+    ));
+
+    let terminal = first_output
+        .finalize(Arc::new(final_input(
+            &first,
+            0,
+            "",
+            ExecutionOutcome::Stopped,
+        )))
+        .unwrap();
+    wait_for_output(terminal).await.unwrap();
+    receive_terminal_live(&mut live, &first_target, &first_attempt).await;
+    assert!(matches!(
+        receive_observation(&mut live).await,
+        loxa_ipc::ServerEnvelope::GenerationSnapshot(
+            loxa_ipc::GenerationObservation::Durable { attempt }
+        ) if attempt.id == first_attempt
+    ));
+    live_task.await.unwrap().unwrap();
+    assert!(tokio::time::timeout(Duration::from_secs(1), live.next())
+        .await
+        .unwrap()
+        .is_none());
+
+    let mut second_input = fixture.input(44, "second observed attempt");
+    second_input.expected_conversation_revision = first.post_conversation_revision;
+    second_input.expected_profile_revision = first.profile_revision;
+    let second = wait_for_admission(
+        fixture
+            .coordinator
+            .admit_history_generation(second_input)
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let second_output = fixture.coordinator.generation_output(&second).unwrap();
+    let second_target = accepted_target(&second);
+    let second_attempt = crate::history::encode_id(second.attempt_id);
+    let terminal = second_output
+        .finalize(Arc::new(final_input(
+            &second,
+            0,
+            "",
+            ExecutionOutcome::Stopped,
+        )))
+        .unwrap();
+    wait_for_output(terminal).await.unwrap();
+
+    let (mut mismatched, mismatched_task) = observation_socket(
+        fixture.coordinator.clone(),
+        first_target,
+        second_attempt.clone(),
+    );
+    assert!(matches!(
+        receive_observation(&mut mismatched).await,
+        loxa_ipc::ServerEnvelope::Reply(loxa_ipc::Reply {
+            outcome: loxa_ipc::ReplyOutcome::Rejected(loxa_ipc::ServiceError {
+                category: ErrorCategory::NotFound,
+                ..
+            }),
+            ..
+        })
+    ));
+    mismatched_task.await.unwrap().unwrap();
+
+    fixture.coordinator.stop_service().unwrap();
+    fixture.finish_stopped().await;
+
+    let bootstrap = loxa_ipc::ClientBootstrap::load(&fixture.root, None).unwrap();
+    let paths = crate::paths::AppPaths::from_values(Some(&fixture.root), None).unwrap();
+    let ownership = crate::runtime::RuntimeOwnership::acquire_service_unreconciled(&paths.run)
+        .unwrap_or_else(|_| panic!("reacquire runtime ownership for observation reopen"));
+    let reopened = Coordinator::start(
+        paths,
+        bootstrap.root().control_dir().to_owned(),
+        bootstrap.root().root_identity().to_owned(),
+        "test-machine-boot".into(),
+        "replacement-service-boot".into(),
+        ownership,
+        tokio::runtime::Handle::current(),
+        None,
+        None,
+    )
+    .unwrap();
+    wait_for_history_ready(&reopened).await;
+    let (mut old_boot, old_boot_task) =
+        observation_socket(reopened.clone(), second_target, second_attempt.clone());
+    assert!(matches!(
+        receive_observation(&mut old_boot).await,
+        loxa_ipc::ServerEnvelope::GenerationSnapshot(
+            loxa_ipc::GenerationObservation::Durable { attempt }
+        ) if attempt.id == second_attempt
+    ));
+    old_boot_task.await.unwrap().unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), old_boot.next())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    reopened.stop_service().unwrap();
+    finish_stopped_coordinator(&reopened).await;
+}
+
+fn accepted_target(committed: &CommittedAdmission) -> GenerationTarget {
+    GenerationTarget::Accepted {
+        boot_epoch: committed.owner_epoch.clone(),
+        submission_id: crate::history::encode_id(committed.submission_id),
+        operation_generation: committed.operation_generation.to_string(),
+    }
+}
+
+fn observation_socket(
+    coordinator: Coordinator,
+    target: GenerationTarget,
+    attempt_id: String,
+) -> (
+    loxa_ipc::IpcFramed,
+    tokio::task::JoinHandle<Result<(), String>>,
+) {
+    let (client, server) = UnixStream::pair().unwrap();
+    let task = tokio::spawn(async move {
+        crate::service::server::stream_generation_observation_for_test(
+            loxa_ipc::framed(server),
+            &coordinator,
+            target,
+            attempt_id,
+        )
+        .await
+    });
+    (loxa_ipc::framed(client), task)
+}
+
+async fn receive_observation(transport: &mut loxa_ipc::IpcFramed) -> loxa_ipc::ServerEnvelope {
+    let frame = tokio::time::timeout(Duration::from_secs(1), transport.next())
+        .await
+        .expect("observation response timed out")
+        .expect("observation transport closed")
+        .expect("observation frame failed");
+    loxa_ipc::decode_with_limit(&frame, loxa_ipc::MAX_HISTORY_FRAME_BYTES)
+        .expect("observation response was invalid")
+}
+
+async fn receive_terminal_live(
+    transport: &mut loxa_ipc::IpcFramed,
+    target: &GenerationTarget,
+    attempt_id: &str,
+) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let mut saved_end = 0_u64;
+        loop {
+            let frame = transport
+                .next()
+                .await
+                .expect("observation transport closed before terminal status")
+                .expect("terminal observation frame failed");
+            let envelope: loxa_ipc::ServerEnvelope =
+                loxa_ipc::decode_with_limit(&frame, loxa_ipc::MAX_HISTORY_FRAME_BYTES)
+                    .expect("terminal observation response was invalid");
+            let loxa_ipc::ServerEnvelope::GenerationSnapshot(
+                loxa_ipc::GenerationObservation::Live { status },
+            ) = envelope
+            else {
+                panic!("expected a live terminal observation")
+            };
+            assert_eq!(&status.target, target);
+            assert_eq!(status.attempt_id, attempt_id);
+            assert_eq!(status.execution, Execution::Stopped);
+            assert!(matches!(status.save, Save::Saving | Save::Saved));
+            let current_saved_end = status.saved_end.parse::<u64>().unwrap();
+            assert!(current_saved_end >= saved_end);
+            saved_end = current_saved_end;
+            let generated_end = status
+                .generated_end
+                .as_deref()
+                .map(str::parse::<u64>)
+                .transpose()
+                .unwrap();
+            assert!(generated_end.is_none_or(|end| end >= saved_end));
+            if status.save == Save::Saved {
+                assert_eq!(generated_end, Some(saved_end));
+                assert_eq!(
+                    status.terminal_saved_end.as_deref(),
+                    Some(status.saved_end.as_str())
+                );
+                return;
+            }
+            assert_eq!(status.terminal_saved_end, None);
+        }
+    })
+    .await
+    .expect("terminal observation timed out");
+}
 
 #[tokio::test(flavor = "current_thread")]
 async fn terminal_suffix_rolls_back_with_terminal_metadata_before_exact_retry() {

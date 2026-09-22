@@ -66,6 +66,9 @@ pub(super) fn execute_with_generation(
             limit,
         } => super::reads::list_turns(connection, &conversation_id, cursor, limit)
             .map(HistoryReply::TurnPage),
+        HistoryCommand::GetAttempt { attempt_id } => {
+            super::reads::get_attempt(connection, &attempt_id).map(HistoryReply::Attempt)
+        }
         HistoryCommand::ReadContentRange {
             source,
             start,

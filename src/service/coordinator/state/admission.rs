@@ -1,7 +1,7 @@
 use super::{CancellationCause, EngineDescriptor};
 use crate::service::coordinator::history::OutputState;
 use crate::service::coordinator::OperationControl;
-use loxa_ipc::ServiceError;
+use loxa_ipc::{GenerationStatus, ServiceError};
 use std::sync::atomic::AtomicBool;
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,6 +29,7 @@ pub(in crate::service::coordinator) struct AdmissionReservation {
     pub(super) accepted_at: OnceLock<Instant>,
     pub(super) outcome:
         watch::Sender<Option<Result<crate::history::CommittedAdmission, ServiceError>>>,
+    pub(super) generation_status: watch::Sender<Option<GenerationStatus>>,
     pub(super) recovery: Mutex<AdmissionRecovery>,
     #[cfg(test)]
     pub(in crate::service::coordinator) recovery_claims: AtomicU64,
@@ -78,6 +79,27 @@ impl AdmissionReservation {
         outcome: Result<crate::history::CommittedAdmission, ServiceError>,
     ) {
         self.outcome.send_replace(Some(outcome));
+    }
+
+    pub(in crate::service::coordinator) fn subscribe_generation_status(
+        &self,
+    ) -> watch::Receiver<Option<GenerationStatus>> {
+        self.generation_status.subscribe()
+    }
+
+    pub(in crate::service::coordinator) fn publish_generation_status(&self, output: &OutputState) {
+        self.generation_status
+            .send_replace(Some(output.status_snapshot(self)));
+    }
+
+    pub(in crate::service::coordinator) fn publish_current_generation_status(&self) {
+        let output = self
+            .output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(output) = output.as_ref() {
+            self.publish_generation_status(output);
+        }
     }
 
     pub(in crate::service::coordinator) fn retain_prepared(
@@ -186,7 +208,9 @@ impl AdmissionReservation {
         {
             return false;
         }
-        *output = Some(OutputState::new(committed));
+        let installed = OutputState::new(committed);
+        self.publish_generation_status(&installed);
+        *output = Some(installed);
         *recovery = AdmissionRecovery::OutputOwned;
         true
     }
