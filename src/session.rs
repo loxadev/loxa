@@ -2,7 +2,6 @@ use crate::chat::{Event, Message, PromptProgress, Role, Timing, Worker};
 use crate::runner::ForegroundServer;
 use crate::runtime::AttachedRuntime;
 use crate::ui;
-use loxa_ipc::{OperationTarget, ServiceClient};
 use rustyline::completion::Completer;
 use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
@@ -15,8 +14,10 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 mod runtime;
+mod saved;
 
 pub(crate) use runtime::{route_chat, ChatRoute};
+pub(crate) use saved::run_service;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const SLASH_COMMANDS: [(&str, &str); 3] = [
@@ -25,18 +26,24 @@ const SLASH_COMMANDS: [(&str, &str); 3] = [
     ("/exit", "Exit chat"),
 ];
 
-fn slash_suggestions(input: &str) -> Vec<&'static str> {
+fn slash_suggestions(
+    commands: &'static [(&'static str, &'static str)],
+    input: &str,
+) -> Vec<String> {
     if !input.starts_with('/') {
         return Vec::new();
     }
-    SLASH_COMMANDS
+    commands
         .iter()
         .map(|(command, _)| *command)
         .filter(|command| command.starts_with(input))
+        .map(str::to_owned)
         .collect()
 }
 
-struct ChatHelper;
+struct ChatHelper {
+    commands: &'static [(&'static str, &'static str)],
+}
 
 struct CommandHint;
 
@@ -60,13 +67,7 @@ impl Completer for ChatHelper {
         _context: &Context<'_>,
     ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
         let input = &line[..pos];
-        Ok((
-            0,
-            slash_suggestions(input)
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
-        ))
+        Ok((0, slash_suggestions(self.commands, input)))
     }
 }
 
@@ -159,18 +160,22 @@ enum InputEvent {
     Error(String),
 }
 
-fn chat_config() -> Config {
+fn chat_config(enable_signals: bool) -> Config {
     Config::builder()
         .completion_type(CompletionType::List)
         .completion_show_all_if_ambiguous(true)
         .bracketed_paste(true)
-        .enable_signals(true)
+        .enable_signals(enable_signals)
         .build()
 }
 
-fn new_editor() -> Result<ChatEditor, String> {
-    let mut editor = Editor::with_config(chat_config()).map_err(|error| error.to_string())?;
-    editor.set_helper(Some(ChatHelper));
+fn new_editor(
+    commands: &'static [(&'static str, &'static str)],
+    enable_signals: bool,
+) -> Result<ChatEditor, String> {
+    let mut editor =
+        Editor::with_config(chat_config(enable_signals)).map_err(|error| error.to_string())?;
+    editor.set_helper(Some(ChatHelper { commands }));
     Ok(editor)
 }
 
@@ -288,34 +293,12 @@ pub(crate) fn run_attached(attached: AttachedRuntime, max_tokens: u32) -> Result
     run_runtime(runtime::ChatRuntime::attached(attached), max_tokens)
 }
 
-pub(crate) fn run_service(
-    client: ServiceClient,
-    model_id: String,
-    target: OperationTarget,
-    max_tokens: u32,
-) -> Result<i32, String> {
-    let runtime = runtime::ChatRuntime::service(model_id, client.clone(), target.clone())?;
-    runtime::with_runtime_teardown(runtime, |runtime| {
-        let mut editor = new_editor()?;
-        let mut output = std::io::stdout();
-        run_session_loop(
-            runtime,
-            max_tokens,
-            || prompt_input(&mut editor),
-            &mut output,
-            move |model, messages, max_tokens| {
-                Worker::start_service(client.clone(), target.clone(), model, messages, max_tokens)
-            },
-        )
-    })
-}
-
 fn run_runtime(runtime: runtime::ChatRuntime, max_tokens: u32) -> Result<i32, String> {
     runtime::with_runtime_teardown(runtime, |runtime| run_session(runtime, max_tokens))
 }
 
 fn run_session(runtime: &mut runtime::ChatRuntime, max_tokens: u32) -> Result<i32, String> {
-    let mut editor = new_editor()?;
+    let mut editor = new_editor(&SLASH_COMMANDS, true)?;
     let mut output = std::io::stdout();
     let port = runtime.port()?;
     run_session_loop(
@@ -600,9 +583,12 @@ mod tests {
 
     #[test]
     fn slash_prefix_shows_matching_commands() {
-        assert_eq!(slash_suggestions("/"), ["/clear", "/help", "/exit"]);
-        assert_eq!(slash_suggestions("/c"), ["/clear"]);
-        assert!(slash_suggestions("hello").is_empty());
+        assert_eq!(
+            slash_suggestions(&super::SLASH_COMMANDS, "/"),
+            ["/clear", "/help", "/exit"]
+        );
+        assert_eq!(slash_suggestions(&super::SLASH_COMMANDS, "/c"), ["/clear"]);
+        assert!(slash_suggestions(&super::SLASH_COMMANDS, "hello").is_empty());
     }
 
     #[test]
@@ -610,7 +596,10 @@ mod tests {
         let history = DefaultHistory::new();
         let context = Context::new(&history);
 
-        let (start, candidates) = ChatHelper.complete("/c", 2, &context).unwrap();
+        let helper = ChatHelper {
+            commands: &super::SLASH_COMMANDS,
+        };
+        let (start, candidates) = helper.complete("/c", 2, &context).unwrap();
 
         assert_eq!(start, 0);
         assert_eq!(candidates, ["/clear"]);
@@ -623,7 +612,10 @@ mod tests {
         let history = DefaultHistory::new();
         let context = Context::new(&history);
 
-        let hint = ChatHelper.hint("/", 1, &context).unwrap();
+        let helper = ChatHelper {
+            commands: &super::SLASH_COMMANDS,
+        };
+        let hint = helper.hint("/", 1, &context).unwrap();
 
         assert_eq!(hint.display(), "  (Tab for commands)");
         assert_eq!(hint.completion(), None);
@@ -631,7 +623,7 @@ mod tests {
 
     #[test]
     fn chat_editor_keeps_session_history_and_accepts_bracketed_paste() {
-        let mut editor = super::new_editor().unwrap();
+        let mut editor = super::new_editor(&super::SLASH_COMMANDS, true).unwrap();
 
         editor.add_history_entry("first").unwrap();
         editor.add_history_entry("second").unwrap();
@@ -646,7 +638,7 @@ mod tests {
             .get(1, rustyline::history::SearchDirection::Forward)
             .is_ok());
 
-        let config = chat_config();
+        let config = chat_config(true);
         assert!(config.enable_bracketed_paste());
         assert!(config.completion_show_all_if_ambiguous());
     }

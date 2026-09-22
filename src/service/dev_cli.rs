@@ -27,6 +27,7 @@ pub(crate) fn run(args: ServiceDevArgs) -> Result<i32, String> {
         let client = runtime.block_on(development_client(&args.data_root))?;
         let target = target_from_args(target)
             .ok_or_else(|| "service chat requires an exact copied service target".to_string())?;
+        drop(runtime);
         return crate::session::run_service(client, model_id.clone(), target, *max_tokens);
     }
     let outcome = runtime.block_on(execute(args))?;

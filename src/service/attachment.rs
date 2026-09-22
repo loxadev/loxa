@@ -24,30 +24,6 @@ pub(crate) async fn validate_target(
         .map(|_| ())
 }
 
-pub(crate) async fn chat(
-    client: &ServiceClient,
-    target: &OperationTarget,
-    model: &str,
-    body: Vec<u8>,
-    mut consume: impl FnMut(&[u8]) -> Result<bool, String>,
-) -> Result<(), String> {
-    transfer(
-        client,
-        Some(model),
-        Some(target),
-        Method::POST,
-        "/v1/chat/completions",
-        body,
-        |status, data| {
-            if !status.is_success() {
-                return Err(format!("service engine returned HTTP {status}"));
-            }
-            consume(data)
-        },
-    )
-    .await
-}
-
 pub(super) async fn api(
     client: &ServiceClient,
     model_id: Option<&str>,
