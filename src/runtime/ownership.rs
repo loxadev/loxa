@@ -82,7 +82,7 @@ impl RuntimeOwnership {
     pub(crate) fn acquire_service_unreconciled(
         run_dir: &Path,
     ) -> Result<Self, RuntimeOwnershipAcquireError> {
-        Self::acquire_unreconciled_with_lock(run_dir, ForegroundLock::acquire)
+        Self::acquire_unreconciled_with_lock(run_dir, ForegroundLock::acquire_service)
     }
 
     #[cfg(all(test, unix))]
@@ -254,6 +254,22 @@ impl RuntimeOwnership {
 }
 
 impl RuntimeChildOwnership {
+    pub(crate) fn duplicate_common_lock_for_service_child(&self) -> Result<fs::File, String> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| "runtime ownership state lock is poisoned".to_string())?;
+        #[cfg(unix)]
+        {
+            inner._foreground_lock.duplicate_for_service_child()
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = inner;
+            Err("service runtime requires an open-file-description foreground lock".into())
+        }
+    }
+
     pub(crate) fn clear_preserving_prepared_stage(
         &mut self,
         prepared: &crate::runtime_bundle::PreparedRuntime,

@@ -43,6 +43,9 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+mod service_locks;
+
 #[cfg(not(unix))]
 #[test]
 fn bundled_runtime_is_a_closed_refusal_on_non_unix_targets() {
@@ -227,7 +230,10 @@ fn bundled_service_unload_preserves_stage_for_reload() {
         None,
     )
     .unwrap();
-    let ownership = crate::runtime::RuntimeOwnership::acquire(&paths.run).unwrap();
+    let ownership = crate::runtime::RuntimeOwnership::acquire_service_unreconciled(&paths.run)
+        .unwrap_or_else(|_| panic!("service ownership requires an OFD lock"));
+    let model_lock_dir = root.path().join("models/service-lock-test");
+    let mut model_lock = crate::catalog::ModelLock::acquire(&model_lock_dir).unwrap();
     let runtime = validate_managed_runtime(&paths).unwrap();
     let stage = runtime
         .execution_server()
@@ -260,13 +266,18 @@ fn bundled_service_unload_preserves_stage_for_reload() {
             policy: LaunchPolicy::Service,
         };
         let endpoint = paths.run.join(format!("engine-{generation}.sock"));
+        let child_ownership = ownership.reserve_child().unwrap();
+        let common_lock = child_ownership
+            .duplicate_common_lock_for_service_child()
+            .unwrap();
+        let selected_model_lock = model_lock.duplicate_for_service_child().unwrap();
         let mut server = match OwnedServer::start_with_service_ownership(
             &launch,
             &fingerprint,
             &endpoint,
             reactor.handle(),
             Duration::from_secs(30),
-            ownership.reserve_child().unwrap(),
+            (child_ownership, common_lock, selected_model_lock),
             &|| false,
         )
         .unwrap()

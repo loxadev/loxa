@@ -9,6 +9,7 @@ use crate::runner::output::{spawn_output_reader, MAX_PENDING_ANNOUNCEMENTS};
 #[cfg(unix)]
 use crate::runner::service_transport::require_absent_unix_endpoint;
 use crate::runner::signal::{clear_server_starting, mark_server_starting};
+use std::fs::File;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::AtomicBool;
@@ -63,6 +64,7 @@ impl OwnedServer {
             )),
             PersistentSignalPolicy::ForegroundExit,
             StartupEndpoint::Tcp,
+            None,
             || signal().map(StartupStop::Signal),
         )
     }
@@ -87,6 +89,7 @@ impl OwnedServer {
             )),
             signal_policy,
             StartupEndpoint::Tcp,
+            None,
             || cancelled().then_some(StartupStop::Interrupted(StartupInterruption::Cancelled)),
         )
     }
@@ -97,12 +100,13 @@ impl OwnedServer {
         endpoint: &Path,
         runtime_handle: &tokio::runtime::Handle,
         timeout: Duration,
-        runtime: crate::runtime::RuntimeChildOwnership,
+        service_child: (crate::runtime::RuntimeChildOwnership, File, File),
         cancelled: &F,
     ) -> Result<StartOutcome, String>
     where
         F: Fn() -> bool,
     {
+        let (runtime, common_lock, model_lock) = service_child;
         Self::start_process(
             launch,
             timeout,
@@ -118,6 +122,7 @@ impl OwnedServer {
                 path: endpoint,
                 runtime: runtime_handle,
             },
+            Some((common_lock, model_lock)),
             || cancelled().then_some(StartupStop::Interrupted(StartupInterruption::Cancelled)),
         )
     }
@@ -141,6 +146,7 @@ impl OwnedServer {
             runtime,
             PersistentSignalPolicy::ForegroundExit,
             StartupEndpoint::Tcp,
+            None,
             stop,
         )
     }
@@ -154,6 +160,7 @@ impl OwnedServer {
         )>,
         signal_policy: PersistentSignalPolicy,
         endpoint: StartupEndpoint<'_>,
+        service_locks: Option<(File, File)>,
         stop: F,
     ) -> Result<StartOutcome, String>
     where
@@ -194,11 +201,26 @@ impl OwnedServer {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
             if launch.policy == LaunchPolicy::Service {
+                use std::os::fd::AsRawFd;
+                let (common_lock, model_lock) = service_locks
+                    .as_ref()
+                    .ok_or_else(|| "service child lock descriptors are missing".to_string())?;
+                let common_fd = common_lock.as_raw_fd();
+                let model_fd = model_lock.as_raw_fd();
                 // The socket and every incidental engine-created file must be
                 // private even when a launcher inherited a permissive umask.
                 unsafe {
-                    command.pre_exec(|| {
+                    command.pre_exec(move || {
                         libc::umask(0o077);
+                        for descriptor in [common_fd, model_fd] {
+                            let flags = libc::fcntl(descriptor, libc::F_GETFD);
+                            if flags == -1
+                                || libc::fcntl(descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC)
+                                    == -1
+                            {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                        }
                         Ok(())
                     });
                 }
@@ -227,6 +249,7 @@ impl OwnedServer {
                 return Err(error);
             }
         };
+        drop(service_locks);
         #[cfg(test)]
         kill_owner_after_spawn_before_lease_for_test();
         #[cfg(test)]

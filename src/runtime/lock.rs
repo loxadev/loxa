@@ -1,6 +1,6 @@
 use std::fs::{File, OpenOptions, TryLockError};
 #[cfg(unix)]
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::path::Path;
 
 #[cfg(unix)]
@@ -21,6 +21,7 @@ pub(super) enum ForegroundLockProtocol {
 #[derive(Clone, Copy)]
 enum ForegroundLockMode {
     Automatic,
+    OpenFileDescriptionOnly,
     #[cfg(test)]
     TraditionalOnly,
 }
@@ -101,12 +102,32 @@ fn try_acquire_foreground_lock_with_mode(
     file: &File,
     mode: ForegroundLockMode,
 ) -> Result<ForegroundLockProtocol, TryLockError> {
-    if matches!(mode, ForegroundLockMode::Automatic) {
+    let use_ofd = match mode {
+        ForegroundLockMode::Automatic | ForegroundLockMode::OpenFileDescriptionOnly => true,
+        #[cfg(test)]
+        ForegroundLockMode::TraditionalOnly => false,
+    };
+    if use_ofd {
         #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
         match set_foreground_lock_with_command(file, libc::F_OFD_SETLK) {
             Ok(()) => return Ok(ForegroundLockProtocol::OpenFileDescription),
-            Err(error) if ofd_lock_command_is_unsupported(&error) => {}
+            Err(error)
+                if ofd_lock_command_is_unsupported(&error)
+                    && matches!(mode, ForegroundLockMode::Automatic) => {}
+            Err(error) if ofd_lock_command_is_unsupported(&error) => {
+                return Err(TryLockError::Error(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "service runtime requires an open-file-description foreground lock",
+                )));
+            }
             Err(error) => return Err(as_try_lock_error(error)),
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+        if matches!(mode, ForegroundLockMode::OpenFileDescriptionOnly) {
+            return Err(TryLockError::Error(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "service runtime requires an open-file-description foreground lock",
+            )));
         }
     }
 
@@ -225,11 +246,45 @@ impl ForegroundLockTestHook {
 pub(super) struct ForegroundLock {
     file: Option<File>,
     #[cfg(unix)]
+    protocol: ForegroundLockProtocol,
+    #[cfg(unix)]
     local_traditional_lock: Option<LocalForegroundLock>,
     test_hook: ForegroundLockTestHook,
 }
 
 impl ForegroundLock {
+    pub(super) fn acquire_service(path: &Path) -> Result<Self, ForegroundLockAcquireError> {
+        #[cfg(unix)]
+        {
+            Self::acquire_with_mode(
+                path,
+                ForegroundLockMode::OpenFileDescriptionOnly,
+                ForegroundLockTestHook::none(),
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Err(ForegroundLockAcquireError::Error(
+                "service runtime requires an open-file-description foreground lock".into(),
+            ))
+        }
+    }
+
+    #[cfg(unix)]
+    pub(super) fn duplicate_for_service_child(&self) -> Result<File, String> {
+        if self.protocol != ForegroundLockProtocol::OpenFileDescription {
+            return Err("service runtime requires an open-file-description foreground lock".into());
+        }
+        self.file
+            .as_ref()
+            .ok_or_else(|| "runtime foreground lock was released".to_string())?
+            .as_fd()
+            .try_clone_to_owned()
+            .map(File::from)
+            .map_err(|error| error.to_string())
+    }
+
     pub(super) fn acquire(path: &Path) -> Result<Self, ForegroundLockAcquireError> {
         #[cfg(unix)]
         {
@@ -306,6 +361,7 @@ impl ForegroundLock {
         };
         Ok(Self {
             file: Some(file),
+            protocol,
             local_traditional_lock,
             test_hook,
         })

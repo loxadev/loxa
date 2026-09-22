@@ -58,6 +58,12 @@ impl Runnable {
         &self.launch
     }
 
+    pub(crate) fn duplicate_model_lock_for_service_child(
+        &mut self,
+    ) -> Result<std::fs::File, String> {
+        self._model_lock.duplicate_for_service_child()
+    }
+
     pub(crate) fn managed_runtime(&self) -> Option<&runner::ValidatedManagedRuntime> {
         self.launch.managed_runtime()
     }
