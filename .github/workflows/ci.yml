@@ -34,7 +34,7 @@ jobs:
       - name: Test core and shared leaves
         run: cargo test --locked --workspace --exclude loxa-app --all-targets
       - name: Verify publishable packages
-        run: cargo package --locked --workspace --exclude loxa-app
+        run: cargo package --locked -p loxa-ipc -p loxa-diagnostics
 
   checks:
     name: Rust checks (macOS)
@@ -81,6 +81,7 @@ jobs:
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Run tests with coverage
+        timeout-minutes: 10
         run: cargo llvm-cov --workspace --all-targets --locked --no-cfg-coverage --json --output-path target/coverage.json
       - name: Upload coverage
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

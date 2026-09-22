@@ -1,6 +1,6 @@
 use super::signals::SessionSignals;
 use crate::session::{new_editor, prompt_input, InputEvent};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
@@ -65,6 +65,15 @@ fn finalizing_saved_and_completed_save_failed_do_not_finish_as_saved_chat() {
 
 const CHILD: &str = "LOXA_SAVED_CHAT_PTY_CHILD";
 
+fn pty_phase(phase: &str, pid: Option<u32>) {
+    let current = std::thread::current();
+    let _ = writeln!(
+        std::io::stderr(),
+        "saved-chat-pty phase={phase} pid={pid:?} thread={:?}",
+        current.name()
+    );
+}
+
 #[test]
 fn child_idle_editor() {
     if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new("idle")) {
@@ -72,15 +81,33 @@ fn child_idle_editor() {
     }
     let mut editor = new_editor(&super::COMMANDS, false).unwrap();
     let signals = SessionSignals::install().unwrap();
-    for _ in 0..2 {
+    for index in 0..2 {
         let original = signals.enter_idle().unwrap();
+        if index == 1 {
+            eprintln!("SECOND_READLINE_ARMED");
+        }
         let input = prompt_input(&mut editor);
         signals.leave_idle();
         if signals.was_interrupted() || matches!(input, InputEvent::Interrupted) {
             signals.exit_now(Some(original));
         }
-        assert!(matches!(input, InputEvent::Line(_)));
+        assert!(matches!(input, InputEvent::Line(ref line) if line == "first"));
     }
+}
+
+#[test]
+fn child_bracketed_paste() {
+    if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new("paste")) {
+        return;
+    }
+    let mut editor = new_editor(&super::COMMANDS, false).unwrap();
+    let signals = SessionSignals::install().unwrap();
+    let _original = signals.enter_idle().unwrap();
+    let input = prompt_input(&mut editor);
+    signals.leave_idle();
+    let expected = "héllo\n世界".repeat(128);
+    assert!(matches!(input, InputEvent::Line(ref line) if line == &expected));
+    eprintln!("PASTE_MATCHED");
 }
 
 #[test]
@@ -113,8 +140,16 @@ fn child_run_service() {
         return;
     }
     let root = std::env::var_os("LOXA_SAVED_CHAT_TEST_ROOT").unwrap();
+    let bootstrap_start = Instant::now();
     let client =
         loxa_ipc::ServiceClient::load(Path::new(&root), None, crate::service::BUILD_ID).unwrap();
+    eprintln!(
+        "SAVED_CHAT_CLIENT_READY {} ms {} bytes",
+        bootstrap_start.elapsed().as_millis(),
+        fs::metadata(std::env::current_exe().unwrap())
+            .unwrap()
+            .len()
+    );
     super::run_service(
         client,
         "demo".into(),
@@ -156,6 +191,7 @@ impl Pty {
     fn spawn_named_with_root(mode: &str, test: &str, root: Option<&Path>) -> Self {
         let mut master = -1;
         let mut slave = -1;
+        pty_phase("openpty-before", None);
         assert_eq!(
             unsafe {
                 libc::openpty(
@@ -168,8 +204,23 @@ impl Pty {
             },
             0
         );
+        pty_phase("openpty-after", None);
         let master = unsafe { File::from_raw_fd(master) };
         let slave = unsafe { File::from_raw_fd(slave) };
+        for descriptor in [&master, &slave] {
+            let flags = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFD) };
+            assert_ne!(flags, -1);
+            assert_ne!(
+                unsafe {
+                    libc::fcntl(
+                        descriptor.as_raw_fd(),
+                        libc::F_SETFD,
+                        flags | libc::FD_CLOEXEC,
+                    )
+                },
+                -1
+            );
+        }
         let original_slave_flags = unsafe { libc::fcntl(slave.as_raw_fd(), libc::F_GETFL) };
         assert_ne!(original_slave_flags, -1);
         let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
@@ -181,6 +232,7 @@ impl Pty {
         let mut command = Command::new(std::env::current_exe().unwrap());
         command.arg("--exact").arg(test).arg("--nocapture");
         command.env(CHILD, mode);
+        command.env("TERM", "xterm-256color");
         if let Some(root) = root {
             command.env("LOXA_SAVED_CHAT_TEST_ROOT", root);
         }
@@ -197,7 +249,9 @@ impl Pty {
                 Ok(())
             });
         }
+        pty_phase("spawn-before", None);
         let child = command.spawn().expect("spawn saved Chat PTY child");
+        pty_phase("spawn-after", Some(child.id()));
         Self {
             child,
             master,
@@ -207,41 +261,29 @@ impl Pty {
         }
     }
 
-    pub(super) fn wait_for_prompts(&mut self, count: usize) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            let mut buffer = [0; 4096];
-            match self.master.read(&mut buffer) {
-                Ok(n) => self.transcript.extend_from_slice(&buffer[..n]),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) if error.raw_os_error() == Some(libc::EIO) => {}
-                Err(error) => panic!("read PTY: {error}"),
-            }
-            if self
-                .transcript
-                .windows(2)
-                .filter(|bytes| *bytes == b"> ")
-                .count()
-                >= count
-            {
-                return;
-            }
-            assert!(
-                self.child.try_wait().unwrap().is_none(),
-                "child exited: {}",
-                String::from_utf8_lossy(&self.transcript)
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        panic!(
-            "saved Chat prompt timed out: {}",
-            String::from_utf8_lossy(&self.transcript)
-        );
+    pub(super) fn wait_for_prompt_after(&mut self, start: usize) {
+        self.wait_for_bytes(b"> ", start, Duration::from_secs(5));
     }
 
-    pub(super) fn wait_for_text(&mut self, needle: &str) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
+    pub(super) fn wait_for_bootstrap(&mut self) -> usize {
+        // Authenticated client setup validates the full test executable before Chat starts.
+        self.wait_for_bytes(b"SAVED_CHAT_CLIENT_READY ", 0, Duration::from_secs(45))
+    }
+
+    pub(super) fn wait_for_text(&mut self, needle: &str) -> usize {
+        self.wait_for_bytes(needle.as_bytes(), 0, Duration::from_secs(5))
+    }
+
+    fn wait_for_bytes(&mut self, needle: &[u8], start: usize, limit: Duration) -> usize {
+        let _ = writeln!(
+            std::io::stderr(),
+            "saved-chat-pty wait-before marker={:?} pid={} thread={:?}",
+            String::from_utf8_lossy(needle),
+            self.child.id(),
+            std::thread::current().name()
+        );
+        let deadline = Instant::now() + limit;
+        loop {
             let mut buffer = [0; 4096];
             match self.master.read(&mut buffer) {
                 Ok(n) => self.transcript.extend_from_slice(&buffer[..n]),
@@ -249,20 +291,27 @@ impl Pty {
                 Err(error) if error.raw_os_error() == Some(libc::EIO) => {}
                 Err(error) => panic!("read PTY: {error}"),
             }
-            if String::from_utf8_lossy(&self.transcript).contains(needle) {
-                return;
+            if let Some(index) = self.transcript[start..]
+                .windows(needle.len())
+                .position(|bytes| bytes == needle)
+            {
+                return start + index + needle.len();
             }
             assert!(
                 self.child.try_wait().unwrap().is_none(),
                 "child exited: {}",
                 String::from_utf8_lossy(&self.transcript)
             );
+            if Instant::now() >= deadline {
+                pty_phase("wait-timeout", Some(self.child.id()));
+                panic!(
+                    "saved Chat marker {:?} timed out: {}",
+                    String::from_utf8_lossy(needle),
+                    String::from_utf8_lossy(&self.transcript)
+                );
+            }
             std::thread::sleep(Duration::from_millis(10));
         }
-        panic!(
-            "saved Chat output marker timed out: {}",
-            String::from_utf8_lossy(&self.transcript)
-        );
     }
 
     pub(super) fn write_input(&mut self, bytes: &[u8]) {
@@ -276,16 +325,23 @@ impl Pty {
         );
     }
 
-    pub(super) fn finish(mut self) {
+    pub(super) fn finish(self) {
+        self.finish_with_code(130);
+    }
+
+    fn finish_with_code(mut self, expected_code: i32) {
         let deadline = Instant::now() + Duration::from_secs(5);
+        pty_phase("finish-wait-before", Some(self.child.id()));
         let status = loop {
             if let Some(status) = self.child.try_wait().unwrap() {
                 break status;
             }
-            assert!(Instant::now() < deadline, "saved Chat SIGINT did not exit");
+            assert!(Instant::now() < deadline, "saved Chat child did not exit");
             std::thread::sleep(Duration::from_millis(10));
         };
-        assert_eq!(status.code(), Some(130));
+        pty_phase("finish-wait-after", Some(self.child.id()));
+        assert_eq!(status.code(), Some(expected_code));
+        pty_phase("restore-check-before", Some(self.child.id()));
         let mut terminal = std::mem::MaybeUninit::<libc::termios>::uninit();
         assert_eq!(
             unsafe { libc::tcgetattr(self.slave.as_raw_fd(), terminal.as_mut_ptr()) },
@@ -307,14 +363,20 @@ impl Pty {
             self.original_slave_flags,
             "terminal output flags were not restored"
         );
+        pty_phase("restore-check-after", Some(self.child.id()));
     }
 }
 
 impl Drop for Pty {
     fn drop(&mut self) {
+        pty_phase("drop-before", Some(self.child.id()));
         if self.child.try_wait().ok().flatten().is_none() {
+            pty_phase("drop-kill-before", Some(self.child.id()));
             let _ = self.child.kill();
+            pty_phase("drop-kill-after", Some(self.child.id()));
+            pty_phase("drop-wait-before", Some(self.child.id()));
             let _ = self.child.wait();
+            pty_phase("drop-wait-after", Some(self.child.id()));
         }
     }
 }
@@ -322,17 +384,26 @@ impl Drop for Pty {
 #[test]
 fn second_idle_prompt_ctrl_c_exits_and_restores_terminal() {
     let mut pty = Pty::spawn();
-    pty.wait_for_prompts(1);
-    pty.master.write_all(b"first\n").unwrap();
-    pty.wait_for_prompts(2);
+    pty.wait_for_prompt_after(0);
+    pty.write_input(b"first\n");
+    let marker_end = pty.wait_for_text("SECOND_READLINE_ARMED");
+    pty.wait_for_prompt_after(marker_end);
     pty.master.write_all(b"\x03").unwrap();
     pty.finish();
 }
 
 #[test]
+fn batched_lines_survive_readline_return() {
+    let mut pty = Pty::spawn();
+    pty.wait_for_prompt_after(0);
+    pty.write_input(b"first\nfirst\n");
+    pty.finish_with_code(0);
+}
+
+#[test]
 fn external_idle_sigint_exits_and_restores_terminal() {
     let mut pty = Pty::spawn();
-    pty.wait_for_prompts(1);
+    pty.wait_for_prompt_after(0);
     assert_eq!(
         unsafe { libc::kill(pty.child.id() as libc::pid_t, libc::SIGINT) },
         0
@@ -343,8 +414,8 @@ fn external_idle_sigint_exits_and_restores_terminal() {
 #[test]
 fn prompt_transition_sigint_never_enters_a_successor_prompt() {
     let mut pty = Pty::spawn();
-    pty.wait_for_prompts(1);
-    pty.master.write_all(b"first\n").unwrap();
+    pty.wait_for_prompt_after(0);
+    pty.write_input(b"first\n");
     assert_eq!(
         unsafe { libc::kill(pty.child.id() as libc::pid_t, libc::SIGINT) },
         0
@@ -362,4 +433,14 @@ fn blocked_partial_output_yields_to_sigint_and_restores_flags() {
         0
     );
     pty.finish();
+}
+
+#[test]
+fn bulk_utf8_bracketed_multiline_paste_reaches_the_editor() {
+    let mut pty = Pty::spawn_named("paste", "session::saved::tests::child_bracketed_paste");
+    pty.wait_for_prompt_after(0);
+    let paste = format!("\u{1b}[200~{}\u{1b}[201~\r", "héllo\n世界".repeat(128));
+    pty.write_input(paste.as_bytes());
+    pty.wait_for_text("PASTE_MATCHED");
+    pty.finish_with_code(0);
 }

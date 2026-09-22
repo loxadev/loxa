@@ -1,6 +1,7 @@
 [package]
 name = "loxa"
 version = "0.1.0-dev"
+publish = false
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Muhammad Mahad"]
@@ -21,7 +22,7 @@ backon = { version = "1.6.0", default-features = false, features = ["std", "toki
 bytes = "1.12.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "json", "rustls"] }
 rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled", "hooks", "limits"] }
-rustyline = { version = "18.0.1", default-features = false, features = ["signal-hook"] }
+rustyline = { git = "https://github.com/kkawakam/rustyline", rev = "b5d88b9f373a498098e3e5e40b7b9514eeda3fa4", default-features = false, features = ["signal-hook", "buffer-redux"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["raw_value"] }
 sha2 = "0.11.0"

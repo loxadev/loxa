@@ -56,6 +56,7 @@ enum Seen {
     Generation(GenerationCommand),
     Subscribe(GenerationTarget, String),
     Range(ContentSource, String, String),
+    RangeDelivered,
     EarlySaveFailure,
     TerminalSaveFailure,
 }
@@ -270,6 +271,12 @@ async fn handle(
     match receive(&mut transport, limit).await? {
         ClientEnvelope::Request(request) => {
             let request_id = request.request_id;
+            let range_delivered = matches!(
+                &request.command,
+                ServiceCommand::History {
+                    command: HistoryCommand::ReadContentRange { .. }
+                }
+            );
             let outcome = match request.command {
                 ServiceCommand::GenerationAt { target, command } => {
                     assert_eq!(target, operation_target());
@@ -392,6 +399,9 @@ async fn handle(
                 limit,
             )
             .await?;
+            if range_delivered {
+                record(&state, &changed, Seen::RangeDelivered).await;
+            }
         }
         ClientEnvelope::SubscribeGeneration {
             target, attempt_id, ..
@@ -569,7 +579,10 @@ fn status(
     save: GenerationSavePhase,
     end: &str,
 ) -> GenerationStatus {
-    let done = execution != GenerationExecutionPhase::Working;
+    let done = !matches!(
+        execution,
+        GenerationExecutionPhase::Working | GenerationExecutionPhase::Cancelling
+    );
     GenerationStatus {
         target,
         attempt_id: attempt_id.into(),
@@ -751,7 +764,7 @@ async fn early_save_failure_waits_for_terminal_execution_before_returning_to_pro
         tokio::pin!(generation);
         tokio::select! {
             biased;
-            _ = &mut generation => panic!("early SaveFailed completed before terminal execution"),
+            result = &mut generation => panic!("early SaveFailed completed before terminal execution: {result:?}"),
             _ = peer.wait_for(|seen| seen.contains(&Seen::EarlySaveFailure)) => {},
         }
         assert!(
@@ -762,7 +775,7 @@ async fn early_save_failure_waits_for_terminal_execution_before_returning_to_pro
         peer.terminal_release.notify_one();
         tokio::select! {
             biased;
-            _ = &mut generation => panic!("terminal SaveFailed completed before the saved retry"),
+            result = &mut generation => panic!("terminal SaveFailed completed before the saved retry: {result:?}"),
             _ = peer.wait_for(|seen| seen.contains(&Seen::TerminalSaveFailure)) => {},
         }
         assert!(
@@ -874,7 +887,7 @@ async fn interrupt_during_observation_stops_only_the_accepted_target() {
             tag
         ),
         async {
-            peer.wait_for(|seen| seen.iter().any(|item| matches!(item, Seen::Subscribe(..))))
+            peer.wait_for(|seen| seen.contains(&Seen::RangeDelivered))
                 .await;
             signals.interrupt_current_for_test();
         },
@@ -1047,13 +1060,26 @@ async fn terminal_output_failure_detaches_without_stop() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn saved_chat_pty_send_output_sigint_stops_the_exact_attempt_and_restores_flags() {
     let peer = FakePeer::start(Mode::AcceptedStop).await;
-    let mut pty = super::tests::Pty::spawn_saved(&peer.root);
-    pty.wait_for_prompts(1);
-    pty.write_input(b"hello\n");
+    let root = peer.root.clone();
+    let pty = tokio::task::spawn_blocking(move || {
+        let mut pty = super::tests::Pty::spawn_saved(&root);
+        let bootstrap_end = pty.wait_for_bootstrap();
+        pty.wait_for_prompt_after(bootstrap_end);
+        pty.write_input(b"hello\n");
+        pty
+    })
+    .await
+    .unwrap();
     peer.wait_for(|seen| seen.iter().any(|item| matches!(item, Seen::Subscribe(..))))
         .await;
-    pty.wait_for_text("ok");
-    pty.signal_sigint();
+    let pty = tokio::task::spawn_blocking(move || {
+        let mut pty = pty;
+        pty.wait_for_text("ok");
+        pty.signal_sigint();
+        pty
+    })
+    .await
+    .unwrap();
     peer.wait_for(|seen| {
         seen.iter().any(|item| {
             matches!(
@@ -1065,7 +1091,9 @@ async fn saved_chat_pty_send_output_sigint_stops_the_exact_attempt_and_restores_
         })
     })
     .await;
-    pty.finish();
+    tokio::task::spawn_blocking(move || pty.finish())
+        .await
+        .unwrap();
     let seen = peer.seen().await;
     let submission_id = seen
         .iter()
