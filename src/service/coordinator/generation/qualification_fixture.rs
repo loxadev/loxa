@@ -7,7 +7,9 @@ pub(super) const MODEL_SHA256: &str =
     "741ad12b64088fedc17c33aacb22e48be1972ef36a39f03666dd68bd15614fb9";
 pub(super) const MODEL_SIZE: u64 = 88_202_080;
 pub(super) const CONTEXT_TOKENS: u32 = 4096;
+#[cfg(target_os = "macos")]
 pub(super) const TEMPERATURE: f64 = 0.0;
+#[cfg(target_os = "macos")]
 pub(super) const TOP_P: f64 = 0.95;
 
 #[cfg(target_os = "macos")]
