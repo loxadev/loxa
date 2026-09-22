@@ -5,7 +5,7 @@ use crate::runtime_fingerprint::RuntimeFingerprint;
 use crate::runtime_identity::RuntimeIdentity;
 use hyper::body::Bytes;
 use hyper::Method;
-use loxa_ipc::{ErrorCategory, ServiceError};
+use loxa_ipc::{EffectiveSamplingSettings, ErrorCategory, SamplingValue, ServiceError};
 use serde::Deserialize;
 use std::time::Duration;
 
@@ -17,6 +17,7 @@ pub(super) struct QualifiedRequest {
     pub(super) request: PreparedEngineRequest,
     actual_context: u32,
     input_tokens: u32,
+    effective_sampling: EffectiveSamplingSettings,
     #[cfg(all(test, target_os = "macos"))]
     template_sha256: [u8; 32],
     #[cfg(all(test, target_os = "macos"))]
@@ -32,6 +33,7 @@ impl QualifiedRequest {
             },
             actual_context: 4096,
             input_tokens: 1,
+            effective_sampling: fallback_sampling(),
             #[cfg(target_os = "macos")]
             template_sha256: [0; 32],
             #[cfg(target_os = "macos")]
@@ -45,6 +47,10 @@ impl QualifiedRequest {
 
     pub(super) fn input_tokens(&self) -> u32 {
         self.input_tokens
+    }
+
+    pub(super) fn effective_sampling(&self) -> EffectiveSamplingSettings {
+        self.effective_sampling
     }
 
     #[cfg(all(test, target_os = "macos"))]
@@ -103,7 +109,8 @@ async fn qualify_engine(
             "engine prompt template and tokenizer basis is not qualified",
         ));
     };
-    let request = PreparedEngineRequest::new(prompt)?;
+    let effective_sampling = resolve_sampling(prompt, &props.default_generation_settings.params)?;
+    let request = PreparedEngineRequest::new(prompt, effective_sampling)?;
     let counted = super::transport::bounded_json_request(
         &reservation.engine,
         reservation,
@@ -142,11 +149,80 @@ async fn qualify_engine(
         request,
         actual_context: qualification.actual_context,
         input_tokens: counted.input_tokens,
+        effective_sampling,
         #[cfg(all(test, target_os = "macos"))]
         template_sha256: qualification.template_sha256,
         #[cfg(all(test, target_os = "macos"))]
         observation_id,
     })
+}
+
+const FALLBACK_TEMPERATURE: f32 = 0.8;
+const FALLBACK_TOP_P: f32 = 0.95;
+
+fn resolve_sampling(
+    prompt: &PromptPreparation,
+    reported: &ReportedSampling,
+) -> Result<EffectiveSamplingSettings, ServiceError> {
+    resolve_sampling_values(prompt.temperature, prompt.top_p, reported)
+}
+
+fn resolve_sampling_values(
+    temperature: Option<SamplingValue>,
+    top_p: Option<SamplingValue>,
+    reported: &ReportedSampling,
+) -> Result<EffectiveSamplingSettings, ServiceError> {
+    let fallback = fallback_sampling();
+    Ok(EffectiveSamplingSettings {
+        temperature: resolve_sampling_value(
+            temperature,
+            reported.temperature,
+            fallback.temperature,
+            "temperature",
+            |value| value >= 0.0,
+        )?,
+        top_p: resolve_sampling_value(top_p, reported.top_p, fallback.top_p, "top P", |value| {
+            (0.0..=1.0).contains(&value)
+        })?,
+    })
+}
+
+fn fallback_sampling() -> EffectiveSamplingSettings {
+    EffectiveSamplingSettings {
+        temperature: SamplingValue::new(f64::from(FALLBACK_TEMPERATURE)).expect("finite fallback"),
+        top_p: SamplingValue::new(f64::from(FALLBACK_TOP_P)).expect("finite fallback"),
+    }
+}
+
+fn resolve_sampling_value(
+    explicit: Option<SamplingValue>,
+    reported: Option<f64>,
+    fallback: SamplingValue,
+    name: &'static str,
+    in_range: fn(f64) -> bool,
+) -> Result<SamplingValue, ServiceError> {
+    if let Some(value) = explicit {
+        return canonical_engine_value(value.get(), in_range).ok_or_else(|| {
+            ServiceError::new(
+                ErrorCategory::InvalidRequest,
+                format!("conversation {name} is outside the engine request range"),
+            )
+        });
+    }
+    Ok(reported
+        .and_then(|value| canonical_engine_value(value, in_range))
+        .unwrap_or(fallback))
+}
+
+fn canonical_engine_value(value: f64, in_range: fn(f64) -> bool) -> Option<SamplingValue> {
+    if !value.is_finite() || !in_range(value) {
+        return None;
+    }
+    let narrowed = value as f32;
+    if !narrowed.is_finite() || (value > 0.0 && narrowed == 0.0) {
+        return None;
+    }
+    SamplingValue::new(f64::from(narrowed))
 }
 
 struct PreflightQualification {
@@ -201,6 +277,13 @@ struct Props {
 #[derive(Deserialize)]
 struct DefaultGenerationSettings {
     n_ctx: u32,
+    params: ReportedSampling,
+}
+
+#[derive(Deserialize)]
+struct ReportedSampling {
+    temperature: Option<f64>,
+    top_p: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -239,7 +322,13 @@ mod tests {
 
     fn fixture_props() -> Props {
         Props {
-            default_generation_settings: DefaultGenerationSettings { n_ctx: 4096 },
+            default_generation_settings: DefaultGenerationSettings {
+                n_ctx: 4096,
+                params: ReportedSampling {
+                    temperature: None,
+                    top_p: None,
+                },
+            },
             total_slots: 1,
             model_alias: super::super::qualification_fixture::MODEL_ID.into(),
             endpoint_slots: true,
@@ -266,6 +355,104 @@ mod tests {
         assert_eq!(valid.object, "response.input_tokens");
         assert!(serde_json::from_str::<InputTokens>(
             r#"{"input_tokens":12,"object":"response.input_tokens","extra":1}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn props_sampling_defaults_resolve_with_explicit_priority_and_fallbacks() {
+        let props: Props = serde_json::from_str(
+            r#"{
+                "default_generation_settings": {
+                    "params": {
+                        "seed": -1,
+                        "temperature": 0.65,
+                        "top_k": 40,
+                        "top_p": 0.7,
+                        "min_p": 0.05
+                    },
+                    "n_ctx": 4096
+                },
+                "total_slots": 1,
+                "model_alias": "loxa-generation-fixture",
+                "endpoint_slots": true,
+                "chat_template": "{{ messages }}",
+                "modalities": {"vision": false}
+            }"#,
+        )
+        .unwrap();
+        let explicit = resolve_sampling_values(
+            Some(SamplingValue::new(0.0).unwrap()),
+            None,
+            &props.default_generation_settings.params,
+        )
+        .unwrap();
+        assert_eq!(explicit.temperature.get(), 0.0);
+        assert_eq!(explicit.top_p.get(), f64::from(0.7_f32));
+
+        let reported =
+            resolve_sampling_values(None, None, &props.default_generation_settings.params).unwrap();
+        assert_eq!(reported.temperature.get(), f64::from(0.65_f32));
+        assert_eq!(reported.top_p.get(), f64::from(0.7_f32));
+
+        let partial = ReportedSampling {
+            temperature: Some(0.4),
+            top_p: None,
+        };
+        let partial = resolve_sampling_values(None, None, &partial).unwrap();
+        assert_eq!(partial.temperature.get(), f64::from(0.4_f32));
+        assert_eq!(partial.top_p.get(), f64::from(FALLBACK_TOP_P));
+
+        let unusable = ReportedSampling {
+            temperature: Some(f64::MAX),
+            top_p: Some(f64::MIN_POSITIVE),
+        };
+        let fallback = resolve_sampling_values(None, None, &unusable).unwrap();
+        assert_eq!(fallback.temperature.get(), f64::from(0.8_f32));
+        assert_eq!(fallback.top_p.get(), f64::from(0.95_f32));
+        let out_of_range = ReportedSampling {
+            temperature: Some(-1.0),
+            top_p: Some(1.1),
+        };
+        assert_eq!(
+            resolve_sampling_values(None, None, &out_of_range).unwrap(),
+            fallback
+        );
+
+        assert!(resolve_sampling_values(
+            Some(SamplingValue::new(f64::MAX).unwrap()),
+            None,
+            &props.default_generation_settings.params,
+        )
+        .is_err());
+        assert!(resolve_sampling_values(
+            Some(SamplingValue::new(-1.0).unwrap()),
+            None,
+            &props.default_generation_settings.params,
+        )
+        .is_err());
+        assert!(resolve_sampling_values(
+            None,
+            Some(SamplingValue::new(f64::MIN_POSITIVE).unwrap()),
+            &props.default_generation_settings.params,
+        )
+        .is_err());
+        assert!(resolve_sampling_values(
+            None,
+            Some(SamplingValue::new(1.1).unwrap()),
+            &props.default_generation_settings.params,
+        )
+        .is_err());
+        assert!(serde_json::from_str::<Props>(
+            r#"{"default_generation_settings":{"n_ctx":4096},"total_slots":1,
+                "model_alias":"loxa-generation-fixture","endpoint_slots":true,
+                "chat_template":"{{ messages }}"}"#,
+        )
+        .is_err());
+        assert!(serde_json::from_str::<Props>(
+            r#"{"default_generation_settings":{"params":{"temperature":"hot"},"n_ctx":4096},
+                "total_slots":1,"model_alias":"loxa-generation-fixture",
+                "endpoint_slots":true,"chat_template":"{{ messages }}"}"#,
         )
         .is_err());
     }

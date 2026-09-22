@@ -18,6 +18,7 @@ pub(super) struct NativeService {
     pub(super) client: ServiceClient,
     pub(super) runtime_evidence: NativeRuntimeEvidence,
     server: Option<tokio::task::JoinHandle<Result<(), String>>>,
+    stop_requested: bool,
 }
 
 pub(super) struct NativeRuntimeEvidence {
@@ -182,6 +183,7 @@ impl NativeService {
             client,
             runtime_evidence,
             server: Some(server),
+            stop_requested: false,
         };
         let initialization = async {
             fixture
@@ -232,7 +234,11 @@ impl NativeService {
     }
 
     pub(super) async fn shutdown(&mut self, require_wire_stop: bool) -> Result<(), String> {
-        let wire_stop = request_wire_stop(&self.client).await;
+        let wire_stop = if self.stop_requested {
+            Ok(())
+        } else {
+            request_wire_stop(&self.client).await
+        };
         let fallback = if wire_stop.is_err() {
             self.coordinator
                 .stop_service()
@@ -248,6 +254,12 @@ impl NativeService {
         } else {
             fallback
         }
+    }
+
+    pub(super) async fn stop_service(&mut self) -> Result<(), String> {
+        request_wire_stop(&self.client).await?;
+        self.stop_requested = true;
+        Ok(())
     }
 
     async fn join_server(&mut self) -> Result<(), String> {
@@ -459,7 +471,9 @@ async fn request_wire_stop(client: &ServiceClient) -> Result<(), String> {
     }
 }
 
-async fn runtime_status(client: &ServiceClient) -> Result<loxa_ipc::RuntimeStatus, String> {
+pub(super) async fn runtime_status(
+    client: &ServiceClient,
+) -> Result<loxa_ipc::RuntimeStatus, String> {
     match client
         .request(ConnectMode::ObserveExisting, ServiceCommand::Status)
         .await

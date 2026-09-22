@@ -3,7 +3,7 @@ use super::state::{AdmissionClaim, AdmissionReservation};
 use super::{history_error, Coordinator, PendingGenerationConnection};
 use crate::history::{
     decode_id, encode_id, parse_revision, AdmissionKind, CommittedAdmission, DraftSubmission,
-    PromptPreparation,
+    PromptPreparation, PromptRequest,
 };
 use loxa_ipc::{
     ErrorCategory, GenerationAccepted, GenerationCommand, GenerationReply, ServiceError,
@@ -28,12 +28,12 @@ mod transport;
 pub(in crate::service) use native_acceptance::run_bundled_generation_acceptance;
 
 impl Coordinator {
-    pub(in crate::service) async fn generation_send(
+    pub(in crate::service) async fn generation_request(
         &self,
         command: GenerationCommand,
         pending: PendingGenerationConnection,
     ) -> Result<GenerationReply, ServiceError> {
-        let submitted = match SubmittedSend::parse(command) {
+        let submitted = match SubmittedGeneration::parse(command) {
             Ok(submitted) => submitted,
             Err(error) => {
                 self.finish_generation_connection(&pending);
@@ -55,40 +55,90 @@ impl Coordinator {
         let coordinator = self.clone();
         let (reply, completion) = oneshot::channel();
         tokio::spawn(async move {
-            let result = drive_send(&coordinator, submitted, pending).await;
+            let result = drive_generation(&coordinator, submitted, pending).await;
             let _ = reply.send(result);
         });
         completion.await.map_err(|_| {
             ServiceError::new(
                 ErrorCategory::ServiceUnavailable,
-                "generation owner stopped before resolving Send",
+                "generation owner stopped before resolving the request",
             )
         })?
     }
 }
 
-struct SubmittedSend {
+struct SubmittedGeneration {
     conversation_id: [u8; 16],
     submission_id: [u8; 16],
     expected_conversation_revision: i64,
     expected_profile_revision: i64,
-    user_text: String,
-    draft: Option<DraftSubmission>,
+    kind: SubmittedKind,
     submission_hash: [u8; 32],
 }
 
-impl SubmittedSend {
+enum SubmittedKind {
+    Send {
+        user_text: String,
+        draft: Option<DraftSubmission>,
+    },
+    Retry {
+        prior_attempt_id: [u8; 16],
+    },
+}
+
+impl SubmittedGeneration {
     fn parse(command: GenerationCommand) -> Result<Self, ServiceError> {
-        let GenerationCommand::Send {
+        let (
             conversation_id,
             submission_id,
             expected_conversation_revision,
             expected_profile_revision,
-            user_text,
-            draft,
-        } = command
-        else {
-            return Err(invalid("generation connection expected Send"));
+            kind,
+        ) = match command {
+            GenerationCommand::Send {
+                conversation_id,
+                submission_id,
+                expected_conversation_revision,
+                expected_profile_revision,
+                user_text,
+                draft,
+            } => {
+                let draft = draft
+                    .map(|draft| {
+                        Ok(DraftSubmission {
+                            id: decode_id(&draft.id).map_err(history_error)?,
+                            desktop_client_id: decode_id(&draft.desktop_client_id)
+                                .map_err(history_error)?,
+                            revision: parse_nonnegative(&draft.revision)?,
+                        })
+                    })
+                    .transpose()?;
+                (
+                    conversation_id,
+                    submission_id,
+                    expected_conversation_revision,
+                    expected_profile_revision,
+                    SubmittedKind::Send { user_text, draft },
+                )
+            }
+            GenerationCommand::Retry {
+                conversation_id,
+                submission_id,
+                expected_conversation_revision,
+                expected_profile_revision,
+                prior_attempt_id,
+            } => (
+                conversation_id,
+                submission_id,
+                expected_conversation_revision,
+                expected_profile_revision,
+                SubmittedKind::Retry {
+                    prior_attempt_id: decode_id(&prior_attempt_id).map_err(history_error)?,
+                },
+            ),
+            GenerationCommand::Stop { .. } => {
+                return Err(invalid("generation request connection cannot Stop"))
+            }
         };
         let conversation_id = decode_id(&conversation_id).map_err(history_error)?;
         let submission_id = decode_id(&submission_id).map_err(history_error)?;
@@ -96,38 +146,53 @@ impl SubmittedSend {
             parse_revision(&expected_conversation_revision).map_err(history_error)?;
         let expected_profile_revision =
             parse_revision(&expected_profile_revision).map_err(history_error)?;
-        let draft = draft
-            .map(|draft| {
-                Ok(DraftSubmission {
-                    id: decode_id(&draft.id).map_err(history_error)?,
-                    desktop_client_id: decode_id(&draft.desktop_client_id)
-                        .map_err(history_error)?,
-                    revision: parse_nonnegative(&draft.revision)?,
-                })
-            })
-            .transpose()?;
-        let submission_hash = stable_submission_hash(
-            conversation_id,
-            expected_conversation_revision,
-            expected_profile_revision,
-            &user_text,
-            draft.as_ref(),
-        );
+        let submission_hash = match &kind {
+            SubmittedKind::Send { user_text, draft } => stable_submission_hash(
+                conversation_id,
+                expected_conversation_revision,
+                expected_profile_revision,
+                user_text,
+                draft.as_ref(),
+            ),
+            SubmittedKind::Retry { prior_attempt_id } => stable_retry_submission_hash(
+                conversation_id,
+                expected_conversation_revision,
+                expected_profile_revision,
+                *prior_attempt_id,
+            ),
+        };
         Ok(Self {
             conversation_id,
             submission_id,
             expected_conversation_revision,
             expected_profile_revision,
-            user_text,
-            draft,
+            kind,
             submission_hash,
         })
     }
+
+    fn prompt_request(&self) -> PromptRequest {
+        match &self.kind {
+            SubmittedKind::Send { user_text, .. } => PromptRequest::Send {
+                user_text: user_text.clone(),
+            },
+            SubmittedKind::Retry { prior_attempt_id } => PromptRequest::Retry {
+                prior_attempt_id: *prior_attempt_id,
+            },
+        }
+    }
+
+    fn admission_kind(self) -> AdmissionKind {
+        match self.kind {
+            SubmittedKind::Send { user_text, draft } => AdmissionKind::Send { user_text, draft },
+            SubmittedKind::Retry { prior_attempt_id } => AdmissionKind::Retry { prior_attempt_id },
+        }
+    }
 }
 
-async fn drive_send(
+async fn drive_generation(
     coordinator: &Coordinator,
-    submitted: SubmittedSend,
+    submitted: SubmittedGeneration,
     pending: PendingGenerationConnection,
 ) -> Result<GenerationReply, ServiceError> {
     let matching = {
@@ -196,7 +261,7 @@ async fn drive_send(
             submitted.conversation_id,
             submitted.expected_conversation_revision,
             submitted.expected_profile_revision,
-            submitted.user_text.clone(),
+            submitted.prompt_request(),
         )
         .await
     {
@@ -257,11 +322,14 @@ async fn drive_send(
         model_id,
         system_instruction,
         max_output_tokens,
+        temperature: _,
+        top_p: _,
         basis,
         messages,
     } = prompt;
     drop(model_id);
     drop(messages);
+    let submission_hash = submitted.submission_hash;
     let input = AdmissionInput {
         conversation_id: submitted.conversation_id,
         submission_id: submitted.submission_id,
@@ -272,15 +340,13 @@ async fn drive_send(
         effective_context: Some(qualified.actual_context()),
         system_instruction,
         max_output_tokens,
+        effective_sampling: qualified.effective_sampling(),
         prompt_basis: basis,
-        kind: AdmissionKind::Send {
-            user_text: submitted.user_text,
-            draft: submitted.draft,
-        },
+        kind: submitted.admission_kind(),
     };
     let observer = match coordinator.dispatch_reserved_admission(
         input,
-        submitted.submission_hash,
+        submission_hash,
         Arc::clone(&reservation),
     ) {
         Ok(observer) => observer,
@@ -384,6 +450,21 @@ pub(super) fn stable_submission_hash(
     hash.finalize().into()
 }
 
+fn stable_retry_submission_hash(
+    conversation_id: [u8; 16],
+    expected_conversation_revision: i64,
+    expected_profile_revision: i64,
+    prior_attempt_id: [u8; 16],
+) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"loxa-generation-retry-v1\0");
+    hash.update(conversation_id);
+    hash.update(expected_conversation_revision.to_le_bytes());
+    hash.update(expected_profile_revision.to_le_bytes());
+    hash.update(prior_attempt_id);
+    hash.finalize().into()
+}
+
 fn update_bytes(hash: &mut Sha256, value: &[u8]) {
     hash.update((value.len() as u64).to_le_bytes());
     hash.update(value);
@@ -415,12 +496,22 @@ mod tests {
         let original = stable_submission_hash([1; 16], 2, 3, "hello", None);
         assert_eq!(
             original,
+            [
+                115, 193, 38, 15, 72, 22, 248, 99, 219, 173, 160, 51, 27, 152, 91, 59, 164, 237,
+                189, 214, 140, 204, 185, 35, 34, 152, 3, 135, 154, 139, 177, 17,
+            ]
+        );
+        assert_eq!(
+            original,
             stable_submission_hash([1; 16], 2, 3, "hello", None)
         );
         assert_ne!(
             original,
             stable_submission_hash([1; 16], 2, 3, "changed", None)
         );
+        let retry = stable_retry_submission_hash([1; 16], 2, 3, [4; 16]);
+        assert_ne!(original, retry);
+        assert_ne!(retry, stable_retry_submission_hash([1; 16], 2, 3, [5; 16]));
     }
 
     #[test]

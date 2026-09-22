@@ -1,4 +1,4 @@
-use loxa_ipc::GenerationSettings;
+use loxa_ipc::{GenerationSettings, SamplingValue};
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use std::fmt;
@@ -8,7 +8,9 @@ use std::path::Path;
 mod file;
 mod policy;
 
-pub(crate) use policy::{apply_generation_patch, SettingsExit, SettingsObserver, SettingsOwner};
+pub(crate) use policy::{
+    apply_generation_patch, CapturedConfig, SettingsExit, SettingsObserver, SettingsOwner,
+};
 
 pub(crate) const MAX_CONFIG_BYTES: usize = 128 * 1024;
 
@@ -23,7 +25,7 @@ pub(crate) struct LoadedSettings {
     pub(crate) config: Config,
     pub(crate) revision: u64,
     pub(crate) generation: GenerationSettings,
-    pub(crate) v2: bool,
+    pub(crate) persisted: bool,
 }
 
 enum Field {
@@ -70,6 +72,8 @@ impl Visitor<'_> for FieldVisitor {
 enum GenerationField {
     SystemInstruction,
     MaxOutputTokens,
+    Temperature,
+    TopP,
 }
 
 impl<'de> Deserialize<'de> for GenerationField {
@@ -97,12 +101,17 @@ impl Visitor<'_> for GenerationFieldVisitor {
         match value {
             "system_instruction" => Ok(GenerationField::SystemInstruction),
             "max_output_tokens" => Ok(GenerationField::MaxOutputTokens),
+            "temperature" => Ok(GenerationField::Temperature),
+            "top_p" => Ok(GenerationField::TopP),
             _ => Err(E::custom("unknown generation field")),
         }
     }
 }
 
-struct StrictGeneration(GenerationSettings);
+struct StrictGeneration {
+    generation: GenerationSettings,
+    sampling_fields: bool,
+}
 
 impl<'de> Deserialize<'de> for StrictGeneration {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -128,6 +137,8 @@ impl<'de> Visitor<'de> for GenerationVisitor {
     {
         let mut system_instruction = None;
         let mut max_output_tokens = None;
+        let mut temperature = None;
+        let mut top_p = None;
         while let Some(field) = map.next_key::<GenerationField>()? {
             match field {
                 GenerationField::SystemInstruction if system_instruction.is_none() => {
@@ -136,22 +147,43 @@ impl<'de> Visitor<'de> for GenerationVisitor {
                 GenerationField::MaxOutputTokens if max_output_tokens.is_none() => {
                     max_output_tokens = Some(map.next_value::<u32>()?);
                 }
+                GenerationField::Temperature if temperature.is_none() => {
+                    temperature = Some(map.next_value::<Option<SamplingValue>>()?);
+                }
+                GenerationField::TopP if top_p.is_none() => {
+                    top_p = Some(map.next_value::<Option<SamplingValue>>()?);
+                }
                 GenerationField::SystemInstruction => {
                     return Err(serde::de::Error::duplicate_field("system_instruction"))
                 }
                 GenerationField::MaxOutputTokens => {
                     return Err(serde::de::Error::duplicate_field("max_output_tokens"))
                 }
+                GenerationField::Temperature => {
+                    return Err(serde::de::Error::duplicate_field("temperature"))
+                }
+                GenerationField::TopP => return Err(serde::de::Error::duplicate_field("top_p")),
             }
+        }
+        let sampling_fields = temperature.is_some() && top_p.is_some();
+        if temperature.is_some() != top_p.is_some() {
+            return Err(serde::de::Error::custom(
+                "generation sampling fields must be present together",
+            ));
         }
         let generation = GenerationSettings {
             system_instruction: system_instruction
                 .ok_or_else(|| serde::de::Error::missing_field("system_instruction"))?,
             max_output_tokens: max_output_tokens
                 .ok_or_else(|| serde::de::Error::missing_field("max_output_tokens"))?,
+            temperature: temperature.flatten(),
+            top_p: top_p.flatten(),
         };
         validate_generation(&generation).map_err(serde::de::Error::custom)?;
-        Ok(StrictGeneration(generation))
+        Ok(StrictGeneration {
+            generation,
+            sampling_fields,
+        })
     }
 }
 
@@ -199,7 +231,7 @@ impl<'de> Visitor<'de> for DocumentVisitor {
                     port = Some(map.next_value::<u16>()?);
                 }
                 Field::Generation if generation.is_none() => {
-                    generation = Some(map.next_value::<StrictGeneration>()?.0);
+                    generation = Some(map.next_value::<StrictGeneration>()?);
                 }
                 Field::Version => return Err(serde::de::Error::duplicate_field("version")),
                 Field::Revision => return Err(serde::de::Error::duplicate_field("revision")),
@@ -220,12 +252,34 @@ impl<'de> Visitor<'de> for DocumentVisitor {
                     .ok_or_else(|| serde::de::Error::custom("invalid config revision"))?;
                 let generation =
                     generation.ok_or_else(|| serde::de::Error::missing_field("generation"))?;
-                validate_generation(&generation).map_err(serde::de::Error::custom)?;
+                if generation.sampling_fields {
+                    return Err(serde::de::Error::custom(
+                        "version 2 config contains version 3 generation fields",
+                    ));
+                }
                 LoadedSettings {
                     config: Config { ctx, port },
                     revision,
-                    generation,
-                    v2: true,
+                    generation: generation.generation,
+                    persisted: true,
+                }
+            }
+            3 => {
+                let revision = revision
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| serde::de::Error::custom("invalid config revision"))?;
+                let generation =
+                    generation.ok_or_else(|| serde::de::Error::missing_field("generation"))?;
+                if !generation.sampling_fields {
+                    return Err(serde::de::Error::custom(
+                        "version 3 config is missing generation sampling fields",
+                    ));
+                }
+                LoadedSettings {
+                    config: Config { ctx, port },
+                    revision,
+                    generation: generation.generation,
+                    persisted: true,
                 }
             }
             1 => {
@@ -263,6 +317,18 @@ pub(crate) fn validate_generation(generation: &GenerationSettings) -> Result<(),
     }
     if generation.max_output_tokens == 0 || generation.max_output_tokens > i32::MAX as u32 {
         return Err("invalid maximum output token request");
+    }
+    if generation
+        .temperature
+        .is_some_and(|value| value.get() < 0.0)
+    {
+        return Err("temperature must be nonnegative");
+    }
+    if generation
+        .top_p
+        .is_some_and(|value| !(0.0..=1.0).contains(&value.get()))
+    {
+        return Err("top P must be between zero and one");
     }
     Ok(())
 }
@@ -310,7 +376,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_v1_and_v2_preserve_the_legacy_projection() {
+    fn strict_versions_preserve_legacy_values_and_sampling_absence() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("config.json");
         std::fs::write(&path, br#"{"version":1,"ctx":8192}"#).unwrap();
@@ -337,6 +403,18 @@ mod tests {
         assert_eq!(loaded.revision, 7);
         assert_eq!(loaded.generation.system_instruction, "system");
         assert_eq!(loaded.generation.max_output_tokens, 42);
+        assert_eq!(loaded.generation.temperature, None);
+        assert_eq!(loaded.generation.top_p, None);
+
+        std::fs::write(
+            &path,
+            br#"{"version":3,"revision":8,"generation":{"system_instruction":"","max_output_tokens":512,"temperature":0.0,"top_p":null}}"#,
+        )
+        .unwrap();
+        let loaded = read(&path, false).unwrap();
+        assert_eq!(loaded.revision, 8);
+        assert_eq!(loaded.generation.temperature.unwrap().get(), 0.0);
+        assert_eq!(loaded.generation.top_p, None);
     }
 
     #[test]
@@ -347,13 +425,19 @@ mod tests {
             br#"{"version":"#.as_slice(),
             br#"{}"#,
             br#"{"version":1,"extra":true}"#,
-            br#"{"version":3}"#,
+            br#"{"version":4}"#,
             br#"{"version":1,"ctx":"8192"}"#,
             br#"{"version":1,"ctx":null}"#,
             br#"{"version":1,"port":70000}"#,
             br#"{"version":1,"revision":1}"#,
             br#"{"version":2,"revision":0,"generation":{"system_instruction":"","max_output_tokens":512}}"#,
             br#"{"version":2,"revision":1,"generation":null}"#,
+            br#"{"version":2,"revision":1,"generation":{"system_instruction":"","max_output_tokens":512,"temperature":0.8,"top_p":0.95}}"#,
+            br#"{"version":3,"revision":1,"generation":{"system_instruction":"","max_output_tokens":512}}"#,
+            br#"{"version":3,"revision":1,"generation":{"system_instruction":"","max_output_tokens":512,"temperature":null}}"#,
+            br#"{"version":3,"revision":1,"generation":{"system_instruction":"","max_output_tokens":512,"temperature":-0.1,"top_p":0.95}}"#,
+            br#"{"version":3,"revision":1,"generation":{"system_instruction":"","max_output_tokens":512,"temperature":0.8,"top_p":1.1}}"#,
+            br#"{"version":3,"revision":1,"generation":{"system_instruction":"","max_output_tokens":512,"temperature":1e999,"top_p":0.95}}"#,
             br#"{"version":1,"version":1}"#,
         ] {
             std::fs::write(&path, json).unwrap();

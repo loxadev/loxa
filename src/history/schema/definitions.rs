@@ -223,6 +223,25 @@ pub(super) const CREATE_ATTEMPT_STATISTICS_V4: &str = r#"CREATE TABLE attempt_st
            OR qualified_output_tokens > 0)
 ) STRICT, WITHOUT ROWID"#;
 
+pub(super) const CREATE_CONVERSATION_SAMPLING_V5: &str = r#"CREATE TABLE conversation_sampling (
+    conversation_id BLOB PRIMARY KEY NOT NULL REFERENCES conversations(id),
+    temperature REAL
+        CHECK (temperature IS NULL OR (typeof(temperature) = 'real'
+               AND temperature >= 0.0 AND temperature <= 1.7976931348623157e308)),
+    top_p REAL
+        CHECK (top_p IS NULL OR (typeof(top_p) = 'real' AND top_p BETWEEN 0.0 AND 1.0)),
+    CHECK (temperature IS NOT NULL OR top_p IS NOT NULL)
+) STRICT, WITHOUT ROWID"#;
+
+pub(super) const CREATE_ATTEMPT_SAMPLING_V5: &str = r#"CREATE TABLE attempt_sampling (
+    attempt_id BLOB PRIMARY KEY NOT NULL REFERENCES attempts(id),
+    temperature REAL NOT NULL
+        CHECK (typeof(temperature) = 'real'
+               AND temperature >= 0.0 AND temperature <= 1.7976931348623157e308),
+    top_p REAL NOT NULL
+        CHECK (typeof(top_p) = 'real' AND top_p BETWEEN 0.0 AND 1.0)
+) STRICT, WITHOUT ROWID"#;
+
 pub(super) const CREATE_TURNS_CONVERSATION_V3: &str = r#"CREATE INDEX turns_conversation
     ON turns (conversation_id, id)"#;
 pub(super) const CREATE_TURNS_SELECTED_ATTEMPT_V3: &str = r#"CREATE INDEX turns_selected_attempt

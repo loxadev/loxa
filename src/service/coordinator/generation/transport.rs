@@ -6,7 +6,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper::{Method, Request, StatusCode};
 use hyper_util::rt::TokioIo;
-use loxa_ipc::{ErrorCategory, ServiceError};
+use loxa_ipc::{EffectiveSamplingSettings, ErrorCategory, SamplingValue, ServiceError};
 use serde::Serialize;
 use std::io::{self, Write};
 
@@ -20,7 +20,10 @@ pub(super) struct PreparedEngineRequest {
 }
 
 impl PreparedEngineRequest {
-    pub(super) fn new(prompt: &PromptPreparation) -> Result<Self, ServiceError> {
+    pub(super) fn new(
+        prompt: &PromptPreparation,
+        sampling: EffectiveSamplingSettings,
+    ) -> Result<Self, ServiceError> {
         let mut messages = Vec::with_capacity(
             prompt
                 .messages
@@ -53,9 +56,8 @@ impl PreparedEngineRequest {
             stream_options: StreamOptions {
                 include_usage: true,
             },
-            #[cfg(test)]
-            temperature: (prompt.model_id == super::qualification_fixture::MODEL_ID)
-                .then_some(super::qualification_fixture::TEMPERATURE),
+            temperature: sampling.temperature,
+            top_p: sampling.top_p,
         };
         let raw_capacity = prompt
             .messages
@@ -82,10 +84,8 @@ struct WireRequest<'a> {
     max_completion_tokens: u32,
     stream: bool,
     stream_options: StreamOptions,
-    // The pinned native fixture needs deterministic content to reach its Stop gate.
-    #[cfg(test)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f32>,
+    temperature: SamplingValue,
+    top_p: SamplingValue,
 }
 
 #[derive(Serialize)]
@@ -272,6 +272,8 @@ mod tests {
             model_id: "demo".into(),
             system_instruction: "system".into(),
             max_output_tokens: 512,
+            temperature: None,
+            top_p: None,
             basis: PromptBasis {
                 references: Vec::new(),
             },
@@ -286,13 +288,23 @@ mod tests {
                 },
             ],
         };
-        let encoded = PreparedEngineRequest::new(&prompt).unwrap().body;
+        let encoded = PreparedEngineRequest::new(
+            &prompt,
+            EffectiveSamplingSettings {
+                temperature: SamplingValue::new(0.0).unwrap(),
+                top_p: SamplingValue::new(0.95).unwrap(),
+            },
+        )
+        .unwrap()
+        .body;
         let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(value["messages"][0]["role"], "system");
         assert_eq!(value["messages"][1]["content"], "hello");
         assert_eq!(value["messages"][2]["role"], "assistant");
         assert_eq!(value["max_completion_tokens"], 512);
         assert_eq!(value["stream"], true);
+        assert_eq!(value["temperature"], 0.0);
+        assert_eq!(value["top_p"], 0.95);
     }
 
     #[test]

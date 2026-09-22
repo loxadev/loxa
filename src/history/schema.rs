@@ -12,14 +12,15 @@ mod definitions;
 use definitions::{
     CREATE_ATTEMPTS_LATEST_V2, CREATE_ATTEMPTS_PRIOR_V3, CREATE_ATTEMPTS_RECOVERY_V3,
     CREATE_ATTEMPTS_UNRESOLVED_V2, CREATE_ATTEMPTS_V2, CREATE_ATTEMPT_CHUNKS_V3,
-    CREATE_ATTEMPT_FINALIZATIONS_V3, CREATE_ATTEMPT_STATISTICS_V4, CREATE_CONVERSATIONS_V1,
-    CREATE_DRAFTS_CLIENT_CONVERSATION_V2, CREATE_DRAFTS_CLIENT_UNBOUND_V2,
-    CREATE_DRAFTS_CONVERSATION_V3, CREATE_DRAFTS_V2, CREATE_RECENCY_INDEX_V1,
-    CREATE_TURNS_CONVERSATION_V3, CREATE_TURNS_SELECTED_ATTEMPT_V3, CREATE_TURNS_V2,
+    CREATE_ATTEMPT_FINALIZATIONS_V3, CREATE_ATTEMPT_SAMPLING_V5, CREATE_ATTEMPT_STATISTICS_V4,
+    CREATE_CONVERSATIONS_V1, CREATE_CONVERSATION_SAMPLING_V5, CREATE_DRAFTS_CLIENT_CONVERSATION_V2,
+    CREATE_DRAFTS_CLIENT_UNBOUND_V2, CREATE_DRAFTS_CONVERSATION_V3, CREATE_DRAFTS_V2,
+    CREATE_RECENCY_INDEX_V1, CREATE_TURNS_CONVERSATION_V3, CREATE_TURNS_SELECTED_ATTEMPT_V3,
+    CREATE_TURNS_V2,
 };
 
 const APPLICATION_ID: i64 = 0x4c4f5841;
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const DATABASE_FILENAME: &str = "app.sqlite";
 const PRIVATE_MODE: u32 = 0o600;
 
@@ -121,6 +122,10 @@ pub(super) fn open_store(
         }
         if version == 3 {
             migrate_v3_to_v4(&mut connection)?;
+            version = 4;
+        }
+        if version == 4 {
+            migrate_v4_to_v5(&mut connection)?;
         }
         verify_schema(&connection, SCHEMA_VERSION)?;
         revalidate_root(root, &root_identity)?;
@@ -250,6 +255,20 @@ fn migrate_v3_to_v4(connection: &mut Connection) -> Result<(), HistoryError> {
     transaction.commit().map_err(classify_sql_error)
 }
 
+fn migrate_v4_to_v5(connection: &mut Connection) -> Result<(), HistoryError> {
+    let transaction = connection.transaction().map_err(classify_sql_error)?;
+    transaction
+        .execute_batch(CREATE_CONVERSATION_SAMPLING_V5)
+        .map_err(classify_sql_error)?;
+    transaction
+        .execute_batch(CREATE_ATTEMPT_SAMPLING_V5)
+        .map_err(classify_sql_error)?;
+    transaction
+        .pragma_update(None, "user_version", 5)
+        .map_err(classify_sql_error)?;
+    transaction.commit().map_err(classify_sql_error)
+}
+
 fn migrate_v2_to_v3_inner(
     connection: &mut Connection,
     inject_fault_after_recovery_index: bool,
@@ -285,6 +304,73 @@ fn migrate_v2_to_v3_inner(
     transaction.commit().map_err(classify_sql_error)
 }
 
+const SCHEMA_3_TO_5_DEFINITIONS: &[(&str, &str, &str, i64)] = &[
+    ("index", "attempts_latest", CREATE_ATTEMPTS_LATEST_V2, 3),
+    ("index", "attempts_prior", CREATE_ATTEMPTS_PRIOR_V3, 3),
+    ("index", "attempts_recovery", CREATE_ATTEMPTS_RECOVERY_V3, 3),
+    (
+        "index",
+        "attempts_unresolved",
+        CREATE_ATTEMPTS_UNRESOLVED_V2,
+        3,
+    ),
+    ("index", "conversations_recency", CREATE_RECENCY_INDEX_V1, 3),
+    (
+        "index",
+        "drafts_client_conversation",
+        CREATE_DRAFTS_CLIENT_CONVERSATION_V2,
+        3,
+    ),
+    (
+        "index",
+        "drafts_client_unbound",
+        CREATE_DRAFTS_CLIENT_UNBOUND_V2,
+        3,
+    ),
+    (
+        "index",
+        "drafts_conversation",
+        CREATE_DRAFTS_CONVERSATION_V3,
+        3,
+    ),
+    (
+        "index",
+        "turns_conversation",
+        CREATE_TURNS_CONVERSATION_V3,
+        3,
+    ),
+    (
+        "index",
+        "turns_selected_attempt",
+        CREATE_TURNS_SELECTED_ATTEMPT_V3,
+        3,
+    ),
+    ("table", "attempt_chunks", CREATE_ATTEMPT_CHUNKS_V3, 3),
+    (
+        "table",
+        "attempt_finalizations",
+        CREATE_ATTEMPT_FINALIZATIONS_V3,
+        3,
+    ),
+    ("table", "attempt_sampling", CREATE_ATTEMPT_SAMPLING_V5, 5),
+    (
+        "table",
+        "attempt_statistics",
+        CREATE_ATTEMPT_STATISTICS_V4,
+        4,
+    ),
+    ("table", "attempts", CREATE_ATTEMPTS_V2, 3),
+    (
+        "table",
+        "conversation_sampling",
+        CREATE_CONVERSATION_SAMPLING_V5,
+        5,
+    ),
+    ("table", "conversations", CREATE_CONVERSATIONS_V1, 3),
+    ("table", "drafts", CREATE_DRAFTS_V2, 3),
+    ("table", "turns", CREATE_TURNS_V2, 3),
+];
+
 #[cfg(test)]
 pub(super) fn fail_v2_to_v3_after_recovery_index(
     connection: &mut Connection,
@@ -317,9 +403,13 @@ fn verify_schema(connection: &Connection, version: i64) -> Result<(), HistoryErr
     if version >= 3 {
         verify_v3_fields(connection)?;
     }
-    if version == 4 {
+    if version >= 4 {
         verify_v4_fields(connection)?;
     }
+    if version == 5 {
+        verify_v5_fields(connection)?;
+    }
+    let versioned_definitions;
     let expected_definitions: &[(&str, &str, &str)] = if version == 1 {
         &[
             ("index", "conversations_recency", CREATE_RECENCY_INDEX_V1),
@@ -349,93 +439,13 @@ fn verify_schema(connection: &Connection, version: i64) -> Result<(), HistoryErr
             ("table", "drafts", CREATE_DRAFTS_V2),
             ("table", "turns", CREATE_TURNS_V2),
         ]
-    } else if version == 3 {
-        &[
-            ("index", "attempts_latest", CREATE_ATTEMPTS_LATEST_V2),
-            ("index", "attempts_prior", CREATE_ATTEMPTS_PRIOR_V3),
-            ("index", "attempts_recovery", CREATE_ATTEMPTS_RECOVERY_V3),
-            (
-                "index",
-                "attempts_unresolved",
-                CREATE_ATTEMPTS_UNRESOLVED_V2,
-            ),
-            ("index", "conversations_recency", CREATE_RECENCY_INDEX_V1),
-            (
-                "index",
-                "drafts_client_conversation",
-                CREATE_DRAFTS_CLIENT_CONVERSATION_V2,
-            ),
-            (
-                "index",
-                "drafts_client_unbound",
-                CREATE_DRAFTS_CLIENT_UNBOUND_V2,
-            ),
-            (
-                "index",
-                "drafts_conversation",
-                CREATE_DRAFTS_CONVERSATION_V3,
-            ),
-            ("index", "turns_conversation", CREATE_TURNS_CONVERSATION_V3),
-            (
-                "index",
-                "turns_selected_attempt",
-                CREATE_TURNS_SELECTED_ATTEMPT_V3,
-            ),
-            ("table", "attempt_chunks", CREATE_ATTEMPT_CHUNKS_V3),
-            (
-                "table",
-                "attempt_finalizations",
-                CREATE_ATTEMPT_FINALIZATIONS_V3,
-            ),
-            ("table", "attempts", CREATE_ATTEMPTS_V2),
-            ("table", "conversations", CREATE_CONVERSATIONS_V1),
-            ("table", "drafts", CREATE_DRAFTS_V2),
-            ("table", "turns", CREATE_TURNS_V2),
-        ]
     } else {
-        &[
-            ("index", "attempts_latest", CREATE_ATTEMPTS_LATEST_V2),
-            ("index", "attempts_prior", CREATE_ATTEMPTS_PRIOR_V3),
-            ("index", "attempts_recovery", CREATE_ATTEMPTS_RECOVERY_V3),
-            (
-                "index",
-                "attempts_unresolved",
-                CREATE_ATTEMPTS_UNRESOLVED_V2,
-            ),
-            ("index", "conversations_recency", CREATE_RECENCY_INDEX_V1),
-            (
-                "index",
-                "drafts_client_conversation",
-                CREATE_DRAFTS_CLIENT_CONVERSATION_V2,
-            ),
-            (
-                "index",
-                "drafts_client_unbound",
-                CREATE_DRAFTS_CLIENT_UNBOUND_V2,
-            ),
-            (
-                "index",
-                "drafts_conversation",
-                CREATE_DRAFTS_CONVERSATION_V3,
-            ),
-            ("index", "turns_conversation", CREATE_TURNS_CONVERSATION_V3),
-            (
-                "index",
-                "turns_selected_attempt",
-                CREATE_TURNS_SELECTED_ATTEMPT_V3,
-            ),
-            ("table", "attempt_chunks", CREATE_ATTEMPT_CHUNKS_V3),
-            (
-                "table",
-                "attempt_finalizations",
-                CREATE_ATTEMPT_FINALIZATIONS_V3,
-            ),
-            ("table", "attempt_statistics", CREATE_ATTEMPT_STATISTICS_V4),
-            ("table", "attempts", CREATE_ATTEMPTS_V2),
-            ("table", "conversations", CREATE_CONVERSATIONS_V1),
-            ("table", "drafts", CREATE_DRAFTS_V2),
-            ("table", "turns", CREATE_TURNS_V2),
-        ]
+        versioned_definitions = SCHEMA_3_TO_5_DEFINITIONS
+            .iter()
+            .filter(|(_, _, _, minimum)| *minimum <= version)
+            .map(|(kind, name, definition, _)| (*kind, *name, *definition))
+            .collect::<Vec<_>>();
+        &versioned_definitions
     };
     for (kind, name, definition) in expected_definitions {
         if normalize_sql(&schema_sql(connection, kind, name)?) != normalize_sql(definition) {
@@ -445,6 +455,13 @@ fn verify_schema(connection: &Connection, version: i64) -> Result<(), HistoryErr
             ));
         }
     }
+    let object_limit =
+        i64::try_from(expected_definitions.len().saturating_add(1)).map_err(|_| {
+            HistoryError::new(
+                HistoryErrorKind::Corrupt,
+                "history schema object count is invalid",
+            )
+        })?;
     let mut statement = connection
         .prepare(
             "SELECT type, name, tbl_name
@@ -452,11 +469,11 @@ fn verify_schema(connection: &Connection, version: i64) -> Result<(), HistoryErr
              WHERE type IN ('table', 'index', 'view', 'trigger')
                AND name NOT GLOB 'sqlite_*'
              ORDER BY type, name
-             LIMIT 18",
+             LIMIT ?1",
         )
         .map_err(classify_sql_error)?;
     let objects = statement
-        .query_map([], |row| {
+        .query_map([object_limit], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -546,6 +563,21 @@ fn verify_v4_fields(connection: &Connection) -> Result<(), HistoryError> {
                 "history schema is missing required schema-4 fields",
             )
         })?;
+    Ok(())
+}
+
+fn verify_v5_fields(connection: &Connection) -> Result<(), HistoryError> {
+    for query in [
+        "SELECT conversation_id, temperature, top_p FROM conversation_sampling WHERE 0",
+        "SELECT attempt_id, temperature, top_p FROM attempt_sampling WHERE 0",
+    ] {
+        connection.prepare(query).map_err(|_| {
+            HistoryError::new(
+                HistoryErrorKind::Corrupt,
+                "history schema is missing required schema-5 fields",
+            )
+        })?;
+    }
     Ok(())
 }
 
@@ -833,4 +865,14 @@ pub(super) fn create_v3_fixture(path: &Path) {
     connection.close().expect("close schema-3 fixture");
     fs::set_permissions(path, fs::Permissions::from_mode(PRIVATE_MODE))
         .expect("make schema-3 fixture private");
+}
+
+#[cfg(test)]
+pub(super) fn create_v4_fixture(path: &Path) {
+    create_v3_fixture(path);
+    let mut connection = Connection::open(path).expect("open schema-4 fixture");
+    migrate_v3_to_v4(&mut connection).expect("migrate schema-4 fixture");
+    connection.close().expect("close schema-4 fixture");
+    fs::set_permissions(path, fs::Permissions::from_mode(PRIVATE_MODE))
+        .expect("make schema-4 fixture private");
 }

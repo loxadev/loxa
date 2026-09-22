@@ -39,6 +39,13 @@ pub enum GenerationCommand {
         user_text: String,
         draft: Option<GenerationDraft>,
     },
+    Retry {
+        conversation_id: String,
+        submission_id: String,
+        expected_conversation_revision: String,
+        expected_profile_revision: String,
+        prior_attempt_id: String,
+    },
     Stop {
         target: GenerationTarget,
     },
@@ -73,12 +80,32 @@ impl GenerationCommand {
                 }
                 Ok(())
             }
+            Self::Retry {
+                conversation_id,
+                submission_id,
+                expected_conversation_revision,
+                expected_profile_revision,
+                prior_attempt_id,
+            } => {
+                validate_hex_id(conversation_id, "invalid conversation identity")?;
+                validate_hex_id(submission_id, "invalid submission identity")?;
+                validate_positive_decimal(
+                    expected_conversation_revision,
+                    "invalid conversation revision",
+                )?;
+                validate_positive_decimal(expected_profile_revision, "invalid profile revision")?;
+                validate_hex_id(prior_attempt_id, "invalid prior attempt identity")
+            }
             Self::Stop { target } => target.validate_shape(),
         }
     }
 
     pub fn is_stop(&self) -> bool {
         matches!(self, Self::Stop { .. })
+    }
+
+    pub(crate) fn is_retry(&self) -> bool {
+        matches!(self, Self::Retry { .. })
     }
 }
 
@@ -242,6 +269,27 @@ mod tests {
         assert_eq!(
             oversized.validate_shape(),
             Err("user text must contain 1 byte to 32 KiB")
+        );
+
+        let retry = GenerationCommand::Retry {
+            conversation_id: "a".repeat(32),
+            submission_id: "e".repeat(32),
+            expected_conversation_revision: "3".into(),
+            expected_profile_revision: "2".into(),
+            prior_attempt_id: "f".repeat(32),
+        };
+        retry.validate_shape().unwrap();
+        let mut invalid = retry;
+        let GenerationCommand::Retry {
+            prior_attempt_id, ..
+        } = &mut invalid
+        else {
+            unreachable!();
+        };
+        prior_attempt_id.push('0');
+        assert_eq!(
+            invalid.validate_shape(),
+            Err("invalid prior attempt identity")
         );
     }
 }

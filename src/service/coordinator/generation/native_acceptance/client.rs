@@ -3,7 +3,8 @@ use loxa_ipc::{
     AttemptExecution, AttemptSave, ClientError, ConnectMode, ContentSource, DraftCommand,
     DraftReply, DraftSnapshot, ErrorCategory, GenerationAccepted, GenerationCommand,
     GenerationDraft, GenerationReply, GenerationSettingsPatch, HistoryCommand, HistoryReply,
-    ServiceClient, ServiceSettingsCommand, ServiceSettingsReply,
+    OptionalSamplingValuePatch, SamplingValue, ServiceClient, ServiceSettingsCommand,
+    ServiceSettingsReply,
 };
 use std::time::Duration;
 
@@ -43,6 +44,14 @@ pub(super) async fn create_conversation(
                 patch: GenerationSettingsPatch::Fields {
                     system_instruction: None,
                     max_output_tokens: Some(max_output_tokens),
+                    temperature: Some(OptionalSamplingValuePatch::Set {
+                        value: SamplingValue::new(super::super::qualification_fixture::TEMPERATURE)
+                            .expect("finite fixture sampling value"),
+                    }),
+                    top_p: Some(OptionalSamplingValuePatch::Set {
+                        value: SamplingValue::new(super::super::qualification_fixture::TOP_P)
+                            .expect("finite fixture sampling value"),
+                    }),
                 },
             },
         )
@@ -160,6 +169,32 @@ pub(super) async fn send(
         GenerationReply::Accepted(accepted) => Ok(accepted),
         GenerationReply::Stopping { .. } => Err(ClientError::Transport(
             "native generation Send returned Stopping".into(),
+        )),
+    }
+}
+
+pub(super) async fn retry(
+    client: ServiceClient,
+    conversation: Conversation,
+    prior: &GenerationAccepted,
+    submission: u8,
+) -> Result<GenerationAccepted, ClientError> {
+    let pending = client
+        .prepare_generation_retry(ConnectMode::ObserveExisting)
+        .await?;
+    let reply = pending
+        .send(GenerationCommand::Retry {
+            conversation_id: conversation.id,
+            submission_id: format!("{submission:02x}").repeat(16),
+            expected_conversation_revision: prior.post_conversation_revision.clone(),
+            expected_profile_revision: prior.profile_revision.clone(),
+            prior_attempt_id: prior.attempt_id.clone(),
+        })
+        .await?;
+    match reply {
+        GenerationReply::Accepted(accepted) => Ok(accepted),
+        GenerationReply::Stopping { .. } => Err(ClientError::Transport(
+            "native generation Retry returned Stopping".into(),
         )),
     }
 }

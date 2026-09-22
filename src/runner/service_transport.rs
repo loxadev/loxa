@@ -4,12 +4,116 @@ use http_body_util::{BodyExt, Empty};
 use hyper::body::Bytes;
 use hyper::Request;
 use hyper_util::rt::TokioIo;
+use serde::Deserialize;
 use std::path::Path;
 use std::time::Duration;
 
 const UNIX_READINESS_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_READINESS_HEADERS: usize = 64;
 const MAX_READINESS_HTTP_BUFFER: usize = 64 * 1024;
+const MAX_PROPERTIES_BYTES: usize = 64 * 1024;
+
+#[derive(Deserialize)]
+struct Properties {
+    default_generation_settings: DefaultGenerationSettings,
+    total_slots: u32,
+    model_alias: String,
+    endpoint_slots: bool,
+}
+
+#[derive(Deserialize)]
+struct DefaultGenerationSettings {
+    n_ctx: u32,
+}
+
+pub(crate) fn observe_context(
+    runtime: &tokio::runtime::Handle,
+    endpoint: &Path,
+    pid: u32,
+    model_id: &str,
+) -> Option<u32> {
+    let body = runtime
+        .block_on(get_authenticated_bounded(
+            endpoint,
+            pid,
+            "/props",
+            MAX_PROPERTIES_BYTES,
+        ))
+        .ok()??;
+    parse_context(&body, model_id)
+}
+
+fn parse_context(body: &[u8], model_id: &str) -> Option<u32> {
+    let properties: Properties = serde_json::from_slice(body).ok()?;
+    (properties.model_alias == model_id && properties.total_slots == 1 && properties.endpoint_slots)
+        .then_some(properties.default_generation_settings.n_ctx)
+}
+
+async fn get_authenticated_bounded(
+    path: &Path,
+    expected_pid: u32,
+    uri: &'static str,
+    max_body: usize,
+) -> Result<Option<Vec<u8>>, String> {
+    tokio::time::timeout(UNIX_READINESS_ATTEMPT_TIMEOUT, async {
+        let mut authenticated = None;
+        let Some(stream) = connect_authenticated(path, expected_pid, &mut authenticated).await?
+        else {
+            return Ok(None);
+        };
+        let io = TokioIo::new(stream);
+        let mut builder = hyper::client::conn::http1::Builder::new();
+        builder
+            .max_headers(MAX_READINESS_HEADERS)
+            .max_buf_size(MAX_READINESS_HTTP_BUFFER);
+        let (mut sender, connection) = builder
+            .handshake(io)
+            .await
+            .map_err(|error| error.to_string())?;
+        let request = Request::builder()
+            .method(hyper::Method::GET)
+            .uri(uri)
+            .header(hyper::header::HOST, "localhost")
+            .header(hyper::header::CONNECTION, "close")
+            .body(Empty::<Bytes>::new())
+            .map_err(|error| error.to_string())?;
+        let exchange = async move {
+            let mut response = sender
+                .send_request(request)
+                .await
+                .map_err(|error| error.to_string())?;
+            if !response.status().is_success() {
+                return Err(format!("{uri} returned HTTP {}", response.status()));
+            }
+            if response
+                .headers()
+                .get(hyper::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<usize>().ok())
+                .is_some_and(|length| length > max_body)
+            {
+                return Err(format!("{uri} response exceeds {max_body} bytes"));
+            }
+            let mut body = Vec::with_capacity(max_body);
+            while let Some(frame) = response.body_mut().frame().await {
+                let frame = frame.map_err(|error| error.to_string())?;
+                let Ok(data) = frame.into_data() else {
+                    continue;
+                };
+                if body.len().saturating_add(data.len()) > max_body {
+                    return Err(format!("{uri} response exceeds {max_body} bytes"));
+                }
+                body.extend_from_slice(&data);
+            }
+            Ok(body)
+        };
+        let (driver, response) = tokio::join!(connection.without_shutdown(), exchange);
+        driver.map_err(|error| error.to_string())?;
+        response.map(Some)
+    })
+    .await
+    .map_err(|_| format!("{uri} request timed out"))?
+}
 
 pub(super) fn require_absent_unix_endpoint(path: &Path) -> Result<(), String> {
     match std::fs::symlink_metadata(path) {
@@ -247,6 +351,32 @@ pub(super) fn remove_owned_unix_endpoint(
         }
         (Some(_), None) => {
             Err("refusing to remove a service engine endpoint that was never authenticated".into())
+        }
+    }
+}
+
+#[cfg(test)]
+mod properties_tests {
+    use super::parse_context;
+
+    #[test]
+    fn observation_requires_the_exact_model_and_single_slot_shape() {
+        let valid = br#"{
+            "default_generation_settings":{"n_ctx":8192,"params":{"temperature":0.8}},
+            "total_slots":1,
+            "model_alias":"demo",
+            "endpoint_slots":true,
+            "chat_template":"{{ messages }}"
+        }"#;
+        assert_eq!(parse_context(valid, "demo"), Some(8192));
+        assert_eq!(parse_context(valid, "other"), None);
+
+        for invalid in [
+            br#"{"default_generation_settings":{"n_ctx":8192},"total_slots":2,"model_alias":"demo","endpoint_slots":true}"#.as_slice(),
+            br#"{"default_generation_settings":{"n_ctx":8192},"total_slots":1,"model_alias":"demo","endpoint_slots":false}"#.as_slice(),
+            br#"{"default_generation_settings":{"n_ctx":"large"},"total_slots":1,"model_alias":"demo","endpoint_slots":true}"#.as_slice(),
+        ] {
+            assert_eq!(parse_context(invalid, "demo"), None);
         }
     }
 }

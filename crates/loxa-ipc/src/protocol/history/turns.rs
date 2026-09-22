@@ -1,6 +1,7 @@
 use super::{
     bounded_decimal, positive_bounded_decimal, validate_hex_id, MAX_ATTEMPT_CONTENT_BYTES,
 };
+use crate::EffectiveSamplingSettings;
 use serde::de::{SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
@@ -149,6 +150,7 @@ pub struct AttemptSummary {
     pub terminal_saved_end: Option<String>,
     pub failure_code: Option<String>,
     pub statistics: Option<AttemptStatistics>,
+    pub effective_sampling: Option<EffectiveSamplingSettings>,
     pub created_ms: String,
     pub updated_ms: String,
 }
@@ -228,6 +230,9 @@ impl AttemptSummary {
                 return Err("attempt statistics do not match the execution outcome");
             }
             statistics.validate_shape()?;
+        }
+        if let Some(sampling) = &self.effective_sampling {
+            sampling.validate_shape()?;
         }
         let created = bounded_decimal(
             &self.created_ms,

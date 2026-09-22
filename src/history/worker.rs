@@ -160,7 +160,7 @@ pub(super) fn run(
                 conversation_id,
                 expected_conversation_revision,
                 expected_profile_revision,
-                current_user_text,
+                request,
                 reply,
                 permit,
             }) => {
@@ -171,7 +171,7 @@ pub(super) fn run(
                         conversation_id,
                         expected_conversation_revision,
                         expected_profile_revision,
-                        current_user_text,
+                        request,
                     ),
                     Some(WorkerStore::Unavailable(_)) | None => Err(super::HistoryError::new(
                         HistoryErrorKind::WorkerUnavailable,

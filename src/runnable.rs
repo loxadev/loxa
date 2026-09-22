@@ -267,7 +267,7 @@ pub(crate) fn resolve_managed_runnable_for_service(
             manifest.id
         )));
     }
-    let ctx = config::resolve_value(None, config.ctx, 4096);
+    let ctx = resolve_service_context(config.ctx);
     let profile = launch_profile(&manifest, &paths.models, paths.runtime_identity)
         .map_err(ManagedRunnableError::ModelUnavailable)?;
     let server = runner::prepare_managed_runtime(paths, retained_runtime, cancelled)?;
@@ -294,6 +294,16 @@ pub(crate) fn resolve_managed_runnable_for_service(
         fingerprint,
         !paths.runtime_identity.is_bundled(),
     ))
+}
+
+pub(crate) fn resolve_service_context(preference: Option<u32>) -> u32 {
+    config::resolve_value(None, preference, 4096)
+}
+
+pub(crate) fn service_context_is_supported(context: u32) -> bool {
+    (crate::runtime_fingerprint::SERVICE_MIN_CONTEXT
+        ..=crate::runtime_fingerprint::SERVICE_MAX_CONTEXT)
+        .contains(&context)
 }
 
 fn resolve_managed_runnable_with_admission(
@@ -535,6 +545,16 @@ mod tests {
     use std::fmt::Write as _;
     use std::path::Path;
     use tempfile::tempdir;
+
+    #[test]
+    fn service_context_resolution_preserves_the_default_equivalence_and_bounds() {
+        assert_eq!(resolve_service_context(None), 4096);
+        assert_eq!(resolve_service_context(Some(4096)), 4096);
+        assert!(service_context_is_supported(512));
+        assert!(service_context_is_supported(32_768));
+        assert!(!service_context_is_supported(511));
+        assert!(!service_context_is_supported(32_769));
+    }
 
     fn manifest() -> Manifest {
         Manifest {

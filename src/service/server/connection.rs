@@ -282,12 +282,12 @@ fn negotiate_hello(
 
 fn available_capabilities(coordinator: &Coordinator, minor: u16) -> Vec<Capability> {
     let mut capabilities = LEGACY_CAPABILITIES.to_vec();
-    if minor >= 1 {
+    if minor >= 5 {
         capabilities.push(Capability::Settings);
-        if coordinator.history_is_ready() {
-            capabilities.push(Capability::History);
-            capabilities.push(Capability::Drafts);
-        }
+    }
+    if minor >= 1 && coordinator.history_is_ready() {
+        capabilities.push(Capability::History);
+        capabilities.push(Capability::Drafts);
     }
     capabilities
 }
@@ -302,6 +302,27 @@ pub(super) async fn execute_request(
     let outcome = match request.command {
         ServiceCommand::Status => ReplyOutcome::Status(coordinator.status_report()),
         ServiceCommand::Load { model_id } => match coordinator.load(model_id).await {
+            Ok(accepted) => ReplyOutcome::Accepted(accepted),
+            Err(error) => ReplyOutcome::Rejected(error),
+        },
+        ServiceCommand::Reload { .. } if negotiated.protocol.minor < 5 => {
+            ReplyOutcome::Rejected(ServiceError::new(
+                ErrorCategory::IncompatibleProtocol,
+                "Reload requires service protocol 1.5",
+            ))
+        }
+        ServiceCommand::Reload { .. }
+            if !negotiated.capabilities.contains(&Capability::Settings) =>
+        {
+            ReplyOutcome::Rejected(ServiceError::new(
+                ErrorCategory::ServiceUnavailable,
+                "service settings are not ready",
+            ))
+        }
+        ServiceCommand::Reload {
+            target,
+            expected_settings_revision,
+        } => match coordinator.reload(&target, &expected_settings_revision) {
             Ok(accepted) => ReplyOutcome::Accepted(accepted),
             Err(error) => ReplyOutcome::Rejected(error),
         },
@@ -333,15 +354,15 @@ pub(super) async fn execute_request(
         }
         ServiceCommand::History {
             command: loxa_ipc::HistoryCommand::GetHistoryStatus,
-        } if negotiated.protocol.minor < 4 => ReplyOutcome::Rejected(ServiceError::new(
+        } if negotiated.protocol.minor < 5 => ReplyOutcome::Rejected(ServiceError::new(
             ErrorCategory::IncompatibleProtocol,
-            "history status requires service protocol 1.4",
+            "history status requires service protocol 1.5",
         )),
         ServiceCommand::History {
             command: loxa_ipc::HistoryCommand::ListTurns { .. },
-        } if negotiated.protocol.minor < 4 => ReplyOutcome::Rejected(ServiceError::new(
+        } if negotiated.protocol.minor < 5 => ReplyOutcome::Rejected(ServiceError::new(
             ErrorCategory::IncompatibleProtocol,
-            "attempt statistics require service protocol 1.4",
+            "attempt settings require service protocol 1.5",
         )),
         ServiceCommand::History { command }
             if command.requires_ready_history()
@@ -388,10 +409,10 @@ pub(super) async fn execute_request(
                 ReplyOutcome::Rejected(error)
             }
         },
-        ServiceCommand::Settings { command: _ } if negotiated.protocol.minor == 0 => {
+        ServiceCommand::Settings { command: _ } if negotiated.protocol.minor < 5 => {
             ReplyOutcome::Rejected(ServiceError::new(
                 ErrorCategory::IncompatibleProtocol,
-                "settings require service protocol 1.1",
+                "sampling settings require service protocol 1.5",
             ))
         }
         ServiceCommand::Settings { command: _ }
@@ -429,11 +450,18 @@ pub(super) async fn execute_request(
             ))
         }
         ServiceCommand::Generation {
-            command: loxa_ipc::GenerationCommand::Send { .. },
+            command: loxa_ipc::GenerationCommand::Retry { .. },
+        } if negotiated.protocol.minor < 5 => ReplyOutcome::Rejected(ServiceError::new(
+            ErrorCategory::IncompatibleProtocol,
+            "generation Retry requires service protocol 1.5",
+        )),
+        ServiceCommand::Generation {
+            command:
+                loxa_ipc::GenerationCommand::Send { .. } | loxa_ipc::GenerationCommand::Retry { .. },
         } if negotiated.generation != Some(loxa_ipc::GenerationConnection::Request) => {
             ReplyOutcome::Rejected(ServiceError::new(
                 ErrorCategory::InvalidRequest,
-                "generation Send requires a prepared generation connection",
+                "generation request requires a prepared generation connection",
             ))
         }
         ServiceCommand::Generation {
@@ -446,15 +474,14 @@ pub(super) async fn execute_request(
         }
         ServiceCommand::Generation { command } => {
             let result = match command {
-                command @ loxa_ipc::GenerationCommand::Send { .. } => {
-                    match pending_generation.take() {
-                        Some(pending) => coordinator.generation_send(command, pending).await,
-                        None => Err(ServiceError::new(
-                            ErrorCategory::Conflict,
-                            "pending generation connection is no longer current",
-                        )),
-                    }
-                }
+                command @ (loxa_ipc::GenerationCommand::Send { .. }
+                | loxa_ipc::GenerationCommand::Retry { .. }) => match pending_generation.take() {
+                    Some(pending) => coordinator.generation_request(command, pending).await,
+                    None => Err(ServiceError::new(
+                        ErrorCategory::Conflict,
+                        "pending generation connection is no longer current",
+                    )),
+                },
                 loxa_ipc::GenerationCommand::Stop { target } => coordinator
                     .stop_generation(&target)
                     .map(|()| loxa_ipc::GenerationReply::Stopping { target }),

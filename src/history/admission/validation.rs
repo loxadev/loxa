@@ -24,6 +24,8 @@ pub(super) fn validate_prepared(prepared: &PreparedAdmission) -> Result<(), Hist
             ..=crate::runtime_fingerprint::SERVICE_MAX_CONTEXT)
             .contains(&prepared.effective_context)
         || prepared.effective_context > prepared.runtime_fingerprint.effective_context()
+        || prepared.effective_sampling.temperature.get() < 0.0
+        || !(0.0..=1.0).contains(&prepared.effective_sampling.top_p.get())
     {
         return Err(invalid("invalid generation profile"));
     }
@@ -363,11 +365,11 @@ pub(super) struct RetryTarget {
 }
 
 pub(super) fn read_retry_target(
-    transaction: &Transaction<'_>,
+    connection: &Connection,
     conversation_id: [u8; 16],
     prior_attempt_id: [u8; 16],
 ) -> Result<Option<RetryTarget>, HistoryError> {
-    transaction
+    connection
         .query_row(
             "SELECT t.id, a.attempt_number + 1
              FROM turns t JOIN attempts a ON a.id = t.selected_attempt_id

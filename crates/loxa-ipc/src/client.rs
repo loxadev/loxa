@@ -112,6 +112,7 @@ impl ServiceClient {
                 | ServiceCommand::Settings { .. }
                 | ServiceCommand::Generation { .. }
                 | ServiceCommand::GetGenerationStatus { .. }
+                | ServiceCommand::Reload { .. }
         ) {
             return Err(ClientError::Transport(
                 "this command requires an explicit versioned client entry point".into(),
@@ -146,6 +147,34 @@ impl ServiceClient {
             | ReplyOutcome::Generation { .. }
             | ReplyOutcome::GenerationStatus { .. } => Err(ClientError::Transport(
                 "service returned an outcome for a different command".into(),
+            )),
+        }
+    }
+
+    pub async fn reload(
+        &self,
+        mode: ConnectMode,
+        target: crate::OperationTarget,
+        expected_settings_revision: String,
+    ) -> Result<crate::Accepted, ClientError> {
+        let retiring = target.clone();
+        let command = ServiceCommand::Reload {
+            target,
+            expected_settings_revision,
+        };
+        command
+            .validate_shape()
+            .map_err(|error| ClientError::Transport(error.into()))?;
+        let mut connection = self.connect_for(mode, ClientContract::Reload).await?;
+        let expected_boot_epoch = connection.hello.boot_epoch.clone();
+        let retiring_ids = validate_reload_target(&retiring, &expected_boot_epoch)?;
+        match connection.request(command).await? {
+            ReplyOutcome::Accepted(accepted) => {
+                validate_reload_successor(retiring_ids, &expected_boot_epoch, accepted)
+            }
+            ReplyOutcome::Rejected(error) => Err(ClientError::Rejected(error)),
+            _ => Err(ClientError::Transport(
+                "service returned an outcome for a different Reload command".into(),
             )),
         }
     }
@@ -231,9 +260,24 @@ impl ServiceClient {
         &self,
         mode: ConnectMode,
     ) -> Result<PendingGenerationRequest, ClientError> {
-        let connection = self
-            .connect_for(mode, ClientContract::GenerationRequest)
-            .await?;
+        self.prepare_generation_with_contract(mode, ClientContract::GenerationRequest)
+            .await
+    }
+
+    pub async fn prepare_generation_retry(
+        &self,
+        mode: ConnectMode,
+    ) -> Result<PendingGenerationRequest, ClientError> {
+        self.prepare_generation_with_contract(mode, ClientContract::GenerationRetry)
+            .await
+    }
+
+    async fn prepare_generation_with_contract(
+        &self,
+        mode: ConnectMode,
+        contract: ClientContract,
+    ) -> Result<PendingGenerationRequest, ClientError> {
+        let connection = self.connect_for(mode, contract).await?;
         if connection.hello.storage_schema != HISTORY_SCHEMA_VERSION
             || !connection.hello.capabilities.contains(&Capability::History)
         {
@@ -476,6 +520,10 @@ impl ServiceClient {
                 self.client_build.clone(),
                 self.bootstrap.root().root_identity(),
             ),
+            ClientContract::Reload => Hello::reload(
+                self.client_build.clone(),
+                self.bootstrap.root().root_identity(),
+            ),
             ClientContract::GenerationStatus => Hello::generation_status(
                 self.client_build.clone(),
                 self.bootstrap.root().root_identity(),
@@ -484,6 +532,10 @@ impl ServiceClient {
                 self.client_build.clone(),
                 self.bootstrap.root().root_identity(),
                 crate::GenerationConnection::Request,
+            ),
+            ClientContract::GenerationRetry => Hello::generation_retry(
+                self.client_build.clone(),
+                self.bootstrap.root().root_identity(),
             ),
             ClientContract::GenerationControl => Hello::generation(
                 self.client_build.clone(),
@@ -512,8 +564,16 @@ impl ServiceClient {
             ClientContract::GenerationRequest => {
                 hello.generation.is_some() && hello.protocol == crate::ProtocolVersion::V1_2
             }
+            ClientContract::GenerationRetry => {
+                hello.generation.is_some() && hello.protocol == crate::ProtocolVersion::V1_5
+            }
             ClientContract::GenerationControl => {
                 hello.generation.is_none() && hello.protocol == crate::ProtocolVersion::V1_2
+            }
+            ClientContract::Reload => {
+                hello.generation.is_none()
+                    && hello.protocol == crate::ProtocolVersion::V1_5
+                    && hello.capabilities.contains(&Capability::Settings)
             }
             ClientContract::GenerationStatus
             | ClientContract::Legacy
@@ -659,7 +719,12 @@ impl PendingGenerationRequest {
     ) -> Result<GenerationReply, ClientError> {
         if command.is_stop() {
             return Err(ClientError::Transport(
-                "prepared generation connection accepts only Send".into(),
+                "prepared generation connection accepts only Send or Retry".into(),
+            ));
+        }
+        if command.is_retry() && self.connection.hello.protocol != crate::ProtocolVersion::V1_5 {
+            return Err(ClientError::Transport(
+                "generation Retry requires service protocol 1.5".into(),
             ));
         }
         command
@@ -684,7 +749,9 @@ enum ClientContract {
     Legacy,
     HistoryStatus,
     History,
+    Reload,
     GenerationRequest,
+    GenerationRetry,
     GenerationControl,
     GenerationStatus,
 }
@@ -774,6 +841,50 @@ fn validate_projection(
         .state_revision
         .parse::<u64>()
         .map_err(|_| ClientError::Transport("invalid service state revision".into()))
+}
+
+fn validate_reload_target(
+    target: &crate::OperationTarget,
+    acknowledged_boot_epoch: &str,
+) -> Result<(u64, u64), ClientError> {
+    if target.boot_epoch != acknowledged_boot_epoch {
+        return Err(ClientError::Transport(
+            "Reload target boot epoch changed".into(),
+        ));
+    }
+    let task_id = target
+        .task_id
+        .parse::<u64>()
+        .map_err(|_| ClientError::Transport("invalid Reload target identity".into()))?;
+    let generation = target
+        .generation
+        .parse::<u64>()
+        .map_err(|_| ClientError::Transport("invalid Reload target identity".into()))?;
+    Ok((task_id, generation))
+}
+
+fn validate_reload_successor(
+    retiring: (u64, u64),
+    acknowledged_boot_epoch: &str,
+    accepted: crate::Accepted,
+) -> Result<crate::Accepted, ClientError> {
+    let task_id = accepted
+        .task_id
+        .parse::<u64>()
+        .map_err(|_| ClientError::Transport("invalid Reload successor identity".into()))?;
+    let generation = accepted
+        .generation
+        .parse::<u64>()
+        .map_err(|_| ClientError::Transport("invalid Reload successor identity".into()))?;
+    if accepted.boot_epoch != acknowledged_boot_epoch
+        || task_id <= retiring.0
+        || generation <= retiring.1
+    {
+        return Err(ClientError::Transport(
+            "service returned an invalid Reload successor identity".into(),
+        ));
+    }
+    Ok(accepted)
 }
 
 async fn run_bootstrap<T, E, F>(work: F) -> Result<T, E>
@@ -952,6 +1063,48 @@ mod tests {
         assert!(matches!(
             request_with_response(TestResponse::PeerEof),
             Err(ClientError::Transport(message)) if message.contains("closed the connection")
+        ));
+    }
+
+    #[test]
+    fn reload_accepts_only_a_monotonic_successor_from_the_acknowledged_boot() {
+        let retiring = crate::OperationTarget {
+            boot_epoch: "boot".into(),
+            task_id: "7".into(),
+            generation: "9".into(),
+        };
+        let retiring_ids = validate_reload_target(&retiring, "boot").unwrap();
+        let accepted = |boot_epoch: &str, task_id: u64, generation: u64| crate::Accepted {
+            boot_epoch: boot_epoch.into(),
+            task_id: task_id.to_string(),
+            generation: generation.to_string(),
+            state_revision: "1".into(),
+        };
+
+        for invalid in [
+            accepted("boot", 0, 10),
+            accepted("boot", 8, 0),
+            accepted("boot", 6, 10),
+            accepted("boot", 8, 8),
+            accepted("boot", 7, 10),
+            accepted("boot", 8, 9),
+            accepted("other", 8, 10),
+        ] {
+            assert!(matches!(
+                validate_reload_successor(retiring_ids, "boot", invalid),
+                Err(ClientError::Transport(message))
+                    if message.contains("invalid Reload successor identity")
+            ));
+        }
+
+        let valid = accepted("boot", 8, 10);
+        assert_eq!(
+            validate_reload_successor(retiring_ids, "boot", valid.clone()).unwrap(),
+            valid
+        );
+        assert!(matches!(
+            validate_reload_target(&retiring, "replacement"),
+            Err(ClientError::Transport(message)) if message.contains("boot epoch changed")
         ));
     }
 

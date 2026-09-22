@@ -20,9 +20,10 @@ pub(super) const LIST_TURNS_AFTER_SQL: &str =
             s.attempt_id, s.qualified_input_tokens, s.qualified_output_tokens,
             s.service_first_output_latency_ms,
             s.qualified_engine_decode_tokens_per_second, s.service_total_duration_ms,
-            s.stop_reason
+            s.stop_reason, p.attempt_id, p.temperature, p.top_p
      FROM turns t LEFT JOIN attempts a ON a.id = t.selected_attempt_id
      LEFT JOIN attempt_statistics s ON s.attempt_id = a.id
+     LEFT JOIN attempt_sampling p ON p.attempt_id = a.id
      WHERE t.conversation_id = ?1 AND t.ordinal < ?2
      ORDER BY t.ordinal DESC LIMIT ?3";
 
@@ -33,9 +34,10 @@ const LIST_TURNS_FIRST_SQL: &str = "SELECT t.id, t.ordinal, length(CAST(t.user_t
             s.attempt_id, s.qualified_input_tokens, s.qualified_output_tokens,
             s.service_first_output_latency_ms,
             s.qualified_engine_decode_tokens_per_second, s.service_total_duration_ms,
-            s.stop_reason
+            s.stop_reason, p.attempt_id, p.temperature, p.top_p
      FROM turns t LEFT JOIN attempts a ON a.id = t.selected_attempt_id
      LEFT JOIN attempt_statistics s ON s.attempt_id = a.id
+     LEFT JOIN attempt_sampling p ON p.attempt_id = a.id
      WHERE t.conversation_id = ?1
      ORDER BY t.ordinal DESC LIMIT ?2";
 
@@ -273,6 +275,7 @@ fn turn_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnSummary> {
             let statistics = statistics::read(row, 15, attempt_id)?
                 .map(|statistics| statistics.to_wire(execution, save, 15))
                 .transpose()?;
+            let effective_sampling = super::sampling::read_attempt(row, 22, attempt_id)?;
             Some(AttemptSummary {
                 id: encode_id(attempt_id),
                 attempt_number: positive(row.get(6)?, 6)?,
@@ -283,6 +286,7 @@ fn turn_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnSummary> {
                 terminal_saved_end: terminal_saved_end_value.map(|value| value.to_string()),
                 failure_code: optional_ascii(row, 12, 64)?,
                 statistics,
+                effective_sampling,
                 created_ms,
                 updated_ms,
             })

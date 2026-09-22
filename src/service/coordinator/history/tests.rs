@@ -8,7 +8,8 @@ use crate::service::coordinator::generation::parser::SseDecoder;
 use crate::service::coordinator::generation::persistence::{OutputPipeline, SaveChunkFailure};
 use crate::service::coordinator::{Coordinator, HistoryExit, OwnerExit};
 use loxa_ipc::{
-    AttemptStopReason, ErrorCategory, GenerationTarget, HistoryCommand, HistoryPhase, HistoryReply,
+    AttemptStopReason, EffectiveSamplingSettings, ErrorCategory, GenerationTarget, HistoryCommand,
+    HistoryPhase, HistoryReply, SamplingValue,
 };
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -114,6 +115,10 @@ impl Fixture {
             effective_context: None,
             system_instruction: String::new(),
             max_output_tokens: 512,
+            effective_sampling: EffectiveSamplingSettings {
+                temperature: SamplingValue::new(0.8).unwrap(),
+                top_p: SamplingValue::new(0.95).unwrap(),
+            },
             prompt_basis: PromptBasis {
                 references: Vec::new(),
             },
@@ -441,7 +446,7 @@ async fn lost_admission_reply_and_terminal_failure_retry_under_drain() {
     assert!(fixture.coordinator.admission_stop_retry_ready_for_test());
     let reply = fixture
         .coordinator
-        .generation_send(
+        .generation_request(
             loxa_ipc::GenerationCommand::Send {
                 conversation_id: fixture.conversation_id.clone(),
                 submission_id: crate::history::encode_id(submission_id),

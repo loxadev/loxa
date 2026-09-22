@@ -1,5 +1,8 @@
-use super::admission::{require_previous_turn_resolved, PromptBasis, PromptReference};
+use super::admission::{
+    require_previous_turn_resolved, retry_is_eligible, PromptBasis, PromptReference,
+};
 use super::{schema, HistoryError, HistoryErrorKind};
+use loxa_ipc::SamplingValue;
 use rusqlite::{params, Connection};
 
 const MAX_PROMPT_REFERENCES: usize = 512;
@@ -26,8 +29,16 @@ pub(crate) struct PromptPreparation {
     pub(crate) model_id: String,
     pub(crate) system_instruction: String,
     pub(crate) max_output_tokens: i64,
+    pub(crate) temperature: Option<SamplingValue>,
+    pub(crate) top_p: Option<SamplingValue>,
     pub(crate) basis: PromptBasis,
     pub(crate) messages: Vec<PromptMessage>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PromptRequest {
+    Send { user_text: String },
+    Retry { prior_attempt_id: [u8; 16] },
 }
 
 pub(super) fn prepare(
@@ -35,22 +46,39 @@ pub(super) fn prepare(
     conversation_id: [u8; 16],
     expected_conversation_revision: i64,
     expected_profile_revision: i64,
-    current_user_text: String,
+    request: PromptRequest,
 ) -> Result<PromptPreparation, HistoryError> {
-    if current_user_text.is_empty()
-        || current_user_text.len() > 32 * 1024
-        || current_user_text.capacity() > 32 * 1024
-    {
-        return Err(HistoryError::new(
-            HistoryErrorKind::InvalidInput,
-            "current user text is invalid",
-        ));
-    }
-    let (model_id, system_instruction, max_output_tokens, revision, profile_revision) = {
+    let (submitted_user_backing, excluded_attempt) = match &request {
+        PromptRequest::Send { user_text } => {
+            if user_text.is_empty()
+                || user_text.len() > 32 * 1024
+                || user_text.capacity() > 32 * 1024
+            {
+                return Err(HistoryError::new(
+                    HistoryErrorKind::InvalidInput,
+                    "current user text is invalid",
+                ));
+            }
+            (user_text.capacity(), None)
+        }
+        PromptRequest::Retry { prior_attempt_id } => (0, Some(*prior_attempt_id)),
+    };
+    let (
+        model_id,
+        system_instruction,
+        max_output_tokens,
+        revision,
+        profile_revision,
+        temperature,
+        top_p,
+    ) = {
         let mut statement = connection
             .prepare(
-                "SELECT model_id, system_instruction, max_output_tokens, revision, profile_revision
-             FROM conversations WHERE id = ?1 AND deleted = 0",
+                "SELECT c.model_id, c.system_instruction, c.max_output_tokens, c.revision,
+                        c.profile_revision, s.conversation_id, s.temperature, s.top_p
+                 FROM conversations c
+                 LEFT JOIN conversation_sampling s ON s.conversation_id = c.id
+                 WHERE c.id = ?1 AND c.deleted = 0",
             )
             .map_err(schema::classify_sql_error)?;
         let mut rows = statement
@@ -62,6 +90,8 @@ pub(super) fn prepare(
             .ok_or_else(|| {
                 HistoryError::new(HistoryErrorKind::NotFound, "conversation was not found")
             })?;
+        let (temperature, top_p) = super::sampling::read_conversation(row, 5, conversation_id)
+            .map_err(schema::classify_sql_error)?;
         let values = (
             bounded_text(
                 row,
@@ -80,6 +110,8 @@ pub(super) fn prepare(
             row.get::<_, i64>(2).map_err(schema::classify_sql_error)?,
             row.get::<_, i64>(3).map_err(schema::classify_sql_error)?,
             row.get::<_, i64>(4).map_err(schema::classify_sql_error)?,
+            temperature,
+            top_p,
         );
         drop(rows);
         drop(statement);
@@ -95,6 +127,14 @@ pub(super) fn prepare(
         ));
     }
     require_previous_turn_resolved(connection, conversation_id)?;
+    if let Some(prior_attempt_id) = excluded_attempt {
+        if !retry_is_eligible(connection, conversation_id, prior_attempt_id)? {
+            return Err(HistoryError::new(
+                HistoryErrorKind::Conflict,
+                "retry target is not the latest selected terminal attempt",
+            ));
+        }
+    }
 
     let mut statement = connection
         .prepare(
@@ -108,9 +148,10 @@ pub(super) fn prepare(
         .query([conversation_id.as_slice()])
         .map_err(schema::classify_sql_error)?;
     let mut raw_bytes = checked_prompt_size(0, system_instruction.capacity())?;
-    raw_bytes = checked_prompt_size(raw_bytes, current_user_text.capacity())?;
+    raw_bytes = checked_prompt_size(raw_bytes, submitted_user_backing)?;
     let mut reference_count = 0usize;
     let mut retained = Vec::new();
+    let mut excluded_attempt_seen = false;
     while let Some(row) = rows.next().map_err(schema::classify_sql_error)? {
         let turn_id = bounded_id(row, 0, "stored turn identity is invalid")?;
         let user_text = bounded_prompt_text(
@@ -122,7 +163,7 @@ pub(super) fn prepare(
             "stored user text is invalid",
         )?;
         let attempt_id = optional_id(row, 2, "stored selected attempt identity is invalid")?;
-        let saved_end = match (
+        let mut saved_end = match (
             attempt_id,
             row.get::<_, Option<i64>>(3)
                 .map_err(schema::classify_sql_error)?,
@@ -138,6 +179,10 @@ pub(super) fn prepare(
             (None, None) => None,
             _ => return Err(corrupt("stored selected attempt is incomplete")),
         };
+        if saved_end.is_some_and(|(attempt_id, _)| Some(attempt_id) == excluded_attempt) {
+            excluded_attempt_seen = true;
+            saved_end = None;
+        }
         retained.push((turn_id, user_text, saved_end));
         reference_count = reference_count
             .checked_add(1 + usize::from(saved_end.is_some_and(|(_, end)| end > 0)))
@@ -180,14 +225,25 @@ pub(super) fn prepare(
             });
         }
     }
-    messages.push(PromptMessage {
-        role: PromptRole::User,
-        content: current_user_text,
-    });
+    match request {
+        PromptRequest::Send { user_text } => messages.push(PromptMessage {
+            role: PromptRole::User,
+            content: user_text,
+        }),
+        PromptRequest::Retry { .. } if !excluded_attempt_seen => {
+            return Err(HistoryError::new(
+                HistoryErrorKind::Conflict,
+                "retry target changed during prompt preparation",
+            ))
+        }
+        PromptRequest::Retry { .. } => {}
+    }
     Ok(PromptPreparation {
         model_id,
         system_instruction,
         max_output_tokens,
+        temperature,
+        top_p,
         basis,
         messages,
     })

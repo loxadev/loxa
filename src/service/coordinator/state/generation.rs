@@ -120,6 +120,12 @@ impl CoordinatorState {
                 "service is draining",
             ));
         }
+        if self.reload.is_some() {
+            return Err(ServiceError::new(
+                ErrorCategory::Busy,
+                "runtime Reload is in progress",
+            ));
+        }
         if self.pending_generations.len() >= MAX_PENDING_GENERATIONS {
             return Err(ServiceError::new(
                 ErrorCategory::Busy,
@@ -273,6 +279,7 @@ impl CoordinatorState {
                     OperationPhase::Ready {
                         engine,
                         fingerprint,
+                        ..
                     },
             } if self.is_current(control) && !control.cancel.load(Ordering::Acquire) => {
                 (control, engine, fingerprint)

@@ -1,9 +1,9 @@
 use super::file::{self, WriteFailure, WriteFault};
 use super::{validate_generation, Config, LoadedSettings, MAX_CONFIG_BYTES};
 use loxa_ipc::{
-    ErrorCategory, GenerationSettings, GenerationSettingsPatch, OptionalU16Patch, OptionalU32Patch,
-    ServiceError, ServiceSettings, ServiceSettingsApplication, ServiceSettingsDurability,
-    ServiceSettingsPatch,
+    ErrorCategory, GenerationSettings, GenerationSettingsPatch, OptionalSamplingValuePatch,
+    OptionalU16Patch, OptionalU32Patch, ServiceError, ServiceSettings, ServiceSettingsApplication,
+    ServiceSettingsDurability, ServiceSettingsPatch,
 };
 use serde::Serialize;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -13,6 +13,12 @@ use std::thread::JoinHandle;
 use tokio::sync::watch;
 
 pub(crate) type SettingsObserver = watch::Receiver<Option<Result<ServiceSettings, ServiceError>>>;
+
+#[derive(Clone, Copy)]
+pub(crate) struct CapturedConfig {
+    pub(crate) config: Config,
+    pub(crate) revision: u64,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SettingsExit {
@@ -131,14 +137,29 @@ impl SettingsOwner {
         Ok(state.committed.generation.clone())
     }
 
-    pub(crate) fn capture_config(&self) -> Result<Config, ServiceError> {
+    pub(crate) fn capture_config(&self) -> Result<CapturedConfig, ServiceError> {
         let state = self.lock_state()?;
         if state.retained.is_some() || state.phase != Phase::Idle || state.thread.is_some() {
             return Err(unavailable(
                 "service settings durability must resolve before loading a runtime",
             ));
         }
-        Ok(state.committed.config)
+        Ok(CapturedConfig {
+            config: state.committed.config,
+            revision: state.committed.revision,
+        })
+    }
+
+    pub(crate) fn capture_config_at(
+        &self,
+        expected_revision: &str,
+    ) -> Result<CapturedConfig, ServiceError> {
+        let expected = parse_revision(expected_revision)?;
+        let captured = self.capture_config()?;
+        if captured.revision != expected {
+            return Err(conflict("service settings revision changed"));
+        }
+        Ok(captured)
     }
 
     pub(crate) fn patch(
@@ -167,7 +188,7 @@ impl SettingsOwner {
             .revision
             .checked_add(1)
             .ok_or_else(|| conflict("service settings revision overflow"))?;
-        candidate.v2 = true;
+        candidate.persisted = true;
         apply_patch(&mut candidate, patch)?;
         validate_generation(&candidate.generation).map_err(invalid)?;
         let encoded = encode(&candidate)?;
@@ -545,8 +566,14 @@ pub(crate) fn apply_generation_patch(
         GenerationSettingsPatch::Fields {
             system_instruction,
             max_output_tokens,
+            temperature,
+            top_p,
         } => {
-            if system_instruction.is_none() && max_output_tokens.is_none() {
+            if system_instruction.is_none()
+                && max_output_tokens.is_none()
+                && temperature.is_none()
+                && top_p.is_none()
+            {
                 return Err(invalid("generation settings patch is empty"));
             }
             if let Some(value) = system_instruction {
@@ -554,6 +581,18 @@ pub(crate) fn apply_generation_patch(
             }
             if let Some(value) = max_output_tokens {
                 generation.max_output_tokens = value;
+            }
+            if let Some(value) = temperature {
+                generation.temperature = match value {
+                    OptionalSamplingValuePatch::Set { value } => Some(value),
+                    OptionalSamplingValuePatch::Clear => None,
+                };
+            }
+            if let Some(value) = top_p {
+                generation.top_p = match value {
+                    OptionalSamplingValuePatch::Set { value } => Some(value),
+                    OptionalSamplingValuePatch::Clear => None,
+                };
             }
         }
         GenerationSettingsPatch::Reset => *generation = GenerationSettings::default(),
@@ -563,7 +602,7 @@ pub(crate) fn apply_generation_patch(
 
 fn encode(candidate: &LoadedSettings) -> Result<Arc<[u8]>, ServiceError> {
     let encoded = serde_json::to_vec(&SavedDocument {
-        version: 2,
+        version: 3,
         revision: candidate.revision,
         ctx: candidate.config.ctx,
         port: candidate.config.port,
@@ -581,7 +620,7 @@ fn durability(state: &State) -> ServiceSettingsDurability {
         Phase::Saving | Phase::Joining => ServiceSettingsDurability::Saving,
         Phase::SaveFailed => ServiceSettingsDurability::SaveFailed,
         Phase::OutcomeUnknown => ServiceSettingsDurability::OutcomeUnknown,
-        Phase::Idle if state.committed.v2 => ServiceSettingsDurability::Saved,
+        Phase::Idle if state.committed.persisted => ServiceSettingsDurability::Saved,
         Phase::Idle => ServiceSettingsDurability::Baseline,
     }
 }
@@ -690,7 +729,16 @@ mod tests {
                 ServiceSettingsPatch {
                     ctx: None,
                     port: Some(OptionalU16Patch::Set { value: 4000 }),
-                    generation: None,
+                    generation: Some(GenerationSettingsPatch::Fields {
+                        system_instruction: None,
+                        max_output_tokens: None,
+                        temperature: Some(OptionalSamplingValuePatch::Set {
+                            value: loxa_ipc::SamplingValue::new(0.0).unwrap(),
+                        }),
+                        top_p: Some(OptionalSamplingValuePatch::Set {
+                            value: loxa_ipc::SamplingValue::new(0.7).unwrap(),
+                        }),
+                    }),
                 },
             )
             .unwrap();
@@ -702,6 +750,8 @@ mod tests {
         let loaded = super::super::load_private(&path).unwrap();
         assert_eq!(loaded.config.ctx, Some(8192));
         assert_eq!(loaded.config.port, Some(4000));
+        assert_eq!(loaded.generation.temperature.unwrap().get(), 0.0);
+        assert_eq!(loaded.generation.top_p.unwrap().get(), 0.7);
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600

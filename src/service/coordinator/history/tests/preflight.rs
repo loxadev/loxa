@@ -81,7 +81,8 @@ async fn exercise_stalled_preflight(stall: Stall, stop: bool) {
             }),
         };
         let coordinator = fixture.coordinator.clone();
-        let send = tokio::spawn(async move { coordinator.generation_send(command, pending).await });
+        let send =
+            tokio::spawn(async move { coordinator.generation_request(command, pending).await });
         let mut engine = receive_props(&listener).await;
         assert!(fixture.coordinator.admission_active_for_test());
         if submission == 31 {

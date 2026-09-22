@@ -1,22 +1,24 @@
-use super::OperationControl;
+use super::{LaunchSettings, OperationControl};
 use loxa_ipc::{
     Accepted, ErrorCategory, OperationTarget, RuntimePhase, RuntimeStatus, ServiceError,
+    ServiceSettingsApplication,
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::sync::Arc;
 use tokio::sync::watch;
-use tokio_util::sync::CancellationToken;
 
-use super::history::OutputState;
-
+mod admission;
 mod generation;
+use admission::AdmissionRecovery;
+pub(super) use admission::{AdmissionClaim, AdmissionRecoveryAction, AdmissionReservation};
 pub(super) use generation::{CancellationCause, EngineDescriptor, PendingGeneration};
 
 // All admission and publication decisions run under Shared::state. The watch
 // value is an observer copy: never read it back to decide a transition.
 pub(super) struct CoordinatorState {
     current: Option<Arc<OperationControl>>,
+    reload: Option<ReloadReservation>,
+    applied: Option<AppliedRuntime>,
     admission: Option<Arc<AdmissionReservation>>,
     pending_generations: Vec<Arc<PendingGeneration>>,
     conversation_mutations: Vec<Arc<ConversationMutationReservation>>,
@@ -45,210 +47,32 @@ enum Phase {
     Draining,
 }
 
+struct ReloadReservation {
+    retiring: Arc<OperationControl>,
+    successor: Arc<OperationControl>,
+    active: bool,
+}
+
+struct AppliedRuntime {
+    operation: Arc<OperationControl>,
+    observed_context: Option<u32>,
+}
+
 #[derive(Clone)]
 pub(super) enum OperationPhase {
     Starting,
     Ready {
         engine: EngineDescriptor,
         fingerprint: Arc<crate::runtime_fingerprint::RuntimeFingerprint>,
+        observed_context: Option<u32>,
     },
     Stopping,
     CleanupFailed,
     LoadFailed(ErrorCategory),
 }
 
-pub(super) struct AdmissionReservation {
-    pub(super) conversation_id: [u8; 16],
-    pub(super) submission_id: [u8; 16],
-    pub(super) submission_hash: [u8; 32],
-    pub(super) expected_conversation_revision: i64,
-    pub(super) expected_profile_revision: i64,
-    pub(super) operation_generation: i64,
-    operation: Arc<OperationControl>,
-    pub(super) fingerprint: Arc<crate::runtime_fingerprint::RuntimeFingerprint>,
-    pub(super) engine: EngineDescriptor,
-    pending_nonce: Option<String>,
-    cancellation: CancellationToken,
-    cancellation_cause: Mutex<Option<CancellationCause>>,
-    engine_quiescent: AtomicBool,
-    durable_terminal: AtomicBool,
-    accepted_at: OnceLock<Instant>,
-    outcome: watch::Sender<Option<Result<crate::history::CommittedAdmission, ServiceError>>>,
-    recovery: Mutex<AdmissionRecovery>,
-    #[cfg(test)]
-    pub(super) recovery_claims: AtomicU64,
-    pub(super) output: Mutex<Option<OutputState>>,
-}
-
 pub(super) struct ConversationMutationReservation {
     conversation_id: [u8; 16],
-}
-
-pub(super) enum AdmissionClaim {
-    Existing(Arc<AdmissionReservation>),
-    Fresh(Arc<AdmissionReservation>),
-}
-
-pub(super) enum AdmissionRecoveryAction {
-    Lookup(Arc<crate::history::PreparedAdmission>),
-    Stop(
-        Arc<crate::history::PreparedAdmission>,
-        crate::history::CommittedAdmission,
-        Arc<crate::history::FinalizationInput>,
-    ),
-}
-
-enum AdmissionRecovery {
-    Preparing,
-    AdmissionInFlight(Arc<crate::history::PreparedAdmission>),
-    AdmissionUnknown(Arc<crate::history::PreparedAdmission>),
-    StopInFlight(
-        Arc<crate::history::PreparedAdmission>,
-        crate::history::CommittedAdmission,
-        Arc<crate::history::FinalizationInput>,
-    ),
-    StopUnknown(
-        Arc<crate::history::PreparedAdmission>,
-        crate::history::CommittedAdmission,
-        Arc<crate::history::FinalizationInput>,
-    ),
-    OutputOwned,
-}
-
-impl AdmissionReservation {
-    pub(super) fn subscribe(
-        &self,
-    ) -> watch::Receiver<Option<Result<crate::history::CommittedAdmission, ServiceError>>> {
-        self.outcome.subscribe()
-    }
-
-    pub(super) fn publish(
-        &self,
-        outcome: Result<crate::history::CommittedAdmission, ServiceError>,
-    ) {
-        self.outcome.send_replace(Some(outcome));
-    }
-
-    pub(super) fn retain_prepared(&self, prepared: Arc<crate::history::PreparedAdmission>) {
-        *self
-            .recovery
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            AdmissionRecovery::AdmissionInFlight(prepared);
-    }
-
-    pub(super) fn admission_unknown(&self) {
-        let mut recovery = self
-            .recovery
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let AdmissionRecovery::AdmissionInFlight(prepared) = &*recovery {
-            *recovery = AdmissionRecovery::AdmissionUnknown(Arc::clone(prepared));
-        }
-    }
-
-    pub(super) fn retain_stop(
-        &self,
-        committed: crate::history::CommittedAdmission,
-        terminal: Arc<crate::history::FinalizationInput>,
-    ) {
-        let mut recovery = self
-            .recovery
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let prepared = match &*recovery {
-            AdmissionRecovery::AdmissionInFlight(prepared)
-            | AdmissionRecovery::AdmissionUnknown(prepared) => Arc::clone(prepared),
-            AdmissionRecovery::StopInFlight(prepared, _, _)
-            | AdmissionRecovery::StopUnknown(prepared, _, _) => Arc::clone(prepared),
-            AdmissionRecovery::Preparing | AdmissionRecovery::OutputOwned => return,
-        };
-        *recovery = AdmissionRecovery::StopInFlight(prepared, committed, terminal);
-    }
-
-    pub(super) fn stop_unknown(&self) {
-        let mut recovery = self
-            .recovery
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let AdmissionRecovery::StopInFlight(prepared, committed, terminal) = &*recovery {
-            *recovery = AdmissionRecovery::StopUnknown(
-                Arc::clone(prepared),
-                committed.clone(),
-                Arc::clone(terminal),
-            );
-        }
-    }
-
-    pub(super) fn take_recovery_action(&self) -> Option<AdmissionRecoveryAction> {
-        let mut recovery = self
-            .recovery
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match &*recovery {
-            AdmissionRecovery::AdmissionUnknown(prepared) => {
-                let prepared = Arc::clone(prepared);
-                *recovery = AdmissionRecovery::AdmissionInFlight(Arc::clone(&prepared));
-                #[cfg(test)]
-                self.recovery_claims.fetch_add(1, Ordering::Relaxed);
-                Some(AdmissionRecoveryAction::Lookup(prepared))
-            }
-            AdmissionRecovery::StopUnknown(prepared, committed, terminal) => {
-                let prepared = Arc::clone(prepared);
-                let committed = committed.clone();
-                let terminal = Arc::clone(terminal);
-                *recovery = AdmissionRecovery::StopInFlight(
-                    Arc::clone(&prepared),
-                    committed.clone(),
-                    Arc::clone(&terminal),
-                );
-                #[cfg(test)]
-                self.recovery_claims.fetch_add(1, Ordering::Relaxed);
-                Some(AdmissionRecoveryAction::Stop(prepared, committed, terminal))
-            }
-            _ => None,
-        }
-    }
-
-    pub(super) fn install_output(&self, committed: crate::history::CommittedAdmission) -> bool {
-        let mut recovery = self
-            .recovery
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut output = self
-            .output
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if output.is_some()
-            || !matches!(
-                &*recovery,
-                AdmissionRecovery::AdmissionInFlight(_) | AdmissionRecovery::AdmissionUnknown(_)
-            )
-        {
-            return false;
-        }
-        *output = Some(OutputState::new(committed));
-        *recovery = AdmissionRecovery::OutputOwned;
-        true
-    }
-
-    #[cfg(test)]
-    pub(super) fn admission_retry_ready(&self) -> bool {
-        let recovery = self
-            .recovery
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        matches!(&*recovery, AdmissionRecovery::AdmissionUnknown(_))
-    }
-
-    #[cfg(test)]
-    pub(super) fn stop_retry_ready(&self) -> bool {
-        let recovery = self
-            .recovery
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        matches!(&*recovery, AdmissionRecovery::StopUnknown(_, _, _))
-    }
 }
 
 impl CoordinatorState {
@@ -270,6 +94,8 @@ impl CoordinatorState {
         let (snapshots, _) = watch::channel(initial);
         Self {
             current: None,
+            reload: None,
+            applied: None,
             admission: None,
             pending_generations: Vec::with_capacity(16),
             conversation_mutations: Vec::with_capacity(8),
@@ -289,6 +115,27 @@ impl CoordinatorState {
             boot_epoch: self.boot_epoch.clone(),
             state_revision: self.revision.to_string(),
             phase: self.phase.to_wire(),
+        }
+    }
+
+    pub(super) fn settings_application(
+        &self,
+        desired_context: Option<u32>,
+    ) -> ServiceSettingsApplication {
+        let Some(applied) = &self.applied else {
+            return ServiceSettingsApplication::NotApplied;
+        };
+        let launch = applied.operation.launch_settings;
+        ServiceSettingsApplication::Applied {
+            target: applied.operation.target(&self.boot_epoch),
+            settings_revision: launch.settings_revision.to_string(),
+            context_preference: launch.context_preference,
+            requested_context: launch.requested_context,
+            observed_context: applied.observed_context,
+            runtime_build: launch.runtime_identity.build().to_owned(),
+            runtime_version: launch.runtime_identity.version_line().to_owned(),
+            reload_required: crate::runnable::resolve_service_context(desired_context)
+                != launch.requested_context,
         }
     }
 
@@ -316,9 +163,10 @@ impl CoordinatorState {
         self.snapshots.subscribe()
     }
 
-    pub(super) fn reserve_load(
+    pub(super) fn reserve_load_with_settings(
         &mut self,
         model_id: String,
+        launch_settings: LaunchSettings,
     ) -> Result<Arc<OperationControl>, ServiceError> {
         if self.draining.load(Ordering::Acquire) {
             return Err(ServiceError::new(
@@ -357,6 +205,7 @@ impl CoordinatorState {
             task_id: self.next_task_id,
             generation: self.next_generation,
             model_id,
+            launch_settings,
             cancel: AtomicBool::new(false),
             retry_cleanup: AtomicU64::new(0),
         });
@@ -364,6 +213,123 @@ impl CoordinatorState {
         self.next_generation = self.next_generation.saturating_add(1);
         self.current = Some(Arc::clone(&operation));
         Ok(operation)
+    }
+
+    #[cfg(test)]
+    pub(super) fn reserve_load(
+        &mut self,
+        model_id: String,
+    ) -> Result<Arc<OperationControl>, ServiceError> {
+        self.reserve_load_with_settings(
+            model_id,
+            LaunchSettings {
+                settings_revision: 0,
+                context_preference: None,
+                requested_context: 4096,
+                runtime_identity: crate::runtime_identity::RuntimeIdentity::BundledB10344,
+            },
+        )
+    }
+
+    pub(super) fn reserve_reload(
+        &mut self,
+        target: &OperationTarget,
+        launch_settings: LaunchSettings,
+    ) -> Result<(Arc<OperationControl>, Arc<OperationControl>), ServiceError> {
+        if self.draining.load(Ordering::Acquire) {
+            return Err(ServiceError::new(
+                ErrorCategory::ServiceUnavailable,
+                "service is draining",
+            ));
+        }
+        if self.reload.is_some() {
+            return Err(ServiceError::new(
+                ErrorCategory::Busy,
+                "a runtime Reload is already pending",
+            ));
+        }
+        if self.admission.is_some() {
+            return Err(ServiceError::new(
+                ErrorCategory::Busy,
+                "conversation output is still active or unresolved",
+            ));
+        }
+        if !self.pending_generations.is_empty() {
+            return Err(ServiceError::new(
+                ErrorCategory::Busy,
+                "generation connections are still pending",
+            ));
+        }
+        let retiring = self.current.as_ref().ok_or_else(|| {
+            ServiceError::new(ErrorCategory::NotFound, "no model operation is active")
+        })?;
+        if !self.matches_target(retiring, target) {
+            return Err(ServiceError::new(
+                ErrorCategory::Conflict,
+                "Reload target does not identify the active operation",
+            ));
+        }
+        if retiring.cancel.load(Ordering::Acquire)
+            || !matches!(
+                &self.phase,
+                Phase::Operation {
+                    control,
+                    phase: OperationPhase::Ready { .. },
+                } if Arc::ptr_eq(control, retiring)
+            )
+        {
+            return Err(ServiceError::new(
+                ErrorCategory::Busy,
+                "the active model operation is not idle and Ready",
+            ));
+        }
+        let retiring = Arc::clone(retiring);
+        let successor = Arc::new(OperationControl {
+            task_id: self.next_task_id,
+            generation: self.next_generation,
+            model_id: retiring.model_id.clone(),
+            launch_settings,
+            cancel: AtomicBool::new(false),
+            retry_cleanup: AtomicU64::new(0),
+        });
+        self.next_task_id = self.next_task_id.saturating_add(1);
+        self.next_generation = self.next_generation.saturating_add(1);
+        self.reload = Some(ReloadReservation {
+            retiring: Arc::clone(&retiring),
+            successor: Arc::clone(&successor),
+            active: false,
+        });
+        Ok((retiring, successor))
+    }
+
+    pub(super) fn activate_reload(
+        &mut self,
+        retiring: &Arc<OperationControl>,
+        successor: &Arc<OperationControl>,
+    ) -> Option<Accepted> {
+        let matches = self.reload.as_ref().is_some_and(|reservation| {
+            !reservation.active
+                && Arc::ptr_eq(&reservation.retiring, retiring)
+                && Arc::ptr_eq(&reservation.successor, successor)
+        });
+        if !matches || !self.is_current(retiring) {
+            return None;
+        }
+        self.reload.as_mut()?.active = true;
+        retiring.request_cleanup();
+        self.publish(Phase::Operation {
+            control: Arc::clone(retiring),
+            phase: OperationPhase::Stopping,
+        });
+        Some(self.accepted(Some(successor)))
+    }
+
+    pub(super) fn release_reload_reservation(&mut self, successor: &Arc<OperationControl>) {
+        if self.reload.as_ref().is_some_and(|reservation| {
+            !reservation.active && Arc::ptr_eq(&reservation.successor, successor)
+        }) {
+            self.reload = None;
+        }
     }
 
     pub(super) fn accept_start(&mut self, operation: &Arc<OperationControl>) -> Option<Accepted> {
@@ -381,10 +347,11 @@ impl CoordinatorState {
         let operation = self.current.as_ref().ok_or_else(|| {
             ServiceError::new(ErrorCategory::NotFound, "no model operation is active")
         })?;
-        if target.boot_epoch != self.boot_epoch
-            || target.task_id != operation.task_id.to_string()
-            || target.generation != operation.generation.to_string()
-        {
+        let matched_successor = self.reload.as_ref().and_then(|reload| {
+            self.matches_target(&reload.successor, target)
+                .then(|| Arc::clone(&reload.successor))
+        });
+        if !self.matches_target(operation, target) && matched_successor.is_none() {
             return Err(ServiceError::new(
                 ErrorCategory::Conflict,
                 "unload target does not identify the active operation",
@@ -392,8 +359,11 @@ impl CoordinatorState {
         }
         let operation = Arc::clone(operation);
         operation.request_cleanup();
+        if let Some(reload) = &self.reload {
+            reload.successor.request_cleanup();
+        }
         self.advance(&operation, OperationPhase::Stopping);
-        Ok(self.accepted(Some(&operation)))
+        Ok(self.accepted(Some(matched_successor.as_deref().unwrap_or(&operation))))
     }
 
     pub(super) fn stop_service(&mut self) -> Result<Accepted, ServiceError> {
@@ -411,6 +381,9 @@ impl CoordinatorState {
         self.draining.store(true, Ordering::Release);
         if let Some(operation) = &self.current {
             operation.request_cleanup();
+        }
+        if let Some(reload) = &self.reload {
+            reload.successor.request_cleanup();
         }
         if let Some(admission) = &self.admission {
             admission.request_cancel();
@@ -440,11 +413,36 @@ impl CoordinatorState {
         {
             return false;
         }
+        if let OperationPhase::Ready {
+            observed_context, ..
+        } = &phase
+        {
+            self.applied = Some(AppliedRuntime {
+                operation: Arc::clone(expected),
+                observed_context: *observed_context,
+            });
+        }
         self.publish(Phase::Operation {
             control: Arc::clone(expected),
             phase,
         });
         true
+    }
+
+    pub(super) fn launch_is_current(&self, expected: &Arc<OperationControl>) -> bool {
+        self.is_current(expected)
+            && !self.draining.load(Ordering::Acquire)
+            && !expected.cancel.load(Ordering::Acquire)
+    }
+
+    pub(super) fn engine_gone(&mut self, expected: &Arc<OperationControl>) {
+        if self
+            .applied
+            .as_ref()
+            .is_some_and(|applied| Arc::ptr_eq(&applied.operation, expected))
+        {
+            self.applied = None;
+        }
     }
 
     pub(super) fn complete(
@@ -467,6 +465,29 @@ impl CoordinatorState {
         for pending in &self.pending_generations {
             pending.request_cancel();
         }
+        let promote = self.reload.as_ref().is_some_and(|reload| {
+            reload.active
+                && Arc::ptr_eq(&reload.retiring, expected)
+                && failure.is_none()
+                && !self.draining.load(Ordering::Acquire)
+                && !reload.successor.cancel.load(Ordering::Acquire)
+        });
+        if promote {
+            let reload = self.reload.take().expect("Reload reservation is present");
+            self.current = Some(reload.successor);
+            self.applied = None;
+            return admission_released;
+        }
+        if self
+            .reload
+            .as_ref()
+            .is_some_and(|reload| Arc::ptr_eq(&reload.retiring, expected))
+        {
+            if let Some(reload) = self.reload.take() {
+                reload.successor.request_cleanup();
+            }
+        }
+        self.applied = None;
         let phase = failure.map_or(Phase::Unloaded, |category| Phase::Operation {
             control: Arc::clone(expected),
             phase: OperationPhase::LoadFailed(category),
@@ -484,6 +505,9 @@ impl CoordinatorState {
         }
         for pending in &self.pending_generations {
             pending.request_cancel();
+        }
+        if let Some(reload) = self.reload.take() {
+            reload.successor.request_cleanup();
         }
         self.release_and_publish(
             expected,
@@ -560,6 +584,12 @@ impl CoordinatorState {
         self.current
             .as_ref()
             .is_some_and(|current| Arc::ptr_eq(current, expected))
+    }
+
+    fn matches_target(&self, operation: &OperationControl, target: &OperationTarget) -> bool {
+        target.boot_epoch == self.boot_epoch
+            && target.task_id == operation.task_id.to_string()
+            && target.generation == operation.generation.to_string()
     }
 
     fn publish(&mut self, phase: Phase) {

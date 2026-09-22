@@ -32,6 +32,7 @@ pub(super) struct AdmissionInput {
     pub(super) effective_context: Option<u32>,
     pub(super) system_instruction: String,
     pub(super) max_output_tokens: i64,
+    pub(super) effective_sampling: loxa_ipc::EffectiveSamplingSettings,
     pub(super) prompt_basis: PromptBasis,
     pub(super) kind: AdmissionKind,
 }
@@ -200,6 +201,7 @@ impl Coordinator {
                 .unwrap_or_else(|| reservation.fingerprint.effective_context()),
             input.system_instruction,
             input.max_output_tokens,
+            input.effective_sampling,
             input.prompt_basis,
             input.kind,
         ) {

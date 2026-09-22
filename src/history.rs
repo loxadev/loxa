@@ -17,6 +17,7 @@ mod prompt;
 mod purge;
 mod reads;
 mod recovery;
+mod sampling;
 mod schema;
 mod statistics;
 mod worker;
@@ -33,7 +34,7 @@ pub(crate) use content::{
 pub(crate) use identity::{decode_id, encode_id, parse_revision};
 #[cfg(test)]
 pub(crate) use prompt::PromptMessage;
-pub(crate) use prompt::{PromptPreparation, PromptRole};
+pub(crate) use prompt::{PromptPreparation, PromptRequest, PromptRole};
 pub(crate) use statistics::AttemptStatistics;
 
 const COMMAND_CAPACITY: usize = 12;
@@ -145,7 +146,7 @@ enum HistoryCommand {
         conversation_id: [u8; 16],
         expected_conversation_revision: i64,
         expected_profile_revision: i64,
-        current_user_text: String,
+        request: PromptRequest,
         reply: oneshot::Sender<PromptCompletion>,
         permit: OwnedSemaphorePermit,
     },
@@ -470,7 +471,7 @@ impl HistoryHandle {
         conversation_id: [u8; 16],
         expected_conversation_revision: i64,
         expected_profile_revision: i64,
-        current_user_text: String,
+        request: PromptRequest,
     ) -> Result<PromptCompletion, HistoryError> {
         if self.draining.load(Ordering::Acquire) {
             return Err(HistoryError::new(
@@ -487,7 +488,7 @@ impl HistoryHandle {
                 conversation_id,
                 expected_conversation_revision,
                 expected_profile_revision,
-                current_user_text,
+                request,
                 reply,
                 permit,
             })

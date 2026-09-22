@@ -82,6 +82,12 @@ pub(super) fn delete_batch(connection: &mut Connection) -> Result<bool, HistoryE
             .map_err(schema::classify_sql_error)?;
         transaction
             .execute(
+                "DELETE FROM attempt_sampling WHERE attempt_id = ?1",
+                [attempt_id.as_slice()],
+            )
+            .map_err(schema::classify_sql_error)?;
+        transaction
+            .execute(
                 CLEAR_SELECTED_SQL,
                 params![turn_id.as_slice(), attempt_id.as_slice()],
             )
@@ -121,6 +127,12 @@ pub(super) fn delete_batch(connection: &mut Connection) -> Result<bool, HistoryE
         return Ok(false);
     }
 
+    transaction
+        .execute(
+            "DELETE FROM conversation_sampling WHERE conversation_id = ?1",
+            [conversation_id.as_slice()],
+        )
+        .map_err(schema::classify_sql_error)?;
     let deleted = transaction
         .execute(
             "DELETE FROM conversations WHERE id = ?1 AND deleted = 1

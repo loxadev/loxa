@@ -138,7 +138,8 @@ fn create(
         }
         None => (None, None, None, None, None, None, None),
     };
-    connection
+    let transaction = connection.transaction().map_err(sql_error)?;
+    transaction
         .execute(
             "INSERT INTO conversations (
                 id, model_id, manifest_version, binding_profile,
@@ -184,6 +185,8 @@ fn create(
             ],
         )
         .map_err(sql_error)?;
+    super::sampling::write_conversation(&transaction, id, &generation).map_err(sql_error)?;
+    transaction.commit().map_err(sql_error)?;
     Ok(summary(
         id,
         binding.model_id,

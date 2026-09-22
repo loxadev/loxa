@@ -5,12 +5,16 @@ mod harness;
 use super::qualification_fixture;
 use client::{
     create_conversation, create_draft, list_turns, read_draft, require_rejected,
-    require_same_draft, send, wait_for_saved, wait_for_stopped,
+    require_same_draft, retry, send, wait_for_saved, wait_for_stopped,
 };
-use harness::{load_model, only_engine_endpoint, wait_for_unloaded, NativeEngine, NativeService};
+use harness::{
+    load_model, only_engine_endpoint, runtime_status, wait_for_unloaded, NativeEngine,
+    NativeService,
+};
 use loxa_ipc::{
     AttemptExecution, AttemptSave, ConnectMode, ErrorCategory, GenerationCommand, GenerationReply,
-    GenerationTarget,
+    OperationTarget, OptionalU32Patch, ReplyOutcome, RuntimePhase, ServiceCommand,
+    ServiceSettingsApplication, ServiceSettingsCommand, ServiceSettingsPatch, ServiceSettingsReply,
 };
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -65,6 +69,14 @@ async fn exercise(fixture: &mut NativeService) -> Result<String, String> {
     {
         return Err("lost-reply gate crossed the output execution boundary".into());
     }
+    let Some(sampling) = pending_attempt.effective_sampling else {
+        return Err("lost-reply gate did not persist effective sampling".into());
+    };
+    if sampling.temperature.get() != qualification_fixture::TEMPERATURE
+        || sampling.top_p.get() != f64::from(qualification_fixture::TOP_P as f32)
+    {
+        return Err("lost-reply gate persisted the wrong effective sampling".into());
+    }
     first_send.abort();
     match first_send.await {
         Err(error) if error.is_cancelled() => {}
@@ -103,14 +115,30 @@ async fn exercise(fixture: &mut NativeService) -> Result<String, String> {
         return Err("native replay did not preserve one canonical turn and attempt".into());
     }
 
-    let second = create_conversation(&fixture.client, GENERATION_TOKENS).await?;
-    let second_accepted = send(fixture.client.clone(), second.clone(), prompt, None, 3)
+    let cached_retry = retry(fixture.client.clone(), first.clone(), &first_accepted, 3)
         .await
         .map_err(client::client_error)?;
-    let second_output =
-        wait_for_saved(&fixture.client, &second, &second_accepted, "cached").await?;
-    if second_output.is_empty() {
-        return Err("cached native generation saved no assistant bytes".into());
+    let expected_cached_revision = next_revision(&first_accepted.post_conversation_revision)?;
+    if cached_retry.turn_id != first_accepted.turn_id
+        || cached_retry.attempt_id == first_accepted.attempt_id
+        || cached_retry.pre_conversation_revision != first_accepted.post_conversation_revision
+        || cached_retry.post_conversation_revision != expected_cached_revision
+    {
+        return Err("cached native Retry changed the wrong durable facts".into());
+    }
+    let cached_output =
+        wait_for_saved(&fixture.client, &first, &cached_retry, "cached Retry").await?;
+    if cached_output.is_empty() {
+        return Err("cached native Retry saved no assistant bytes".into());
+    }
+    let cached_turns = list_turns(&fixture.client, &first.id).await?;
+    if !matches!(cached_turns.as_slice(), [turn]
+        if turn.id == first_accepted.turn_id && turn.selected_attempt.as_ref().is_some_and(|attempt|
+            attempt.id == cached_retry.attempt_id && attempt.attempt_number == "2"))
+    {
+        return Err(
+            "cached native Retry created an extra user turn or selected the wrong attempt".into(),
+        );
     }
 
     let overflow = create_conversation(&fixture.client, CONTEXT_TOKENS).await?;
@@ -137,24 +165,61 @@ async fn exercise(fixture: &mut NativeService) -> Result<String, String> {
         return Err("context overflow created a durable turn".into());
     }
 
-    let stopped = create_conversation(&fixture.client, GENERATION_TOKENS).await?;
-    let mut execution = fixture.coordinator.pause_native_generation_execution();
-    let stopped_accepted = send(
-        fixture.client.clone(),
-        stopped.clone(),
-        "This request must stop after durable admission.",
-        None,
-        5,
-    )
-    .await
-    .map_err(client::client_error)?;
-    execution.wait_reached().await?;
-    let endpoint = only_engine_endpoint(&fixture.root.join("run/service"))?;
-    let target = GenerationTarget::Accepted {
-        boot_epoch: stopped_accepted.boot_epoch.clone(),
-        submission_id: stopped_accepted.submission_id.clone(),
-        operation_generation: stopped_accepted.operation_generation.clone(),
+    let mut retry_completion = fixture.coordinator.pause_native_admission_completion();
+    let mut retry_execution = fixture.coordinator.pause_native_generation_execution();
+    let retry_client = fixture.client.clone();
+    let retry_conversation = first.clone();
+    let retry_prior = cached_retry.clone();
+    let first_retry =
+        tokio::spawn(async move { retry(retry_client, retry_conversation, &retry_prior, 5).await });
+    retry_completion.wait_reached().await?;
+    let retry_turns = list_turns(&fixture.client, &first.id).await?;
+    let [retry_turn] = retry_turns.as_slice() else {
+        return Err("native Retry did not preserve one durable user turn".into());
     };
+    let retry_attempt = retry_turn
+        .selected_attempt
+        .as_ref()
+        .ok_or_else(|| "native Retry did not select its durable attempt".to_string())?;
+    let retry_sampling = retry_attempt
+        .effective_sampling
+        .ok_or_else(|| "native Retry did not freeze effective sampling".to_string())?;
+    if retry_turn.id != first_accepted.turn_id
+        || retry_attempt.id == cached_retry.attempt_id
+        || retry_attempt.attempt_number != "3"
+        || retry_attempt.execution != AttemptExecution::Pending
+        || retry_attempt.save != AttemptSave::Open
+        || retry_sampling.temperature.get() != qualification_fixture::TEMPERATURE
+        || retry_sampling.top_p.get() != f64::from(qualification_fixture::TOP_P as f32)
+    {
+        return Err("native Retry committed the wrong attempt facts".into());
+    }
+    first_retry.abort();
+    match first_retry.await {
+        Err(error) if error.is_cancelled() => {}
+        Err(error) => return Err(format!("native Retry did not cancel cleanly: {error}")),
+        Ok(_) => return Err("native Retry received its reply before disconnect".into()),
+    }
+    retry_completion.release();
+    let retried = retry(fixture.client.clone(), first.clone(), &cached_retry, 5)
+        .await
+        .map_err(client::client_error)?;
+    let expected_retried_revision = next_revision(&cached_retry.post_conversation_revision)?;
+    if retried.turn_id != first_accepted.turn_id
+        || retried.attempt_id == cached_retry.attempt_id
+        || retried.pre_conversation_revision != cached_retry.post_conversation_revision
+        || retried.post_conversation_revision != expected_retried_revision
+    {
+        return Err("native Retry changed its durable turn or revision facts".into());
+    }
+    retry_execution.wait_reached().await?;
+    require_rejected(
+        retry(fixture.client.clone(), first.clone(), &retried, 5).await,
+        ErrorCategory::Conflict,
+        "changed native Retry replay",
+    )?;
+    let endpoint = only_engine_endpoint(&fixture.root.join("run/service"))?;
+    let target = retried.target();
     let stop_result = fixture
         .client
         .generation_request(
@@ -164,18 +229,26 @@ async fn exercise(fixture: &mut NativeService) -> Result<String, String> {
             },
         )
         .await;
-    execution.release();
+    retry_execution.release();
     match stop_result.map_err(client::client_error)? {
         GenerationReply::Stopping { target: returned } if returned == target => {}
-        _ => return Err("generation Stop returned the wrong target".into()),
+        _ => return Err("native Retry Stop returned the wrong target".into()),
     }
-    wait_for_stopped(&fixture.client, &stopped, &stopped_accepted, "stopped").await?;
+    wait_for_stopped(&fixture.client, &first, &retried, "retried").await?;
+    let retried_turns = list_turns(&fixture.client, &first.id).await?;
+    if !matches!(retried_turns.as_slice(), [turn]
+        if turn.id == first_accepted.turn_id && turn.selected_attempt.as_ref().is_some_and(|attempt|
+            attempt.id == retried.attempt_id && attempt.attempt_number == "3"))
+    {
+        return Err("native Retry created an extra user turn or selected the wrong attempt".into());
+    }
     wait_for_unloaded(&fixture.client).await?;
     if endpoint.exists() {
         return Err("stopped exact engine endpoint survived verified cleanup".into());
     }
     load_model(&fixture.client).await?;
     stop_after_content_and_reject_stale_target(fixture, prompt).await?;
+    exercise_reload_lifecycle(fixture).await?;
 
     let observations = qualification_fixture::observations();
     evidence::validate(&observations, &fixture.runtime_evidence)?;
@@ -184,6 +257,319 @@ async fn exercise(fixture: &mut NativeService) -> Result<String, String> {
         &fixture.runtime_evidence,
         true,
     ))
+}
+
+fn next_revision(revision: &str) -> Result<String, String> {
+    revision
+        .parse::<u64>()
+        .ok()
+        .and_then(|revision| revision.checked_add(1))
+        .map(|revision| revision.to_string())
+        .ok_or_else(|| "native generation returned an invalid conversation revision".into())
+}
+
+async fn exercise_reload_lifecycle(fixture: &mut NativeService) -> Result<(), String> {
+    let old = ready_target(&fixture.client).await?;
+    let settings = service_settings(&fixture.client).await?;
+    let settings = match fixture
+        .client
+        .settings_request(
+            ConnectMode::ObserveExisting,
+            ServiceSettingsCommand::PatchServiceSettings {
+                expected_revision: settings.revision,
+                patch: ServiceSettingsPatch {
+                    ctx: Some(OptionalU32Patch::Set {
+                        value: CONTEXT_TOKENS,
+                    }),
+                    port: None,
+                    generation: None,
+                },
+            },
+        )
+        .await
+        .map_err(client::client_error)?
+    {
+        ServiceSettingsReply::Service(settings) => settings,
+        _ => return Err("native context patch returned the wrong settings reply".into()),
+    };
+
+    let engine = NativeEngine::capture(fixture)?;
+    let queue_probe = fixture.coordinator.occupy_native_owner_queue();
+    match fixture
+        .client
+        .reload(
+            ConnectMode::ObserveExisting,
+            old.clone(),
+            settings.revision.clone(),
+        )
+        .await
+    {
+        Err(loxa_ipc::ClientError::Rejected(error))
+            if error.category == ErrorCategory::ServiceUnavailable => {}
+        Err(error) => return Err(format!("native failed-enqueue Reload returned {error}")),
+        Ok(_) => return Err("native failed-enqueue Reload was unexpectedly accepted".into()),
+    }
+    engine.require_current(fixture)?;
+    if ready_target(&fixture.client).await? != old {
+        return Err("failed Reload enqueue changed the Ready operation".into());
+    }
+    unload(&fixture.client, old).await?;
+    wait_for_unloaded(&fixture.client).await?;
+    engine.require_removed()?;
+    queue_probe
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .map_err(|_| "runtime owner did not consume the queue probe".to_string())?;
+
+    load_model(&fixture.client).await?;
+    let old = ready_target(&fixture.client).await?;
+    let engine = NativeEngine::capture(fixture)?;
+    fixture.coordinator.fail_next_native_runtime_termination();
+    let termination_successor = fixture
+        .client
+        .reload(
+            ConnectMode::ObserveExisting,
+            old.clone(),
+            settings.revision.clone(),
+        )
+        .await
+        .map_err(client::client_error)?;
+    wait_for_cleanup_failed(&fixture.client, &old).await?;
+    assert_applied_target(&fixture.client, &old, "termination failure").await?;
+    unload(&fixture.client, accepted_target(&termination_successor)).await?;
+    wait_for_unloaded(&fixture.client).await?;
+    engine.require_removed()?;
+
+    load_model(&fixture.client).await?;
+    let old = ready_target(&fixture.client).await?;
+    let engine = NativeEngine::capture(fixture)?;
+    fixture.coordinator.fail_next_native_intent_clear();
+    let clear_successor = fixture
+        .client
+        .reload(
+            ConnectMode::ObserveExisting,
+            old.clone(),
+            settings.revision.clone(),
+        )
+        .await
+        .map_err(client::client_error)?;
+    wait_for_cleanup_failed(&fixture.client, &old).await?;
+    engine.require_removed()?;
+    if !matches!(
+        service_settings(&fixture.client).await?.application,
+        ServiceSettingsApplication::NotApplied
+    ) {
+        return Err("intent-clear failure retained applied runtime facts after engine exit".into());
+    }
+    unload(&fixture.client, accepted_target(&clear_successor)).await?;
+    wait_for_unloaded(&fixture.client).await?;
+
+    load_model(&fixture.client).await?;
+    let old = ready_target(&fixture.client).await?;
+    let successor = fixture
+        .client
+        .reload(ConnectMode::ObserveExisting, old, settings.revision.clone())
+        .await
+        .map_err(client::client_error)?;
+    let successor_target = accepted_target(&successor);
+    wait_for_ready(&fixture.client, &successor_target).await?;
+    match service_settings(&fixture.client).await?.application {
+        ServiceSettingsApplication::Applied {
+            target,
+            settings_revision,
+            context_preference,
+            requested_context,
+            observed_context,
+            reload_required,
+            ..
+        } if target == successor_target
+            && settings_revision == settings.revision
+            && context_preference == Some(CONTEXT_TOKENS)
+            && requested_context == CONTEXT_TOKENS
+            && observed_context == Some(CONTEXT_TOKENS)
+            && !reload_required => {}
+        _ => return Err("successful native Reload published the wrong applied settings".into()),
+    }
+
+    let old = successor_target;
+    let engine = NativeEngine::capture(fixture)?;
+    let mut launch = fixture.coordinator.pause_native_reload_launch();
+    let cancelled = fixture
+        .client
+        .reload(ConnectMode::ObserveExisting, old, settings.revision.clone())
+        .await
+        .map_err(client::client_error)?;
+    launch.wait_reached().await?;
+    engine.require_removed()?;
+    require_no_launch_artifacts(fixture)?;
+    unload(&fixture.client, accepted_target(&cancelled)).await?;
+    launch.release();
+    wait_for_unloaded(&fixture.client).await?;
+    require_no_launch_artifacts(fixture)?;
+
+    load_model(&fixture.client).await?;
+    let old = ready_target(&fixture.client).await?;
+    let engine = NativeEngine::capture(fixture)?;
+    let mut launch = fixture.coordinator.pause_native_reload_launch();
+    fixture
+        .client
+        .reload(ConnectMode::ObserveExisting, old, settings.revision)
+        .await
+        .map_err(client::client_error)?;
+    launch.wait_reached().await?;
+    engine.require_removed()?;
+    require_no_launch_artifacts(fixture)?;
+    fixture.stop_service().await?;
+    launch.release();
+    if !matches!(fixture.coordinator.status().phase, RuntimePhase::Draining) {
+        return Err("StopService did not fence the promoted Reload successor".into());
+    }
+    Ok(())
+}
+
+async fn service_settings(
+    client: &loxa_ipc::ServiceClient,
+) -> Result<loxa_ipc::ServiceSettings, String> {
+    match client
+        .settings_request(
+            ConnectMode::ObserveExisting,
+            ServiceSettingsCommand::GetServiceSettings,
+        )
+        .await
+        .map_err(client::client_error)?
+    {
+        ServiceSettingsReply::Service(settings) => Ok(settings),
+        _ => Err("native settings read returned a conversation profile".into()),
+    }
+}
+
+fn accepted_target(accepted: &loxa_ipc::Accepted) -> OperationTarget {
+    OperationTarget {
+        boot_epoch: accepted.boot_epoch.clone(),
+        task_id: accepted.task_id.clone(),
+        generation: accepted.generation.clone(),
+    }
+}
+
+async fn ready_target(client: &loxa_ipc::ServiceClient) -> Result<OperationTarget, String> {
+    let status = runtime_status(client).await?;
+    let RuntimePhase::Ready {
+        task_id,
+        generation,
+        ..
+    } = status.phase
+    else {
+        return Err("native runtime is not Ready".into());
+    };
+    Ok(OperationTarget {
+        boot_epoch: status.boot_epoch,
+        task_id,
+        generation,
+    })
+}
+
+async fn wait_for_ready(
+    client: &loxa_ipc::ServiceClient,
+    target: &OperationTarget,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let status = runtime_status(client).await?;
+        match status.phase {
+            RuntimePhase::Ready {
+                task_id,
+                generation,
+                ..
+            } if status.boot_epoch == target.boot_epoch
+                && task_id == target.task_id
+                && generation == target.generation =>
+            {
+                return Ok(())
+            }
+            RuntimePhase::CleanupFailed { .. } | RuntimePhase::RecoveryRequired { .. } => {
+                return Err("native Reload entered cleanup recovery".into());
+            }
+            _ if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            _ => return Err("native Reload successor did not become Ready".into()),
+        }
+    }
+}
+
+async fn wait_for_cleanup_failed(
+    client: &loxa_ipc::ServiceClient,
+    retiring: &OperationTarget,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let status = runtime_status(client).await?;
+        match status.phase {
+            RuntimePhase::CleanupFailed {
+                task_id,
+                generation,
+                ..
+            } if status.boot_epoch == retiring.boot_epoch
+                && task_id == retiring.task_id
+                && generation == retiring.generation =>
+            {
+                return Ok(())
+            }
+            _ if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            _ => return Err("native Reload did not retain the failed retiring operation".into()),
+        }
+    }
+}
+
+async fn assert_applied_target(
+    client: &loxa_ipc::ServiceClient,
+    expected: &OperationTarget,
+    label: &str,
+) -> Result<(), String> {
+    if matches!(
+        service_settings(client).await?.application,
+        ServiceSettingsApplication::Applied { target, .. } if target == *expected
+    ) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{label} did not retain the retiring applied receipt"
+        ))
+    }
+}
+
+async fn unload(client: &loxa_ipc::ServiceClient, target: OperationTarget) -> Result<(), String> {
+    match client
+        .request(
+            ConnectMode::ObserveExisting,
+            ServiceCommand::Unload {
+                target: target.clone(),
+            },
+        )
+        .await
+        .map_err(client::client_error)?
+    {
+        ReplyOutcome::Accepted(accepted) if accepted_target(&accepted) == target => Ok(()),
+        _ => Err("native Reload cleanup Unload returned the wrong reply".into()),
+    }
+}
+
+fn require_no_launch_artifacts(fixture: &NativeService) -> Result<(), String> {
+    let control = fixture.root.join("run/service");
+    if control.join("launch-intent.json").exists()
+        || std::fs::read_dir(&control)
+            .map_err(|error| error.to_string())?
+            .any(|entry| {
+                entry
+                    .ok()
+                    .and_then(|entry| entry.file_name().into_string().ok())
+                    .is_some_and(|name| name.starts_with("engine-") && name.ends_with(".sock"))
+            })
+    {
+        return Err("cancelled Reload published successor launch artifacts".into());
+    }
+    Ok(())
 }
 
 async fn stop_after_content_and_reject_stale_target(

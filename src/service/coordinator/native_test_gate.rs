@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
-use super::{Coordinator, OwnerExit};
+use super::{Coordinator, OwnerCommand, OwnerExit};
 use crate::config::SettingsExit;
 use crate::history::HistoryExit;
 
@@ -114,6 +114,36 @@ impl Coordinator {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
+    }
+
+    pub(super) fn pause_native_reload_launch(&self) -> NativeTestGateControl {
+        let (gate, control) = NativeTestGate::pair();
+        *self
+            .shared
+            .native_reload_launch_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(gate);
+        control
+    }
+
+    pub(super) fn occupy_native_owner_queue(&self) -> std::sync::mpsc::Receiver<()> {
+        let (completion, consumed) = std::sync::mpsc::sync_channel(1);
+        self.owner_tx
+            .try_send(OwnerCommand::QueueProbeForTest(completion))
+            .expect("native runtime owner queue must be empty before the probe");
+        consumed
+    }
+
+    pub(super) fn fail_next_native_runtime_termination(&self) {
+        self.shared
+            .fail_next_runtime_termination
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(super) fn fail_next_native_intent_clear(&self) {
+        self.shared
+            .fail_next_intent_clear
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     pub(super) async fn wait_for_native_shutdown_resolution(&self) -> Result<(), String> {

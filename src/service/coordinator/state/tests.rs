@@ -48,6 +48,7 @@ fn ready_state() -> (CoordinatorState, Arc<OperationControl>) {
                 endpoint: Arc::new("/tmp/engine.sock".into()),
             },
             fingerprint: fingerprint("demo"),
+            observed_context: Some(4096),
         }
     ));
     (state, operation)
@@ -331,6 +332,7 @@ fn stop_during_blocked_start_cancels_without_waiting_and_prevents_late_ready() {
                         endpoint: Arc::new("/tmp/engine.sock".into()),
                     },
                     fingerprint: fingerprint("demo"),
+                    observed_context: Some(4096),
                 },
             );
             finished.send((cancelled, ready)).unwrap();
@@ -377,6 +379,7 @@ fn cleanup_failure_keeps_admission_and_exact_identity_until_explicit_retry_compl
                 endpoint: Arc::new("/tmp/engine.sock".into()),
             },
             fingerprint: fingerprint("demo"),
+            observed_context: Some(4096),
         }
     ));
     state.unload(&target(&accepted)).unwrap();
@@ -427,6 +430,7 @@ fn cleanup_failure_keeps_admission_and_exact_identity_until_explicit_retry_compl
                 endpoint: Arc::new("/tmp/engine.sock".into()),
             },
             fingerprint: fingerprint("demo"),
+            observed_context: Some(4096),
         }
     ));
     assert_eq!(
@@ -461,6 +465,7 @@ fn unresolved_output_fences_a_new_load_after_runtime_completion() {
                 endpoint: Arc::new("/tmp/engine.sock".into()),
             },
             fingerprint: fingerprint("demo"),
+            observed_context: Some(4096),
         }
     ));
     let reservation = match state
@@ -497,6 +502,7 @@ fn stale_runtime_completion_and_failure_cannot_cancel_a_replacement_admission() 
                 endpoint: Arc::new("/tmp/replacement.sock".into()),
             },
             fingerprint: fingerprint("replacement"),
+            observed_context: Some(4096),
         }
     ));
     let admission = match state
@@ -548,4 +554,198 @@ fn engine_failure_fences_the_operation_even_without_an_admission() {
     );
     state.complete(&operation, None);
     assert!(state.reserve_load("replacement".into()).is_ok());
+}
+
+#[test]
+fn reload_reservation_rolls_back_and_promotion_has_no_unloaded_gap() {
+    let (mut state, retiring) = ready_state();
+    let retiring_target = retiring.target("boot");
+    let launch = LaunchSettings {
+        settings_revision: 7,
+        context_preference: None,
+        requested_context: 4096,
+        runtime_identity: crate::runtime_identity::RuntimeIdentity::BundledB10344,
+    };
+
+    let (_, rolled_back) = state
+        .reserve_reload(&retiring_target, launch)
+        .expect("idle Ready runtime accepts Reload reservation");
+    assert_eq!(
+        state.register_pending_generation().err().unwrap().category,
+        ErrorCategory::Busy
+    );
+    state.release_reload_reservation(&rolled_back);
+    let pending = state.register_pending_generation().unwrap();
+    state.finish_pending_generation(&pending);
+    assert!(matches!(state.snapshot().phase, RuntimePhase::Ready { .. }));
+    assert!(!retiring.cancel.load(Ordering::Acquire));
+
+    let (matched, successor) = state.reserve_reload(&retiring_target, launch).unwrap();
+    assert!(Arc::ptr_eq(&matched, &retiring));
+    state.activate_reload(&matched, &successor).unwrap();
+    assert!(retiring.cancel.load(Ordering::Acquire));
+    assert!(matches!(
+        state.snapshot().phase,
+        RuntimePhase::Stopping { .. }
+    ));
+    assert!(state.accept_start(&successor).is_none());
+
+    assert!(state.advance(&retiring, OperationPhase::CleanupFailed));
+    assert!(matches!(
+        state.snapshot().phase,
+        RuntimePhase::CleanupFailed { .. }
+    ));
+    assert!(matches!(
+        state.settings_application(Some(8192)),
+        ServiceSettingsApplication::Applied {
+            requested_context: 4096,
+            observed_context: Some(4096),
+            reload_required: true,
+            ..
+        }
+    ));
+    state.engine_gone(&retiring);
+    assert_eq!(
+        state.settings_application(Some(8192)),
+        ServiceSettingsApplication::NotApplied
+    );
+    assert!(state.accept_start(&successor).is_none());
+    assert!(!state.complete(&retiring, None));
+    assert!(matches!(
+        state.snapshot().phase,
+        RuntimePhase::CleanupFailed { .. }
+    ));
+    assert_eq!(
+        state.settings_application(Some(8192)),
+        ServiceSettingsApplication::NotApplied
+    );
+
+    let accepted = state
+        .accept_start(&successor)
+        .expect("successor publishes Starting only after its launch intent");
+    assert_eq!(accepted.task_id, successor.task_id.to_string());
+    assert!(state.advance(
+        &successor,
+        OperationPhase::Ready {
+            engine: EngineDescriptor {
+                pid: 84,
+                endpoint: Arc::new("/tmp/reloaded.sock".into()),
+            },
+            fingerprint: fingerprint("demo"),
+            observed_context: Some(8192),
+        }
+    ));
+    assert!(matches!(
+        state.settings_application(Some(4096)),
+        ServiceSettingsApplication::Applied {
+            settings_revision,
+            context_preference: None,
+            requested_context: 4096,
+            observed_context: Some(8192),
+            reload_required: false,
+            ..
+        } if settings_revision == "7"
+    ));
+    assert!(!state.advance(
+        &retiring,
+        OperationPhase::Ready {
+            engine: EngineDescriptor {
+                pid: 42,
+                endpoint: Arc::new("/tmp/stale.sock".into()),
+            },
+            fingerprint: fingerprint("demo"),
+            observed_context: Some(16_384),
+        }
+    ));
+    state.engine_gone(&retiring);
+    assert!(matches!(
+        state.settings_application(None),
+        ServiceSettingsApplication::Applied {
+            observed_context: Some(8192),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn reload_refuses_active_work_and_competing_operations() {
+    let launch = LaunchSettings {
+        settings_revision: 1,
+        context_preference: Some(4096),
+        requested_context: 4096,
+        runtime_identity: crate::runtime_identity::RuntimeIdentity::BundledB10344,
+    };
+    let (mut state, retiring) = ready_state();
+    let target = retiring.target("boot");
+    let pending = state.register_pending_generation().unwrap();
+    assert_eq!(
+        state
+            .reserve_reload(&target, launch)
+            .err()
+            .unwrap()
+            .category,
+        ErrorCategory::Busy
+    );
+    state.finish_pending_generation(&pending);
+    let admission = match state
+        .reserve_admission([1; 16], [2; 16], [3; 32], 1, 1)
+        .unwrap()
+    {
+        AdmissionClaim::Fresh(admission) => admission,
+        AdmissionClaim::Existing(_) => unreachable!(),
+    };
+    assert_eq!(
+        state
+            .reserve_reload(&target, launch)
+            .err()
+            .unwrap()
+            .category,
+        ErrorCategory::Busy
+    );
+    state.finish_admission(&admission);
+
+    let (retiring, _) = state.reserve_reload(&target, launch).unwrap();
+    assert_eq!(
+        state
+            .reserve_reload(&target, launch)
+            .err()
+            .unwrap()
+            .category,
+        ErrorCategory::Busy
+    );
+    assert_eq!(
+        state.reserve_load("other".into()).err().unwrap().category,
+        ErrorCategory::Busy
+    );
+    assert!(!retiring.cancel.load(Ordering::Acquire));
+}
+
+#[test]
+fn stop_or_unload_during_reload_cannot_resurrect_the_successor() {
+    for stop_service in [false, true] {
+        let (mut state, retiring) = ready_state();
+        let target = retiring.target("boot");
+        let launch = LaunchSettings {
+            settings_revision: 1,
+            context_preference: None,
+            requested_context: 4096,
+            runtime_identity: crate::runtime_identity::RuntimeIdentity::BundledB10344,
+        };
+        let (retiring, successor) = state.reserve_reload(&target, launch).unwrap();
+        state.activate_reload(&retiring, &successor).unwrap();
+        if stop_service {
+            state.stop_service().unwrap();
+        } else {
+            state.unload(&successor.target("boot")).unwrap();
+        }
+        assert!(retiring.cancel.load(Ordering::Acquire));
+        assert!(successor.cancel.load(Ordering::Acquire));
+        state.complete(&retiring, None);
+        assert!(state.accept_start(&successor).is_none());
+        if stop_service {
+            assert!(matches!(state.snapshot().phase, RuntimePhase::Draining));
+        } else {
+            assert!(matches!(state.snapshot().phase, RuntimePhase::Unloaded));
+        }
+    }
 }

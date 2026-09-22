@@ -8,7 +8,7 @@ pub(super) fn validate(
     observations: &[PreflightObservation],
     runtime: &NativeRuntimeEvidence,
 ) -> Result<(), String> {
-    let [first, cached, overflow, stopped, output_stop, replacement] = observations else {
+    let [first, cached, overflow, retry, output_stop, replacement] = observations else {
         return Err(format!(
             "native generation recorded {} preflights instead of six",
             observations.len()
@@ -55,14 +55,14 @@ pub(super) fn validate(
             return Err("native completion did not preserve count, basis, or idle evidence".into());
         }
     }
-    if first.input_tokens != cached.input_tokens {
+    if first.input_tokens != retry.input_tokens || first.input_tokens != cached.input_tokens {
         return Err("identical UTF-8 prompts changed token counts after cache reuse".into());
     }
     if !cached
         .completion_cached_tokens
         .is_some_and(|cached| cached > 0)
     {
-        return Err("repeated native generation did not report prompt-cache reuse".into());
+        return Err("successful native Retry did not report prompt-cache reuse".into());
     }
     if overflow.max_output_tokens != CONTEXT_TOKENS
         || overflow.postcommit_gate_entered
@@ -74,14 +74,14 @@ pub(super) fn validate(
     {
         return Err("native context overflow crossed the generation dispatch gate".into());
     }
-    if !stopped.postcommit_gate_entered
-        || stopped.generation_dispatches != 0
-        || !stopped.basis_carried_to_execution
-        || stopped.completion_prompt_tokens.is_some()
-        || stopped.completion_cached_tokens.is_some()
-        || stopped.quiescent_after_terminal
+    if !retry.postcommit_gate_entered
+        || retry.generation_dispatches != 0
+        || !retry.basis_carried_to_execution
+        || retry.completion_prompt_tokens.is_some()
+        || retry.completion_cached_tokens.is_some()
+        || retry.quiescent_after_terminal
     {
-        return Err("native postcommit Stop crossed the engine request boundary".into());
+        return Err("native Retry Stop crossed the engine request boundary".into());
     }
     let prefix = output_stop
         .output_gate_prefix
@@ -113,7 +113,7 @@ pub(super) fn render(
     runtime: &NativeRuntimeEvidence,
     cleanup_verified: bool,
 ) -> String {
-    let [first, cached, overflow, stopped, output_stop, replacement] = observations else {
+    let [first, cached, overflow, retry, output_stop, replacement] = observations else {
         panic!("native observations must be validated before rendering");
     };
     let prefix = output_stop
@@ -144,7 +144,16 @@ pub(super) fn render(
         "template_sha256": &first.template_sha256,
         "actual_context": first.actual_context,
         "fixture_sampling_temperature": super::qualification_fixture::TEMPERATURE,
+        "fixture_sampling_top_p": super::qualification_fixture::TOP_P,
         "count_usage_pairs": count_usage_pairs,
+        "cached_retry": {
+            "canonical_turns": 1,
+            "selected_attempt_number": 2,
+            "input_tokens": cached.input_tokens,
+            "completion_cached_tokens": cached.completion_cached_tokens,
+            "execution": "completed",
+            "save": "saved",
+        },
         "busy_preflight_count": 0,
         "lost_original_reply": {
             "request_aborted_and_joined_after_commit": true,
@@ -162,8 +171,17 @@ pub(super) fn render(
             "generation_dispatches": overflow.generation_dispatches,
         },
         "postcommit_stop": {
-            "gate_entered": stopped.postcommit_gate_entered,
-            "generation_dispatches": stopped.generation_dispatches,
+            "operation": "retry",
+            "lost_original_reply": true,
+            "replayed_original_request": true,
+            "changed_replay": "conflict",
+            "canonical_turns": 1,
+            "selected_attempt_number": 3,
+            "input_tokens": retry.input_tokens,
+            "gate_entered": retry.postcommit_gate_entered,
+            "generation_dispatches": retry.generation_dispatches,
+            "execution": "stopped",
+            "save": "saved",
             "exact_engine_cleanup": cleanup_verified,
         },
         "nonterminal_output_stop": {

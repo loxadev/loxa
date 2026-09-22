@@ -16,6 +16,14 @@ use validation::{
     validate_prompt_basis,
 };
 
+pub(super) fn retry_is_eligible(
+    connection: &Connection,
+    conversation_id: [u8; 16],
+    prior_attempt_id: [u8; 16],
+) -> Result<bool, HistoryError> {
+    Ok(read_retry_target(connection, conversation_id, prior_attempt_id)?.is_some())
+}
+
 pub(super) fn lookup_submission(
     connection: &Connection,
     submission_id: [u8; 16],
@@ -264,6 +272,8 @@ fn admit(
                 now,
             ],
         )
+        .map_err(schema::classify_sql_error)?;
+    super::sampling::write_attempt(&transaction, attempt_id, prepared.effective_sampling)
         .map_err(schema::classify_sql_error)?;
     let selected = transaction
         .execute(

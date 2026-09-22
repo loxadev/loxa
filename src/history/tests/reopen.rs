@@ -54,6 +54,10 @@ async fn owner_reopen_recovers_the_committed_utf8_prefix_and_preserves_stopped_o
     );
     assert_eq!(statistics.service_total_duration_ms, "9");
     assert_eq!(statistics.stop_reason, AttemptStopReason::UserStop);
+    assert_eq!(
+        stopped_before.effective_sampling,
+        Some(effective_sampling())
+    );
 
     let (pending_conversation, pending) = admit(&handle, 42).await;
     let checkpoint = handle
@@ -69,6 +73,10 @@ async fn owner_reopen_recovers_the_committed_utf8_prefix_and_preserves_stopped_o
     assert_eq!(pending_before.saved_end, "6");
     assert_eq!(pending_before.generated_end, None);
     assert_eq!(pending_before.terminal_saved_end, None);
+    assert_eq!(
+        pending_before.effective_sampling,
+        Some(effective_sampling())
+    );
     // Close the real owner without a finalization intent. Startup recovery on
     // the next owner must handle this retained attempt, not a test SQL helper.
     drain(owner);
@@ -85,6 +93,10 @@ async fn owner_reopen_recovers_the_committed_utf8_prefix_and_preserves_stopped_o
         assert_eq!(recovered.generated_end, None);
         assert_eq!(recovered.terminal_saved_end, None);
         assert_eq!(recovered.failure_code, None);
+        assert_eq!(
+            recovered.effective_sampling,
+            pending_before.effective_sampling
+        );
         if let Some(previous) = &recovered_before {
             assert_eq!(
                 &recovered, previous,
