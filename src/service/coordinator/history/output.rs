@@ -38,7 +38,6 @@ pub(in crate::service::coordinator) struct OutputState {
     committed: CommittedAdmission,
     saved_end: u64,
     current: Option<OutputIntent>,
-    pending: Option<OutputIntent>,
     failed: bool,
     closed: bool,
     next_sequence: u64,
@@ -65,7 +64,6 @@ impl OutputState {
             committed,
             saved_end: 0,
             current: None,
-            pending: None,
             failed: false,
             closed: false,
             next_sequence: 1,
@@ -319,8 +317,7 @@ impl GenerationOutput {
     ) -> Result<(OutputObserver, Option<ExecutionOutcome>), (ServiceError, bool)> {
         let mut cancelled_rejection = false;
         let result = (|| {
-            let mut dispatch_now = None;
-            let (observer, selected_outcome) = {
+            let (observer, selected_outcome, intent) = {
                 let state = self.shared.state();
                 if !state.admission_is_current(&self.reservation) {
                     return Err(conflict("output persistence is no longer authoritative"));
@@ -345,25 +342,18 @@ impl GenerationOutput {
                     return Err(conflict("output persistence is already finalized"));
                 }
                 validate_identity(&self.shared, output, kind.suffix())?;
-                if output.failed && !matches!(&kind, OutputIntentKind::Final(_)) {
+                if output.failed {
                     return Err(unavailable(
                         "output save failed; retry the exact retained suffix",
                     ));
                 }
-                if output.pending.is_some() {
-                    return Err(busy("output persistence already has a pending suffix"));
+                if output.current.is_some() {
+                    return Err(busy("output persistence already has a suffix in flight"));
                 }
-                let expected_start = output
-                    .current
-                    .as_ref()
-                    .map_or(output.saved_end, OutputIntent::end);
-                if kind.start() != expected_start {
+                if kind.start() != output.saved_end {
                     return Err(conflict(
                         "output suffix does not follow the retained prefix",
                     ));
-                }
-                if output.current.as_ref().is_some_and(OutputIntent::is_final) {
-                    return Err(conflict("output finalization is already in flight"));
                 }
                 if let OutputIntentKind::Final(input) = &mut kind {
                     input.validate().map_err(history_error)?;
@@ -397,25 +387,18 @@ impl GenerationOutput {
                     outcome,
                 };
                 output.next_sequence = output.next_sequence.saturating_add(1);
-                if output.current.is_none() {
-                    output.current = Some(intent.clone());
-                    output.status = OutputSavePhase::Saving {
-                        saved_end: output.saved_end,
-                    };
-                    dispatch_now = Some(intent);
-                } else {
-                    output.pending = Some(intent);
-                }
+                output.current = Some(intent.clone());
+                output.status = OutputSavePhase::Saving {
+                    saved_end: output.saved_end,
+                };
                 drop(state);
-                (observer, selected_outcome)
+                (observer, selected_outcome, intent)
             };
-            if let Some(intent) = dispatch_now {
-                dispatch(
-                    Arc::clone(&self.shared),
-                    Arc::clone(&self.reservation),
-                    intent,
-                );
-            }
+            dispatch(
+                Arc::clone(&self.shared),
+                Arc::clone(&self.reservation),
+                intent,
+            );
             Ok((observer, selected_outcome))
         })();
         result.map_err(|error| (error, cancelled_rejection))
@@ -454,7 +437,6 @@ fn resolve(
     result: Result<SuffixCommit, ServiceError>,
 ) {
     let outcome = intent.outcome.clone();
-    let mut next = None;
     let mut terminal = false;
     let mut published = result.clone();
     {
@@ -481,26 +463,13 @@ fn resolve(
                 let save_failed = matches!(output.status, OutputSavePhase::SaveFailed { .. });
                 output.saved_end = commit.current_saved_end;
                 terminal = intent.is_final();
-                output.current = output.pending.take();
+                output.current = None;
                 output.failed = false;
                 if terminal {
-                    if output.current.is_some() {
-                        published = Err(internal(
-                            "output persisted a finalization before a pending suffix",
-                        ));
-                        output.failed = true;
-                        terminal = false;
-                    } else {
-                        output.closed = true;
-                        output.status = OutputSavePhase::Saved {
-                            saved_end: output.saved_end,
-                        };
-                    }
-                } else if let Some(current) = &output.current {
-                    output.status = OutputSavePhase::Saving {
+                    output.closed = true;
+                    output.status = OutputSavePhase::Saved {
                         saved_end: output.saved_end,
                     };
-                    next = Some(current.clone());
                 } else if save_failed {
                     output.status = OutputSavePhase::SaveFailed {
                         saved_end: output.saved_end,
@@ -539,9 +508,6 @@ fn resolve(
         maybe_begin_history_drain(&shared);
     } else {
         outcome.send_replace(Some(published));
-        if let Some(next) = next {
-            dispatch(shared, reservation, next);
-        }
     }
 }
 

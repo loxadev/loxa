@@ -753,7 +753,7 @@ async fn committed_admission_hands_off_before_publish_and_stop_keeps_the_fence()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn output_owner_orders_pending_final_and_survives_dropped_observer() {
+async fn output_owner_rejects_concurrent_intents_and_survives_dropped_observer() {
     let fixture = Fixture::start().await;
     let committed = wait_for_admission(
         fixture
@@ -774,7 +774,13 @@ async fn output_owner_orders_pending_final_and_survives_dropped_observer() {
     let checkpoint = Arc::new(suffix_input(&committed, 0, "saved"));
     let finalization = Arc::new(final_input(&committed, 5, "!", ExecutionOutcome::Completed));
     let checkpoint_observer = output.checkpoint(Arc::clone(&checkpoint)).unwrap();
-    let final_observer = output.finalize(Arc::clone(&finalization)).unwrap();
+    assert_eq!(
+        output
+            .finalize(Arc::clone(&finalization))
+            .unwrap_err()
+            .category,
+        ErrorCategory::Busy
+    );
     drop(checkpoint_observer);
     assert_eq!(
         output
@@ -784,6 +790,14 @@ async fn output_owner_orders_pending_final_and_survives_dropped_observer() {
         ErrorCategory::Busy
     );
     barrier.wait();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while output.status().unwrap() != (OutputSavePhase::Open { saved_end: 5 }) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("checkpoint did not resolve after its observer was dropped");
+    let final_observer = output.finalize(Arc::clone(&finalization)).unwrap();
     assert_eq!(wait_for_output(final_observer).await.unwrap().end, 6);
     assert_eq!(
         output.status().unwrap(),
@@ -866,7 +880,7 @@ async fn failed_output_cancels_and_retry_reuses_the_exact_retained_suffix() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn failed_checkpoint_retains_a_later_failed_terminal_for_exact_retry() {
+async fn failed_checkpoint_requires_exact_retry_before_a_terminal_intent() {
     let fixture = Fixture::start().await;
     let committed = wait_for_admission(
         fixture
@@ -890,9 +904,12 @@ async fn failed_checkpoint_retains_a_later_failed_terminal_for_exact_retry() {
         failure_code: Some("output_save".into()),
         ..final_input(&committed, 5, "tail", ExecutionOutcome::Failed)
     });
-    let final_observer = output.finalize(Arc::clone(&terminal)).unwrap();
+    assert_eq!(
+        output.finalize(Arc::clone(&terminal)).unwrap_err().category,
+        ErrorCategory::ServiceUnavailable
+    );
     assert_eq!(Arc::strong_count(&checkpoint), 2);
-    assert_eq!(Arc::strong_count(&terminal), 2);
+    assert_eq!(Arc::strong_count(&terminal), 1);
     assert_eq!(
         wait_for_output(output.retry_save().unwrap())
             .await
@@ -900,6 +917,7 @@ async fn failed_checkpoint_retains_a_later_failed_terminal_for_exact_retry() {
             .end,
         5
     );
+    let final_observer = output.finalize(Arc::clone(&terminal)).unwrap();
     assert_eq!(wait_for_output(final_observer).await.unwrap().end, 9);
     assert_eq!(Arc::strong_count(&checkpoint), 1);
     assert_eq!(Arc::strong_count(&terminal), 1);
@@ -1017,12 +1035,12 @@ async fn full_output_envelope_cancels_then_drains_one_large_event_exactly() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn lost_checkpoint_with_pending_completed_final_retries_before_stop_drains_history() {
+async fn lost_checkpoint_retries_before_terminal_and_stop_waits_for_durability() {
     let fixture = Fixture::start().await;
     let committed = wait_for_admission(
         fixture
             .coordinator
-            .admit_history_generation(fixture.input(14, "retry pending final"))
+            .admit_history_generation(fixture.input(14, "retry before final"))
             .await
             .unwrap(),
     )
@@ -1039,7 +1057,13 @@ async fn lost_checkpoint_with_pending_completed_final_retries_before_stop_drains
         .stall_history_for_test(Arc::clone(&barrier));
     barrier.wait();
     let checkpoint_observer = output.checkpoint(Arc::clone(&checkpoint)).unwrap();
-    let final_observer = output.finalize(Arc::clone(&finalization)).unwrap();
+    assert_eq!(
+        output
+            .finalize(Arc::clone(&finalization))
+            .unwrap_err()
+            .category,
+        ErrorCategory::Busy
+    );
     fixture.coordinator.stop_service().unwrap();
     barrier.wait();
     assert!(wait_for_output(checkpoint_observer).await.is_err());
@@ -1050,7 +1074,7 @@ async fn lost_checkpoint_with_pending_completed_final_retries_before_stop_drains
         HistoryExit::Drained
     );
     assert_eq!(Arc::strong_count(&checkpoint), 2);
-    assert_eq!(Arc::strong_count(&finalization), 2);
+    assert_eq!(Arc::strong_count(&finalization), 1);
 
     assert_eq!(
         wait_for_output(output.retry_save().unwrap())
@@ -1059,6 +1083,7 @@ async fn lost_checkpoint_with_pending_completed_final_retries_before_stop_drains
             .end,
         5
     );
+    let final_observer = output.finalize(Arc::clone(&finalization)).unwrap();
     assert_eq!(wait_for_output(final_observer).await.unwrap().end, 6);
     assert_eq!(Arc::strong_count(&checkpoint), 1);
     assert_eq!(Arc::strong_count(&finalization), 1);
@@ -1070,10 +1095,10 @@ async fn lost_checkpoint_with_pending_completed_final_retries_before_stop_drains
     fixture.finish_stopped().await;
 
     let connection = rusqlite::Connection::open(fixture.root.join("app.sqlite")).unwrap();
-    let terminal: (i64, i64, i64, Option<i64>, Option<i64>) = connection
+    let terminal: (i64, i64, i64, Option<i64>, Option<i64>, Option<String>) = connection
         .query_row(
             "SELECT execution_outcome, save_outcome, saved_end, generated_end,
-                    terminal_saved_end FROM attempts",
+                    terminal_saved_end, failure_code FROM attempts",
             [],
             |row| {
                 Ok((
@@ -1082,11 +1107,15 @@ async fn lost_checkpoint_with_pending_completed_final_retries_before_stop_drains
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
+                    row.get(5)?,
                 ))
             },
         )
         .unwrap();
-    assert_eq!(terminal, (1, 1, 6, Some(6), Some(6)));
+    assert_eq!(
+        terminal,
+        (3, 1, 6, Some(6), Some(6), Some("output_save".into()))
+    );
     connection.close().unwrap();
 }
 
