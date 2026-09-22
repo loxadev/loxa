@@ -166,7 +166,7 @@ impl Fixture {
             loxa_ipc::RuntimePhase::Ready { .. }
         ));
         assert!(self.coordinator.history_is_ready());
-        assert_terminalized(&self.root);
+        assert_terminalized(&self.root, None);
 
         let connection = rusqlite::Connection::open(self.root.join("app.sqlite")).unwrap();
         let (attempts, matching): (i64, i64) = connection
@@ -359,7 +359,7 @@ async fn stop_inside_admission_transaction_terminalizes_before_drain() {
     commit.wait();
     wait_for_admission(observer).await.unwrap();
     fixture.finish_stopped().await;
-    assert_terminalized(&fixture.root);
+    assert_terminalized(&fixture.root, None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -401,7 +401,7 @@ async fn committed_lookup_joins_an_active_matching_reservation() {
         wait_for_admission(duplicate).await.unwrap()
     );
     fixture.finish_stopped().await;
-    assert_terminalized(&fixture.root);
+    assert_terminalized(&fixture.root, None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -468,7 +468,7 @@ async fn lost_admission_reply_and_terminal_failure_retry_under_drain() {
         committed.operation_generation.to_string()
     );
     fixture.finish_stopped().await;
-    assert_terminalized(&fixture.root);
+    assert_terminalized(&fixture.root, None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -752,7 +752,7 @@ async fn committed_admission_hands_off_before_publish_and_stop_keeps_the_fence()
     assert_eq!(result.end, 0);
     assert!(!fixture.coordinator.admission_active_for_test());
     fixture.finish_stopped().await;
-    assert_terminalized(&fixture.root);
+    assert_terminalized(&fixture.root, Some(1));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1055,6 +1055,12 @@ async fn lost_checkpoint_retries_before_terminal_and_stop_waits_for_durability()
     .await
     .unwrap();
     let output = fixture.coordinator.generation_output(&committed).unwrap();
+    let reservation = fixture
+        .coordinator
+        .shared
+        .state()
+        .current_admission()
+        .unwrap();
     let checkpoint = Arc::new(suffix_input(&committed, 0, "saved"));
     let finalization = Arc::new(final_input(&committed, 5, "!", ExecutionOutcome::Completed));
 
@@ -1073,8 +1079,16 @@ async fn lost_checkpoint_retries_before_terminal_and_stop_waits_for_durability()
         ErrorCategory::Busy
     );
     fixture.coordinator.stop_service().unwrap();
+    assert_eq!(
+        reservation.cancellation_cause(),
+        Some(CancellationCause::Requested)
+    );
     barrier.wait();
     assert!(wait_for_output(checkpoint_observer).await.is_err());
+    assert_eq!(
+        reservation.cancellation_cause(),
+        Some(CancellationCause::Requested)
+    );
 
     assert!(fixture.coordinator.admission_active_for_test());
     assert_ne!(
@@ -1122,7 +1136,7 @@ async fn lost_checkpoint_retries_before_terminal_and_stop_waits_for_durability()
         .unwrap();
     assert_eq!(
         terminal,
-        (3, 1, 6, Some(6), Some(6), Some("output_save".into()))
+        (2, 1, 6, Some(6), Some(6), Some("stopped".into()))
     );
     connection.close().unwrap();
 }
@@ -1272,7 +1286,7 @@ async fn stop_winning_before_output_intent_rejects_more_completed_content() {
         0
     );
     fixture.finish_stopped().await;
-    assert_terminalized(&fixture.root);
+    assert_terminalized(&fixture.root, Some(1));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1514,7 +1528,7 @@ async fn wait_for_history_ready(coordinator: &Coordinator) {
     assert_eq!(coordinator.history_status().phase, HistoryPhase::Ready);
 }
 
-fn assert_terminalized(root: &std::path::Path) {
+fn assert_terminalized(root: &std::path::Path, expected_qualified_input_tokens: Option<i64>) {
     let connection = rusqlite::Connection::open(root.join("app.sqlite")).unwrap();
     let terminal: (i64, i64, i64, Option<i64>, Option<i64>) = connection
         .query_row(
@@ -1534,7 +1548,7 @@ fn assert_terminalized(root: &std::path::Path) {
         .unwrap();
     assert_eq!(terminal, (2, 1, 0, Some(0), Some(0)));
     let statistics = attempt_statistics_row(root);
-    assert_eq!(statistics.0, None);
+    assert_eq!(statistics.0, expected_qualified_input_tokens);
     assert_eq!(statistics.1, None);
     assert_eq!(statistics.2, None);
     assert_eq!(statistics.3, None);
