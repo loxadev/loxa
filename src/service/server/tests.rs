@@ -301,7 +301,7 @@ async fn history_client(bootstrap: &ClientBootstrap, client: UnixStream) -> loxa
     let ServerEnvelope::HelloAck(hello) = hello else {
         panic!("expected history hello acknowledgement");
     };
-    assert_eq!(hello.protocol, loxa_ipc::ProtocolVersion::V1_1);
+    assert_eq!(hello.protocol, loxa_ipc::ProtocolVersion::V1_4);
     assert_eq!(hello.storage_schema, HISTORY_SCHEMA_VERSION);
     assert!(hello.capabilities.contains(&Capability::History));
     set_frame_limit(&mut transport, MAX_HISTORY_FRAME_BYTES).unwrap();
@@ -971,6 +971,26 @@ async fn opening_handshake_cannot_use_sql_backed_profile_settings() {
         generation: None,
     };
     let mut pending = None;
+    let (reply, permit) = connection::execute_request(
+        &fixture.coordinator,
+        Request::new(
+            "history-status-before-ready",
+            ServiceCommand::History {
+                command: loxa_ipc::HistoryCommand::GetHistoryStatus,
+            },
+        ),
+        &negotiated,
+        &mut pending,
+    )
+    .await;
+    assert!(permit.is_none());
+    assert!(matches!(
+        reply.outcome,
+        ReplyOutcome::History {
+            reply: loxa_ipc::HistoryReply::Status(_)
+        }
+    ));
+
     for minor in 0..=3 {
         let ordinary = NegotiatedHello {
             protocol: loxa_ipc::ProtocolVersion { major: 1, minor },
@@ -1048,6 +1068,62 @@ async fn opening_handshake_cannot_use_sql_backed_profile_settings() {
     .await;
     assert!(permit.is_none());
     assert!(matches!(reply.outcome, ReplyOutcome::Settings { .. }));
+
+    fixture.coordinator.stop_service().unwrap();
+    let mut owner_exit = fixture.coordinator.owner_exit_receiver();
+    let mut history_exit = fixture.coordinator.history_exit_receiver();
+    let mut settings_exit = fixture.coordinator.settings_exit_receiver();
+    wait_for_owner_resolution(
+        &fixture.coordinator,
+        &mut owner_exit,
+        &mut history_exit,
+        &mut settings_exit,
+    )
+    .await;
+    fixture.coordinator.join_owner().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn protocol_one_three_rejects_schema_four_history_replies() {
+    let fixture = ServerFixture::start().await;
+    let negotiated = NegotiatedHello {
+        protocol: loxa_ipc::ProtocolVersion::V1_3,
+        capabilities: LEGACY_CAPABILITIES.to_vec(),
+        storage_schema: 3,
+        frame_limit: MAX_HISTORY_FRAME_BYTES,
+        generation: None,
+    };
+    let mut pending = None;
+    for (request_id, command) in [
+        (
+            "old-history-status",
+            loxa_ipc::HistoryCommand::GetHistoryStatus,
+        ),
+        (
+            "old-list-turns",
+            loxa_ipc::HistoryCommand::ListTurns {
+                conversation_id: "00".repeat(16),
+                cursor: None,
+                limit: 1,
+            },
+        ),
+    ] {
+        let (reply, permit) = connection::execute_request(
+            &fixture.coordinator,
+            Request::new(request_id, ServiceCommand::History { command }),
+            &negotiated,
+            &mut pending,
+        )
+        .await;
+        assert!(permit.is_none());
+        assert!(matches!(
+            reply.outcome,
+            ReplyOutcome::Rejected(loxa_ipc::ServiceError {
+                category: ErrorCategory::IncompatibleProtocol,
+                ..
+            })
+        ));
+    }
 
     fixture.coordinator.stop_service().unwrap();
     let mut owner_exit = fixture.coordinator.owner_exit_receiver();

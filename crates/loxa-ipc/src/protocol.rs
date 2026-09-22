@@ -13,11 +13,12 @@ pub use generation::{
 };
 pub use generation_status::{GenerationExecutionPhase, GenerationSavePhase, GenerationStatus};
 pub use history::{
-    AttemptExecution, AttemptSave, AttemptSummary, ContentRange, ContentSource, ConversationCursor,
-    ConversationPage, ConversationSummary, HistoryCommand, HistoryPhase, HistoryReply,
-    HistoryStatus, TurnCursor, TurnPage, TurnSummary, HISTORY_SCHEMA_VERSION,
-    MAX_CONTENT_RANGE_BYTES, MAX_CONVERSATION_PAGE_BYTES, MAX_CONVERSATION_PAGE_ITEMS,
-    MAX_CONVERSATION_TITLE_BYTES, MAX_TURN_PAGE_BYTES, MAX_TURN_PAGE_ITEMS,
+    AttemptExecution, AttemptSave, AttemptStatistics, AttemptStopReason, AttemptSummary,
+    ContentRange, ContentSource, ConversationCursor, ConversationPage, ConversationSummary,
+    EngineDecodeRate, HistoryCommand, HistoryPhase, HistoryReply, HistoryStatus, TurnCursor,
+    TurnPage, TurnSummary, HISTORY_SCHEMA_VERSION, MAX_CONTENT_RANGE_BYTES,
+    MAX_CONVERSATION_PAGE_BYTES, MAX_CONVERSATION_PAGE_ITEMS, MAX_CONVERSATION_TITLE_BYTES,
+    MAX_TURN_PAGE_BYTES, MAX_TURN_PAGE_ITEMS,
 };
 pub use settings::{
     ConversationProfile, GenerationSettings, GenerationSettingsPatch, OptionalU16Patch,
@@ -26,7 +27,7 @@ pub use settings::{
 };
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 3;
+pub const PROTOCOL_MINOR: u16 = 4;
 
 pub const MAX_BUILD_BYTES: usize = 96;
 pub const MAX_ID_BYTES: usize = 160;
@@ -45,6 +46,8 @@ impl ProtocolVersion {
     pub const V1_0: Self = Self { major: 1, minor: 0 };
     pub const V1_1: Self = Self { major: 1, minor: 1 };
     pub const V1_2: Self = Self { major: 1, minor: 2 };
+    pub const V1_3: Self = Self { major: 1, minor: 3 };
+    pub const V1_4: Self = Self { major: 1, minor: 4 };
 
     pub const CURRENT: Self = Self {
         major: PROTOCOL_MAJOR,
@@ -105,7 +108,7 @@ impl Hello {
 
     pub fn history(build: impl Into<String>, root_identity: impl Into<String>) -> Self {
         Self {
-            protocol: ProtocolVersion::V1_1,
+            protocol: ProtocolVersion::CURRENT,
             // Protocol 1.0 peers have a closed capability enum. Keep this
             // initial vocabulary decodable so they can return the typed
             // protocol mismatch before a 1.1 client asks for history.
@@ -134,7 +137,7 @@ impl Hello {
 
     pub fn generation_status(build: impl Into<String>, root_identity: impl Into<String>) -> Self {
         Self {
-            protocol: ProtocolVersion::CURRENT,
+            protocol: ProtocolVersion::V1_3,
             ..Self::current(build, root_identity)
         }
     }
@@ -786,17 +789,20 @@ mod tests {
     }
 
     #[test]
-    fn history_hello_is_decodable_by_a_closed_protocol_1_0_peer() {
-        let encoded =
-            serde_json::to_vec(&ClientEnvelope::Hello(Hello::history("0.1.0-dev", "root")))
-                .unwrap();
-        let OldClientEnvelope::Hello {
-            protocol,
-            required_capabilities,
-            ..
-        } = serde_json::from_slice(&encoded).unwrap();
-        assert_eq!(protocol, OldProtocolVersion { major: 1, minor: 1 });
-        assert_eq!(required_capabilities.len(), REQUIRED_CAPABILITIES.len());
+    fn history_hellos_request_the_current_protocol_through_the_closed_old_shape() {
+        for hello in [
+            Hello::history_status("0.1.0-dev", "root"),
+            Hello::history("0.1.0-dev", "root"),
+        ] {
+            let encoded = serde_json::to_vec(&ClientEnvelope::Hello(hello)).unwrap();
+            let OldClientEnvelope::Hello {
+                protocol,
+                required_capabilities,
+                ..
+            } = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(protocol, OldProtocolVersion { major: 1, minor: 4 });
+            assert_eq!(required_capabilities.len(), REQUIRED_CAPABILITIES.len());
+        }
     }
 
     #[test]
@@ -858,7 +864,7 @@ mod tests {
 
     #[test]
     fn turn_and_content_dtos_reject_impossible_public_shapes() {
-        let valid_attempt = AttemptSummary {
+        let mut valid_attempt = AttemptSummary {
             id: "b".repeat(32),
             attempt_number: "1".into(),
             execution: AttemptExecution::Completed,
@@ -867,6 +873,7 @@ mod tests {
             generated_end: Some("2".into()),
             terminal_saved_end: Some("2".into()),
             failure_code: None,
+            statistics: None,
             created_ms: "1".into(),
             updated_ms: "2".into(),
         };
@@ -882,12 +889,38 @@ mod tests {
             })
         };
 
+        valid_attempt.statistics = Some(AttemptStatistics {
+            qualified_input_tokens: Some(7),
+            qualified_output_tokens: Some(2),
+            service_first_output_latency_ms: Some("3".into()),
+            qualified_engine_decode_tokens_per_second: EngineDecodeRate::new(25.0),
+            service_total_duration_ms: "9".into(),
+            stop_reason: AttemptStopReason::Completed,
+        });
+        let encoded = serde_json::to_value(&valid_attempt).unwrap();
+        assert_eq!(encoded["statistics"]["qualified_input_tokens"], 7);
+        assert_eq!(
+            encoded["statistics"]["qualified_engine_decode_tokens_per_second"],
+            25.0
+        );
+        assert_eq!(encoded["statistics"]["service_total_duration_ms"], "9");
+
         let mut invalid = valid_attempt.clone();
         invalid.terminal_saved_end = None;
         assert!(page(invalid, "1").validate_shape().is_err());
 
         let mut invalid = valid_attempt.clone();
         invalid.updated_ms = "0".into();
+        assert!(page(invalid, "1").validate_shape().is_err());
+        let mut invalid = valid_attempt.clone();
+        invalid
+            .statistics
+            .as_mut()
+            .unwrap()
+            .service_first_output_latency_ms = Some("10".into());
+        assert!(page(invalid, "1").validate_shape().is_err());
+        let mut invalid = valid_attempt.clone();
+        invalid.statistics.as_mut().unwrap().qualified_output_tokens = None;
         assert!(page(invalid, "1").validate_shape().is_err());
         assert!(page(valid_attempt, "32769").validate_shape().is_err());
 

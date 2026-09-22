@@ -82,6 +82,7 @@ pub(super) fn admit_retry(
     admit(connection, prepared, None)
 }
 
+#[cfg(test)]
 pub(super) fn stop_before_execution(
     connection: &Connection,
     committed: &CommittedAdmission,

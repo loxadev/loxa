@@ -1,4 +1,4 @@
-use super::super::history::{GenerationOutput, OutputObserver};
+use super::super::history::{AttemptMeasurements, GenerationOutput, OutputObserver};
 use crate::history::{
     CommittedAdmission, ExecutionOutcome, FinalizationInput, SuffixInput, MAX_SUFFIX_BYTES,
 };
@@ -109,32 +109,46 @@ impl OutputPipeline {
         decoder: &mut super::parser::SseDecoder,
         proposed_outcome: ExecutionOutcome,
         failure_code: Option<&'static str>,
+        measurements: AttemptMeasurements,
     ) -> Result<ExecutionOutcome, ServiceError> {
         let generated_end = u64::try_from(decoder.generated_end()).unwrap_or(u64::MAX);
         let fact = self
             .output
-            .publish_execution(proposed_outcome, failure_code, generated_end)
+            .publish_execution(proposed_outcome, failure_code, generated_end, measurements)
             .inspect_err(|_| self.output.cancel_output_save())?;
         self.settle_checkpoint().await;
-        if let Some(content) = self.retained_tail.take() {
+        let final_suffix = loop {
+            let content = self
+                .retained_tail
+                .take()
+                .or_else(|| decoder.take_remaining_chunk());
+            let Some(content) = content else {
+                break String::new();
+            };
+            let end = self
+                .enqueued_end
+                .checked_add(content.len() as u64)
+                .expect("generated output offset remains bounded");
+            if end == generated_end {
+                break content;
+            }
+            debug_assert!(end < generated_end);
             self.persist_terminal_chunk(content).await;
-        }
-        while let Some(content) = decoder.take_remaining_chunk() {
-            self.persist_terminal_chunk(content).await;
-        }
+        };
 
-        debug_assert_eq!(generated_end, self.enqueued_end);
+        debug_assert_eq!(generated_end, self.enqueued_end + final_suffix.len() as u64);
         let input = Arc::new(FinalizationInput {
             suffix: SuffixInput {
                 attempt_id: self.committed.attempt_id,
                 owner_epoch: self.committed.owner_epoch.clone(),
                 operation_generation: self.committed.operation_generation,
                 expected_saved_end: self.enqueued_end,
-                content: String::new(),
+                content: final_suffix,
             },
             execution_outcome: fact.outcome,
             generated_end: fact.generated_end,
             failure_code: fact.failure_code,
+            statistics: Some(fact.statistics),
         });
         let mut delay = MIN_RETRY_DELAY;
         let (mut observer, selected_outcome) = loop {

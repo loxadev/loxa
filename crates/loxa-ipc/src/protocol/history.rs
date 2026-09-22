@@ -6,11 +6,12 @@ use std::fmt;
 mod turns;
 
 pub use turns::{
-    AttemptExecution, AttemptSave, AttemptSummary, ContentRange, ContentSource, TurnCursor,
-    TurnPage, TurnSummary, MAX_CONTENT_RANGE_BYTES, MAX_TURN_PAGE_BYTES, MAX_TURN_PAGE_ITEMS,
+    AttemptExecution, AttemptSave, AttemptStatistics, AttemptStopReason, AttemptSummary,
+    ContentRange, ContentSource, EngineDecodeRate, TurnCursor, TurnPage, TurnSummary,
+    MAX_CONTENT_RANGE_BYTES, MAX_TURN_PAGE_BYTES, MAX_TURN_PAGE_ITEMS,
 };
 
-pub const HISTORY_SCHEMA_VERSION: u32 = 3;
+pub const HISTORY_SCHEMA_VERSION: u32 = 4;
 pub const MAX_CONVERSATION_TITLE_BYTES: usize = 256;
 pub const MAX_CONVERSATION_PAGE_ITEMS: usize = 50;
 pub const MAX_CONVERSATION_PAGE_BYTES: usize = 24 * 1024;

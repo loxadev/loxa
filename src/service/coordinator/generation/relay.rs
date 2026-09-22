@@ -1,9 +1,10 @@
 use super::super::state::AdmissionReservation;
 use super::super::Coordinator;
-use super::parser::{DecodeError, SseDecoder};
+use super::parser::{DecodeError, EngineFinishReason, SseDecoder};
 use super::persistence::{OutputPipeline, SaveChunkFailure};
 use super::preflight::QualifiedRequest;
 use crate::history::{CommittedAdmission, ExecutionOutcome};
+use crate::service::coordinator::history::AttemptMeasurements;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper::{Request, StatusCode};
@@ -45,6 +46,8 @@ pub(super) async fn run(
     };
     let mut pipeline = OutputPipeline::new(output, committed);
     let mut decoder = SseDecoder::new();
+    let expected_input_tokens = qualified.input_tokens();
+    let mut measurements = AttemptMeasurements::new(expected_input_tokens);
     let execution = {
         let state = coordinator.shared.state();
         state.begin_generation_execution(&reservation)
@@ -53,8 +56,14 @@ pub(super) async fn run(
         Ok(engine) => engine,
         Err(_) if reservation.is_cancelled() => {
             drop(qualified);
+            measurements.freeze_duration(reservation.accepted_elapsed());
             if pipeline
-                .finish(&mut decoder, ExecutionOutcome::Stopped, Some("stopped"))
+                .finish(
+                    &mut decoder,
+                    ExecutionOutcome::Stopped,
+                    Some("stopped"),
+                    measurements,
+                )
                 .await
                 .is_err()
             {
@@ -67,6 +76,7 @@ pub(super) async fn run(
         }
         Err(_) => {
             drop(qualified);
+            measurements.freeze_duration(reservation.accepted_elapsed());
             coordinator
                 .shared
                 .state()
@@ -76,12 +86,12 @@ pub(super) async fn run(
                     &mut decoder,
                     ExecutionOutcome::Failed,
                     Some("runtime_changed"),
+                    measurements,
                 )
                 .await;
             return;
         }
     };
-    let expected_input_tokens = qualified.input_tokens();
     #[cfg(all(test, target_os = "macos"))]
     let observation_id = qualified.observation_id();
     #[cfg(all(test, target_os = "macos"))]
@@ -105,14 +115,23 @@ pub(super) async fn run(
         progress,
         &mut decoder,
         &mut pipeline,
+        &mut measurements,
     )
     .await;
+    measurements.freeze_duration(reservation.accepted_elapsed());
     #[cfg(all(test, target_os = "macos"))]
     super::qualification_fixture::record_usage(
         observation_id,
         decoder.prompt_tokens(),
         decoder.cached_prompt_tokens(),
     );
+    if matches!(stream, Ok(StreamEnd::Completed)) {
+        measurements.record_terminal_usage(
+            decoder.completion_tokens(),
+            decoder.engine_decode_tokens_per_second(),
+            decoder.finish_reason() == Some(EngineFinishReason::OutputLimit),
+        );
+    }
     let (mut outcome, mut failure_code) = match stream {
         Ok(StreamEnd::Completed) if !reservation.is_cancelled() => {
             (ExecutionOutcome::Completed, None)
@@ -151,7 +170,9 @@ pub(super) async fn run(
             .state()
             .require_generation_cleanup(&reservation);
     }
-    let selected_outcome = pipeline.finish(&mut decoder, outcome, failure_code).await;
+    let selected_outcome = pipeline
+        .finish(&mut decoder, outcome, failure_code, measurements)
+        .await;
     if !matches!(selected_outcome, Ok(ExecutionOutcome::Completed)) {
         coordinator
             .shared
@@ -182,6 +203,7 @@ async fn stream(
     #[cfg(test)] progress: Option<tokio::sync::watch::Sender<StreamProgress>>,
     decoder: &mut SseDecoder,
     pipeline: &mut OutputPipeline,
+    measurements: &mut AttemptMeasurements,
 ) -> Result<StreamEnd, StreamFailure> {
     let mut authenticated = None;
     let stream = tokio::select! {
@@ -294,7 +316,12 @@ async fn stream(
                 } else {
                     input
                 };
-                let step = decoder.push(input).map_err(decode_failure)?;
+                let generated_before = decoder.generated_end();
+                let step = decoder.push(input);
+                if generated_before == 0 && decoder.generated_end() > 0 {
+                    measurements.observe_first_output(reservation.accepted_elapsed());
+                }
+                let step = step.map_err(decode_failure)?;
                 offset += step.consumed;
                 if decoder.has_pending_chunk() {
                     checkpoint_deadline
@@ -353,9 +380,13 @@ async fn stream(
             }
         }
         decoder.finish().map_err(decode_failure)?;
+        if decoder.prompt_tokens() != Some(expected_input_tokens) {
+            return Err(failure("engine_usage"));
+        }
         Ok(StreamEnd::Completed)
     };
     let result = exchange.await;
+    measurements.freeze_duration(reservation.accepted_elapsed());
     match tokio::time::timeout(DRIVER_JOIN_TIMEOUT, &mut driver).await {
         Ok(_) => {}
         Err(_) => {
@@ -391,6 +422,7 @@ pub(in crate::service::coordinator) async fn stream_for_test(
     pipeline: &mut OutputPipeline,
     progress: tokio::sync::watch::Sender<StreamProgress>,
 ) -> Result<ExecutionOutcome, &'static str> {
+    let mut measurements = AttemptMeasurements::new(1);
     match stream(
         engine,
         reservation,
@@ -403,6 +435,7 @@ pub(in crate::service::coordinator) async fn stream_for_test(
         Some(progress),
         decoder,
         pipeline,
+        &mut measurements,
     )
     .await
     {

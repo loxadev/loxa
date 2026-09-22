@@ -18,6 +18,7 @@ mod purge;
 mod reads;
 mod recovery;
 mod schema;
+mod statistics;
 mod worker;
 
 pub(crate) use admission::{
@@ -33,6 +34,7 @@ pub(crate) use identity::{decode_id, encode_id, parse_revision};
 #[cfg(test)]
 pub(crate) use prompt::PromptMessage;
 pub(crate) use prompt::{PromptPreparation, PromptRole};
+pub(crate) use statistics::AttemptStatistics;
 
 const COMMAND_CAPACITY: usize = 12;
 const ORDINARY_CAPACITY: usize = 8;
@@ -116,12 +118,6 @@ pub(crate) struct AdmissionCompletion {
 }
 
 #[derive(Debug)]
-pub(crate) struct RequiredCompletion {
-    pub(crate) result: Result<(), HistoryError>,
-    pub(crate) permit: OwnedSemaphorePermit,
-}
-
-#[derive(Debug)]
 pub(crate) struct SuffixCompletion {
     pub(crate) result: Result<SuffixCommit, HistoryError>,
     pub(crate) permit: OwnedSemaphorePermit,
@@ -170,11 +166,6 @@ enum HistoryCommand {
         reply: oneshot::Sender<AdmissionCompletion>,
         permit: OwnedSemaphorePermit,
     },
-    StopBeforeExecution {
-        committed: CommittedAdmission,
-        reply: oneshot::Sender<RequiredCompletion>,
-        permit: OwnedSemaphorePermit,
-    },
     AppendSuffix {
         input: Arc<SuffixInput>,
         reply: oneshot::Sender<SuffixCompletion>,
@@ -199,8 +190,6 @@ enum HistoryCommand {
     DropNextAdmissionReply(SyncSender<()>),
     #[cfg(test)]
     DropNextPersistenceReply(SyncSender<()>),
-    #[cfg(test)]
-    FailNextStopBeforeExecution(SyncSender<()>),
     #[cfg(test)]
     SetProgressInterval {
         instructions: i32,
@@ -580,34 +569,6 @@ impl HistoryHandle {
         Ok(completion)
     }
 
-    pub(crate) fn try_stop_before_execution(
-        &self,
-        committed: CommittedAdmission,
-    ) -> Result<oneshot::Receiver<RequiredCompletion>, HistoryError> {
-        let permit = Arc::clone(&self.persistence)
-            .try_acquire_owned()
-            .map_err(|_| {
-                HistoryError::new(HistoryErrorKind::Busy, "history terminal slot is full")
-            })?;
-        let (reply, completion) = oneshot::channel();
-        self.commands
-            .try_send(HistoryCommand::StopBeforeExecution {
-                committed,
-                reply,
-                permit,
-            })
-            .map_err(|error| match error {
-                TrySendError::Full(_) => {
-                    HistoryError::new(HistoryErrorKind::Busy, "history capacity is full")
-                }
-                TrySendError::Disconnected(_) => HistoryError::new(
-                    HistoryErrorKind::OutcomeUnknown,
-                    "history owner cannot save cancelled admission",
-                ),
-            })?;
-        Ok(completion)
-    }
-
     pub(crate) fn try_append_suffix(
         &self,
         input: Arc<SuffixInput>,
@@ -727,17 +688,6 @@ impl HistoryHandle {
         received
             .recv()
             .expect("history owner must install the admission reply hook");
-    }
-
-    #[cfg(test)]
-    pub(crate) fn fail_next_stop_before_execution(&self) {
-        let (ready, received) = mpsc::sync_channel(0);
-        self.commands
-            .try_send(HistoryCommand::FailNextStopBeforeExecution(ready))
-            .expect("history terminal fault hook must fit the bounded queue");
-        received
-            .recv()
-            .expect("history owner must install the terminal fault hook");
     }
 
     #[cfg(test)]

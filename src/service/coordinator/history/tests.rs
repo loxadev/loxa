@@ -1,11 +1,15 @@
 use super::*;
 use crate::catalog::{Manifest, Origin};
-use crate::history::{ExecutionOutcome, FinalizationInput, SuffixCommit, SuffixInput};
+use crate::history::{
+    AttemptStatistics, ExecutionOutcome, FinalizationInput, SuffixCommit, SuffixInput,
+};
 use crate::runtime_fingerprint::{EffectiveProfile, RuntimeFingerprint};
 use crate::service::coordinator::generation::parser::SseDecoder;
 use crate::service::coordinator::generation::persistence::{OutputPipeline, SaveChunkFailure};
 use crate::service::coordinator::{Coordinator, HistoryExit, OwnerExit};
-use loxa_ipc::{ErrorCategory, GenerationTarget, HistoryCommand, HistoryPhase, HistoryReply};
+use loxa_ipc::{
+    AttemptStopReason, ErrorCategory, GenerationTarget, HistoryCommand, HistoryPhase, HistoryReply,
+};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -404,9 +408,7 @@ async fn committed_lookup_joins_an_active_matching_reservation() {
 async fn lost_admission_reply_and_terminal_failure_retry_under_drain() {
     let fixture = Fixture::start().await;
     fixture.coordinator.drop_next_admission_reply_for_test();
-    fixture
-        .coordinator
-        .fail_next_stop_before_execution_for_test();
+    fixture.coordinator.drop_next_persistence_reply_for_test();
     let user_text = "recover me";
     let submission_id = [5; 16];
     let submission_hash = super::super::generation::stable_submission_hash(
@@ -470,12 +472,10 @@ async fn lost_admission_reply_and_terminal_failure_retry_under_drain() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn targeted_stop_retries_failed_pre_execution_save_once() {
+async fn targeted_stop_replays_exact_statistics_after_lost_terminal_acknowledgement() {
     for accepted_target in [false, true] {
         let fixture = Fixture::start().await;
-        fixture
-            .coordinator
-            .fail_next_stop_before_execution_for_test();
+        fixture.coordinator.drop_next_persistence_reply_for_test();
         let commit = Arc::new(Barrier::new(2));
         fixture
             .coordinator
@@ -521,6 +521,8 @@ async fn targeted_stop_retries_failed_pre_execution_save_once() {
             .begin_generation_execution(&reservation)
             .is_err());
         assert_eq!(reservation.recovery_claims.load(Ordering::Relaxed), 0);
+        let first_statistics = attempt_statistics_row(&fixture.root);
+        tokio::time::sleep(Duration::from_millis(5)).await;
 
         let recovery = Arc::new(Barrier::new(2));
         fixture
@@ -549,6 +551,7 @@ async fn targeted_stop_retries_failed_pre_execution_save_once() {
         fixture
             .assert_recovered_before_execution(&reservation, &committed)
             .await;
+        assert_eq!(attempt_statistics_row(&fixture.root), first_statistics);
         fixture.coordinator.stop_service().unwrap();
         fixture.finish_stopped().await;
     }
@@ -980,7 +983,12 @@ async fn full_output_envelope_cancels_then_drains_one_large_event_exactly() {
 
     assert_eq!(
         pipeline
-            .finish(&mut decoder, ExecutionOutcome::Failed, Some("output_save"),)
+            .finish(
+                &mut decoder,
+                ExecutionOutcome::Failed,
+                Some("output_save"),
+                frozen_measurements(),
+            )
             .await
             .unwrap(),
         ExecutionOutcome::Failed
@@ -1232,7 +1240,7 @@ async fn stop_winning_before_output_intent_rejects_more_completed_content() {
         ErrorCategory::ServiceUnavailable
     );
     let frozen = output
-        .publish_execution(ExecutionOutcome::Completed, None, 0)
+        .publish_execution(ExecutionOutcome::Completed, None, 0, frozen_measurements())
         .unwrap();
     assert_eq!(frozen.outcome, ExecutionOutcome::Stopped);
     assert_eq!(
@@ -1294,7 +1302,12 @@ async fn rejected_terminal_inputs_leave_execution_unpublished() {
     let mut decoder = SseDecoder::new();
     let error = tokio::time::timeout(
         Duration::from_secs(2),
-        pipeline.finish(&mut decoder, ExecutionOutcome::Failed, Some("")),
+        pipeline.finish(
+            &mut decoder,
+            ExecutionOutcome::Failed,
+            Some(""),
+            frozen_measurements(),
+        ),
     )
     .await
     .expect("invalid publication entered the persistence retry loop")
@@ -1390,7 +1403,12 @@ async fn stop_before_checkpoint_handoff_stays_stopped_and_saves_the_observed_tai
     ));
     assert_eq!(
         pipeline
-            .finish(&mut decoder, ExecutionOutcome::Stopped, Some("stopped"),)
+            .finish(
+                &mut decoder,
+                ExecutionOutcome::Stopped,
+                Some("stopped"),
+                frozen_measurements(),
+            )
             .await
             .unwrap(),
         ExecutionOutcome::Stopped
@@ -1465,7 +1483,25 @@ fn final_input(
         execution_outcome,
         generated_end: start + content.len() as u64,
         failure_code: None,
+        statistics: Some(AttemptStatistics {
+            qualified_input_tokens: Some(1),
+            qualified_output_tokens: None,
+            service_first_output_latency_ms: None,
+            qualified_engine_decode_tokens_per_second: None,
+            service_total_duration_ms: 0,
+            stop_reason: match execution_outcome {
+                ExecutionOutcome::Completed => AttemptStopReason::Completed,
+                ExecutionOutcome::Stopped => AttemptStopReason::UserStop,
+                ExecutionOutcome::Failed => AttemptStopReason::Failure,
+            },
+        }),
     }
+}
+
+fn frozen_measurements() -> AttemptMeasurements {
+    let mut measurements = AttemptMeasurements::new(1);
+    measurements.freeze_duration(Duration::ZERO);
+    measurements
 }
 
 async fn wait_for_history_ready(coordinator: &Coordinator) {
@@ -1497,7 +1533,40 @@ fn assert_terminalized(root: &std::path::Path) {
         )
         .unwrap();
     assert_eq!(terminal, (2, 1, 0, Some(0), Some(0)));
+    let statistics = attempt_statistics_row(root);
+    assert_eq!(statistics.0, None);
+    assert_eq!(statistics.1, None);
+    assert_eq!(statistics.2, None);
+    assert_eq!(statistics.3, None);
+    assert_eq!(statistics.5, 3);
     connection.close().unwrap();
+}
+
+fn attempt_statistics_row(
+    root: &std::path::Path,
+) -> (Option<i64>, Option<i64>, Option<i64>, Option<f64>, i64, i64) {
+    let connection = rusqlite::Connection::open(root.join("app.sqlite")).unwrap();
+    let statistics = connection
+        .query_row(
+            "SELECT qualified_input_tokens, qualified_output_tokens,
+                    service_first_output_latency_ms,
+                    qualified_engine_decode_tokens_per_second, service_total_duration_ms,
+                    stop_reason FROM attempt_statistics",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    connection.close().unwrap();
+    statistics
 }
 
 fn model_manifest() -> Manifest {

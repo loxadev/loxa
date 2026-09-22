@@ -76,6 +76,12 @@ pub(super) fn delete_batch(connection: &mut Connection) -> Result<bool, HistoryE
             .map_err(schema::classify_sql_error)?;
         transaction
             .execute(
+                "DELETE FROM attempt_statistics WHERE attempt_id = ?1",
+                [attempt_id.as_slice()],
+            )
+            .map_err(schema::classify_sql_error)?;
+        transaction
+            .execute(
                 CLEAR_SELECTED_SQL,
                 params![turn_id.as_slice(), attempt_id.as_slice()],
             )

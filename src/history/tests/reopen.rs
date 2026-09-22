@@ -1,5 +1,5 @@
 use super::*;
-use loxa_ipc::{AttemptExecution, AttemptSave, AttemptSummary, ContentSource};
+use loxa_ipc::{AttemptExecution, AttemptSave, AttemptStopReason, AttemptSummary, ContentSource};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn owner_reopen_recovers_the_committed_utf8_prefix_and_preserves_stopped_output() {
@@ -17,6 +17,14 @@ async fn owner_reopen_recovers_the_committed_utf8_prefix_and_preserves_stopped_o
             execution_outcome: ExecutionOutcome::Stopped,
             generated_end: 7,
             failure_code: Some("stopped".into()),
+            statistics: Some(AttemptStatistics {
+                qualified_input_tokens: Some(17),
+                qualified_output_tokens: Some(2),
+                service_first_output_latency_ms: Some(3),
+                qualified_engine_decode_tokens_per_second: Some(25.0),
+                service_total_duration_ms: 9,
+                stop_reason: AttemptStopReason::UserStop,
+            }),
         }))
         .unwrap()
         .await
@@ -30,6 +38,22 @@ async fn owner_reopen_recovers_the_committed_utf8_prefix_and_preserves_stopped_o
     assert_eq!(stopped_before.saved_end, "7");
     assert_eq!(stopped_before.generated_end.as_deref(), Some("7"));
     assert_eq!(stopped_before.terminal_saved_end.as_deref(), Some("7"));
+    let statistics = stopped_before.statistics.as_ref().unwrap();
+    assert_eq!(statistics.qualified_input_tokens, Some(17));
+    assert_eq!(statistics.qualified_output_tokens, Some(2));
+    assert_eq!(
+        statistics.service_first_output_latency_ms.as_deref(),
+        Some("3")
+    );
+    assert_eq!(
+        statistics
+            .qualified_engine_decode_tokens_per_second
+            .unwrap()
+            .get(),
+        25.0
+    );
+    assert_eq!(statistics.service_total_duration_ms, "9");
+    assert_eq!(statistics.stop_reason, AttemptStopReason::UserStop);
 
     let (pending_conversation, pending) = admit(&handle, 42).await;
     let checkpoint = handle

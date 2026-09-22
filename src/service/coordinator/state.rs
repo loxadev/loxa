@@ -3,7 +3,8 @@ use loxa_ipc::{
     Accepted, ErrorCategory, OperationTarget, RuntimePhase, RuntimeStatus, ServiceError,
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
@@ -71,6 +72,7 @@ pub(super) struct AdmissionReservation {
     cancellation_cause: Mutex<Option<CancellationCause>>,
     engine_quiescent: AtomicBool,
     durable_terminal: AtomicBool,
+    accepted_at: OnceLock<Instant>,
     outcome: watch::Sender<Option<Result<crate::history::CommittedAdmission, ServiceError>>>,
     recovery: Mutex<AdmissionRecovery>,
     #[cfg(test)]
@@ -92,6 +94,7 @@ pub(super) enum AdmissionRecoveryAction {
     Stop(
         Arc<crate::history::PreparedAdmission>,
         crate::history::CommittedAdmission,
+        Arc<crate::history::FinalizationInput>,
     ),
 }
 
@@ -102,10 +105,12 @@ enum AdmissionRecovery {
     StopInFlight(
         Arc<crate::history::PreparedAdmission>,
         crate::history::CommittedAdmission,
+        Arc<crate::history::FinalizationInput>,
     ),
     StopUnknown(
         Arc<crate::history::PreparedAdmission>,
         crate::history::CommittedAdmission,
+        Arc<crate::history::FinalizationInput>,
     ),
     OutputOwned,
 }
@@ -142,7 +147,11 @@ impl AdmissionReservation {
         }
     }
 
-    pub(super) fn retain_stop(&self, committed: crate::history::CommittedAdmission) {
+    pub(super) fn retain_stop(
+        &self,
+        committed: crate::history::CommittedAdmission,
+        terminal: Arc<crate::history::FinalizationInput>,
+    ) {
         let mut recovery = self
             .recovery
             .lock()
@@ -150,11 +159,11 @@ impl AdmissionReservation {
         let prepared = match &*recovery {
             AdmissionRecovery::AdmissionInFlight(prepared)
             | AdmissionRecovery::AdmissionUnknown(prepared) => Arc::clone(prepared),
-            AdmissionRecovery::StopInFlight(prepared, _)
-            | AdmissionRecovery::StopUnknown(prepared, _) => Arc::clone(prepared),
+            AdmissionRecovery::StopInFlight(prepared, _, _)
+            | AdmissionRecovery::StopUnknown(prepared, _, _) => Arc::clone(prepared),
             AdmissionRecovery::Preparing | AdmissionRecovery::OutputOwned => return,
         };
-        *recovery = AdmissionRecovery::StopInFlight(prepared, committed);
+        *recovery = AdmissionRecovery::StopInFlight(prepared, committed, terminal);
     }
 
     pub(super) fn stop_unknown(&self) {
@@ -162,8 +171,12 @@ impl AdmissionReservation {
             .recovery
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let AdmissionRecovery::StopInFlight(prepared, committed) = &*recovery {
-            *recovery = AdmissionRecovery::StopUnknown(Arc::clone(prepared), committed.clone());
+        if let AdmissionRecovery::StopInFlight(prepared, committed, terminal) = &*recovery {
+            *recovery = AdmissionRecovery::StopUnknown(
+                Arc::clone(prepared),
+                committed.clone(),
+                Arc::clone(terminal),
+            );
         }
     }
 
@@ -180,14 +193,18 @@ impl AdmissionReservation {
                 self.recovery_claims.fetch_add(1, Ordering::Relaxed);
                 Some(AdmissionRecoveryAction::Lookup(prepared))
             }
-            AdmissionRecovery::StopUnknown(prepared, committed) => {
+            AdmissionRecovery::StopUnknown(prepared, committed, terminal) => {
                 let prepared = Arc::clone(prepared);
                 let committed = committed.clone();
-                *recovery =
-                    AdmissionRecovery::StopInFlight(Arc::clone(&prepared), committed.clone());
+                let terminal = Arc::clone(terminal);
+                *recovery = AdmissionRecovery::StopInFlight(
+                    Arc::clone(&prepared),
+                    committed.clone(),
+                    Arc::clone(&terminal),
+                );
                 #[cfg(test)]
                 self.recovery_claims.fetch_add(1, Ordering::Relaxed);
-                Some(AdmissionRecoveryAction::Stop(prepared, committed))
+                Some(AdmissionRecoveryAction::Stop(prepared, committed, terminal))
             }
             _ => None,
         }
@@ -230,7 +247,7 @@ impl AdmissionReservation {
             .recovery
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        matches!(&*recovery, AdmissionRecovery::StopUnknown(_, _))
+        matches!(&*recovery, AdmissionRecovery::StopUnknown(_, _, _))
     }
 }
 

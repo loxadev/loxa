@@ -331,6 +331,18 @@ pub(super) async fn execute_request(
                 "history requires service protocol 1.1",
             ))
         }
+        ServiceCommand::History {
+            command: loxa_ipc::HistoryCommand::GetHistoryStatus,
+        } if negotiated.protocol.minor < 4 => ReplyOutcome::Rejected(ServiceError::new(
+            ErrorCategory::IncompatibleProtocol,
+            "history status requires service protocol 1.4",
+        )),
+        ServiceCommand::History {
+            command: loxa_ipc::HistoryCommand::ListTurns { .. },
+        } if negotiated.protocol.minor < 4 => ReplyOutcome::Rejected(ServiceError::new(
+            ErrorCategory::IncompatibleProtocol,
+            "attempt statistics require service protocol 1.4",
+        )),
         ServiceCommand::History { command }
             if command.requires_ready_history()
                 && (!negotiated.capabilities.contains(&Capability::History)

@@ -6,6 +6,7 @@ use loxa_ipc::{ErrorCategory, GenerationTarget, ServiceError};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
@@ -90,6 +91,17 @@ impl AdmissionReservation {
 
     pub(in crate::service::coordinator) fn mark_durable_terminal(&self) {
         self.durable_terminal.store(true, Ordering::Release);
+    }
+
+    pub(in crate::service::coordinator) fn mark_admission_accepted(&self) {
+        let _ = self.accepted_at.set(Instant::now());
+    }
+
+    pub(in crate::service::coordinator) fn accepted_elapsed(&self) -> Duration {
+        self.accepted_at
+            .get()
+            .expect("accepted generation has an admission timestamp")
+            .elapsed()
     }
 
     fn terminal_resolved(&self) -> bool {
@@ -298,6 +310,7 @@ impl CoordinatorState {
             cancellation,
             engine_quiescent: AtomicBool::new(true),
             durable_terminal: AtomicBool::new(false),
+            accepted_at: std::sync::OnceLock::new(),
             outcome,
             recovery: Mutex::new(AdmissionRecovery::Preparing),
             #[cfg(test)]

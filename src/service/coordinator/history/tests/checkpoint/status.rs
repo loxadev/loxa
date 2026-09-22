@@ -2,6 +2,101 @@ use super::*;
 use loxa_ipc::{GenerationExecutionPhase as Execution, GenerationSavePhase as Save};
 
 #[tokio::test(flavor = "current_thread")]
+async fn terminal_suffix_rolls_back_with_terminal_metadata_before_exact_retry() {
+    let fixture = Fixture::start().await;
+    let committed = wait_for_admission(
+        fixture
+            .coordinator
+            .admit_history_generation(fixture.input(42, "atomic terminal suffix"))
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let output = fixture.coordinator.generation_output(&committed).unwrap();
+    let mut pipeline = OutputPipeline::new(output.clone(), committed);
+    let mut decoder = SseDecoder::new();
+    let step = decoder
+        .push(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"tail\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\ndata: [DONE]\n\n",
+        )
+        .unwrap();
+    assert!(step.done);
+    assert_eq!(decoder.generated_end(), 4);
+
+    let connection = rusqlite::Connection::open(fixture.root.join("app.sqlite")).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_terminal_attempt
+             BEFORE UPDATE OF execution_outcome, save_outcome, generated_end, terminal_saved_end
+             ON attempts WHEN NEW.save_outcome = 1
+             BEGIN
+                 SELECT RAISE(ABORT, 'terminal write blocked');
+             END",
+        )
+        .unwrap();
+    let save = tokio::spawn(async move {
+        pipeline
+            .finish(
+                &mut decoder,
+                ExecutionOutcome::Completed,
+                None,
+                frozen_measurements(),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while output.status().unwrap() != (OutputSavePhase::SaveFailed { saved_end: 0 }) {
+            tokio::task::yield_now().await
+        }
+    })
+    .await
+    .expect("terminal failure did not become observable");
+
+    let rolled_back: (i64, i64, i64, i64, i64, i64) = connection
+        .query_row(
+            "SELECT saved_end, execution_outcome, save_outcome,
+                    (SELECT COUNT(*) FROM attempt_chunks),
+                    (SELECT COUNT(*) FROM attempt_finalizations),
+                    (SELECT COUNT(*) FROM attempt_statistics)
+             FROM attempts",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(rolled_back, (0, 0, 0, 0, 0, 0));
+
+    connection
+        .execute_batch("DROP TRIGGER reject_terminal_attempt")
+        .unwrap();
+    connection.close().unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), save)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        ExecutionOutcome::Completed
+    );
+    assert_eq!(
+        output.status().unwrap(),
+        OutputSavePhase::Saved { saved_end: 4 }
+    );
+    assert!(!fixture.coordinator.admission_active_for_test());
+    fixture.coordinator.stop_service().unwrap();
+    fixture.finish_stopped().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn lost_checkpoint_reconciles_automatically_and_first_cancellation_cause_wins() {
     for stop_first in [false, true] {
         let mut relay = StreamingFixture::start().await;

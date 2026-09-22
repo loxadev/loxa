@@ -259,7 +259,7 @@ fn install_bundle_manifest(models: &Path) {
 fn store_initialization_is_private_verified_and_reopenable() {
     let (_directory, root) = private_root("loxa-history-schema-");
     let (connection, info) = open_store(&root).unwrap();
-    assert_eq!(info.schema_version, 3);
+    assert_eq!(info.schema_version, 4);
     assert!(!info.sqlite_version.is_empty());
     assert!(!info.sqlite_source_id.is_empty());
     assert_eq!(
@@ -341,7 +341,7 @@ fn foreign_newer_malformed_and_unsafe_stores_fail_closed() {
 
     let (_newer_directory, newer_root) = private_root("loxa-history-newer-");
     let (newer, _) = open_store(&newer_root).unwrap();
-    newer.pragma_update(None, "user_version", 4).unwrap();
+    newer.pragma_update(None, "user_version", 5).unwrap();
     newer.close().unwrap();
     assert_eq!(
         open_store(&newer_root).unwrap_err().kind(),
@@ -1297,12 +1297,32 @@ fn suffixes_finalize_exactly_and_ranges_keep_a_captured_prefix() {
         execution_outcome: ExecutionOutcome::Completed,
         generated_end: 11,
         failure_code: None,
+        statistics: Some(AttemptStatistics {
+            qualified_input_tokens: Some(7),
+            qualified_output_tokens: Some(3),
+            service_first_output_latency_ms: Some(4),
+            qualified_engine_decode_tokens_per_second: Some(50.0),
+            service_total_duration_ms: 10,
+            stop_reason: loxa_ipc::AttemptStopReason::Completed,
+        }),
     };
     assert_eq!(
         content::finalize(&mut connection, &finalization)
             .unwrap()
             .end,
         11
+    );
+    let mut changed_statistics = finalization.clone();
+    changed_statistics
+        .statistics
+        .as_mut()
+        .unwrap()
+        .qualified_output_tokens = Some(4);
+    assert_eq!(
+        content::finalize(&mut connection, &changed_statistics)
+            .unwrap_err()
+            .kind(),
+        HistoryErrorKind::Conflict
     );
     assert_eq!(
         content::finalize(&mut connection, &finalization)
@@ -1315,6 +1335,7 @@ fn suffixes_finalize_exactly_and_ranges_keep_a_captured_prefix() {
         execution_outcome: ExecutionOutcome::Completed,
         generated_end: 11,
         failure_code: None,
+        statistics: None,
     };
     assert_eq!(
         content::finalize(&mut connection, &empty_replay)
@@ -1327,12 +1348,74 @@ fn suffixes_finalize_exactly_and_ranges_keep_a_captured_prefix() {
         execution_outcome: ExecutionOutcome::Failed,
         generated_end: 11,
         failure_code: Some("stopped".into()),
+        statistics: None,
     };
     assert_eq!(
         content::finalize(&mut connection, &changed_outcome)
             .unwrap_err()
             .kind(),
         HistoryErrorKind::Conflict
+    );
+    connection.close().unwrap();
+}
+
+#[test]
+fn terminal_statistics_and_outcome_roll_back_together() {
+    let (_directory, root) = private_root("loxa-history-statistics-atomic-");
+    let models = root.join("models");
+    fs::create_dir(&models).unwrap();
+    install_local_manifest(&models, "demo");
+    let (mut connection, _) = open_store(&root).unwrap();
+    let (_, committed) = admitted_attempt(&mut connection, &models, 22, 22);
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_terminal_update BEFORE UPDATE OF execution_outcome ON attempts
+             WHEN NEW.execution_outcome != 0 BEGIN SELECT RAISE(ABORT, 'injected'); END",
+        )
+        .unwrap();
+    let finalization = FinalizationInput {
+        suffix: suffix_input(&committed, 22, 0, "answer"),
+        execution_outcome: ExecutionOutcome::Completed,
+        generated_end: 6,
+        failure_code: None,
+        statistics: Some(AttemptStatistics {
+            qualified_input_tokens: Some(5),
+            qualified_output_tokens: None,
+            service_first_output_latency_ms: Some(1),
+            qualified_engine_decode_tokens_per_second: None,
+            service_total_duration_ms: 2,
+            stop_reason: loxa_ipc::AttemptStopReason::Completed,
+        }),
+    };
+    assert!(content::finalize(&mut connection, &finalization).is_err());
+    let rolled_back: (i64, i64, i64, i64, i64) = connection
+        .query_row(
+            "SELECT execution_outcome, save_outcome,
+                    (SELECT COUNT(*) FROM attempt_chunks),
+                    (SELECT COUNT(*) FROM attempt_finalizations),
+                    (SELECT COUNT(*) FROM attempt_statistics)
+             FROM attempts WHERE id = ?1",
+            [committed.attempt_id.as_slice()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(rolled_back, (0, 0, 0, 0, 0));
+    connection
+        .execute_batch("DROP TRIGGER fail_terminal_update")
+        .unwrap();
+    assert_eq!(
+        content::finalize(&mut connection, &finalization)
+            .unwrap()
+            .end,
+        6
     );
     connection.close().unwrap();
 }
@@ -1413,6 +1496,7 @@ fn turn_reads_reject_saved_nulls_and_cross_turn_selected_attempts() {
             execution_outcome: ExecutionOutcome::Completed,
             generated_end: 0,
             failure_code: None,
+            statistics: None,
         },
     )
     .unwrap();
@@ -1698,6 +1782,7 @@ fn tombstone_hides_immediately_and_purge_removes_bounded_content_batches() {
             execution_outcome: ExecutionOutcome::Completed,
             generated_end: 20,
             failure_code: None,
+            statistics: None,
         },
     )
     .unwrap();
@@ -1711,6 +1796,7 @@ fn tombstone_hides_immediately_and_purge_removes_bounded_content_batches() {
                 execution_outcome: ExecutionOutcome::Completed,
                 generated_end: 0,
                 failure_code: None,
+                statistics: None,
             },
         )
         .unwrap();
@@ -1853,6 +1939,7 @@ fn deep_turn_seek_and_late_purge_keep_bounded_progress_with_128_terminal_turns()
                 execution_outcome: ExecutionOutcome::Completed,
                 generated_end: 0,
                 failure_code: None,
+                statistics: None,
             },
         )
         .unwrap();
@@ -1988,17 +2075,17 @@ fn deep_turn_seek_and_late_purge_keep_bounded_progress_with_128_terminal_turns()
 }
 
 #[test]
-fn schema_one_fixture_migrates_atomically_to_schema_three() {
+fn schema_one_fixture_migrates_atomically_to_schema_four() {
     let (_directory, root) = private_root("loxa-history-v1-migration-");
     let path = root.join("app.sqlite");
     schema::create_v1_fixture(&path);
 
     let (connection, info) = open_store(&root).unwrap();
-    assert_eq!(info.schema_version, 3);
+    assert_eq!(info.schema_version, 4);
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     let objects: Vec<String> = connection
         .prepare(
             "SELECT name FROM sqlite_schema
@@ -2015,6 +2102,7 @@ fn schema_one_fixture_migrates_atomically_to_schema_three() {
         [
             "attempt_chunks",
             "attempt_finalizations",
+            "attempt_statistics",
             "attempts",
             "attempts_latest",
             "attempts_prior",
@@ -2035,18 +2123,18 @@ fn schema_one_fixture_migrates_atomically_to_schema_three() {
 }
 
 #[test]
-fn schema_two_fixture_migrates_atomically_to_schema_three() {
+fn schema_two_fixture_migrates_atomically_to_schema_four() {
     let (_directory, root) = private_root("loxa-history-v2-migration-");
     let path = root.join("app.sqlite");
     schema::create_v2_fixture(&path);
 
     let (connection, info) = open_store(&root).unwrap();
-    assert_eq!(info.schema_version, 3);
+    assert_eq!(info.schema_version, 4);
     assert_eq!(
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        3
+        4
     );
     assert!(connection
         .prepare("SELECT attempt_id, start_offset, end_offset, content FROM attempt_chunks")
@@ -2054,6 +2142,114 @@ fn schema_two_fixture_migrates_atomically_to_schema_three() {
     assert!(connection
         .prepare("SELECT attempt_id, start_offset, end_offset FROM attempt_finalizations")
         .is_ok());
+    assert!(connection
+        .prepare(
+            "SELECT attempt_id, qualified_input_tokens, qualified_output_tokens,
+                    service_first_output_latency_ms,
+                    qualified_engine_decode_tokens_per_second, service_total_duration_ms,
+                    stop_reason FROM attempt_statistics",
+        )
+        .is_ok());
+    connection.close().unwrap();
+}
+
+#[test]
+fn schema_three_fixture_migrates_atomically_to_schema_four() {
+    let (_directory, root) = private_root("loxa-history-v3-to-v4-migration-");
+    let path = root.join("app.sqlite");
+    schema::create_v3_fixture(&path);
+
+    let conversation_id = [1_u8; 16];
+    let turn_id = [2_u8; 16];
+    let attempt_id = [3_u8; 16];
+    let mut fixture = Connection::open(&path).unwrap();
+    fixture.pragma_update(None, "foreign_keys", true).unwrap();
+    let transaction = fixture.transaction().unwrap();
+    transaction
+        .execute(
+            "INSERT INTO conversations (
+                 id, model_id, manifest_version, binding_profile,
+                 primary_filename, primary_sha256, primary_size,
+                 primary_source_kind, primary_source_filename,
+                 title, system_instruction, max_output_tokens,
+                 created_ms, updated_ms, revision, profile_revision, deleted
+             ) VALUES (?1, 'demo', 2, 0, 'model.gguf', ?2, 4, 0,
+                       'source.gguf', 'Migration', '', 512, 1, 2, 2, 1, 0)",
+            params![conversation_id.as_slice(), [4_u8; 32].as_slice()],
+        )
+        .unwrap();
+    transaction
+        .execute(
+            "INSERT INTO turns (id, conversation_id, ordinal, user_text, selected_attempt_id)
+             VALUES (?1, ?2, 1, 'hello', NULL)",
+            params![turn_id.as_slice(), conversation_id.as_slice()],
+        )
+        .unwrap();
+    transaction
+        .execute(
+            "INSERT INTO attempts (
+                 id, turn_id, attempt_number, submission_id, submission_hash,
+                 admitted_conversation_revision, admitted_profile_revision,
+                 prior_attempt_id, owner_epoch, operation_generation, model_id,
+                 applied_engine_build, applied_engine_version, runtime_fingerprint,
+                 effective_context, system_instruction, max_output_tokens, prompt_basis,
+                 execution_outcome, save_outcome, saved_end, generated_end,
+                 terminal_saved_end, failure_code, created_ms, updated_ms
+             ) VALUES (
+                 ?1, ?2, 1, ?3, ?4, 2, 1, NULL, 'owner', 1, 'demo',
+                 'build', 'version', ?5, 4096, '', 512, ?6,
+                 2, 1, 0, 0, 0, 'stopped', 1, 2
+             )",
+            params![
+                attempt_id.as_slice(),
+                turn_id.as_slice(),
+                [5_u8; 16].as_slice(),
+                [6_u8; 32].as_slice(),
+                b"fingerprint".as_slice(),
+                b"[]".as_slice(),
+            ],
+        )
+        .unwrap();
+    transaction
+        .execute(
+            "INSERT INTO attempt_finalizations (attempt_id, start_offset, end_offset)
+             VALUES (?1, 0, 0)",
+            params![attempt_id.as_slice()],
+        )
+        .unwrap();
+    transaction
+        .execute(
+            "UPDATE turns SET selected_attempt_id = ?1 WHERE id = ?2",
+            params![attempt_id.as_slice(), turn_id.as_slice()],
+        )
+        .unwrap();
+    transaction.commit().unwrap();
+    fixture.close().unwrap();
+
+    let (connection, info) = open_store(&root).unwrap();
+    assert_eq!(info.schema_version, 4);
+    assert_eq!(
+        connection
+            .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap(),
+        4
+    );
+    assert!(connection
+        .prepare(
+            "SELECT attempt_id, qualified_input_tokens, qualified_output_tokens,
+                    service_first_output_latency_ms,
+                    qualified_engine_decode_tokens_per_second, service_total_duration_ms,
+                    stop_reason FROM attempt_statistics",
+        )
+        .is_ok());
+    let page =
+        reads::list_turns(&connection, &identity::encode_id(conversation_id), None, 50).unwrap();
+    let attempt = page.turns[0].selected_attempt.as_ref().unwrap();
+    assert_eq!(attempt.id, identity::encode_id(attempt_id));
+    assert_eq!(attempt.execution, loxa_ipc::AttemptExecution::Stopped);
+    assert_eq!(attempt.save, loxa_ipc::AttemptSave::Saved);
+    assert_eq!(attempt.failure_code.as_deref(), Some("stopped"));
+    assert_eq!(attempt.statistics, None);
     connection.close().unwrap();
 }
 
@@ -2099,12 +2295,12 @@ fn failed_schema_three_migration_rolls_back_and_clean_retry_upgrades() {
     connection.close().unwrap();
 
     let (connection, info) = open_store(&root).unwrap();
-    assert_eq!(info.schema_version, 3);
+    assert_eq!(info.schema_version, 4);
     assert_eq!(
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        3
+        4
     );
     assert!(connection
         .prepare("SELECT attempt_id, start_offset, end_offset, content FROM attempt_chunks")
@@ -2370,6 +2566,7 @@ async fn persistence_owner_bounds_pending_bytes_and_orders_final_after_checkpoin
                 execution_outcome: ExecutionOutcome::Failed,
                 generated_end: 0,
                 failure_code: Some(oversized_code),
+                statistics: None,
             }))
             .unwrap_err()
             .kind(),
@@ -2382,6 +2579,7 @@ async fn persistence_owner_bounds_pending_bytes_and_orders_final_after_checkpoin
         execution_outcome: ExecutionOutcome::Completed,
         generated_end: 2,
         failure_code: None,
+        statistics: None,
     });
     let checkpoint_result = handle.try_append_suffix(Arc::clone(&checkpoint)).unwrap();
     let terminal_result = handle.try_finalize(Arc::clone(&terminal)).unwrap();
@@ -2468,6 +2666,7 @@ async fn lost_suffix_result_reconciles_from_retained_shared_input() {
         execution_outcome: ExecutionOutcome::Completed,
         generated_end: 7,
         failure_code: None,
+        statistics: None,
     });
     handle.drop_next_persistence_reply();
     assert!(handle

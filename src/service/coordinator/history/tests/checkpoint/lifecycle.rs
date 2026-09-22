@@ -138,6 +138,30 @@ async fn full_relay_malformed_event_and_missing_done_save_the_valid_prefix_as_fa
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn full_relay_observes_first_output_before_a_later_event_in_the_same_frame_fails() {
+    let mut relay = StreamingFixture::start_full_run().await;
+    relay.start_body().await;
+    relay
+        .engine
+        .as_mut()
+        .unwrap()
+        .write_all(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"é\"}}]}\n\ndata: {bad}\n\n"
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    relay.engine.as_mut().unwrap().shutdown().await.unwrap();
+    relay
+        .wait_status(|snapshot| snapshot.save == Save::Saved)
+        .await;
+    relay.complete_synthetic_cleanup().await;
+    relay
+        .finish(ExecutionOutcome::Failed, Some("engine_stream"), "é", 1)
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn full_relay_requires_valid_idle_slots_before_preserving_the_engine() {
     let idle_slots = "[{\"is_processing\":false}]";
     for (body, content_length, idle) in [

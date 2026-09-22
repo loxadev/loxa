@@ -1,7 +1,7 @@
 use super::{
     admission, conversations, drafts, prompt, schema, AdmissionCompletion, AdmissionKind,
     DraftCompletion, HistoryCommand, HistoryCompletion, HistoryErrorKind, HistoryExit,
-    HistoryHandle, ProfileCompletion, PromptCompletion, RequiredCompletion, SuffixCompletion,
+    HistoryHandle, ProfileCompletion, PromptCompletion, SuffixCompletion,
 };
 use loxa_ipc::HistoryStatus;
 use std::collections::VecDeque;
@@ -70,8 +70,6 @@ pub(super) fn run(
     let mut drop_next_admission_reply = false;
     #[cfg(test)]
     let mut drop_next_persistence_reply = false;
-    #[cfg(test)]
-    let mut fail_next_stop_before_execution = false;
     let mut pending = VecDeque::with_capacity(super::COMMAND_CAPACITY);
     loop {
         match next_command(&receiver, &mut pending) {
@@ -265,42 +263,6 @@ pub(super) fn run(
                 #[cfg(not(test))]
                 let _ = reply.send(AdmissionCompletion { result, permit });
             }
-            Ok(HistoryCommand::StopBeforeExecution {
-                committed,
-                reply,
-                permit,
-            }) => {
-                interrupt_on_drain.store(false, Ordering::Release);
-                #[cfg(test)]
-                let result = if fail_next_stop_before_execution {
-                    fail_next_stop_before_execution = false;
-                    Err(super::HistoryError::new(
-                        HistoryErrorKind::Io,
-                        "injected cancelled-admission save failure",
-                    ))
-                } else {
-                    match connection.as_ref() {
-                        Some(WorkerStore::Ready(store)) => {
-                            admission::stop_before_execution(store, &committed)
-                        }
-                        Some(WorkerStore::Unavailable(_)) | None => Err(super::HistoryError::new(
-                            HistoryErrorKind::OutcomeUnknown,
-                            "history owner cannot save cancelled admission",
-                        )),
-                    }
-                };
-                #[cfg(not(test))]
-                let result = match connection.as_ref() {
-                    Some(WorkerStore::Ready(store)) => {
-                        admission::stop_before_execution(store, &committed)
-                    }
-                    Some(WorkerStore::Unavailable(_)) | None => Err(super::HistoryError::new(
-                        HistoryErrorKind::OutcomeUnknown,
-                        "history owner cannot save cancelled admission",
-                    )),
-                };
-                let _ = reply.send(RequiredCompletion { result, permit });
-            }
             Ok(HistoryCommand::AppendSuffix {
                 input,
                 reply,
@@ -374,11 +336,6 @@ pub(super) fn run(
                 let _ = ready.send(());
             }
             #[cfg(test)]
-            Ok(HistoryCommand::FailNextStopBeforeExecution(ready)) => {
-                fail_next_stop_before_execution = true;
-                let _ = ready.send(());
-            }
-            #[cfg(test)]
             Ok(HistoryCommand::SetProgressInterval {
                 instructions,
                 ready,
@@ -430,7 +387,6 @@ fn is_required(command: &HistoryCommand) -> bool {
         command,
         HistoryCommand::Admit { .. }
             | HistoryCommand::ReconcileSubmission { .. }
-            | HistoryCommand::StopBeforeExecution { .. }
             | HistoryCommand::AppendSuffix { .. }
             | HistoryCommand::Finalize { .. }
     )

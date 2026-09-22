@@ -1,20 +1,120 @@
 use super::{history_error, maybe_begin_history_drain};
 use crate::history::{
-    CommittedAdmission, ExecutionOutcome, FinalizationInput, SuffixCommit, SuffixInput,
+    AttemptStatistics, CommittedAdmission, ExecutionOutcome, FinalizationInput, SuffixCommit,
+    SuffixInput,
 };
 use crate::service::coordinator::state::{AdmissionReservation, CancellationCause};
 use crate::service::coordinator::Shared;
-use loxa_ipc::{ErrorCategory, ServiceError};
+use loxa_ipc::{AttemptStopReason, ErrorCategory, ServiceError};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::watch;
 
 mod status;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(in crate::service::coordinator) struct ExecutionFact {
     pub(in crate::service::coordinator) outcome: ExecutionOutcome,
     pub(in crate::service::coordinator) failure_code: Option<String>,
     pub(in crate::service::coordinator) generated_end: u64,
+    pub(in crate::service::coordinator) statistics: AttemptStatistics,
+}
+
+#[derive(Clone, Copy)]
+pub(in crate::service::coordinator) struct AttemptMeasurements {
+    qualified_input_tokens: Option<u32>,
+    qualified_output_tokens: Option<u32>,
+    service_first_output_latency_ms: Option<u64>,
+    qualified_engine_decode_tokens_per_second: Option<f64>,
+    service_total_duration_ms: Option<u64>,
+    engine_output_limit: bool,
+}
+
+impl AttemptMeasurements {
+    pub(in crate::service::coordinator) fn new(qualified_input_tokens: u32) -> Self {
+        Self {
+            qualified_input_tokens: Some(qualified_input_tokens),
+            qualified_output_tokens: None,
+            service_first_output_latency_ms: None,
+            qualified_engine_decode_tokens_per_second: None,
+            service_total_duration_ms: None,
+            engine_output_limit: false,
+        }
+    }
+
+    pub(in crate::service::coordinator) fn observe_first_output(&mut self, elapsed: Duration) {
+        self.service_first_output_latency_ms
+            .get_or_insert_with(|| super::duration_ms(elapsed));
+    }
+
+    pub(in crate::service::coordinator) fn freeze_duration(&mut self, elapsed: Duration) {
+        self.service_total_duration_ms
+            .get_or_insert_with(|| super::duration_ms(elapsed));
+    }
+
+    pub(in crate::service::coordinator) fn record_terminal_usage(
+        &mut self,
+        output_tokens: Option<u32>,
+        decode_rate: Option<f64>,
+        output_limit: bool,
+    ) {
+        self.qualified_output_tokens = output_tokens;
+        self.qualified_engine_decode_tokens_per_second = decode_rate.filter(|rate| {
+            rate.is_finite()
+                && *rate > 0.0
+                && *rate < 1.0e308
+                && self
+                    .qualified_output_tokens
+                    .is_some_and(|tokens| tokens > 0)
+        });
+        self.engine_output_limit = output_limit;
+    }
+
+    fn finish(self, outcome: ExecutionOutcome) -> Result<AttemptStatistics, ServiceError> {
+        let total = self
+            .service_total_duration_ms
+            .ok_or_else(|| internal("generation duration was not frozen"))?;
+        let statistics = AttemptStatistics {
+            qualified_input_tokens: self.qualified_input_tokens,
+            qualified_output_tokens: self.qualified_output_tokens,
+            service_first_output_latency_ms: self.service_first_output_latency_ms,
+            qualified_engine_decode_tokens_per_second: self
+                .qualified_engine_decode_tokens_per_second,
+            service_total_duration_ms: total,
+            stop_reason: match outcome {
+                ExecutionOutcome::Completed if self.engine_output_limit => {
+                    AttemptStopReason::OutputLimit
+                }
+                ExecutionOutcome::Completed => AttemptStopReason::Completed,
+                ExecutionOutcome::Stopped => AttemptStopReason::UserStop,
+                ExecutionOutcome::Failed => AttemptStopReason::Failure,
+            },
+        };
+        statistics.validate_for(outcome).map_err(history_error)?;
+        Ok(statistics)
+    }
+}
+
+enum ExecutionStatistics {
+    Measurements(AttemptMeasurements),
+    Frozen(AttemptStatistics),
+}
+
+impl ExecutionStatistics {
+    fn finish(self, outcome: ExecutionOutcome) -> Result<AttemptStatistics, ServiceError> {
+        match self {
+            Self::Measurements(measurements) => measurements.finish(outcome),
+            Self::Frozen(mut statistics) => {
+                statistics.stop_reason = match outcome {
+                    ExecutionOutcome::Completed => statistics.stop_reason,
+                    ExecutionOutcome::Stopped => AttemptStopReason::UserStop,
+                    ExecutionOutcome::Failed => AttemptStopReason::Failure,
+                };
+                statistics.validate_for(outcome).map_err(history_error)?;
+                Ok(statistics)
+            }
+        }
+    }
 }
 
 pub(in crate::service::coordinator) type OutputObserver =
@@ -78,6 +178,7 @@ impl OutputState {
         proposed: ExecutionOutcome,
         failure_code: Option<&str>,
         generated_end: u64,
+        statistics: ExecutionStatistics,
     ) -> Result<ExecutionFact, ServiceError> {
         if let Some(fact) = &self.execution {
             return Ok(fact.clone());
@@ -108,6 +209,7 @@ impl OutputState {
             outcome,
             failure_code: failure_code.map(str::to_owned),
             generated_end,
+            statistics: statistics.finish(outcome)?,
         };
         self.execution = Some(fact.clone());
         Ok(fact)
@@ -156,6 +258,7 @@ impl GenerationOutput {
         proposed: ExecutionOutcome,
         failure_code: Option<&str>,
         generated_end: u64,
+        measurements: AttemptMeasurements,
     ) -> Result<ExecutionFact, ServiceError> {
         let state = self.shared.state();
         if !state.admission_is_current(&self.reservation) {
@@ -170,7 +273,13 @@ impl GenerationOutput {
             .as_mut()
             .filter(|output| !output.closed)
             .ok_or_else(|| conflict("generation execution is no longer active"))?;
-        output.publish_execution(&self.reservation, proposed, failure_code, generated_end)
+        output.publish_execution(
+            &self.reservation,
+            proposed,
+            failure_code,
+            generated_end,
+            ExecutionStatistics::Measurements(measurements),
+        )
     }
 
     pub(in crate::service::coordinator) fn report_capacity_saturation(&self) {
@@ -357,23 +466,27 @@ impl GenerationOutput {
                 }
                 if let OutputIntentKind::Final(input) = &mut kind {
                     input.validate().map_err(history_error)?;
-                    // An unpublished low-level final intent must pass every
-                    // ownership/range check before it can freeze execution.
+                    let statistics = input.statistics.clone().ok_or_else(|| {
+                        internal("final generation is missing frozen attempt statistics")
+                    })?;
                     let fact = output.publish_execution(
                         &self.reservation,
                         input.execution_outcome,
                         input.failure_code.as_deref(),
                         input.generated_end,
+                        ExecutionStatistics::Frozen(statistics),
                     )?;
                     if input.generated_end != fact.generated_end {
                         return Err(conflict("final output does not match frozen execution"));
                     }
                     if input.execution_outcome != fact.outcome
                         || input.failure_code != fact.failure_code
+                        || input.statistics.as_ref() != Some(&fact.statistics)
                     {
                         let input = Arc::make_mut(input);
                         input.execution_outcome = fact.outcome;
                         input.failure_code = fact.failure_code;
+                        input.statistics = Some(fact.statistics);
                     }
                 }
                 let selected_outcome = match &kind {
@@ -573,4 +686,29 @@ fn unavailable(context: impl Into<String>) -> ServiceError {
 
 fn internal(context: impl Into<String>) -> ServiceError {
     ServiceError::new(ErrorCategory::Internal, context)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_measurements_stay_frozen_across_later_cleanup_delays() {
+        let mut measurements = AttemptMeasurements::new(7);
+        measurements.observe_first_output(Duration::from_millis(4));
+        measurements.record_terminal_usage(Some(3), Some(50.0), true);
+        measurements.freeze_duration(Duration::from_millis(9));
+        measurements.freeze_duration(Duration::from_secs(3));
+
+        let statistics = measurements.finish(ExecutionOutcome::Completed).unwrap();
+        assert_eq!(statistics.qualified_input_tokens, Some(7));
+        assert_eq!(statistics.qualified_output_tokens, Some(3));
+        assert_eq!(statistics.service_first_output_latency_ms, Some(4));
+        assert_eq!(
+            statistics.qualified_engine_decode_tokens_per_second,
+            Some(50.0)
+        );
+        assert_eq!(statistics.service_total_duration_ms, 9);
+        assert_eq!(statistics.stop_reason, AttemptStopReason::OutputLimit);
+    }
 }

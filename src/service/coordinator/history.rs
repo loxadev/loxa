@@ -15,7 +15,9 @@ use tokio::sync::watch;
 mod output;
 #[cfg(test)]
 pub(in crate::service::coordinator) use output::OutputSavePhase;
-pub(in crate::service::coordinator) use output::{GenerationOutput, OutputObserver, OutputState};
+pub(in crate::service::coordinator) use output::{
+    AttemptMeasurements, GenerationOutput, OutputObserver, OutputState,
+};
 
 const MAX_ADMISSION_BACKING_BYTES: usize = 256 * 1024;
 
@@ -347,22 +349,23 @@ async fn resolve_committed(
         && committed.profile_revision == reservation.expected_profile_revision
         && committed.owner_epoch == shared.boot_epoch
         && committed.operation_generation == reservation.operation_generation;
-    let cancelled = {
+    let terminal = {
         let state = shared.state();
         if !exact || !state.admission_is_current(reservation) {
             reservation.admission_unknown();
             return;
         }
+        reservation.mark_admission_accepted();
         let cancelled = reservation.is_cancelled() || shared.draining.load(Ordering::Acquire);
         if !cancelled && !reservation.install_output(committed.clone()) {
             reservation.admission_unknown();
             return;
         }
-        cancelled
+        cancelled.then(|| cancelled_terminal(reservation, &committed))
     };
-    if cancelled {
-        reservation.retain_stop(committed.clone());
-        resolve_stop(shared, reservation, committed).await;
+    if let Some(terminal) = terminal {
+        reservation.retain_stop(committed.clone(), Arc::clone(&terminal));
+        resolve_stop(shared, reservation, committed, terminal).await;
     } else {
         #[cfg(test)]
         wait_at_barrier(&shared.output_handoff_barrier);
@@ -374,8 +377,9 @@ async fn resolve_stop(
     shared: &Arc<super::Shared>,
     reservation: &Arc<AdmissionReservation>,
     committed: CommittedAdmission,
+    terminal: Arc<FinalizationInput>,
 ) {
-    if persist_cancelled_admission(shared, reservation, &committed)
+    if persist_cancelled_admission(shared, Arc::clone(&terminal))
         .await
         .is_none()
     {
@@ -389,41 +393,58 @@ async fn resolve_stop(
 
 async fn persist_cancelled_admission(
     shared: &super::Shared,
+    terminal: Arc<FinalizationInput>,
+) -> Option<()> {
+    let completion = shared.history.try_finalize(terminal).ok()?.await.ok()?;
+    let result = completion.result;
+    drop(completion.permit);
+    result.ok().map(|_| ())
+}
+
+fn cancelled_terminal(
     reservation: &AdmissionReservation,
     committed: &CommittedAdmission,
-) -> Option<()> {
-    if reservation.cancellation_cause() == Some(CancellationCause::EngineFailure) {
-        let terminal = shared
-            .history
-            .try_finalize(Arc::new(FinalizationInput {
-                suffix: SuffixInput {
-                    attempt_id: committed.attempt_id,
-                    owner_epoch: committed.owner_epoch.clone(),
-                    operation_generation: committed.operation_generation,
-                    expected_saved_end: 0,
-                    content: String::new(),
-                },
-                execution_outcome: ExecutionOutcome::Failed,
-                generated_end: 0,
-                failure_code: Some("engine_transport".into()),
-            }))
-            .ok()?
-            .await
-            .ok()?;
-        let result = terminal.result;
-        drop(terminal.permit);
-        result.ok().map(|_| ())
-    } else {
-        let terminal = shared
-            .history
-            .try_stop_before_execution(committed.clone())
-            .ok()?
-            .await
-            .ok()?;
-        let result = terminal.result;
-        drop(terminal.permit);
-        result.ok()
-    }
+) -> Arc<FinalizationInput> {
+    let failed = reservation.cancellation_cause() == Some(CancellationCause::EngineFailure);
+    Arc::new(FinalizationInput {
+        suffix: SuffixInput {
+            attempt_id: committed.attempt_id,
+            owner_epoch: committed.owner_epoch.clone(),
+            operation_generation: committed.operation_generation,
+            expected_saved_end: 0,
+            content: String::new(),
+        },
+        execution_outcome: if failed {
+            ExecutionOutcome::Failed
+        } else {
+            ExecutionOutcome::Stopped
+        },
+        generated_end: 0,
+        failure_code: Some(
+            if failed {
+                "engine_transport"
+            } else {
+                "stopped"
+            }
+            .into(),
+        ),
+        statistics: Some(crate::history::AttemptStatistics {
+            qualified_input_tokens: None,
+            qualified_output_tokens: None,
+            service_first_output_latency_ms: None,
+            qualified_engine_decode_tokens_per_second: None,
+            service_total_duration_ms: duration_ms(reservation.accepted_elapsed()),
+            stop_reason: if failed {
+                loxa_ipc::AttemptStopReason::Failure
+            } else {
+                loxa_ipc::AttemptStopReason::UserStop
+            },
+        }),
+    })
+}
+
+fn duration_ms(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 pub(super) fn maybe_resume_admission(
@@ -456,8 +477,8 @@ pub(super) fn maybe_resume_admission(
                     Err(_) => reservation.admission_unknown(),
                 }
             }
-            AdmissionRecoveryAction::Stop(_prepared, committed) => {
-                resolve_stop(&shared, &reservation, committed).await;
+            AdmissionRecoveryAction::Stop(_prepared, committed, terminal) => {
+                resolve_stop(&shared, &reservation, committed, terminal).await;
             }
         }
         maybe_begin_history_drain(&shared);

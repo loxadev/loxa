@@ -561,11 +561,6 @@ impl Coordinator {
     }
 
     #[cfg(test)]
-    pub(super) fn fail_next_stop_before_execution_for_test(&self) {
-        self.shared.history.fail_next_stop_before_execution();
-    }
-
-    #[cfg(test)]
     pub(super) fn drop_next_persistence_reply_for_test(&self) {
         self.shared.history.drop_next_persistence_reply();
     }

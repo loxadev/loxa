@@ -42,6 +42,8 @@ async fn engine_failure_before_output_reconciles_lost_final_reply_and_fences_rep
     })
     .await
     .expect("lost pre-execution failure save did not retain recovery ownership");
+    let first_statistics = attempt_statistics_row(&fixture.root);
+    tokio::time::sleep(Duration::from_millis(5)).await;
     assert!(observer.borrow().is_none());
     assert!(fixture.coordinator.admission_active_for_test());
     let retry = fixture
@@ -98,6 +100,8 @@ async fn engine_failure_before_output_reconciles_lost_final_reply_and_fences_rep
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
     ).unwrap();
     assert_eq!(finalization, (3, 1, 0, 0, 0, "engine_transport".into()));
+    assert_eq!(attempt_statistics_row(&fixture.root), first_statistics);
+    assert_eq!(first_statistics.5, 4);
     let counts: (i64, i64) = connection
         .query_row(
             "SELECT (SELECT COUNT(*) FROM attempts), (SELECT COUNT(*) FROM attempt_chunks)",

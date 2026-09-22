@@ -1,5 +1,5 @@
 use super::identity::{decode_id, encode_id, parse_nonnegative};
-use super::{content, schema, HistoryError, HistoryErrorKind};
+use super::{content, schema, statistics, HistoryError, HistoryErrorKind};
 use loxa_ipc::{
     AttemptExecution, AttemptSave, AttemptSummary, ContentRange, ContentSource, TurnCursor,
     TurnPage, TurnSummary,
@@ -16,16 +16,26 @@ pub(super) const LIST_TURNS_AFTER_SQL: &str =
     "SELECT t.id, t.ordinal, length(CAST(t.user_text AS BLOB)),
             t.selected_attempt_id, a.id, a.turn_id, a.attempt_number,
             a.execution_outcome, a.save_outcome, a.saved_end, a.generated_end,
-            a.terminal_saved_end, a.failure_code, a.created_ms, a.updated_ms
+            a.terminal_saved_end, a.failure_code, a.created_ms, a.updated_ms,
+            s.attempt_id, s.qualified_input_tokens, s.qualified_output_tokens,
+            s.service_first_output_latency_ms,
+            s.qualified_engine_decode_tokens_per_second, s.service_total_duration_ms,
+            s.stop_reason
      FROM turns t LEFT JOIN attempts a ON a.id = t.selected_attempt_id
+     LEFT JOIN attempt_statistics s ON s.attempt_id = a.id
      WHERE t.conversation_id = ?1 AND t.ordinal < ?2
      ORDER BY t.ordinal DESC LIMIT ?3";
 
 const LIST_TURNS_FIRST_SQL: &str = "SELECT t.id, t.ordinal, length(CAST(t.user_text AS BLOB)),
             t.selected_attempt_id, a.id, a.turn_id, a.attempt_number,
             a.execution_outcome, a.save_outcome, a.saved_end, a.generated_end,
-            a.terminal_saved_end, a.failure_code, a.created_ms, a.updated_ms
+            a.terminal_saved_end, a.failure_code, a.created_ms, a.updated_ms,
+            s.attempt_id, s.qualified_input_tokens, s.qualified_output_tokens,
+            s.service_first_output_latency_ms,
+            s.qualified_engine_decode_tokens_per_second, s.service_total_duration_ms,
+            s.stop_reason
      FROM turns t LEFT JOIN attempts a ON a.id = t.selected_attempt_id
+     LEFT JOIN attempt_statistics s ON s.attempt_id = a.id
      WHERE t.conversation_id = ?1
      ORDER BY t.ordinal DESC LIMIT ?2";
 
@@ -260,6 +270,9 @@ fn turn_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnSummary> {
             if updated_value < created_value {
                 return Err(invalid_row(14));
             }
+            let statistics = statistics::read(row, 15, attempt_id)?
+                .map(|statistics| statistics.to_wire(execution, save, 15))
+                .transpose()?;
             Some(AttemptSummary {
                 id: encode_id(attempt_id),
                 attempt_number: positive(row.get(6)?, 6)?,
@@ -269,6 +282,7 @@ fn turn_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnSummary> {
                 generated_end: generated_end_value.map(|value| value.to_string()),
                 terminal_saved_end: terminal_saved_end_value.map(|value| value.to_string()),
                 failure_code: optional_ascii(row, 12, 64)?,
+                statistics,
                 created_ms,
                 updated_ms,
             })
@@ -381,6 +395,13 @@ fn turn_backing(turn: &TurnSummary) -> usize {
                     .map_or(0, String::capacity),
             )
             .saturating_add(attempt.failure_code.as_ref().map_or(0, String::capacity))
+            .saturating_add(attempt.statistics.as_ref().map_or(0, |statistics| {
+                statistics
+                    .service_first_output_latency_ms
+                    .as_ref()
+                    .map_or(0, String::capacity)
+                    .saturating_add(statistics.service_total_duration_ms.capacity())
+            }))
             .saturating_add(attempt.created_ms.capacity())
             .saturating_add(attempt.updated_ms.capacity())
     })

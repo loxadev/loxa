@@ -1,6 +1,7 @@
 use crate::history::MAX_SUFFIX_BYTES;
 use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
+use serde_json::value::RawValue;
 use std::fmt;
 
 pub(super) const MAX_EVENT_BYTES: usize = 1024 * 1024;
@@ -26,7 +27,10 @@ pub(in crate::service::coordinator) struct SseDecoder {
     event_bytes: usize,
     generated_end: usize,
     prompt_tokens: Option<u32>,
+    completion_tokens: Option<u32>,
     cached_prompt_tokens: Option<u32>,
+    engine_decode_tokens_per_second: Option<f64>,
+    finish_reason: Option<EngineFinishReason>,
     done: bool,
     poisoned: bool,
     skip_lf: bool,
@@ -49,7 +53,10 @@ impl SseDecoder {
             event_bytes: 0,
             generated_end: 0,
             prompt_tokens: None,
+            completion_tokens: None,
             cached_prompt_tokens: None,
+            engine_decode_tokens_per_second: None,
+            finish_reason: None,
             done: false,
             poisoned: false,
             skip_lf: false,
@@ -74,6 +81,18 @@ impl SseDecoder {
 
     pub(super) fn prompt_tokens(&self) -> Option<u32> {
         self.prompt_tokens
+    }
+
+    pub(super) fn completion_tokens(&self) -> Option<u32> {
+        self.completion_tokens
+    }
+
+    pub(super) fn engine_decode_tokens_per_second(&self) -> Option<f64> {
+        self.engine_decode_tokens_per_second
+    }
+
+    pub(super) fn finish_reason(&self) -> Option<EngineFinishReason> {
+        self.finish_reason
     }
 
     #[cfg(all(test, target_os = "macos"))]
@@ -247,7 +266,7 @@ impl SseDecoder {
             self.done = true;
             return Ok(());
         }
-        let payload: StreamPayload = serde_json::from_slice(&self.data)
+        let payload: StreamPayload<'_> = serde_json::from_slice(&self.data)
             .map_err(|_| DecodeError::InvalidStream("engine returned malformed streaming JSON"))?;
         if payload.error.is_some() {
             return Err(DecodeError::InvalidStream(
@@ -269,21 +288,57 @@ impl SseDecoder {
                     "engine returned an invalid cached-token count",
                 ));
             }
-            match (self.prompt_tokens, self.cached_prompt_tokens) {
-                (None, None) => {
-                    self.prompt_tokens = Some(usage.prompt_tokens);
-                    self.cached_prompt_tokens = cached;
+            let completion = match (usage.completion_tokens, usage.total_tokens) {
+                (Some(completion), Some(total)) => {
+                    if usage.prompt_tokens.checked_add(completion) != Some(total) {
+                        return Err(DecodeError::InvalidStream(
+                            "engine returned inconsistent total-token usage",
+                        ));
+                    }
+                    Some(completion)
                 }
-                (Some(existing), existing_cached)
-                    if existing == usage.prompt_tokens && existing_cached == cached => {}
-                (Some(_), _) => {
+                (None, Some(total)) if total < usage.prompt_tokens => {
                     return Err(DecodeError::InvalidStream(
-                        "engine changed its streaming input-token count",
+                        "engine returned inconsistent total-token usage",
                     ));
                 }
-                _ => {
+                _ => None,
+            };
+            let rate = completion.and_then(|tokens| qualified_decode_rate(payload.timings, tokens));
+            match self.prompt_tokens {
+                None => {
+                    self.prompt_tokens = Some(usage.prompt_tokens);
+                    self.completion_tokens = completion;
+                    self.cached_prompt_tokens = cached;
+                    self.engine_decode_tokens_per_second = rate;
+                }
+                Some(existing_prompt) if existing_prompt == usage.prompt_tokens => {
+                    if matches!(
+                        (self.completion_tokens, completion),
+                        (Some(existing), Some(current)) if existing != current
+                    ) || matches!(
+                        (self.cached_prompt_tokens, cached),
+                        (Some(existing), Some(current)) if existing != current
+                    ) {
+                        return Err(DecodeError::InvalidStream(
+                            "engine changed its streaming usage",
+                        ));
+                    }
+                    let existing_completion = self.completion_tokens;
+                    let existing_rate = self.engine_decode_tokens_per_second;
+                    self.completion_tokens = self.completion_tokens.or(completion);
+                    self.cached_prompt_tokens = self.cached_prompt_tokens.or(cached);
+                    match (existing_completion, completion) {
+                        (None, Some(_)) => self.engine_decode_tokens_per_second = rate,
+                        (Some(_), Some(_)) if !rates_match(existing_rate, rate) => {
+                            self.engine_decode_tokens_per_second = None;
+                        }
+                        _ => {}
+                    }
+                }
+                Some(_) => {
                     return Err(DecodeError::InvalidStream(
-                        "engine changed its streaming usage details",
+                        "engine changed its streaming usage",
                     ));
                 }
             }
@@ -296,6 +351,37 @@ impl SseDecoder {
             return Err(DecodeError::InvalidStream(
                 "engine returned an unexpected streaming choice",
             ));
+        }
+        if let Some(reason) = choice.finish_reason {
+            if choice
+                .delta
+                .content
+                .as_ref()
+                .is_some_and(|content| !content.is_empty())
+            {
+                return Err(DecodeError::InvalidStream(
+                    "engine returned content with its finish reason",
+                ));
+            }
+            let reason = match reason {
+                WireFinishReason::Stop => EngineFinishReason::Completed,
+                WireFinishReason::Length => EngineFinishReason::OutputLimit,
+                WireFinishReason::ToolCalls => {
+                    return Err(DecodeError::InvalidStream(
+                        "engine returned an unsupported tool-call finish reason",
+                    ))
+                }
+            };
+            match self.finish_reason {
+                None => self.finish_reason = Some(reason),
+                Some(existing) if existing == reason => {}
+                Some(_) => {
+                    return Err(DecodeError::InvalidStream(
+                        "engine changed its streaming finish reason",
+                    ))
+                }
+            }
+            return Ok(());
         }
         let Some(content) = choice.delta.content.filter(|content| !content.is_empty()) else {
             return Ok(());
@@ -374,16 +460,20 @@ fn utf8_prefix(value: &str, maximum: usize) -> usize {
 }
 
 #[derive(Deserialize)]
-struct StreamPayload {
+struct StreamPayload<'a> {
     #[serde(default)]
     choices: AtMostOneChoice,
     error: Option<EngineError>,
     usage: Option<Usage>,
+    #[serde(borrow)]
+    timings: Option<&'a RawValue>,
 }
 
 #[derive(Deserialize)]
 struct Usage {
     prompt_tokens: u32,
+    completion_tokens: Option<u32>,
+    total_tokens: Option<u32>,
     prompt_tokens_details: Option<PromptTokenDetails>,
 }
 
@@ -429,6 +519,54 @@ impl<'de> Deserialize<'de> for AtMostOneChoice {
 struct Choice {
     index: u32,
     delta: Delta,
+    finish_reason: Option<WireFinishReason>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WireFinishReason {
+    Stop,
+    Length,
+    ToolCalls,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum EngineFinishReason {
+    Completed,
+    OutputLimit,
+}
+
+fn qualified_decode_rate(timings: Option<&RawValue>, completion_tokens: u32) -> Option<f64> {
+    let timings = serde_json::from_str::<Timings>(timings?.get()).ok()?;
+    let tokens = timings.predicted_n;
+    let milliseconds = timings.predicted_ms;
+    let rate = timings.predicted_per_second;
+    if tokens != completion_tokens
+        || tokens == 0
+        || !milliseconds.is_finite()
+        || milliseconds <= 0.0
+        || !rate.is_finite()
+        || rate <= 0.0
+    {
+        return None;
+    }
+    let derived = 1000.0 * f64::from(tokens) / milliseconds;
+    if !derived.is_finite() {
+        return None;
+    }
+    let tolerance = derived.abs().max(rate.abs()).max(1.0) * 1e-9;
+    ((derived - rate).abs() <= tolerance).then_some(rate)
+}
+
+#[derive(Deserialize)]
+struct Timings {
+    predicted_n: u32,
+    predicted_ms: f64,
+    predicted_per_second: f64,
+}
+
+fn rates_match(left: Option<f64>, right: Option<f64>) -> bool {
+    left.map(f64::to_bits) == right.map(f64::to_bits)
 }
 
 #[derive(Deserialize)]
@@ -598,14 +736,162 @@ mod tests {
         decoder.finish().unwrap();
         assert_eq!(decoder.prompt_tokens(), Some(37));
         assert_eq!(decoder.cached_prompt_tokens, Some(11));
+        assert_eq!(decoder.completion_tokens(), Some(2));
         assert_eq!(decoder.generated_end(), 0);
+
+        let mut prompt_only = SseDecoder::new();
+        prompt_only
+            .push(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":37}}\n\ndata: [DONE]\n\n")
+            .unwrap();
+        prompt_only.finish().unwrap();
+        assert_eq!(prompt_only.prompt_tokens(), Some(37));
+        assert_eq!(prompt_only.completion_tokens(), None);
+        assert_eq!(prompt_only.engine_decode_tokens_per_second(), None);
+
+        let mut contradictory = SseDecoder::new();
+        assert_eq!(
+            contradictory
+                .push(
+                    b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":37,\"total_tokens\":36}}\n\n",
+                )
+                .err(),
+            Some(DecodeError::InvalidStream(
+                "engine returned inconsistent total-token usage"
+            ))
+        );
 
         let mut invalid = SseDecoder::new();
         assert_eq!(
             invalid.push(
-                b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"}}],\"usage\":{\"prompt_tokens\":1}}\n\n"
+                b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n"
             ).err(),
             Some(DecodeError::InvalidStream("engine returned usage with a streaming choice"))
+        );
+    }
+
+    #[test]
+    fn terminal_usage_qualifies_complete_consistent_engine_timings() {
+        let mut decoder = SseDecoder::new();
+        decoder
+            .push(
+                concat!(
+                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":37,",
+                    "\"completion_tokens\":2,\"total_tokens\":39},",
+                    "\"timings\":{\"predicted_n\":2,\"predicted_ms\":20.0,",
+                    "\"predicted_per_second\":100.0}}\n\n",
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(decoder.completion_tokens(), Some(2));
+        assert_eq!(decoder.engine_decode_tokens_per_second(), Some(100.0));
+        decoder
+            .push(
+                b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":37,\"completion_tokens\":2,\"total_tokens\":39}}\n\n",
+            )
+            .unwrap();
+        assert_eq!(decoder.engine_decode_tokens_per_second(), None);
+
+        let mut partial = SseDecoder::new();
+        partial
+            .push(
+                concat!(
+                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":37,",
+                    "\"completion_tokens\":2,\"total_tokens\":39},",
+                    "\"timings\":{\"predicted_n\":2,\"predicted_ms\":20.0}}\n\n",
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(partial.completion_tokens(), Some(2));
+        assert_eq!(partial.engine_decode_tokens_per_second(), None);
+
+        let mut malformed = SseDecoder::new();
+        malformed
+            .push(
+                concat!(
+                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":37,",
+                    "\"completion_tokens\":2,\"total_tokens\":39},",
+                    "\"timings\":{\"predicted_n\":\"two\",\"predicted_ms\":20.0,",
+                    "\"predicted_per_second\":100.0}}\n\n",
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(malformed.completion_tokens(), Some(2));
+        assert_eq!(malformed.engine_decode_tokens_per_second(), None);
+
+        let mut duplicate = SseDecoder::new();
+        duplicate
+            .push(
+                concat!(
+                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":37,",
+                    "\"completion_tokens\":2,\"total_tokens\":39},",
+                    "\"timings\":{\"predicted_n\":2,\"predicted_n\":2,",
+                    "\"predicted_ms\":20.0,\"predicted_per_second\":100.0}}\n\n",
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(duplicate.engine_decode_tokens_per_second(), None);
+
+        let mut overflow = SseDecoder::new();
+        overflow
+            .push(
+                concat!(
+                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,",
+                    "\"completion_tokens\":1,\"total_tokens\":2},",
+                    "\"timings\":{\"predicted_n\":1,\"predicted_ms\":1e-320,",
+                    "\"predicted_per_second\":1.0}}\n\n",
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(overflow.completion_tokens(), Some(1));
+        assert_eq!(overflow.engine_decode_tokens_per_second(), None);
+    }
+
+    #[test]
+    fn changed_terminal_usage_is_rejected() {
+        let mut decoder = SseDecoder::new();
+        decoder
+            .push(
+                b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}\n\n",
+            )
+            .unwrap();
+        assert_eq!(
+            decoder
+                .push(
+                    b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":3,\"total_tokens\":4}}\n\n",
+                )
+                .err(),
+            Some(DecodeError::InvalidStream(
+                "engine changed its streaming usage"
+            ))
+        );
+    }
+
+    #[test]
+    fn finish_reasons_are_typed_and_cannot_change() {
+        let mut decoder = SseDecoder::new();
+        decoder
+            .push(
+                b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+            )
+            .unwrap();
+        assert_eq!(
+            decoder.finish_reason(),
+            Some(EngineFinishReason::OutputLimit)
+        );
+        assert_eq!(
+            decoder
+                .push(
+                    b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                )
+                .err(),
+            Some(DecodeError::InvalidStream(
+                "engine changed its streaming finish reason"
+            ))
         );
     }
 

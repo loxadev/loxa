@@ -61,6 +61,18 @@ async fn delayed_checkpoint_keeps_one_tail_and_acknowledgement_flushes_it() {
         .await;
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn prompt_only_terminal_usage_keeps_optional_output_statistics_unknown() {
+    let mut relay = StreamingFixture::start().await;
+    relay.delta("answer").await;
+    relay
+        .complete_engine_with_usage(r#"{"prompt_tokens":1}"#)
+        .await;
+    relay
+        .finish_with_output_tokens(ExecutionOutcome::Completed, None, "answer", 1, None)
+        .await;
+}
+
 struct StreamingFixture {
     _engine_directory: tempfile::TempDir,
     fixture: Fixture,
@@ -138,8 +150,10 @@ impl StreamingFixture {
                     Ok(outcome) => (outcome, None),
                     Err(code) => (ExecutionOutcome::Failed, Some(code)),
                 };
+                let mut measurements = AttemptMeasurements::new(1);
+                measurements.freeze_duration(reservation.accepted_elapsed());
                 pipeline
-                    .finish(&mut decoder, outcome, failure)
+                    .finish(&mut decoder, outcome, failure, measurements)
                     .await
                     .unwrap();
             })
@@ -333,23 +347,54 @@ impl StreamingFixture {
     }
 
     async fn complete_engine(&mut self) {
+        self.complete_engine_with_usage(
+            r#"{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}"#,
+        )
+        .await;
+    }
+
+    async fn complete_engine_with_usage(&mut self, usage: &str) {
         self.engine
             .as_mut()
             .unwrap()
-            .write_all(
-                b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1}}\n\ndata: [DONE]\n\n",
-            )
+            .write_all(format!(
+                "data: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: {{\"choices\":[],\"usage\":{usage}}}\n\ndata: [DONE]\n\n"
+            ).as_bytes())
             .await
             .unwrap();
         self.engine.as_mut().unwrap().shutdown().await.unwrap();
     }
 
     async fn finish(
+        self,
+        expected: ExecutionOutcome,
+        failure_code: Option<&str>,
+        text: &str,
+        chunks: i64,
+    ) {
+        self.finish_inner(expected, failure_code, text, chunks, None)
+            .await;
+    }
+
+    async fn finish_with_output_tokens(
+        self,
+        expected: ExecutionOutcome,
+        failure_code: Option<&str>,
+        text: &str,
+        chunks: i64,
+        output_tokens: Option<i64>,
+    ) {
+        self.finish_inner(expected, failure_code, text, chunks, Some(output_tokens))
+            .await;
+    }
+
+    async fn finish_inner(
         mut self,
         expected: ExecutionOutcome,
         failure_code: Option<&str>,
         text: &str,
         chunks: i64,
+        expected_output_tokens: Option<Option<i64>>,
     ) {
         tokio::time::timeout(Duration::from_secs(2), &mut self.task)
             .await
@@ -410,6 +455,39 @@ impl StreamingFixture {
         };
         let expected_terminal = (outcome, 1, failure_code.map(str::to_owned));
         assert_eq!(terminal, expected_terminal);
+        let statistics: (Option<i64>, Option<i64>, Option<i64>, i64, i64) = connection
+            .query_row(
+                "SELECT qualified_input_tokens, qualified_output_tokens,
+                        service_first_output_latency_ms, service_total_duration_ms, stop_reason
+                 FROM attempt_statistics",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(statistics.0, Some(1));
+        if let Some(expected_output_tokens) = expected_output_tokens {
+            assert_eq!(statistics.1, expected_output_tokens);
+        }
+        if self.full_run && !text.is_empty() {
+            assert!(statistics.2.is_some());
+        }
+        assert!(statistics.2.is_none_or(|first| first <= statistics.3));
+        assert_eq!(
+            statistics.4,
+            match expected {
+                ExecutionOutcome::Completed => 1,
+                ExecutionOutcome::Stopped => 3,
+                ExecutionOutcome::Failed => 4,
+            }
+        );
         connection.close().unwrap();
     }
 }
