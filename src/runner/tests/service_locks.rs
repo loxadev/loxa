@@ -225,7 +225,8 @@ fn service_lock_owner_child() {
         );
     }
     drop((common, model, token));
-    let reactor = tokio::runtime::Builder::new_current_thread()
+    let reactor = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
         .enable_all()
         .build()
         .unwrap();
