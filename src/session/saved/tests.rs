@@ -280,7 +280,7 @@ impl Pty {
             0
         );
         let master = unsafe { File::from_raw_fd(master) };
-        let slave = unsafe { File::from_raw_fd(slave) };
+        let mut slave = unsafe { File::from_raw_fd(slave) };
         for descriptor in [&master, &slave] {
             let flags = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFD) };
             assert_ne!(flags, -1);
@@ -295,6 +295,8 @@ impl Pty {
                 -1
             );
         }
+        // Darwin exposes its sticky FWASWRITTEN bit through F_GETFL; prime it first.
+        slave.write_all(b"\0").unwrap();
         let original_slave_flags = unsafe { libc::fcntl(slave.as_raw_fd(), libc::F_GETFL) };
         assert_ne!(original_slave_flags, -1);
         let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
@@ -480,7 +482,28 @@ impl Pty {
     }
 
     pub(super) fn write_input(&mut self, bytes: &[u8]) {
-        self.master.write_all(bytes).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut remaining = bytes;
+        while !remaining.is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "saved Chat input timed out with {} of {} bytes unwritten",
+                remaining.len(),
+                bytes.len()
+            );
+            match self.master.write(remaining) {
+                Ok(0) => panic!("saved Chat PTY input write made no progress"),
+                Ok(n) => remaining = &remaining[n..],
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => panic!("write saved Chat PTY input: {error}"),
+            }
+            self.drain_output(16)
+                .expect("drain saved Chat PTY while writing input");
+            if !remaining.is_empty() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
     }
 
     pub(super) fn signal_sigint(&self) {
@@ -574,7 +597,7 @@ fn second_idle_prompt_ctrl_c_exits_and_restores_terminal() {
     pty.write_input(b"first\n");
     let marker_end = pty.wait_for_text("SECOND_READLINE_ARMED");
     pty.wait_for_prompt_after(marker_end);
-    pty.master.write_all(b"\x03").unwrap();
+    pty.write_input(b"\x03");
     pty.finish();
 }
 

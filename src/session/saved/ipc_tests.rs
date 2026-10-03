@@ -1072,6 +1072,7 @@ async fn saved_chat_pty_send_output_sigint_stops_the_exact_attempt_and_restores_
         let bootstrap_end = pty.wait_for_bootstrap();
         pty.wait_for_prompt_after(bootstrap_end);
         pty.write_input(b"hello\n");
+        pty.wait_for_text("ok");
         pty
     })
     .await
@@ -1079,8 +1080,6 @@ async fn saved_chat_pty_send_output_sigint_stops_the_exact_attempt_and_restores_
     peer.wait_for(|seen| seen.iter().any(|item| matches!(item, Seen::Subscribe(..))))
         .await;
     let pty = tokio::task::spawn_blocking(move || {
-        let mut pty = pty;
-        pty.wait_for_text("ok");
         pty.signal_sigint();
         pty
     })
