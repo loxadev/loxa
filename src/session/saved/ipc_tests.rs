@@ -161,7 +161,7 @@ impl FakePeer {
     }
 
     async fn wait_for(&self, predicate: impl Fn(&[Seen]) -> bool) {
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
             loop {
                 let notified = self.changed.notified();
                 tokio::pin!(notified);
@@ -179,8 +179,14 @@ impl FakePeer {
                 notified.await;
             }
         })
-        .await
-        .expect("fake peer did not observe the expected client operation");
+        .await;
+        if result.is_err() {
+            let state = self.state.lock().await;
+            panic!(
+                "fake peer did not observe the expected client operation; seen={:?}; errors={:?}",
+                state.seen, state.errors
+            );
+        }
     }
 }
 

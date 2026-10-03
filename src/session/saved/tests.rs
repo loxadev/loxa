@@ -3,7 +3,8 @@ use crate::session::{new_editor, prompt_input, InputEvent};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::process::CommandExt;
+use std::os::unix::net::UnixStream;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -64,14 +65,84 @@ fn finalizing_saved_and_completed_save_failed_do_not_finish_as_saved_chat() {
 }
 
 const CHILD: &str = "LOXA_SAVED_CHAT_PTY_CHILD";
+const SUPERVISOR: &str = "LOXA_SAVED_CHAT_PTY_SUPERVISOR";
+const WORKER_TEST: &str = "LOXA_SAVED_CHAT_PTY_WORKER_TEST";
+const TRANSCRIPT_LIMIT: usize = 32 * 1024;
 
-fn pty_phase(phase: &str, pid: Option<u32>) {
-    let current = std::thread::current();
-    let _ = writeln!(
-        std::io::stderr(),
-        "saved-chat-pty phase={phase} pid={pid:?} thread={:?}",
-        current.name()
+#[test]
+fn child_pty_supervisor() {
+    let Some(descriptor) = std::env::var_os(SUPERVISOR) else {
+        return;
+    };
+    let descriptor = descriptor.to_str().unwrap().parse().unwrap();
+    let mut control = unsafe { UnixStream::from_raw_fd(descriptor) };
+    assert_ne!(
+        unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) },
+        -1
     );
+    control.set_nonblocking(true).unwrap();
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .arg("--exact")
+        .arg(std::env::var_os(WORKER_TEST).unwrap())
+        .arg("--nocapture")
+        .env_remove(SUPERVISOR)
+        .env_remove(WORKER_TEST)
+        .process_group(0);
+    unsafe {
+        command.pre_exec(|| {
+            // The worker starts in the background until it claims the foreground group.
+            if libc::signal(libc::SIGTTOU, libc::SIG_IGN) == libc::SIG_ERR
+                || libc::tcsetpgrp(libc::STDIN_FILENO, libc::getpid()) == -1
+                || libc::signal(libc::SIGTTOU, libc::SIG_DFL) == libc::SIG_ERR
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut worker = PtyWorker(command.spawn().expect("spawn saved Chat PTY worker"));
+    control.write_all(&worker.0.id().to_ne_bytes()).unwrap();
+    let status = loop {
+        if let Some(status) = worker.0.try_wait().unwrap() {
+            break status;
+        }
+        match control.read(&mut [0]) {
+            Ok(_) => return,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => panic!("read saved Chat PTY supervisor control: {error}"),
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    control.write_all(&status.into_raw().to_ne_bytes()).unwrap();
+    // Keep the controlling session alive until the parent checks the unchanged slave.
+    control.set_nonblocking(false).unwrap();
+    let _ = control.read(&mut [0]);
+}
+
+struct PtyWorker(Child);
+
+impl Drop for PtyWorker {
+    fn drop(&mut self) {
+        if !matches!(self.0.try_wait(), Ok(Some(_))) {
+            unsafe { libc::kill(-(self.0.id() as libc::pid_t), libc::SIGKILL) };
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if matches!(self.0.try_wait(), Ok(Some(_))) {
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    eprintln!(
+                        "saved Chat PTY worker {} did not reap after kill",
+                        self.0.id()
+                    );
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
 }
 
 #[test]
@@ -164,10 +235,15 @@ fn child_run_service() {
 }
 
 pub(super) struct Pty {
-    child: Child,
+    supervisor: Child,
+    control: UnixStream,
+    worker_pid: libc::pid_t,
+    worker_status: [u8; 4],
+    worker_status_len: usize,
     master: File,
     slave: File,
     transcript: Vec<u8>,
+    transcript_start: usize,
     original_slave_flags: libc::c_int,
 }
 
@@ -191,7 +267,6 @@ impl Pty {
     fn spawn_named_with_root(mode: &str, test: &str, root: Option<&Path>) -> Self {
         let mut master = -1;
         let mut slave = -1;
-        pty_phase("openpty-before", None);
         assert_eq!(
             unsafe {
                 libc::openpty(
@@ -204,7 +279,6 @@ impl Pty {
             },
             0
         );
-        pty_phase("openpty-after", None);
         let master = unsafe { File::from_raw_fd(master) };
         let slave = unsafe { File::from_raw_fd(slave) };
         for descriptor in [&master, &slave] {
@@ -229,9 +303,16 @@ impl Pty {
             unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
             -1
         );
+        let (control, supervisor_control) = UnixStream::pair().unwrap();
+        let supervisor_descriptor = supervisor_control.as_raw_fd();
         let mut command = Command::new(std::env::current_exe().unwrap());
-        command.arg("--exact").arg(test).arg("--nocapture");
+        command
+            .arg("--exact")
+            .arg("session::saved::tests::child_pty_supervisor")
+            .arg("--nocapture");
         command.env(CHILD, mode);
+        command.env(SUPERVISOR, supervisor_descriptor.to_string());
+        command.env(WORKER_TEST, test);
         command.env("TERM", "xterm-256color");
         if let Some(root) = root {
             command.env("LOXA_SAVED_CHAT_TEST_ROOT", root);
@@ -240,25 +321,41 @@ impl Pty {
         command.stdout(Stdio::from(slave.try_clone().unwrap()));
         command.stderr(Stdio::from(slave.try_clone().unwrap()));
         unsafe {
-            command.pre_exec(|| {
+            command.pre_exec(move || {
                 if libc::setsid() == -1
                     || libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) == -1
+                    || libc::fcntl(supervisor_descriptor, libc::F_SETFD, 0) == -1
                 {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
             });
         }
-        pty_phase("spawn-before", None);
-        let child = command.spawn().expect("spawn saved Chat PTY child");
-        pty_phase("spawn-after", Some(child.id()));
-        Self {
-            child,
+        let supervisor = command.spawn().expect("spawn saved Chat PTY supervisor");
+        drop(supervisor_control);
+        let mut pty = Self {
+            supervisor,
+            control,
+            worker_pid: 0,
+            worker_status: [0; 4],
+            worker_status_len: 0,
             master,
             slave,
             transcript: Vec::new(),
+            transcript_start: 0,
             original_slave_flags,
-        }
+        };
+        pty.control
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut worker_pid = [0; 4];
+        pty.control
+            .read_exact(&mut worker_pid)
+            .expect("saved Chat PTY supervisor did not report its worker");
+        pty.worker_pid = libc::pid_t::from_ne_bytes(worker_pid);
+        assert!(pty.worker_pid > 1);
+        pty.control.set_nonblocking(true).unwrap();
+        pty
     }
 
     pub(super) fn wait_for_prompt_after(&mut self, start: usize) {
@@ -275,40 +372,108 @@ impl Pty {
     }
 
     fn wait_for_bytes(&mut self, needle: &[u8], start: usize, limit: Duration) -> usize {
-        let _ = writeln!(
-            std::io::stderr(),
-            "saved-chat-pty wait-before marker={:?} pid={} thread={:?}",
-            String::from_utf8_lossy(needle),
-            self.child.id(),
-            std::thread::current().name()
-        );
         let deadline = Instant::now() + limit;
         loop {
-            let mut buffer = [0; 4096];
-            match self.master.read(&mut buffer) {
-                Ok(n) => self.transcript.extend_from_slice(&buffer[..n]),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) if error.raw_os_error() == Some(libc::EIO) => {}
-                Err(error) => panic!("read PTY: {error}"),
-            }
-            if let Some(index) = self.transcript[start..]
+            self.drain_output(1).expect("read saved Chat PTY");
+            let relative_start = start
+                .saturating_sub(self.transcript_start)
+                .min(self.transcript.len());
+            if let Some(index) = self.transcript[relative_start..]
                 .windows(needle.len())
                 .position(|bytes| bytes == needle)
             {
-                return start + index + needle.len();
+                return self.transcript_start + relative_start + index + needle.len();
             }
             assert!(
-                self.child.try_wait().unwrap().is_none(),
+                self.poll_worker_status().unwrap().is_none(),
                 "child exited: {}",
                 String::from_utf8_lossy(&self.transcript)
             );
             if Instant::now() >= deadline {
-                pty_phase("wait-timeout", Some(self.child.id()));
                 panic!(
-                    "saved Chat marker {:?} timed out: {}",
+                    "saved Chat marker {:?} timed out for child {}: {}",
                     String::from_utf8_lossy(needle),
+                    self.worker_pid,
                     String::from_utf8_lossy(&self.transcript)
                 );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn drain_output(&mut self, max_reads: usize) -> std::io::Result<()> {
+        for _ in 0..max_reads {
+            let mut buffer = [0; 4096];
+            match self.master.read(&mut buffer) {
+                Ok(0) => return Ok(()),
+                Ok(n) => {
+                    self.transcript.extend_from_slice(&buffer[..n]);
+                    if self.transcript.len() > TRANSCRIPT_LIMIT {
+                        let excess = self.transcript.len() - TRANSCRIPT_LIMIT;
+                        self.transcript.drain(..excess);
+                        self.transcript_start += excess;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                Err(error) if error.raw_os_error() == Some(libc::EIO) => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    fn wait_for_exit(
+        &mut self,
+        deadline: Instant,
+    ) -> std::io::Result<Option<std::process::ExitStatus>> {
+        loop {
+            self.drain_output(16)?;
+            if let Some(status) = self.poll_worker_status()? {
+                self.drain_output(16)?;
+                return Ok(Some(status));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn poll_worker_status(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        if self.worker_status_len < self.worker_status.len() {
+            match self
+                .control
+                .read(&mut self.worker_status[self.worker_status_len..])
+            {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "PTY supervisor exited without the worker status",
+                    ));
+                }
+                Ok(n) => self.worker_status_len += n,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok((self.worker_status_len == self.worker_status.len())
+            .then(|| std::process::ExitStatus::from_raw(i32::from_ne_bytes(self.worker_status))))
+    }
+
+    fn wait_for_supervisor_exit(
+        &mut self,
+        deadline: Instant,
+    ) -> std::io::Result<Option<std::process::ExitStatus>> {
+        loop {
+            self.drain_output(16)?;
+            if let Some(status) = self.supervisor.try_wait()? {
+                self.drain_output(16)?;
+                return Ok(Some(status));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
             }
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -319,10 +484,7 @@ impl Pty {
     }
 
     pub(super) fn signal_sigint(&self) {
-        assert_eq!(
-            unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGINT) },
-            0
-        );
+        assert_eq!(unsafe { libc::kill(self.worker_pid, libc::SIGINT) }, 0);
     }
 
     pub(super) fn finish(self) {
@@ -331,17 +493,15 @@ impl Pty {
 
     fn finish_with_code(mut self, expected_code: i32) {
         let deadline = Instant::now() + Duration::from_secs(5);
-        pty_phase("finish-wait-before", Some(self.child.id()));
-        let status = loop {
-            if let Some(status) = self.child.try_wait().unwrap() {
-                break status;
-            }
-            assert!(Instant::now() < deadline, "saved Chat child did not exit");
-            std::thread::sleep(Duration::from_millis(10));
-        };
-        pty_phase("finish-wait-after", Some(self.child.id()));
+        let status = self
+            .wait_for_exit(deadline)
+            .expect("drain saved Chat PTY while waiting for exit")
+            .expect("saved Chat child did not exit");
         assert_eq!(status.code(), Some(expected_code));
-        pty_phase("restore-check-before", Some(self.child.id()));
+        assert!(
+            self.supervisor.try_wait().unwrap().is_none(),
+            "PTY session leader exited before the terminal restoration check"
+        );
         let mut terminal = std::mem::MaybeUninit::<libc::termios>::uninit();
         assert_eq!(
             unsafe { libc::tcgetattr(self.slave.as_raw_fd(), terminal.as_mut_ptr()) },
@@ -363,20 +523,46 @@ impl Pty {
             self.original_slave_flags,
             "terminal output flags were not restored"
         );
-        pty_phase("restore-check-after", Some(self.child.id()));
+        self.control.write_all(&[1]).unwrap();
+        let status = self
+            .wait_for_supervisor_exit(Instant::now() + Duration::from_secs(5))
+            .expect("drain saved Chat PTY while waiting for supervisor exit")
+            .expect("saved Chat PTY supervisor did not exit");
+        assert!(
+            status.success(),
+            "saved Chat PTY supervisor failed: {status}"
+        );
     }
 }
 
 impl Drop for Pty {
     fn drop(&mut self) {
-        pty_phase("drop-before", Some(self.child.id()));
-        if self.child.try_wait().ok().flatten().is_none() {
-            pty_phase("drop-kill-before", Some(self.child.id()));
-            let _ = self.child.kill();
-            pty_phase("drop-kill-after", Some(self.child.id()));
-            pty_phase("drop-wait-before", Some(self.child.id()));
-            let _ = self.child.wait();
-            pty_phase("drop-wait-after", Some(self.child.id()));
+        if !matches!(self.supervisor.try_wait(), Ok(Some(_))) {
+            // Releasing a live worker first makes the supervisor kill and reap its group.
+            let _ = self.control.write_all(&[1]);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            if !matches!(self.wait_for_supervisor_exit(deadline), Ok(Some(_))) {
+                if self.worker_pid > 1 && !matches!(self.poll_worker_status(), Ok(Some(_))) {
+                    unsafe { libc::kill(-self.worker_pid, libc::SIGKILL) };
+                    let _ = self.wait_for_exit(Instant::now() + Duration::from_secs(5));
+                }
+                let _ = self.supervisor.kill();
+                let reaped = self.wait_for_supervisor_exit(Instant::now() + Duration::from_secs(5));
+                if !matches!(reaped, Ok(Some(_))) {
+                    eprintln!(
+                        "saved Chat PTY supervisor {} did not reap after kill",
+                        self.supervisor.id()
+                    );
+                }
+            }
+        }
+        if std::thread::panicking() {
+            let _ = self.drain_output(16);
+            eprintln!(
+                "saved Chat PTY child {} transcript tail: {}",
+                self.worker_pid,
+                String::from_utf8_lossy(&self.transcript)
+            );
         }
     }
 }
@@ -404,10 +590,7 @@ fn batched_lines_survive_readline_return() {
 fn external_idle_sigint_exits_and_restores_terminal() {
     let mut pty = Pty::spawn();
     pty.wait_for_prompt_after(0);
-    assert_eq!(
-        unsafe { libc::kill(pty.child.id() as libc::pid_t, libc::SIGINT) },
-        0
-    );
+    pty.signal_sigint();
     pty.finish();
 }
 
@@ -416,10 +599,7 @@ fn prompt_transition_sigint_never_enters_a_successor_prompt() {
     let mut pty = Pty::spawn();
     pty.wait_for_prompt_after(0);
     pty.write_input(b"first\n");
-    assert_eq!(
-        unsafe { libc::kill(pty.child.id() as libc::pid_t, libc::SIGINT) },
-        0
-    );
+    pty.signal_sigint();
     pty.finish();
 }
 
@@ -428,10 +608,7 @@ fn blocked_partial_output_yields_to_sigint_and_restores_flags() {
     let mut pty = Pty::spawn_named("blocked", "session::saved::tests::child_blocked_output");
     pty.wait_for_text("BLOCKED_OUTPUT_ARMED");
     std::thread::sleep(Duration::from_millis(100));
-    assert_eq!(
-        unsafe { libc::kill(pty.child.id() as libc::pid_t, libc::SIGINT) },
-        0
-    );
+    pty.signal_sigint();
     pty.finish();
 }
 
