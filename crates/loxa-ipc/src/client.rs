@@ -239,13 +239,6 @@ impl ServiceClient {
             .map_err(|error| ClientError::Transport(error.into()))?;
         let contract = ClientContract::GenerationControl;
         let mut connection = self.connect_for(mode, contract).await?;
-        if connection.hello.storage_schema != HISTORY_SCHEMA_VERSION
-            || !connection.hello.capabilities.contains(&Capability::History)
-        {
-            return Err(ClientError::Transport(
-                "service generation history is not ready with a supported schema".into(),
-            ));
-        }
         let outcome = connection
             .request(ServiceCommand::Generation { command })
             .await?;

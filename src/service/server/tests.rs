@@ -684,6 +684,219 @@ async fn history_protocol_freezes_a_conversation_and_stop_bypasses_stalled_sql()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_typed_stop_does_not_require_ready_history() {
+    let fixture = ServerFixture::start().await;
+    let (listener, _socket) = bind_control_socket(fixture.bootstrap.root().socket_path()).unwrap();
+    let client = ServiceClient::load(
+        fixture.bootstrap.root().root(),
+        None,
+        super::super::BUILD_ID,
+    )
+    .unwrap();
+    let targets = [
+        loxa_ipc::GenerationTarget::Pending {
+            boot_epoch: fixture.coordinator.boot_epoch().into(),
+            pending_nonce: "11".repeat(16),
+        },
+        loxa_ipc::GenerationTarget::Accepted {
+            boot_epoch: fixture.coordinator.boot_epoch().into(),
+            submission_id: "22".repeat(16),
+            operation_generation: "3".into(),
+        },
+    ];
+    for storage_schema in [0, HISTORY_SCHEMA_VERSION + 1] {
+        for target in &targets {
+            let expected = target.clone();
+            let hello = Hello::generation(
+                super::super::BUILD_ID,
+                fixture.bootstrap.root().root_identity(),
+                loxa_ipc::GenerationConnection::Control,
+            );
+            let ack = generation_client_ack(&fixture, storage_schema);
+            let peer = async {
+                let mut transport = acknowledge_typed_client(&listener, hello, ack).await;
+                let ClientEnvelope::Request(request) = receive_frame_with_limit(
+                    &mut transport,
+                    REQUEST_TIMEOUT,
+                    MAX_HISTORY_FRAME_BYTES,
+                )
+                .await
+                .unwrap() else {
+                    panic!("typed Stop did not send a request");
+                };
+                assert_eq!(
+                    request.command,
+                    ServiceCommand::Generation {
+                        command: loxa_ipc::GenerationCommand::Stop {
+                            target: expected.clone(),
+                        },
+                    }
+                );
+                send_frame_with_limit(
+                    &mut transport,
+                    &ServerEnvelope::Reply(Reply {
+                        request_id: request.request_id,
+                        outcome: ReplyOutcome::Generation {
+                            reply: loxa_ipc::GenerationReply::Stopping { target: expected },
+                        },
+                    }),
+                    REQUEST_TIMEOUT,
+                    MAX_HISTORY_FRAME_BYTES,
+                )
+                .await
+                .unwrap();
+            };
+            let stop = client.generation_request(
+                ConnectMode::ObserveExisting,
+                loxa_ipc::GenerationCommand::Stop {
+                    target: target.clone(),
+                },
+            );
+            let (reply, ()) = tokio::join!(stop, peer);
+            assert_eq!(
+                reply.unwrap(),
+                loxa_ipc::GenerationReply::Stopping {
+                    target: target.clone(),
+                }
+            );
+        }
+    }
+    stop_generation_client_fixture(&fixture).await;
+}
+
+fn generation_client_ack(fixture: &ServerFixture, storage_schema: u32) -> loxa_ipc::HelloAck {
+    let mut capabilities = LEGACY_CAPABILITIES.to_vec();
+    if storage_schema != 0 {
+        capabilities.push(Capability::History);
+    }
+    loxa_ipc::HelloAck {
+        protocol: loxa_ipc::ProtocolVersion::V1_2,
+        capabilities,
+        build: super::super::BUILD_ID.into(),
+        storage_schema,
+        boot_epoch: fixture.coordinator.boot_epoch().into(),
+        root_identity: fixture.bootstrap.root().root_identity().into(),
+        service_pid: std::process::id(),
+        origin_sha256: fixture.bootstrap.origin().executable_sha256().into(),
+        generation: None,
+    }
+}
+
+async fn acknowledge_typed_client(
+    listener: &UnixListener,
+    hello: Hello,
+    ack: loxa_ipc::HelloAck,
+) -> loxa_ipc::IpcFramed {
+    let (stream, _) = tokio::time::timeout(HANDSHAKE_TIMEOUT, listener.accept())
+        .await
+        .expect("typed client did not connect")
+        .unwrap();
+    let mut transport = framed(stream);
+    assert_eq!(
+        receive_frame::<ClientEnvelope>(&mut transport, HANDSHAKE_TIMEOUT)
+            .await
+            .unwrap(),
+        ClientEnvelope::Hello(hello)
+    );
+    send_frame(
+        &mut transport,
+        &ServerEnvelope::HelloAck(ack),
+        HANDSHAKE_TIMEOUT,
+    )
+    .await
+    .unwrap();
+    set_frame_limit(&mut transport, MAX_HISTORY_FRAME_BYTES).unwrap();
+    transport
+}
+
+async fn stop_generation_client_fixture(fixture: &ServerFixture) {
+    fixture.coordinator.stop_service().unwrap();
+    let mut owner_exit = fixture.coordinator.owner_exit_receiver();
+    let mut history_exit = fixture.coordinator.history_exit_receiver();
+    let mut settings_exit = fixture.coordinator.settings_exit_receiver();
+    wait_for_owner_resolution(
+        &fixture.coordinator,
+        &mut owner_exit,
+        &mut history_exit,
+        &mut settings_exit,
+    )
+    .await;
+    fixture.coordinator.join_owner().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_typed_generation_preparation_still_requires_ready_history() {
+    let fixture = ServerFixture::start().await;
+    let (listener, _socket) = bind_control_socket(fixture.bootstrap.root().socket_path()).unwrap();
+    let client = ServiceClient::load(
+        fixture.bootstrap.root().root(),
+        None,
+        super::super::BUILD_ID,
+    )
+    .unwrap();
+    for (storage_schema, protocol) in [
+        (0, loxa_ipc::ProtocolVersion::V1_2),
+        (0, loxa_ipc::ProtocolVersion::V1_5),
+        (HISTORY_SCHEMA_VERSION + 1, loxa_ipc::ProtocolVersion::V1_6),
+    ] {
+        let mut hello = Hello::generation(
+            super::super::BUILD_ID,
+            fixture.bootstrap.root().root_identity(),
+            loxa_ipc::GenerationConnection::Request,
+        );
+        hello.protocol = protocol;
+        let mut ack = generation_client_ack(&fixture, storage_schema);
+        ack.protocol = protocol;
+        ack.generation = Some(loxa_ipc::GenerationHelloAck {
+            pending_nonce: "11".repeat(16),
+        });
+        let peer = async {
+            let mut transport = acknowledge_typed_client(&listener, hello, ack).await;
+            assert!(
+                tokio::time::timeout(REQUEST_TIMEOUT, transport.next())
+                    .await
+                    .expect("preparation did not close its rejected connection")
+                    .is_none(),
+                "preparation sent a request"
+            );
+        };
+        let preparation = async {
+            match protocol {
+                loxa_ipc::ProtocolVersion::V1_2 => {
+                    client
+                        .prepare_generation(ConnectMode::ObserveExisting)
+                        .await
+                }
+                loxa_ipc::ProtocolVersion::V1_5 => {
+                    client
+                        .prepare_generation_retry(ConnectMode::ObserveExisting)
+                        .await
+                }
+                _ => {
+                    client
+                        .prepare_generation_at(
+                            ConnectMode::ObserveExisting,
+                            loxa_ipc::OperationTarget {
+                                boot_epoch: fixture.coordinator.boot_epoch().into(),
+                                task_id: "1".into(),
+                                generation: "1".into(),
+                            },
+                        )
+                        .await
+                }
+            }
+        };
+        let (result, ()) = tokio::join!(preparation, peer);
+        assert!(matches!(
+            result,
+            Err(loxa_ipc::ClientError::Transport(message))
+                if message.contains("generation history is not ready")
+        ));
+    }
+    stop_generation_client_fixture(&fixture).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn public_typed_client_round_trips_legacy_history_drafts_and_settings() {
     let fixture = ServerFixture::start().await;
     wait_for_history_ready(&fixture.coordinator).await;
