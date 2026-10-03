@@ -134,6 +134,7 @@ fn service_lock_engine_child() {
     while !root.join("release-engine").is_file() {
         match listener.accept() {
             Ok((mut stream, _)) => {
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(1)))
                     .unwrap();
